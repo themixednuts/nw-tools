@@ -1,0 +1,22 @@
+[package]
+name = "nw-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+humansize.workspace = true
+nw-catalog.workspace = true
+nw-datasheet.workspace = true
+nw-dds.workspace = true
+nw-filesystem.workspace = true
+nw-jobs.workspace = true
+nw-objectstream.workspace = true
+nw-pak.workspace = true
+nw-resources.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

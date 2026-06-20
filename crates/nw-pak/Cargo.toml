@@ -1,0 +1,19 @@
+[package]
+name = "nw-pak"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flate2.workspace = true
+humansize.workspace = true
+memmap2.workspace = true
+crc32fast.workspace = true
+nw-filesystem.workspace = true
+nw-jobs.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+time.workspace = true
+zip.workspace = true
