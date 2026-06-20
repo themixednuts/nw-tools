@@ -3,8 +3,9 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use humansize::{DECIMAL, format_size};
+use nw_objectstream::ObjectStreamEncoding;
 use nw_objectstream::lookup::NameLookup;
 
 use crate::jobs::{JobArgs, RunCtx};
@@ -139,11 +140,23 @@ pub struct Dds {
 pub struct ObjectStream {
     path: PathBuf,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "to")]
     dom: bool,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "to")]
     query: Option<String>,
+
+    /// Convert ObjectStream files to this encoding.
+    #[arg(long, value_enum, requires = "out")]
+    to: Option<EncodingArg>,
+
+    /// Conversion output file or directory.
+    #[arg(long, value_name = "PATH", requires = "to")]
+    out: Option<PathBuf>,
+
+    /// Replace existing conversion outputs.
+    #[arg(long, requires = "to")]
+    overwrite: bool,
 
     /// Case-insensitive path substring prefilter.
     #[arg(long)]
@@ -168,6 +181,13 @@ pub struct ObjectStream {
 
     #[command(flatten)]
     jobs: JobArgs,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EncodingArg {
+    Binary,
+    Xml,
+    Json,
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +307,14 @@ struct ObjectHit {
     count: u64,
     score: u32,
     value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectConvertRow {
+    source: String,
+    output: String,
+    encoding: String,
+    bytes: String,
 }
 
 impl Catalog {
@@ -619,6 +647,22 @@ impl ObjectStream {
         let lookup = load_lookup(self.no_names)?;
         let selector = PathSelector::new(self.filter, self.glob);
         let paths = objectstream_paths(&self.path, &self.extensions, &selector)?;
+        if let Some(encoding) = self.to {
+            let out = self
+                .out
+                .as_ref()
+                .context("--out is required when --to is set")?;
+            return convert_objectstreams(
+                &ctx,
+                &self.path,
+                &paths,
+                out,
+                encoding.into(),
+                self.overwrite,
+                lookup.as_ref(),
+            );
+        }
+
         let mode = if self.dom {
             nw_objectstream::stats::ObjectStreamInspectionMode::dom(self.show)
         } else {
@@ -686,6 +730,92 @@ impl ObjectStream {
 
         finish_scan(cancelled, skipped, &errors, "objectstream")
     }
+}
+
+fn convert_objectstreams(
+    ctx: &RunCtx,
+    root: &Path,
+    paths: &[PathBuf],
+    out: &Path,
+    encoding: ObjectStreamEncoding,
+    overwrite: bool,
+    lookup: Option<&NameLookup>,
+) -> Result<()> {
+    let batch = ctx.map_results_compact(
+        "objectstream conversion",
+        paths,
+        |path| path_label(path),
+        |path, progress| {
+            progress.step(|| convert_objectstream(root, path, out, encoding, overwrite, lookup))
+        },
+    );
+    let skipped = batch.skipped();
+    let cancelled = batch.was_cancelled();
+    let mut converted = Vec::new();
+    let mut errors = Vec::new();
+
+    for result in batch.into_completed() {
+        match result {
+            Ok(Some(row)) => converted.push(row),
+            Ok(None) => {}
+            Err(error) => errors.push(error),
+        }
+    }
+    converted.sort_by(|left, right| left.source.cmp(&right.source));
+
+    println!(
+        "objectstreams: {}  converted: {}  encoding: {}",
+        paths.len(),
+        converted.len(),
+        encoding
+    );
+    let mut table = Table::new(["Source", "Output", "Encoding", "Bytes"]);
+    for row in converted {
+        table.push([row.source, row.output, row.encoding, row.bytes]);
+    }
+    if table.is_empty() {
+        println!("no ObjectStreams converted");
+    } else {
+        print!("{table}");
+    }
+
+    finish_scan(cancelled, skipped, &errors, "objectstream conversion")
+}
+
+fn convert_objectstream(
+    root: &Path,
+    path: &Path,
+    out: &Path,
+    encoding: ObjectStreamEncoding,
+    overwrite: bool,
+    lookup: Option<&NameLookup>,
+) -> Result<Option<ObjectConvertRow>> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let Some(payload) = objectstream_payload(&bytes)
+        .with_context(|| format!("decode wrapper for {}", path.display()))?
+    else {
+        return Ok(None);
+    };
+    let converted = nw_objectstream::ObjectStream::transcode_bytes(&payload, encoding, lookup)
+        .with_context(|| format!("convert {}", path.display()))?;
+    let output = objectstream_output_path(root, path, out, encoding);
+    if output.exists() && !overwrite {
+        bail!(
+            "{} exists (pass --overwrite to replace it)",
+            output.display()
+        );
+    }
+    if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(&output, &converted).with_context(|| format!("write {}", output.display()))?;
+
+    Ok(Some(ObjectConvertRow {
+        source: path_label(path),
+        output: output.display().to_string(),
+        encoding: encoding.to_string(),
+        bytes: format_size(converted.len(), DECIMAL),
+    }))
 }
 
 fn convert_dds_to_ktx2(ctx: &RunCtx, path: &Path, out: &Path, overwrite: bool) -> Result<()> {
@@ -1357,6 +1487,50 @@ fn objectstream_paths(
     })
 }
 
+fn objectstream_output_path(
+    root: &Path,
+    source: &Path,
+    out: &Path,
+    encoding: ObjectStreamEncoding,
+) -> PathBuf {
+    if root.is_file() {
+        return out.to_path_buf();
+    }
+
+    let relative = source.strip_prefix(root).unwrap_or(source);
+    objectstream_encoded_path(out.join(relative), encoding)
+}
+
+fn objectstream_encoded_path(path: PathBuf, encoding: ObjectStreamEncoding) -> PathBuf {
+    let stripped = strip_objectstream_text_extension(&path);
+    match encoding.extension() {
+        "" => stripped,
+        extension => {
+            let mut output = stripped.clone();
+            if let Some(file_name) = stripped.file_name().and_then(|name| name.to_str()) {
+                output.set_file_name(format!("{file_name}.{extension}"));
+            }
+            output
+        }
+    }
+}
+
+fn strip_objectstream_text_extension(path: &Path) -> PathBuf {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return path.to_path_buf();
+    };
+    if !matches!(extension.to_ascii_lowercase().as_str(), "json" | "xml") {
+        return path.to_path_buf();
+    }
+
+    let Some(stem) = path.file_stem() else {
+        return path.to_path_buf();
+    };
+    let mut stripped = path.to_path_buf();
+    stripped.set_file_name(stem);
+    stripped
+}
+
 fn path_selected(root: &Path, path: &Path, selector: &PathSelector) -> bool {
     let relative = nw_filesystem::display_relative(root, path);
     if !relative.is_empty() && selector.matches(&relative) {
@@ -1396,6 +1570,16 @@ fn object_source(scan: &ObjectScan) -> &str {
 
 fn path_label(path: &Path) -> String {
     path.display().to_string()
+}
+
+impl From<EncodingArg> for ObjectStreamEncoding {
+    fn from(value: EncodingArg) -> Self {
+        match value {
+            EncodingArg::Binary => Self::Binary,
+            EncodingArg::Xml => Self::Xml,
+            EncodingArg::Json => Self::Json,
+        }
+    }
 }
 
 fn lowered(values: Vec<String>) -> Vec<String> {
@@ -1447,4 +1631,25 @@ fn finish_scan(
         bail!("{} {label} file(s) failed", errors.len());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn objectstream_directory_conversion_paths_use_target_encoding() {
+        let root = Path::new("in");
+        let source = Path::new("in/slices/player.slice.json");
+        let out = Path::new("out");
+
+        assert_eq!(
+            objectstream_output_path(root, source, out, ObjectStreamEncoding::Xml),
+            PathBuf::from("out/slices/player.slice.xml")
+        );
+        assert_eq!(
+            objectstream_output_path(root, source, out, ObjectStreamEncoding::Binary),
+            PathBuf::from("out/slices/player.slice")
+        );
+    }
 }
