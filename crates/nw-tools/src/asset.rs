@@ -11,7 +11,7 @@ use nw_pak::{Compression, EntryInfo, PakMmapReader, azcs, crypak, shape};
 
 use crate::jobs::JobArgs;
 use crate::output::Table;
-use crate::support::{GlobSet, PakSet, ScanIssues, load_lookup};
+use crate::support::{AssetRootArg, GlobSet, PakSet, ScanIssues, load_lookup};
 
 const DEFAULT_MAX_ENTRY_SIZE: u64 = 128 * 1024 * 1024;
 
@@ -40,7 +40,8 @@ impl Cmd {
 
 #[derive(Debug, Args)]
 pub struct Inventory {
-    root: PathBuf,
+    #[command(flatten)]
+    root: AssetRootArg,
 
     #[arg(long = "pak")]
     paks: Vec<String>,
@@ -77,8 +78,10 @@ pub enum SearchCmd {
 
 #[derive(Debug, Args)]
 pub struct SearchPath {
-    root: PathBuf,
     query: String,
+
+    #[command(flatten)]
+    root: AssetRootArg,
 
     #[arg(long = "pak")]
     paks: Vec<String>,
@@ -98,8 +101,10 @@ pub struct SearchPath {
 
 #[derive(Debug, Args)]
 pub struct SearchObjectStream {
-    root: PathBuf,
     query: String,
+
+    #[command(flatten)]
+    root: AssetRootArg,
 
     #[arg(long = "pak")]
     paks: Vec<String>,
@@ -159,9 +164,11 @@ pub enum ExtractCmd {
 
 #[derive(Debug, Args)]
 pub struct ExtractExt {
-    root: PathBuf,
     extension: String,
     out: PathBuf,
+
+    #[command(flatten)]
+    root: AssetRootArg,
 
     #[arg(long = "pak")]
     paks: Vec<String>,
@@ -178,8 +185,10 @@ pub struct ExtractExt {
 
 #[derive(Debug, Args)]
 pub struct ExtractObjectStream {
-    root: PathBuf,
     out: PathBuf,
+
+    #[command(flatten)]
+    root: AssetRootArg,
 
     #[arg(long = "pak")]
     paks: Vec<String>,
@@ -304,7 +313,8 @@ struct ObjectPayload {
 impl Inventory {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paks = PakSet::collect(self.root, self.paks)?;
+        let root = self.root.resolve()?;
+        let paks = PakSet::collect(root, self.paks)?;
         let batch = ctx
             .runner
             .map_until_cancelled(paks.paths(), &ctx.cancel, |path| {
@@ -339,7 +349,8 @@ impl Search {
 impl SearchPath {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paks = PakSet::collect(self.root, self.paks)?;
+        let root = self.root.resolve()?;
+        let paks = PakSet::collect(root, self.paks)?;
         let query = TextQuery::new(self.query, self.case_sensitive, self.glob);
         let batch = ctx
             .runner
@@ -405,7 +416,8 @@ impl SearchPath {
 impl SearchObjectStream {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paks = PakSet::collect(self.root, self.paks)?;
+        let root = self.root.resolve()?;
+        let paks = PakSet::collect(root, self.paks)?;
         let lookup = load_lookup(self.no_names)?;
         let query = TextQuery::new(self.query, false, false);
         let batch = ctx
@@ -563,7 +575,8 @@ impl UpdateObjectStream {
 impl ExtractExt {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paks = PakSet::collect(self.root, self.paks)?;
+        let root = self.root.resolve()?;
+        let paks = PakSet::collect(root, self.paks)?;
         let extension = Extension::new(&self.extension);
         let batch = ctx
             .runner
@@ -622,7 +635,8 @@ impl ExtractExt {
 impl ExtractObjectStream {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paks = PakSet::collect(self.root, self.paks)?;
+        let root = self.root.resolve()?;
+        let paks = PakSet::collect(root, self.paks)?;
         let lookup = load_lookup(self.no_names)?;
         let encoding = ObjectStreamEncoding::from(self.encoding);
         let batch = ctx

@@ -18,6 +18,7 @@ nw-catalog.workspace = true
 nw-datasheet.workspace = true
 nw-dds.workspace = true
 nw-filesystem.workspace = true
+nw-locator.workspace = true
 nw-jobs.workspace = true
 nw-objectstream.workspace = true
 nw-pak.workspace = true

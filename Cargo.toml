@@ -48,6 +48,7 @@ nw-catalog = { path = "crates/nw-catalog" }
 nw-datasheet = { path = "crates/nw-datasheet" }
 nw-dds = { path = "crates/nw-dds" }
 nw-filesystem = { path = "crates/nw-filesystem" }
+nw-locator = { path = "crates/nw-locator" }
 nw-jobs = { path = "crates/nw-jobs" }
 nw-objectstream = { path = "crates/nw-objectstream" }
 nw-pak = { path = "crates/nw-pak" }

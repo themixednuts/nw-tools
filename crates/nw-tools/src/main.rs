@@ -16,6 +16,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = "Print the detected New World install paths")]
+    Locate,
     #[command(about = "Normalize an archive path")]
     Paths { path: String },
     #[command(about = "Cross-pak asset inventory, search, and extraction")]
@@ -43,6 +45,14 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command {
+        Some(Command::Locate) => {
+            let install = nw_locator::Install::locate()?;
+            let mut table = output::Table::new(["Key", "Value"]);
+            table.push(["Source".to_string(), install.source().to_string()]);
+            table.push(["Root".to_string(), install.root().display().to_string()]);
+            table.push(["Assets".to_string(), install.assets().display().to_string()]);
+            print!("{table}");
+        }
         Some(Command::Paths { path }) => {
             println!("{}", nw_filesystem::normalize_archive_path(&path));
         }

@@ -8,7 +8,7 @@ use nw_pak::{Compression, PakFile, PakMmapReader, azcs, crypak, oodle, shape};
 
 use crate::jobs::JobArgs;
 use crate::output::Table;
-use crate::support::{GlobSet, collect_paks};
+use crate::support::{AssetRootArg, GlobSet, collect_paks};
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
@@ -38,7 +38,8 @@ impl Cmd {
 
 #[derive(Debug, Args)]
 pub struct List {
-    root: PathBuf,
+    #[command(flatten)]
+    root: AssetRootArg,
 
     #[arg(long, value_enum)]
     method: Option<MethodArg>,
@@ -61,7 +62,8 @@ pub struct List {
 
 #[derive(Debug, Args)]
 pub struct Shape {
-    root: PathBuf,
+    #[command(flatten)]
+    root: AssetRootArg,
 
     #[arg(long, default_value_t = 20)]
     samples: usize,
@@ -246,14 +248,14 @@ struct EntryRow {
 impl List {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paks = collect_paks(&self.root)?;
+        let root = self.root.resolve()?;
+        let paks = collect_paks(&root)?;
         let filter = ListFilter {
             method: self.method,
             family: self.family,
             names: GlobSet::archive(self.name),
             azcs: self.azcs,
         };
-        let root = self.root;
         let batch = ctx
             .runner
             .map_until_cancelled(&paks, &ctx.cancel, |pak| scan_entries(&root, pak, &filter));
@@ -308,10 +310,11 @@ impl List {
 impl Shape {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
+        let root = self.root.resolve()?;
         let report = shape::Scanner::new()
             .max_samples(self.samples)
             .azcs(self.azcs)
-            .scan_with(self.root, &ctx.runner, &ctx.cancel)?;
+            .scan_with(root, &ctx.runner, &ctx.cancel)?;
         println!("{report}");
         Ok(())
     }

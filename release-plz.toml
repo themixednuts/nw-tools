@@ -2,6 +2,7 @@
 git_only = true
 publish = false
 semver_check = false
+features_always_increment_minor = false
 
 [changelog]
 protect_breaking_commits = true

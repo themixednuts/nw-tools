@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use clap::Args;
 use nw_filesystem::display_relative;
 use nw_objectstream::lookup::NameLookup;
 
@@ -35,6 +36,21 @@ impl GlobSet {
 pub struct PakSet {
     root: PathBuf,
     paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+pub struct AssetRootArg {
+    #[arg(long, value_name = "ROOT")]
+    root: Option<PathBuf>,
+}
+
+impl AssetRootArg {
+    pub fn resolve(&self) -> Result<PathBuf> {
+        match &self.root {
+            Some(root) => Ok(root.clone()),
+            None => Ok(nw_locator::Install::locate()?.assets()),
+        }
+    }
 }
 
 impl PakSet {

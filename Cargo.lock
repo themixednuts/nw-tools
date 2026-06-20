@@ -475,6 +475,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nw-locator"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "nw-objectstream"
 version = "0.1.0"
 dependencies = [
@@ -521,6 +528,7 @@ dependencies = [
  "nw-dds",
  "nw-filesystem",
  "nw-jobs",
+ "nw-locator",
  "nw-objectstream",
  "nw-pak",
  "nw-resources",
