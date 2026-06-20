@@ -11,6 +11,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-dashmap.workspace = true
+nw-localization.workspace = true
 serde.workspace = true
 thiserror.workspace = true

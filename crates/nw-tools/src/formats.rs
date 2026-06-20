@@ -1,16 +1,23 @@
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use humansize::{DECIMAL, format_size};
+use nw_asset::AssetId;
+use nw_localization::{
+    LanguageCode, LocalizationCatalog, LocalizationDocument, LocalizationKey, LocalizationTag,
+    SourceManifest, TAG_MANIFEST_ASSET_PATH, is_localization_source_name, localization_asset_path,
+    localization_keys,
+};
 use nw_objectstream::ObjectStreamEncoding;
 use nw_objectstream::lookup::NameLookup;
 
 use crate::jobs::{JobArgs, RunCtx};
 use crate::output::Table;
-use crate::support::{PathSelector, collect_matching, load_lookup, path_ext};
+use crate::support::{PakSet, PathSelector, collect_matching, load_lookup, path_ext};
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
@@ -113,6 +120,30 @@ pub struct Datasheet {
     #[arg(long)]
     show_empty: bool,
 
+    /// Locale used to resolve localization labels in string cells.
+    #[arg(long)]
+    locale: Option<LanguageCode>,
+
+    /// Asset root used to load localization. Defaults to the detected game assets path.
+    #[arg(long = "loc-root", value_name = "ROOT", requires = "locale")]
+    loc_root: Option<PathBuf>,
+
+    /// Localization manifest tag to load; repeat for multiple tags.
+    #[arg(long = "loc-tag", requires = "locale")]
+    loc_tags: Vec<LocalizationTag>,
+
+    /// String rendering mode when localization is loaded.
+    #[arg(long, value_enum, default_value_t = LocalizeArg::Text)]
+    localize: LocalizeArg,
+
+    /// Export rows to CSV under this file or directory.
+    #[arg(long, value_name = "PATH")]
+    csv: Option<PathBuf>,
+
+    /// Replace existing CSV outputs.
+    #[arg(long, requires = "csv")]
+    overwrite: bool,
+
     #[command(flatten)]
     jobs: JobArgs,
 }
@@ -190,6 +221,13 @@ enum EncodingArg {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LocalizeArg {
+    Key,
+    Text,
+    Both,
+}
+
 #[derive(Debug, Clone)]
 struct CatalogScan {
     source: String,
@@ -224,11 +262,13 @@ struct CatalogExportRow {
 }
 
 #[derive(Debug, Clone)]
-struct SheetOptions {
+struct SheetOptions<'a> {
     columns: bool,
     rows: Option<usize>,
     find: Vec<String>,
     show_empty: bool,
+    localization: Option<&'a LocalizationCatalog>,
+    localize: LocalizeArg,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +302,13 @@ struct SheetHit {
     row: String,
     column: String,
     value: String,
+}
+
+#[derive(Debug, Clone)]
+struct SheetExport {
+    source: String,
+    output: String,
+    rows: String,
 }
 
 #[derive(Debug, Clone)]
@@ -512,12 +559,55 @@ impl Datasheet {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
         let paths = collect_matching(&self.path, nw_datasheet::is_datasheet_path)?;
+        let find = lowered(self.find);
+        let needs_localization = self.locale.is_some()
+            && self.localize != LocalizeArg::Key
+            && (self.csv.is_some() || self.rows.is_some() || !find.is_empty());
+        let needed_keys = if needs_localization {
+            collect_datasheet_localization_keys(
+                &paths,
+                (self.csv.is_none() && find.is_empty())
+                    .then_some(self.rows)
+                    .flatten(),
+            )?
+        } else {
+            BTreeSet::new()
+        };
+        let localization = self
+            .locale
+            .clone()
+            .filter(|_| needs_localization)
+            .map(|locale| {
+                load_localization_catalog(
+                    locale,
+                    self.loc_root.as_deref(),
+                    &self.loc_tags,
+                    &needed_keys,
+                )
+            })
+            .transpose()?;
+        if let Some(catalog) = localization.as_ref() {
+            let report = catalog.report();
+            println!(
+                "localization: {}  needed: {}  files: {}  entries: {}  duplicates: {}",
+                catalog.language(),
+                needed_keys.len(),
+                report.source_files(),
+                report.entries(),
+                report.duplicates().len()
+            );
+        }
         let options = SheetOptions {
             columns: self.columns,
             rows: self.rows,
-            find: lowered(self.find),
+            find,
             show_empty: self.show_empty,
+            localization: localization.as_ref(),
+            localize: self.localize,
         };
+        if let Some(out) = self.csv.as_ref() {
+            return export_datasheets(&ctx, &self.path, &paths, out, &options, self.overwrite);
+        }
         let batch = ctx.map_results_compact(
             "datasheet",
             &paths,
@@ -1291,10 +1381,435 @@ fn csv_cell(value: &str) -> String {
     }
 }
 
+fn export_datasheets(
+    ctx: &RunCtx,
+    root: &Path,
+    paths: &[PathBuf],
+    out: &Path,
+    options: &SheetOptions<'_>,
+    overwrite: bool,
+) -> Result<()> {
+    if paths.len() > 1 && out.extension().is_some() {
+        bail!("CSV output must be a directory when exporting more than one datasheet");
+    }
+
+    let batch = ctx.map_results_compact(
+        "datasheet export",
+        paths,
+        |path| path_label(path),
+        |path, progress| progress.step(|| export_datasheet(root, path, out, options, overwrite)),
+    );
+    let skipped = batch.skipped();
+    let cancelled = batch.was_cancelled();
+    let mut exported = Vec::new();
+    let mut errors = Vec::new();
+
+    for result in batch.into_completed() {
+        match result {
+            Ok(row) => exported.push(row),
+            Err(error) => errors.push(error),
+        }
+    }
+    exported.sort_by(|left, right| left.source.cmp(&right.source));
+
+    println!("datasheets: {}  exported: {}", paths.len(), exported.len());
+    let mut table = Table::new(["Source", "Output", "Rows"]);
+    for row in exported {
+        table.push([row.source, row.output, row.rows]);
+    }
+    if table.is_empty() {
+        println!("no datasheets exported");
+    } else {
+        print!("{table}");
+    }
+
+    finish_scan(cancelled, skipped, &errors, "datasheet export")
+}
+
+fn export_datasheet(
+    root: &Path,
+    path: &Path,
+    out: &Path,
+    options: &SheetOptions<'_>,
+    overwrite: bool,
+) -> Result<SheetExport> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let mut sheet = nw_datasheet::Datasheet::parse(&bytes)
+        .with_context(|| format!("parse {}", path.display()))?;
+    if let Some(localization) = options.localization {
+        sheet.set_localization(Some(localization));
+    }
+
+    let output = datasheet_csv_output_path(root, path, out);
+    if output.exists() && !overwrite {
+        bail!(
+            "{} exists (pass --overwrite to replace it)",
+            output.display()
+        );
+    }
+    write_datasheet_csv(&output, &sheet, options)
+        .with_context(|| format!("write {}", output.display()))?;
+
+    Ok(SheetExport {
+        source: path_label(path),
+        output: output.display().to_string(),
+        rows: sheet.len().to_string(),
+    })
+}
+
+fn write_datasheet_csv(
+    path: &Path,
+    sheet: &nw_datasheet::Datasheet<'_>,
+    options: &SheetOptions<'_>,
+) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut csv = String::new();
+    for (index, column) in sheet.columns().iter().enumerate() {
+        if index > 0 {
+            csv.push(',');
+        }
+        csv.push_str(&csv_cell(column.name()));
+    }
+    csv.push('\n');
+
+    for row in sheet.rows() {
+        for (index, cell) in row.cells().iter().enumerate() {
+            if index > 0 {
+                csv.push(',');
+            }
+            csv.push_str(&csv_cell(&cell_text(sheet, cell, options)));
+        }
+        csv.push('\n');
+    }
+
+    std::fs::write(path, csv)?;
+    Ok(())
+}
+
+fn datasheet_csv_output_path(root: &Path, source: &Path, out: &Path) -> PathBuf {
+    if root.is_file() && out.extension().is_some() {
+        return out.to_path_buf();
+    }
+
+    let relative = if root.is_file() {
+        source
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| source.to_path_buf())
+    } else {
+        source.strip_prefix(root).unwrap_or(source).to_path_buf()
+    };
+    let mut output = out.join(relative);
+    output.set_extension("csv");
+    output
+}
+
+#[derive(Debug, Clone)]
+struct LocalizationSource {
+    asset: AssetFile,
+    tag: LocalizationTag,
+}
+
+#[derive(Debug, Clone)]
+struct AssetFile {
+    path: String,
+    asset_id: Option<AssetId>,
+}
+
+impl AssetFile {
+    fn label(&self) -> String {
+        self.asset_id.map_or_else(
+            || self.path.clone(),
+            |asset_id| format!("{} ({asset_id})", self.path),
+        )
+    }
+}
+
+struct AssetTree {
+    root: PathBuf,
+    catalog: Option<nw_catalog::AssetCatalog>,
+    paks: PakSet,
+}
+
+impl AssetTree {
+    fn open(root: PathBuf) -> Result<Self> {
+        let catalog = load_asset_catalog(&root)?;
+        let paks = PakSet::collect(root.clone(), Vec::new())?;
+        Ok(Self {
+            root,
+            catalog,
+            paks,
+        })
+    }
+
+    fn asset(&self, path: &str) -> AssetFile {
+        let normalized = nw_filesystem::normalize_archive_path(path);
+        if let Some(entry) = self
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.entry_by_path(&normalized))
+        {
+            return AssetFile {
+                path: entry.path().to_string(),
+                asset_id: Some(entry.asset_id()),
+            };
+        }
+        AssetFile {
+            path: normalized,
+            asset_id: None,
+        }
+    }
+
+    fn catalog_paths(&self) -> impl Iterator<Item = &str> {
+        self.catalog
+            .as_ref()
+            .into_iter()
+            .flat_map(|catalog| catalog.entries().iter().map(nw_catalog::RascEntry::path))
+    }
+
+    fn loose_path(&self, path: &str) -> Result<PathBuf> {
+        nw_filesystem::safe_join(&self.root, path)
+            .with_context(|| format!("asset path is not relative: {path}"))
+    }
+
+    fn read_path(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        self.read(&self.asset(path))
+    }
+
+    fn read(&self, asset: &AssetFile) -> Result<Option<Vec<u8>>> {
+        let loose = self.loose_path(&asset.path)?;
+        if loose.is_file() {
+            return std::fs::read(&loose)
+                .with_context(|| format!("read {}", loose.display()))
+                .map(Some);
+        }
+
+        for pak_path in self.paks.paths() {
+            let pak = nw_pak::PakMmapReader::open(pak_path)?;
+            if let Some(entry) = pak.entry(&asset.path) {
+                return Ok(Some(pak.read_wrapped_by_index(entry.index())?));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+fn load_asset_catalog(root: &Path) -> Result<Option<nw_catalog::AssetCatalog>> {
+    let rasc_path = root.join(nw_catalog::ASSET_CATALOG_PATH);
+    if !rasc_path.is_file() {
+        return Ok(None);
+    }
+
+    let rasc_bytes =
+        std::fs::read(&rasc_path).with_context(|| format!("read {}", rasc_path.display()))?;
+    let rasc = nw_catalog::Rasc::parse(&rasc_bytes)
+        .with_context(|| format!("parse {}", rasc_path.display()))?;
+    let raoc_path = root.join(nw_catalog::ASSET_CATALOG_OPTIMIZED_PATH);
+    let raoc = if raoc_path.is_file() {
+        let bytes =
+            std::fs::read(&raoc_path).with_context(|| format!("read {}", raoc_path.display()))?;
+        Some(
+            nw_catalog::Raoc::parse(&bytes)
+                .with_context(|| format!("parse {}", raoc_path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    Ok(Some(nw_catalog::AssetCatalog::new(rasc, raoc)))
+}
+
+fn collect_datasheet_localization_keys(
+    paths: &[PathBuf],
+    row_limit: Option<usize>,
+) -> Result<BTreeSet<LocalizationKey>> {
+    let mut keys = BTreeSet::new();
+    for path in paths {
+        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let sheet = nw_datasheet::Datasheet::parse(&bytes)
+            .with_context(|| format!("parse {}", path.display()))?;
+        for row in sheet.rows().take(row_limit.unwrap_or(usize::MAX)) {
+            for cell in row.cells() {
+                if let Some(value) = cell.as_str() {
+                    keys.extend(localization_keys(value));
+                }
+            }
+        }
+    }
+    Ok(keys)
+}
+
+fn load_localization_catalog(
+    language: LanguageCode,
+    loc_root: Option<&Path>,
+    tags: &[LocalizationTag],
+    needed_keys: &BTreeSet<LocalizationKey>,
+) -> Result<LocalizationCatalog> {
+    let root = match loc_root {
+        Some(root) => root.to_path_buf(),
+        None => nw_locator::Install::locate()?.assets(),
+    };
+    let tags = localization_tags(tags);
+    if needed_keys.is_empty() {
+        return Ok(LocalizationCatalog::builder(language).build());
+    }
+
+    let assets = AssetTree::open(root.clone())?;
+    let sources = localization_sources(&assets, &language, &tags)
+        .with_context(|| format!("find localization sources in {}", root.display()))?;
+    let mut remaining = needed_keys.clone();
+    let mut builder = LocalizationCatalog::builder(language);
+
+    for source in sources {
+        if remaining.is_empty() {
+            break;
+        }
+        let Some(bytes) = assets.read(&source.asset)? else {
+            continue;
+        };
+        let document = LocalizationDocument::parse_bytes(&bytes)
+            .with_context(|| format!("parse localization {}", source.asset.label()))?;
+        let source_keys = document_keys(&document)?;
+        if !source_keys.iter().any(|key| remaining.contains(key)) {
+            continue;
+        }
+
+        let loaded = builder.add_document_if(
+            source.asset.path.clone().into_boxed_str(),
+            &source.tag,
+            &document,
+            |key| remaining.contains(key),
+        )?;
+        for key in loaded {
+            remaining.remove(&key);
+        }
+    }
+
+    Ok(builder.build())
+}
+
+fn localization_tags(tags: &[LocalizationTag]) -> Vec<LocalizationTag> {
+    if tags.is_empty() {
+        vec![LocalizationTag::init()]
+    } else {
+        tags.to_vec()
+    }
+}
+
+fn localization_sources(
+    assets: &AssetTree,
+    language: &LanguageCode,
+    tags: &[LocalizationTag],
+) -> Result<Vec<LocalizationSource>> {
+    if let Some(bytes) = assets.read_path(TAG_MANIFEST_ASSET_PATH)? {
+        let manifest = SourceManifest::parse_bytes(&bytes)?;
+        return localization_manifest_sources(assets, &manifest, language, tags);
+    }
+
+    let mut sources = BTreeMap::<String, LocalizationTag>::new();
+    let tag = tags.first().cloned().unwrap_or_else(LocalizationTag::init);
+    let prefix = format!("localization/{}/", language.asset_folder());
+    for path in assets.catalog_paths() {
+        let normalized = nw_filesystem::normalize_archive_path(path);
+        if normalized.starts_with(&prefix) && is_localization_source_name(&normalized) {
+            sources.entry(normalized).or_insert_with(|| tag.clone());
+        }
+    }
+
+    if sources.is_empty() {
+        let locale_root = assets
+            .root
+            .join("localization")
+            .join(language.asset_folder());
+        if locale_root.exists() {
+            for path in collect_matching(&locale_root, |path| {
+                path.to_str().is_some_and(is_localization_source_name)
+            })? {
+                let source_path = nw_filesystem::normalize_archive_path(
+                    &nw_filesystem::display_relative(&assets.root, &path),
+                );
+                sources.entry(source_path).or_insert_with(|| tag.clone());
+            }
+        }
+    }
+
+    if sources.is_empty() {
+        for pak_path in assets.paks.paths() {
+            let pak = nw_pak::PakMmapReader::open(pak_path)?;
+            for entry in pak.entries() {
+                let normalized = nw_filesystem::normalize_archive_path(entry.name());
+                if normalized.starts_with(&prefix) && is_localization_source_name(&normalized) {
+                    sources.entry(normalized).or_insert_with(|| tag.clone());
+                }
+            }
+        }
+    }
+
+    Ok(sources
+        .into_iter()
+        .map(|(path, tag)| LocalizationSource {
+            asset: assets.asset(&path),
+            tag,
+        })
+        .collect())
+}
+
+fn localization_manifest_sources(
+    assets: &AssetTree,
+    manifest: &SourceManifest,
+    language: &LanguageCode,
+    tags: &[LocalizationTag],
+) -> Result<Vec<LocalizationSource>> {
+    let mut sources = BTreeMap::<String, LocalizationTag>::new();
+    for tag in tags {
+        let Some(entries) = manifest.tag(tag) else {
+            bail!(
+                "localization tag `{}` is not present in {}",
+                tag,
+                TAG_MANIFEST_ASSET_PATH
+            );
+        };
+
+        for entry in entries {
+            if entry.file_name().is_empty() {
+                continue;
+            }
+            let asset = assets.asset(&localization_asset_path(language, entry.file_name()));
+            sources.entry(asset.path).or_insert_with(|| tag.clone());
+        }
+    }
+    Ok(sources
+        .into_iter()
+        .map(|(path, tag)| LocalizationSource {
+            asset: assets.asset(&path),
+            tag,
+        })
+        .collect())
+}
+
+fn document_keys(document: &LocalizationDocument) -> Result<BTreeSet<LocalizationKey>> {
+    let mut keys = BTreeSet::new();
+    for entry in document.entries() {
+        if let Some(key) = entry.key() {
+            keys.insert(LocalizationKey::from_source_key(key)?);
+        }
+    }
+    Ok(keys)
+}
+
 fn scan_sheet(path: &Path, options: &SheetOptions) -> Result<SheetScan> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let sheet = nw_datasheet::Datasheet::parse(&bytes)
+    let mut sheet = nw_datasheet::Datasheet::parse(&bytes)
         .with_context(|| format!("parse {}", path.display()))?;
+    if let Some(localization) = options.localization {
+        sheet.set_localization(Some(localization));
+    }
     let summary = nw_datasheet::OwnedDatasheetSummary::from(
         nw_datasheet::DatasheetSummary::from_datasheet(&sheet),
     );
@@ -1325,7 +1840,7 @@ fn scan_sheet(path: &Path, options: &SheetOptions) -> Result<SheetScan> {
                 .map(|(index, row)| RowSample {
                     source: source.clone(),
                     row: index.to_string(),
-                    values: row_values(&row, options.show_empty),
+                    values: row_values(&sheet, &row, options),
                 })
                 .collect()
         })
@@ -1333,7 +1848,7 @@ fn scan_sheet(path: &Path, options: &SheetOptions) -> Result<SheetScan> {
     let hits = if options.find.is_empty() {
         Vec::new()
     } else {
-        find_sheet_cells(&source, &sheet, &options.find)
+        find_sheet_cells(&source, &sheet, options)
     };
 
     Ok(SheetScan {
@@ -1429,11 +1944,15 @@ fn print_sheet_summary(scans: &[SheetScan], limit: usize) {
     }
 }
 
-fn row_values(row: &nw_datasheet::Row<'_, '_>, show_empty: bool) -> String {
+fn row_values(
+    sheet: &nw_datasheet::Datasheet<'_>,
+    row: &nw_datasheet::Row<'_, '_>,
+    options: &SheetOptions<'_>,
+) -> String {
     let mut values = Vec::new();
     for (column, cell) in row.columns().iter().zip(row.cells()) {
-        let value = cell.to_string();
-        if !show_empty && value.is_empty() {
+        let value = cell_text(sheet, cell, options);
+        if !options.show_empty && value.is_empty() {
             continue;
         }
         values.push(format!("{}={}", column.name(), trim_cell(value)));
@@ -1444,13 +1963,13 @@ fn row_values(row: &nw_datasheet::Row<'_, '_>, show_empty: bool) -> String {
 fn find_sheet_cells(
     source: &str,
     sheet: &nw_datasheet::Datasheet<'_>,
-    find: &[String],
+    options: &SheetOptions<'_>,
 ) -> Vec<SheetHit> {
     let mut hits = Vec::new();
     for (row_index, row) in sheet.rows().enumerate() {
         for (column, cell) in row.columns().iter().zip(row.cells()) {
-            let value = cell.to_string();
-            if text_matches(&value, find) || text_matches(column.name(), find) {
+            let value = cell_text(sheet, cell, options);
+            if text_matches(&value, &options.find) || text_matches(column.name(), &options.find) {
                 hits.push(SheetHit {
                     source: source.to_string(),
                     row: row_index.to_string(),
@@ -1461,6 +1980,29 @@ fn find_sheet_cells(
         }
     }
     hits
+}
+
+fn cell_text<'a>(
+    sheet: &nw_datasheet::Datasheet<'_>,
+    cell: &'a nw_datasheet::Cell<'a>,
+    options: &SheetOptions<'_>,
+) -> Cow<'a, str> {
+    let Some(value) = cell.as_str() else {
+        return Cow::Owned(cell.to_string());
+    };
+
+    match options.localize {
+        LocalizeArg::Key => Cow::Borrowed(value),
+        LocalizeArg::Text => sheet.localized(value),
+        LocalizeArg::Both => {
+            let localized = sheet.localized(value);
+            if localized == value {
+                Cow::Borrowed(value)
+            } else {
+                Cow::Owned(format!("{value} | {localized}"))
+            }
+        }
+    }
 }
 
 fn objectstream_paths(

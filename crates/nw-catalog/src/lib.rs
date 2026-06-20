@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::Path;
 
 use nw_asset::{AssetId, AssetType};
+use sha1::{Digest, Sha1};
 use thiserror::Error as ThisError;
 use uuid::Uuid;
 
@@ -95,6 +96,12 @@ pub enum Catalog {
     Raoc(Box<Raoc>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetCatalog {
+    rasc: Box<Rasc>,
+    raoc: Option<Box<Raoc>>,
+}
+
 impl Catalog {
     /// Parse a catalog and select the reader from the file signature.
     ///
@@ -139,6 +146,64 @@ impl Catalog {
     }
 }
 
+impl AssetCatalog {
+    #[must_use]
+    pub fn new(rasc: Rasc, raoc: Option<Raoc>) -> Self {
+        Self {
+            rasc: Box::new(rasc),
+            raoc: raoc.map(Box::new),
+        }
+    }
+
+    #[must_use]
+    pub fn rasc(&self) -> &Rasc {
+        &self.rasc
+    }
+
+    #[must_use]
+    pub fn raoc(&self) -> Option<&Raoc> {
+        self.raoc.as_deref()
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[RascEntry] {
+        self.rasc.entries()
+    }
+
+    #[must_use]
+    pub fn entry_by_id(&self, asset_id: AssetId) -> Option<&RascEntry> {
+        self.rasc.entry(asset_id)
+    }
+
+    #[must_use]
+    pub fn id_by_path(&self, path: &str) -> Option<AssetId> {
+        if let Some(asset_id) = self.raoc.as_ref().and_then(|raoc| raoc.id_by_path(path)) {
+            return Some(asset_id);
+        }
+        self.rasc.id_by_path(path)
+    }
+
+    #[must_use]
+    pub fn entry_by_path(&self, path: &str) -> Option<&RascEntry> {
+        if let Some(asset_id) = self.raoc.as_ref().and_then(|raoc| raoc.id_by_path(path))
+            && let Some(entry) = self.rasc.entry(asset_id)
+        {
+            return Some(entry);
+        }
+        self.rasc.entry_by_path(path)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rasc.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rasc.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RascEntry {
     asset_id: AssetId,
@@ -151,6 +216,8 @@ pub struct RascEntry {
 pub struct Rasc {
     version: u32,
     entries: Vec<RascEntry>,
+    by_id: HashMap<AssetId, usize>,
+    by_path: HashMap<String, usize>,
 }
 
 impl RascEntry {
@@ -206,6 +273,21 @@ impl Rasc {
         parse_rasc(bytes)
     }
 
+    fn from_entries(version: u32, entries: Vec<RascEntry>) -> Self {
+        let mut by_id = HashMap::with_capacity(entries.len());
+        let mut by_path = HashMap::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            by_id.entry(entry.asset_id()).or_insert(index);
+            by_path.entry(entry.path().to_string()).or_insert(index);
+        }
+        Self {
+            version,
+            entries,
+            by_id,
+            by_path,
+        }
+    }
+
     #[must_use]
     pub const fn version(&self) -> u32 {
         self.version
@@ -228,6 +310,26 @@ impl Rasc {
 
     pub fn iter(&self) -> std::slice::Iter<'_, RascEntry> {
         self.entries.iter()
+    }
+
+    #[must_use]
+    pub fn entry(&self, asset_id: AssetId) -> Option<&RascEntry> {
+        self.by_id
+            .get(&asset_id)
+            .and_then(|index| self.entries.get(*index))
+    }
+
+    #[must_use]
+    pub fn entry_by_path(&self, path: &str) -> Option<&RascEntry> {
+        let path = normalize_virtual_path(path);
+        self.by_path
+            .get(&path)
+            .and_then(|index| self.entries.get(*index))
+    }
+
+    #[must_use]
+    pub fn id_by_path(&self, path: &str) -> Option<AssetId> {
+        self.entry_by_path(path).map(RascEntry::asset_id)
     }
 }
 
@@ -472,6 +574,11 @@ impl Raoc {
     }
 
     #[must_use]
+    pub fn id_by_path(&self, path: &str) -> Option<AssetId> {
+        self.id_by_path_hash(&asset_path_hash(path))
+    }
+
+    #[must_use]
     pub fn dir_str(&self, offset: usize) -> Cow<'_, str> {
         read_cstr(&self.dir_blob, offset)
     }
@@ -519,6 +626,19 @@ pub fn normalize_virtual_path(path: impl AsRef<str>) -> String {
         }
     }
     normalized
+}
+
+#[must_use]
+pub fn asset_path_hash(path: &str) -> [u8; 16] {
+    let normalized = normalize_virtual_path(path);
+    let digest = Sha1::digest(normalized.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out[8] &= 0xbf;
+    out[8] |= 0x80;
+    out[6] &= 0x5f;
+    out[6] |= 0x50;
+    out
 }
 
 /// Return the catalog kind from the leading signature bytes.
@@ -605,7 +725,7 @@ fn parse_rasc(bytes: &[u8]) -> Result<Rasc, Error> {
         entries.push(RascEntry::new(asset_id, asset_type, path, size_bytes));
     }
 
-    Ok(Rasc { version, entries })
+    Ok(Rasc::from_entries(version, entries))
 }
 
 fn parse_raoc(bytes: &[u8]) -> Result<Raoc, Error> {
@@ -894,6 +1014,57 @@ mod tests {
         assert_eq!(
             normalize_virtual_path(r"\Objects\\Foo//Bar.DDS.1A/"),
             "objects/foo/bar.dds.1a"
+        );
+    }
+
+    #[test]
+    fn asset_path_hash_is_stable_across_case_and_separators() {
+        let a = asset_path_hash("LyShineUI/Globals.luac");
+        let b = asset_path_hash("lyshineui/globals.luac");
+        let c = asset_path_hash("LyShineUI\\Globals.luac");
+
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_eq!(a[6] & 0xf0, 0x50);
+        assert_eq!(a[8] & 0xc0, 0x80);
+    }
+
+    #[test]
+    fn asset_catalog_resolves_paths_through_raoc_then_rasc() {
+        let asset_id = AssetId::new(
+            Uuid::from_u128(0x699f_a9e5_4f8a_5b01_87b2_d5f7_18c9_27b8),
+            7,
+        );
+        let asset_type = AssetType::new(Uuid::from_u128(0xaabb_ccdd_eeff_0011_2233_4455_6677_8899));
+        let path = "localization/en-us/main.loc.xml";
+        let rasc = Rasc::from_entries(1, vec![RascEntry::new(asset_id, asset_type, path, 42)]);
+        let raoc = Raoc {
+            version: RAOC_VERSION,
+            file_size: 0,
+            entries: vec![RaocEntry::new(asset_id, asset_type, 42, 0)],
+            aux_index: Vec::new(),
+            path_ids: vec![PathId {
+                path_hash: asset_path_hash(path),
+                asset_id,
+            }],
+            dependencies: Vec::new(),
+            types: Vec::new(),
+            dir_blob: Vec::new(),
+            file_blob: Vec::new(),
+            by_id: [(asset_id, 0)].into_iter().collect(),
+            by_path_hash: [(asset_path_hash(path), asset_id)].into_iter().collect(),
+        };
+        let catalog = AssetCatalog::new(rasc, Some(raoc));
+
+        assert_eq!(
+            catalog.id_by_path("Localization\\EN-US\\Main.loc.xml"),
+            Some(asset_id)
+        );
+        assert_eq!(
+            catalog
+                .entry_by_path("Localization\\EN-US\\Main.loc.xml")
+                .map(RascEntry::asset_type),
+            Some(asset_type)
         );
     }
 

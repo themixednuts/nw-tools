@@ -1,5 +1,5 @@
 [package]
-name = "nw-catalog"
+name = "nw-localization"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-nw-asset.workspace = true
-sha1.workspace = true
+crc32fast.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
 thiserror.workspace = true
-uuid.workspace = true

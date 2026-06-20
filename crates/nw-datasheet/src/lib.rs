@@ -1,4 +1,4 @@
-use dashmap::DashMap;
+use nw_localization::LocalizedTextResolver;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
@@ -157,7 +157,7 @@ pub struct Datasheet<'a> {
     columns: Vec<Column<'a>>,
     cells: Vec<Cell<'a>>,
     row_count: usize,
-    localization: Option<&'a DashMap<String, Option<String>>>,
+    localization: Option<&'a dyn LocalizedTextResolver>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -724,35 +724,26 @@ impl<'a> Datasheet<'a> {
     }
 
     #[must_use]
-    pub fn with_localization(mut self, localization: &'a DashMap<String, Option<String>>) -> Self {
+    pub fn with_localization(mut self, localization: &'a dyn LocalizedTextResolver) -> Self {
         self.localization = Some(localization);
         self
     }
 
-    pub fn set_localization(&mut self, localization: Option<&'a DashMap<String, Option<String>>>) {
+    pub fn set_localization(&mut self, localization: Option<&'a dyn LocalizedTextResolver>) {
         self.localization = localization;
     }
 
     #[must_use]
     #[inline]
-    pub const fn localization(&self) -> Option<&'a DashMap<String, Option<String>>> {
+    pub const fn localization(&self) -> Option<&'a dyn LocalizedTextResolver> {
         self.localization
     }
 
     #[must_use]
     pub fn localized<'value>(&self, value: &'value str) -> Cow<'value, str> {
-        let Some(key) = value.strip_prefix('@') else {
-            return Cow::Borrowed(value);
-        };
-
-        let Some(map) = self.localization else {
-            return Cow::Borrowed(value);
-        };
-
-        match map.get(&key.to_lowercase()).and_then(|entry| entry.clone()) {
-            Some(localized) => Cow::Owned(localized),
-            None => Cow::Borrowed(value),
-        }
+        self.localization.map_or(Cow::Borrowed(value), |resolver| {
+            resolver.localize_text(value)
+        })
     }
 }
 
