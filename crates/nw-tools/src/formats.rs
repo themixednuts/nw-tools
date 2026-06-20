@@ -9,7 +9,7 @@ use nw_objectstream::lookup::NameLookup;
 
 use crate::jobs::{JobArgs, RunCtx};
 use crate::output::Table;
-use crate::support::{collect_matching, load_lookup, path_ext};
+use crate::support::{PathSelector, collect_matching, load_lookup, path_ext};
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
@@ -144,6 +144,14 @@ pub struct ObjectStream {
 
     #[arg(long)]
     query: Option<String>,
+
+    /// Case-insensitive path substring prefilter.
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// Path glob prefilter; repeat for multiple patterns.
+    #[arg(long)]
+    glob: Vec<String>,
 
     #[arg(long, default_value_t = 40)]
     show: usize,
@@ -609,7 +617,8 @@ impl ObjectStream {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
         let lookup = load_lookup(self.no_names)?;
-        let paths = objectstream_paths(&self.path, &self.extensions)?;
+        let selector = PathSelector::new(self.filter, self.glob);
+        let paths = objectstream_paths(&self.path, &self.extensions, &selector)?;
         let mode = if self.dom {
             nw_objectstream::stats::ObjectStreamInspectionMode::dom(self.show)
         } else {
@@ -1328,16 +1337,39 @@ fn find_sheet_cells(
     hits
 }
 
-fn objectstream_paths(path: &Path, extensions: &[String]) -> Result<Vec<PathBuf>> {
-    if path.is_file() {
-        return Ok(vec![path.to_path_buf()]);
+fn objectstream_paths(
+    root: &Path,
+    extensions: &[String],
+    selector: &PathSelector,
+) -> Result<Vec<PathBuf>> {
+    if root.is_file() {
+        return Ok(path_selected(root, root, selector)
+            .then(|| root.to_path_buf())
+            .into_iter()
+            .collect());
     }
 
     let extensions = lowered(extensions.to_vec());
-    collect_matching(path, |path| {
-        extensions.is_empty()
-            || path_ext(path).is_some_and(|extension| extensions.contains(&extension))
+    collect_matching(root, |path| {
+        (extensions.is_empty()
+            || path_ext(path).is_some_and(|extension| extensions.contains(&extension)))
+            && path_selected(root, path, selector)
     })
+}
+
+fn path_selected(root: &Path, path: &Path, selector: &PathSelector) -> bool {
+    let relative = nw_filesystem::display_relative(root, path);
+    if !relative.is_empty() && selector.matches(&relative) {
+        return true;
+    }
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| selector.matches(name))
+    {
+        return true;
+    }
+    selector.matches(&path.display().to_string())
 }
 
 fn objectstream_payload(bytes: &[u8]) -> Result<Option<Vec<u8>>> {

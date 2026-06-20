@@ -11,7 +11,7 @@ use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
 use crate::output::Table;
 use crate::progress::Job;
-use crate::support::{AssetRootArg, GlobSet, PakSet, ScanIssues, collect_paks};
+use crate::support::{AssetRootArg, GlobSet, PakSet, PathSelector, ScanIssues, collect_paks};
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
@@ -88,9 +88,11 @@ pub struct Extract {
     #[arg(long = "pak")]
     paks: Vec<String>,
 
+    /// Case-insensitive path substring prefilter.
     #[arg(long)]
     filter: Option<String>,
 
+    /// Archive path glob prefilter; repeat for multiple patterns.
     #[arg(long)]
     glob: Vec<String>,
 
@@ -253,16 +255,10 @@ struct EntryRow {
     name: String,
 }
 
-#[derive(Debug, Clone)]
-struct PakExtractFilter {
-    text: Option<String>,
-    globs: GlobSet,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct PakExtractRun<'a> {
     out: &'a Path,
-    filter: &'a PakExtractFilter,
+    filter: &'a PathSelector,
     overwrite: bool,
     claims: &'a PathClaims,
     cancel: &'a CancellationToken,
@@ -372,10 +368,7 @@ impl Extract {
         let ctx = self.jobs.ctx()?;
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
-        let filter = PakExtractFilter {
-            text: self.filter.map(|filter| filter.to_ascii_lowercase()),
-            globs: GlobSet::archive(self.glob),
-        };
+        let filter = PathSelector::new(self.filter, self.glob);
         let claims = PathClaims::default();
         let cancel = ctx.cancel.clone();
         let run = PakExtractRun {
@@ -598,16 +591,6 @@ impl MethodArg {
             Self::Deflate => crypak::Method::Deflate,
             Self::Oodle => crypak::Method::Oodle(oodle_options),
         }
-    }
-}
-
-impl PakExtractFilter {
-    fn matches(&self, name: &str) -> bool {
-        let text_matches = self
-            .text
-            .as_ref()
-            .is_none_or(|text| name.to_ascii_lowercase().contains(text));
-        text_matches && (self.globs.is_empty() || self.globs.matches(name))
     }
 }
 

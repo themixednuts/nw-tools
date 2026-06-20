@@ -10,6 +10,12 @@ pub struct GlobSet {
     patterns: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PathSelector {
+    text: Option<String>,
+    globs: GlobSet,
+}
+
 impl GlobSet {
     pub fn archive(patterns: Vec<String>) -> Self {
         Self {
@@ -29,6 +35,26 @@ impl GlobSet {
         self.patterns
             .iter()
             .any(|pattern| wildcard_matches(pattern, &value))
+    }
+}
+
+impl PathSelector {
+    pub fn new(text: Option<String>, globs: Vec<String>) -> Self {
+        Self {
+            text: text.and_then(|text| {
+                let text = text.trim().to_ascii_lowercase();
+                (!text.is_empty()).then_some(text)
+            }),
+            globs: GlobSet::archive(globs),
+        }
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        let text_matches = self
+            .text
+            .as_ref()
+            .is_none_or(|text| path.to_ascii_lowercase().contains(text));
+        text_matches && (self.globs.is_empty() || self.globs.matches(path))
     }
 }
 
@@ -252,5 +278,17 @@ mod tests {
             paks.mount_root(Path::new("assets/levels/ftue_v2/level.pak")),
             "levels/ftue_v2"
         );
+    }
+
+    #[test]
+    fn path_selector_combines_text_and_globs() {
+        let selector = PathSelector::new(
+            Some("Player".to_string()),
+            vec!["slices/**/*.slice".to_string()],
+        );
+
+        assert!(selector.matches("slices/characters/player.slice"));
+        assert!(!selector.matches("slices/characters/player.dds"));
+        assert!(!selector.matches("slices/characters/npc.slice"));
     }
 }

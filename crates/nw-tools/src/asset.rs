@@ -14,7 +14,7 @@ use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
 use crate::output::Table;
 use crate::progress::Job;
-use crate::support::{AssetRootArg, GlobSet, PakSet, ScanIssues, load_lookup};
+use crate::support::{AssetRootArg, GlobSet, PakSet, PathSelector, ScanIssues, load_lookup};
 
 const DEFAULT_MAX_ENTRY_SIZE: u64 = 128 * 1024 * 1024;
 
@@ -112,6 +112,14 @@ pub struct SearchObjectStream {
     #[arg(long = "pak")]
     paks: Vec<String>,
 
+    /// Case-insensitive path substring prefilter.
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// Archive path glob prefilter; repeat for multiple patterns.
+    #[arg(long)]
+    glob: Vec<String>,
+
     #[arg(long, default_value_t = 100)]
     show: usize,
 
@@ -176,6 +184,14 @@ pub struct ExtractExt {
     #[arg(long = "pak")]
     paks: Vec<String>,
 
+    /// Case-insensitive path substring prefilter.
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// Archive path glob prefilter; repeat for multiple patterns.
+    #[arg(long)]
+    glob: Vec<String>,
+
     #[arg(long)]
     overwrite: bool,
 
@@ -195,6 +211,14 @@ pub struct ExtractObjectStream {
 
     #[arg(long = "pak")]
     paks: Vec<String>,
+
+    /// Case-insensitive path substring prefilter.
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// Archive path glob prefilter; repeat for multiple patterns.
+    #[arg(long)]
+    glob: Vec<String>,
 
     #[arg(long, value_enum, default_value_t = EncodingArg::Json)]
     encoding: EncodingArg,
@@ -315,8 +339,18 @@ struct ObjectPayload {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct ObjectSearchOptions<'a> {
+    query: &'a TextQuery,
+    max_entry_size: u64,
+    lookup: Option<&'a NameLookup>,
+    selector: &'a PathSelector,
+    cancel: &'a CancellationToken,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ObjectExtractOptions<'a> {
     out: &'a Path,
+    selector: &'a PathSelector,
     encoding: ObjectStreamEncoding,
     max_entry_size: u64,
     lookup: Option<&'a NameLookup>,
@@ -328,6 +362,7 @@ struct ObjectExtractOptions<'a> {
 #[derive(Debug, Clone, Copy)]
 struct ExtExtractOptions<'a> {
     extension: &'a Extension,
+    selector: &'a PathSelector,
     out: &'a Path,
     overwrite: bool,
     claims: &'a PathClaims,
@@ -468,22 +503,20 @@ impl SearchObjectStream {
         let paks = PakSet::collect(root, self.paks)?;
         let lookup = load_lookup(self.no_names)?;
         let query = TextQuery::new(self.query, false, false);
+        let selector = PathSelector::new(self.filter, self.glob);
         let cancel = ctx.cancel.clone();
+        let options = ObjectSearchOptions {
+            query: &query,
+            max_entry_size: self.max_entry_size,
+            lookup: lookup.as_ref(),
+            selector: &selector,
+            cancel: &cancel,
+        };
         let batch = ctx.map_results(
             "objectstream search",
             paks.paths(),
             |path| paks.relative(path),
-            |path, progress| {
-                Self::scan_pak(
-                    &paks,
-                    path,
-                    &query,
-                    self.max_entry_size,
-                    lookup.as_ref(),
-                    &cancel,
-                    &progress,
-                )
-            },
+            |path, progress| Self::scan_pak(&paks, path, &options, &progress),
         );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
@@ -541,10 +574,7 @@ impl SearchObjectStream {
     fn scan_pak(
         paks: &PakSet,
         path: &Path,
-        query: &TextQuery,
-        max_entry_size: u64,
-        lookup: Option<&NameLookup>,
-        cancel: &CancellationToken,
+        options: &ObjectSearchOptions<'_>,
         progress: &Job,
     ) -> Result<Vec<ObjectHit>> {
         let pak = PakMmapReader::open(path)?;
@@ -553,11 +583,14 @@ impl SearchObjectStream {
         let mut rows = Vec::new();
 
         for entry in pak.entries() {
-            if cancel.is_cancelled() {
+            if options.cancel.is_cancelled() {
                 break;
             }
             progress.inc(1);
-            if entry.uncompressed_size() > max_entry_size {
+            if !options.selector.matches(entry.name()) {
+                continue;
+            }
+            if entry.uncompressed_size() > options.max_entry_size {
                 continue;
             }
             let Some(payload) = ObjectPayload::read(&pak, entry)
@@ -566,11 +599,12 @@ impl SearchObjectStream {
                 continue;
             };
 
-            let hits =
-                nw_objectstream::query::collect_search_matches(&payload.bytes, lookup, |value| {
-                    query.score(value)
-                })
-                .with_context(|| format!("search {} in {}", entry.name(), path.display()))?;
+            let hits = nw_objectstream::query::collect_search_matches(
+                &payload.bytes,
+                options.lookup,
+                |value| options.query.score(value),
+            )
+            .with_context(|| format!("search {} in {}", entry.name(), path.display()))?;
 
             for (hit, stats) in hits {
                 rows.push(ObjectHit {
@@ -648,10 +682,12 @@ impl ExtractExt {
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
         let extension = Extension::new(&self.extension);
+        let selector = PathSelector::new(self.filter, self.glob);
         let claims = PathClaims::default();
         let cancel = ctx.cancel.clone();
         let options = ExtExtractOptions {
             extension: &extension,
+            selector: &selector,
             out: &self.out,
             overwrite: self.overwrite,
             claims: &claims,
@@ -699,6 +735,9 @@ impl ExtractExt {
             if !options.extension.matches(entry.name()) {
                 continue;
             }
+            if !options.selector.matches(entry.name()) {
+                continue;
+            }
             report.matched += 1;
             let bytes = pak
                 .read_by_index(entry.index())
@@ -726,9 +765,11 @@ impl ExtractObjectStream {
         let paks = PakSet::collect(root, self.paks)?;
         let lookup = load_lookup(self.no_names)?;
         let encoding = ObjectStreamEncoding::from(self.encoding);
+        let selector = PathSelector::new(self.filter, self.glob);
         let claims = PathClaims::default();
         let options = ObjectExtractOptions {
             out: &self.out,
+            selector: &selector,
             encoding,
             max_entry_size: self.max_entry_size,
             lookup: lookup.as_ref(),
@@ -775,6 +816,9 @@ impl ExtractObjectStream {
                 break;
             }
             progress.inc(1);
+            if !options.selector.matches(entry.name()) {
+                continue;
+            }
             if entry.uncompressed_size() > options.max_entry_size {
                 continue;
             }
