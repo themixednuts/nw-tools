@@ -81,7 +81,7 @@ impl Scanner {
         let mut report = Report::new(root, paks.len());
         let batch = runner.map_until_cancelled(&paks, cancel, |pak| {
             let mut partial = Report::new(pak.clone(), 0);
-            match scan_pak(pak, &mut partial, self.options) {
+            match scan_pak(pak, &mut partial, self.options, cancel) {
                 Ok(()) => {
                     partial.parsed_archives = 1;
                     Ok(partial)
@@ -398,7 +398,12 @@ fn is_pak(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("pak"))
 }
 
-fn scan_pak(path: &Path, report: &mut Report, options: Options) -> Result<(), Error> {
+fn scan_pak(
+    path: &Path,
+    report: &mut Report,
+    options: Options,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
     let max_samples = options.max_samples;
     let file = fs::File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
@@ -440,6 +445,9 @@ fn scan_pak(path: &Path, report: &mut Report, options: Options) -> Result<(), Er
     let mut pos = 0usize;
     let mut actual_entries = 0u64;
     while pos + CENTRAL_DIRECTORY_HEADER_LEN <= cd.len() {
+        if cancel.is_cancelled() {
+            break;
+        }
         if read_u32(cd, pos, "central directory header")? != CENTRAL_DIRECTORY_HEADER {
             report.samples.push_mismatch(
                 format!("{}: bad CDR signature at +{pos}", path.display()),

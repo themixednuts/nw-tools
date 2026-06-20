@@ -503,7 +503,7 @@ fn repack_directory(
 ) -> Result<Report, Error> {
     let input_dir = input_dir.as_ref();
     let output_pak = output_pak.as_ref();
-    let work = collect_work(input_dir, options)?;
+    let work = collect_work(input_dir, options, cancel)?;
 
     let batch = runner.map_until_cancelled(&work, cancel, prepare_work_item);
     let cancelled = batch.was_cancelled();
@@ -526,7 +526,7 @@ fn repack_directory(
     }
 
     let mut output = File::create(output_pak)?;
-    write_prepared_entries(&mut output, prepared)
+    write_prepared_entries_with_cancel(&mut output, prepared, Some(cancel))
 }
 
 fn update_pak(
@@ -552,7 +552,12 @@ fn update_pak(
             .collect::<HashMap<_, _>>();
         let mut work = Vec::with_capacity(reader.len() + pending.len());
 
-        for entry in reader.entries() {
+        for (index, entry) in reader.entries().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled {
+                    skipped: reader.len().saturating_sub(index),
+                });
+            }
             let patch = pending.remove(entry.name());
             work.push(UpdateItem {
                 source_index: Some(entry.index()),
@@ -607,7 +612,7 @@ fn update_pak(
 
         let changed = work.iter().filter(|item| item.patch.is_some()).count();
         let mut output = File::create(&write_path)?;
-        let report = write_prepared_entries(&mut output, prepared)?;
+        let report = write_prepared_entries_with_cancel(&mut output, prepared, Some(cancel))?;
         UpdateReport {
             entries: report.entries,
             changed,
@@ -635,9 +640,16 @@ where
     write_prepared_entries(writer, prepared)
 }
 
-fn collect_work(input_dir: &Path, options: &Options) -> Result<Vec<WorkItem>, Error> {
+fn collect_work(
+    input_dir: &Path,
+    options: &Options,
+    cancel: &CancellationToken,
+) -> Result<Vec<WorkItem>, Error> {
     let mut files = Vec::new();
-    collect_files(input_dir, &mut files)?;
+    collect_files(input_dir, &mut files, cancel)?;
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled { skipped: 0 });
+    }
     files.sort();
 
     files
@@ -658,14 +670,24 @@ fn collect_work(input_dir: &Path, options: &Options) -> Result<Vec<WorkItem>, Er
         .collect()
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
+fn collect_files(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::path);
 
     for entry in entries {
+        if cancel.is_cancelled() {
+            break;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_files(&entry.path(), out)?;
+            collect_files(&entry.path(), out, cancel)?;
         } else if file_type.is_file() {
             out.push(entry.path());
         }
@@ -848,6 +870,14 @@ fn write_prepared_entries<W: Write>(
     writer: &mut W,
     entries: Vec<PreparedEntry>,
 ) -> Result<Report, Error> {
+    write_prepared_entries_with_cancel(writer, entries, None)
+}
+
+fn write_prepared_entries_with_cancel<W: Write>(
+    writer: &mut W,
+    entries: Vec<PreparedEntry>,
+    cancel: Option<&CancellationToken>,
+) -> Result<Report, Error> {
     if entries.len() > u16::MAX as usize {
         return Err(Error::TooManyFiles(entries.len()));
     }
@@ -855,7 +885,12 @@ fn write_prepared_entries<W: Write>(
     let entry_count = entries.len();
     let mut pak = crypak_format::Writer::new(writer);
 
-    for entry in entries {
+    for (index, entry) in entries.into_iter().enumerate() {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(Error::Cancelled {
+                skipped: entry_count.saturating_sub(index),
+            });
+        }
         pak.push(crypak_format::Entry {
             name: &entry.name,
             method: entry.method.id(),

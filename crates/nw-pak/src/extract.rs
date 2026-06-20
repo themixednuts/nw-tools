@@ -217,7 +217,7 @@ fn extract_to_dir(
                 source,
             })?;
 
-    let names = selected_entry_names(pak_path, options.filter, options.globs)?;
+    let names = selected_entry_names(pak_path, options.filter, options.globs, cancel)?;
     let mut report = PakExtractReport {
         output_root: output_root.clone(),
         selected_entries: names.len(),
@@ -233,6 +233,7 @@ fn extract_to_dir(
             &names,
             options.overwrite,
             &mut report,
+            cancel,
         )?;
     } else {
         extract_parallel(
@@ -253,16 +254,22 @@ fn selected_entry_names(
     pak_path: &Path,
     filter: Option<&str>,
     globs: &[&str],
+    cancel: &CancellationToken,
 ) -> Result<Vec<String>, PakExtractError> {
     let archive = PakFile::open(pak_path).map_err(|source| PakExtractError::OpenPak {
         path: pak_path.to_path_buf(),
         source,
     })?;
-    Ok(archive
-        .entries()
-        .filter(|entry| entry_selected(entry.name(), filter, globs))
-        .map(|entry| entry.name().to_string())
-        .collect())
+    let mut names = Vec::new();
+    for entry in archive.entries() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        if entry_selected(entry.name(), filter, globs) {
+            names.push(entry.name().to_string());
+        }
+    }
+    Ok(names)
 }
 
 fn entry_selected(name: &str, filter: Option<&str>, globs: &[&str]) -> bool {
@@ -312,13 +319,19 @@ fn extract_sequential(
     names: &[String],
     overwrite: bool,
     report: &mut PakExtractReport,
+    cancel: &CancellationToken,
 ) -> Result<(), PakExtractError> {
     let mut archive = PakFile::open(pak_path).map_err(|source| PakExtractError::OpenPak {
         path: pak_path.to_path_buf(),
         source,
     })?;
     let mut buf = Vec::new();
-    for name in names {
+    for (index, name) in names.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(PakExtractError::Cancelled {
+                skipped: names.len().saturating_sub(index),
+            });
+        }
         let Some(dest) = resolve_destination(output_root, name, report) else {
             continue;
         };
@@ -350,7 +363,12 @@ fn extract_parallel(
     cancel: &CancellationToken,
 ) -> Result<(), PakExtractError> {
     let mut pending = Vec::new();
-    for name in names {
+    for (index, name) in names.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(PakExtractError::Cancelled {
+                skipped: names.len().saturating_sub(index),
+            });
+        }
         let Some(dest) = resolve_destination(output_root, name, report) else {
             continue;
         };

@@ -57,7 +57,7 @@ pub struct CatalogSummary {
     path: PathBuf,
 
     #[arg(long, default_value_t = 25)]
-    limit: usize,
+    show: usize,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -69,7 +69,7 @@ pub struct CatalogFind {
     query: Vec<String>,
 
     #[arg(long, default_value_t = 25)]
-    limit: usize,
+    show: usize,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -98,7 +98,7 @@ pub struct Datasheet {
     path: PathBuf,
 
     #[arg(long, default_value_t = 25)]
-    limit: usize,
+    show: usize,
 
     #[arg(long)]
     columns: bool,
@@ -121,7 +121,7 @@ pub struct Dds {
     path: PathBuf,
 
     #[arg(long, default_value_t = 40)]
-    limit: usize,
+    show: usize,
 
     /// Convert DDS textures to KTX2 files under this path.
     #[arg(long = "to-ktx2", value_name = "PATH")]
@@ -146,7 +146,7 @@ pub struct ObjectStream {
     query: Option<String>,
 
     #[arg(long, default_value_t = 40)]
-    limit: usize,
+    show: usize,
 
     #[arg(long, default_value_t = 20)]
     files: usize,
@@ -296,9 +296,12 @@ impl CatalogSummary {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
         let paths = collect_matching(&self.path, |path| nw_catalog::is_asset_catalog_path(path))?;
-        let batch = ctx.runner.map_until_cancelled(&paths, &ctx.cancel, |path| {
-            scan_catalog(path, self.limit, &[])
-        });
+        let batch = ctx.map_results_compact(
+            "catalog",
+            &paths,
+            |path| path_label(path),
+            |path, progress| progress.step(|| scan_catalog(path, self.show, &[])),
+        );
         print_catalog_scans(batch, paths.len(), "catalog")
     }
 }
@@ -308,9 +311,12 @@ impl CatalogFind {
         let ctx = self.jobs.ctx()?;
         let paths = collect_matching(&self.path, |path| nw_catalog::is_asset_catalog_path(path))?;
         let find = lowered(self.query);
-        let batch = ctx.runner.map_until_cancelled(&paths, &ctx.cancel, |path| {
-            scan_catalog(path, self.limit, &find)
-        });
+        let batch = ctx.map_results_compact(
+            "catalog find",
+            &paths,
+            |path| path_label(path),
+            |path, progress| progress.step(|| scan_catalog(path, self.show, &find)),
+        );
         print_catalog_scans(batch, paths.len(), "catalog find")
     }
 }
@@ -320,9 +326,12 @@ impl CatalogGet {
         let ctx = self.jobs.ctx()?;
         let paths = collect_matching(&self.path, |path| nw_catalog::is_asset_catalog_path(path))?;
         let queries = lowered(self.query);
-        let batch = ctx
-            .runner
-            .map_until_cancelled(&paths, &ctx.cancel, |path| get_catalog(path, &queries));
+        let batch = ctx.map_results_compact(
+            "catalog get",
+            &paths,
+            |path| path_label(path),
+            |path, progress| progress.step(|| get_catalog(path, &queries)),
+        );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
         let mut rows = Vec::new();
@@ -370,9 +379,12 @@ impl CatalogExport {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
         let paths = collect_matching(&self.path, |path| nw_catalog::is_asset_catalog_path(path))?;
-        let batch = ctx
-            .runner
-            .map_until_cancelled(&paths, &ctx.cancel, |path| export_catalog(path));
+        let batch = ctx.map_results_compact(
+            "catalog export",
+            &paths,
+            |path| path_label(path),
+            |path, progress| progress.step(|| export_catalog(path)),
+        );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
         let mut rows = Vec::new();
@@ -470,9 +482,12 @@ impl Datasheet {
             find: lowered(self.find),
             show_empty: self.show_empty,
         };
-        let batch = ctx
-            .runner
-            .map_until_cancelled(&paths, &ctx.cancel, |path| scan_sheet(path, &options));
+        let batch = ctx.map_results_compact(
+            "datasheet",
+            &paths,
+            |path| path_label(path),
+            |path, progress| progress.step(|| scan_sheet(path, &options)),
+        );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
         let mut scans = Vec::new();
@@ -485,7 +500,7 @@ impl Datasheet {
             }
         }
         scans.sort_by(|left, right| left.source.cmp(&right.source));
-        print_sheet_summary(&scans, self.limit);
+        print_sheet_summary(&scans, self.show);
 
         if self.columns {
             let mut table = Table::new(["Source", "Index", "Type", "CRC", "Name"]);
@@ -531,9 +546,12 @@ impl Dds {
         }
 
         let paths = collect_matching(&self.path, |path| nw_dds::is_dds_path(path))?;
-        let batch = ctx
-            .runner
-            .map_until_cancelled(&paths, &ctx.cancel, |path| scan_dds(path));
+        let batch = ctx.map_results_compact(
+            "dds",
+            &paths,
+            |path| path_label(path),
+            |path, progress| progress.step(|| scan_dds(path)),
+        );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
         let mut scans = Vec::new();
@@ -550,7 +568,7 @@ impl Dds {
         println!(
             "dds files: {}  shown: {}",
             scans.len(),
-            scans.len().min(self.limit)
+            scans.len().min(self.show)
         );
         let mut table = Table::new([
             "Source",
@@ -562,7 +580,7 @@ impl Dds {
             "Cry",
             "Bytes",
         ]);
-        for scan in scans.iter().take(self.limit) {
+        for scan in scans.iter().take(self.show) {
             table.push([
                 scan.source.clone(),
                 scan.kind.clone(),
@@ -579,8 +597,8 @@ impl Dds {
         } else {
             print!("{table}");
         }
-        if scans.len() > self.limit {
-            println!("... {} more file(s)", scans.len() - self.limit);
+        if scans.len() > self.show {
+            println!("... {} more file(s)", scans.len() - self.show);
         }
 
         finish_scan(cancelled, skipped, &errors, "dds")
@@ -593,14 +611,21 @@ impl ObjectStream {
         let lookup = load_lookup(self.no_names)?;
         let paths = objectstream_paths(&self.path, &self.extensions)?;
         let mode = if self.dom {
-            nw_objectstream::stats::ObjectStreamInspectionMode::dom(self.limit)
+            nw_objectstream::stats::ObjectStreamInspectionMode::dom(self.show)
         } else {
             nw_objectstream::stats::ObjectStreamInspectionMode::streaming()
         };
         let query = self.query.clone();
-        let batch = ctx.runner.map_until_cancelled(&paths, &ctx.cancel, |path| {
-            scan_objectstream(path, mode, query.as_deref(), self.limit, lookup.as_ref())
-        });
+        let batch = ctx.map_results_compact(
+            "objectstream",
+            &paths,
+            |path| path_label(path),
+            |path, progress| {
+                progress.step(|| {
+                    scan_objectstream(path, mode, query.as_deref(), self.show, lookup.as_ref())
+                })
+            },
+        );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
         let mut scans = Vec::new();
@@ -656,11 +681,12 @@ impl ObjectStream {
 
 fn convert_dds_to_ktx2(ctx: &RunCtx, path: &Path, out: &Path, overwrite: bool) -> Result<()> {
     let groups = collect_dds_groups(path)?;
-    let batch = ctx
-        .runner
-        .map_until_cancelled(&groups, &ctx.cancel, |group| {
-            convert_dds_group(group, path, out, overwrite)
-        });
+    let batch = ctx.map_results_compact(
+        "dds conversion",
+        &groups,
+        |group| path_label(&group.header),
+        |group, progress| progress.step(|| convert_dds_group(group, path, out, overwrite)),
+    );
     let skipped = batch.skipped();
     let cancelled = batch.was_cancelled();
     let mut converted = Vec::new();
@@ -1334,6 +1360,10 @@ fn object_source(scan: &ObjectScan) -> &str {
     match scan {
         ObjectScan::Inspect { source, .. } | ObjectScan::Search { source, .. } => source,
     }
+}
+
+fn path_label(path: &Path) -> String {
+    path.display().to_string()
 }
 
 fn lowered(values: Vec<String>) -> Vec<String> {

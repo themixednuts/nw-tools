@@ -1,8 +1,10 @@
 mod asset;
+mod extract;
 mod formats;
 mod jobs;
 mod output;
 mod pak;
+mod progress;
 mod support;
 
 use clap::{CommandFactory, Parser, Subcommand};

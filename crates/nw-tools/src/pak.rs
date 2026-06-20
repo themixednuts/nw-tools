@@ -4,11 +4,14 @@ use std::str::FromStr;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use humansize::{DECIMAL, format_size};
-use nw_pak::{Compression, PakFile, PakMmapReader, azcs, crypak, oodle, shape};
+use nw_jobs::CancellationToken;
+use nw_pak::{Compression, PakMmapReader, azcs, crypak, oodle, shape};
 
+use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
 use crate::output::Table;
-use crate::support::{AssetRootArg, GlobSet, collect_paks};
+use crate::progress::Job;
+use crate::support::{AssetRootArg, GlobSet, PakSet, ScanIssues, collect_paks};
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
@@ -54,7 +57,7 @@ pub struct List {
     azcs: bool,
 
     #[arg(long)]
-    limit: Option<usize>,
+    show: Option<usize>,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -77,8 +80,13 @@ pub struct Shape {
 
 #[derive(Debug, Args)]
 pub struct Extract {
-    pak: PathBuf,
     out: PathBuf,
+
+    #[command(flatten)]
+    root: AssetRootArg,
+
+    #[arg(long = "pak")]
+    paks: Vec<String>,
 
     #[arg(long)]
     filter: Option<String>,
@@ -89,8 +97,8 @@ pub struct Extract {
     #[arg(long)]
     overwrite: bool,
 
-    #[arg(long)]
-    sequential: bool,
+    #[arg(long, default_value_t = 25)]
+    show: usize,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -245,6 +253,38 @@ struct EntryRow {
     name: String,
 }
 
+#[derive(Debug, Clone)]
+struct PakExtractFilter {
+    text: Option<String>,
+    globs: GlobSet,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PakExtractRun<'a> {
+    out: &'a Path,
+    filter: &'a PakExtractFilter,
+    overwrite: bool,
+    claims: &'a PathClaims,
+    cancel: &'a CancellationToken,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PakExtractReport {
+    matched: u64,
+    written: u64,
+    skipped_existing: u64,
+    skipped_duplicate: u64,
+    bytes_written: u64,
+    rows: Vec<PakExtractRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PakExtractRow {
+    pak: String,
+    size: String,
+    path: String,
+}
+
 impl List {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
@@ -256,9 +296,13 @@ impl List {
             names: GlobSet::archive(self.name),
             azcs: self.azcs,
         };
-        let batch = ctx
-            .runner
-            .map_until_cancelled(&paks, &ctx.cancel, |pak| scan_entries(&root, pak, &filter));
+        let cancel = ctx.cancel.clone();
+        let batch = ctx.map_results(
+            "pak list",
+            &paks,
+            |pak| nw_filesystem::display_relative(&root, pak),
+            |pak, progress| scan_entries(&root, pak, &filter, &cancel, &progress),
+        );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
         let mut rows = Vec::new();
@@ -272,8 +316,8 @@ impl List {
         }
         rows.sort();
         let total_rows = rows.len();
-        if let Some(limit) = self.limit {
-            rows.truncate(limit);
+        if let Some(show) = self.show {
+            rows.truncate(show);
         }
 
         println!(
@@ -311,10 +355,13 @@ impl Shape {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
         let root = self.root.resolve()?;
+        let progress = ctx.progress.stage("pak shape");
         let report = shape::Scanner::new()
             .max_samples(self.samples)
             .azcs(self.azcs)
-            .scan_with(root, &ctx.runner, &ctx.cancel)?;
+            .scan_with(root, &ctx.runner, &ctx.cancel);
+        progress.finish(if report.is_ok() { "done" } else { "failed" });
+        let report = report?;
         println!("{report}");
         Ok(())
     }
@@ -323,18 +370,41 @@ impl Shape {
 impl Extract {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let globs = self.glob.iter().map(String::as_str).collect::<Vec<_>>();
-        let options = nw_pak::PakExtractOptions {
-            filter: self.filter.as_deref(),
-            globs: &globs,
-            sequential: self.sequential,
-            overwrite: self.overwrite,
+        let root = self.root.resolve()?;
+        let paks = PakSet::collect(root, self.paks)?;
+        let filter = PakExtractFilter {
+            text: self.filter.map(|filter| filter.to_ascii_lowercase()),
+            globs: GlobSet::archive(self.glob),
         };
-        let report =
-            PakFile::extract_to_dir_with(self.pak, self.out, options, &ctx.runner, &ctx.cancel)?;
-        println!("{report}");
-        report.ensure_success()?;
-        Ok(())
+        let claims = PathClaims::default();
+        let cancel = ctx.cancel.clone();
+        let run = PakExtractRun {
+            out: &self.out,
+            filter: &filter,
+            overwrite: self.overwrite,
+            claims: &claims,
+            cancel: &cancel,
+        };
+        let batch = ctx.map_results(
+            "pak extract",
+            paks.paths(),
+            |path| paks.relative(path),
+            |path, progress| extract_pak(&paks, path, &run, &progress),
+        );
+        let skipped = batch.skipped();
+        let cancelled = batch.was_cancelled();
+        let mut report = PakExtractReport::default();
+        let mut errors = Vec::new();
+
+        for result in batch.into_completed() {
+            match result {
+                Ok(scan) => report.merge(scan, self.show),
+                Err(error) => errors.push(error),
+            }
+        }
+
+        report.print("pak extract", self.show);
+        ScanIssues::new("pak extract", skipped, cancelled, errors).finish()
     }
 }
 
@@ -352,9 +422,12 @@ impl Repack {
             options = options.oodle_pattern(pattern);
         }
 
+        let progress = ctx.progress.stage("pak repack");
         let report = crypak::Repacker::new(self.input_dir, self.output_pak)
             .options(options)
-            .run(&ctx.runner, &ctx.cancel)?;
+            .run(&ctx.runner, &ctx.cancel);
+        progress.finish(if report.is_ok() { "done" } else { "failed" });
+        let report = report?;
         println!(
             "wrote {} entries, {}",
             report.entries,
@@ -396,10 +469,13 @@ impl Update {
             patches.push(patch);
         }
 
+        let progress = ctx.progress.stage("pak update");
         let report = crypak::Updater::new(self.input_pak, self.output_pak)
             .options(options)
             .patches(patches)
-            .run(&ctx.runner, &ctx.cancel)?;
+            .run(&ctx.runner, &ctx.cancel);
+        progress.finish(if report.is_ok() { "done" } else { "failed" });
+        let report = report?;
         println!(
             "wrote {} entries, changed {}, {}",
             report.entries,
@@ -410,12 +486,23 @@ impl Update {
     }
 }
 
-fn scan_entries(root: &Path, pak_path: &Path, filter: &ListFilter) -> Result<Vec<EntryRow>> {
+fn scan_entries(
+    root: &Path,
+    pak_path: &Path,
+    filter: &ListFilter,
+    cancel: &CancellationToken,
+    progress: &Job,
+) -> Result<Vec<EntryRow>> {
     let pak = PakMmapReader::open(pak_path)?;
+    progress.set_len(pak.len());
     let pak_name = nw_filesystem::display_relative(root, pak_path);
     let mut rows = Vec::new();
 
     for entry in pak.entries() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        progress.inc(1);
         if filter
             .method
             .is_some_and(|method| !method.matches(entry.compression()))
@@ -458,6 +545,43 @@ fn scan_entries(root: &Path, pak_path: &Path, filter: &ListFilter) -> Result<Vec
     Ok(rows)
 }
 
+fn extract_pak(
+    paks: &PakSet,
+    path: &Path,
+    run: &PakExtractRun<'_>,
+    progress: &Job,
+) -> Result<PakExtractReport> {
+    let pak = PakMmapReader::open(path)?;
+    progress.set_len(pak.len());
+    let pak_name = paks.relative(path);
+    let mount_root = paks.mount_root(path);
+    let mut report = PakExtractReport::default();
+
+    for entry in pak.entries() {
+        if run.cancel.is_cancelled() {
+            break;
+        }
+        progress.inc(1);
+        if !run.filter.matches(entry.name()) {
+            continue;
+        }
+        report.matched += 1;
+        let bytes = pak
+            .read_by_index(entry.index())
+            .with_context(|| format!("read {} from {}", entry.name(), path.display()))?;
+        let target = MountedPath::new(run.out, &mount_root, entry.name())?;
+        if report.write(&target, &bytes, run.overwrite, run.claims)? == WriteOutcome::Written {
+            report.rows.push(PakExtractRow {
+                pak: pak_name.clone(),
+                size: format_size(bytes.len(), DECIMAL),
+                path: target.display(),
+            });
+        }
+    }
+
+    Ok(report)
+}
+
 impl MethodArg {
     fn matches(self, method: Compression) -> bool {
         matches!(
@@ -475,6 +599,81 @@ impl MethodArg {
             Self::Oodle => crypak::Method::Oodle(oodle_options),
         }
     }
+}
+
+impl PakExtractFilter {
+    fn matches(&self, name: &str) -> bool {
+        let text_matches = self
+            .text
+            .as_ref()
+            .is_none_or(|text| name.to_ascii_lowercase().contains(text));
+        text_matches && (self.globs.is_empty() || self.globs.matches(name))
+    }
+}
+
+impl PakExtractReport {
+    fn write(
+        &mut self,
+        target: &MountedPath,
+        bytes: &[u8],
+        overwrite: bool,
+        claims: &PathClaims,
+    ) -> Result<WriteOutcome> {
+        if target.path().exists() && !overwrite {
+            self.skipped_existing += 1;
+            return Ok(WriteOutcome::Skipped);
+        }
+        if !claims.claim(target) {
+            self.skipped_duplicate += 1;
+            return Ok(WriteOutcome::Skipped);
+        }
+        if let Some(parent) = target.path().parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target.path(), bytes)?;
+        self.written += 1;
+        self.bytes_written += bytes.len() as u64;
+        Ok(WriteOutcome::Written)
+    }
+
+    fn merge(&mut self, mut other: Self, row_limit: usize) {
+        self.matched += other.matched;
+        self.written += other.written;
+        self.skipped_existing += other.skipped_existing;
+        self.skipped_duplicate += other.skipped_duplicate;
+        self.bytes_written += other.bytes_written;
+        let remaining = row_limit.saturating_sub(self.rows.len());
+        let take = remaining.min(other.rows.len());
+        self.rows.extend(other.rows.drain(..take));
+    }
+
+    fn print(&self, label: &str, limit: usize) {
+        println!(
+            "{label}: matched {}  written {}  skipped existing {}  skipped duplicate {}  bytes {}",
+            self.matched,
+            self.written,
+            self.skipped_existing,
+            self.skipped_duplicate,
+            format_size(self.bytes_written, DECIMAL)
+        );
+        let mut table = Table::new(["Pak", "Size", "Path"]);
+        for row in &self.rows {
+            table.push([row.pak.clone(), row.size.clone(), row.path.clone()]);
+        }
+        if !table.is_empty() {
+            print!("{table}");
+        }
+        let remaining = self.written.saturating_sub(limit as u64);
+        if remaining > 0 {
+            println!("... {remaining} more file(s)");
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOutcome {
+    Written,
+    Skipped,
 }
 
 impl FamilyArg {

@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use humansize::{DECIMAL, format_size};
+use nw_jobs::CancellationToken;
 use nw_objectstream::lookup::NameLookup;
 use nw_objectstream::{ObjectStream, ObjectStreamEncoding};
 use nw_pak::{Compression, EntryInfo, PakMmapReader, azcs, crypak, shape};
 
+use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
 use crate::output::Table;
+use crate::progress::Job;
 use crate::support::{AssetRootArg, GlobSet, PakSet, ScanIssues, load_lookup};
 
 const DEFAULT_MAX_ENTRY_SIZE: u64 = 128 * 1024 * 1024;
@@ -56,7 +59,7 @@ pub struct Inventory {
     max_entry_size: u64,
 
     #[arg(long, default_value_t = 40)]
-    limit: usize,
+    show: usize,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -93,7 +96,7 @@ pub struct SearchPath {
     case_sensitive: bool,
 
     #[arg(long, default_value_t = 100)]
-    limit: usize,
+    show: usize,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -110,7 +113,7 @@ pub struct SearchObjectStream {
     paks: Vec<String>,
 
     #[arg(long, default_value_t = 100)]
-    limit: usize,
+    show: usize,
 
     #[arg(long, default_value_t = DEFAULT_MAX_ENTRY_SIZE)]
     max_entry_size: u64,
@@ -177,7 +180,7 @@ pub struct ExtractExt {
     overwrite: bool,
 
     #[arg(long, default_value_t = 25)]
-    limit: usize,
+    show: usize,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -206,7 +209,7 @@ pub struct ExtractObjectStream {
     overwrite: bool,
 
     #[arg(long, default_value_t = 25)]
-    limit: usize,
+    show: usize,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -283,7 +286,8 @@ struct ObjectHit {
 struct ExtractReport {
     matched: u64,
     written: u64,
-    skipped: u64,
+    skipped_existing: u64,
+    skipped_duplicate: u64,
     bytes_written: u64,
     rows: Vec<ExtractRow>,
 }
@@ -310,16 +314,47 @@ struct ObjectPayload {
     encoding: ObjectStreamEncoding,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ObjectExtractOptions<'a> {
+    out: &'a Path,
+    encoding: ObjectStreamEncoding,
+    max_entry_size: u64,
+    lookup: Option<&'a NameLookup>,
+    overwrite: bool,
+    claims: &'a PathClaims,
+    cancel: &'a CancellationToken,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExtExtractOptions<'a> {
+    extension: &'a Extension,
+    out: &'a Path,
+    overwrite: bool,
+    claims: &'a PathClaims,
+    cancel: &'a CancellationToken,
+}
+
 impl Inventory {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
-        let batch = ctx
-            .runner
-            .map_until_cancelled(paks.paths(), &ctx.cancel, |path| {
-                InventoryReport::from_pak(&paks, path, self.group, self.max_entry_size)
-            });
+        let cancel = ctx.cancel.clone();
+        let batch = ctx.map_results(
+            "asset inventory",
+            paks.paths(),
+            |path| paks.relative(path),
+            |path, progress| {
+                InventoryReport::from_pak(
+                    &paks,
+                    path,
+                    self.group,
+                    self.max_entry_size,
+                    &cancel,
+                    &progress,
+                )
+            },
+        );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
         let mut report = InventoryReport::default();
@@ -332,7 +367,7 @@ impl Inventory {
             }
         }
 
-        report.print(self.sort, self.limit);
+        report.print(self.sort, self.show);
         ScanIssues::new("asset inventory", skipped, cancelled, errors).finish()
     }
 }
@@ -352,11 +387,13 @@ impl SearchPath {
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
         let query = TextQuery::new(self.query, self.case_sensitive, self.glob);
-        let batch = ctx
-            .runner
-            .map_until_cancelled(paks.paths(), &ctx.cancel, |path| {
-                Self::scan_pak(&paks, path, &query)
-            });
+        let cancel = ctx.cancel.clone();
+        let batch = ctx.map_results(
+            "path search",
+            paks.paths(),
+            |path| paks.relative(path),
+            |path, progress| Self::scan_pak(&paks, path, &query, &cancel, &progress),
+        );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
         let mut rows = Vec::new();
@@ -371,7 +408,7 @@ impl SearchPath {
 
         rows.sort();
         let matched = rows.len();
-        rows.truncate(self.limit);
+        rows.truncate(self.show);
 
         println!(
             "archives: {}  matched: {}  shown: {}",
@@ -392,12 +429,23 @@ impl SearchPath {
         ScanIssues::new("asset path search", skipped, cancelled, errors).finish()
     }
 
-    fn scan_pak(paks: &PakSet, path: &Path, query: &TextQuery) -> Result<Vec<PathHit>> {
+    fn scan_pak(
+        paks: &PakSet,
+        path: &Path,
+        query: &TextQuery,
+        cancel: &CancellationToken,
+        progress: &Job,
+    ) -> Result<Vec<PathHit>> {
         let pak = PakMmapReader::open(path)?;
+        progress.set_len(pak.len());
         let pak_name = paks.relative(path);
         let mut rows = Vec::new();
 
         for entry in pak.entries() {
+            if cancel.is_cancelled() {
+                break;
+            }
+            progress.inc(1);
             if !query.matches(entry.name()) {
                 continue;
             }
@@ -420,11 +468,23 @@ impl SearchObjectStream {
         let paks = PakSet::collect(root, self.paks)?;
         let lookup = load_lookup(self.no_names)?;
         let query = TextQuery::new(self.query, false, false);
-        let batch = ctx
-            .runner
-            .map_until_cancelled(paks.paths(), &ctx.cancel, |path| {
-                Self::scan_pak(&paks, path, &query, self.max_entry_size, lookup.as_ref())
-            });
+        let cancel = ctx.cancel.clone();
+        let batch = ctx.map_results(
+            "objectstream search",
+            paks.paths(),
+            |path| paks.relative(path),
+            |path, progress| {
+                Self::scan_pak(
+                    &paks,
+                    path,
+                    &query,
+                    self.max_entry_size,
+                    lookup.as_ref(),
+                    &cancel,
+                    &progress,
+                )
+            },
+        );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
         let mut rows = Vec::new();
@@ -448,7 +508,7 @@ impl SearchObjectStream {
                 .then(left.value.cmp(&right.value))
         });
         let matched = rows.len();
-        rows.truncate(self.limit);
+        rows.truncate(self.show);
 
         println!(
             "archives: {}  matched: {}  shown: {}  names: {}",
@@ -484,12 +544,19 @@ impl SearchObjectStream {
         query: &TextQuery,
         max_entry_size: u64,
         lookup: Option<&NameLookup>,
+        cancel: &CancellationToken,
+        progress: &Job,
     ) -> Result<Vec<ObjectHit>> {
         let pak = PakMmapReader::open(path)?;
+        progress.set_len(pak.len());
         let pak_name = paks.relative(path);
         let mut rows = Vec::new();
 
         for entry in pak.entries() {
+            if cancel.is_cancelled() {
+                break;
+            }
+            progress.inc(1);
             if entry.uncompressed_size() > max_entry_size {
                 continue;
             }
@@ -559,9 +626,12 @@ impl UpdateObjectStream {
             .with_context(|| format!("encode replacement as {}", original.encoding))?;
 
         drop(pak);
+        let progress = ctx.progress.stage("objectstream update");
         let report = crypak::Updater::new(self.input_pak, self.output_pak)
             .patch(crypak::Patch::new(entry_name, bytes).azcs(crypak::AzcsMode::Preserve))
-            .run(&ctx.runner, &ctx.cancel)?;
+            .run(&ctx.runner, &ctx.cancel);
+        progress.finish(if report.is_ok() { "done" } else { "failed" });
+        let report = report?;
         println!(
             "wrote {} entries, changed {}, {}",
             report.entries,
@@ -578,11 +648,21 @@ impl ExtractExt {
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
         let extension = Extension::new(&self.extension);
-        let batch = ctx
-            .runner
-            .map_until_cancelled(paks.paths(), &ctx.cancel, |path| {
-                Self::extract_pak(&paks, path, &extension, &self.out, self.overwrite)
-            });
+        let claims = PathClaims::default();
+        let cancel = ctx.cancel.clone();
+        let options = ExtExtractOptions {
+            extension: &extension,
+            out: &self.out,
+            overwrite: self.overwrite,
+            claims: &claims,
+            cancel: &cancel,
+        };
+        let batch = ctx.map_results(
+            "extension extract",
+            paks.paths(),
+            |path| paks.relative(path),
+            |path, progress| Self::extract_pak(&paks, path, &options, &progress),
+        );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
         let mut report = ExtractReport::default();
@@ -590,36 +670,43 @@ impl ExtractExt {
 
         for result in batch.into_completed() {
             match result {
-                Ok(scan) => report.merge(scan, self.limit),
+                Ok(scan) => report.merge(scan, self.show),
                 Err(error) => errors.push(error),
             }
         }
 
-        report.print("extension extract", self.limit);
+        report.print("extension extract", self.show);
         ScanIssues::new("asset extension extract", skipped, cancelled, errors).finish()
     }
 
     fn extract_pak(
         paks: &PakSet,
         path: &Path,
-        extension: &Extension,
-        out: &Path,
-        overwrite: bool,
+        options: &ExtExtractOptions<'_>,
+        progress: &Job,
     ) -> Result<ExtractReport> {
         let pak = PakMmapReader::open(path)?;
+        progress.set_len(pak.len());
         let pak_name = paks.relative(path);
+        let mount_root = paks.mount_root(path);
         let mut report = ExtractReport::default();
 
         for entry in pak.entries() {
-            if !extension.matches(entry.name()) {
+            if options.cancel.is_cancelled() {
+                break;
+            }
+            progress.inc(1);
+            if !options.extension.matches(entry.name()) {
                 continue;
             }
             report.matched += 1;
             let bytes = pak
                 .read_by_index(entry.index())
                 .with_context(|| format!("read {} from {}", entry.name(), path.display()))?;
-            let target = ExtractTarget::new(out, &pak_name, entry.name())?;
-            if report.write(&target, &bytes, overwrite)? == WriteOutcome::Written {
+            let target = MountedPath::new(options.out, &mount_root, entry.name())?;
+            if report.write(&target, &bytes, options.overwrite, options.claims)?
+                == WriteOutcome::Written
+            {
                 report.rows.push(ExtractRow {
                     pak: pak_name.clone(),
                     size: format_size(bytes.len(), DECIMAL),
@@ -639,19 +726,22 @@ impl ExtractObjectStream {
         let paks = PakSet::collect(root, self.paks)?;
         let lookup = load_lookup(self.no_names)?;
         let encoding = ObjectStreamEncoding::from(self.encoding);
-        let batch = ctx
-            .runner
-            .map_until_cancelled(paks.paths(), &ctx.cancel, |path| {
-                Self::extract_pak(
-                    &paks,
-                    path,
-                    &self.out,
-                    encoding,
-                    self.max_entry_size,
-                    lookup.as_ref(),
-                    self.overwrite,
-                )
-            });
+        let claims = PathClaims::default();
+        let options = ObjectExtractOptions {
+            out: &self.out,
+            encoding,
+            max_entry_size: self.max_entry_size,
+            lookup: lookup.as_ref(),
+            overwrite: self.overwrite,
+            claims: &claims,
+            cancel: &ctx.cancel,
+        };
+        let batch = ctx.map_results(
+            "objectstream extract",
+            paks.paths(),
+            |path| paks.relative(path),
+            |path, progress| Self::extract_pak(&paks, path, &options, &progress),
+        );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
         let mut report = ExtractReport::default();
@@ -659,30 +749,33 @@ impl ExtractObjectStream {
 
         for result in batch.into_completed() {
             match result {
-                Ok(scan) => report.merge(scan, self.limit),
+                Ok(scan) => report.merge(scan, self.show),
                 Err(error) => errors.push(error),
             }
         }
 
-        report.print("ObjectStream extract", self.limit);
+        report.print("ObjectStream extract", self.show);
         ScanIssues::new("asset objectstream extract", skipped, cancelled, errors).finish()
     }
 
     fn extract_pak(
         paks: &PakSet,
         path: &Path,
-        out: &Path,
-        encoding: ObjectStreamEncoding,
-        max_entry_size: u64,
-        lookup: Option<&NameLookup>,
-        overwrite: bool,
+        options: &ObjectExtractOptions<'_>,
+        progress: &Job,
     ) -> Result<ExtractReport> {
         let pak = PakMmapReader::open(path)?;
+        progress.set_len(pak.len());
         let pak_name = paks.relative(path);
+        let mount_root = paks.mount_root(path);
         let mut report = ExtractReport::default();
 
         for entry in pak.entries() {
-            if entry.uncompressed_size() > max_entry_size {
+            if options.cancel.is_cancelled() {
+                break;
+            }
+            progress.inc(1);
+            if entry.uncompressed_size() > options.max_entry_size {
                 continue;
             }
             let Some(payload) = ObjectPayload::read(&pak, entry)
@@ -693,15 +786,17 @@ impl ExtractObjectStream {
             report.matched += 1;
 
             let bytes = payload
-                .into_encoding(encoding, lookup)
+                .into_encoding(options.encoding, options.lookup)
                 .with_context(|| format!("transcode {} from {}", entry.name(), path.display()))?;
-            let target = ExtractTarget::with_added_extension(
-                out,
-                &pak_name,
+            let target = MountedPath::with_added_extension(
+                options.out,
+                &mount_root,
                 entry.name(),
-                EncodingArg::extension_for(encoding),
+                EncodingArg::extension_for(options.encoding),
             )?;
-            if report.write(&target, &bytes, overwrite)? == WriteOutcome::Written {
+            if report.write(&target, &bytes, options.overwrite, options.claims)?
+                == WriteOutcome::Written
+            {
                 report.rows.push(ExtractRow {
                     pak: pak_name.clone(),
                     size: format_size(bytes.len(), DECIMAL),
@@ -720,8 +815,11 @@ impl InventoryReport {
         path: &Path,
         group: InventoryGroup,
         max_entry_size: u64,
+        cancel: &CancellationToken,
+        progress: &Job,
     ) -> Result<Self> {
         let pak = PakMmapReader::open(path)?;
+        progress.set_len(pak.len());
         let pak_name = paks.relative(path);
         let mut report = Self {
             paks: 1,
@@ -729,6 +827,10 @@ impl InventoryReport {
         };
 
         for entry in pak.entries() {
+            if cancel.is_cancelled() {
+                break;
+            }
+            progress.inc(1);
             let key = inventory_key(&pak, entry, group, max_entry_size)
                 .with_context(|| format!("classify {} in {}", entry.name(), path.display()))?;
             report.add(&pak_name, entry, key);
@@ -1008,52 +1110,26 @@ impl Extension {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ExtractTarget {
-    path: PathBuf,
-}
-
-impl ExtractTarget {
-    fn new(root: &Path, pak: &str, entry: &str) -> Result<Self> {
-        Self::with_added_extension(root, pak, entry, None)
-    }
-
-    fn with_added_extension(
-        root: &Path,
-        pak: &str,
-        entry: &str,
-        extension: Option<&'static str>,
-    ) -> Result<Self> {
-        let entry = nw_filesystem::normalize_archive_path(entry);
-        let mut relative = format!("{}/{}", pak.replace('\\', "/"), entry);
-        if let Some(extension) = extension {
-            relative.push('.');
-            relative.push_str(extension);
-        }
-        let path = nw_filesystem::safe_join(root, &relative)?;
-        Ok(Self { path })
-    }
-
-    fn display(&self) -> String {
-        self.path.display().to_string()
-    }
-}
-
 impl ExtractReport {
     fn write(
         &mut self,
-        target: &ExtractTarget,
+        target: &MountedPath,
         bytes: &[u8],
         overwrite: bool,
+        claims: &PathClaims,
     ) -> Result<WriteOutcome> {
-        if target.path.exists() && !overwrite {
-            self.skipped += 1;
+        if target.path().exists() && !overwrite {
+            self.skipped_existing += 1;
             return Ok(WriteOutcome::Skipped);
         }
-        if let Some(parent) = target.path.parent() {
+        if !claims.claim(target) {
+            self.skipped_duplicate += 1;
+            return Ok(WriteOutcome::Skipped);
+        }
+        if let Some(parent) = target.path().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&target.path, bytes)?;
+        std::fs::write(target.path(), bytes)?;
         self.written += 1;
         self.bytes_written += bytes.len() as u64;
         Ok(WriteOutcome::Written)
@@ -1062,18 +1138,21 @@ impl ExtractReport {
     fn merge(&mut self, mut other: Self, row_limit: usize) {
         self.matched += other.matched;
         self.written += other.written;
-        self.skipped += other.skipped;
+        self.skipped_existing += other.skipped_existing;
+        self.skipped_duplicate += other.skipped_duplicate;
         self.bytes_written += other.bytes_written;
         let remaining = row_limit.saturating_sub(self.rows.len());
-        self.rows.extend(other.rows.drain(..remaining));
+        let take = remaining.min(other.rows.len());
+        self.rows.extend(other.rows.drain(..take));
     }
 
     fn print(&self, label: &str, limit: usize) {
         println!(
-            "{label}: matched {}  written {}  skipped {}  bytes {}",
+            "{label}: matched {}  written {}  skipped existing {}  skipped duplicate {}  bytes {}",
             self.matched,
             self.written,
-            self.skipped,
+            self.skipped_existing,
+            self.skipped_duplicate,
             format_size(self.bytes_written, DECIMAL)
         );
         let mut table = Table::new(["Pak", "Size", "Path"]);

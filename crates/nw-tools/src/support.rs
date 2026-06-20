@@ -87,6 +87,16 @@ impl PakSet {
             relative
         }
     }
+
+    #[must_use]
+    pub fn mount_root(&self, pak: &Path) -> String {
+        let relative = PathBuf::from(self.relative(pak));
+        relative
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.display().to_string().replace('\\', "/"))
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug)]
@@ -215,4 +225,32 @@ fn wildcard_matches_bytes(pattern: &[u8], value: &[u8]) -> bool {
     }
 
     pattern[pattern_index..].iter().all(|byte| *byte == b'*')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pak_mount_root_omits_root_level_pak_name() {
+        let paks = PakSet {
+            root: PathBuf::from("assets"),
+            paths: vec![PathBuf::from("assets/Engine.pak")],
+        };
+
+        assert_eq!(paks.mount_root(Path::new("assets/Engine.pak")), "");
+    }
+
+    #[test]
+    fn pak_mount_root_preserves_nested_parent() {
+        let paks = PakSet {
+            root: PathBuf::from("assets"),
+            paths: vec![PathBuf::from("assets/levels/ftue_v2/level.pak")],
+        };
+
+        assert_eq!(
+            paks.mount_root(Path::new("assets/levels/ftue_v2/level.pak")),
+            "levels/ftue_v2"
+        );
+    }
 }
