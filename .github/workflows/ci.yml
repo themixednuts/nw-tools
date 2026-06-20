@@ -1,0 +1,133 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: windows-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    needs: fmt
+    runs-on: windows-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: clippy
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test
+    needs: clippy
+    runs-on: windows-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: test
+
+      - name: test
+        run: cargo test --workspace --locked
+
+  release:
+    name: release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: release
+
+      - name: release
+        uses: release-plz/action@v0.5.130
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  releasepr:
+    name: releasepr
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: releaseplz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: releasepr
+
+      - name: releasepr
+        uses: release-plz/action@v0.5.130
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
