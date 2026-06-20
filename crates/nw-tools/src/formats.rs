@@ -147,10 +147,10 @@ pub struct ObjectStream {
     query: Option<String>,
 
     /// Convert ObjectStream files to this encoding.
-    #[arg(long, value_enum, requires = "out")]
+    #[arg(long, value_enum)]
     to: Option<EncodingArg>,
 
-    /// Conversion output file or directory.
+    /// Conversion output file or directory. Defaults beside each input.
     #[arg(long, value_name = "PATH", requires = "to")]
     out: Option<PathBuf>,
 
@@ -648,15 +648,11 @@ impl ObjectStream {
         let selector = PathSelector::new(self.filter, self.glob);
         let paths = objectstream_paths(&self.path, &self.extensions, &selector)?;
         if let Some(encoding) = self.to {
-            let out = self
-                .out
-                .as_ref()
-                .context("--out is required when --to is set")?;
             return convert_objectstreams(
                 &ctx,
                 &self.path,
                 &paths,
-                out,
+                self.out.as_deref(),
                 encoding.into(),
                 self.overwrite,
                 lookup.as_ref(),
@@ -736,7 +732,7 @@ fn convert_objectstreams(
     ctx: &RunCtx,
     root: &Path,
     paths: &[PathBuf],
-    out: &Path,
+    out: Option<&Path>,
     encoding: ObjectStreamEncoding,
     overwrite: bool,
     lookup: Option<&NameLookup>,
@@ -785,7 +781,7 @@ fn convert_objectstreams(
 fn convert_objectstream(
     root: &Path,
     path: &Path,
-    out: &Path,
+    out: Option<&Path>,
     encoding: ObjectStreamEncoding,
     overwrite: bool,
     lookup: Option<&NameLookup>,
@@ -1490,9 +1486,12 @@ fn objectstream_paths(
 fn objectstream_output_path(
     root: &Path,
     source: &Path,
-    out: &Path,
+    out: Option<&Path>,
     encoding: ObjectStreamEncoding,
 ) -> PathBuf {
+    let Some(out) = out else {
+        return objectstream_encoded_path(source.to_path_buf(), encoding);
+    };
     if root.is_file() {
         return out.to_path_buf();
     }
@@ -1644,12 +1643,31 @@ mod tests {
         let out = Path::new("out");
 
         assert_eq!(
-            objectstream_output_path(root, source, out, ObjectStreamEncoding::Xml),
+            objectstream_output_path(root, source, Some(out), ObjectStreamEncoding::Xml),
             PathBuf::from("out/slices/player.slice.xml")
         );
         assert_eq!(
-            objectstream_output_path(root, source, out, ObjectStreamEncoding::Binary),
+            objectstream_output_path(root, source, Some(out), ObjectStreamEncoding::Binary),
             PathBuf::from("out/slices/player.slice")
+        );
+    }
+
+    #[test]
+    fn objectstream_conversion_defaults_next_to_input() {
+        let source = Path::new("in/slices/player.slice.json");
+
+        assert_eq!(
+            objectstream_output_path(Path::new("in"), source, None, ObjectStreamEncoding::Binary),
+            PathBuf::from("in/slices/player.slice")
+        );
+        assert_eq!(
+            objectstream_output_path(
+                Path::new("in"),
+                Path::new("in/slices/player.slice"),
+                None,
+                ObjectStreamEncoding::Xml
+            ),
+            PathBuf::from("in/slices/player.slice.xml")
         );
     }
 }
