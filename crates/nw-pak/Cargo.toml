@@ -12,7 +12,6 @@ workspace = true
 
 [dependencies]
 flate2.workspace = true
-humansize.workspace = true
 memmap2.workspace = true
 crc32fast.workspace = true
 nw-filesystem.workspace = true

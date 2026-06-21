@@ -37,7 +37,7 @@
 //!     }
 //! }
 //!
-//! let bytes = std::fs::read("some.slice").unwrap();
+//! let bytes = [0, 0, 0, 0, 3, 0];
 //! let mut counter = CountByType { counts: Default::default() };
 //! let _version = parse_streaming_bytes(&bytes, None, &mut counter).unwrap();
 //! ```

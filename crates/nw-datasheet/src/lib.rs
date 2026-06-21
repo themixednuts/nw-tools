@@ -2,10 +2,10 @@ use nw_localization::LocalizedTextResolver;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
-    fmt, io,
+    fmt,
     iter::FusedIterator,
     ops::{Deref, Index},
-    path::{Path, PathBuf},
+    path::Path,
     slice, str,
 };
 use thiserror::Error;
@@ -77,15 +77,6 @@ pub enum ParseError {
 }
 
 pub type DatasheetParseError = ParseError;
-
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum DatasheetInspectionError {
-    #[error("read {path:?}: {source}")]
-    Read { path: PathBuf, source: io::Error },
-    #[error("parse datasheet {path:?}: {source}")]
-    Parse { path: PathBuf, source: ParseError },
-}
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -173,40 +164,8 @@ pub struct DatasheetSummary<'a> {
     pub boolean_columns: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnedDatasheetSummary {
-    pub version: u32,
-    pub rows: usize,
-    pub columns: usize,
-    pub cells: usize,
-    pub name: String,
-    pub type_name: String,
-    pub string_columns: usize,
-    pub number_columns: usize,
-    pub boolean_columns: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DatasheetFileSummary {
-    pub source: String,
-    pub summary: OwnedDatasheetSummary,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct DatasheetInspection {
-    pub rows: Vec<DatasheetFileSummary>,
-    pub totals: DatasheetTotals,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DatasheetInspectionReport<'a> {
-    inspection: &'a DatasheetInspection,
-    limit: usize,
-}
-
-impl<'a> DatasheetSummary<'a> {
-    #[must_use]
-    pub fn from_datasheet(sheet: &Datasheet<'a>) -> Self {
+impl<'a> From<&Datasheet<'a>> for DatasheetSummary<'a> {
+    fn from(sheet: &Datasheet<'a>) -> Self {
         let mut summary = Self {
             version: sheet.version(),
             rows: sheet.len(),
@@ -228,188 +187,6 @@ impl<'a> DatasheetSummary<'a> {
         }
 
         summary
-    }
-}
-
-impl OwnedDatasheetSummary {
-    #[must_use]
-    pub fn as_borrowed(&self) -> DatasheetSummary<'_> {
-        DatasheetSummary {
-            version: self.version,
-            rows: self.rows,
-            columns: self.columns,
-            cells: self.cells,
-            name: &self.name,
-            type_name: &self.type_name,
-            string_columns: self.string_columns,
-            number_columns: self.number_columns,
-            boolean_columns: self.boolean_columns,
-        }
-    }
-}
-
-impl From<DatasheetSummary<'_>> for OwnedDatasheetSummary {
-    fn from(summary: DatasheetSummary<'_>) -> Self {
-        Self {
-            version: summary.version,
-            rows: summary.rows,
-            columns: summary.columns,
-            cells: summary.cells,
-            name: summary.name.to_owned(),
-            type_name: summary.type_name.to_owned(),
-            string_columns: summary.string_columns,
-            number_columns: summary.number_columns,
-            boolean_columns: summary.boolean_columns,
-        }
-    }
-}
-
-impl fmt::Display for DatasheetSummary<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "v0x{:x}, {} rows, {} columns, {} cells, sheet {:?}, type {:?}",
-            self.version, self.rows, self.columns, self.cells, self.name, self.type_name
-        )
-    }
-}
-
-impl fmt::Display for OwnedDatasheetSummary {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_borrowed().fmt(f)
-    }
-}
-
-/// Parse bytes and return the datasheet's summary counts.
-///
-/// # Errors
-///
-/// Returns [`ParseError`] if `bytes` is not a supported binary datasheet.
-pub fn summarize_datasheet(bytes: &[u8]) -> Result<DatasheetSummary<'_>, ParseError> {
-    Datasheet::parse(bytes).map(|sheet| DatasheetSummary::from_datasheet(&sheet))
-}
-
-/// Parse bytes from one datasheet file and attach the source path to the summary.
-///
-/// # Errors
-///
-/// Returns [`ParseError`] if `bytes` is not a supported binary datasheet.
-pub fn inspect_datasheet_file(
-    path: impl AsRef<Path>,
-    bytes: &[u8],
-) -> Result<DatasheetFileSummary, ParseError> {
-    Ok(DatasheetFileSummary {
-        source: path.as_ref().display().to_string(),
-        summary: summarize_datasheet(bytes)?.into(),
-    })
-}
-
-/// Read and inspect one datasheet path.
-///
-/// # Errors
-///
-/// Returns [`DatasheetInspectionError`] if the file cannot be read or parsed.
-pub fn inspect_datasheet_path(
-    path: impl AsRef<Path>,
-) -> Result<DatasheetFileSummary, DatasheetInspectionError> {
-    let path = path.as_ref();
-    let bytes = std::fs::read(path).map_err(|source| DatasheetInspectionError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    inspect_datasheet_file(path, &bytes).map_err(|source| DatasheetInspectionError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-/// Read and inspect multiple datasheet paths.
-///
-/// # Errors
-///
-/// Returns [`DatasheetInspectionError`] for the first file that cannot be read
-/// or parsed.
-pub fn inspect_datasheet_files<I, P>(
-    paths: I,
-) -> Result<DatasheetInspection, DatasheetInspectionError>
-where
-    I: IntoIterator<Item = P>,
-    P: AsRef<Path>,
-{
-    let mut inspection = DatasheetInspection::default();
-    for path in paths {
-        inspection.add_file_summary(inspect_datasheet_path(path)?);
-    }
-    Ok(inspection)
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct DatasheetTotals {
-    pub files: usize,
-    pub rows: usize,
-    pub columns: usize,
-    pub cells: usize,
-    pub string_columns: usize,
-    pub number_columns: usize,
-    pub boolean_columns: usize,
-}
-
-impl DatasheetTotals {
-    pub fn add_summary(&mut self, summary: DatasheetSummary<'_>) {
-        self.files += 1;
-        self.rows += summary.rows;
-        self.columns += summary.columns;
-        self.cells += summary.cells;
-        self.string_columns += summary.string_columns;
-        self.number_columns += summary.number_columns;
-        self.boolean_columns += summary.boolean_columns;
-    }
-}
-
-impl DatasheetInspection {
-    pub fn add_file_summary(&mut self, row: DatasheetFileSummary) {
-        self.totals.add_summary(row.summary.as_borrowed());
-        self.rows.push(row);
-    }
-
-    #[must_use]
-    pub const fn report(&self, limit: usize) -> DatasheetInspectionReport<'_> {
-        DatasheetInspectionReport {
-            inspection: self,
-            limit,
-        }
-    }
-}
-
-impl fmt::Display for DatasheetTotals {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "  files: {}", self.files)?;
-        writeln!(f, "  rows: {}", self.rows)?;
-        writeln!(f, "  columns: {}", self.columns)?;
-        writeln!(f, "  cells: {}", self.cells)?;
-        writeln!(f, "  string columns: {}", self.string_columns)?;
-        writeln!(f, "  number columns: {}", self.number_columns)?;
-        writeln!(f, "  boolean columns: {}", self.boolean_columns)
-    }
-}
-
-impl fmt::Display for DatasheetInspectionReport<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.limit > 0 {
-            for row in self.inspection.rows.iter().take(self.limit) {
-                writeln!(f, "{}: {}", row.source, row.summary)?;
-            }
-
-            if self.inspection.rows.len() > self.limit {
-                writeln!(
-                    f,
-                    "... {} more files",
-                    self.inspection.rows.len() - self.limit
-                )?;
-            }
-        }
-
-        write!(f, "{}", self.inspection.totals)
     }
 }
 
@@ -580,6 +357,12 @@ impl<'a> Datasheet<'a> {
             row_count,
             localization: None,
         })
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn summary(&self) -> DatasheetSummary<'a> {
+        DatasheetSummary::from(self)
     }
 
     #[must_use]

@@ -56,7 +56,7 @@ impl FoundElement {
     }
 }
 
-/// ObjectStream surface used by search tools.
+/// Searchable ObjectStream surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ObjectStreamSearchKind {
     Path,

@@ -117,7 +117,7 @@ impl JobRunner {
         }
     }
 
-    /// Build a runner from an optional CLI-style worker count.
+    /// Build a runner from an optional worker count.
     ///
     /// `None` uses the global Rayon pool, `Some(0)` runs on the caller thread,
     /// and any other value creates a private worker pool.

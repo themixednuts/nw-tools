@@ -9,17 +9,16 @@
 //! ```no_run
 //! use nw_objectstream::ObjectStream;
 //!
-//! let bytes = std::fs::read("some.slice")?;
+//! let bytes = [0, 0, 0, 0, 3, 0];
 //! let stream = ObjectStream::from_bytes(&bytes, None)?;
-//! for element in stream.iter_recursive() {
-//!     println!("{} {}", element.id(), element.name());
-//! }
+//! let element_count = stream.iter_recursive().count();
+//! assert_eq!(element_count, 0);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! Format boundaries live in [`deserialize`] and [`serialize`].
-//! Higher-level tools should select an [`ObjectStreamEncoding`] and let
-//! this crate own the byte/XML/JSON details.
+//! Callers select an [`ObjectStreamEncoding`] and let this crate own the
+//! byte/XML/JSON details.
 
 pub mod asset_id;
 pub mod asset_reference;

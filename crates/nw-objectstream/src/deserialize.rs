@@ -1,8 +1,8 @@
 //! ObjectStream payload deserialization.
 //!
-//! This module owns the byte/XML/JSON input boundary. Higher-level
-//! tools can consume the resulting [`ObjectStream`] graph or the
-//! streaming visitor API.
+//! This module owns the byte/XML/JSON input boundary. Callers can
+//! consume the resulting [`ObjectStream`] graph or the streaming
+//! visitor API.
 
 use std::io::{self, Cursor, Read};
 use std::str;

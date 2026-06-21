@@ -226,6 +226,12 @@ enum LocalizeArg {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectMode {
+    Stats,
+    Dom { limit: usize },
+}
+
 #[derive(Debug, Clone)]
 struct CatalogScan {
     source: String,
@@ -269,10 +275,31 @@ struct SheetOptions<'a> {
     localize: LocalizeArg,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SheetSummary {
+    version: u32,
+    rows: usize,
+    columns: usize,
+    cells: usize,
+    name: String,
+    type_name: String,
+    string_columns: usize,
+    number_columns: usize,
+    boolean_columns: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SheetTotals {
+    files: usize,
+    rows: usize,
+    columns: usize,
+    cells: usize,
+}
+
 #[derive(Debug, Clone)]
 struct SheetScan {
     source: String,
-    summary: nw_datasheet::OwnedDatasheetSummary,
+    summary: SheetSummary,
     columns: Vec<ColumnRow>,
     rows: Vec<RowSample>,
     hits: Vec<SheetHit>,
@@ -336,14 +363,37 @@ struct DdsConvert {
 
 #[derive(Debug, Clone)]
 enum ObjectScan {
-    Inspect {
-        source: String,
-        report: String,
-    },
+    Stats(ObjectStatsScan),
+    Dom(ObjectDomScan),
     Search {
         source: String,
         hits: Vec<ObjectHit>,
     },
+}
+
+#[derive(Debug, Clone)]
+struct ObjectStatsScan {
+    source: String,
+    stats: nw_objectstream::stats::Stats,
+    names_loaded: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectDomScan {
+    source: String,
+    version: u32,
+    top_level_elements: usize,
+    total_elements: usize,
+    rows: Vec<ObjectDomRow>,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectDomRow {
+    index: String,
+    flags: String,
+    id: String,
+    type_name: String,
+    field: String,
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +410,31 @@ struct ObjectConvertRow {
     output: String,
     encoding: String,
     bytes: String,
+}
+
+impl From<nw_datasheet::DatasheetSummary<'_>> for SheetSummary {
+    fn from(summary: nw_datasheet::DatasheetSummary<'_>) -> Self {
+        Self {
+            version: summary.version,
+            rows: summary.rows,
+            columns: summary.columns,
+            cells: summary.cells,
+            name: summary.name.to_owned(),
+            type_name: summary.type_name.to_owned(),
+            string_columns: summary.string_columns,
+            number_columns: summary.number_columns,
+            boolean_columns: summary.boolean_columns,
+        }
+    }
+}
+
+impl SheetTotals {
+    fn add(&mut self, summary: &SheetSummary) {
+        self.files += 1;
+        self.rows += summary.rows;
+        self.columns += summary.columns;
+        self.cells += summary.cells;
+    }
 }
 
 impl Catalog {
@@ -753,9 +828,9 @@ impl ObjectStream {
         }
 
         let mode = if self.dom {
-            nw_objectstream::stats::ObjectStreamInspectionMode::dom(self.show)
+            ObjectMode::Dom { limit: self.show }
         } else {
-            nw_objectstream::stats::ObjectStreamInspectionMode::streaming()
+            ObjectMode::Stats
         };
         let query = self.query.clone();
         let batch = ctx.map_results_compact(
@@ -791,12 +866,8 @@ impl ObjectStream {
         );
         for scan in scans.into_iter().take(self.files) {
             match scan {
-                ObjectScan::Inspect { report, .. } => {
-                    print!("{report}");
-                    if !report.ends_with('\n') {
-                        println!();
-                    }
-                }
+                ObjectScan::Stats(scan) => print_object_stats(&scan),
+                ObjectScan::Dom(scan) => print_object_dom(&scan),
                 ObjectScan::Search { source, hits } => {
                     println!("{source}: {} hit group(s)", hits.len());
                     let mut table = Table::new(["Kind", "Count", "Score", "Value"]);
@@ -1539,9 +1610,7 @@ fn scan_sheet(path: &Path, options: &SheetOptions) -> Result<SheetScan> {
     if let Some(localization) = options.localization {
         sheet.set_localization(Some(localization));
     }
-    let summary = nw_datasheet::OwnedDatasheetSummary::from(
-        nw_datasheet::DatasheetSummary::from_datasheet(&sheet),
-    );
+    let summary = SheetSummary::from(sheet.summary());
     let source = path.display().to_string();
     let columns = if options.columns {
         sheet
@@ -1591,7 +1660,7 @@ fn scan_sheet(path: &Path, options: &SheetOptions) -> Result<SheetScan> {
 
 fn scan_objectstream(
     path: &Path,
-    mode: nw_objectstream::stats::ObjectStreamInspectionMode,
+    mode: ObjectMode,
     query: Option<&str>,
     limit: usize,
     lookup: Option<&NameLookup>,
@@ -1631,10 +1700,100 @@ fn scan_objectstream(
         return Ok(Some(ObjectScan::Search { source, hits }));
     }
 
-    let report = nw_objectstream::stats::inspect_file_bytes_with_mode(path, &bytes, mode, lookup)
-        .with_context(|| format!("inspect {}", path.display()))?
-        .to_string();
-    Ok(Some(ObjectScan::Inspect { source, report }))
+    match mode {
+        ObjectMode::Stats => {
+            let stats = nw_objectstream::stats::Stats::from_bytes(&bytes, lookup)
+                .with_context(|| format!("inspect {}", path.display()))?;
+            Ok(Some(ObjectScan::Stats(ObjectStatsScan {
+                source,
+                stats,
+                names_loaded: lookup.is_some(),
+            })))
+        }
+        ObjectMode::Dom { limit } => {
+            let stream = nw_objectstream::ObjectStream::from_bytes(&bytes, lookup)
+                .with_context(|| format!("parse {}", path.display()))?;
+            Ok(Some(ObjectScan::Dom(object_dom_scan(
+                source, &stream, limit,
+            ))))
+        }
+    }
+}
+
+fn object_dom_scan(
+    source: String,
+    stream: &nw_objectstream::ObjectStream,
+    limit: usize,
+) -> ObjectDomScan {
+    let mut rows = Vec::new();
+    let mut total_elements = 0usize;
+    for (index, element) in stream.iter_recursive().enumerate() {
+        total_elements += 1;
+        if rows.len() < limit {
+            let type_name = if element.name().is_empty() {
+                "<unknown-type>".to_string()
+            } else {
+                element.name().to_string()
+            };
+            rows.push(ObjectDomRow {
+                index: index.to_string(),
+                flags: format!("{:#04x}", element.flags),
+                id: element.id().to_string(),
+                type_name,
+                field: element
+                    .field()
+                    .map_or_else(String::new, ToString::to_string),
+            });
+        }
+    }
+
+    ObjectDomScan {
+        source,
+        version: stream.version(),
+        top_level_elements: stream.elements().len(),
+        total_elements,
+        rows,
+    }
+}
+
+fn print_object_stats(scan: &ObjectStatsScan) {
+    let stats = scan.stats;
+    println!("{} ({})", scan.source, stats.mode_label());
+    println!("  version:   {}", stats.version);
+    println!("  elements:  {}", stats.elements);
+    println!("  max depth: {}", stats.max_depth);
+    println!("  bytes:     {}", stats.bytes);
+    if scan.names_loaded {
+        println!(
+            "  resolved:  {} elements had a known type, {} fields had a known name",
+            stats.resolved_types, stats.resolved_fields
+        );
+    } else {
+        println!("  resolved:  (no serialize.json - names unresolved)");
+    }
+}
+
+fn print_object_dom(scan: &ObjectDomScan) {
+    println!("{} (DOM)", scan.source);
+    println!("  version: {}", scan.version);
+    println!("  top-level elements: {}", scan.top_level_elements);
+    if !scan.rows.is_empty() {
+        let mut table = Table::new(["Index", "Flags", "Id", "Type", "Field"]);
+        for row in &scan.rows {
+            table.push([
+                row.index.clone(),
+                row.flags.clone(),
+                row.id.clone(),
+                row.type_name.clone(),
+                row.field.clone(),
+            ]);
+        }
+        print!("{table}");
+    }
+    let remaining = scan.total_elements.saturating_sub(scan.rows.len());
+    if remaining > 0 {
+        println!("... {remaining} more element(s)");
+    }
 }
 
 fn print_sheet_summary(scans: &[SheetScan], limit: usize) {
@@ -1642,12 +1801,12 @@ fn print_sheet_summary(scans: &[SheetScan], limit: usize) {
         "Source", "Version", "Rows", "Columns", "Cells", "Strings", "Numbers", "Booleans", "Name",
         "Type",
     ]);
-    let mut totals = nw_datasheet::DatasheetTotals::default();
+    let mut totals = SheetTotals::default();
     for scan in scans {
-        totals.add_summary(scan.summary.as_borrowed());
+        totals.add(&scan.summary);
     }
     for scan in scans.iter().take(limit) {
-        let summary = scan.summary.as_borrowed();
+        let summary = &scan.summary;
         table.push([
             scan.source.clone(),
             format!("0x{:x}", summary.version),
@@ -1834,7 +1993,9 @@ fn objectstream_payload(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
 
 fn object_source(scan: &ObjectScan) -> &str {
     match scan {
-        ObjectScan::Inspect { source, .. } | ObjectScan::Search { source, .. } => source,
+        ObjectScan::Stats(scan) => &scan.source,
+        ObjectScan::Dom(scan) => &scan.source,
+        ObjectScan::Search { source, .. } => source,
     }
 }
 

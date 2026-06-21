@@ -1,6 +1,5 @@
 //! Extract pak entries to a filesystem tree.
 
-use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,6 +35,12 @@ pub struct PakExtractReport {
 }
 
 impl PakExtractReport {
+    #[inline]
+    #[must_use]
+    pub fn output_root(&self) -> &Path {
+        &self.output_root
+    }
+
     #[inline]
     #[must_use]
     pub fn selected_entries(&self) -> usize {
@@ -75,43 +80,6 @@ impl PakExtractReport {
         } else {
             Ok(())
         }
-    }
-}
-
-impl fmt::Display for PakExtractReport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            f,
-            "{} entries to extract -> {}",
-            self.selected_entries,
-            self.output_root.display()
-        )?;
-        writeln!(
-            f,
-            "wrote {} files{}{}",
-            self.written_files,
-            if self.skipped_existing_files > 0 {
-                format!(
-                    ", skipped {} existing (pass --overwrite to replace)",
-                    self.skipped_existing_files
-                )
-            } else {
-                String::new()
-            },
-            if self.failures.is_empty() {
-                String::new()
-            } else {
-                format!(", {} errors", self.failures.len())
-            }
-        )?;
-
-        for failure in self.failures.iter().take(20) {
-            writeln!(f, "  {}: {}", failure.entry, failure.error)?;
-        }
-        if self.failures.len() > 20 {
-            writeln!(f, "  ... ({} more errors hidden)", self.failures.len() - 20)?;
-        }
-        Ok(())
     }
 }
 
@@ -455,41 +423,6 @@ fn write_entry(dest: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn report_formats_success_deterministically() {
-        let report = PakExtractReport {
-            output_root: PathBuf::from("out"),
-            selected_entries: 3,
-            written_files: 2,
-            skipped_existing_files: 1,
-            failures: Vec::new(),
-        };
-
-        assert_eq!(
-            report.to_string(),
-            "3 entries to extract -> out\nwrote 2 files, skipped 1 existing (pass --overwrite to replace)\n"
-        );
-    }
-
-    #[test]
-    fn report_formats_failures_deterministically() {
-        let report = PakExtractReport {
-            output_root: PathBuf::from("out"),
-            selected_entries: 1,
-            written_files: 0,
-            skipped_existing_files: 0,
-            failures: vec![PakExtractEntryFailure {
-                entry: "../bad".to_string(),
-                error: "archive path contains a parent-directory component: ../bad".to_string(),
-            }],
-        };
-
-        assert_eq!(
-            report.to_string(),
-            "1 entries to extract -> out\nwrote 0 files, 1 errors\n  ../bad: archive path contains a parent-directory component: ../bad\n"
-        );
-    }
 
     #[test]
     fn wildcard_selector_matches_paths_case_insensitively() {

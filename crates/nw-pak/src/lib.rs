@@ -12,10 +12,9 @@
 //! use nw_pak::PakFile;
 //!
 //! let mut pak = PakFile::open("assets/game.pak")?;
-//! for entry in pak.entries() {
-//!     println!("{}: {} bytes", entry.name(), entry.uncompressed_size());
-//! }
+//! let entry_count = pak.len();
 //! let bytes = pak.read("textures/foo.dds")?;
+//! assert!(entry_count > 0 || bytes.is_empty());
 //! # Ok::<(), nw_pak::PakError>(())
 //! ```
 //!
@@ -25,9 +24,7 @@ pub mod crypak;
 mod crypak_format;
 pub mod decompress;
 pub mod extract;
-pub mod inspection;
 pub mod oodle;
-pub mod search;
 pub mod shape;
 
 pub use archive::{
@@ -42,6 +39,4 @@ pub use extract::{
     PakExtractEntryFailure, PakExtractError, PakExtractFailures, PakExtractOptions,
     PakExtractReport,
 };
-pub use inspection::{PakInspectionError, PakInspectionReport, inspect_pak_path};
-pub use search::{PakSearchReport, PakSearchRow, PakSearchSummary};
 pub use shape::{Report as PakShapeReport, Scanner as PakShapeScanner};

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -358,8 +359,89 @@ impl Shape {
             .scan_with(root, &ctx.runner, &ctx.cancel);
         progress.finish(if report.is_ok() { "done" } else { "failed" });
         let report = report?;
-        println!("{report}");
+        print_shape_report(&report);
         Ok(())
+    }
+}
+
+fn print_shape_report(report: &shape::Report) {
+    println!("root: {}", report.root.display());
+    println!(
+        "archives: {} parsed: {} entries: {}",
+        report.archives, report.parsed_archives, report.entries
+    );
+    println!("methods: {}", count_line(&report.methods));
+    println!("versions: {}", count_line(&report.versions));
+    println!("flags: {}", count_line(&report.flags));
+    println!(
+        "cdr_extra_lengths: {}",
+        count_line(&report.central_directory_extra_lengths)
+    );
+    println!(
+        "cdr_extra_values: {}",
+        count_line(&report.central_directory_extra_values)
+    );
+    println!("extra_by_method: {}", count_line(&report.extra_by_method));
+    println!("extra_by_family: {}", count_line(&report.extra_by_family));
+    println!("method_by_family: {}", count_line(&report.method_by_family));
+    println!("azcs: {}", count_line(&report.azcs));
+    println!("azcs_by_method: {}", count_line(&report.azcs_by_method));
+    println!("azcs_by_extra: {}", count_line(&report.azcs_by_extra));
+    println!("azcs_by_family: {}", count_line(&report.azcs_by_family));
+    println!(
+        "local_extra_lengths: {}",
+        count_line(&report.local_extra_lengths)
+    );
+    println!(
+        "cdr_comment_lengths: {}",
+        count_line(&report.central_directory_comment_lengths)
+    );
+    println!("disk_starts: {}", count_line(&report.disk_starts));
+    println!(
+        "internal_attrs: {}",
+        count_line(&report.internal_attributes)
+    );
+    println!(
+        "external_attrs: {}",
+        count_line(&report.external_attributes)
+    );
+    println!("separators: {}", count_line(&report.separators));
+    println!("uppercase_names: {}", report.uppercase_names);
+    println!("zip64_archives: {}", report.zip64_archives);
+    println!("eocd_comment_archives: {}", report.eocd_comment_archives);
+    println!("multi_disk_archives: {}", report.multi_disk_archives);
+
+    let samples = &report.samples;
+    print_samples("errors", &samples.errors);
+    print_samples("unknown_methods", &samples.unknown_methods);
+    print_samples("nonzero_flags", &samples.nonzero_flags);
+    print_samples("nonzero_extra", &samples.nonzero_extra);
+    print_samples("comments", &samples.comments);
+    print_samples("mismatches", &samples.mismatches);
+    print_samples("zip64_entries", &samples.zip64_entries);
+    print_samples("azcs_errors", &samples.azcs_errors);
+}
+
+fn count_line(counts: &BTreeMap<String, u64>) -> String {
+    if counts.is_empty() {
+        return "<none>".to_string();
+    }
+    counts
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn print_samples(title: &str, samples: &[String]) {
+    if samples.is_empty() {
+        println!("{title}: <none>");
+        return;
+    }
+
+    println!("{title}:");
+    for sample in samples {
+        println!("  {sample}");
     }
 }
 

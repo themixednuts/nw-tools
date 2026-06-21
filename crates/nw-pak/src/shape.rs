@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -219,74 +218,6 @@ fn merge_counts(target: &mut BTreeMap<String, u64>, source: BTreeMap<String, u64
     }
 }
 
-impl fmt::Display for Report {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "root: {}", self.root.display())?;
-        writeln!(
-            f,
-            "archives: {} parsed: {} entries: {}",
-            self.archives, self.parsed_archives, self.entries
-        )?;
-        writeln!(f, "methods: {}", Counts(&self.methods))?;
-        writeln!(f, "versions: {}", Counts(&self.versions))?;
-        writeln!(f, "flags: {}", Counts(&self.flags))?;
-        writeln!(
-            f,
-            "cdr_extra_lengths: {}",
-            Counts(&self.central_directory_extra_lengths)
-        )?;
-        writeln!(
-            f,
-            "cdr_extra_values: {}",
-            Counts(&self.central_directory_extra_values)
-        )?;
-        writeln!(f, "extra_by_method: {}", Counts(&self.extra_by_method))?;
-        writeln!(f, "extra_by_family: {}", Counts(&self.extra_by_family))?;
-        writeln!(f, "method_by_family: {}", Counts(&self.method_by_family))?;
-        writeln!(f, "azcs: {}", Counts(&self.azcs))?;
-        writeln!(f, "azcs_by_method: {}", Counts(&self.azcs_by_method))?;
-        writeln!(f, "azcs_by_extra: {}", Counts(&self.azcs_by_extra))?;
-        writeln!(f, "azcs_by_family: {}", Counts(&self.azcs_by_family))?;
-        writeln!(
-            f,
-            "local_extra_lengths: {}",
-            Counts(&self.local_extra_lengths)
-        )?;
-        writeln!(
-            f,
-            "cdr_comment_lengths: {}",
-            Counts(&self.central_directory_comment_lengths)
-        )?;
-        writeln!(f, "disk_starts: {}", Counts(&self.disk_starts))?;
-        writeln!(f, "internal_attrs: {}", Counts(&self.internal_attributes))?;
-        writeln!(f, "external_attrs: {}", Counts(&self.external_attributes))?;
-        writeln!(f, "separators: {}", Counts(&self.separators))?;
-        writeln!(f, "uppercase_names: {}", self.uppercase_names)?;
-        writeln!(f, "zip64_archives: {}", self.zip64_archives)?;
-        writeln!(f, "eocd_comment_archives: {}", self.eocd_comment_archives)?;
-        writeln!(f, "multi_disk_archives: {}", self.multi_disk_archives)?;
-        self.samples.fmt(f)
-    }
-}
-
-struct Counts<'a>(&'a BTreeMap<String, u64>);
-
-impl fmt::Display for Counts<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0.is_empty() {
-            return f.write_str("<none>");
-        }
-
-        for (index, (key, value)) in self.0.iter().enumerate() {
-            if index > 0 {
-                f.write_str(", ")?;
-            }
-            write!(f, "{key}={value}")?;
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct Samples {
     pub errors: Vec<String>,
@@ -341,19 +272,6 @@ impl Samples {
         extend_samples(&mut self.mismatches, other.mismatches, max);
         extend_samples(&mut self.zip64_entries, other.zip64_entries, max);
         extend_samples(&mut self.azcs_errors, other.azcs_errors, max);
-    }
-}
-
-impl fmt::Display for Samples {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_samples(f, "errors", &self.errors)?;
-        write_samples(f, "unknown_methods", &self.unknown_methods)?;
-        write_samples(f, "nonzero_flags", &self.nonzero_flags)?;
-        write_samples(f, "nonzero_extra", &self.nonzero_extra)?;
-        write_samples(f, "comments", &self.comments)?;
-        write_samples(f, "mismatches", &self.mismatches)?;
-        write_samples(f, "zip64_entries", &self.zip64_entries)?;
-        write_samples(f, "azcs_errors", &self.azcs_errors)
     }
 }
 
@@ -887,19 +805,6 @@ fn extend_samples(samples: &mut Vec<String>, other: Vec<String>, max: usize) {
     for sample in other {
         push_sample(samples, sample, max);
     }
-}
-
-fn write_samples(f: &mut fmt::Formatter<'_>, title: &str, samples: &[String]) -> fmt::Result {
-    if samples.is_empty() {
-        writeln!(f, "{title}: <none>")?;
-        return Ok(());
-    }
-
-    writeln!(f, "{title}:")?;
-    for sample in samples {
-        writeln!(f, "  {sample}")?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

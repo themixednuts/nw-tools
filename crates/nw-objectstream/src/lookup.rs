@@ -1,4 +1,4 @@
-//! Optional lookup tables that pretty-print element names + fields.
+//! Optional lookup tables that resolve element names and fields.
 //!
 //! ObjectStream payloads carry only UUIDs (type) and CRC-32 hashes
 //! (field name). Resolving them back to human-readable strings requires
