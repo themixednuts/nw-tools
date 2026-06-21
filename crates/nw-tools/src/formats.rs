@@ -6,10 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use humansize::{DECIMAL, format_size};
-use nw_asset::AssetId;
 use nw_localization::{
-    LanguageCode, LocalizationCatalog, LocalizationDocument, LocalizationKey, LocalizationTag,
-    SourceManifest, TAG_MANIFEST_ASSET_PATH, is_localization_source_name, localization_asset_path,
+    LanguageCode, LocalizationCatalog, LocalizationKey, LocalizationLoader, LocalizationTag,
     localization_keys,
 };
 use nw_objectstream::ObjectStreamEncoding;
@@ -17,7 +15,7 @@ use nw_objectstream::lookup::NameLookup;
 
 use crate::jobs::{JobArgs, RunCtx};
 use crate::output::Table;
-use crate::support::{PakSet, PathSelector, collect_matching, load_lookup, path_ext};
+use crate::support::{PathSelector, collect_matching, load_lookup, path_ext};
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
@@ -378,7 +376,7 @@ impl Catalog {
 impl CatalogSummary {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paths = collect_matching(&self.path, |path| nw_catalog::is_asset_catalog_path(path))?;
+        let paths = collect_matching(&self.path, |path| nw_asset::is_asset_catalog_path(path))?;
         let batch = ctx.map_results_compact(
             "catalog",
             &paths,
@@ -392,7 +390,7 @@ impl CatalogSummary {
 impl CatalogFind {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paths = collect_matching(&self.path, |path| nw_catalog::is_asset_catalog_path(path))?;
+        let paths = collect_matching(&self.path, |path| nw_asset::is_asset_catalog_path(path))?;
         let find = lowered(self.query);
         let batch = ctx.map_results_compact(
             "catalog find",
@@ -407,7 +405,7 @@ impl CatalogFind {
 impl CatalogGet {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paths = collect_matching(&self.path, |path| nw_catalog::is_asset_catalog_path(path))?;
+        let paths = collect_matching(&self.path, |path| nw_asset::is_asset_catalog_path(path))?;
         let queries = lowered(self.query);
         let batch = ctx.map_results_compact(
             "catalog get",
@@ -461,7 +459,7 @@ impl CatalogGet {
 impl CatalogExport {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paths = collect_matching(&self.path, |path| nw_catalog::is_asset_catalog_path(path))?;
+        let paths = collect_matching(&self.path, |path| nw_asset::is_asset_catalog_path(path))?;
         let batch = ctx.map_results_compact(
             "catalog export",
             &paths,
@@ -578,11 +576,16 @@ impl Datasheet {
             .clone()
             .filter(|_| needs_localization)
             .map(|locale| {
-                load_localization_catalog(
-                    locale,
-                    self.loc_root.as_deref(),
-                    &self.loc_tags,
-                    &needed_keys,
+                let root = match self.loc_root.as_ref() {
+                    Some(root) => root.clone(),
+                    None => nw_locator::Install::locate()?.assets(),
+                };
+                let assets = nw_asset::AssetStore::open(root)?;
+                Ok::<LocalizationCatalog, anyhow::Error>(
+                    LocalizationLoader::new(&assets, locale)
+                        .tags(self.loc_tags.clone())
+                        .keys(needed_keys.iter().cloned())
+                        .load()?,
                 )
             })
             .transpose()?;
@@ -1171,11 +1174,11 @@ fn scan_dds(path: &Path) -> Result<DdsScan> {
 fn scan_catalog(path: &Path, limit: usize, find: &[String]) -> Result<CatalogScan> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let catalog =
-        nw_catalog::Catalog::parse(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        nw_asset::Catalog::parse(&bytes).with_context(|| format!("parse {}", path.display()))?;
     let source = path.display().to_string();
 
     match catalog {
-        nw_catalog::Catalog::Rasc(catalog) => {
+        nw_asset::Catalog::Rasc(catalog) => {
             let mut rows = Vec::new();
             let mut matched = 0usize;
             for entry in catalog.entries() {
@@ -1205,7 +1208,7 @@ fn scan_catalog(path: &Path, limit: usize, find: &[String]) -> Result<CatalogSca
                 rows,
             })
         }
-        nw_catalog::Catalog::Raoc(catalog) => {
+        nw_asset::Catalog::Raoc(catalog) => {
             let mut rows = Vec::new();
             let mut matched = 0usize;
             for entry in catalog.entries() {
@@ -1246,12 +1249,12 @@ fn scan_catalog(path: &Path, limit: usize, find: &[String]) -> Result<CatalogSca
 fn get_catalog(path: &Path, queries: &[String]) -> Result<Vec<CatalogRow>> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let catalog =
-        nw_catalog::Catalog::parse(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        nw_asset::Catalog::parse(&bytes).with_context(|| format!("parse {}", path.display()))?;
     let source = path.display().to_string();
     let mut rows = Vec::new();
 
     match catalog {
-        nw_catalog::Catalog::Rasc(catalog) => {
+        nw_asset::Catalog::Rasc(catalog) => {
             for entry in catalog.entries() {
                 let asset_id = entry.asset_id().to_string();
                 let asset_type = entry.asset_type().to_string();
@@ -1278,7 +1281,7 @@ fn get_catalog(path: &Path, queries: &[String]) -> Result<Vec<CatalogRow>> {
                 });
             }
         }
-        nw_catalog::Catalog::Raoc(catalog) => {
+        nw_asset::Catalog::Raoc(catalog) => {
             for entry in catalog.entries() {
                 let asset_id = entry.asset_id().to_string();
                 let asset_type = entry.asset_type().to_string();
@@ -1313,11 +1316,11 @@ fn get_catalog(path: &Path, queries: &[String]) -> Result<Vec<CatalogRow>> {
 fn export_catalog(path: &Path) -> Result<Vec<CatalogExportRow>> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let catalog =
-        nw_catalog::Catalog::parse(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        nw_asset::Catalog::parse(&bytes).with_context(|| format!("parse {}", path.display()))?;
     let source = path.display().to_string();
 
     Ok(match catalog {
-        nw_catalog::Catalog::Rasc(catalog) => catalog
+        nw_asset::Catalog::Rasc(catalog) => catalog
             .entries()
             .iter()
             .map(|entry| CatalogExportRow {
@@ -1330,7 +1333,7 @@ fn export_catalog(path: &Path) -> Result<Vec<CatalogExportRow>> {
                 path: entry.path().to_string(),
             })
             .collect(),
-        nw_catalog::Catalog::Raoc(catalog) => catalog
+        nw_asset::Catalog::Raoc(catalog) => catalog
             .entries()
             .iter()
             .map(|entry| CatalogExportRow {
@@ -1509,122 +1512,6 @@ fn datasheet_csv_output_path(root: &Path, source: &Path, out: &Path) -> PathBuf 
     output
 }
 
-#[derive(Debug, Clone)]
-struct LocalizationSource {
-    asset: AssetFile,
-    tag: LocalizationTag,
-}
-
-#[derive(Debug, Clone)]
-struct AssetFile {
-    path: String,
-    asset_id: Option<AssetId>,
-}
-
-impl AssetFile {
-    fn label(&self) -> String {
-        self.asset_id.map_or_else(
-            || self.path.clone(),
-            |asset_id| format!("{} ({asset_id})", self.path),
-        )
-    }
-}
-
-struct AssetTree {
-    root: PathBuf,
-    catalog: Option<nw_catalog::AssetCatalog>,
-    paks: PakSet,
-}
-
-impl AssetTree {
-    fn open(root: PathBuf) -> Result<Self> {
-        let catalog = load_asset_catalog(&root)?;
-        let paks = PakSet::collect(root.clone(), Vec::new())?;
-        Ok(Self {
-            root,
-            catalog,
-            paks,
-        })
-    }
-
-    fn asset(&self, path: &str) -> AssetFile {
-        let normalized = nw_filesystem::normalize_archive_path(path);
-        if let Some(entry) = self
-            .catalog
-            .as_ref()
-            .and_then(|catalog| catalog.entry_by_path(&normalized))
-        {
-            return AssetFile {
-                path: entry.path().to_string(),
-                asset_id: Some(entry.asset_id()),
-            };
-        }
-        AssetFile {
-            path: normalized,
-            asset_id: None,
-        }
-    }
-
-    fn catalog_paths(&self) -> impl Iterator<Item = &str> {
-        self.catalog
-            .as_ref()
-            .into_iter()
-            .flat_map(|catalog| catalog.entries().iter().map(nw_catalog::RascEntry::path))
-    }
-
-    fn loose_path(&self, path: &str) -> Result<PathBuf> {
-        nw_filesystem::safe_join(&self.root, path)
-            .with_context(|| format!("asset path is not relative: {path}"))
-    }
-
-    fn read_path(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        self.read(&self.asset(path))
-    }
-
-    fn read(&self, asset: &AssetFile) -> Result<Option<Vec<u8>>> {
-        let loose = self.loose_path(&asset.path)?;
-        if loose.is_file() {
-            return std::fs::read(&loose)
-                .with_context(|| format!("read {}", loose.display()))
-                .map(Some);
-        }
-
-        for pak_path in self.paks.paths() {
-            let pak = nw_pak::PakMmapReader::open(pak_path)?;
-            if let Some(entry) = pak.entry(&asset.path) {
-                return Ok(Some(pak.read_wrapped_by_index(entry.index())?));
-            }
-        }
-
-        Ok(None)
-    }
-}
-
-fn load_asset_catalog(root: &Path) -> Result<Option<nw_catalog::AssetCatalog>> {
-    let rasc_path = root.join(nw_catalog::ASSET_CATALOG_PATH);
-    if !rasc_path.is_file() {
-        return Ok(None);
-    }
-
-    let rasc_bytes =
-        std::fs::read(&rasc_path).with_context(|| format!("read {}", rasc_path.display()))?;
-    let rasc = nw_catalog::Rasc::parse(&rasc_bytes)
-        .with_context(|| format!("parse {}", rasc_path.display()))?;
-    let raoc_path = root.join(nw_catalog::ASSET_CATALOG_OPTIMIZED_PATH);
-    let raoc = if raoc_path.is_file() {
-        let bytes =
-            std::fs::read(&raoc_path).with_context(|| format!("read {}", raoc_path.display()))?;
-        Some(
-            nw_catalog::Raoc::parse(&bytes)
-                .with_context(|| format!("parse {}", raoc_path.display()))?,
-        )
-    } else {
-        None
-    };
-
-    Ok(Some(nw_catalog::AssetCatalog::new(rasc, raoc)))
-}
-
 fn collect_datasheet_localization_keys(
     paths: &[PathBuf],
     row_limit: Option<usize>,
@@ -1640,164 +1527,6 @@ fn collect_datasheet_localization_keys(
                     keys.extend(localization_keys(value));
                 }
             }
-        }
-    }
-    Ok(keys)
-}
-
-fn load_localization_catalog(
-    language: LanguageCode,
-    loc_root: Option<&Path>,
-    tags: &[LocalizationTag],
-    needed_keys: &BTreeSet<LocalizationKey>,
-) -> Result<LocalizationCatalog> {
-    let root = match loc_root {
-        Some(root) => root.to_path_buf(),
-        None => nw_locator::Install::locate()?.assets(),
-    };
-    let tags = localization_tags(tags);
-    if needed_keys.is_empty() {
-        return Ok(LocalizationCatalog::builder(language).build());
-    }
-
-    let assets = AssetTree::open(root.clone())?;
-    let sources = localization_sources(&assets, &language, &tags)
-        .with_context(|| format!("find localization sources in {}", root.display()))?;
-    let mut remaining = needed_keys.clone();
-    let mut builder = LocalizationCatalog::builder(language);
-
-    for source in sources {
-        if remaining.is_empty() {
-            break;
-        }
-        let Some(bytes) = assets.read(&source.asset)? else {
-            continue;
-        };
-        let document = LocalizationDocument::parse_bytes(&bytes)
-            .with_context(|| format!("parse localization {}", source.asset.label()))?;
-        let source_keys = document_keys(&document)?;
-        if !source_keys.iter().any(|key| remaining.contains(key)) {
-            continue;
-        }
-
-        let loaded = builder.add_document_if(
-            source.asset.path.clone().into_boxed_str(),
-            &source.tag,
-            &document,
-            |key| remaining.contains(key),
-        )?;
-        for key in loaded {
-            remaining.remove(&key);
-        }
-    }
-
-    Ok(builder.build())
-}
-
-fn localization_tags(tags: &[LocalizationTag]) -> Vec<LocalizationTag> {
-    if tags.is_empty() {
-        vec![LocalizationTag::init()]
-    } else {
-        tags.to_vec()
-    }
-}
-
-fn localization_sources(
-    assets: &AssetTree,
-    language: &LanguageCode,
-    tags: &[LocalizationTag],
-) -> Result<Vec<LocalizationSource>> {
-    if let Some(bytes) = assets.read_path(TAG_MANIFEST_ASSET_PATH)? {
-        let manifest = SourceManifest::parse_bytes(&bytes)?;
-        return localization_manifest_sources(assets, &manifest, language, tags);
-    }
-
-    let mut sources = BTreeMap::<String, LocalizationTag>::new();
-    let tag = tags.first().cloned().unwrap_or_else(LocalizationTag::init);
-    let prefix = format!("localization/{}/", language.asset_folder());
-    for path in assets.catalog_paths() {
-        let normalized = nw_filesystem::normalize_archive_path(path);
-        if normalized.starts_with(&prefix) && is_localization_source_name(&normalized) {
-            sources.entry(normalized).or_insert_with(|| tag.clone());
-        }
-    }
-
-    if sources.is_empty() {
-        let locale_root = assets
-            .root
-            .join("localization")
-            .join(language.asset_folder());
-        if locale_root.exists() {
-            for path in collect_matching(&locale_root, |path| {
-                path.to_str().is_some_and(is_localization_source_name)
-            })? {
-                let source_path = nw_filesystem::normalize_archive_path(
-                    &nw_filesystem::display_relative(&assets.root, &path),
-                );
-                sources.entry(source_path).or_insert_with(|| tag.clone());
-            }
-        }
-    }
-
-    if sources.is_empty() {
-        for pak_path in assets.paks.paths() {
-            let pak = nw_pak::PakMmapReader::open(pak_path)?;
-            for entry in pak.entries() {
-                let normalized = nw_filesystem::normalize_archive_path(entry.name());
-                if normalized.starts_with(&prefix) && is_localization_source_name(&normalized) {
-                    sources.entry(normalized).or_insert_with(|| tag.clone());
-                }
-            }
-        }
-    }
-
-    Ok(sources
-        .into_iter()
-        .map(|(path, tag)| LocalizationSource {
-            asset: assets.asset(&path),
-            tag,
-        })
-        .collect())
-}
-
-fn localization_manifest_sources(
-    assets: &AssetTree,
-    manifest: &SourceManifest,
-    language: &LanguageCode,
-    tags: &[LocalizationTag],
-) -> Result<Vec<LocalizationSource>> {
-    let mut sources = BTreeMap::<String, LocalizationTag>::new();
-    for tag in tags {
-        let Some(entries) = manifest.tag(tag) else {
-            bail!(
-                "localization tag `{}` is not present in {}",
-                tag,
-                TAG_MANIFEST_ASSET_PATH
-            );
-        };
-
-        for entry in entries {
-            if entry.file_name().is_empty() {
-                continue;
-            }
-            let asset = assets.asset(&localization_asset_path(language, entry.file_name()));
-            sources.entry(asset.path).or_insert_with(|| tag.clone());
-        }
-    }
-    Ok(sources
-        .into_iter()
-        .map(|(path, tag)| LocalizationSource {
-            asset: assets.asset(&path),
-            tag,
-        })
-        .collect())
-}
-
-fn document_keys(document: &LocalizationDocument) -> Result<BTreeSet<LocalizationKey>> {
-    let mut keys = BTreeSet::new();
-    for entry in document.entries() {
-        if let Some(key) = entry.key() {
-            keys.insert(LocalizationKey::from_source_key(key)?);
         }
     }
     Ok(keys)
@@ -2135,7 +1864,7 @@ fn text_matches(value: &str, needles: &[String]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
 
-fn raoc_text_matches(entry: &nw_catalog::RaocEntry, needles: &[String]) -> bool {
+fn raoc_text_matches(entry: &nw_asset::RaocEntry, needles: &[String]) -> bool {
     let fields = [
         entry.asset_id().to_string().to_ascii_lowercase(),
         entry.asset_type().to_string().to_ascii_lowercase(),

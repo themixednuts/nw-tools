@@ -46,7 +46,6 @@ uuid = { version = "1.23.3", features = ["serde"] }
 vk2dfd = "0.1.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 nw-asset = { path = "crates/nw-asset" }
-nw-catalog = { path = "crates/nw-catalog" }
 nw-datasheet = { path = "crates/nw-datasheet" }
 nw-dds = { path = "crates/nw-dds" }
 nw-filesystem = { path = "crates/nw-filesystem" }

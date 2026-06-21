@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use nw_asset::{AssetId, AssetType};
 use sha1::{Digest, Sha1};
 use thiserror::Error as ThisError;
 use uuid::Uuid;
+
+use crate::{AssetId, AssetType};
 
 pub const ASSET_CATALOG_PATH: &str = "assetcatalog.catalog";
 pub const ASSET_CATALOG_OPTIMIZED_PATH: &str = "assetcatalog_optimized.catalog";
@@ -273,7 +274,7 @@ impl Rasc {
         parse_rasc(bytes)
     }
 
-    fn from_entries(version: u32, entries: Vec<RascEntry>) -> Self {
+    pub(crate) fn from_entries(version: u32, entries: Vec<RascEntry>) -> Self {
         let mut by_id = HashMap::with_capacity(entries.len());
         let mut by_path = HashMap::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {

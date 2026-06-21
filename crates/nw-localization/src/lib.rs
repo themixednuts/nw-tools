@@ -4,7 +4,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
     fmt, fs, io,
     path::{Path, PathBuf},
     str::{self, FromStr},
@@ -64,6 +64,8 @@ pub enum LocalizationError {
         key: Box<str>,
         source: LocalizationKeyError,
     },
+    #[error(transparent)]
+    Asset(#[from] nw_asset::AssetStoreError),
 }
 
 pub type LocalizationParseError = LocalizationError;
@@ -769,6 +771,162 @@ impl SourceManifestEntry {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct LocalizationLoader<'a> {
+    assets: &'a nw_asset::AssetStore,
+    language: LanguageCode,
+    tags: Vec<LocalizationTag>,
+    keys: BTreeSet<LocalizationKey>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalizationSource {
+    asset: nw_asset::AssetInfo,
+    tag: LocalizationTag,
+}
+
+impl<'a> LocalizationLoader<'a> {
+    #[must_use]
+    pub fn new(assets: &'a nw_asset::AssetStore, language: LanguageCode) -> Self {
+        Self {
+            assets,
+            language,
+            tags: vec![LocalizationTag::init()],
+            keys: BTreeSet::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn tag(mut self, tag: LocalizationTag) -> Self {
+        self.tags = vec![tag];
+        self
+    }
+
+    #[must_use]
+    pub fn tags(mut self, tags: impl IntoIterator<Item = LocalizationTag>) -> Self {
+        self.tags = tags.into_iter().collect();
+        if self.tags.is_empty() {
+            self.tags.push(LocalizationTag::init());
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn keys(mut self, keys: impl IntoIterator<Item = LocalizationKey>) -> Self {
+        self.keys = keys.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn extend_keys(mut self, keys: impl IntoIterator<Item = LocalizationKey>) -> Self {
+        self.keys.extend(keys);
+        self
+    }
+
+    pub fn load(self) -> Result<LocalizationCatalog, LocalizationError> {
+        if self.keys.is_empty() {
+            return Ok(LocalizationCatalog::builder(self.language).build());
+        }
+
+        let sources = self.sources()?;
+        let mut remaining = self.keys;
+        let mut builder = LocalizationCatalog::builder(self.language);
+
+        for source in sources {
+            if remaining.is_empty() {
+                break;
+            }
+            let Some(bytes) = self.assets.read(&source.asset)? else {
+                continue;
+            };
+            let document = LocalizationDocument::parse_bytes(&bytes)?;
+            if !document
+                .entries()
+                .iter()
+                .filter_map(LocalizationEntry::key)
+                .filter_map(|key| LocalizationKey::from_source_key(key).ok())
+                .any(|key| remaining.contains(&key))
+            {
+                continue;
+            }
+
+            let loaded = builder.add_matching(
+                source.asset.path().into(),
+                &source.tag,
+                &document,
+                |key| remaining.contains(key),
+            )?;
+            for key in loaded {
+                remaining.remove(&key);
+            }
+        }
+
+        Ok(builder.build())
+    }
+
+    fn sources(&self) -> Result<Vec<LocalizationSource>, LocalizationError> {
+        if let Some(bytes) = self.assets.read_path(TAG_MANIFEST_ASSET_PATH)? {
+            let manifest = SourceManifest::parse_bytes(&bytes)?;
+            return self.manifest_sources(&manifest);
+        }
+
+        let tag = self
+            .tags
+            .first()
+            .cloned()
+            .unwrap_or_else(LocalizationTag::init);
+        let prefix = format!("localization/{}/", self.language.asset_folder());
+        let mut sources = BTreeMap::<String, LocalizationTag>::new();
+        for path in self.assets.catalog_paths() {
+            let normalized = nw_asset::normalize_virtual_path(path);
+            if normalized.starts_with(&prefix) && is_localization_source_name(&normalized) {
+                sources.entry(normalized).or_insert_with(|| tag.clone());
+            }
+        }
+        Ok(sources
+            .into_iter()
+            .map(|(path, tag)| LocalizationSource {
+                asset: self.assets.info(&path),
+                tag,
+            })
+            .collect())
+    }
+
+    fn manifest_sources(
+        &self,
+        manifest: &SourceManifest,
+    ) -> Result<Vec<LocalizationSource>, LocalizationError> {
+        let mut sources = BTreeMap::<String, LocalizationTag>::new();
+        for tag in &self.tags {
+            let Some(entries) = manifest.tag(tag) else {
+                return Err(LocalizationError::UnknownTag {
+                    tag: tag.as_str().into(),
+                    manifest: PathBuf::from(TAG_MANIFEST_ASSET_PATH),
+                });
+            };
+
+            for entry in entries {
+                if entry.file_name().is_empty() {
+                    continue;
+                }
+                let asset = self
+                    .assets
+                    .info(&localization_asset_path(&self.language, entry.file_name()));
+                sources
+                    .entry(asset.path().to_string())
+                    .or_insert_with(|| tag.clone());
+            }
+        }
+        Ok(sources
+            .into_iter()
+            .map(|(path, tag)| LocalizationSource {
+                asset: self.assets.info(&path),
+                tag,
+            })
+            .collect())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalizationCatalog {
     language: LanguageCode,
@@ -781,55 +939,6 @@ impl LocalizationCatalog {
     #[must_use]
     pub fn builder(language: LanguageCode) -> LocalizationCatalogBuilder {
         LocalizationCatalogBuilder::new(language)
-    }
-
-    pub fn load_init_from_asset_root(
-        asset_root: impl AsRef<Path>,
-        language: LanguageCode,
-    ) -> Result<Self, LocalizationError> {
-        Self::load_tag_from_asset_root(asset_root, language, &LocalizationTag::init())
-    }
-
-    pub fn load_tag_from_asset_root(
-        asset_root: impl AsRef<Path>,
-        language: LanguageCode,
-        tag: &LocalizationTag,
-    ) -> Result<Self, LocalizationError> {
-        Self::load_tags_from_asset_root(asset_root, language, std::slice::from_ref(tag))
-    }
-
-    pub fn load_tags_from_asset_root(
-        asset_root: impl AsRef<Path>,
-        language: LanguageCode,
-        tags: &[LocalizationTag],
-    ) -> Result<Self, LocalizationError> {
-        let asset_root = asset_root.as_ref();
-        let manifest = SourceManifest::load_from_asset_root(asset_root)?;
-        let mut builder = LocalizationCatalogBuilder::new(language);
-
-        for tag in tags {
-            let Some(entries) = manifest.tag(tag) else {
-                return Err(LocalizationError::UnknownTag {
-                    tag: tag.as_str().into(),
-                    manifest: asset_root.join(TAG_MANIFEST_ASSET_PATH),
-                });
-            };
-
-            for entry in entries {
-                if entry.file_name().is_empty() {
-                    continue;
-                }
-                let source_path = localization_asset_path(builder.language(), entry.file_name());
-                let path = asset_root.join(&source_path);
-                let bytes = fs::read(&path).map_err(|source| LocalizationError::ReadSource {
-                    path: path.clone(),
-                    source,
-                })?;
-                builder.add_document_bytes(source_path, tag, &bytes)?;
-            }
-        }
-
-        Ok(builder.build())
     }
 
     #[must_use]
@@ -915,10 +1024,10 @@ impl LocalizationCatalogBuilder {
         tag: &LocalizationTag,
         document: &LocalizationDocument,
     ) -> Result<Vec<LocalizationKey>, LocalizationError> {
-        self.add_document_if(source_path, tag, document, |_| true)
+        self.add_matching(source_path, tag, document, |_| true)
     }
 
-    pub fn add_document_if(
+    pub fn add_matching(
         &mut self,
         source_path: Box<str>,
         tag: &LocalizationTag,

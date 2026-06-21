@@ -1012,7 +1012,7 @@ fn classify_entry(
     if wrapped_azcs {
         return Ok("azcs".to_string());
     }
-    if nw_catalog::is_asset_catalog_path(Path::new(entry.name())) {
+    if nw_asset::is_asset_catalog_path(Path::new(entry.name())) {
         return Ok("catalog".to_string());
     }
     if nw_datasheet::is_datasheet_path(Path::new(entry.name())) {

@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 crc32fast.workspace = true
+nw-asset.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
 thiserror.workspace = true

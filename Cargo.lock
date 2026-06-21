@@ -482,14 +482,8 @@ dependencies = [
 name = "nw-asset"
 version = "0.1.0"
 dependencies = [
- "uuid",
-]
-
-[[package]]
-name = "nw-catalog"
-version = "0.1.0"
-dependencies = [
- "nw-asset",
+ "nw-filesystem",
+ "nw-pak",
  "sha1",
  "thiserror 2.0.18",
  "uuid",
@@ -535,6 +529,7 @@ name = "nw-localization"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "nw-asset",
  "quick-xml",
  "serde",
  "thiserror 2.0.18",
@@ -591,7 +586,6 @@ dependencies = [
  "humansize",
  "indicatif",
  "nw-asset",
- "nw-catalog",
  "nw-datasheet",
  "nw-dds",
  "nw-filesystem",

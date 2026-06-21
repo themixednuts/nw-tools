@@ -16,7 +16,6 @@ clap.workspace = true
 humansize.workspace = true
 indicatif.workspace = true
 nw-asset.workspace = true
-nw-catalog.workspace = true
 nw-datasheet.workspace = true
 nw-dds.workspace = true
 nw-filesystem.workspace = true
