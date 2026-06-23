@@ -1,0 +1,790 @@
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::{self, Read},
+    path::{Component, Path, PathBuf},
+};
+
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use nw_serialize_codegen::{
+    CodegenContext, CompileUnit, CompletedCodegenUnits, GoSourceEmitter, GoStandaloneProjectFile,
+    ReflectedTypeCatalogSummary, RustCodegenPlanner, RustSourceEmitter, RustStandaloneProjectFile,
+    SerializeCodegenRootMode, SerializeCodegenRootSelection, SerializeCodegenUnit,
+    SerializeContextCompileInputs, SerializeContextCompiler, SerializeContextDocument, Severity,
+    TypeScriptSourceEmitter, TypeScriptStandaloneProjectFile, TypeScriptStandaloneProjectOptions,
+    class_registration_trace_root_from_jsonl_str, complete_known_missing_reflected_bodies,
+    is_module_descriptor_json_name, module_descriptor_capture, module_descriptors_root,
+    module_descriptors_root_from_capture, module_name_from_path, module_name_from_resource_name,
+    resolve_codegen_root_type_ids,
+};
+use rust_embed::RustEmbed;
+use serde_json::Value;
+
+const EMBEDDED_SERIALIZE_CONTEXT: &[u8] = include_bytes!("../../../../resources/serialize.json");
+
+#[derive(RustEmbed)]
+#[folder = "../../resources/modules"]
+struct EmbeddedModuleDescriptors;
+
+#[derive(Debug, Parser)]
+#[command(author, version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Print a summary of the embedded or overridden SerializeContext inputs.
+    Summary(CatalogArgs),
+    /// Generate standalone Rust, Go, and/or TypeScript source trees.
+    Generate(GenerateArgs),
+}
+
+#[derive(Debug, Args)]
+struct CatalogArgs {
+    /// Override the embedded SerializeContext JSON snapshot.
+    #[arg(long)]
+    serialize_context: Option<PathBuf>,
+    /// Override the embedded AZ::Module descriptor captures; accepts a JSON file or directory.
+    #[arg(long)]
+    modules: Option<PathBuf>,
+    /// Override the embedded SerializeContext::Class<T> registration trace JSONL capture.
+    #[arg(long)]
+    class_registration_trace: Option<PathBuf>,
+    /// Worker count. Omit for Rayon default; use 0 to run on the caller thread.
+    #[arg(long)]
+    jobs: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct GenerateArgs {
+    #[command(flatten)]
+    catalog: CatalogArgs,
+    /// Output directory. With `--language all`, language subdirectories are created inside it.
+    #[arg(long)]
+    out: PathBuf,
+    /// Language to generate.
+    #[arg(long, value_enum, default_value_t = Language::All)]
+    language: Language,
+    /// Type selection to emit.
+    #[arg(long, value_enum, default_value_t = SelectionMode::Runtime)]
+    selection: SelectionMode,
+    /// Explicit root type to emit with its dependency closure. With `--selection explicit`, these are the only roots; otherwise they are added to the selected mode. Accepts a UUID, exact source name, or unique unqualified name.
+    #[arg(long = "root", value_name = "NAME_OR_UUID")]
+    roots: Vec<String>,
+    /// Rust package name for generated Cargo.toml.
+    #[arg(long, default_value = "aztypes-rust")]
+    rust_package: String,
+    /// Rust output layout.
+    #[arg(long, value_enum, default_value_t = RustLayout::Standalone)]
+    rust_layout: RustLayout,
+    /// Go module path for generated go.mod and imports.
+    #[arg(long, default_value = "aztypes")]
+    go_module: String,
+    /// Root Go package name for generated root package files.
+    #[arg(long, default_value = "aztypes")]
+    go_package: String,
+    /// TypeScript package name for generated package.json.
+    #[arg(long, default_value = "aztypes")]
+    typescript_package: String,
+    /// TypeScript VitePlus pack entry. Repeat to add entries.
+    #[arg(long = "typescript-pack-entry")]
+    typescript_pack_entries: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Language {
+    All,
+    Rust,
+    Go,
+    #[value(name = "typescript")]
+    TypeScript,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RustLayout {
+    /// Emit a complete standalone Rust crate.
+    Standalone,
+    /// Emit a single module file that integrates with an existing crate.
+    #[value(name = "module")]
+    Module,
+    /// Emit an existing-crate module tree.
+    #[value(name = "modules")]
+    Modules,
+}
+
+impl std::fmt::Display for Language {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => f.write_str("all"),
+            Self::Rust => f.write_str("rust"),
+            Self::Go => f.write_str("go"),
+            Self::TypeScript => f.write_str("typescript"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SelectionMode {
+    All,
+    Runtime,
+    /// Emit only explicit --root entries and their dependencies.
+    Explicit,
+}
+
+impl SelectionMode {
+    const fn root_mode(self) -> SerializeCodegenRootMode {
+        match self {
+            Self::All => SerializeCodegenRootMode::All,
+            Self::Runtime => SerializeCodegenRootMode::Runtime,
+            Self::Explicit => SerializeCodegenRootMode::Explicit,
+        }
+    }
+
+    const fn requires_explicit_roots(self) -> bool {
+        matches!(self, Self::Explicit)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutputFile {
+    path: String,
+    source: String,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct WriteSummary {
+    changed: usize,
+    unchanged: usize,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Summary(args) => summary(&args),
+        Command::Generate(args) => generate(&args),
+    }
+}
+
+fn summary(args: &CatalogArgs) -> Result<()> {
+    let context = CodegenContext::from_jobs(args.jobs).context("build codegen worker pool")?;
+    let compile_unit = context.install(|context| compile_catalog(args, context))?;
+    let catalog_summary = compile_unit.catalog.summary();
+    let field_summary = compile_unit.field_owner_evidence.summary();
+    let (errors, warnings) = diagnostic_counts(&compile_unit);
+
+    print_catalog_summary(catalog_summary);
+    println!("field owner type IDs: {}", field_summary.owner_type_count);
+    println!("field owner fields: {}", field_summary.field_count);
+    println!("field owner exact keys: {}", field_summary.exact_key_count);
+    println!(
+        "field owner ambiguous exact keys: {}",
+        field_summary.ambiguous_exact_key_count
+    );
+    println!("diagnostics: {errors} error(s), {warnings} warning(s)");
+    Ok(())
+}
+
+fn generate(args: &GenerateArgs) -> Result<()> {
+    let context =
+        CodegenContext::from_jobs(args.catalog.jobs).context("build codegen worker pool")?;
+    context.install(|context| generate_with_context(args, context))
+}
+
+fn generate_with_context(args: &GenerateArgs, context: &CodegenContext) -> Result<()> {
+    let compile_unit = compile_catalog(&args.catalog, context)?;
+    reject_compile_errors(&compile_unit)?;
+    let root_selection = codegen_root_selection(&compile_unit.codegen_unit, args)?;
+    let selected = root_selection.select_unit(&compile_unit.codegen_unit);
+    let completed = completed_codegen_units(selected, compile_unit.codegen_unit.clone());
+
+    match args.language {
+        Language::All => {
+            generate_language(
+                &completed,
+                args,
+                Language::Rust,
+                &args.out.join("rust"),
+                &context,
+            )?;
+            generate_language(
+                &completed,
+                args,
+                Language::Go,
+                &args.out.join("go"),
+                &context,
+            )?;
+            generate_language(
+                &completed,
+                args,
+                Language::TypeScript,
+                &args.out.join("typescript"),
+                &context,
+            )?;
+        }
+        language => generate_language(&completed, args, language, &args.out, &context)?,
+    }
+
+    let (errors, warnings) = diagnostic_counts(&compile_unit);
+    println!("diagnostics: {errors} error(s), {warnings} warning(s)");
+    Ok(())
+}
+
+fn generate_language(
+    completed: &CompletedCodegenUnits,
+    args: &GenerateArgs,
+    language: Language,
+    out: &Path,
+    context: &CodegenContext,
+) -> Result<()> {
+    let files = match language {
+        Language::All => unreachable!("all is expanded before generation"),
+        Language::Rust => {
+            rust_output_files(completed, args.rust_layout, &args.rust_package, context)?
+        }
+        Language::Go => go_output_files(completed, &args.go_module, &args.go_package)?,
+        Language::TypeScript => typescript_output_files(
+            completed,
+            &args.typescript_package,
+            &args.typescript_pack_entries,
+        )?,
+    };
+    let summary = write_output_files(out, &files, context)
+        .with_context(|| format!("write {language} output to {}", out.display()))?;
+    println!(
+        "{language}: wrote {} files to {} ({} changed, {} unchanged)",
+        files.len(),
+        out.display(),
+        summary.changed,
+        summary.unchanged
+    );
+    Ok(())
+}
+
+fn completed_codegen_units(
+    selected: SerializeCodegenUnit,
+    context: SerializeCodegenUnit,
+) -> CompletedCodegenUnits {
+    let completed = complete_known_missing_reflected_bodies(selected, context);
+    for placeholder in &completed.placeholders {
+        eprintln!(
+            "warning: generating placeholder type `{}` ({}) for missing reflected body used by `{}.{}`: {} ({} reference(s))",
+            placeholder.source_name,
+            placeholder.type_id,
+            placeholder.owner_name,
+            placeholder.field_name,
+            placeholder.reason,
+            placeholder.reference_count
+        );
+    }
+    completed
+}
+
+fn codegen_root_selection(
+    unit: &SerializeCodegenUnit,
+    args: &GenerateArgs,
+) -> Result<SerializeCodegenRootSelection> {
+    let root_type_ids = resolve_codegen_root_type_ids(unit, args.roots.iter().map(String::as_str))?;
+    if args.selection.requires_explicit_roots() && root_type_ids.is_empty() {
+        bail!("--selection explicit requires at least one --root");
+    }
+    Ok(
+        SerializeCodegenRootSelection::new(args.selection.root_mode())
+            .with_explicit_roots(root_type_ids),
+    )
+}
+
+fn compile_catalog(args: &CatalogArgs, context: &CodegenContext) -> Result<CompileUnit> {
+    let ((serialize_context, module_descriptors), class_registration_trace) =
+        context.runner().join(
+            || {
+                context.runner().join(
+                    || load_serialize_context(args.serialize_context.as_deref()),
+                    || load_module_descriptors(args.modules.as_deref(), context),
+                )
+            },
+            || load_class_registration_trace(args.class_registration_trace.as_deref()),
+        );
+    let serialize_context = serialize_context?;
+    let module_descriptors = module_descriptors?;
+    let class_registration_trace = class_registration_trace?;
+
+    Ok(SerializeContextCompiler::compile_with_inputs(
+        serialize_context,
+        SerializeContextCompileInputs {
+            module_descriptors_root: Some(&module_descriptors),
+            serialize_porting_root: None,
+            class_registration_trace_root: class_registration_trace.as_ref(),
+        },
+        context,
+    ))
+}
+
+fn load_serialize_context(path: Option<&Path>) -> Result<SerializeContextDocument> {
+    match path {
+        Some(path) => SerializeContextDocument::from_path(path)
+            .with_context(|| format!("parse SerializeContext JSON from {}", path.display())),
+        None => SerializeContextDocument::from_slice(EMBEDDED_SERIALIZE_CONTEXT)
+            .context("parse embedded SerializeContext JSON snapshot"),
+    }
+}
+
+fn load_module_descriptors(path: Option<&Path>, context: &CodegenContext) -> Result<Value> {
+    match path {
+        Some(path) if path.is_dir() => load_module_descriptor_directory(path, context),
+        Some(path) => load_module_descriptor_file(path),
+        None => load_embedded_module_descriptors(context),
+    }
+}
+
+fn load_module_descriptor_file(path: &Path) -> Result<Value> {
+    let root = load_json_root(path, "AZ::Module descriptor capture")?;
+    if root.get("modules").is_some() {
+        return Ok(root);
+    }
+    if root.get("descriptors").is_none() {
+        bail!(
+            "AZ::Module descriptor file {} does not contain `descriptors` or `modules`",
+            path.display()
+        );
+    }
+    Ok(module_descriptors_root_from_capture(
+        module_name_from_path(path),
+        root,
+    ))
+}
+
+fn load_module_descriptor_directory(path: &Path, context: &CodegenContext) -> Result<Value> {
+    let mut entries = fs::read_dir(path)
+        .with_context(|| format!("read AZ::Module descriptor directory {}", path.display()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .with_context(|| format!("read entry in {}", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.retain(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_module_descriptor_json_name)
+    });
+    entries.sort();
+
+    let modules = context
+        .runner()
+        .map(&entries, |entry| {
+            let root = load_json_root(entry, "AZ::Module descriptor capture")?;
+            if root.get("descriptors").is_none() {
+                bail!(
+                    "AZ::Module descriptor file {} does not contain `descriptors`",
+                    entry.display()
+                );
+            }
+            Ok(module_descriptor_capture(
+                module_name_from_path(entry),
+                root,
+            ))
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(module_descriptors_root(modules))
+}
+
+fn load_embedded_module_descriptors(context: &CodegenContext) -> Result<Value> {
+    let mut names = EmbeddedModuleDescriptors::iter()
+        .filter(|name| is_module_descriptor_json_name(name.as_ref()))
+        .map(|name| name.into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+
+    let modules = context
+        .runner()
+        .map(&names, |name| {
+            let embedded = EmbeddedModuleDescriptors::get(name)
+                .with_context(|| format!("read embedded AZ::Module descriptor capture {name}"))?;
+            let root = serde_json::from_slice::<Value>(embedded.data.as_ref())
+                .with_context(|| format!("parse embedded AZ::Module descriptor capture {name}"))?;
+            if root.get("descriptors").is_none() {
+                bail!(
+                    "embedded AZ::Module descriptor capture {name} does not contain `descriptors`"
+                );
+            }
+            Ok(module_descriptor_capture(
+                module_name_from_resource_name(name),
+                root,
+            ))
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(module_descriptors_root(modules))
+}
+
+fn load_class_registration_trace(path: Option<&Path>) -> Result<Option<Value>> {
+    match path {
+        Some(path) => {
+            let text = fs::read_to_string(path).with_context(|| {
+                format!("read class registration trace from {}", path.display())
+            })?;
+            class_registration_trace_root_from_jsonl_str(&text)
+                .map(Some)
+                .with_context(|| format!("parse class registration trace from {}", path.display()))
+        }
+        None => Ok(None),
+    }
+}
+
+fn load_json_root(path: &Path, label: &str) -> Result<Value> {
+    let bytes = fs::read(path).with_context(|| format!("read {label} from {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse {label} from {}", path.display()))
+}
+
+fn rust_output_files(
+    completed: &CompletedCodegenUnits,
+    layout: RustLayout,
+    package_name: &str,
+    context: &CodegenContext,
+) -> Result<Vec<OutputFile>> {
+    match layout {
+        RustLayout::Standalone => {
+            let rust_unit = RustCodegenPlanner::standalone()
+                .plan_serialize_codegen_unit_with_context(&completed.emitted, &completed.context);
+            let mut files = RustSourceEmitter::emit_standalone_project(&rust_unit, context)
+                .context("emit standalone Rust project")?
+                .files
+                .into_iter()
+                .map(output_file_from_rust)
+                .collect::<Vec<_>>();
+            files.push(OutputFile {
+                path: "Cargo.toml".to_owned(),
+                source: rust_cargo_toml(package_name),
+            });
+            Ok(files)
+        }
+        RustLayout::Module => {
+            let rust_unit = RustCodegenPlanner::default()
+                .plan_serialize_codegen_unit_with_context(&completed.emitted, &completed.context);
+            let source = RustSourceEmitter::emit_unit(&rust_unit, context)
+                .context("emit integrated Rust module")?;
+            Ok(vec![OutputFile {
+                path: "mod.rs".to_owned(),
+                source: generated_rust_module_source(&source),
+            }])
+        }
+        RustLayout::Modules => {
+            let rust_unit = RustCodegenPlanner::default()
+                .plan_serialize_codegen_unit_with_context(&completed.emitted, &completed.context);
+            RustSourceEmitter::emit_integrated_project(&rust_unit, context)
+                .context("emit integrated Rust module tree")
+                .map(|project| {
+                    project
+                        .files
+                        .into_iter()
+                        .map(output_file_from_rust)
+                        .collect()
+                })
+        }
+    }
+}
+
+fn generated_rust_module_source(source: &str) -> String {
+    format!("#![allow(clippy::struct_excessive_bools, clippy::zero_sized_map_values)]\n\n{source}")
+}
+
+fn go_output_files(
+    completed: &CompletedCodegenUnits,
+    module_path: &str,
+    package_name: &str,
+) -> Result<Vec<OutputFile>> {
+    let mut files = GoSourceEmitter::default()
+        .emit_standalone_project_with_context(
+            &completed.emitted,
+            &completed.context,
+            module_path,
+            package_name,
+        )
+        .context("emit standalone Go project")?
+        .files
+        .into_iter()
+        .map(output_file_from_go)
+        .collect::<Vec<_>>();
+    files.push(OutputFile {
+        path: "go.mod".to_owned(),
+        source: go_mod(module_path),
+    });
+    files.push(OutputFile {
+        path: "go.sum".to_owned(),
+        source: go_sum(),
+    });
+    Ok(files)
+}
+
+fn typescript_output_files(
+    completed: &CompletedCodegenUnits,
+    package_name: &str,
+    pack_entries: &[String],
+) -> Result<Vec<OutputFile>> {
+    let pack_entries = if pack_entries.is_empty() {
+        vec!["src/index.ts".to_owned()]
+    } else {
+        pack_entries.to_vec()
+    };
+    let options = TypeScriptStandaloneProjectOptions {
+        package_name: package_name.to_owned(),
+        pack_entries,
+    };
+    Ok(TypeScriptSourceEmitter
+        .emit_standalone_project_with_options_and_context(
+            &completed.emitted,
+            &completed.context,
+            &options,
+        )
+        .context("emit standalone TypeScript project")?
+        .files
+        .into_iter()
+        .map(output_file_from_typescript)
+        .collect())
+}
+
+fn output_file_from_rust(file: RustStandaloneProjectFile) -> OutputFile {
+    OutputFile {
+        path: file.path,
+        source: file.source,
+    }
+}
+
+fn output_file_from_go(file: GoStandaloneProjectFile) -> OutputFile {
+    OutputFile {
+        path: file.path,
+        source: file.source,
+    }
+}
+
+fn output_file_from_typescript(file: TypeScriptStandaloneProjectFile) -> OutputFile {
+    OutputFile {
+        path: file.path,
+        source: file.source,
+    }
+}
+
+fn rust_cargo_toml(package_name: &str) -> String {
+    format!(
+        r#"[package]
+name = "{package_name}"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+
+[dependencies]
+bevy_app = "0.18"
+bevy_ecs = {{ version = "0.18", features = ["serialize"] }}
+bevy_color = {{ version = "0.18", features = ["serialize"] }}
+bevy_math = {{ version = "0.18", features = ["serialize"] }}
+bevy_reflect = {{ version = "0.18", features = ["smallvec", "uuid"] }}
+bevy_transform = {{ version = "0.18", features = ["serialize"] }}
+sha1 = "0.11"
+serde = {{ version = "1", features = ["derive"] }}
+smallvec = {{ version = "1", features = ["serde"] }}
+uuid = {{ version = "1.23", features = ["serde", "v4", "v7"] }}
+
+[workspace]
+"#
+    )
+}
+
+fn go_mod(module_path: &str) -> String {
+    format!("module {module_path}\n\ngo 1.26\n\nrequire github.com/google/uuid v1.6.0\n")
+}
+
+fn go_sum() -> String {
+    "github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=\n\
+     github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=\n"
+        .to_owned()
+}
+
+fn write_output_files(
+    root: &Path,
+    files: &[OutputFile],
+    context: &CodegenContext,
+) -> Result<WriteSummary> {
+    assert_unique_paths(files)?;
+    fs::create_dir_all(root)
+        .with_context(|| format!("create output directory {}", root.display()))?;
+
+    let tasks = files
+        .iter()
+        .map(|file| {
+            output_path(root, &file.path).map(|path| OutputTask {
+                path,
+                source: file.source.as_str(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let parent_dirs = tasks
+        .iter()
+        .filter_map(|task| task.path.parent())
+        .map(Path::to_path_buf)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let created = context
+        .runner()
+        .map_until_cancelled(&parent_dirs, context.cancel(), |dir| {
+            fs::create_dir_all(dir)
+                .with_context(|| format!("create output directory {}", dir.display()))
+        });
+    let create_cancelled = created.was_cancelled();
+    for result in created.into_completed() {
+        result?;
+    }
+    if create_cancelled {
+        bail!("cancelled while creating output directories");
+    }
+
+    let writes = context
+        .runner()
+        .map_until_cancelled(&tasks, context.cancel(), |task| {
+            write_file_if_changed(&task.path, task.source.as_bytes())
+        });
+    let write_cancelled = writes.was_cancelled();
+    let mut summary = WriteSummary::default();
+    for result in writes.into_completed() {
+        if result? {
+            summary.changed += 1;
+        } else {
+            summary.unchanged += 1;
+        }
+    }
+    if write_cancelled {
+        bail!("cancelled while writing output files");
+    }
+    Ok(summary)
+}
+
+#[derive(Debug)]
+struct OutputTask<'a> {
+    path: PathBuf,
+    source: &'a str,
+}
+
+fn assert_unique_paths(files: &[OutputFile]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for file in files {
+        if !seen.insert(file.path.as_str()) {
+            bail!("duplicate output path: {}", file.path);
+        }
+    }
+    Ok(())
+}
+
+fn output_path(root: &Path, relative: &str) -> Result<PathBuf> {
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir
+            )
+        })
+    {
+        bail!("refusing to write output path outside root: {relative}");
+    }
+    Ok(root.join(relative_path))
+}
+
+fn write_file_if_changed(path: &Path, source: &[u8]) -> Result<bool> {
+    let source_hash = blake3::hash(source);
+    if existing_file_matches_hash(path, source.len() as u64, source_hash)? {
+        return Ok(false);
+    }
+    fs::write(path, source).with_context(|| format!("write {}", path.display()))?;
+    Ok(true)
+}
+
+fn existing_file_matches_hash(
+    path: &Path,
+    expected_len: u64,
+    expected_hash: blake3::Hash,
+) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.len() != expected_len => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+
+    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(hasher.finalize() == expected_hash)
+}
+
+fn reject_compile_errors(compile_unit: &CompileUnit) -> Result<()> {
+    let errors = compile_unit
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    for diagnostic in errors.iter().take(16) {
+        eprintln!("error: {}", diagnostic.message);
+    }
+    if errors.len() > 16 {
+        eprintln!("... {} more error(s)", errors.len() - 16);
+    }
+    bail!("SerializeContext compile emitted errors; refusing to generate source");
+}
+
+fn diagnostic_counts(compile_unit: &CompileUnit) -> (usize, usize) {
+    let errors = compile_unit
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .count();
+    let warnings = compile_unit
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Warning)
+        .count();
+    (errors, warnings)
+}
+
+fn print_catalog_summary(summary: ReflectedTypeCatalogSummary) {
+    println!("reflected types: {}", summary.reflected_types);
+    println!("generic types: {}", summary.generic_types);
+    println!("component descriptors: {}", summary.component_descriptors);
+    println!(
+        "component descriptor name collisions: {}",
+        summary.component_descriptor_name_collisions
+    );
+    println!(
+        "class registration records: {}",
+        summary.class_registration_records
+    );
+    println!(
+        "class registration type IDs: {}",
+        summary.class_registration_type_ids
+    );
+    println!(
+        "class registration duplicate type IDs: {}",
+        summary.class_registration_duplicate_type_ids
+    );
+    println!("faceted components: {}", summary.faceted_components);
+    println!("az components: {}", summary.az_components);
+    println!("client facets: {}", summary.client_facets);
+    println!("server facets: {}", summary.server_facets);
+}

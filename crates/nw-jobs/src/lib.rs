@@ -183,6 +183,31 @@ impl JobRunner {
         }
     }
 
+    pub fn install<R, F>(&self, f: F) -> R
+    where
+        R: Send,
+        F: FnOnce() -> R + Send,
+    {
+        match &self.execution {
+            Execution::Inline | Execution::Global => f(),
+            Execution::Pool(pool) => pool.install(f),
+        }
+    }
+
+    pub fn join<A, B, FA, FB>(&self, left: FA, right: FB) -> (A, B)
+    where
+        A: Send,
+        B: Send,
+        FA: FnOnce() -> A + Send,
+        FB: FnOnce() -> B + Send,
+    {
+        match &self.execution {
+            Execution::Inline => (left(), right()),
+            Execution::Global => rayon::join(left, right),
+            Execution::Pool(pool) => pool.install(|| rayon::join(left, right)),
+        }
+    }
+
     pub fn map_until_cancelled<T, R, F>(
         &self,
         items: &[T],
@@ -386,5 +411,17 @@ mod tests {
     fn explicit_zero_jobs_is_inline() {
         let runner = JobRunner::from_jobs(Some(0)).unwrap();
         assert!(runner.is_inline());
+    }
+
+    #[test]
+    fn install_runs_work_on_runner() {
+        let runner = JobRunner::with_workers(2).unwrap();
+        assert_eq!(runner.install(|| 42), 42);
+    }
+
+    #[test]
+    fn join_runs_both_sides() {
+        let runner = JobRunner::with_workers(2).unwrap();
+        assert_eq!(runner.join(|| 20, || 22), (20, 22));
     }
 }

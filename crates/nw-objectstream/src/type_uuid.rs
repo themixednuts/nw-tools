@@ -457,6 +457,7 @@ pub mod type_ids {
     pub const AZSTD_STRING: Uuid = Uuid::from_u128(0x03AAAB3F_5C47_5A66_9EBC_D5FA4DB353C9);
     pub const AZSTD_STRING_XML_ALIAS: Uuid =
         Uuid::from_u128(0xEF8FF807_DDEE_4EB0_B678_4CA3A2C490A4);
+    pub const AZSTD_STRING_LEGACY_XML: Uuid = AZSTD_STRING_XML_ALIAS;
     pub const AZSTD_BASIC_STRING_VIEW: Uuid =
         Uuid::from_u128(0xD348D661_6BDE_4C0A_9540_FCEA4522D497);
     pub const AZSTD_PAIR: Uuid = Uuid::from_u128(0x919645C1_E464_482B_A69B_04AA688B6847);
