@@ -86,6 +86,7 @@ import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolIterator;
 import ghidra.program.model.symbol.SymbolTable;
 import ghidra.program.model.symbol.SymbolType;
 import ghidra.util.exception.CancelledException;
@@ -145,6 +146,24 @@ public class AzReflectionRenamer extends GhidraScript {
         "Cast",
     };
 
+    private static final String[] INFERRED_STATIC_RTTI_SLOT_NAMES = {
+        "GetTypeId",
+        "GetTypeName",
+        "IsTypeOf",
+        "EnumHierarchy",
+        "CastConst",
+        "Cast",
+    };
+
+    private static final String[] AZ_RTTI_INSTANCE_SLOT_NAMES = {
+        "GetType",
+        "GetTypeName",
+        "IsTypeOf",
+        "EnumTypes",
+        "AddressOfConst",
+        "AddressOf",
+    };
+
     private static final String[] OBJECT_FIELDS = {
         "factory",
         "serializer",
@@ -171,6 +190,12 @@ public class AzReflectionRenamer extends GhidraScript {
     private Map<String, ArrayList<Address>> definedStringAddressesByValue;
     private Set<String> labelSeen;
     private Map<String, String> targetNameOwners;
+    private Map<String, Address> pointerReadCache;
+    private Map<String, Boolean> executableAddressCache;
+    private Map<String, Namespace> scopeCache;
+    private Map<String, List<Function>> calledFunctionsCache;
+    private Map<String, List<InstanceVtableCandidate>> instanceVtableCandidatesCache;
+    private Set<String> moduleInstanceVtableAddresses;
     private String currentModuleSource;
     private String currentModuleName;
     private Set<String> ambiguousModuleComponentNames;
@@ -188,6 +213,12 @@ public class AzReflectionRenamer extends GhidraScript {
         gson = new GsonBuilder().setPrettyPrinting().create();
         labelSeen = new HashSet<>();
         targetNameOwners = new HashMap<>();
+        pointerReadCache = new HashMap<>();
+        executableAddressCache = new HashMap<>();
+        scopeCache = new HashMap<>();
+        calledFunctionsCache = new HashMap<>();
+        instanceVtableCandidatesCache = new HashMap<>();
+        moduleInstanceVtableAddresses = new HashSet<>();
         definedStringAddressesByValue = null;
         ambiguousModuleComponentNames = new TreeSet<>();
 
@@ -220,7 +251,6 @@ public class AzReflectionRenamer extends GhidraScript {
         Set<String> functionSeen = new HashSet<>();
         Set<String> aliasSeen = new HashSet<>();
         ActionSink actions = new ActionSink(includeFullActions);
-        cleanupRepeatedFunctionNamespaces(actions);
         ensureCoreReflectionDatatypes(actions);
         processCoreRttiCastHelpers(functionSeen, actions);
 
@@ -252,6 +282,7 @@ public class AzReflectionRenamer extends GhidraScript {
             actions);
         processFieldRegistrationTraces(functionSeen, actions);
         processModuleDescriptorRenames(actions);
+        processInferredStaticRttiHelperVtables(functionSeen, aliasSeen, actions);
         processBehaviorContextEvidence(
             behaviorContextEvidence,
             functionSeen,
@@ -259,6 +290,7 @@ public class AzReflectionRenamer extends GhidraScript {
             actions);
         processMbGetTypeNameFunctions(functionSeen, actions);
         processStaticReflectFunctionParameters(scan.classData, actions);
+        cleanupRepeatedFunctionNamespaces(actions);
 
         ActionStats stats = actions.stats;
 
@@ -637,25 +669,52 @@ public class AzReflectionRenamer extends GhidraScript {
         if (!isProgramAddress(address)) {
             return null;
         }
+        Address stringAddress = stringAddressReturnedBySimpleFunction(address);
+        if (stringAddress == null) {
+            return null;
+        }
         try {
-            int b0 = unsignedByte(address, 0);
-            int b1 = unsignedByte(address, 1);
-            int b2 = unsignedByte(address, 2);
+            return readCString(stringAddress);
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private Address stringAddressReturnedBySimpleFunction(Address address) {
+        Address target = resolvedThunkTarget(address);
+        if (!isProgramAddress(target)) {
+            return null;
+        }
+        try {
+            int b0 = unsignedByte(target, 0);
+            int b1 = unsignedByte(target, 1);
+            int b2 = unsignedByte(target, 2);
             if (b0 == 0x48 && b1 == 0x8d && b2 == 0x05) {
-                int displacement = int32(address, 3);
-                return readCString(absoluteAddress(address.getOffset() + 7L + displacement));
+                int displacement = int32(target, 3);
+                return absoluteAddress(target.getOffset() + 7L + displacement);
             }
             if (b0 == 0x48 && b1 == 0xb8) {
-                return readCString(absoluteAddress(int64(address, 2)));
+                return absoluteAddress(int64(target, 2));
             }
             if (b0 == 0xb8) {
-                return readCString(absoluteAddress(uint32(address, 1)));
+                return absoluteAddress(uint32(target, 1));
             }
         }
         catch (Exception ignored) {
             return null;
         }
         return null;
+    }
+
+    private Address resolvedThunkTarget(Address address) {
+        ThisAdjustThunk thunk = thisAdjustThunk(address);
+        if (thunk != null) {
+            return thunk.targetAddress;
+        }
+
+        Address directTarget = directJumpTarget(address);
+        return directTarget != null ? directTarget : address;
     }
 
     private JsonObject moduleEvidenceReport(ModuleEvidenceIndex index) {
@@ -4848,6 +4907,165 @@ public class AzReflectionRenamer extends GhidraScript {
         }
     }
 
+    private void processInferredStaticRttiHelperVtables(
+        Set<String> functionSeen,
+        Set<String> aliasSeen,
+        ActionSink actions) throws Exception {
+
+        ArrayList<InferredStaticRttiHelper> helpers = inferredStaticRttiHelpers();
+        if (helpers.isEmpty()) {
+            return;
+        }
+
+        Map<String, SlotGroup> groups =
+            inferredStaticRttiSlotGroups(helpers, INFERRED_STATIC_RTTI_SLOT_NAMES);
+        for (InferredStaticRttiHelper helper : helpers) {
+            List<String> scope = inferredStaticRttiScope(helper.typeName);
+            renameLabel(
+                formatAddress(helper.vtableAddress),
+                scope,
+                "vftable",
+                "inferred_static_rtti_vftable",
+                actions);
+
+            for (int slot = 0; slot < INFERRED_STATIC_RTTI_SLOT_NAMES.length; slot++) {
+                Address slotPointer = readPointer(helper.vtableAddress.add(slot * 8L));
+                Address bodyAddress = resolvedThunkTarget(slotPointer);
+                if (!isProgramAddress(bodyAddress) || !isExecutableAddress(bodyAddress)) {
+                    continue;
+                }
+                renameFunction(
+                    "inferred_static_rtti_function",
+                    formatAddress(bodyAddress),
+                    scope,
+                    INFERRED_STATIC_RTTI_SLOT_NAMES[slot],
+                    groups,
+                    functionSeen,
+                    aliasSeen,
+                    actions);
+            }
+        }
+    }
+
+    private ArrayList<InferredStaticRttiHelper> inferredStaticRttiHelpers() {
+        ArrayList<InferredStaticRttiHelper> result = new ArrayList<>();
+        Set<String> seenVtables = new HashSet<>();
+        for (Map.Entry<String, ArrayList<Address>> entry :
+            definedStringAddressesByValue().entrySet()) {
+
+            String typeName = safeTypeName(entry.getKey());
+            if (!isPlausibleRttiTypeName(typeName)) {
+                continue;
+            }
+
+            for (Address stringAddress : entry.getValue()) {
+                InferredStaticRttiHelper helper =
+                    inferredStaticRttiHelperForString(typeName, stringAddress);
+                if (helper == null) {
+                    continue;
+                }
+                String key = helper.vtableAddress.toString();
+                if (seenVtables.add(key)) {
+                    result.add(helper);
+                }
+            }
+        }
+        return result;
+    }
+
+    private InferredStaticRttiHelper inferredStaticRttiHelperForString(
+        String typeName,
+        Address stringAddress) {
+
+        for (long delta = 8; delta <= 0x80; delta += 8) {
+            Address vtableAddress = absoluteAddress(stringAddress.getOffset() - delta);
+            if (!isProgramAddress(vtableAddress)) {
+                continue;
+            }
+            if (moduleInstanceVtableAddresses.contains(vtableAddress.toString())) {
+                continue;
+            }
+            if (!isInferredStaticRttiHelperVtable(vtableAddress, stringAddress)) {
+                continue;
+            }
+
+            InferredStaticRttiHelper helper = new InferredStaticRttiHelper();
+            helper.typeName = typeName;
+            helper.typeNameAddress = stringAddress;
+            helper.vtableAddress = vtableAddress;
+            return helper;
+        }
+        return null;
+    }
+
+    private boolean isInferredStaticRttiHelperVtable(
+        Address vtableAddress,
+        Address typeNameAddress) {
+
+        Address getTypeName = readPointer(vtableAddress.add(8));
+        if (!isExecutableAddress(getTypeName)) {
+            return false;
+        }
+        Address returnedString = stringAddressReturnedBySimpleFunction(getTypeName);
+        if (returnedString == null || !returnedString.equals(typeNameAddress)) {
+            return false;
+        }
+
+        int executableSlots = 0;
+        for (int slot = 0; slot < INFERRED_STATIC_RTTI_SLOT_NAMES.length; slot++) {
+            Address slotPointer = readPointer(vtableAddress.add(slot * 8L));
+            Address bodyAddress = resolvedThunkTarget(slotPointer);
+            if (isExecutableAddress(bodyAddress)) {
+                executableSlots++;
+            }
+        }
+        return executableSlots >= 4;
+    }
+
+    private boolean isPlausibleRttiTypeName(String value) {
+        if (value == null || value.length() < 3) {
+            return false;
+        }
+        if (value.startsWith("{") || value.indexOf('/') >= 0 || value.indexOf('\\') >= 0) {
+            return false;
+        }
+        return value.indexOf(' ') < 0 || value.indexOf('<') >= 0;
+    }
+
+    private List<String> inferredStaticRttiScope(String typeName) {
+        ArrayList<String> result = new ArrayList<>();
+        result.add("AZ");
+        result.add("Internal");
+        result.add("RttiHelper<" + typeName + ">");
+        return result;
+    }
+
+    private Map<String, SlotGroup> inferredStaticRttiSlotGroups(
+        List<InferredStaticRttiHelper> helpers,
+        String[] slotNames) {
+
+        Map<String, SlotGroup> result = new HashMap<>();
+        for (InferredStaticRttiHelper helper : helpers) {
+            for (int slot = 0; slot < slotNames.length; slot++) {
+                Address slotPointer = readPointer(helper.vtableAddress.add(slot * 8L));
+                Address bodyAddress = resolvedThunkTarget(slotPointer);
+                if (!isProgramAddress(bodyAddress)) {
+                    continue;
+                }
+                String address = formatAddress(bodyAddress);
+                String key = addressKey(address);
+                SlotGroup group = result.get(key);
+                if (group == null) {
+                    group = new SlotGroup(address);
+                    result.put(key, group);
+                }
+                group.slotNames.add(slotNames[slot]);
+                group.useCount++;
+            }
+        }
+        return result;
+    }
+
     private void processClassData(
         ClassData classData,
         Map<String, SlotGroup> callbackGroups,
@@ -5462,6 +5680,7 @@ public class AzReflectionRenamer extends GhidraScript {
             if (!seenVtables.add(key)) {
                 continue;
             }
+            moduleInstanceVtableAddresses.add(candidate.vtableAddress.toString());
             renameModuleDescriptorInstanceVtable(
                 descriptor,
                 names,
@@ -5484,6 +5703,7 @@ public class AzReflectionRenamer extends GhidraScript {
                 if (!seenVtables.add(key)) {
                     continue;
                 }
+                moduleInstanceVtableAddresses.add(candidate.vtableAddress.toString());
                 renameModuleDescriptorInstanceVtable(
                     descriptor,
                     names,
@@ -5521,9 +5741,15 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private List<Function> calledFunctions(Function function, int limit) {
+        String cacheKey = functionCacheKey(function, limit);
+        if (calledFunctionsCache.containsKey(cacheKey)) {
+            return calledFunctionsCache.get(cacheKey);
+        }
+
         ArrayList<Function> result = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         if (function == null || function.getBody() == null) {
+            calledFunctionsCache.put(cacheKey, result);
             return result;
         }
         for (Instruction instruction :
@@ -5542,10 +5768,12 @@ public class AzReflectionRenamer extends GhidraScript {
                 }
                 result.add(called);
                 if (result.size() >= limit) {
+                    calledFunctionsCache.put(cacheKey, result);
                     return result;
                 }
             }
         }
+        calledFunctionsCache.put(cacheKey, result);
         return result;
     }
 
@@ -5553,9 +5781,15 @@ public class AzReflectionRenamer extends GhidraScript {
         Function constructor,
         int limit) {
 
+        String cacheKey = functionCacheKey(constructor, limit);
+        if (instanceVtableCandidatesCache.containsKey(cacheKey)) {
+            return instanceVtableCandidatesCache.get(cacheKey);
+        }
+
         ArrayList<InstanceVtableCandidate> result = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         if (constructor == null || constructor.getBody() == null) {
+            instanceVtableCandidatesCache.put(cacheKey, result);
             return result;
         }
         for (Instruction instruction :
@@ -5583,11 +5817,20 @@ public class AzReflectionRenamer extends GhidraScript {
                 candidate.vptrOffset = vptrOffset;
                 result.add(candidate);
                 if (result.size() >= limit) {
+                    instanceVtableCandidatesCache.put(cacheKey, result);
                     return result;
                 }
             }
         }
+        instanceVtableCandidatesCache.put(cacheKey, result);
         return result;
+    }
+
+    private String functionCacheKey(Function function, int limit) {
+        if (function == null || function.getEntryPoint() == null) {
+            return "null|" + limit;
+        }
+        return function.getEntryPoint().toString() + "|" + limit;
     }
 
     private Integer vptrStoreOffsetAfter(Function function, Instruction loadInstruction) {
@@ -5841,17 +6084,13 @@ public class AzReflectionRenamer extends GhidraScript {
         InstanceVtableCandidate candidate,
         ActionSink actions) throws Exception {
 
-        String localName = candidate.vptrOffset == 0
-            ? "vftable"
-            : "vftable_at_0x" + Integer.toHexString(candidate.vptrOffset);
-        List<String> scope = moduleDescriptorComponentScope(descriptor, names);
-        String targetName = fullName(scope, localName);
+        List<String> componentScope = moduleDescriptorComponentScope(descriptor, names);
+        InstanceVtableName vtableName = moduleDescriptorInstanceVtableName(candidate);
         String jsonAddress = formatAddress(candidate.vtableAddress);
 
         JsonObject action = new JsonObject();
         action.addProperty("kind", "module_descriptor_instance_vftable");
         action.addProperty("address", jsonAddress);
-        action.addProperty("name", targetName);
         action.addProperty("componentName", descriptorComponentName(descriptor));
         action.addProperty("componentUuid", descriptor.componentUuid);
         action.addProperty("createComponent", createComponentAddress);
@@ -5859,16 +6098,52 @@ public class AzReflectionRenamer extends GhidraScript {
         action.addProperty("sourceInstruction", formatAddress(candidate.sourceInstruction));
         action.addProperty("vptrOffset", "0x" + Integer.toHexString(candidate.vptrOffset));
         addModuleDescriptorEvidence(action);
-        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
-            return;
-        }
 
         if (actions.keepsFullActions()) {
             action.add("oldNames", oldNames(candidate.vtableAddress));
         }
+
+        if (vtableName == null) {
+            boolean cleaned = false;
+            if (applyRenames) {
+                cleaned = removeStaleGeneratedVtableLabels(
+                    candidate.vtableAddress,
+                    instanceVtableCleanupScopes(descriptor, names, componentScope),
+                    Collections.emptyList(),
+                    null,
+                    action);
+            }
+            action.addProperty("applied", cleaned);
+            action.addProperty("reason", "semantic-vtable-unresolved");
+            actions.add(action);
+            processAzRttiInstanceVtableSlots(componentScope, candidate, actions);
+            return;
+        }
+
+        List<String> scope = appendScope(componentScope, vtableName.extraScope);
+        String targetName = fullName(scope, vtableName.localName);
+        action.addProperty("name", targetName);
+        action.addProperty("semanticVtable", vtableName.semanticName);
+        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
+            return;
+        }
+
         boolean applied = false;
         if (applyRenames) {
-            applied = ensurePrimaryLabel(candidate.vtableAddress, scope, localName, action);
+            if (!vtableName.extraScope.isEmpty()) {
+                createScope(componentScope);
+            }
+            boolean cleaned = removeStaleGeneratedVtableLabels(
+                candidate.vtableAddress,
+                instanceVtableCleanupScopes(descriptor, names, componentScope),
+                scope,
+                vtableName.localName,
+                action);
+            applied = ensurePrimaryLabel(
+                candidate.vtableAddress,
+                scope,
+                vtableName.localName,
+                action) || cleaned;
         }
         action.addProperty("applied", applied);
         if (!applyRenames) {
@@ -5876,6 +6151,373 @@ public class AzReflectionRenamer extends GhidraScript {
             action.addProperty("reason", "dry-run");
         }
         actions.add(action);
+        processAzRttiInstanceVtableSlots(componentScope, candidate, actions);
+        processKnownInterfaceVtableSlots(componentScope, vtableName, candidate, actions);
+    }
+
+    private void processAzRttiInstanceVtableSlots(
+        List<String> componentScope,
+        InstanceVtableCandidate candidate,
+        ActionSink actions) throws Exception {
+
+        if (!isAzRttiInstanceVtable(candidate.vtableAddress)) {
+            return;
+        }
+
+        List<String> rttiScope = azRttiInstanceScope(componentScope);
+        for (int slot = 0; slot < AZ_RTTI_INSTANCE_SLOT_NAMES.length; slot++) {
+            Address slotPointer = readPointer(candidate.vtableAddress.add(slot * 8L));
+            if (!isProgramAddress(slotPointer) || !isExecutableAddress(slotPointer)) {
+                continue;
+            }
+
+            ThisAdjustThunk thunk = thisAdjustThunk(slotPointer);
+            String localName = AZ_RTTI_INSTANCE_SLOT_NAMES[slot];
+            Address bodyAddress = thunk == null ? slotPointer : thunk.targetAddress;
+            if (isProgramAddress(bodyAddress) && isExecutableAddress(bodyAddress)) {
+                addAzRttiInstanceFunctionAlias(bodyAddress, rttiScope, localName, actions);
+            }
+            if (thunk != null) {
+                renameAzRttiInstanceAdjustorThunk(
+                    thunk,
+                    rttiScope,
+                    localName,
+                    actions);
+            }
+        }
+    }
+
+    private void processKnownInterfaceVtableSlots(
+        List<String> componentScope,
+        InstanceVtableName vtableName,
+        InstanceVtableCandidate candidate,
+        ActionSink actions) throws Exception {
+
+        if (vtableName == null || !"AZ::TickEvents".equals(vtableName.semanticName)) {
+            return;
+        }
+
+        List<String> interfaceScope = appendScope(componentScope, vtableName.extraScope);
+        processEmbeddedAzRttiInstanceSlots(interfaceScope, candidate, 3, actions);
+    }
+
+    private void processEmbeddedAzRttiInstanceSlots(
+        List<String> scope,
+        InstanceVtableCandidate candidate,
+        int startSlot,
+        ActionSink actions) throws Exception {
+
+        if (!embeddedAzRttiInstanceSlotsLookValid(candidate.vtableAddress, startSlot)) {
+            return;
+        }
+
+        for (int slot = 0; slot < AZ_RTTI_INSTANCE_SLOT_NAMES.length; slot++) {
+            Address slotPointer = readPointer(candidate.vtableAddress.add((startSlot + slot) * 8L));
+            if (!isProgramAddress(slotPointer) || !isExecutableAddress(slotPointer)) {
+                continue;
+            }
+
+            String localName = AZ_RTTI_INSTANCE_SLOT_NAMES[slot];
+            ThisAdjustThunk thunk = thisAdjustThunk(slotPointer);
+            if (thunk != null) {
+                renameAzRttiInstanceAdjustorThunk(thunk, scope, localName, actions);
+            }
+            else {
+                addAzRttiInstanceFunctionAlias(slotPointer, scope, localName, actions);
+            }
+        }
+    }
+
+    private boolean embeddedAzRttiInstanceSlotsLookValid(Address vtableAddress, int startSlot) {
+        Address typeSlot = readPointer(vtableAddress.add(startSlot * 8L));
+        Address nameSlot = readPointer(vtableAddress.add((startSlot + 1L) * 8L));
+        if (!isExecutableAddress(typeSlot) || !isExecutableAddress(nameSlot)) {
+            return false;
+        }
+
+        Address nameTarget = resolvedThunkTarget(nameSlot);
+        return stringAddressReturnedBySimpleFunction(nameTarget) != null;
+    }
+
+    private List<String> azRttiInstanceScope(List<String> componentScope) {
+        return componentScope;
+    }
+
+    private boolean isAzRttiInstanceVtable(Address vtableAddress) {
+        return azRttiSlotResolvesTo(
+                vtableAddress,
+                0,
+                Set.of("GetUuid", "GetType", "RTTI_GetType")) &&
+            azRttiSlotResolvesTo(
+                vtableAddress,
+                1,
+                Set.of("GetName", "GetTypeName", "RTTI_GetTypeName")) &&
+            azRttiSlotResolvesTo(
+                vtableAddress,
+                2,
+                Set.of("IsTypeOf", "RTTI_IsTypeOf"));
+    }
+
+    private boolean azRttiSlotResolvesTo(
+        Address vtableAddress,
+        int slot,
+        Set<String> expectedNames) {
+
+        Address slotPointer = readPointer(vtableAddress.add(slot * 8L));
+        if (!isProgramAddress(slotPointer) || !isExecutableAddress(slotPointer)) {
+            return false;
+        }
+        ThisAdjustThunk thunk = thisAdjustThunk(slotPointer);
+        Address target = thunk == null ? slotPointer : thunk.targetAddress;
+        if (!isProgramAddress(target) || !isExecutableAddress(target)) {
+            return false;
+        }
+        for (Symbol symbol : symbolsAt(target)) {
+            if (expectedNames.contains(symbol.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void addAzRttiInstanceFunctionAlias(
+        Address address,
+        List<String> scope,
+        String localName,
+        ActionSink actions) throws Exception {
+
+        String jsonAddress = formatAddress(address);
+        String targetName = fullName(scope, localName);
+        String key = addressKey(jsonAddress) + "|" + targetName;
+        if (labelSeen.contains(key)) {
+            return;
+        }
+        labelSeen.add(key);
+
+        JsonObject action = new JsonObject();
+        action.addProperty("kind", "instance_rtti_function_alias");
+        action.addProperty("address", jsonAddress);
+        action.addProperty("name", targetName);
+        addModuleDescriptorEvidence(action);
+        if (!reserveTargetName(targetName, jsonAddress, action, actions)) {
+            return;
+        }
+        if (actions.keepsFullActions()) {
+            action.add("oldNames", oldNames(address));
+        }
+        boolean applied = false;
+        if (applyRenames) {
+            Function function = currentProgram.getFunctionManager().getFunctionAt(address);
+            if (function == null) {
+                function = createMissingFunction(address, localName, action);
+            }
+            if (function == null) {
+                action.addProperty("applied", false);
+                action.addProperty("reason", "function-create-failed");
+                actions.add(action);
+                return;
+            }
+            applied = ensureLabel(address, scope, localName, action);
+        }
+        action.addProperty("applied", applied);
+        if (!applyRenames) {
+            action.addProperty("wouldApply", true);
+            action.addProperty("reason", "dry-run");
+        }
+        actions.add(action);
+    }
+
+    private void renameAzRttiInstanceAdjustorThunk(
+        ThisAdjustThunk thunk,
+        List<String> scope,
+        String localName,
+        ActionSink actions) throws Exception {
+
+        String jsonAddress = formatAddress(thunk.address);
+        String targetName = fullName(scope, localName);
+        String key = addressKey(jsonAddress) + "|" + targetName;
+        if (labelSeen.contains(key)) {
+            return;
+        }
+        labelSeen.add(key);
+
+        JsonObject action = new JsonObject();
+        action.addProperty("kind", "instance_rtti_adjustor_thunk");
+        action.addProperty("address", jsonAddress);
+        action.addProperty("name", targetName);
+        action.addProperty("target", formatAddress(thunk.targetAddress));
+        action.addProperty("thisAdjustment", "0x" + Integer.toHexString(thunk.adjustment));
+        action.addProperty("duplicateNameAllowed", true);
+        addModuleDescriptorEvidence(action);
+        if (actions.keepsFullActions()) {
+            action.add("oldNames", oldNames(thunk.address));
+        }
+
+        boolean applied = false;
+        if (applyRenames) {
+            Function function = currentProgram.getFunctionManager().getFunctionAt(thunk.address);
+            boolean created = false;
+            if (function == null) {
+                function = createMissingFunction(thunk.address, localName, action);
+                created = function != null;
+            }
+            action.addProperty("created", created);
+            if (function == null) {
+                action.addProperty("applied", false);
+                action.addProperty("reason", "function-create-failed");
+                actions.add(action);
+                return;
+            }
+            action.addProperty("oldName", function.getName(true));
+            if (!function.getName(true).equals(targetName)) {
+                applied = applyFunctionRename(function, scope, localName, action);
+            }
+        }
+        action.addProperty("applied", applied);
+        if (!applyRenames) {
+            action.addProperty("wouldApply", true);
+            action.addProperty("reason", "dry-run");
+        }
+        actions.add(action);
+    }
+
+    private InstanceVtableName moduleDescriptorInstanceVtableName(
+        InstanceVtableCandidate candidate) {
+
+        if (candidate.vptrOffset == 0) {
+            InstanceVtableName result = new InstanceVtableName();
+            result.localName = "vftable";
+            result.semanticName = "primary";
+            return result;
+        }
+
+        if (isTickEventsVtable(candidate.vtableAddress)) {
+            InstanceVtableName result = new InstanceVtableName();
+            result.extraScope = List.of("TickEvents");
+            result.localName = "vftable";
+            result.semanticName = "AZ::TickEvents";
+            return result;
+        }
+
+        return null;
+    }
+
+    private boolean isTickEventsVtable(Address address) {
+        Address getTickOrder = readPointer(address.add(0x10));
+        return isTickOrderGetDefault(getTickOrder);
+    }
+
+    private boolean isTickOrderGetDefault(Address address) {
+        if (address == null) {
+            return false;
+        }
+        SymbolIterator symbolIterator = symbols.getSymbolsAsIterator(address);
+        while (symbolIterator.hasNext()) {
+            Symbol symbol = symbolIterator.next();
+            String fullName = symbol.getName(true);
+            if (fullName.equals("TickOrder::Get_Default") ||
+                fullName.endsWith("::TickOrder::Get_Default")) {
+                return true;
+            }
+            if (fullName.contains("TickOrder") && fullName.endsWith("Get_Default")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<String> appendScope(List<String> scope, List<String> extraScope) {
+        if (extraScope == null || extraScope.isEmpty()) {
+            return scope;
+        }
+        ArrayList<String> result = new ArrayList<>(scope);
+        result.addAll(extraScope);
+        return result;
+    }
+
+    private ArrayList<List<String>> instanceVtableCleanupScopes(
+        Descriptor descriptor,
+        DescriptorNames names,
+        List<String> componentScope) {
+
+        ArrayList<List<String>> scopes = new ArrayList<>();
+        addUniqueScope(scopes, componentScope);
+
+        String componentName = descriptorComponentName(descriptor);
+        if (componentName != null && !componentName.isEmpty()) {
+            addUniqueScope(scopes, List.of(componentName));
+        }
+        else if (names != null && names.scope != null && !names.scope.isEmpty()) {
+            addUniqueScope(scopes, names.scope);
+        }
+
+        return scopes;
+    }
+
+    private void addUniqueScope(ArrayList<List<String>> scopes, List<String> scope) {
+        if (scope == null || scope.isEmpty()) {
+            return;
+        }
+        for (List<String> existing : scopes) {
+            if (existing.equals(scope)) {
+                return;
+            }
+        }
+        scopes.add(new ArrayList<>(scope));
+    }
+
+    private boolean removeStaleGeneratedVtableLabels(
+        Address address,
+        List<List<String>> cleanupScopes,
+        List<String> keepScope,
+        String keepLocalName,
+        JsonObject action) throws Exception {
+
+        JsonArray removed = new JsonArray();
+        for (List<String> cleanupScope : cleanupScopes) {
+            Namespace namespace = findScope(cleanupScope);
+            if (namespace == null) {
+                continue;
+            }
+            ArrayList<Symbol> staleSymbols = new ArrayList<>();
+            SymbolIterator symbolIterator = symbols.getSymbolsAsIterator(address);
+            while (symbolIterator.hasNext()) {
+                Symbol symbol = symbolIterator.next();
+                if (!symbol.getParentNamespace().equals(namespace) ||
+                    !symbol.getSymbolType().equals(SymbolType.LABEL) ||
+                    !isGeneratedVtableLabel(symbol)) {
+                    continue;
+                }
+                if (keepLocalName != null &&
+                    symbol.getName().equals(keepLocalName) &&
+                    cleanupScope.equals(keepScope)) {
+                    continue;
+                }
+                staleSymbols.add(symbol);
+            }
+
+            for (Symbol symbol : staleSymbols) {
+                String oldName = symbol.getName(true);
+                if (symbol.delete()) {
+                    removed.add(oldName);
+                }
+            }
+        }
+        if (removed.size() > 0) {
+            action.add("removedStaleLabels", removed);
+            return true;
+        }
+        return false;
+    }
+
+    private boolean isGeneratedVtableLabel(Symbol symbol) {
+        if (!symbol.getSource().equals(SourceType.USER_DEFINED)) {
+            return false;
+        }
+        String name = symbol.getName();
+        return name.equals("vftable") ||
+            name.startsWith("vftable_at_0x") ||
+            name.endsWith("_vftable");
     }
 
     private void addModuleDescriptorInstanceVtableSkipped(
@@ -6196,6 +6838,61 @@ public class AzReflectionRenamer extends GhidraScript {
         return bytes.length >= 5 &&
             unsignedByte(bytes[0]) == 0xe9 &&
             instruction.getFlowType().isJump();
+    }
+
+    private Address directJumpTarget(Address address) {
+        Instruction instruction = currentProgram.getListing().getInstructionAt(address);
+        if (instruction == null || !isDirectJump(instruction)) {
+            return null;
+        }
+        Address[] flows = instruction.getFlows();
+        if (flows == null || flows.length != 1 || !isExecutableAddress(flows[0])) {
+            return null;
+        }
+        return flows[0];
+    }
+
+    private ThisAdjustThunk thisAdjustThunk(Address address) {
+        Instruction first = currentProgram.getListing().getInstructionAt(address);
+        Integer adjustment = subRcxImmediate(first);
+        if (adjustment == null) {
+            return null;
+        }
+
+        Instruction second = first.getNext();
+        if (second == null || !isDirectJump(second)) {
+            return null;
+        }
+        Address[] flows = second.getFlows();
+        if (flows == null || flows.length != 1 || !isExecutableAddress(flows[0])) {
+            return null;
+        }
+
+        ThisAdjustThunk thunk = new ThisAdjustThunk();
+        thunk.address = address;
+        thunk.targetAddress = flows[0];
+        thunk.adjustment = adjustment;
+        return thunk;
+    }
+
+    private Integer subRcxImmediate(Instruction instruction) {
+        if (instruction == null) {
+            return null;
+        }
+        byte[] bytes = instructionBytes(instruction);
+        if (bytes.length == 4 &&
+            unsignedByte(bytes[0]) == 0x48 &&
+            unsignedByte(bytes[1]) == 0x83 &&
+            unsignedByte(bytes[2]) == 0xe9) {
+            return signedByte(bytes[3]);
+        }
+        if (bytes.length == 7 &&
+            unsignedByte(bytes[0]) == 0x48 &&
+            unsignedByte(bytes[1]) == 0x81 &&
+            unsignedByte(bytes[2]) == 0xe9) {
+            return int32(bytes, 3);
+        }
+        return null;
     }
 
     private void addModuleDescriptorFunctionAlias(
@@ -8775,8 +9472,18 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private boolean isExecutableAddress(Address address) {
+        if (address == null) {
+            return false;
+        }
+        String cacheKey = address.toString();
+        Boolean cached = executableAddressCache.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
         MemoryBlock block = currentProgram.getMemory().getBlock(address);
-        return block != null && block.isExecute();
+        boolean executable = block != null && block.isExecute();
+        executableAddressCache.put(cacheKey, executable);
+        return executable;
     }
 
     private void addFunctionAlias(
@@ -8929,6 +9636,15 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private Namespace createScope(List<String> scope) throws Exception {
+        if (scope == null || scope.isEmpty()) {
+            return currentProgram.getGlobalNamespace();
+        }
+        String cacheKey = scopeKey(scope);
+        Namespace cached = scopeCache.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+
         Namespace parent = currentProgram.getGlobalNamespace();
         for (int i = 0; i < scope.size(); i++) {
             String part = scope.get(i);
@@ -8937,7 +9653,40 @@ public class AzReflectionRenamer extends GhidraScript {
             }
             parent = getOrCreateScope(parent, part, isClassScope(scope, i));
         }
+        scopeCache.put(cacheKey, parent);
         return parent;
+    }
+
+    private Namespace findScope(List<String> scope) {
+        if (scope == null || scope.isEmpty()) {
+            return currentProgram.getGlobalNamespace();
+        }
+        String cacheKey = scopeKey(scope);
+        Namespace cached = scopeCache.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+
+        Namespace parent = currentProgram.getGlobalNamespace();
+        for (String part : scope) {
+            if (part == null || part.isEmpty()) {
+                continue;
+            }
+            Namespace namespace = symbols.getNamespace(part, parent);
+            if (namespace == null) {
+                return null;
+            }
+            parent = namespace;
+        }
+        scopeCache.put(cacheKey, parent);
+        return parent;
+    }
+
+    private String scopeKey(List<String> scope) {
+        if (scope == null || scope.isEmpty()) {
+            return "";
+        }
+        return String.join("\u0001", scope);
     }
 
     private Namespace getOrCreateScope(Namespace parent, String name, boolean classScope) throws Exception {
@@ -8988,9 +9737,17 @@ public class AzReflectionRenamer extends GhidraScript {
 
     private JsonArray oldNames(Address address) {
         JsonArray result = new JsonArray();
-        Symbol[] existing = symbols.getSymbols(address);
-        for (Symbol symbol : existing) {
+        for (Symbol symbol : symbolsAt(address)) {
             result.add(symbol.getName(true));
+        }
+        return result;
+    }
+
+    private ArrayList<Symbol> symbolsAt(Address address) {
+        ArrayList<Symbol> result = new ArrayList<>();
+        SymbolIterator symbolIterator = symbols.getSymbolsAsIterator(address);
+        while (symbolIterator.hasNext()) {
+            result.add(symbolIterator.next());
         }
         return result;
     }
@@ -9018,16 +9775,24 @@ public class AzReflectionRenamer extends GhidraScript {
         if (!isProgramAddress(address)) {
             return null;
         }
+        String cacheKey = address.toString();
+        if (pointerReadCache.containsKey(cacheKey)) {
+            return pointerReadCache.get(cacheKey);
+        }
         try {
             long value = getLong(address);
             if (value == 0) {
+                pointerReadCache.put(cacheKey, null);
                 return null;
             }
-            return currentProgram.getAddressFactory()
+            Address pointer = currentProgram.getAddressFactory()
                 .getDefaultAddressSpace()
                 .getAddress(value);
+            pointerReadCache.put(cacheKey, pointer);
+            return pointer;
         }
         catch (Exception ignored) {
+            pointerReadCache.put(cacheKey, null);
             return null;
         }
     }
@@ -10252,6 +11017,24 @@ public class AzReflectionRenamer extends GhidraScript {
         Address vtableAddress;
         Address sourceInstruction;
         int vptrOffset;
+    }
+
+    private static class InstanceVtableName {
+        List<String> extraScope = Collections.emptyList();
+        String localName;
+        String semanticName;
+    }
+
+    private static class ThisAdjustThunk {
+        Address address;
+        Address targetAddress;
+        int adjustment;
+    }
+
+    private static class InferredStaticRttiHelper {
+        String typeName;
+        Address typeNameAddress;
+        Address vtableAddress;
     }
 
     private static class DescriptorNames {

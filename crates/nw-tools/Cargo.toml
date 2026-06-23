@@ -13,8 +13,8 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 humansize.workspace = true
-indicatif.workspace = true
 nw-asset.workspace = true
 nw-datasheet.workspace = true
 nw-dds.workspace = true
@@ -25,5 +25,6 @@ nw-localization.workspace = true
 nw-objectstream.workspace = true
 nw-pak.workspace = true
 nw-resources.workspace = true
+ratatui.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -173,6 +173,11 @@ fn imports_for_unit(unit: &RustCodegenUnit, options: RustSourceOptions) -> Vec<T
             .iter()
             .any(|derive_name| derive_name == "Reflect")
     });
+    let needs_marshaler = unit.items.iter().any(|item| {
+        item.derives
+            .iter()
+            .any(|derive_name| derive_name == "Marshaler")
+    });
 
     let mut imports = Vec::new();
     let mut az_derives = Vec::new();
@@ -193,6 +198,11 @@ fn imports_for_unit(unit: &RustCodegenUnit, options: RustSourceOptions) -> Vec<T
         )),
         (true, false) | (false, true) => {}
         (false, false) => {}
+    }
+    if needs_marshaler {
+        imports.push(quote!(
+            use gridmate::Marshaler;
+        ));
     }
     imports
 }
@@ -407,7 +417,6 @@ fn render_item(
                 .collect::<Result<Vec<_>, _>>()?;
             let raw_conversion_impls = render_raw_conversion_impls(item, &ident)?;
             let string_conversion_impls = render_string_conversion_impls(item, &ident)?;
-            let marshaler_impl = render_enum_marshaler_impl(item, &ident, options)?;
             Ok(quote! {
                 #[derive(#(#derives,)*)]
                 #repr_attr
@@ -419,7 +428,6 @@ fn render_item(
 
                 #raw_conversion_impls
                 #string_conversion_impls
-                #marshaler_impl
                 #standalone_identity
             })
         }
@@ -1089,66 +1097,6 @@ fn is_semantic_default_variant(variant: &RustVariantPlan) -> bool {
             .any(|part| matches!(part, "None" | "Invalid" | "Disabled"))
 }
 
-fn render_enum_marshaler_impl(
-    item: &RustItemPlan,
-    ident: &Ident,
-    options: RustSourceOptions,
-) -> Result<TokenStream, RustSourceEmitError> {
-    if matches!(options.mode, RustSourceMode::Standalone) {
-        return Ok(TokenStream::new());
-    }
-
-    let Some(raw_conversion) = &item.raw_conversion else {
-        return Ok(TokenStream::new());
-    };
-    let raw_ty = syn::parse_str::<Type>(&raw_conversion.raw_type).map_err(|source| {
-        RustSourceEmitError::RawConversionType {
-            item_name: item.rust_name.clone(),
-            raw_type: raw_conversion.raw_type.clone(),
-            source,
-        }
-    })?;
-    let Some((min, max)) = enum_discriminant_range(item) else {
-        return Ok(TokenStream::new());
-    };
-    let min = LitInt::new(&format!("{}u64", min.max(0)), Span::call_site());
-    let max = LitInt::new(&format!("{}u64", max.max(0)), Span::call_site());
-
-    Ok(quote! {
-        impl ::gridmate::serialize::marshaler::Marshaler for #ident {
-            fn marshal(&self, wb: &mut ::gridmate::serialize::buffer::WriteBuffer) {
-                let value: #raw_ty = (*self).into();
-                <#raw_ty as ::gridmate::serialize::marshaler::Marshaler>::marshal(&value, wb);
-            }
-
-            fn unmarshal(
-                rb: &mut ::gridmate::serialize::buffer::ReadBuffer,
-            ) -> Result<Self, ::gridmate::serialize::error::MarshalerError> {
-                let value = <#raw_ty as ::gridmate::serialize::marshaler::Marshaler>::unmarshal(rb)?;
-                Self::try_from(value).map_err(|_| {
-                    let value = (value as i128).max(0) as u64;
-                    ::gridmate::serialize::error::MarshalerError::InvalidRange {
-                        value,
-                        min: #min,
-                        max: #max,
-                    }
-                })
-            }
-        }
-    })
-}
-
-fn enum_discriminant_range(item: &RustItemPlan) -> Option<(i32, i32)> {
-    let mut values = item
-        .variants
-        .iter()
-        .filter_map(|variant| variant.discriminant);
-    let first = values.next()?;
-    Some(values.fold((first, first), |(min, max), value| {
-        (min.min(value), max.max(value))
-    }))
-}
-
 fn render_string_conversion_impls(
     item: &RustItemPlan,
     ident: &Ident,
@@ -1438,6 +1386,7 @@ mod tests {
             .expect("emitted Rust source");
 
         assert!(source.contains("use az_derive::AzTypeInfo;"));
+        assert!(source.contains("use gridmate::Marshaler;"));
         assert!(!source.contains("use bevy::prelude::Reflect;"));
         assert!(source.contains("bevy::prelude::Reflect"));
         assert!(source.contains("AzTypeInfo"));
@@ -1466,7 +1415,8 @@ mod tests {
         assert!(source.contains("impl<'a> ::core::convert::TryFrom<&'a str> for Mode"));
         assert!(source.contains("impl ::core::str::FromStr for Mode"));
         assert!(source.contains("impl ::core::fmt::Display for Mode"));
-        assert!(source.contains("impl ::gridmate::serialize::marshaler::Marshaler for Mode"));
+        assert!(source.contains("Marshaler"));
+        assert!(!source.contains("impl ::gridmate::serialize::marshaler::Marshaler for Mode"));
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
 
@@ -2384,6 +2334,7 @@ mod tests {
             .expect("emitted Rust source");
 
         assert!(source.contains("pub struct CharacterActionGridCellValue(pub u32);"));
+        assert!(source.contains("Marshaler"));
         assert!(source.contains("pub const VARIANTS: &[(u32, &str)]"));
         assert!(source.contains("(1, \"TransitionAllowed\")"));
         assert!(source.contains("(1, \"Always\")"));
