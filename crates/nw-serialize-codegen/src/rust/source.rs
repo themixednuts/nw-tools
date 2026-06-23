@@ -1145,7 +1145,7 @@ fn render_string_conversion_impls(
             type Err = ::std::string::String;
 
             fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Self::try_from(value).map_err(|value| value.to_owned())
+                Self::try_from(value).map_err(str::to_owned)
             }
         }
 
