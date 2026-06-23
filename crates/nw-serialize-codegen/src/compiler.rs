@@ -707,23 +707,30 @@ pub struct ExternalPayload;
             )
             .expect("selected standalone Rust project");
         let go_project = unit
-            .emit_standalone_go_project("aztypesvalidation", "aztypesvalidation")
+            .emit_standalone_go_project("aztypesvalidation", "aztypesvalidation", &context)
             .expect("standalone Go project");
         let selected_go_project = unit
             .emit_selected_standalone_go_project(
                 SerializeCodegenSelection::RuntimeRoots,
                 "aztypesvalidation",
                 "aztypesvalidation",
+                &context,
             )
             .expect("selected standalone Go project");
         let typescript_project = unit
-            .emit_standalone_typescript_project_with_options(&TypeScriptStandaloneProjectOptions {
-                package_name: "aztypes-typescript-validation".to_owned(),
-                pack_entries: vec!["src/index.ts".to_owned()],
-            })
+            .emit_standalone_typescript_project_with_options(
+                &TypeScriptStandaloneProjectOptions {
+                    package_name: "aztypes-typescript-validation".to_owned(),
+                    pack_entries: vec!["src/index.ts".to_owned()],
+                },
+                &context,
+            )
             .expect("standalone TypeScript project");
         let selected_typescript_project = unit
-            .emit_selected_standalone_typescript_project(SerializeCodegenSelection::RuntimeRoots)
+            .emit_selected_standalone_typescript_project(
+                SerializeCodegenSelection::RuntimeRoots,
+                &context,
+            )
             .expect("selected standalone TypeScript project");
 
         assert_eq!(selected_view.emitted_unit().items.len(), 2);

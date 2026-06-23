@@ -202,27 +202,23 @@ fn generate_with_context(args: &GenerateArgs, context: &CodegenContext) -> Resul
 
     match args.language {
         Language::All => {
-            generate_language(
-                &completed,
-                args,
-                Language::Rust,
-                &args.out.join("rust"),
-                &context,
-            )?;
-            generate_language(
-                &completed,
-                args,
-                Language::Go,
-                &args.out.join("go"),
-                &context,
-            )?;
-            generate_language(
-                &completed,
-                args,
-                Language::TypeScript,
-                &args.out.join("typescript"),
-                &context,
-            )?;
+            let tasks = [
+                LanguageTask {
+                    language: Language::Rust,
+                    out: args.out.join("rust"),
+                },
+                LanguageTask {
+                    language: Language::Go,
+                    out: args.out.join("go"),
+                },
+                LanguageTask {
+                    language: Language::TypeScript,
+                    out: args.out.join("typescript"),
+                },
+            ];
+            context.runner().try_map(&tasks, |task| {
+                generate_language(&completed, args, task.language, &task.out, context)
+            })?;
         }
         language => generate_language(&completed, args, language, &args.out, &context)?,
     }
@@ -230,6 +226,12 @@ fn generate_with_context(args: &GenerateArgs, context: &CodegenContext) -> Resul
     let (errors, warnings) = diagnostic_counts(&compile_unit);
     println!("diagnostics: {errors} error(s), {warnings} warning(s)");
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct LanguageTask {
+    language: Language,
+    out: PathBuf,
 }
 
 fn generate_language(
@@ -244,11 +246,12 @@ fn generate_language(
         Language::Rust => {
             rust_output_files(completed, args.rust_layout, &args.rust_package, context)?
         }
-        Language::Go => go_output_files(completed, &args.go_module, &args.go_package)?,
+        Language::Go => go_output_files(completed, &args.go_module, &args.go_package, context)?,
         Language::TypeScript => typescript_output_files(
             completed,
             &args.typescript_package,
             &args.typescript_pack_entries,
+            context,
         )?,
     };
     let summary = write_output_files(out, &files, context)
@@ -372,23 +375,19 @@ fn load_module_descriptor_directory(path: &Path, context: &CodegenContext) -> Re
     });
     entries.sort();
 
-    let modules = context
-        .runner()
-        .map(&entries, |entry| {
-            let root = load_json_root(entry, "AZ::Module descriptor capture")?;
-            if root.get("descriptors").is_none() {
-                bail!(
-                    "AZ::Module descriptor file {} does not contain `descriptors`",
-                    entry.display()
-                );
-            }
-            Ok(module_descriptor_capture(
-                module_name_from_path(entry),
-                root,
-            ))
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+    let modules = context.runner().try_map(&entries, |entry| {
+        let root = load_json_root(entry, "AZ::Module descriptor capture")?;
+        if root.get("descriptors").is_none() {
+            bail!(
+                "AZ::Module descriptor file {} does not contain `descriptors`",
+                entry.display()
+            );
+        }
+        Ok(module_descriptor_capture(
+            module_name_from_path(entry),
+            root,
+        ))
+    })?;
     Ok(module_descriptors_root(modules))
 }
 
@@ -399,25 +398,19 @@ fn load_embedded_module_descriptors(context: &CodegenContext) -> Result<Value> {
         .collect::<Vec<_>>();
     names.sort();
 
-    let modules = context
-        .runner()
-        .map(&names, |name| {
-            let embedded = EmbeddedModuleDescriptors::get(name)
-                .with_context(|| format!("read embedded AZ::Module descriptor capture {name}"))?;
-            let root = serde_json::from_slice::<Value>(embedded.data.as_ref())
-                .with_context(|| format!("parse embedded AZ::Module descriptor capture {name}"))?;
-            if root.get("descriptors").is_none() {
-                bail!(
-                    "embedded AZ::Module descriptor capture {name} does not contain `descriptors`"
-                );
-            }
-            Ok(module_descriptor_capture(
-                module_name_from_resource_name(name),
-                root,
-            ))
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+    let modules = context.runner().try_map(&names, |name| {
+        let embedded = EmbeddedModuleDescriptors::get(name)
+            .with_context(|| format!("read embedded AZ::Module descriptor capture {name}"))?;
+        let root = serde_json::from_slice::<Value>(embedded.data.as_ref())
+            .with_context(|| format!("parse embedded AZ::Module descriptor capture {name}"))?;
+        if root.get("descriptors").is_none() {
+            bail!("embedded AZ::Module descriptor capture {name} does not contain `descriptors`");
+        }
+        Ok(module_descriptor_capture(
+            module_name_from_resource_name(name),
+            root,
+        ))
+    })?;
     Ok(module_descriptors_root(modules))
 }
 
@@ -496,6 +489,7 @@ fn go_output_files(
     completed: &CompletedCodegenUnits,
     module_path: &str,
     package_name: &str,
+    context: &CodegenContext,
 ) -> Result<Vec<OutputFile>> {
     let mut files = GoSourceEmitter::default()
         .emit_standalone_project_with_context(
@@ -503,6 +497,7 @@ fn go_output_files(
             &completed.context,
             module_path,
             package_name,
+            context,
         )
         .context("emit standalone Go project")?
         .files
@@ -524,6 +519,7 @@ fn typescript_output_files(
     completed: &CompletedCodegenUnits,
     package_name: &str,
     pack_entries: &[String],
+    context: &CodegenContext,
 ) -> Result<Vec<OutputFile>> {
     let pack_entries = if pack_entries.is_empty() {
         vec!["src/index.ts".to_owned()]
@@ -539,6 +535,7 @@ fn typescript_output_files(
             &completed.emitted,
             &completed.context,
             &options,
+            context,
         )
         .context("emit standalone TypeScript project")?
         .files
@@ -629,35 +626,31 @@ fn write_output_files(
         .into_iter()
         .collect::<Vec<_>>();
 
-    let created = context
-        .runner()
-        .map_until_cancelled(&parent_dirs, context.cancel(), |dir| {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("create output directory {}", dir.display()))
-        });
-    let create_cancelled = created.was_cancelled();
-    for result in created.into_completed() {
-        result?;
-    }
-    if create_cancelled {
+    let created =
+        context
+            .runner()
+            .try_map_until_cancelled(&parent_dirs, context.cancel(), |dir| {
+                fs::create_dir_all(dir)
+                    .with_context(|| format!("create output directory {}", dir.display()))
+            })?;
+    if created.was_cancelled() {
         bail!("cancelled while creating output directories");
     }
 
     let writes = context
         .runner()
-        .map_until_cancelled(&tasks, context.cancel(), |task| {
+        .try_map_until_cancelled(&tasks, context.cancel(), |task| {
             write_file_if_changed(&task.path, task.source.as_bytes())
-        });
-    let write_cancelled = writes.was_cancelled();
+        })?;
     let mut summary = WriteSummary::default();
-    for result in writes.into_completed() {
-        if result? {
+    for changed in writes.completed() {
+        if *changed {
             summary.changed += 1;
         } else {
             summary.unchanged += 1;
         }
     }
-    if write_cancelled {
+    if writes.was_cancelled() {
         bail!("cancelled while writing output files");
     }
     Ok(summary)

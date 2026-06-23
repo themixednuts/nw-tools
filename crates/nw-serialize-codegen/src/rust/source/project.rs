@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use nw_jobs::JobBatch;
 use quote::quote;
 use syn::{GenericArgument, Ident, PathArguments, Type};
 
@@ -89,7 +88,7 @@ fn emit_standalone_type_files(
 
     let emitted = context
         .runner()
-        .map_until_cancelled(&tasks, context.cancel(), |task| {
+        .try_map_until_cancelled(&tasks, context.cancel(), |task| {
             emit_standalone_type_module(
                 &task.module_path,
                 &symbol_surface,
@@ -98,13 +97,17 @@ fn emit_standalone_type_files(
                 task.leaf_modules.iter().map(String::as_str),
                 Vec::new(),
                 &task.items,
+                context,
             )
             .map(|source| RustStandaloneProjectFile {
                 path: task.path.clone(),
                 source,
             })
-        });
-    collect_emitted_files(emitted)
+        })?;
+    if emitted.was_cancelled() {
+        return Err(RustSourceEmitError::Cancelled);
+    }
+    Ok(emitted.into_completed())
 }
 
 fn standalone_type_tasks<'a>(
@@ -175,7 +178,7 @@ fn emit_integrated_type_files(
 
     let emitted = context
         .runner()
-        .map_until_cancelled(&tasks, context.cancel(), |task| {
+        .try_map_until_cancelled(&tasks, context.cancel(), |task| {
             emit_integrated_type_module(
                 &task.module_path,
                 &symbol_surface,
@@ -184,13 +187,17 @@ fn emit_integrated_type_files(
                 task.leaf_modules.iter().map(String::as_str),
                 &task.register_child_modules,
                 &task.items,
+                context,
             )
             .map(|source| RustStandaloneProjectFile {
                 path: task.path.clone(),
                 source,
             })
-        });
-    collect_emitted_files(emitted)
+        })?;
+    if emitted.was_cancelled() {
+        return Err(RustSourceEmitError::Cancelled);
+    }
+    Ok(emitted.into_completed())
 }
 
 fn integrated_type_tasks<'a>(
@@ -266,20 +273,6 @@ struct TypeModuleTask<'a> {
     items: Vec<&'a RustItemPlan>,
 }
 
-fn collect_emitted_files(
-    emitted: JobBatch<Result<RustStandaloneProjectFile, RustSourceEmitError>>,
-) -> Result<Vec<RustStandaloneProjectFile>, RustSourceEmitError> {
-    let cancelled = emitted.was_cancelled();
-    let mut files = Vec::with_capacity(emitted.completed().len());
-    for result in emitted.into_completed() {
-        files.push(result?);
-    }
-    if cancelled {
-        return Err(RustSourceEmitError::Cancelled);
-    }
-    Ok(files)
-}
-
 fn emit_standalone_type_module<'a>(
     module_path: &[String],
     symbol_surface: &BTreeMap<Vec<String>, SymbolSurfaceModule<()>>,
@@ -288,6 +281,7 @@ fn emit_standalone_type_module<'a>(
     leaf_modules: impl Iterator<Item = &'a str>,
     extra_module_reexports: Vec<StandaloneModuleReexport>,
     items: &[&RustItemPlan],
+    context: &CodegenContext,
 ) -> Result<String, RustSourceEmitError> {
     let child_modules = child_dirs
         .map(parse_module_ident)
@@ -298,15 +292,7 @@ fn emit_standalone_type_module<'a>(
     let options = RustSourceOptions {
         mode: RustSourceMode::Standalone,
     };
-    let rendered_items = items
-        .iter()
-        .map(|item| render_item(item, options))
-        .collect::<Result<Vec<_>, _>>()?;
-    let item_file = syn::parse2::<syn::File>(quote! {
-        #(#rendered_items)*
-    })
-    .map_err(RustSourceEmitError::File)?;
-    let item_source = prettyplease::unparse(&item_file);
+    let item_source = render_module_item_source(items, options, context)?;
 
     let mut reexports = if child_modules.is_empty() && leaf_modules.is_empty() {
         Vec::new()
@@ -359,6 +345,7 @@ fn emit_integrated_type_module<'a>(
     leaf_modules: impl Iterator<Item = &'a str>,
     register_child_modules: &[String],
     items: &[&RustItemPlan],
+    context: &CodegenContext,
 ) -> Result<String, RustSourceEmitError> {
     let child_modules = child_dirs
         .map(parse_module_ident)
@@ -369,15 +356,7 @@ fn emit_integrated_type_module<'a>(
     let options = RustSourceOptions {
         mode: RustSourceMode::Integrated,
     };
-    let rendered_items = items
-        .iter()
-        .map(|item| render_item(item, options))
-        .collect::<Result<Vec<_>, _>>()?;
-    let item_file = syn::parse2::<syn::File>(quote! {
-        #(#rendered_items)*
-    })
-    .map_err(RustSourceEmitError::File)?;
-    let item_source = prettyplease::unparse(&item_file);
+    let item_source = render_module_item_source(items, options, context)?;
 
     let mut reexports = if child_modules.is_empty() && leaf_modules.is_empty() {
         Vec::new()
@@ -432,6 +411,42 @@ fn emit_integrated_type_module<'a>(
     }
 
     rustfmt_source(&source)
+}
+
+fn render_module_item_source(
+    items: &[&RustItemPlan],
+    options: RustSourceOptions,
+    context: &CodegenContext,
+) -> Result<String, RustSourceEmitError> {
+    let rendered = context
+        .runner()
+        .try_map_until_cancelled(items, context.cancel(), |item| {
+            render_item_source(item, options)
+        })?;
+    let cancelled = rendered.was_cancelled();
+    let mut source = String::new();
+    for item in rendered.into_completed() {
+        source.push_str(item.trim_start());
+        if !source.ends_with('\n') {
+            source.push('\n');
+        }
+    }
+    if cancelled {
+        return Err(RustSourceEmitError::Cancelled);
+    }
+    Ok(source)
+}
+
+fn render_item_source(
+    item: &RustItemPlan,
+    options: RustSourceOptions,
+) -> Result<String, RustSourceEmitError> {
+    let rendered = render_item(item, options)?;
+    let file = syn::parse2::<syn::File>(quote! {
+        #rendered
+    })
+    .map_err(RustSourceEmitError::File)?;
+    Ok(prettyplease::unparse(&file))
 }
 
 fn integrated_register_children_by_module(

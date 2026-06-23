@@ -100,14 +100,11 @@ impl RustSourceEmitter {
         let rendered =
             context
                 .runner()
-                .map_until_cancelled(&unit.items, context.cancel(), |item| {
+                .try_map_until_cancelled(&unit.items, context.cancel(), |item| {
                     render_item_source(item, self.options)
-                });
+                })?;
         let cancelled = rendered.was_cancelled();
-        let items = rendered
-            .into_completed()
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+        let items = rendered.into_completed();
         if cancelled {
             return Err(RustSourceEmitError::Cancelled);
         }

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use heck::ToUpperCamelCase;
 
+use crate::CodegenContext;
 use crate::field_projection::{
     CodegenFieldProjection, CodegenFieldTypeProjection, CodegenTypeReferenceProjection,
     classify_codegen_field, classify_codegen_field_type, codegen_item_referenced_type_ids,
@@ -33,6 +34,7 @@ impl crate::typescript::source::TypeScriptSourceEmitter {
         &self,
         emitted_unit: &SerializeCodegenUnit,
         context_unit: &SerializeCodegenUnit,
+        context: &CodegenContext,
     ) -> Result<Vec<TypeScriptStandaloneProjectFile>, TypeScriptSourceEmitError> {
         reject_unresolved_types(emitted_unit)?;
         let items_by_type_id = items_by_type_id(context_unit);
@@ -42,22 +44,23 @@ impl crate::typescript::source::TypeScriptSourceEmitter {
         let groups = layout.groups;
         let index_reexports_by_dir =
             typescript_index_reexports_by_dir(emitted_unit, &groups, &names_by_type_id);
-        let mut files = Vec::new();
-
-        for ((type_file, _bucket), items) in groups {
-            files.push(TypeScriptStandaloneProjectFile {
-                path: typescript_type_source_path(&type_file),
+        let group_tasks = groups.into_iter().collect::<Vec<_>>();
+        let mut files = context.runner().try_map(&group_tasks, |task| {
+            let ((type_file, _bucket), items) = task;
+            Ok(TypeScriptStandaloneProjectFile {
+                path: typescript_type_source_path(type_file),
                 source: self.emit_project_type_file(
-                    &items,
+                    items,
                     &items_by_type_id,
                     &names_by_type_id,
                     &files_by_type_id,
-                    &type_file,
+                    type_file,
                 )?,
-            });
-        }
+            })
+        })?;
 
-        for (dir, reexports) in index_reexports_by_dir {
+        let index_tasks = index_reexports_by_dir.into_iter().collect::<Vec<_>>();
+        let index_files = context.runner().try_map(&index_tasks, |(dir, reexports)| {
             let mut source = String::new();
             for reexport in reexports {
                 append_typescript_index_reexport(&mut source, &reexport);
@@ -65,11 +68,12 @@ impl crate::typescript::source::TypeScriptSourceEmitter {
             if source.trim().is_empty() {
                 source.push_str("export {};\n");
             }
-            files.push(TypeScriptStandaloneProjectFile {
+            Ok(TypeScriptStandaloneProjectFile {
                 path: format!("src/{dir}/index.ts"),
                 source: format_typescript_source(&source)?,
-            });
-        }
+            })
+        })?;
+        files.extend(index_files);
 
         if !files.iter().any(|file| file.path == "src/types/index.ts") {
             files.push(TypeScriptStandaloneProjectFile {

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::CodegenContext;
 use crate::field_projection::{
     CodegenFieldProjection, CodegenFieldTypeProjection, CodegenTypeReferenceProjection,
     base_class_is_abstract, classify_codegen_field, classify_codegen_field_type,
@@ -37,6 +38,7 @@ pub(super) fn emit_standalone_project_with_context(
     context_unit: &SerializeCodegenUnit,
     module_path: &str,
     package_name: &str,
+    context: &CodegenContext,
 ) -> Result<GoStandaloneProject, GoSourceEmitError> {
     reject_unresolved_types(emitted_unit)?;
 
@@ -76,6 +78,7 @@ pub(super) fn emit_standalone_project_with_context(
         emitted_unit,
         context_unit,
         module_path,
+        context,
     )?);
     Ok(GoStandaloneProject { files })
 }
@@ -84,6 +87,7 @@ fn emit_project_type_files_with_context(
     emitted_unit: &SerializeCodegenUnit,
     context_unit: &SerializeCodegenUnit,
     module_path: &str,
+    context: &CodegenContext,
 ) -> Result<Vec<GoStandaloneProjectFile>, GoSourceEmitError> {
     let items_by_type_id = items_by_type_id(context_unit);
     let base_type_ids = reflected_base_type_ids(context_unit);
@@ -94,28 +98,29 @@ fn emit_project_type_files_with_context(
         &base_type_ids,
     );
     let names_by_type_id = codegen_type_names_by_id_in_packages(emitted_unit, &packages_by_type_id);
-    let mut files = Vec::new();
-
-    for ((package, file_stem), items) in go_package_groups_with_context(
+    let tasks = go_package_groups_with_context(
         emitted_unit,
         context_unit,
         &items_by_type_id,
         &base_type_ids,
-    ) {
-        files.push(GoStandaloneProjectFile {
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
+
+    context.runner().try_map(&tasks, |task| {
+        let ((package, file_stem), items) = task;
+        Ok(GoStandaloneProjectFile {
             path: go_type_file_path(&package, &file_stem),
             source: emit_project_type_file(
-                &items,
+                items,
                 &items_by_type_id,
                 &names_by_type_id,
                 &packages_by_type_id,
                 module_path,
-                &package,
+                package,
             )?,
-        });
-    }
-
-    Ok(files)
+        })
+    })
 }
 
 fn emit_project_type_file(

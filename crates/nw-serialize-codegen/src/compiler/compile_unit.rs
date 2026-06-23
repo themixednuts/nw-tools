@@ -203,34 +203,38 @@ impl CompileUnit {
 
     pub fn emit_standalone_typescript_project(
         &self,
+        context: &CodegenContext,
     ) -> Result<TypeScriptStandaloneProject, TypeScriptSourceEmitError> {
         self.full_codegen_view()
-            .emit_standalone_typescript_project()
+            .emit_standalone_typescript_project(context)
     }
 
     pub fn emit_standalone_typescript_project_with_options(
         &self,
         options: &TypeScriptStandaloneProjectOptions,
+        context: &CodegenContext,
     ) -> Result<TypeScriptStandaloneProject, TypeScriptSourceEmitError> {
         self.full_codegen_view()
-            .emit_standalone_typescript_project_with_options(options)
+            .emit_standalone_typescript_project_with_options(options, context)
     }
 
     pub fn emit_selected_standalone_typescript_project(
         &self,
         selection: SerializeCodegenSelection,
+        context: &CodegenContext,
     ) -> Result<TypeScriptStandaloneProject, TypeScriptSourceEmitError> {
         self.codegen_view(selection)
-            .emit_standalone_typescript_project()
+            .emit_standalone_typescript_project(context)
     }
 
     pub fn emit_selected_standalone_typescript_project_with_options(
         &self,
         selection: SerializeCodegenSelection,
         options: &TypeScriptStandaloneProjectOptions,
+        context: &CodegenContext,
     ) -> Result<TypeScriptStandaloneProject, TypeScriptSourceEmitError> {
         self.codegen_view(selection)
-            .emit_standalone_typescript_project_with_options(options)
+            .emit_standalone_typescript_project_with_options(options, context)
     }
 
     pub fn emit_go_source(&self) -> Result<String, GoSourceEmitError> {
@@ -278,9 +282,10 @@ impl CompileUnit {
         &self,
         module_path: &str,
         package_name: &str,
+        context: &CodegenContext,
     ) -> Result<GoStandaloneProject, GoSourceEmitError> {
         self.full_codegen_view()
-            .emit_standalone_go_project(module_path, package_name)
+            .emit_standalone_go_project(module_path, package_name, context)
     }
 
     pub fn emit_selected_standalone_go_project(
@@ -288,9 +293,10 @@ impl CompileUnit {
         selection: SerializeCodegenSelection,
         module_path: &str,
         package_name: &str,
+        context: &CodegenContext,
     ) -> Result<GoStandaloneProject, GoSourceEmitError> {
         self.codegen_view(selection)
-            .emit_standalone_go_project(module_path, package_name)
+            .emit_standalone_go_project(module_path, package_name, context)
     }
 
     #[must_use]

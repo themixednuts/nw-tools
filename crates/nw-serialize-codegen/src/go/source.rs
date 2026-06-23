@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use treesitter_types_go::FromNode;
 
+use crate::CodegenContext;
 use crate::field_projection::{CodegenFieldTypeProjection, classify_codegen_field_type};
 use crate::go::layout::GoStandaloneLayoutReport;
 use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind, SerializeCodegenUnit};
@@ -96,8 +97,9 @@ impl GoSourceEmitter {
         unit: &SerializeCodegenUnit,
         module_path: &str,
         package_name: &str,
+        context: &CodegenContext,
     ) -> Result<GoStandaloneProject, GoSourceEmitError> {
-        self.emit_standalone_project_with_context(unit, unit, module_path, package_name)
+        self.emit_standalone_project_with_context(unit, unit, module_path, package_name, context)
     }
 
     pub fn emit_standalone_project_with_context(
@@ -106,12 +108,14 @@ impl GoSourceEmitter {
         context_unit: &SerializeCodegenUnit,
         module_path: &str,
         package_name: &str,
+        context: &CodegenContext,
     ) -> Result<GoStandaloneProject, GoSourceEmitError> {
         project::emit_standalone_project_with_context(
             emitted_unit,
             context_unit,
             module_path,
             package_name,
+            context,
         )
     }
 
@@ -971,7 +975,12 @@ mod tests {
         assert!(!unit_source.contains("Typeaaaaaaaa"), "{unit_source}");
 
         let project = GoSourceEmitter
-            .emit_standalone_project(&unit, "example.com/aztypes", "aztypes")
+            .emit_standalone_project(
+                &unit,
+                "example.com/aztypes",
+                "aztypes",
+                &crate::CodegenContext::inline(),
+            )
             .expect("Go project");
         let source = project
             .files
@@ -1131,6 +1140,7 @@ mod tests {
                 &context_unit,
                 "example.com/aztypes",
                 "aztypes",
+                &crate::CodegenContext::inline(),
             )
             .expect("standalone Go project");
         let sources = project
@@ -1180,7 +1190,12 @@ mod tests {
         };
 
         let project = GoSourceEmitter
-            .emit_standalone_project(&unit, "example.com/aztypes", "aztypes")
+            .emit_standalone_project(
+                &unit,
+                "example.com/aztypes",
+                "aztypes",
+                &crate::CodegenContext::inline(),
+            )
             .expect("standalone Go project");
         let catalog_item = project
             .files
@@ -1259,7 +1274,12 @@ mod tests {
         };
 
         let project = GoSourceEmitter
-            .emit_standalone_project(&unit, "aztypesvalidation", "aztypesvalidation")
+            .emit_standalone_project(
+                &unit,
+                "aztypesvalidation",
+                "aztypesvalidation",
+                &crate::CodegenContext::inline(),
+            )
             .expect("standalone Go project");
         let component = project
             .files
@@ -1321,7 +1341,12 @@ mod tests {
         };
 
         let project = GoSourceEmitter
-            .emit_standalone_project(&unit, "example.com/aztypes", "aztypes")
+            .emit_standalone_project(
+                &unit,
+                "example.com/aztypes",
+                "aztypes",
+                &crate::CodegenContext::inline(),
+            )
             .expect("standalone Go project");
         let source = project
             .files
@@ -1380,7 +1405,12 @@ mod tests {
         };
 
         let project = GoSourceEmitter
-            .emit_standalone_project(&unit, "example.com/aztypes", "aztypes")
+            .emit_standalone_project(
+                &unit,
+                "example.com/aztypes",
+                "aztypes",
+                &crate::CodegenContext::inline(),
+            )
             .expect("standalone Go project");
         let source = project
             .files
@@ -1466,7 +1496,12 @@ mod tests {
         };
 
         let project = GoSourceEmitter
-            .emit_standalone_project(&unit, "example.com/aztypes", "aztypes")
+            .emit_standalone_project(
+                &unit,
+                "example.com/aztypes",
+                "aztypes",
+                &crate::CodegenContext::inline(),
+            )
             .expect("standalone Go project");
         let paths = project
             .files
@@ -1508,7 +1543,12 @@ mod tests {
         let unit = namespace_and_base_family_fixture();
 
         let project = GoSourceEmitter::default()
-            .emit_standalone_project(&unit, "aztypesvalidation", "aztypesvalidation")
+            .emit_standalone_project(
+                &unit,
+                "aztypesvalidation",
+                "aztypesvalidation",
+                &crate::CodegenContext::inline(),
+            )
             .expect("Go standalone project");
         let paths = project
             .files

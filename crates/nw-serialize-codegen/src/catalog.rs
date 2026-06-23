@@ -294,30 +294,28 @@ impl ReflectedTypeCatalog {
         let mut type_ids_by_name = BTreeMap::new();
         {
             let classes = model.classes.values().collect::<Vec<_>>();
-            let mut reflected_types = context
-                .runner()
-                .map(&classes, |class| {
-                    let class = *class;
-                    let fields = reflected_fields_from_model(
-                        class,
-                        &class_names_by_id,
-                        role_classifier.reflection_marker_type_ids(),
-                    );
-                    let base_type_ids = fields
-                        .iter()
-                        .filter(|field| field.is_base_class)
-                        .map(|field| field.type_id)
-                        .collect::<Vec<_>>();
-                    ReflectedType {
-                        name: class.name.clone(),
-                        type_id: class.type_id,
-                        version: class.version,
-                        role: ReflectedTypeRole::SupportType,
-                        is_reflection_marker: role_classifier.is_reflection_marker(class.type_id),
-                        fields,
-                        base_type_ids,
-                    }
-                });
+            let mut reflected_types = context.runner().map(&classes, |class| {
+                let class = *class;
+                let fields = reflected_fields_from_model(
+                    class,
+                    &class_names_by_id,
+                    role_classifier.reflection_marker_type_ids(),
+                );
+                let base_type_ids = fields
+                    .iter()
+                    .filter(|field| field.is_base_class)
+                    .map(|field| field.type_id)
+                    .collect::<Vec<_>>();
+                ReflectedType {
+                    name: class.name.clone(),
+                    type_id: class.type_id,
+                    version: class.version,
+                    role: ReflectedTypeRole::SupportType,
+                    is_reflection_marker: role_classifier.is_reflection_marker(class.type_id),
+                    fields,
+                    base_type_ids,
+                }
+            });
 
             for reflected in &mut reflected_types {
                 reflected.role = role_classifier.classify(reflected.type_id);
@@ -553,14 +551,9 @@ fn read_module_descriptor_directory(
     });
     entries.sort();
 
-    let modules = context
-        .runner()
-        .map(&entries, |entry| {
-            read_json(entry)
-                .map(|root| module_descriptor_capture(module_name_from_path(entry), root))
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+    let modules = context.runner().try_map(&entries, |entry| {
+        read_json(entry).map(|root| module_descriptor_capture(module_name_from_path(entry), root))
+    })?;
 
     Ok(module_descriptors_root(modules))
 }

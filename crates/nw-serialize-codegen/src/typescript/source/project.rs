@@ -1,3 +1,4 @@
+use crate::CodegenContext;
 use crate::ir::SerializeCodegenUnit;
 
 use super::super::support;
@@ -39,19 +40,22 @@ impl TypeScriptSourceEmitter {
     pub fn emit_standalone_project(
         &self,
         unit: &SerializeCodegenUnit,
+        context: &CodegenContext,
     ) -> Result<TypeScriptStandaloneProject, TypeScriptSourceEmitError> {
-        self.emit_standalone_project_with_context(unit, unit)
+        self.emit_standalone_project_with_context(unit, unit, context)
     }
 
     pub fn emit_standalone_project_with_context(
         &self,
         emitted_unit: &SerializeCodegenUnit,
         context_unit: &SerializeCodegenUnit,
+        context: &CodegenContext,
     ) -> Result<TypeScriptStandaloneProject, TypeScriptSourceEmitError> {
         self.emit_standalone_project_with_options_and_context(
             emitted_unit,
             context_unit,
             &TypeScriptStandaloneProjectOptions::default(),
+            context,
         )
     }
 
@@ -59,8 +63,9 @@ impl TypeScriptSourceEmitter {
         &self,
         unit: &SerializeCodegenUnit,
         options: &TypeScriptStandaloneProjectOptions,
+        context: &CodegenContext,
     ) -> Result<TypeScriptStandaloneProject, TypeScriptSourceEmitError> {
-        self.emit_standalone_project_with_options_and_context(unit, unit, options)
+        self.emit_standalone_project_with_options_and_context(unit, unit, options, context)
     }
 
     pub fn emit_standalone_project_with_options_and_context(
@@ -68,6 +73,7 @@ impl TypeScriptSourceEmitter {
         emitted_unit: &SerializeCodegenUnit,
         context_unit: &SerializeCodegenUnit,
         options: &TypeScriptStandaloneProjectOptions,
+        context: &CodegenContext,
     ) -> Result<TypeScriptStandaloneProject, TypeScriptSourceEmitError> {
         let mut files = vec![
             TypeScriptStandaloneProjectFile {
@@ -119,7 +125,11 @@ impl TypeScriptSourceEmitter {
                 source: format_typescript_source(support::math_module_source())?,
             },
         ];
-        files.extend(self.emit_project_type_files_with_context(emitted_unit, context_unit)?);
+        files.extend(self.emit_project_type_files_with_context(
+            emitted_unit,
+            context_unit,
+            context,
+        )?);
         Ok(TypeScriptStandaloneProject { files })
     }
 }

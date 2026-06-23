@@ -92,10 +92,15 @@ fn sample_output_unit_keeps_scalar_support_coverage() {
     RustSourceEmitter::emit_standalone_project(&rust_unit, &CodegenContext::inline())
         .expect("sample Rust project");
     GoSourceEmitter::default()
-        .emit_standalone_project(&unit, "aztypesvalidation", "aztypesvalidation")
+        .emit_standalone_project(
+            &unit,
+            "aztypesvalidation",
+            "aztypesvalidation",
+            &CodegenContext::inline(),
+        )
         .expect("sample Go project");
     TypeScriptSourceEmitter
-        .emit_standalone_project(&unit)
+        .emit_standalone_project(&unit, &CodegenContext::inline())
         .expect("sample TypeScript project");
 }
 
@@ -240,7 +245,11 @@ fn validate_go(compile_unit: &CompileUnit) {
 fn write_go_output(compile_unit: &CompileUnit) -> PathBuf {
     write_go_project(
         compile_unit
-            .emit_standalone_go_project("aztypesvalidation", "aztypesvalidation")
+            .emit_standalone_go_project(
+                "aztypesvalidation",
+                "aztypesvalidation",
+                &CodegenContext::inline(),
+            )
             .expect("Go standalone project"),
     )
 }
@@ -253,6 +262,7 @@ fn write_selected_go_output(regen_units: &CompletedCodegenUnits) -> PathBuf {
                 &regen_units.context,
                 "aztypesvalidation",
                 "aztypesvalidation",
+                &CodegenContext::inline(),
             )
             .expect("selected Go standalone project"),
     )
@@ -355,7 +365,10 @@ fn join_regeneration<T>(name: &str, handle: thread::ScopedJoinHandle<'_, T>) {
 fn write_typescript_output(compile_unit: &CompileUnit) -> PathBuf {
     write_typescript_project(
         compile_unit
-            .emit_standalone_typescript_project_with_options(&typescript_project_options())
+            .emit_standalone_typescript_project_with_options(
+                &typescript_project_options(),
+                &CodegenContext::inline(),
+            )
             .expect("TypeScript standalone project"),
     )
 }
@@ -367,6 +380,7 @@ fn write_selected_typescript_output(regen_units: &CompletedCodegenUnits) -> Path
                 &regen_units.emitted,
                 &regen_units.context,
                 &typescript_project_options(),
+                &CodegenContext::inline(),
             )
             .expect("selected TypeScript standalone project"),
     )

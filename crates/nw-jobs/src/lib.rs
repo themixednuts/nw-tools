@@ -183,6 +183,20 @@ impl JobRunner {
         }
     }
 
+    pub fn try_map<T, R, E, F>(&self, items: &[T], f: F) -> Result<Vec<R>, E>
+    where
+        T: Sync,
+        R: Send,
+        E: Send,
+        F: Fn(&T) -> Result<R, E> + Send + Sync,
+    {
+        match &self.execution {
+            Execution::Inline => items.iter().map(f).collect(),
+            Execution::Global => items.par_iter().map(f).collect(),
+            Execution::Pool(pool) => pool.install(|| items.par_iter().map(f).collect()),
+        }
+    }
+
     pub fn install<R, F>(&self, f: F) -> R
     where
         R: Send,
@@ -257,6 +271,51 @@ impl JobRunner {
         collect_job_batch(mapped, cancel.is_cancelled())
     }
 
+    pub fn try_map_until_cancelled<T, R, E, F>(
+        &self,
+        items: &[T],
+        cancel: &CancellationToken,
+        f: F,
+    ) -> Result<JobBatch<R>, E>
+    where
+        T: Sync,
+        R: Send,
+        E: Send,
+        F: Fn(&T) -> Result<R, E> + Send + Sync,
+    {
+        let mapped: Vec<Option<R>> = match &self.execution {
+            Execution::Inline => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    if cancel.is_cancelled() {
+                        out.push(None);
+                        continue;
+                    }
+
+                    match f(item) {
+                        Ok(value) => out.push(Some(value)),
+                        Err(error) => {
+                            cancel.cancel();
+                            return Err(error);
+                        }
+                    }
+                }
+                out
+            }
+            Execution::Global => items
+                .par_iter()
+                .map(|item| try_map_item_until_cancelled(item, cancel, &f))
+                .collect::<Result<Vec<_>, _>>()?,
+            Execution::Pool(pool) => pool.install(|| {
+                items
+                    .par_iter()
+                    .map(|item| try_map_item_until_cancelled(item, cancel, &f))
+                    .collect::<Result<Vec<_>, _>>()
+            })?,
+        };
+        Ok(collect_job_batch(mapped, cancel.is_cancelled()))
+    }
+
     pub fn map_init<T, S, R, Init, F>(&self, items: &[T], init: Init, f: F) -> Vec<R>
     where
         T: Sync,
@@ -264,6 +323,30 @@ impl JobRunner {
         R: Send,
         Init: Fn() -> S + Send + Sync,
         F: Fn(&mut S, &T) -> R + Send + Sync,
+    {
+        match &self.execution {
+            Execution::Inline => {
+                let mut state = init();
+                items.iter().map(|item| f(&mut state, item)).collect()
+            }
+            Execution::Global => items.par_iter().map_init(init, f).collect(),
+            Execution::Pool(pool) => pool.install(|| items.par_iter().map_init(init, f).collect()),
+        }
+    }
+
+    pub fn try_map_init<T, S, R, E, Init, F>(
+        &self,
+        items: &[T],
+        init: Init,
+        f: F,
+    ) -> Result<Vec<R>, E>
+    where
+        T: Sync,
+        S: Send,
+        R: Send,
+        E: Send,
+        Init: Fn() -> S + Send + Sync,
+        F: Fn(&mut S, &T) -> Result<R, E> + Send + Sync,
     {
         match &self.execution {
             Execution::Inline => {
@@ -327,6 +410,59 @@ impl JobRunner {
         };
         collect_job_batch(mapped, cancel.is_cancelled())
     }
+
+    pub fn try_map_init_until_cancelled<T, S, R, E, Init, F>(
+        &self,
+        items: &[T],
+        cancel: &CancellationToken,
+        init: Init,
+        f: F,
+    ) -> Result<JobBatch<R>, E>
+    where
+        T: Sync,
+        S: Send,
+        R: Send,
+        E: Send,
+        Init: Fn() -> S + Send + Sync,
+        F: Fn(&mut S, &T) -> Result<R, E> + Send + Sync,
+    {
+        let mapped: Vec<Option<R>> = match &self.execution {
+            Execution::Inline => {
+                let mut state = init();
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    if cancel.is_cancelled() {
+                        out.push(None);
+                        continue;
+                    }
+
+                    match f(&mut state, item) {
+                        Ok(value) => out.push(Some(value)),
+                        Err(error) => {
+                            cancel.cancel();
+                            return Err(error);
+                        }
+                    }
+                }
+                out
+            }
+            Execution::Global => items
+                .par_iter()
+                .map_init(init, |state, item| {
+                    try_map_init_item_until_cancelled(state, item, cancel, &f)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Execution::Pool(pool) => pool.install(|| {
+                items
+                    .par_iter()
+                    .map_init(init, |state, item| {
+                        try_map_init_item_until_cancelled(state, item, cancel, &f)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?,
+        };
+        Ok(collect_job_batch(mapped, cancel.is_cancelled()))
+    }
 }
 
 /// Register SIGINT/SIGTERM handlers that cancel `cancel`.
@@ -357,6 +493,47 @@ fn collect_job_batch<R>(mapped: Vec<Option<R>>, cancelled: bool) -> JobBatch<R> 
     let skipped = mapped.iter().filter(|item| item.is_none()).count();
     let completed = mapped.into_iter().flatten().collect();
     JobBatch::new(completed, skipped, cancelled || skipped > 0)
+}
+
+fn try_map_item_until_cancelled<T, R, E, F>(
+    item: &T,
+    cancel: &CancellationToken,
+    f: &F,
+) -> Result<Option<R>, E>
+where
+    F: Fn(&T) -> Result<R, E>,
+{
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
+    match f(item) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            cancel.cancel();
+            Err(error)
+        }
+    }
+}
+
+fn try_map_init_item_until_cancelled<T, S, R, E, F>(
+    state: &mut S,
+    item: &T,
+    cancel: &CancellationToken,
+    f: &F,
+) -> Result<Option<R>, E>
+where
+    F: Fn(&mut S, &T) -> Result<R, E>,
+{
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
+    match f(state, item) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            cancel.cancel();
+            Err(error)
+        }
+    }
 }
 
 #[derive(Debug)]

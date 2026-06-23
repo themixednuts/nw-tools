@@ -1153,7 +1153,7 @@ mod tests {
         assert!(!unit_source.contains("Typeaaaaaaaa"), "{unit_source}");
 
         let project = TypeScriptSourceEmitter
-            .emit_standalone_project(&unit)
+            .emit_standalone_project(&unit, &crate::CodegenContext::inline())
             .expect("TypeScript project");
         let source = project
             .files
@@ -1208,7 +1208,11 @@ mod tests {
         };
 
         let project = TypeScriptSourceEmitter
-            .emit_standalone_project_with_context(&emitted_unit, &context_unit)
+            .emit_standalone_project_with_context(
+                &emitted_unit,
+                &context_unit,
+                &crate::CodegenContext::inline(),
+            )
             .expect("standalone TypeScript project");
         let sources = project
             .files
@@ -1257,7 +1261,7 @@ mod tests {
         };
 
         let project = TypeScriptSourceEmitter
-            .emit_standalone_project(&unit)
+            .emit_standalone_project(&unit, &crate::CodegenContext::inline())
             .expect("standalone TypeScript project");
         let catalog_item = project
             .files
@@ -1376,7 +1380,7 @@ mod tests {
         };
 
         let project = TypeScriptSourceEmitter
-            .emit_standalone_project(&unit)
+            .emit_standalone_project(&unit, &crate::CodegenContext::inline())
             .expect("TypeScript standalone project");
         let source = project
             .files
@@ -1435,7 +1439,7 @@ mod tests {
         let unit = namespace_and_base_family_fixture();
 
         let project = TypeScriptSourceEmitter
-            .emit_standalone_project(&unit)
+            .emit_standalone_project(&unit, &crate::CodegenContext::inline())
             .expect("TypeScript standalone project");
         let paths = project
             .files

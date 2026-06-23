@@ -131,19 +131,25 @@ impl<'a> SerializeCodegenView<'a> {
 
     pub fn emit_standalone_typescript_project(
         &self,
+        context: &CodegenContext,
     ) -> Result<TypeScriptStandaloneProject, TypeScriptSourceEmitError> {
-        TypeScriptSourceEmitter
-            .emit_standalone_project_with_context(self.emitted_unit(), self.context_unit())
+        TypeScriptSourceEmitter.emit_standalone_project_with_context(
+            self.emitted_unit(),
+            self.context_unit(),
+            context,
+        )
     }
 
     pub fn emit_standalone_typescript_project_with_options(
         &self,
         options: &TypeScriptStandaloneProjectOptions,
+        context: &CodegenContext,
     ) -> Result<TypeScriptStandaloneProject, TypeScriptSourceEmitError> {
         TypeScriptSourceEmitter.emit_standalone_project_with_options_and_context(
             self.emitted_unit(),
             self.context_unit(),
             options,
+            context,
         )
     }
 
@@ -170,12 +176,14 @@ impl<'a> SerializeCodegenView<'a> {
         &self,
         module_path: &str,
         package_name: &str,
+        context: &CodegenContext,
     ) -> Result<GoStandaloneProject, GoSourceEmitError> {
         GoSourceEmitter::default().emit_standalone_project_with_context(
             self.emitted_unit(),
             self.context_unit(),
             module_path,
             package_name,
+            context,
         )
     }
 }
