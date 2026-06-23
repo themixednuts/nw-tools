@@ -335,7 +335,11 @@ mod tests {
         let inventory = RustSourceInventory::from_sources([]).expect("empty source inventory");
 
         let plan = compile_unit
-            .plan_rust_integration(&inventory, &FlatRustItemPathResolver::new("components"))
+            .plan_rust_integration(
+                &inventory,
+                &FlatRustItemPathResolver::new("components"),
+                &CodegenContext::inline(),
+            )
             .expect("rust integration plan");
 
         let counter = plan
@@ -413,7 +417,11 @@ pub struct ExternalPayload;
             .expect("inventory");
 
         let plan = compile_unit
-            .plan_rust_integration(&inventory, &FlatRustItemPathResolver::new("components"))
+            .plan_rust_integration(
+                &inventory,
+                &FlatRustItemPathResolver::new("components"),
+                &CodegenContext::inline(),
+            )
             .expect("rust integration plan");
 
         let owner = plan
@@ -674,17 +682,19 @@ pub struct ExternalPayload;
         let unit = SerializeContextCompiler::compile(document, &CodegenContext::inline());
         let selected_view = unit.codegen_view(SerializeCodegenSelection::RuntimeRoots);
 
+        let context = crate::CodegenContext::inline();
         let analysis = unit.layout_analysis_report();
-        let layout = unit.standalone_rust_layout_report();
-        let selected_layout =
-            unit.selected_standalone_rust_layout_report(SerializeCodegenSelection::RuntimeRoots);
+        let layout = unit.standalone_rust_layout_report(&context);
+        let selected_layout = unit.selected_standalone_rust_layout_report(
+            SerializeCodegenSelection::RuntimeRoots,
+            &context,
+        );
         let go_layout = unit.standalone_go_layout_report();
         let selected_go_layout =
             unit.selected_standalone_go_layout_report(SerializeCodegenSelection::RuntimeRoots);
         let typescript_layout = unit.standalone_typescript_layout_report();
         let selected_typescript_layout = unit
             .selected_standalone_typescript_layout_report(SerializeCodegenSelection::RuntimeRoots);
-        let context = crate::CodegenContext::inline();
         let rust = unit.emit_rust_source(&context).expect("Rust source");
         let typescript = unit
             .emit_typescript_source_with_options(&TypeScriptSourceOptions {
@@ -740,7 +750,7 @@ pub struct ExternalPayload;
         );
         assert_eq!(
             selected_view
-                .standalone_rust_layout_report()
+                .standalone_rust_layout_report(&context)
                 .files
                 .iter()
                 .map(|file| file.path.as_str())

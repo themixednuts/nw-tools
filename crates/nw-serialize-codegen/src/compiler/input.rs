@@ -78,14 +78,9 @@ fn read_module_descriptor_directory(
     });
     entries.sort();
 
-    let modules = context
-        .runner()
-        .map(&entries, |entry| {
-            read_json(entry)
-                .map(|root| module_descriptor_capture(module_name_from_path(entry), root))
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+    let modules = context.runner().try_map(&entries, |entry| {
+        read_json(entry).map(|root| module_descriptor_capture(module_name_from_path(entry), root))
+    })?;
 
     Ok(module_descriptors_root(modules))
 }

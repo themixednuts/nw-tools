@@ -441,8 +441,11 @@ fn rust_output_files(
 ) -> Result<Vec<OutputFile>> {
     match layout {
         RustLayout::Standalone => {
-            let rust_unit = RustCodegenPlanner::standalone()
-                .plan_serialize_codegen_unit_with_context(&completed.emitted, &completed.context);
+            let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_units(
+                &completed.emitted,
+                &completed.context,
+                context,
+            );
             let mut files = RustSourceEmitter::emit_standalone_project(&rust_unit, context)
                 .context("emit standalone Rust project")?
                 .files
@@ -456,8 +459,11 @@ fn rust_output_files(
             Ok(files)
         }
         RustLayout::Module => {
-            let rust_unit = RustCodegenPlanner::default()
-                .plan_serialize_codegen_unit_with_context(&completed.emitted, &completed.context);
+            let rust_unit = RustCodegenPlanner::default().plan_serialize_codegen_units(
+                &completed.emitted,
+                &completed.context,
+                context,
+            );
             let source = RustSourceEmitter::emit_unit(&rust_unit, context)
                 .context("emit integrated Rust module")?;
             Ok(vec![OutputFile {
@@ -466,8 +472,11 @@ fn rust_output_files(
             }])
         }
         RustLayout::Modules => {
-            let rust_unit = RustCodegenPlanner::default()
-                .plan_serialize_codegen_unit_with_context(&completed.emitted, &completed.context);
+            let rust_unit = RustCodegenPlanner::default().plan_serialize_codegen_units(
+                &completed.emitted,
+                &completed.context,
+                context,
+            );
             RustSourceEmitter::emit_integrated_project(&rust_unit, context)
                 .context("emit integrated Rust module tree")
                 .map(|project| {

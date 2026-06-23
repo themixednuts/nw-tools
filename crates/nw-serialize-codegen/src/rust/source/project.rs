@@ -425,8 +425,8 @@ fn render_module_item_source(
         })?;
     let cancelled = rendered.was_cancelled();
     let mut source = String::new();
-    for item in rendered.into_completed() {
-        source.push_str(item.trim_start());
+    for result in rendered.into_completed() {
+        source.push_str(result.trim_start());
         if !source.ends_with('\n') {
             source.push('\n');
         }

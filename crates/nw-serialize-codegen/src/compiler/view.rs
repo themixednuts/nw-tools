@@ -59,37 +59,47 @@ impl<'a> SerializeCodegenView<'a> {
     }
 
     #[must_use]
-    pub fn rust_codegen_unit(&self) -> RustCodegenUnit {
-        RustCodegenPlanner::default()
-            .plan_serialize_codegen_unit_with_context(self.emitted_unit(), self.context_unit())
+    pub fn rust_codegen_unit(&self, context: &CodegenContext) -> RustCodegenUnit {
+        RustCodegenPlanner::default().plan_serialize_codegen_units(
+            self.emitted_unit(),
+            self.context_unit(),
+            context,
+        )
     }
 
     #[must_use]
     pub fn rust_codegen_unit_with_source_types(
         &self,
         source_types: RustSourceTypeIndex,
+        context: &CodegenContext,
     ) -> RustCodegenUnit {
         RustCodegenPlanner::default()
             .with_source_type_index(source_types)
-            .plan_serialize_codegen_unit_with_context(self.emitted_unit(), self.context_unit())
+            .plan_serialize_codegen_units(self.emitted_unit(), self.context_unit(), context)
     }
 
     #[must_use]
-    pub fn standalone_rust_codegen_unit(&self) -> RustCodegenUnit {
-        RustCodegenPlanner::standalone()
-            .plan_serialize_codegen_unit_with_context(self.emitted_unit(), self.context_unit())
+    pub fn standalone_rust_codegen_unit(&self, context: &CodegenContext) -> RustCodegenUnit {
+        RustCodegenPlanner::standalone().plan_serialize_codegen_units(
+            self.emitted_unit(),
+            self.context_unit(),
+            context,
+        )
     }
 
     #[must_use]
-    pub fn standalone_rust_layout_report(&self) -> RustStandaloneLayoutReport {
-        RustStandaloneLayoutReport::from_codegen_unit(&self.standalone_rust_codegen_unit())
+    pub fn standalone_rust_layout_report(
+        &self,
+        context: &CodegenContext,
+    ) -> RustStandaloneLayoutReport {
+        RustStandaloneLayoutReport::from_codegen_unit(&self.standalone_rust_codegen_unit(context))
     }
 
     pub fn emit_rust_source(
         &self,
         context: &CodegenContext,
     ) -> Result<String, RustSourceEmitError> {
-        RustSourceEmitter::emit_unit(&self.rust_codegen_unit(), context)
+        RustSourceEmitter::emit_unit(&self.rust_codegen_unit(context), context)
     }
 
     pub fn emit_rust_source_with_source_types(
@@ -98,7 +108,7 @@ impl<'a> SerializeCodegenView<'a> {
         context: &CodegenContext,
     ) -> Result<String, RustSourceEmitError> {
         RustSourceEmitter::emit_unit(
-            &self.rust_codegen_unit_with_source_types(source_types),
+            &self.rust_codegen_unit_with_source_types(source_types, context),
             context,
         )
     }
@@ -107,7 +117,10 @@ impl<'a> SerializeCodegenView<'a> {
         &self,
         context: &CodegenContext,
     ) -> Result<RustStandaloneProject, RustSourceEmitError> {
-        RustSourceEmitter::emit_standalone_project(&self.standalone_rust_codegen_unit(), context)
+        RustSourceEmitter::emit_standalone_project(
+            &self.standalone_rust_codegen_unit(context),
+            context,
+        )
     }
 
     pub fn emit_typescript_source(&self) -> Result<String, TypeScriptSourceEmitError> {

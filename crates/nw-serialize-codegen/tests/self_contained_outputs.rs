@@ -19,6 +19,10 @@ use nw_serialize_codegen::{MapKind, PointerKind, ReflectedTypeRole, ResolvedType
 use nw_serialize_codegen::{RustCodegenUnit, SequenceKind};
 use uuid::uuid;
 
+fn codegen_context() -> CodegenContext {
+    CodegenContext::inline()
+}
+
 #[test]
 #[ignore = "runs external language toolchains against repo-local type output directories"]
 fn full_serialize_output_directories_are_self_contained_and_lint_clean() {
@@ -86,21 +90,16 @@ fn default_runtime_rust_output_directory_is_regenerated() {
 #[test]
 fn sample_output_unit_keeps_scalar_support_coverage() {
     let unit = sample_unit();
+    let context = codegen_context();
 
-    let rust_unit: RustCodegenUnit =
-        RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
-    RustSourceEmitter::emit_standalone_project(&rust_unit, &CodegenContext::inline())
-        .expect("sample Rust project");
+    let rust_unit: RustCodegenUnit = RustCodegenPlanner::standalone()
+        .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
+    RustSourceEmitter::emit_standalone_project(&rust_unit, &context).expect("sample Rust project");
     GoSourceEmitter::default()
-        .emit_standalone_project(
-            &unit,
-            "aztypesvalidation",
-            "aztypesvalidation",
-            &CodegenContext::inline(),
-        )
+        .emit_standalone_project(&unit, "aztypesvalidation", "aztypesvalidation", &context)
         .expect("sample Go project");
     TypeScriptSourceEmitter
-        .emit_standalone_project(&unit, &CodegenContext::inline())
+        .emit_standalone_project(&unit, &context)
         .expect("sample TypeScript project");
 }
 
@@ -130,7 +129,7 @@ fn validate_rust(compile_unit: &CompileUnit) {
 fn write_rust_output(compile_unit: &CompileUnit) -> PathBuf {
     write_rust_project(
         compile_unit
-            .emit_standalone_rust_project(&CodegenContext::automatic())
+            .emit_standalone_rust_project(&codegen_context())
             .expect("standalone Rust project"),
     )
 }
@@ -143,10 +142,13 @@ fn write_selected_rust_output_to_dir(
     regen_units: &CompletedCodegenUnits,
     output_dir_name: &str,
 ) -> PathBuf {
-    let rust_unit = RustCodegenPlanner::standalone()
-        .plan_serialize_codegen_unit_with_context(&regen_units.emitted, &regen_units.context);
+    let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_units(
+        &regen_units.emitted,
+        &regen_units.context,
+        &crate::CodegenContext::inline(),
+    );
     write_rust_project_to_dir(
-        RustSourceEmitter::emit_standalone_project(&rust_unit, &CodegenContext::inline())
+        RustSourceEmitter::emit_standalone_project(&rust_unit, &codegen_context())
             .expect("selected standalone Rust project"),
         output_dir_name,
     )
@@ -248,7 +250,7 @@ fn write_go_output(compile_unit: &CompileUnit) -> PathBuf {
             .emit_standalone_go_project(
                 "aztypesvalidation",
                 "aztypesvalidation",
-                &CodegenContext::inline(),
+                &codegen_context(),
             )
             .expect("Go standalone project"),
     )
@@ -262,7 +264,7 @@ fn write_selected_go_output(regen_units: &CompletedCodegenUnits) -> PathBuf {
                 &regen_units.context,
                 "aztypesvalidation",
                 "aztypesvalidation",
-                &CodegenContext::inline(),
+                &codegen_context(),
             )
             .expect("selected Go standalone project"),
     )
@@ -367,7 +369,7 @@ fn write_typescript_output(compile_unit: &CompileUnit) -> PathBuf {
         compile_unit
             .emit_standalone_typescript_project_with_options(
                 &typescript_project_options(),
-                &CodegenContext::inline(),
+                &codegen_context(),
             )
             .expect("TypeScript standalone project"),
     )
@@ -380,7 +382,7 @@ fn write_selected_typescript_output(regen_units: &CompletedCodegenUnits) -> Path
                 &regen_units.emitted,
                 &regen_units.context,
                 &typescript_project_options(),
-                &CodegenContext::inline(),
+                &codegen_context(),
             )
             .expect("selected TypeScript standalone project"),
     )
@@ -423,7 +425,7 @@ fn project_compile_unit() -> CompileUnit {
         Some(resources.join("modules")),
         None::<&Path>,
         None::<&Path>,
-        &CodegenContext::inline(),
+        &codegen_context(),
     )
     .expect("compile project serialize context");
     assert!(

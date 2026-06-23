@@ -29,18 +29,14 @@ impl RustSourceTypeIndex {
         paths.sort();
 
         let mut index = Self::default();
-        let scans = context
-            .runner()
-            .map(&paths, |path| {
-                let source =
-                    std::fs::read_to_string(path).map_err(|source| RustIntegrationError::Read {
-                        path: path.clone(),
-                        source,
-                    })?;
-                Self::from_source(root, path, &source)
-            })
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+        let scans = context.runner().try_map(&paths, |path| {
+            let source =
+                std::fs::read_to_string(path).map_err(|source| RustIntegrationError::Read {
+                    path: path.clone(),
+                    source,
+                })?;
+            Self::from_source(root, path, &source)
+        })?;
         for scan in scans {
             index.merge(scan);
         }

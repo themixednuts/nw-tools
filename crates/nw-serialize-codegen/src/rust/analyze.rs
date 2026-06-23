@@ -589,7 +589,7 @@ mod tests {
             "editContext": {"$id": 2, "classData": [], "enumData": []},
             "enumTypeIdToUnderlyingTypeIdMap": {}
         }));
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
         let item = unit
             .items
             .iter()

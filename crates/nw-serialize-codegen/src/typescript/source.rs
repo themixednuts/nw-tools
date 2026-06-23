@@ -1152,8 +1152,9 @@ mod tests {
         );
         assert!(!unit_source.contains("Typeaaaaaaaa"), "{unit_source}");
 
+        let context = crate::CodegenContext::inline();
         let project = TypeScriptSourceEmitter
-            .emit_standalone_project(&unit, &crate::CodegenContext::inline())
+            .emit_standalone_project(&unit, &context)
             .expect("TypeScript project");
         let source = project
             .files
@@ -1207,12 +1208,9 @@ mod tests {
             items: vec![component, shared, other_shared],
         };
 
+        let context = crate::CodegenContext::inline();
         let project = TypeScriptSourceEmitter
-            .emit_standalone_project_with_context(
-                &emitted_unit,
-                &context_unit,
-                &crate::CodegenContext::inline(),
-            )
+            .emit_standalone_project_with_context(&emitted_unit, &context_unit, &context)
             .expect("standalone TypeScript project");
         let sources = project
             .files
@@ -1260,8 +1258,9 @@ mod tests {
             ],
         };
 
+        let context = crate::CodegenContext::inline();
         let project = TypeScriptSourceEmitter
-            .emit_standalone_project(&unit, &crate::CodegenContext::inline())
+            .emit_standalone_project(&unit, &context)
             .expect("standalone TypeScript project");
         let catalog_item = project
             .files
@@ -1379,8 +1378,9 @@ mod tests {
             }],
         };
 
+        let context = crate::CodegenContext::inline();
         let project = TypeScriptSourceEmitter
-            .emit_standalone_project(&unit, &crate::CodegenContext::inline())
+            .emit_standalone_project(&unit, &context)
             .expect("TypeScript standalone project");
         let source = project
             .files
@@ -1438,8 +1438,9 @@ mod tests {
     fn standalone_project_places_namespace_before_component_family() {
         let unit = namespace_and_base_family_fixture();
 
+        let context = crate::CodegenContext::inline();
         let project = TypeScriptSourceEmitter
-            .emit_standalone_project(&unit, &crate::CodegenContext::inline())
+            .emit_standalone_project(&unit, &context)
             .expect("TypeScript standalone project");
         let paths = project
             .files

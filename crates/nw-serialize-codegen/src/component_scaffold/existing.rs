@@ -53,44 +53,39 @@ pub(super) fn discover_existing_components(
     collect_rust_files(root, &mut files)?;
     files.sort();
 
-    let scanned_files = context
-        .runner()
-        .map(
-            &files,
-            |file_path| -> Result<ExistingRustFileScan, ComponentScaffoldError> {
-                let text = fs::read_to_string(file_path).map_err(|source| {
-                    ComponentScaffoldError::Read {
-                        path: file_path.to_path_buf(),
-                        source,
-                    }
+    let scanned_files = context.runner().try_map(
+        &files,
+        |file_path| -> Result<ExistingRustFileScan, ComponentScaffoldError> {
+            let text =
+                fs::read_to_string(file_path).map_err(|source| ComponentScaffoldError::Read {
+                    path: file_path.to_path_buf(),
+                    source,
                 })?;
-                let components = identity::scan_component_structs(&text, file_path)
-                    .into_iter()
-                    .filter_map(|scanned| {
-                        scanned.type_id.map(|type_id| {
-                            (
-                                type_id,
-                                ExistingComponent {
-                                    component_name: scanned.component_name,
-                                    file_path: scanned.file_path,
-                                    field_names: scanned.field_names,
-                                    field_names_in_order: scanned.field_names_in_order,
-                                    insert_offset: scanned.insert_offset,
-                                    unit_struct_semicolon: scanned.unit_struct_semicolon,
-                                },
-                            )
-                        })
+            let components = identity::scan_component_structs(&text, file_path)
+                .into_iter()
+                .filter_map(|scanned| {
+                    scanned.type_id.map(|type_id| {
+                        (
+                            type_id,
+                            ExistingComponent {
+                                component_name: scanned.component_name,
+                                file_path: scanned.file_path,
+                                field_names: scanned.field_names,
+                                field_names_in_order: scanned.field_names_in_order,
+                                insert_offset: scanned.insert_offset,
+                                unit_struct_semicolon: scanned.unit_struct_semicolon,
+                            },
+                        )
                     })
-                    .collect::<Vec<_>>();
-                let source_types = RustSourceTypeIndex::from_source(root, file_path, &text)?;
-                Ok(ExistingRustFileScan {
-                    components,
-                    source_types,
                 })
-            },
-        )
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Vec<_>>();
+            let source_types = RustSourceTypeIndex::from_source(root, file_path, &text)?;
+            Ok(ExistingRustFileScan {
+                components,
+                source_types,
+            })
+        },
+    )?;
 
     for file_scan in scanned_files {
         source_types.merge(file_scan.source_types);

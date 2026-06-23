@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use uuid::Uuid;
 
+use crate::CodegenContext;
 use crate::field_projection::item_has_materialized_payload;
 use crate::ir::{
     SerializeCodegenItem, SerializeCodegenItemKind, SerializeCodegenPlanner, SerializeCodegenUnit,
@@ -32,6 +33,16 @@ pub struct RustCodegenPlanner {
     field_planner: RustFieldPlanner,
     source_types: Option<RustSourceTypeIndex>,
     manual_default_type_ids: BTreeSet<Uuid>,
+}
+
+#[derive(Debug, Default)]
+struct RustPlanWorkerState {
+    eq_cache: BTreeMap<Uuid, bool>,
+    default_cache: BTreeMap<Uuid, bool>,
+    hash_cache: BTreeMap<Uuid, bool>,
+    copy_cache: BTreeMap<Uuid, bool>,
+    marshaler_cache: BTreeMap<Uuid, bool>,
+    serde_cache: BTreeMap<Uuid, bool>,
 }
 
 impl Default for RustCodegenPlanner {
@@ -83,28 +94,38 @@ impl RustCodegenPlanner {
     }
 
     #[must_use]
-    pub fn plan_model(model: &SerializeContextModel) -> RustCodegenUnit {
-        Self::default().plan(model)
+    pub fn plan_model(model: &SerializeContextModel, context: &CodegenContext) -> RustCodegenUnit {
+        Self::default().plan(model, context)
     }
 
     #[must_use]
-    pub fn plan_standalone_model(model: &SerializeContextModel) -> RustCodegenUnit {
-        Self::standalone().plan(model)
+    pub fn plan_standalone_model(
+        model: &SerializeContextModel,
+        context: &CodegenContext,
+    ) -> RustCodegenUnit {
+        Self::standalone().plan(model, context)
     }
 
     #[must_use]
-    pub fn plan_codegen_unit(unit: &SerializeCodegenUnit) -> RustCodegenUnit {
-        Self::default().plan_serialize_codegen_unit(unit)
+    pub fn plan_codegen_unit(
+        unit: &SerializeCodegenUnit,
+        context: &CodegenContext,
+    ) -> RustCodegenUnit {
+        Self::default().plan_serialize_codegen_unit(unit, context)
     }
 
     #[must_use]
-    pub fn plan(&self, model: &SerializeContextModel) -> RustCodegenUnit {
-        self.plan_serialize_codegen_unit(&SerializeCodegenPlanner::plan_model(model))
+    pub fn plan(&self, model: &SerializeContextModel, context: &CodegenContext) -> RustCodegenUnit {
+        self.plan_serialize_codegen_unit(&SerializeCodegenPlanner::plan_model(model), context)
     }
 
     #[must_use]
-    pub fn plan_serialize_codegen_unit(&self, unit: &SerializeCodegenUnit) -> RustCodegenUnit {
-        self.plan_serialize_codegen_unit_with_context(unit, unit)
+    pub fn plan_serialize_codegen_unit(
+        &self,
+        unit: &SerializeCodegenUnit,
+        context: &CodegenContext,
+    ) -> RustCodegenUnit {
+        self.plan_serialize_codegen_units(unit, unit, context)
     }
 
     #[must_use]
@@ -112,22 +133,25 @@ impl RustCodegenPlanner {
         &self,
         unit: &SerializeCodegenUnit,
         selection: crate::ir::SerializeCodegenSelection,
+        context: &CodegenContext,
     ) -> RustCodegenUnit {
         let selected = unit.select(selection);
-        self.plan_serialize_codegen_unit_with_context(&selected, unit)
+        self.plan_serialize_codegen_units(&selected, unit, context)
     }
 
     #[must_use]
-    pub fn plan_serialize_codegen_unit_with_context(
+    pub fn plan_serialize_codegen_units(
         &self,
         emitted_unit: &SerializeCodegenUnit,
         context_unit: &SerializeCodegenUnit,
+        context: &CodegenContext,
     ) -> RustCodegenUnit {
         let context_index = context_unit.index();
         self.plan_serialize_codegen_unit_from_indexes(
             emitted_unit,
             context_index.items_by_type_id(),
             context_unit,
+            context,
         )
     }
 
@@ -136,6 +160,7 @@ impl RustCodegenPlanner {
         emitted_unit: &SerializeCodegenUnit,
         context_items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
         context_unit: &SerializeCodegenUnit,
+        context: &CodegenContext,
     ) -> RustCodegenUnit {
         debug_assert!(
             emitted_unit
@@ -159,33 +184,31 @@ impl RustCodegenPlanner {
             &layout_index,
             &abstract_value_base_type_ids,
         );
-        let mut eq_cache = BTreeMap::new();
-        let mut default_cache = BTreeMap::new();
-        let mut hash_cache = BTreeMap::new();
-        let mut copy_cache = BTreeMap::new();
-        let mut marshaler_cache = BTreeMap::new();
-        let mut serde_cache = BTreeMap::new();
-        let mut items = dependency_ordered_codegen_items(emitted_unit)
+        let ordered_items = dependency_ordered_codegen_items(emitted_unit)
             .into_iter()
             .filter(|item| !item.is_reflection_marker)
-            .map(|item| {
+            .collect::<Vec<_>>();
+        let mut items = context.runner().map_init(
+            &ordered_items,
+            RustPlanWorkerState::default,
+            |state, item| {
                 self.plan_serialize_item(
                     item,
                     context_items_by_type_id,
-                    &mut eq_cache,
-                    &mut default_cache,
-                    &mut hash_cache,
-                    &mut copy_cache,
-                    &mut marshaler_cache,
-                    &mut serde_cache,
+                    &mut state.eq_cache,
+                    &mut state.default_cache,
+                    &mut state.hash_cache,
+                    &mut state.copy_cache,
+                    &mut state.marshaler_cache,
+                    &mut state.serde_cache,
                     &name_plan,
                     &reflected_base_type_ids,
                     &layout_index,
                     &abstract_value_base_type_ids,
                     &emitted_type_ids,
                 )
-            })
-            .collect::<Vec<_>>();
+            },
+        );
         prune_derives_for_planned_dependencies(&mut items, &name_plan);
         prune_integrated_hash_derives(&mut items, self.options.mode, &name_plan);
         RustCodegenUnit { items }
@@ -1007,7 +1030,7 @@ mod tests {
             }
         }));
 
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
         let component = unit
             .items
             .iter()
@@ -1098,7 +1121,8 @@ mod tests {
             ],
         };
 
-        let rust_unit = RustCodegenPlanner::default().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::default()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let float_colors = rust_unit
             .items
             .iter()
@@ -1176,7 +1200,7 @@ pub struct ExternalPayload;
 
         let rust_unit = RustCodegenPlanner::default()
             .with_source_type_index(source_types)
-            .plan_serialize_codegen_unit(&unit);
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let owner = rust_unit.items.first().expect("owner item");
         let field = owner.fields.first().expect("payload field");
 
@@ -1240,7 +1264,8 @@ pub struct ExternalPayload;
             ],
         };
 
-        let rust_unit = RustCodegenPlanner::plan_codegen_unit(&unit);
+        let rust_unit =
+            RustCodegenPlanner::plan_codegen_unit(&unit, &crate::CodegenContext::inline());
         let mode = rust_unit
             .items
             .iter()
@@ -1289,7 +1314,8 @@ pub struct ExternalPayload;
             }],
         };
 
-        let rust_unit = RustCodegenPlanner::plan_codegen_unit(&unit);
+        let rust_unit =
+            RustCodegenPlanner::plan_codegen_unit(&unit, &crate::CodegenContext::inline());
         let field = &rust_unit.items[0].fields[0];
 
         assert_eq!(field.rust_type, "[u8; 16]");
@@ -1375,7 +1401,8 @@ pub struct ExternalPayload;
             ],
         };
 
-        let rust_unit = RustCodegenPlanner::plan_codegen_unit(&unit);
+        let rust_unit =
+            RustCodegenPlanner::plan_codegen_unit(&unit, &crate::CodegenContext::inline());
 
         let actor_ref = rust_unit
             .items
@@ -1488,7 +1515,8 @@ pub struct ExternalPayload;
             ],
         };
 
-        let rust_unit = RustCodegenPlanner::plan_codegen_unit(&unit);
+        let rust_unit =
+            RustCodegenPlanner::plan_codegen_unit(&unit, &crate::CodegenContext::inline());
 
         let home_point_list = rust_unit
             .items
@@ -1552,7 +1580,8 @@ pub struct ExternalPayload;
             }],
         };
 
-        let rust_unit = RustCodegenPlanner::plan_codegen_unit(&unit);
+        let rust_unit =
+            RustCodegenPlanner::plan_codegen_unit(&unit, &crate::CodegenContext::inline());
         let local_entity_ref = &rust_unit.items[0];
 
         assert!(
@@ -1607,7 +1636,8 @@ pub struct ExternalPayload;
             }],
         };
 
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let item = &rust_unit.items[0];
 
         assert_eq!(item.fields[0].rust_type, "[u8; 40]");
@@ -1664,7 +1694,7 @@ pub struct ExternalPayload;
 
         let rust_unit = RustCodegenPlanner::default()
             .without_default_derive_for([type_id])
-            .plan_serialize_codegen_unit(&unit);
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let item = &rust_unit.items[0];
 
         assert!(
@@ -1739,7 +1769,8 @@ pub struct ExternalPayload;
             }],
         };
 
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let item = &rust_unit.items[0];
 
         assert_eq!(item.fields[0].rust_type, "Vec<(f32, String)>");
@@ -1813,7 +1844,8 @@ pub struct ExternalPayload;
             ],
         };
 
-        let rust_unit = RustCodegenPlanner::default().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::default()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         for item_name in ["FloatData", "SlotData"] {
             let item = rust_unit
                 .items
@@ -1873,7 +1905,7 @@ pub struct ExternalPayload;
             "enumTypeIdToUnderlyingTypeIdMap": {}
         }));
 
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
         let component = unit
             .items
             .iter()
@@ -1963,7 +1995,8 @@ pub struct ExternalPayload;
             "enumTypeIdToUnderlyingTypeIdMap": {}
         }));
 
-        let unit = RustCodegenPlanner::plan_standalone_model(&model);
+        let unit =
+            RustCodegenPlanner::plan_standalone_model(&model, &crate::CodegenContext::inline());
         let component = unit
             .items
             .iter()
@@ -2036,7 +2069,8 @@ pub struct ExternalPayload;
             ],
         };
 
-        let rust_unit = RustCodegenPlanner::plan_codegen_unit(&unit);
+        let rust_unit =
+            RustCodegenPlanner::plan_codegen_unit(&unit, &crate::CodegenContext::inline());
         let client_base = rust_unit
             .items
             .iter()
@@ -2182,7 +2216,7 @@ pub struct ExternalPayload;
             "enumTypeIdToUnderlyingTypeIdMap": {}
         }));
 
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
         let component = unit
             .items
             .iter()
@@ -2242,7 +2276,10 @@ pub struct ExternalPayload;
         }));
         let serialize_unit = SerializeCodegenPlanner::plan_model(&model);
 
-        let rust_unit = RustCodegenPlanner::plan_codegen_unit(&serialize_unit);
+        let rust_unit = RustCodegenPlanner::plan_codegen_unit(
+            &serialize_unit,
+            &crate::CodegenContext::inline(),
+        );
         let component = rust_unit
             .items
             .iter()
@@ -2317,7 +2354,8 @@ pub struct ExternalPayload;
             ],
         };
 
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let item_family = rust_unit
             .items
             .iter()
@@ -2394,6 +2432,7 @@ pub struct ExternalPayload;
         let selected = RustCodegenPlanner::standalone().plan_selected_serialize_codegen_unit(
             &serialize_unit,
             SerializeCodegenSelection::RuntimeRoots,
+            &crate::CodegenContext::inline(),
         );
         let component = selected
             .items
@@ -2455,8 +2494,11 @@ pub struct ExternalPayload;
             items: vec![base, derived],
         };
 
-        let rust_unit = RustCodegenPlanner::standalone()
-            .plan_serialize_codegen_unit_with_context(&emitted_unit, &context_unit);
+        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_units(
+            &emitted_unit,
+            &context_unit,
+            &crate::CodegenContext::inline(),
+        );
         let report = RustStandaloneLayoutReport::from_codegen_unit(&rust_unit);
 
         assert!(report.modules.iter().any(|module| {
@@ -2559,7 +2601,8 @@ pub struct ExternalPayload;
             ],
         };
 
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let layer = rust_unit
             .items
             .iter()
@@ -2635,7 +2678,7 @@ pub struct ExternalPayload;
             "enumTypeIdToUnderlyingTypeIdMap": {}
         }));
 
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
         let derived = unit
             .items
             .iter()
@@ -2747,7 +2790,7 @@ pub struct ExternalPayload;
         .expect("schema document");
         let model = SerializeContextModel::from_document(&document);
 
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
         let set_mannequin = unit
             .items
             .iter()
@@ -2857,7 +2900,7 @@ pub struct ExternalPayload;
         .expect("schema document");
         let model = SerializeContextModel::from_document(&document);
 
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
         let condition = unit
             .items
             .iter()

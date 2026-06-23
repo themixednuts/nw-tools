@@ -1364,7 +1364,8 @@ mod tests {
             }],
         };
 
-        let rust_unit = RustCodegenPlanner::plan_codegen_unit(&unit);
+        let rust_unit =
+            RustCodegenPlanner::plan_codegen_unit(&unit, &crate::CodegenContext::inline());
         let project = RustSourceEmitter::emit_integrated_project(
             &rust_unit,
             &crate::CodegenContext::inline(),
@@ -1431,7 +1432,7 @@ mod tests {
                 "22222222-2222-2222-2222-222222222222": type_ids::U8.hyphenated().to_string()
             }
         }));
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
 
         let source = RustSourceEmitter::emit_unit(&unit, &crate::CodegenContext::inline())
             .expect("emitted Rust source");
@@ -1702,7 +1703,8 @@ mod tests {
                 variants: Vec::new(),
             }],
         };
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
 
         let project = RustSourceEmitter::emit_standalone_project(
             &rust_unit,
@@ -1766,7 +1768,8 @@ mod tests {
                 ),
             ],
         };
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let project = RustSourceEmitter::emit_standalone_project(
             &rust_unit,
             &crate::CodegenContext::inline(),
@@ -1836,7 +1839,8 @@ mod tests {
             ],
         };
 
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let project = RustSourceEmitter::emit_standalone_project(
             &rust_unit,
             &crate::CodegenContext::inline(),
@@ -1940,7 +1944,8 @@ mod tests {
             ],
         };
 
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let project = RustSourceEmitter::emit_standalone_project(
             &rust_unit,
             &crate::CodegenContext::inline(),
@@ -1996,7 +2001,8 @@ mod tests {
             ],
         };
 
-        let rust_unit = RustCodegenPlanner::default().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::default()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let project = RustSourceEmitter::emit_integrated_project(
             &rust_unit,
             &crate::CodegenContext::inline(),
@@ -2169,7 +2175,8 @@ mod tests {
                 variants: Vec::new(),
             }],
         };
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
 
         let project = RustSourceEmitter::emit_standalone_project(
             &rust_unit,
@@ -2258,7 +2265,7 @@ mod tests {
                 "33333333-3333-3333-3333-333333333333": type_ids::U32.hyphenated().to_string()
             }
         }));
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
 
         let source = RustSourceEmitter::emit_unit(&unit, &crate::CodegenContext::inline())
             .expect("emitted Rust source");
@@ -2315,7 +2322,7 @@ mod tests {
                 "44444444-4444-4444-4444-444444444444": type_ids::U8.hyphenated().to_string()
             }
         }));
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
 
         let source = RustSourceEmitter::emit_unit(&unit, &crate::CodegenContext::inline())
             .expect("emitted Rust source");
@@ -2371,7 +2378,7 @@ mod tests {
                 "55555555-5555-5555-5555-555555555555": type_ids::U32.hyphenated().to_string()
             }
         }));
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
 
         let source = RustSourceEmitter::emit_unit(&unit, &crate::CodegenContext::inline())
             .expect("emitted Rust source");
@@ -2426,7 +2433,7 @@ mod tests {
             "editContext": {"$id": 2, "classData": [], "enumData": []},
             "enumTypeIdToUnderlyingTypeIdMap": {}
         }));
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
         let component = unit
             .items
             .iter()
@@ -2593,7 +2600,8 @@ mod tests {
             "editContext": {"$id": 2, "classData": [], "enumData": []},
             "enumTypeIdToUnderlyingTypeIdMap": {}
         }));
-        let unit = RustCodegenPlanner::plan_standalone_model(&model);
+        let unit =
+            RustCodegenPlanner::plan_standalone_model(&model, &crate::CodegenContext::inline());
 
         let source =
             RustSourceEmitter::emit_standalone_unit(&unit, &crate::CodegenContext::inline())
@@ -2695,7 +2703,7 @@ mod tests {
             "editContext": {"$id": 2, "classData": [], "enumData": []},
             "enumTypeIdToUnderlyingTypeIdMap": {}
         }));
-        let unit = RustCodegenPlanner::plan_model(&model);
+        let unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
         let component = unit
             .items
             .iter()
@@ -2726,7 +2734,8 @@ mod tests {
     #[test]
     fn standalone_project_places_namespace_before_component_family_and_uses_leaf_files() {
         let unit = namespace_and_base_family_fixture();
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
 
         let project = RustSourceEmitter::emit_standalone_project(
             &rust_unit,
@@ -2796,7 +2805,8 @@ mod tests {
                 )],
             )],
         };
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
 
         let project = RustSourceEmitter::emit_standalone_project(
             &rust_unit,
@@ -2841,7 +2851,8 @@ mod tests {
                 )],
             )],
         };
-        let rust_unit = RustCodegenPlanner::default().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::default()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
 
         let project = RustSourceEmitter::emit_integrated_project(
             &rust_unit,
@@ -2892,7 +2903,8 @@ mod tests {
     #[test]
     fn integrated_family_registration_includes_reflected_children() {
         let unit = namespace_and_base_family_fixture();
-        let rust_unit = RustCodegenPlanner::default().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::default()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
 
         let project = RustSourceEmitter::emit_integrated_project(
             &rust_unit,
@@ -3068,7 +3080,8 @@ mod tests {
     #[test]
     fn standalone_layout_report_exposes_layout_without_emitting_sources() {
         let unit = namespace_and_base_family_fixture();
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
 
         let report = RustSourceEmitter::standalone_layout_report(&rust_unit);
         let text = report.to_text();
@@ -3163,7 +3176,8 @@ mod tests {
                 },
             ],
         };
-        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(&unit);
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
         let component = rust_unit
             .items
             .iter()
@@ -3235,8 +3249,10 @@ mod tests {
                 &crate::CodegenContext::inline(),
             )
             .expect("compiled serialize context");
-        let rust_unit = RustCodegenPlanner::standalone()
-            .plan_serialize_codegen_unit(&compile_unit.codegen_unit);
+        let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_unit(
+            &compile_unit.codegen_unit,
+            &crate::CodegenContext::inline(),
+        );
         let report = RustSourceEmitter::standalone_layout_report(&rust_unit);
 
         println!("{}", report.to_text());

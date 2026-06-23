@@ -31,20 +31,15 @@ impl RustSourceInventory {
         let mut paths = Vec::new();
         collect_rust_files(root, &mut paths)?;
         paths.sort();
-        let scans = context
-            .runner()
-            .map(&paths, |path| {
-                let source =
-                    fs::read_to_string(path).map_err(|source| RustIntegrationError::Read {
-                        path: path.clone(),
-                        source,
-                    })?;
-                let file = parse_inventory_file(path.clone(), &source)?;
-                let source_types = RustSourceTypeIndex::from_source(root, path, &source)?;
-                Ok(RustSourceInventoryFileScan { file, source_types })
-            })
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+        let scans = context.runner().try_map(&paths, |path| {
+            let source = fs::read_to_string(path).map_err(|source| RustIntegrationError::Read {
+                path: path.clone(),
+                source,
+            })?;
+            let file = parse_inventory_file(path.clone(), &source)?;
+            let source_types = RustSourceTypeIndex::from_source(root, path, &source)?;
+            Ok(RustSourceInventoryFileScan { file, source_types })
+        })?;
 
         let mut files = Vec::with_capacity(scans.len());
         let mut source_types = RustSourceTypeIndex::default();
@@ -61,18 +56,13 @@ impl RustSourceInventory {
     ) -> Result<Self, RustIntegrationError> {
         let mut paths = paths.into_iter().collect::<Vec<_>>();
         paths.sort();
-        let files = context
-            .runner()
-            .map(&paths, |path| {
-                let source =
-                    fs::read_to_string(path).map_err(|source| RustIntegrationError::Read {
-                        path: path.clone(),
-                        source,
-                    })?;
-                parse_inventory_file(path.clone(), &source)
-            })
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+        let files = context.runner().try_map(&paths, |path| {
+            let source = fs::read_to_string(path).map_err(|source| RustIntegrationError::Read {
+                path: path.clone(),
+                source,
+            })?;
+            parse_inventory_file(path.clone(), &source)
+        })?;
         Ok(Self::from_files(files))
     }
 
@@ -157,7 +147,7 @@ pub struct RustSourceInventoryItem {
     pub item: crate::rust::analyze::RustSourceItem,
 }
 
-pub trait RustItemPathResolver {
+pub trait RustItemPathResolver: Sync {
     fn path_for(&self, item: &RustItemPlan) -> PathBuf;
 }
 
@@ -180,24 +170,16 @@ impl RustItemPathResolver for FlatRustItemPathResolver {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RustIntegrationPlanner {
     emitter: RustSourceEmitter,
-    context: CodegenContext,
-}
-
-impl Default for RustIntegrationPlanner {
-    fn default() -> Self {
-        Self::new(CodegenContext::default())
-    }
 }
 
 impl RustIntegrationPlanner {
     #[must_use]
-    pub fn new(context: CodegenContext) -> Self {
+    pub fn new() -> Self {
         Self {
             emitter: RustSourceEmitter::default(),
-            context,
         }
     }
 
@@ -206,56 +188,68 @@ impl RustIntegrationPlanner {
         unit: &RustCodegenUnit,
         inventory: &RustSourceInventory,
         paths: &impl RustItemPathResolver,
+        context: &CodegenContext,
     ) -> Result<RustIntegrationPlan, RustIntegrationError> {
-        let mut items = Vec::with_capacity(unit.items.len());
-        for desired in &unit.items {
-            let candidates = inventory.candidates_for(&desired.rust_name);
-            let action = match candidates {
-                [] => RustIntegrationAction::Create {
-                    target_path: paths.path_for(desired),
-                    source: self.emit_single_item(desired)?,
-                },
-                [candidate] => {
-                    let update = candidate.item.plan_update(desired).map_err(|source| {
-                        RustIntegrationError::Analyze {
-                            path: candidate.path.clone(),
-                            source,
+        let items =
+            context
+                .runner()
+                .try_map_until_cancelled(&unit.items, context.cancel(), |desired| {
+                    let candidates = inventory.candidates_for(&desired.rust_name);
+                    let action = match candidates {
+                        [] => RustIntegrationAction::Create {
+                            target_path: paths.path_for(desired),
+                            source: self.emit_single_item(desired, context)?,
+                        },
+                        [candidate] => {
+                            let update = candidate.item.plan_update(desired).map_err(|source| {
+                                RustIntegrationError::Analyze {
+                                    path: candidate.path.clone(),
+                                    source,
+                                }
+                            })?;
+                            if update.is_current() {
+                                RustIntegrationAction::Current {
+                                    path: candidate.path.clone(),
+                                }
+                            } else {
+                                RustIntegrationAction::Update {
+                                    path: candidate.path.clone(),
+                                    update,
+                                }
+                            }
                         }
-                    })?;
-                    if update.is_current() {
-                        RustIntegrationAction::Current {
-                            path: candidate.path.clone(),
-                        }
-                    } else {
-                        RustIntegrationAction::Update {
-                            path: candidate.path.clone(),
-                            update,
-                        }
-                    }
-                }
-                candidates => RustIntegrationAction::Ambiguous {
-                    item_name: desired.rust_name.clone(),
-                    candidate_paths: candidates
-                        .iter()
-                        .map(|candidate| candidate.path.clone())
-                        .collect(),
-                },
-            };
-            items.push(RustIntegrationItemPlan {
-                item: desired.clone(),
-                action,
-            });
+                        candidates => RustIntegrationAction::Ambiguous {
+                            item_name: desired.rust_name.clone(),
+                            candidate_paths: candidates
+                                .iter()
+                                .map(|candidate| candidate.path.clone())
+                                .collect(),
+                        },
+                    };
+                    Ok(RustIntegrationItemPlan {
+                        item: desired.clone(),
+                        action,
+                    })
+                })?;
+        if items.was_cancelled() {
+            return Err(RustIntegrationError::Emit(RustSourceEmitError::Cancelled));
         }
-        Ok(RustIntegrationPlan { items })
+        Ok(RustIntegrationPlan {
+            items: items.into_completed(),
+        })
     }
 
-    fn emit_single_item(&self, item: &RustItemPlan) -> Result<String, RustIntegrationError> {
+    fn emit_single_item(
+        &self,
+        item: &RustItemPlan,
+        context: &CodegenContext,
+    ) -> Result<String, RustIntegrationError> {
         self.emitter
             .emit(
                 &RustCodegenUnit {
                     items: vec![item.clone()],
                 },
-                &self.context,
+                context,
             )
             .map_err(RustIntegrationError::Emit)
     }
@@ -449,6 +443,7 @@ mod tests {
                 },
                 &inventory,
                 &FlatRustItemPathResolver::new("components"),
+                &CodegenContext::inline(),
             )
             .expect("integration plan");
 
@@ -470,6 +465,7 @@ mod tests {
                 },
                 &inventory,
                 &FlatRustItemPathResolver::new("components"),
+                &CodegenContext::inline(),
             )
             .expect("integration plan");
 
@@ -504,6 +500,7 @@ pub struct HealthComponent {
                 },
                 &inventory,
                 &FlatRustItemPathResolver::new("components"),
+                &CodegenContext::inline(),
             )
             .expect("integration plan");
 
@@ -547,6 +544,7 @@ pub struct HealthComponent;
                 },
                 &inventory,
                 &FlatRustItemPathResolver::new("components"),
+                &CodegenContext::inline(),
             )
             .expect("integration plan");
 

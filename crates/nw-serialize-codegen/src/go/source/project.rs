@@ -98,15 +98,13 @@ fn emit_project_type_files_with_context(
         &base_type_ids,
     );
     let names_by_type_id = codegen_type_names_by_id_in_packages(emitted_unit, &packages_by_type_id);
-    let tasks = go_package_groups_with_context(
+    let groups = go_package_groups_with_context(
         emitted_unit,
         context_unit,
         &items_by_type_id,
         &base_type_ids,
-    )
-    .into_iter()
-    .collect::<Vec<_>>();
-
+    );
+    let tasks = groups.into_iter().collect::<Vec<_>>();
     context.runner().try_map(&tasks, |task| {
         let ((package, file_stem), items) = task;
         Ok(GoStandaloneProjectFile {

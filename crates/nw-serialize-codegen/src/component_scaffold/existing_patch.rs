@@ -57,7 +57,7 @@ pub(super) fn apply_existing_patches(
     file_patches.sort_by(|left, right| left.0.cmp(&right.0));
     context
         .runner()
-        .map(&file_patches, |(file_path, file_patches)| {
+        .try_map(&file_patches, |(file_path, file_patches)| {
             let mut file_patches = file_patches.clone();
             let file_path = file_path.clone();
             file_patches.sort_by_key(|patch| std::cmp::Reverse(patch.offset()));
@@ -121,9 +121,7 @@ pub(super) fn apply_existing_patches(
                 ensure_map_entities_derives(&mut text, &map_entity_components);
             }
             write_string(&file_path, &text)
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+        })?;
     Ok(())
 }
 

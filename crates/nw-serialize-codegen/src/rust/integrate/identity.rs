@@ -86,13 +86,9 @@ pub fn reconcile_az_type_identities(
     collect_rust_files(components_root, &mut files)?;
     files.sort();
 
-    let file_outcomes = context
-        .runner()
-        .map(&files, |file_path| {
-            plan_or_apply_az_identity_reconciliation_for_file(file_path, apply, evidence)
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+    let file_outcomes = context.runner().try_map(&files, |file_path| {
+        plan_or_apply_az_identity_reconciliation_for_file(file_path, apply, evidence)
+    })?;
 
     for outcome in file_outcomes {
         skipped.extend(outcome.skipped);

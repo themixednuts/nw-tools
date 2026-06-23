@@ -50,30 +50,33 @@ impl CompileUnit {
     }
 
     #[must_use]
-    pub fn rust_codegen_unit(&self) -> RustCodegenUnit {
-        self.full_codegen_view().rust_codegen_unit()
+    pub fn rust_codegen_unit(&self, context: &CodegenContext) -> RustCodegenUnit {
+        self.full_codegen_view().rust_codegen_unit(context)
     }
 
     #[must_use]
     pub fn rust_codegen_unit_with_source_types(
         &self,
         source_types: RustSourceTypeIndex,
+        context: &CodegenContext,
     ) -> RustCodegenUnit {
         self.full_codegen_view()
-            .rust_codegen_unit_with_source_types(source_types)
+            .rust_codegen_unit_with_source_types(source_types, context)
     }
 
     #[must_use]
-    pub fn standalone_rust_codegen_unit(&self) -> RustCodegenUnit {
-        self.full_codegen_view().standalone_rust_codegen_unit()
+    pub fn standalone_rust_codegen_unit(&self, context: &CodegenContext) -> RustCodegenUnit {
+        self.full_codegen_view()
+            .standalone_rust_codegen_unit(context)
     }
 
     #[must_use]
     pub fn selected_rust_codegen_unit(
         &self,
         selection: SerializeCodegenSelection,
+        context: &CodegenContext,
     ) -> RustCodegenUnit {
-        self.codegen_view(selection).rust_codegen_unit()
+        self.codegen_view(selection).rust_codegen_unit(context)
     }
 
     #[must_use]
@@ -81,30 +84,39 @@ impl CompileUnit {
         &self,
         selection: SerializeCodegenSelection,
         source_types: RustSourceTypeIndex,
+        context: &CodegenContext,
     ) -> RustCodegenUnit {
         self.codegen_view(selection)
-            .rust_codegen_unit_with_source_types(source_types)
+            .rust_codegen_unit_with_source_types(source_types, context)
     }
 
     #[must_use]
     pub fn selected_standalone_rust_codegen_unit(
         &self,
         selection: SerializeCodegenSelection,
+        context: &CodegenContext,
     ) -> RustCodegenUnit {
-        self.codegen_view(selection).standalone_rust_codegen_unit()
+        self.codegen_view(selection)
+            .standalone_rust_codegen_unit(context)
     }
 
     #[must_use]
-    pub fn standalone_rust_layout_report(&self) -> RustStandaloneLayoutReport {
-        self.full_codegen_view().standalone_rust_layout_report()
+    pub fn standalone_rust_layout_report(
+        &self,
+        context: &CodegenContext,
+    ) -> RustStandaloneLayoutReport {
+        self.full_codegen_view()
+            .standalone_rust_layout_report(context)
     }
 
     #[must_use]
     pub fn selected_standalone_rust_layout_report(
         &self,
         selection: SerializeCodegenSelection,
+        context: &CodegenContext,
     ) -> RustStandaloneLayoutReport {
-        self.codegen_view(selection).standalone_rust_layout_report()
+        self.codegen_view(selection)
+            .standalone_rust_layout_report(context)
     }
 
     pub fn emit_rust_source(
@@ -310,9 +322,10 @@ impl CompileUnit {
         &self,
         inventory: &RustSourceInventory,
         paths: &impl RustItemPathResolver,
+        context: &CodegenContext,
     ) -> Result<RustIntegrationPlan, RustIntegrationError> {
-        let rust_unit =
-            self.rust_codegen_unit_with_source_types(inventory.source_type_index().clone());
-        RustIntegrationPlanner::default().plan(&rust_unit, inventory, paths)
+        let rust_unit = self
+            .rust_codegen_unit_with_source_types(inventory.source_type_index().clone(), context);
+        RustIntegrationPlanner::default().plan(&rust_unit, inventory, paths, context)
     }
 }
