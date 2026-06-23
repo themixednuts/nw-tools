@@ -1,0 +1,81 @@
+{
+  "$id": 1,
+  "addr": "0x20118b40e40",
+  "vftable": "NewWorld+0x850c860",
+  "descriptorCount": "1",
+  "descriptors": [
+    {
+      "$id": 2,
+      "addr": "0x20118b54b40",
+      "vftable": "NewWorld+0x850c808",
+      "componentName": "ScriptedEntityTweenerSystemComponent",
+      "componentNameAddress": "NewWorld+0x850c760",
+      "componentUuid": null,
+      "componentUuidAddress": null,
+      "azRtti": {
+        "$id": 3,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b54b40",
+        "typeId": null,
+        "typeName": "ScriptedEntityTweenerSystemComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0x64f47e0"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0x64fcfa0"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0x648fd00"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0x650b2e0"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0x64fc1d0"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x64fc1d0"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    }
+  ]
+}

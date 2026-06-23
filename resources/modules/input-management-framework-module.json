@@ -1,0 +1,154 @@
+{
+  "$id": 1,
+  "addr": "0x20118b40bc0",
+  "vftable": "NewWorld+0x850c470",
+  "descriptorCount": "2",
+  "descriptors": [
+    {
+      "$id": 2,
+      "addr": "0x20118b55880",
+      "vftable": "NewWorld+0x850c2c0",
+      "componentName": "InputConfigurationComponent",
+      "componentNameAddress": "NewWorld+0x850c220",
+      "componentUuid": "3106EE2A-4816-433E-B855-D17A6484D5EC",
+      "componentUuidAddress": "NewWorld+0xa5557e0",
+      "azRtti": {
+        "$id": 3,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b55880",
+        "typeId": "3106EE2A-4816-433E-B855-D17A6484D5EC",
+        "typeName": "InputConfigurationComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0x64f4600"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0x64fcf90"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0x648fb60"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0x650b230"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0x64fdf70"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    },
+    {
+      "$id": 4,
+      "addr": "0x20118b558a0",
+      "vftable": "NewWorld+0x850c3c8",
+      "componentName": "InputManagementFrameworkSystemComponent",
+      "componentNameAddress": "NewWorld+0x8505b50",
+      "componentUuid": "B52457FC-2DEA-4F0E-B0D0-F17786B40F02",
+      "componentUuidAddress": "NewWorld+0xa555800",
+      "azRtti": {
+        "$id": 5,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b558a0",
+        "typeId": "B52457FC-2DEA-4F0E-B0D0-F17786B40F02",
+        "typeName": "InputManagementFrameworkSystemComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0x64f46f0"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0x648ef90"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0x648ef80"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0x650b240"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0x64fc190"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x64fdfb0"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x64fc190"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    }
+  ]
+}

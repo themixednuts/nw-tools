@@ -1,0 +1,227 @@
+{
+  "$id": 1,
+  "addr": "0x20118b41660",
+  "vftable": "NewWorld+0x7fb65a8",
+  "descriptorCount": "3",
+  "descriptors": [
+    {
+      "$id": 2,
+      "addr": "0x20118b55be0",
+      "vftable": "NewWorld+0x7fb67c8",
+      "componentName": "WaterSystemComponent",
+      "componentNameAddress": "NewWorld+0x7fb6730",
+      "componentUuid": "E77EF0DB-92C1-4490-BABA-DE2894FDEB27",
+      "componentUuidAddress": "NewWorld+0xa2f6e90",
+      "azRtti": {
+        "$id": 3,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b55be0",
+        "typeId": "E77EF0DB-92C1-4490-BABA-DE2894FDEB27",
+        "typeName": "WaterSystemComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0xec0400"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0xecfec0"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0xe01260"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0xee8ef0"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0xece490"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0xece490"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    },
+    {
+      "$id": 4,
+      "addr": "0x20118b55c00",
+      "vftable": "NewWorld+0x7fb6e00",
+      "componentName": "WaterOceanComponent",
+      "componentNameAddress": "NewWorld+0x7fb6d68",
+      "componentUuid": "517760D2-237E-4582-9CEF-A91EFF641441",
+      "componentUuidAddress": "NewWorld+0xa2f6f70",
+      "azRtti": {
+        "$id": 5,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b55c00",
+        "typeId": "517760D2-237E-4582-9CEF-A91EFF641441",
+        "typeName": "WaterOceanComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0xec0310"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0xecfeb0"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0xe04cd0"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0xee8ee0"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0xece470"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x6c6c20"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0xece470"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    },
+    {
+      "$id": 6,
+      "addr": "0x20118b55c20",
+      "vftable": "NewWorld+0x7fb73e0",
+      "componentName": "WaterVolumeComponent",
+      "componentNameAddress": "NewWorld+0x7fb7348",
+      "componentUuid": "D1576A29-B1B5-4FE2-9D9E-3A7781561C49",
+      "componentUuidAddress": "NewWorld+0xa2f6fb0",
+      "azRtti": {
+        "$id": 7,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b55c20",
+        "typeId": "D1576A29-B1B5-4FE2-9D9E-3A7781561C49",
+        "typeName": "WaterVolumeComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0xec0500"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0xecfed0"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0xdfbf80"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0xee8f50"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0xed48d0"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x6c6c20"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    }
+  ]
+}

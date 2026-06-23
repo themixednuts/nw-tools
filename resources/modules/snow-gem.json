@@ -1,0 +1,154 @@
+{
+  "$id": 1,
+  "addr": "0x20118b41340",
+  "vftable": "NewWorld+0x7fb6490",
+  "descriptorCount": "2",
+  "descriptors": [
+    {
+      "$id": 2,
+      "addr": "0x20118b55a60",
+      "vftable": "NewWorld+0x7fb5fe0",
+      "componentName": "SnowComponent",
+      "componentNameAddress": "NewWorld+0x7fb5f50",
+      "componentUuid": "F16AD691-091B-44E2-8FBD-2E3AFC2739EF",
+      "componentUuidAddress": "NewWorld+0xa2f6e10",
+      "azRtti": {
+        "$id": 3,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b55a60",
+        "typeId": "F16AD691-091B-44E2-8FBD-2E3AFC2739EF",
+        "typeName": "SnowComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0xec0220"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0xecfea0"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0xe01170"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0xee8ed0"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0xece430"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0xece430"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    },
+    {
+      "$id": 4,
+      "addr": "0x20118b55aa0",
+      "vftable": "NewWorld+0x7fb5bc8",
+      "componentName": "SandComponent",
+      "componentNameAddress": "NewWorld+0x7fb5b38",
+      "componentUuid": "926D7796-5115-4EB9-A9A3-F1165585BC4A",
+      "componentUuidAddress": "NewWorld+0xa2f6dd0",
+      "azRtti": {
+        "$id": 5,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b55aa0",
+        "typeId": "926D7796-5115-4EB9-A9A3-F1165585BC4A",
+        "typeName": "SandComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0xebff20"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0xecfe70"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0xdfeeb0"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0xee8d50"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0xece3f0"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0xece3f0"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    }
+  ]
+}

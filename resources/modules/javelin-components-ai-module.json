@@ -1,0 +1,592 @@
+{
+  "$id": 1,
+  "addr": "0x20118b40c60",
+  "vftable": "NewWorld+0x847d650",
+  "descriptorCount": "8",
+  "descriptors": [
+    {
+      "$id": 2,
+      "addr": "0x20118b548c0",
+      "vftable": "NewWorld+0x847d5f8",
+      "componentName": "AISystemComponent",
+      "componentNameAddress": "NewWorld+0x847d560",
+      "componentUuid": "89D29F65-CE80-43BA-B55D-E88958D209E7",
+      "componentUuidAddress": "NewWorld+0xa405480",
+      "azRtti": {
+        "$id": 3,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b548c0",
+        "typeId": "89D29F65-CE80-43BA-B55D-E88958D209E7",
+        "typeName": "AISystemComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0x5d73380"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0x5d7b090"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0x5d3bdb0"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0x5d88950"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    },
+    {
+      "$id": 4,
+      "addr": "0x20118b54900",
+      "vftable": "NewWorld+0x847af58",
+      "componentName": "StimulusComponent",
+      "componentNameAddress": "NewWorld+0x7fd8060",
+      "componentUuid": "1A3A143C-F324-4073-8BAA-2C99B4DFEC55",
+      "componentUuidAddress": "NewWorld+0xa32a840",
+      "azRtti": {
+        "$id": 5,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b54900",
+        "typeId": "1A3A143C-F324-4073-8BAA-2C99B4DFEC55",
+        "typeName": "StimulusComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0x5d73740"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0x5d7b0d0"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0x5d45a40"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0x5d88990"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0x25d5d80"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x25d5d80"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    },
+    {
+      "$id": 6,
+      "addr": "0x20118b54940",
+      "vftable": "NewWorld+0x84781d0",
+      "componentName": "AIObjectiveManagerComponent",
+      "componentNameAddress": "NewWorld+0x7fd7e70",
+      "componentUuid": "DE711133-D58D-4338-AEE6-8B0D919E8667",
+      "componentUuidAddress": "NewWorld+0xa405160",
+      "azRtti": {
+        "$id": 7,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b54940",
+        "typeId": "DE711133-D58D-4338-AEE6-8B0D919E8667",
+        "typeName": "AIObjectiveManagerComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0x5d73250"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0x5d7b080"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0x5d40520"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0x5d888c0"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0x5d780e0"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x26efe40"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x5d780e0"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    },
+    {
+      "$id": 8,
+      "addr": "0x20118b54980",
+      "vftable": "NewWorld+0x847cbe8",
+      "componentName": "TransformLinkComponent",
+      "componentNameAddress": "NewWorld+0x847cb50",
+      "componentUuid": "7F24EBE2-1729-4D59-9EF1-937DD5BF7654",
+      "componentUuidAddress": "NewWorld+0xa405400",
+      "azRtti": {
+        "$id": 9,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b54980",
+        "typeId": "7F24EBE2-1729-4D59-9EF1-937DD5BF7654",
+        "typeName": "TransformLinkComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0x5d73960"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0x5d7b0f0"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0x5d3b580"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0x5d889b0"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0x5d7b830"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x5d7b8b0"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x5d781a0"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    },
+    {
+      "$id": 10,
+      "addr": "0x20118b549c0",
+      "vftable": "NewWorld+0x847c248",
+      "componentName": "TransformLinkChildComponent",
+      "componentNameAddress": "NewWorld+0x847c1a8",
+      "componentUuid": "96E1730A-AD0F-4AA6-A198-CB28F7717D66",
+      "componentUuidAddress": "NewWorld+0xa4053a0",
+      "azRtti": {
+        "$id": 11,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b549c0",
+        "typeId": "96E1730A-AD0F-4AA6-A198-CB28F7717D66",
+        "typeName": "TransformLinkChildComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0x5d73870"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0x5d7b0e0"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0x5d3afc0"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0x5d889a0"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0x5d7b830"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x6c6c20"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x5d781a0"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    },
+    {
+      "$id": 12,
+      "addr": "0x20118b54a00",
+      "vftable": "NewWorld+0x84794a8",
+      "componentName": "HubLocalCacheComponent",
+      "componentNameAddress": "NewWorld+0x7fd7fb8",
+      "componentUuid": "B3CBD45C-2E02-44B5-8AFC-EE4E09F375E6",
+      "componentUuidAddress": "NewWorld+0xa327420",
+      "azRtti": {
+        "$id": 13,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b54a00",
+        "typeId": "B3CBD45C-2E02-44B5-8AFC-EE4E09F375E6",
+        "typeName": "HubLocalCacheComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0x5d73470"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0x5d7b0a0"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0x5d41d50"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0x5d88960"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0x26efe40"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x5d77d50"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x26efe40"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    },
+    {
+      "$id": 14,
+      "addr": "0x20118b54a40",
+      "vftable": "NewWorld+0x8479b40",
+      "componentName": "HubLocalCacheSpawnForwarderComponent",
+      "componentNameAddress": "NewWorld+0x8479a98",
+      "componentUuid": "0B58FE7E-8B61-49D5-BB1A-6A6B080CBE7B",
+      "componentUuidAddress": "NewWorld+0xa405240",
+      "azRtti": {
+        "$id": 15,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b54a40",
+        "typeId": "0B58FE7E-8B61-49D5-BB1A-6A6B080CBE7B",
+        "typeName": "HubLocalCacheSpawnForwarderComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0x5d73560"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0x5d7b0b0"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0x5d42190"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0x5d88970"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0x5d7b7d0"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x294860"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x5d78120"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    },
+    {
+      "$id": 16,
+      "addr": "0x20118b54a80",
+      "vftable": "NewWorld+0x847a410",
+      "componentName": "PerceptionComponent",
+      "componentNameAddress": "NewWorld+0x7fd8048",
+      "componentUuid": "868F6F4C-8843-400F-98DA-4AD24FC09F56",
+      "componentUuidAddress": "NewWorld+0xa327440",
+      "azRtti": {
+        "$id": 17,
+        "source": "AZ::ComponentDescriptor",
+        "address": "0x20118b54a80",
+        "typeId": "868F6F4C-8843-400F-98DA-4AD24FC09F56",
+        "typeName": "PerceptionComponent"
+      },
+      "vtableSlots": [
+        {
+          "slot": 0,
+          "expected": "CreateComponent",
+          "address": "NewWorld+0x5d73650"
+        },
+        {
+          "slot": 1,
+          "expected": "GetName",
+          "address": "NewWorld+0x5d7b0c0"
+        },
+        {
+          "slot": 2,
+          "expected": "GetUuid",
+          "address": "NewWorld+0x5d45170"
+        },
+        {
+          "slot": 3,
+          "expected": "Reflect",
+          "address": "NewWorld+0x5d88980"
+        },
+        {
+          "slot": 4,
+          "expected": "GetProvidedServices",
+          "address": "NewWorld+0x5d78160"
+        },
+        {
+          "slot": 5,
+          "expected": "GetDependentServices",
+          "address": "NewWorld+0x25d1470"
+        },
+        {
+          "slot": 6,
+          "expected": "GetRequiredServices",
+          "address": "NewWorld+0x25d5d80"
+        },
+        {
+          "slot": 7,
+          "expected": "GetIncompatibleServices",
+          "address": "NewWorld+0x5d78160"
+        },
+        {
+          "slot": 8,
+          "expected": "GetDescriptor",
+          "address": "NewWorld+0x46dca0"
+        },
+        {
+          "slot": 9,
+          "expected": "ReleaseDescriptor",
+          "address": "NewWorld+0x145a8a0"
+        },
+        {
+          "slot": 10,
+          "expected": "~ComponentDescriptor",
+          "address": "NewWorld+0x5bf900"
+        }
+      ]
+    }
+  ]
+}

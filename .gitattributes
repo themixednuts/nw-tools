@@ -1,2 +1,3 @@
 * text=auto eol=lf
 *.lib binary
+*.7z binary
