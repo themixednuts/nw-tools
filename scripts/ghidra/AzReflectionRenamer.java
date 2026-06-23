@@ -3,8 +3,14 @@
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileReader;
 import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -29,6 +35,9 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.stream.JsonReader;
+
+import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
+import org.apache.commons.compress.archivers.sevenz.SevenZFile;
 
 import docking.widgets.filechooser.GhidraFileChooser;
 import docking.widgets.filechooser.GhidraFileChooserMode;
@@ -1340,18 +1349,23 @@ public class AzReflectionRenamer extends GhidraScript {
 
     private BehaviorContextEvidence loadBehaviorContextEvidence(File serializeInput) {
         BehaviorContextEvidence index = new BehaviorContextEvidence();
-        File input = behaviorContextInput(serializeInput);
+        BehaviorContextInput input = findBehaviorContextInput(serializeInput);
         if (input == null) {
             return index;
         }
-        index.input = input.getAbsolutePath();
+        index.input = input.description();
+        index.inputFormat = input.format();
+        index.archiveEntry = input.archiveEntryName;
 
         boolean readClasses = false;
         boolean readMethods = false;
         boolean readProperties = false;
         boolean readEbuses = false;
         boolean readTypeToClassMap = false;
-        try (JsonReader reader = new JsonReader(new BufferedReader(new FileReader(input)))) {
+        try (
+            Reader source = input.openReader();
+            JsonReader reader = new JsonReader(new BufferedReader(source))
+        ) {
             reader.beginObject();
             while (reader.hasNext()) {
                 String name = reader.nextName();
@@ -1385,18 +1399,18 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         catch (Exception error) {
             index.skippedInputs++;
-            index.skippedReasons.add(input.getName() + ":" + error.getMessage());
+            index.skippedReasons.add(input.description() + ":" + error.getMessage());
         }
 
         finalizeBehaviorContextEvidence(index);
         return index;
     }
 
-    private File behaviorContextInput(File serializeInput) {
+    private BehaviorContextInput findBehaviorContextInput(File serializeInput) {
         String explicit = envValue("AZ_BEHAVIOR_CONTEXT_JSON");
         if (explicit != null) {
             File file = new File(explicit);
-            return file.exists() ? file : null;
+            return behaviorContextFileInput(file);
         }
         if (serializeInput == null) {
             return null;
@@ -1406,7 +1420,57 @@ public class AzReflectionRenamer extends GhidraScript {
             return null;
         }
         File sibling = new File(parent, "behavior-context.json");
-        return sibling.exists() ? sibling : null;
+        if (sibling.exists()) {
+            return behaviorContextFileInput(sibling);
+        }
+        File compressedSibling = new File(parent, "behavior-context.7z");
+        return behaviorContextFileInput(compressedSibling);
+    }
+
+    private BehaviorContextInput behaviorContextFileInput(File file) {
+        if (file == null || !file.exists() || !file.isFile()) {
+            return null;
+        }
+        if (file.getName().toLowerCase(Locale.ROOT).endsWith(".7z")) {
+            String entryName = behaviorContextArchiveEntry(file);
+            if (entryName == null) {
+                return null;
+            }
+            return new BehaviorContextInput(file, entryName);
+        }
+        return new BehaviorContextInput(file);
+    }
+
+    private String behaviorContextArchiveEntry(File archiveFile) {
+        String firstJson = null;
+        String firstFile = null;
+        try (SevenZFile archive = new SevenZFile(archiveFile)) {
+            SevenZArchiveEntry entry;
+            while ((entry = archive.getNextEntry()) != null) {
+                if (entry.isDirectory()) {
+                    continue;
+                }
+                String entryName = entry.getName();
+                if (entryName == null || entryName.isEmpty()) {
+                    continue;
+                }
+                String normalized = entryName.replace('\\', '/').toLowerCase(Locale.ROOT);
+                if (normalized.equals("behavior-context.json") ||
+                    normalized.endsWith("/behavior-context.json")) {
+                    return entryName;
+                }
+                if (firstJson == null && normalized.endsWith(".json")) {
+                    firstJson = entryName;
+                }
+                if (firstFile == null) {
+                    firstFile = entryName;
+                }
+            }
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+        return firstJson != null ? firstJson : firstFile;
     }
 
     private int countArrayValues(JsonReader reader) throws Exception {
@@ -2838,6 +2902,8 @@ public class AzReflectionRenamer extends GhidraScript {
             return report;
         }
         report.addProperty("input", index.input);
+        report.addProperty("inputFormat", index.inputFormat);
+        report.addProperty("archiveEntry", index.archiveEntry);
         report.addProperty("skippedInputs", index.skippedInputs);
         report.addProperty("skippedRecords", index.skippedRecords);
         report.addProperty("classes", index.classCount);
@@ -3004,6 +3070,10 @@ public class AzReflectionRenamer extends GhidraScript {
         }
         else {
             summary.append("\n  Input: ").append(behaviorContextEvidence.input);
+            summary.append("\n  Input format: ").append(behaviorContextEvidence.inputFormat);
+            if (behaviorContextEvidence.archiveEntry != null) {
+                summary.append("\n  Archive entry: ").append(behaviorContextEvidence.archiveEntry);
+            }
             summary.append("\n  Classes: ").append(behaviorContextEvidence.classCount);
             summary.append("\n  RTTI helpers: ").append(behaviorContextEvidence.rttiTypes.size());
             summary.append("\n  Global properties: ")
@@ -9419,8 +9489,109 @@ public class AzReflectionRenamer extends GhidraScript {
         }
     }
 
+    private static class BehaviorContextInput {
+        final File file;
+        final String archiveEntryName;
+
+        BehaviorContextInput(File file) {
+            this.file = file;
+            this.archiveEntryName = null;
+        }
+
+        BehaviorContextInput(File file, String archiveEntryName) {
+            this.file = file;
+            this.archiveEntryName = archiveEntryName;
+        }
+
+        String description() {
+            if (archiveEntryName == null) {
+                return file.getAbsolutePath();
+            }
+            return file.getAbsolutePath() + "!" + archiveEntryName;
+        }
+
+        String format() {
+            return archiveEntryName == null ? "json" : "7z";
+        }
+
+        Reader openReader() throws Exception {
+            if (archiveEntryName == null) {
+                return new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8);
+            }
+
+            SevenZFile archive = new SevenZFile(file);
+            boolean closeArchive = true;
+            try {
+                SevenZArchiveEntry entry;
+                while ((entry = archive.getNextEntry()) != null) {
+                    if (entry.isDirectory() || !archiveEntryName.equals(entry.getName())) {
+                        continue;
+                    }
+                    InputStream stream = archive.getInputStream(entry);
+                    closeArchive = false;
+                    return new InputStreamReader(
+                        new SevenZEntryInputStream(archive, stream),
+                        StandardCharsets.UTF_8);
+                }
+            }
+            finally {
+                if (closeArchive) {
+                    archive.close();
+                }
+            }
+            throw new IOException("archive entry not found: " + archiveEntryName);
+        }
+    }
+
+    private static class SevenZEntryInputStream extends InputStream {
+        private final SevenZFile archive;
+        private final InputStream stream;
+
+        SevenZEntryInputStream(SevenZFile archive, InputStream stream) {
+            this.archive = archive;
+            this.stream = stream;
+        }
+
+        @Override
+        public int read() throws IOException {
+            return stream.read();
+        }
+
+        @Override
+        public int read(byte[] bytes, int offset, int length) throws IOException {
+            return stream.read(bytes, offset, length);
+        }
+
+        @Override
+        public void close() throws IOException {
+            IOException failure = null;
+            try {
+                stream.close();
+            }
+            catch (IOException error) {
+                failure = error;
+            }
+            try {
+                archive.close();
+            }
+            catch (IOException error) {
+                if (failure == null) {
+                    failure = error;
+                }
+                else {
+                    failure.addSuppressed(error);
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+    }
+
     private static class BehaviorContextEvidence {
         String input;
+        String inputFormat;
+        String archiveEntry;
         int skippedInputs;
         int skippedRecords;
         int classCount;

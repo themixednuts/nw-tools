@@ -17,8 +17,8 @@ The script automatically loads sibling evidence when present:
 - `resources/serialize-field-registration.jsonl`
 
 `resources/behavior-context.7z` contains the optional behavior context evidence.
-Extract it to `resources/behavior-context.json` before running the script if you
-want BehaviorContext and EBus renames.
+The script reads `resources/behavior-context.json` when present; otherwise it
+streams `behavior-context.json` directly from the `.7z` archive.
 
 By default the script runs in dry-run mode and writes:
 
