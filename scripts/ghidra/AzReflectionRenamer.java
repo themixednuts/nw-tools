@@ -79,6 +79,8 @@ import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Parameter;
 import ghidra.program.model.listing.ParameterImpl;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.scalar.Scalar;
 import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
@@ -5600,7 +5602,9 @@ public class AzReflectionRenamer extends GhidraScript {
             }
             Integer offset = vptrStoreOffset(instruction);
             if (offset != null) {
-                return offset;
+                String baseRegister = memoryBaseRegister(instruction, 0);
+                Integer baseOffset = thisAliasOffsetBefore(function, instruction, baseRegister);
+                return baseOffset == null ? offset : baseOffset + offset;
             }
             if (isRipRelativeLea(instruction)) {
                 return null;
@@ -5630,6 +5634,175 @@ public class AzReflectionRenamer extends GhidraScript {
             return int32(bytes, 3);
         }
         return null;
+    }
+
+    private Integer thisAliasOffsetBefore(
+        Function function,
+        Instruction beforeInstruction,
+        String registerName) {
+
+        if (registerName == null) {
+            return null;
+        }
+        HashMap<String, Integer> aliases = new HashMap<>();
+        aliases.put("RCX", 0);
+
+        for (Instruction instruction :
+            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+            if (instruction.getAddress().equals(beforeInstruction.getAddress())) {
+                return aliases.get(canonicalRegisterName(registerName));
+            }
+            updateThisAliases(instruction, aliases);
+        }
+        return null;
+    }
+
+    private void updateThisAliases(Instruction instruction, Map<String, Integer> aliases) {
+        String mnemonic = instruction.getMnemonicString();
+        if (mnemonic == null) {
+            return;
+        }
+        String upperMnemonic = mnemonic.toUpperCase(Locale.ROOT);
+        if ("CALL".equals(upperMnemonic)) {
+            removeVolatileRegisterAliases(aliases);
+            return;
+        }
+
+        String destination = registerOperand(instruction, 0);
+        if (destination == null) {
+            return;
+        }
+
+        if ("MOV".equals(upperMnemonic)) {
+            String source = registerOperand(instruction, 1);
+            if (source != null && aliases.containsKey(source)) {
+                aliases.put(destination, aliases.get(source));
+            }
+            else {
+                aliases.remove(destination);
+            }
+        }
+        else if ("LEA".equals(upperMnemonic)) {
+            Integer sourceOffset = memoryThisAliasOffset(instruction, 1, aliases);
+            if (sourceOffset != null) {
+                aliases.put(destination, sourceOffset);
+            }
+            else {
+                aliases.remove(destination);
+            }
+        }
+        else if (writesRegister(instruction, destination)) {
+            aliases.remove(destination);
+        }
+    }
+
+    private void removeVolatileRegisterAliases(Map<String, Integer> aliases) {
+        aliases.remove("RAX");
+        aliases.remove("RCX");
+        aliases.remove("RDX");
+        aliases.remove("R8");
+        aliases.remove("R9");
+        aliases.remove("R10");
+        aliases.remove("R11");
+    }
+
+    private boolean writesRegister(Instruction instruction, String destination) {
+        if (destination == null) {
+            return false;
+        }
+        String mnemonic = instruction.getMnemonicString();
+        if (mnemonic == null) {
+            return false;
+        }
+        String upperMnemonic = mnemonic.toUpperCase(Locale.ROOT);
+        return "XOR".equals(upperMnemonic) ||
+            "SUB".equals(upperMnemonic) ||
+            "ADD".equals(upperMnemonic) ||
+            "INC".equals(upperMnemonic) ||
+            "DEC".equals(upperMnemonic) ||
+            "POP".equals(upperMnemonic);
+    }
+
+    private Integer memoryThisAliasOffset(
+        Instruction instruction,
+        int operandIndex,
+        Map<String, Integer> aliases) {
+
+        String baseRegister = memoryBaseRegister(instruction, operandIndex);
+        if (baseRegister == null || !aliases.containsKey(baseRegister)) {
+            return null;
+        }
+        return aliases.get(baseRegister) + memoryDisplacement(instruction, operandIndex);
+    }
+
+    private String memoryBaseRegister(Instruction instruction, int operandIndex) {
+        Object[] objects = operandObjects(instruction, operandIndex);
+        for (Object object : objects) {
+            if (object instanceof Register register) {
+                String name = canonicalRegisterName(register.getName());
+                if (!"RIP".equals(name) && !"RSP".equals(name)) {
+                    return name;
+                }
+            }
+        }
+        return null;
+    }
+
+    private int memoryDisplacement(Instruction instruction, int operandIndex) {
+        int displacement = 0;
+        Object[] objects = operandObjects(instruction, operandIndex);
+        for (Object object : objects) {
+            if (object instanceof Scalar scalar) {
+                long value = scalar.getSignedValue();
+                if (value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE) {
+                    displacement += (int)value;
+                }
+            }
+        }
+        return displacement;
+    }
+
+    private String registerOperand(Instruction instruction, int operandIndex) {
+        Object[] objects = operandObjects(instruction, operandIndex);
+        if (objects.length != 1 || !(objects[0] instanceof Register register)) {
+            return null;
+        }
+        return canonicalRegisterName(register.getName());
+    }
+
+    private Object[] operandObjects(Instruction instruction, int operandIndex) {
+        try {
+            return instruction.getOpObjects(operandIndex);
+        }
+        catch (Exception ignored) {
+            return new Object[0];
+        }
+    }
+
+    private String canonicalRegisterName(String name) {
+        if (name == null) {
+            return null;
+        }
+        String upperName = name.toUpperCase(Locale.ROOT);
+        if (upperName.length() == 2 && upperName.charAt(1) == 'X') {
+            return "R" + upperName;
+        }
+        if (upperName.length() == 3 && upperName.charAt(0) == 'E') {
+            return "R" + upperName.substring(1);
+        }
+        if (upperName.equals("DIL") || upperName.equals("EDI")) {
+            return "RDI";
+        }
+        if (upperName.equals("SIL") || upperName.equals("ESI")) {
+            return "RSI";
+        }
+        if (upperName.equals("BPL") || upperName.equals("EBP")) {
+            return "RBP";
+        }
+        if (upperName.equals("SPL") || upperName.equals("ESP")) {
+            return "RSP";
+        }
+        return upperName;
     }
 
     private boolean isRipRelativeLea(Instruction instruction) {
