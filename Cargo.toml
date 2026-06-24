@@ -61,13 +61,13 @@ vk2dfd = "0.1.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 treesitter-types-go = "0.2"
 treesitter-types-cpp = "0.2"
-nw-asset = { path = "crates/nw-asset" }
-nw-datasheet = { path = "crates/nw-datasheet" }
-nw-dds = { path = "crates/nw-dds" }
-nw-filesystem = { path = "crates/nw-filesystem" }
-nw-locator = { path = "crates/nw-locator" }
-nw-jobs = { path = "crates/nw-jobs" }
-nw-localization = { path = "crates/nw-localization" }
-nw-objectstream = { path = "crates/nw-objectstream" }
-nw-pak = { path = "crates/nw-pak" }
-nw-resources = { path = "crates/nw-resources" }
+nw-asset = { version = "0.1.0", path = "crates/nw-asset" }
+nw-datasheet = { version = "0.1.0", path = "crates/nw-datasheet" }
+nw-dds = { version = "0.1.0", path = "crates/nw-dds" }
+nw-filesystem = { version = "0.1.0", path = "crates/nw-filesystem" }
+nw-locator = { version = "0.1.0", path = "crates/nw-locator" }
+nw-jobs = { version = "0.1.0", path = "crates/nw-jobs" }
+nw-localization = { version = "0.1.0", path = "crates/nw-localization" }
+nw-objectstream = { version = "0.1.0", path = "crates/nw-objectstream" }
+nw-pak = { version = "0.1.0", path = "crates/nw-pak" }
+nw-resources = { version = "0.1.0", path = "crates/nw-resources" }
