@@ -1156,6 +1156,107 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return null;
     }
 
+    private WireShape classifyWireShape(Address marshal, Address marshalTarget) {
+        Address effectiveMarshal = marshalTarget == null ? marshal : marshalTarget;
+        return classifyMarshalPath(effectiveMarshal, 0, new LinkedHashSet<>());
+    }
+
+    private WireShape classifyMarshalPath(Address address, int depth, Set<String> seen) {
+        if (!isExecutableAddress(address) || depth > 3 || !seen.add(address.toString())) {
+            return null;
+        }
+
+        WireShape named = wireShapeFromFunctionName(address);
+        if (named != null) {
+            return named;
+        }
+
+        if (looksLikeBoolMarshal(address)) {
+            return new WireShape("bool", "marshal-bool-pattern");
+        }
+
+        Function function = functionAtOrContaining(address);
+        if (function == null) {
+            return null;
+        }
+
+        int count = 0;
+        for (Instruction instruction :
+            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+            Address target = resolvedCodeTarget(callTarget(instruction));
+            WireShape called = classifyMarshalPath(target, depth + 1, seen);
+            if (called != null) {
+                return new WireShape(called.shape, "marshal-call:" + called.source);
+            }
+        }
+        return null;
+    }
+
+    private WireShape wireShapeFromFunctionName(Address address) {
+        Function function = functionAtOrContaining(address);
+        if (function == null) {
+            return null;
+        }
+        String name = fullFunctionName(function);
+        if (name.contains("GridMate::Marshaler<u8>::Marshal")) {
+            return new WireShape("u8", "marshal-function-name");
+        }
+        if (name.contains("GridMate::Marshaler<u16>::Marshal")) {
+            return new WireShape("u16", "marshal-function-name");
+        }
+        if (name.contains("GridMate::Marshaler<u32>::Marshal")) {
+            return new WireShape("u32", "marshal-function-name");
+        }
+        if (name.contains("GridMate::Marshaler<u64>::Marshal")) {
+            return new WireShape("u64", "marshal-function-name");
+        }
+        if (name.contains("GridMate::Marshaler<f32>::Marshal")) {
+            return new WireShape("f32", "marshal-function-name");
+        }
+        if (name.contains("GridMate::HalfMarshaler::Marshal")) {
+            return new WireShape("half-f32", "marshal-function-name");
+        }
+        if (name.contains("GridMate::VlqU32Marshaler::Marshal")) {
+            return new WireShape("vlq-u32", "marshal-function-name");
+        }
+        if (name.contains("GridMate::QuatCompNormMarshaler::Marshal")) {
+            return new WireShape("quat-comp-norm", "marshal-function-name");
+        }
+        return null;
+    }
+
+    private boolean looksLikeBoolMarshal(Address address) {
+        byte[] bytes = codeBytesBeforePadding(readBytes(address, 96));
+        return containsBytes(bytes, 0x0f, 0x95) &&
+            (containsBytes(bytes, 0x41, 0xb8, 0x01, 0x00, 0x00, 0x00) ||
+                containsBytes(bytes, 0xba, 0x01, 0x00, 0x00, 0x00));
+    }
+
+    private boolean containsBytes(byte[] bytes, int... pattern) {
+        if (pattern.length == 0 || bytes.length < pattern.length) {
+            return false;
+        }
+        for (int i = 0; i <= bytes.length - pattern.length; i++) {
+            boolean matches = true;
+            for (int j = 0; j < pattern.length; j++) {
+                if (unsignedByte(bytes[i + j]) != pattern[j]) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private boolean isRipRelativeLea(byte[] bytes, int offset) {
         if (offset + 6 >= bytes.length || unsignedByte(bytes[offset + 1]) != 0x8d) {
             return false;
@@ -1850,6 +1951,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
             object.addProperty("fieldCount", fieldCount);
 
             JsonArray slots = new JsonArray();
+            Address marshal = null;
+            Address marshalTarget = null;
+            Address unmarshal = null;
+            Address unmarshalTarget = null;
             for (int slot = 0; slot < FIELD_HANDLER_VTABLE_SLOTS; slot++) {
                 Address target = readPointer(address.add(slot * 8L));
                 if (target == null || !isExecutableAddress(target)) {
@@ -1860,16 +1965,35 @@ public class NetworkSchemaExtractor extends GhidraScript {
                     : null;
                 slots.add(virtualFunctionSlot(slot, name, target));
                 if (slot == FIELD_HANDLER_MARSHAL_SLOT) {
-                    object.addProperty("marshal", formatAddress(target));
-                    add(object, "marshalTarget", formatAddress(terminalJumpTarget(target)));
+                    marshal = target;
+                    marshalTarget = terminalJumpTarget(target);
+                    object.addProperty("marshal", formatAddress(marshal));
+                    add(object, "marshalTarget", formatAddress(marshalTarget));
                 }
                 else if (slot == FIELD_HANDLER_UNMARSHAL_SLOT) {
-                    object.addProperty("unmarshal", formatAddress(target));
-                    add(object, "unmarshalTarget", formatAddress(terminalJumpTarget(target)));
+                    unmarshal = target;
+                    unmarshalTarget = terminalJumpTarget(target);
+                    object.addProperty("unmarshal", formatAddress(unmarshal));
+                    add(object, "unmarshalTarget", formatAddress(unmarshalTarget));
                 }
+            }
+            WireShape wireShape = classifyWireShape(marshal, marshalTarget);
+            if (wireShape != null) {
+                object.addProperty("wireShape", wireShape.shape);
+                object.addProperty("wireShapeSource", wireShape.source);
             }
             object.add("slots", slots);
             return object;
+        }
+    }
+
+    private static final class WireShape {
+        final String shape;
+        final String source;
+
+        WireShape(String shape, String source) {
+            this.shape = shape;
+            this.source = source;
         }
     }
 

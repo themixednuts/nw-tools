@@ -210,8 +210,26 @@ pub struct NetworkFieldHandlerVtable {
     pub unmarshal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unmarshal_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wire_shape: Option<NetworkWireShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wire_shape_source: Option<String>,
     pub slots: Vec<NetworkVirtualFunction>,
     pub evidence: Vec<NetworkEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkWireShape {
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    HalfF32,
+    VlqU32,
+    QuatCompNorm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -785,6 +803,8 @@ fn network_field_handler_vtable(vtable: &Map<String, Value>) -> NetworkFieldHand
         marshal_target: string(vtable, "marshalTarget"),
         unmarshal: string(vtable, "unmarshal"),
         unmarshal_target: string(vtable, "unmarshalTarget"),
+        wire_shape: wire_shape(vtable, "wireShape"),
+        wire_shape_source: string(vtable, "wireShapeSource"),
         slots: array_values(vtable, "slots")
             .filter_map(Value::as_object)
             .map(network_virtual_function)
@@ -926,6 +946,21 @@ fn stable_address(object: &Map<String, Value>, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn wire_shape(object: &Map<String, Value>, key: &str) -> Option<NetworkWireShape> {
+    match string_ref(object, key)? {
+        "bool" => Some(NetworkWireShape::Bool),
+        "u8" => Some(NetworkWireShape::U8),
+        "u16" => Some(NetworkWireShape::U16),
+        "u32" => Some(NetworkWireShape::U32),
+        "u64" => Some(NetworkWireShape::U64),
+        "f32" => Some(NetworkWireShape::F32),
+        "half-f32" => Some(NetworkWireShape::HalfF32),
+        "vlq-u32" => Some(NetworkWireShape::VlqU32),
+        "quat-comp-norm" => Some(NetworkWireShape::QuatCompNorm),
+        _ => None,
+    }
+}
+
 fn u32_value(object: &Map<String, Value>, key: &str) -> Option<u32> {
     object.get(key).and_then(|value| match value {
         Value::Number(number) => number.as_u64().and_then(|value| value.try_into().ok()),
@@ -1045,6 +1080,8 @@ mod tests {
                 "marshal": "NewWorld+0x344a700",
                 "marshalTarget": "NewWorld+0x17266c0",
                 "unmarshal": "NewWorld+0x3464830",
+                "wireShape": "u64",
+                "wireShapeSource": "marshal-call:marshal-function-name",
                 "slots": [{
                     "slot": 5,
                     "slotOffset": "0x28",
@@ -1132,6 +1169,11 @@ mod tests {
         assert_eq!(
             handler_vtable.marshal_target.as_deref(),
             Some("NewWorld+0x17266c0")
+        );
+        assert_eq!(handler_vtable.wire_shape, Some(NetworkWireShape::U64));
+        assert_eq!(
+            handler_vtable.wire_shape_source.as_deref(),
+            Some("marshal-call:marshal-function-name")
         );
         assert_eq!(handler_vtable.slots[0].name.as_deref(), Some("Marshal"));
         assert_eq!(
