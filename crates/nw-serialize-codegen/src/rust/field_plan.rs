@@ -47,8 +47,17 @@ impl RustFieldPlanner {
         current_module: &str,
     ) -> Vec<RustFieldPlan> {
         let mut field_counts = BTreeMap::<String, usize>::new();
+        let mut seen_fields = Vec::<&SerializeCodegenField>::new();
         item.fields
             .iter()
+            .filter(|field| {
+                if seen_fields.iter().any(|seen| *seen == *field) {
+                    false
+                } else {
+                    seen_fields.push(*field);
+                    true
+                }
+            })
             .filter(|field| should_materialize_rust_field(field, items_by_type_id))
             .map(|field| {
                 let mut plan = self.plan_serialize_field(
@@ -727,6 +736,7 @@ mod tests {
 
     use crate::ir::{SerializeCodegenField, SerializeCodegenItem, SerializeCodegenItemKind};
     use crate::role::ReflectedTypeRole;
+    use crate::rust::types::RustTypeOptions;
     use crate::types::{ResolvedType, ScalarType};
 
     use super::*;
@@ -802,5 +812,48 @@ mod tests {
             rust_storage_override_for_field(RustCodegenMode::Standalone, &item, &field),
             None
         );
+    }
+
+    #[test]
+    fn exact_duplicate_fields_are_materialized_once() {
+        let duplicate = SerializeCodegenField {
+            source_name: "m_rarityLevel".to_owned(),
+            source_type_id: uuid!("72039442-eb38-4d42-a1ad-cb68f7e0eef6"),
+            resolved_type: ResolvedType::Scalar(ScalarType::I32),
+            data_size: Some(4),
+            offset: Some(264),
+            flags: Some(0),
+            is_base_class: false,
+            is_pointer: false,
+            is_dynamic_field: false,
+        };
+        let item = SerializeCodegenItem {
+            source_type_id: uuid!("72f23ce6-385d-4ff4-a494-c42f9069c686"),
+            source_name: "ContractItemSimpleData".to_owned(),
+            role: ReflectedTypeRole::SupportType,
+            is_reflection_marker: false,
+            is_abstract: Some(false),
+            factory: None,
+            rtti_base_chain: Vec::new(),
+            kind: SerializeCodegenItemKind::Struct,
+            enum_underlying_type: None,
+            fields: vec![duplicate.clone(), duplicate],
+            variants: Vec::new(),
+        };
+        let planner = RustFieldPlanner::new(
+            RustCodegenMode::Standalone,
+            RustTypeRenderer::new(RustTypeOptions::default()),
+        );
+
+        let fields = planner.plan_struct_fields(
+            &item,
+            &BTreeMap::new(),
+            &RustNamePlan::default(),
+            None,
+            "types",
+        );
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].rust_name, "rarity_level");
     }
 }
