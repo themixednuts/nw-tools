@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
@@ -6,13 +6,13 @@ use syn::LitStr;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::naming::rust_type_ident;
+use crate::naming::{rust_field_ident, rust_module_ident, rust_type_ident};
 use crate::network_schema::{
     NetworkConfidence, NetworkField, NetworkRootKind, NetworkSchema, NetworkType,
     NetworkWireShape as SchemaWireShape,
 };
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v4";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v5";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -304,6 +304,90 @@ impl NetworkRustEmitter {
             report,
         })
     }
+
+    pub fn emit_replicated_states(
+        schema: &NetworkSchema,
+        type_indices: impl IntoIterator<Item = u32>,
+    ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
+        let selected = type_indices.into_iter().collect::<BTreeSet<_>>();
+        let wire_shapes = wire_shapes_by_handler_vtable(schema);
+        let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
+        let rust_names = identity_names_by_type_index(schema);
+        let types_by_type_index = schema
+            .types
+            .iter()
+            .filter_map(|network_type| Some((network_type.type_index?, network_type)))
+            .collect::<BTreeMap<_, _>>();
+        let plans_by_type_index = schema
+            .types
+            .iter()
+            .filter(|network_type| {
+                network_type
+                    .root_kinds
+                    .contains(&NetworkRootKind::ReplicatedState)
+            })
+            .filter_map(|network_type| {
+                Some((
+                    network_type.type_index?,
+                    state_generation_plan(network_type, &wire_shapes, &wire_shape_sources),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut report = NetworkRustGenerationReport::default();
+        let mut modules = Vec::new();
+        for type_index in selected {
+            let Some(network_type) = types_by_type_index.get(&type_index).copied() else {
+                report
+                    .state_generation_plans
+                    .push(blocked_state_generation_plan(
+                        Some(type_index),
+                        None,
+                        "missing-network-type",
+                    ));
+                continue;
+            };
+            let Some(plan) = plans_by_type_index.get(&type_index) else {
+                report
+                    .state_generation_plans
+                    .push(blocked_state_generation_plan(
+                        Some(type_index),
+                        network_type.name.clone(),
+                        "not-replicated-state",
+                    ));
+                continue;
+            };
+            report.state_generation_plans.push(plan.clone());
+            if plan.can_generate {
+                modules.push(replicated_state_module_tokens(
+                    network_type,
+                    plan,
+                    &rust_names,
+                ));
+            }
+        }
+
+        report.state_generation_plan_count = report.state_generation_plans.len();
+        report.generatable_state_count = report
+            .state_generation_plans
+            .iter()
+            .filter(|plan| plan.can_generate)
+            .count();
+        report.blocked_state_count =
+            report.state_generation_plan_count - report.generatable_state_count;
+        report.replicated_state_count = report.generatable_state_count;
+
+        let tokens = quote! {
+            #![allow(clippy::unreadable_literal)]
+
+            #(#modules)*
+        };
+        let file = syn::parse2(tokens)?;
+        Ok(NetworkRustOutput {
+            source: prettyplease::unparse(&file),
+            report,
+        })
+    }
 }
 
 fn identity_tokens(schema: &NetworkSchema) -> Vec<proc_macro2::TokenStream> {
@@ -557,6 +641,15 @@ fn state_generation_plan(
         .filter(|field| field.wire_shape.is_none())
         .count();
     let unsupported_wire_shape_count = 0;
+    let invalid_field_metadata_count = fields
+        .iter()
+        .filter(|field| {
+            matches!(
+                field.blocked_reason.as_deref(),
+                Some("missing-field-index" | "missing-field-name")
+            )
+        })
+        .count();
     let low_confidence_field_count = fields
         .iter()
         .filter(|field| !field.confidence.is_high_or_exact())
@@ -566,6 +659,7 @@ fn state_generation_plan(
         field_count,
         missing_wire_shape_count,
         unsupported_wire_shape_count,
+        invalid_field_metadata_count,
         low_confidence_field_count,
     );
     NetworkStateGenerationPlanReport {
@@ -631,6 +725,7 @@ fn state_blocked_reasons(
     field_count: usize,
     missing_wire_shape_count: usize,
     unsupported_wire_shape_count: usize,
+    invalid_field_metadata_count: usize,
     low_confidence_field_count: usize,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
@@ -649,6 +744,11 @@ fn state_blocked_reasons(
     if unsupported_wire_shape_count != 0 {
         reasons.push(format!(
             "unsupported-wire-shape:{unsupported_wire_shape_count}"
+        ));
+    }
+    if invalid_field_metadata_count != 0 {
+        reasons.push(format!(
+            "invalid-field-metadata:{invalid_field_metadata_count}"
         ));
     }
     if low_confidence_field_count != 0 {
@@ -717,6 +817,143 @@ const fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
             value_type: "QuatCompNorm",
             field_type: "ReplicatedFieldHandler<QuatCompNorm>",
         },
+    }
+}
+
+fn blocked_state_generation_plan(
+    type_index: Option<u32>,
+    type_name: Option<String>,
+    reason: &str,
+) -> NetworkStateGenerationPlanReport {
+    NetworkStateGenerationPlanReport {
+        type_index,
+        type_name,
+        field_count: 0,
+        shaped_field_count: 0,
+        supported_field_count: 0,
+        missing_wire_shape_count: 0,
+        unsupported_wire_shape_count: 0,
+        low_confidence_field_count: 0,
+        can_generate: false,
+        blocked_reasons: vec![reason.to_owned()],
+        fields: Vec::new(),
+    }
+}
+
+fn replicated_state_module_tokens(
+    network_type: &NetworkType,
+    plan: &NetworkStateGenerationPlanReport,
+    rust_names: &BTreeMap<u32, String>,
+) -> proc_macro2::TokenStream {
+    let type_index = network_type
+        .type_index
+        .expect("generatable replicated state has a type index");
+    let type_id = network_type
+        .type_id
+        .expect("generatable replicated state has a type ID");
+    let source_name = network_type
+        .name
+        .as_deref()
+        .expect("generatable replicated state has a name");
+    let rust_name = rust_names
+        .get(&type_index)
+        .cloned()
+        .unwrap_or_else(|| rust_type_ident(source_name));
+    let module_ident = format_ident!("{}", rust_module_ident(&rust_name));
+    let state_ident = format_ident!("{rust_name}");
+    let type_id = LitStr::new(
+        &type_id.hyphenated().to_string().to_ascii_uppercase(),
+        proc_macro2::Span::call_site(),
+    );
+    let fields = plan
+        .fields
+        .iter()
+        .map(replicated_state_field_tokens)
+        .collect::<Vec<_>>();
+
+    quote! {
+        pub mod #module_ident {
+            use ::nw_network::{AzRtti, ReplicatedState, TypeRegistry};
+
+            #[derive(Debug, Clone, Default, ReplicatedState, AzRtti, TypeRegistry)]
+            #[az_rtti(#type_id)]
+            #[type_registry(#type_index)]
+            pub struct #state_ident {
+                #(#fields)*
+
+                pub hub: ::nw_network::hub::ReplicatedState,
+            }
+        }
+
+        pub use #module_ident::#state_ident;
+    }
+}
+
+fn replicated_state_field_tokens(field: &NetworkStateFieldShapeReport) -> proc_macro2::TokenStream {
+    let field_name = field
+        .field_name
+        .as_deref()
+        .expect("generatable replicated state field has a name");
+    let field_ident = format_ident!("{}", rust_field_ident(field_name));
+    let group_attr = match field.group {
+        Some(0) | None => quote! {},
+        Some(group) => quote! { #[replicated_state(group = #group)] },
+    };
+    let field_type = replicated_state_field_type_tokens(
+        field
+            .wire_shape
+            .expect("generatable replicated state field has a wire shape"),
+    );
+
+    quote! {
+        #group_attr
+        pub #field_ident: #field_type,
+    }
+}
+
+fn replicated_state_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream {
+    match shape {
+        SchemaWireShape::Bool => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<bool>)
+        }
+        SchemaWireShape::U8 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<u8>)
+        }
+        SchemaWireShape::U16 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<u16>)
+        }
+        SchemaWireShape::U32 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<u32>)
+        }
+        SchemaWireShape::U64 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<u64>)
+        }
+        SchemaWireShape::F32 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<f32>)
+        }
+        SchemaWireShape::HalfF32 => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    f32,
+                    ::nw_network::serialize::HalfF32Marshaler,
+                >
+            )
+        }
+        SchemaWireShape::VlqU32 => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    u32,
+                    ::nw_network::serialize::VlqU32Marshaler,
+                >
+            )
+        }
+        SchemaWireShape::QuatCompNorm => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::nw_network::serialize::QuatCompNorm,
+                >
+            )
+        }
     }
 }
 
@@ -903,6 +1140,70 @@ mod tests {
                 .contains("wire_shape: Some(NetworkWireShape::U64)")
         );
         assert!(output.source.contains("unknown_type_indices"));
+
+        let state_output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [28]).expect("state source");
+
+        assert_eq!(state_output.report.state_generation_plan_count, 1);
+        assert_eq!(state_output.report.generatable_state_count, 1);
+        assert_eq!(state_output.report.blocked_state_count, 0);
+        assert!(
+            state_output
+                .source
+                .contains("pub mod raid_data_component_replicated_state")
+        );
+        assert!(
+            state_output
+                .source
+                .contains("pub struct RaidDataComponentReplicatedState")
+        );
+        assert!(state_output.source.contains("pub raid_id:"));
+        assert!(
+            state_output
+                .source
+                .contains("#[az_rtti(\"A85DF621-DCE0-409F-8D39-A447EA0807FF\")]")
+        );
+        assert!(state_output.source.contains("type_registry"));
+        assert!(state_output.source.contains("28"));
+        assert!(
+            state_output
+                .source
+                .contains("pub use raid_data_component_replicated_state")
+        );
+    }
+
+    #[test]
+    fn reports_selected_replicated_states_that_cannot_be_generated() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "A85DF621-DCE0-409F-8D39-A447EA0807FF",
+                "typeIndex": 28,
+                "typeName": "Javelin::RaidDataComponentReplicatedState",
+                "fields": []
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [28, 29]).expect("state source");
+
+        assert_eq!(output.report.state_generation_plan_count, 2);
+        assert_eq!(output.report.generatable_state_count, 0);
+        assert_eq!(output.report.blocked_state_count, 2);
+        assert_eq!(
+            output.report.state_generation_plans[0].blocked_reasons,
+            vec!["no-registered-fields"]
+        );
+        assert_eq!(
+            output.report.state_generation_plans[1].blocked_reasons,
+            vec!["missing-network-type"]
+        );
+        assert!(
+            !output
+                .source
+                .contains("pub struct RaidDataComponentReplicatedState")
+        );
     }
 
     #[test]
