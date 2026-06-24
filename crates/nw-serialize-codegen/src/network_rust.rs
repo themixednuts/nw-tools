@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::naming::rust_type_ident;
 use crate::network_schema::{
     NetworkConfidence, NetworkField, NetworkRootKind, NetworkSchema, NetworkType,
+    NetworkWireShape as SchemaWireShape,
 };
 
 #[derive(Debug, Error)]
@@ -39,6 +40,8 @@ pub struct NetworkRustGenerationReport {
     pub field_registered_count: usize,
     pub support_type_count: usize,
     pub low_confidence_field_count: usize,
+    pub field_wire_shape_count: usize,
+    pub unresolved_field_wire_shape_count: usize,
 }
 
 #[derive(Debug, Default)]
@@ -49,10 +52,11 @@ impl NetworkRustEmitter {
         schema: &NetworkSchema,
     ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
         let mut report = NetworkRustGenerationReport::default();
+        let wire_shapes = wire_shapes_by_handler_vtable(schema);
         let descriptors = schema
             .types
             .iter()
-            .filter_map(|network_type| descriptor_tokens(network_type, &mut report))
+            .filter_map(|network_type| descriptor_tokens(network_type, &wire_shapes, &mut report))
             .collect::<Vec<_>>();
         report.descriptor_count = descriptors.len();
         report.identity_name_collision_count = identity_name_collision_count(schema);
@@ -83,10 +87,24 @@ impl NetworkRustEmitter {
             }
 
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            pub enum NetworkWireShape {
+                Bool,
+                U8,
+                U16,
+                U32,
+                U64,
+                F32,
+                HalfF32,
+                VlqU32,
+                QuatCompNorm,
+            }
+
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
             pub struct NetworkFieldDescriptor {
                 pub index: u32,
                 pub name: &'static str,
                 pub group: Option<u32>,
+                pub wire_shape: Option<NetworkWireShape>,
                 pub confidence: NetworkFieldConfidence,
             }
 
@@ -296,6 +314,7 @@ fn identity_name_collision_count(schema: &NetworkSchema) -> usize {
 
 fn descriptor_tokens(
     network_type: &NetworkType,
+    wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     report: &mut NetworkRustGenerationReport,
 ) -> Option<proc_macro2::TokenStream> {
     let type_id = match network_type.type_id {
@@ -331,7 +350,7 @@ fn descriptor_tokens(
     let fields = network_type
         .fields
         .iter()
-        .filter_map(|field| field_tokens(field, report))
+        .filter_map(|field| field_tokens(field, wire_shapes, report))
         .collect::<Vec<_>>();
     report.field_descriptor_count += fields.len();
 
@@ -351,6 +370,7 @@ fn descriptor_tokens(
 
 fn field_tokens(
     field: &NetworkField,
+    wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     report: &mut NetworkRustGenerationReport,
 ) -> Option<proc_macro2::TokenStream> {
     let index = field.index?;
@@ -360,15 +380,46 @@ fn field_tokens(
     }
     let name = LitStr::new(name, proc_macro2::Span::call_site());
     let group = option_u32_tokens(field.group);
+    let wire_shape = field_wire_shape_tokens(field, wire_shapes, report);
     let confidence = confidence_ident(field.confidence);
     Some(quote! {
         NetworkFieldDescriptor {
             index: #index,
             name: #name,
             group: #group,
+            wire_shape: #wire_shape,
             confidence: NetworkFieldConfidence::#confidence,
         }
     })
+}
+
+fn wire_shapes_by_handler_vtable(schema: &NetworkSchema) -> BTreeMap<&str, SchemaWireShape> {
+    schema
+        .field_handler_vtables
+        .iter()
+        .filter_map(|vtable| {
+            let address = vtable.address.as_deref()?;
+            let shape = vtable.wire_shape?;
+            Some((address, shape))
+        })
+        .collect()
+}
+
+fn field_wire_shape_tokens(
+    field: &NetworkField,
+    wire_shapes: &BTreeMap<&str, SchemaWireShape>,
+    report: &mut NetworkRustGenerationReport,
+) -> proc_macro2::TokenStream {
+    let Some(handler_vtable) = field.handler_vtable.as_deref() else {
+        return quote!(None);
+    };
+    let Some(shape) = wire_shapes.get(handler_vtable).copied() else {
+        report.unresolved_field_wire_shape_count += 1;
+        return quote!(None);
+    };
+    report.field_wire_shape_count += 1;
+    let shape = wire_shape_ident(shape);
+    quote!(Some(NetworkWireShape::#shape))
 }
 
 fn root_kind(network_type: &NetworkType) -> NetworkRootKind {
@@ -417,6 +468,20 @@ fn confidence_ident(confidence: NetworkConfidence) -> proc_macro2::Ident {
     }
 }
 
+fn wire_shape_ident(shape: SchemaWireShape) -> proc_macro2::Ident {
+    match shape {
+        SchemaWireShape::Bool => format_ident!("Bool"),
+        SchemaWireShape::U8 => format_ident!("U8"),
+        SchemaWireShape::U16 => format_ident!("U16"),
+        SchemaWireShape::U32 => format_ident!("U32"),
+        SchemaWireShape::U64 => format_ident!("U64"),
+        SchemaWireShape::F32 => format_ident!("F32"),
+        SchemaWireShape::HalfF32 => format_ident!("HalfF32"),
+        SchemaWireShape::VlqU32 => format_ident!("VlqU32"),
+        SchemaWireShape::QuatCompNorm => format_ident!("QuatCompNorm"),
+    }
+}
+
 fn option_u32_tokens(value: Option<u32>) -> proc_macro2::TokenStream {
     match value {
         Some(value) => quote!(Some(#value)),
@@ -459,10 +524,21 @@ mod tests {
                     "index": 0,
                     "name": "raidId",
                     "group": 0,
+                    "handlerVtable": "NewWorld+0x81dad80",
                     "confidence": "register-field-call"
                 }]
             }],
-            "fieldRegistrationFunctions": []
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81dad80",
+                "fieldCount": 1,
+                "marshal": "NewWorld+0x344a700",
+                "marshalTarget": "NewWorld+0x17266c0",
+                "unmarshal": "NewWorld+0x3464830",
+                "wireShape": "u64",
+                "wireShapeSource": "marshal-call:marshal-function-name",
+                "slots": []
+            }]
         }))
         .expect("schema");
 
@@ -471,9 +547,12 @@ mod tests {
         assert_eq!(output.report.descriptor_count, 1);
         assert_eq!(output.report.identity_type_count, 1);
         assert_eq!(output.report.field_descriptor_count, 1);
+        assert_eq!(output.report.field_wire_shape_count, 1);
+        assert_eq!(output.report.unresolved_field_wire_shape_count, 0);
         assert_eq!(output.report.replicated_state_count, 1);
         assert!(output.source.contains("pub trait NetworkTypeIdentity"));
         assert!(output.source.contains("pub mod identity"));
+        assert!(output.source.contains("pub enum NetworkWireShape"));
         assert!(
             output
                 .source
@@ -497,6 +576,11 @@ mod tests {
                 .contains("name: Some(\"Javelin::RaidDataComponentReplicatedState\")")
         );
         assert!(output.source.contains("raidId"));
+        assert!(
+            output
+                .source
+                .contains("wire_shape: Some(NetworkWireShape::U64)")
+        );
         assert!(output.source.contains("unknown_type_indices"));
     }
 
