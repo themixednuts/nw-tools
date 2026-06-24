@@ -12,7 +12,7 @@ use crate::network_schema::{
     NetworkWireShape as SchemaWireShape,
 };
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v6";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v8";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -144,6 +144,7 @@ impl NetworkRustEmitter {
                 HalfF32,
                 VlqU32,
                 QuatCompNorm,
+                String,
             }
 
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +152,8 @@ impl NetworkRustEmitter {
                 pub index: u32,
                 pub name: &'static str,
                 pub group: Option<u32>,
+                pub native_type: Option<&'static str>,
+                pub storage_offset: Option<u32>,
                 pub wire_shape: Option<NetworkWireShape>,
                 pub confidence: NetworkFieldConfidence,
             }
@@ -162,6 +165,7 @@ impl NetworkRustEmitter {
                 pub name: Option<&'static str>,
                 pub kind: NetworkTypeKind,
                 pub is_field_registered: bool,
+                pub instance_size: Option<u32>,
                 pub fields: &'static [NetworkFieldDescriptor],
             }
 
@@ -516,6 +520,12 @@ fn descriptor_tokens(
     let name = option_str_tokens(network_type.name.as_deref());
     let kind = root_kind(network_type);
     let kind_ident = network_type_kind_ident(kind);
+    let instance_size = option_u32_tokens(
+        network_type
+            .instance
+            .as_ref()
+            .and_then(|instance| instance.size),
+    );
     count_kind(kind, report);
     if network_type
         .root_kinds
@@ -540,6 +550,7 @@ fn descriptor_tokens(
             name: #name,
             kind: NetworkTypeKind::#kind_ident,
             is_field_registered: #is_field_registered,
+            instance_size: #instance_size,
             fields: &[
                 #(#fields),*
             ],
@@ -559,6 +570,8 @@ fn field_tokens(
     }
     let name = LitStr::new(name, proc_macro2::Span::call_site());
     let group = option_u32_tokens(field.group);
+    let native_type = option_str_tokens(field.native_type.as_deref());
+    let storage_offset = option_u32_tokens(field.storage_offset);
     let wire_shape = field_wire_shape_tokens(field, wire_shapes, report);
     let confidence = confidence_ident(field.confidence);
     Some(quote! {
@@ -566,6 +579,8 @@ fn field_tokens(
             index: #index,
             name: #name,
             group: #group,
+            native_type: #native_type,
+            storage_offset: #storage_offset,
             wire_shape: #wire_shape,
             confidence: NetworkFieldConfidence::#confidence,
         }
@@ -589,6 +604,11 @@ fn field_wire_shape_tokens(
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     report: &mut NetworkRustGenerationReport,
 ) -> proc_macro2::TokenStream {
+    if let Some(shape) = field.wire_shape {
+        report.field_wire_shape_count += 1;
+        let shape = wire_shape_ident(shape);
+        return quote!(Some(NetworkWireShape::#shape));
+    }
     let Some(handler_vtable) = field.handler_vtable.as_deref() else {
         return quote!(None);
     };
@@ -680,10 +700,12 @@ fn state_field_shape_report(
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
 ) -> NetworkStateFieldShapeReport {
-    let shape = field
-        .handler_vtable
-        .as_deref()
-        .and_then(|handler_vtable| wire_shapes.get(handler_vtable).copied());
+    let shape = field.wire_shape.or_else(|| {
+        field
+            .handler_vtable
+            .as_deref()
+            .and_then(|handler_vtable| wire_shapes.get(handler_vtable).copied())
+    });
     let rust_shape = shape.map(rust_field_shape);
     let blocked_reason = field_blocked_reason(field, shape);
     NetworkStateFieldShapeReport {
@@ -692,11 +714,13 @@ fn state_field_shape_report(
         group: field.group,
         handler_vtable: field.handler_vtable.clone(),
         wire_shape: shape,
-        wire_shape_source: field
-            .handler_vtable
-            .as_deref()
-            .and_then(|handler_vtable| wire_shape_sources.get(handler_vtable).copied())
-            .map(ToOwned::to_owned),
+        wire_shape_source: field.wire_shape_source.clone().or_else(|| {
+            field
+                .handler_vtable
+                .as_deref()
+                .and_then(|handler_vtable| wire_shape_sources.get(handler_vtable).copied())
+                .map(ToOwned::to_owned)
+        }),
         rust_value_type: rust_shape.map(|shape| shape.value_type.to_owned()),
         rust_field_type: rust_shape.map(|shape| shape.field_type.to_owned()),
         confidence: field.confidence,
@@ -814,6 +838,10 @@ const fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
         SchemaWireShape::QuatCompNorm => RustFieldShape {
             value_type: "QuatCompNorm",
             field_type: "ReplicatedFieldHandler<QuatCompNorm>",
+        },
+        SchemaWireShape::String => RustFieldShape {
+            value_type: "String",
+            field_type: "ReplicatedFieldHandler<String>",
         },
     }
 }
@@ -952,6 +980,9 @@ fn replicated_state_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::To
                 >
             )
         }
+        SchemaWireShape::String => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<String>)
+        }
     }
 }
 
@@ -1012,6 +1043,7 @@ fn wire_shape_ident(shape: SchemaWireShape) -> proc_macro2::Ident {
         SchemaWireShape::HalfF32 => format_ident!("HalfF32"),
         SchemaWireShape::VlqU32 => format_ident!("VlqU32"),
         SchemaWireShape::QuatCompNorm => format_ident!("QuatCompNorm"),
+        SchemaWireShape::String => format_ident!("String"),
     }
 }
 
@@ -1223,6 +1255,67 @@ mod tests {
         assert_eq!(output.report.skipped_missing_name, 0);
         assert!(output.source.contains("type_index: 67"));
         assert!(output.source.contains("name: None"));
+    }
+
+    #[test]
+    fn emits_message_unmarshal_fields_as_descriptors() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
+                "typeIndex": 19,
+                "typeName": "RegistrationRequestV3Msg",
+                "messageUnmarshal": {
+                    "createInstance": "NewWorld+0x7ce840",
+                    "instanceSize": "0x470",
+                    "instanceSizeSource": "create-instance-operator-new"
+                },
+                "fields": [{
+                    "index": 0,
+                    "name": "field_0",
+                    "nativeType": "u32",
+                    "storageOffset": "0x8",
+                    "wireShape": "u32",
+                    "wireShapeSource": "message-unmarshal-native-type",
+                    "confidence": "message-unmarshal-call"
+                }, {
+                    "index": 2,
+                    "name": "field_2",
+                    "nativeType": "AZStd::string",
+                    "storageOffset": "0xa0",
+                    "wireShape": "string",
+                    "wireShapeSource": "message-unmarshal-native-type",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_descriptors(&schema).expect("rust source");
+
+        assert_eq!(output.report.descriptor_count, 1);
+        assert_eq!(output.report.message_count, 1);
+        assert_eq!(output.report.field_registered_count, 0);
+        assert_eq!(output.report.field_descriptor_count, 2);
+        assert_eq!(output.report.field_wire_shape_count, 2);
+        assert!(
+            output
+                .source
+                .contains("pub struct RegistrationRequestV3Msg")
+        );
+        assert!(output.source.contains("native_type: Some(\"u32\")"));
+        assert!(output.source.contains("storage_offset: Some(8u32)"));
+        assert!(output.source.contains("instance_size: Some(1136u32)"));
+        assert!(
+            output
+                .source
+                .contains("native_type: Some(\"AZStd::string\")")
+        );
+        assert!(
+            output
+                .source
+                .contains("wire_shape: Some(NetworkWireShape::String)")
+        );
     }
 
     #[test]
