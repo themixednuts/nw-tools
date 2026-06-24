@@ -102,6 +102,7 @@ pub struct NetworkType {
     pub name: Option<String>,
     pub name_source: Option<String>,
     pub root_kinds: Vec<NetworkRootKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_address: Option<String>,
     pub base_vtable: Option<String>,
     pub vtable: Option<String>,
@@ -612,6 +613,9 @@ fn typeindex_evidence(
 
 fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
     let type_id = uuid(entry, "uuid");
+    let storage_address = stable_address(entry, "storageAddress");
+    let base_vtable = stable_address(entry, "baseVtable");
+    let vtable = stable_address(entry, "vtable");
     let handler = entry
         .get("handler")
         .and_then(Value::as_object)
@@ -636,7 +640,7 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
         evidence.push(NetworkEvidence {
             kind: NetworkEvidenceKind::TypeRegistry,
             source: "registryEntries".to_owned(),
-            address: string(entry, "storageAddress"),
+            address: storage_address.clone(),
             detail: name.clone(),
             confidence: NetworkConfidence::Exact,
         });
@@ -666,7 +670,7 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
         evidence.push(NetworkEvidence {
             kind: NetworkEvidenceKind::HandlerVtable,
             source: "handler".to_owned(),
-            address: string(entry, "vtable").or_else(|| string(entry, "baseVtable")),
+            address: vtable.clone().or_else(|| base_vtable.clone()),
             detail: None,
             confidence: NetworkConfidence::High,
         });
@@ -679,9 +683,9 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
         name,
         name_source: string(entry, "typeNameSource"),
         root_kinds,
-        storage_address: string(entry, "storageAddress"),
-        base_vtable: string(entry, "baseVtable"),
-        vtable: string(entry, "vtable"),
+        storage_address,
+        base_vtable,
+        vtable,
         handler,
         serialize: None,
         az_rtti,
@@ -916,6 +920,12 @@ fn string_ref<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> 
         .filter(|value| !value.is_empty())
 }
 
+fn stable_address(object: &Map<String, Value>, key: &str) -> Option<String> {
+    string_ref(object, key)
+        .filter(|value| value.starts_with("NewWorld+0x"))
+        .map(ToOwned::to_owned)
+}
+
 fn u32_value(object: &Map<String, Value>, key: &str) -> Option<u32> {
     object.get(key).and_then(|value| match value {
         Value::Number(number) => number.as_u64().and_then(|value| value.try_into().ok()),
@@ -1078,6 +1088,12 @@ mod tests {
             network_type.name.as_deref(),
             Some("Javelin::RaidDataComponentReplicatedState")
         );
+        assert_eq!(network_type.storage_address, None);
+        assert_eq!(
+            network_type.base_vtable.as_deref(),
+            Some("NewWorld+0x84cb580")
+        );
+        assert_eq!(network_type.vtable, None);
         assert_eq!(
             network_type.root_kinds,
             vec![
