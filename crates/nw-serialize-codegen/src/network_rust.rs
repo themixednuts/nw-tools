@@ -12,7 +12,7 @@ use crate::network_schema::{
     NetworkWireShape as SchemaWireShape,
 };
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v3";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v4";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -44,6 +44,42 @@ pub struct NetworkRustGenerationReport {
     pub low_confidence_field_count: usize,
     pub field_wire_shape_count: usize,
     pub unresolved_field_wire_shape_count: usize,
+    pub state_generation_plan_count: usize,
+    pub generatable_state_count: usize,
+    pub blocked_state_count: usize,
+    pub state_generation_plans: Vec<NetworkStateGenerationPlanReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkStateGenerationPlanReport {
+    pub type_index: Option<u32>,
+    pub type_name: Option<String>,
+    pub field_count: usize,
+    pub shaped_field_count: usize,
+    pub supported_field_count: usize,
+    pub missing_wire_shape_count: usize,
+    pub unsupported_wire_shape_count: usize,
+    pub low_confidence_field_count: usize,
+    pub can_generate: bool,
+    pub blocked_reasons: Vec<String>,
+    pub fields: Vec<NetworkStateFieldShapeReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkStateFieldShapeReport {
+    pub field_index: Option<u32>,
+    pub field_name: Option<String>,
+    pub group: Option<u32>,
+    pub handler_vtable: Option<String>,
+    pub wire_shape: Option<SchemaWireShape>,
+    pub wire_shape_source: Option<String>,
+    pub rust_value_type: Option<String>,
+    pub rust_field_type: Option<String>,
+    pub confidence: NetworkConfidence,
+    pub supported: bool,
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -62,6 +98,15 @@ impl NetworkRustEmitter {
             .collect::<Vec<_>>();
         report.descriptor_count = descriptors.len();
         report.identity_name_collision_count = identity_name_collision_count(schema);
+        report.state_generation_plans = state_generation_plans(schema, &wire_shapes);
+        report.state_generation_plan_count = report.state_generation_plans.len();
+        report.generatable_state_count = report
+            .state_generation_plans
+            .iter()
+            .filter(|plan| plan.can_generate)
+            .count();
+        report.blocked_state_count =
+            report.state_generation_plan_count - report.generatable_state_count;
         let identities = identity_tokens(schema);
         report.identity_type_count = identities.len();
 
@@ -474,6 +519,207 @@ fn field_wire_shape_tokens(
     quote!(Some(NetworkWireShape::#shape))
 }
 
+fn state_generation_plans(
+    schema: &NetworkSchema,
+    wire_shapes: &BTreeMap<&str, SchemaWireShape>,
+) -> Vec<NetworkStateGenerationPlanReport> {
+    let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
+    schema
+        .types
+        .iter()
+        .filter(|network_type| {
+            network_type
+                .root_kinds
+                .contains(&NetworkRootKind::ReplicatedState)
+        })
+        .map(|network_type| state_generation_plan(network_type, wire_shapes, &wire_shape_sources))
+        .collect()
+}
+
+fn state_generation_plan(
+    network_type: &NetworkType,
+    wire_shapes: &BTreeMap<&str, SchemaWireShape>,
+    wire_shape_sources: &BTreeMap<&str, &str>,
+) -> NetworkStateGenerationPlanReport {
+    let fields = network_type
+        .fields
+        .iter()
+        .map(|field| state_field_shape_report(field, wire_shapes, wire_shape_sources))
+        .collect::<Vec<_>>();
+    let field_count = fields.len();
+    let shaped_field_count = fields
+        .iter()
+        .filter(|field| field.wire_shape.is_some())
+        .count();
+    let supported_field_count = fields.iter().filter(|field| field.supported).count();
+    let missing_wire_shape_count = fields
+        .iter()
+        .filter(|field| field.wire_shape.is_none())
+        .count();
+    let unsupported_wire_shape_count = 0;
+    let low_confidence_field_count = fields
+        .iter()
+        .filter(|field| !field.confidence.is_high_or_exact())
+        .count();
+    let blocked_reasons = state_blocked_reasons(
+        network_type,
+        field_count,
+        missing_wire_shape_count,
+        unsupported_wire_shape_count,
+        low_confidence_field_count,
+    );
+    NetworkStateGenerationPlanReport {
+        type_index: network_type.type_index,
+        type_name: network_type.name.clone(),
+        field_count,
+        shaped_field_count,
+        supported_field_count,
+        missing_wire_shape_count,
+        unsupported_wire_shape_count,
+        low_confidence_field_count,
+        can_generate: blocked_reasons.is_empty(),
+        blocked_reasons,
+        fields,
+    }
+}
+
+fn state_field_shape_report(
+    field: &NetworkField,
+    wire_shapes: &BTreeMap<&str, SchemaWireShape>,
+    wire_shape_sources: &BTreeMap<&str, &str>,
+) -> NetworkStateFieldShapeReport {
+    let shape = field
+        .handler_vtable
+        .as_deref()
+        .and_then(|handler_vtable| wire_shapes.get(handler_vtable).copied());
+    let rust_shape = shape.map(rust_field_shape);
+    let blocked_reason = field_blocked_reason(field, shape);
+    NetworkStateFieldShapeReport {
+        field_index: field.index,
+        field_name: field.name.clone(),
+        group: field.group,
+        handler_vtable: field.handler_vtable.clone(),
+        wire_shape: shape,
+        wire_shape_source: field
+            .handler_vtable
+            .as_deref()
+            .and_then(|handler_vtable| wire_shape_sources.get(handler_vtable).copied())
+            .map(ToOwned::to_owned),
+        rust_value_type: rust_shape.map(|shape| shape.value_type.to_owned()),
+        rust_field_type: rust_shape.map(|shape| shape.field_type.to_owned()),
+        confidence: field.confidence,
+        supported: blocked_reason.is_none(),
+        blocked_reason,
+    }
+}
+
+fn wire_shape_sources_by_handler_vtable(schema: &NetworkSchema) -> BTreeMap<&str, &str> {
+    schema
+        .field_handler_vtables
+        .iter()
+        .filter_map(|vtable| {
+            Some((
+                vtable.address.as_deref()?,
+                vtable.wire_shape_source.as_deref()?,
+            ))
+        })
+        .collect()
+}
+
+fn state_blocked_reasons(
+    network_type: &NetworkType,
+    field_count: usize,
+    missing_wire_shape_count: usize,
+    unsupported_wire_shape_count: usize,
+    low_confidence_field_count: usize,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if network_type.type_index.is_none() {
+        reasons.push("missing-type-index".to_owned());
+    }
+    if network_type.name.is_none() {
+        reasons.push("missing-type-name".to_owned());
+    }
+    if field_count == 0 {
+        reasons.push("no-registered-fields".to_owned());
+    }
+    if missing_wire_shape_count != 0 {
+        reasons.push(format!("missing-wire-shape:{missing_wire_shape_count}"));
+    }
+    if unsupported_wire_shape_count != 0 {
+        reasons.push(format!(
+            "unsupported-wire-shape:{unsupported_wire_shape_count}"
+        ));
+    }
+    if low_confidence_field_count != 0 {
+        reasons.push(format!("low-confidence-field:{low_confidence_field_count}"));
+    }
+    reasons
+}
+
+fn field_blocked_reason(field: &NetworkField, shape: Option<SchemaWireShape>) -> Option<String> {
+    if field.index.is_none() {
+        return Some("missing-field-index".to_owned());
+    }
+    if field.name.is_none() {
+        return Some("missing-field-name".to_owned());
+    }
+    if !field.confidence.is_high_or_exact() {
+        return Some("low-confidence-field".to_owned());
+    }
+    if shape.is_none() {
+        return Some("missing-wire-shape".to_owned());
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RustFieldShape {
+    value_type: &'static str,
+    field_type: &'static str,
+}
+
+const fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
+    match shape {
+        SchemaWireShape::Bool => RustFieldShape {
+            value_type: "bool",
+            field_type: "ReplicatedFieldHandler<bool>",
+        },
+        SchemaWireShape::U8 => RustFieldShape {
+            value_type: "u8",
+            field_type: "ReplicatedFieldHandler<u8>",
+        },
+        SchemaWireShape::U16 => RustFieldShape {
+            value_type: "u16",
+            field_type: "ReplicatedFieldHandler<u16>",
+        },
+        SchemaWireShape::U32 => RustFieldShape {
+            value_type: "u32",
+            field_type: "ReplicatedFieldHandler<u32>",
+        },
+        SchemaWireShape::U64 => RustFieldShape {
+            value_type: "u64",
+            field_type: "ReplicatedFieldHandler<u64>",
+        },
+        SchemaWireShape::F32 => RustFieldShape {
+            value_type: "f32",
+            field_type: "ReplicatedFieldHandler<f32>",
+        },
+        SchemaWireShape::HalfF32 => RustFieldShape {
+            value_type: "f32",
+            field_type: "ReplicatedFieldHandler<f32, HalfF32Marshaler>",
+        },
+        SchemaWireShape::VlqU32 => RustFieldShape {
+            value_type: "u32",
+            field_type: "ReplicatedFieldHandler<u32, VlqU32Marshaler>",
+        },
+        SchemaWireShape::QuatCompNorm => RustFieldShape {
+            value_type: "QuatCompNorm",
+            field_type: "ReplicatedFieldHandler<QuatCompNorm>",
+        },
+    }
+}
+
 fn root_kind(network_type: &NetworkType) -> NetworkRootKind {
     if network_type
         .root_kinds
@@ -601,7 +847,23 @@ mod tests {
         assert_eq!(output.report.field_descriptor_count, 1);
         assert_eq!(output.report.field_wire_shape_count, 1);
         assert_eq!(output.report.unresolved_field_wire_shape_count, 0);
+        assert_eq!(output.report.state_generation_plan_count, 1);
+        assert_eq!(output.report.generatable_state_count, 1);
+        assert_eq!(output.report.blocked_state_count, 0);
         assert_eq!(output.report.replicated_state_count, 1);
+        let state_plan = &output.report.state_generation_plans[0];
+        assert!(state_plan.can_generate);
+        assert_eq!(
+            state_plan.type_name.as_deref(),
+            Some("Javelin::RaidDataComponentReplicatedState")
+        );
+        assert_eq!(state_plan.field_count, 1);
+        assert_eq!(state_plan.shaped_field_count, 1);
+        assert_eq!(state_plan.supported_field_count, 1);
+        assert_eq!(
+            state_plan.fields[0].rust_field_type.as_deref(),
+            Some("ReplicatedFieldHandler<u64>")
+        );
         assert!(output.source.contains("pub trait NetworkTypeIdentity"));
         assert!(output.source.contains("pub mod identity"));
         assert!(output.source.contains("pub enum NetworkWireShape"));
