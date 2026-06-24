@@ -27,6 +27,8 @@ pub mod model;
 pub mod module_descriptors;
 pub mod naming;
 pub mod native;
+pub mod network_rust;
+pub mod network_schema;
 pub mod reference;
 pub mod role;
 pub mod rust;
@@ -123,6 +125,17 @@ pub use naming::{
     rust_type_name, rust_type_names_by_id,
 };
 pub use native::{NativeSymbol, NativeSymbolIndex, NativeSymbolUse, NativeSymbolUseKind};
+pub use network_rust::{
+    NetworkRustEmitError, NetworkRustEmitter, NetworkRustGenerationReport, NetworkRustOutput,
+};
+pub use network_schema::{
+    NETWORK_SCHEMA_VERSION, NetworkAzRtti, NetworkAzRttiProvider, NetworkConfidence,
+    NetworkEvidence, NetworkEvidenceKind, NetworkField, NetworkFieldRegistrationFunction,
+    NetworkHandler, NetworkRegistrationHook, NetworkRootKind, NetworkSchema,
+    NetworkSchemaImportError, NetworkSchemaSource, NetworkSchemaSourceKind, NetworkSchemaSummary,
+    NetworkSerializeKind, NetworkSerializeMergeReport, NetworkSerializeRole, NetworkSerializeType,
+    NetworkType, NetworkTypeIndexMergeReport, NetworkVirtualFunction,
+};
 pub use reference::{
     ReferenceExpansionContext, ReferenceIndex, ReferenceKey, ReferencePathSegment, ReferenceReport,
 };
