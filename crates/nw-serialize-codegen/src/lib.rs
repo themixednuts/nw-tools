@@ -17,6 +17,7 @@ pub mod dependency_graph;
 pub mod document;
 pub mod field_evidence;
 pub mod field_projection;
+pub mod generate;
 pub mod go;
 pub mod graph;
 pub mod ir;
@@ -74,6 +75,7 @@ pub use field_projection::{
     codegen_item_references_missing_type, item_has_materialized_payload,
     projected_missing_reflected_type_reasons, projected_missing_reflected_types,
 };
+pub use generate::{IntegratedRustProject, IntegratedRustProjectRequest};
 pub use go::layout::{
     GoStandaloneLayoutFileReport, GoStandaloneLayoutItemReport, GoStandaloneLayoutReport,
 };
