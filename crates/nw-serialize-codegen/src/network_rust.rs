@@ -30,6 +30,7 @@ pub struct NetworkRustGenerationReport {
     pub identity_type_count: usize,
     pub identity_name_collision_count: usize,
     pub field_descriptor_count: usize,
+    pub unnamed_descriptor_count: usize,
     pub skipped_missing_type_id: usize,
     pub skipped_missing_type_index: usize,
     pub skipped_missing_name: usize,
@@ -93,7 +94,7 @@ impl NetworkRustEmitter {
             pub struct NetworkTypeDescriptor {
                 pub type_id: Uuid,
                 pub type_index: u32,
-                pub name: &'static str,
+                pub name: Option<&'static str>,
                 pub kind: NetworkTypeKind,
                 pub is_field_registered: bool,
                 pub fields: &'static [NetworkFieldDescriptor],
@@ -136,12 +137,18 @@ impl NetworkRustEmitter {
 
             #[must_use]
             pub fn name_for_type_index(type_index: u32) -> Option<&'static str> {
-                type_by_type_index(type_index).map(|descriptor| descriptor.name)
+                type_by_type_index(type_index).and_then(|descriptor| descriptor.name)
             }
 
             #[must_use]
             pub fn is_known_type_index(type_index: u32) -> bool {
                 type_by_type_index(type_index).is_some()
+            }
+
+            #[must_use]
+            pub fn is_replicated_state_type_index(type_index: u32) -> bool {
+                type_by_type_index(type_index)
+                    .is_some_and(|descriptor| descriptor.kind == NetworkTypeKind::ReplicatedState)
             }
 
             #[must_use]
@@ -157,6 +164,20 @@ impl NetworkRustEmitter {
                 type_indices
                     .into_iter()
                     .filter(|type_index| !is_known_type_index(*type_index))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            }
+
+            pub fn non_replicated_state_type_indices(
+                type_indices: impl IntoIterator<Item = u32>,
+            ) -> Vec<u32> {
+                type_indices
+                    .into_iter()
+                    .filter(|type_index| {
+                        type_by_type_index(*type_index)
+                            .is_some_and(|descriptor| descriptor.kind != NetworkTypeKind::ReplicatedState)
+                    })
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect()
@@ -291,13 +312,10 @@ fn descriptor_tokens(
             return None;
         }
     };
-    let name = match network_type.name.as_deref() {
-        Some(name) => LitStr::new(name, proc_macro2::Span::call_site()),
-        None => {
-            report.skipped_missing_name += 1;
-            return None;
-        }
-    };
+    if network_type.name.is_none() {
+        report.unnamed_descriptor_count += 1;
+    }
+    let name = option_str_tokens(network_type.name.as_deref());
     let kind = root_kind(network_type);
     let kind_ident = network_type_kind_ident(kind);
     count_kind(kind, report);
@@ -406,6 +424,16 @@ fn option_u32_tokens(value: Option<u32>) -> proc_macro2::TokenStream {
     }
 }
 
+fn option_str_tokens(value: Option<&str>) -> proc_macro2::TokenStream {
+    match value {
+        Some(value) => {
+            let value = LitStr::new(value, proc_macro2::Span::call_site());
+            quote!(Some(#value))
+        }
+        None => quote!(None),
+    }
+}
+
 fn type_id_literal(type_id: Uuid) -> proc_macro2::TokenStream {
     format!("0x{:032x}", type_id.as_u128())
         .parse()
@@ -456,13 +484,41 @@ mod tests {
                 .source
                 .contains("pub const NETWORK_TYPES: &[NetworkTypeDescriptor]")
         );
+        assert!(output.source.contains("is_replicated_state_type_index"));
+        assert!(output.source.contains("non_replicated_state_type_indices"));
         assert!(
             output
                 .source
                 .contains("Javelin::RaidDataComponentReplicatedState")
         );
+        assert!(
+            output
+                .source
+                .contains("name: Some(\"Javelin::RaidDataComponentReplicatedState\")")
+        );
         assert!(output.source.contains("raidId"));
         assert!(output.source.contains("unknown_type_indices"));
+    }
+
+    #[test]
+    fn emits_unnamed_registry_entries_as_descriptors() {
+        let schema = NetworkSchema::from_replicated_state_ghidra_report(&json!({
+            "registryEntries": [{
+                "uuid": "6C735DB3-871C-4762-A02C-1DA6B5DAB7E9",
+                "typeIndex": 67
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_descriptors(&schema).expect("rust source");
+
+        assert_eq!(output.report.descriptor_count, 1);
+        assert_eq!(output.report.identity_type_count, 0);
+        assert_eq!(output.report.unnamed_descriptor_count, 1);
+        assert_eq!(output.report.skipped_missing_name, 0);
+        assert!(output.source.contains("type_index: 67"));
+        assert!(output.source.contains("name: None"));
     }
 
     #[test]

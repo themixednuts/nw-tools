@@ -354,10 +354,10 @@ fn network_rust(args: &NetworkRustArgs) -> Result<()> {
         write_path_if_changed(report_path, &report)?;
     }
     println!(
-        "network rust: {} descriptor(s), {} field descriptor(s), {} skipped missing name(s)",
+        "network rust: {} descriptor(s), {} field descriptor(s), {} unnamed descriptor(s)",
         output.report.descriptor_count,
         output.report.field_descriptor_count,
-        output.report.skipped_missing_name
+        output.report.unnamed_descriptor_count
     );
     Ok(())
 }
