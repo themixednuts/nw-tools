@@ -41,8 +41,27 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private static final int BACKWARD_ARGUMENT_SCAN_LIMIT = 48;
     private static final int VTABLE_SCAN_LIMIT = 96;
     private static final int AZ_RTTI_VTABLE_SCAN_SLOTS = 24;
+    private static final int FIELD_HANDLER_VTABLE_SLOTS = 14;
+    private static final int FIELD_HANDLER_MARSHAL_SLOT = 5;
+    private static final int FIELD_HANDLER_UNMARSHAL_SLOT = 6;
     private static final int TYPE_ID_PROVIDER_BYTES = 256;
     private static final int TYPE_NAME_PROVIDER_BYTES = 384;
+    private static final String[] FIELD_HANDLER_SLOT_NAMES = {
+        "Destructor",
+        "IsDefaultValue",
+        "SetCurrentValueAsDefault",
+        "IsDirty",
+        "HasValue",
+        "Marshal",
+        "Unmarshal",
+        "MergeAndUpdateSequence",
+        "ResetHasNewNetworkData",
+        "GetLastModified",
+        "SetLastModified",
+        "IsFieldValid",
+        "HasNewNetworkData",
+        "LogToStream",
+    };
     private static final Pattern MODULE_ADDR_RE =
         Pattern.compile("(?i)^NewWorld\\+0x(?<offset>[0-9a-f]+)$");
     private static final Pattern HEX_ADDR_RE =
@@ -108,6 +127,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
             dynamicFieldCount += function.fields.size();
             functionJson.add(function.toJson());
         }
+        JsonArray fieldHandlerVtableJson = fieldHandlerVtablesJson(registrationFunctions);
 
         JsonObject report = new JsonObject();
         report.addProperty("schema", "newworld.network_schema.static.v1");
@@ -125,6 +145,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         summary.addProperty("installRegistrationHooks", hookTypeNamesById.size());
         summary.addProperty("fieldRegistrationFunctions", registrationFunctions.size());
         summary.addProperty("fieldRegistrationCalls", dynamicFieldCount);
+        summary.addProperty("fieldHandlerVtables", fieldHandlerVtableJson.size());
         summary.addProperty("mappedRegistryEntries", mappedRegistryEntries);
         summary.addProperty("mappedRegistryFields", mappedFieldCount);
         report.add("summary", summary);
@@ -132,6 +153,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         report.add("registryEntries", registryJson);
         report.add("installRegistrationHooks", hookTypeNamesJson(hookTypeNamesById));
         report.add("fieldRegistrationFunctions", functionJson);
+        report.add("fieldHandlerVtables", fieldHandlerVtableJson);
 
         try (FileWriter writer = new FileWriter(output)) {
             gson.toJson(report, writer);
@@ -604,6 +626,32 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return array;
     }
 
+    private JsonArray fieldHandlerVtablesJson(
+        Map<String, RegistrationFunction> registrationFunctions) {
+
+        LinkedHashMap<String, FieldHandlerVtable> vtables = new LinkedHashMap<>();
+        for (RegistrationFunction function : registrationFunctions.values()) {
+            for (FieldCall field : function.fields) {
+                if (field.handlerVtable == null) {
+                    continue;
+                }
+                String key = field.handlerVtable.toString();
+                FieldHandlerVtable vtable = vtables.get(key);
+                if (vtable == null) {
+                    vtable = new FieldHandlerVtable(field.handlerVtable);
+                    vtables.put(key, vtable);
+                }
+                vtable.fieldCount++;
+            }
+        }
+
+        JsonArray array = new JsonArray();
+        for (FieldHandlerVtable vtable : vtables.values()) {
+            array.add(vtable.toJson());
+        }
+        return array;
+    }
+
     private List<Address> unmarshalCallTargets(RegistryEntry entry) {
         ArrayList<Address> result = new ArrayList<>();
         Address unmarshalAddress = parseCapturedAddress(entry.unmarshal);
@@ -887,17 +935,32 @@ public class NetworkSchemaExtractor extends GhidraScript {
             if (target == null || !isExecutableAddress(target)) {
                 break;
             }
-            JsonObject slot = new JsonObject();
-            slot.addProperty("slot", i);
-            slot.addProperty("slotOffset", "0x" + Integer.toHexString(i * 8));
-            slot.addProperty("address", formatAddress(target));
-            Function function = functionAtOrContaining(target);
-            if (function != null) {
-                slot.addProperty("function", fullFunctionName(function));
-            }
-            result.add(slot);
+            result.add(virtualFunctionSlot(i, null, target));
         }
         return result;
+    }
+
+    private JsonObject virtualFunctionSlot(int slotIndex, String slotName, Address target) {
+        JsonObject slot = new JsonObject();
+        slot.addProperty("slot", slotIndex);
+        slot.addProperty("slotOffset", "0x" + Integer.toHexString(slotIndex * 8));
+        add(slot, "name", slotName);
+        slot.addProperty("address", formatAddress(target));
+        Address resolvedTarget = resolvedCodeTarget(target);
+        if (target != null && resolvedTarget != null && !target.equals(resolvedTarget)) {
+            add(slot, "target", formatAddress(resolvedTarget));
+        }
+        else {
+            Address tailTarget = terminalJumpTarget(target);
+            if (tailTarget != null && !tailTarget.equals(target)) {
+                add(slot, "target", formatAddress(tailTarget));
+            }
+        }
+        Function function = functionAtOrContaining(target);
+        if (function != null) {
+            slot.addProperty("function", fullFunctionName(function));
+        }
+        return slot;
     }
 
     private AzRttiEvidence decodeAzRttiFromVtable(Address vtable) {
@@ -1064,6 +1127,33 @@ public class NetworkSchemaExtractor extends GhidraScript {
             return current;
         }
         return current;
+    }
+
+    private Address terminalJumpTarget(Address address) {
+        if (!isExecutableAddress(address)) {
+            return null;
+        }
+        Address cursor = address;
+        for (int i = 0; i < 32; i++) {
+            Instruction instruction = currentProgram.getListing().getInstructionAt(cursor);
+            if (instruction == null) {
+                return null;
+            }
+            String mnemonic = upperMnemonic(instruction);
+            if ("JMP".equals(mnemonic)) {
+                Address target = callTarget(instruction);
+                return isProgramAddress(target) ? target : null;
+            }
+            if (mnemonic != null && (mnemonic.startsWith("RET") || mnemonic.startsWith("INT"))) {
+                return null;
+            }
+            Address fallThrough = instruction.getFallThrough();
+            if (fallThrough == null || !isProgramAddress(fallThrough)) {
+                return null;
+            }
+            cursor = fallThrough;
+        }
+        return null;
     }
 
     private boolean isRipRelativeLea(byte[] bytes, int offset) {
@@ -1364,7 +1454,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
     private String registerOperand(Instruction instruction, int operandIndex) {
         String operandText = operandText(instruction, operandIndex);
-        if (operandText.contains("[")) {
+        if (operandText != null && operandText.contains("[")) {
             return null;
         }
         Object[] objects = operandObjects(instruction, operandIndex);
@@ -1742,6 +1832,43 @@ public class NetworkSchemaExtractor extends GhidraScript {
             add(object, "handlerExpression", handlerExpression);
             add(object, "handlerVtable", formatAddress(handlerVtable));
             add(object, "confidence", confidence);
+            return object;
+        }
+    }
+
+    private final class FieldHandlerVtable {
+        final Address address;
+        int fieldCount;
+
+        FieldHandlerVtable(Address address) {
+            this.address = address;
+        }
+
+        JsonObject toJson() {
+            JsonObject object = new JsonObject();
+            object.addProperty("address", formatAddress(address));
+            object.addProperty("fieldCount", fieldCount);
+
+            JsonArray slots = new JsonArray();
+            for (int slot = 0; slot < FIELD_HANDLER_VTABLE_SLOTS; slot++) {
+                Address target = readPointer(address.add(slot * 8L));
+                if (target == null || !isExecutableAddress(target)) {
+                    continue;
+                }
+                String name = slot < FIELD_HANDLER_SLOT_NAMES.length
+                    ? FIELD_HANDLER_SLOT_NAMES[slot]
+                    : null;
+                slots.add(virtualFunctionSlot(slot, name, target));
+                if (slot == FIELD_HANDLER_MARSHAL_SLOT) {
+                    object.addProperty("marshal", formatAddress(target));
+                    add(object, "marshalTarget", formatAddress(terminalJumpTarget(target)));
+                }
+                else if (slot == FIELD_HANDLER_UNMARSHAL_SLOT) {
+                    object.addProperty("unmarshal", formatAddress(target));
+                    add(object, "unmarshalTarget", formatAddress(terminalJumpTarget(target)));
+                }
+            }
+            object.add("slots", slots);
             return object;
         }
     }

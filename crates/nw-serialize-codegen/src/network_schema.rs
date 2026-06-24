@@ -29,6 +29,8 @@ pub struct NetworkSchema {
     pub summary: NetworkSchemaSummary,
     pub types: Vec<NetworkType>,
     pub field_registration_functions: Vec<NetworkFieldRegistrationFunction>,
+    #[serde(default)]
+    pub field_handler_vtables: Vec<NetworkFieldHandlerVtable>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +47,8 @@ pub struct NetworkSchemaSummary {
     pub type_index_evidence_count: usize,
     pub serialize_type_count: usize,
     pub serialize_dependency_count: usize,
+    #[serde(default)]
+    pub field_handler_vtable_count: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,8 +190,27 @@ pub struct NetworkFieldRegistrationFunction {
 pub struct NetworkVirtualFunction {
     pub slot: Option<u32>,
     pub slot_offset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     pub function: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkFieldHandlerVtable {
+    pub address: Option<String>,
+    pub field_count: usize,
+    pub marshal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marshal_target: Option<String>,
+    pub unmarshal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmarshal_target: Option<String>,
+    pub slots: Vec<NetworkVirtualFunction>,
+    pub evidence: Vec<NetworkEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +316,10 @@ impl NetworkSchema {
             .filter_map(Value::as_object)
             .map(network_field_registration_function)
             .collect::<Vec<_>>();
+        let field_handler_vtables = array_values(root, "fieldHandlerVtables")
+            .filter_map(Value::as_object)
+            .map(network_field_handler_vtable)
+            .collect::<Vec<_>>();
         let mut schema = Self {
             schema: NETWORK_SCHEMA_VERSION.to_owned(),
             sources: vec![NetworkSchemaSource {
@@ -305,6 +332,7 @@ impl NetworkSchema {
             summary: NetworkSchemaSummary::default(),
             types,
             field_registration_functions,
+            field_handler_vtables,
         };
         schema.summary = schema.build_summary();
         Ok(schema)
@@ -482,6 +510,7 @@ impl NetworkSchema {
                 .filter_map(|network_type| network_type.serialize.as_ref())
                 .map(|serialize| serialize.direct_dependency_type_ids.len())
                 .sum(),
+            field_handler_vtable_count: self.field_handler_vtables.len(),
         }
     }
 }
@@ -736,8 +765,33 @@ fn network_virtual_function(function: &Map<String, Value>) -> NetworkVirtualFunc
     NetworkVirtualFunction {
         slot: u32_value(function, "slot"),
         slot_offset: string(function, "slotOffset"),
+        name: string(function, "name"),
         address: string(function, "address"),
+        target: string(function, "target"),
         function: string(function, "function"),
+    }
+}
+
+fn network_field_handler_vtable(vtable: &Map<String, Value>) -> NetworkFieldHandlerVtable {
+    let confidence = NetworkConfidence::High;
+    NetworkFieldHandlerVtable {
+        address: string(vtable, "address"),
+        field_count: usize_value(vtable, "fieldCount").unwrap_or_default(),
+        marshal: string(vtable, "marshal"),
+        marshal_target: string(vtable, "marshalTarget"),
+        unmarshal: string(vtable, "unmarshal"),
+        unmarshal_target: string(vtable, "unmarshalTarget"),
+        slots: array_values(vtable, "slots")
+            .filter_map(Value::as_object)
+            .map(network_virtual_function)
+            .collect(),
+        evidence: vec![NetworkEvidence {
+            kind: NetworkEvidenceKind::HandlerVtable,
+            source: "fieldHandlerVtables".to_owned(),
+            address: string(vtable, "address"),
+            detail: None,
+            confidence,
+        }],
     }
 }
 
@@ -870,6 +924,14 @@ fn u32_value(object: &Map<String, Value>, key: &str) -> Option<u32> {
     })
 }
 
+fn usize_value(object: &Map<String, Value>, key: &str) -> Option<usize> {
+    object.get(key).and_then(|value| match value {
+        Value::Number(number) => number.as_u64().and_then(|value| value.try_into().ok()),
+        Value::String(value) => value.parse().ok(),
+        _ => None,
+    })
+}
+
 fn uuid(object: &Map<String, Value>, key: &str) -> Option<Uuid> {
     string_ref(object, key).and_then(parse_uuid)
 }
@@ -966,6 +1028,25 @@ mod tests {
                     "group": 0,
                     "confidence": "register-field-call"
                 }]
+            }],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81dad80",
+                "fieldCount": 1,
+                "marshal": "NewWorld+0x344a700",
+                "marshalTarget": "NewWorld+0x17266c0",
+                "unmarshal": "NewWorld+0x3464830",
+                "slots": [{
+                    "slot": 5,
+                    "slotOffset": "0x28",
+                    "name": "Marshal",
+                    "address": "NewWorld+0x344a700",
+                    "target": "NewWorld+0x17266c0"
+                }, {
+                    "slot": 6,
+                    "slotOffset": "0x30",
+                    "name": "Unmarshal",
+                    "address": "NewWorld+0x3464830"
+                }]
             }]
         });
 
@@ -985,6 +1066,7 @@ mod tests {
         assert_eq!(schema.summary.register_field_function_count, 1);
         assert_eq!(schema.summary.register_field_count, 1);
         assert_eq!(schema.summary.high_confidence_field_count, 1);
+        assert_eq!(schema.summary.field_handler_vtable_count, 1);
 
         let network_type = &schema.types[0];
         assert_eq!(
@@ -1023,6 +1105,22 @@ mod tests {
         assert_eq!(
             function.fields[0].callsite.as_deref(),
             Some("NewWorld+0x3495762")
+        );
+
+        let handler_vtable = &schema.field_handler_vtables[0];
+        assert_eq!(
+            handler_vtable.address.as_deref(),
+            Some("NewWorld+0x81dad80")
+        );
+        assert_eq!(handler_vtable.field_count, 1);
+        assert_eq!(
+            handler_vtable.marshal_target.as_deref(),
+            Some("NewWorld+0x17266c0")
+        );
+        assert_eq!(handler_vtable.slots[0].name.as_deref(), Some("Marshal"));
+        assert_eq!(
+            handler_vtable.slots[0].target.as_deref(),
+            Some("NewWorld+0x17266c0")
         );
     }
 
