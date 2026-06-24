@@ -159,6 +159,8 @@ pub struct NetworkField {
     pub group: Option<u32>,
     pub handler_offset: Option<String>,
     pub handler_expression: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handler_vtable: Option<String>,
     pub callsite: Option<String>,
     pub confidence: NetworkConfidence,
     pub evidence: Vec<NetworkEvidence>,
@@ -717,6 +719,7 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
         group: u32_value(field, "group"),
         handler_offset: string(field, "handlerOffset"),
         handler_expression: string(field, "handlerExpression"),
+        handler_vtable: string(field, "handlerVtable"),
         callsite: string(field, "callsite"),
         confidence,
         evidence: vec![NetworkEvidence {
@@ -943,6 +946,7 @@ mod tests {
                     "nameAddress": "NewWorld+0x81db5f4",
                     "group": 0,
                     "handlerExpression": "R15",
+                    "handlerVtable": "NewWorld+0x81dad80",
                     "confidence": "register-field-call"
                 }]
             }],
@@ -1008,6 +1012,10 @@ mod tests {
         );
         assert_eq!(network_type.fields[0].name.as_deref(), Some("raidId"));
         assert_eq!(network_type.fields[0].group, Some(0));
+        assert_eq!(
+            network_type.fields[0].handler_vtable.as_deref(),
+            Some("NewWorld+0x81dad80")
+        );
         assert_eq!(network_type.fields[0].confidence, NetworkConfidence::High);
 
         let function = &schema.field_registration_functions[0];

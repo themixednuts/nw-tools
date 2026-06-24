@@ -625,6 +625,26 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private FieldCall recoverFieldCall(Function owner, Address callsite, int index) {
+        ArgState state = recoverForwardArgState(owner, callsite);
+        ArgState fallback = recoverBackwardArgState(owner, callsite);
+        state.fillMissingFrom(fallback);
+
+        FieldCall field = new FieldCall();
+        field.index = index;
+        field.callsite = callsite;
+        field.nameAddress = state.nameAddress;
+        field.name = state.name;
+        field.group = state.groupKnown ? state.group : null;
+        field.handlerOffset = state.handlerOffset;
+        field.handlerExpression = state.handlerExpression;
+        field.handlerVtable = state.handlerVtable;
+        field.confidence = field.name == null
+            ? "register-field-call-unresolved-name"
+            : "register-field-call";
+        return field;
+    }
+
+    private ArgState recoverBackwardArgState(Function owner, Address callsite) {
         ArgState state = new ArgState();
         Instruction cursor = currentProgram.getListing().getInstructionBefore(callsite);
         for (int i = 0; i < BACKWARD_ARGUMENT_SCAN_LIMIT && cursor != null; i++) {
@@ -640,19 +660,106 @@ public class NetworkSchemaExtractor extends GhidraScript {
             }
             cursor = cursor.getPrevious();
         }
+        return state;
+    }
 
-        FieldCall field = new FieldCall();
-        field.index = index;
-        field.callsite = callsite;
-        field.nameAddress = state.nameAddress;
-        field.name = state.name;
-        field.group = state.groupKnown ? state.group : null;
-        field.handlerOffset = state.handlerOffset;
-        field.handlerExpression = state.handlerExpression;
-        field.confidence = field.name == null
-            ? "register-field-call-unresolved-name"
-            : "register-field-call";
-        return field;
+    private ArgState recoverForwardArgState(Function owner, Address callsite) {
+        ForwardArgState state = new ForwardArgState();
+        state.registers.put("RCX", TrackedValue.thisOffset(0));
+        for (Instruction instruction :
+            currentProgram.getListing().getInstructions(owner.getBody(), true)) {
+            if (instruction.getMinAddress().compareTo(callsite) >= 0) {
+                break;
+            }
+            observeForwardInstruction(instruction, state);
+        }
+
+        ArgState result = new ArgState();
+        TrackedValue name = state.registers.get("RDX");
+        if (name != null && name.address != null) {
+            String value = readPrintableString(name.address);
+            if (isFieldName(value)) {
+                result.nameAddress = name.address;
+                result.name = value;
+            }
+        }
+
+        TrackedValue handler = state.registers.get("R8");
+        if (handler != null) {
+            result.handlerKnown = true;
+            if (handler.thisOffset != null) {
+                result.handlerOffset = handler.thisOffset;
+                result.handlerExpression = handler.expression;
+                result.handlerVtable = state.vtablesByThisOffset.get(handler.thisOffset);
+            }
+            else if (handler.address != null) {
+                result.handlerExpression = formatAddress(handler.address);
+            }
+            else {
+                result.handlerExpression = handler.expression;
+            }
+        }
+
+        TrackedValue group = state.registers.get("R9");
+        if (group != null && group.immediate != null) {
+            result.groupKnown = true;
+            result.group = group.immediate.intValue();
+        }
+        return result;
+    }
+
+    private void observeForwardInstruction(Instruction instruction, ForwardArgState state) {
+        String mnemonic = upperMnemonic(instruction);
+        if (mnemonic == null) {
+            return;
+        }
+
+        if (instruction.getFlowType().isCall()) {
+            clearVolatileRegisters(state.registers);
+            return;
+        }
+
+        String destination = registerOperand(instruction, 0);
+        if (destination != null) {
+            if (("XOR".equals(mnemonic) || "SUB".equals(mnemonic)) &&
+                destination.equals(registerOperand(instruction, 1))) {
+                state.registers.put(destination, TrackedValue.immediate(0));
+                return;
+            }
+
+            if ("LEA".equals(mnemonic)) {
+                TrackedValue value = trackedLeaValue(instruction, state.registers);
+                putOrRemove(state.registers, destination, value);
+                return;
+            }
+
+            if ("MOV".equals(mnemonic)) {
+                TrackedValue value = trackedMoveSource(instruction, state.registers);
+                putOrRemove(state.registers, destination, value);
+                return;
+            }
+
+            if ("ADD".equals(mnemonic)) {
+                TrackedValue current = state.registers.get(destination);
+                Long immediate = immediateValue(instruction, 1);
+                if (current != null && current.thisOffset != null && immediate != null) {
+                    state.registers.put(destination, current.addOffset(immediate.intValue()));
+                }
+                else {
+                    state.registers.remove(destination);
+                }
+                return;
+            }
+        }
+
+        if ("MOV".equals(mnemonic)) {
+            Integer offset = trackedThisOffsetForMemoryOperand(instruction, 0, state.registers);
+            TrackedValue source = trackedMoveSource(instruction, state.registers);
+            if (offset != null && source != null &&
+                source.address != null && isVtableLike(source.address)) {
+                state.vtablesByThisOffset.put(offset, source.address);
+            }
+        }
     }
 
     private void observeArgumentAssignment(Instruction instruction, ArgState state) {
@@ -1137,6 +1244,97 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return hasBaseRegister && displacement != 0 ? displacement : null;
     }
 
+    private TrackedValue trackedLeaValue(
+        Instruction instruction,
+        Map<String, TrackedValue> registers) {
+
+        Integer offset = trackedThisOffsetForMemoryOperand(instruction, 1, registers);
+        if (offset != null) {
+            return TrackedValue.thisOffset(offset);
+        }
+
+        Address address = referencedAddress(instruction);
+        if (address != null) {
+            return TrackedValue.address(address);
+        }
+        return null;
+    }
+
+    private TrackedValue trackedMoveSource(
+        Instruction instruction,
+        Map<String, TrackedValue> registers) {
+
+        String sourceRegister = registerOperand(instruction, 1);
+        if (sourceRegister != null) {
+            TrackedValue value = registers.get(sourceRegister);
+            return value == null ? null : value.copy();
+        }
+
+        Address address = referencedAddress(instruction);
+        if (address != null) {
+            return TrackedValue.address(address);
+        }
+
+        Long immediate = immediateValue(instruction, 1);
+        return immediate == null ? null : TrackedValue.immediate(immediate);
+    }
+
+    private Integer trackedThisOffsetForMemoryOperand(
+        Instruction instruction,
+        int operandIndex,
+        Map<String, TrackedValue> registers) {
+
+        Object[] objects = operandObjects(instruction, operandIndex);
+        String baseRegister = null;
+        int displacement = 0;
+        for (Object object : objects) {
+            if (object instanceof Register register) {
+                String name = canonicalRegisterName(register.getName());
+                if (!"RIP".equals(name) && !"RSP".equals(name)) {
+                    baseRegister = name;
+                }
+            }
+            else if (object instanceof Scalar scalar) {
+                long value = scalar.getSignedValue();
+                if (value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE) {
+                    displacement += (int)value;
+                }
+            }
+        }
+
+        if (baseRegister == null) {
+            return null;
+        }
+        TrackedValue base = registers.get(baseRegister);
+        if (base == null || base.thisOffset == null) {
+            return null;
+        }
+        return base.thisOffset + displacement;
+    }
+
+    private void putOrRemove(
+        Map<String, TrackedValue> registers,
+        String register,
+        TrackedValue value) {
+
+        if (value == null) {
+            registers.remove(register);
+        }
+        else {
+            registers.put(register, value);
+        }
+    }
+
+    private void clearVolatileRegisters(Map<String, TrackedValue> registers) {
+        registers.remove("RAX");
+        registers.remove("RCX");
+        registers.remove("RDX");
+        registers.remove("R8");
+        registers.remove("R9");
+        registers.remove("R10");
+        registers.remove("R11");
+    }
+
     private Long immediateValue(Instruction instruction, int operandIndex) {
         for (Object object : operandObjects(instruction, operandIndex)) {
             if (object instanceof Scalar scalar) {
@@ -1524,6 +1722,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         Integer group;
         Integer handlerOffset;
         String handlerExpression;
+        Address handlerVtable;
         String confidence;
 
         JsonObject toJson() {
@@ -1537,6 +1736,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 object.addProperty("handlerOffset", "0x" + Integer.toHexString(handlerOffset));
             }
             add(object, "handlerExpression", handlerExpression);
+            add(object, "handlerVtable", formatAddress(handlerVtable));
             add(object, "confidence", confidence);
             return object;
         }
@@ -1651,6 +1851,84 @@ public class NetworkSchemaExtractor extends GhidraScript {
         boolean handlerKnown;
         Integer handlerOffset;
         String handlerExpression;
+        Address handlerVtable;
+
+        void fillMissingFrom(ArgState fallback) {
+            if (nameAddress == null) {
+                nameAddress = fallback.nameAddress;
+                name = fallback.name;
+            }
+            if (!groupKnown && fallback.groupKnown) {
+                groupKnown = true;
+                group = fallback.group;
+            }
+            if (!handlerKnown && fallback.handlerKnown) {
+                handlerKnown = true;
+                handlerOffset = fallback.handlerOffset;
+                handlerExpression = fallback.handlerExpression;
+                handlerVtable = fallback.handlerVtable;
+            }
+            else if (handlerVtable == null) {
+                handlerVtable = fallback.handlerVtable;
+            }
+        }
+    }
+
+    private static final class ForwardArgState {
+        final Map<String, TrackedValue> registers = new HashMap<>();
+        final Map<Integer, Address> vtablesByThisOffset = new HashMap<>();
+    }
+
+    private static final class TrackedValue {
+        final Address address;
+        final Integer thisOffset;
+        final Long immediate;
+        final String expression;
+
+        private TrackedValue(
+            Address address,
+            Integer thisOffset,
+            Long immediate,
+            String expression) {
+
+            this.address = address;
+            this.thisOffset = thisOffset;
+            this.immediate = immediate;
+            this.expression = expression;
+        }
+
+        static TrackedValue address(Address address) {
+            return new TrackedValue(address, null, null, null);
+        }
+
+        static TrackedValue thisOffset(int offset) {
+            return new TrackedValue(null, offset, null, thisExpression(offset));
+        }
+
+        static TrackedValue immediate(long value) {
+            return new TrackedValue(null, null, value, Long.toUnsignedString(value));
+        }
+
+        TrackedValue addOffset(int delta) {
+            if (thisOffset == null) {
+                return this;
+            }
+            return thisOffset(thisOffset + delta);
+        }
+
+        TrackedValue copy() {
+            return new TrackedValue(address, thisOffset, immediate, expression);
+        }
+
+        private static String thisExpression(int offset) {
+            if (offset == 0) {
+                return "this";
+            }
+            if (offset > 0) {
+                return "this+0x" + Integer.toHexString(offset);
+            }
+            return "this-0x" + Integer.toHexString(-offset);
+        }
     }
 
     private void add(JsonObject object, String name, String value) {
