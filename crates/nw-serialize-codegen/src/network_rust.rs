@@ -378,8 +378,6 @@ impl NetworkRustEmitter {
         report.replicated_state_count = report.generatable_state_count;
 
         let tokens = quote! {
-            #![allow(clippy::unreadable_literal)]
-
             #(#modules)*
         };
         let file = syn::parse2(tokens)?;
