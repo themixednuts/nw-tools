@@ -39,7 +39,7 @@ pub struct GoSourceEmitter;
 
 impl GoSourceEmitter {
     pub fn emit_unit(unit: &SerializeCodegenUnit) -> Result<String, GoSourceEmitError> {
-        Self::default().emit(unit, &GoSourceOptions::default())
+        Self.emit(unit, &GoSourceOptions::default())
     }
 
     pub fn emit(
@@ -1520,7 +1520,7 @@ mod tests {
         let unit = namespace_and_base_family_fixture();
 
         let context = crate::CodegenContext::inline();
-        let project = GoSourceEmitter::default()
+        let project = GoSourceEmitter
             .emit_standalone_project(&unit, "aztypesvalidation", "aztypesvalidation", &context)
             .expect("Go standalone project");
         let paths = project
@@ -1606,7 +1606,7 @@ mod tests {
     #[test]
     fn rejects_invalid_package_names() {
         let unit = SerializeCodegenUnit::default();
-        let err = GoSourceEmitter::default()
+        let err = GoSourceEmitter
             .emit(
                 &unit,
                 &GoSourceOptions {

@@ -20,7 +20,6 @@ impl RustSourceFile {
         Ok(Self::from_syn_file(&file))
     }
 
-    #[must_use]
     pub fn items(&self) -> impl Iterator<Item = &RustSourceItem> {
         self.items_by_name.values()
     }

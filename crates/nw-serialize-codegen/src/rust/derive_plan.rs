@@ -68,6 +68,15 @@ pub(super) struct RustDerivePlanner {
     mode: RustCodegenMode,
 }
 
+pub(super) struct RustDeriveCaches<'a> {
+    pub eq: &'a mut BTreeMap<Uuid, bool>,
+    pub default: &'a mut BTreeMap<Uuid, bool>,
+    pub hash: &'a mut BTreeMap<Uuid, bool>,
+    pub copy: &'a mut BTreeMap<Uuid, bool>,
+    pub marshaler: &'a mut BTreeMap<Uuid, bool>,
+    pub serde: &'a mut BTreeMap<Uuid, bool>,
+}
+
 impl RustDerivePlanner {
     pub(super) const fn new(mode: RustCodegenMode) -> Self {
         Self { mode }
@@ -79,12 +88,7 @@ impl RustDerivePlanner {
         identity_kind: RustTypeIdentityKind,
         item: &SerializeCodegenItem,
         items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
-        eq_cache: &mut BTreeMap<Uuid, bool>,
-        default_cache: &mut BTreeMap<Uuid, bool>,
-        hash_cache: &mut BTreeMap<Uuid, bool>,
-        copy_cache: &mut BTreeMap<Uuid, bool>,
-        marshaler_cache: &mut BTreeMap<Uuid, bool>,
-        serde_cache: &mut BTreeMap<Uuid, bool>,
+        caches: &mut RustDeriveCaches<'_>,
     ) -> Vec<String> {
         let supports_partial_eq = item_supports_partial_eq(
             item,
@@ -96,7 +100,7 @@ impl RustDerivePlanner {
         let supports_eq = item_supports_eq(
             item,
             items_by_type_id,
-            eq_cache,
+            &mut *caches.eq,
             &mut BTreeSet::new(),
             self.mode,
         );
@@ -109,21 +113,21 @@ impl RustDerivePlanner {
         let supports_default = item_supports_default(
             item,
             items_by_type_id,
-            default_cache,
+            &mut *caches.default,
             &mut BTreeSet::new(),
             self.mode,
         );
         let supports_hash = item_supports_hash(
             item,
             items_by_type_id,
-            hash_cache,
+            &mut *caches.hash,
             &mut BTreeSet::new(),
             self.mode,
         );
         let supports_copy = item_supports_copy(
             item,
             items_by_type_id,
-            copy_cache,
+            &mut *caches.copy,
             &mut BTreeSet::new(),
             self.mode,
         );
@@ -138,13 +142,13 @@ impl RustDerivePlanner {
             && item_supports_marshaler(
                 item,
                 items_by_type_id,
-                marshaler_cache,
+                &mut *caches.marshaler,
                 &mut BTreeSet::new(),
             );
         let supports_serde = item_supports_serde(
             item,
             items_by_type_id,
-            serde_cache,
+            &mut *caches.serde,
             &mut BTreeSet::new(),
             self.mode,
         );
@@ -753,16 +757,18 @@ fn resolved_type_supports_eq(
                     SequenceKind::UnorderedSet => {
                         rust_type_supports_native_hash_key(element, items_by_type_id)
                     }
-                    SequenceKind::Set if matches!(mode, RustCodegenMode::Standalone) => true,
+                    SequenceKind::Set if mode == RustCodegenMode::Standalone => true,
                     SequenceKind::Set => {
                         rust_type_supports_native_ordering(element, items_by_type_id)
                     }
                     _ => true,
                 }
         }
-        ResolvedType::Map { kind, key, value }
-            if matches!(kind, MapKind::UnorderedMap | MapKind::UnorderedFlatMap) =>
-        {
+        ResolvedType::Map {
+            kind: MapKind::UnorderedMap | MapKind::UnorderedFlatMap,
+            key,
+            value,
+        } => {
             resolved_type_supports_eq(key, items_by_type_id, cache, visiting, mode)
                 && (matches!(mode, RustCodegenMode::Standalone)
                     || rust_type_supports_native_hash_key(key, items_by_type_id))

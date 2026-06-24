@@ -409,13 +409,13 @@ fn collect_cpp_nodes(
     source: &[u8],
     nodes: &mut Vec<CppSyntaxNode>,
 ) {
-    if node.is_named() {
-        if let Ok(text) = node.utf8_text(source) {
-            nodes.push(CppSyntaxNode {
-                kind: node.kind().to_owned(),
-                text: text.to_owned(),
-            });
-        }
+    if node.is_named()
+        && let Ok(text) = node.utf8_text(source)
+    {
+        nodes.push(CppSyntaxNode {
+            kind: node.kind().to_owned(),
+            text: text.to_owned(),
+        });
     }
 
     let mut cursor = node.walk();
@@ -443,9 +443,7 @@ fn get_type_name_template_argument(text: &str) -> Option<String> {
         text[start..end].trim()
     } else {
         let tail = text[start..].trim();
-        let end = tail
-            .find(|ch| matches!(ch, '(' | ')' | ';'))
-            .unwrap_or(tail.len());
+        let end = tail.find(['(', ')', ';']).unwrap_or(tail.len());
         tail[..end].trim().trim_end_matches('>').trim()
     };
     normalized_cpp_target_type(candidate)
@@ -514,10 +512,10 @@ fn split_identifier_words(value: &str) -> Vec<&str> {
     let chars = value.char_indices().collect::<Vec<_>>();
     for (index, (byte_index, ch)) in chars.iter().copied().enumerate() {
         if !ch.is_ascii_alphanumeric() {
-            if let Some(word_start) = start.take() {
-                if word_start < byte_index {
-                    words.push(&value[word_start..byte_index]);
-                }
+            if let Some(word_start) = start.take()
+                && word_start < byte_index
+            {
+                words.push(&value[word_start..byte_index]);
             }
             continue;
         }
@@ -534,10 +532,8 @@ fn split_identifier_words(value: &str) -> Vec<&str> {
             || (previous.is_ascii_uppercase()
                 && ch.is_ascii_uppercase()
                 && next.is_some_and(|next| next.is_ascii_lowercase()));
-        if starts_new_word {
-            if let Some(word_start) = start.replace(byte_index) {
-                words.push(&value[word_start..byte_index]);
-            }
+        if starts_new_word && let Some(word_start) = start.replace(byte_index) {
+            words.push(&value[word_start..byte_index]);
         }
     }
     if let Some(word_start) = start {

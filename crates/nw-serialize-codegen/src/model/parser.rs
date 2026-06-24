@@ -109,11 +109,9 @@ impl<'a> ModelParser<'a> {
     fn parse_schema_indexes(&mut self, schema: &SerializeContext) {
         self.model.class_name_index = schema
             .class_name_entries()
-            .filter_map(|entry| {
-                Some(ClassNameIndexEntry {
-                    name_crc: u32::try_from(entry.name_crc).ok(),
-                    type_id: parse_uuid(entry.type_id),
-                })
+            .map(|entry| ClassNameIndexEntry {
+                name_crc: u32::try_from(entry.name_crc).ok(),
+                type_id: parse_uuid(entry.type_id),
             })
             .collect();
         self.model.any_creators = schema

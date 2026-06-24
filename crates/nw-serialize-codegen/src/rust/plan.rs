@@ -12,7 +12,7 @@ use crate::layout::{LayoutIndex, dependency_ordered_codegen_items, reflected_bas
 use crate::model::SerializeContextModel;
 use crate::naming::{rust_type_ident, rust_variant_ident};
 use crate::role::ReflectedTypeRole;
-use crate::rust::derive_plan::RustDerivePlanner;
+use crate::rust::derive_plan::{RustDeriveCaches, RustDerivePlanner};
 use crate::rust::enum_plan::{RustEnumPlanner, RustVariantPlan, enum_has_duplicate_discriminants};
 use crate::rust::field_plan::{RustFieldPlanner, integrated_custom_field_type};
 use crate::rust::identity::RustTypeIdentityPlan;
@@ -43,6 +43,29 @@ struct RustPlanWorkerState {
     copy_cache: BTreeMap<Uuid, bool>,
     marshaler_cache: BTreeMap<Uuid, bool>,
     serde_cache: BTreeMap<Uuid, bool>,
+}
+
+impl RustPlanWorkerState {
+    fn derive_caches(&mut self) -> RustDeriveCaches<'_> {
+        RustDeriveCaches {
+            eq: &mut self.eq_cache,
+            default: &mut self.default_cache,
+            hash: &mut self.hash_cache,
+            copy: &mut self.copy_cache,
+            marshaler: &mut self.marshaler_cache,
+            serde: &mut self.serde_cache,
+        }
+    }
+}
+
+struct RustSerializePlanContext<'a> {
+    items_by_type_id: &'a BTreeMap<Uuid, &'a SerializeCodegenItem>,
+    derive_caches: RustDeriveCaches<'a>,
+    name_plan: &'a RustNamePlan,
+    reflected_base_type_ids: &'a BTreeSet<Uuid>,
+    layout_index: &'a LayoutIndex,
+    abstract_value_base_type_ids: &'a BTreeSet<Uuid>,
+    emitted_type_ids: &'a BTreeSet<Uuid>,
 }
 
 impl Default for RustCodegenPlanner {
@@ -192,21 +215,16 @@ impl RustCodegenPlanner {
             &ordered_items,
             RustPlanWorkerState::default,
             |state, item| {
-                self.plan_serialize_item(
-                    item,
-                    context_items_by_type_id,
-                    &mut state.eq_cache,
-                    &mut state.default_cache,
-                    &mut state.hash_cache,
-                    &mut state.copy_cache,
-                    &mut state.marshaler_cache,
-                    &mut state.serde_cache,
-                    &name_plan,
-                    &reflected_base_type_ids,
-                    &layout_index,
-                    &abstract_value_base_type_ids,
-                    &emitted_type_ids,
-                )
+                let mut plan_context = RustSerializePlanContext {
+                    items_by_type_id: context_items_by_type_id,
+                    derive_caches: state.derive_caches(),
+                    name_plan: &name_plan,
+                    reflected_base_type_ids: &reflected_base_type_ids,
+                    layout_index: &layout_index,
+                    abstract_value_base_type_ids: &abstract_value_base_type_ids,
+                    emitted_type_ids: &emitted_type_ids,
+                };
+                self.plan_serialize_item(item, &mut plan_context)
             },
         );
         prune_derives_for_planned_dependencies(&mut items, &name_plan);
@@ -316,41 +334,16 @@ impl RustCodegenPlanner {
     fn plan_serialize_item(
         &self,
         item: &SerializeCodegenItem,
-        items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
-        eq_cache: &mut BTreeMap<Uuid, bool>,
-        default_cache: &mut BTreeMap<Uuid, bool>,
-        hash_cache: &mut BTreeMap<Uuid, bool>,
-        copy_cache: &mut BTreeMap<Uuid, bool>,
-        marshaler_cache: &mut BTreeMap<Uuid, bool>,
-        serde_cache: &mut BTreeMap<Uuid, bool>,
-        name_plan: &RustNamePlan,
-        reflected_base_type_ids: &BTreeSet<Uuid>,
-        layout_index: &LayoutIndex,
-        abstract_value_base_type_ids: &BTreeSet<Uuid>,
-        emitted_type_ids: &BTreeSet<Uuid>,
+        plan_context: &mut RustSerializePlanContext<'_>,
     ) -> RustItemPlan {
         match item.kind {
-            SerializeCodegenItemKind::Struct => self.plan_serialize_struct(
-                item,
-                items_by_type_id,
-                eq_cache,
-                default_cache,
-                hash_cache,
-                copy_cache,
-                marshaler_cache,
-                serde_cache,
-                name_plan,
-                reflected_base_type_ids,
-                layout_index,
-                abstract_value_base_type_ids,
-                emitted_type_ids,
-            ),
+            SerializeCodegenItemKind::Struct => self.plan_serialize_struct(item, plan_context),
             SerializeCodegenItemKind::Enum => self.plan_serialize_enum(
                 item,
-                items_by_type_id,
-                name_plan,
-                reflected_base_type_ids,
-                layout_index,
+                plan_context.items_by_type_id,
+                plan_context.name_plan,
+                plan_context.reflected_base_type_ids,
+                plan_context.layout_index,
             ),
         }
     }
@@ -358,48 +351,33 @@ impl RustCodegenPlanner {
     fn plan_serialize_struct(
         &self,
         item: &SerializeCodegenItem,
-        items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
-        eq_cache: &mut BTreeMap<Uuid, bool>,
-        default_cache: &mut BTreeMap<Uuid, bool>,
-        hash_cache: &mut BTreeMap<Uuid, bool>,
-        copy_cache: &mut BTreeMap<Uuid, bool>,
-        marshaler_cache: &mut BTreeMap<Uuid, bool>,
-        serde_cache: &mut BTreeMap<Uuid, bool>,
-        name_plan: &RustNamePlan,
-        reflected_base_type_ids: &BTreeSet<Uuid>,
-        layout_index: &LayoutIndex,
-        abstract_value_base_type_ids: &BTreeSet<Uuid>,
-        emitted_type_ids: &BTreeSet<Uuid>,
+        plan_context: &mut RustSerializePlanContext<'_>,
     ) -> RustItemPlan {
-        if let Some(sum_enum) = self.plan_abstract_sum_enum(
-            item,
-            items_by_type_id,
-            name_plan,
-            reflected_base_type_ids,
-            layout_index,
-            abstract_value_base_type_ids,
-            emitted_type_ids,
-        ) {
+        if let Some(sum_enum) = self.plan_abstract_sum_enum(item, plan_context) {
             return sum_enum;
         }
 
         let is_bevy_component = is_bevy_component_role(item);
         let identity = self.rust_identity_for_struct(item, is_bevy_component);
-        let is_slot_owner = layout_index.has_concrete_slot_children(item);
-        let has_layout_family_descendants = layout_index.has_layout_family_descendants(item);
-        let type_path = layout_index.type_path(item, items_by_type_id);
+        let is_slot_owner = plan_context.layout_index.has_concrete_slot_children(item);
+        let has_layout_family_descendants = plan_context
+            .layout_index
+            .has_layout_family_descendants(item);
+        let type_path = plan_context
+            .layout_index
+            .type_path(item, plan_context.items_by_type_id);
         let current_module = current_module_path(&type_path.scope_segments, &type_path.file_stem);
         let fields = self.field_planner.plan_struct_fields(
             item,
-            items_by_type_id,
-            name_plan,
+            plan_context.items_by_type_id,
+            plan_context.name_plan,
             self.source_types.as_ref(),
             &current_module,
         );
         let rtti_bases = self.field_planner.plan_rtti_bases(
             item,
-            items_by_type_id,
-            name_plan,
+            plan_context.items_by_type_id,
+            plan_context.name_plan,
             self.source_types.as_ref(),
             &current_module,
         );
@@ -407,13 +385,8 @@ impl RustCodegenPlanner {
             is_bevy_component,
             identity.kind,
             item,
-            items_by_type_id,
-            eq_cache,
-            default_cache,
-            hash_cache,
-            copy_cache,
-            marshaler_cache,
-            serde_cache,
+            plan_context.items_by_type_id,
+            &mut plan_context.derive_caches,
         );
         prune_integrated_derives_for_rendered_fields(self.options.mode, &mut derives, &fields);
         prune_custom_field_identity_derives(self.options.mode, &mut derives, item);
@@ -424,18 +397,24 @@ impl RustCodegenPlanner {
         RustItemPlan {
             source_type_id: item.source_type_id,
             source_name: item.source_name.clone(),
-            is_reflected_base: reflected_base_type_ids.contains(&item.source_type_id),
+            is_reflected_base: plan_context
+                .reflected_base_type_ids
+                .contains(&item.source_type_id),
             is_slot_owner,
             has_layout_family_descendants,
             is_bevy_component,
             file_stem_override: Some(type_path.file_stem),
             scope_path: type_path.scope_segments,
             family_scope_path: if is_slot_owner {
-                layout_index.concrete_slot_owner_scope_segments(item, items_by_type_id)
+                plan_context
+                    .layout_index
+                    .concrete_slot_owner_scope_segments(item, plan_context.items_by_type_id)
             } else {
-                layout_index.inheritance_family_scope_segments(item, items_by_type_id)
+                plan_context
+                    .layout_index
+                    .inheritance_family_scope_segments(item, plan_context.items_by_type_id)
             },
-            rust_name: name_plan.definition_name(item),
+            rust_name: plan_context.name_plan.definition_name(item),
             kind: RustItemKind::Struct,
             identity,
             repr: None,
@@ -450,51 +429,54 @@ impl RustCodegenPlanner {
     fn plan_abstract_sum_enum(
         &self,
         item: &SerializeCodegenItem,
-        items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
-        name_plan: &RustNamePlan,
-        reflected_base_type_ids: &BTreeSet<Uuid>,
-        layout_index: &LayoutIndex,
-        abstract_value_base_type_ids: &BTreeSet<Uuid>,
-        emitted_type_ids: &BTreeSet<Uuid>,
+        plan_context: &RustSerializePlanContext<'_>,
     ) -> Option<RustItemPlan> {
-        if !abstract_value_base_type_ids.contains(&item.source_type_id)
+        if !plan_context
+            .abstract_value_base_type_ids
+            .contains(&item.source_type_id)
             || item.is_abstract != Some(true)
-            || item_has_materialized_payload(item, items_by_type_id)
+            || item_has_materialized_payload(item, plan_context.items_by_type_id)
         {
             return None;
         }
 
-        let direct_type_ids = layout_index
+        let direct_type_ids = plan_context
+            .layout_index
             .direct_derived_type_ids_by_base_type_id
             .get(&item.source_type_id)?;
         if direct_type_ids.is_empty()
             || !direct_type_ids
                 .iter()
-                .all(|type_id| emitted_type_ids.contains(type_id))
+                .all(|type_id| plan_context.emitted_type_ids.contains(type_id))
         {
             return None;
         }
 
         let children = direct_type_ids
             .iter()
-            .filter_map(|type_id| items_by_type_id.get(type_id).copied())
+            .filter_map(|type_id| plan_context.items_by_type_id.get(type_id).copied())
             .filter(|child| child.is_abstract != Some(true))
             .collect::<Vec<_>>();
         if children.len() != direct_type_ids.len() {
             return None;
         }
 
-        let type_path = layout_index.type_path(item, items_by_type_id);
+        let type_path = plan_context
+            .layout_index
+            .type_path(item, plan_context.items_by_type_id);
         let variants = children
             .iter()
             .map(|child| {
-                let has_payload = item_has_materialized_payload(child, items_by_type_id);
+                let has_payload =
+                    item_has_materialized_payload(child, plan_context.items_by_type_id);
                 RustVariantPlan {
                     source_name: child.source_name.clone(),
-                    rust_name: abstract_sum_variant_name(item, child, name_plan),
+                    rust_name: abstract_sum_variant_name(item, child, plan_context.name_plan),
                     discriminant: None,
                     payload_type: has_payload.then(|| {
-                        name_plan.reference_name(child.source_type_id, &child.source_name)
+                        plan_context
+                            .name_plan
+                            .reference_name(child.source_type_id, &child.source_name)
                     }),
                 }
             })
@@ -504,15 +486,20 @@ impl RustCodegenPlanner {
         Some(RustItemPlan {
             source_type_id: item.source_type_id,
             source_name: item.source_name.clone(),
-            is_reflected_base: reflected_base_type_ids.contains(&item.source_type_id),
+            is_reflected_base: plan_context
+                .reflected_base_type_ids
+                .contains(&item.source_type_id),
             is_slot_owner: false,
-            has_layout_family_descendants: layout_index.has_layout_family_descendants(item),
+            has_layout_family_descendants: plan_context
+                .layout_index
+                .has_layout_family_descendants(item),
             is_bevy_component: false,
             file_stem_override: Some(type_path.file_stem),
             scope_path: type_path.scope_segments,
-            family_scope_path: layout_index
-                .inheritance_family_scope_segments(item, items_by_type_id),
-            rust_name: name_plan.definition_name(item),
+            family_scope_path: plan_context
+                .layout_index
+                .inheritance_family_scope_segments(item, plan_context.items_by_type_id),
+            rust_name: plan_context.name_plan.definition_name(item),
             kind: RustItemKind::SumEnum,
             identity: RustTypeIdentityPlan::az_rtti(
                 item.source_type_id,

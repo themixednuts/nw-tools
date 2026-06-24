@@ -60,12 +60,10 @@ pub struct ReflectedType {
 }
 
 impl ReflectedType {
-    #[must_use]
     pub fn authored_fields(&self) -> impl Iterator<Item = &ReflectedField> {
         self.fields.iter().filter(|field| !field.is_base_class)
     }
 
-    #[must_use]
     pub fn serializable_fields(&self) -> impl Iterator<Item = &ReflectedField> {
         self.fields
             .iter()
@@ -418,14 +416,12 @@ impl ReflectedTypeCatalog {
         self.generic_types_by_id.get(&type_id)
     }
 
-    #[must_use]
     pub fn component_scaffold_types(&self) -> impl Iterator<Item = &ReflectedType> {
         self.types_by_id
             .values()
             .filter(|ty| ty.is_component_scaffold_type())
     }
 
-    #[must_use]
     pub fn reflected_types(&self) -> impl Iterator<Item = &ReflectedType> {
         self.types_by_id.values()
     }

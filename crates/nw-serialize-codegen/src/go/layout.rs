@@ -590,6 +590,46 @@ fn type_id_suffix(type_id: uuid::Uuid) -> String {
     type_id.as_simple().to_string().chars().take(8).collect()
 }
 
+fn is_go_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn is_go_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "break"
+            | "default"
+            | "func"
+            | "interface"
+            | "select"
+            | "case"
+            | "defer"
+            | "go"
+            | "map"
+            | "struct"
+            | "chan"
+            | "else"
+            | "goto"
+            | "package"
+            | "switch"
+            | "const"
+            | "fallthrough"
+            | "if"
+            | "range"
+            | "type"
+            | "continue"
+            | "for"
+            | "import"
+            | "return"
+            | "var"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -896,44 +936,4 @@ mod tests {
             is_dynamic_field: false,
         }
     }
-}
-
-fn is_go_identifier(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-}
-
-fn is_go_keyword(value: &str) -> bool {
-    matches!(
-        value,
-        "break"
-            | "default"
-            | "func"
-            | "interface"
-            | "select"
-            | "case"
-            | "defer"
-            | "go"
-            | "map"
-            | "struct"
-            | "chan"
-            | "else"
-            | "goto"
-            | "package"
-            | "switch"
-            | "const"
-            | "fallthrough"
-            | "if"
-            | "range"
-            | "type"
-            | "continue"
-            | "for"
-            | "import"
-            | "return"
-            | "var"
-    )
 }

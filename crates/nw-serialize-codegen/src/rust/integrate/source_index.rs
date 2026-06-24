@@ -53,7 +53,7 @@ impl RustSourceTypeIndex {
         };
         let file = syn::parse_file(source).map_err(|source| RustIntegrationError::Parse {
             path: file_path.to_path_buf(),
-            source: crate::rust::analyze::RustSourceAnalyzeError::Parse(source),
+            source: Box::new(crate::rust::analyze::RustSourceAnalyzeError::Parse(source)),
         })?;
         Ok(Self::from_syn_file(&module_path, file_path, &file))
     }

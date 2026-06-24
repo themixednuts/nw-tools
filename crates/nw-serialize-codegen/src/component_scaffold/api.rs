@@ -109,7 +109,13 @@ pub enum ComponentScaffoldError {
     #[error(transparent)]
     SourceReconcile(#[from] SourceReconcileError),
     #[error(transparent)]
-    RustIntegration(#[from] RustIntegrationError),
+    RustIntegration(Box<RustIntegrationError>),
+}
+
+impl From<RustIntegrationError> for ComponentScaffoldError {
+    fn from(source: RustIntegrationError) -> Self {
+        Self::RustIntegration(Box::new(source))
+    }
 }
 
 impl fmt::Display for ComponentScaffoldReport {

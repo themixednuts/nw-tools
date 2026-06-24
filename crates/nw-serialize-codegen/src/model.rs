@@ -102,10 +102,10 @@ fn collect_bodyless_member_types(
     bodyless: &mut BTreeMap<Uuid, ReflectedBodylessType>,
 ) {
     if let Some(rtti) = &member.az_rtti {
-        if member.is_base_class || rtti.is_abstract == Some(true) {
-            if let Some(name) = member_rtti_name(member) {
-                insert_bodyless_type(model, bodyless, member.type_id, name, rtti.is_abstract);
-            }
+        if (member.is_base_class || rtti.is_abstract == Some(true))
+            && let Some(name) = member_rtti_name(member)
+        {
+            insert_bodyless_type(model, bodyless, member.type_id, name, rtti.is_abstract);
         }
         collect_bodyless_rtti_hierarchy_types(model, Some(rtti), bodyless);
     }

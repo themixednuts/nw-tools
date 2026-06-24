@@ -15,14 +15,12 @@ pub fn parse_value(value: serde_json::Value) -> serde_json::Result<SerializeCont
 }
 
 impl SerializeContext {
-    #[must_use]
     pub fn uuid_map_entries(&self) -> impl Iterator<Item = (&str, &UuidMap)> {
         self.uuid_map
             .iter()
             .map(|(type_id, class)| (type_id.as_str(), class))
     }
 
-    #[must_use]
     pub fn class_name_entries(&self) -> impl Iterator<Item = SchemaClassNameEntry<'_>> {
         self.class_name_to_uuid.iter().filter_map(|entry| {
             let [
@@ -39,7 +37,6 @@ impl SerializeContext {
         })
     }
 
-    #[must_use]
     pub fn uuid_generic_map_entries(&self) -> impl Iterator<Item = (&str, &UuidGenericMap)> {
         self.uuid_generic_map.iter().filter_map(|entry| {
             let [
@@ -49,11 +46,10 @@ impl SerializeContext {
             else {
                 return None;
             };
-            Some((type_id.as_str(), generic))
+            Some((type_id.as_str(), generic.as_ref()))
         })
     }
 
-    #[must_use]
     pub fn uuid_generic_class_entries(
         &self,
     ) -> impl Iterator<Item = (&str, SchemaGenericClassInfo<'_>)> {
@@ -61,7 +57,6 @@ impl SerializeContext {
             .map(|(type_id, generic)| (type_id, generic.as_generic_class_info()))
     }
 
-    #[must_use]
     pub fn uuid_any_creation_entries(&self) -> impl Iterator<Item = (&str, &str)> {
         self.uuid_any_creation_map
             .iter()

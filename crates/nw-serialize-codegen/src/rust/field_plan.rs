@@ -26,6 +26,13 @@ pub(super) struct RustFieldPlanner {
     rust_types: RustTypeRenderer,
 }
 
+struct IntegratedRustTypeContext<'a> {
+    name_plan: &'a RustNamePlan,
+    items_by_type_id: &'a BTreeMap<Uuid, &'a SerializeCodegenItem>,
+    source_types: Option<&'a RustSourceTypeIndex>,
+    current_module: &'a str,
+}
+
 impl RustFieldPlanner {
     pub(super) const fn new(mode: RustCodegenMode, rust_types: RustTypeRenderer) -> Self {
         Self { mode, rust_types }
@@ -332,19 +339,23 @@ impl RustFieldPlanner {
                 *kind,
                 element,
                 *capacity,
-                name_plan,
-                items_by_type_id,
-                source_types,
-                current_module,
+                &IntegratedRustTypeContext {
+                    name_plan,
+                    items_by_type_id,
+                    source_types,
+                    current_module,
+                },
             ),
             ResolvedType::Map { kind, key, value } => self.integrated_rust_map_type(
                 *kind,
                 key,
                 value,
-                name_plan,
-                items_by_type_id,
-                source_types,
-                current_module,
+                &IntegratedRustTypeContext {
+                    name_plan,
+                    items_by_type_id,
+                    source_types,
+                    current_module,
+                },
             ),
             ResolvedType::ReplicatedField { value } => {
                 let value = self.integrated_rust_type_for_resolved_type(
@@ -434,17 +445,14 @@ impl RustFieldPlanner {
         kind: SequenceKind,
         element: &ResolvedType,
         capacity: Option<usize>,
-        name_plan: &RustNamePlan,
-        items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
-        source_types: Option<&RustSourceTypeIndex>,
-        current_module: &str,
+        context: &IntegratedRustTypeContext<'_>,
     ) -> String {
         let element_type = self.integrated_rust_type_for_resolved_type(
             element,
-            name_plan,
-            items_by_type_id,
-            source_types,
-            current_module,
+            context.name_plan,
+            context.items_by_type_id,
+            context.source_types,
+            context.current_module,
         );
         match (kind, capacity) {
             (SequenceKind::Array, Some(capacity)) => format!("[{element_type}; {capacity}]"),
@@ -465,24 +473,21 @@ impl RustFieldPlanner {
         kind: MapKind,
         key: &ResolvedType,
         value: &ResolvedType,
-        name_plan: &RustNamePlan,
-        items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
-        source_types: Option<&RustSourceTypeIndex>,
-        current_module: &str,
+        context: &IntegratedRustTypeContext<'_>,
     ) -> String {
         let key_type = self.integrated_rust_type_for_resolved_type(
             key,
-            name_plan,
-            items_by_type_id,
-            source_types,
-            current_module,
+            context.name_plan,
+            context.items_by_type_id,
+            context.source_types,
+            context.current_module,
         );
         let value_type = self.integrated_rust_type_for_resolved_type(
             value,
-            name_plan,
-            items_by_type_id,
-            source_types,
-            current_module,
+            context.name_plan,
+            context.items_by_type_id,
+            context.source_types,
+            context.current_module,
         );
         match kind {
             MapKind::Map => format!("std::collections::BTreeMap<{key_type}, {value_type}>"),

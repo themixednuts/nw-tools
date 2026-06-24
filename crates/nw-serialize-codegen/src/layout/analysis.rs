@@ -43,7 +43,7 @@ impl LayoutAnalysisReport {
             .iter()
             .filter(|item| !item.is_reflection_marker)
             .map(|item| {
-                let emitted_scope = layout_index.emitted_scope(item, &items_by_type_id);
+                let emitted_scope = layout_index.emitted_scope(item, items_by_type_id);
                 LayoutAnalysisItem {
                     source_type_id: item.source_type_id,
                     source_name: item.source_name.clone(),
@@ -56,10 +56,10 @@ impl LayoutAnalysisReport {
                     serialized_shape: serialized_shape(item),
                     is_base_family_root: base_type_ids.contains(&item.source_type_id),
                     namespace_segments: source_scope_segments(&item.source_name),
-                    primary_base_chain: primary_base_chain_edges(item, &items_by_type_id),
+                    primary_base_chain: primary_base_chain_edges(item, items_by_type_id),
                     direct_derived_source_names: direct_derived_source_names(
                         item,
-                        &items_by_type_id,
+                        items_by_type_id,
                         &layout_index,
                     ),
                     slot_anchor: layout_index.slot_anchor(item).cloned(),

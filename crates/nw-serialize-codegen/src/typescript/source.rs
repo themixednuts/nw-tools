@@ -37,7 +37,7 @@ pub struct TypeScriptSourceEmitter;
 
 impl TypeScriptSourceEmitter {
     pub fn emit_unit(unit: &SerializeCodegenUnit) -> Result<String, TypeScriptSourceEmitError> {
-        Self::default().emit(unit)
+        Self.emit(unit)
     }
 
     pub fn emit(&self, unit: &SerializeCodegenUnit) -> Result<String, TypeScriptSourceEmitError> {
@@ -989,7 +989,7 @@ mod tests {
             }],
         };
 
-        let source = TypeScriptSourceEmitter::default()
+        let source = TypeScriptSourceEmitter
             .emit_with_options(
                 &unit,
                 &TypeScriptSourceOptions {
@@ -1035,7 +1035,7 @@ mod tests {
             }],
         };
 
-        let source = TypeScriptSourceEmitter::default()
+        let source = TypeScriptSourceEmitter
             .emit_with_options(
                 &unit,
                 &TypeScriptSourceOptions {

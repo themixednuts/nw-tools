@@ -204,7 +204,7 @@ impl RustIntegrationPlanner {
                             let update = candidate.item.plan_update(desired).map_err(|source| {
                                 RustIntegrationError::Analyze {
                                     path: candidate.path.clone(),
-                                    source,
+                                    source: Box::new(source),
                                 }
                             })?;
                             if update.is_current() {
@@ -214,7 +214,7 @@ impl RustIntegrationPlanner {
                             } else {
                                 RustIntegrationAction::Update {
                                     path: candidate.path.clone(),
-                                    update,
+                                    update: Box::new(update),
                                 }
                             }
                         }
@@ -232,7 +232,9 @@ impl RustIntegrationPlanner {
                     })
                 })?;
         if items.was_cancelled() {
-            return Err(RustIntegrationError::Emit(RustSourceEmitError::Cancelled));
+            return Err(RustIntegrationError::Emit(Box::new(
+                RustSourceEmitError::Cancelled,
+            )));
         }
         Ok(RustIntegrationPlan {
             items: items.into_completed(),
@@ -251,7 +253,7 @@ impl RustIntegrationPlanner {
                 },
                 context,
             )
-            .map_err(RustIntegrationError::Emit)
+            .map_err(|source| RustIntegrationError::Emit(Box::new(source)))
     }
 }
 
@@ -268,21 +270,18 @@ impl RustIntegrationPlan {
             .all(|item| matches!(item.action, RustIntegrationAction::Current { .. }))
     }
 
-    #[must_use]
     pub fn creates(&self) -> impl Iterator<Item = &RustIntegrationItemPlan> {
         self.items
             .iter()
             .filter(|item| matches!(item.action, RustIntegrationAction::Create { .. }))
     }
 
-    #[must_use]
     pub fn updates(&self) -> impl Iterator<Item = &RustIntegrationItemPlan> {
         self.items
             .iter()
             .filter(|item| matches!(item.action, RustIntegrationAction::Update { .. }))
     }
 
-    #[must_use]
     pub fn ambiguities(&self) -> impl Iterator<Item = &RustIntegrationItemPlan> {
         self.items
             .iter()
@@ -307,7 +306,7 @@ pub enum RustIntegrationAction {
     },
     Update {
         path: PathBuf,
-        update: RustItemUpdatePlan,
+        update: Box<RustItemUpdatePlan>,
     },
     Ambiguous {
         item_name: String,
@@ -333,16 +332,16 @@ pub enum RustIntegrationError {
     Parse {
         path: PathBuf,
         #[source]
-        source: RustSourceAnalyzeError,
+        source: Box<RustSourceAnalyzeError>,
     },
     #[error("failed to analyze Rust source at {path}")]
     Analyze {
         path: PathBuf,
         #[source]
-        source: RustSourceAnalyzeError,
+        source: Box<RustSourceAnalyzeError>,
     },
     #[error("failed to emit Rust source")]
-    Emit(#[source] RustSourceEmitError),
+    Emit(#[source] Box<RustSourceEmitError>),
 }
 
 fn parse_inventory_file(
@@ -351,7 +350,7 @@ fn parse_inventory_file(
 ) -> Result<RustSourceInventoryFile, RustIntegrationError> {
     let file = RustSourceFile::parse(source).map_err(|source| RustIntegrationError::Parse {
         path: path.clone(),
-        source,
+        source: Box::new(source),
     })?;
     Ok(RustSourceInventoryFile { path, file })
 }

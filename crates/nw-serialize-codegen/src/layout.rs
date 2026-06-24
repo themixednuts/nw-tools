@@ -284,15 +284,14 @@ impl LayoutIndex {
             };
         }
 
-        if self.base_type_ids.contains(&item.source_type_id) {
-            if let Some(segments) =
+        if self.base_type_ids.contains(&item.source_type_id)
+            && let Some(segments) =
                 self.descendant_common_family_scope_segments(item, items_by_type_id)
-            {
-                return LayoutScopeDecision {
-                    segments,
-                    reason: LayoutScopeReason::DescendantCommonFamily,
-                };
-            }
+        {
+            return LayoutScopeDecision {
+                segments,
+                reason: LayoutScopeReason::DescendantCommonFamily,
+            };
         }
 
         self.unanchored_scope_decision(item, items_by_type_id, FieldScopeKind::Family)
@@ -1208,7 +1207,7 @@ fn target_slot_anchors_by_type_id(
         let Some(owner) = items_by_type_id.get(&owner_edge.owner_type_id) else {
             continue;
         };
-        let Some(slot) = items_by_type_id.get(&slot_type_id) else {
+        let Some(slot) = items_by_type_id.get(slot_type_id) else {
             continue;
         };
         anchors.insert(

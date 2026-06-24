@@ -108,7 +108,7 @@ fn emit_project_type_files_with_context(
     context.runner().try_map(&tasks, |task| {
         let ((package, file_stem), items) = task;
         Ok(GoStandaloneProjectFile {
-            path: go_type_file_path(&package, &file_stem),
+            path: go_type_file_path(package, file_stem),
             source: emit_project_type_file(
                 items,
                 &items_by_type_id,
@@ -421,11 +421,13 @@ fn render_project_go_type_for_package(
             *kind,
             element,
             *capacity,
-            items_by_type_id,
-            names_by_type_id,
-            packages_by_type_id,
-            current_package,
-            import_context,
+            &GoProjectTypeRenderContext {
+                items_by_type_id,
+                names_by_type_id,
+                packages_by_type_id,
+                current_package,
+                import_context,
+            },
         ),
         ResolvedType::Map { key, value, .. } => {
             let key_type = render_project_go_type_for_package(
@@ -550,30 +552,34 @@ fn render_project_go_scalar(scalar: ScalarType, import_context: &GoProjectImport
     }
 }
 
+struct GoProjectTypeRenderContext<'a> {
+    items_by_type_id: &'a BTreeMap<uuid::Uuid, &'a SerializeCodegenItem>,
+    names_by_type_id: &'a BTreeMap<uuid::Uuid, String>,
+    packages_by_type_id: &'a BTreeMap<uuid::Uuid, GoTypePackage>,
+    current_package: &'a GoTypePackage,
+    import_context: &'a GoProjectImportContext,
+}
+
 fn render_project_go_sequence_for_package(
     kind: SequenceKind,
     element: &ResolvedType,
     capacity: Option<usize>,
-    items_by_type_id: &BTreeMap<uuid::Uuid, &SerializeCodegenItem>,
-    names_by_type_id: &BTreeMap<uuid::Uuid, String>,
-    packages_by_type_id: &BTreeMap<uuid::Uuid, GoTypePackage>,
-    current_package: &GoTypePackage,
-    import_context: &GoProjectImportContext,
+    context: &GoProjectTypeRenderContext<'_>,
 ) -> String {
     let element_type = render_project_go_type_for_package(
         element,
-        items_by_type_id,
-        names_by_type_id,
-        packages_by_type_id,
-        current_package,
-        import_context,
+        context.items_by_type_id,
+        context.names_by_type_id,
+        context.packages_by_type_id,
+        context.current_package,
+        context.import_context,
     );
     match (kind, capacity) {
         (SequenceKind::Array | SequenceKind::BitSet, Some(capacity)) => {
             format!("[{capacity}]{element_type}")
         }
         (SequenceKind::Set | SequenceKind::UnorderedSet, _)
-            if go_type_is_comparable(element_type.as_str(), element, items_by_type_id) =>
+            if go_type_is_comparable(element_type.as_str(), element, context.items_by_type_id) =>
         {
             format!("map[{element_type}]struct{{}}")
         }

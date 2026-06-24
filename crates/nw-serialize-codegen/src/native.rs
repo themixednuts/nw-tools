@@ -171,7 +171,6 @@ impl NativeSymbolIndex {
         index
     }
 
-    #[must_use]
     pub fn symbols(&self) -> impl Iterator<Item = &NativeSymbol> {
         self.symbols_by_address.values()
     }

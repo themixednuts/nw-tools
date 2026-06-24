@@ -191,7 +191,7 @@ impl<'a> SerializeCodegenView<'a> {
         package_name: &str,
         context: &CodegenContext,
     ) -> Result<GoStandaloneProject, GoSourceEmitError> {
-        GoSourceEmitter::default().emit_standalone_project_with_context(
+        GoSourceEmitter.emit_standalone_project_with_context(
             self.emitted_unit(),
             self.context_unit(),
             module_path,

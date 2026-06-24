@@ -146,10 +146,10 @@ impl<'a> ReferenceIndex<'a> {
         while let Some(value) = stack.pop() {
             match value {
                 Value::Object(map) => {
-                    if let Some(id) = map.get("$id").and_then(reference_id) {
-                        if self.values.insert(id.clone(), value).is_some() {
-                            self.duplicate_ids.insert(id);
-                        }
+                    if let Some(id) = map.get("$id").and_then(reference_id)
+                        && self.values.insert(id.clone(), value).is_some()
+                    {
+                        self.duplicate_ids.insert(id);
                     }
                     if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
                         self.references.insert(ReferenceKey::parse(reference));

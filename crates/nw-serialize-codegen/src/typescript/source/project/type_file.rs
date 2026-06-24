@@ -63,7 +63,7 @@ impl crate::typescript::source::TypeScriptSourceEmitter {
         let index_files = context.runner().try_map(&index_tasks, |(dir, reexports)| {
             let mut source = String::new();
             for reexport in reexports {
-                append_typescript_index_reexport(&mut source, &reexport);
+                append_typescript_index_reexport(&mut source, reexport);
             }
             if source.trim().is_empty() {
                 source.push_str("export {};\n");
@@ -110,17 +110,18 @@ impl crate::typescript::source::TypeScriptSourceEmitter {
             current_file,
             &mut out,
         );
+        let file_context = TypeScriptTypeFileEmitContext {
+            items_by_type_id,
+            names_by_type_id,
+            reference_names_by_type_id: &reference_names_by_type_id,
+            files_by_type_id,
+            current_file,
+        };
         for item in items {
             match item.kind {
-                SerializeCodegenItemKind::Struct => self.emit_project_struct_for_file(
-                    item,
-                    items_by_type_id,
-                    names_by_type_id,
-                    &reference_names_by_type_id,
-                    files_by_type_id,
-                    current_file,
-                    &mut out,
-                ),
+                SerializeCodegenItemKind::Struct => {
+                    self.emit_project_struct_for_file(item, &file_context, &mut out);
+                }
                 SerializeCodegenItemKind::Enum => {
                     self.emit_project_enum(item, names_by_type_id, &mut out);
                 }
@@ -133,14 +134,10 @@ impl crate::typescript::source::TypeScriptSourceEmitter {
     fn emit_project_struct_for_file(
         &self,
         item: &SerializeCodegenItem,
-        items_by_type_id: &BTreeMap<uuid::Uuid, &SerializeCodegenItem>,
-        names_by_type_id: &BTreeMap<uuid::Uuid, String>,
-        reference_names_by_type_id: &BTreeMap<uuid::Uuid, String>,
-        files_by_type_id: &BTreeMap<uuid::Uuid, TypeScriptTypeFile>,
-        current_file: &TypeScriptTypeFile,
+        file_context: &TypeScriptTypeFileEmitContext<'_>,
         out: &mut String,
     ) {
-        let type_name = typescript_type_name(item, names_by_type_id);
+        let type_name = typescript_type_name(item, file_context.names_by_type_id);
         emit_typescript_rtti_const(item, &type_name, out);
         out.push_str("export ");
         if item.is_abstract == Some(true) {
@@ -153,14 +150,14 @@ impl crate::typescript::source::TypeScriptSourceEmitter {
             .fields
             .iter()
             .filter(|field| field.is_base_class)
-            .filter(|field| base_class_should_extend(field, items_by_type_id))
+            .filter(|field| base_class_should_extend(field, file_context.items_by_type_id))
             .map(|field| {
                 render_project_typescript_type_for_file(
                     &field.resolved_type,
-                    names_by_type_id,
-                    reference_names_by_type_id,
-                    files_by_type_id,
-                    current_file,
+                    file_context.names_by_type_id,
+                    file_context.reference_names_by_type_id,
+                    file_context.files_by_type_id,
+                    file_context.current_file,
                 )
             })
             .collect::<Vec<_>>();
@@ -174,7 +171,7 @@ impl crate::typescript::source::TypeScriptSourceEmitter {
         let mut used_field_names = BTreeMap::new();
         for field in &item.fields {
             if field.is_base_class {
-                if !base_class_has_materialized_payload(field, items_by_type_id) {
+                if !base_class_has_materialized_payload(field, file_context.items_by_type_id) {
                     continue;
                 }
                 out.push('\t');
@@ -187,10 +184,10 @@ impl crate::typescript::source::TypeScriptSourceEmitter {
                 out.push_str(": ");
                 out.push_str(&render_project_typescript_field_type_for_file(
                     field,
-                    names_by_type_id,
-                    reference_names_by_type_id,
-                    files_by_type_id,
-                    current_file,
+                    file_context.names_by_type_id,
+                    file_context.reference_names_by_type_id,
+                    file_context.files_by_type_id,
+                    file_context.current_file,
                 ));
                 out.push_str(";\n");
                 continue;
@@ -201,10 +198,10 @@ impl crate::typescript::source::TypeScriptSourceEmitter {
             out.push_str(": ");
             out.push_str(&render_project_typescript_field_type_for_file(
                 field,
-                names_by_type_id,
-                reference_names_by_type_id,
-                files_by_type_id,
-                current_file,
+                file_context.names_by_type_id,
+                file_context.reference_names_by_type_id,
+                file_context.files_by_type_id,
+                file_context.current_file,
             ));
             out.push_str(";\n");
         }
@@ -224,6 +221,14 @@ impl crate::typescript::source::TypeScriptSourceEmitter {
         emit_typescript_const_enum_like(item, &type_name, &variant_names, out);
         emit_typescript_rtti_registration(&type_name, out);
     }
+}
+
+struct TypeScriptTypeFileEmitContext<'a> {
+    items_by_type_id: &'a BTreeMap<uuid::Uuid, &'a SerializeCodegenItem>,
+    names_by_type_id: &'a BTreeMap<uuid::Uuid, String>,
+    reference_names_by_type_id: &'a BTreeMap<uuid::Uuid, String>,
+    files_by_type_id: &'a BTreeMap<uuid::Uuid, TypeScriptTypeFile>,
+    current_file: &'a TypeScriptTypeFile,
 }
 
 fn render_project_typescript_type_for_file(

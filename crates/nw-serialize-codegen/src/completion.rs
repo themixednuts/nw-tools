@@ -67,7 +67,7 @@ pub fn complete_known_missing_reflected_bodies(
         .into_values()
         .filter_map(|missing| placeholder_from_missing(&emitted, &context, missing))
         .collect::<Vec<_>>();
-    placeholders.sort_by(|a, b| a.type_id.cmp(&b.type_id));
+    placeholders.sort_by_key(|placeholder| placeholder.type_id);
 
     if placeholders.is_empty() {
         return CompletedCodegenUnits {

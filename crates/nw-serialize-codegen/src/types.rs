@@ -213,13 +213,13 @@ impl<'a> TypeResolver<'a> {
 
     #[must_use]
     pub fn resolve_member_type(&self, member: &ReflectedMember) -> ResolvedType {
-        if member.is_base_class {
-            if let Some(base_name) = member_base_type_name(member) {
-                return ResolvedType::Named {
-                    type_id: member.type_id,
-                    source_name: base_name.to_owned(),
-                };
-            }
+        if member.is_base_class
+            && let Some(base_name) = member_base_type_name(member)
+        {
+            return ResolvedType::Named {
+                type_id: member.type_id,
+                source_name: base_name.to_owned(),
+            };
         }
         if let Some(enum_type_id) = member.enum_type_id()
             && let Some(name) = self.model.type_name(enum_type_id)

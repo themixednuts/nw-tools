@@ -130,7 +130,7 @@ pub enum EnumTypeIdToUnderlyingTypeIdMap {
 #[serde(untagged)]
 pub enum UuidGenericMapElement {
     String(String),
-    UuidGenericMap(UuidGenericMap),
+    UuidGenericMap(Box<UuidGenericMap>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

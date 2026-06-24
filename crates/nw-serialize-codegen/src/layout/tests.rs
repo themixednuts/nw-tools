@@ -2384,16 +2384,14 @@ fn layout_analysis_explains_real_action_condition_and_chrono_schema_facts() {
     assert!(
         components
             .reasons
-            .iter()
-            .any(|reason| *reason == LayoutScopeReason::ConcreteSlotOwner),
+            .contains(&LayoutScopeReason::ConcreteSlotOwner),
         "components root should include concrete slot owner evidence:\n{}",
         root_report.to_text()
     );
     assert!(
         components
             .reasons
-            .iter()
-            .any(|reason| *reason == LayoutScopeReason::ConcreteSlotBinding),
+            .contains(&LayoutScopeReason::ConcreteSlotBinding),
         "components root should include concrete slot binding evidence:\n{}",
         root_report.to_text()
     );

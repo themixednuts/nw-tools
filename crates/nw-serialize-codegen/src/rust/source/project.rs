@@ -89,15 +89,18 @@ fn emit_standalone_type_files(
     let emitted = context
         .runner()
         .try_map_until_cancelled(&tasks, context.cancel(), |task| {
+            let emit_context = TypeModuleEmitContext {
+                module_path: &task.module_path,
+                symbol_surface: &symbol_surface,
+                known_type_names: &known_type_names,
+                context,
+            };
             emit_standalone_type_module(
-                &task.module_path,
-                &symbol_surface,
-                &known_type_names,
+                &emit_context,
                 task.child_dirs.iter().map(String::as_str),
                 task.leaf_modules.iter().map(String::as_str),
                 Vec::new(),
                 &task.items,
-                context,
             )
             .map(|source| RustStandaloneProjectFile {
                 path: task.path.clone(),
@@ -179,15 +182,18 @@ fn emit_integrated_type_files(
     let emitted = context
         .runner()
         .try_map_until_cancelled(&tasks, context.cancel(), |task| {
+            let emit_context = TypeModuleEmitContext {
+                module_path: &task.module_path,
+                symbol_surface: &symbol_surface,
+                known_type_names: &known_type_names,
+                context,
+            };
             emit_integrated_type_module(
-                &task.module_path,
-                &symbol_surface,
-                &known_type_names,
+                &emit_context,
                 task.child_dirs.iter().map(String::as_str),
                 task.leaf_modules.iter().map(String::as_str),
                 &task.register_child_modules,
                 &task.items,
-                context,
             )
             .map(|source| RustStandaloneProjectFile {
                 path: task.path.clone(),
@@ -273,15 +279,19 @@ struct TypeModuleTask<'a> {
     items: Vec<&'a RustItemPlan>,
 }
 
+struct TypeModuleEmitContext<'a> {
+    module_path: &'a [String],
+    symbol_surface: &'a BTreeMap<Vec<String>, SymbolSurfaceModule<()>>,
+    known_type_names: &'a BTreeSet<String>,
+    context: &'a CodegenContext,
+}
+
 fn emit_standalone_type_module<'a>(
-    module_path: &[String],
-    symbol_surface: &BTreeMap<Vec<String>, SymbolSurfaceModule<()>>,
-    known_type_names: &BTreeSet<String>,
+    emit_context: &TypeModuleEmitContext<'_>,
     child_dirs: impl Iterator<Item = &'a str>,
     leaf_modules: impl Iterator<Item = &'a str>,
     extra_module_reexports: Vec<StandaloneModuleReexport>,
     items: &[&RustItemPlan],
-    context: &CodegenContext,
 ) -> Result<String, RustSourceEmitError> {
     let child_modules = child_dirs
         .map(parse_module_ident)
@@ -292,12 +302,12 @@ fn emit_standalone_type_module<'a>(
     let options = RustSourceOptions {
         mode: RustSourceMode::Standalone,
     };
-    let item_source = render_module_item_source(items, options, context)?;
+    let item_source = render_module_item_source(items, options, emit_context.context)?;
 
     let mut reexports = if child_modules.is_empty() && leaf_modules.is_empty() {
         Vec::new()
     } else {
-        standalone_module_reexports(module_path, symbol_surface)
+        standalone_module_reexports(emit_context.module_path, emit_context.symbol_surface)
     };
     reexports.extend(extra_module_reexports);
     let reexported_type_names = reexports
@@ -306,7 +316,12 @@ fn emit_standalone_type_module<'a>(
         .collect::<BTreeSet<_>>();
 
     let mut source = String::new();
-    append_standalone_type_imports(&mut source, items, known_type_names, &reexported_type_names);
+    append_standalone_type_imports(
+        &mut source,
+        items,
+        emit_context.known_type_names,
+        &reexported_type_names,
+    );
 
     let mut modules = child_modules;
     modules.extend(leaf_modules);
@@ -338,14 +353,11 @@ fn emit_standalone_type_module<'a>(
 }
 
 fn emit_integrated_type_module<'a>(
-    module_path: &[String],
-    symbol_surface: &BTreeMap<Vec<String>, SymbolSurfaceModule<()>>,
-    known_type_names: &BTreeSet<String>,
+    emit_context: &TypeModuleEmitContext<'_>,
     child_dirs: impl Iterator<Item = &'a str>,
     leaf_modules: impl Iterator<Item = &'a str>,
     register_child_modules: &[String],
     items: &[&RustItemPlan],
-    context: &CodegenContext,
 ) -> Result<String, RustSourceEmitError> {
     let child_modules = child_dirs
         .map(parse_module_ident)
@@ -356,25 +368,25 @@ fn emit_integrated_type_module<'a>(
     let options = RustSourceOptions {
         mode: RustSourceMode::Integrated,
     };
-    let item_source = render_module_item_source(items, options, context)?;
+    let item_source = render_module_item_source(items, options, emit_context.context)?;
 
     let mut reexports = if child_modules.is_empty() && leaf_modules.is_empty() {
         Vec::new()
     } else {
-        standalone_module_reexports(module_path, symbol_surface)
+        standalone_module_reexports(emit_context.module_path, emit_context.symbol_surface)
     };
     let reexported_type_names = reexports
         .iter()
         .flat_map(|reexport| reexport.items.iter().cloned())
         .collect::<BTreeSet<_>>();
-    let has_register = !module_path.is_empty()
+    let has_register = !emit_context.module_path.is_empty()
         && (!register_child_modules.is_empty() || items.iter().any(|item| can_register_type(item)));
 
     let mut source = String::new();
     append_integrated_type_imports(
         &mut source,
         items,
-        known_type_names,
+        emit_context.known_type_names,
         &reexported_type_names,
         has_register,
     );

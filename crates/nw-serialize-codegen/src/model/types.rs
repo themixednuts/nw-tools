@@ -111,7 +111,6 @@ pub struct ReflectedBodylessType {
 }
 
 impl ReflectedGenericClass {
-    #[must_use]
     pub fn concrete_type_ids(&self) -> impl Iterator<Item = Uuid> + '_ {
         self.map_key_type_id
             .into_iter()

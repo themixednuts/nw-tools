@@ -220,7 +220,7 @@ fn generate_with_context(args: &GenerateArgs, context: &CodegenContext) -> Resul
                 generate_language(&completed, args, task.language, &task.out, context)
             })?;
         }
-        language => generate_language(&completed, args, language, &args.out, &context)?,
+        language => generate_language(&completed, args, language, &args.out, context)?,
     }
 
     let (errors, warnings) = diagnostic_counts(&compile_unit);
@@ -500,7 +500,7 @@ fn go_output_files(
     package_name: &str,
     context: &CodegenContext,
 ) -> Result<Vec<OutputFile>> {
-    let mut files = GoSourceEmitter::default()
+    let mut files = GoSourceEmitter
         .emit_standalone_project_with_context(
             &completed.emitted,
             &completed.context,

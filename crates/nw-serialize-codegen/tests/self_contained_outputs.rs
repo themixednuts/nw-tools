@@ -95,7 +95,7 @@ fn sample_output_unit_keeps_scalar_support_coverage() {
     let rust_unit: RustCodegenUnit = RustCodegenPlanner::standalone()
         .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
     RustSourceEmitter::emit_standalone_project(&rust_unit, &context).expect("sample Rust project");
-    GoSourceEmitter::default()
+    GoSourceEmitter
         .emit_standalone_project(&unit, "aztypesvalidation", "aztypesvalidation", &context)
         .expect("sample Go project");
     TypeScriptSourceEmitter
