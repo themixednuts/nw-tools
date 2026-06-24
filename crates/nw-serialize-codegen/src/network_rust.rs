@@ -12,7 +12,7 @@ use crate::network_schema::{
     NetworkWireShape as SchemaWireShape,
 };
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v2";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v3";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -120,6 +120,33 @@ impl NetworkRustEmitter {
                 pub fields: &'static [NetworkFieldDescriptor],
             }
 
+            impl NetworkFieldDescriptor {
+                #[must_use]
+                pub const fn has_wire_shape(&self) -> bool {
+                    self.wire_shape.is_some()
+                }
+            }
+
+            impl NetworkTypeDescriptor {
+                #[must_use]
+                pub fn field_by_index(&self, field_index: u32) -> Option<&NetworkFieldDescriptor> {
+                    self.fields.iter().find(|field| field.index == field_index)
+                }
+
+                #[must_use]
+                pub fn has_complete_field_wire_shapes(&self) -> bool {
+                    self.fields.iter().all(NetworkFieldDescriptor::has_wire_shape)
+                }
+
+                #[must_use]
+                pub fn missing_field_wire_shape_count(&self) -> usize {
+                    self.fields
+                        .iter()
+                        .filter(|field| !field.has_wire_shape())
+                        .count()
+                }
+            }
+
             pub trait NetworkTypeIdentity {
                 const TYPE_ID: Uuid;
                 const TYPE_INDEX: u32;
@@ -178,6 +205,15 @@ impl NetworkRustEmitter {
                 type_by_type_index(type_index).map(|descriptor| descriptor.fields)
             }
 
+            #[must_use]
+            pub fn field_for_type_index(
+                type_index: u32,
+                field_index: u32,
+            ) -> Option<&'static NetworkFieldDescriptor> {
+                type_by_type_index(type_index)
+                    .and_then(|descriptor| descriptor.field_by_index(field_index))
+            }
+
             pub fn unknown_type_indices(
                 type_indices: impl IntoIterator<Item = u32>,
             ) -> Vec<u32> {
@@ -197,6 +233,20 @@ impl NetworkRustEmitter {
                     .filter(|type_index| {
                         type_by_type_index(*type_index)
                             .is_some_and(|descriptor| descriptor.kind != NetworkTypeKind::ReplicatedState)
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            }
+
+            pub fn type_indices_missing_field_wire_shapes(
+                type_indices: impl IntoIterator<Item = u32>,
+            ) -> Vec<u32> {
+                type_indices
+                    .into_iter()
+                    .filter(|type_index| {
+                        type_by_type_index(*type_index)
+                            .is_some_and(|descriptor| descriptor.missing_field_wire_shape_count() > 0)
                     })
                     .collect::<BTreeSet<_>>()
                     .into_iter()
@@ -555,6 +605,13 @@ mod tests {
         assert!(output.source.contains("pub trait NetworkTypeIdentity"));
         assert!(output.source.contains("pub mod identity"));
         assert!(output.source.contains("pub enum NetworkWireShape"));
+        assert!(output.source.contains("pub fn field_by_index"));
+        assert!(output.source.contains("pub fn field_for_type_index"));
+        assert!(
+            output
+                .source
+                .contains("pub fn type_indices_missing_field_wire_shapes")
+        );
         assert!(
             output
                 .source
