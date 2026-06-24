@@ -126,7 +126,8 @@ pub use naming::{
 };
 pub use native::{NativeSymbol, NativeSymbolIndex, NativeSymbolUse, NativeSymbolUseKind};
 pub use network_rust::{
-    NetworkRustEmitError, NetworkRustEmitter, NetworkRustGenerationReport, NetworkRustOutput,
+    NETWORK_RUST_EMITTER_VERSION, NetworkRustEmitError, NetworkRustEmitter,
+    NetworkRustGenerationReport, NetworkRustOutput,
 };
 pub use network_schema::{
     NETWORK_SCHEMA_VERSION, NetworkAzRtti, NetworkAzRttiProvider, NetworkConfidence,
@@ -134,7 +135,7 @@ pub use network_schema::{
     NetworkHandler, NetworkRegistrationHook, NetworkRootKind, NetworkSchema,
     NetworkSchemaImportError, NetworkSchemaSource, NetworkSchemaSourceKind, NetworkSchemaSummary,
     NetworkSerializeKind, NetworkSerializeMergeReport, NetworkSerializeRole, NetworkSerializeType,
-    NetworkType, NetworkTypeIndexMergeReport, NetworkVirtualFunction,
+    NetworkType, NetworkTypeIndexMergeReport, NetworkVirtualFunction, NetworkWireShape,
 };
 pub use reference::{
     ReferenceExpansionContext, ReferenceIndex, ReferenceKey, ReferencePathSegment, ReferenceReport,

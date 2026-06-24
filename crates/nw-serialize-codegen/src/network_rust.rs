@@ -12,6 +12,8 @@ use crate::network_schema::{
     NetworkWireShape as SchemaWireShape,
 };
 
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v2";
+
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
     #[error("generated network Rust source did not parse")]
