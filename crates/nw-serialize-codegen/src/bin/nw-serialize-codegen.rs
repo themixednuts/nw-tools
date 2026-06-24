@@ -290,9 +290,12 @@ fn network_schema(args: &NetworkSchemaArgs) -> Result<()> {
         )),
     );
     println!(
-        "serialize: {} source type(s), {} matched, {} filled name(s)",
+        "serialize: {} source type(s), {} matched ({} by type id, {} by name, {} ambiguous name), {} filled name(s)",
         serialize_merge.source_type_count,
         serialize_merge.matched_type_count,
+        serialize_merge.type_id_matched_count,
+        serialize_merge.name_matched_count,
+        serialize_merge.ambiguous_name_match_count,
         serialize_merge.filled_name_count
     );
     if let Some(typeindex_path) = &args.typeindex {

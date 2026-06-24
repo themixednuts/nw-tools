@@ -5,7 +5,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind, SerializeCodegenUnit};
+use crate::ir::{
+    SerializeCodegenIndex, SerializeCodegenItem, SerializeCodegenItemKind, SerializeCodegenUnit,
+};
 use crate::role::ReflectedTypeRole;
 
 pub const NETWORK_SCHEMA_VERSION: &str = "newworld.network_schema.v1";
@@ -60,6 +62,9 @@ pub struct NetworkTypeIndexMergeReport {
 pub struct NetworkSerializeMergeReport {
     pub source_type_count: usize,
     pub matched_type_count: usize,
+    pub type_id_matched_count: usize,
+    pub name_matched_count: usize,
+    pub ambiguous_name_match_count: usize,
     pub filled_name_count: usize,
     pub unmatched_schema_type_count: usize,
 }
@@ -385,33 +390,31 @@ impl NetworkSchema {
         source_path: Option<String>,
     ) -> NetworkSerializeMergeReport {
         let index = unit.index();
+        let name_index = serialize_items_by_name(unit);
         let mut report = NetworkSerializeMergeReport {
             source_type_count: unit.items.len(),
             ..NetworkSerializeMergeReport::default()
         };
 
         for network_type in &mut self.types {
-            let Some(type_id) = network_type.type_id else {
-                report.unmatched_schema_type_count += 1;
-                continue;
-            };
-            let Some(item) = index.item_by_type_id(type_id) else {
-                report.unmatched_schema_type_count += 1;
+            let Some((item, confidence, source)) =
+                serialize_match(network_type, &index, &name_index, &mut report)
+            else {
                 continue;
             };
             report.matched_type_count += 1;
             if network_type.name.is_none() {
                 network_type.name = Some(item.source_name.clone());
-                network_type.name_source = Some("serializeContext".to_owned());
+                network_type.name_source = Some(source.clone());
                 report.filled_name_count += 1;
             }
             network_type.serialize = Some(network_serialize_type(item));
             network_type.evidence.push(NetworkEvidence {
                 kind: NetworkEvidenceKind::SerializeContext,
-                source: "serializeContext".to_owned(),
+                source,
                 address: None,
                 detail: Some(item.source_name.clone()),
-                confidence: NetworkConfidence::High,
+                confidence,
             });
         }
 
@@ -478,6 +481,51 @@ impl NetworkSchema {
                 .sum(),
         }
     }
+}
+
+fn serialize_items_by_name(
+    unit: &SerializeCodegenUnit,
+) -> BTreeMap<&str, Vec<&SerializeCodegenItem>> {
+    let mut index = BTreeMap::<&str, Vec<&SerializeCodegenItem>>::new();
+    for item in &unit.items {
+        index.entry(&item.source_name).or_default().push(item);
+    }
+    index
+}
+
+fn serialize_match<'a>(
+    network_type: &NetworkType,
+    type_index: &'a SerializeCodegenIndex<'a>,
+    name_index: &'a BTreeMap<&str, Vec<&'a SerializeCodegenItem>>,
+    report: &mut NetworkSerializeMergeReport,
+) -> Option<(&'a SerializeCodegenItem, NetworkConfidence, String)> {
+    if let Some(type_id) = network_type.type_id
+        && !type_id.is_nil()
+        && let Some(item) = type_index.item_by_type_id(type_id)
+    {
+        report.type_id_matched_count += 1;
+        return Some((item, NetworkConfidence::High, "serializeContext".to_owned()));
+    }
+
+    let Some(name) = network_type.name.as_deref() else {
+        report.unmatched_schema_type_count += 1;
+        return None;
+    };
+    let Some(candidates) = name_index.get(name) else {
+        report.unmatched_schema_type_count += 1;
+        return None;
+    };
+    let [item] = candidates.as_slice() else {
+        report.ambiguous_name_match_count += 1;
+        report.unmatched_schema_type_count += 1;
+        return None;
+    };
+    report.name_matched_count += 1;
+    Some((
+        item,
+        NetworkConfidence::Inferred,
+        "serializeContext:name".to_owned(),
+    ))
 }
 
 fn network_serialize_type(item: &SerializeCodegenItem) -> NetworkSerializeType {
@@ -1077,6 +1125,8 @@ mod tests {
 
         assert_eq!(merge.source_type_count, 1);
         assert_eq!(merge.matched_type_count, 1);
+        assert_eq!(merge.type_id_matched_count, 1);
+        assert_eq!(merge.name_matched_count, 0);
         assert_eq!(merge.filled_name_count, 0);
         assert_eq!(schema.summary.serialize_type_count, 1);
         assert_eq!(schema.summary.serialize_dependency_count, 1);
@@ -1094,5 +1144,138 @@ mod tests {
                 .iter()
                 .any(|evidence| evidence.kind == NetworkEvidenceKind::SerializeContext)
         );
+    }
+
+    #[test]
+    fn merges_serialize_codegen_by_unique_source_name_with_inferred_confidence() {
+        let network_type_id = uuid!("8673a3cc-2848-4c87-aa72-cc860589d1b5");
+        let serialize_type_id = uuid!("da4e5889-a65c-4480-8642-0278160125a7");
+        let report = json!({
+            "registryEntries": [{
+                "uuid": network_type_id.to_string(),
+                "typeName": "Example::SharedName"
+            }],
+            "fieldRegistrationFunctions": []
+        });
+        let unit = SerializeCodegenUnit {
+            items: vec![SerializeCodegenItem {
+                source_type_id: serialize_type_id,
+                source_name: "Example::SharedName".to_owned(),
+                role: ReflectedTypeRole::SupportType,
+                is_reflection_marker: false,
+                is_abstract: Some(false),
+                factory: None,
+                rtti_base_chain: Vec::new(),
+                kind: SerializeCodegenItemKind::Struct,
+                enum_underlying_type: None,
+                fields: Vec::new(),
+                variants: Vec::new(),
+            }],
+        };
+
+        let mut schema =
+            NetworkSchema::from_replicated_state_ghidra_report(&report).expect("normalized schema");
+        let merge = schema.merge_serialize_codegen_unit(&unit, Some("serialize.json".to_owned()));
+
+        assert_eq!(merge.matched_type_count, 1);
+        assert_eq!(merge.type_id_matched_count, 0);
+        assert_eq!(merge.name_matched_count, 1);
+        assert_eq!(merge.ambiguous_name_match_count, 0);
+        assert_eq!(schema.summary.serialize_type_count, 1);
+        let evidence = schema.types[0]
+            .evidence
+            .iter()
+            .find(|evidence| evidence.kind == NetworkEvidenceKind::SerializeContext)
+            .expect("serialize evidence");
+        assert_eq!(evidence.source, "serializeContext:name");
+        assert_eq!(evidence.confidence, NetworkConfidence::Inferred);
+    }
+
+    #[test]
+    fn skips_ambiguous_serialize_codegen_name_matches() {
+        let network_type_id = uuid!("8673a3cc-2848-4c87-aa72-cc860589d1b5");
+        let report = json!({
+            "registryEntries": [{
+                "uuid": network_type_id.to_string(),
+                "typeName": "Example::SharedName"
+            }],
+            "fieldRegistrationFunctions": []
+        });
+        let unit = SerializeCodegenUnit {
+            items: vec![
+                SerializeCodegenItem {
+                    source_type_id: uuid!("11111111-1111-1111-1111-111111111111"),
+                    source_name: "Example::SharedName".to_owned(),
+                    role: ReflectedTypeRole::SupportType,
+                    is_reflection_marker: false,
+                    is_abstract: Some(false),
+                    factory: None,
+                    rtti_base_chain: Vec::new(),
+                    kind: SerializeCodegenItemKind::Struct,
+                    enum_underlying_type: None,
+                    fields: Vec::new(),
+                    variants: Vec::new(),
+                },
+                SerializeCodegenItem {
+                    source_type_id: uuid!("22222222-2222-2222-2222-222222222222"),
+                    source_name: "Example::SharedName".to_owned(),
+                    role: ReflectedTypeRole::SupportType,
+                    is_reflection_marker: false,
+                    is_abstract: Some(false),
+                    factory: None,
+                    rtti_base_chain: Vec::new(),
+                    kind: SerializeCodegenItemKind::Struct,
+                    enum_underlying_type: None,
+                    fields: Vec::new(),
+                    variants: Vec::new(),
+                },
+            ],
+        };
+
+        let mut schema =
+            NetworkSchema::from_replicated_state_ghidra_report(&report).expect("normalized schema");
+        let merge = schema.merge_serialize_codegen_unit(&unit, Some("serialize.json".to_owned()));
+
+        assert_eq!(merge.matched_type_count, 0);
+        assert_eq!(merge.name_matched_count, 0);
+        assert_eq!(merge.ambiguous_name_match_count, 1);
+        assert_eq!(merge.unmatched_schema_type_count, 1);
+        assert_eq!(schema.summary.serialize_type_count, 0);
+    }
+
+    #[test]
+    fn does_not_merge_serialize_codegen_by_nil_type_id() {
+        let report = json!({
+            "registryEntries": [{
+                "uuid": "00000000-0000-0000-0000-000000000000",
+                "typeName": "NullType"
+            }],
+            "fieldRegistrationFunctions": []
+        });
+        let unit = SerializeCodegenUnit {
+            items: vec![SerializeCodegenItem {
+                source_type_id: Uuid::nil(),
+                source_name: "WaterDepth".to_owned(),
+                role: ReflectedTypeRole::SupportType,
+                is_reflection_marker: false,
+                is_abstract: Some(false),
+                factory: None,
+                rtti_base_chain: Vec::new(),
+                kind: SerializeCodegenItemKind::Struct,
+                enum_underlying_type: None,
+                fields: Vec::new(),
+                variants: Vec::new(),
+            }],
+        };
+
+        let mut schema =
+            NetworkSchema::from_replicated_state_ghidra_report(&report).expect("normalized schema");
+        let merge = schema.merge_serialize_codegen_unit(&unit, Some("serialize.json".to_owned()));
+
+        assert_eq!(merge.matched_type_count, 0);
+        assert_eq!(merge.type_id_matched_count, 0);
+        assert_eq!(merge.name_matched_count, 0);
+        assert_eq!(merge.unmatched_schema_type_count, 1);
+        assert_eq!(schema.summary.serialize_type_count, 0);
     }
 }
