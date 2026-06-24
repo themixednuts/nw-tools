@@ -11,6 +11,7 @@ use crate::ir::{
 use crate::role::ReflectedTypeRole;
 
 pub const NETWORK_SCHEMA_VERSION: &str = "newworld.network_schema.v1";
+pub const NETWORK_STATIC_REPORT_SCHEMA_VERSION: &str = "newworld.network_schema.static.v1";
 
 #[derive(Debug, Error)]
 pub enum NetworkSchemaImportError {
@@ -295,7 +296,7 @@ impl NetworkSchema {
             sources: vec![NetworkSchemaSource {
                 kind: NetworkSchemaSourceKind::GhidraNetworkStaticReport,
                 path: string(root, "input"),
-                schema: string(root, "schema"),
+                schema: Some(NETWORK_STATIC_REPORT_SCHEMA_VERSION.to_owned()),
                 program: string(root, "program"),
                 image_base: string(root, "imageBase"),
             }],
@@ -971,6 +972,10 @@ mod tests {
         assert_eq!(
             schema.sources[0].path.as_deref(),
             Some("E:/Projects/new-world/resources/typeregistry.json")
+        );
+        assert_eq!(
+            schema.sources[0].schema.as_deref(),
+            Some(NETWORK_STATIC_REPORT_SCHEMA_VERSION)
         );
         assert_eq!(schema.summary.type_count, 1);
         assert_eq!(schema.summary.register_field_function_count, 1);
