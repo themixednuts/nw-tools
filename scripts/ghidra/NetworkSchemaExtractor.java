@@ -1363,6 +1363,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private String registerOperand(Instruction instruction, int operandIndex) {
+        String operandText = operandText(instruction, operandIndex);
+        if (operandText.contains("[")) {
+            return null;
+        }
         Object[] objects = operandObjects(instruction, operandIndex);
         if (objects.length != 1 || !(objects[0] instanceof Register register)) {
             return null;
