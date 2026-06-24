@@ -28,17 +28,17 @@ resources/serialize.renames.json
 
 Set `AZ_SERIALIZE_RENAME_APPLY=true` before launching Ghidra to apply renames.
 
-## Replicated-State Schema Extractor
+## Network Schema Extractor
 
-`ReplicatedStateSchemaExtractor.java` builds a static JSON report for replicated
-state registration evidence. Run it against the loaded `NewWorld 3-26` program
+`NetworkSchemaExtractor.java` builds a static JSON report for network type and
+field registration evidence. Run it against the loaded `NewWorld 3-26` program
 and point it at `typeregistry.json`.
 
 Useful environment variables:
 
 ```text
-NW_REPLICATED_STATE_TYPEREGISTRY_JSON=E:\Projects\new-world\resources\typeregistry.json
-NW_REPLICATED_STATE_SCHEMA_OUT=E:\Projects\new-world\resources\replicated-state-schema.static.json
+NW_NETWORK_SCHEMA_TYPEREGISTRY_JSON=E:\Projects\new-world\resources\typeregistry.json
+NW_NETWORK_SCHEMA_OUT=E:\Projects\new-world\resources\network-schema.static.json
 ```
 
 The script emits every `typeregistry.json` row, recovers

@@ -1,4 +1,4 @@
-// Extract replicated-state field registration evidence from typeregistry.json and Ghidra.
+// Extract network type and field registration evidence from typeregistry.json and Ghidra.
 //@category NewWorld
 
 import java.io.File;
@@ -35,7 +35,7 @@ import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
-public class ReplicatedStateSchemaExtractor extends GhidraScript {
+public class NetworkSchemaExtractor extends GhidraScript {
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long QUEUE_REGISTRATION_HOOK_RVA = 0x61a95c0L;
     private static final int BACKWARD_ARGUMENT_SCAN_LIMIT = 48;
@@ -110,7 +110,7 @@ public class ReplicatedStateSchemaExtractor extends GhidraScript {
         }
 
         JsonObject report = new JsonObject();
-        report.addProperty("schema", "newworld.replicated_state_schema.static.v1");
+        report.addProperty("schema", "newworld.network_schema.static.v1");
         report.addProperty("program", currentProgram.getName());
         report.addProperty("imageBase", formatAddress(currentProgram.getImageBase()));
         report.addProperty("input", input.getAbsolutePath());
@@ -137,14 +137,14 @@ public class ReplicatedStateSchemaExtractor extends GhidraScript {
             gson.toJson(report, writer);
         }
 
-        println("Wrote replicated-state schema report: " + output.getAbsolutePath());
+        println("Wrote network schema static report: " + output.getAbsolutePath());
         println("RegisterField functions: " + registrationFunctions.size() +
             ", calls: " + dynamicFieldCount +
             ", mapped registry entries: " + mappedRegistryEntries);
     }
 
     private File inputFile() throws Exception {
-        String explicit = envValue("NW_REPLICATED_STATE_TYPEREGISTRY_JSON");
+        String explicit = envValue("NW_NETWORK_SCHEMA_TYPEREGISTRY_JSON");
         if (explicit != null) {
             return new File(explicit);
         }
@@ -152,7 +152,7 @@ public class ReplicatedStateSchemaExtractor extends GhidraScript {
     }
 
     private File outputFile(File input) {
-        String explicit = envValue("NW_REPLICATED_STATE_SCHEMA_OUT");
+        String explicit = envValue("NW_NETWORK_SCHEMA_OUT");
         if (explicit != null) {
             return new File(explicit);
         }
@@ -160,7 +160,7 @@ public class ReplicatedStateSchemaExtractor extends GhidraScript {
         if (parent == null) {
             parent = new File(".");
         }
-        return new File(parent, "replicated-state-schema.static.json");
+        return new File(parent, "network-schema.static.json");
     }
 
     private String envValue(String name) {

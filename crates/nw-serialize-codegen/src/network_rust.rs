@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn emits_compile_ready_descriptor_module() {
-        let schema = NetworkSchema::from_replicated_state_ghidra_report(&json!({
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
                 "uuid": "A85DF621-DCE0-409F-8D39-A447EA0807FF",
                 "typeIndex": 28,
@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn emits_unnamed_registry_entries_as_descriptors() {
-        let schema = NetworkSchema::from_replicated_state_ghidra_report(&json!({
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
                 "uuid": "6C735DB3-871C-4762-A02C-1DA6B5DAB7E9",
                 "typeIndex": 67
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn emits_identity_for_nil_uuid_descriptor() {
-        let schema = NetworkSchema::from_replicated_state_ghidra_report(&json!({
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
                 "uuid": "00000000-0000-0000-0000-000000000000",
                 "typeIndex": 0,
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn suffixes_identity_leaf_name_collisions() {
-        let schema = NetworkSchema::from_replicated_state_ghidra_report(&json!({
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [
                 {
                     "uuid": "11111111-1111-1111-1111-111111111111",

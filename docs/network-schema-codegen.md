@@ -21,7 +21,7 @@ The target generated surface is:
    - Run the Ghidra extractor against `NewWorld 3-26`.
    - Emit every TypeRegistry row, handler vtable functions, AZ RTTI provider
      evidence, registration-hook names, and `RegisterField` call evidence.
-   - Output: `newworld.replicated_state_schema.static.v1`.
+   - Output: `newworld.network_schema.static.v1`.
 
 2. **Normalization**
    - Convert the static report into `newworld.network_schema.v1`.
@@ -61,7 +61,7 @@ The target generated surface is:
 
 ```powershell
 cargo run -p nw-serialize-codegen -- network-schema `
-  --ghidra-report E:\Projects\new-world\resources\replicated-state-schema.static.json `
+  --ghidra-report E:\Projects\new-world\resources\network-schema.static.json `
   --typeindex "E:\Games\steamapps\common\New World\typeindex.json" `
   --out tmp\network-schema.v1.json
 

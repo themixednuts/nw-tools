@@ -82,7 +82,7 @@ pub struct NetworkSchemaSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NetworkSchemaSourceKind {
-    GhidraReplicatedStateStaticReport,
+    GhidraNetworkStaticReport,
     TypeRegistry,
     TypeIndex,
     SerializeContext,
@@ -276,7 +276,7 @@ impl NetworkConfidence {
 }
 
 impl NetworkSchema {
-    pub fn from_replicated_state_ghidra_report(
+    pub fn from_ghidra_static_network_report(
         report: &Value,
     ) -> Result<Self, NetworkSchemaImportError> {
         let root = report
@@ -293,7 +293,7 @@ impl NetworkSchema {
         let mut schema = Self {
             schema: NETWORK_SCHEMA_VERSION.to_owned(),
             sources: vec![NetworkSchemaSource {
-                kind: NetworkSchemaSourceKind::GhidraReplicatedStateStaticReport,
+                kind: NetworkSchemaSourceKind::GhidraNetworkStaticReport,
                 path: string(root, "input"),
                 schema: string(root, "schema"),
                 program: string(root, "program"),
@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn converts_ghidra_report_to_normalized_network_schema() {
         let report = json!({
-            "schema": "newworld.replicated_state_schema.static.v1",
+            "schema": "newworld.network_schema.static.v1",
             "program": "NewWorld.exe",
             "imageBase": "NewWorld+0x0",
             "input": "E:/Projects/new-world/resources/typeregistry.json",
@@ -965,7 +965,7 @@ mod tests {
         });
 
         let schema =
-            NetworkSchema::from_replicated_state_ghidra_report(&report).expect("normalized schema");
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
 
         assert_eq!(schema.schema, NETWORK_SCHEMA_VERSION);
         assert_eq!(
@@ -1030,7 +1030,7 @@ mod tests {
         });
 
         let schema =
-            NetworkSchema::from_replicated_state_ghidra_report(&report).expect("normalized schema");
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
 
         assert_eq!(schema.types[0].root_kinds, vec![NetworkRootKind::Message]);
         assert_eq!(
@@ -1064,7 +1064,7 @@ mod tests {
         });
 
         let mut schema =
-            NetworkSchema::from_replicated_state_ghidra_report(&report).expect("normalized schema");
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
         let merge = schema
             .merge_typeindex_root(&typeindex, Some("typeindex.json".to_owned()))
             .expect("typeindex merge");
@@ -1120,7 +1120,7 @@ mod tests {
         };
 
         let mut schema =
-            NetworkSchema::from_replicated_state_ghidra_report(&report).expect("normalized schema");
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
         let merge = schema.merge_serialize_codegen_unit(&unit, Some("serialize.json".to_owned()));
 
         assert_eq!(merge.source_type_count, 1);
@@ -1174,7 +1174,7 @@ mod tests {
         };
 
         let mut schema =
-            NetworkSchema::from_replicated_state_ghidra_report(&report).expect("normalized schema");
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
         let merge = schema.merge_serialize_codegen_unit(&unit, Some("serialize.json".to_owned()));
 
         assert_eq!(merge.matched_type_count, 1);
@@ -1233,7 +1233,7 @@ mod tests {
         };
 
         let mut schema =
-            NetworkSchema::from_replicated_state_ghidra_report(&report).expect("normalized schema");
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
         let merge = schema.merge_serialize_codegen_unit(&unit, Some("serialize.json".to_owned()));
 
         assert_eq!(merge.matched_type_count, 0);
@@ -1269,7 +1269,7 @@ mod tests {
         };
 
         let mut schema =
-            NetworkSchema::from_replicated_state_ghidra_report(&report).expect("normalized schema");
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
         let merge = schema.merge_serialize_codegen_unit(&unit, Some("serialize.json".to_owned()));
 
         assert_eq!(merge.matched_type_count, 0);
