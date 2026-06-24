@@ -12,7 +12,7 @@ use crate::network_schema::{
     NetworkWireShape as SchemaWireShape,
 };
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v5";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v6";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
