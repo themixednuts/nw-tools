@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
+
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 use syn::LitStr;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::naming::rust_type_ident;
 use crate::network_schema::{
     NetworkConfidence, NetworkField, NetworkRootKind, NetworkSchema, NetworkType,
 };
@@ -24,6 +27,8 @@ pub struct NetworkRustOutput {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkRustGenerationReport {
     pub descriptor_count: usize,
+    pub identity_type_count: usize,
+    pub identity_name_collision_count: usize,
     pub field_descriptor_count: usize,
     pub skipped_missing_type_id: usize,
     pub skipped_missing_type_index: usize,
@@ -49,6 +54,9 @@ impl NetworkRustEmitter {
             .filter_map(|network_type| descriptor_tokens(network_type, &mut report))
             .collect::<Vec<_>>();
         report.descriptor_count = descriptors.len();
+        report.identity_name_collision_count = identity_name_collision_count(schema);
+        let identities = identity_tokens(schema);
+        report.identity_type_count = identities.len();
 
         let tokens = quote! {
             #![allow(clippy::unreadable_literal)]
@@ -89,6 +97,23 @@ impl NetworkRustEmitter {
                 pub kind: NetworkTypeKind,
                 pub is_field_registered: bool,
                 pub fields: &'static [NetworkFieldDescriptor],
+            }
+
+            pub trait NetworkTypeIdentity {
+                const TYPE_ID: Uuid;
+                const TYPE_INDEX: u32;
+                const NAME: &'static str;
+                const KIND: NetworkTypeKind;
+
+                #[must_use]
+                fn descriptor() -> &'static NetworkTypeDescriptor {
+                    type_by_type_index(Self::TYPE_INDEX)
+                        .expect("generated network identity must have a descriptor")
+                }
+            }
+
+            pub mod identity {
+                #(#identities)*
             }
 
             pub const NETWORK_TYPES: &[NetworkTypeDescriptor] = &[
@@ -143,6 +168,109 @@ impl NetworkRustEmitter {
             report,
         })
     }
+}
+
+fn identity_tokens(schema: &NetworkSchema) -> Vec<proc_macro2::TokenStream> {
+    let names_by_type_index = identity_names_by_type_index(schema);
+    schema
+        .types
+        .iter()
+        .filter_map(|network_type| {
+            let type_id = network_type.type_id?;
+            let type_index = network_type.type_index?;
+            let source_name = network_type.name.as_deref()?;
+            let rust_name = names_by_type_index.get(&type_index)?;
+            let ident = format_ident!("{rust_name}");
+            let type_id = type_id_literal(type_id);
+            let name = LitStr::new(source_name, proc_macro2::Span::call_site());
+            let kind_ident = network_type_kind_ident(root_kind(network_type));
+            Some(quote! {
+                #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+                pub struct #ident;
+
+                impl super::NetworkTypeIdentity for #ident {
+                    const TYPE_ID: ::uuid::Uuid = ::uuid::Uuid::from_u128(#type_id);
+                    const TYPE_INDEX: u32 = #type_index;
+                    const NAME: &'static str = #name;
+                    const KIND: super::NetworkTypeKind = super::NetworkTypeKind::#kind_ident;
+                }
+            })
+        })
+        .collect()
+}
+
+fn identity_names_by_type_index(schema: &NetworkSchema) -> BTreeMap<u32, String> {
+    let mut entries_by_candidate = BTreeMap::<String, Vec<&NetworkType>>::new();
+    for network_type in &schema.types {
+        let (Some(_), Some(name)) = (network_type.type_index, network_type.name.as_deref()) else {
+            continue;
+        };
+        entries_by_candidate
+            .entry(rust_type_ident(name))
+            .or_default()
+            .push(network_type);
+    }
+
+    let mut names_by_type_index = BTreeMap::new();
+    for (candidate, mut entries) in entries_by_candidate {
+        entries.sort_by(|left, right| {
+            left.type_index
+                .cmp(&right.type_index)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        if entries.len() == 1 {
+            names_by_type_index.insert(
+                entries[0]
+                    .type_index
+                    .expect("single candidate entry has a type index"),
+                candidate,
+            );
+            continue;
+        }
+        for network_type in entries {
+            let type_index = network_type
+                .type_index
+                .expect("collision candidate entry has a type index");
+            names_by_type_index.insert(
+                type_index,
+                format!("{candidate}{}", identity_collision_suffix(network_type)),
+            );
+        }
+    }
+    names_by_type_index
+}
+
+fn identity_collision_suffix(network_type: &NetworkType) -> String {
+    match network_type.type_id {
+        Some(type_id) if !type_id.is_nil() => short_type_id(type_id),
+        _ => format!(
+            "TypeIndex{}",
+            network_type
+                .type_index
+                .expect("identity collision candidate has a type index")
+        ),
+    }
+}
+
+fn short_type_id(type_id: Uuid) -> String {
+    type_id
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn identity_name_collision_count(schema: &NetworkSchema) -> usize {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for network_type in &schema.types {
+        let Some(name) = network_type.name.as_deref() else {
+            continue;
+        };
+        *counts.entry(rust_type_ident(name)).or_default() += 1;
+    }
+    counts.values().filter(|count| **count > 1).count()
 }
 
 fn descriptor_tokens(
@@ -313,8 +441,16 @@ mod tests {
         let output = NetworkRustEmitter::emit_descriptors(&schema).expect("rust source");
 
         assert_eq!(output.report.descriptor_count, 1);
+        assert_eq!(output.report.identity_type_count, 1);
         assert_eq!(output.report.field_descriptor_count, 1);
         assert_eq!(output.report.replicated_state_count, 1);
+        assert!(output.source.contains("pub trait NetworkTypeIdentity"));
+        assert!(output.source.contains("pub mod identity"));
+        assert!(
+            output
+                .source
+                .contains("pub struct RaidDataComponentReplicatedState")
+        );
         assert!(
             output
                 .source
@@ -327,5 +463,54 @@ mod tests {
         );
         assert!(output.source.contains("raidId"));
         assert!(output.source.contains("unknown_type_indices"));
+    }
+
+    #[test]
+    fn emits_identity_for_nil_uuid_descriptor() {
+        let schema = NetworkSchema::from_replicated_state_ghidra_report(&json!({
+            "registryEntries": [{
+                "uuid": "00000000-0000-0000-0000-000000000000",
+                "typeIndex": 0,
+                "typeName": "NullType",
+                "fields": []
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_descriptors(&schema).expect("rust source");
+
+        assert_eq!(output.report.descriptor_count, 1);
+        assert_eq!(output.report.identity_type_count, 1);
+        assert!(output.source.contains("pub struct NullType"));
+    }
+
+    #[test]
+    fn suffixes_identity_leaf_name_collisions() {
+        let schema = NetworkSchema::from_replicated_state_ghidra_report(&json!({
+            "registryEntries": [
+                {
+                    "uuid": "11111111-1111-1111-1111-111111111111",
+                    "typeIndex": 10,
+                    "typeName": "First::SharedName",
+                    "fields": []
+                },
+                {
+                    "uuid": "22222222-2222-2222-2222-222222222222",
+                    "typeIndex": 11,
+                    "typeName": "Second::SharedName",
+                    "fields": []
+                }
+            ],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_descriptors(&schema).expect("rust source");
+
+        assert_eq!(output.report.identity_name_collision_count, 1);
+        assert_eq!(output.report.identity_type_count, 2);
+        assert!(output.source.contains("pub struct SharedName11111111"));
+        assert!(output.source.contains("pub struct SharedName22222222"));
     }
 }
