@@ -44,6 +44,8 @@ pub struct NetworkSchemaSummary {
     pub register_field_count: usize,
     pub typed_register_field_function_count: usize,
     pub high_confidence_field_count: usize,
+    #[serde(default)]
+    pub message_unmarshal_field_count: usize,
     pub type_index_evidence_count: usize,
     pub serialize_type_count: usize,
     pub serialize_dependency_count: usize,
@@ -107,6 +109,8 @@ pub struct NetworkType {
     pub base_vtable: Option<String>,
     pub vtable: Option<String>,
     pub handler: Option<NetworkHandler>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<NetworkInstanceLayout>,
     pub serialize: Option<NetworkSerializeType>,
     pub az_rtti: Option<NetworkAzRtti>,
     pub registration_type_name: Option<String>,
@@ -166,6 +170,16 @@ pub struct NetworkField {
     pub handler_expression: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handler_vtable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_expression: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_offset: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wire_shape: Option<NetworkWireShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wire_shape_source: Option<String>,
     pub callsite: Option<String>,
     pub confidence: NetworkConfidence,
     pub evidence: Vec<NetworkEvidence>,
@@ -230,6 +244,7 @@ pub enum NetworkWireShape {
     HalfF32,
     VlqU32,
     QuatCompNorm,
+    String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +256,23 @@ pub struct NetworkHandler {
     pub copy_value: Option<String>,
     pub marshal: Option<String>,
     pub unmarshal: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkInstanceLayout {
+    pub create_instance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constructor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constructor_callsite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constructor_name: Option<String>,
+    pub evidence: Vec<NetworkEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,8 +331,11 @@ pub enum NetworkEvidenceKind {
     HandlerVtable,
     InstallRegistrationHook,
     AzRtti,
+    InstanceLayout,
     RegisterField,
     FieldRegistrationFunction,
+    MessageUnmarshal,
+    MessageSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,6 +547,17 @@ impl NetworkSchema {
                 .flat_map(|network_type| &network_type.fields)
                 .filter(|field| field.confidence.is_high_or_exact())
                 .count(),
+            message_unmarshal_field_count: self
+                .types
+                .iter()
+                .flat_map(|network_type| &network_type.fields)
+                .filter(|field| {
+                    field
+                        .evidence
+                        .iter()
+                        .any(|evidence| evidence.kind == NetworkEvidenceKind::MessageUnmarshal)
+                })
+                .count(),
             type_index_evidence_count: self
                 .types
                 .iter()
@@ -638,6 +684,10 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
         .get("handler")
         .and_then(Value::as_object)
         .map(network_handler);
+    let instance = entry
+        .get("messageUnmarshal")
+        .and_then(Value::as_object)
+        .map(network_instance_layout);
     let az_rtti = entry
         .get("azRtti")
         .and_then(Value::as_object)
@@ -651,7 +701,13 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
         .filter_map(Value::as_object)
         .map(network_field)
         .collect::<Vec<_>>();
-    let root_kinds = root_kinds(name.as_deref(), !fields.is_empty());
+    let has_registered_fields = fields.iter().any(|field| {
+        field
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == NetworkEvidenceKind::RegisterField)
+    });
+    let root_kinds = root_kinds(name.as_deref(), has_registered_fields);
     let mut evidence = Vec::new();
 
     if type_id.is_some() || entry.contains_key("typeIndex") || entry.contains_key("index") {
@@ -705,6 +761,7 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
         base_vtable,
         vtable,
         handler,
+        instance,
         serialize: None,
         az_rtti,
         registration_type_name: string(entry, "registrationTypeName"),
@@ -762,7 +819,32 @@ fn network_field_registration_function(
 }
 
 fn network_field(field: &Map<String, Value>) -> NetworkField {
+    let raw_confidence = string(field, "confidence");
     let confidence = confidence_from_raw(string_ref(field, "confidence"));
+    let evidence_kind = if raw_confidence
+        .as_deref()
+        .is_some_and(|value| value.starts_with("message-unmarshal"))
+    {
+        NetworkEvidenceKind::MessageUnmarshal
+    } else {
+        NetworkEvidenceKind::RegisterField
+    };
+    let mut evidence = vec![NetworkEvidence {
+        kind: evidence_kind,
+        source: raw_confidence.unwrap_or_else(|| "field".to_owned()),
+        address: string(field, "callsite"),
+        detail: string(field, "name").or_else(|| string(field, "nativeType")),
+        confidence,
+    }];
+    if let Some(name_source) = string(field, "nameSource") {
+        evidence.push(NetworkEvidence {
+            kind: NetworkEvidenceKind::MessageSource,
+            source: name_source,
+            address: string(field, "nameSourceAddress"),
+            detail: string(field, "sourceTypeName").or_else(|| string(field, "name")),
+            confidence: NetworkConfidence::High,
+        });
+    }
     NetworkField {
         index: u32_value(field, "index"),
         name: string(field, "name"),
@@ -771,15 +853,14 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
         handler_offset: string(field, "handlerOffset"),
         handler_expression: string(field, "handlerExpression"),
         handler_vtable: string(field, "handlerVtable"),
+        native_type: string(field, "nativeType"),
+        storage_expression: string(field, "storageExpression"),
+        storage_offset: hex_or_decimal_u32(field, "storageOffset"),
+        wire_shape: wire_shape(field, "wireShape"),
+        wire_shape_source: string(field, "wireShapeSource"),
         callsite: string(field, "callsite"),
         confidence,
-        evidence: vec![NetworkEvidence {
-            kind: NetworkEvidenceKind::RegisterField,
-            source: string(field, "confidence").unwrap_or_else(|| "field".to_owned()),
-            address: string(field, "callsite"),
-            detail: string(field, "name"),
-            confidence,
-        }],
+        evidence,
     }
 }
 
@@ -827,6 +908,30 @@ fn network_handler(handler: &Map<String, Value>) -> NetworkHandler {
         copy_value: string(handler, "CopyValue"),
         marshal: string(handler, "Marshal"),
         unmarshal: string(handler, "Unmarshal"),
+    }
+}
+
+fn network_instance_layout(message_unmarshal: &Map<String, Value>) -> NetworkInstanceLayout {
+    let confidence = if message_unmarshal.contains_key("instanceSize") {
+        NetworkConfidence::High
+    } else {
+        NetworkConfidence::Inferred
+    };
+    NetworkInstanceLayout {
+        create_instance: string(message_unmarshal, "createInstance"),
+        size: hex_or_decimal_u32(message_unmarshal, "instanceSize"),
+        size_source: string(message_unmarshal, "instanceSizeSource"),
+        constructor: string(message_unmarshal, "instanceConstructor"),
+        constructor_callsite: string(message_unmarshal, "instanceConstructorCallsite"),
+        constructor_name: string(message_unmarshal, "instanceConstructorName"),
+        evidence: vec![NetworkEvidence {
+            kind: NetworkEvidenceKind::InstanceLayout,
+            source: string(message_unmarshal, "instanceSizeSource")
+                .unwrap_or_else(|| "messageUnmarshal".to_owned()),
+            address: string(message_unmarshal, "createInstance"),
+            detail: string(message_unmarshal, "instanceConstructorName"),
+            confidence,
+        }],
     }
 }
 
@@ -909,7 +1014,9 @@ fn is_message_name(name: &str) -> bool {
 fn confidence_from_raw(raw: Option<&str>) -> NetworkConfidence {
     match raw {
         Some("exact") => NetworkConfidence::Exact,
-        Some("register-field-call" | "registration-hook" | "az-rtti") => NetworkConfidence::High,
+        Some(
+            "register-field-call" | "registration-hook" | "az-rtti" | "message-unmarshal-call",
+        ) => NetworkConfidence::High,
         Some("constructor-match" | "vtable-match") => NetworkConfidence::Inferred,
         Some("hint") => NetworkConfidence::Weak,
         Some(_) => NetworkConfidence::Unknown,
@@ -957,6 +1064,7 @@ fn wire_shape(object: &Map<String, Value>, key: &str) -> Option<NetworkWireShape
         "half-f32" => Some(NetworkWireShape::HalfF32),
         "vlq-u32" => Some(NetworkWireShape::VlqU32),
         "quat-comp-norm" => Some(NetworkWireShape::QuatCompNorm),
+        "string" => Some(NetworkWireShape::String),
         _ => None,
     }
 }
@@ -965,6 +1073,23 @@ fn u32_value(object: &Map<String, Value>, key: &str) -> Option<u32> {
     object.get(key).and_then(|value| match value {
         Value::Number(number) => number.as_u64().and_then(|value| value.try_into().ok()),
         Value::String(value) => value.parse().ok(),
+        _ => None,
+    })
+}
+
+fn hex_or_decimal_u32(object: &Map<String, Value>, key: &str) -> Option<u32> {
+    object.get(key).and_then(|value| match value {
+        Value::Number(number) => number.as_u64().and_then(|value| value.try_into().ok()),
+        Value::String(value) => {
+            let trimmed = value.trim();
+            trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+                .map_or_else(
+                    || trimmed.parse().ok(),
+                    |hex| u32::from_str_radix(hex, 16).ok(),
+                )
+        }
         _ => None,
     })
 }
@@ -1205,6 +1330,116 @@ mod tests {
         assert_eq!(
             schema.types[1].root_kinds,
             vec![NetworkRootKind::SupportType]
+        );
+    }
+
+    #[test]
+    fn imports_message_unmarshal_fields_without_field_registered_kind() {
+        let report = json!({
+            "registryEntries": [{
+                "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
+                "typeIndex": 19,
+                "typeName": "RegistrationRequestV3Msg",
+                "messageUnmarshal": {
+                    "wrapper": "NewWorld+0x7ce8e0",
+                    "helperCallsite": "NewWorld+0x7ce955",
+                    "helper": "NewWorld+0x7d9620",
+                    "helperName": "Amazon::REP::REPClient::RegistrationRequestV3Msg::UnmarshalFields<ClientVersionTokenMap,LoginToken,AuthToken,ImpersonatedValues>",
+                    "createInstance": "NewWorld+0x7ce840",
+                    "instanceSize": "0x470",
+                    "instanceSizeSource": "create-instance-operator-new",
+                    "instanceConstructorCallsite": "NewWorld+0x7ce8fc",
+                    "instanceConstructor": "NewWorld+0x7e37d0",
+                    "instanceConstructorName": "Amazon::REP::REPClient::RegistrationRequestV3::RegistrationRequestV3",
+                    "templateTypes": [
+                        "ClientVersionTokenMap",
+                        "LoginToken",
+                        "AuthToken",
+                        "ImpersonatedValues"
+                    ]
+                },
+                "fields": [{
+                    "index": 0,
+                    "callsite": "NewWorld+0x7ce955",
+                    "name": "TypeIndexCrc",
+                    "nameSource": "msvc-rtti-source-signature",
+                    "nameSourceAddress": "NewWorld+0xa268e80",
+                    "sourceTypeName": "AZ::Crc32",
+                    "nativeType": "u32",
+                    "storageExpression": "(plVar1 + 1)",
+                    "storageOffset": "0x8",
+                    "wireShape": "u32",
+                    "wireShapeSource": "message-unmarshal-native-type",
+                    "confidence": "message-unmarshal-call"
+                }, {
+                    "index": 2,
+                    "callsite": "NewWorld+0x7ce955",
+                    "name": "ConnTicket",
+                    "nativeType": "AZStd::string",
+                    "storageExpression": "(plVar1 + 0x14)",
+                    "storageOffset": "0xa0",
+                    "wireShape": "string",
+                    "wireShapeSource": "message-unmarshal-native-type",
+                    "confidence": "message-unmarshal-call"
+                }, {
+                    "index": 6,
+                    "callsite": "NewWorld+0x7ce955",
+                    "name": "UseCapabilities",
+                    "nameSource": "msvc-rtti-source-signature",
+                    "nameSourceAddress": "NewWorld+0xa268e80",
+                    "sourceTypeName": "bool",
+                    "nativeType": "bool",
+                    "storageExpression": "plVar1 + 0x8c",
+                    "storageOffset": "0x460",
+                    "wireShape": "bool",
+                    "wireShapeSource": "nested-unmarshal-bool-write",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+
+        assert_eq!(schema.summary.message_unmarshal_field_count, 3);
+        assert_eq!(schema.types[0].root_kinds, vec![NetworkRootKind::Message]);
+        let instance = schema.types[0].instance.as_ref().expect("instance layout");
+        assert_eq!(instance.size, Some(0x470));
+        assert_eq!(instance.constructor.as_deref(), Some("NewWorld+0x7e37d0"));
+        assert_eq!(
+            schema.types[0].fields[0].native_type.as_deref(),
+            Some("u32")
+        );
+        assert_eq!(
+            schema.types[0].fields[0].name.as_deref(),
+            Some("TypeIndexCrc")
+        );
+        assert_eq!(schema.types[0].fields[0].storage_offset, Some(0x8));
+        assert_eq!(
+            schema.types[0].fields[0].wire_shape,
+            Some(NetworkWireShape::U32)
+        );
+        assert_eq!(
+            schema.types[0].fields[0].evidence[0].kind,
+            NetworkEvidenceKind::MessageUnmarshal
+        );
+        assert_eq!(
+            schema.types[0].fields[0].evidence[1].kind,
+            NetworkEvidenceKind::MessageSource
+        );
+        assert_eq!(
+            schema.types[0].fields[0].evidence[1].detail.as_deref(),
+            Some("AZ::Crc32")
+        );
+        assert_eq!(
+            schema.types[0].fields[1].wire_shape,
+            Some(NetworkWireShape::String)
+        );
+        assert_eq!(schema.types[0].fields[2].storage_offset, Some(0x460));
+        assert_eq!(
+            schema.types[0].fields[2].wire_shape,
+            Some(NetworkWireShape::Bool)
         );
     }
 

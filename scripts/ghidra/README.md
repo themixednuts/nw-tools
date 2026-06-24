@@ -47,3 +47,8 @@ adds constructor field order, groups, handler offsets, instance vtables, and
 decoded AZ RTTI provider evidence to rows that can be statically mapped. Native
 type names are recovered from actual AZ/Hub registration helper tables or AZ RTTI
 providers; TypeRegistry names remain the raw TypeRegistry/debug-name field.
+
+For message-only types with no replicated-state field registration, the extractor
+also follows `UnmarshalFields<...>` helper calls and records source-signature
+evidence when MSVC RTTI strings expose the source constructor/callback path. This
+keeps wire-shape evidence separate from semantic field-name evidence.
