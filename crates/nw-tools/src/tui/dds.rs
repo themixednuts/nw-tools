@@ -4,7 +4,7 @@
 //! thread that fans the work out across the shared [`JobRunner`], so the list is
 //! responsive from the first frame and scrolling pre-warms a window of neighbours.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -187,34 +187,20 @@ enum Slot {
 
 type Cache = Mutex<HashMap<usize, Slot>>;
 
-/// One node in the texture tree: a directory, or a leaf texture.
-struct Node {
-    /// Path segment (directory name, or file name for a leaf).
-    label: String,
-    depth: usize,
-    parent: Option<usize>,
-    children: Vec<usize>,
-    expanded: bool,
-    /// For leaves: index into `items`. `None` for directories.
-    item: Option<usize>,
-}
-
 pub struct DdsBrowser {
     caps: Caps,
     /// Local snapshot of the discovered textures, grown from `catalog` on tick.
+    /// Kept in discovery order so indices match the catalog (the decode cache key).
     items: Vec<DdsItem>,
     /// Background discovery, ingested progressively so the UI never blocks on it.
     catalog: Arc<DdsCatalog>,
     /// Where the textures came from — shown in the header (e.g. the install path).
     source: String,
-    // Tree arena.
-    nodes: Vec<Node>,
-    roots: Vec<usize>,
-    /// Leaf node ids and their lowercased full paths, for fuzzy filtering.
-    file_nodes: Vec<usize>,
+    /// Lowercased label per item (parallel to `items`), for fuzzy filtering.
     haystacks: Vec<String>,
-    file_count: usize,
-    // View state (indices into `visible`).
+    /// All item indices sorted by label — the unfiltered display order.
+    order: Vec<usize>,
+    /// Item indices currently shown (the active filter applied to `order`).
     visible: Vec<usize>,
     selected: usize,
     offset: usize,
@@ -251,11 +237,8 @@ impl DdsBrowser {
             items: Vec::new(),
             catalog,
             source,
-            nodes: Vec::new(),
-            roots: Vec::new(),
-            file_nodes: Vec::new(),
             haystacks: Vec::new(),
-            file_count: 0,
+            order: Vec::new(),
             visible: Vec::new(),
             selected: 0,
             offset: 0,
@@ -275,114 +258,65 @@ impl DdsBrowser {
         browser
     }
 
-    /// Pull any textures discovered since the last ingest into the local snapshot
-    /// and rebuild the tree. Returns whether anything new arrived.
+    /// Pull any textures discovered since the last ingest into the snapshot, sort
+    /// the display order by label, and reapply the filter. Returns whether
+    /// anything new arrived.
     fn ingest(&mut self) -> bool {
         let fresh = self.catalog.tail_from(self.items.len());
         if fresh.is_empty() {
             return false;
         }
+        for item in &fresh {
+            self.haystacks.push(item.label.to_ascii_lowercase());
+        }
         self.items.extend(fresh);
-        self.rebuild_tree();
+        self.order = (0..self.items.len()).collect();
+        self.order.sort_by(|&a, &b| self.items[a].label.cmp(&self.items[b].label));
         self.rebuild();
         true
     }
 
-    /// Rebuild the directory tree and fuzzy haystacks from the current snapshot.
-    fn rebuild_tree(&mut self) {
-        let (nodes, roots) = build_tree(&self.items);
-        self.file_nodes.clear();
-        self.haystacks.clear();
-        for (id, node) in nodes.iter().enumerate() {
-            if let Some(item) = node.item {
-                self.file_nodes.push(id);
-                self.haystacks.push(self.items[item].label.to_ascii_lowercase());
-            }
-        }
-        self.file_count = self.file_nodes.len();
-        self.nodes = nodes;
-        self.roots = roots;
-    }
-
-    /// Recompute the visible rows from the tree and the active filter, keeping the
-    /// selection anchored to the same node where possible.
+    /// Recompute the visible rows: every texture in label order, or — when a
+    /// filter is set — the fuzzy matches ranked best-first. Keeps the selection on
+    /// the same texture where possible.
     fn rebuild(&mut self) {
-        let anchor = self.visible.get(self.selected).copied();
-        self.visible.clear();
-        if self.filter.is_empty() {
-            let roots = self.roots.clone();
-            for root in roots {
-                collect_open(&self.nodes, root, &mut self.visible);
-            }
+        let anchor = self.current_item();
+        self.visible = if self.filter.is_empty() {
+            self.order.clone()
         } else {
-            self.collect_filtered();
-        }
+            fuzzy::rank(&self.filter, &self.haystacks)
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect()
+        };
         self.selected = anchor
-            .and_then(|node| self.visible.iter().position(|&candidate| candidate == node))
+            .and_then(|item| self.visible.iter().position(|&candidate| candidate == item))
             .unwrap_or(self.selected)
             .min(self.visible.len().saturating_sub(1));
     }
 
-    /// Prune the tree to branches containing a fuzzy match, auto-expanded.
-    fn collect_filtered(&mut self) {
-        let ranked = fuzzy::rank(&self.filter, &self.haystacks);
-        if ranked.is_empty() {
-            return;
-        }
-        let matched: HashSet<usize> = ranked
-            .into_iter()
-            .map(|(index, _)| self.file_nodes[index])
-            .collect();
-        // Mark every ancestor directory of a match.
-        let mut contains: HashSet<usize> = HashSet::new();
-        for &leaf in &matched {
-            let mut parent = self.nodes[leaf].parent;
-            while let Some(node) = parent {
-                if !contains.insert(node) {
-                    break;
-                }
-                parent = self.nodes[node].parent;
-            }
-        }
-        let roots = self.roots.clone();
-        for root in roots {
-            collect_match(&self.nodes, root, &matched, &contains, &mut self.visible);
-        }
-    }
-
-    fn current(&self) -> Option<usize> {
+    /// The focused texture (an index into `items`), if any.
+    fn current_item(&self) -> Option<usize> {
         self.visible.get(self.selected).copied()
     }
 
-    fn current_item(&self) -> Option<usize> {
-        self.current().and_then(|node| self.nodes[node].item)
-    }
-
-    /// Queue the focused texture (first, so it lands soonest) plus the file leaves
-    /// just above/below it in view order, so scrolling pre-warms neighbours.
+    /// Queue the focused texture (first, so it lands soonest) plus the rows just
+    /// above/below it in view order, so scrolling pre-warms neighbours.
     fn request(&self) {
         if self.visible.is_empty() {
             return;
         }
-        let mut want = Vec::new();
-        if let Some(item) = self.current_item() {
-            want.push(item);
-        }
         let start = self.selected.saturating_sub(3);
         let end = (self.selected + 12).min(self.visible.len());
+        let mut want = vec![self.visible[self.selected]];
         for row in start..end {
-            if row == self.selected {
-                continue;
-            }
-            if let Some(&node) = self.visible.get(row)
-                && let Some(item) = self.nodes[node].item
+            if row != self.selected
+                && let Some(&item) = self.visible.get(row)
             {
                 want.push(item);
             }
         }
-        if !want.is_empty() {
-            let _ = self.tx.try_send(want);
-        }
+        let _ = self.tx.try_send(want);
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -444,44 +378,6 @@ impl DdsBrowser {
     }
 
     /// Toggle a directory; on a file, do nothing (handled as "open" elsewhere).
-    fn toggle(&mut self) {
-        if let Some(node) = self.current()
-            && self.nodes[node].item.is_none()
-        {
-            self.nodes[node].expanded = !self.nodes[node].expanded;
-            self.rebuild();
-        }
-    }
-
-    /// Right/`l`: expand a directory (or step into it if already open).
-    fn expand(&mut self) {
-        if let Some(node) = self.current() {
-            if self.nodes[node].item.is_some() {
-                return;
-            }
-            if self.nodes[node].expanded {
-                self.move_by(1);
-            } else {
-                self.nodes[node].expanded = true;
-                self.rebuild();
-            }
-        }
-    }
-
-    /// Left/`h`: collapse an open directory, else jump to the parent directory.
-    fn collapse(&mut self) {
-        if let Some(node) = self.current() {
-            if self.nodes[node].item.is_none() && self.nodes[node].expanded {
-                self.nodes[node].expanded = false;
-                self.rebuild();
-            } else if let Some(parent) = self.nodes[node].parent
-                && let Some(row) = self.visible.iter().position(|&candidate| candidate == parent)
-            {
-                self.select(row);
-            }
-        }
-    }
-
     fn copy_path(&mut self) {
         if let Some(item) = self.current_item() {
             let path = self.items[item].header.clone();
@@ -489,91 +385,6 @@ impl DdsBrowser {
                 Ok(()) => format!("copied {path}"),
                 Err(error) => format!("copy failed: {error}"),
             });
-        }
-    }
-}
-
-/// Build the directory tree arena from the items' (sorted) full paths.
-fn build_tree(items: &[DdsItem]) -> (Vec<Node>, Vec<usize>) {
-    let mut nodes: Vec<Node> = Vec::new();
-    let mut roots: Vec<usize> = Vec::new();
-    // (parent, segment) -> node id; usize::MAX is the virtual root.
-    let mut lookup: HashMap<(usize, String), usize> = HashMap::new();
-
-    for (item_index, item) in items.iter().enumerate() {
-        let mut parent: Option<usize> = None;
-        let segments: Vec<&str> = item.label.split('/').filter(|s| !s.is_empty()).collect();
-        for (depth, segment) in segments.iter().enumerate() {
-            let is_leaf = depth + 1 == segments.len();
-            let key = (parent.unwrap_or(usize::MAX), (*segment).to_string());
-            let node = if let Some(&existing) = lookup.get(&key) {
-                existing
-            } else {
-                let id = nodes.len();
-                nodes.push(Node {
-                    label: (*segment).to_string(),
-                    depth,
-                    parent,
-                    children: Vec::new(),
-                    expanded: false,
-                    item: is_leaf.then_some(item_index),
-                });
-                lookup.insert(key, id);
-                match parent {
-                    Some(p) => nodes[p].children.push(id),
-                    None => roots.push(id),
-                }
-                id
-            };
-            parent = Some(node);
-        }
-    }
-
-    // Directories before files, alphabetical within each.
-    let order = |nodes: &[Node], a: usize, b: usize| {
-        nodes[a]
-            .item
-            .is_some()
-            .cmp(&nodes[b].item.is_some())
-            .then_with(|| nodes[a].label.cmp(&nodes[b].label))
-    };
-    for id in 0..nodes.len() {
-        let mut children = std::mem::take(&mut nodes[id].children);
-        children.sort_by(|&a, &b| order(&nodes, a, b));
-        nodes[id].children = children;
-    }
-    roots.sort_by(|&a, &b| order(&nodes, a, b));
-    (nodes, roots)
-}
-
-/// DFS append `node` and its open descendants in display order.
-fn collect_open(nodes: &[Node], node: usize, out: &mut Vec<usize>) {
-    out.push(node);
-    if nodes[node].expanded {
-        for &child in &nodes[node].children {
-            collect_open(nodes, child, out);
-        }
-    }
-}
-
-/// DFS append only matched leaves and the directories that contain them.
-fn collect_match(
-    nodes: &[Node],
-    node: usize,
-    matched: &HashSet<usize>,
-    contains: &HashSet<usize>,
-    out: &mut Vec<usize>,
-) {
-    if nodes[node].item.is_some() {
-        if matched.contains(&node) {
-            out.push(node);
-        }
-        return;
-    }
-    if contains.contains(&node) {
-        out.push(node);
-        for &child in &nodes[node].children {
-            collect_match(nodes, child, matched, contains, out);
         }
     }
 }
@@ -658,12 +469,9 @@ impl View for DdsBrowser {
             KeyCode::Char('G') | KeyCode::End => {
                 self.select(self.visible.len().saturating_sub(1))
             }
-            KeyCode::Char('h') | KeyCode::Left => self.collapse(),
-            KeyCode::Char('l') | KeyCode::Right => self.expand(),
-            KeyCode::Char('[') | KeyCode::Char(',') => self.cycle_mip(-1),
-            KeyCode::Char(']') | KeyCode::Char('.') => self.cycle_mip(1),
+            KeyCode::Char('[') | KeyCode::Char(',') | KeyCode::Left => self.cycle_mip(-1),
+            KeyCode::Char(']') | KeyCode::Char('.') | KeyCode::Right => self.cycle_mip(1),
             KeyCode::Char('a') | KeyCode::Tab => self.cycle_surface(1),
-            KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('y') => self.copy_path(),
             KeyCode::Enter => {
@@ -671,7 +479,6 @@ impl View for DdsBrowser {
                     self.result = Some(self.items[item].header.clone());
                     return Flow::Quit;
                 }
-                self.toggle();
             }
             _ => {}
         }
@@ -702,13 +509,13 @@ impl View for DdsBrowser {
             divider.width,
         );
 
-        // A narrow tree on the left, a large viewport on the right — the point.
-        let tree_width = ((u32::from(body.width) * 32 / 100) as u16).clamp(22, 52);
+        // A path list on the left, a large viewport on the right — the point.
+        let list_width = ((u32::from(body.width) * 40 / 100) as u16).clamp(24, 64);
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(tree_width), Constraint::Min(1)])
+            .constraints([Constraint::Length(list_width), Constraint::Min(1)])
             .split(body);
-        self.render_tree(frame, columns[0]);
+        self.render_list(frame, columns[0]);
         self.render_viewport(frame, columns[1]);
         self.render_bottom(frame, bottom);
     }
@@ -723,7 +530,7 @@ impl DdsBrowser {
             Span::styled(self.source.clone(), theme::dim()),
             Span::raw("  "),
             Span::styled("textures ", theme::dim()),
-            Span::styled(self.file_count.to_string(), theme::bold()),
+            Span::styled(self.items.len().to_string(), theme::bold()),
         ];
         let (scanned, total) = self.catalog.progress();
         if scanned < total {
@@ -732,14 +539,7 @@ impl DdsBrowser {
         if !self.filter.is_empty() {
             spans.push(Span::styled(glyphs.sep.to_string(), theme::dim()));
             spans.push(Span::styled("matched ", theme::dim()));
-            spans.push(Span::styled(
-                self.visible
-                    .iter()
-                    .filter(|&&node| self.nodes[node].item.is_some())
-                    .count()
-                    .to_string(),
-                theme::bold(),
-            ));
+            spans.push(Span::styled(self.visible.len().to_string(), theme::bold()));
         }
         let buf = frame.buffer_mut();
         buf.set_line(area.x, area.y, &Line::from(spans), area.width);
@@ -760,7 +560,7 @@ impl DdsBrowser {
         }
     }
 
-    fn render_tree(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_list(&mut self, frame: &mut Frame, area: Rect) {
         let height = area.height as usize;
         if height == 0 || self.visible.is_empty() {
             return;
@@ -775,34 +575,15 @@ impl DdsBrowser {
         let width = area.width as usize;
         for slot in 0..height {
             let row = self.offset + slot;
-            let Some(&node_id) = self.visible.get(row) else {
+            let Some(&item) = self.visible.get(row) else {
                 break;
             };
-            let node = &self.nodes[node_id];
             let y = area.y + slot as u16;
-            let indent = "  ".repeat(node.depth);
-            let marker = if node.item.is_some() {
-                "  "
-            } else if node.expanded {
-                if self.caps.unicode { "▾ " } else { "v " }
-            } else if self.caps.unicode {
-                "▸ "
-            } else {
-                "> "
-            };
-            let name_width = width.saturating_sub(indent.len() + marker.len());
-            let name = theme::fit_end(&node.label, name_width, glyphs.ellipsis);
-            let name_style = if node.item.is_some() {
-                Style::default()
-            } else {
-                theme::accent()
-            };
-            let line = Line::from(vec![
-                Span::raw(indent),
-                Span::styled(marker.to_string(), theme::dim()),
-                Span::styled(name, name_style),
-            ]);
-            frame.buffer_mut().set_line(area.x, y, &line, area.width);
+            // Middle-ellipsize the full path so the directory and file both show.
+            let label = theme::fit_middle(&self.items[item].label, width, glyphs.ellipsis);
+            frame
+                .buffer_mut()
+                .set_line(area.x, y, &Line::from(Span::raw(label)), area.width);
             if row == self.selected {
                 let style = if self.caps.color {
                     Style::default().bg(HILITE).add_modifier(Modifier::BOLD)
@@ -1018,9 +799,9 @@ impl DdsBrowser {
             Line::from(Span::styled(status.clone(), theme::dim()))
         } else {
             let hint = if self.caps.unicode {
-                "↑↓ move   ←→ fold   [ ] mip   a alpha   / search   y copy   q quit"
+                "↑↓ move   [ ] mip   a alpha   / filter   y copy   ⏎ select   q quit"
             } else {
-                "up/dn move   l/r fold   [ ] mip   a alpha   / search   y copy   q quit"
+                "up/dn move   [ ] mip   a alpha   / filter   y copy   enter select   q quit"
             };
             Line::from(Span::styled(hint.to_string(), theme::dim()))
         };
