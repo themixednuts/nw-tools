@@ -38,9 +38,6 @@ const PREVIEW_MAX: u32 = 1024;
 const TARGET_CELL_W: u16 = 40;
 const MIN_COLS: u16 = 2;
 const MAX_COLS: u16 = 6;
-/// Thumbnails decode to at most this many pixels on the long edge before encoding,
-/// which is plenty to fill a grid cell crisply.
-const THUMB_PX: u32 = 512;
 /// Keep this many decoded thumbnails before evicting (oldest off-screen first), so
 /// scrolling back doesn't re-decode what was just viewed.
 const THUMB_CACHE_CAP: usize = 1024;
@@ -1154,15 +1151,21 @@ fn decode_thumbnail(
     picker: &Picker,
     size: Size,
 ) -> Result<Protocol, String> {
-    // Thumbnails decode only the header file's mip — no large split-sidecar reads,
-    // and a small mip — which is plenty for a grid cell and keeps it fast.
+    // Decode the mip that matches the cell's pixel size so the thumbnail fills the
+    // cell — reading only the one sidecar that mip needs (not the huge top mip).
     let header = store.read(&item.header)?;
-    let decoded = nw_dds::decode_header_mip(&header).map_err(|error| error.to_string())?;
+    let font = picker.font_size();
+    let target_px = u32::from(font.width) * u32::from(size.width);
+    let target_py = u32::from(font.height) * u32::from(size.height);
+    let max_dim = target_px.max(target_py).max(64);
+    let decoded = nw_dds::decode_mip_max(&header, max_dim, |part| {
+        item.sidecars.iter().find(|(p, _)| *p == part).and_then(|(_, key)| store.read(key).ok())
+    })
+    .map_err(|error| error.to_string())?;
     let image = RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)
         .ok_or_else(|| "decoded texture had an unexpected size".to_string())?;
-    let dynamic = DynamicImage::ImageRgba8(downscale(image, THUMB_PX));
     picker
-        .new_protocol(dynamic, size, Resize::Fit(None))
+        .new_protocol(DynamicImage::ImageRgba8(image), size, Resize::Fit(None))
         .map_err(|error| error.to_string())
 }
 

@@ -238,6 +238,79 @@ pub fn decode_header_mip(bytes: &[u8]) -> Result<DecodedImage, Error> {
     Ok(DecodedImage { width, height, rgba })
 }
 
+/// Decode one mip sized to cover `max_dim` pixels on its longest edge (the
+/// smallest mip that still does, so it's crisp when downscaled to a thumbnail) —
+/// reading only the single split sidecar that mip needs, via `fetch`, or nothing
+/// but the header when the target mip is persistent.
+///
+/// This is the thumbnail path: it fills a grid cell without decoding the full
+/// top mip or reading every large sidecar.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the DDS is invalid, the needed sidecar is missing or the
+/// wrong size, or the mip cannot be decoded.
+pub fn decode_mip_max(
+    bytes: &[u8],
+    max_dim: u32,
+    fetch: impl FnOnce(SplitPart) -> Option<Vec<u8>>,
+) -> Result<DecodedImage, Error> {
+    let dds = Dds::parse(bytes)?;
+    let texture = Texture::from_dds(&dds)?;
+    let sizes = texture.level_sizes()?;
+    let mipmaps = sizes.len();
+    if mipmaps == 0 {
+        return Err(Error::UnsupportedShape {
+            reason: "texture has no mip levels",
+        });
+    }
+
+    // Levels run largest (0) to smallest. Walk down while still >= max_dim, so we
+    // land on the smallest mip that still covers the target (or level 0 if the
+    // whole texture is smaller).
+    let dim_at = |level: u32| mip_extent(texture.width, level).max(mip_extent(texture.height, level)).max(1);
+    let mut target = 0u32;
+    for level in 0..mipmaps as u32 {
+        if dim_at(level) >= max_dim {
+            target = level;
+        } else {
+            break;
+        }
+    }
+
+    let split_count = if dds.is_split() {
+        let persistent = usize::from(dds.header().persistent_mips()).min(mipmaps);
+        mipmaps - persistent
+    } else {
+        0
+    };
+    let width = mip_extent(texture.width, target).max(1);
+    let height = mip_extent(texture.height, target).max(1);
+    let target_usize = target as usize;
+
+    if target_usize >= split_count {
+        // Persistent mip — sliced straight from the header payload, no sidecar read.
+        let payload = dds.payload(bytes).ok_or(Error::PayloadSize {
+            expected: u64::try_from(dds.payload_bytes()).unwrap_or(u64::MAX),
+            actual: bytes.len().saturating_sub(DDS_FILE_HEADER_LEN),
+        })?;
+        let chain = slice_chain(payload, &sizes[split_count..], split_count)?;
+        let blocks = *chain.get(target_usize - split_count).ok_or(Error::UnsupportedShape {
+            reason: "missing header mip",
+        })?;
+        let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
+        Ok(DecodedImage { width, height, rgba })
+    } else {
+        // Split mip — read just this one sidecar (index = split_count - level).
+        let index = u32::try_from(split_count - target_usize).unwrap_or(u32::MAX);
+        let sidecar = fetch(SplitPart::Mip { index, alpha: false })
+            .ok_or(Error::MissingSidecar { index })?;
+        check_mip_size(target, sizes[target_usize], sidecar.len())?;
+        let rgba = decode_rgba(texture.format.vk, &sidecar, width as usize, height as usize)?;
+        Ok(DecodedImage { width, height, rgba })
+    }
+}
+
 fn decode_rgba(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Error> {
     let pixels = width.checked_mul(height).ok_or(Error::SizeOverflow {
         what: "image dimensions",
