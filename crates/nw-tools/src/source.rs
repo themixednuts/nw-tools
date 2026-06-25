@@ -30,6 +30,25 @@ pub fn locate() -> Result<nw_locator::Install> {
     )
 }
 
+/// Read the asset catalog (rasc, plus the optional raoc) straight from the
+/// install's `Engine.pak`, where New World ships it — without building the full
+/// table of contents.
+///
+/// # Errors
+///
+/// Returns an error if `Engine.pak` cannot be opened or does not contain the
+/// primary catalog entry.
+pub fn install_catalog_bytes(assets: &Path) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    let engine = assets.join("Engine.pak");
+    let reader =
+        PakMmapReader::open(&engine).with_context(|| format!("open {}", engine.display()))?;
+    let rasc = reader.read_wrapped(nw_asset::ASSET_CATALOG_PATH).with_context(|| {
+        format!("{} not found in {}", nw_asset::ASSET_CATALOG_PATH, engine.display())
+    })?;
+    let raoc = reader.read_wrapped(nw_asset::ASSET_CATALOG_OPTIMIZED_PATH).ok();
+    Ok((rasc, raoc))
+}
+
 /// The install's paks indexed by virtual path, plus the catalog material map.
 ///
 /// `read` resolves a virtual path through the pak table-of-contents; `material_path`

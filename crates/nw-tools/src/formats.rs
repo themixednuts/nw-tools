@@ -68,7 +68,9 @@ pub enum CatalogCmd {
 
 #[derive(Debug, Args)]
 pub struct CatalogSummary {
-    path: PathBuf,
+    /// Catalog file or directory. Omit to read from the located install's Engine.pak.
+    #[arg(long)]
+    path: Option<PathBuf>,
 
     #[arg(long, default_value_t = 25)]
     show: usize,
@@ -79,8 +81,11 @@ pub struct CatalogSummary {
 
 #[derive(Debug, Args)]
 pub struct CatalogFind {
-    path: PathBuf,
     query: Vec<String>,
+
+    /// Catalog file or directory. Omit to read from the located install's Engine.pak.
+    #[arg(long)]
+    path: Option<PathBuf>,
 
     /// Exact substring match instead of the default fuzzy ranking.
     #[arg(long)]
@@ -95,8 +100,11 @@ pub struct CatalogFind {
 
 #[derive(Debug, Args)]
 pub struct CatalogGet {
-    path: PathBuf,
     query: Vec<String>,
+
+    /// Catalog file or directory. Omit to read from the located install's Engine.pak.
+    #[arg(long)]
+    path: Option<PathBuf>,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -104,8 +112,11 @@ pub struct CatalogGet {
 
 #[derive(Debug, Args)]
 pub struct CatalogExport {
-    path: PathBuf,
     out: PathBuf,
+
+    /// Catalog file or directory. Omit to read from the located install's Engine.pak.
+    #[arg(long)]
+    path: Option<PathBuf>,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -494,43 +505,49 @@ impl Catalog {
 impl CatalogSummary {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paths = collect_matching(&self.path, |path| nw_asset::is_asset_catalog_path(path))?;
+        let inputs = CatalogInput::collect(self.path.as_deref())?;
         let batch = ctx.map_results_compact(
             "catalog",
-            &paths,
-            |path| path_label(path),
-            |path, progress| progress.step(|| scan_catalog(path, self.show, &[], false)),
+            &inputs,
+            CatalogInput::label,
+            |input, progress| {
+                progress.step(|| scan_catalog(&input.label(), &input.bytes()?, self.show, &[], false))
+            },
         );
-        print_catalog_scans(batch, paths.len(), "catalog")
+        print_catalog_scans(batch, inputs.len(), "catalog")
     }
 }
 
 impl CatalogFind {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paths = collect_matching(&self.path, |path| nw_asset::is_asset_catalog_path(path))?;
+        let inputs = CatalogInput::collect(self.path.as_deref())?;
         let find = lowered(self.query);
         let fuzzy = !self.exact;
         let batch = ctx.map_results_compact(
             "catalog find",
-            &paths,
-            |path| path_label(path),
-            |path, progress| progress.step(|| scan_catalog(path, self.show, &find, fuzzy)),
+            &inputs,
+            CatalogInput::label,
+            |input, progress| {
+                progress.step(|| scan_catalog(&input.label(), &input.bytes()?, self.show, &find, fuzzy))
+            },
         );
-        print_catalog_scans(batch, paths.len(), "catalog find")
+        print_catalog_scans(batch, inputs.len(), "catalog find")
     }
 }
 
 impl CatalogGet {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paths = collect_matching(&self.path, |path| nw_asset::is_asset_catalog_path(path))?;
+        let inputs = CatalogInput::collect(self.path.as_deref())?;
         let queries = lowered(self.query);
         let batch = ctx.map_results_compact(
             "catalog get",
-            &paths,
-            |path| path_label(path),
-            |path, progress| progress.step(|| get_catalog(path, &queries)),
+            &inputs,
+            CatalogInput::label,
+            |input, progress| {
+                progress.step(|| get_catalog(&input.label(), &input.bytes()?, &queries))
+            },
         );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
@@ -551,7 +568,7 @@ impl CatalogGet {
         });
 
         let mut report = Report::new("catalog get")
-            .stat("catalogs", paths.len())
+            .stat("catalogs", inputs.len())
             .stat("matched", rows.len());
         report.table_or(catalog_rows_table(rows), "no catalog rows to show");
         report.print();
@@ -563,12 +580,12 @@ impl CatalogGet {
 impl CatalogExport {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let paths = collect_matching(&self.path, |path| nw_asset::is_asset_catalog_path(path))?;
+        let inputs = CatalogInput::collect(self.path.as_deref())?;
         let batch = ctx.map_results_compact(
             "catalog export",
-            &paths,
-            |path| path_label(path),
-            |path, progress| progress.step(|| export_catalog(path)),
+            &inputs,
+            CatalogInput::label,
+            |input, progress| progress.step(|| export_catalog(&input.label(), &input.bytes()?)),
         );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
@@ -591,7 +608,7 @@ impl CatalogExport {
         write_catalog_csv(&self.out, &rows)
             .with_context(|| format!("write {}", self.out.display()))?;
         Report::new("catalog export")
-            .stat("catalogs", paths.len())
+            .stat("catalogs", inputs.len())
             .stat("exported", rows.len())
             .stat("path", self.out.display())
             .print();
@@ -1625,11 +1642,67 @@ fn scan_dds(path: &Path) -> Result<DdsScan> {
     })
 }
 
-fn scan_catalog(path: &Path, limit: usize, find: &[String], fuzzy: bool) -> Result<CatalogScan> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let catalog =
-        nw_asset::Catalog::parse(&bytes).with_context(|| format!("parse {}", path.display()))?;
-    let source = path.display().to_string();
+/// A catalog to scan: either a loose file on disk, or bytes already read out of
+/// the install's `Engine.pak`.
+enum CatalogInput {
+    File(PathBuf),
+    Pak { label: String, bytes: Vec<u8> },
+}
+
+impl CatalogInput {
+    /// The catalogs for a command: matching loose files under `path`, or — when
+    /// `path` is omitted — the catalog read straight from the located install.
+    fn collect(path: Option<&Path>) -> Result<Vec<Self>> {
+        match path {
+            Some(path) => Ok(collect_matching(path, |p| nw_asset::is_asset_catalog_path(p))?
+                .into_iter()
+                .map(Self::File)
+                .collect()),
+            None => {
+                let install = crate::source::locate()?;
+                let (rasc, raoc) = crate::source::install_catalog_bytes(&install.assets())?;
+                let mut inputs = vec![Self::Pak {
+                    label: format!("Engine.pak/{}", nw_asset::ASSET_CATALOG_PATH),
+                    bytes: rasc,
+                }];
+                if let Some(raoc) = raoc {
+                    inputs.push(Self::Pak {
+                        label: format!("Engine.pak/{}", nw_asset::ASSET_CATALOG_OPTIMIZED_PATH),
+                        bytes: raoc,
+                    });
+                }
+                Ok(inputs)
+            }
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::File(path) => path_label(path),
+            Self::Pak { label, .. } => label.clone(),
+        }
+    }
+
+    /// The catalog bytes, reading the file on demand.
+    fn bytes(&self) -> Result<Cow<'_, [u8]>> {
+        match self {
+            Self::File(path) => Ok(Cow::Owned(
+                std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
+            )),
+            Self::Pak { bytes, .. } => Ok(Cow::Borrowed(bytes)),
+        }
+    }
+}
+
+fn scan_catalog(
+    source: &str,
+    bytes: &[u8],
+    limit: usize,
+    find: &[String],
+    fuzzy: bool,
+) -> Result<CatalogScan> {
+    let catalog = nw_asset::Catalog::parse(bytes).with_context(|| format!("parse {source}"))?;
+    let source = source.to_string();
     let mut search = (fuzzy && !find.is_empty()).then(|| crate::fuzzy::MultiSearch::new(find));
 
     match catalog {
@@ -1726,11 +1799,9 @@ fn scan_catalog(path: &Path, limit: usize, find: &[String], fuzzy: bool) -> Resu
     }
 }
 
-fn get_catalog(path: &Path, queries: &[String]) -> Result<Vec<CatalogRow>> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let catalog =
-        nw_asset::Catalog::parse(&bytes).with_context(|| format!("parse {}", path.display()))?;
-    let source = path.display().to_string();
+fn get_catalog(source: &str, bytes: &[u8], queries: &[String]) -> Result<Vec<CatalogRow>> {
+    let catalog = nw_asset::Catalog::parse(bytes).with_context(|| format!("parse {source}"))?;
+    let source = source.to_string();
     let mut rows = Vec::new();
 
     match catalog {
@@ -1795,11 +1866,9 @@ fn get_catalog(path: &Path, queries: &[String]) -> Result<Vec<CatalogRow>> {
     Ok(rows)
 }
 
-fn export_catalog(path: &Path) -> Result<Vec<CatalogExportRow>> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let catalog =
-        nw_asset::Catalog::parse(&bytes).with_context(|| format!("parse {}", path.display()))?;
-    let source = path.display().to_string();
+fn export_catalog(source: &str, bytes: &[u8]) -> Result<Vec<CatalogExportRow>> {
+    let catalog = nw_asset::Catalog::parse(bytes).with_context(|| format!("parse {source}"))?;
+    let source = source.to_string();
 
     Ok(match catalog {
         nw_asset::Catalog::Rasc(catalog) => catalog
