@@ -47,6 +47,7 @@ memmap2 = "0.9.10"
 oxc_allocator = "0.135"
 oxc_codegen = { version = "0.135", default-features = false }
 oxc_parser = { version = "0.135", default-features = false }
+crossbeam-channel = "0.5.15"
 oxc_span = "0.135"
 prettyplease = "0.2"
 proc-macro2 = "1"

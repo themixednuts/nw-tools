@@ -512,15 +512,26 @@ fn group_sprites(items: Vec<crate::tui::DdsItem>) -> Vec<crate::tui::DdsItem> {
     out
 }
 
-/// Split a `.dds` label into its sprite base and frame number, if it ends in
-/// `_<digits>` (e.g. `fx/spark_00.dds` → (`fx/spark`, 0)).
+/// Split a `.dds` label into its sprite base and frame number. The frame number is
+/// the trailing run of digits; an optional single `_` separator is absorbed into
+/// the base. The underscore form accepts any digit count (`fx/spark_0.dds` →
+/// (`fx/spark`, 0)); the bare form requires ≥2 digits (`ui/coin01.dds` →
+/// (`ui/coin`, 1)) so ordinary names like `wood1.dds` aren't mistaken for frames.
 fn sprite_base(label: &str) -> Option<(String, u32)> {
     let stem = label.strip_suffix(".dds")?;
-    let (base, digits) = stem.rsplit_once('_')?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    let digits = stem.len() - stem.bytes().rev().take_while(u8::is_ascii_digit).count();
+    let (head, digits) = stem.split_at(digits);
+    if digits.is_empty() {
         return None;
     }
     let number = digits.parse().ok()?;
+    let (base, separated) = match head.strip_suffix('_') {
+        Some(base) => (base, true),
+        None => (head, false),
+    };
+    if base.is_empty() || (!separated && digits.len() < 2) {
+        return None;
+    }
     Some((base.to_string(), number))
 }
 
@@ -757,4 +768,31 @@ fn scan_dds(path: &Path) -> Result<DdsScan> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sprite_base;
+
+    #[test]
+    fn sprite_base_matches_underscore_and_bare_forms() {
+        // Underscore form: any digit count.
+        assert_eq!(sprite_base("fx/spark_0.dds"), Some(("fx/spark".into(), 0)));
+        assert_eq!(sprite_base("fx/spark_07.dds"), Some(("fx/spark".into(), 7)));
+        // Bare form: requires ≥2 digits.
+        assert_eq!(sprite_base("ui/coin01.dds"), Some(("ui/coin".into(), 1)));
+        assert_eq!(sprite_base("ui/coin12.dds"), Some(("ui/coin".into(), 12)));
+    }
+
+    #[test]
+    fn sprite_base_rejects_non_frames() {
+        // A single trailing digit without a separator is part of the name.
+        assert_eq!(sprite_base("wood1.dds"), None);
+        // No trailing digits at all.
+        assert_eq!(sprite_base("stone.dds"), None);
+        // All digits (no base) is not a frame.
+        assert_eq!(sprite_base("00.dds"), None);
+        // Not a DDS.
+        assert_eq!(sprite_base("fx/spark_00.png"), None);
+    }
 }

@@ -41,6 +41,13 @@ pub trait View {
     /// Called on each poll timeout while [`View::ticking`] is true.
     fn tick(&mut self) {}
 
+    /// How long to wait for input before [`View::tick`] while [`View::ticking`].
+    /// A view animating (e.g. a sprite) returns a shorter interval to redraw at
+    /// its frame rate; the default suits background-progress polling.
+    fn poll_interval(&self) -> Duration {
+        Duration::from_millis(120)
+    }
+
     /// A region that must be force-repainted on the next frame (not the whole
     /// screen). Needed when a graphics-protocol image changes in place — e.g.
     /// cycling a DDS texture's mip — since those cells would otherwise leave
@@ -123,8 +130,8 @@ fn event_loop<V: View>(terminal: &mut Terminal<Backend>, view: &mut V) -> io::Re
         }
         terminal.draw(|frame| view.render(frame))?;
         if view.ticking() {
-            // Wake periodically so background progress and growing results render.
-            if event::poll(Duration::from_millis(120))? {
+            // Wake at the view's cadence so background progress and animations render.
+            if event::poll(view.poll_interval())? {
                 if handle(view, event::read()?) == Flow::Quit {
                     return Ok(());
                 }
