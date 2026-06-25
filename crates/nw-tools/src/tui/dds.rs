@@ -229,6 +229,13 @@ struct ThumbReq {
     cancel: CancellationToken,
 }
 
+/// A request to decode the focus-view preview(s). `cancel` is tripped when the
+/// focused texture changes, so cycling doesn't pile up stale full decodes.
+struct PreviewReq {
+    items: Vec<usize>,
+    cancel: CancellationToken,
+}
+
 /// Persistent, terminal-independent thumbnail cache: the decoded+downscaled image
 /// (QOI) per asset, keyed by an `Engine.pak` fingerprint so a game patch
 /// invalidates it. A hit skips the pak read + DDS decode (only re-encoding to the
@@ -355,7 +362,9 @@ pub struct DdsBrowser {
     mip: usize,
     // Full-preview decode (focus view).
     cache: Arc<Cache>,
-    tx: SyncSender<Vec<usize>>,
+    tx: SyncSender<PreviewReq>,
+    /// Cancels the in-flight preview decode when the focused texture changes.
+    preview_cancel: CancellationToken,
     // Thumbnail decode (grid).
     thumbs: Arc<Thumbs>,
     thumb_tx: SyncSender<ThumbReq>,
@@ -365,6 +374,9 @@ pub struct DdsBrowser {
     requested: Vec<usize>,
     /// Monotonic clock stamped onto thumbnails as they're shown, for LRU eviction.
     clock: u64,
+    /// Set when the focused image changes (cycle/enter/exit) so the next frame is a
+    /// full redraw — graphics-protocol image cells would otherwise leave residue.
+    dirty: bool,
     picker: Picker,
     /// The encoded protocol for the focused (texture, surface, mip) at a given
     /// image-area size — rebuilt only when that key changes.
@@ -414,11 +426,13 @@ impl DdsBrowser {
             mip: 0,
             cache,
             tx,
+            preview_cancel: CancellationToken::new(),
             thumbs,
             thumb_tx,
             thumb_cancel: CancellationToken::new(),
             requested: Vec::new(),
             clock: 0,
+            dirty: false,
             picker,
             protocol: None,
             status: None,
@@ -492,14 +506,19 @@ impl DdsBrowser {
             self.surface = 0;
             self.mip = 0;
             self.status = None;
+            self.dirty = true;
             self.request_preview();
         }
     }
 
-    /// Request a full-resolution preview decode of the focused texture.
-    fn request_preview(&self) {
+    /// Request a full-resolution preview decode of the focused texture, cancelling
+    /// any previous (now stale) preview decode.
+    fn request_preview(&mut self) {
         if let Some(item) = self.current_item() {
-            let _ = self.tx.try_send(vec![item]);
+            self.preview_cancel.cancel();
+            let cancel = CancellationToken::new();
+            self.preview_cancel = cancel.clone();
+            let _ = self.tx.try_send(PreviewReq { items: vec![item], cancel });
         }
     }
 
@@ -546,6 +565,7 @@ impl DdsBrowser {
         self.surface = 0;
         self.mip = 0;
         self.status = None;
+        self.dirty = true;
         self.request_preview();
     }
 
@@ -588,6 +608,7 @@ impl DdsBrowser {
             KeyCode::Esc => {
                 self.focused = false;
                 self.status = None;
+                self.dirty = true;
             }
             KeyCode::Char('[') | KeyCode::Char(',') | KeyCode::Left => self.cycle_mip(-1),
             KeyCode::Char(']') | KeyCode::Char('.') | KeyCode::Right => self.cycle_mip(1),
@@ -634,6 +655,7 @@ impl DdsBrowser {
         }
         self.mip = (self.mip as isize + delta).rem_euclid(count as isize) as usize;
         self.status = None;
+        self.dirty = true;
     }
 
     /// Switch between the base and attached-alpha surfaces, resetting to mip 0.
@@ -648,6 +670,7 @@ impl DdsBrowser {
         self.surface = (self.surface as isize + delta).rem_euclid(count as isize) as usize;
         self.mip = 0;
         self.status = None;
+        self.dirty = true;
     }
 
     /// Toggle a directory; on a file, do nothing (handled as "open" elsewhere).
@@ -693,6 +716,10 @@ impl View for DdsBrowser {
 
     fn tick(&mut self) {
         self.ingest();
+    }
+
+    fn needs_clear(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Flow {
@@ -1125,35 +1152,38 @@ fn spawn_decoder(
     store: Arc<TextureStore>,
     runner: JobRunner,
     cache: Arc<Cache>,
-) -> SyncSender<Vec<usize>> {
-    let (tx, rx) = sync_channel::<Vec<usize>>(8);
+) -> SyncSender<PreviewReq> {
+    let (tx, rx) = sync_channel::<PreviewReq>(8);
     std::thread::spawn(move || decode_loop(&rx, &catalog, &store, &runner, &cache));
     tx
 }
 
 fn decode_loop(
-    rx: &Receiver<Vec<usize>>,
+    rx: &Receiver<PreviewReq>,
     catalog: &DdsCatalog,
     store: &TextureStore,
     runner: &JobRunner,
     cache: &Cache,
 ) {
-    while let Ok(mut want) = rx.recv() {
-        // Coalesce to the most recent request so fast scrolling doesn't backlog.
+    while let Ok(mut req) = rx.recv() {
+        // Coalesce to the most recent request so fast cycling doesn't backlog.
         while let Ok(next) = rx.try_recv() {
-            want = next;
+            req = next;
+        }
+        if req.cancel.is_cancelled() {
+            continue;
         }
         // Claim the not-yet-decoded items and snapshot them out of the (growing)
         // catalog, so the decode runs without holding any lock.
         let todo: Vec<(usize, DdsItem)> = {
             let mut guard = cache.lock().unwrap();
             let mut todo = Vec::new();
-            for index in want {
-                if !guard.contains_key(&index)
-                    && let Some(item) = catalog.item(index)
+            for index in &req.items {
+                if !guard.contains_key(index)
+                    && let Some(item) = catalog.item(*index)
                 {
-                    guard.insert(index, Slot::Pending);
-                    todo.push((index, item));
+                    guard.insert(*index, Slot::Pending);
+                    todo.push((*index, item));
                 }
             }
             todo
@@ -1161,15 +1191,24 @@ fn decode_loop(
         if todo.is_empty() {
             continue;
         }
-        // Fan the decode out across the shared job pool.
-        let decoded = runner.map(&todo, |(index, item)| (*index, decode_item(store, item)));
+        let batch = runner.map_until_cancelled(&todo, &req.cancel, |(index, item)| {
+            (*index, decode_item(store, item))
+        });
         let mut guard = cache.lock().unwrap();
-        for (index, result) in decoded {
+        let mut done = HashSet::new();
+        for (index, result) in batch.into_completed() {
+            done.insert(index);
             let slot = match result {
                 Ok(preview) => Slot::Ready(Arc::new(preview)),
                 Err(error) => Slot::Failed(error),
             };
             guard.insert(index, slot);
+        }
+        // Drop any still-Pending (cancelled) items so they re-decode when refocused.
+        for (index, _) in &todo {
+            if !done.contains(index) {
+                guard.remove(index);
+            }
         }
     }
 }

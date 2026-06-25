@@ -40,6 +40,13 @@ pub trait View {
 
     /// Called on each poll timeout while [`View::ticking`] is true.
     fn tick(&mut self) {}
+
+    /// Whether the next frame must be a full redraw (clear the whole screen first).
+    /// Needed when graphics-protocol images change in place — e.g. cycling a DDS
+    /// texture's mip — since their cells would otherwise leave residue.
+    fn needs_clear(&mut self) -> bool {
+        false
+    }
 }
 
 /// Run `view` to completion on the alternate screen, restoring the terminal
@@ -100,6 +107,9 @@ fn leave(terminal: &mut Terminal<Backend>) -> io::Result<()> {
 
 fn event_loop<V: View>(terminal: &mut Terminal<Backend>, view: &mut V) -> io::Result<()> {
     loop {
+        if view.needs_clear() {
+            terminal.clear()?;
+        }
         terminal.draw(|frame| view.render(frame))?;
         if view.ticking() {
             // Wake periodically so background progress and growing results render.
