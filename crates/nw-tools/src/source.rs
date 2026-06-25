@@ -159,7 +159,7 @@ fn load_material_map(
     tracing::debug!("catalog material map: {} entries (rebuilt)", map.len());
     if let Some(fp) = &fingerprint {
         let _ = std::fs::remove_file(&db_path);
-        match crate::cache::Cache::open(&db_path).and_then(|cache| Ok(cache.store(fp, &map)?)) {
+        match crate::cache::Cache::open(&db_path).and_then(|mut cache| Ok(cache.store(fp, &map)?)) {
             Ok(()) => {}
             Err(error) => tracing::warn!("could not write catalog cache: {error}"),
         }

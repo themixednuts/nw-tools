@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use drizzle::migrations::Tracking;
+use drizzle::sqlite::connection::SQLiteTransactionType;
 use drizzle::sqlite::prelude::*;
 use drizzle::sqlite::rusqlite::Drizzle;
 
@@ -121,20 +122,23 @@ impl Cache {
     /// # Errors
     ///
     /// Returns an error if any insert fails.
-    pub fn store(&self, fingerprint: &str, map: &HashMap<String, String>) -> drizzle::Result<()> {
+    pub fn store(&mut self, fingerprint: &str, map: &HashMap<String, String>) -> drizzle::Result<()> {
         let Schema { guid, meta } = Schema::new();
-        for chunk in map.iter().collect::<Vec<_>>().chunks(INSERT_CHUNK) {
-            let rows = chunk
-                .iter()
-                .map(|(g, p)| InsertGuid::new(g.as_str(), p.as_str()))
-                .collect::<Vec<_>>();
-            self.db.insert(guid).values(rows).execute()?;
-        }
+        let entries = map.iter().collect::<Vec<_>>();
         self.db
-            .insert(meta)
-            .value(InsertMeta::new(FINGERPRINT_KEY, fingerprint))
-            .execute()?;
-        Ok(())
+            .transaction(SQLiteTransactionType::Deferred, |tx| {
+                for chunk in entries.chunks(INSERT_CHUNK) {
+                    let rows = chunk
+                        .iter()
+                        .map(|(g, p)| InsertGuid::new(g.as_str(), p.as_str()))
+                        .collect::<Vec<_>>();
+                    tx.insert(guid).values(rows).execute()?;
+                }
+                tx.insert(meta)
+                    .value(InsertMeta::new(FINGERPRINT_KEY, fingerprint))
+                    .execute()?;
+                Ok(())
+            })
     }
 }
 
@@ -169,7 +173,7 @@ mod tests {
 
     #[test]
     fn store_and_reload_map() {
-        let cache = Cache::open_in_memory().unwrap();
+        let mut cache = Cache::open_in_memory().unwrap();
         assert!(cache.fingerprint().is_none());
 
         let mut map = HashMap::new();
