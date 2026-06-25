@@ -50,12 +50,87 @@ pub fn install_catalog_bytes(assets: &Path) -> Result<(Vec<u8>, Option<Vec<u8>>)
     Ok((rasc, raoc))
 }
 
+/// A pak table-of-contents: virtual path (lowercased) → owning reader + entry
+/// index, enumerated across a set of archives. The shared seam for commands that
+/// stream assets out of the install without needing the catalog.
+pub struct Toc {
+    entries: HashMap<String, (Arc<PakMmapReader>, usize)>,
+}
+
+impl Toc {
+    /// Enumerate every pak's entries in parallel, keeping those whose (lowercased)
+    /// name satisfies `keep`. On duplicate names the last archive wins.
+    #[must_use]
+    pub fn build(
+        ctx: &RunCtx,
+        pak_paths: &[PathBuf],
+        keep: impl Fn(&str) -> bool + Sync,
+    ) -> Self {
+        let per_pak = ctx.runner.map(pak_paths, |path| {
+            let mut found = Vec::new();
+            if let Ok(reader) = PakMmapReader::open(path) {
+                let reader = Arc::new(reader);
+                for entry in reader.entries() {
+                    let name = entry.name().to_ascii_lowercase();
+                    if keep(&name) {
+                        found.push((name, entry.index(), reader.clone()));
+                    }
+                }
+            }
+            found
+        });
+        let mut entries = HashMap::new();
+        for list in per_pak {
+            for (name, entry, reader) in list {
+                entries.insert(name, (reader, entry));
+            }
+        }
+        Self { entries }
+    }
+
+    /// Read an asset's bytes by virtual path (forward slashes, case-insensitive).
+    #[must_use]
+    pub fn read(&self, path: &str) -> Option<Vec<u8>> {
+        let (reader, entry) = self.entries.get(&path.to_ascii_lowercase())?;
+        reader.read_wrapped_by_index(*entry).ok()
+    }
+
+    /// The indexed virtual paths.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    /// Consume into the raw path → (reader, index) map (e.g. for a lazy reader).
+    #[must_use]
+    pub fn into_entries(self) -> HashMap<String, (Arc<PakMmapReader>, usize)> {
+        self.entries
+    }
+
+    /// Sorted virtual paths whose extension is one of `extensions` (lowercase, no
+    /// dot), optionally narrowed to those containing `filter` (case-insensitive).
+    #[must_use]
+    pub fn paths_with_extensions(&self, extensions: &[&str], filter: Option<&str>) -> Vec<String> {
+        let filter = filter.map(str::to_ascii_lowercase);
+        let mut paths = self
+            .names()
+            .filter(|key| {
+                key.rsplit_once('.')
+                    .is_some_and(|(_, ext)| extensions.contains(&ext))
+            })
+            .filter(|key| filter.as_ref().is_none_or(|needle| key.contains(needle.as_str())))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+}
+
 /// The install's paks indexed by virtual path, plus the catalog material map.
 ///
 /// `read` resolves a virtual path through the pak table-of-contents; `material_path`
 /// resolves a `MtlName` GUID to its `.mtl` path through the cached catalog map.
 pub struct Install {
-    toc: HashMap<String, (Arc<PakMmapReader>, usize)>,
+    toc: Toc,
     materials: HashMap<String, String>,
 }
 
@@ -71,7 +146,7 @@ impl Install {
         if paks.paths().is_empty() {
             bail!("no pak archives found in {}", assets.display());
         }
-        let toc = build_toc(ctx, paks.paths());
+        let toc = Toc::build(ctx, paks.paths(), |_| true);
         let materials = ensure_catalog_cache(assets)?.material_map();
         Ok(Self { toc, materials })
     }
@@ -79,8 +154,7 @@ impl Install {
     /// Read an asset's bytes by virtual path (forward slashes, case-insensitive).
     #[must_use]
     pub fn read(&self, path: &str) -> Option<Vec<u8>> {
-        let (reader, entry) = self.toc.get(&path.to_ascii_lowercase())?;
-        reader.read_wrapped_by_index(*entry).ok()
+        self.toc.read(path)
     }
 
     /// Resolve a `MtlName`-chunk GUID to its `.mtl` path via the cached catalog map.
@@ -90,46 +164,12 @@ impl Install {
         self.materials.get(&id.to_string()).cloned()
     }
 
-    /// Sorted virtual paths whose extension is one of `extensions` (lowercase, no
-    /// dot), optionally narrowed to those containing `filter` (case-insensitive).
+    /// Sorted virtual paths whose extension is one of `extensions`, optionally
+    /// narrowed to those containing `filter`.
     #[must_use]
     pub fn paths_with_extensions(&self, extensions: &[&str], filter: Option<&str>) -> Vec<String> {
-        let filter = filter.map(str::to_ascii_lowercase);
-        let mut paths = self
-            .toc
-            .keys()
-            .filter(|key| {
-                key.rsplit_once('.')
-                    .is_some_and(|(_, ext)| extensions.contains(&ext))
-            })
-            .filter(|key| filter.as_ref().is_none_or(|needle| key.contains(needle.as_str())))
-            .cloned()
-            .collect::<Vec<_>>();
-        paths.sort();
-        paths
+        self.toc.paths_with_extensions(extensions, filter)
     }
-}
-
-/// Build the pak table of contents: every entry's virtual path → (reader, index),
-/// enumerated across all archives in parallel.
-fn build_toc(ctx: &RunCtx, pak_paths: &[PathBuf]) -> HashMap<String, (Arc<PakMmapReader>, usize)> {
-    let per_pak = ctx.runner.map(pak_paths, |path| {
-        let mut found = Vec::new();
-        if let Ok(reader) = PakMmapReader::open(path) {
-            let reader = Arc::new(reader);
-            for entry in reader.entries() {
-                found.push((entry.name().to_ascii_lowercase(), entry.index(), reader.clone()));
-            }
-        }
-        found
-    });
-    let mut toc = HashMap::new();
-    for list in per_pak {
-        for (name, entry, reader) in list {
-            toc.insert(name, (reader, entry));
-        }
-    }
-    toc
 }
 
 /// What the catalog knows about one asset, for enriching a pak entry.

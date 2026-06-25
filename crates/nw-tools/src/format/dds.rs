@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use humansize::{DECIMAL, format_size};
-use nw_pak::PakMmapReader;
 
 use crate::jobs::{JobArgs, RunCtx};
 use crate::support::{PakSet, collect_matching, ensure_parent, guard_existing, write_guarded};
@@ -350,43 +349,23 @@ fn dds_browser_items_fs(ctx: &RunCtx, root: &Path) -> Result<Vec<crate::tui::Dds
     Ok(items)
 }
 
-/// Discover logical textures straight out of the install's pak archives. Each pak
-/// is opened and enumerated on a worker thread; DDS entries are classified into
-/// logical textures, and a path → (reader, entry) index is built from the readers
-/// discovery already opened so the browser's lazy reads are O(1) (no re-parsing,
-/// no catalog — the install ships none).
+/// Discover logical textures straight out of the install's pak archives via the
+/// shared [`crate::source::Toc`], classify the DDS entries into logical textures,
+/// and hand back the same path → (reader, entry) index so the browser's lazy reads
+/// are O(1) (no re-parsing, no catalog — DDS browsing doesn't need it).
 fn dds_browser_items_pak(
     ctx: &RunCtx,
     pak_paths: &[PathBuf],
 ) -> Result<(Vec<crate::tui::DdsItem>, crate::tui::PakIndex)> {
-    let per_pak = ctx.runner.map(pak_paths, |path| {
-        let mut found = Vec::new();
-        if let Ok(reader) = PakMmapReader::open(path) {
-            let reader = Arc::new(reader);
-            for entry in reader.entries() {
-                let name = entry.name();
-                if nw_dds::is_dds_path(name) {
-                    found.push((name.to_ascii_lowercase(), entry.index(), reader.clone()));
-                }
-            }
-        }
-        found
-    });
-
-    let mut index = crate::tui::PakIndex::new();
-    let mut classified = Vec::new();
-    for list in per_pak {
-        for (name, entry, reader) in list {
-            if let Some(part) = nw_dds::SplitPart::from_path(&name) {
-                classified.push((part, name.clone()));
-            }
-            index.insert(name, (reader, entry));
-        }
-    }
+    let toc = crate::source::Toc::build(ctx, pak_paths, |name| nw_dds::is_dds_path(name));
+    let classified = toc
+        .names()
+        .filter_map(|name| nw_dds::SplitPart::from_path(name).map(|part| (part, name.to_string())))
+        .collect::<Vec<_>>();
 
     let mut items = group_dds_items(classified, |header| header.to_string())?;
     items.sort_by(|left, right| left.label.cmp(&right.label));
-    Ok((items, index))
+    Ok((items, toc.into_entries()))
 }
 
 /// Group classified `(part, key)` pairs into one [`crate::tui::DdsItem`] per
