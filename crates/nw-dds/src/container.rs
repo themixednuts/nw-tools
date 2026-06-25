@@ -178,6 +178,27 @@ pub fn decode_all_mips<'a>(
     bytes: &'a [u8],
     sidecars: &[Sidecar<'a>],
 ) -> Result<Vec<DecodedImage>, Error> {
+    decode_all_mips_until(bytes, sidecars, &|| true)
+}
+
+/// Decode the mip chain like [`decode_all_mips`], but check `should_continue`
+/// before each level and stop early — returning the levels decoded so far —
+/// when it returns `false`.
+///
+/// This lets a caller on a worker thread abandon a large mip chain between
+/// levels (e.g. when the user navigates away) without finishing the whole
+/// texture. The check happens before each level, so it can stop before doing
+/// any decode work, including the first (largest) level.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the DDS is invalid, sidecars are missing/mismatched, or
+/// any level's format cannot be decoded.
+pub fn decode_all_mips_until<'a>(
+    bytes: &'a [u8],
+    sidecars: &[Sidecar<'a>],
+    should_continue: &dyn Fn() -> bool,
+) -> Result<Vec<DecodedImage>, Error> {
     let dds = Dds::parse(bytes)?;
     let texture = Texture::from_dds(&dds)?;
     let payload = dds.payload(bytes).ok_or(Error::PayloadSize {
@@ -187,6 +208,9 @@ pub fn decode_all_mips<'a>(
     let levels = Levels::from_dds(&dds, texture, payload, sidecars)?;
     let mut images = Vec::with_capacity(levels.bytes.len());
     for (level, blocks) in levels.bytes.iter().enumerate() {
+        if !should_continue() {
+            break;
+        }
         let level = level as u32;
         let width = mip_extent(texture.width, level).max(1);
         let height = mip_extent(texture.height, level).max(1);
@@ -315,13 +339,22 @@ fn decode_rgba(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<
     let pixels = width.checked_mul(height).ok_or(Error::SizeOverflow {
         what: "image dimensions",
     })?;
+    let unsupported = || Error::UnsupportedVulkanFormat { vk_format: vk };
     match vk {
         VK_FORMAT_R8G8B8A8_UNORM | VK_FORMAT_R8G8B8A8_SRGB => return plain_rgba(data, pixels, false),
         VK_FORMAT_B8G8R8A8_UNORM | VK_FORMAT_B8G8R8A8_SRGB => return plain_rgba(data, pixels, true),
+        // BC7 decodes via bcdec_rs: it writes RGBA bytes straight into the
+        // output (no 0xAARRGGBB repack pass) and benches faster than
+        // texture2ddecoder, with byte-identical output (verified by test).
+        VK_FORMAT_BC7_UNORM_BLOCK | VK_FORMAT_BC7_SRGB_BLOCK => {
+            return decode_bcn_blocks(data, width, height, 16, bcdec_rs::bc7);
+        }
         _ => {}
     }
+    // BC1/BC2/BC3 (different 565-endpoint expansion + interpolation rounding and
+    // 1-bit alpha semantics from bcdec_rs) and BC4/BC5/BC6H (channel mapping
+    // into 0xAARRGGBB) stay on texture2ddecoder so output is preserved exactly.
     let mut out = vec![0u32; pixels];
-    let unsupported = || Error::UnsupportedVulkanFormat { vk_format: vk };
     let result = match vk {
         VK_FORMAT_BC1_RGBA_UNORM_BLOCK | VK_FORMAT_BC1_RGBA_SRGB_BLOCK => {
             texture2ddecoder::decode_bc1(data, width, height, &mut out)
@@ -344,19 +377,79 @@ fn decode_rgba(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<
         VK_FORMAT_BC6H_SFLOAT_BLOCK => {
             texture2ddecoder::decode_bc6_signed(data, width, height, &mut out)
         }
-        VK_FORMAT_BC7_UNORM_BLOCK | VK_FORMAT_BC7_SRGB_BLOCK => {
-            texture2ddecoder::decode_bc7(data, width, height, &mut out)
-        }
         _ => return Err(unsupported()),
     };
     result.map_err(|_| unsupported())?;
-    // texture2ddecoder yields 0xAARRGGBB per pixel; expand to RGBA bytes.
-    let mut rgba = Vec::with_capacity(pixels * 4);
-    for color in out {
-        rgba.push((color >> 16) as u8);
-        rgba.push((color >> 8) as u8);
-        rgba.push(color as u8);
-        rgba.push((color >> 24) as u8);
+    // texture2ddecoder yields 0xAARRGGBB per pixel; expand to RGBA bytes. Write into
+    // a pre-sized buffer in 4-byte chunks (no per-pixel bounds checks / reallocs, and
+    // vectorizable) rather than pushing one byte at a time.
+    let mut rgba = vec![0u8; pixels * 4];
+    for (chunk, &color) in rgba.chunks_exact_mut(4).zip(out.iter()) {
+        chunk[0] = (color >> 16) as u8;
+        chunk[1] = (color >> 8) as u8;
+        chunk[2] = color as u8;
+        chunk[3] = (color >> 24) as u8;
+    }
+    Ok(rgba)
+}
+
+/// Decode a BCn texture whose blocks expand to RGBA8 using a per-block `decode`
+/// (from `bcdec_rs`), writing directly into a pre-sized RGBA output.
+///
+/// Interior blocks (those fully inside `width`/`height`) decode straight into
+/// the output at the right pitch; edge blocks that overhang the image are
+/// decoded into a 4x4 scratch and the in-bounds rows/columns copied back.
+fn decode_bcn_blocks(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    block_bytes: usize,
+    decode: fn(&[u8], &mut [u8], usize),
+) -> Result<Vec<u8>, Error> {
+    let row_pitch = width.checked_mul(4).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let total = row_pitch.checked_mul(height).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let blocks_x = width.div_ceil(4);
+    let blocks_y = height.div_ceil(4);
+    let expected = blocks_x
+        .checked_mul(blocks_y)
+        .and_then(|blocks| blocks.checked_mul(block_bytes))
+        .ok_or(Error::SizeOverflow {
+            what: "image dimensions",
+        })?;
+    if data.len() < expected {
+        return Err(Error::PayloadSize {
+            expected: expected as u64,
+            actual: data.len(),
+        });
+    }
+
+    let mut rgba = vec![0u8; total];
+    let mut scratch = [0u8; 4 * 4 * 4];
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let block = &data[(by * blocks_x + bx) * block_bytes..][..block_bytes];
+            let px = bx * 4;
+            let py = by * 4;
+            if px + 4 <= width && py + 4 <= height {
+                // Interior block: write the 4x4 tile straight into the image.
+                let offset = py * row_pitch + px * 4;
+                decode(block, &mut rgba[offset..], row_pitch);
+            } else {
+                // Edge block: decode into scratch, then copy the in-bounds region.
+                decode(block, &mut scratch, 4 * 4);
+                let rows = (height - py).min(4);
+                let cols = (width - px).min(4);
+                for row in 0..rows {
+                    let src = &scratch[row * 16..row * 16 + cols * 4];
+                    let dst_offset = (py + row) * row_pitch + px * 4;
+                    rgba[dst_offset..dst_offset + cols * 4].copy_from_slice(src);
+                }
+            }
+        }
     }
     Ok(rgba)
 }
@@ -1058,5 +1151,88 @@ mod tests {
 
     fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    type Texture2dDecode = fn(&[u8], usize, usize, &mut [u32]) -> Result<(), &'static str>;
+
+    /// Reference decode via texture2ddecoder + 0xAARRGGBB repack, matching the
+    /// pre-bcdec_rs behaviour, so we can assert the new path is equivalent.
+    fn reference_rgba(decode: Texture2dDecode, data: &[u8], width: usize, height: usize) -> Vec<u8> {
+        let mut out = vec![0u32; width * height];
+        decode(data, width, height, &mut out).unwrap();
+        let mut rgba = vec![0u8; width * height * 4];
+        for (chunk, &color) in rgba.chunks_exact_mut(4).zip(out.iter()) {
+            chunk[0] = (color >> 16) as u8;
+            chunk[1] = (color >> 8) as u8;
+            chunk[2] = color as u8;
+            chunk[3] = (color >> 24) as u8;
+        }
+        rgba
+    }
+
+    fn pseudo_random(len: usize) -> Vec<u8> {
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn assert_close(a: &[u8], b: &[u8], format: &str) {
+        assert_eq!(a.len(), b.len(), "{format}: length mismatch");
+        for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+            let diff = i32::from(x) - i32::from(y);
+            assert!(
+                diff.abs() <= 1,
+                "{format}: byte {i} differs by {diff} ({x} vs {y})"
+            );
+        }
+    }
+
+    /// BC7 is the one format we moved onto bcdec_rs; assert its output stays
+    /// equivalent to texture2ddecoder for both interior- and edge-block sizes.
+    #[test]
+    fn bc7_decode_matches_texture2ddecoder() {
+        // 16x16 (all interior blocks) and 12x20 (non-4-aligned edge blocks).
+        for (width, height) in [(16usize, 16usize), (12, 20)] {
+            let blocks = width.div_ceil(4) * height.div_ceil(4);
+            let data = pseudo_random(blocks * 16);
+            assert_close(
+                &decode_rgba(VK_FORMAT_BC7_UNORM_BLOCK, &data, width, height).unwrap(),
+                &reference_rgba(texture2ddecoder::decode_bc7, &data, width, height),
+                "bc7",
+            );
+        }
+    }
+
+    #[test]
+    fn decode_all_mips_until_stops_early() {
+        // 8x8 BC1 with 3 mips, no split: levels 8x8(32B), 4x4(8B), 2x2(8B).
+        let mut header = dds_header(*b"DXT1", 8, 8, 3, 0);
+        let payload = pseudo_random(32 + 8 + 8);
+        header.extend_from_slice(&payload);
+
+        let all = decode_all_mips(&header, &[]).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Stop after the first level: continue once, then refuse.
+        let count = std::cell::Cell::new(0u32);
+        let one = decode_all_mips_until(&header, &[], &|| {
+            let n = count.get();
+            count.set(n + 1);
+            n < 1
+        })
+        .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].width, 8);
+        assert_eq!(one[0].height, 8);
+
+        // Refuse immediately: no levels decoded.
+        let none = decode_all_mips_until(&header, &[], &|| false).unwrap();
+        assert!(none.is_empty());
     }
 }

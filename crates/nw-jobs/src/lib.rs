@@ -411,6 +411,51 @@ impl JobRunner {
         collect_job_batch(mapped, cancel.is_cancelled())
     }
 
+    /// Run `f` for its side effects on each item, skipping any items once
+    /// `cancel` is tripped.
+    ///
+    /// Unlike [`Self::map_until_cancelled`], this never builds a per-item
+    /// `Vec<Option<_>>`; completed and skipped counts are tracked with atomics
+    /// inside the parallel closure. The returned [`JobBatch`] carries a
+    /// zero-sized `Vec<()>` whose length equals the number of items actually
+    /// run, so `completed().len()` stays consistent with the other methods at
+    /// no heap cost.
+    pub fn for_each_until_cancelled<T, F>(
+        &self,
+        items: &[T],
+        cancel: &CancellationToken,
+        f: F,
+    ) -> JobBatch<()>
+    where
+        T: Sync,
+        F: Fn(&T) + Send + Sync,
+    {
+        use std::sync::atomic::AtomicUsize;
+
+        let completed = AtomicUsize::new(0);
+        let skipped = AtomicUsize::new(0);
+
+        let run = |item: &T| {
+            if cancel.is_cancelled() {
+                skipped.fetch_add(1, Ordering::Relaxed);
+            } else {
+                f(item);
+                completed.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+
+        match &self.execution {
+            Execution::Inline => items.iter().for_each(run),
+            Execution::Global => items.par_iter().for_each(run),
+            Execution::Pool(pool) => pool.install(|| items.par_iter().for_each(run)),
+        }
+
+        let completed = completed.load(Ordering::Relaxed);
+        let skipped = skipped.load(Ordering::Relaxed);
+        let cancelled = cancel.is_cancelled() || skipped > 0;
+        JobBatch::new(vec![(); completed], skipped, cancelled)
+    }
+
     pub fn try_map_init_until_cancelled<T, S, R, E, Init, F>(
         &self,
         items: &[T],
@@ -600,5 +645,58 @@ mod tests {
     fn join_runs_both_sides() {
         let runner = JobRunner::with_workers(2).unwrap();
         assert_eq!(runner.join(|| 20, || 22), (20, 22));
+    }
+
+    #[test]
+    fn inline_for_each_runs_side_effects() {
+        use std::sync::Mutex;
+
+        let runner = JobRunner::inline();
+        let cancel = CancellationToken::new();
+        let seen = Mutex::new(Vec::new());
+
+        let batch = runner.for_each_until_cancelled(&[1, 2, 3], &cancel, |value| {
+            seen.lock().unwrap().push(*value);
+        });
+
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2, 3]);
+        assert_eq!(batch.completed().len(), 3);
+        assert_eq!(batch.skipped(), 0);
+        assert!(!batch.was_cancelled());
+    }
+
+    #[test]
+    fn for_each_cancellation_skips_remaining_items() {
+        let runner = JobRunner::inline();
+        let cancel = CancellationToken::new();
+
+        let batch = runner.for_each_until_cancelled(&[1, 2, 3], &cancel, |value| {
+            if *value == 1 {
+                cancel.cancel();
+            }
+        });
+
+        assert_eq!(batch.completed().len(), 1);
+        assert_eq!(batch.skipped(), 2);
+        assert!(batch.was_cancelled());
+    }
+
+    #[test]
+    fn pool_for_each_runs_all_items() {
+        use std::sync::atomic::AtomicUsize;
+
+        let runner = JobRunner::with_workers(2).unwrap();
+        let cancel = CancellationToken::new();
+        let items: Vec<usize> = (0..64).collect();
+        let total = AtomicUsize::new(0);
+
+        let batch = runner.for_each_until_cancelled(&items, &cancel, |value| {
+            total.fetch_add(*value, Ordering::Relaxed);
+        });
+
+        assert_eq!(total.load(Ordering::Relaxed), items.iter().sum());
+        assert_eq!(batch.completed().len(), items.len());
+        assert_eq!(batch.skipped(), 0);
+        assert!(!batch.was_cancelled());
     }
 }

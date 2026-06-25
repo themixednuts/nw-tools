@@ -5,12 +5,14 @@
 //! background thread (so the UI never blocks on image work) as textures stream in
 //! from discovery, and stale decode batches are cancelled when the view moves.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, unbounded};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use image::{DynamicImage, ImageEncoder, RgbaImage};
 use ratatui::Frame;
@@ -45,8 +47,23 @@ const THUMB_CACHE_CAP: usize = 1024;
 /// Thumbnails are decoded + cached at this size (longest edge); the protocol is
 /// then fit to whatever cell, so one cache entry serves any grid size.
 const THUMB_CACHE_PX: u32 = 512;
-/// Cap the on-disk thumbnail cache; oldest files are pruned past this.
-const THUMB_DISK_CAP: u64 = 256 * 1024 * 1024;
+/// How many recently-focused textures keep their full decoded previews (RGBA mip
+/// chains, all sprite frames) in memory. Bounds the otherwise-unbounded preview
+/// cache; the current focus is always pinned. Disk/thumbnail caches stay large.
+const MAX_PREVIEW_ITEMS: usize = 3;
+/// Cap the on-disk thumbnail cache; oldest files are pruned past this. The disk
+/// cache is content-addressed and costs no RAM, so keep it generous — a hit skips
+/// the pak sidecar reads + DDS decode entirely, across sessions and game patches.
+const THUMB_DISK_CAP: u64 = 1024 * 1024 * 1024;
+
+/// Sprite playback rate bounds and default. The `.dds` files carry no rate of
+/// their own; the engine keeps it on the `UiFlipbookAnimationComponent` in the
+/// `.uicanvas`, where the content overwhelmingly uses 30 fps (some at 24, a few at
+/// 50) — so default to 30 and allow up to 60 (terminal image animation tops out
+/// well below that, but allow it).
+const FPS_MIN: u32 = 1;
+const FPS_MAX: u32 = 60;
+const FPS_DEFAULT: u32 = 30;
 
 /// Resolves a texture key (a pak virtual path) to the archive entry that holds
 /// it. Built during discovery from the readers it already opened, so reads are an
@@ -231,36 +248,80 @@ enum Slot {
     Failed(String),
 }
 
-type Cache = Mutex<HashMap<usize, Slot>>;
+/// Preview cache keyed by (item, frame) so each sprite frame is decoded once.
+type Cache = Mutex<HashMap<(usize, usize), Slot>>;
 
 /// A grid thumbnail's decode state: in-flight, an encoded protocol ready to blit,
 /// or failed.
 enum Thumb {
     Pending,
-    Ready(Protocol),
+    // `Arc` so the UI can cheaply snapshot a ready protocol under a brief lock and
+    // blit it after releasing the lock (never holding it across rendering).
+    Ready(Arc<Protocol>),
     Failed,
 }
 
-/// The thumbnail cache: item index → (last-used clock, state). The clock drives
-/// LRU eviction so decoded thumbnails survive scrolling away (and switching to the
-/// focus view) and are only dropped, oldest-off-screen first, past a memory cap.
-type Thumbs = Mutex<HashMap<usize, (u64, Thumb)>>;
+/// A snapshot of one grid cell's visual, taken under a brief lock and rendered
+/// after the lock is released.
+enum CellVisual {
+    Image(Arc<Protocol>),
+    Failed,
+    Pending,
+}
 
-/// Identifies the focus-view protocol: (item, surface, mip, area width, area height).
-type FocusKey = (usize, usize, usize, u16, u16);
+/// The thumbnail cache: `(item, frame)` → (last-used clock, state). Most cells use
+/// frame 0; a selected sprite caches every frame so it can animate. The clock
+/// drives LRU eviction so decoded thumbnails survive scrolling away (and switching
+/// to the focus view) and are only dropped, oldest-off-screen first, past a cap.
+type Thumbs = Mutex<HashMap<(usize, usize), (u64, Thumb)>>;
 
-/// A request to decode thumbnails for a window of item indices at `size` (cells).
-/// `cancel` is tripped by the UI when the window moves, so a stale batch stops.
+/// Identifies the focus-view protocol: (item, frame, surface, mip, area w, area h).
+type FocusKey = (usize, usize, usize, usize, u16, u16);
+
+/// Work for the off-thread protocol encoder. `picker.new_protocol` (the costly
+/// encode of decoded RGBA into a terminal graphics protocol) must never run on the
+/// render thread, so the UI ships decoded previews here and blits the result later.
+enum EncodeJob {
+    /// Encode one frame's `(surface, mip)` at the focus image size.
+    Frame {
+        preview: Arc<Preview>,
+        surface: usize,
+        mip: usize,
+    },
+    /// Assemble all of a sprite's frames into one montage sheet and encode it.
+    Montage { frames: Vec<Arc<Preview>> },
+}
+
+/// A request to encode a focus-view protocol off the UI thread. `gen` is bumped by
+/// the UI when the focused texture or image size changes, so results for a stale
+/// generation are discarded on arrival.
+struct EncodeReq {
+    key: FocusKey,
+    generation: u64,
+    job: EncodeJob,
+}
+
+/// The encoded result handed back to the UI (lock-free) via a crossbeam channel.
+struct EncodeResult {
+    key: FocusKey,
+    generation: u64,
+    protocol: Option<Arc<Protocol>>,
+}
+
+/// A request to decode thumbnails for a window of `(item, frame)` pairs at `size`
+/// (cells). `cancel` is tripped by the UI when the window moves, so a stale batch
+/// stops.
 struct ThumbReq {
-    items: Vec<usize>,
+    items: Vec<(usize, usize)>,
     size: Size,
     cancel: CancellationToken,
 }
 
-/// A request to decode the focus-view preview(s). `cancel` is tripped when the
-/// focused texture changes, so cycling doesn't pile up stale full decodes.
+/// A request to decode focus-view previews for `(item, frame)` pairs (all of a
+/// sprite's frames, so playback is smooth). `cancel` is tripped when the focused
+/// texture changes, so cycling doesn't pile up stale full decodes.
 struct PreviewReq {
-    items: Vec<usize>,
+    items: Vec<(usize, usize)>,
     cancel: CancellationToken,
 }
 
@@ -279,9 +340,11 @@ impl ThumbCache {
         let dir = crate::cache::default_path()
             .parent()
             .map(|parent| parent.join("thumbnails"));
-        if let Some(dir) = &dir {
-            let _ = std::fs::create_dir_all(dir);
-            prune_dir(dir, THUMB_DISK_CAP);
+        if let Some(dir) = dir.clone() {
+            let _ = std::fs::create_dir_all(&dir);
+            // Prune off the UI thread: scanning/sorting the cache dir must never
+            // delay the browser opening.
+            std::thread::spawn(move || prune_dir(&dir, THUMB_DISK_CAP));
         }
         Self { dir }
     }
@@ -308,7 +371,13 @@ impl ThumbCache {
             .write_image(image, image.width(), image.height(), image::ExtendedColorType::Rgba8)
             .is_ok()
         {
-            let _ = std::fs::write(path, bytes);
+            // Write to a sibling temp file then rename, so a concurrent reader (or a
+            // crash mid-write) never sees a truncated QOI. The temp name is keyed by
+            // the content hash, so parallel stores of different thumbnails don't clash.
+            let temp = path.with_extension("qoi.tmp");
+            if std::fs::write(&temp, &bytes).is_ok() && std::fs::rename(&temp, &path).is_err() {
+                let _ = std::fs::remove_file(&temp);
+            }
         }
     }
 }
@@ -379,6 +448,18 @@ pub struct DdsBrowser {
     filtering: bool,
     /// Whether the single-texture focus view is open (else the grid).
     focused: bool,
+    /// Sprite playback frames per second (user-adjustable within [`FPS_MIN`,
+    /// `FPS_MAX`]); the displayed frame is derived from wall-clock time so it's
+    /// rate-correct regardless of redraw jitter.
+    fps: u32,
+    /// Whether sprite playback is running (else frozen on `base_frame`).
+    playing: bool,
+    /// Whether a sprite's frames are shown joined into one montage (all frames
+    /// tiled) instead of cycling one at a time.
+    joined: bool,
+    /// Clock base for playback and the frame index at that base.
+    anim_base: Instant,
+    base_frame: usize,
     /// Selected surface (0=base, 1=alpha) for the focused texture.
     surface: usize,
     /// Selected mip level for the focused texture (clamped to its chain at render).
@@ -393,19 +474,41 @@ pub struct DdsBrowser {
     thumb_tx: SyncSender<ThumbReq>,
     /// Cancels the in-flight thumbnail batch when the visible window changes.
     thumb_cancel: CancellationToken,
-    /// The item-index window last requested, so we only re-decode (and cancel) on change.
-    requested: Vec<usize>,
+    /// The `(item, frame)` window last requested, so we only re-decode (and cancel)
+    /// on change.
+    requested: Vec<(usize, usize)>,
     /// Monotonic clock stamped onto thumbnails as they're shown, for LRU eviction.
     clock: u64,
+    /// Whether the last grid render had a visible sprite — drives the animation
+    /// redraw cadence while in the grid.
+    grid_has_sprite: bool,
     /// Set when the focused image changes (cycle/enter/exit) so the image region is
     /// force-repainted next frame — graphics cells would otherwise leave residue.
     dirty: bool,
     /// The body (image) region from the last render, repainted when `dirty`.
     body: Rect,
-    picker: Picker,
-    /// The encoded protocol for the focused (texture, surface, mip) at a given
-    /// image-area size — rebuilt only when that key changes.
-    protocol: Option<(FocusKey, Protocol)>,
+    /// The focused image's draw rect from the last render; when the next frame's
+    /// rect differs (a differently-sized sprite frame), we clear once to avoid
+    /// residue — rather than clearing every frame.
+    last_image: Option<Rect>,
+    /// Send focus/montage encode work to the off-thread encoder.
+    encode_tx: CbSender<EncodeReq>,
+    /// Drain encoded protocols from the encoder (lock-free, non-blocking).
+    encode_rx: CbReceiver<EncodeResult>,
+    /// UI-owned cache of encoded focus protocols, keyed by [`FocusKey`]. Filled by
+    /// the encoder; cleared when the focused texture or image size changes.
+    focus_protocols: HashMap<FocusKey, Arc<Protocol>>,
+    /// Focus keys with an encode in flight, so we don't re-request them each frame.
+    focus_requested: HashSet<FocusKey>,
+    /// Bumped on focus/size change; encode results from an older generation are
+    /// dropped on arrival.
+    encode_generation: u64,
+    /// Recently-focused item indices (most recent at the back). Bounds the preview
+    /// cache: previews for items evicted from this list are dropped.
+    preview_lru: VecDeque<usize>,
+    /// The focus image-area size from the last render; a change invalidates the
+    /// encoded protocols (they were sized for the old area).
+    focus_size: Option<(u16, u16)>,
     status: Option<String>,
     result: Option<String>,
 }
@@ -419,18 +522,32 @@ impl DdsBrowser {
         picker: Picker,
         caps: Caps,
     ) -> Self {
+        // Decode on a private pool so interactive thumbnail/preview work never
+        // queues behind (or is starved by) background pak discovery, which runs on
+        // the passed-in `runner`. Fall back to the shared runner if a private pool
+        // can't be built.
+        let decode_runner = std::thread::available_parallelism()
+            .ok()
+            .and_then(|n| JobRunner::with_workers(n.get().saturating_sub(1).max(2)).ok())
+            .unwrap_or(runner);
         let cache: Arc<Cache> = Arc::new(Mutex::new(HashMap::new()));
-        let tx = spawn_decoder(catalog.clone(), store.clone(), runner.clone(), cache.clone());
+        let tx = spawn_decoder(
+            catalog.clone(),
+            store.clone(),
+            decode_runner.clone(),
+            cache.clone(),
+        );
         let thumbs: Arc<Thumbs> = Arc::new(Mutex::new(HashMap::new()));
         let thumb_cache = Arc::new(ThumbCache::open());
         let thumb_tx = spawn_thumb_decoder(
             catalog.clone(),
             store,
             thumb_cache,
-            runner,
+            decode_runner,
             picker.clone(),
             thumbs.clone(),
         );
+        let (encode_tx, encode_rx) = spawn_encoder(picker);
         let mut browser = Self {
             caps,
             items: Vec::new(),
@@ -446,6 +563,11 @@ impl DdsBrowser {
             filter: String::new(),
             filtering: false,
             focused: false,
+            fps: FPS_DEFAULT,
+            playing: true,
+            joined: false,
+            anim_base: Instant::now(),
+            base_frame: 0,
             surface: 0,
             mip: 0,
             cache,
@@ -456,10 +578,17 @@ impl DdsBrowser {
             thumb_cancel: CancellationToken::new(),
             requested: Vec::new(),
             clock: 0,
+            grid_has_sprite: false,
             dirty: false,
             body: Rect::default(),
-            picker,
-            protocol: None,
+            last_image: None,
+            encode_tx,
+            encode_rx,
+            focus_protocols: HashMap::new(),
+            focus_requested: HashSet::new(),
+            encode_generation: 0,
+            preview_lru: VecDeque::new(),
+            focus_size: None,
             status: None,
             result: None,
         };
@@ -498,15 +627,142 @@ impl DdsBrowser {
                 .map(|(index, _)| index)
                 .collect()
         };
+        // Keep the selection on the same texture if it survived the filter;
+        // otherwise jump to the best match (index 0), never the stale index —
+        // which `.min(len-1)` would clamp to the *last* result.
         self.selected = anchor
             .and_then(|item| self.visible.iter().position(|&candidate| candidate == item))
-            .unwrap_or(self.selected)
+            .unwrap_or(0)
             .min(self.visible.len().saturating_sub(1));
     }
 
     /// The focused texture (an index into `items`), if any.
     fn current_item(&self) -> Option<usize> {
         self.visible.get(self.selected).copied()
+    }
+
+    /// Frame count of the focused texture (1 for a non-sprite).
+    fn focused_frames(&self) -> usize {
+        self.current_item().map_or(1, |item| self.items[item].frames.len())
+    }
+
+    /// The frame to show now — derived from wall-clock time while playing, so it's
+    /// rate-correct regardless of redraw cadence; frozen otherwise.
+    fn current_frame(&self, count: usize) -> usize {
+        if count <= 1 {
+            return 0;
+        }
+        if self.playing {
+            let advanced = (self.anim_base.elapsed().as_secs_f64() * f64::from(self.fps)) as usize;
+            (self.base_frame + advanced) % count
+        } else {
+            self.base_frame % count
+        }
+    }
+
+    /// True while sprites are actively cycling (drives redraw cadence): the focused
+    /// sprite, or any sprite visible in the grid. The joined montage is static.
+    fn animating(&self) -> bool {
+        if !self.playing {
+            return false;
+        }
+        if self.focused {
+            return !self.joined && self.focused_frames() > 1;
+        }
+        self.grid_has_sprite
+    }
+
+    /// Toggle a sprite between the joined montage (all frames tiled) and cycling.
+    fn toggle_joined(&mut self) {
+        if self.focused_frames() > 1 {
+            self.joined = !self.joined;
+            self.status = None;
+            self.dirty = true;
+        }
+    }
+
+    /// Drain encoded focus protocols from the encoder into the UI-owned cache
+    /// (non-blocking). Results from a superseded generation are discarded.
+    fn drain_encodes(&mut self) {
+        while let Ok(result) = self.encode_rx.try_recv() {
+            self.focus_requested.remove(&result.key);
+            if result.generation == self.encode_generation
+                && let Some(protocol) = result.protocol
+            {
+                self.focus_protocols.insert(result.key, protocol);
+            }
+        }
+    }
+
+    /// Queue an off-thread encode for `key` unless it's already cached or in flight.
+    fn request_focus_encode(&mut self, key: FocusKey, job: EncodeJob) {
+        if self.focus_protocols.contains_key(&key) || !self.focus_requested.insert(key) {
+            return;
+        }
+        let _ = self.encode_tx.send(EncodeReq {
+            key,
+            generation: self.encode_generation,
+            job,
+        });
+    }
+
+    /// Invalidate cached focus protocols (on a texture or image-size change) so any
+    /// in-flight encodes for the old generation are dropped when they arrive.
+    fn reset_focus_encodes(&mut self) {
+        self.encode_generation = self.encode_generation.wrapping_add(1);
+        self.focus_protocols.clear();
+        self.focus_requested.clear();
+    }
+
+    /// True while the focused frame's preview or its encoded protocol is still
+    /// pending — keeps the view redrawing until the image is ready to blit.
+    fn focus_pending(&self) -> bool {
+        if !self.focus_requested.is_empty() {
+            return true;
+        }
+        match self.current_item() {
+            Some(item) => {
+                let frame = self.current_frame(self.items[item].frames.len());
+                let cache = self.cache.lock().unwrap();
+                !matches!(
+                    cache.get(&(item, frame)),
+                    Some(Slot::Ready(_)) | Some(Slot::Failed(_))
+                )
+            }
+            None => false,
+        }
+    }
+
+    /// Rebase playback onto the frame showing now (so toggling play/pause or
+    /// changing fps is seamless).
+    fn rebase_playback(&mut self) {
+        self.base_frame = self.current_frame(self.focused_frames());
+        self.anim_base = Instant::now();
+    }
+
+    fn toggle_play(&mut self) {
+        self.rebase_playback();
+        self.playing = !self.playing;
+        self.dirty = true;
+    }
+
+    fn adjust_fps(&mut self, delta: i32) {
+        self.rebase_playback();
+        self.fps = (self.fps as i32 + delta).clamp(FPS_MIN as i32, FPS_MAX as i32) as u32;
+        self.status = Some(format!("{} fps", self.fps));
+        self.dirty = true;
+    }
+
+    /// Step frames manually (pauses playback).
+    fn step_frame(&mut self, delta: isize) {
+        let count = self.focused_frames();
+        if count <= 1 {
+            return;
+        }
+        let current = self.current_frame(count) as isize;
+        self.playing = false;
+        self.base_frame = (current + delta).rem_euclid(count as isize) as usize;
+        self.dirty = true;
     }
 
     /// Move the grid selection by `delta` (±1 to step, ±cols to change row).
@@ -530,20 +786,43 @@ impl DdsBrowser {
             self.focused = true;
             self.surface = 0;
             self.mip = 0;
+            self.base_frame = 0;
+            self.anim_base = Instant::now();
+            self.playing = true;
+            self.joined = false;
+            self.last_image = None;
+            self.reset_focus_encodes();
             self.status = None;
             self.dirty = true;
             self.request_preview();
         }
     }
 
-    /// Request a full-resolution preview decode of the focused texture, cancelling
-    /// any previous (now stale) preview decode.
+    /// Request a full decode of every frame of the focused texture (so sprite
+    /// playback is smooth), cancelling any previous (now stale) decode.
     fn request_preview(&mut self) {
         if let Some(item) = self.current_item() {
+            self.pin_preview_item(item);
             self.preview_cancel.cancel();
             let cancel = CancellationToken::new();
             self.preview_cancel = cancel.clone();
-            let _ = self.tx.try_send(PreviewReq { items: vec![item], cancel });
+            let frames = (0..self.items[item].frames.len()).map(|frame| (item, frame)).collect();
+            let _ = self.tx.try_send(PreviewReq { items: frames, cancel });
+        }
+    }
+
+    /// Mark `item` most-recently focused and drop the decoded previews of textures
+    /// that fall off the end — bounding the preview cache (the current focus, at the
+    /// back, is never evicted). Sprite frames make full previews large, so retaining
+    /// every focused texture would leak memory over a long session.
+    fn pin_preview_item(&mut self, item: usize) {
+        self.preview_lru.retain(|&existing| existing != item);
+        self.preview_lru.push_back(item);
+        while self.preview_lru.len() > MAX_PREVIEW_ITEMS {
+            if let Some(evicted) = self.preview_lru.pop_front() {
+                let mut cache = self.cache.lock().unwrap();
+                cache.retain(|&(owner, _), _| owner != evicted);
+            }
         }
     }
 
@@ -551,7 +830,7 @@ impl DdsBrowser {
     /// previous batch. No-op when the window is unchanged, so a still grid keeps
     /// decoding instead of being cancelled every frame; thumbnails outside the
     /// window are evicted to bound memory.
-    fn request_thumbs(&mut self, window: Vec<usize>) {
+    fn request_thumbs(&mut self, window: Vec<(usize, usize)>) {
         if window == self.requested {
             return;
         }
@@ -567,21 +846,21 @@ impl DdsBrowser {
     /// least-recently-shown thumbnails that aren't currently visible. Off-screen
     /// and other-screen thumbnails are kept until that pressure point, so moving
     /// around never forces a re-decode of what was just viewed.
-    fn evict_thumbs(&self, window: &[usize]) {
+    fn evict_thumbs(&self, window: &[(usize, usize)]) {
         let mut thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
         if thumbs.len() <= THUMB_CACHE_CAP {
             return;
         }
-        let keep: HashSet<usize> = window.iter().copied().collect();
-        let mut evictable: Vec<(u64, usize)> = thumbs
+        let keep: HashSet<(usize, usize)> = window.iter().copied().collect();
+        let mut evictable: Vec<(u64, (usize, usize))> = thumbs
             .iter()
-            .filter(|(item, _)| !keep.contains(item))
-            .map(|(item, (used, _))| (*used, *item))
+            .filter(|(key, _)| !keep.contains(key))
+            .map(|(key, (used, _))| (*used, *key))
             .collect();
         evictable.sort_unstable();
         let excess = thumbs.len() - THUMB_CACHE_CAP;
-        for (_, item) in evictable.into_iter().take(excess) {
-            thumbs.remove(&item);
+        for (_, key) in evictable.into_iter().take(excess) {
+            thumbs.remove(&key);
         }
     }
 
@@ -589,6 +868,12 @@ impl DdsBrowser {
     fn refocus(&mut self) {
         self.surface = 0;
         self.mip = 0;
+        self.base_frame = 0;
+        self.anim_base = Instant::now();
+        self.playing = true;
+        self.joined = false;
+        self.last_image = None;
+        self.reset_focus_encodes();
         self.status = None;
         self.dirty = true;
         self.request_preview();
@@ -635,9 +920,15 @@ impl DdsBrowser {
                 self.status = None;
                 self.dirty = true;
             }
-            KeyCode::Char('[') | KeyCode::Char(',') | KeyCode::Left => self.cycle_mip(-1),
-            KeyCode::Char(']') | KeyCode::Char('.') | KeyCode::Right => self.cycle_mip(1),
+            KeyCode::Char('[') | KeyCode::Left => self.cycle_mip(-1),
+            KeyCode::Char(']') | KeyCode::Right => self.cycle_mip(1),
             KeyCode::Char('a') | KeyCode::Tab => self.cycle_surface(1),
+            KeyCode::Char(' ') => self.toggle_play(),
+            KeyCode::Char('m') => self.toggle_joined(),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.adjust_fps(1),
+            KeyCode::Char('-') | KeyCode::Char('_') => self.adjust_fps(-1),
+            KeyCode::Char(',') => self.step_frame(-1),
+            KeyCode::Char('.') => self.step_frame(1),
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_by(1);
                 self.refocus();
@@ -658,11 +949,12 @@ impl DdsBrowser {
         Flow::Continue
     }
 
-    /// The decoded preview for the focused texture, if ready.
+    /// The decoded preview for the frame showing now, if ready.
     fn ready_preview(&self) -> Option<Arc<Preview>> {
         let item = self.current_item()?;
+        let frame = self.current_frame(self.items[item].frames.len());
         let cache = self.cache.lock().unwrap();
-        match cache.get(&item) {
+        match cache.get(&(item, frame)) {
             Some(Slot::Ready(preview)) => Some(preview.clone()),
             _ => None,
         }
@@ -721,19 +1013,19 @@ impl View for DdsBrowser {
         if self.catalog.is_scanning() {
             return true;
         }
+        // A playing sprite always redraws at its frame rate (grid or focus).
+        if self.animating() {
+            return true;
+        }
         if self.focused {
-            return match self.current_item() {
-                Some(item) => {
-                    let cache = self.cache.lock().unwrap();
-                    !matches!(cache.get(&item), Some(Slot::Ready(_)) | Some(Slot::Failed(_)))
-                }
-                None => false,
-            };
+            // Otherwise tick until the frame showing now is decoded AND its
+            // protocol has been encoded off-thread.
+            return self.focus_pending();
         }
         let thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
-        self.requested.iter().any(|item| {
+        self.requested.iter().any(|key| {
             !matches!(
-                thumbs.get(item).map(|(_, state)| state),
+                thumbs.get(key).map(|(_, state)| state),
                 Some(Thumb::Ready(_)) | Some(Thumb::Failed)
             )
         })
@@ -741,9 +1033,24 @@ impl View for DdsBrowser {
 
     fn tick(&mut self) {
         self.ingest();
+        self.drain_encodes();
+    }
+
+    fn poll_interval(&self) -> Duration {
+        // Redraw at the sprite's frame rate while it plays; fall back to the
+        // slower background-progress cadence otherwise.
+        if self.animating() {
+            Duration::from_millis((1000 / self.fps.max(1)).max(16) as u64)
+        } else {
+            Duration::from_millis(120)
+        }
     }
 
     fn needs_clear(&mut self) -> Option<Rect> {
+        // Only clear on a discrete change (enter/exit, cycle mip/surface, resize,
+        // or a frame whose size differs from the last). Steady same-size animation
+        // relies on the graphics protocol's cell diff to swap frames in place — an
+        // unconditional per-frame clear is what caused the flicker.
         std::mem::take(&mut self.dirty).then_some(self.body)
     }
 
@@ -900,14 +1207,60 @@ impl DdsBrowser {
 
         let start = self.offset * cols;
         let end = (start + cols * rows_visible).min(self.visible.len());
-        let window: Vec<usize> = self.visible[start..end].to_vec();
-        self.request_thumbs(window.clone());
+        let items: Vec<usize> = self.visible[start..end].to_vec();
+
+        // Every visible sprite caches all its frames so they all animate in the
+        // grid (sharing one wall-clock-derived frame index); static textures use
+        // frame 0 only.
+        let mut thumb_window: Vec<(usize, usize)> = Vec::with_capacity(items.len());
+        let mut has_sprite = false;
+        for &item in &items {
+            let frames = self.items[item].frames.len();
+            if frames > 1 {
+                has_sprite = true;
+                thumb_window.extend((0..frames).map(|frame| (item, frame)));
+            } else {
+                thumb_window.push((item, 0));
+            }
+        }
+        self.grid_has_sprite = has_sprite;
+        self.request_thumbs(thumb_window);
 
         self.clock = self.clock.wrapping_add(1);
         let now = self.clock;
         let glyphs = theme::glyphs(self.caps);
-        let mut thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
-        for (slot, &item) in window.iter().enumerate() {
+
+        // First pass: snapshot each cell's ready protocol (cheap `Arc` clone) and
+        // stamp LRU under a brief lock. The lock is released before any rendering,
+        // so the UI never holds it across image blits (workers can keep publishing).
+        let cells: Vec<CellVisual> = {
+            let mut thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
+            items
+                .iter()
+                .map(|&item| {
+                    let frames = self.items[item].frames.len();
+                    // Show this sprite's live frame, falling back to frame 0 while it
+                    // decodes (so it never blinks to a placeholder mid-cycle).
+                    let live = if frames > 1 { self.current_frame(frames) } else { 0 };
+                    for candidate in [live, 0] {
+                        if let Some(entry) = thumbs.get_mut(&(item, candidate)) {
+                            entry.0 = now; // mark recently shown for LRU
+                            match &entry.1 {
+                                Thumb::Ready(protocol) => {
+                                    return CellVisual::Image(protocol.clone());
+                                }
+                                Thumb::Failed if candidate == 0 => return CellVisual::Failed,
+                                _ => {}
+                            }
+                        }
+                    }
+                    CellVisual::Pending
+                })
+                .collect()
+        };
+
+        // Second pass: render the snapshot (no lock held).
+        for (slot, (&item, visual)) in items.iter().zip(&cells).enumerate() {
             let grid_index = start + slot;
             let col = (slot % cols) as u16;
             let row = (slot / cols) as u16;
@@ -915,27 +1268,21 @@ impl DdsBrowser {
             let cell_y = area.y + row * cell_h;
             let img_area = Rect { x: cell_x + 1, y: cell_y, width: thumb_w, height: thumb_h };
 
-            match thumbs.get_mut(&item) {
-                Some(entry) => {
-                    entry.0 = now; // mark recently shown for LRU
-                    match &entry.1 {
-                        Thumb::Ready(protocol) => {
-                            let size = protocol.size();
-                            let w = size.width.min(thumb_w);
-                            let h = size.height.min(thumb_h);
-                            let rect = Rect {
-                                x: img_area.x + (thumb_w - w) / 2,
-                                y: img_area.y + (thumb_h - h) / 2,
-                                width: w,
-                                height: h,
-                            };
-                            frame.render_widget(Image::new(protocol), rect);
-                        }
-                        Thumb::Failed => self.center_text(frame, img_area, "✕", theme::bad()),
-                        Thumb::Pending => self.center_text(frame, img_area, "·", theme::dim()),
-                    }
+            match visual {
+                CellVisual::Image(protocol) => {
+                    let size = protocol.size();
+                    let w = size.width.min(thumb_w);
+                    let h = size.height.min(thumb_h);
+                    let rect = Rect {
+                        x: img_area.x + (thumb_w - w) / 2,
+                        y: img_area.y + (thumb_h - h) / 2,
+                        width: w,
+                        height: h,
+                    };
+                    frame.render_widget(Image::new(protocol.as_ref()), rect);
                 }
-                None => self.center_text(frame, img_area, "·", theme::dim()),
+                CellVisual::Failed => self.center_text(frame, img_area, "✕", theme::bad()),
+                CellVisual::Pending => self.center_text(frame, img_area, "·", theme::dim()),
             }
 
             // Filename label under the thumbnail; highlight the selected cell.
@@ -976,21 +1323,38 @@ impl DdsBrowser {
             return;
         };
 
+        let frames = self.items[item].frames.len();
+        let frame_index = self.current_frame(frames);
         let label = self.items[item].label.clone();
         let glyphs = theme::glyphs(self.caps);
+        let title = if frames > 1 {
+            if self.joined {
+                format!("⊞ {frames} frames joined   m cycle   {label}")
+            } else {
+                let state = if self.playing { glyphs.play } else { glyphs.pause };
+                format!("{state} {}/{frames}  {} fps   m join   {label}", frame_index + 1, self.fps)
+            }
+        } else {
+            label
+        };
         frame.buffer_mut().set_line(
             area.x,
             area.y,
             &Line::from(Span::styled(
-                theme::fit_middle(&label, area.width as usize, glyphs.ellipsis),
+                theme::fit_middle(&title, area.width as usize, glyphs.ellipsis),
                 theme::accent(),
             )),
             area.width,
         );
 
+        if self.joined && frames > 1 {
+            self.render_montage(frame, area, item, frames);
+            return;
+        }
+
         let slot = {
             let cache = self.cache.lock().unwrap();
-            match cache.get(&item) {
+            match cache.get(&(item, frame_index)) {
                 Some(Slot::Ready(preview)) => Some(Ok(preview.clone())),
                 Some(Slot::Failed(error)) => Some(Err(error.clone())),
                 _ => None,
@@ -1057,19 +1421,16 @@ impl DdsBrowser {
                 if image_area.height == 0 {
                     return;
                 }
-                // Encode the mip to fill the image area, then blit it centered, so
-                // it's centered regardless of mip level (no top-left jump).
-                let key: FocusKey = (item, surface_index, mip, image_area.width, image_area.height);
-                if self.protocol.as_ref().map(|(existing, _)| *existing) != Some(key) {
-                    let dynamic = DynamicImage::ImageRgba8(level.image.clone());
-                    let size = Size::new(image_area.width, image_area.height);
-                    self.protocol = self
-                        .picker
-                        .new_protocol(dynamic, size, Resize::Fit(None))
-                        .ok()
-                        .map(|protocol| (key, protocol));
+                // The encode (the costly step) runs off-thread: blit the cached
+                // protocol if ready, else queue it and show a spinner. A size change
+                // invalidates the cache (protocols were sized for the old area).
+                if self.focus_size != Some((image_area.width, image_area.height)) {
+                    self.focus_size = Some((image_area.width, image_area.height));
+                    self.reset_focus_encodes();
                 }
-                if let Some((_, protocol)) = &self.protocol {
+                let key: FocusKey =
+                    (item, frame_index, surface_index, mip, image_area.width, image_area.height);
+                if let Some(protocol) = self.focus_protocols.get(&key) {
                     let size = protocol.size();
                     let w = size.width.min(image_area.width);
                     let h = size.height.min(image_area.height);
@@ -1079,15 +1440,90 @@ impl DdsBrowser {
                         width: w,
                         height: h,
                     };
-                    frame.render_widget(Image::new(protocol), rect);
+                    // A frame whose size differs from the last needs one clear to
+                    // avoid residue; same-size frames swap in place (no flicker).
+                    if self.last_image.is_some_and(|previous| previous != rect) {
+                        self.dirty = true;
+                    }
+                    self.last_image = Some(rect);
+                    frame.render_widget(Image::new(protocol.as_ref()), rect);
+                } else {
+                    self.request_focus_encode(
+                        key,
+                        EncodeJob::Frame {
+                            preview: preview.clone(),
+                            surface: surface_index,
+                            mip,
+                        },
+                    );
+                    self.center_text(frame, spinner_area, "decoding…", theme::dim());
                 }
             }
             Some(Ok(_)) | None => {
-                self.request_preview();
+                // The decode was already requested on focus; just wait for it.
                 self.center_text(frame, spinner_area, "decoding…", theme::dim());
             }
             Some(Err(error)) => self.center_text(frame, spinner_area, &error, theme::bad()),
         }
+    }
+
+    /// Render every frame of a sprite tiled into one sheet (the "joined" view).
+    /// Assembly + encode happen off-thread; until the sheet is ready a spinner shows.
+    fn render_montage(&mut self, frame: &mut Frame, area: Rect, item: usize, frames: usize) {
+        let image_area = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height.saturating_sub(1),
+        };
+        if image_area.height == 0 {
+            return;
+        }
+        if self.focus_size != Some((image_area.width, image_area.height)) {
+            self.focus_size = Some((image_area.width, image_area.height));
+            self.reset_focus_encodes();
+        }
+        // Sentinel frame `usize::MAX` distinguishes the montage from per-frame keys.
+        let key: FocusKey = (item, usize::MAX, 0, 0, image_area.width, image_area.height);
+        if let Some(protocol) = self.focus_protocols.get(&key) {
+            let size = protocol.size();
+            let w = size.width.min(image_area.width);
+            let h = size.height.min(image_area.height);
+            let rect = Rect {
+                x: image_area.x + (image_area.width - w) / 2,
+                y: image_area.y + (image_area.height - h) / 2,
+                width: w,
+                height: h,
+            };
+            self.last_image = Some(rect);
+            frame.render_widget(Image::new(protocol.as_ref()), rect);
+            return;
+        }
+
+        // Snapshot every frame's preview (cheap Arc clones); bail until all ready.
+        let previews: Vec<Arc<Preview>> = {
+            let cache = self.cache.lock().unwrap();
+            let mut previews = Vec::with_capacity(frames);
+            for index in 0..frames {
+                match cache.get(&(item, index)) {
+                    Some(Slot::Ready(preview)) => previews.push(preview.clone()),
+                    Some(Slot::Failed(error)) => {
+                        let error = error.clone();
+                        drop(cache);
+                        self.center_text(frame, image_area, &error, theme::bad());
+                        return;
+                    }
+                    _ => {
+                        drop(cache);
+                        self.center_text(frame, image_area, "decoding…", theme::dim());
+                        return;
+                    }
+                }
+            }
+            previews
+        };
+        self.request_focus_encode(key, EncodeJob::Montage { frames: previews });
+        self.center_text(frame, image_area, "building…", theme::dim());
     }
 
     /// The surface selector: `surface  base  alpha` with the active one highlighted.
@@ -1166,11 +1602,22 @@ impl DdsBrowser {
         } else if let Some(status) = &self.status {
             Line::from(Span::styled(status.clone(), theme::dim()))
         } else {
-            let hint = match (self.focused, self.caps.unicode) {
-                (false, true) => "↑↓←→ move   ⏎ open   / filter   y copy   q quit",
-                (false, false) => "arrows move   enter open   / filter   y copy   q quit",
-                (true, true) => "[ ] mip   a alpha   ↑↓ texture   ⏎ select   esc back   q quit",
-                (true, false) => "[ ] mip   a alpha   up/dn texture   enter select   esc back   q quit",
+            // Sprite playback controls appear only when the focused texture is an
+            // animated sequence.
+            let sprite = self.focused && self.focused_frames() > 1;
+            let hint = match (self.focused, sprite, self.caps.unicode) {
+                (false, _, true) => "↑↓←→ move   ⏎ open   / filter   y copy   q quit",
+                (false, _, false) => "arrows move   enter open   / filter   y copy   q quit",
+                (true, true, true) => {
+                    "[ ] mip   a alpha   space play   ± fps   , . frame   m join   esc back"
+                }
+                (true, true, false) => {
+                    "[ ] mip   a alpha   space play   +/- fps   , . frame   m join   esc back"
+                }
+                (true, false, true) => "[ ] mip   a alpha   ↑↓ texture   ⏎ select   esc back",
+                (true, false, false) => {
+                    "[ ] mip   a alpha   up/dn texture   enter select   esc back"
+                }
             };
             Line::from(Span::styled(hint.to_string(), theme::dim()))
         };
@@ -1191,6 +1638,80 @@ fn spawn_decoder(
     tx
 }
 
+/// Spawn the focus-view protocol encoder. It owns a cloned [`Picker`] and turns
+/// decoded previews into terminal graphics protocols off the UI thread, returning
+/// each over a lock-free channel the UI drains without blocking.
+fn spawn_encoder(picker: Picker) -> (CbSender<EncodeReq>, CbReceiver<EncodeResult>) {
+    let (req_tx, req_rx) = unbounded::<EncodeReq>();
+    let (res_tx, res_rx) = unbounded::<EncodeResult>();
+    std::thread::spawn(move || {
+        while let Ok(req) = req_rx.recv() {
+            let (.., width, height) = req.key;
+            let protocol = match req.job {
+                EncodeJob::Frame {
+                    preview,
+                    surface,
+                    mip,
+                } => preview
+                    .surfaces
+                    .get(surface)
+                    .and_then(|surface| surface.mips.get(mip))
+                    .and_then(|level| encode_image(&picker, level.image.clone(), width, height)),
+                EncodeJob::Montage { frames } => {
+                    montage_sheet(&frames).and_then(|sheet| encode_image(&picker, sheet, width, height))
+                }
+            };
+            if res_tx
+                .send(EncodeResult {
+                    key: req.key,
+                    generation: req.generation,
+                    protocol,
+                })
+                .is_err()
+            {
+                break; // UI gone
+            }
+        }
+    });
+    (req_tx, res_rx)
+}
+
+/// Encode an RGBA image to a terminal graphics protocol fit to `width`×`height` cells.
+fn encode_image(picker: &Picker, image: RgbaImage, width: u16, height: u16) -> Option<Arc<Protocol>> {
+    picker
+        .new_protocol(
+            DynamicImage::ImageRgba8(image),
+            Size::new(width, height),
+            Resize::Fit(None),
+        )
+        .ok()
+        .map(Arc::new)
+}
+
+/// Tile every frame's base-surface top mip into one montage sheet (√-grid, each
+/// frame centered in its cell). Returns `None` if any frame lacks a decoded mip.
+fn montage_sheet(frames: &[Arc<Preview>]) -> Option<RgbaImage> {
+    let images: Vec<&RgbaImage> = frames
+        .iter()
+        .map(|preview| preview.surfaces.first().and_then(|s| s.mips.first()).map(|m| &m.image))
+        .collect::<Option<Vec<_>>>()?;
+    if images.is_empty() {
+        return None;
+    }
+    let count = images.len();
+    let cols = (count as f64).sqrt().ceil() as usize;
+    let rows = count.div_ceil(cols);
+    let cell_w = images.iter().map(|image| image.width()).max().unwrap_or(1);
+    let cell_h = images.iter().map(|image| image.height()).max().unwrap_or(1);
+    let mut sheet = RgbaImage::new(cell_w * cols as u32, cell_h * rows as u32);
+    for (index, image) in images.iter().enumerate() {
+        let x = (index % cols) as u32 * cell_w + (cell_w - image.width()) / 2;
+        let y = (index / cols) as u32 * cell_h + (cell_h - image.height()) / 2;
+        image::imageops::overlay(&mut sheet, *image, i64::from(x), i64::from(y));
+    }
+    Some(sheet)
+}
+
 fn decode_loop(
     rx: &Receiver<PreviewReq>,
     catalog: &DdsCatalog,
@@ -1206,17 +1727,20 @@ fn decode_loop(
         if req.cancel.is_cancelled() {
             continue;
         }
-        // Claim the not-yet-decoded items and snapshot them out of the (growing)
-        // catalog, so the decode runs without holding any lock.
-        let todo: Vec<(usize, DdsItem)> = {
+        // Claim the not-yet-decoded frames and snapshot them out of the (growing)
+        // catalog, so the decode runs without holding any lock. Each key is
+        // (texture index, frame) — sprites decode every frame for smooth playback.
+        let todo: Vec<((usize, usize), String, DdsFrame)> = {
             let mut guard = cache.lock().unwrap();
             let mut todo = Vec::new();
-            for index in &req.items {
-                if !guard.contains_key(index)
-                    && let Some(item) = catalog.item(*index)
+            for &(index, frame) in &req.items {
+                let key = (index, frame);
+                if !guard.contains_key(&key)
+                    && let Some(item) = catalog.item(index)
+                    && let Some(data) = item.frames.get(frame)
                 {
-                    guard.insert(*index, Slot::Pending);
-                    todo.push((*index, item));
+                    guard.insert(key, Slot::Pending);
+                    todo.push((key, item.label.clone(), data.clone()));
                 }
             }
             todo
@@ -1224,23 +1748,28 @@ fn decode_loop(
         if todo.is_empty() {
             continue;
         }
-        let batch = runner.map_until_cancelled(&todo, &req.cancel, |(index, item)| {
-            (*index, decode_item(store, &item.label, item.frame(0)))
-        });
-        let mut guard = cache.lock().unwrap();
-        let mut done = HashSet::new();
-        for (index, result) in batch.into_completed() {
-            done.insert(index);
-            let slot = match result {
+        // Publish each frame the instant it decodes (no result Vec), so the focus
+        // view shows the first frame immediately instead of waiting for the whole
+        // sprite. The cancel token is also threaded into the decode so a cancelled
+        // job abandons the remaining mip levels between levels.
+        runner.for_each_until_cancelled(&todo, &req.cancel, |(key, label, data)| {
+            let slot = match decode_item(store, label, data, &req.cancel) {
                 Ok(preview) => Slot::Ready(Arc::new(preview)),
+                // Abandoned mid-decode: leave Pending for the cleanup below to drop.
+                Err(_) if req.cancel.is_cancelled() => return,
                 Err(error) => Slot::Failed(error),
             };
-            guard.insert(index, slot);
-        }
-        // Drop any still-Pending (cancelled) items so they re-decode when refocused.
-        for (index, _) in &todo {
-            if !done.contains(index) {
-                guard.remove(index);
+            let mut guard = cache.lock().unwrap();
+            // Only publish if still the in-flight entry (not superseded/cancelled).
+            if matches!(guard.get(key), Some(Slot::Pending)) {
+                guard.insert(*key, slot);
+            }
+        });
+        // Drop any frames left Pending by a cancelled batch so they re-decode later.
+        let mut guard = cache.lock().unwrap();
+        for (key, _, _) in &todo {
+            if matches!(guard.get(key), Some(Slot::Pending)) {
+                guard.remove(key);
             }
         }
     }
@@ -1282,17 +1811,19 @@ fn thumb_loop(
         if req.cancel.is_cancelled() {
             continue;
         }
-        // Claim the not-yet-decoded items, snapshotting their DdsItem out of the
-        // (growing) catalog so the decode holds no lock.
-        let todo: Vec<(usize, DdsItem)> = {
+        // Claim the not-yet-decoded frames, snapshotting each out of the (growing)
+        // catalog so the decode holds no lock.
+        let todo: Vec<((usize, usize), DdsFrame)> = {
             let mut guard = thumbs.lock().unwrap_or_else(|error| error.into_inner());
             let mut todo = Vec::new();
-            for &item in &req.items {
-                if !guard.contains_key(&item)
+            for &(item, frame) in &req.items {
+                let key = (item, frame);
+                if !guard.contains_key(&key)
                     && let Some(dds) = catalog.item(item)
+                    && let Some(data) = dds.frames.get(frame)
                 {
-                    guard.insert(item, (0, Thumb::Pending));
-                    todo.push((item, dds));
+                    guard.insert(key, (0, Thumb::Pending));
+                    todo.push((key, data.clone()));
                 }
             }
             todo
@@ -1304,23 +1835,23 @@ fn thumb_loop(
         // is published the instant it decodes, so the grid fills progressively
         // (roughly top-to-bottom) instead of all at once after the slowest one.
         let size = req.size;
-        runner.map_until_cancelled(&todo, &req.cancel, |(item, dds)| {
-            let state = match decode_thumbnail(store, cache, dds, picker, size) {
-                Ok(protocol) => Thumb::Ready(protocol),
+        runner.for_each_until_cancelled(&todo, &req.cancel, |(key, data)| {
+            let state = match decode_thumbnail(store, cache, data, picker, size) {
+                Ok(protocol) => Thumb::Ready(Arc::new(protocol)),
                 Err(_) => Thumb::Failed,
             };
             let mut guard = thumbs.lock().unwrap_or_else(|error| error.into_inner());
             // Only publish if still the in-flight entry (not evicted/superseded).
-            if matches!(guard.get(item), Some((_, Thumb::Pending))) {
-                guard.insert(*item, (0, state));
+            if matches!(guard.get(key), Some((_, Thumb::Pending))) {
+                guard.insert(*key, (0, state));
             }
         });
-        // Items left Pending by a cancelled batch: drop them so they re-decode
+        // Frames left Pending by a cancelled batch: drop them so they re-decode
         // when next requested.
         let mut guard = thumbs.lock().unwrap_or_else(|error| error.into_inner());
-        for (item, _) in &todo {
-            if matches!(guard.get(item), Some((_, Thumb::Pending))) {
-                guard.remove(item);
+        for (key, _) in &todo {
+            if matches!(guard.get(key), Some((_, Thumb::Pending))) {
+                guard.remove(key);
             }
         }
     }
@@ -1331,14 +1862,13 @@ fn thumb_loop(
 fn decode_thumbnail(
     store: &TextureStore,
     cache: &ThumbCache,
-    item: &DdsItem,
+    frame: &DdsFrame,
     picker: &Picker,
     size: Size,
 ) -> Result<Protocol, String> {
     // The header read is cheap and identifies the texture's content; key the disk
     // cache on its hash so an unchanged DDS reuses the cached thumbnail (even after
     // a game patch). A hit skips the sidecar reads + DDS decode.
-    let frame = item.frame(0);
     let header = store.read(&frame.header)?;
     let key = fnv1a(&header);
     let image = match cache.load(key) {
@@ -1363,16 +1893,23 @@ fn decode_thumbnail(
 /// Decode a texture's surfaces (base, and the attached alpha if present) and
 /// gather its metadata. Runs on a worker. The base must decode; a failing alpha
 /// surface is simply omitted rather than failing the whole texture.
-fn decode_item(store: &TextureStore, label: &str, frame: &DdsFrame) -> Result<Preview, String> {
+fn decode_item(
+    store: &TextureStore,
+    label: &str,
+    frame: &DdsFrame,
+    cancel: &CancellationToken,
+) -> Result<Preview, String> {
     let header_bytes = store.read(&frame.header)?;
     let meta = read_meta(label, &header_bytes);
 
     let mut surfaces = vec![Surface {
         name: "base",
-        mips: decode_chain(store, &frame.header, &frame.sidecars)?,
+        // Reuse the header bytes already read for `meta` instead of re-reading.
+        mips: decode_chain(store, &header_bytes, &frame.sidecars, cancel)?,
     }];
     if let Some(alpha) = &frame.alpha
-        && let Ok(mips) = decode_chain(store, &alpha.header, &alpha.sidecars)
+        && let Ok(alpha_header) = store.read(&alpha.header)
+        && let Ok(mips) = decode_chain(store, &alpha_header, &alpha.sidecars, cancel)
         && !mips.is_empty()
     {
         surfaces.push(Surface {
@@ -1383,14 +1920,15 @@ fn decode_item(store: &TextureStore, label: &str, frame: &DdsFrame) -> Result<Pr
     Ok(Preview { meta, surfaces })
 }
 
-/// Decode one surface's full mip chain to display-sized RGBA, assembling sidecars.
-/// Falls back to the top mip alone if the full chain can't be decoded.
+/// Decode one surface's full mip chain to display-sized RGBA, assembling sidecars
+/// from `header_bytes` (already read by the caller). Falls back to the top mip
+/// alone if the full chain can't be decoded.
 fn decode_chain(
     store: &TextureStore,
-    header: &str,
+    header_bytes: &[u8],
     sidecars: &[(nw_dds::SplitPart, String)],
+    cancel: &CancellationToken,
 ) -> Result<Vec<Mip>, String> {
-    let header_bytes = store.read(header)?;
     let mut sidecar_bytes = Vec::with_capacity(sidecars.len());
     for (part, key) in sidecars {
         sidecar_bytes.push((*part, store.read(key)?));
@@ -1400,9 +1938,12 @@ fn decode_chain(
         .map(|(part, bytes)| nw_dds::Sidecar::new(*part, bytes.as_slice()))
         .collect::<Vec<_>>();
 
-    let decoded = match nw_dds::decode_all_mips(&header_bytes, &parts) {
+    // Abandon the chain between mip levels if the request was cancelled.
+    let decoded = match nw_dds::decode_all_mips_until(header_bytes, &parts, &|| !cancel.is_cancelled())
+    {
         Ok(mips) if !mips.is_empty() => mips,
-        _ => vec![nw_dds::decode_top_mip(&header_bytes, &parts).map_err(|e| e.to_string())?],
+        _ if cancel.is_cancelled() => return Err("cancelled".to_string()),
+        _ => vec![nw_dds::decode_top_mip(header_bytes, &parts).map_err(|e| e.to_string())?],
     };
 
     let mut mips = Vec::with_capacity(decoded.len());

@@ -159,6 +159,8 @@ pub struct Glyphs {
     pub rule: char,
     pub ellipsis: &'static str,
     pub sep: &'static str,
+    pub play: &'static str,
+    pub pause: &'static str,
 }
 
 pub fn glyphs(caps: Caps) -> Glyphs {
@@ -167,12 +169,16 @@ pub fn glyphs(caps: Caps) -> Glyphs {
             rule: '─',
             ellipsis: "…",
             sep: " · ",
+            play: "▶",
+            pause: "❚❚",
         }
     } else {
         Glyphs {
             rule: '-',
             ellipsis: "...",
             sep: "  ",
+            play: ">",
+            pause: "||",
         }
     }
 }

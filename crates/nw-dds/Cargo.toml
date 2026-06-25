@@ -11,9 +11,15 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+bcdec_rs = "0.2.0"
 texture2ddecoder = "0.1.2"
 thiserror.workspace = true
 vk2dfd.workspace = true
 
 [dev-dependencies]
+criterion = "0.8.2"
 ktx2.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false
