@@ -595,6 +595,19 @@ fn path_hit_cells(hit: PathHit, with_guid: bool) -> Vec<Cell> {
     cells
 }
 
+/// The browser/report cells for one ObjectStream search hit.
+fn object_hit_cells(hit: ObjectHit) -> Vec<Cell> {
+    vec![
+        Cell::path(hit.pak),
+        Cell::path(hit.name),
+        Cell::yes_no(hit.envelope == "yes"),
+        Cell::text(hit.kind),
+        Cell::text(hit.count.to_string()),
+        Cell::text(hit.score.to_string()),
+        Cell::text(hit.value),
+    ]
+}
+
 impl SearchObjectStream {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
@@ -608,10 +621,50 @@ impl SearchObjectStream {
         };
         let query = TextQuery::new(self.query, mode);
         let selector = PathSelector::new(self.filter, self.glob);
+        let names_stat = if lookup.is_some() { "loaded" } else { "off" }.to_string();
+        let max_entry_size = self.max_entry_size;
+
+        // Interactive: open instantly and stream matches in from a background scan.
+        if theme::caps().interactive {
+            let stats = vec![
+                ("archives".to_string(), paks.paths().len().to_string()),
+                ("names".to_string(), names_stat),
+            ];
+            let template =
+                Table::new(["Pak", "Name", "AZCS", "Kind", "Count", "Score", "Value"]).right([4, 5]);
+            let feed = crate::tui::RowFeed::new(paks.paths().len());
+            let runner = ctx.runner.clone();
+            let cancel = ctx.cancel.clone();
+            let feed_bg = feed.clone();
+            std::thread::spawn(move || {
+                let options = ObjectSearchOptions {
+                    query: &query,
+                    max_entry_size,
+                    lookup: lookup.as_ref(),
+                    selector: &selector,
+                    cancel: &cancel,
+                };
+                runner.map(paks.paths(), |pak| {
+                    if let Ok(hits) = SearchObjectStream::scan_pak(&paks, pak, &options, None) {
+                        feed_bg.extend(hits.into_iter().map(object_hit_cells).collect());
+                    }
+                    feed_bg.mark_done();
+                });
+            });
+            return Ok(crate::tui::browse_streaming(
+                "asset search objectstream",
+                stats,
+                template,
+                1,
+                feed,
+            )?);
+        }
+
+        // Piped: scan fully, then print a static report.
         let cancel = ctx.cancel.clone();
         let options = ObjectSearchOptions {
             query: &query,
-            max_entry_size: self.max_entry_size,
+            max_entry_size,
             lookup: lookup.as_ref(),
             selector: &selector,
             cancel: &cancel,
@@ -620,7 +673,7 @@ impl SearchObjectStream {
             "objectstream search",
             paks.paths(),
             |path| paks.relative(path),
-            |path, progress| Self::scan_pak(&paks, path, &options, &progress),
+            |path, progress| Self::scan_pak(&paks, path, &options, Some(&progress)),
         );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
@@ -651,31 +704,16 @@ impl SearchObjectStream {
             ("archives".to_string(), paks.paths().len().to_string()),
             ("matched".to_string(), matched.to_string()),
             ("shown".to_string(), rows.len().to_string()),
-            (
-                "names".to_string(),
-                if lookup.is_some() { "loaded" } else { "off" }.to_string(),
-            ),
+            ("names".to_string(), names_stat),
         ];
         let mut table =
             Table::new(["Pak", "Name", "AZCS", "Kind", "Count", "Score", "Value"]).right([4, 5]);
         for row in rows {
-            table.push([
-                Cell::path(row.pak),
-                Cell::path(row.name),
-                Cell::yes_no(row.envelope == "yes"),
-                Cell::text(row.kind),
-                Cell::text(row.count.to_string()),
-                Cell::text(row.score.to_string()),
-                Cell::text(row.value),
-            ]);
+            table.push(object_hit_cells(row));
         }
-        if theme::caps().interactive && !table.is_empty() {
-            crate::tui::browse("asset search objectstream", stats, table, 1)?;
-        } else {
-            let mut report = Report::with_stats("asset search objectstream", stats);
-            report.table_or(table, "no ObjectStream matches");
-            report.print();
-        }
+        let mut report = Report::with_stats("asset search objectstream", stats);
+        report.table_or(table, "no ObjectStream matches");
+        report.print();
 
         ScanIssues::new("asset objectstream search", skipped, cancelled, errors).finish()
     }
@@ -684,10 +722,12 @@ impl SearchObjectStream {
         paks: &PakSet,
         path: &Path,
         options: &ObjectSearchOptions<'_>,
-        progress: &Job,
+        progress: Option<&Job>,
     ) -> Result<Vec<ObjectHit>> {
         let pak = PakMmapReader::open(path)?;
-        progress.set_len(pak.len());
+        if let Some(progress) = progress {
+            progress.set_len(pak.len());
+        }
         let pak_name = paks.relative(path);
         let mut search = options
             .query
@@ -699,7 +739,9 @@ impl SearchObjectStream {
             if options.cancel.is_cancelled() {
                 break;
             }
-            progress.inc(1);
+            if let Some(progress) = progress {
+                progress.inc(1);
+            }
             if !options.selector.matches(entry.name()) {
                 continue;
             }
