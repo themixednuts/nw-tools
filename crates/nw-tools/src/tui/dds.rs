@@ -1,10 +1,11 @@
-//! Interactive DDS texture browser. A fuzzy-filterable file list on the left, a
-//! live image preview on the right (via the kitty/sixel/iterm graphics protocols
-//! with a unicode half-block fallback). Textures decode lazily on a background
-//! thread that fans the work out across the shared [`JobRunner`], so the list is
-//! responsive from the first frame and scrolling pre-warms a window of neighbours.
+//! Interactive DDS texture browser — an engine-style asset grid. A scrollable
+//! grid of image thumbnails (via the kitty/sixel/iterm graphics protocols with a
+//! unicode half-block fallback), filterable by path, with Enter to focus one
+//! texture for a full mip/surface view. Thumbnails decode AND encode on a
+//! background thread (so the UI never blocks on image work) as textures stream in
+//! from discovery, and stale decode batches are cancelled when the view moves.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -12,14 +13,14 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use image::{DynamicImage, RgbaImage};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui_image::StatefulImage;
 use ratatui_image::picker::Picker;
-use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::protocol::{Protocol, StatefulProtocol};
+use ratatui_image::{Image, Resize, StatefulImage};
 
-use nw_jobs::JobRunner;
+use nw_jobs::{CancellationToken, JobRunner};
 
 use super::app::{Flow, View};
 use crate::fuzzy;
@@ -29,6 +30,15 @@ const HILITE: ratatui::style::Color = ratatui::style::Color::Indexed(238);
 
 /// Largest preview decoded off-thread; the widget downscales further to the pane.
 const PREVIEW_MAX: u32 = 1024;
+
+/// Grid thumbnail geometry, in terminal cells: the image area per cell, plus a
+/// label row and gaps. A texture cell is `CELL_W × CELL_H`.
+const THUMB_W: u16 = 24;
+const THUMB_H: u16 = 11;
+const CELL_W: u16 = THUMB_W + 2;
+const CELL_H: u16 = THUMB_H + 2;
+/// Thumbnails decode to at most this many pixels on the long edge before encoding.
+const THUMB_PX: u32 = 320;
 
 /// Resolves a texture key (a pak virtual path) to the archive entry that holds
 /// it. Built during discovery from the readers it already opened, so reads are an
@@ -187,6 +197,24 @@ enum Slot {
 
 type Cache = Mutex<HashMap<usize, Slot>>;
 
+/// A grid thumbnail's decode state: in-flight, an encoded protocol ready to blit,
+/// or failed.
+enum Thumb {
+    Pending,
+    Ready(Protocol),
+    Failed,
+}
+
+type Thumbs = Mutex<HashMap<usize, Thumb>>;
+
+/// A request to decode thumbnails for a window of item indices at `size` (cells).
+/// `cancel` is tripped by the UI when the window moves, so a stale batch stops.
+struct ThumbReq {
+    items: Vec<usize>,
+    size: Size,
+    cancel: CancellationToken,
+}
+
 pub struct DdsBrowser {
     caps: Caps,
     /// Local snapshot of the discovered textures, grown from `catalog` on tick.
@@ -203,17 +231,28 @@ pub struct DdsBrowser {
     /// Item indices currently shown (the active filter applied to `order`).
     visible: Vec<usize>,
     selected: usize,
+    /// First grid row drawn (vertical scroll), in grid rows.
     offset: usize,
+    /// Grid columns from the last render (for 2-D navigation between frames).
+    cols: usize,
     filter: String,
     filtering: bool,
+    /// Whether the single-texture focus view is open (else the grid).
+    focused: bool,
     /// Selected surface (0=base, 1=alpha) for the focused texture.
     surface: usize,
     /// Selected mip level for the focused texture (clamped to its chain at render).
     mip: usize,
-    // Decode plumbing.
+    // Full-preview decode (focus view).
     cache: Arc<Cache>,
-    /// Sends a priority-ordered window of item indices to the decode worker.
     tx: SyncSender<Vec<usize>>,
+    // Thumbnail decode (grid).
+    thumbs: Arc<Thumbs>,
+    thumb_tx: SyncSender<ThumbReq>,
+    /// Cancels the in-flight thumbnail batch when the visible window changes.
+    thumb_cancel: CancellationToken,
+    /// The item-index window last requested, so we only re-decode (and cancel) on change.
+    requested: Vec<usize>,
     picker: Picker,
     /// The graphics protocol for the displayed (texture, surface, mip) — UI thread.
     protocol: Option<(usize, usize, usize, StatefulProtocol)>,
@@ -231,7 +270,10 @@ impl DdsBrowser {
         caps: Caps,
     ) -> Self {
         let cache: Arc<Cache> = Arc::new(Mutex::new(HashMap::new()));
-        let tx = spawn_decoder(catalog.clone(), store, runner, cache.clone());
+        let tx = spawn_decoder(catalog.clone(), store.clone(), runner.clone(), cache.clone());
+        let thumbs: Arc<Thumbs> = Arc::new(Mutex::new(HashMap::new()));
+        let thumb_tx =
+            spawn_thumb_decoder(catalog.clone(), store, runner, picker.clone(), thumbs.clone());
         let mut browser = Self {
             caps,
             items: Vec::new(),
@@ -242,19 +284,24 @@ impl DdsBrowser {
             visible: Vec::new(),
             selected: 0,
             offset: 0,
+            cols: 1,
             filter: String::new(),
             filtering: false,
+            focused: false,
             surface: 0,
             mip: 0,
             cache,
             tx,
+            thumbs,
+            thumb_tx,
+            thumb_cancel: CancellationToken::new(),
+            requested: Vec::new(),
             picker,
             protocol: None,
             status: None,
             result: None,
         };
         browser.ingest();
-        browser.request();
         browser
     }
 
@@ -300,25 +347,7 @@ impl DdsBrowser {
         self.visible.get(self.selected).copied()
     }
 
-    /// Queue the focused texture (first, so it lands soonest) plus the rows just
-    /// above/below it in view order, so scrolling pre-warms neighbours.
-    fn request(&self) {
-        if self.visible.is_empty() {
-            return;
-        }
-        let start = self.selected.saturating_sub(3);
-        let end = (self.selected + 12).min(self.visible.len());
-        let mut want = vec![self.visible[self.selected]];
-        for row in start..end {
-            if row != self.selected
-                && let Some(&item) = self.visible.get(row)
-            {
-                want.push(item);
-            }
-        }
-        let _ = self.tx.try_send(want);
-    }
-
+    /// Move the grid selection by `delta` (±1 to step, ±cols to change row).
     fn move_by(&mut self, delta: isize) {
         if self.visible.is_empty() {
             return;
@@ -326,17 +355,124 @@ impl DdsBrowser {
         let last = (self.visible.len() - 1) as isize;
         self.selected = (self.selected as isize).saturating_add(delta).clamp(0, last) as usize;
         self.status = None;
-        self.surface = 0;
-        self.mip = 0;
-        self.request();
     }
 
-    fn select(&mut self, row: usize) {
-        self.selected = row.min(self.visible.len().saturating_sub(1));
+    fn select(&mut self, index: usize) {
+        self.selected = index.min(self.visible.len().saturating_sub(1));
         self.status = None;
+    }
+
+    /// Open the focus view on the current texture and request its full decode.
+    fn focus(&mut self) {
+        if self.current_item().is_some() {
+            self.focused = true;
+            self.surface = 0;
+            self.mip = 0;
+            self.status = None;
+            self.request_preview();
+        }
+    }
+
+    /// Request a full-resolution preview decode of the focused texture.
+    fn request_preview(&self) {
+        if let Some(item) = self.current_item() {
+            let _ = self.tx.try_send(vec![item]);
+        }
+    }
+
+    /// Request thumbnail decodes for the visible grid `window`, cancelling the
+    /// previous batch. No-op when the window is unchanged, so a still grid keeps
+    /// decoding instead of being cancelled every frame; thumbnails outside the
+    /// window are evicted to bound memory.
+    fn request_thumbs(&mut self, window: Vec<usize>) {
+        if window == self.requested {
+            return;
+        }
+        self.thumb_cancel.cancel();
+        let cancel = CancellationToken::new();
+        self.thumb_cancel = cancel.clone();
+        let keep: HashSet<usize> = window.iter().copied().collect();
+        self.thumbs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|item, _| keep.contains(item));
+        let _ = self.thumb_tx.try_send(ThumbReq {
+            items: window.clone(),
+            size: Size::new(THUMB_W, THUMB_H),
+            cancel,
+        });
+        self.requested = window;
+    }
+
+    /// Reset the focus view to the newly-selected texture and request its decode.
+    fn refocus(&mut self) {
         self.surface = 0;
         self.mip = 0;
-        self.request();
+        self.status = None;
+        self.request_preview();
+    }
+
+    fn on_grid_key(&mut self, key: KeyEvent) -> Flow {
+        let cols = self.cols.max(1) as isize;
+        match key.code {
+            KeyCode::Char('q') => return Flow::Quit,
+            KeyCode::Esc => {
+                if self.filter.is_empty() {
+                    return Flow::Quit;
+                }
+                self.filter.clear();
+                self.rebuild();
+            }
+            KeyCode::Char('h') | KeyCode::Left => self.move_by(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.move_by(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_by(-cols),
+            KeyCode::Char('j') | KeyCode::Down => self.move_by(cols),
+            KeyCode::PageDown => self.move_by(cols * 4),
+            KeyCode::PageUp => self.move_by(-cols * 4),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_by(cols * 4);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_by(-cols * 4);
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.select(0),
+            KeyCode::Char('G') | KeyCode::End => self.select(self.visible.len().saturating_sub(1)),
+            KeyCode::Char('/') => self.filtering = true,
+            KeyCode::Char('y') => self.copy_path(),
+            KeyCode::Enter => self.focus(),
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    fn on_focus_key(&mut self, key: KeyEvent) -> Flow {
+        match key.code {
+            KeyCode::Char('q') => return Flow::Quit,
+            KeyCode::Esc => {
+                self.focused = false;
+                self.status = None;
+            }
+            KeyCode::Char('[') | KeyCode::Char(',') | KeyCode::Left => self.cycle_mip(-1),
+            KeyCode::Char(']') | KeyCode::Char('.') | KeyCode::Right => self.cycle_mip(1),
+            KeyCode::Char('a') | KeyCode::Tab => self.cycle_surface(1),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.move_by(1);
+                self.refocus();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.move_by(-1);
+                self.refocus();
+            }
+            KeyCode::Char('y') => self.copy_path(),
+            KeyCode::Enter => {
+                if let Some(item) = self.current_item() {
+                    self.result = Some(self.items[item].header.clone());
+                    return Flow::Quit;
+                }
+            }
+            _ => {}
+        }
+        Flow::Continue
     }
 
     /// The decoded preview for the focused texture, if ready.
@@ -395,27 +531,28 @@ impl View for DdsBrowser {
     }
 
     fn ticking(&self) -> bool {
-        // Keep ticking while discovery is still streaming in textures, or while the
-        // focused texture is still decoding.
+        // Keep redrawing while discovery streams textures in, or while anything
+        // on screen is still decoding (the focused preview, or grid thumbnails).
         if self.catalog.is_scanning() {
             return true;
         }
-        match self.current_item() {
-            Some(item) => {
-                let cache = self.cache.lock().unwrap();
-                !matches!(
-                    cache.get(&item),
-                    Some(Slot::Ready(_)) | Some(Slot::Failed(_))
-                )
-            }
-            None => false,
+        if self.focused {
+            return match self.current_item() {
+                Some(item) => {
+                    let cache = self.cache.lock().unwrap();
+                    !matches!(cache.get(&item), Some(Slot::Ready(_)) | Some(Slot::Failed(_)))
+                }
+                None => false,
+            };
         }
+        let thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
+        self.requested
+            .iter()
+            .any(|item| !matches!(thumbs.get(item), Some(Thumb::Ready(_)) | Some(Thumb::Failed)))
     }
 
     fn tick(&mut self) {
-        if self.ingest() {
-            self.request();
-        }
+        self.ingest();
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Flow {
@@ -425,64 +562,28 @@ impl View for DdsBrowser {
                     self.filter.clear();
                     self.filtering = false;
                     self.rebuild();
-                    self.request();
                 }
                 KeyCode::Enter => self.filtering = false,
                 KeyCode::Backspace => {
                     self.filter.pop();
                     self.rebuild();
-                    self.request();
                 }
                 KeyCode::Char(c) => {
                     self.filter.push(c);
                     self.rebuild();
-                    self.request();
                 }
                 _ => {}
             }
             return Flow::Continue;
         }
 
-        let page = 10;
-        match key.code {
-            KeyCode::Char('q') => return Flow::Quit,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Flow::Quit;
-            }
-            KeyCode::Esc => {
-                if self.filter.is_empty() {
-                    return Flow::Quit;
-                }
-                self.filter.clear();
-                self.rebuild();
-                self.request();
-            }
-            KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
-            KeyCode::PageDown => self.move_by(page),
-            KeyCode::PageUp => self.move_by(-page),
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => self.move_by(page),
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_by(-page)
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.select(0),
-            KeyCode::Char('G') | KeyCode::End => {
-                self.select(self.visible.len().saturating_sub(1))
-            }
-            KeyCode::Char('[') | KeyCode::Char(',') | KeyCode::Left => self.cycle_mip(-1),
-            KeyCode::Char(']') | KeyCode::Char('.') | KeyCode::Right => self.cycle_mip(1),
-            KeyCode::Char('a') | KeyCode::Tab => self.cycle_surface(1),
-            KeyCode::Char('/') => self.filtering = true,
-            KeyCode::Char('y') => self.copy_path(),
-            KeyCode::Enter => {
-                if let Some(item) = self.current_item() {
-                    self.result = Some(self.items[item].header.clone());
-                    return Flow::Quit;
-                }
-            }
-            _ => {}
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Flow::Quit;
         }
-        Flow::Continue
+        if self.focused {
+            return self.on_focus_key(key);
+        }
+        self.on_grid_key(key)
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -509,14 +610,11 @@ impl View for DdsBrowser {
             divider.width,
         );
 
-        // A path list on the left, a large viewport on the right — the point.
-        let list_width = ((u32::from(body.width) * 40 / 100) as u16).clamp(24, 64);
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(list_width), Constraint::Min(1)])
-            .split(body);
-        self.render_list(frame, columns[0]);
-        self.render_viewport(frame, columns[1]);
+        if self.focused {
+            self.render_focus(frame, body);
+        } else {
+            self.render_grid(frame, body);
+        }
         self.render_bottom(frame, bottom);
     }
 }
@@ -560,63 +658,89 @@ impl DdsBrowser {
         }
     }
 
-    fn render_list(&mut self, frame: &mut Frame, area: Rect) {
-        let height = area.height as usize;
-        if height == 0 || self.visible.is_empty() {
+    fn render_grid(&mut self, frame: &mut Frame, area: Rect) {
+        if self.visible.is_empty() {
+            let message = if self.catalog.is_scanning() {
+                "scanning…"
+            } else {
+                "no textures"
+            };
+            self.center_text(frame, area, message, theme::dim());
             return;
         }
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        } else if self.selected >= self.offset + height {
-            self.offset = self.selected + 1 - height;
+        if area.width < CELL_W || area.height < CELL_H {
+            return;
+        }
+        let cols = (area.width / CELL_W).max(1) as usize;
+        self.cols = cols;
+        let rows_visible = (area.height / CELL_H).max(1) as usize;
+
+        // Vertical scroll: keep the selected row in view.
+        let sel_row = self.selected / cols;
+        if sel_row < self.offset {
+            self.offset = sel_row;
+        } else if sel_row >= self.offset + rows_visible {
+            self.offset = sel_row + 1 - rows_visible;
         }
 
+        let start = self.offset * cols;
+        let end = (start + cols * rows_visible).min(self.visible.len());
+        let window: Vec<usize> = self.visible[start..end].to_vec();
+        self.request_thumbs(window.clone());
+
         let glyphs = theme::glyphs(self.caps);
-        let width = area.width as usize;
-        for slot in 0..height {
-            let row = self.offset + slot;
-            let Some(&item) = self.visible.get(row) else {
-                break;
+        let thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
+        for (slot, &item) in window.iter().enumerate() {
+            let grid_index = start + slot;
+            let col = (slot % cols) as u16;
+            let row = (slot / cols) as u16;
+            let cell_x = area.x + col * CELL_W;
+            let cell_y = area.y + row * CELL_H;
+            let img_area = Rect { x: cell_x + 1, y: cell_y, width: THUMB_W, height: THUMB_H };
+
+            match thumbs.get(&item) {
+                Some(Thumb::Ready(protocol)) => {
+                    let size = protocol.size();
+                    let w = size.width.min(THUMB_W);
+                    let h = size.height.min(THUMB_H);
+                    let rect = Rect {
+                        x: img_area.x + (THUMB_W - w) / 2,
+                        y: img_area.y + (THUMB_H - h) / 2,
+                        width: w,
+                        height: h,
+                    };
+                    frame.render_widget(Image::new(protocol), rect);
+                }
+                Some(Thumb::Failed) => self.center_text(frame, img_area, "✕", theme::bad()),
+                _ => self.center_text(frame, img_area, "·", theme::dim()),
+            }
+
+            // Filename label under the thumbnail; highlight the selected cell.
+            let name = self.items[item].label.rsplit('/').next().unwrap_or(&self.items[item].label);
+            let label = theme::fit_end(name, THUMB_W as usize, glyphs.ellipsis);
+            let label_y = cell_y + THUMB_H;
+            let selected = grid_index == self.selected;
+            let style = if selected {
+                theme::accent().add_modifier(Modifier::BOLD)
+            } else {
+                theme::dim()
             };
-            let y = area.y + slot as u16;
-            // Middle-ellipsize the full path so the directory and file both show.
-            let label = theme::fit_middle(&self.items[item].label, width, glyphs.ellipsis);
             frame
                 .buffer_mut()
-                .set_line(area.x, y, &Line::from(Span::raw(label)), area.width);
-            if row == self.selected {
-                let style = if self.caps.color {
-                    Style::default().bg(HILITE).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                };
+                .set_line(img_area.x, label_y, &Line::from(Span::styled(label, style)), THUMB_W);
+            if selected && self.caps.color {
                 let buf = frame.buffer_mut();
-                for x in area.x..area.right() {
-                    buf[(x, y)].set_style(style);
+                for x in img_area.x..img_area.x + THUMB_W {
+                    buf[(x, label_y)].set_bg(HILITE);
                 }
             }
         }
     }
 
-    fn render_viewport(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_focus(&mut self, frame: &mut Frame, area: Rect) {
         if area.width < 6 || area.height < 3 {
             return;
         }
-        // Vertical separator + gutter so the viewport doesn't touch the tree.
-        for y in area.y..area.bottom() {
-            frame.buffer_mut().set_line(
-                area.x,
-                y,
-                &Line::from(Span::styled("│", theme::dim())),
-                1,
-            );
-        }
-        let area = Rect {
-            x: area.x + 2,
-            width: area.width - 2,
-            ..area
-        };
-
         let Some(item) = self.current_item() else {
             self.center_text(frame, area, "select a texture", theme::dim());
             return;
@@ -715,7 +839,7 @@ impl DdsBrowser {
                 }
             }
             Some(Ok(_)) | None => {
-                self.request();
+                self.request_preview();
                 self.center_text(frame, spinner_area, "decoding…", theme::dim());
             }
             Some(Err(error)) => self.center_text(frame, spinner_area, &error, theme::bad()),
@@ -798,10 +922,11 @@ impl DdsBrowser {
         } else if let Some(status) = &self.status {
             Line::from(Span::styled(status.clone(), theme::dim()))
         } else {
-            let hint = if self.caps.unicode {
-                "↑↓ move   [ ] mip   a alpha   / filter   y copy   ⏎ select   q quit"
-            } else {
-                "up/dn move   [ ] mip   a alpha   / filter   y copy   enter select   q quit"
+            let hint = match (self.focused, self.caps.unicode) {
+                (false, true) => "↑↓←→ move   ⏎ open   / filter   y copy   q quit",
+                (false, false) => "arrows move   enter open   / filter   y copy   q quit",
+                (true, true) => "[ ] mip   a alpha   ↑↓ texture   ⏎ select   esc back   q quit",
+                (true, false) => "[ ] mip   a alpha   up/dn texture   enter select   esc back   q quit",
             };
             Line::from(Span::styled(hint.to_string(), theme::dim()))
         };
@@ -890,6 +1015,106 @@ fn decode_loop(
             guard.insert(index, slot);
         }
     }
+}
+
+fn spawn_thumb_decoder(
+    catalog: Arc<DdsCatalog>,
+    store: Arc<TextureStore>,
+    runner: JobRunner,
+    picker: Picker,
+    thumbs: Arc<Thumbs>,
+) -> SyncSender<ThumbReq> {
+    let (tx, rx) = sync_channel::<ThumbReq>(8);
+    std::thread::spawn(move || thumb_loop(&rx, &catalog, &store, &runner, &picker, &thumbs));
+    tx
+}
+
+/// Decode + encode grid thumbnails on a worker thread. Each request is a window
+/// of items at a cell size; the batch is cancellable (the UI trips the token when
+/// the window moves), and items are decoded straight out of the (still-growing)
+/// catalog as soon as they are discovered — never waiting for discovery to finish.
+fn thumb_loop(
+    rx: &Receiver<ThumbReq>,
+    catalog: &DdsCatalog,
+    store: &TextureStore,
+    runner: &JobRunner,
+    picker: &Picker,
+    thumbs: &Thumbs,
+) {
+    while let Ok(mut req) = rx.recv() {
+        // Coalesce to the most recent request so fast scrolling doesn't backlog.
+        while let Ok(next) = rx.try_recv() {
+            req = next;
+        }
+        if req.cancel.is_cancelled() {
+            continue;
+        }
+        // Claim the not-yet-decoded items, snapshotting their DdsItem out of the
+        // (growing) catalog so the decode holds no lock.
+        let todo: Vec<(usize, DdsItem)> = {
+            let mut guard = thumbs.lock().unwrap_or_else(|error| error.into_inner());
+            let mut todo = Vec::new();
+            for &item in &req.items {
+                if !guard.contains_key(&item)
+                    && let Some(dds) = catalog.item(item)
+                {
+                    guard.insert(item, Thumb::Pending);
+                    todo.push((item, dds));
+                }
+            }
+            todo
+        };
+        if todo.is_empty() {
+            continue;
+        }
+        let size = req.size;
+        let batch = runner.map_until_cancelled(&todo, &req.cancel, |(item, dds)| {
+            (*item, decode_thumbnail(store, dds, picker, size))
+        });
+        let mut guard = thumbs.lock().unwrap_or_else(|error| error.into_inner());
+        let mut done = HashSet::new();
+        for (item, result) in batch.into_completed() {
+            done.insert(item);
+            let slot = match result {
+                Ok(protocol) => Thumb::Ready(protocol),
+                Err(_) => Thumb::Failed,
+            };
+            guard.insert(item, slot);
+        }
+        // Items left Pending by a cancelled batch: drop them so they re-decode
+        // when next requested.
+        for (item, _) in &todo {
+            if !done.contains(item) {
+                guard.remove(item);
+            }
+        }
+    }
+}
+
+/// Decode a texture's top mip to a small thumbnail and encode it to a terminal
+/// graphics protocol sized to a grid cell — all off the UI thread.
+fn decode_thumbnail(
+    store: &TextureStore,
+    item: &DdsItem,
+    picker: &Picker,
+    size: Size,
+) -> Result<Protocol, String> {
+    let header = store.read(&item.header)?;
+    let mut sidecar_bytes = Vec::with_capacity(item.sidecars.len());
+    for (part, key) in &item.sidecars {
+        sidecar_bytes.push((*part, store.read(key)?));
+    }
+    let parts = sidecar_bytes
+        .iter()
+        .map(|(part, bytes)| nw_dds::Sidecar::new(*part, bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let decoded = nw_dds::decode_top_mip(&header, &parts).map_err(|error| error.to_string())?;
+    let image = RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)
+        .ok_or_else(|| "decoded texture had an unexpected size".to_string())?;
+    let dynamic = DynamicImage::ImageRgba8(downscale(image, THUMB_PX));
+    picker
+        .new_protocol(dynamic, size, Resize::Fit(None))
+        .map_err(|error| error.to_string())
 }
 
 /// Decode a texture's surfaces (base, and the attached alpha if present) and
