@@ -333,11 +333,42 @@ struct ExtractRow {
     path: String,
 }
 
+/// How a query string is matched against entry names/values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchMode {
+    /// Frizbee fuzzy ranking (the default).
+    Fuzzy,
+    /// Literal substring containment.
+    Substring { case_sensitive: bool },
+    /// Archive-style glob.
+    Glob,
+}
+
+impl MatchMode {
+    /// Resolve the mode from the search flags. Glob wins, then case-sensitive,
+    /// then `--exact`; otherwise fuzzy.
+    fn from_flags(glob: bool, case_sensitive: bool, exact: bool) -> Self {
+        if glob {
+            Self::Glob
+        } else if case_sensitive {
+            Self::Substring { case_sensitive: true }
+        } else if exact {
+            Self::Substring { case_sensitive: false }
+        } else {
+            Self::Fuzzy
+        }
+    }
+
+    const fn is_fuzzy(self) -> bool {
+        matches!(self, Self::Fuzzy)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TextQuery {
     raw: String,
     lowered: String,
-    case_sensitive: bool,
+    mode: MatchMode,
     glob: Option<GlobSet>,
 }
 
@@ -351,7 +382,6 @@ struct ObjectPayload {
 #[derive(Debug, Clone, Copy)]
 struct ObjectSearchOptions<'a> {
     query: &'a TextQuery,
-    fuzzy: bool,
     max_entry_size: u64,
     lookup: Option<&'a NameLookup>,
     selector: &'a PathSelector,
@@ -433,15 +463,15 @@ impl SearchPath {
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
         // Fuzzy ranking is the default; glob, case-sensitive, and --exact all
-        // select literal substring matching instead.
-        let fuzzy = !self.exact && !self.glob && !self.case_sensitive;
-        let query = TextQuery::new(self.query, self.case_sensitive, self.glob);
+        // select literal matching instead.
+        let mode = MatchMode::from_flags(self.glob, self.case_sensitive, self.exact);
+        let query = TextQuery::new(self.query, mode);
         let cancel = ctx.cancel.clone();
         let batch = ctx.map_results(
             "path search",
             paks.paths(),
             |path| paks.relative(path),
-            |path, progress| Self::scan_pak(&paks, path, &query, fuzzy, &cancel, &progress),
+            |path, progress| Self::scan_pak(&paks, path, &query, &cancel, &progress),
         );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
@@ -455,7 +485,7 @@ impl SearchPath {
             }
         }
 
-        if fuzzy {
+        if query.is_fuzzy() {
             rows.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
         } else {
             rows.sort();
@@ -492,14 +522,13 @@ impl SearchPath {
         paks: &PakSet,
         path: &Path,
         query: &TextQuery,
-        fuzzy: bool,
         cancel: &CancellationToken,
         progress: &Job,
     ) -> Result<Vec<PathHit>> {
         let pak = PakMmapReader::open(path)?;
         progress.set_len(pak.len());
         let pak_name = paks.relative(path);
-        let mut search = fuzzy.then(|| crate::fuzzy::Search::new(&query.raw));
+        let mut search = query.is_fuzzy().then(|| crate::fuzzy::Search::new(&query.raw));
         let mut rows = Vec::new();
 
         for entry in pak.entries() {
@@ -538,12 +567,16 @@ impl SearchObjectStream {
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
         let lookup = load_lookup(self.no_names)?;
-        let query = TextQuery::new(self.query, false, false);
+        let mode = if self.exact {
+            MatchMode::Substring { case_sensitive: false }
+        } else {
+            MatchMode::Fuzzy
+        };
+        let query = TextQuery::new(self.query, mode);
         let selector = PathSelector::new(self.filter, self.glob);
         let cancel = ctx.cancel.clone();
         let options = ObjectSearchOptions {
             query: &query,
-            fuzzy: !self.exact,
             max_entry_size: self.max_entry_size,
             lookup: lookup.as_ref(),
             selector: &selector,
@@ -623,7 +656,8 @@ impl SearchObjectStream {
         progress.set_len(pak.len());
         let pak_name = paks.relative(path);
         let mut search = options
-            .fuzzy
+            .query
+            .is_fuzzy()
             .then(|| crate::fuzzy::Search::new(&options.query.raw));
         let mut rows = Vec::new();
 
@@ -1127,23 +1161,29 @@ impl From<&InventoryStat> for InventoryRow {
 }
 
 impl TextQuery {
-    fn new(raw: String, case_sensitive: bool, glob: bool) -> Self {
+    fn new(raw: String, mode: MatchMode) -> Self {
         Self {
             lowered: raw.to_ascii_lowercase(),
-            glob: glob.then(|| GlobSet::archive(vec![raw.clone()])),
+            glob: matches!(mode, MatchMode::Glob)
+                .then(|| GlobSet::archive(vec![raw.clone()])),
             raw,
-            case_sensitive,
+            mode,
         }
     }
 
+    const fn is_fuzzy(&self) -> bool {
+        self.mode.is_fuzzy()
+    }
+
+    /// Literal (non-fuzzy) match. Fuzzy ranking is handled by the frizbee search,
+    /// not here.
     fn matches(&self, value: &str) -> bool {
-        if let Some(glob) = &self.glob {
-            return glob.matches(value);
-        }
-        if self.case_sensitive {
-            value.contains(&self.raw)
-        } else {
-            value.to_ascii_lowercase().contains(&self.lowered)
+        match self.mode {
+            MatchMode::Glob => self.glob.as_ref().is_some_and(|glob| glob.matches(value)),
+            MatchMode::Substring { case_sensitive: true } => value.contains(&self.raw),
+            MatchMode::Substring { case_sensitive: false } | MatchMode::Fuzzy => {
+                value.to_ascii_lowercase().contains(&self.lowered)
+            }
         }
     }
 
@@ -1337,9 +1377,11 @@ mod tests {
 
     #[test]
     fn path_query_supports_case_modes_and_globs() {
-        let insensitive = TextQuery::new("Player".to_string(), false, false);
-        let sensitive = TextQuery::new("Player".to_string(), true, false);
-        let glob = TextQuery::new("*/player.*".to_string(), false, true);
+        let insensitive =
+            TextQuery::new("Player".to_string(), MatchMode::Substring { case_sensitive: false });
+        let sensitive =
+            TextQuery::new("Player".to_string(), MatchMode::Substring { case_sensitive: true });
+        let glob = TextQuery::new("*/player.*".to_string(), MatchMode::Glob);
 
         assert!(insensitive.matches("slices/player.slice"));
         assert!(!sensitive.matches("slices/player.slice"));
