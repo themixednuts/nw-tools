@@ -7,6 +7,7 @@ mod jobs;
 mod model;
 mod pak;
 mod progress;
+mod source;
 mod support;
 mod tui;
 mod ui;

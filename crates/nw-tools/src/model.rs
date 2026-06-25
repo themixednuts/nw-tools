@@ -6,20 +6,16 @@
 //! source loads New World's asset catalog from `Engine.pak` to resolve each mesh's
 //! material by its MtlName GUID rather than guessing by file name.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use humansize::{DECIMAL, format_size};
 use image::ImageEncoder;
-use nw_asset::{AssetCatalog, AssetId, Raoc, Rasc};
-use nw_pak::PakMmapReader;
-use uuid::Uuid;
 
 use crate::jobs::{JobArgs, RunCtx};
-use crate::support::{PakSet, ScanIssues, collect_matching, path_ext};
+use crate::source::{self, Install};
+use crate::support::{ScanIssues, collect_matching, path_ext};
 use crate::ui::Report;
 
 /// Output container.
@@ -139,11 +135,9 @@ impl Model {
 
     /// Convert meshes straight out of the install's paks (+ asset catalog), parallel.
     fn export_install(&self, ctx: &RunCtx) -> Result<()> {
-        let install = nw_locator::Install::locate().context(
-            "no New World install found; pass a path, or run `nw-tools locate` to check detection",
-        )?;
+        let install = source::locate()?;
         let source = Install::open(ctx, &install.assets())?;
-        let meshes = source.meshes(self.filter.as_deref());
+        let meshes = source.paths_with_extensions(&["cgf", "skin"], self.filter.as_deref());
         if meshes.is_empty() {
             bail!("no matching meshes found in the install paks");
         }
@@ -335,55 +329,9 @@ fn cgf_submaterial_names(cgf: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The install's paks plus its asset catalog material map. `read` resolves a
-/// virtual path through the pak table-of-contents; `material_path` resolves a
-/// `MtlName` GUID to its `.mtl` path.
-///
-/// The material map (asset-id → `.mtl` path) is cached on disk and only rebuilt
-/// from the 365 MB catalog when `Engine.pak` changes (see [`crate::cache`]).
-struct Install {
-    toc: HashMap<String, (Arc<PakMmapReader>, usize)>,
-    materials: HashMap<String, String>,
-}
-
-impl Install {
-    fn open(ctx: &RunCtx, assets: &Path) -> Result<Self> {
-        let paks = PakSet::collect(assets.to_path_buf(), Vec::new())?;
-        if paks.paths().is_empty() {
-            bail!("no pak archives found in {}", assets.display());
-        }
-        let toc = build_toc(ctx, paks.paths());
-        let materials = load_material_map(ctx, assets, &toc)?;
-        Ok(Self { toc, materials })
-    }
-
-    /// Mesh asset paths (`.cgf`/`.skin`), optionally filtered by substring.
-    fn meshes(&self, filter: Option<&str>) -> Vec<String> {
-        let filter = filter.map(str::to_ascii_lowercase);
-        let mut meshes = self
-            .toc
-            .keys()
-            .filter(|key| key.ends_with(".cgf") || key.ends_with(".skin"))
-            .filter(|key| filter.as_ref().is_none_or(|f| key.contains(f.as_str())))
-            .cloned()
-            .collect::<Vec<_>>();
-        meshes.sort();
-        meshes
-    }
-}
-
-impl Install {
-    /// Resolve a MtlName-chunk GUID to its `.mtl` path via the cached catalog map.
-    fn material_path(&self, guid: &str) -> Option<String> {
-        let id = guid_to_asset_id(guid)?;
-        self.materials.get(&id.to_string()).cloned()
-    }
-}
-
 impl AssetSource for Install {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
-        let (reader, entry) = self.toc.get(&path.to_ascii_lowercase())?;
-        reader.read_wrapped_by_index(*entry).ok()
+        Install::read(self, path)
     }
 
     /// Resolve the material by the mesh's MtlName GUID through the catalog, falling
@@ -450,20 +398,6 @@ fn mtlname_guid(cgf: &[u8]) -> Option<String> {
         .map(|mtl| mtl.name.to_string())
 }
 
-/// Map a Cry MtlName GUID to a Lumberyard catalog [`AssetId`].
-///
-/// AzCore stores UUIDs as straight big-endian bytes (`Uuid::CreateName` →
-/// `from_be_bytes`), but the MtlName chunk records the GUID in Microsoft display
-/// form, where Data1/Data2/Data3 are little-endian. Reinterpreting those three
-/// fields (`swap_bytes`) yields the AZ-canonical UUID. A `.mtl` is a single-product
-/// source asset, so its product sub-id is 0.
-fn guid_to_asset_id(guid: &str) -> Option<AssetId> {
-    let uuid = Uuid::parse_str(guid.trim()).ok()?;
-    let (d1, d2, d3, d4) = uuid.as_fields();
-    let canonical = Uuid::from_fields(d1.swap_bytes(), d2.swap_bytes(), d3.swap_bytes(), d4);
-    Some(AssetId::new(canonical, 0))
-}
-
 /// Decode a referenced texture (`.tif` → `.dds`, split mips assembled) to PNG bytes.
 fn decode_texture(source: &dyn AssetSource, file: &str) -> Option<nw_model::TextureData> {
     let dds = tif_to_dds(file);
@@ -521,94 +455,6 @@ fn write_gltf(out: &Path, json: &str, blob: &[u8]) -> Result<usize> {
     std::fs::write(out, json.as_bytes()).with_context(|| format!("write {}", out.display()))?;
     std::fs::write(&bin, blob).with_context(|| format!("write {}", bin.display()))?;
     Ok(json.len() + blob.len())
-}
-
-/// Build the pak table of contents: every entry's virtual path → (reader, index),
-/// enumerated across all archives in parallel.
-fn build_toc(ctx: &RunCtx, pak_paths: &[PathBuf]) -> HashMap<String, (Arc<PakMmapReader>, usize)> {
-    let per_pak = ctx.runner.map(pak_paths, |path| {
-        let mut found = Vec::new();
-        if let Ok(reader) = PakMmapReader::open(path) {
-            let reader = Arc::new(reader);
-            for entry in reader.entries() {
-                found.push((entry.name().to_ascii_lowercase(), entry.index(), reader.clone()));
-            }
-        }
-        found
-    });
-    let mut toc = HashMap::new();
-    for list in per_pak {
-        for (name, entry, reader) in list {
-            toc.insert(name, (reader, entry));
-        }
-    }
-    toc
-}
-
-/// Load the catalog's material map (asset-id → `.mtl` path), reusing the on-disk
-/// cache when `Engine.pak` is unchanged and otherwise rebuilding it from the
-/// catalog.
-fn load_material_map(
-    ctx: &RunCtx,
-    assets: &Path,
-    toc: &HashMap<String, (Arc<PakMmapReader>, usize)>,
-) -> Result<HashMap<String, String>> {
-    let fingerprint = crate::cache::file_fingerprint(&assets.join("Engine.pak"));
-    let db_path = crate::cache::default_path();
-
-    // Fast path: reuse the cache while Engine.pak is unchanged.
-    if let Some(fp) = &fingerprint {
-        if let Ok(cache) = crate::cache::Cache::open(&db_path) {
-            if cache.fingerprint().as_ref() == Some(fp) {
-                let map = cache.material_map();
-                if !map.is_empty() {
-                    tracing::debug!("catalog material map: {} entries (cached)", map.len());
-                    return Ok(map);
-                }
-            }
-        }
-    }
-
-    // Rebuild from the catalog, then persist into a fresh cache file (replacing any
-    // stale one, so a game patch rebuilds cleanly).
-    let map = build_material_map(ctx, toc).context("load asset catalog from Engine.pak")?;
-    tracing::debug!("catalog material map: {} entries (rebuilt)", map.len());
-    if let Some(fp) = &fingerprint {
-        let _ = std::fs::remove_file(&db_path);
-        match crate::cache::Cache::open(&db_path).and_then(|cache| Ok(cache.store(fp, &map)?)) {
-            Ok(()) => {}
-            Err(error) => tracing::warn!("could not write catalog cache: {error}"),
-        }
-    }
-    Ok(map)
-}
-
-/// Parse the asset catalog from the pak TOC (rasc + raoc in parallel) and project
-/// it to the `.mtl` material map: `AssetId` string → asset path.
-fn build_material_map(
-    ctx: &RunCtx,
-    toc: &HashMap<String, (Arc<PakMmapReader>, usize)>,
-) -> Result<HashMap<String, String>> {
-    let read = |key: &str| -> Option<Vec<u8>> {
-        let (reader, entry) = toc.get(key)?;
-        reader.read_wrapped_by_index(*entry).ok()
-    };
-    let rasc_bytes = read(nw_asset::ASSET_CATALOG_PATH)
-        .context("assetcatalog.catalog not found in paks")?;
-    let raoc_bytes = read(nw_asset::ASSET_CATALOG_OPTIMIZED_PATH);
-
-    let (rasc, raoc) = ctx.runner.join(
-        || Rasc::parse(&rasc_bytes),
-        || raoc_bytes.as_deref().map(Raoc::parse).transpose(),
-    );
-    let catalog = AssetCatalog::new(rasc?, raoc?);
-
-    Ok(catalog
-        .entries()
-        .iter()
-        .filter(|entry| entry.path().ends_with(".mtl"))
-        .map(|entry| (entry.asset_id().to_string(), entry.path().to_string()))
-        .collect())
 }
 
 #[derive(Debug, Default, Clone, Copy)]
