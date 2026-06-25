@@ -729,7 +729,7 @@ fn rust_storage_override_for_field(
 
 pub(super) fn integrated_custom_field_type(source_name: &str) -> Option<&'static str> {
     match source_name {
-        "Amazon::Hub::ActorRef" => Some("crate::refs::ClientActorRef"),
+        "Amazon::Hub::ActorRef" => Some("crate::refs::HubActorRef"),
         "CritWindow" => Some("crate::combat::damage_receiver::messages::CritWindowData"),
         "HomePoint" => Some("crate::housing::player_home::HomePointReplicatedState"),
         "HomePointList" => Some(
@@ -815,7 +815,7 @@ mod tests {
 
         assert_eq!(
             rust_storage_override_for_field(RustCodegenMode::Integrated, &item, &field),
-            Some("crate::refs::ClientActorRef")
+            Some("crate::refs::HubActorRef")
         );
         assert_eq!(
             rust_storage_override_for_field(RustCodegenMode::Standalone, &item, &field),

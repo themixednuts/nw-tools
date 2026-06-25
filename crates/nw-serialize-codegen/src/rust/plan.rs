@@ -1404,7 +1404,7 @@ pub struct ExternalPayload;
             .expect("ClientRef plan");
         assert_eq!(
             client_ref.fields[0].rust_type,
-            "crate::refs::ClientActorRef"
+            "crate::refs::HubActorRef"
         );
         assert!(
             client_ref
