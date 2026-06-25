@@ -1262,6 +1262,21 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
             confidence: NetworkConfidence::High,
         });
     }
+    let mut native_type = string(field, "nativeType");
+    let mut wire_shape = wire_shape(field, "wireShape");
+    let mut wire_shape_source = string(field, "wireShapeSource");
+    let raw_byte_length = u32_value(field, "rawByteLength");
+    let helper_internal_conflict =
+        raw_byte_length_conflicts_with_wire_shape(raw_byte_length, wire_shape)
+            && wire_shape_source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("message-unmarshal-helper-"));
+    let raw_byte_length = consistent_raw_byte_length(raw_byte_length, wire_shape);
+    if helper_internal_conflict {
+        native_type = None;
+        wire_shape = None;
+        wire_shape_source = None;
+    }
     NetworkField {
         index: u32_value(field, "index"),
         name: string(field, "name"),
@@ -1270,16 +1285,43 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
         handler_offset: string(field, "handlerOffset"),
         handler_expression: string(field, "handlerExpression"),
         handler_vtable: string(field, "handlerVtable"),
-        native_type: string(field, "nativeType"),
+        native_type,
         rust_type: string(field, "rustType"),
         storage_expression: string(field, "storageExpression"),
         storage_offset: hex_or_decimal_u32(field, "storageOffset"),
-        raw_byte_length: u32_value(field, "rawByteLength"),
-        wire_shape: wire_shape(field, "wireShape"),
-        wire_shape_source: string(field, "wireShapeSource"),
+        raw_byte_length,
+        wire_shape,
+        wire_shape_source,
         callsite: string(field, "callsite"),
         confidence,
         evidence,
+    }
+}
+
+fn consistent_raw_byte_length(
+    raw_byte_length: Option<u32>,
+    wire_shape: Option<NetworkWireShape>,
+) -> Option<u32> {
+    let byte_length = raw_byte_length?;
+    if raw_byte_length_conflicts_with_wire_shape(raw_byte_length, wire_shape) {
+        None
+    } else {
+        Some(byte_length)
+    }
+}
+
+fn raw_byte_length_conflicts_with_wire_shape(
+    raw_byte_length: Option<u32>,
+    wire_shape: Option<NetworkWireShape>,
+) -> bool {
+    let Some(byte_length) = raw_byte_length else {
+        return false;
+    };
+    match wire_shape {
+        Some(NetworkWireShape::U8) => byte_length != 1,
+        Some(NetworkWireShape::FixedBytes(width)) => byte_length != u32::from(width),
+        Some(_) => true,
+        None => false,
     }
 }
 
@@ -1847,6 +1889,36 @@ mod tests {
             schema.field_handler_vtables[1].wire_shape,
             Some(NetworkWireShape::FixedBytes(16))
         );
+    }
+
+    #[test]
+    fn ignores_raw_byte_lengths_that_conflict_with_wire_shape() {
+        let conflict = json!({
+            "index": 0,
+            "name": "field_0",
+            "rawByteLength": 16,
+            "wireShape": "u64",
+            "wireShapeSource": "message-unmarshal-helper-nested-call",
+            "confidence": "message-unmarshal-helper-argument"
+        });
+        let field = network_field(conflict.as_object().expect("field object"));
+
+        assert_eq!(field.raw_byte_length, None);
+        assert_eq!(field.native_type, None);
+        assert_eq!(field.wire_shape, None);
+
+        let fixed = json!({
+            "index": 0,
+            "name": "field_0",
+            "rawByteLength": 16,
+            "wireShape": "fixed-bytes-16",
+            "wireShapeSource": "message-unmarshal-read-raw",
+            "confidence": "message-unmarshal-read-raw"
+        });
+        let field = network_field(fixed.as_object().expect("field object"));
+
+        assert_eq!(field.raw_byte_length, Some(16));
+        assert_eq!(field.wire_shape, Some(NetworkWireShape::FixedBytes(16)));
     }
 
     #[test]

@@ -40,7 +40,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
 public class NetworkSchemaExtractor extends GhidraScript {
-    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260625-readraw-message-pass";
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260625-helper-exact-pass";
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long QUEUE_REGISTRATION_HOOK_RVA = 0x61a95c0L;
@@ -1181,7 +1181,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
         }
         for (ParsedUnmarshalCall call : parseMarshalerUnmarshalCalls(helperText)) {
             String storage = storageArgumentForMarshalerCall(call);
-            String helperParam = helperParameterFromExpression(storage, fieldsByHelperParam);
+            String helperParam =
+                exactHelperParameterFromExpression(storage, fieldsByHelperParam);
             if (helperParam == null) {
                 continue;
             }
@@ -1193,7 +1194,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
         }
         for (ParsedUnmarshalCall call : parseDirectTypeUnmarshalCalls(helperText)) {
             String storage = storageArgumentForDirectUnmarshalCall(call);
-            String helperParam = helperParameterFromExpression(storage, fieldsByHelperParam);
+            String helperParam =
+                exactHelperParameterFromExpression(storage, fieldsByHelperParam);
             if (helperParam == null) {
                 continue;
             }
@@ -1205,7 +1207,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         }
         for (ParsedReadRawCall call : parseReadRawCalls(helperText)) {
             String helperParam =
-                helperParameterFromExpression(call.storageExpression, fieldsByHelperParam);
+                exactHelperParameterFromExpression(call.storageExpression, fieldsByHelperParam);
             if (helperParam == null) {
                 continue;
             }
@@ -2280,6 +2282,33 @@ public class NetworkSchemaExtractor extends GhidraScript {
             }
         }
         return null;
+    }
+
+    private String exactHelperParameterFromExpression(
+        String expression,
+        Map<String, FieldCall> fieldsByHelperParam) {
+
+        String value = normalizedExpression(expression);
+        if (value == null || fieldsByHelperParam.isEmpty()) {
+            return null;
+        }
+        String castStripped = stripSimpleCasts(value);
+        for (String helperParam : fieldsByHelperParam.keySet()) {
+            if (value.equals(helperParam) ||
+                castStripped.equals(helperParam) ||
+                value.matches("\\b" + Pattern.quote(helperParam) + "\\s*\\+\\s*0\\b") ||
+                castStripped.matches("\\b" + Pattern.quote(helperParam) + "\\s*\\+\\s*0\\b")) {
+                return helperParam;
+            }
+        }
+        return null;
+    }
+
+    private String stripSimpleCasts(String expression) {
+        if (expression == null) {
+            return "";
+        }
+        return expression.replaceAll("\\([^()]*\\)", "").trim();
     }
 
     private List<String> callArgumentsForTarget(String text, Function target) {
