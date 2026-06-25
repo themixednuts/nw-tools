@@ -13,7 +13,9 @@ use nw_pak::{Compression, EntryInfo, PakMmapReader, azcs, crypak, shape};
 use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
 use crate::progress::Job;
-use crate::support::{AssetRootArg, GlobSet, PakSet, PathSelector, ScanIssues, load_lookup};
+use crate::support::{
+    AssetRootArg, GlobSet, MatchMode, PakSet, PathSelector, ScanIssues, load_lookup,
+};
 use crate::ui::{Cell, Report, Table, theme};
 
 const DEFAULT_MAX_ENTRY_SIZE: u64 = 128 * 1024 * 1024;
@@ -331,37 +333,6 @@ struct ExtractRow {
     pak: String,
     size: String,
     path: String,
-}
-
-/// How a query string is matched against entry names/values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MatchMode {
-    /// Frizbee fuzzy ranking (the default).
-    Fuzzy,
-    /// Literal substring containment.
-    Substring { case_sensitive: bool },
-    /// Archive-style glob.
-    Glob,
-}
-
-impl MatchMode {
-    /// Resolve the mode from the search flags. Glob wins, then case-sensitive,
-    /// then `--exact`; otherwise fuzzy.
-    fn from_flags(glob: bool, case_sensitive: bool, exact: bool) -> Self {
-        if glob {
-            Self::Glob
-        } else if case_sensitive {
-            Self::Substring { case_sensitive: true }
-        } else if exact {
-            Self::Substring { case_sensitive: false }
-        } else {
-            Self::Fuzzy
-        }
-    }
-
-    const fn is_fuzzy(self) -> bool {
-        matches!(self, Self::Fuzzy)
-    }
 }
 
 #[derive(Debug, Clone)]

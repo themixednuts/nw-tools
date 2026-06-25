@@ -6,7 +6,7 @@ use clap::{Args, Subcommand};
 use humansize::{DECIMAL, format_size};
 
 use crate::jobs::JobArgs;
-use crate::support::{collect_matching, ensure_parent};
+use crate::support::{MatchMode, collect_matching, ensure_parent};
 use crate::ui::{Cell, Report, Table};
 
 use super::common::{csv_cell, finish_scan, lowered, path_label, text_matches};
@@ -140,7 +140,9 @@ impl CatalogSummary {
             &inputs,
             CatalogInput::label,
             |input, progress| {
-                progress.step(|| scan_catalog(&input.label(), &input.bytes()?, self.show, &[], false))
+                progress.step(|| {
+                    scan_catalog(&input.label(), &input.bytes()?, self.show, &[], MatchMode::Fuzzy)
+                })
             },
         );
         print_catalog_scans(batch, inputs.len(), "catalog")
@@ -152,13 +154,13 @@ impl CatalogFind {
         let ctx = self.jobs.ctx()?;
         let inputs = CatalogInput::collect(self.path.as_deref())?;
         let find = lowered(self.query);
-        let fuzzy = !self.exact;
+        let mode = MatchMode::from_flags(false, false, self.exact);
         let batch = ctx.map_results_compact(
             "catalog find",
             &inputs,
             CatalogInput::label,
             |input, progress| {
-                progress.step(|| scan_catalog(&input.label(), &input.bytes()?, self.show, &find, fuzzy))
+                progress.step(|| scan_catalog(&input.label(), &input.bytes()?, self.show, &find, mode))
             },
         );
         print_catalog_scans(batch, inputs.len(), "catalog find")
@@ -374,11 +376,12 @@ fn scan_catalog(
     bytes: &[u8],
     limit: usize,
     find: &[String],
-    fuzzy: bool,
+    mode: MatchMode,
 ) -> Result<CatalogScan> {
     let catalog = nw_asset::Catalog::parse(bytes).with_context(|| format!("parse {source}"))?;
     let source = source.to_string();
-    let mut search = (fuzzy && !find.is_empty()).then(|| crate::fuzzy::MultiSearch::new(find));
+    let mut search =
+        (mode.is_fuzzy() && !find.is_empty()).then(|| crate::fuzzy::MultiSearch::new(find));
 
     match catalog {
         nw_asset::Catalog::Rasc(catalog) => {

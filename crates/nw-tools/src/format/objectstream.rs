@@ -8,7 +8,9 @@ use nw_objectstream::ObjectStreamEncoding;
 use nw_objectstream::lookup::NameLookup;
 
 use crate::jobs::{JobArgs, RunCtx};
-use crate::support::{PathSelector, collect_matching, load_lookup, path_ext, write_guarded};
+use crate::support::{
+    MatchMode, PathSelector, collect_matching, load_lookup, path_ext, write_guarded,
+};
 use crate::ui::{Cell, Report, Table};
 
 use super::common::{EncodingArg, finish_scan, lowered, path_label, trim_cell};
@@ -151,7 +153,7 @@ impl ObjectStream {
             ObjectMode::Stats
         };
         let query = self.query.clone();
-        let fuzzy = !self.exact;
+        let match_mode = MatchMode::from_flags(false, false, self.exact);
         let batch = ctx.map_results_compact(
             "objectstream",
             &paths,
@@ -162,7 +164,7 @@ impl ObjectStream {
                         path,
                         mode,
                         query.as_deref(),
-                        fuzzy,
+                        match_mode,
                         self.show,
                         lookup.as_ref(),
                     )
@@ -284,7 +286,7 @@ fn scan_objectstream(
     path: &Path,
     mode: ObjectMode,
     query: Option<&str>,
-    fuzzy: bool,
+    match_mode: MatchMode,
     limit: usize,
     lookup: Option<&NameLookup>,
 ) -> Result<Option<ObjectScan>> {
@@ -297,7 +299,7 @@ fn scan_objectstream(
     let source = path.display().to_string();
     if let Some(query) = query {
         let needle = query.to_ascii_lowercase();
-        let mut search = fuzzy.then(|| crate::fuzzy::Search::new(query));
+        let mut search = match_mode.is_fuzzy().then(|| crate::fuzzy::Search::new(query));
         let hits =
             nw_objectstream::query::collect_search_matches(
                 &bytes,

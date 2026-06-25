@@ -193,6 +193,39 @@ pub fn path_ext(path: &Path) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// How a query string is matched against text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchMode {
+    /// Frizbee fuzzy ranking (the default).
+    Fuzzy,
+    /// Literal substring containment.
+    Substring { case_sensitive: bool },
+    /// Archive-style glob.
+    Glob,
+}
+
+impl MatchMode {
+    /// Resolve the mode from search flags. Glob wins, then case-sensitive, then
+    /// `--exact`; otherwise fuzzy.
+    #[must_use]
+    pub fn from_flags(glob: bool, case_sensitive: bool, exact: bool) -> Self {
+        if glob {
+            Self::Glob
+        } else if case_sensitive {
+            Self::Substring { case_sensitive: true }
+        } else if exact {
+            Self::Substring { case_sensitive: false }
+        } else {
+            Self::Fuzzy
+        }
+    }
+
+    #[must_use]
+    pub const fn is_fuzzy(self) -> bool {
+        matches!(self, Self::Fuzzy)
+    }
+}
+
 /// What to do when an output file already exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overwrite {
