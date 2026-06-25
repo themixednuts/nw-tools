@@ -210,11 +210,12 @@ impl Dds {
             .stat("install", &source)
             .stat("textures", items.len())
             .stat("shown", items.len().min(self.show));
-        let mut table = Table::new(["Texture", "Mips"]).right([1]);
+        let mut table = Table::new(["Texture", "Frames", "Mips"]).right([1, 2]);
         for item in items.iter().take(self.show) {
             table.push([
                 Cell::path(item.label.clone()),
-                Cell::text(item.sidecars.len().to_string()),
+                Cell::text(item.frames.len().to_string()),
+                Cell::text(item.frame(0).sidecars.len().to_string()),
             ]);
         }
         report.table_or(table, "no DDS textures to show");
@@ -269,11 +270,13 @@ fn discover_pak(path: &Path, catalog: &crate::tui::DdsCatalog, index: &crate::tu
                 index.insert(name, (reader.clone(), entry));
             }
         }
-        // Group within the pak — a texture's header and split mips ship together.
-        if let Ok(items) = group_dds_items(classified, |header| header.to_string())
-            && !items.is_empty()
-        {
-            catalog.extend(items);
+        // Group within the pak — a texture's header and split mips ship together,
+        // and X_NN.dds frames into one sprite entry.
+        if let Ok(items) = group_dds_items(classified, |header| header.to_string()) {
+            let items = group_sprites(items);
+            if !items.is_empty() {
+                catalog.extend(items);
+            }
         }
     }
     catalog.mark_pak_done();
@@ -402,7 +405,7 @@ fn dds_browser_items_fs(ctx: &RunCtx, root: &Path) -> Result<Vec<crate::tui::Dds
         .try_map(&paths, |path| -> Result<(nw_dds::SplitPart, String)> {
             Ok((split_part_for_path(path)?, path.to_string_lossy().into_owned()))
         })?;
-    let mut items = group_dds_items(classified, |header| relative_label(root, header))?;
+    let mut items = group_sprites(group_dds_items(classified, |header| relative_label(root, header))?);
     items.sort_by(|left, right| left.label.cmp(&right.label));
     Ok(items)
 }
@@ -421,7 +424,7 @@ fn dds_browser_items_pak(
         .filter_map(|name| nw_dds::SplitPart::from_path(name).map(|part| (part, name.to_string())))
         .collect::<Vec<_>>();
 
-    let mut items = group_dds_items(classified, |header| header.to_string())?;
+    let mut items = group_sprites(group_dds_items(classified, |header| header.to_string())?);
     items.sort_by(|left, right| left.label.cmp(&right.label));
     Ok((items, toc.into_entries()))
 }
@@ -468,14 +471,57 @@ fn group_dds_items(
                     sidecars: group.alpha_mips,
                 }
             });
-            crate::tui::DdsItem {
-                label: label(&base),
+            let frame = crate::tui::DdsFrame {
                 header: group.base_header.unwrap_or_else(|| base.clone()),
                 sidecars: group.base_mips,
                 alpha,
-            }
+            };
+            crate::tui::DdsItem::single(label(&base), frame)
         })
         .collect())
+}
+
+/// Collapse `X_NN.dds` frame sequences (≥2 frames) into one animatable sprite
+/// entry; everything else passes through unchanged. Frames are co-located in a
+/// pak, so this runs per-pak after [`group_dds_items`].
+fn group_sprites(items: Vec<crate::tui::DdsItem>) -> Vec<crate::tui::DdsItem> {
+    use std::collections::BTreeMap;
+    // base label -> (frame number, item)
+    let mut sprites: BTreeMap<String, Vec<(u32, crate::tui::DdsItem)>> = BTreeMap::new();
+    let mut passthrough = Vec::new();
+    for item in items {
+        match sprite_base(&item.label) {
+            Some((base, number)) => sprites.entry(base).or_default().push((number, item)),
+            None => passthrough.push(item),
+        }
+    }
+    let mut out = passthrough;
+    for (base, mut group) in sprites {
+        if group.len() < 2 {
+            // A lone `_NN` is just a regular texture.
+            out.extend(group.into_iter().map(|(_, item)| item));
+            continue;
+        }
+        group.sort_by_key(|(number, _)| *number);
+        let frames = group
+            .into_iter()
+            .flat_map(|(_, item)| item.frames)
+            .collect::<Vec<_>>();
+        out.push(crate::tui::DdsItem { label: format!("{base}_*.dds"), frames });
+    }
+    out
+}
+
+/// Split a `.dds` label into its sprite base and frame number, if it ends in
+/// `_<digits>` (e.g. `fx/spark_00.dds` → (`fx/spark`, 0)).
+fn sprite_base(label: &str) -> Option<(String, u32)> {
+    let stem = label.strip_suffix(".dds")?;
+    let (base, digits) = stem.rsplit_once('_')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let number = digits.parse().ok()?;
+    Some((base.to_string(), number))
 }
 
 /// Resolve the base texture key (`foo.dds`) for any DDS part — base or attached

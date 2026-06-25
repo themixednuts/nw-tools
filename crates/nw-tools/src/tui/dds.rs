@@ -155,17 +155,45 @@ impl DdsCatalog {
     }
 }
 
-/// One logical texture: a DDS header plus its ordered split-mip sidecars. Keys
-/// are filesystem paths or pak virtual paths, resolved through a [`TextureStore`].
+/// One frame of a texture: its DDS header path, split sidecars, and optional
+/// attached-alpha surface. A standalone texture is a single frame; a sprite
+/// sequence (`X_NN.dds`) has several.
 #[derive(Clone)]
-pub struct DdsItem {
-    /// Display label (relative path, forward slashes).
-    pub label: String,
+pub struct DdsFrame {
     pub header: String,
     pub sidecars: Vec<(nw_dds::SplitPart, String)>,
     /// The attached-alpha surface (`.dds.a` header + `.dds.Na` mips), if present —
     /// a second image of the same texture (gloss/opacity), viewable on its own.
     pub alpha: Option<AlphaSurface>,
+}
+
+/// A browser entry: a single texture, or a sprite sequence shown as one
+/// animatable entry (its `X_NN.dds` frames grouped into `frames`).
+#[derive(Clone)]
+pub struct DdsItem {
+    /// Display label (relative path, forward slashes).
+    pub label: String,
+    /// One or more frames; more than one means an animated sprite.
+    pub frames: Vec<DdsFrame>,
+}
+
+impl DdsItem {
+    /// A single-frame entry.
+    #[must_use]
+    pub fn single(label: String, frame: DdsFrame) -> Self {
+        Self { label, frames: vec![frame] }
+    }
+
+    /// The frame at `index`, wrapping — for animation.
+    #[must_use]
+    pub fn frame(&self, index: usize) -> &DdsFrame {
+        &self.frames[index % self.frames.len().max(1)]
+    }
+
+    #[must_use]
+    pub fn is_sprite(&self) -> bool {
+        self.frames.len() > 1
+    }
 }
 
 /// The attached-alpha companion surface of a [`DdsItem`].
@@ -621,7 +649,7 @@ impl DdsBrowser {
             KeyCode::Char('y') => self.copy_path(),
             KeyCode::Enter => {
                 if let Some(item) = self.current_item() {
-                    self.result = Some(self.items[item].header.clone());
+                    self.result = Some(self.items[item].frame(0).header.clone());
                     return Flow::Quit;
                 }
             }
@@ -673,7 +701,7 @@ impl DdsBrowser {
     /// Toggle a directory; on a file, do nothing (handled as "open" elsewhere).
     fn copy_path(&mut self) {
         if let Some(item) = self.current_item() {
-            let path = self.items[item].header.clone();
+            let path = self.items[item].frame(0).header.clone();
             self.status = Some(match set_clipboard(&path) {
                 Ok(()) => format!("copied {path}"),
                 Err(error) => format!("copy failed: {error}"),
@@ -911,8 +939,15 @@ impl DdsBrowser {
             }
 
             // Filename label under the thumbnail; highlight the selected cell.
-            let name = self.items[item].label.rsplit('/').next().unwrap_or(&self.items[item].label);
-            let label = theme::fit_end(name, thumb_w as usize, glyphs.ellipsis);
+            let entry = &self.items[item];
+            let name = entry.label.rsplit('/').next().unwrap_or(&entry.label);
+            // Mark sprites (animated sequences) with a play glyph + frame count.
+            let name = if entry.is_sprite() {
+                format!("▶{} {name}", entry.frames.len())
+            } else {
+                name.to_string()
+            };
+            let label = theme::fit_end(&name, thumb_w as usize, glyphs.ellipsis);
             let label_y = cell_y + thumb_h;
             let selected = grid_index == self.selected;
             let style = if selected {
@@ -1190,7 +1225,7 @@ fn decode_loop(
             continue;
         }
         let batch = runner.map_until_cancelled(&todo, &req.cancel, |(index, item)| {
-            (*index, decode_item(store, item))
+            (*index, decode_item(store, &item.label, item.frame(0)))
         });
         let mut guard = cache.lock().unwrap();
         let mut done = HashSet::new();
@@ -1303,13 +1338,14 @@ fn decode_thumbnail(
     // The header read is cheap and identifies the texture's content; key the disk
     // cache on its hash so an unchanged DDS reuses the cached thumbnail (even after
     // a game patch). A hit skips the sidecar reads + DDS decode.
-    let header = store.read(&item.header)?;
+    let frame = item.frame(0);
+    let header = store.read(&frame.header)?;
     let key = fnv1a(&header);
     let image = match cache.load(key) {
         Some(image) => image,
         None => {
             let decoded = nw_dds::decode_mip_max(&header, THUMB_CACHE_PX, |part| {
-                item.sidecars.iter().find(|(p, _)| *p == part).and_then(|(_, key)| store.read(key).ok())
+                frame.sidecars.iter().find(|(p, _)| *p == part).and_then(|(_, key)| store.read(key).ok())
             })
             .map_err(|error| error.to_string())?;
             let decoded = RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)
@@ -1327,15 +1363,15 @@ fn decode_thumbnail(
 /// Decode a texture's surfaces (base, and the attached alpha if present) and
 /// gather its metadata. Runs on a worker. The base must decode; a failing alpha
 /// surface is simply omitted rather than failing the whole texture.
-fn decode_item(store: &TextureStore, item: &DdsItem) -> Result<Preview, String> {
-    let header_bytes = store.read(&item.header)?;
-    let meta = read_meta(&item.label, &header_bytes);
+fn decode_item(store: &TextureStore, label: &str, frame: &DdsFrame) -> Result<Preview, String> {
+    let header_bytes = store.read(&frame.header)?;
+    let meta = read_meta(label, &header_bytes);
 
     let mut surfaces = vec![Surface {
         name: "base",
-        mips: decode_chain(store, &item.header, &item.sidecars)?,
+        mips: decode_chain(store, &frame.header, &frame.sidecars)?,
     }];
-    if let Some(alpha) = &item.alpha
+    if let Some(alpha) = &frame.alpha
         && let Ok(mips) = decode_chain(store, &alpha.header, &alpha.sidecars)
         && !mips.is_empty()
     {

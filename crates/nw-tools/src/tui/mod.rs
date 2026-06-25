@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use app::View;
 use datasheet::DatasheetView;
-pub use dds::{AlphaSurface, DdsCatalog, DdsItem, PakIndex, SharedIndex, TextureStore, shared_index};
+pub use dds::{
+    AlphaSurface, DdsCatalog, DdsFrame, DdsItem, PakIndex, SharedIndex, TextureStore, shared_index,
+};
 use dds::DdsBrowser;
 use nw_jobs::JobRunner;
 use ratatui_image::picker::Picker;
