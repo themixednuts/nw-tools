@@ -16,9 +16,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Clear;
 use ratatui_image::picker::Picker;
-use ratatui_image::protocol::{Protocol, StatefulProtocol};
-use ratatui_image::{Image, Resize, StatefulImage};
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 
 use nw_jobs::{CancellationToken, JobRunner};
 
@@ -40,6 +41,9 @@ const MAX_COLS: u16 = 6;
 /// Thumbnails decode to at most this many pixels on the long edge before encoding,
 /// which is plenty to fill a grid cell crisply.
 const THUMB_PX: u32 = 512;
+/// Keep this many decoded thumbnails before evicting (oldest off-screen first), so
+/// scrolling back doesn't re-decode what was just viewed.
+const THUMB_CACHE_CAP: usize = 1024;
 
 /// Resolves a texture key (a pak virtual path) to the archive entry that holds
 /// it. Built during discovery from the readers it already opened, so reads are an
@@ -206,7 +210,13 @@ enum Thumb {
     Failed,
 }
 
-type Thumbs = Mutex<HashMap<usize, Thumb>>;
+/// The thumbnail cache: item index → (last-used clock, state). The clock drives
+/// LRU eviction so decoded thumbnails survive scrolling away (and switching to the
+/// focus view) and are only dropped, oldest-off-screen first, past a memory cap.
+type Thumbs = Mutex<HashMap<usize, (u64, Thumb)>>;
+
+/// Identifies the focus-view protocol: (item, surface, mip, area width, area height).
+type FocusKey = (usize, usize, usize, u16, u16);
 
 /// A request to decode thumbnails for a window of item indices at `size` (cells).
 /// `cancel` is tripped by the UI when the window moves, so a stale batch stops.
@@ -257,9 +267,12 @@ pub struct DdsBrowser {
     thumb_cancel: CancellationToken,
     /// The item-index window last requested, so we only re-decode (and cancel) on change.
     requested: Vec<usize>,
+    /// Monotonic clock stamped onto thumbnails as they're shown, for LRU eviction.
+    clock: u64,
     picker: Picker,
-    /// The graphics protocol for the displayed (texture, surface, mip) — UI thread.
-    protocol: Option<(usize, usize, usize, StatefulProtocol)>,
+    /// The encoded protocol for the focused (texture, surface, mip) at a given
+    /// image-area size — rebuilt only when that key changes.
+    protocol: Option<(FocusKey, Protocol)>,
     status: Option<String>,
     result: Option<String>,
 }
@@ -301,6 +314,7 @@ impl DdsBrowser {
             thumb_tx,
             thumb_cancel: CancellationToken::new(),
             requested: Vec::new(),
+            clock: 0,
             picker,
             protocol: None,
             status: None,
@@ -396,13 +410,31 @@ impl DdsBrowser {
         self.thumb_cancel.cancel();
         let cancel = CancellationToken::new();
         self.thumb_cancel = cancel.clone();
-        let keep: HashSet<usize> = window.iter().copied().collect();
-        self.thumbs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|item, _| keep.contains(item));
+        self.evict_thumbs(&window);
         let _ = self.thumb_tx.try_send(ThumbReq { items: window.clone(), size: self.cell, cancel });
         self.requested = window;
+    }
+
+    /// Bound the thumbnail cache: only when it exceeds the cap, drop the
+    /// least-recently-shown thumbnails that aren't currently visible. Off-screen
+    /// and other-screen thumbnails are kept until that pressure point, so moving
+    /// around never forces a re-decode of what was just viewed.
+    fn evict_thumbs(&self, window: &[usize]) {
+        let mut thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
+        if thumbs.len() <= THUMB_CACHE_CAP {
+            return;
+        }
+        let keep: HashSet<usize> = window.iter().copied().collect();
+        let mut evictable: Vec<(u64, usize)> = thumbs
+            .iter()
+            .filter(|(item, _)| !keep.contains(item))
+            .map(|(item, (used, _))| (*used, *item))
+            .collect();
+        evictable.sort_unstable();
+        let excess = thumbs.len() - THUMB_CACHE_CAP;
+        for (_, item) in evictable.into_iter().take(excess) {
+            thumbs.remove(&item);
+        }
     }
 
     /// Reset the focus view to the newly-selected texture and request its decode.
@@ -547,9 +579,12 @@ impl View for DdsBrowser {
             };
         }
         let thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
-        self.requested
-            .iter()
-            .any(|item| !matches!(thumbs.get(item), Some(Thumb::Ready(_)) | Some(Thumb::Failed)))
+        self.requested.iter().any(|item| {
+            !matches!(
+                thumbs.get(item).map(|(_, state)| state),
+                Some(Thumb::Ready(_)) | Some(Thumb::Failed)
+            )
+        })
     }
 
     fn tick(&mut self) {
@@ -611,6 +646,10 @@ impl View for DdsBrowser {
             divider.width,
         );
 
+        // Wipe the body so graphics-protocol image cells from the previous frame
+        // (a scrolled-off thumbnail, or the grid when switching to focus) don't
+        // leave residue behind the new content.
+        frame.render_widget(Clear, body);
         if self.focused {
             self.render_focus(frame, body);
         } else {
@@ -707,8 +746,10 @@ impl DdsBrowser {
         let window: Vec<usize> = self.visible[start..end].to_vec();
         self.request_thumbs(window.clone());
 
+        self.clock = self.clock.wrapping_add(1);
+        let now = self.clock;
         let glyphs = theme::glyphs(self.caps);
-        let thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
+        let mut thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
         for (slot, &item) in window.iter().enumerate() {
             let grid_index = start + slot;
             let col = (slot % cols) as u16;
@@ -717,21 +758,27 @@ impl DdsBrowser {
             let cell_y = area.y + row * cell_h;
             let img_area = Rect { x: cell_x + 1, y: cell_y, width: thumb_w, height: thumb_h };
 
-            match thumbs.get(&item) {
-                Some(Thumb::Ready(protocol)) => {
-                    let size = protocol.size();
-                    let w = size.width.min(thumb_w);
-                    let h = size.height.min(thumb_h);
-                    let rect = Rect {
-                        x: img_area.x + (thumb_w - w) / 2,
-                        y: img_area.y + (thumb_h - h) / 2,
-                        width: w,
-                        height: h,
-                    };
-                    frame.render_widget(Image::new(protocol), rect);
+            match thumbs.get_mut(&item) {
+                Some(entry) => {
+                    entry.0 = now; // mark recently shown for LRU
+                    match &entry.1 {
+                        Thumb::Ready(protocol) => {
+                            let size = protocol.size();
+                            let w = size.width.min(thumb_w);
+                            let h = size.height.min(thumb_h);
+                            let rect = Rect {
+                                x: img_area.x + (thumb_w - w) / 2,
+                                y: img_area.y + (thumb_h - h) / 2,
+                                width: w,
+                                height: h,
+                            };
+                            frame.render_widget(Image::new(protocol), rect);
+                        }
+                        Thumb::Failed => self.center_text(frame, img_area, "✕", theme::bad()),
+                        Thumb::Pending => self.center_text(frame, img_area, "·", theme::dim()),
+                    }
                 }
-                Some(Thumb::Failed) => self.center_text(frame, img_area, "✕", theme::bad()),
-                _ => self.center_text(frame, img_area, "·", theme::dim()),
+                None => self.center_text(frame, img_area, "·", theme::dim()),
             }
 
             // Filename label under the thumbnail; highlight the selected cell.
@@ -846,18 +893,29 @@ impl DdsBrowser {
                 if image_area.height == 0 {
                     return;
                 }
-                let key = (item, surface_index, mip);
-                if self.protocol.as_ref().map(|(it, su, mp, _)| (*it, *su, *mp)) != Some(key) {
+                // Encode the mip to fill the image area, then blit it centered, so
+                // it's centered regardless of mip level (no top-left jump).
+                let key: FocusKey = (item, surface_index, mip, image_area.width, image_area.height);
+                if self.protocol.as_ref().map(|(existing, _)| *existing) != Some(key) {
                     let dynamic = DynamicImage::ImageRgba8(level.image.clone());
-                    self.protocol = Some((item, surface_index, mip, self.picker.new_resize_protocol(dynamic)));
+                    let size = Size::new(image_area.width, image_area.height);
+                    self.protocol = self
+                        .picker
+                        .new_protocol(dynamic, size, Resize::Fit(None))
+                        .ok()
+                        .map(|protocol| (key, protocol));
                 }
-                // Anchor the display rect to the full (largest) mip so cycling mip
-                // levels keeps the image the same size and centered — not jumping.
-                let font = self.picker.font_size();
-                let base = surface.mips.first().unwrap_or(level);
-                let rect = centered_image_rect(image_area, base.width, base.height, font);
-                if let Some((_, _, _, protocol)) = self.protocol.as_mut() {
-                    frame.render_stateful_widget(StatefulImage::default(), rect, protocol);
+                if let Some((_, protocol)) = &self.protocol {
+                    let size = protocol.size();
+                    let w = size.width.min(image_area.width);
+                    let h = size.height.min(image_area.height);
+                    let rect = Rect {
+                        x: image_area.x + (image_area.width - w) / 2,
+                        y: image_area.y + (image_area.height - h) / 2,
+                        width: w,
+                        height: h,
+                    };
+                    frame.render_widget(Image::new(protocol), rect);
                 }
             }
             Some(Ok(_)) | None => {
@@ -958,33 +1016,6 @@ impl DdsBrowser {
     }
 }
 
-/// Center an image inside `area`, preserving aspect. Converts the image's pixel
-/// dimensions to terminal cells using the detected font size, fits to the area,
-/// then centers the resulting rectangle.
-fn centered_image_rect(
-    area: Rect,
-    width: u32,
-    height: u32,
-    font: ratatui_image::FontSize,
-) -> Rect {
-    let font_w = f32::from(font.width.max(1));
-    let font_h = f32::from(font.height.max(1));
-    let cells_w = width as f32 / font_w;
-    let cells_h = height as f32 / font_h;
-    if cells_w <= 0.0 || cells_h <= 0.0 {
-        return area;
-    }
-    let scale = (f32::from(area.width) / cells_w).min(f32::from(area.height) / cells_h);
-    let w = ((cells_w * scale).round() as u16).clamp(1, area.width);
-    let h = ((cells_h * scale).round() as u16).clamp(1, area.height);
-    Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height - h) / 2,
-        width: w,
-        height: h,
-    }
-}
-
 fn spawn_decoder(
     catalog: Arc<DdsCatalog>,
     store: Arc<TextureStore>,
@@ -1080,7 +1111,7 @@ fn thumb_loop(
                 if !guard.contains_key(&item)
                     && let Some(dds) = catalog.item(item)
                 {
-                    guard.insert(item, Thumb::Pending);
+                    guard.insert(item, (0, Thumb::Pending));
                     todo.push((item, dds));
                 }
             }
@@ -1089,24 +1120,26 @@ fn thumb_loop(
         if todo.is_empty() {
             continue;
         }
+        // `todo` is in display order; rayon starts it in order and each thumbnail
+        // is published the instant it decodes, so the grid fills progressively
+        // (roughly top-to-bottom) instead of all at once after the slowest one.
         let size = req.size;
-        let batch = runner.map_until_cancelled(&todo, &req.cancel, |(item, dds)| {
-            (*item, decode_thumbnail(store, dds, picker, size))
-        });
-        let mut guard = thumbs.lock().unwrap_or_else(|error| error.into_inner());
-        let mut done = HashSet::new();
-        for (item, result) in batch.into_completed() {
-            done.insert(item);
-            let slot = match result {
+        runner.map_until_cancelled(&todo, &req.cancel, |(item, dds)| {
+            let state = match decode_thumbnail(store, dds, picker, size) {
                 Ok(protocol) => Thumb::Ready(protocol),
                 Err(_) => Thumb::Failed,
             };
-            guard.insert(item, slot);
-        }
+            let mut guard = thumbs.lock().unwrap_or_else(|error| error.into_inner());
+            // Only publish if still the in-flight entry (not evicted/superseded).
+            if matches!(guard.get(item), Some((_, Thumb::Pending))) {
+                guard.insert(*item, (0, state));
+            }
+        });
         // Items left Pending by a cancelled batch: drop them so they re-decode
         // when next requested.
+        let mut guard = thumbs.lock().unwrap_or_else(|error| error.into_inner());
         for (item, _) in &todo {
-            if !done.contains(item) {
+            if matches!(guard.get(item), Some((_, Thumb::Pending))) {
                 guard.remove(item);
             }
         }
@@ -1121,16 +1154,10 @@ fn decode_thumbnail(
     picker: &Picker,
     size: Size,
 ) -> Result<Protocol, String> {
+    // Thumbnails decode only the header file's mip — no large split-sidecar reads,
+    // and a small mip — which is plenty for a grid cell and keeps it fast.
     let header = store.read(&item.header)?;
-    let mut sidecar_bytes = Vec::with_capacity(item.sidecars.len());
-    for (part, key) in &item.sidecars {
-        sidecar_bytes.push((*part, store.read(key)?));
-    }
-    let parts = sidecar_bytes
-        .iter()
-        .map(|(part, bytes)| nw_dds::Sidecar::new(*part, bytes.as_slice()))
-        .collect::<Vec<_>>();
-    let decoded = nw_dds::decode_top_mip(&header, &parts).map_err(|error| error.to_string())?;
+    let decoded = nw_dds::decode_header_mip(&header).map_err(|error| error.to_string())?;
     let image = RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)
         .ok_or_else(|| "decoded texture had an unexpected size".to_string())?;
     let dynamic = DynamicImage::ImageRgba8(downscale(image, THUMB_PX));

@@ -10,7 +10,8 @@ use std::path::Path;
 use thiserror::Error;
 
 pub use container::{
-    DecodedImage, Error as Ktx2Error, Ktx2, Sidecar, decode_all_mips, decode_top_mip,
+    DecodedImage, Error as Ktx2Error, Ktx2, Sidecar, decode_all_mips, decode_header_mip,
+    decode_top_mip,
 };
 
 pub const DDS_EXTENSION: &str = "dds";

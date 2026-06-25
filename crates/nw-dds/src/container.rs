@@ -200,6 +200,44 @@ pub fn decode_all_mips<'a>(
     Ok(images)
 }
 
+/// Decode the largest mip that lives in the DDS header file itself — the
+/// persistent (smallest) mips for a split texture, or the whole image for a
+/// non-split one — *without reading any split sidecars*.
+///
+/// This is the cheap path for thumbnails: no large sidecar reads, and only a small
+/// mip is decoded. For a full-resolution image use [`decode_top_mip`].
+///
+/// # Errors
+///
+/// Returns [`Error`] when the DDS is invalid or the header mip cannot be decoded.
+pub fn decode_header_mip(bytes: &[u8]) -> Result<DecodedImage, Error> {
+    let dds = Dds::parse(bytes)?;
+    let texture = Texture::from_dds(&dds)?;
+    let payload = dds.payload(bytes).ok_or(Error::PayloadSize {
+        expected: u64::try_from(dds.payload_bytes()).unwrap_or(u64::MAX),
+        actual: bytes.len().saturating_sub(DDS_FILE_HEADER_LEN),
+    })?;
+    let sizes = texture.level_sizes()?;
+    let mipmaps = sizes.len();
+    // For a split texture the header holds the persistent (smallest) mips, at the
+    // tail of the chain; for a non-split texture it holds the whole chain.
+    let start_level = if dds.is_split() {
+        let persistent = usize::from(dds.header().persistent_mips()).min(mipmaps);
+        mipmaps.saturating_sub(persistent)
+    } else {
+        0
+    };
+    let chain = slice_chain(payload, &sizes[start_level..], start_level)?;
+    let blocks = chain.first().copied().ok_or(Error::UnsupportedShape {
+        reason: "header has no mip levels",
+    })?;
+    let level = u32::try_from(start_level).unwrap_or(0);
+    let width = mip_extent(texture.width, level).max(1);
+    let height = mip_extent(texture.height, level).max(1);
+    let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
+    Ok(DecodedImage { width, height, rgba })
+}
+
 fn decode_rgba(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Error> {
     let pixels = width.checked_mul(height).ok_or(Error::SizeOverflow {
         what: "image dimensions",
