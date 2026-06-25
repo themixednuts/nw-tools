@@ -1,0 +1,138 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "id": "d93f9035-e638-43da-8bb9-2ee09892a629",
+  "prevIds": [
+    "00000000-0000-0000-0000-000000000000"
+  ],
+  "ddl": [
+    {
+      "entityType": "tables",
+      "name": "catalog"
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "asset_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "path",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "asset_type",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "size",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "catalog",
+      "name": "catalog_pkey",
+      "columns": [
+        "asset_id"
+      ],
+      "nameExplicit": false
+    },
+    {
+      "entityType": "tables",
+      "name": "meta"
+    },
+    {
+      "entityType": "columns",
+      "table": "meta",
+      "name": "key",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "meta",
+      "name": "value",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "meta",
+      "name": "meta_pkey",
+      "columns": [
+        "key"
+      ],
+      "nameExplicit": false
+    },
+    {
+      "entityType": "tables",
+      "name": "guid"
+    },
+    {
+      "entityType": "columns",
+      "table": "guid",
+      "name": "guid",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "guid",
+      "name": "path",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "guid",
+      "name": "guid_pkey",
+      "columns": [
+        "guid"
+      ],
+      "nameExplicit": false
+    }
+  ],
+  "renames": []
+}

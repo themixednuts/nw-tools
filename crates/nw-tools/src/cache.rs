@@ -1,10 +1,11 @@
-//! On-disk cache (SQLite via `drizzle`) for the asset catalog's material map.
+//! On-disk cache (SQLite via `drizzle`) for the asset catalog (its RASC table).
 //!
 //! Parsing New World's 365 MB asset catalog out of `Engine.pak` costs ~12 s per
-//! run. The catalog only changes when the game updates, so we parse it once,
-//! persist the `MtlName`-GUID → `.mtl`-path map, and on later runs load that map
-//! straight from SQLite — gated on a fingerprint of `Engine.pak` so a game patch
-//! transparently rebuilds it.
+//! run. The catalog only changes when the game updates, so we parse the RASC
+//! catalog once and persist it — both the full `AssetId → path/type/size` index
+//! (for `asset`/`format catalog` lookups) and the derived `.mtl` material map
+//! (for `format model`). On later runs both load straight from SQLite, gated on a
+//! fingerprint of `Engine.pak` so a game patch transparently rebuilds them.
 //!
 //! The migration set is generated from the [`Schema`] below by `build.rs` (see
 //! `drizzle-migrations`) and embedded at compile time via
@@ -17,6 +18,26 @@ use drizzle::migrations::Tracking;
 use drizzle::sqlite::connection::SQLiteTransactionType;
 use drizzle::sqlite::prelude::*;
 use drizzle::sqlite::rusqlite::Drizzle;
+
+/// One RASC catalog entry: its `AssetId` string (`{GUID}:subid`), virtual path,
+/// AZ asset-type string, and asset size in bytes.
+#[derive(Debug, Clone)]
+pub struct CatalogRecord {
+    pub asset_id: String,
+    pub path: String,
+    pub asset_type: String,
+    pub size: i64,
+}
+
+/// Full RASC catalog index, keyed by `AssetId` string.
+#[SQLiteTable]
+pub struct Catalog {
+    #[column(primary)]
+    pub asset_id: String,
+    pub path: String,
+    pub asset_type: String,
+    pub size: i64,
+}
 
 /// Catalog material map: asset-id string (`{GUID}:subid`) → `.mtl` asset path.
 #[SQLiteTable]
@@ -36,6 +57,7 @@ pub struct Meta {
 
 #[derive(SQLiteSchema)]
 pub struct Schema {
+    pub catalog: Catalog,
     pub guid: Guid,
     pub meta: Meta,
 }
@@ -52,9 +74,11 @@ PRAGMA synchronous = NORMAL;
 PRAGMA temp_store = MEMORY;
 PRAGMA mmap_size = 268435456;";
 
-/// SQLite is capped at 999 bound parameters per statement; [`Guid`] binds two
-/// columns per row, so this many rows is the largest safe multi-row insert.
-const INSERT_CHUNK: usize = 400;
+/// SQLite is capped at 999 bound parameters per statement. [`Guid`] binds two
+/// columns per row and [`Catalog`] four, so these are the largest safe multi-row
+/// inserts for each.
+const GUID_CHUNK: usize = 400;
+const CATALOG_CHUNK: usize = 240;
 
 /// The catalog material cache, backed by a migrated SQLite database.
 pub struct Cache {
@@ -81,7 +105,6 @@ impl Cache {
     /// # Errors
     ///
     /// Returns an error if the database cannot be created or a migration fails.
-    #[cfg(test)]
     pub fn open_in_memory() -> anyhow::Result<Self> {
         Ok(Self::migrated(rusqlite::Connection::open_in_memory()?)?)
     }
@@ -117,28 +140,66 @@ impl Cache {
             .unwrap_or_default()
     }
 
-    /// Replace the material map and record the fingerprint that produced it.
+    /// Load the full RASC catalog index into memory.
+    #[must_use]
+    pub fn catalog_records(&self) -> Vec<CatalogRecord> {
+        let Schema { catalog, .. } = Schema::new();
+        self.db
+            .select(())
+            .from(catalog)
+            .all()
+            .map(|rows: Vec<SelectCatalog>| {
+                rows.into_iter()
+                    .map(|row| CatalogRecord {
+                        asset_id: row.asset_id,
+                        path: row.path,
+                        asset_type: row.asset_type,
+                        size: row.size,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Replace the catalog index (and its derived `.mtl` material map) and record
+    /// the fingerprint that produced it — all in one transaction.
     ///
     /// # Errors
     ///
     /// Returns an error if any insert fails.
-    pub fn store(&mut self, fingerprint: &str, map: &HashMap<String, String>) -> drizzle::Result<()> {
-        let Schema { guid, meta } = Schema::new();
-        let entries = map.iter().collect::<Vec<_>>();
-        self.db
-            .transaction(SQLiteTransactionType::Deferred, |tx| {
-                for chunk in entries.chunks(INSERT_CHUNK) {
-                    let rows = chunk
-                        .iter()
-                        .map(|(g, p)| InsertGuid::new(g.as_str(), p.as_str()))
-                        .collect::<Vec<_>>();
-                    tx.insert(guid).values(rows).execute()?;
-                }
-                tx.insert(meta)
-                    .value(InsertMeta::new(FINGERPRINT_KEY, fingerprint))
-                    .execute()?;
-                Ok(())
-            })
+    pub fn store(&mut self, fingerprint: &str, records: &[CatalogRecord]) -> drizzle::Result<()> {
+        let Schema { catalog, guid, meta } = Schema::new();
+        let materials = records
+            .iter()
+            .filter(|record| record.path.ends_with(".mtl"))
+            .collect::<Vec<_>>();
+        self.db.transaction(SQLiteTransactionType::Deferred, |tx| {
+            for chunk in records.chunks(CATALOG_CHUNK) {
+                let rows = chunk
+                    .iter()
+                    .map(|record| {
+                        InsertCatalog::new(
+                            record.asset_id.as_str(),
+                            record.path.as_str(),
+                            record.asset_type.as_str(),
+                            record.size,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                tx.insert(catalog).values(rows).execute()?;
+            }
+            for chunk in materials.chunks(GUID_CHUNK) {
+                let rows = chunk
+                    .iter()
+                    .map(|record| InsertGuid::new(record.asset_id.as_str(), record.path.as_str()))
+                    .collect::<Vec<_>>();
+                tx.insert(guid).values(rows).execute()?;
+            }
+            tx.insert(meta)
+                .value(InsertMeta::new(FINGERPRINT_KEY, fingerprint))
+                .execute()?;
+            Ok(())
+        })
     }
 }
 
@@ -172,16 +233,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn store_and_reload_map() {
+    fn store_indexes_catalog_and_derives_material_map() {
         let mut cache = Cache::open_in_memory().unwrap();
         assert!(cache.fingerprint().is_none());
 
-        let mut map = HashMap::new();
-        map.insert("{ABC}:0".to_string(), "objects/foo_mat.mtl".to_string());
-        map.insert("{DEF}:0".to_string(), "objects/bar_mat.mtl".to_string());
-        cache.store("123:456", &map).unwrap();
+        let records = vec![
+            CatalogRecord {
+                asset_id: "{ABC}:0".to_string(),
+                path: "objects/foo_mat.mtl".to_string(),
+                asset_type: "{MTL}".to_string(),
+                size: 10,
+            },
+            CatalogRecord {
+                asset_id: "{DEF}:0".to_string(),
+                path: "objects/foo_mesh.cgf".to_string(),
+                asset_type: "{MESH}".to_string(),
+                size: 20,
+            },
+        ];
+        cache.store("123:456", &records).unwrap();
 
         assert_eq!(cache.fingerprint().as_deref(), Some("123:456"));
-        assert_eq!(cache.material_map(), map);
+        assert_eq!(cache.catalog_records().len(), 2);
+
+        // Only the `.mtl` entry is projected into the material map.
+        let map = cache.material_map();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("{ABC}:0").map(String::as_str), Some("objects/foo_mat.mtl"));
     }
 }

@@ -12,10 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use nw_asset::{AssetCatalog, AssetId, Raoc, Rasc};
+use nw_asset::{AssetId, Rasc};
 use nw_pak::PakMmapReader;
 use uuid::Uuid;
 
+use crate::cache::{Cache, CatalogRecord};
 use crate::jobs::RunCtx;
 use crate::support::PakSet;
 
@@ -71,7 +72,7 @@ impl Install {
             bail!("no pak archives found in {}", assets.display());
         }
         let toc = build_toc(ctx, paks.paths());
-        let materials = load_material_map(ctx, assets, &toc)?;
+        let materials = ensure_catalog_cache(assets)?.material_map();
         Ok(Self { toc, materials })
     }
 
@@ -131,67 +132,100 @@ fn build_toc(ctx: &RunCtx, pak_paths: &[PathBuf]) -> HashMap<String, (Arc<PakMma
     toc
 }
 
-/// Load the catalog's material map (asset-id → `.mtl` path), reusing the on-disk
-/// cache when `Engine.pak` is unchanged and otherwise rebuilding it.
-fn load_material_map(
-    ctx: &RunCtx,
-    assets: &Path,
-    toc: &HashMap<String, (Arc<PakMmapReader>, usize)>,
-) -> Result<HashMap<String, String>> {
-    let fingerprint = crate::cache::file_fingerprint(&assets.join("Engine.pak"));
+/// What the catalog knows about one asset, for enriching a pak entry.
+#[derive(Debug, Clone)]
+pub struct AssetInfo {
+    pub asset_id: String,
+}
+
+/// The RASC catalog indexed by virtual path, for enriching pak entries with their
+/// catalog identity.
+pub struct CatalogIndex {
+    by_path: HashMap<String, AssetInfo>,
+}
+
+impl CatalogIndex {
+    fn from_records(records: Vec<CatalogRecord>) -> Self {
+        let by_path = records
+            .into_iter()
+            .map(|record| {
+                (record.path.to_ascii_lowercase(), AssetInfo { asset_id: record.asset_id })
+            })
+            .collect();
+        Self { by_path }
+    }
+
+    /// The catalog identity of a virtual path, if any.
+    #[must_use]
+    pub fn info(&self, path: &str) -> Option<&AssetInfo> {
+        self.by_path.get(&path.to_ascii_lowercase())
+    }
+}
+
+/// Load the install's RASC catalog index (path → `AssetId`/type), from cache when
+/// `Engine.pak` is unchanged.
+///
+/// # Errors
+///
+/// Returns an error if `Engine.pak` cannot be read or the catalog cannot be parsed.
+pub fn catalog_index(assets: &Path) -> Result<CatalogIndex> {
+    Ok(CatalogIndex::from_records(ensure_catalog_cache(assets)?.catalog_records()))
+}
+
+/// Ensure the RASC catalog cache is current for `assets`, rebuilding it from
+/// `Engine.pak` when the fingerprint changed, and return the opened cache.
+///
+/// The cache is replaced wholesale on a rebuild (a fresh file), so re-storing can
+/// never collide with stale rows; the fingerprint row is written last in the same
+/// transaction, so its presence means the rebuild committed.
+fn ensure_catalog_cache(assets: &Path) -> Result<Cache> {
+    // The leading version forces a rebuild when the cached projection's shape
+    // changes, even if Engine.pak itself is unchanged.
+    let fingerprint = crate::cache::file_fingerprint(&assets.join("Engine.pak"))
+        .map(|fp| format!("v2:{fp}"));
     let db_path = crate::cache::default_path();
 
     // Fast path: reuse the cache while Engine.pak is unchanged.
     if let Some(fp) = &fingerprint
-        && let Ok(cache) = crate::cache::Cache::open(&db_path)
+        && let Ok(cache) = Cache::open(&db_path)
         && cache.fingerprint().as_ref() == Some(fp)
     {
-        let map = cache.material_map();
-        if !map.is_empty() {
-            tracing::debug!("catalog material map: {} entries (cached)", map.len());
-            return Ok(map);
-        }
+        return Ok(cache);
     }
 
-    // Rebuild from the catalog, then persist into a fresh cache file (replacing any
-    // stale one, so a game patch rebuilds cleanly).
-    let map = build_material_map(ctx, toc).context("load asset catalog from Engine.pak")?;
-    tracing::debug!("catalog material map: {} entries (rebuilt)", map.len());
-    if let Some(fp) = &fingerprint {
-        let _ = std::fs::remove_file(&db_path);
-        match crate::cache::Cache::open(&db_path).and_then(|mut cache| Ok(cache.store(fp, &map)?)) {
-            Ok(()) => {}
-            Err(error) => tracing::warn!("could not write catalog cache: {error}"),
+    // Rebuild from Engine.pak's RASC catalog.
+    let (rasc_bytes, _raoc) = install_catalog_bytes(assets)?;
+    let records = build_catalog_records(&rasc_bytes)?;
+    tracing::debug!("catalog index: {} entries (rebuilt)", records.len());
+
+    match &fingerprint {
+        Some(fp) => {
+            let _ = std::fs::remove_file(&db_path);
+            let mut cache = Cache::open(&db_path)?;
+            cache.store(fp, &records)?;
+            Ok(cache)
+        }
+        // Can't fingerprint Engine.pak (rare) — serve this run from a transient cache.
+        None => {
+            let mut cache = Cache::open_in_memory()?;
+            cache.store("transient", &records)?;
+            Ok(cache)
         }
     }
-    Ok(map)
 }
 
-/// Parse the asset catalog from the pak TOC (rasc + raoc in parallel) and project
-/// it to the `.mtl` material map: `AssetId` string → asset path.
-fn build_material_map(
-    ctx: &RunCtx,
-    toc: &HashMap<String, (Arc<PakMmapReader>, usize)>,
-) -> Result<HashMap<String, String>> {
-    let read = |key: &str| -> Option<Vec<u8>> {
-        let (reader, entry) = toc.get(key)?;
-        reader.read_wrapped_by_index(*entry).ok()
-    };
-    let rasc_bytes =
-        read(nw_asset::ASSET_CATALOG_PATH).context("assetcatalog.catalog not found in paks")?;
-    let raoc_bytes = read(nw_asset::ASSET_CATALOG_OPTIMIZED_PATH);
-
-    let (rasc, raoc) = ctx.runner.join(
-        || Rasc::parse(&rasc_bytes),
-        || raoc_bytes.as_deref().map(Raoc::parse).transpose(),
-    );
-    let catalog = AssetCatalog::new(rasc?, raoc?);
-
-    Ok(catalog
+/// Parse the RASC catalog and project every entry to a [`CatalogRecord`].
+fn build_catalog_records(rasc_bytes: &[u8]) -> Result<Vec<CatalogRecord>> {
+    let rasc = Rasc::parse(rasc_bytes).context("parse asset catalog (rasc) from Engine.pak")?;
+    Ok(rasc
         .entries()
         .iter()
-        .filter(|entry| entry.path().ends_with(".mtl"))
-        .map(|entry| (entry.asset_id().to_string(), entry.path().to_string()))
+        .map(|entry| CatalogRecord {
+            asset_id: entry.asset_id().to_string(),
+            path: entry.path().to_string(),
+            asset_type: entry.asset_type().to_string(),
+            size: i64::from(entry.size_bytes()),
+        })
         .collect())
 }
 

@@ -13,6 +13,7 @@ use nw_pak::{Compression, EntryInfo, PakMmapReader, azcs, crypak, shape};
 use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
 use crate::progress::Job;
+use crate::source::{self, CatalogIndex};
 use crate::support::{
     AssetRootArg, GlobSet, MatchMode, PakSet, PathSelector, ScanIssues, load_lookup,
 };
@@ -100,6 +101,11 @@ pub struct SearchPath {
     /// Exact substring match instead of the default fuzzy ranking.
     #[arg(long)]
     exact: bool,
+
+    /// Resolve each hit's catalog AssetId (adds a GUID column) and let the query
+    /// match a GUID. Loads the asset catalog, so it is slower than a plain search.
+    #[arg(long)]
+    catalog: bool,
 
     #[arg(long, default_value_t = 100)]
     show: usize,
@@ -303,6 +309,8 @@ struct PathHit {
     method: String,
     size: String,
     name: String,
+    /// Catalog `AssetId` for this path (`-` when absent / no catalog).
+    asset_id: String,
     /// Fuzzy match score (0 in exact mode); higher ranks first.
     score: u16,
 }
@@ -432,6 +440,9 @@ impl SearchPath {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
         let root = self.root.resolve()?;
+        // Opt-in: --catalog enriches each hit with its AssetId and lets the query
+        // match a GUID. Best-effort — absent for non-install roots.
+        let catalog = self.catalog.then(|| source::catalog_index(&root).ok()).flatten();
         let paks = PakSet::collect(root, self.paks)?;
         // Fuzzy ranking is the default; glob, case-sensitive, and --exact all
         // select literal matching instead.
@@ -442,7 +453,7 @@ impl SearchPath {
             "path search",
             paks.paths(),
             |path| paks.relative(path),
-            |path, progress| Self::scan_pak(&paks, path, &query, &cancel, &progress),
+            |path, progress| Self::scan_pak(&paks, path, &query, catalog.as_ref(), &cancel, &progress),
         );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
@@ -469,14 +480,22 @@ impl SearchPath {
             ("matched".to_string(), matched.to_string()),
             ("shown".to_string(), rows.len().to_string()),
         ];
-        let mut table = Table::new(["Pak", "Method", "Size", "Name"]).right([2]);
+        let mut headers = vec!["Pak", "Method", "Size", "Name"];
+        if catalog.is_some() {
+            headers.push("GUID");
+        }
+        let mut table = Table::new(headers).right([2]);
         for row in rows {
-            table.push([
+            let mut cells = vec![
                 Cell::path(row.pak),
                 Cell::method(row.method),
                 Cell::size(row.size),
                 Cell::path(row.name),
-            ]);
+            ];
+            if catalog.is_some() {
+                cells.push(Cell::text(row.asset_id));
+            }
+            table.push(cells);
         }
         if theme::caps().interactive && !table.is_empty() {
             crate::tui::browse("asset search path", stats, table, 3)?;
@@ -493,6 +512,7 @@ impl SearchPath {
         paks: &PakSet,
         path: &Path,
         query: &TextQuery,
+        catalog: Option<&CatalogIndex>,
         cancel: &CancellationToken,
         progress: &Job,
     ) -> Result<Vec<PathHit>> {
@@ -507,13 +527,16 @@ impl SearchPath {
                 break;
             }
             progress.inc(1);
+            let info = catalog.and_then(|catalog| catalog.info(entry.name()));
             let score = match &mut search {
                 Some(search) => match search.score(entry.name()) {
                     Some(score) => score,
                     None => continue,
                 },
                 None => {
-                    if !query.matches(entry.name()) {
+                    // Literal mode also matches the catalog GUID, so an AssetId query resolves.
+                    let guid_match = info.is_some_and(|info| query.matches(&info.asset_id));
+                    if !query.matches(entry.name()) && !guid_match {
                         continue;
                     }
                     0
@@ -524,6 +547,7 @@ impl SearchPath {
                 method: entry.compression().to_string(),
                 size: format_size(entry.uncompressed_size(), DECIMAL),
                 name: entry.name().to_string(),
+                asset_id: info.map_or_else(|| "-".to_string(), |info| info.asset_id.clone()),
                 score,
             });
         }
