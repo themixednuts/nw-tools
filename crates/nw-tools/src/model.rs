@@ -15,7 +15,7 @@ use image::ImageEncoder;
 
 use crate::jobs::{JobArgs, RunCtx};
 use crate::source::{self, Install};
-use crate::support::{ScanIssues, collect_matching, path_ext};
+use crate::support::{ScanIssues, collect_matching, ensure_parent, guard_existing, path_ext};
 use crate::ui::Report;
 
 /// Output container.
@@ -86,7 +86,7 @@ impl Model {
             .out
             .clone()
             .unwrap_or_else(|| path.with_extension(self.format.extension()));
-        self.guard_existing(&out)?;
+        guard_existing(&out, self.overwrite.into())?;
         let cgf = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         let heap = std::fs::read(heap_sibling(path)).unwrap_or_default();
         let mtl_override = self
@@ -122,8 +122,8 @@ impl Model {
                     let source = Tree::around(path);
                     let relative = path.strip_prefix(dir).unwrap_or(path);
                     let out = out_dir.join(relative).with_extension(self.format.extension());
-                    self.guard_existing(&out)?;
-                    create_parent(&out)?;
+                    guard_existing(&out, self.overwrite.into())?;
+                    ensure_parent(&out)?;
                     let cgf = std::fs::read(path)?;
                     let heap = std::fs::read(heap_sibling(path)).unwrap_or_default();
                     self.convert(&source, &cgf, &heap, &MeshRef::for_file(path), None, &out)
@@ -150,8 +150,8 @@ impl Model {
             |key, progress| {
                 progress.step(|| {
                     let out = out_dir.join(key).with_extension(self.format.extension());
-                    self.guard_existing(&out)?;
-                    create_parent(&out)?;
+                    guard_existing(&out, self.overwrite.into())?;
+                    ensure_parent(&out)?;
                     let cgf = source.read(key).with_context(|| format!("read {key}"))?;
                     let heap = source.read(&format!("{key}heap")).unwrap_or_default();
                     self.convert(&source, &cgf, &heap, &MeshRef::for_key(key), None, &out)
@@ -159,13 +159,6 @@ impl Model {
             },
         );
         report_batch(&batch.into_completed(), install.assets().display().to_string())
-    }
-
-    fn guard_existing(&self, out: &Path) -> Result<()> {
-        if out.exists() && !self.overwrite {
-            bail!("{} exists (pass --overwrite to replace it)", out.display());
-        }
-        Ok(())
     }
 
     /// The shared conversion: assemble the model, resolve materials/textures via the
@@ -518,14 +511,6 @@ fn tif_to_dds(file: &str) -> String {
         }
         _ => file.to_string(),
     }
-}
-
-fn create_parent(out: &Path) -> Result<()> {
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    Ok(())
 }
 
 fn display_path(path: &Path) -> String {

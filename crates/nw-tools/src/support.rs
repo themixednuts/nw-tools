@@ -193,6 +193,59 @@ pub fn path_ext(path: &Path) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// What to do when an output file already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overwrite {
+    /// Replace the existing file.
+    Replace,
+    /// Keep it and refuse to write.
+    Keep,
+}
+
+impl From<bool> for Overwrite {
+    /// Maps a `--overwrite` flag: `true` ⇒ [`Overwrite::Replace`].
+    fn from(replace: bool) -> Self {
+        if replace { Self::Replace } else { Self::Keep }
+    }
+}
+
+/// Refuse to clobber `path` under [`Overwrite::Keep`].
+///
+/// # Errors
+///
+/// Returns an error if the file exists and `overwrite` is [`Overwrite::Keep`].
+pub fn guard_existing(path: &Path, overwrite: Overwrite) -> Result<()> {
+    if overwrite == Overwrite::Keep && path.exists() {
+        bail!("{} exists (pass --overwrite to replace it)", path.display());
+    }
+    Ok(())
+}
+
+/// Create `path`'s parent directory if it has one.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be created.
+pub fn ensure_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `path`, guarding against clobber and creating parent dirs.
+///
+/// # Errors
+///
+/// Returns an error if `path` exists under [`Overwrite::Keep`], the parent cannot
+/// be created, or the write fails.
+pub fn write_guarded(path: &Path, bytes: &[u8], overwrite: Overwrite) -> Result<()> {
+    guard_existing(path, overwrite)?;
+    ensure_parent(path)?;
+    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 fn collect_matching_inner(
     path: &Path,
     keep: impl Fn(&Path) -> bool + Copy,

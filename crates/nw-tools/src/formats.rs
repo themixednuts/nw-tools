@@ -18,7 +18,10 @@ use nw_objectstream::lookup::NameLookup;
 use nw_pak::PakMmapReader;
 
 use crate::jobs::{JobArgs, RunCtx};
-use crate::support::{PakSet, PathSelector, collect_matching, load_lookup, path_ext};
+use crate::support::{
+    PakSet, PathSelector, collect_matching, ensure_parent, guard_existing, load_lookup, path_ext,
+    write_guarded,
+};
 use crate::tui::SheetSource;
 use crate::ui::{Cell, Report, Table};
 
@@ -1146,16 +1149,7 @@ fn convert_objectstream(
     let converted = nw_objectstream::ObjectStream::transcode_bytes(&payload, encoding, lookup)
         .with_context(|| format!("convert {}", path.display()))?;
     let output = objectstream_output_path(root, path, out, encoding);
-    if output.exists() && !overwrite {
-        bail!(
-            "{} exists (pass --overwrite to replace it)",
-            output.display()
-        );
-    }
-    if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    std::fs::write(&output, &converted).with_context(|| format!("write {}", output.display()))?;
+    write_guarded(&output, &converted, overwrite.into())?;
 
     Ok(Some(ObjectConvertRow {
         source: path_label(path),
@@ -1215,12 +1209,8 @@ fn view_dds(path: &Path) -> Result<()> {
 /// Decode a DDS texture and write it as a PNG.
 fn write_dds_png(path: &Path, out: &Path, overwrite: bool) -> Result<()> {
     let (header, image) = decode_dds(path)?;
-    if out.exists() && !overwrite {
-        bail!("{} exists (pass --overwrite to replace it)", out.display());
-    }
-    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
+    guard_existing(out, overwrite.into())?;
+    ensure_parent(out)?;
     image
         .save(out)
         .with_context(|| format!("write {}", out.display()))?;
@@ -1491,18 +1481,7 @@ fn convert_dds_group(
     let ktx = nw_dds::Ktx2::from_dds(&header_bytes, &sidecars)
         .with_context(|| format!("convert {}", group.header.display()))?;
     let output = dds_ktx2_output_path(input, &group.header, out)?;
-    if output.exists() && !overwrite {
-        bail!(
-            "{} exists; pass --overwrite to replace it",
-            output.display()
-        );
-    }
-    if let Some(parent) = output.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    std::fs::write(&output, ktx.bytes()).with_context(|| format!("write {}", output.display()))?;
+    write_guarded(&output, ktx.bytes(), overwrite.into())?;
 
     Ok(DdsConvert {
         source: group.header.display().to_string(),
@@ -1901,11 +1880,7 @@ fn export_catalog(source: &str, bytes: &[u8]) -> Result<Vec<CatalogExportRow>> {
 }
 
 fn write_catalog_csv(path: &Path, rows: &[CatalogExportRow]) -> Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
+    ensure_parent(path)?;
     let mut csv = String::from("catalog,kind,asset_id,asset_type,size_bytes,flags,path\n");
     for row in rows {
         csv.push_str(&csv_cell(&row.source));
@@ -1998,12 +1973,7 @@ fn export_datasheet(
     }
 
     let output = datasheet_csv_output_path(root, path, out);
-    if output.exists() && !overwrite {
-        bail!(
-            "{} exists (pass --overwrite to replace it)",
-            output.display()
-        );
-    }
+    guard_existing(&output, overwrite.into())?;
     write_datasheet_csv(&output, &sheet, options)
         .with_context(|| format!("write {}", output.display()))?;
 
@@ -2019,11 +1989,7 @@ fn write_datasheet_csv(
     sheet: &nw_datasheet::Datasheet<'_>,
     options: &SheetOptions<'_>,
 ) -> Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
+    ensure_parent(path)?;
 
     let mut csv = String::new();
     for (index, column) in sheet.columns().iter().enumerate() {
