@@ -51,7 +51,7 @@ impl RustFieldPlanner {
         item.fields
             .iter()
             .filter(|field| {
-                if seen_fields.iter().any(|seen| *seen == *field) {
+                if seen_fields.contains(field) {
                     false
                 } else {
                     seen_fields.push(*field);
@@ -92,19 +92,14 @@ impl RustFieldPlanner {
             .iter()
             .filter(|field| field.is_base_class)
             .filter_map(|field| {
-                let ResolvedType::Named {
-                    type_id,
-                    source_name,
-                } = &field.resolved_type
-                else {
-                    return None;
-                };
-                if !seen.insert(*type_id) {
+                let type_id = field.source_type_id;
+                if !seen.insert(type_id) {
                     return None;
                 }
+                let source_name = base_source_name(field, items_by_type_id);
                 Some(RustRttiBasePlan {
-                    source_type_id: *type_id,
-                    source_name: source_name.clone(),
+                    source_type_id: type_id,
+                    source_name,
                     rust_type: self.rust_type_for_field(
                         field,
                         name_plan,
@@ -621,6 +616,20 @@ fn should_materialize_rust_field(
     classify_codegen_field(field, items_by_type_id).is_materialized()
 }
 
+fn base_source_name(
+    field: &SerializeCodegenField,
+    items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+) -> String {
+    items_by_type_id
+        .get(&field.source_type_id)
+        .map(|item| item.source_name.clone())
+        .or_else(|| match &field.resolved_type {
+            ResolvedType::Named { source_name, .. } => Some(source_name.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| field.source_name.clone())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RecursiveBaseFieldTarget<'a> {
     type_id: Uuid,
@@ -812,6 +821,71 @@ mod tests {
             rust_storage_override_for_field(RustCodegenMode::Standalone, &item, &field),
             None
         );
+    }
+
+    #[test]
+    fn rtti_base_planning_uses_base_field_source_type_id() {
+        let component_type_id = uuid!("edfac2cf-f75d-43be-b26b-f35821b29247");
+        let action_list_type_id = uuid!("30ed0ace-51dd-48b9-ba41-2fa6775cd106");
+        let base_item = SerializeCodegenItem {
+            source_type_id: component_type_id,
+            source_name: "AZ::Component".to_owned(),
+            role: ReflectedTypeRole::SupportType,
+            is_reflection_marker: false,
+            is_abstract: Some(true),
+            factory: None,
+            rtti_base_chain: Vec::new(),
+            kind: SerializeCodegenItemKind::Struct,
+            enum_underlying_type: None,
+            fields: Vec::new(),
+            variants: Vec::new(),
+        };
+        let item = SerializeCodegenItem {
+            source_type_id: action_list_type_id,
+            source_name: "ActionListComponent".to_owned(),
+            role: ReflectedTypeRole::FacetedComponent,
+            is_reflection_marker: false,
+            is_abstract: Some(false),
+            factory: None,
+            rtti_base_chain: Vec::new(),
+            kind: SerializeCodegenItemKind::Struct,
+            enum_underlying_type: None,
+            fields: vec![SerializeCodegenField {
+                source_name: "BaseClass1".to_owned(),
+                source_type_id: component_type_id,
+                resolved_type: ResolvedType::Unknown {
+                    type_id: component_type_id,
+                    reason: "base class resolved through source type id".to_owned(),
+                },
+                data_size: None,
+                offset: Some(0),
+                flags: Some(2),
+                is_base_class: true,
+                is_pointer: false,
+                is_dynamic_field: false,
+            }],
+            variants: Vec::new(),
+        };
+        let items_by_type_id = BTreeMap::from([
+            (base_item.source_type_id, &base_item),
+            (item.source_type_id, &item),
+        ]);
+        let planner = RustFieldPlanner::new(
+            RustCodegenMode::Standalone,
+            RustTypeRenderer::new(RustTypeOptions::default()),
+        );
+
+        let bases = planner.plan_rtti_bases(
+            &item,
+            &items_by_type_id,
+            &RustNamePlan::default(),
+            None,
+            "types",
+        );
+
+        assert_eq!(bases.len(), 1);
+        assert_eq!(bases[0].source_type_id, component_type_id);
+        assert_eq!(bases[0].source_name, "AZ::Component");
     }
 
     #[test]

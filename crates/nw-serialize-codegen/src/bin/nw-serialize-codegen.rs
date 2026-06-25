@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
@@ -9,17 +9,19 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nw_serialize_codegen::{
     CodegenContext, CompileUnit, CompletedCodegenUnits, GoSourceEmitter, GoStandaloneProjectFile,
-    NetworkRustEmitter, NetworkSchema, ReflectedTypeCatalogSummary, RustCodegenPlanner,
-    RustSourceEmitter, RustStandaloneProjectFile, SerializeCodegenRootMode,
-    SerializeCodegenRootSelection, SerializeCodegenUnit, SerializeContextCompileInputs,
-    SerializeContextCompiler, SerializeContextDocument, Severity, TypeScriptSourceEmitter,
-    TypeScriptStandaloneProjectFile, TypeScriptStandaloneProjectOptions,
-    class_registration_trace_root_from_jsonl_str, complete_known_missing_reflected_bodies,
-    is_module_descriptor_json_name, module_descriptor_capture, module_descriptors_root,
-    module_descriptors_root_from_capture, module_name_from_path, module_name_from_resource_name,
-    resolve_codegen_root_type_ids,
+    NetworkMessageFieldSignature, NetworkMessageSignature, NetworkRootKind, NetworkRustEmitter,
+    NetworkSchema, NetworkType, NetworkWireShape, ReflectedTypeCatalogSummary, RustCodegenPlanner,
+    RustSourceEmitter, RustSourceField, RustSourceInventory, RustSourceInventoryItem,
+    RustStandaloneProjectFile, SerializeCodegenRootMode, SerializeCodegenRootSelection,
+    SerializeCodegenUnit, SerializeContextCompileInputs, SerializeContextCompiler,
+    SerializeContextDocument, Severity, TypeScriptSourceEmitter, TypeScriptStandaloneProjectFile,
+    TypeScriptStandaloneProjectOptions, class_registration_trace_root_from_jsonl_str,
+    complete_known_missing_reflected_bodies, is_module_descriptor_json_name,
+    module_descriptor_capture, module_descriptors_root, module_descriptors_root_from_capture,
+    module_name_from_path, module_name_from_resource_name, resolve_codegen_root_type_ids,
 };
 use rust_embed::RustEmbed;
+use serde::Serialize;
 use serde_json::Value;
 
 const EMBEDDED_SERIALIZE_CONTEXT: &[u8] = include_bytes!("../../../../resources/serialize.json");
@@ -115,6 +117,18 @@ struct NetworkSchemaArgs {
     /// Public label to store for typeindex.json instead of the local input path.
     #[arg(long = "typeindex-source")]
     typeindex_source: Option<String>,
+    /// Optional JSON file containing explicit message field signatures.
+    #[arg(long = "message-signatures")]
+    message_signatures: Vec<PathBuf>,
+    /// Public label to store for message signature JSON instead of the local input path.
+    #[arg(long = "message-signatures-source")]
+    message_signatures_source: Option<String>,
+    /// Optional Rust source root used to fill message field names in declaration order.
+    #[arg(long = "message-rust-source-root")]
+    message_rust_source_root: Option<PathBuf>,
+    /// Public label to store for the Rust message source instead of the local input path.
+    #[arg(long = "message-rust-source")]
+    message_rust_source: Option<String>,
     /// Output path for the derived network schema JSON. This does not rewrite typeregistry.json.
     #[arg(long)]
     out: PathBuf,
@@ -131,6 +145,12 @@ struct NetworkRustArgs {
     /// Optional generation report JSON path.
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Optional Rust source root to audit generated network descriptors against.
+    #[arg(long = "rust-source-root")]
+    rust_source_root: Option<PathBuf>,
+    /// Optional JSON path for the Rust source audit report.
+    #[arg(long = "rust-source-audit")]
+    rust_source_audit: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -318,6 +338,46 @@ fn network_schema(args: &NetworkSchemaArgs) -> Result<()> {
             merge.conflicting_type_index_count
         );
     }
+    for signatures_path in &args.message_signatures {
+        let signatures = load_message_signatures(signatures_path)?;
+        let source = args
+            .message_signatures_source
+            .clone()
+            .unwrap_or_else(|| signatures_path.display().to_string());
+        let merge = schema.merge_message_signatures(&signatures, Some(source));
+        println!(
+            "message signatures: {} source message(s), {} matched, {} field name(s) filled, {} native type(s) filled, {} wire shape(s) filled, {} field-count mismatch, {} ambiguous, {} unmatched",
+            merge.source_message_count,
+            merge.matched_message_count,
+            merge.field_name_filled_count,
+            merge.native_type_filled_count,
+            merge.wire_shape_filled_count,
+            merge.field_count_mismatch_count,
+            merge.ambiguous_message_count,
+            merge.unmatched_message_count
+        );
+    }
+    if let Some(root) = &args.message_rust_source_root {
+        let inventory = RustSourceInventory::from_root(root, &context)
+            .with_context(|| format!("scan Rust message source root {}", root.display()))?;
+        let signatures = message_signatures_from_rust_source(&schema, &inventory);
+        let source = args
+            .message_rust_source
+            .clone()
+            .unwrap_or_else(|| root.display().to_string());
+        let merge = schema.merge_message_signatures(&signatures, Some(source));
+        println!(
+            "message source: {} source message(s), {} matched, {} field name(s) filled, {} native type(s) filled, {} wire shape(s) filled, {} field-count mismatch, {} ambiguous, {} unmatched",
+            merge.source_message_count,
+            merge.matched_message_count,
+            merge.field_name_filled_count,
+            merge.native_type_filled_count,
+            merge.wire_shape_filled_count,
+            merge.field_count_mismatch_count,
+            merge.ambiguous_message_count,
+            merge.unmatched_message_count
+        );
+    }
     let mut source = serde_json::to_vec_pretty(&schema).context("serialize network schema JSON")?;
     source.push(b'\n');
     if let Some(parent) = args
@@ -347,6 +407,14 @@ fn network_rust(args: &NetworkRustArgs) -> Result<()> {
     let root = load_json_root(&args.schema, "network schema JSON")?;
     let schema = serde_json::from_value::<NetworkSchema>(root)
         .with_context(|| format!("parse network schema from {}", args.schema.display()))?;
+    let source_audit = match &args.rust_source_root {
+        Some(root) => {
+            let inventory = RustSourceInventory::from_root(root, &CodegenContext::inline())
+                .with_context(|| format!("scan Rust source root {}", root.display()))?;
+            Some(audit_network_rust_source(&schema, &inventory))
+        }
+        None => None,
+    };
     let output = NetworkRustEmitter::emit_descriptors(&schema)
         .context("emit network Rust descriptor source")?;
     write_path_if_changed(&args.out, output.source.as_bytes())?;
@@ -356,6 +424,23 @@ fn network_rust(args: &NetworkRustArgs) -> Result<()> {
         report.push(b'\n');
         write_path_if_changed(report_path, &report)?;
     }
+    if let Some(audit) = &source_audit {
+        if let Some(report_path) = &args.rust_source_audit {
+            let mut report =
+                serde_json::to_vec_pretty(audit).context("serialize network Rust source audit")?;
+            report.push(b'\n');
+            write_path_if_changed(report_path, &report)?;
+        }
+        println!(
+            "source audit: {} checked, {} current, {} missing, {} ambiguous, {} field mismatch, {} derive mismatch",
+            audit.checked_type_count,
+            audit.current_type_count,
+            audit.missing_type_count,
+            audit.ambiguous_type_count,
+            audit.field_count_mismatch_count,
+            audit.derive_mismatch_count
+        );
+    }
     println!(
         "network rust: {} descriptor(s), {} field descriptor(s), {} unnamed descriptor(s)",
         output.report.descriptor_count,
@@ -363,6 +448,333 @@ fn network_rust(args: &NetworkRustArgs) -> Result<()> {
         output.report.unnamed_descriptor_count
     );
     Ok(())
+}
+
+fn load_message_signatures(path: &Path) -> Result<Vec<NetworkMessageSignature>> {
+    let root = load_json_root(path, "message signatures JSON")?;
+    if root.is_array() {
+        return serde_json::from_value(root)
+            .with_context(|| format!("parse message signatures from {}", path.display()));
+    }
+    if let Some(messages) = root.get("messages") {
+        return serde_json::from_value(messages.clone())
+            .with_context(|| format!("parse message signatures from {}", path.display()));
+    }
+    bail!(
+        "message signatures JSON {} must be an array or an object with `messages`",
+        path.display()
+    )
+}
+
+fn message_signatures_from_rust_source(
+    schema: &NetworkSchema,
+    inventory: &RustSourceInventory,
+) -> Vec<NetworkMessageSignature> {
+    schema
+        .types
+        .iter()
+        .filter(|network_type| should_audit_network_source_type(network_type))
+        .filter_map(|network_type| {
+            let schema_name = network_type.name.as_deref()?;
+            let rust_name = rust_source_candidate_name(schema_name);
+            let candidates =
+                rust_source_candidates(inventory, network_type, schema_name, &rust_name);
+            let [candidate] = candidates.as_slice() else {
+                return None;
+            };
+            Some(message_signature_from_rust_source_item(
+                network_type,
+                schema_name,
+                &candidate.item.name,
+                candidate,
+            ))
+        })
+        .collect()
+}
+
+fn message_signature_from_rust_source_item(
+    network_type: &NetworkType,
+    schema_name: &str,
+    rust_name: &str,
+    candidate: &RustSourceInventoryItem,
+) -> NetworkMessageSignature {
+    let fields = candidate
+        .item
+        .fields_in_order()
+        .into_iter()
+        .enumerate()
+        .map(|(index, field)| NetworkMessageFieldSignature {
+            index: u32::try_from(index).ok(),
+            name: field.name.clone(),
+            rust_type: Some(field.rust_type.clone()),
+            native_type: None,
+            wire_shape: rust_source_field_wire_shape(field),
+        })
+        .collect();
+
+    NetworkMessageSignature {
+        type_id: network_type.type_id,
+        type_index: network_type.type_index,
+        name: Some(schema_name.to_owned()),
+        rust_name: Some(rust_name.to_owned()),
+        source: None,
+        fields,
+    }
+}
+
+fn rust_source_field_wire_shape(field: &RustSourceField) -> Option<NetworkWireShape> {
+    if let Some(marshal_as) = field.marshal_as.as_deref() {
+        let compact = compact_rust_type(marshal_as);
+        if compact.ends_with("HalfF32") {
+            return Some(NetworkWireShape::HalfF32);
+        }
+        if compact.ends_with("VlqU32") {
+            return Some(NetworkWireShape::VlqU32);
+        }
+        if compact.ends_with("QuatCompNorm") {
+            return Some(NetworkWireShape::QuatCompNorm);
+        }
+    }
+
+    match compact_rust_type(&field.rust_type).rsplit("::").next()? {
+        "bool" => Some(NetworkWireShape::Bool),
+        "u8" => Some(NetworkWireShape::U8),
+        "u16" => Some(NetworkWireShape::U16),
+        "u32" => Some(NetworkWireShape::U32),
+        "u64" => Some(NetworkWireShape::U64),
+        "f32" => Some(NetworkWireShape::F32),
+        "f64" => Some(NetworkWireShape::F64),
+        "Vec2" => Some(NetworkWireShape::Vec2),
+        "Vec3" => Some(NetworkWireShape::Vec3),
+        "Vec4" => Some(NetworkWireShape::Vec4),
+        "Quat" => Some(NetworkWireShape::Quat),
+        "Mat3" => Some(NetworkWireShape::Mat3),
+        "Affine3A" => Some(NetworkWireShape::Affine3),
+        "Aabb3d" => Some(NetworkWireShape::Aabb3d),
+        "EntityRef" => Some(NetworkWireShape::EntityRef),
+        "String" => Some(NetworkWireShape::String),
+        "QuatCompNorm" => Some(NetworkWireShape::QuatCompNorm),
+        _ => None,
+    }
+}
+
+fn compact_rust_type(value: &str) -> String {
+    value.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkRustSourceAudit {
+    checked_type_count: usize,
+    current_type_count: usize,
+    missing_type_count: usize,
+    ambiguous_type_count: usize,
+    field_count_mismatch_count: usize,
+    derive_mismatch_count: usize,
+    items: Vec<NetworkRustSourceAuditItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkRustSourceAuditItem {
+    type_index: Option<u32>,
+    schema_name: String,
+    rust_name: String,
+    status: NetworkRustSourceAuditStatus,
+    path: Option<PathBuf>,
+    expected_field_count: usize,
+    existing_field_count: Option<usize>,
+    missing_derives: Vec<String>,
+    existing_fields: Vec<String>,
+    candidate_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum NetworkRustSourceAuditStatus {
+    Current,
+    Missing,
+    Ambiguous,
+    FieldCountMismatch,
+    DeriveMismatch,
+}
+
+fn audit_network_rust_source(
+    schema: &NetworkSchema,
+    inventory: &RustSourceInventory,
+) -> NetworkRustSourceAudit {
+    let mut items = Vec::new();
+    for network_type in schema
+        .types
+        .iter()
+        .filter(|network_type| should_audit_network_source_type(network_type))
+    {
+        let Some(schema_name) = network_type.name.as_deref() else {
+            continue;
+        };
+        let rust_name = rust_source_candidate_name(schema_name);
+        let candidates = rust_source_candidates(inventory, network_type, schema_name, &rust_name);
+        items.push(audit_network_rust_source_item(
+            network_type,
+            schema_name,
+            &rust_name,
+            candidates,
+        ));
+    }
+
+    let mut counts = BTreeMap::<NetworkRustSourceAuditStatus, usize>::new();
+    for item in &items {
+        *counts.entry(item.status).or_default() += 1;
+    }
+
+    NetworkRustSourceAudit {
+        checked_type_count: items.len(),
+        current_type_count: *counts
+            .get(&NetworkRustSourceAuditStatus::Current)
+            .unwrap_or(&0),
+        missing_type_count: *counts
+            .get(&NetworkRustSourceAuditStatus::Missing)
+            .unwrap_or(&0),
+        ambiguous_type_count: *counts
+            .get(&NetworkRustSourceAuditStatus::Ambiguous)
+            .unwrap_or(&0),
+        field_count_mismatch_count: *counts
+            .get(&NetworkRustSourceAuditStatus::FieldCountMismatch)
+            .unwrap_or(&0),
+        derive_mismatch_count: *counts
+            .get(&NetworkRustSourceAuditStatus::DeriveMismatch)
+            .unwrap_or(&0),
+        items,
+    }
+}
+
+fn should_audit_network_source_type(network_type: &NetworkType) -> bool {
+    network_type
+        .root_kinds
+        .iter()
+        .any(|kind| matches!(kind, NetworkRootKind::Message))
+}
+
+fn rust_source_candidate_name(schema_name: &str) -> String {
+    schema_name
+        .rsplit("::")
+        .next()
+        .unwrap_or(schema_name)
+        .to_owned()
+}
+
+fn rust_source_candidates<'a>(
+    inventory: &'a RustSourceInventory,
+    network_type: &NetworkType,
+    schema_name: &str,
+    rust_name: &str,
+) -> Vec<&'a RustSourceInventoryItem> {
+    if let Some(type_id) = network_type.type_id {
+        let exact = inventory.candidates_for_type_id(type_id);
+        if !exact.is_empty() {
+            return exact.iter().collect();
+        }
+    }
+
+    let direct = inventory.candidates_for(schema_name);
+    if !direct.is_empty() {
+        return direct.iter().collect();
+    }
+    inventory.candidates_for(rust_name).iter().collect()
+}
+
+fn audit_network_rust_source_item(
+    network_type: &NetworkType,
+    schema_name: &str,
+    rust_name: &str,
+    candidates: Vec<&RustSourceInventoryItem>,
+) -> NetworkRustSourceAuditItem {
+    let expected_field_count = network_type.fields.len();
+    match candidates.as_slice() {
+        [] => NetworkRustSourceAuditItem {
+            type_index: network_type.type_index,
+            schema_name: schema_name.to_owned(),
+            rust_name: rust_name.to_owned(),
+            status: NetworkRustSourceAuditStatus::Missing,
+            path: None,
+            expected_field_count,
+            existing_field_count: None,
+            missing_derives: expected_network_source_derives(network_type),
+            existing_fields: Vec::new(),
+            candidate_paths: Vec::new(),
+        },
+        [candidate] => audit_single_network_rust_source_candidate(
+            network_type,
+            schema_name,
+            rust_name,
+            candidate,
+        ),
+        candidates => NetworkRustSourceAuditItem {
+            type_index: network_type.type_index,
+            schema_name: schema_name.to_owned(),
+            rust_name: rust_name.to_owned(),
+            status: NetworkRustSourceAuditStatus::Ambiguous,
+            path: None,
+            expected_field_count,
+            existing_field_count: None,
+            missing_derives: Vec::new(),
+            existing_fields: Vec::new(),
+            candidate_paths: candidates
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect(),
+        },
+    }
+}
+
+fn audit_single_network_rust_source_candidate(
+    network_type: &NetworkType,
+    schema_name: &str,
+    rust_name: &str,
+    candidate: &RustSourceInventoryItem,
+) -> NetworkRustSourceAuditItem {
+    let expected_field_count = network_type.fields.len();
+    let existing_field_count = candidate.item.fields.len();
+    let missing_derives = expected_network_source_derives(network_type)
+        .into_iter()
+        .filter(|derive| !candidate.item.derives.contains(derive))
+        .collect::<Vec<_>>();
+    let status = if existing_field_count != expected_field_count {
+        NetworkRustSourceAuditStatus::FieldCountMismatch
+    } else if !missing_derives.is_empty() {
+        NetworkRustSourceAuditStatus::DeriveMismatch
+    } else {
+        NetworkRustSourceAuditStatus::Current
+    };
+    NetworkRustSourceAuditItem {
+        type_index: network_type.type_index,
+        schema_name: schema_name.to_owned(),
+        rust_name: rust_name.to_owned(),
+        status,
+        path: Some(candidate.path.clone()),
+        expected_field_count,
+        existing_field_count: Some(existing_field_count),
+        missing_derives,
+        existing_fields: candidate
+            .item
+            .fields_in_order()
+            .into_iter()
+            .map(|field| field.name.clone())
+            .collect(),
+        candidate_paths: Vec::new(),
+    }
+}
+
+fn expected_network_source_derives(network_type: &NetworkType) -> Vec<String> {
+    let mut derives = vec!["Marshaler".to_owned()];
+    if network_type
+        .root_kinds
+        .iter()
+        .any(|kind| matches!(kind, NetworkRootKind::Message))
+    {
+        derives.extend(["ClassDesc".to_owned(), "Message".to_owned()]);
+    }
+    derives
 }
 
 #[derive(Debug, Clone)]

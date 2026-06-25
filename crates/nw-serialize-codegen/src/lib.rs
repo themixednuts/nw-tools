@@ -133,7 +133,8 @@ pub use network_rust::{
 pub use network_schema::{
     NETWORK_SCHEMA_VERSION, NetworkAzRtti, NetworkAzRttiProvider, NetworkConfidence,
     NetworkEvidence, NetworkEvidenceKind, NetworkField, NetworkFieldRegistrationFunction,
-    NetworkHandler, NetworkRegistrationHook, NetworkRootKind, NetworkSchema,
+    NetworkHandler, NetworkMessageFieldSignature, NetworkMessageSignature,
+    NetworkMessageSignatureMergeReport, NetworkRegistrationHook, NetworkRootKind, NetworkSchema,
     NetworkSchemaImportError, NetworkSchemaSource, NetworkSchemaSourceKind, NetworkSchemaSummary,
     NetworkSerializeKind, NetworkSerializeMergeReport, NetworkSerializeRole, NetworkSerializeType,
     NetworkType, NetworkTypeIndexMergeReport, NetworkVirtualFunction, NetworkWireShape,

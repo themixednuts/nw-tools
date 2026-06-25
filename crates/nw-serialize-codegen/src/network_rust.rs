@@ -6,13 +6,15 @@ use syn::LitStr;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind};
 use crate::naming::{rust_field_ident, rust_module_ident, rust_type_ident};
 use crate::network_schema::{
     NetworkConfidence, NetworkField, NetworkRootKind, NetworkSchema, NetworkType,
     NetworkWireShape as SchemaWireShape,
 };
+use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v8";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v20";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -48,6 +50,12 @@ pub struct NetworkRustGenerationReport {
     pub generatable_state_count: usize,
     pub blocked_state_count: usize,
     pub state_generation_plans: Vec<NetworkStateGenerationPlanReport>,
+    pub message_generation_plan_count: usize,
+    pub generatable_message_count: usize,
+    pub blocked_message_count: usize,
+    pub message_generation_plans: Vec<NetworkMessageGenerationPlanReport>,
+    #[serde(default)]
+    pub marshaler_conversion_count: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +90,24 @@ pub struct NetworkStateFieldShapeReport {
     pub blocked_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkMessageGenerationPlanReport {
+    pub type_index: Option<u32>,
+    pub type_name: Option<String>,
+    pub field_count: usize,
+    pub shaped_field_count: usize,
+    pub supported_field_count: usize,
+    pub missing_wire_shape_count: usize,
+    #[serde(default)]
+    pub missing_field_type_count: usize,
+    pub unsupported_wire_shape_count: usize,
+    pub low_confidence_field_count: usize,
+    pub can_generate: bool,
+    pub blocked_reasons: Vec<String>,
+    pub fields: Vec<NetworkStateFieldShapeReport>,
+}
+
 #[derive(Debug, Default)]
 pub struct NetworkRustEmitter;
 
@@ -107,6 +133,15 @@ impl NetworkRustEmitter {
             .count();
         report.blocked_state_count =
             report.state_generation_plan_count - report.generatable_state_count;
+        report.message_generation_plans = message_generation_plans(schema, &wire_shapes);
+        report.message_generation_plan_count = report.message_generation_plans.len();
+        report.generatable_message_count = report
+            .message_generation_plans
+            .iter()
+            .filter(|plan| plan.can_generate)
+            .count();
+        report.blocked_message_count =
+            report.message_generation_plan_count - report.generatable_message_count;
         let identities = identity_tokens(schema);
         report.identity_type_count = identities.len();
 
@@ -141,9 +176,20 @@ impl NetworkRustEmitter {
                 U32,
                 U64,
                 F32,
+                F64,
                 HalfF32,
                 VlqU32,
+                Vec2,
+                Vec3,
+                Vec4,
+                Quat,
                 QuatCompNorm,
+                Mat3,
+                Affine3,
+                Aabb3d,
+                EntityRef,
+                FixedBytes6,
+                FixedBytes16,
                 String,
             }
 
@@ -153,6 +199,7 @@ impl NetworkRustEmitter {
                 pub name: &'static str,
                 pub group: Option<u32>,
                 pub native_type: Option<&'static str>,
+                pub rust_type: Option<&'static str>,
                 pub storage_offset: Option<u32>,
                 pub wire_shape: Option<NetworkWireShape>,
                 pub confidence: NetworkFieldConfidence,
@@ -390,6 +437,305 @@ impl NetworkRustEmitter {
             report,
         })
     }
+
+    pub fn emit_messages(
+        schema: &NetworkSchema,
+    ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
+        let wire_shapes = wire_shapes_by_handler_vtable(schema);
+        let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
+        let rust_names = identity_names_by_type_index(schema);
+        let mut report = NetworkRustGenerationReport::default();
+        let modules = schema
+            .types
+            .iter()
+            .filter(|network_type| network_type.root_kinds.contains(&NetworkRootKind::Message))
+            .filter_map(|network_type| {
+                let plan = message_generation_plan(network_type, &wire_shapes, &wire_shape_sources);
+                report.message_generation_plans.push(plan.clone());
+                plan.can_generate
+                    .then(|| message_module_tokens(network_type, &plan, &rust_names))
+            })
+            .collect::<Vec<_>>();
+
+        report.message_generation_plan_count = report.message_generation_plans.len();
+        report.generatable_message_count = report
+            .message_generation_plans
+            .iter()
+            .filter(|plan| plan.can_generate)
+            .count();
+        report.blocked_message_count =
+            report.message_generation_plan_count - report.generatable_message_count;
+        report.message_count = report.generatable_message_count;
+
+        let tokens = quote! {
+            #(#modules)*
+        };
+        let file = syn::parse2(tokens)?;
+        Ok(NetworkRustOutput {
+            source: prettyplease::unparse(&file),
+            report,
+        })
+    }
+
+    pub fn emit_marshaler_conversions<'a>(
+        items: impl IntoIterator<Item = &'a SerializeCodegenItem>,
+    ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
+        let mut report = NetworkRustGenerationReport::default();
+        let conversions = items
+            .into_iter()
+            .flat_map(enum_marshaler_conversion_tokens)
+            .collect::<Vec<_>>();
+        report.marshaler_conversion_count = conversions.len();
+
+        let tokens = quote! {
+            #(#conversions)*
+        };
+        let file = syn::parse2(tokens)?;
+        Ok(NetworkRustOutput {
+            source: prettyplease::unparse(&file),
+            report,
+        })
+    }
+}
+
+fn enum_marshaler_conversion_tokens(item: &SerializeCodegenItem) -> Vec<proc_macro2::TokenStream> {
+    if item.kind != SerializeCodegenItemKind::Enum {
+        return Vec::new();
+    }
+    let Some(underlying) = enum_underlying_scalar(item) else {
+        return Vec::new();
+    };
+    let Some((min, max)) = enum_value_range(item) else {
+        return Vec::new();
+    };
+    if min < 0 {
+        return Vec::new();
+    }
+
+    let enum_ident = format_ident!("{}", rust_type_ident(&item.source_name));
+    [
+        UnsignedConversion::U8,
+        UnsignedConversion::U16,
+        UnsignedConversion::U32,
+    ]
+    .into_iter()
+    .filter(|conversion| max <= i128::from(conversion.max_value()))
+    .map(|conversion| {
+        enum_marshaler_conversion_token(&enum_ident, underlying, conversion, min, max)
+    })
+    .collect()
+}
+
+fn enum_underlying_scalar(item: &SerializeCodegenItem) -> Option<ScalarType> {
+    match item.enum_underlying_type.as_ref()? {
+        ResolvedType::Scalar(scalar) if is_integer_scalar(*scalar) => Some(*scalar),
+        _ => None,
+    }
+}
+
+const fn is_integer_scalar(scalar: ScalarType) -> bool {
+    matches!(
+        scalar,
+        ScalarType::Char
+            | ScalarType::SignedChar
+            | ScalarType::I8
+            | ScalarType::U8
+            | ScalarType::I16
+            | ScalarType::U16
+            | ScalarType::I32
+            | ScalarType::U32
+            | ScalarType::I64
+            | ScalarType::U64
+            | ScalarType::UnsignedLong
+    )
+}
+
+fn enum_value_range(item: &SerializeCodegenItem) -> Option<(i128, i128)> {
+    let mut values = item
+        .variants
+        .iter()
+        .map(|variant| {
+            variant
+                .value_i32
+                .map(i128::from)
+                .or_else(|| variant.value_u32.map(i128::from))
+                .or_else(|| variant.value_u64.map(i128::from))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    values.sort_unstable();
+    Some((*values.first()?, *values.last()?))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UnsignedConversion {
+    U8,
+    U16,
+    U32,
+}
+
+impl UnsignedConversion {
+    const fn bit_width(self) -> u8 {
+        match self {
+            Self::U8 => 8,
+            Self::U16 => 16,
+            Self::U32 => 32,
+        }
+    }
+
+    const fn max_value(self) -> u32 {
+        match self {
+            Self::U8 => u8::MAX as u32,
+            Self::U16 => u16::MAX as u32,
+            Self::U32 => u32::MAX,
+        }
+    }
+
+    fn rust_type(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::U8 => quote!(u8),
+            Self::U16 => quote!(u16),
+            Self::U32 => quote!(u32),
+        }
+    }
+}
+
+fn enum_marshaler_conversion_token(
+    enum_ident: &proc_macro2::Ident,
+    underlying: ScalarType,
+    conversion: UnsignedConversion,
+    min: i128,
+    max: i128,
+) -> proc_macro2::TokenStream {
+    let serialized_ty = conversion.rust_type();
+    let underlying_ty = enum_underlying_rust_type(underlying);
+    let serialize_value = enum_serialize_value_tokens(underlying, conversion);
+    let deserialize_value = enum_deserialize_value_tokens(underlying, conversion, min, max);
+    let min_i128 = syn::LitInt::new(&min.to_string(), proc_macro2::Span::call_site());
+    let max_i128 = syn::LitInt::new(&max.to_string(), proc_macro2::Span::call_site());
+    let min_u64 = u64::try_from(min).expect("unsigned enum conversion has nonnegative min");
+    let max_u64 = u64::try_from(max).expect("unsigned enum conversion has nonnegative max");
+
+    quote! {
+        impl ::nw_network::serialize::MarshalerConversion<#serialized_ty>
+            for ::nw_network::source::#enum_ident
+        {
+            fn to_serialized(self) -> #serialized_ty {
+                let raw = #underlying_ty::from(self);
+                let raw_i128 = i128::from(raw);
+                debug_assert!((#min_i128..=#max_i128).contains(&raw_i128));
+                #serialize_value
+            }
+
+            fn try_from_serialized(
+                value: #serialized_ty,
+            ) -> Result<Self, ::nw_network::serialize::MarshalerError> {
+                let raw = #deserialize_value;
+                Self::try_from(raw).map_err(|_| {
+                    ::nw_network::serialize::MarshalerError::InvalidRange {
+                        value: u64::from(value),
+                        min: #min_u64,
+                        max: #max_u64,
+                    }
+                })
+            }
+        }
+    }
+}
+
+fn enum_serialize_value_tokens(
+    underlying: ScalarType,
+    conversion: UnsignedConversion,
+) -> proc_macro2::TokenStream {
+    let serialized_ty = conversion.rust_type();
+    if underlying == conversion.scalar_type() {
+        return quote!(raw);
+    }
+    if unsigned_scalar_bit_width(underlying).is_some_and(|bits| bits <= conversion.bit_width()) {
+        return quote!(#serialized_ty::from(raw));
+    }
+    quote! {
+        #serialized_ty::try_from(raw)
+            .expect("generated enum discriminant fits serialized representation")
+    }
+}
+
+fn enum_deserialize_value_tokens(
+    underlying: ScalarType,
+    conversion: UnsignedConversion,
+    min: i128,
+    max: i128,
+) -> proc_macro2::TokenStream {
+    let underlying_ty = enum_underlying_rust_type(underlying);
+    let min_u64 = u64::try_from(min).expect("unsigned enum conversion has nonnegative min");
+    let max_u64 = u64::try_from(max).expect("unsigned enum conversion has nonnegative max");
+    if underlying == conversion.scalar_type() {
+        return quote!(value);
+    }
+    if scalar_accepts_all_unsigned_values(underlying, conversion) {
+        return quote!(#underlying_ty::from(value));
+    }
+    quote! {
+        #underlying_ty::try_from(value).map_err(|_| {
+            ::nw_network::serialize::MarshalerError::InvalidRange {
+                value: u64::from(value),
+                min: #min_u64,
+                max: #max_u64,
+            }
+        })?
+    }
+}
+
+impl UnsignedConversion {
+    const fn scalar_type(self) -> ScalarType {
+        match self {
+            Self::U8 => ScalarType::U8,
+            Self::U16 => ScalarType::U16,
+            Self::U32 => ScalarType::U32,
+        }
+    }
+}
+
+const fn unsigned_scalar_bit_width(scalar: ScalarType) -> Option<u8> {
+    match scalar {
+        ScalarType::U8 => Some(8),
+        ScalarType::U16 => Some(16),
+        ScalarType::U32 => Some(32),
+        ScalarType::U64 | ScalarType::UnsignedLong => Some(64),
+        _ => None,
+    }
+}
+
+const fn scalar_accepts_all_unsigned_values(
+    scalar: ScalarType,
+    conversion: UnsignedConversion,
+) -> bool {
+    match scalar {
+        ScalarType::U8 => conversion.bit_width() <= 8,
+        ScalarType::U16 => conversion.bit_width() <= 16,
+        ScalarType::U32 => conversion.bit_width() <= 32,
+        ScalarType::U64 | ScalarType::UnsignedLong => true,
+        ScalarType::Char | ScalarType::SignedChar | ScalarType::I8 => {
+            conversion.max_value() <= i8::MAX as u32
+        }
+        ScalarType::I16 => conversion.max_value() <= i16::MAX as u32,
+        ScalarType::I32 => conversion.max_value() <= i32::MAX as u32,
+        ScalarType::I64 => true,
+        _ => false,
+    }
+}
+
+fn enum_underlying_rust_type(scalar: ScalarType) -> proc_macro2::TokenStream {
+    match scalar {
+        ScalarType::Char | ScalarType::SignedChar | ScalarType::I8 => quote!(i8),
+        ScalarType::U8 => quote!(u8),
+        ScalarType::I16 => quote!(i16),
+        ScalarType::U16 => quote!(u16),
+        ScalarType::I32 => quote!(i32),
+        ScalarType::U32 => quote!(u32),
+        ScalarType::I64 => quote!(i64),
+        ScalarType::U64 | ScalarType::UnsignedLong => quote!(u64),
+        _ => unreachable!("non-integer enum underlyings are skipped before emission"),
+    }
 }
 
 fn identity_tokens(schema: &NetworkSchema) -> Vec<proc_macro2::TokenStream> {
@@ -449,17 +795,39 @@ fn identity_names_by_type_index(schema: &NetworkSchema) -> BTreeMap<u32, String>
             );
             continue;
         }
+        let namespaced_counts = entries
+            .iter()
+            .filter_map(|network_type| namespaced_identity_candidate(network_type))
+            .fold(BTreeMap::<String, usize>::new(), |mut counts, name| {
+                *counts.entry(name).or_default() += 1;
+                counts
+            });
         for network_type in entries {
             let type_index = network_type
                 .type_index
                 .expect("collision candidate entry has a type index");
-            names_by_type_index.insert(
-                type_index,
-                format!("{candidate}{}", identity_collision_suffix(network_type)),
-            );
+            let name = namespaced_identity_candidate(network_type)
+                .filter(|name| namespaced_counts.get(name) == Some(&1))
+                .unwrap_or_else(|| {
+                    format!("{candidate}{}", identity_collision_suffix(network_type))
+                });
+            names_by_type_index.insert(type_index, name);
         }
     }
     names_by_type_index
+}
+
+fn namespaced_identity_candidate(network_type: &NetworkType) -> Option<String> {
+    let name = network_type.name.as_deref()?;
+    if !name.contains("::") {
+        return None;
+    }
+    let candidate = name
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .map(rust_type_ident)
+        .collect::<String>();
+    (!candidate.is_empty() && candidate != rust_type_ident(name)).then_some(candidate)
 }
 
 fn identity_collision_suffix(network_type: &NetworkType) -> String {
@@ -571,6 +939,7 @@ fn field_tokens(
     let name = LitStr::new(name, proc_macro2::Span::call_site());
     let group = option_u32_tokens(field.group);
     let native_type = option_str_tokens(field.native_type.as_deref());
+    let rust_type = option_str_tokens(field.rust_type.as_deref());
     let storage_offset = option_u32_tokens(field.storage_offset);
     let wire_shape = field_wire_shape_tokens(field, wire_shapes, report);
     let confidence = confidence_ident(field.confidence);
@@ -580,6 +949,7 @@ fn field_tokens(
             name: #name,
             group: #group,
             native_type: #native_type,
+            rust_type: #rust_type,
             storage_offset: #storage_offset,
             wire_shape: #wire_shape,
             confidence: NetworkFieldConfidence::#confidence,
@@ -604,21 +974,15 @@ fn field_wire_shape_tokens(
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     report: &mut NetworkRustGenerationReport,
 ) -> proc_macro2::TokenStream {
-    if let Some(shape) = field.wire_shape {
+    if let Some(shape) = field_wire_shape(field, wire_shapes) {
         report.field_wire_shape_count += 1;
         let shape = wire_shape_ident(shape);
         return quote!(Some(NetworkWireShape::#shape));
     }
-    let Some(handler_vtable) = field.handler_vtable.as_deref() else {
-        return quote!(None);
-    };
-    let Some(shape) = wire_shapes.get(handler_vtable).copied() else {
+    if field.handler_vtable.is_some() {
         report.unresolved_field_wire_shape_count += 1;
-        return quote!(None);
-    };
-    report.field_wire_shape_count += 1;
-    let shape = wire_shape_ident(shape);
-    quote!(Some(NetworkWireShape::#shape))
+    }
+    quote!(None)
 }
 
 fn state_generation_plans(
@@ -635,6 +999,19 @@ fn state_generation_plans(
                 .contains(&NetworkRootKind::ReplicatedState)
         })
         .map(|network_type| state_generation_plan(network_type, wire_shapes, &wire_shape_sources))
+        .collect()
+}
+
+fn message_generation_plans(
+    schema: &NetworkSchema,
+    wire_shapes: &BTreeMap<&str, SchemaWireShape>,
+) -> Vec<NetworkMessageGenerationPlanReport> {
+    let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
+    schema
+        .types
+        .iter()
+        .filter(|network_type| network_type.root_kinds.contains(&NetworkRootKind::Message))
+        .map(|network_type| message_generation_plan(network_type, wire_shapes, &wire_shape_sources))
         .collect()
 }
 
@@ -695,37 +1072,186 @@ fn state_generation_plan(
     }
 }
 
+fn message_generation_plan(
+    network_type: &NetworkType,
+    wire_shapes: &BTreeMap<&str, SchemaWireShape>,
+    wire_shape_sources: &BTreeMap<&str, &str>,
+) -> NetworkMessageGenerationPlanReport {
+    let fields = network_type
+        .fields
+        .iter()
+        .map(|field| message_field_shape_report(field, wire_shapes, wire_shape_sources))
+        .collect::<Vec<_>>();
+    let field_count = fields.len();
+    let shaped_field_count = fields
+        .iter()
+        .filter(|field| field.wire_shape.is_some())
+        .count();
+    let supported_field_count = fields.iter().filter(|field| field.supported).count();
+    let missing_wire_shape_count = fields
+        .iter()
+        .filter(|field| field.wire_shape.is_none())
+        .count();
+    let missing_field_type_count = fields
+        .iter()
+        .filter(|field| field.blocked_reason.as_deref() == Some("missing-field-type"))
+        .count();
+    let unsupported_wire_shape_count = 0;
+    let invalid_field_metadata_count = fields
+        .iter()
+        .filter(|field| {
+            matches!(
+                field.blocked_reason.as_deref(),
+                Some("missing-field-index" | "missing-field-name")
+            )
+        })
+        .count();
+    let low_confidence_field_count = fields
+        .iter()
+        .filter(|field| !field.confidence.is_high_or_exact())
+        .count();
+    let placeholder_field_name_count = fields
+        .iter()
+        .filter(|field| field.blocked_reason.as_deref() == Some("placeholder-field-name"))
+        .count();
+    let blocked_reasons = message_blocked_reasons(
+        network_type,
+        field_count,
+        missing_field_type_count,
+        unsupported_wire_shape_count,
+        invalid_field_metadata_count,
+        low_confidence_field_count,
+        placeholder_field_name_count,
+    );
+
+    NetworkMessageGenerationPlanReport {
+        type_index: network_type.type_index,
+        type_name: network_type.name.clone(),
+        field_count,
+        shaped_field_count,
+        supported_field_count,
+        missing_wire_shape_count,
+        missing_field_type_count,
+        unsupported_wire_shape_count,
+        low_confidence_field_count,
+        can_generate: blocked_reasons.is_empty(),
+        blocked_reasons,
+        fields,
+    }
+}
+
+fn message_field_shape_report(
+    field: &NetworkField,
+    wire_shapes: &BTreeMap<&str, SchemaWireShape>,
+    wire_shape_sources: &BTreeMap<&str, &str>,
+) -> NetworkStateFieldShapeReport {
+    let mut report = state_field_shape_report(field, wire_shapes, wire_shape_sources);
+    let rust_type = field
+        .rust_type
+        .clone()
+        .or_else(|| report.rust_value_type.clone());
+    report.rust_value_type = rust_type.clone();
+    report.rust_field_type = rust_type.clone();
+    report.blocked_reason =
+        message_field_blocked_reason(field, report.wire_shape, rust_type.as_deref());
+    report.supported = report.blocked_reason.is_none();
+    if is_placeholder_message_field_name(field) {
+        report.supported = false;
+        report.blocked_reason = Some("placeholder-field-name".to_owned());
+    }
+    report
+}
+
 fn state_field_shape_report(
     field: &NetworkField,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
 ) -> NetworkStateFieldShapeReport {
-    let shape = field.wire_shape.or_else(|| {
-        field
-            .handler_vtable
-            .as_deref()
-            .and_then(|handler_vtable| wire_shapes.get(handler_vtable).copied())
-    });
+    let shape = field_wire_shape(field, wire_shapes);
+    let rust_type = field
+        .rust_type
+        .as_deref()
+        .filter(|rust_type| syn::parse_str::<syn::Type>(rust_type).is_ok());
     let rust_shape = shape.map(rust_field_shape);
-    let blocked_reason = field_blocked_reason(field, shape);
+    let blocked_reason = field_blocked_reason(field, shape, field.rust_type.as_deref());
     NetworkStateFieldShapeReport {
         field_index: field.index,
         field_name: field.name.clone(),
         group: field.group,
         handler_vtable: field.handler_vtable.clone(),
         wire_shape: shape,
-        wire_shape_source: field.wire_shape_source.clone().or_else(|| {
-            field
-                .handler_vtable
-                .as_deref()
-                .and_then(|handler_vtable| wire_shape_sources.get(handler_vtable).copied())
-                .map(ToOwned::to_owned)
-        }),
-        rust_value_type: rust_shape.map(|shape| shape.value_type.to_owned()),
+        wire_shape_source: field_wire_shape_source(field, wire_shapes, wire_shape_sources),
+        rust_value_type: rust_type
+            .map(ToOwned::to_owned)
+            .or_else(|| rust_shape.map(|shape| shape.value_type.to_owned())),
         rust_field_type: rust_shape.map(|shape| shape.field_type.to_owned()),
         confidence: field.confidence,
         supported: blocked_reason.is_none(),
         blocked_reason,
+    }
+}
+
+fn field_wire_shape(
+    field: &NetworkField,
+    wire_shapes: &BTreeMap<&str, SchemaWireShape>,
+) -> Option<SchemaWireShape> {
+    field
+        .wire_shape
+        .or_else(|| {
+            field
+                .handler_vtable
+                .as_deref()
+                .and_then(|handler_vtable| wire_shapes.get(handler_vtable).copied())
+        })
+        .or_else(|| {
+            field
+                .native_type
+                .as_deref()
+                .and_then(native_type_wire_shape)
+        })
+}
+
+fn field_wire_shape_source(
+    field: &NetworkField,
+    wire_shapes: &BTreeMap<&str, SchemaWireShape>,
+    wire_shape_sources: &BTreeMap<&str, &str>,
+) -> Option<String> {
+    field.wire_shape_source.clone().or_else(|| {
+        let handler_source = field
+            .handler_vtable
+            .as_deref()
+            .filter(|handler_vtable| wire_shapes.contains_key(*handler_vtable))
+            .and_then(|handler_vtable| wire_shape_sources.get(handler_vtable).copied())
+            .map(ToOwned::to_owned);
+        handler_source.or_else(|| {
+            field
+                .native_type
+                .as_deref()
+                .and_then(native_type_wire_shape)
+                .map(|_| "native-type".to_owned())
+        })
+    })
+}
+
+fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
+    match native_type.trim() {
+        "bool" => Some(SchemaWireShape::Bool),
+        "u8" | "uint8_t" | "AZ::u8" => Some(SchemaWireShape::U8),
+        "u16" | "uint16_t" | "AZ::u16" => Some(SchemaWireShape::U16),
+        "u32" | "uint32_t" | "AZ::u32" => Some(SchemaWireShape::U32),
+        "u64" | "uint64_t" | "AZ::u64" => Some(SchemaWireShape::U64),
+        "f32" | "float" => Some(SchemaWireShape::F32),
+        "f64" | "double" => Some(SchemaWireShape::F64),
+        "AZ::Vector2" => Some(SchemaWireShape::Vec2),
+        "AZ::Vector3" => Some(SchemaWireShape::Vec3),
+        "AZ::Vector4" => Some(SchemaWireShape::Vec4),
+        "AZ::Quaternion" => Some(SchemaWireShape::Quat),
+        "AZ::Matrix3x3" => Some(SchemaWireShape::Mat3),
+        "AZ::Transform" => Some(SchemaWireShape::Affine3),
+        "AZ::Aabb" => Some(SchemaWireShape::Aabb3d),
+        "EntityRef" => Some(SchemaWireShape::EntityRef),
+        "AZStd::string" | "std::string" | "string" => Some(SchemaWireShape::String),
+        _ => None,
     }
 }
 
@@ -779,7 +1305,57 @@ fn state_blocked_reasons(
     reasons
 }
 
-fn field_blocked_reason(field: &NetworkField, shape: Option<SchemaWireShape>) -> Option<String> {
+fn message_blocked_reasons(
+    network_type: &NetworkType,
+    field_count: usize,
+    missing_field_type_count: usize,
+    unsupported_wire_shape_count: usize,
+    invalid_field_metadata_count: usize,
+    low_confidence_field_count: usize,
+    placeholder_field_name_count: usize,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if network_type.type_id.is_none() {
+        reasons.push("missing-type-id".to_owned());
+    }
+    if network_type.type_index.is_none() {
+        reasons.push("missing-type-index".to_owned());
+    }
+    if network_type.name.is_none() {
+        reasons.push("missing-type-name".to_owned());
+    }
+    if field_count == 0 {
+        reasons.push("no-message-fields".to_owned());
+    }
+    if missing_field_type_count != 0 {
+        reasons.push(format!("missing-field-type:{missing_field_type_count}"));
+    }
+    if unsupported_wire_shape_count != 0 {
+        reasons.push(format!(
+            "unsupported-wire-shape:{unsupported_wire_shape_count}"
+        ));
+    }
+    if invalid_field_metadata_count != 0 {
+        reasons.push(format!(
+            "invalid-field-metadata:{invalid_field_metadata_count}"
+        ));
+    }
+    if low_confidence_field_count != 0 {
+        reasons.push(format!("low-confidence-field:{low_confidence_field_count}"));
+    }
+    if placeholder_field_name_count != 0 {
+        reasons.push(format!(
+            "placeholder-field-name:{placeholder_field_name_count}"
+        ));
+    }
+    reasons
+}
+
+fn field_blocked_reason(
+    field: &NetworkField,
+    shape: Option<SchemaWireShape>,
+    rust_type: Option<&str>,
+) -> Option<String> {
     if field.index.is_none() {
         return Some("missing-field-index".to_owned());
     }
@@ -792,7 +1368,77 @@ fn field_blocked_reason(field: &NetworkField, shape: Option<SchemaWireShape>) ->
     if shape.is_none() {
         return Some("missing-wire-shape".to_owned());
     }
+    if let Some(rust_type) = rust_type
+        && syn::parse_str::<syn::Type>(rust_type).is_err()
+    {
+        return Some("invalid-rust-field-type".to_owned());
+    }
     None
+}
+
+fn message_field_blocked_reason(
+    field: &NetworkField,
+    shape: Option<SchemaWireShape>,
+    rust_type: Option<&str>,
+) -> Option<String> {
+    if field.index.is_none() {
+        return Some("missing-field-index".to_owned());
+    }
+    if field.name.is_none() {
+        return Some("missing-field-name".to_owned());
+    }
+    if !field.confidence.is_high_or_exact() {
+        return Some("low-confidence-field".to_owned());
+    }
+    if let Some(rust_type) = rust_type
+        && syn::parse_str::<syn::Type>(rust_type).is_ok()
+    {
+        return None;
+    }
+    if rust_type.is_some() {
+        return Some("invalid-rust-field-type".to_owned());
+    }
+    if shape.is_none() {
+        return Some("missing-field-type".to_owned());
+    }
+    None
+}
+
+fn is_placeholder_field_name(value: &str) -> bool {
+    value
+        .strip_prefix("field_")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn is_placeholder_message_field_name(field: &NetworkField) -> bool {
+    let Some(name) = field.name.as_deref() else {
+        return false;
+    };
+    is_placeholder_field_name(name) || is_native_type_field_name(name)
+}
+
+fn is_native_type_field_name(name: &str) -> bool {
+    matches!(
+        name.trim(),
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "f32"
+            | "f64"
+            | "float"
+            | "double"
+            | "String"
+            | "Vector2"
+            | "Vector3"
+            | "Vector4"
+            | "Quaternion"
+            | "Matrix3x3"
+            | "Aabb"
+            | "EntityRef"
+            | "composite"
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -827,6 +1473,10 @@ const fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
             value_type: "f32",
             field_type: "ReplicatedFieldHandler<f32>",
         },
+        SchemaWireShape::F64 => RustFieldShape {
+            value_type: "f64",
+            field_type: "ReplicatedFieldHandler<f64>",
+        },
         SchemaWireShape::HalfF32 => RustFieldShape {
             value_type: "f32",
             field_type: "ReplicatedFieldHandler<f32, HalfF32Marshaler>",
@@ -835,9 +1485,49 @@ const fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
             value_type: "u32",
             field_type: "ReplicatedFieldHandler<u32, VlqU32Marshaler>",
         },
+        SchemaWireShape::Vec2 => RustFieldShape {
+            value_type: "::glam::Vec2",
+            field_type: "ReplicatedFieldHandler<::glam::Vec2>",
+        },
+        SchemaWireShape::Vec3 => RustFieldShape {
+            value_type: "::glam::Vec3",
+            field_type: "ReplicatedFieldHandler<::glam::Vec3>",
+        },
+        SchemaWireShape::Vec4 => RustFieldShape {
+            value_type: "::glam::Vec4",
+            field_type: "ReplicatedFieldHandler<::glam::Vec4>",
+        },
+        SchemaWireShape::Quat => RustFieldShape {
+            value_type: "::glam::Quat",
+            field_type: "ReplicatedFieldHandler<::glam::Quat>",
+        },
         SchemaWireShape::QuatCompNorm => RustFieldShape {
             value_type: "QuatCompNorm",
             field_type: "ReplicatedFieldHandler<QuatCompNorm>",
+        },
+        SchemaWireShape::Mat3 => RustFieldShape {
+            value_type: "::glam::Mat3",
+            field_type: "ReplicatedFieldHandler<::glam::Mat3>",
+        },
+        SchemaWireShape::Affine3 => RustFieldShape {
+            value_type: "::glam::Affine3A",
+            field_type: "ReplicatedFieldHandler<::glam::Affine3A>",
+        },
+        SchemaWireShape::Aabb3d => RustFieldShape {
+            value_type: "::bevy_math::bounding::Aabb3d",
+            field_type: "ReplicatedFieldHandler<::bevy_math::bounding::Aabb3d>",
+        },
+        SchemaWireShape::EntityRef => RustFieldShape {
+            value_type: "::nw_network::EntityRef",
+            field_type: "ReplicatedFieldHandler<::nw_network::EntityRef>",
+        },
+        SchemaWireShape::FixedBytes6 => RustFieldShape {
+            value_type: "[u8; 6]",
+            field_type: "ReplicatedFieldHandler<[u8; 6]>",
+        },
+        SchemaWireShape::FixedBytes16 => RustFieldShape {
+            value_type: "[u8; 16]",
+            field_type: "ReplicatedFieldHandler<[u8; 16]>",
         },
         SchemaWireShape::String => RustFieldShape {
             value_type: "String",
@@ -925,11 +1615,7 @@ fn replicated_state_field_tokens(field: &NetworkStateFieldShapeReport) -> proc_m
         Some(0) | None => quote! {},
         Some(group) => quote! { #[replicated_state(group = #group)] },
     };
-    let field_type = replicated_state_field_type_tokens(
-        field
-            .wire_shape
-            .expect("generatable replicated state field has a wire shape"),
-    );
+    let field_type = replicated_state_field_type_tokens(field);
 
     quote! {
         #group_attr
@@ -937,7 +1623,26 @@ fn replicated_state_field_tokens(field: &NetworkStateFieldShapeReport) -> proc_m
     }
 }
 
-fn replicated_state_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream {
+fn replicated_state_field_type_tokens(
+    field: &NetworkStateFieldShapeReport,
+) -> proc_macro2::TokenStream {
+    let shape = field
+        .wire_shape
+        .expect("generatable replicated state field has a wire shape");
+    if let Some(conversion) = field_conversion_marshal_type_tokens(field) {
+        let rust_type = field
+            .rust_value_type
+            .as_deref()
+            .and_then(|rust_type| syn::parse_str::<syn::Type>(rust_type).ok())
+            .expect("converted replicated state field has a valid Rust type");
+        return quote!(
+            ::nw_network::serialize::ReplicatedFieldHandler<
+                #rust_type,
+                #conversion,
+            >
+        );
+    }
+
     match shape {
         SchemaWireShape::Bool => {
             quote!(::nw_network::serialize::ReplicatedFieldHandler<bool>)
@@ -957,6 +1662,9 @@ fn replicated_state_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::To
         SchemaWireShape::F32 => {
             quote!(::nw_network::serialize::ReplicatedFieldHandler<f32>)
         }
+        SchemaWireShape::F64 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<f64>)
+        }
         SchemaWireShape::HalfF32 => {
             quote!(
                 ::nw_network::serialize::ReplicatedFieldHandler<
@@ -973,6 +1681,18 @@ fn replicated_state_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::To
                 >
             )
         }
+        SchemaWireShape::Vec2 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<::glam::Vec2>)
+        }
+        SchemaWireShape::Vec3 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<::glam::Vec3>)
+        }
+        SchemaWireShape::Vec4 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<::glam::Vec4>)
+        }
+        SchemaWireShape::Quat => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<::glam::Quat>)
+        }
         SchemaWireShape::QuatCompNorm => {
             quote!(
                 ::nw_network::serialize::ReplicatedFieldHandler<
@@ -980,9 +1700,190 @@ fn replicated_state_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::To
                 >
             )
         }
+        SchemaWireShape::Mat3 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<::glam::Mat3>)
+        }
+        SchemaWireShape::Affine3 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<::glam::Affine3A>)
+        }
+        SchemaWireShape::Aabb3d => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::bevy_math::bounding::Aabb3d,
+                >
+            )
+        }
+        SchemaWireShape::EntityRef => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<::nw_network::EntityRef>)
+        }
+        SchemaWireShape::FixedBytes6 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<[u8; 6]>)
+        }
+        SchemaWireShape::FixedBytes16 => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<[u8; 16]>)
+        }
         SchemaWireShape::String => {
             quote!(::nw_network::serialize::ReplicatedFieldHandler<String>)
         }
+    }
+}
+
+fn message_module_tokens(
+    network_type: &NetworkType,
+    plan: &NetworkMessageGenerationPlanReport,
+    rust_names: &BTreeMap<u32, String>,
+) -> proc_macro2::TokenStream {
+    let type_index = network_type
+        .type_index
+        .expect("generatable message has a type index");
+    let type_id = network_type
+        .type_id
+        .expect("generatable message has a type ID");
+    let source_name = network_type
+        .name
+        .as_deref()
+        .expect("generatable message has a name");
+    let rust_name = rust_names
+        .get(&type_index)
+        .cloned()
+        .unwrap_or_else(|| rust_type_ident(source_name));
+    let module_ident = format_ident!("{}", rust_module_ident(&rust_name));
+    let message_ident = format_ident!("{rust_name}");
+    let type_id = LitStr::new(
+        &type_id.hyphenated().to_string().to_ascii_uppercase(),
+        proc_macro2::Span::call_site(),
+    );
+    let fields = plan
+        .fields
+        .iter()
+        .map(message_field_tokens)
+        .collect::<Vec<_>>();
+
+    quote! {
+        pub mod #module_ident {
+            use ::nw_network::{AzRtti, Marshaler, TypeRegistry};
+
+            #[derive(Debug, Clone, Default, PartialEq, Marshaler, AzRtti, TypeRegistry)]
+            #[az_rtti(#type_id)]
+            #[type_registry(#type_index)]
+            pub struct #message_ident {
+                #(#fields)*
+            }
+        }
+
+        pub use #module_ident::#message_ident;
+    }
+}
+
+fn message_field_tokens(field: &NetworkStateFieldShapeReport) -> proc_macro2::TokenStream {
+    let field_name = field
+        .field_name
+        .as_deref()
+        .expect("generatable message field has a name");
+    let field_ident = format_ident!("{}", rust_field_ident(field_name));
+    let field_type = field
+        .rust_field_type
+        .as_deref()
+        .and_then(|rust_type| syn::parse_str::<syn::Type>(rust_type).ok())
+        .map(|rust_type| quote!(#rust_type))
+        .unwrap_or_else(|| {
+            message_field_type_tokens(
+                field
+                    .wire_shape
+                    .expect("generatable message field has a field type"),
+            )
+        });
+    let marshal_attr = message_field_marshal_attr_tokens(field);
+
+    quote! {
+        #marshal_attr
+        pub #field_ident: #field_type,
+    }
+}
+
+fn message_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream {
+    match shape {
+        SchemaWireShape::Bool => quote!(bool),
+        SchemaWireShape::U8 => quote!(u8),
+        SchemaWireShape::U16 => quote!(u16),
+        SchemaWireShape::U32 | SchemaWireShape::VlqU32 => quote!(u32),
+        SchemaWireShape::U64 => quote!(u64),
+        SchemaWireShape::F64 => quote!(f64),
+        SchemaWireShape::F32 | SchemaWireShape::HalfF32 => quote!(f32),
+        SchemaWireShape::Vec2 => quote!(::glam::Vec2),
+        SchemaWireShape::Vec3 => quote!(::glam::Vec3),
+        SchemaWireShape::Vec4 => quote!(::glam::Vec4),
+        SchemaWireShape::Quat => quote!(::glam::Quat),
+        SchemaWireShape::QuatCompNorm => quote!(::nw_network::serialize::QuatCompNorm),
+        SchemaWireShape::Mat3 => quote!(::glam::Mat3),
+        SchemaWireShape::Affine3 => quote!(::glam::Affine3A),
+        SchemaWireShape::Aabb3d => quote!(::bevy_math::bounding::Aabb3d),
+        SchemaWireShape::EntityRef => quote!(::nw_network::EntityRef),
+        SchemaWireShape::FixedBytes6 => quote!([u8; 6]),
+        SchemaWireShape::FixedBytes16 => quote!([u8; 16]),
+        SchemaWireShape::String => quote!(String),
+    }
+}
+
+fn message_field_marshal_attr_tokens(
+    field: &NetworkStateFieldShapeReport,
+) -> proc_macro2::TokenStream {
+    if let Some(conversion) = field_conversion_marshal_type_string(field) {
+        let conversion = LitStr::new(&conversion, proc_macro2::Span::call_site());
+        return quote!(#[marshal(codec = #conversion)]);
+    }
+
+    match field.wire_shape {
+        Some(shape) => message_wire_shape_marshal_attr_tokens(shape),
+        None => quote! {},
+    }
+}
+
+fn message_wire_shape_marshal_attr_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream {
+    match shape {
+        SchemaWireShape::HalfF32 => {
+            quote!(#[marshal(as = "::nw_network::serialize::HalfF32")])
+        }
+        SchemaWireShape::VlqU32 => {
+            quote!(#[marshal(as = "::nw_network::serialize::VlqU32")])
+        }
+        _ => quote! {},
+    }
+}
+
+fn field_conversion_marshal_type_tokens(
+    field: &NetworkStateFieldShapeReport,
+) -> Option<proc_macro2::TokenStream> {
+    let ty = field_conversion_marshal_type_string(field)?;
+    syn::parse_str::<syn::Type>(&ty).ok().map(|ty| quote!(#ty))
+}
+
+fn field_conversion_marshal_type_string(field: &NetworkStateFieldShapeReport) -> Option<String> {
+    let shape = field.wire_shape?;
+    let serialized_type = scalar_conversion_serialized_type(shape)?;
+    let rust_type = field.rust_value_type.as_deref()?.trim();
+    if rust_type == serialized_type {
+        return None;
+    }
+    if !is_generated_source_type(rust_type) {
+        return None;
+    }
+    Some(format!(
+        "::nw_network::serialize::ConversionMarshaler<{serialized_type}, {rust_type}>"
+    ))
+}
+
+fn is_generated_source_type(rust_type: &str) -> bool {
+    let rust_type = rust_type.trim_start_matches("::");
+    rust_type.starts_with("nw_network::source::")
+}
+
+const fn scalar_conversion_serialized_type(shape: SchemaWireShape) -> Option<&'static str> {
+    match shape {
+        SchemaWireShape::U8 => Some("u8"),
+        SchemaWireShape::U16 => Some("u16"),
+        SchemaWireShape::U32 => Some("u32"),
+        _ => None,
     }
 }
 
@@ -1040,9 +1941,20 @@ fn wire_shape_ident(shape: SchemaWireShape) -> proc_macro2::Ident {
         SchemaWireShape::U32 => format_ident!("U32"),
         SchemaWireShape::U64 => format_ident!("U64"),
         SchemaWireShape::F32 => format_ident!("F32"),
+        SchemaWireShape::F64 => format_ident!("F64"),
         SchemaWireShape::HalfF32 => format_ident!("HalfF32"),
         SchemaWireShape::VlqU32 => format_ident!("VlqU32"),
+        SchemaWireShape::Vec2 => format_ident!("Vec2"),
+        SchemaWireShape::Vec3 => format_ident!("Vec3"),
+        SchemaWireShape::Vec4 => format_ident!("Vec4"),
+        SchemaWireShape::Quat => format_ident!("Quat"),
         SchemaWireShape::QuatCompNorm => format_ident!("QuatCompNorm"),
+        SchemaWireShape::Mat3 => format_ident!("Mat3"),
+        SchemaWireShape::Affine3 => format_ident!("Affine3"),
+        SchemaWireShape::Aabb3d => format_ident!("Aabb3d"),
+        SchemaWireShape::EntityRef => format_ident!("EntityRef"),
+        SchemaWireShape::FixedBytes6 => format_ident!("FixedBytes6"),
+        SchemaWireShape::FixedBytes16 => format_ident!("FixedBytes16"),
         SchemaWireShape::String => format_ident!("String"),
     }
 }
@@ -1074,7 +1986,7 @@ fn type_id_literal(type_id: Uuid) -> proc_macro2::TokenStream {
 mod tests {
     use serde_json::json;
 
-    use crate::network_schema::NetworkSchema;
+    use crate::{ir::SerializeCodegenVariant, network_schema::NetworkSchema};
 
     use super::*;
 
@@ -1203,6 +2115,76 @@ mod tests {
     }
 
     #[test]
+    fn emits_fixed_byte_replicated_field_handlers() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "B8B8D08F-3AC4-47E9-8B1A-AD3704D0E001",
+                "typeIndex": 702,
+                "typeName": "Javelin::GameModeParticipantReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "flags",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81b6eb8",
+                    "confidence": "register-field-call"
+                }, {
+                    "index": 1,
+                    "name": "groupActivityEligibility",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x80b9830",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81b6eb8",
+                "fieldCount": 1,
+                "wireShape": "fixed-bytes-6",
+                "wireShapeSource": "marshal-raw-write-length",
+                "slots": []
+            }, {
+                "address": "NewWorld+0x80b9830",
+                "fieldCount": 1,
+                "wireShape": "fixed-bytes-16",
+                "wireShapeSource": "marshal-raw-write-length",
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let descriptor_output =
+            NetworkRustEmitter::emit_descriptors(&schema).expect("descriptor source");
+
+        assert_eq!(descriptor_output.report.field_wire_shape_count, 2);
+        assert!(
+            descriptor_output
+                .source
+                .contains("NetworkWireShape::FixedBytes6")
+        );
+        assert!(
+            descriptor_output
+                .source
+                .contains("NetworkWireShape::FixedBytes16")
+        );
+
+        let state_output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [702]).expect("state source");
+
+        assert_eq!(state_output.report.generatable_state_count, 1);
+        assert!(
+            state_output
+                .source
+                .contains("pub flags: ::nw_network::serialize::ReplicatedFieldHandler<[u8; 6]>")
+        );
+        assert!(
+            state_output
+                .source
+                .contains("pub group_activity_eligibility:")
+        );
+        assert!(state_output.source.contains("[u8; 16]"));
+    }
+
+    #[test]
     fn reports_selected_replicated_states_that_cannot_be_generated() {
         let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
@@ -1271,7 +2253,7 @@ mod tests {
                 },
                 "fields": [{
                     "index": 0,
-                    "name": "field_0",
+                    "name": "StatusCode",
                     "nativeType": "u32",
                     "storageOffset": "0x8",
                     "wireShape": "u32",
@@ -1279,7 +2261,7 @@ mod tests {
                     "confidence": "message-unmarshal-call"
                 }, {
                     "index": 2,
-                    "name": "field_2",
+                    "name": "ServerVersion",
                     "nativeType": "AZStd::string",
                     "storageOffset": "0xa0",
                     "wireShape": "string",
@@ -1316,6 +2298,349 @@ mod tests {
                 .source
                 .contains("wire_shape: Some(NetworkWireShape::String)")
         );
+
+        let message_output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(message_output.report.message_generation_plan_count, 1);
+        assert_eq!(message_output.report.generatable_message_count, 1);
+        assert_eq!(message_output.report.blocked_message_count, 0);
+        assert!(
+            message_output
+                .source
+                .contains("pub mod registration_request_v3_msg")
+        );
+        assert!(
+            message_output
+                .source
+                .contains("pub struct RegistrationRequestV3Msg")
+        );
+        assert!(message_output.source.contains("pub status_code: u32"));
+        assert!(message_output.source.contains("pub server_version: String"));
+        assert!(message_output.source.contains("Marshaler"));
+        assert!(message_output.source.contains("AzRtti"));
+        assert!(message_output.source.contains("TypeRegistry"));
+    }
+
+    #[test]
+    fn infers_message_wire_shapes_from_native_types() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
+                "typeIndex": 6179,
+                "typeName": "Aoi::PhysicsTrait::ResizeAoiObserverMsg",
+                "rootKinds": ["message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "Observer",
+                    "nativeType": "EntityRef",
+                    "confidence": "message-unmarshal-call"
+                }, {
+                    "index": 1,
+                    "name": "Elapsed",
+                    "nativeType": "f32",
+                    "confidence": "message-unmarshal-call"
+                }, {
+                    "index": 2,
+                    "name": "Extents",
+                    "nativeType": "AZ::Vector2",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let descriptor_output =
+            NetworkRustEmitter::emit_descriptors(&schema).expect("descriptor source");
+
+        assert_eq!(descriptor_output.report.field_wire_shape_count, 3);
+        assert!(
+            descriptor_output
+                .source
+                .contains("wire_shape: Some(NetworkWireShape::EntityRef)")
+        );
+        assert!(
+            descriptor_output
+                .source
+                .contains("wire_shape: Some(NetworkWireShape::F32)")
+        );
+        assert!(
+            descriptor_output
+                .source
+                .contains("wire_shape: Some(NetworkWireShape::Vec2)")
+        );
+
+        let message_output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(message_output.report.message_generation_plan_count, 1);
+        assert_eq!(message_output.report.generatable_message_count, 1);
+        assert_eq!(message_output.report.blocked_message_count, 0);
+        let plan = &message_output.report.message_generation_plans[0];
+        assert_eq!(plan.missing_wire_shape_count, 0);
+        assert_eq!(plan.supported_field_count, 3);
+        assert_eq!(
+            plan.fields[2].wire_shape_source.as_deref(),
+            Some("native-type")
+        );
+        assert!(
+            message_output
+                .source
+                .contains("pub observer: ::nw_network::EntityRef")
+        );
+        assert!(message_output.source.contains("pub elapsed: f32"));
+        assert!(message_output.source.contains("pub extents: ::glam::Vec2"));
+    }
+
+    #[test]
+    fn blocks_message_struct_generation_for_native_type_field_names() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "77D6477C-F057-4098-A644-58D36C551989",
+                "typeIndex": 1444,
+                "typeName": "Aoi::PhysicsTrait::ResizeAoiObservableMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "f32",
+                    "nativeType": "f32",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.message_generation_plan_count, 1);
+        assert_eq!(output.report.generatable_message_count, 0);
+        assert_eq!(output.report.blocked_message_count, 1);
+        assert_eq!(
+            output.report.message_generation_plans[0].blocked_reasons,
+            vec!["placeholder-field-name:1"]
+        );
+        assert!(!output.source.contains("pub struct ResizeAoiObservableMsg"));
+    }
+
+    #[test]
+    fn blocks_message_struct_generation_for_placeholder_field_names() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "6A379FB8-0BDD-43A1-AB3E-9843D7BE8CD3",
+                "typeIndex": 349,
+                "typeName": "REPClient::PingMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "field_0",
+                    "nativeType": "u64",
+                    "wireShape": "u64",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.message_generation_plan_count, 1);
+        assert_eq!(output.report.generatable_message_count, 0);
+        assert_eq!(output.report.blocked_message_count, 1);
+        assert_eq!(
+            output.report.message_generation_plans[0].blocked_reasons,
+            vec!["placeholder-field-name:1"]
+        );
+        assert!(!output.source.contains("pub struct PingMsg"));
+    }
+
+    #[test]
+    fn emits_message_fields_from_explicit_rust_types_without_wire_shapes() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
+                "typeIndex": 19,
+                "typeName": "RegistrationRequestV3Msg",
+                "fields": [{
+                    "index": 0,
+                    "name": "LoginToken",
+                    "nativeType": "LoginToken",
+                    "rustType": "::nw_network::LoginToken",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.message_generation_plan_count, 1);
+        assert_eq!(output.report.generatable_message_count, 1);
+        assert_eq!(output.report.blocked_message_count, 0);
+        let plan = &output.report.message_generation_plans[0];
+        assert_eq!(plan.missing_wire_shape_count, 1);
+        assert_eq!(plan.missing_field_type_count, 0);
+        assert_eq!(plan.supported_field_count, 1);
+        assert!(
+            output
+                .source
+                .contains("pub login_token: ::nw_network::LoginToken")
+        );
+    }
+
+    #[test]
+    fn emits_conversion_marshaler_for_explicit_message_scalar_types() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
+                "typeIndex": 19,
+                "typeName": "GridSideMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "GridSide",
+                    "nativeType": "u8",
+                    "rustType": "::nw_network::source::GridSides",
+                    "wireShape": "u8",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.generatable_message_count, 1);
+        assert!(
+            output
+                .source
+                .contains("pub grid_side: ::nw_network::source::GridSides")
+        );
+        assert!(
+            output.source.contains("codec =")
+                && output.source.contains(
+                    "::nw_network::serialize::ConversionMarshaler<u8, ::nw_network::source::GridSides>"
+                )
+        );
+    }
+
+    #[test]
+    fn leaves_explicit_self_marshaling_scalar_types_unwrapped() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
+                "typeIndex": 19,
+                "typeName": "RegistrationRequestV3Msg",
+                "fields": [{
+                    "index": 0,
+                    "name": "TypeIndexCrc",
+                    "nativeType": "AZ::Crc32",
+                    "rustType": "::nw_network::TypeIndexCrc",
+                    "wireShape": "u32",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.generatable_message_count, 1);
+        assert!(
+            output
+                .source
+                .contains("pub type_index_crc: ::nw_network::TypeIndexCrc")
+        );
+        assert!(!output.source.contains("ConversionMarshaler"));
+        assert!(!output.source.contains("codec ="));
+    }
+
+    #[test]
+    fn emits_conversion_marshaler_for_explicit_replicated_state_scalar_types() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "A85DF621-DCE0-409F-8D39-A447EA0807FF",
+                "typeIndex": 28,
+                "typeName": "Javelin::GridSideReplicatedState",
+                "rootKinds": ["replicated-state"],
+                "fields": [{
+                    "index": 0,
+                    "name": "GridSide",
+                    "group": 0,
+                    "nativeType": "u8",
+                    "rustType": "::nw_network::source::GridSides",
+                    "wireShape": "u8",
+                    "confidence": "exact"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [28]).expect("state source");
+
+        assert_eq!(output.report.generatable_state_count, 1);
+        assert!(
+            output
+                .source
+                .contains("pub grid_side: ::nw_network::serialize::ReplicatedFieldHandler<")
+        );
+        assert!(output.source.contains("::nw_network::source::GridSides"));
+        assert!(
+            output
+                .source
+                .contains("::nw_network::serialize::ConversionMarshaler<")
+        );
+        assert!(output.source.contains("u8,"));
+    }
+
+    #[test]
+    fn emits_marshaler_conversions_for_compact_generated_enums() {
+        let item = SerializeCodegenItem {
+            source_type_id: Uuid::from_u128(0xffe86b0916b9429e9cd22901adbe8de3),
+            source_name: "GridSides".to_owned(),
+            role: crate::role::ReflectedTypeRole::SupportType,
+            is_reflection_marker: false,
+            is_abstract: None,
+            factory: None,
+            rtti_base_chain: Vec::new(),
+            kind: SerializeCodegenItemKind::Enum,
+            enum_underlying_type: Some(ResolvedType::Scalar(ScalarType::I32)),
+            fields: Vec::new(),
+            variants: vec![
+                SerializeCodegenVariant {
+                    source_name: "InvalidSide".to_owned(),
+                    value_u64: Some(0),
+                    value_u32: Some(0),
+                    value_i32: Some(0),
+                },
+                SerializeCodegenVariant {
+                    source_name: "Left".to_owned(),
+                    value_u64: Some(4),
+                    value_u32: Some(4),
+                    value_i32: Some(4),
+                },
+            ],
+        };
+
+        let output =
+            NetworkRustEmitter::emit_marshaler_conversions([&item]).expect("conversion source");
+
+        assert_eq!(output.report.marshaler_conversion_count, 3);
+        assert!(
+            output
+                .source
+                .contains("impl ::nw_network::serialize::MarshalerConversion<u8>")
+        );
+        assert!(
+            output
+                .source
+                .contains("for ::nw_network::source::GridSides")
+        );
+        assert!(output.source.contains("let raw = i32::from(self);"));
+        assert!(output.source.contains("min: 0u64"));
+        assert!(output.source.contains("max: 4u64"));
     }
 
     #[test]
@@ -1339,7 +2664,7 @@ mod tests {
     }
 
     #[test]
-    fn suffixes_identity_leaf_name_collisions() {
+    fn qualifies_identity_leaf_name_collisions_with_namespace() {
         let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [
                 {
@@ -1363,7 +2688,7 @@ mod tests {
 
         assert_eq!(output.report.identity_name_collision_count, 1);
         assert_eq!(output.report.identity_type_count, 2);
-        assert!(output.source.contains("pub struct SharedName11111111"));
-        assert!(output.source.contains("pub struct SharedName22222222"));
+        assert!(output.source.contains("pub struct FirstSharedName"));
+        assert!(output.source.contains("pub struct SecondSharedName"));
     }
 }

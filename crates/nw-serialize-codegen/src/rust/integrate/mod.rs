@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+use uuid::Uuid;
 
 pub mod identity;
 pub mod source_index;
@@ -19,6 +20,7 @@ use crate::rust::source::{RustSourceEmitError, RustSourceEmitter};
 pub struct RustSourceInventory {
     files: Vec<RustSourceInventoryFile>,
     items_by_name: BTreeMap<String, Vec<RustSourceInventoryItem>>,
+    items_by_type_id: BTreeMap<Uuid, Vec<RustSourceInventoryItem>>,
     source_types: RustSourceTypeIndex,
 }
 
@@ -85,23 +87,44 @@ impl RustSourceInventory {
         source_types: RustSourceTypeIndex,
     ) -> Self {
         let mut items_by_name: BTreeMap<String, Vec<RustSourceInventoryItem>> = BTreeMap::new();
+        let mut items_by_type_id: BTreeMap<Uuid, Vec<RustSourceInventoryItem>> = BTreeMap::new();
         for inventory_file in &files {
             for item in inventory_file.file.items() {
+                let inventory_item = RustSourceInventoryItem {
+                    path: inventory_file.path.clone(),
+                    item: item.clone(),
+                };
                 items_by_name
                     .entry(item.name.clone())
                     .or_default()
-                    .push(RustSourceInventoryItem {
-                        path: inventory_file.path.clone(),
-                        item: item.clone(),
-                    });
+                    .push(inventory_item.clone());
+                for type_id in item
+                    .identity_attrs
+                    .iter()
+                    .filter_map(|attr| attr.type_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                {
+                    items_by_type_id
+                        .entry(type_id)
+                        .or_default()
+                        .push(inventory_item.clone());
+                }
             }
         }
         for items in items_by_name.values_mut() {
             items.sort_by(|left, right| left.path.cmp(&right.path));
         }
+        for items in items_by_type_id.values_mut() {
+            items.sort_by(|left, right| {
+                left.path
+                    .cmp(&right.path)
+                    .then_with(|| left.item.name.cmp(&right.item.name))
+            });
+        }
         Self {
             files,
             items_by_name,
+            items_by_type_id,
             source_types,
         }
     }
@@ -120,6 +143,14 @@ impl RustSourceInventory {
     pub fn candidates_for(&self, item_name: &str) -> &[RustSourceInventoryItem] {
         self.items_by_name
             .get(item_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    #[must_use]
+    pub fn candidates_for_type_id(&self, type_id: Uuid) -> &[RustSourceInventoryItem] {
+        self.items_by_type_id
+            .get(&type_id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }

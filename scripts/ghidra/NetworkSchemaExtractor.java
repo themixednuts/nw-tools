@@ -39,6 +39,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
 public class NetworkSchemaExtractor extends GhidraScript {
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260624-linear-raw-write-pass";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long QUEUE_REGISTRATION_HOOK_RVA = 0x61a95c0L;
     private static final int BACKWARD_ARGUMENT_SCAN_LIMIT = 48;
@@ -88,10 +89,12 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
     private final Map<String, Address> pointerReadCache = new HashMap<>();
     private final Map<String, List<Address>> asciiStringSearchCache = new HashMap<>();
+    private final Map<String, Address> fieldHandlerConstructorVtableCache = new HashMap<>();
     private DecompInterface decompiler;
 
     @Override
     protected void run() throws Exception {
+        println("NetworkSchemaExtractor version: " + EXTRACTOR_VERSION);
         File input = inputFile();
         File output = outputFile(input);
         Address registerField = currentProgram.getImageBase().add(REGISTER_FIELD_RVA);
@@ -162,6 +165,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
         JsonObject report = new JsonObject();
         report.addProperty("schema", "newworld.network_schema.static.v1");
+        report.addProperty("extractorVersion", EXTRACTOR_VERSION);
         report.addProperty("program", currentProgram.getName());
         report.addProperty("imageBase", formatAddress(currentProgram.getImageBase()));
         report.addProperty("input", input.getAbsolutePath());
@@ -713,29 +717,21 @@ public class NetworkSchemaExtractor extends GhidraScript {
         }
 
         MessageHelperCall helperCall = findMessageHelperCall(wrapper);
+        String wrapperText = decompileC(wrapper);
         if (helperCall == null) {
-            return null;
+            return recoverFallbackMessageUnmarshalPlan(entry, wrapper, wrapperText);
         }
 
-        String wrapperText = decompileC(wrapper);
         ParsedUnmarshalFieldsCall parsedCall = parseUnmarshalFieldsCall(wrapperText);
         if (parsedCall == null) {
-            return null;
+            return recoverFallbackMessageUnmarshalPlan(entry, wrapper, wrapperText);
         }
 
-        MessageUnmarshalPlan plan = new MessageUnmarshalPlan();
-        plan.wrapper = wrapper.getEntryPoint();
-        plan.wrapperName = fullFunctionName(wrapper);
+        MessageUnmarshalPlan plan = newMessageUnmarshalPlan(entry, wrapper);
         plan.templateTypes.addAll(parsedCall.templateTypes);
         plan.helperCallsite = helperCall.callsite;
         plan.helper = helperCall.target;
         plan.helperName = helperCall.targetName;
-        Long instanceSize = recoverCreateInstanceSize(entry);
-        if (instanceSize != null) {
-            plan.instanceSize = instanceSize;
-            plan.instanceSizeSource = "create-instance-operator-new";
-            plan.createInstance = parseCapturedAddress(entry.createInstance);
-        }
         MessageConstructorCall constructor = findMessageConstructorCall(wrapper, helperCall.callsite);
         if (constructor != null) {
             plan.instanceConstructorCallsite = constructor.callsite;
@@ -778,6 +774,305 @@ public class NetworkSchemaExtractor extends GhidraScript {
         refineMessageFieldsFromHelper(plan);
         enrichMessageFieldsFromSourceSignatures(entry, plan);
         return plan;
+    }
+
+    private MessageUnmarshalPlan newMessageUnmarshalPlan(RegistryEntry entry, Function wrapper) {
+        MessageUnmarshalPlan plan = new MessageUnmarshalPlan();
+        plan.wrapper = wrapper.getEntryPoint();
+        plan.wrapperName = fullFunctionName(wrapper);
+        Long instanceSize = recoverCreateInstanceSize(entry);
+        if (instanceSize != null) {
+            plan.instanceSize = instanceSize;
+            plan.instanceSizeSource = "create-instance-operator-new";
+            plan.createInstance = parseCapturedAddress(entry.createInstance);
+        }
+        return plan;
+    }
+
+    private MessageUnmarshalPlan recoverFallbackMessageUnmarshalPlan(
+        RegistryEntry entry,
+        Function wrapper,
+        String wrapperText) {
+
+        if (wrapperText == null) {
+            return null;
+        }
+
+        MessageUnmarshalPlan plan = newMessageUnmarshalPlan(entry, wrapper);
+        recoverInlineMessageFields(plan, wrapper.getEntryPoint(), wrapperText);
+        recoverHelperArgumentMessageFields(plan, wrapper, wrapperText);
+        if (plan.fields.isEmpty()) {
+            return null;
+        }
+        sortMessageFieldsByRecoveryOrder(plan);
+        enrichMessageFieldsFromSourceSignatures(entry, plan);
+        return plan;
+    }
+
+    private void recoverInlineMessageFields(
+        MessageUnmarshalPlan plan,
+        Address callsite,
+        String text) {
+
+        for (ParsedUnmarshalCall call : parseMarshalerUnmarshalCalls(text)) {
+            String storage = storageArgumentForMarshalerCall(call);
+            if (!isLikelyMessageStorage(storage)) {
+                continue;
+            }
+            addMessageField(
+                plan,
+                callsite,
+                storage,
+                call.templateType,
+                "message-unmarshal-inline-call",
+                call.textIndex);
+        }
+    }
+
+    private void recoverHelperArgumentMessageFields(
+        MessageUnmarshalPlan plan,
+        Function wrapper,
+        String wrapperText) {
+
+        for (Instruction instruction :
+            currentProgram.getListing().getInstructions(wrapper.getBody(), true)) {
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+
+            Function helper = functionAtOrContaining(callTarget(instruction));
+            if (helper == null) {
+                continue;
+            }
+
+            List<String> wrapperArgs = callArgumentsForTarget(wrapperText, helper);
+            if (wrapperArgs.size() <= 2) {
+                continue;
+            }
+
+            int helperTextIndex = callTextIndexForTarget(wrapperText, helper);
+            String directTemplateType = unmarshalTemplateType(fullFunctionName(helper));
+            if (directTemplateType != null) {
+                String storage = messageStorageArgumentFromWrapperArgs(wrapperArgs);
+                if (storage != null) {
+                    addMessageField(
+                        plan,
+                        instruction.getMinAddress(),
+                        storage,
+                        directTemplateType,
+                        "message-unmarshal-helper-direct",
+                        helperTextIndex);
+                }
+                continue;
+            }
+
+            String helperText = decompileC(helper);
+            if (!looksLikeMessageUnmarshalHelper(helperText)) {
+                continue;
+            }
+
+            String singleTemplateType = singleMarshalerUnmarshalTemplateType(helperText);
+            if (singleTemplateType != null) {
+                String storage = messageStorageArgumentFromWrapperArgs(wrapperArgs);
+                if (storage != null) {
+                    addMessageField(
+                        plan,
+                        instruction.getMinAddress(),
+                        storage,
+                        singleTemplateType,
+                        "message-unmarshal-helper-wrapper",
+                        helperTextIndex);
+                }
+                continue;
+            }
+
+            if (plan.helper == null) {
+                plan.helperCallsite = instruction.getMinAddress();
+                plan.helper = helper.getEntryPoint();
+                plan.helperName = fullFunctionName(helper);
+            }
+
+            List<String> helperParams = parameterNamesFromDecompiledFunction(helperText);
+            HashMap<String, FieldCall> fieldsByHelperParam = new HashMap<>();
+            for (int i = 2; i < wrapperArgs.size(); i++) {
+                String storage = wrapperArgs.get(i);
+                if (!isLikelyMessageStorage(storage)) {
+                    continue;
+                }
+                FieldCall field = addMessageField(
+                    plan,
+                    instruction.getMinAddress(),
+                    storage,
+                    null,
+                    "message-unmarshal-helper-argument",
+                    relativeRecoveryOrder(helperTextIndex, i));
+                if (i < helperParams.size()) {
+                    fieldsByHelperParam.put(helperParams.get(i), field);
+                }
+            }
+
+            refineHelperArgumentFieldTypes(helperText, fieldsByHelperParam);
+            refineDirectBoolWrites(helperText, fieldsByHelperParam);
+            refineNestedBoolWrites(helper, helperText, fieldsByHelperParam);
+        }
+    }
+
+    private boolean looksLikeMessageUnmarshalHelper(String text) {
+        return text != null &&
+            (text.contains("Marshaler<") ||
+                text.contains("::Unmarshal(") ||
+                text.contains("ReadBuffer::ReadRaw") ||
+                BOOL_POINTER_WRITE_RE.matcher(text).find());
+    }
+
+    private String singleMarshalerUnmarshalTemplateType(String text) {
+        List<ParsedUnmarshalCall> calls = parseMarshalerUnmarshalCalls(text);
+        return calls.size() == 1 ? calls.get(0).templateType : null;
+    }
+
+    private String messageStorageArgumentFromWrapperArgs(List<String> args) {
+        for (int i = args.size() - 1; i >= 0; i--) {
+            String arg = args.get(i);
+            if (isLikelyMessageStorage(arg)) {
+                return arg;
+            }
+        }
+        return null;
+    }
+
+    private int relativeRecoveryOrder(int base, int offset) {
+        return base == Integer.MAX_VALUE ? Integer.MAX_VALUE : base + offset;
+    }
+
+    private void refineHelperArgumentFieldTypes(
+        String helperText,
+        Map<String, FieldCall> fieldsByHelperParam) {
+
+        if (fieldsByHelperParam.isEmpty()) {
+            return;
+        }
+        for (ParsedUnmarshalCall call : parseMarshalerUnmarshalCalls(helperText)) {
+            String storage = storageArgumentForMarshalerCall(call);
+            String helperParam = helperParameterFromExpression(storage, fieldsByHelperParam);
+            if (helperParam == null) {
+                continue;
+            }
+            FieldCall field = fieldsByHelperParam.get(helperParam);
+            refineMessageFieldType(
+                field,
+                call.templateType,
+                "message-unmarshal-helper-nested-call");
+        }
+    }
+
+    private FieldCall addMessageField(
+        MessageUnmarshalPlan plan,
+        Address callsite,
+        String storageExpression,
+        String nativeType,
+        String confidence) {
+        return addMessageField(
+            plan,
+            callsite,
+            storageExpression,
+            nativeType,
+            confidence,
+            Integer.MAX_VALUE);
+    }
+
+    private FieldCall addMessageField(
+        MessageUnmarshalPlan plan,
+        Address callsite,
+        String storageExpression,
+        String nativeType,
+        String confidence,
+        int recoveryOrder) {
+
+        String storage = normalizedExpression(storageExpression);
+        for (FieldCall existing : plan.fields) {
+            if (storage != null && storage.equals(normalizedExpression(existing.storageExpression))) {
+                refineMessageFieldType(existing, nativeType, confidence);
+                existing.recoveryOrder = Math.min(existing.recoveryOrder, recoveryOrder);
+                return existing;
+            }
+        }
+
+        FieldCall field = new FieldCall();
+        field.index = plan.fields.size();
+        field.callsite = callsite;
+        field.recoveryOrder = recoveryOrder;
+        field.name = "field_" + field.index;
+        field.nativeType = nativeType;
+        field.storageExpression = storageExpression;
+        field.storageOffset = storageByteOffsetFromExpression(storageExpression);
+        field.wireShape = wireShapeFromNativeType(nativeType);
+        field.wireShapeSource = field.wireShape == null ? null : confidence;
+        field.confidence = confidence;
+
+        String derived = sourceFieldNameFromType(nativeType);
+        if (derived != null) {
+            field.name = derived;
+            field.nameSource = "message-native-type-name";
+            field.sourceTypeName = nativeType;
+        }
+
+        plan.fields.add(field);
+        return field;
+    }
+
+    private void sortMessageFieldsByRecoveryOrder(MessageUnmarshalPlan plan) {
+        plan.fields.sort((left, right) -> {
+            int order = Integer.compare(left.recoveryOrder, right.recoveryOrder);
+            if (order != 0) {
+                return order;
+            }
+            return Integer.compare(left.index, right.index);
+        });
+        for (int i = 0; i < plan.fields.size(); i++) {
+            FieldCall field = plan.fields.get(i);
+            if (isGeneratedFieldName(field.name)) {
+                field.name = "field_" + i;
+            }
+            field.index = i;
+        }
+    }
+
+    private void refineMessageFieldType(
+        FieldCall field,
+        String nativeType,
+        String source) {
+
+        if (field == null || nativeType == null || nativeType.isEmpty()) {
+            return;
+        }
+        if (field.nativeType == null) {
+            field.nativeType = nativeType;
+            field.wireShape = wireShapeFromNativeType(nativeType);
+            field.wireShapeSource = field.wireShape == null ? null : source;
+            return;
+        }
+        if (!field.nativeType.equals(nativeType)) {
+            field.sourceTypeName = appendDistinctType(field.sourceTypeName, field.nativeType);
+            field.sourceTypeName = appendDistinctType(field.sourceTypeName, nativeType);
+            field.nativeType = "composite";
+            field.wireShape = null;
+            field.wireShapeSource = null;
+        }
+    }
+
+    private String appendDistinctType(String existing, String value) {
+        if (value == null || value.isEmpty()) {
+            return existing;
+        }
+        if (existing == null || existing.isEmpty()) {
+            return value;
+        }
+        for (String part : existing.split(",")) {
+            if (part.trim().equals(value)) {
+                return existing;
+            }
+        }
+        return existing + "," + value;
     }
 
     private void enrichMessageFieldsFromSourceSignatures(
@@ -1216,6 +1511,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private Long storageByteOffsetFromExpression(String expression) {
+        expression = normalizedExpression(expression);
         if (expression == null) {
             return null;
         }
@@ -1417,11 +1713,193 @@ public class NetworkSchemaExtractor extends GhidraScript {
             String templateType = text.substring(templateStart + 1, templateEnd).trim();
             ParsedUnmarshalCall call = new ParsedUnmarshalCall();
             call.templateType = templateType;
+            call.textIndex = nameIndex;
             call.args.addAll(splitTopLevel(text.substring(argsStart + 1, argsEnd)));
             result.add(call);
             search = argsEnd + 1;
         }
         return result;
+    }
+
+    private List<ParsedUnmarshalCall> parseMarshalerUnmarshalCalls(String text) {
+        ArrayList<ParsedUnmarshalCall> result = new ArrayList<>();
+        if (text == null) {
+            return result;
+        }
+        int search = 0;
+        while (search < text.length()) {
+            int nameIndex = text.indexOf("Marshaler<", search);
+            if (nameIndex < 0) {
+                break;
+            }
+            int templateStart = text.indexOf('<', nameIndex);
+            int templateEnd = matchingIndex(text, templateStart, '<', '>');
+            int unmarshalIndex = templateEnd < 0
+                ? -1
+                : text.indexOf("::Unmarshal", templateEnd);
+            int argsStart = unmarshalIndex < 0 ? -1 : text.indexOf('(', unmarshalIndex);
+            int argsEnd = matchingIndex(text, argsStart, '(', ')');
+            if (templateStart < 0 || templateEnd < 0 || unmarshalIndex < 0 ||
+                argsStart < 0 || argsEnd < 0) {
+                search = nameIndex + "Marshaler<".length();
+                continue;
+            }
+
+            ParsedUnmarshalCall call = new ParsedUnmarshalCall();
+            call.templateType = text.substring(templateStart + 1, templateEnd).trim();
+            call.textIndex = nameIndex;
+            call.args.addAll(splitTopLevel(text.substring(argsStart + 1, argsEnd)));
+            result.add(call);
+            search = argsEnd + 1;
+        }
+        return result;
+    }
+
+    private String storageArgumentForMarshalerCall(ParsedUnmarshalCall call) {
+        if (call == null || call.args.size() < 3) {
+            return null;
+        }
+        return call.args.get(call.args.size() - 2);
+    }
+
+    private boolean isLikelyMessageStorage(String expression) {
+        if (expression == null) {
+            return false;
+        }
+        String value = normalizedExpression(expression);
+        if (value == null || value.matches("param_\\d+")) {
+            return false;
+        }
+        return value.startsWith("_Dst") ||
+            value.matches(".*\\bparam_\\d+\\s*\\+\\s*(0x[0-9a-fA-F]+|\\d+).*");
+    }
+
+    private String helperParameterFromExpression(
+        String expression,
+        Map<String, FieldCall> fieldsByHelperParam) {
+
+        if (expression == null || fieldsByHelperParam.isEmpty()) {
+            return null;
+        }
+        Matcher matcher = Pattern.compile("\\b[A-Za-z_][A-Za-z0-9_]*\\b").matcher(expression);
+        while (matcher.find()) {
+            String token = matcher.group();
+            if (fieldsByHelperParam.containsKey(token)) {
+                return token;
+            }
+        }
+        return null;
+    }
+
+    private List<String> callArgumentsForTarget(String text, Function target) {
+        if (text == null || target == null) {
+            return List.of();
+        }
+        for (String name : functionCallNameCandidates(target)) {
+            List<String> args = callArgumentsForName(text, name);
+            if (!args.isEmpty()) {
+                return args;
+            }
+        }
+        return List.of();
+    }
+
+    private int callTextIndexForTarget(String text, Function target) {
+        if (text == null || target == null) {
+            return Integer.MAX_VALUE;
+        }
+        for (String name : functionCallNameCandidates(target)) {
+            int index = callTextIndexForName(text, name);
+            if (index >= 0) {
+                return index;
+            }
+        }
+        return Integer.MAX_VALUE;
+    }
+
+    private int callTextIndexForName(String text, String name) {
+        if (text == null || name == null || name.isEmpty()) {
+            return -1;
+        }
+        int search = 0;
+        while (search < text.length()) {
+            int nameIndex = text.indexOf(name, search);
+            if (nameIndex < 0) {
+                return -1;
+            }
+            int argsStart = text.indexOf('(', nameIndex + name.length());
+            if (argsStart < 0) {
+                return -1;
+            }
+            String between = text.substring(nameIndex + name.length(), argsStart).trim();
+            if (!between.isEmpty()) {
+                search = nameIndex + name.length();
+                continue;
+            }
+            return nameIndex;
+        }
+        return -1;
+    }
+
+    private List<String> functionCallNameCandidates(Function function) {
+        ArrayList<String> result = new ArrayList<>();
+        String fullName = fullFunctionName(function);
+        addDistinct(result, fullName);
+        String plainName = function.getName();
+        if (!isGenericCallName(plainName)) {
+            addDistinct(result, plainName);
+        }
+        String leaf = sourceTypeLeaf(fullName);
+        if (!isGenericCallName(leaf)) {
+            addDistinct(result, leaf);
+        }
+        return result;
+    }
+
+    private boolean isGenericCallName(String value) {
+        return value == null ||
+            value.isEmpty() ||
+            "Unmarshal".equals(value) ||
+            "Marshal".equals(value) ||
+            "CopyValue".equals(value) ||
+            "CreateInstance".equals(value) ||
+            "GetEmptyValue".equals(value) ||
+            "Destructor".equals(value);
+    }
+
+    private void addDistinct(List<String> values, String value) {
+        if (value == null || value.isEmpty() || values.contains(value)) {
+            return;
+        }
+        values.add(value);
+    }
+
+    private List<String> callArgumentsForName(String text, String name) {
+        if (text == null || name == null || name.isEmpty()) {
+            return List.of();
+        }
+        int search = 0;
+        while (search < text.length()) {
+            int nameIndex = text.indexOf(name, search);
+            if (nameIndex < 0) {
+                return List.of();
+            }
+            int argsStart = text.indexOf('(', nameIndex + name.length());
+            if (argsStart < 0) {
+                return List.of();
+            }
+            String between = text.substring(nameIndex + name.length(), argsStart).trim();
+            if (!between.isEmpty()) {
+                search = nameIndex + name.length();
+                continue;
+            }
+            int argsEnd = matchingIndex(text, argsStart, '(', ')');
+            if (argsEnd < 0) {
+                return List.of();
+            }
+            return splitTopLevel(text.substring(argsStart + 1, argsEnd));
+        }
+        return List.of();
     }
 
     private String unmarshalTemplateType(String functionName) {
@@ -1541,6 +2019,31 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return result;
     }
 
+    private String normalizedExpression(String value) {
+        if (value == null) {
+            return null;
+        }
+        String result = value.trim();
+        while (result.startsWith("&")) {
+            result = result.substring(1).trim();
+        }
+        while (result.startsWith("(")) {
+            int end = matchingIndex(result, 0, '(', ')');
+            if (end <= 0) {
+                break;
+            }
+            String cast = result.substring(1, end).trim();
+            if (!isLikelyCastType(cast)) {
+                break;
+            }
+            result = result.substring(end + 1).trim();
+        }
+        while (result.startsWith("&")) {
+            result = result.substring(1).trim();
+        }
+        return result.replaceAll("\\s+", " ");
+    }
+
     private boolean isLikelyCastType(String value) {
         if (value == null || value.isEmpty()) {
             return false;
@@ -1550,7 +2053,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
             value.contains("unordered_map") ||
             value.startsWith("undefined") ||
             value.startsWith("byte") ||
-            value.startsWith("bool");
+            value.startsWith("bool") ||
+            value.startsWith("longlong") ||
+            value.startsWith("ulonglong");
     }
 
     private int matchingIndex(String text, int start, char open, char close) {
@@ -1690,8 +2195,34 @@ public class NetworkSchemaExtractor extends GhidraScript {
             "u8".equals(nativeType) ||
             "u16".equals(nativeType) ||
             "u32".equals(nativeType) ||
-            "u64".equals(nativeType)) {
+            "u64".equals(nativeType) ||
+            "f32".equals(nativeType) ||
+            "f64".equals(nativeType)) {
             return nativeType;
+        }
+        if ("AZ::Vector2".equals(nativeType)) {
+            return "vec2";
+        }
+        if ("AZ::Vector3".equals(nativeType)) {
+            return "vec3";
+        }
+        if ("AZ::Vector4".equals(nativeType)) {
+            return "vec4";
+        }
+        if ("AZ::Quaternion".equals(nativeType)) {
+            return "quat";
+        }
+        if ("AZ::Matrix3x3".equals(nativeType)) {
+            return "mat3";
+        }
+        if ("AZ::Transform".equals(nativeType)) {
+            return "affine3";
+        }
+        if ("AZ::Aabb".equals(nativeType)) {
+            return "aabb3d";
+        }
+        if ("EntityRef".equals(nativeType)) {
+            return "entity-ref";
         }
         if ("AZStd::string".equals(nativeType)) {
             return "string";
@@ -1752,10 +2283,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
         ArgState result = new ArgState();
         TrackedValue name = state.registers.get("RDX");
         if (name != null && name.address != null) {
-            String value = readPrintableString(name.address);
-            if (isFieldName(value)) {
-                result.nameAddress = name.address;
-                result.name = value;
+            StringDecode decoded = readFieldNameAtOrThroughPointer(name.address);
+            if (decoded != null) {
+                result.nameAddress = decoded.address;
+                result.name = decoded.value;
             }
         }
 
@@ -1790,6 +2321,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         }
 
         if (instruction.getFlowType().isCall()) {
+            observeFieldHandlerConstructorCall(instruction, state);
             clearVolatileRegisters(state.registers);
             return;
         }
@@ -1837,6 +2369,129 @@ public class NetworkSchemaExtractor extends GhidraScript {
         }
     }
 
+    private void observeFieldHandlerConstructorCall(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        TrackedValue receiver = state.registers.get("RCX");
+        if (receiver == null || receiver.thisOffset == null) {
+            return;
+        }
+
+        Address vtable = fieldHandlerConstructorVtable(callTarget(instruction));
+        if (vtable != null) {
+            state.vtablesByThisOffset.put(receiver.thisOffset, vtable);
+        }
+    }
+
+    private Address fieldHandlerConstructorVtable(Address address) {
+        Address target = resolvedCodeTarget(address);
+        if (!isExecutableAddress(target)) {
+            return null;
+        }
+
+        String key = target.toString();
+        if (fieldHandlerConstructorVtableCache.containsKey(key)) {
+            return fieldHandlerConstructorVtableCache.get(key);
+        }
+
+        Address result = recoverFieldHandlerConstructorVtable(target);
+        fieldHandlerConstructorVtableCache.put(key, result);
+        return result;
+    }
+
+    private Address recoverFieldHandlerConstructorVtable(Address target) {
+        Function function = functionAtOrContaining(target);
+        if (function == null) {
+            return null;
+        }
+
+        ForwardArgState state = new ForwardArgState();
+        state.registers.put("RCX", TrackedValue.thisOffset(0));
+        int count = 0;
+        for (Instruction instruction :
+            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+            if (instruction.getMinAddress().compareTo(target) < 0) {
+                continue;
+            }
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+
+            String mnemonic = upperMnemonic(instruction);
+            if (mnemonic == null) {
+                continue;
+            }
+            if (instruction.getFlowType().isCall()) {
+                break;
+            }
+
+            Address vtable = vtableWrittenToTrackedThis(instruction, state.registers);
+            if (vtable != null) {
+                return vtable;
+            }
+            observeForwardRegisterInstruction(instruction, state.registers);
+        }
+        return null;
+    }
+
+    private Address vtableWrittenToTrackedThis(
+        Instruction instruction,
+        Map<String, TrackedValue> registers) {
+
+        if (!"MOV".equals(upperMnemonic(instruction))) {
+            return null;
+        }
+
+        Integer offset = trackedThisOffsetForMemoryOperand(instruction, 0, registers);
+        TrackedValue source = trackedMoveSource(instruction, registers);
+        if (offset != null && offset == 0 && source != null &&
+            source.address != null && isVtableLike(source.address)) {
+            return source.address;
+        }
+        return null;
+    }
+
+    private void observeForwardRegisterInstruction(
+        Instruction instruction,
+        Map<String, TrackedValue> registers) {
+
+        String mnemonic = upperMnemonic(instruction);
+        String destination = registerOperand(instruction, 0);
+        if (mnemonic == null || destination == null) {
+            return;
+        }
+
+        if (("XOR".equals(mnemonic) || "SUB".equals(mnemonic)) &&
+            destination.equals(registerOperand(instruction, 1))) {
+            registers.put(destination, TrackedValue.immediate(0));
+            return;
+        }
+
+        if ("LEA".equals(mnemonic)) {
+            TrackedValue value = trackedLeaValue(instruction, registers);
+            putOrRemove(registers, destination, value);
+            return;
+        }
+
+        if ("MOV".equals(mnemonic)) {
+            TrackedValue value = trackedMoveSource(instruction, registers);
+            putOrRemove(registers, destination, value);
+            return;
+        }
+
+        if ("ADD".equals(mnemonic)) {
+            TrackedValue current = registers.get(destination);
+            Long immediate = immediateValue(instruction, 1);
+            if (current != null && current.thisOffset != null && immediate != null) {
+                registers.put(destination, current.addOffset(immediate.intValue()));
+            }
+            else {
+                registers.remove(destination);
+            }
+        }
+    }
+
     private void observeArgumentAssignment(Instruction instruction, ArgState state) {
         String mnemonic = upperMnemonic(instruction);
         if (mnemonic == null) {
@@ -1847,10 +2502,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (destination != null) {
             if ("RDX".equals(destination) && state.nameAddress == null) {
                 Address address = referencedAddress(instruction);
-                String value = readPrintableString(address);
-                if (isFieldName(value)) {
-                    state.nameAddress = address;
-                    state.name = value;
+                StringDecode decoded = readFieldNameAtOrThroughPointer(address);
+                if (decoded != null) {
+                    state.nameAddress = decoded.address;
+                    state.name = decoded.value;
                 }
             }
             else if ("R8".equals(destination) && !state.handlerKnown) {
@@ -2202,6 +2857,19 @@ public class NetworkSchemaExtractor extends GhidraScript {
             return new WireShape("bool", "marshal-bool-pattern");
         }
 
+        Integer fixedRawLength = fixedRawMarshalLength(address);
+        if (fixedRawLength != null) {
+            if (fixedRawLength == 1) {
+                return new WireShape("u8", "marshal-raw-write-length");
+            }
+            if (fixedRawLength == 6) {
+                return new WireShape("fixed-bytes-6", "marshal-raw-write-length");
+            }
+            if (fixedRawLength == 16) {
+                return new WireShape("fixed-bytes-16", "marshal-raw-write-length");
+            }
+        }
+
         Function function = functionAtOrContaining(address);
         if (function == null) {
             return null;
@@ -2223,6 +2891,118 @@ public class NetworkSchemaExtractor extends GhidraScript {
             }
         }
         return null;
+    }
+
+    private Integer fixedRawMarshalLength(Address address) {
+        Integer bytePatternLength = fixedRawMarshalLengthFromBytes(address);
+        if (bytePatternLength != null) {
+            return bytePatternLength;
+        }
+
+        Integer linearLength = fixedRawMarshalLengthFromLinearInstructions(address);
+        if (linearLength != null) {
+            return linearLength;
+        }
+
+        Function function = functionAtOrContaining(address);
+        if (function == null) {
+            return null;
+        }
+
+        Integer lastR8Length = null;
+        int count = 0;
+        for (Instruction instruction :
+            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+            if (instruction.getMinAddress().compareTo(address) < 0) {
+                continue;
+            }
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+
+            String mnemonic = upperMnemonic(instruction);
+            if ("MOV".equals(mnemonic)) {
+                String destination = registerOperand(instruction, 0);
+                Long immediate = immediateValue(instruction, 1);
+                if ("R8".equals(destination) && immediate != null &&
+                    immediate >= 0 && immediate <= 0x1000) {
+                    lastR8Length = immediate.intValue();
+                }
+            }
+            else if ("JMP".equals(mnemonic) && isVirtualRawWriteJump(instruction)) {
+                return lastR8Length;
+            }
+            else if (instruction.getFlowType().isCall()) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private Integer fixedRawMarshalLengthFromLinearInstructions(Address address) {
+        Integer lastR8Length = null;
+        int count = 0;
+        for (Instruction instruction :
+            currentProgram.getListing().getInstructions(address, true)) {
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+            Address instructionAddress = instruction.getMinAddress();
+            if (instructionAddress.compareTo(address) < 0 ||
+                !isExecutableAddress(instructionAddress)) {
+                break;
+            }
+
+            String mnemonic = upperMnemonic(instruction);
+            if ("MOV".equals(mnemonic)) {
+                String destination = registerOperand(instruction, 0);
+                Long immediate = immediateValue(instruction, 1);
+                if ("R8".equals(destination) && immediate != null &&
+                    immediate > 0 && immediate <= 0x1000) {
+                    lastR8Length = immediate.intValue();
+                }
+            }
+            else if ("JMP".equals(mnemonic) && isVirtualRawWriteJump(instruction)) {
+                return lastR8Length;
+            }
+            else if ("RET".equals(mnemonic) || "CCH".equals(mnemonic)) {
+                break;
+            }
+            else if (instruction.getFlowType().isCall()) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private Integer fixedRawMarshalLengthFromBytes(Address address) {
+        byte[] bytes = codeBytesBeforePadding(readBytes(address, 96));
+        for (int i = 0; i <= bytes.length - 11; i++) {
+            if (unsignedByte(bytes[i]) == 0x41 &&
+                unsignedByte(bytes[i + 1]) == 0xb8 &&
+                unsignedByte(bytes[i + 6]) == 0x48 &&
+                unsignedByte(bytes[i + 7]) == 0xff &&
+                unsignedByte(bytes[i + 8]) == 0x60 &&
+                unsignedByte(bytes[i + 9]) == 0x40) {
+                long length = uint32(bytes, i + 2);
+                if (length > 0 && length <= 0x1000) {
+                    return (int)length;
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean isVirtualRawWriteJump(Instruction instruction) {
+        String operand = operandText(instruction, 0);
+        if (operand == null) {
+            return false;
+        }
+        String normalized = operand
+            .replace(" ", "")
+            .toUpperCase(Locale.ROOT);
+        return normalized.contains("[RAX+0X40]") ||
+            normalized.contains("[RAX+40H]");
     }
 
     private WireShape wireShapeFromFunctionName(Address address) {
@@ -2252,7 +3032,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (name.contains("GridMate::VlqU32Marshaler::Marshal")) {
             return new WireShape("vlq-u32", "marshal-function-name");
         }
-        if (name.contains("GridMate::QuatCompNormMarshaler::Marshal")) {
+        if (name.contains("GridMate::QuatCompNormMarshaler::Marshal") ||
+            name.contains("GridMate::QuatCompressSmallestThree")) {
             return new WireShape("quat-comp-norm", "marshal-function-name");
         }
         return null;
@@ -2727,6 +3508,27 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return null;
     }
 
+    private StringDecode readFieldNameAtOrThroughPointer(Address address) {
+        if (!isProgramAddress(address)) {
+            return null;
+        }
+
+        String direct = readPrintableString(address);
+        if (isFieldName(direct)) {
+            return new StringDecode(address, direct);
+        }
+
+        Address pointer = readPointer(address);
+        if (isProgramAddress(pointer)) {
+            String indirect = readPrintableString(pointer);
+            if (isFieldName(indirect)) {
+                return new StringDecode(pointer, indirect);
+            }
+        }
+
+        return null;
+    }
+
     private boolean isFieldName(String value) {
         if (value == null || value.isEmpty() || value.length() > 160) {
             return false;
@@ -2955,6 +3757,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final class FieldCall {
         int index;
         Address callsite;
+        int recoveryOrder = Integer.MAX_VALUE;
         Address nameAddress;
         String name;
         String nameSource;
@@ -3143,6 +3946,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
     private static final class ParsedUnmarshalCall {
         String templateType;
+        int textIndex = Integer.MAX_VALUE;
         final ArrayList<String> args = new ArrayList<>();
     }
 
@@ -3397,6 +4201,16 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 return "this+0x" + Integer.toHexString(offset);
             }
             return "this-0x" + Integer.toHexString(-offset);
+        }
+    }
+
+    private static final class StringDecode {
+        final Address address;
+        final String value;
+
+        StringDecode(Address address, String value) {
+            this.address = address;
+            this.value = value;
         }
     }
 

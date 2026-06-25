@@ -51,6 +51,8 @@ pub struct NetworkSchemaSummary {
     pub serialize_dependency_count: usize,
     #[serde(default)]
     pub field_handler_vtable_count: usize,
+    #[serde(default)]
+    pub message_source_field_count: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +78,42 @@ pub struct NetworkSerializeMergeReport {
     pub unmatched_schema_type_count: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkMessageSignatureMergeReport {
+    pub source_message_count: usize,
+    pub matched_message_count: usize,
+    pub ambiguous_message_count: usize,
+    pub unmatched_message_count: usize,
+    pub field_count_mismatch_count: usize,
+    pub field_index_mismatch_count: usize,
+    pub field_name_filled_count: usize,
+    pub field_name_conflict_count: usize,
+    pub native_type_filled_count: usize,
+    pub wire_shape_filled_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkMessageSignature {
+    pub type_id: Option<Uuid>,
+    pub type_index: Option<u32>,
+    pub name: Option<String>,
+    pub rust_name: Option<String>,
+    pub source: Option<String>,
+    pub fields: Vec<NetworkMessageFieldSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkMessageFieldSignature {
+    pub index: Option<u32>,
+    pub name: String,
+    pub rust_type: Option<String>,
+    pub native_type: Option<String>,
+    pub wire_shape: Option<NetworkWireShape>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkSchemaSource {
@@ -93,6 +131,7 @@ pub enum NetworkSchemaSourceKind {
     TypeRegistry,
     TypeIndex,
     SerializeContext,
+    MessageSignatures,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +212,8 @@ pub struct NetworkField {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rust_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_expression: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_offset: Option<u32>,
@@ -241,9 +282,22 @@ pub enum NetworkWireShape {
     U32,
     U64,
     F32,
+    F64,
     HalfF32,
     VlqU32,
+    Vec2,
+    Vec3,
+    Vec4,
+    Quat,
     QuatCompNorm,
+    Mat3,
+    Affine3,
+    Aabb3d,
+    EntityRef,
+    #[serde(rename = "fixed-bytes-6", alias = "fixed-bytes6")]
+    FixedBytes6,
+    #[serde(rename = "fixed-bytes-16", alias = "fixed-bytes16")]
+    FixedBytes16,
     String,
 }
 
@@ -514,6 +568,120 @@ impl NetworkSchema {
         report
     }
 
+    pub fn merge_message_signatures(
+        &mut self,
+        signatures: &[NetworkMessageSignature],
+        source_path: Option<String>,
+    ) -> NetworkMessageSignatureMergeReport {
+        let mut report = NetworkMessageSignatureMergeReport {
+            source_message_count: signatures.len(),
+            ..NetworkMessageSignatureMergeReport::default()
+        };
+
+        for signature in signatures {
+            let candidates = message_signature_candidates(&self.types, signature);
+            let [network_type_index] = candidates.as_slice() else {
+                if candidates.is_empty() {
+                    report.unmatched_message_count += 1;
+                } else {
+                    report.ambiguous_message_count += 1;
+                }
+                continue;
+            };
+
+            let network_type = &mut self.types[*network_type_index];
+            let source = signature
+                .source
+                .clone()
+                .or_else(|| source_path.clone())
+                .unwrap_or_else(|| "messageSignatures".to_owned());
+            if network_type.fields.is_empty() && !signature.fields.is_empty() {
+                network_type.fields = signature
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        network_field_from_message_signature(index, field, source.clone())
+                    })
+                    .collect();
+                report.matched_message_count += 1;
+                report.field_name_filled_count += signature.fields.len();
+                report.native_type_filled_count += signature
+                    .fields
+                    .iter()
+                    .filter(|field| field.native_type.is_some())
+                    .count();
+                report.wire_shape_filled_count += signature
+                    .fields
+                    .iter()
+                    .filter(|field| field.wire_shape.is_some())
+                    .count();
+                continue;
+            }
+
+            if network_type.fields.len() != signature.fields.len() {
+                report.field_count_mismatch_count += 1;
+                continue;
+            }
+
+            report.matched_message_count += 1;
+            for (field, field_signature) in
+                network_type.fields.iter_mut().zip(signature.fields.iter())
+            {
+                if let (Some(existing), Some(expected)) = (field.index, field_signature.index)
+                    && existing != expected
+                {
+                    report.field_index_mismatch_count += 1;
+                    continue;
+                }
+
+                if field.name.as_deref().is_none_or(is_placeholder_field_name) {
+                    field.name = Some(field_signature.name.clone());
+                    report.field_name_filled_count += 1;
+                } else if field.name.as_deref() != Some(field_signature.name.as_str()) {
+                    report.field_name_conflict_count += 1;
+                }
+
+                if field.native_type.is_none() {
+                    field.native_type = field_signature.native_type.clone();
+                    if field.native_type.is_some() {
+                        report.native_type_filled_count += 1;
+                    }
+                }
+
+                if field.rust_type.is_none() {
+                    field.rust_type = field_signature.rust_type.clone();
+                }
+
+                if field.wire_shape.is_none()
+                    && let Some(wire_shape) = field_signature.wire_shape
+                {
+                    field.wire_shape = Some(wire_shape);
+                    field.wire_shape_source = Some(source.clone());
+                    report.wire_shape_filled_count += 1;
+                }
+
+                field.evidence.push(NetworkEvidence {
+                    kind: NetworkEvidenceKind::MessageSource,
+                    source: source.clone(),
+                    address: None,
+                    detail: Some(field_signature.name.clone()),
+                    confidence: NetworkConfidence::High,
+                });
+            }
+        }
+
+        self.sources.push(NetworkSchemaSource {
+            kind: NetworkSchemaSourceKind::MessageSignatures,
+            path: source_path,
+            schema: None,
+            program: None,
+            image_base: None,
+        });
+        self.summary = self.build_summary();
+        report
+    }
+
     #[must_use]
     pub fn build_summary(&self) -> NetworkSchemaSummary {
         let register_field_count = self
@@ -576,7 +744,53 @@ impl NetworkSchema {
                 .map(|serialize| serialize.direct_dependency_type_ids.len())
                 .sum(),
             field_handler_vtable_count: self.field_handler_vtables.len(),
+            message_source_field_count: self
+                .types
+                .iter()
+                .flat_map(|network_type| &network_type.fields)
+                .filter(|field| {
+                    field
+                        .evidence
+                        .iter()
+                        .any(|evidence| evidence.kind == NetworkEvidenceKind::MessageSource)
+                })
+                .count(),
         }
+    }
+}
+
+fn network_field_from_message_signature(
+    fallback_index: usize,
+    signature: &NetworkMessageFieldSignature,
+    source: String,
+) -> NetworkField {
+    let index = signature
+        .index
+        .or_else(|| u32::try_from(fallback_index).ok());
+    let evidence = vec![NetworkEvidence {
+        kind: NetworkEvidenceKind::MessageSource,
+        source: source.clone(),
+        address: None,
+        detail: Some(signature.name.clone()),
+        confidence: NetworkConfidence::High,
+    }];
+    NetworkField {
+        index,
+        name: Some(signature.name.clone()),
+        name_address: None,
+        group: None,
+        handler_offset: None,
+        handler_expression: None,
+        handler_vtable: None,
+        native_type: signature.native_type.clone(),
+        rust_type: signature.rust_type.clone(),
+        storage_expression: None,
+        storage_offset: None,
+        wire_shape: signature.wire_shape,
+        wire_shape_source: signature.wire_shape.map(|_| source),
+        callsite: None,
+        confidence: NetworkConfidence::High,
+        evidence,
     }
 }
 
@@ -623,6 +837,82 @@ fn serialize_match<'a>(
         NetworkConfidence::Inferred,
         "serializeContext:name".to_owned(),
     ))
+}
+
+fn message_signature_candidates(
+    types: &[NetworkType],
+    signature: &NetworkMessageSignature,
+) -> Vec<usize> {
+    if let Some(type_id) = signature.type_id {
+        let matches = types
+            .iter()
+            .enumerate()
+            .filter_map(|(index, network_type)| {
+                (network_type.type_id == Some(type_id)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if !matches.is_empty() {
+            return matches;
+        }
+    }
+
+    if let Some(type_index) = signature.type_index {
+        let matches = types
+            .iter()
+            .enumerate()
+            .filter_map(|(index, network_type)| {
+                (network_type.type_index == Some(type_index)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if !matches.is_empty() {
+            return matches;
+        }
+    }
+
+    if let Some(name) = signature.name.as_deref() {
+        let matches = types
+            .iter()
+            .enumerate()
+            .filter_map(|(index, network_type)| {
+                network_type
+                    .name
+                    .as_deref()
+                    .is_some_and(|network_name| {
+                        network_name == name || type_leaf_name(network_name) == name
+                    })
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if !matches.is_empty() {
+            return matches;
+        }
+    }
+
+    if let Some(rust_name) = signature.rust_name.as_deref() {
+        return types
+            .iter()
+            .enumerate()
+            .filter_map(|(index, network_type)| {
+                network_type
+                    .name
+                    .as_deref()
+                    .is_some_and(|network_name| type_leaf_name(network_name) == rust_name)
+                    .then_some(index)
+            })
+            .collect();
+    }
+
+    Vec::new()
+}
+
+fn type_leaf_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+fn is_placeholder_field_name(value: &str) -> bool {
+    value
+        .strip_prefix("field_")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn network_serialize_type(item: &SerializeCodegenItem) -> NetworkSerializeType {
@@ -697,10 +987,12 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
         .and_then(Value::as_object)
         .map(network_registration_hook);
     let name = registry_entry_name(entry, az_rtti.as_ref(), registration_hook.as_ref());
-    let fields = array_values(entry, "fields")
+    let mut fields = array_values(entry, "fields")
         .filter_map(Value::as_object)
+        .filter(|field| is_plausible_network_field(field))
         .map(network_field)
         .collect::<Vec<_>>();
+    reindex_message_fields(&mut fields);
     let has_registered_fields = fields.iter().any(|field| {
         field
             .evidence
@@ -768,6 +1060,39 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
         registration_hook,
         fields,
         evidence,
+    }
+}
+
+fn is_plausible_network_field(field: &Map<String, Value>) -> bool {
+    let Some(confidence) = string_ref(field, "confidence") else {
+        return true;
+    };
+    if !confidence.starts_with("message-unmarshal") {
+        return true;
+    }
+
+    let has_known_field_type = string_ref(field, "wireShape").is_some()
+        || string_ref(field, "rustType").is_some()
+        || string_ref(field, "nativeType").is_some();
+    let Some(storage) = string_ref(field, "storageExpression") else {
+        return has_known_field_type;
+    };
+    let storage = storage.trim();
+    storage.starts_with("_Dst")
+        || ((storage.contains("param_") || storage.contains("plVar") || storage.contains("puVar"))
+            && storage.contains('+'))
+}
+
+fn reindex_message_fields(fields: &mut [NetworkField]) {
+    if fields.iter().all(|field| {
+        field
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == NetworkEvidenceKind::MessageUnmarshal)
+    }) {
+        for (index, field) in fields.iter_mut().enumerate() {
+            field.index = Some(index as u32);
+        }
     }
 }
 
@@ -854,6 +1179,7 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
         handler_expression: string(field, "handlerExpression"),
         handler_vtable: string(field, "handlerVtable"),
         native_type: string(field, "nativeType"),
+        rust_type: string(field, "rustType"),
         storage_expression: string(field, "storageExpression"),
         storage_offset: hex_or_decimal_u32(field, "storageOffset"),
         wire_shape: wire_shape(field, "wireShape"),
@@ -1017,6 +1343,7 @@ fn confidence_from_raw(raw: Option<&str>) -> NetworkConfidence {
         Some(
             "register-field-call" | "registration-hook" | "az-rtti" | "message-unmarshal-call",
         ) => NetworkConfidence::High,
+        Some(value) if value.starts_with("message-unmarshal-") => NetworkConfidence::High,
         Some("constructor-match" | "vtable-match") => NetworkConfidence::Inferred,
         Some("hint") => NetworkConfidence::Weak,
         Some(_) => NetworkConfidence::Unknown,
@@ -1061,9 +1388,20 @@ fn wire_shape(object: &Map<String, Value>, key: &str) -> Option<NetworkWireShape
         "u32" => Some(NetworkWireShape::U32),
         "u64" => Some(NetworkWireShape::U64),
         "f32" => Some(NetworkWireShape::F32),
+        "f64" => Some(NetworkWireShape::F64),
         "half-f32" => Some(NetworkWireShape::HalfF32),
         "vlq-u32" => Some(NetworkWireShape::VlqU32),
+        "vec2" => Some(NetworkWireShape::Vec2),
+        "vec3" => Some(NetworkWireShape::Vec3),
+        "vec4" => Some(NetworkWireShape::Vec4),
+        "quat" => Some(NetworkWireShape::Quat),
         "quat-comp-norm" => Some(NetworkWireShape::QuatCompNorm),
+        "mat3" => Some(NetworkWireShape::Mat3),
+        "affine3" => Some(NetworkWireShape::Affine3),
+        "aabb3d" => Some(NetworkWireShape::Aabb3d),
+        "entity-ref" => Some(NetworkWireShape::EntityRef),
+        "fixed-bytes-6" => Some(NetworkWireShape::FixedBytes6),
+        "fixed-bytes-16" => Some(NetworkWireShape::FixedBytes16),
         "string" => Some(NetworkWireShape::String),
         _ => None,
     }
@@ -1308,6 +1646,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_fixed_byte_wire_shapes() {
+        let report = json!({
+            "registryEntries": [],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81b6eb8",
+                "fieldCount": 1,
+                "wireShape": "fixed-bytes-6",
+                "wireShapeSource": "marshal-raw-write-length",
+                "slots": []
+            }, {
+                "address": "NewWorld+0x80b9830",
+                "fieldCount": 1,
+                "wireShape": "fixed-bytes-16",
+                "wireShapeSource": "marshal-raw-write-length",
+                "slots": []
+            }]
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+
+        assert_eq!(
+            schema.field_handler_vtables[0].wire_shape,
+            Some(NetworkWireShape::FixedBytes6)
+        );
+        assert_eq!(
+            schema.field_handler_vtables[1].wire_shape,
+            Some(NetworkWireShape::FixedBytes16)
+        );
+    }
+
+    #[test]
     fn keeps_message_and_support_type_classification_separate() {
         let report = json!({
             "registryEntries": [
@@ -1412,6 +1783,14 @@ mod tests {
             Some("u32")
         );
         assert_eq!(
+            schema.types[0]
+                .fields
+                .iter()
+                .map(|field| field.index)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+        assert_eq!(
             schema.types[0].fields[0].name.as_deref(),
             Some("TypeIndexCrc")
         );
@@ -1441,6 +1820,131 @@ mod tests {
             schema.types[0].fields[2].wire_shape,
             Some(NetworkWireShape::Bool)
         );
+    }
+
+    #[test]
+    fn filters_implausible_message_unmarshal_storage_and_reindexes_remaining_fields() {
+        let report = json!({
+            "registryEntries": [{
+                "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
+                "typeIndex": 19,
+                "typeName": "RegistrationRequestV3Msg",
+                "fields": [{
+                    "index": 0,
+                    "name": "param_4",
+                    "storageExpression": "param_4",
+                    "confidence": "message-unmarshal-helper-argument"
+                }, {
+                    "index": 5,
+                    "name": "UseCapabilities",
+                    "nativeType": "bool",
+                    "storageExpression": "param_3 + 0x8c",
+                    "wireShape": "bool",
+                    "confidence": "message-unmarshal-helper-argument"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+
+        assert_eq!(schema.types[0].fields.len(), 1);
+        assert_eq!(schema.types[0].fields[0].index, Some(0));
+        assert_eq!(
+            schema.types[0].fields[0].name.as_deref(),
+            Some("UseCapabilities")
+        );
+    }
+
+    #[test]
+    fn merges_message_signature_field_names_without_overwriting_real_names() {
+        let report = json!({
+            "registryEntries": [{
+                "uuid": "6A379FB8-8E18-4D62-89A1-9A891DC98CAD",
+                "typeIndex": 349,
+                "typeName": "REPClient::PingMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "field_0",
+                    "storageExpression": "param_3 + 1",
+                    "wireShape": "u64",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        });
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&report).expect("schema");
+
+        let merge = schema.merge_message_signatures(
+            &[NetworkMessageSignature {
+                type_id: Some(uuid!("6a379fb8-8e18-4d62-89a1-9a891dc98cad")),
+                type_index: Some(349),
+                name: Some("REPClient::PingMsg".to_owned()),
+                rust_name: Some("PingMsg".to_owned()),
+                source: None,
+                fields: vec![NetworkMessageFieldSignature {
+                    index: Some(0),
+                    name: "epoch_time_send".to_owned(),
+                    rust_type: Some("u64".to_owned()),
+                    native_type: Some("u64".to_owned()),
+                    wire_shape: Some(NetworkWireShape::U64),
+                }],
+            }],
+            Some("rust-source".to_owned()),
+        );
+
+        assert_eq!(merge.matched_message_count, 1);
+        assert_eq!(merge.field_name_filled_count, 1);
+        assert_eq!(merge.field_name_conflict_count, 0);
+        assert_eq!(schema.summary.message_source_field_count, 1);
+        let field = &schema.types[0].fields[0];
+        assert_eq!(field.name.as_deref(), Some("epoch_time_send"));
+        assert_eq!(field.native_type.as_deref(), Some("u64"));
+        assert_eq!(field.wire_shape, Some(NetworkWireShape::U64));
+    }
+
+    #[test]
+    fn merges_message_signature_fields_when_static_report_has_none() {
+        let report = json!({
+            "registryEntries": [{
+                "uuid": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+                "typeIndex": 77,
+                "typeName": "ExampleMsg",
+                "fields": []
+            }],
+            "fieldRegistrationFunctions": []
+        });
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&report).expect("schema");
+
+        let merge = schema.merge_message_signatures(
+            &[NetworkMessageSignature {
+                type_id: Some(uuid!("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+                type_index: Some(77),
+                name: Some("ExampleMsg".to_owned()),
+                rust_name: Some("ExampleMsg".to_owned()),
+                source: None,
+                fields: vec![NetworkMessageFieldSignature {
+                    index: Some(0),
+                    name: "Payload".to_owned(),
+                    rust_type: Some("::nw_network::Payload".to_owned()),
+                    native_type: Some("Payload".to_owned()),
+                    wire_shape: None,
+                }],
+            }],
+            Some("message-signatures.json".to_owned()),
+        );
+
+        assert_eq!(merge.matched_message_count, 1);
+        assert_eq!(merge.field_name_filled_count, 1);
+        assert_eq!(merge.native_type_filled_count, 1);
+        assert_eq!(merge.wire_shape_filled_count, 0);
+        assert_eq!(schema.types[0].fields.len(), 1);
+        let field = &schema.types[0].fields[0];
+        assert_eq!(field.name.as_deref(), Some("Payload"));
+        assert_eq!(field.rust_type.as_deref(), Some("::nw_network::Payload"));
+        assert_eq!(field.confidence, NetworkConfidence::High);
+        assert_eq!(field.evidence[0].kind, NetworkEvidenceKind::MessageSource);
     }
 
     #[test]

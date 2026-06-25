@@ -722,7 +722,7 @@ fn append_integrated_type_imports(
     }
 
     let reflected_type_imports =
-        reflected_type_imports_for_items(items, known_type_names, reexported_type_names);
+        reflected_type_imports_for_items(items, known_type_names, reexported_type_names, true);
     if !reflected_type_imports.is_empty() {
         source.push_str("use crate::generated::");
         append_import_items(source, &reflected_type_imports);
@@ -851,7 +851,7 @@ fn append_standalone_type_imports(
     }
 
     let reflected_type_imports =
-        reflected_type_imports_for_items(items, known_type_names, reexported_type_names);
+        reflected_type_imports_for_items(items, known_type_names, reexported_type_names, false);
     if !reflected_type_imports.is_empty() {
         source.push_str("use crate::types::");
         append_import_items(source, &reflected_type_imports);
@@ -864,7 +864,12 @@ fn append_standalone_type_imports(
             .iter()
             .any(|derive_name| derive_name == "Component")
     });
-    if needs_bevy_component {
+    let needs_reflect = items.iter().any(|item| {
+        item.derives
+            .iter()
+            .any(|derive_name| derive_name == "Reflect")
+    });
+    if needs_bevy_component && needs_reflect {
         source.push_str("use bevy_ecs::reflect::ReflectComponent;\n");
         source.push('\n');
     }
@@ -952,6 +957,7 @@ fn reflected_type_imports_for_items(
     items: &[&RustItemPlan],
     known_type_names: &BTreeSet<String>,
     reexported_type_names: &BTreeSet<String>,
+    include_rtti_bases: bool,
 ) -> BTreeSet<String> {
     let mut local_names = items
         .iter()
@@ -960,13 +966,15 @@ fn reflected_type_imports_for_items(
     local_names.extend(reexported_type_names.iter().map(String::as_str));
     let mut imports = BTreeSet::new();
     for item in items {
-        for base in &item.rtti_bases {
-            collect_reflected_type_imports_from_rust_type(
-                &base.rust_type,
-                known_type_names,
-                &local_names,
-                &mut imports,
-            );
+        if include_rtti_bases {
+            for base in &item.rtti_bases {
+                collect_reflected_type_imports_from_rust_type(
+                    &base.rust_type,
+                    known_type_names,
+                    &local_names,
+                    &mut imports,
+                );
+            }
         }
         for field in &item.fields {
             collect_reflected_type_imports_from_rust_type(
@@ -1212,6 +1220,64 @@ mod tests {
         assert_eq!(imports, BTreeSet::from(["ReflectedThing".to_owned()]));
     }
 
+    #[test]
+    fn standalone_reflected_imports_skip_rtti_base_metadata() {
+        let known_type_names = BTreeSet::from(["ActionCondition".to_owned()]);
+        let reexported_type_names = BTreeSet::new();
+        let item = rtti_leaf_with_base("ActionConditionActivateVirtualInput", "ActionCondition");
+        let items = vec![&item];
+
+        assert_eq!(
+            reflected_type_imports_for_items(
+                &items,
+                &known_type_names,
+                &reexported_type_names,
+                false,
+            ),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            reflected_type_imports_for_items(
+                &items,
+                &known_type_names,
+                &reexported_type_names,
+                true,
+            ),
+            BTreeSet::from(["ActionCondition".to_owned()])
+        );
+    }
+
+    #[test]
+    fn standalone_imports_reflect_component_only_for_reflected_components() {
+        let known_type_names = BTreeSet::new();
+        let reexported_type_names = BTreeSet::new();
+        let mut item = rtti_leaf_with_base("ScriptComponent", "Component");
+        item.derives = vec!["Component".to_owned()];
+        let items = vec![&item];
+
+        let mut source = String::new();
+        append_standalone_type_imports(
+            &mut source,
+            &items,
+            &known_type_names,
+            &reexported_type_names,
+        );
+
+        assert!(!source.contains("ReflectComponent"));
+
+        item.derives.push("Reflect".to_owned());
+        let items = vec![&item];
+        let mut source = String::new();
+        append_standalone_type_imports(
+            &mut source,
+            &items,
+            &known_type_names,
+            &reexported_type_names,
+        );
+
+        assert!(source.contains("use bevy_ecs::reflect::ReflectComponent;"));
+    }
+
     fn symbol_reexport<const N: usize>(module: &str, names: [&str; N]) -> SymbolSurfaceExport<()> {
         SymbolSurfaceExport {
             module: module.to_owned(),
@@ -1232,5 +1298,37 @@ mod tests {
                 items: reexport.symbols.keys().cloned().collect(),
             })
             .collect()
+    }
+
+    fn rtti_leaf_with_base(rust_name: &str, base: &str) -> RustItemPlan {
+        use crate::rust::identity::RustTypeIdentityPlan;
+        use crate::rust::item_plan::{RustItemKind, RustRttiBasePlan};
+        use uuid::uuid;
+
+        let type_id = uuid!("11111111-1111-1111-1111-111111111111");
+        RustItemPlan {
+            source_type_id: type_id,
+            source_name: rust_name.to_owned(),
+            is_reflected_base: false,
+            is_slot_owner: false,
+            has_layout_family_descendants: false,
+            is_bevy_component: false,
+            file_stem_override: None,
+            scope_path: Vec::new(),
+            family_scope_path: Vec::new(),
+            rust_name: rust_name.to_owned(),
+            kind: RustItemKind::Struct,
+            identity: RustTypeIdentityPlan::az_rtti(type_id, Some(rust_name.to_owned())),
+            repr: None,
+            raw_conversion: None,
+            derives: Vec::new(),
+            rtti_bases: vec![RustRttiBasePlan {
+                source_type_id: uuid!("22222222-2222-2222-2222-222222222222"),
+                source_name: base.to_owned(),
+                rust_type: base.to_owned(),
+            }],
+            fields: Vec::new(),
+            variants: Vec::new(),
+        }
     }
 }

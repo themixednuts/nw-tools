@@ -730,10 +730,21 @@ fn render_standalone_identity_impls(
         .as_deref()
         .unwrap_or(item.source_name.as_str());
     let name = LitStr::new(name, Span::call_site());
+    let base_type_ids = item
+        .rtti_bases
+        .iter()
+        .map(|base| az_uuid_expr(base.source_type_id))
+        .collect::<Vec<_>>();
+    let base_type_ids = (!base_type_ids.is_empty()).then(|| {
+        quote! {
+            const BASE_TYPE_IDS: &'static [AzUuid] = &[#(#base_type_ids),*];
+        }
+    });
     quote! {
         impl AzRtti for #ident {
             const NAME: &'static str = #name;
             const TYPE_ID: AzUuid = #type_id;
+            #base_type_ids
         }
     }
 }
@@ -2584,6 +2595,7 @@ mod tests {
         assert!(source.contains("impl AzRtti for TargetComponent"));
         assert!(source.contains("const NAME: &'static str = \"Example::TargetComponent\""));
         assert!(source.contains("const TYPE_ID: AzUuid = AzUuid::from_u128"));
+        assert!(source.contains("const BASE_TYPE_IDS: &'static [AzUuid]"));
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
 

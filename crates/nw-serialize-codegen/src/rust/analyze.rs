@@ -101,6 +101,7 @@ pub struct RustSourceItem {
     pub kind: RustItemKind,
     pub derives: BTreeSet<String>,
     pub identity_attrs: Vec<RustIdentityAttr>,
+    pub field_order: Vec<String>,
     pub fields: BTreeMap<String, RustSourceField>,
     pub variants: BTreeMap<String, RustSourceVariant>,
 }
@@ -108,24 +109,37 @@ pub struct RustSourceItem {
 impl RustSourceItem {
     fn from_syn_item(item: &Item) -> Option<Self> {
         match item {
-            Item::Struct(item) => Some(Self {
-                name: item.ident.to_string(),
-                kind: RustItemKind::Struct,
-                derives: derive_names(&item.attrs),
-                identity_attrs: identity_attrs(&item.attrs),
-                fields: source_fields(&item.fields),
-                variants: BTreeMap::new(),
-            }),
+            Item::Struct(item) => {
+                let (fields, field_order) = source_fields(&item.fields);
+                Some(Self {
+                    name: item.ident.to_string(),
+                    kind: RustItemKind::Struct,
+                    derives: derive_names(&item.attrs),
+                    identity_attrs: identity_attrs(&item.attrs),
+                    field_order,
+                    fields,
+                    variants: BTreeMap::new(),
+                })
+            }
             Item::Enum(item) => Some(Self {
                 name: item.ident.to_string(),
                 kind: RustItemKind::Enum,
                 derives: derive_names(&item.attrs),
                 identity_attrs: identity_attrs(&item.attrs),
+                field_order: Vec::new(),
                 fields: BTreeMap::new(),
                 variants: source_variants(item),
             }),
             _ => None,
         }
+    }
+
+    #[must_use]
+    pub fn fields_in_order(&self) -> Vec<&RustSourceField> {
+        self.field_order
+            .iter()
+            .filter_map(|field_name| self.fields.get(field_name))
+            .collect()
     }
 }
 
@@ -133,6 +147,7 @@ impl RustSourceItem {
 pub struct RustSourceField {
     pub name: String,
     pub rust_type: String,
+    pub marshal_as: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,24 +386,48 @@ fn uuid_from_expr(expr: &Expr) -> Option<Uuid> {
     }
 }
 
-fn source_fields(fields: &Fields) -> BTreeMap<String, RustSourceField> {
+fn source_fields(fields: &Fields) -> (BTreeMap<String, RustSourceField>, Vec<String>) {
     let Fields::Named(fields) = fields else {
-        return BTreeMap::new();
+        return (BTreeMap::new(), Vec::new());
     };
-    fields
-        .named
+    let mut field_map = BTreeMap::new();
+    let mut field_order = Vec::new();
+    for field in &fields.named {
+        let Some(ident) = &field.ident else {
+            continue;
+        };
+        let name = ident.to_string();
+        let source_field = RustSourceField {
+            name: name.clone(),
+            rust_type: normalize_type(&field.ty),
+            marshal_as: marshal_as_attr(&field.attrs),
+        };
+        field_order.push(name.clone());
+        field_map.insert(name, source_field);
+    }
+    (field_map, field_order)
+}
+
+fn marshal_as_attr(attrs: &[Attribute]) -> Option<String> {
+    attrs
         .iter()
-        .filter_map(|field| {
-            let name = field.ident.as_ref()?.to_string();
-            Some((
-                name.clone(),
-                RustSourceField {
-                    name,
-                    rust_type: normalize_type(&field.ty),
-                },
-            ))
+        .find(|attr| attr.path().is_ident("marshal"))
+        .and_then(|attr| {
+            attr.parse_args_with(Punctuated::<Expr, syn::Token![,]>::parse_terminated)
+                .ok()
         })
-        .collect()
+        .and_then(|args| {
+            args.into_iter().find_map(|arg| {
+                let Expr::Assign(assign) = arg else {
+                    return None;
+                };
+                if !expr_assign_lhs_is(&assign.left, "as") {
+                    return None;
+                }
+                lit_str_expr_value(&assign.right)
+                    .or_else(|| Some(assign.right.to_token_stream().to_string()))
+            })
+        })
 }
 
 fn source_variants(item: &syn::ItemEnum) -> BTreeMap<String, RustSourceVariant> {
