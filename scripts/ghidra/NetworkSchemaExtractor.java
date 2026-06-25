@@ -7,6 +7,7 @@ import java.io.FileWriter;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -39,7 +40,8 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
 public class NetworkSchemaExtractor extends GhidraScript {
-    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260624-direct-type-unmarshal-pass";
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260624-cache-pass";
+    private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long QUEUE_REGISTRATION_HOOK_RVA = 0x61a95c0L;
     private static final int BACKWARD_ARGUMENT_SCAN_LIMIT = 48;
@@ -90,10 +92,26 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final Map<String, Address> pointerReadCache = new HashMap<>();
     private final Map<String, List<Address>> asciiStringSearchCache = new HashMap<>();
     private final Map<String, Address> fieldHandlerConstructorVtableCache = new HashMap<>();
+    private final Map<String, Function> functionLookupCache = new HashMap<>();
+    private final Map<String, String> functionNameCache = new HashMap<>();
+    private final Map<String, List<Instruction>> functionInstructionsCache = new HashMap<>();
+    private final Map<String, String> decompileCache = new HashMap<>();
+    private final Map<String, Long> createInstanceSizeCache = new HashMap<>();
+    private final Map<String, List<String>> parameterNameCache = new HashMap<>();
+    private final Map<String, Set<Integer>> boolParameterIndicesCache = new HashMap<>();
+    private final Map<String, Map<String, Set<Integer>>> nestedBoolParameterIndicesCache =
+        new HashMap<>();
+    private final Map<String, List<ParsedUnmarshalCall>> unmarshalCallCache = new HashMap<>();
+    private final Map<String, List<ParsedUnmarshalCall>> marshalerUnmarshalCallCache =
+        new HashMap<>();
+    private final Map<String, List<ParsedUnmarshalCall>> directTypeUnmarshalCallCache =
+        new HashMap<>();
+    private String cacheProgramKey;
     private DecompInterface decompiler;
 
     @Override
     protected void run() throws Exception {
+        resetAnalysisCachesForRun();
         println("NetworkSchemaExtractor version: " + EXTRACTOR_VERSION);
         File input = inputFile();
         File output = outputFile(input);
@@ -166,6 +184,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         JsonObject report = new JsonObject();
         report.addProperty("schema", "newworld.network_schema.static.v1");
         report.addProperty("extractorVersion", EXTRACTOR_VERSION);
+        report.addProperty("cacheSchemaVersion", CACHE_SCHEMA_VERSION);
         report.addProperty("program", currentProgram.getName());
         report.addProperty("imageBase", formatAddress(currentProgram.getImageBase()));
         report.addProperty("input", input.getAbsolutePath());
@@ -200,6 +219,67 @@ public class NetworkSchemaExtractor extends GhidraScript {
         println("RegisterField functions: " + registrationFunctions.size() +
             ", calls: " + dynamicFieldCount +
             ", mapped registry entries: " + mappedRegistryEntries);
+        println("Extractor caches: decompile=" + decompileCache.size() +
+            ", instructions=" + functionInstructionsCache.size() +
+            ", functions=" + functionLookupCache.size());
+    }
+
+    private void resetAnalysisCachesForRun() {
+        clearAnalysisCaches();
+        cacheProgramKey = currentProgramCacheKey();
+        decompiler = null;
+    }
+
+    private void clearAnalysisCaches() {
+        pointerReadCache.clear();
+        asciiStringSearchCache.clear();
+        fieldHandlerConstructorVtableCache.clear();
+        functionLookupCache.clear();
+        functionNameCache.clear();
+        functionInstructionsCache.clear();
+        decompileCache.clear();
+        createInstanceSizeCache.clear();
+        parameterNameCache.clear();
+        boolParameterIndicesCache.clear();
+        nestedBoolParameterIndicesCache.clear();
+        unmarshalCallCache.clear();
+        marshalerUnmarshalCallCache.clear();
+        directTypeUnmarshalCallCache.clear();
+    }
+
+    private void ensureAnalysisCachesValid() {
+        String key = currentProgramCacheKey();
+        if (key.equals(cacheProgramKey)) {
+            return;
+        }
+        clearAnalysisCaches();
+        cacheProgramKey = key;
+        if (decompiler != null && currentProgram != null) {
+            decompiler.openProgram(currentProgram);
+        }
+    }
+
+    private String currentProgramCacheKey() {
+        if (currentProgram == null) {
+            return "<no-program>";
+        }
+        return CACHE_SCHEMA_VERSION + ":" + System.identityHashCode(currentProgram) + ":" +
+            currentProgram.getName() + "@" + currentProgram.getImageBase();
+    }
+
+    private String addressCacheKey(String kind, Address address) {
+        ensureAnalysisCachesValid();
+        return cacheProgramKey + "|" + kind + "|" + address;
+    }
+
+    private String functionCacheKey(String kind, Function function) {
+        ensureAnalysisCachesValid();
+        return cacheProgramKey + "|" + kind + "|" + function.getEntryPoint();
+    }
+
+    private String programTextCacheKey(String kind, String value) {
+        ensureAnalysisCachesValid();
+        return cacheProgramKey + "|" + kind + "|" + value;
     }
 
     private File inputFile() throws Exception {
@@ -589,8 +669,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
     private Address findRegistrationHelperTable(Function function) {
         int count = 0;
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(function)) {
             if (count++ >= BACKWARD_ARGUMENT_SCAN_LIMIT) {
                 break;
             }
@@ -638,8 +717,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         }
 
         int count = 0;
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(function)) {
             if (count++ >= VTABLE_SCAN_LIMIT) {
                 break;
             }
@@ -696,8 +774,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (unmarshal == null) {
             return result;
         }
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(unmarshal.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(unmarshal)) {
             if (!instruction.getFlowType().isCall()) {
                 continue;
             }
@@ -847,8 +924,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         Function wrapper,
         String wrapperText) {
 
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(wrapper.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(wrapper)) {
             if (!instruction.getFlowType().isCall()) {
                 continue;
             }
@@ -1279,8 +1355,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         }
 
         int calls = 0;
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(function)) {
             if (calls >= SOURCE_SIGNATURE_CALL_GRAPH_LIMIT ||
                 signature.sourceFunctions.size() >= SOURCE_SIGNATURE_CALL_GRAPH_LIMIT) {
                 break;
@@ -1302,7 +1377,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (token == null || token.isEmpty()) {
             return List.of();
         }
-        List<Address> cached = asciiStringSearchCache.get(token);
+        String key = programTextCacheKey("ascii-strings-containing", token);
+        List<Address> cached = asciiStringSearchCache.get(key);
         if (cached != null) {
             return cached;
         }
@@ -1334,8 +1410,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 cursor = found.add(1);
             }
         }
-        asciiStringSearchCache.put(token, result);
-        return result;
+        List<Address> cachedResult = Collections.unmodifiableList(new ArrayList<>(result));
+        asciiStringSearchCache.put(key, cachedResult);
+        return cachedResult;
     }
 
     private Address printableStringStartContaining(Address address) {
@@ -1489,15 +1566,21 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
     private Long recoverCreateInstanceSize(RegistryEntry entry) {
         Address createInstance = parseCapturedAddress(entry.createInstance);
+        String key = createInstance == null ? null : addressCacheKey("create-instance-size", createInstance);
+        if (key != null && createInstanceSizeCache.containsKey(key)) {
+            return createInstanceSizeCache.get(key);
+        }
         Function function = functionAtOrContaining(createInstance);
         if (function == null) {
+            if (key != null) {
+                createInstanceSizeCache.put(key, null);
+            }
             return null;
         }
 
         Long ecx = null;
         int count = 0;
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(function)) {
             if (count++ >= 16) {
                 break;
             }
@@ -1508,16 +1591,21 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 continue;
             }
             if (instruction.getFlowType().isCall() && ecx != null) {
+                if (key != null) {
+                    createInstanceSizeCache.put(key, ecx);
+                }
                 return ecx;
             }
+        }
+        if (key != null) {
+            createInstanceSizeCache.put(key, ecx);
         }
         return ecx;
     }
 
     private MessageConstructorCall findMessageConstructorCall(Function wrapper, Address beforeCallsite) {
         MessageConstructorCall result = null;
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(wrapper.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(wrapper)) {
             if (beforeCallsite != null && instruction.getMinAddress().compareTo(beforeCallsite) >= 0) {
                 break;
             }
@@ -1625,9 +1713,16 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private Map<String, Set<Integer>> nestedBoolParameterIndices(Function helper) {
+        if (helper == null) {
+            return Collections.emptyMap();
+        }
+        String key = functionCacheKey("nested-bool-parameters", helper);
+        Map<String, Set<Integer>> cached = nestedBoolParameterIndicesCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
         LinkedHashMap<String, Set<Integer>> result = new LinkedHashMap<>();
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(helper.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(helper)) {
             if (!instruction.getFlowType().isCall()) {
                 continue;
             }
@@ -1647,7 +1742,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
                     .addAll(boolIndices);
             }
         }
-        return result;
+        Map<String, Set<Integer>> cachedResult = immutableStringSetMap(result);
+        nestedBoolParameterIndicesCache.put(key, cachedResult);
+        return cachedResult;
     }
 
     private Set<Integer> boolParameterIndices(String decompiledText) {
@@ -1655,9 +1752,13 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (decompiledText == null) {
             return result;
         }
+        Set<Integer> cached = boolParameterIndicesCache.get(decompiledText);
+        if (cached != null) {
+            return cached;
+        }
         List<String> parameterNames = parameterNamesFromDecompiledFunction(decompiledText);
         if (parameterNames.isEmpty()) {
-            return result;
+            return cacheIntegerSet(boolParameterIndicesCache, decompiledText, result);
         }
         HashMap<String, Integer> parameterIndex = new HashMap<>();
         for (int i = 0; i < parameterNames.size(); i++) {
@@ -1671,7 +1772,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 result.add(index);
             }
         }
-        return result;
+        return cacheIntegerSet(boolParameterIndicesCache, decompiledText, result);
     }
 
     private List<String> parameterNamesFromDecompiledFunction(String decompiledText) {
@@ -1679,16 +1780,20 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (decompiledText == null) {
             return result;
         }
+        List<String> cached = parameterNameCache.get(decompiledText);
+        if (cached != null) {
+            return cached;
+        }
         int bodyStart = decompiledText.indexOf('{');
         int argsEnd = bodyStart < 0
             ? decompiledText.lastIndexOf(')')
             : decompiledText.lastIndexOf(')', bodyStart);
         if (argsEnd < 0) {
-            return result;
+            return cacheStringList(parameterNameCache, decompiledText, result);
         }
         int argsStart = decompiledText.lastIndexOf('(', argsEnd);
         if (argsStart < 0) {
-            return result;
+            return cacheStringList(parameterNameCache, decompiledText, result);
         }
         for (String parameter : splitTopLevel(decompiledText.substring(argsStart + 1, argsEnd))) {
             String name = parameterName(parameter);
@@ -1696,7 +1801,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 result.add(name);
             }
         }
-        return result;
+        return cacheStringList(parameterNameCache, decompiledText, result);
     }
 
     private String parameterName(String parameter) {
@@ -1718,10 +1823,56 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return trimmed.substring(index + 1);
     }
 
+    private List<String> cacheStringList(
+        Map<String, List<String>> cache,
+        String key,
+        ArrayList<String> value) {
+
+        List<String> cached = Collections.unmodifiableList(new ArrayList<>(value));
+        cache.put(key, cached);
+        return cached;
+    }
+
+    private Set<Integer> cacheIntegerSet(
+        Map<String, Set<Integer>> cache,
+        String key,
+        LinkedHashSet<Integer> value) {
+
+        Set<Integer> cached = Collections.unmodifiableSet(new LinkedHashSet<>(value));
+        cache.put(key, cached);
+        return cached;
+    }
+
+    private List<ParsedUnmarshalCall> cacheParsedUnmarshalCalls(
+        Map<String, List<ParsedUnmarshalCall>> cache,
+        String key,
+        ArrayList<ParsedUnmarshalCall> value) {
+
+        List<ParsedUnmarshalCall> cached = Collections.unmodifiableList(new ArrayList<>(value));
+        cache.put(key, cached);
+        return cached;
+    }
+
+    private Map<String, Set<Integer>> immutableStringSetMap(
+        LinkedHashMap<String, Set<Integer>> value) {
+
+        LinkedHashMap<String, Set<Integer>> cached = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<Integer>> entry : value.entrySet()) {
+            cached.put(
+                entry.getKey(),
+                Collections.unmodifiableSet(new LinkedHashSet<>(entry.getValue())));
+        }
+        return Collections.unmodifiableMap(cached);
+    }
+
     private List<ParsedUnmarshalCall> parseUnmarshalCalls(String text) {
         ArrayList<ParsedUnmarshalCall> result = new ArrayList<>();
         if (text == null) {
             return result;
+        }
+        List<ParsedUnmarshalCall> cached = unmarshalCallCache.get(text);
+        if (cached != null) {
+            return cached;
         }
         int search = 0;
         while (search < text.length()) {
@@ -1738,20 +1889,23 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 continue;
             }
             String templateType = text.substring(templateStart + 1, templateEnd).trim();
-            ParsedUnmarshalCall call = new ParsedUnmarshalCall();
-            call.templateType = templateType;
-            call.textIndex = nameIndex;
-            call.args.addAll(splitTopLevel(text.substring(argsStart + 1, argsEnd)));
-            result.add(call);
+            result.add(new ParsedUnmarshalCall(
+                templateType,
+                nameIndex,
+                splitTopLevel(text.substring(argsStart + 1, argsEnd))));
             search = argsEnd + 1;
         }
-        return result;
+        return cacheParsedUnmarshalCalls(unmarshalCallCache, text, result);
     }
 
     private List<ParsedUnmarshalCall> parseMarshalerUnmarshalCalls(String text) {
         ArrayList<ParsedUnmarshalCall> result = new ArrayList<>();
         if (text == null) {
             return result;
+        }
+        List<ParsedUnmarshalCall> cached = marshalerUnmarshalCallCache.get(text);
+        if (cached != null) {
+            return cached;
         }
         int search = 0;
         while (search < text.length()) {
@@ -1772,20 +1926,23 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 continue;
             }
 
-            ParsedUnmarshalCall call = new ParsedUnmarshalCall();
-            call.templateType = text.substring(templateStart + 1, templateEnd).trim();
-            call.textIndex = nameIndex;
-            call.args.addAll(splitTopLevel(text.substring(argsStart + 1, argsEnd)));
-            result.add(call);
+            result.add(new ParsedUnmarshalCall(
+                text.substring(templateStart + 1, templateEnd).trim(),
+                nameIndex,
+                splitTopLevel(text.substring(argsStart + 1, argsEnd))));
             search = argsEnd + 1;
         }
-        return result;
+        return cacheParsedUnmarshalCalls(marshalerUnmarshalCallCache, text, result);
     }
 
     private List<ParsedUnmarshalCall> parseDirectTypeUnmarshalCalls(String text) {
         ArrayList<ParsedUnmarshalCall> result = new ArrayList<>();
         if (text == null) {
             return result;
+        }
+        List<ParsedUnmarshalCall> cached = directTypeUnmarshalCallCache.get(text);
+        if (cached != null) {
+            return cached;
         }
         int search = 0;
         while (search < text.length()) {
@@ -1807,14 +1964,13 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 continue;
             }
 
-            ParsedUnmarshalCall call = new ParsedUnmarshalCall();
-            call.templateType = sourceTypeLeaf(owner);
-            call.textIndex = unmarshalIndex;
-            call.args.addAll(splitTopLevel(text.substring(argsStart + 1, argsEnd)));
-            result.add(call);
+            result.add(new ParsedUnmarshalCall(
+                sourceTypeLeaf(owner),
+                unmarshalIndex,
+                splitTopLevel(text.substring(argsStart + 1, argsEnd))));
             search = argsEnd + 1;
         }
-        return result;
+        return cacheParsedUnmarshalCalls(directTypeUnmarshalCallCache, text, result);
     }
 
     private int directCallOwnerStart(String text, int unmarshalIndex) {
@@ -2021,21 +2177,28 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (function == null || decompiler == null) {
             return null;
         }
+        String key = functionCacheKey("decompile", function);
+        if (decompileCache.containsKey(key)) {
+            return decompileCache.get(key);
+        }
         try {
             DecompileResults results = decompiler.decompileFunction(function, 30, monitor);
             if (!results.decompileCompleted() || results.getDecompiledFunction() == null) {
+                decompileCache.put(key, null);
                 return null;
             }
-            return results.getDecompiledFunction().getC();
+            String text = results.getDecompiledFunction().getC();
+            decompileCache.put(key, text);
+            return text;
         }
         catch (Exception ignored) {
+            decompileCache.put(key, null);
             return null;
         }
     }
 
     private MessageHelperCall findMessageHelperCall(Function wrapper) {
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(wrapper.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(wrapper)) {
             if (!instruction.getFlowType().isCall()) {
                 continue;
             }
@@ -2355,8 +2518,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private ArgState recoverForwardArgState(Function owner, Address callsite) {
         ForwardArgState state = new ForwardArgState();
         state.registers.put("RCX", TrackedValue.thisOffset(0));
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(owner.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(owner)) {
             if (instruction.getMinAddress().compareTo(callsite) >= 0) {
                 break;
             }
@@ -2473,7 +2635,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
             return null;
         }
 
-        String key = target.toString();
+        String key = addressCacheKey("field-handler-constructor-vtable", target);
         if (fieldHandlerConstructorVtableCache.containsKey(key)) {
             return fieldHandlerConstructorVtableCache.get(key);
         }
@@ -2492,8 +2654,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         ForwardArgState state = new ForwardArgState();
         state.registers.put("RCX", TrackedValue.thisOffset(0));
         int count = 0;
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(function)) {
             if (instruction.getMinAddress().compareTo(target) < 0) {
                 continue;
             }
@@ -2629,8 +2790,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private Address findInstanceVtable(Function function) {
         HashMap<String, Address> registerAddresses = new HashMap<>();
         int count = 0;
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(function)) {
             if (count++ >= VTABLE_SCAN_LIMIT) {
                 break;
             }
@@ -2959,8 +3119,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         }
 
         int count = 0;
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(function)) {
             if (count++ >= VTABLE_SCAN_LIMIT) {
                 break;
             }
@@ -2994,8 +3153,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
         Integer lastR8Length = null;
         int count = 0;
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+        for (Instruction instruction : functionInstructions(function)) {
             if (instruction.getMinAddress().compareTo(address) < 0) {
                 continue;
             }
@@ -3510,18 +3668,51 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (address == null) {
             return null;
         }
-        return currentProgram.getFunctionManager().getFunctionContaining(address);
+        String key = addressCacheKey("function-containing", address);
+        if (functionLookupCache.containsKey(key)) {
+            return functionLookupCache.get(key);
+        }
+        Function function = currentProgram.getFunctionManager().getFunctionContaining(address);
+        functionLookupCache.put(key, function);
+        return function;
     }
 
     private Function functionAtOrContaining(Address address) {
         if (address == null) {
             return null;
         }
+        String key = addressCacheKey("function-at-or-containing", address);
+        if (functionLookupCache.containsKey(key)) {
+            return functionLookupCache.get(key);
+        }
         Function function = currentProgram.getFunctionManager().getFunctionAt(address);
         if (function != null) {
+            functionLookupCache.put(key, function);
             return function;
         }
-        return currentProgram.getFunctionManager().getFunctionContaining(address);
+        function = currentProgram.getFunctionManager().getFunctionContaining(address);
+        functionLookupCache.put(key, function);
+        return function;
+    }
+
+    private List<Instruction> functionInstructions(Function function) {
+        if (function == null) {
+            return List.of();
+        }
+        String key = functionCacheKey("instructions", function);
+        List<Instruction> cached = functionInstructionsCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        ArrayList<Instruction> instructions = new ArrayList<>();
+        for (Instruction instruction :
+            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+            instructions.add(instruction);
+        }
+        List<Instruction> cachedInstructions =
+            Collections.unmodifiableList(new ArrayList<>(instructions));
+        functionInstructionsCache.put(key, cachedInstructions);
+        return cachedInstructions;
     }
 
     private Address parseCapturedAddress(String value) {
@@ -3547,7 +3738,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (!isProgramAddress(address)) {
             return null;
         }
-        String key = address.toString();
+        String key = addressCacheKey("pointer", address);
         if (pointerReadCache.containsKey(key)) {
             return pointerReadCache.get(key);
         }
@@ -3676,13 +3867,25 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private String fullFunctionName(Function function) {
+        if (function == null) {
+            return null;
+        }
         String namespace = function.getParentNamespace() == null
             ? null
             : function.getParentNamespace().getName(true);
-        if (namespace == null || namespace.isEmpty() || "Global".equals(namespace)) {
-            return function.getName();
+        String key = functionCacheKey("function-name:" + namespace + "::" + function.getName(), function);
+        String cached = functionNameCache.get(key);
+        if (cached != null) {
+            return cached;
         }
-        return namespace + "::" + function.getName();
+        if (namespace == null || namespace.isEmpty() || "Global".equals(namespace)) {
+            String name = function.getName();
+            functionNameCache.put(key, name);
+            return name;
+        }
+        String name = namespace + "::" + function.getName();
+        functionNameCache.put(key, name);
+        return name;
     }
 
     private JsonObject object(JsonObject object, String name) {
@@ -4028,9 +4231,15 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private static final class ParsedUnmarshalCall {
-        String templateType;
-        int textIndex = Integer.MAX_VALUE;
-        final ArrayList<String> args = new ArrayList<>();
+        final String templateType;
+        final int textIndex;
+        final List<String> args;
+
+        ParsedUnmarshalCall(String templateType, int textIndex, List<String> args) {
+            this.templateType = templateType;
+            this.textIndex = textIndex;
+            this.args = Collections.unmodifiableList(new ArrayList<>(args));
+        }
     }
 
     private static final class ParsedArgument {

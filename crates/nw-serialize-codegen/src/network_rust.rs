@@ -1245,7 +1245,9 @@ fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
         "bool" => Some(SchemaWireShape::Bool),
         "u8" | "uint8_t" | "AZ::u8" => Some(SchemaWireShape::U8),
         "u16" | "uint16_t" | "AZ::u16" => Some(SchemaWireShape::U16),
-        "u32" | "uint32_t" | "AZ::u32" | "FragmentKey" => Some(SchemaWireShape::U32),
+        "u32" | "uint32_t" | "AZ::u32" | "FragmentKey" | "Amazon::Hub::FragmentKey" => {
+            Some(SchemaWireShape::U32)
+        }
         "u64" | "uint64_t" | "AZ::u64" => Some(SchemaWireShape::U64),
         "f32" | "float" => Some(SchemaWireShape::F32),
         "f64" | "double" => Some(SchemaWireShape::F64),
@@ -1265,8 +1267,10 @@ fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
 fn message_native_type_rust_type(native_type: &str) -> Option<&'static str> {
     match native_type.trim() {
         "ActorRef" | "HubAddress" | "ProxyAddress" => Some("::nw_network::HubAddress"),
-        "BaselineableFragment" => Some("::nw_network::hub::BaselineableFragment"),
-        "FragmentKey" => Some("::nw_network::hub::FragmentKey"),
+        "BaselineableFragment" | "Amazon::Hub::BaselineableFragment" => {
+            Some("::nw_network::hub::BaselineableFragment")
+        }
+        "FragmentKey" | "Amazon::Hub::FragmentKey" => Some("::nw_network::hub::FragmentKey"),
         _ => None,
     }
 }
@@ -2610,7 +2614,7 @@ mod tests {
                 "fields": [{
                     "index": 0,
                     "name": "Fragment",
-                    "nativeType": "BaselineableFragment",
+                    "nativeType": "Amazon::Hub::BaselineableFragment",
                     "confidence": "message-unmarshal-helper-direct-type-call"
                 }]
             }],
