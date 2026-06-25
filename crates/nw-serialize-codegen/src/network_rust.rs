@@ -14,7 +14,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v21";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v22";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -54,6 +54,8 @@ pub struct NetworkRustGenerationReport {
     pub generatable_message_count: usize,
     pub blocked_message_count: usize,
     pub message_generation_plans: Vec<NetworkMessageGenerationPlanReport>,
+    #[serde(default)]
+    pub message_blocker_summary: NetworkBlockerSummaryReport,
     #[serde(default)]
     pub marshaler_conversion_count: usize,
 }
@@ -108,6 +110,52 @@ pub struct NetworkMessageGenerationPlanReport {
     pub fields: Vec<NetworkStateFieldShapeReport>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkBlockerSummaryReport {
+    pub total_plan_count: usize,
+    pub generatable_count: usize,
+    pub blocked_count: usize,
+    pub reason_buckets: Vec<NetworkBlockerReasonBucketReport>,
+    pub combination_buckets: Vec<NetworkBlockerCombinationBucketReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkBlockerReasonBucketReport {
+    pub reason: String,
+    pub type_count: usize,
+    pub blocked_field_count: usize,
+    pub examples: Vec<NetworkBlockedTypeExampleReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkBlockerCombinationBucketReport {
+    pub reasons: Vec<String>,
+    pub type_count: usize,
+    pub examples: Vec<NetworkBlockedTypeExampleReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkBlockedTypeExampleReport {
+    pub type_index: Option<u32>,
+    pub type_name: Option<String>,
+    pub field_count: usize,
+    pub blocked_reasons: Vec<String>,
+    pub blocked_fields: Vec<NetworkBlockedFieldExampleReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkBlockedFieldExampleReport {
+    pub field_index: Option<u32>,
+    pub field_name: Option<String>,
+    pub rust_value_type: Option<String>,
+    pub blocked_reason: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct NetworkRustEmitter;
 
@@ -142,6 +190,7 @@ impl NetworkRustEmitter {
             .count();
         report.blocked_message_count =
             report.message_generation_plan_count - report.generatable_message_count;
+        report.message_blocker_summary = message_blocker_summary(&report.message_generation_plans);
         let identities = identity_tokens(schema);
         report.identity_type_count = identities.len();
 
@@ -466,6 +515,7 @@ impl NetworkRustEmitter {
         report.blocked_message_count =
             report.message_generation_plan_count - report.generatable_message_count;
         report.message_count = report.generatable_message_count;
+        report.message_blocker_summary = message_blocker_summary(&report.message_generation_plans);
 
         let tokens = quote! {
             #(#modules)*
@@ -1137,6 +1187,122 @@ fn message_generation_plan(
         can_generate: blocked_reasons.is_empty(),
         blocked_reasons,
         fields,
+    }
+}
+
+const BLOCKER_EXAMPLE_LIMIT: usize = 8;
+const BLOCKED_FIELD_EXAMPLE_LIMIT: usize = 8;
+
+fn message_blocker_summary(
+    plans: &[NetworkMessageGenerationPlanReport],
+) -> NetworkBlockerSummaryReport {
+    let mut reason_buckets = BTreeMap::<String, NetworkBlockerReasonBucketReport>::new();
+    let mut combination_buckets =
+        BTreeMap::<Vec<String>, NetworkBlockerCombinationBucketReport>::new();
+
+    for plan in plans.iter().filter(|plan| !plan.can_generate) {
+        let example = blocked_type_example(plan);
+        let reason_families = plan
+            .blocked_reasons
+            .iter()
+            .map(|reason| blocker_reason_family(reason).to_owned())
+            .collect::<BTreeSet<_>>();
+        for reason in reason_families {
+            let bucket = reason_buckets.entry(reason.clone()).or_insert_with(|| {
+                NetworkBlockerReasonBucketReport {
+                    reason,
+                    ..NetworkBlockerReasonBucketReport::default()
+                }
+            });
+            bucket.type_count += 1;
+            bucket.blocked_field_count += blocked_field_count_for_reason(plan, &bucket.reason);
+            if bucket.examples.len() < BLOCKER_EXAMPLE_LIMIT {
+                bucket.examples.push(example.clone());
+            }
+        }
+
+        let mut reasons = plan.blocked_reasons.clone();
+        reasons.sort();
+        let bucket = combination_buckets
+            .entry(reasons.clone())
+            .or_insert_with(|| NetworkBlockerCombinationBucketReport {
+                reasons,
+                ..NetworkBlockerCombinationBucketReport::default()
+            });
+        bucket.type_count += 1;
+        if bucket.examples.len() < BLOCKER_EXAMPLE_LIMIT {
+            bucket.examples.push(example);
+        }
+    }
+
+    let mut reason_buckets = reason_buckets.into_values().collect::<Vec<_>>();
+    reason_buckets.sort_by(|left, right| {
+        right
+            .type_count
+            .cmp(&left.type_count)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+
+    let mut combination_buckets = combination_buckets.into_values().collect::<Vec<_>>();
+    combination_buckets.sort_by(|left, right| {
+        right
+            .type_count
+            .cmp(&left.type_count)
+            .then_with(|| left.reasons.cmp(&right.reasons))
+    });
+
+    NetworkBlockerSummaryReport {
+        total_plan_count: plans.len(),
+        generatable_count: plans.iter().filter(|plan| plan.can_generate).count(),
+        blocked_count: plans.iter().filter(|plan| !plan.can_generate).count(),
+        reason_buckets,
+        combination_buckets,
+    }
+}
+
+fn blocker_reason_family(reason: &str) -> &str {
+    reason.split_once(':').map_or(reason, |(family, _)| family)
+}
+
+fn blocked_field_count_for_reason(
+    plan: &NetworkMessageGenerationPlanReport,
+    reason: &str,
+) -> usize {
+    plan.fields
+        .iter()
+        .filter(|field| {
+            field
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|field_reason| blocker_reason_family(field_reason) == reason)
+        })
+        .count()
+}
+
+fn blocked_type_example(
+    plan: &NetworkMessageGenerationPlanReport,
+) -> NetworkBlockedTypeExampleReport {
+    NetworkBlockedTypeExampleReport {
+        type_index: plan.type_index,
+        type_name: plan.type_name.clone(),
+        field_count: plan.field_count,
+        blocked_reasons: plan.blocked_reasons.clone(),
+        blocked_fields: plan
+            .fields
+            .iter()
+            .filter(|field| field.blocked_reason.is_some())
+            .take(BLOCKED_FIELD_EXAMPLE_LIMIT)
+            .map(blocked_field_example)
+            .collect(),
+    }
+}
+
+fn blocked_field_example(field: &NetworkStateFieldShapeReport) -> NetworkBlockedFieldExampleReport {
+    NetworkBlockedFieldExampleReport {
+        field_index: field.field_index,
+        field_name: field.field_name.clone(),
+        rust_value_type: field.rust_value_type.clone(),
+        blocked_reason: field.blocked_reason.clone(),
     }
 }
 
@@ -2407,6 +2573,67 @@ mod tests {
         assert!(message_output.source.contains("Marshaler"));
         assert!(message_output.source.contains("AzRtti"));
         assert!(message_output.source.contains("TypeRegistry"));
+    }
+
+    #[test]
+    fn reports_message_blocker_summary_with_examples() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "11111111-1111-1111-1111-111111111111",
+                "typeIndex": 1,
+                "typeName": "Example::EmptyMsg",
+                "rootKinds": ["message"],
+                "fields": []
+            }, {
+                "uuid": "22222222-2222-2222-2222-222222222222",
+                "typeIndex": 2,
+                "typeName": "Example::PlaceholderMsg",
+                "rootKinds": ["message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "ActorRef",
+                    "nativeType": "Amazon::Hub::ActorRef",
+                    "confidence": "message-unmarshal-helper-wrapper"
+                }]
+            }, {
+                "uuid": "33333333-3333-3333-3333-333333333333",
+                "typeIndex": 3,
+                "typeName": "Example::ReadyMsg",
+                "rootKinds": ["message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "Value",
+                    "nativeType": "u32",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+        let summary = &output.report.message_blocker_summary;
+
+        assert_eq!(summary.total_plan_count, 3);
+        assert_eq!(summary.generatable_count, 1);
+        assert_eq!(summary.blocked_count, 2);
+        assert_eq!(summary.reason_buckets.len(), 2);
+        assert_eq!(summary.reason_buckets[0].reason, "no-message-fields");
+        assert_eq!(summary.reason_buckets[0].type_count, 1);
+        assert_eq!(
+            summary.reason_buckets[0].examples[0].type_name.as_deref(),
+            Some("Example::EmptyMsg")
+        );
+        assert_eq!(summary.reason_buckets[1].reason, "placeholder-field-name");
+        assert_eq!(summary.reason_buckets[1].type_count, 1);
+        assert_eq!(summary.reason_buckets[1].blocked_field_count, 1);
+        assert_eq!(
+            summary.reason_buckets[1].examples[0].blocked_fields[0]
+                .field_name
+                .as_deref(),
+            Some("ActorRef")
+        );
+        assert_eq!(summary.combination_buckets.len(), 2);
     }
 
     #[test]
