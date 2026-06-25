@@ -1266,7 +1266,9 @@ fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
 
 fn message_native_type_rust_type(native_type: &str) -> Option<&'static str> {
     match native_type.trim() {
-        "ActorRef" | "HubAddress" | "ProxyAddress" => Some("::nw_network::HubAddress"),
+        "ActorRef" | "Amazon::Hub::ActorRef" | "HubAddress" | "ProxyAddress" => {
+            Some("::nw_network::HubAddress")
+        }
         "BaselineableFragment" | "Amazon::Hub::BaselineableFragment" => {
             Some("::nw_network::hub::BaselineableFragment")
         }
@@ -1457,6 +1459,14 @@ fn is_native_type_field_name(name: &str) -> bool {
             | "Matrix3x3"
             | "Aabb"
             | "EntityRef"
+            | "ActorRef"
+            | "HubAddress"
+            | "ProxyAddress"
+            | "FragmentKey"
+            | "BaselineableFragment"
+            | "Amazon::Hub::ActorRef"
+            | "Amazon::Hub::FragmentKey"
+            | "Amazon::Hub::BaselineableFragment"
             | "composite"
     )
 }
@@ -2482,6 +2492,16 @@ mod tests {
                     "nativeType": "f32",
                     "confidence": "message-unmarshal-call"
                 }]
+            }, {
+                "uuid": "1E93F466-CD84-4502-BA28-4632F80DD0FA",
+                "typeIndex": 780,
+                "typeName": "Amazon::Hub::ScaleTestTrait::SetTargetsMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "ActorRef",
+                    "nativeType": "Amazon::Hub::ActorRef",
+                    "confidence": "message-unmarshal-helper-wrapper"
+                }]
             }],
             "fieldRegistrationFunctions": []
         }))
@@ -2489,14 +2509,14 @@ mod tests {
 
         let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
-        assert_eq!(output.report.message_generation_plan_count, 1);
+        assert_eq!(output.report.message_generation_plan_count, 2);
         assert_eq!(output.report.generatable_message_count, 0);
-        assert_eq!(output.report.blocked_message_count, 1);
-        assert_eq!(
-            output.report.message_generation_plans[0].blocked_reasons,
-            vec!["placeholder-field-name:1"]
-        );
+        assert_eq!(output.report.blocked_message_count, 2);
+        for plan in &output.report.message_generation_plans {
+            assert_eq!(plan.blocked_reasons, vec!["placeholder-field-name:1"]);
+        }
         assert!(!output.source.contains("pub struct ResizeAoiObservableMsg"));
+        assert!(!output.source.contains("pub struct SetTargetsMsg"));
     }
 
     #[test]
@@ -2575,7 +2595,7 @@ mod tests {
                 "fields": [{
                     "index": 0,
                     "name": "ProxyRef",
-                    "nativeType": "ProxyAddress",
+                    "nativeType": "Amazon::Hub::ActorRef",
                     "confidence": "message-unmarshal-helper-direct-type-call"
                 }, {
                     "index": 1,
