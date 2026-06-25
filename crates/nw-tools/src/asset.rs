@@ -440,20 +440,54 @@ impl SearchPath {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
         let root = self.root.resolve()?;
-        // Opt-in: --catalog enriches each hit with its AssetId and lets the query
-        // match a GUID. Best-effort — absent for non-install roots.
-        let catalog = self.catalog.then(|| source::catalog_index(&root).ok()).flatten();
-        let paks = PakSet::collect(root, self.paks)?;
         // Fuzzy ranking is the default; glob, case-sensitive, and --exact all
         // select literal matching instead.
         let mode = MatchMode::from_flags(self.glob, self.case_sensitive, self.exact);
         let query = TextQuery::new(self.query, mode);
+        let paks = PakSet::collect(root.clone(), self.paks)?;
+        // --catalog adds a GUID column and lets the query match a GUID; loading the
+        // catalog is opt-in because it is slower than a plain search.
+        let with_guid = self.catalog;
+
+        // Interactive: open instantly and stream matches in from a background scan.
+        // The catalog (for --catalog) loads on that thread too, so it never blocks
+        // the UI.
+        if theme::caps().interactive {
+            let mut headers = vec!["Pak", "Method", "Size", "Name"];
+            if with_guid {
+                headers.push("GUID");
+            }
+            let template = Table::new(headers).right([2]);
+            let stats = vec![("archives".to_string(), paks.paths().len().to_string())];
+            let feed = crate::tui::RowFeed::new(paks.paths().len());
+            let runner = ctx.runner.clone();
+            let cancel = ctx.cancel.clone();
+            let feed_bg = feed.clone();
+            std::thread::spawn(move || {
+                let catalog = with_guid.then(|| source::catalog_index(&root).ok()).flatten();
+                runner.map(paks.paths(), |pak| {
+                    if let Ok(hits) =
+                        Self::scan_pak(&paks, pak, &query, catalog.as_ref(), &cancel, None)
+                    {
+                        feed_bg
+                            .extend(hits.into_iter().map(|hit| path_hit_cells(hit, with_guid)).collect());
+                    }
+                    feed_bg.mark_done();
+                });
+            });
+            return Ok(crate::tui::browse_streaming("asset search path", stats, template, 3, feed)?);
+        }
+
+        // Piped: scan fully, then print a static report.
+        let catalog = with_guid.then(|| source::catalog_index(&root).ok()).flatten();
         let cancel = ctx.cancel.clone();
         let batch = ctx.map_results(
             "path search",
             paks.paths(),
             |path| paks.relative(path),
-            |path, progress| Self::scan_pak(&paks, path, &query, catalog.as_ref(), &cancel, &progress),
+            |path, progress| {
+                Self::scan_pak(&paks, path, &query, catalog.as_ref(), &cancel, Some(&progress))
+            },
         );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
@@ -481,29 +515,16 @@ impl SearchPath {
             ("shown".to_string(), rows.len().to_string()),
         ];
         let mut headers = vec!["Pak", "Method", "Size", "Name"];
-        if catalog.is_some() {
+        if with_guid {
             headers.push("GUID");
         }
         let mut table = Table::new(headers).right([2]);
         for row in rows {
-            let mut cells = vec![
-                Cell::path(row.pak),
-                Cell::method(row.method),
-                Cell::size(row.size),
-                Cell::path(row.name),
-            ];
-            if catalog.is_some() {
-                cells.push(Cell::text(row.asset_id));
-            }
-            table.push(cells);
+            table.push(path_hit_cells(row, with_guid));
         }
-        if theme::caps().interactive && !table.is_empty() {
-            crate::tui::browse("asset search path", stats, table, 3)?;
-        } else {
-            let mut report = Report::with_stats("asset search path", stats);
-            report.table_or(table, "no path matches");
-            report.print();
-        }
+        let mut report = Report::with_stats("asset search path", stats);
+        report.table_or(table, "no path matches");
+        report.print();
 
         ScanIssues::new("asset path search", skipped, cancelled, errors).finish()
     }
@@ -514,10 +535,12 @@ impl SearchPath {
         query: &TextQuery,
         catalog: Option<&CatalogIndex>,
         cancel: &CancellationToken,
-        progress: &Job,
+        progress: Option<&Job>,
     ) -> Result<Vec<PathHit>> {
         let pak = PakMmapReader::open(path)?;
-        progress.set_len(pak.len());
+        if let Some(progress) = progress {
+            progress.set_len(pak.len());
+        }
         let pak_name = paks.relative(path);
         let mut search = query.is_fuzzy().then(|| crate::fuzzy::Search::new(&query.raw));
         let mut rows = Vec::new();
@@ -526,7 +549,9 @@ impl SearchPath {
             if cancel.is_cancelled() {
                 break;
             }
-            progress.inc(1);
+            if let Some(progress) = progress {
+                progress.inc(1);
+            }
             let info = catalog.and_then(|catalog| catalog.info(entry.name()));
             let score = match &mut search {
                 Some(search) => match search.score(entry.name()) {
@@ -554,6 +579,20 @@ impl SearchPath {
 
         Ok(rows)
     }
+}
+
+/// The browser/report cells for one path hit (with the GUID column when `--catalog`).
+fn path_hit_cells(hit: PathHit, with_guid: bool) -> Vec<Cell> {
+    let mut cells = vec![
+        Cell::path(hit.pak),
+        Cell::method(hit.method),
+        Cell::size(hit.size),
+        Cell::path(hit.name),
+    ];
+    if with_guid {
+        cells.push(Cell::text(hit.asset_id));
+    }
+    cells
 }
 
 impl SearchObjectStream {

@@ -292,12 +292,34 @@ impl List {
             names: GlobSet::archive(self.name),
             azcs: self.azcs,
         };
+        // Interactive: open the browser instantly and stream entries in from a
+        // background scan, so the UI never blocks on the enumeration.
+        if theme::caps().interactive {
+            let stats = vec![("archives".to_string(), paks.paths().len().to_string())];
+            let template =
+                Table::new(["Pak", "Method", "Family", "AZCS", "Size", "Name"]).right([4]);
+            let feed = crate::tui::RowFeed::new(paks.paths().len());
+            let runner = ctx.runner.clone();
+            let cancel = ctx.cancel.clone();
+            let feed_bg = feed.clone();
+            std::thread::spawn(move || {
+                runner.map(paks.paths(), |pak| {
+                    if let Ok(rows) = scan_entries(&paks, pak, &filter, &cancel, None) {
+                        feed_bg.extend(rows.into_iter().map(entry_cells).collect());
+                    }
+                    feed_bg.mark_done();
+                });
+            });
+            return Ok(crate::tui::browse_streaming("pak list", stats, template, 5, feed)?);
+        }
+
+        // Piped / non-interactive: scan fully, then print a static report.
         let cancel = ctx.cancel.clone();
         let batch = ctx.map_results(
             "pak list",
             paks.paths(),
             |pak| paks.relative(pak),
-            |pak, progress| scan_entries(&paks, pak, &filter, &cancel, &progress),
+            |pak, progress| scan_entries(&paks, pak, &filter, &cancel, Some(&progress)),
         );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
@@ -323,22 +345,11 @@ impl List {
         ];
         let mut table = Table::new(["Pak", "Method", "Family", "AZCS", "Size", "Name"]).right([4]);
         for row in rows {
-            table.push([
-                Cell::path(row.pak),
-                Cell::method(row.method),
-                Cell::text(row.family),
-                Cell::yes_no(row.azcs),
-                Cell::size(row.size),
-                Cell::path(row.name),
-            ]);
+            table.push(entry_cells(row));
         }
-        if theme::caps().interactive && !table.is_empty() {
-            crate::tui::browse("pak list", stats, table, 5)?;
-        } else {
-            let mut report = Report::with_stats("pak list", stats);
-            report.table_or(table, "no matching entries");
-            report.print();
-        }
+        let mut report = Report::with_stats("pak list", stats);
+        report.table_or(table, "no matching entries");
+        report.print();
 
         if cancelled {
             bail!("pak list cancelled ({skipped} queued archive(s) skipped)");
@@ -351,6 +362,18 @@ impl List {
         }
         Ok(())
     }
+}
+
+/// The browser/report cells for one listed entry.
+fn entry_cells(row: EntryRow) -> Vec<Cell> {
+    vec![
+        Cell::path(row.pak),
+        Cell::method(row.method),
+        Cell::text(row.family),
+        Cell::yes_no(row.azcs),
+        Cell::size(row.size),
+        Cell::path(row.name),
+    ]
 }
 
 impl Shape {
@@ -583,10 +606,12 @@ fn scan_entries(
     pak_path: &Path,
     filter: &ListFilter,
     cancel: &CancellationToken,
-    progress: &Job,
+    progress: Option<&Job>,
 ) -> Result<Vec<EntryRow>> {
     let pak = PakMmapReader::open(pak_path)?;
-    progress.set_len(pak.len());
+    if let Some(progress) = progress {
+        progress.set_len(pak.len());
+    }
     let pak_name = paks.relative(pak_path);
     let mut rows = Vec::new();
 
@@ -594,7 +619,9 @@ fn scan_entries(
         if cancel.is_cancelled() {
             break;
         }
-        progress.inc(1);
+        if let Some(progress) = progress {
+            progress.inc(1);
+        }
         if filter
             .method
             .is_some_and(|method| !method.matches(entry.compression()))

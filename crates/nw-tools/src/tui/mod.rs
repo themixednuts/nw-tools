@@ -23,6 +23,7 @@ pub use datasheet::{
     GridCell, GridColumn, GridType, IndexProgress, Loc, LocaleState, SheetData, SheetSource,
 };
 use sheets::SheetPicker;
+pub use table::RowFeed;
 use table::TableView;
 pub use tree::TreeNode;
 use tree::TreeView;
@@ -40,6 +41,24 @@ pub fn browse(
     primary_col: usize,
 ) -> io::Result<()> {
     let mut view = TableView::new(title, stats, table, primary_col, theme::caps());
+    app::run(&mut view)?;
+    if let Some(line) = view.take_result() {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Like [`browse`], but the rows stream in from `feed` (filled by a background
+/// scan) so the browser opens instantly and never blocks on the full scan.
+/// `table` is an empty template carrying the headers and column alignment.
+pub fn browse_streaming(
+    title: impl Into<String>,
+    stats: Vec<(String, String)>,
+    table: Table,
+    primary_col: usize,
+    feed: Arc<RowFeed>,
+) -> io::Result<()> {
+    let mut view = TableView::streaming(title, stats, table, primary_col, feed, theme::caps());
     app::run(&mut view)?;
     if let Some(line) = view.take_result() {
         println!("{line}");

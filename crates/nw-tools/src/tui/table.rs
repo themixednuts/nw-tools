@@ -3,6 +3,8 @@
 //! there is a single source of truth for columns and cell styling.
 
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -13,11 +15,59 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use super::app::{Flow, View};
 use crate::fuzzy;
-use crate::ui::Table;
 use crate::ui::theme::{self, Caps};
+use crate::ui::{Cell, Table};
 
 /// Background applied to the selected row when color is available.
 const HILITE: ratatui::style::Color = ratatui::style::Color::Indexed(238);
+
+/// A growing set of table rows, filled by a background scan while the browser is
+/// already on screen. Lets row-listing browsers open instantly and stream their
+/// results in instead of blocking on the full scan first.
+pub struct RowFeed {
+    rows: Mutex<Vec<Vec<Cell>>>,
+    scanned: AtomicUsize,
+    total: usize,
+}
+
+impl RowFeed {
+    /// A feed awaiting `total` units of work (e.g. one per pak).
+    #[must_use]
+    pub fn new(total: usize) -> Arc<Self> {
+        Arc::new(Self {
+            rows: Mutex::new(Vec::new()),
+            scanned: AtomicUsize::new(0),
+            total,
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<Vec<Cell>>> {
+        self.rows.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Append a batch of fully-built rows.
+    pub fn extend(&self, rows: Vec<Vec<Cell>>) {
+        self.lock().extend(rows);
+    }
+
+    /// Record one more unit of work (e.g. one pak) finished.
+    pub fn mark_done(&self) {
+        self.scanned.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn tail_from(&self, have: usize) -> Vec<Vec<Cell>> {
+        let rows = self.lock();
+        rows.get(have..).map(<[Vec<Cell>]>::to_vec).unwrap_or_default()
+    }
+
+    fn progress(&self) -> (usize, usize) {
+        (self.scanned.load(AtomicOrdering::Relaxed), self.total)
+    }
+
+    fn scanning(&self) -> bool {
+        self.scanned.load(AtomicOrdering::Relaxed) < self.total
+    }
+}
 
 pub struct TableView {
     title: String,
@@ -38,6 +88,10 @@ pub struct TableView {
     sort_desc: bool,
     help: bool,
     result: Option<String>,
+    /// Background scan streaming rows in; `None` for an already-complete table.
+    feed: Option<Arc<RowFeed>>,
+    /// Rows already pulled from `feed` into `table`.
+    ingested: usize,
 }
 
 impl TableView {
@@ -48,7 +102,8 @@ impl TableView {
         primary_col: usize,
         caps: Caps,
     ) -> Self {
-        let view = (0..table.rows().len()).collect();
+        let ingested = table.rows().len();
+        let view = (0..ingested).collect();
         Self {
             title: title.into(),
             stats,
@@ -65,7 +120,42 @@ impl TableView {
             sort_desc: false,
             help: false,
             result: None,
+            feed: None,
+            ingested,
         }
+    }
+
+    /// A browser whose rows stream in from `feed` (which a background scan fills).
+    /// `table` is an empty template carrying the headers and column alignment.
+    pub fn streaming(
+        title: impl Into<String>,
+        stats: Vec<(String, String)>,
+        table: Table,
+        primary_col: usize,
+        feed: Arc<RowFeed>,
+        caps: Caps,
+    ) -> Self {
+        let mut view = Self::new(title, stats, table, primary_col, caps);
+        view.feed = Some(feed);
+        view
+    }
+
+    /// Pull rows discovered since the last ingest into the table and reapply the
+    /// current filter/sort. Returns whether anything new arrived.
+    fn ingest(&mut self) -> bool {
+        let Some(feed) = self.feed.clone() else {
+            return false;
+        };
+        let fresh = feed.tail_from(self.ingested);
+        if fresh.is_empty() {
+            return false;
+        }
+        self.ingested += fresh.len();
+        for row in fresh {
+            self.table.push(row);
+        }
+        self.recompute();
+        true
     }
 
     fn cell_text(&self, row: usize, col: usize) -> &str {
@@ -180,6 +270,14 @@ impl TableView {
 impl View for TableView {
     fn take_result(&mut self) -> Option<String> {
         self.result.take()
+    }
+
+    fn ticking(&self) -> bool {
+        self.feed.as_ref().is_some_and(|feed| feed.scanning())
+    }
+
+    fn tick(&mut self) {
+        self.ingest();
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Flow {
@@ -309,6 +407,11 @@ impl TableView {
         } else {
             format!("{}/{}", self.selected + 1, self.view.len())
         };
+        if let Some((scanned, total)) = self.feed.as_ref().map(|feed| feed.progress())
+            && scanned < total
+        {
+            return format!("scanning {scanned}/{total}   {position}");
+        }
         if self.sorted {
             let column = self
                 .table
