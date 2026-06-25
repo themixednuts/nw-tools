@@ -1,7 +1,7 @@
 mod asset;
 mod cache;
 mod extract;
-mod formats;
+mod format;
 mod fuzzy;
 mod jobs;
 mod model;
@@ -67,7 +67,7 @@ enum Command {
     #[command(about = "Inspect a specific supported file format")]
     Format {
         #[command(subcommand)]
-        command: formats::Cmd,
+        command: format::Cmd,
     },
 }
 
