@@ -14,6 +14,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Widget};
 
+use crate::ui::theme;
+
 const DRAW_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Clone)]
@@ -438,7 +440,7 @@ fn draw_batch(area: Rect, buf: &mut ratatui::buffer::Buffer, batch: &BatchModel,
         .split(area);
 
     let title = Line::from(vec![
-        Span::styled("nw-tools ", Style::default().fg(Color::Cyan)),
+        Span::styled("nw-tools ", Style::default().fg(theme::palette::ACCENT)),
         Span::styled(
             batch.label.as_str(),
             Style::default().add_modifier(Modifier::BOLD),
@@ -448,7 +450,7 @@ fn draw_batch(area: Rect, buf: &mut ratatui::buffer::Buffer, batch: &BatchModel,
     let ratio = ratio(batch.done, batch.total);
     Gauge::default()
         .block(block)
-        .gauge_style(Style::default().fg(Color::Cyan))
+        .gauge_style(Style::default().fg(theme::palette::ACCENT))
         .ratio(ratio)
         .label(format!(
             "{:.0}%  {}/{}",
@@ -502,15 +504,11 @@ fn draw_jobs(area: Rect, buf: &mut ratatui::buffer::Buffer, batch: &BatchModel) 
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     ));
-    lines.extend(batch.jobs[start..].iter().map(|job| {
-        Line::from(job_line(
-            columns,
-            job_state(job.state),
-            &job_bar(job, columns.progress),
-            &format!("{}/{}", job.pos, job.len),
-            &job.label,
-        ))
-    }));
+    lines.extend(
+        batch.jobs[start..]
+            .iter()
+            .map(|job| job_row_line(columns, job)),
+    );
 
     Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("Jobs"))
@@ -592,6 +590,41 @@ fn job_line(columns: JobColumns, state: &str, progress: &str, files: &str, path:
         progress_width = columns.progress,
         files_width = columns.files,
     )
+}
+
+fn job_row_line(columns: JobColumns, job: &JobRow) -> Line<'static> {
+    let state = fit_end(job_state(job.state), columns.state);
+    let progress = job_bar(job, columns.progress);
+    let files = format!("{}/{}", job.pos, job.len);
+    Line::from(vec![
+        Span::styled(
+            format!("{state:<width$}", width = columns.state),
+            state_style(job.state),
+        ),
+        Span::raw("  "),
+        Span::raw(format!(
+            "{:<width$}",
+            fit_end(&progress, columns.progress),
+            width = columns.progress
+        )),
+        Span::raw("  "),
+        Span::raw(format!(
+            "{:>width$}",
+            fit_end(&files, columns.files),
+            width = columns.files
+        )),
+        Span::raw("  "),
+        Span::raw(fit_middle(&job.label, columns.path)),
+    ])
+}
+
+fn state_style(state: JobState) -> Style {
+    match state {
+        JobState::Queued => theme::dim(),
+        JobState::Running => theme::warn(),
+        JobState::Done => theme::good(),
+        JobState::Failed => theme::bad(),
+    }
 }
 
 fn job_bar(job: &JobRow, width: usize) -> String {

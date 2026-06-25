@@ -1,0 +1,92 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "id": "a8f22ac1-2ba1-46fe-bf62-543b7e762eab",
+  "prevIds": [
+    "00000000-0000-0000-0000-000000000000"
+  ],
+  "ddl": [
+    {
+      "entityType": "tables",
+      "name": "toc"
+    },
+    {
+      "entityType": "columns",
+      "table": "toc",
+      "name": "path",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "toc",
+      "name": "pak",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "toc",
+      "name": "entry",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "toc",
+      "name": "toc_pkey",
+      "columns": [
+        "path"
+      ],
+      "nameExplicit": false
+    },
+    {
+      "entityType": "tables",
+      "name": "guid"
+    },
+    {
+      "entityType": "columns",
+      "table": "guid",
+      "name": "guid",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "guid",
+      "name": "path",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "guid",
+      "name": "guid_pkey",
+      "columns": [
+        "guid"
+      ],
+      "nameExplicit": false
+    }
+  ],
+  "renames": []
+}

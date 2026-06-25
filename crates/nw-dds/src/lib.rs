@@ -9,7 +9,9 @@ use std::path::Path;
 
 use thiserror::Error;
 
-pub use container::{Error as Ktx2Error, Ktx2, Sidecar};
+pub use container::{
+    DecodedImage, Error as Ktx2Error, Ktx2, Sidecar, decode_all_mips, decode_top_mip,
+};
 
 pub const DDS_EXTENSION: &str = "dds";
 pub const DDS_MAGIC: &[u8; 4] = b"DDS ";

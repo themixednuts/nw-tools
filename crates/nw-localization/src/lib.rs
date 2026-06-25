@@ -8,9 +8,11 @@ use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
     str::{self, FromStr},
+    sync::Mutex,
 };
 
 use quick_xml::de::from_str;
+use rayon::prelude::*;
 use serde::{
     Deserialize, Deserializer,
     de::{IgnoredAny, MapAccess, Visitor},
@@ -723,7 +725,10 @@ impl<'de> Visitor<'de> for SourceManifestVisitor {
 
 #[derive(Debug, Deserialize)]
 struct SourceTagXml {
-    #[serde(rename = "entry", default, deserialize_with = "one_or_many")]
+    // quick-xml surfaces each repeated `<entry>` as its own occurrence; a plain
+    // `Vec` collects them all. (A `deserialize_with` shim here only consumes the
+    // first and then trips serde's "duplicate field" check on the second.)
+    #[serde(rename = "entry", default)]
     entries: Vec<SourceEntryXml>,
 }
 
@@ -733,24 +738,6 @@ struct SourceEntryXml {
     file_name: String,
     #[serde(flatten)]
     attributes: BTreeMap<String, String>,
-}
-
-fn one_or_many<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany<T> {
-        One(T),
-        Many(Vec<T>),
-    }
-
-    match OneOrMany::deserialize(deserializer)? {
-        OneOrMany::One(value) => Ok(vec![value]),
-        OneOrMany::Many(values) => Ok(values),
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -829,17 +816,22 @@ impl<'a> LocalizationLoader<'a> {
         }
 
         let sources = self.sources()?;
+        // Read + oodle-decompress + XML-parse every source in parallel (the
+        // expensive part); the merge below is cheap and stays sequential so the
+        // catalog and duplicate report are deterministic.
+        let documents = read_documents(self.assets, &sources)?;
         let mut remaining = self.keys;
         let mut builder = LocalizationCatalog::builder(self.language);
 
-        for source in sources {
+        for (source, document) in sources.iter().zip(documents) {
             if remaining.is_empty() {
                 break;
             }
-            let Some(bytes) = self.assets.read(&source.asset)? else {
+            let Some(document) = document else {
                 continue;
             };
-            let document = LocalizationDocument::parse_bytes(&bytes)?;
+            // Skip files that hold none of the keys we still need, so the merge
+            // (and the load report) only touches contributing files.
             if !document
                 .entries()
                 .iter()
@@ -849,7 +841,6 @@ impl<'a> LocalizationLoader<'a> {
             {
                 continue;
             }
-
             let loaded = builder.add_matching(
                 source.asset.path().into(),
                 &source.tag,
@@ -924,6 +915,335 @@ impl<'a> LocalizationLoader<'a> {
                 tag,
             })
             .collect())
+    }
+
+    /// Load every localization entry for the language (all manifest tags), with
+    /// no key filter. Used to back a lazy [`Localizer`] on a cache miss.
+    pub fn load_all(self) -> Result<LocalizationCatalog, LocalizationError> {
+        let sources = self.all_sources()?;
+        let documents = read_documents(self.assets, &sources)?;
+        let mut builder = LocalizationCatalog::builder(self.language.clone());
+        for (source, document) in sources.iter().zip(documents) {
+            let Some(document) = document else {
+                continue;
+            };
+            builder.add_document(source.asset.path().into(), &source.tag, &document)?;
+        }
+        Ok(builder.build())
+    }
+
+    /// Every source file for the language across *all* manifest tags (not just the
+    /// configured ones), falling back to a catalog scan when there is no manifest.
+    fn all_sources(&self) -> Result<Vec<LocalizationSource>, LocalizationError> {
+        let Some(bytes) = self.assets.read_path(TAG_MANIFEST_ASSET_PATH)? else {
+            return self.sources();
+        };
+        let manifest = SourceManifest::parse_bytes(&bytes)?;
+        let mut sources = BTreeMap::<String, LocalizationTag>::new();
+        for (name, entries) in manifest.tags() {
+            let tag = LocalizationTag::new(name).unwrap_or_else(|_| LocalizationTag::init());
+            for entry in entries {
+                if entry.file_name().is_empty() {
+                    continue;
+                }
+                let asset = self
+                    .assets
+                    .info(&localization_asset_path(&self.language, entry.file_name()));
+                sources
+                    .entry(asset.path().to_string())
+                    .or_insert_with(|| tag.clone());
+            }
+        }
+        Ok(sources
+            .into_iter()
+            .map(|(path, tag)| LocalizationSource {
+                asset: self.assets.info(&path),
+                tag,
+            })
+            .collect())
+    }
+
+    /// The language-invariant file names of every localization source (across all
+    /// manifest tags). Used to load the whole language when no key→file index is
+    /// available yet.
+    pub fn source_file_names(&self) -> Result<Vec<String>, LocalizationError> {
+        let mut names = self
+            .all_sources()?
+            .iter()
+            .map(|source| source_file_name(source.asset.path()).to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// Build a [`KeyFileIndex`] by reading every source once and recording which
+    /// file defines each key. Language-invariant — build from any one language and
+    /// reuse it for all of them. `version` is an opaque stamp the caller uses to
+    /// invalidate a persisted index (e.g. a hash of the install's paks).
+    pub fn build_key_index(self, version: u64) -> Result<KeyFileIndex, LocalizationError> {
+        let sources = self.all_sources()?;
+        let documents = read_documents(self.assets, &sources)?;
+        let mut files: Vec<Box<str>> = Vec::new();
+        let mut file_ids: HashMap<String, u32> = HashMap::new();
+        let mut by_key: HashMap<u32, u32> = HashMap::new();
+        for (source, document) in sources.iter().zip(documents) {
+            let Some(document) = document else {
+                continue;
+            };
+            let name = source_file_name(source.asset.path());
+            let next = files.len() as u32;
+            let file_id = *file_ids.entry(name.to_string()).or_insert_with(|| {
+                files.push(name.into());
+                next
+            });
+            for entry in document.entries() {
+                if let LocalizationEntry::String(entry) = entry
+                    && let Ok(key) = LocalizationKey::from_source_key(entry.key())
+                {
+                    by_key.entry(key.crc32()).or_insert(file_id);
+                }
+            }
+        }
+        Ok(KeyFileIndex {
+            version,
+            files,
+            by_key,
+        })
+    }
+}
+
+/// The file name component of a localization asset path (e.g.
+/// `localization/en-us/javelindata_perks.loc.xml` → `javelindata_perks.loc.xml`).
+/// Language-independent, so it keys a [`KeyFileIndex`] across languages.
+fn source_file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// A language-invariant map from localization key → the source file that defines
+/// it. Built once (read every loc file), then a key resolves to its file in O(1),
+/// so per-key/per-sheet loads read only the handful of files they need instead of
+/// the whole language. Serializes to a compact binary blob for on-disk caching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyFileIndex {
+    version: u64,
+    files: Vec<Box<str>>,
+    by_key: HashMap<u32, u32>,
+}
+
+const KEY_FILE_INDEX_MAGIC: &[u8; 4] = b"NWKI";
+const KEY_FILE_INDEX_FORMAT: u32 = 1;
+
+impl KeyFileIndex {
+    /// The opaque version stamp this index was built with.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    #[must_use]
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    #[must_use]
+    pub fn key_count(&self) -> usize {
+        self.by_key.len()
+    }
+
+    /// The language-invariant file name that defines `key`, if known.
+    #[must_use]
+    pub fn file_name(&self, key: &LocalizationKey) -> Option<&str> {
+        let index = *self.by_key.get(&key.crc32())?;
+        self.files.get(index as usize).map(Box::as_ref)
+    }
+
+    /// Serialize to a compact binary blob (magic + format + version + files + map).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(20 + self.by_key.len() * 8);
+        out.extend_from_slice(KEY_FILE_INDEX_MAGIC);
+        out.extend_from_slice(&KEY_FILE_INDEX_FORMAT.to_le_bytes());
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
+        for file in &self.files {
+            out.extend_from_slice(&(file.len() as u32).to_le_bytes());
+            out.extend_from_slice(file.as_bytes());
+        }
+        out.extend_from_slice(&(self.by_key.len() as u32).to_le_bytes());
+        for (crc, file_id) in &self.by_key {
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&file_id.to_le_bytes());
+        }
+        out
+    }
+
+    /// Parse a blob produced by [`KeyFileIndex::to_bytes`]; `None` if malformed or
+    /// a different format version.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut reader = ByteReader::new(bytes);
+        if reader.take(4)? != KEY_FILE_INDEX_MAGIC {
+            return None;
+        }
+        if reader.u32()? != KEY_FILE_INDEX_FORMAT {
+            return None;
+        }
+        let version = reader.u64()?;
+        let file_count = reader.u32()? as usize;
+        let mut files = Vec::with_capacity(file_count);
+        for _ in 0..file_count {
+            let len = reader.u32()? as usize;
+            let name = std::str::from_utf8(reader.take(len)?).ok()?;
+            files.push(name.into());
+        }
+        let key_count = reader.u32()? as usize;
+        let mut by_key = HashMap::with_capacity(key_count);
+        for _ in 0..key_count {
+            let crc = reader.u32()?;
+            let file_id = reader.u32()?;
+            if file_id as usize >= files.len() {
+                return None;
+            }
+            by_key.insert(crc, file_id);
+        }
+        Some(Self {
+            version,
+            files,
+            by_key,
+        })
+    }
+}
+
+/// Minimal little-endian cursor for [`KeyFileIndex::from_bytes`].
+struct ByteReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let slice = self.bytes.get(self.pos..self.pos.checked_add(len)?)?;
+        self.pos += len;
+        Some(slice)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+}
+
+/// Read and parse every source in parallel; element `i` is `None` when that
+/// source is absent. The decompress + XML parse is the dominant cost, so doing it
+/// across the rayon pool is a large speedup over a sequential read loop. Any read
+/// or parse error short-circuits the batch.
+fn read_documents(
+    assets: &nw_asset::AssetStore,
+    sources: &[LocalizationSource],
+) -> Result<Vec<Option<LocalizationDocument>>, LocalizationError> {
+    sources
+        .par_iter()
+        .map(|source| match assets.read(&source.asset)? {
+            Some(bytes) => Ok(Some(LocalizationDocument::parse_bytes(&bytes)?)),
+            None => Ok(None),
+        })
+        .collect()
+}
+
+/// A localization front end that resolves keys against an eagerly-loaded warm
+/// [`LocalizationCatalog`] (lock-free, zero-copy) and falls back to a lazy
+/// full-language load on a miss, memoizing the result (including misses).
+///
+/// This is the recommended high-level entry point. Consumers that want the pure,
+/// immutable, borrow-returning primitive can use [`Localizer::catalog`] or build a
+/// [`LocalizationCatalog`] directly.
+pub struct Localizer<'a> {
+    assets: &'a nw_asset::AssetStore,
+    language: LanguageCode,
+    tags: Vec<LocalizationTag>,
+    warm: LocalizationCatalog,
+    full: Mutex<Option<LocalizationCatalog>>,
+}
+
+impl<'a> Localizer<'a> {
+    /// A localizer with an empty warm set — every lookup goes through the lazy
+    /// full-language load on first miss.
+    #[must_use]
+    pub fn new(assets: &'a nw_asset::AssetStore, language: LanguageCode) -> Self {
+        let warm = LocalizationCatalog::builder(language.clone()).build();
+        Self::with_catalog(assets, warm)
+    }
+
+    /// A localizer seeded with an already-built warm catalog; its keys resolve
+    /// lock-free, and anything else falls back to the lazy load.
+    #[must_use]
+    pub fn with_catalog(assets: &'a nw_asset::AssetStore, warm: LocalizationCatalog) -> Self {
+        let language = warm.language().clone();
+        Self {
+            assets,
+            language,
+            tags: vec![LocalizationTag::init()],
+            warm,
+            full: Mutex::new(None),
+        }
+    }
+
+    /// Tags used when the lazy full-language load runs (defaults to `init`).
+    #[must_use]
+    pub fn tags(mut self, tags: impl IntoIterator<Item = LocalizationTag>) -> Self {
+        self.tags = tags.into_iter().collect();
+        if self.tags.is_empty() {
+            self.tags.push(LocalizationTag::init());
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn language(&self) -> &LanguageCode {
+        &self.language
+    }
+
+    /// The eagerly-loaded warm catalog — lock-free, zero-copy access for callers
+    /// that want the primitive directly.
+    #[must_use]
+    pub fn catalog(&self) -> &LocalizationCatalog {
+        &self.warm
+    }
+
+    /// Resolve `key`: the warm set first (lock-free), then a lazy full-language
+    /// load (done once, then memoized — a still-missing key is cached as absent).
+    pub fn resolve(&self, key: &LocalizationKey) -> Option<LocalizedText> {
+        if let Some(text) = self.warm.localized_text(key) {
+            return Some(text.clone());
+        }
+        let mut full = self.full.lock().unwrap_or_else(|error| error.into_inner());
+        if full.is_none() {
+            *full = Some(self.load_full());
+        }
+        full.as_ref()
+            .and_then(|catalog| catalog.localized_text(key))
+            .cloned()
+    }
+
+    /// Resolve an `@label` (or a bare key).
+    pub fn resolve_label(&self, label: &str) -> Option<LocalizedText> {
+        let key = LocalizationKey::from_source_key(label).ok()?;
+        self.resolve(&key)
+    }
+
+    fn load_full(&self) -> LocalizationCatalog {
+        LocalizationLoader::new(self.assets, self.language.clone())
+            .tags(self.tags.clone())
+            .load_all()
+            .unwrap_or_else(|_| LocalizationCatalog::builder(self.language.clone()).build())
     }
 }
 
@@ -1218,6 +1538,21 @@ pub fn localization_asset_path(language: &LanguageCode, file_name: &str) -> Stri
     format!("localization/{}/{file_name}", language.asset_folder())
 }
 
+/// The localization source file that, by New World's naming convention, holds a
+/// datatable's strings: e.g. `…/javelindata_perks.datasheet` →
+/// `localization/<lang>/javelindata_perks.loc.xml`.
+///
+/// This is a **strong heuristic, not a guarantee**: it holds for the `JavelinData`
+/// tables (the bulk of localized content), but some datasheets (e.g. quest
+/// objectives) have no matching file — their text is aggregated into shared files.
+/// Callers should treat the result as a candidate and fall back when a key isn't
+/// found there.
+#[must_use]
+pub fn datatable_localization_source(datatable: &Path, language: &LanguageCode) -> Option<String> {
+    let stem = datatable.file_stem()?.to_str()?;
+    Some(localization_asset_path(language, &format!("{stem}.loc.xml")))
+}
+
 #[must_use]
 pub fn is_localization_source_name(name: &str) -> bool {
     let normalized = name.replace('\\', "/").to_ascii_lowercase();
@@ -1443,17 +1778,108 @@ mod tests {
 
     #[test]
     fn parses_source_manifest_tag_entries() {
+        // The real manifest lists many <entry> elements under a tag — quick-xml
+        // surfaces them as repeated occurrences, which must collect into a Vec.
         let manifest = SourceManifest::parse_str(
-            r#"<localization version="0"><init><entry rel_version="Launch">Main.loc.xml</entry></init></localization>"#,
+            r#"<localization version="0"><init><entry rel_version="Launch">Main.loc.xml</entry><entry>Second.loc.xml</entry><entry>Third.loc.xml</entry></init></localization>"#,
         )
         .expect("manifest");
         let init = manifest
             .tag(&LocalizationTag::init())
             .expect("init tag entries");
 
-        assert_eq!(init.len(), 1);
+        assert_eq!(init.len(), 3, "every repeated <entry> is collected");
         assert_eq!(init[0].file_name(), "Main.loc.xml");
         assert_eq!(init[0].attributes()[0].name(), "rel_version");
+        assert_eq!(init[2].file_name(), "Third.loc.xml");
+    }
+
+    #[test]
+    fn parses_single_source_manifest_entry() {
+        let manifest = SourceManifest::parse_str(
+            r#"<localization version="0"><init><entry>Only.loc.xml</entry></init></localization>"#,
+        )
+        .expect("manifest");
+        let init = manifest
+            .tag(&LocalizationTag::init())
+            .expect("init tag entries");
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].file_name(), "Only.loc.xml");
+    }
+
+    #[test]
+    fn localizer_resolves_warm_set_then_falls_back_lazily() {
+        let document = LocalizationDocument::parse_str(
+            r#"<resources><string key="quest_x_title">Hello</string></resources>"#,
+        )
+        .expect("document");
+        let language = LanguageCode::new("en-US").expect("language");
+        let mut builder = LocalizationCatalog::builder(language.clone());
+        builder
+            .add_document("test".into(), &LocalizationTag::init(), &document)
+            .expect("seed");
+        let catalog = builder.build();
+
+        // An empty asset store: the lazy full load finds nothing, exercising the
+        // miss path without needing pak fixtures.
+        let assets = nw_asset::AssetStore::new("missing-root", None, Vec::new());
+        let localizer = Localizer::with_catalog(&assets, catalog);
+
+        // Warm hit — resolved from the seeded catalog, no I/O.
+        assert_eq!(
+            localizer.resolve_label("@quest_x_title").expect("warm hit").text(),
+            "Hello"
+        );
+        // Miss — lazy load yields nothing from the empty store, and is cached.
+        assert!(localizer.resolve_label("@missing").is_none());
+        // The warm catalog is exposed lock-free for the primitive use case.
+        assert_eq!(localizer.catalog().len(), 1);
+    }
+
+    #[test]
+    fn key_file_index_resolves_and_roundtrips() {
+        let title = LocalizationKey::from_source_key("quest_x_title").expect("key");
+        let perk = LocalizationKey::from_source_key("perk_y_desc").expect("key");
+        let mut by_key = HashMap::new();
+        by_key.insert(title.crc32(), 0u32);
+        by_key.insert(perk.crc32(), 1u32);
+        let index = KeyFileIndex {
+            version: 42,
+            files: vec!["quests.loc.xml".into(), "javelindata_perks.loc.xml".into()],
+            by_key,
+        };
+
+        assert_eq!(index.file_name(&title), Some("quests.loc.xml"));
+        assert_eq!(index.file_name(&perk), Some("javelindata_perks.loc.xml"));
+        let unknown = LocalizationKey::from_source_key("nope").expect("key");
+        assert_eq!(index.file_name(&unknown), None);
+
+        let restored = KeyFileIndex::from_bytes(&index.to_bytes()).expect("roundtrip");
+        assert_eq!(restored, index);
+        assert_eq!(restored.version(), 42);
+        assert!(KeyFileIndex::from_bytes(b"junk").is_none());
+    }
+
+    #[test]
+    fn datatable_localization_source_follows_naming_convention() {
+        let language = LanguageCode::new("en-US").expect("language");
+        assert_eq!(
+            datatable_localization_source(
+                Path::new("datatables/javelindata_perks.datasheet"),
+                &language,
+            )
+            .as_deref(),
+            Some("localization/en-us/javelindata_perks.loc.xml"),
+        );
+        // Backslashes and case are normalized by localization_asset_path.
+        assert_eq!(
+            datatable_localization_source(
+                Path::new("DataTables/JavelinData_Items.datasheet"),
+                &language,
+            )
+            .as_deref(),
+            Some("localization/en-us/javelindata_items.loc.xml"),
+        );
     }
 
     #[test]

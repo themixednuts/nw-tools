@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Args;
 use nw_filesystem::display_relative;
 use nw_objectstream::lookup::NameLookup;
@@ -205,7 +205,13 @@ fn collect_matching_inner(
         return Ok(());
     }
 
-    for entry in std::fs::read_dir(path)? {
+    if !path.exists() {
+        bail!("no such file or directory: {}", path.display());
+    }
+
+    for entry in
+        std::fs::read_dir(path).with_context(|| format!("scan directory {}", path.display()))?
+    {
         let entry = entry?;
         let file_type = entry.file_type()?;
         if file_type.is_dir() {

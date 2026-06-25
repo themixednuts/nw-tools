@@ -12,9 +12,9 @@ use nw_pak::{Compression, EntryInfo, PakMmapReader, azcs, crypak, shape};
 
 use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
-use crate::output::Table;
 use crate::progress::Job;
 use crate::support::{AssetRootArg, GlobSet, PakSet, PathSelector, ScanIssues, load_lookup};
+use crate::ui::{Cell, Report, Table, theme};
 
 const DEFAULT_MAX_ENTRY_SIZE: u64 = 128 * 1024 * 1024;
 
@@ -95,6 +95,10 @@ pub struct SearchPath {
     #[arg(long)]
     case_sensitive: bool,
 
+    /// Exact substring match instead of the default fuzzy ranking.
+    #[arg(long)]
+    exact: bool,
+
     #[arg(long, default_value_t = 100)]
     show: usize,
 
@@ -119,6 +123,10 @@ pub struct SearchObjectStream {
     /// Archive path glob prefilter; repeat for multiple patterns.
     #[arg(long)]
     glob: Vec<String>,
+
+    /// Exact substring match instead of the default fuzzy ranking.
+    #[arg(long)]
+    exact: bool,
 
     #[arg(long, default_value_t = 100)]
     show: usize,
@@ -293,6 +301,8 @@ struct PathHit {
     method: String,
     size: String,
     name: String,
+    /// Fuzzy match score (0 in exact mode); higher ranks first.
+    score: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +351,7 @@ struct ObjectPayload {
 #[derive(Debug, Clone, Copy)]
 struct ObjectSearchOptions<'a> {
     query: &'a TextQuery,
+    fuzzy: bool,
     max_entry_size: u64,
     lookup: Option<&'a NameLookup>,
     selector: &'a PathSelector,
@@ -421,13 +432,16 @@ impl SearchPath {
         let ctx = self.jobs.ctx()?;
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
+        // Fuzzy ranking is the default; glob, case-sensitive, and --exact all
+        // select literal substring matching instead.
+        let fuzzy = !self.exact && !self.glob && !self.case_sensitive;
         let query = TextQuery::new(self.query, self.case_sensitive, self.glob);
         let cancel = ctx.cancel.clone();
         let batch = ctx.map_results(
             "path search",
             paks.paths(),
             |path| paks.relative(path),
-            |path, progress| Self::scan_pak(&paks, path, &query, &cancel, &progress),
+            |path, progress| Self::scan_pak(&paks, path, &query, fuzzy, &cancel, &progress),
         );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
@@ -441,24 +455,34 @@ impl SearchPath {
             }
         }
 
-        rows.sort();
+        if fuzzy {
+            rows.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
+        } else {
+            rows.sort();
+        }
         let matched = rows.len();
         rows.truncate(self.show);
 
-        println!(
-            "archives: {}  matched: {}  shown: {}",
-            paks.paths().len(),
-            matched,
-            rows.len()
-        );
-        let mut table = Table::new(["Pak", "Method", "Size", "Name"]);
+        let stats = vec![
+            ("archives".to_string(), paks.paths().len().to_string()),
+            ("matched".to_string(), matched.to_string()),
+            ("shown".to_string(), rows.len().to_string()),
+        ];
+        let mut table = Table::new(["Pak", "Method", "Size", "Name"]).right([2]);
         for row in rows {
-            table.push([row.pak, row.method, row.size, row.name]);
+            table.push([
+                Cell::path(row.pak),
+                Cell::method(row.method),
+                Cell::size(row.size),
+                Cell::path(row.name),
+            ]);
         }
-        if table.is_empty() {
-            println!("no path matches");
+        if theme::caps().interactive && !table.is_empty() {
+            crate::tui::browse("asset search path", stats, table, 3)?;
         } else {
-            print!("{table}");
+            let mut report = Report::with_stats("asset search path", stats);
+            report.table_or(table, "no path matches");
+            report.print();
         }
 
         ScanIssues::new("asset path search", skipped, cancelled, errors).finish()
@@ -468,12 +492,14 @@ impl SearchPath {
         paks: &PakSet,
         path: &Path,
         query: &TextQuery,
+        fuzzy: bool,
         cancel: &CancellationToken,
         progress: &Job,
     ) -> Result<Vec<PathHit>> {
         let pak = PakMmapReader::open(path)?;
         progress.set_len(pak.len());
         let pak_name = paks.relative(path);
+        let mut search = fuzzy.then(|| crate::fuzzy::Search::new(&query.raw));
         let mut rows = Vec::new();
 
         for entry in pak.entries() {
@@ -481,14 +507,24 @@ impl SearchPath {
                 break;
             }
             progress.inc(1);
-            if !query.matches(entry.name()) {
-                continue;
-            }
+            let score = match &mut search {
+                Some(search) => match search.score(entry.name()) {
+                    Some(score) => score,
+                    None => continue,
+                },
+                None => {
+                    if !query.matches(entry.name()) {
+                        continue;
+                    }
+                    0
+                }
+            };
             rows.push(PathHit {
                 pak: pak_name.clone(),
                 method: entry.compression().to_string(),
                 size: format_size(entry.uncompressed_size(), DECIMAL),
                 name: entry.name().to_string(),
+                score,
             });
         }
 
@@ -507,6 +543,7 @@ impl SearchObjectStream {
         let cancel = ctx.cancel.clone();
         let options = ObjectSearchOptions {
             query: &query,
+            fuzzy: !self.exact,
             max_entry_size: self.max_entry_size,
             lookup: lookup.as_ref(),
             selector: &selector,
@@ -543,29 +580,34 @@ impl SearchObjectStream {
         let matched = rows.len();
         rows.truncate(self.show);
 
-        println!(
-            "archives: {}  matched: {}  shown: {}  names: {}",
-            paks.paths().len(),
-            matched,
-            rows.len(),
-            if lookup.is_some() { "loaded" } else { "off" }
-        );
-        let mut table = Table::new(["Pak", "Name", "AZCS", "Kind", "Count", "Score", "Value"]);
+        let stats = vec![
+            ("archives".to_string(), paks.paths().len().to_string()),
+            ("matched".to_string(), matched.to_string()),
+            ("shown".to_string(), rows.len().to_string()),
+            (
+                "names".to_string(),
+                if lookup.is_some() { "loaded" } else { "off" }.to_string(),
+            ),
+        ];
+        let mut table =
+            Table::new(["Pak", "Name", "AZCS", "Kind", "Count", "Score", "Value"]).right([4, 5]);
         for row in rows {
             table.push([
-                row.pak,
-                row.name,
-                row.envelope,
-                row.kind,
-                row.count.to_string(),
-                row.score.to_string(),
-                row.value,
+                Cell::path(row.pak),
+                Cell::path(row.name),
+                Cell::yes_no(row.envelope == "yes"),
+                Cell::text(row.kind),
+                Cell::text(row.count.to_string()),
+                Cell::text(row.score.to_string()),
+                Cell::text(row.value),
             ]);
         }
-        if table.is_empty() {
-            println!("no ObjectStream matches");
+        if theme::caps().interactive && !table.is_empty() {
+            crate::tui::browse("asset search objectstream", stats, table, 1)?;
         } else {
-            print!("{table}");
+            let mut report = Report::with_stats("asset search objectstream", stats);
+            report.table_or(table, "no ObjectStream matches");
+            report.print();
         }
 
         ScanIssues::new("asset objectstream search", skipped, cancelled, errors).finish()
@@ -580,6 +622,9 @@ impl SearchObjectStream {
         let pak = PakMmapReader::open(path)?;
         progress.set_len(pak.len());
         let pak_name = paks.relative(path);
+        let mut search = options
+            .fuzzy
+            .then(|| crate::fuzzy::Search::new(&options.query.raw));
         let mut rows = Vec::new();
 
         for entry in pak.entries() {
@@ -602,7 +647,10 @@ impl SearchObjectStream {
             let hits = nw_objectstream::query::collect_search_matches(
                 &payload.bytes,
                 options.lookup,
-                |value| options.query.score(value),
+                |value| match &mut search {
+                    Some(search) => search.score(value).map(u32::from),
+                    None => options.query.score(value),
+                },
             )
             .with_context(|| format!("search {} in {}", entry.name(), path.display()))?;
 
@@ -610,11 +658,11 @@ impl SearchObjectStream {
                 rows.push(ObjectHit {
                     pak: pak_name.clone(),
                     name: entry.name().to_string(),
-                    envelope: Cell::yes_no(payload.envelope),
+                    envelope: Value::yes_no(payload.envelope),
                     kind: hit.kind.label().to_string(),
                     count: stats.count,
                     score: stats.score,
-                    value: Cell::trim(hit.value),
+                    value: Value::trim(hit.value),
                 });
             }
         }
@@ -666,12 +714,11 @@ impl UpdateObjectStream {
             .run(&ctx.runner, &ctx.cancel);
         progress.finish(if report.is_ok() { "done" } else { "failed" });
         let report = report?;
-        println!(
-            "wrote {} entries, changed {}, {}",
-            report.entries,
-            report.changed,
-            format_size(report.bytes_written, DECIMAL)
-        );
+        Report::new("asset update objectstream")
+            .stat("entries", report.entries)
+            .stat("changed", report.changed)
+            .stat("bytes", format_size(report.bytes_written, DECIMAL))
+            .print();
         Ok(())
     }
 }
@@ -934,32 +981,44 @@ impl InventoryReport {
     }
 
     fn print(&self, sort: InventorySort, limit: usize) {
-        println!(
-            "archives: {}  entries: {}  groups: {}",
-            self.paks,
-            self.entries,
-            self.stats.len()
-        );
-        let mut table = Table::new(["Key", "Entries", "Unpacked", "Packed", "Paks", "Sample"]);
-        for row in self.rows(sort).into_iter().take(limit) {
-            table.push([
-                row.key,
-                row.entries.to_string(),
-                format_size(row.unpacked_bytes, DECIMAL),
-                format_size(row.packed_bytes, DECIMAL),
-                row.paks.to_string(),
-                row.sample,
-            ]);
+        let rows = self.rows(sort);
+        let stats = vec![
+            ("archives".to_string(), self.paks.to_string()),
+            ("entries".to_string(), self.entries.to_string()),
+            ("groups".to_string(), self.stats.len().to_string()),
+        ];
+        if theme::caps().interactive
+            && !rows.is_empty()
+            && crate::tui::browse("asset inventory", stats.clone(), inventory_table(&rows), 0)
+                .is_ok()
+        {
+            return;
         }
-        if table.is_empty() {
-            println!("no entries");
-        } else {
-            print!("{table}");
-        }
+
+        let mut report = Report::with_stats("asset inventory", stats);
+        let shown = &rows[..rows.len().min(limit)];
+        report.table_or(inventory_table(shown), "no entries");
         if self.stats.len() > limit {
-            println!("... {} more group(s)", self.stats.len() - limit);
+            report.more(self.stats.len() - limit, "group(s)");
         }
+        report.print();
     }
+}
+
+fn inventory_table(rows: &[InventoryRow]) -> Table {
+    let mut table =
+        Table::new(["Key", "Entries", "Unpacked", "Packed", "Paks", "Sample"]).right([1, 2, 3, 4]);
+    for row in rows {
+        table.push([
+            Cell::text(row.key.clone()),
+            Cell::text(row.entries.to_string()),
+            Cell::size(format_size(row.unpacked_bytes, DECIMAL)),
+            Cell::size(format_size(row.packed_bytes, DECIMAL)),
+            Cell::text(row.paks.to_string()),
+            Cell::path(row.sample.clone()),
+        ]);
+    }
+    table
 }
 
 fn inventory_key(
@@ -1191,25 +1250,28 @@ impl ExtractReport {
     }
 
     fn print(&self, label: &str, limit: usize) {
-        println!(
-            "{label}: matched {}  written {}  skipped existing {}  skipped duplicate {}  bytes {}",
-            self.matched,
-            self.written,
-            self.skipped_existing,
-            self.skipped_duplicate,
-            format_size(self.bytes_written, DECIMAL)
-        );
-        let mut table = Table::new(["Pak", "Size", "Path"]);
+        let mut report = Report::new(label)
+            .stat("matched", self.matched)
+            .stat("written", self.written)
+            .stat("skip-existing", self.skipped_existing)
+            .stat("skip-duplicate", self.skipped_duplicate)
+            .stat("bytes", format_size(self.bytes_written, DECIMAL));
+        let mut table = Table::new(["Pak", "Size", "Path"]).right([1]);
         for row in &self.rows {
-            table.push([row.pak.clone(), row.size.clone(), row.path.clone()]);
+            table.push([
+                Cell::path(row.pak.clone()),
+                Cell::size(row.size.clone()),
+                Cell::path(row.path.clone()),
+            ]);
         }
         if !table.is_empty() {
-            print!("{table}");
+            report.table(table);
         }
         let remaining = self.written.saturating_sub(limit as u64);
         if remaining > 0 {
-            println!("... {remaining} more file(s)");
+            report.more(remaining, "file(s)");
         }
+        report.print();
     }
 }
 
@@ -1239,9 +1301,9 @@ impl From<EncodingArg> for ObjectStreamEncoding {
     }
 }
 
-struct Cell;
+struct Value;
 
-impl Cell {
+impl Value {
     fn trim(value: impl AsRef<str>) -> String {
         const MAX: usize = 160;
         let value = value.as_ref().replace(['\r', '\n', '\t'], " ");

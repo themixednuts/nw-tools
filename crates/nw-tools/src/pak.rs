@@ -10,9 +10,9 @@ use nw_pak::{Compression, PakMmapReader, azcs, crypak, oodle, shape};
 
 use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
-use crate::output::Table;
 use crate::progress::Job;
 use crate::support::{AssetRootArg, GlobSet, PakSet, PathSelector, ScanIssues, collect_paks};
+use crate::ui::{Cell, Report, Table, theme};
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
@@ -317,22 +317,28 @@ impl List {
             rows.truncate(show);
         }
 
-        println!(
-            "archives: {}  matched: {}  shown: {}",
-            paks.len(),
-            total_rows,
-            rows.len()
-        );
-        let mut table = Table::new(["Pak", "Method", "Family", "AZCS", "Size", "Name"]);
+        let stats = vec![
+            ("archives".to_string(), paks.len().to_string()),
+            ("matched".to_string(), total_rows.to_string()),
+            ("shown".to_string(), rows.len().to_string()),
+        ];
+        let mut table = Table::new(["Pak", "Method", "Family", "AZCS", "Size", "Name"]).right([4]);
         for row in rows {
             table.push([
-                row.pak, row.method, row.family, row.azcs, row.size, row.name,
+                Cell::path(row.pak),
+                Cell::method(row.method),
+                Cell::text(row.family),
+                Cell::yes_no(row.azcs == "yes"),
+                Cell::size(row.size),
+                Cell::path(row.name),
             ]);
         }
-        if table.is_empty() {
-            println!("no matching entries");
+        if theme::caps().interactive && !table.is_empty() {
+            crate::tui::browse("pak list", stats, table, 5)?;
         } else {
-            print!("{table}");
+            let mut report = Report::with_stats("pak list", stats);
+            report.table_or(table, "no matching entries");
+            report.print();
         }
 
         if cancelled {
@@ -365,61 +371,77 @@ impl Shape {
 }
 
 fn print_shape_report(report: &shape::Report) {
-    println!("root: {}", report.root.display());
-    println!(
-        "archives: {} parsed: {} entries: {}",
-        report.archives, report.parsed_archives, report.entries
+    let mut out = Report::new("pak shape")
+        .stat("archives", report.archives)
+        .stat("parsed", report.parsed_archives)
+        .stat("entries", report.entries);
+    out.kv("root", report.root.display().to_string());
+
+    out.section("distribution");
+    out.kv("methods", count_line(&report.methods));
+    out.kv("versions", count_line(&report.versions));
+    out.kv("flags", count_line(&report.flags));
+    out.kv(
+        "cdr_extra_lengths",
+        count_line(&report.central_directory_extra_lengths),
     );
-    println!("methods: {}", count_line(&report.methods));
-    println!("versions: {}", count_line(&report.versions));
-    println!("flags: {}", count_line(&report.flags));
-    println!(
-        "cdr_extra_lengths: {}",
-        count_line(&report.central_directory_extra_lengths)
+    out.kv(
+        "cdr_extra_values",
+        count_line(&report.central_directory_extra_values),
     );
-    println!(
-        "cdr_extra_values: {}",
-        count_line(&report.central_directory_extra_values)
+    out.kv("extra_by_method", count_line(&report.extra_by_method));
+    out.kv("extra_by_family", count_line(&report.extra_by_family));
+    out.kv("method_by_family", count_line(&report.method_by_family));
+
+    out.section("azcs");
+    out.kv("azcs", count_line(&report.azcs));
+    out.kv("azcs_by_method", count_line(&report.azcs_by_method));
+    out.kv("azcs_by_extra", count_line(&report.azcs_by_extra));
+    out.kv("azcs_by_family", count_line(&report.azcs_by_family));
+
+    out.section("layout");
+    out.kv(
+        "local_extra_lengths",
+        count_line(&report.local_extra_lengths),
     );
-    println!("extra_by_method: {}", count_line(&report.extra_by_method));
-    println!("extra_by_family: {}", count_line(&report.extra_by_family));
-    println!("method_by_family: {}", count_line(&report.method_by_family));
-    println!("azcs: {}", count_line(&report.azcs));
-    println!("azcs_by_method: {}", count_line(&report.azcs_by_method));
-    println!("azcs_by_extra: {}", count_line(&report.azcs_by_extra));
-    println!("azcs_by_family: {}", count_line(&report.azcs_by_family));
-    println!(
-        "local_extra_lengths: {}",
-        count_line(&report.local_extra_lengths)
+    out.kv(
+        "cdr_comment_lengths",
+        count_line(&report.central_directory_comment_lengths),
     );
-    println!(
-        "cdr_comment_lengths: {}",
-        count_line(&report.central_directory_comment_lengths)
+    out.kv("disk_starts", count_line(&report.disk_starts));
+    out.kv("internal_attrs", count_line(&report.internal_attributes));
+    out.kv("external_attrs", count_line(&report.external_attributes));
+    out.kv("separators", count_line(&report.separators));
+    out.kv("uppercase_names", report.uppercase_names.to_string());
+    out.kv("zip64_archives", report.zip64_archives.to_string());
+    out.kv(
+        "eocd_comment_archives",
+        report.eocd_comment_archives.to_string(),
     );
-    println!("disk_starts: {}", count_line(&report.disk_starts));
-    println!(
-        "internal_attrs: {}",
-        count_line(&report.internal_attributes)
+    out.kv(
+        "multi_disk_archives",
+        report.multi_disk_archives.to_string(),
     );
-    println!(
-        "external_attrs: {}",
-        count_line(&report.external_attributes)
-    );
-    println!("separators: {}", count_line(&report.separators));
-    println!("uppercase_names: {}", report.uppercase_names);
-    println!("zip64_archives: {}", report.zip64_archives);
-    println!("eocd_comment_archives: {}", report.eocd_comment_archives);
-    println!("multi_disk_archives: {}", report.multi_disk_archives);
 
     let samples = &report.samples;
-    print_samples("errors", &samples.errors);
-    print_samples("unknown_methods", &samples.unknown_methods);
-    print_samples("nonzero_flags", &samples.nonzero_flags);
-    print_samples("nonzero_extra", &samples.nonzero_extra);
-    print_samples("comments", &samples.comments);
-    print_samples("mismatches", &samples.mismatches);
-    print_samples("zip64_entries", &samples.zip64_entries);
-    print_samples("azcs_errors", &samples.azcs_errors);
+    let groups = [
+        ("errors", &samples.errors),
+        ("unknown_methods", &samples.unknown_methods),
+        ("nonzero_flags", &samples.nonzero_flags),
+        ("nonzero_extra", &samples.nonzero_extra),
+        ("comments", &samples.comments),
+        ("mismatches", &samples.mismatches),
+        ("zip64_entries", &samples.zip64_entries),
+        ("azcs_errors", &samples.azcs_errors),
+    ];
+    if groups.iter().any(|(_, items)| !items.is_empty()) {
+        out.section("samples");
+        for (title, items) in groups {
+            push_sample_group(&mut out, title, items);
+        }
+    }
+
+    out.print();
 }
 
 fn count_line(counts: &BTreeMap<String, u64>) -> String {
@@ -433,15 +455,13 @@ fn count_line(counts: &BTreeMap<String, u64>) -> String {
         .join(", ")
 }
 
-fn print_samples(title: &str, samples: &[String]) {
+fn push_sample_group(report: &mut Report, title: &str, samples: &[String]) {
     if samples.is_empty() {
-        println!("{title}: <none>");
         return;
     }
-
-    println!("{title}:");
+    report.kv(title, format!("{} sample(s)", samples.len()));
     for sample in samples {
-        println!("  {sample}");
+        report.note(format!("      {sample}"));
     }
 }
 
@@ -503,11 +523,10 @@ impl Repack {
             .run(&ctx.runner, &ctx.cancel);
         progress.finish(if report.is_ok() { "done" } else { "failed" });
         let report = report?;
-        println!(
-            "wrote {} entries, {}",
-            report.entries,
-            format_size(report.bytes_written, DECIMAL)
-        );
+        Report::new("pak repack")
+            .stat("entries", report.entries)
+            .stat("bytes", format_size(report.bytes_written, DECIMAL))
+            .print();
         Ok(())
     }
 }
@@ -551,12 +570,11 @@ impl Update {
             .run(&ctx.runner, &ctx.cancel);
         progress.finish(if report.is_ok() { "done" } else { "failed" });
         let report = report?;
-        println!(
-            "wrote {} entries, changed {}, {}",
-            report.entries,
-            report.changed,
-            format_size(report.bytes_written, DECIMAL)
-        );
+        Report::new("pak update")
+            .stat("entries", report.entries)
+            .stat("changed", report.changed)
+            .stat("bytes", format_size(report.bytes_written, DECIMAL))
+            .print();
         Ok(())
     }
 }
@@ -713,25 +731,28 @@ impl PakExtractReport {
     }
 
     fn print(&self, label: &str, limit: usize) {
-        println!(
-            "{label}: matched {}  written {}  skipped existing {}  skipped duplicate {}  bytes {}",
-            self.matched,
-            self.written,
-            self.skipped_existing,
-            self.skipped_duplicate,
-            format_size(self.bytes_written, DECIMAL)
-        );
-        let mut table = Table::new(["Pak", "Size", "Path"]);
+        let mut report = Report::new(label)
+            .stat("matched", self.matched)
+            .stat("written", self.written)
+            .stat("skip-existing", self.skipped_existing)
+            .stat("skip-duplicate", self.skipped_duplicate)
+            .stat("bytes", format_size(self.bytes_written, DECIMAL));
+        let mut table = Table::new(["Pak", "Size", "Path"]).right([1]);
         for row in &self.rows {
-            table.push([row.pak.clone(), row.size.clone(), row.path.clone()]);
+            table.push([
+                Cell::path(row.pak.clone()),
+                Cell::size(row.size.clone()),
+                Cell::path(row.path.clone()),
+            ]);
         }
         if !table.is_empty() {
-            print!("{table}");
+            report.table(table);
         }
         let remaining = self.written.saturating_sub(limit as u64);
         if remaining > 0 {
-            println!("... {remaining} more file(s)");
+            report.more(remaining, "file(s)");
         }
+        report.print();
     }
 }
 

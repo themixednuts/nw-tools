@@ -12,7 +12,8 @@ workspace = true
 
 [dependencies]
 crc32fast.workspace = true
-nw-asset.workspace = true
+nw-asset = { workspace = true, features = ["oodle"] }
 quick-xml.workspace = true
+rayon.workspace = true
 serde.workspace = true
 thiserror.workspace = true

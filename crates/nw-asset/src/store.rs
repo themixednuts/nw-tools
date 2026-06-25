@@ -1,7 +1,11 @@
+use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use nw_pak::PakMmapReader;
 use thiserror::Error;
 
 use crate::{
@@ -87,11 +91,54 @@ impl AssetInfo {
     }
 }
 
+/// Pak-reader caches for an [`AssetStore`].
+///
+/// `readers` memoizes opened paks (keyed by file path) so repeated reads reuse a
+/// parsed central directory instead of re-parsing it. `by_path` is an optional
+/// fast path: a virtual-asset-path → owning-reader index that turns a read into
+/// an O(1) lookup, skipping the linear pak scan entirely. Callers that already
+/// know which pak holds which assets (e.g. after a discovery sweep) can seed it
+/// with [`AssetStore::seed_paths`].
+#[derive(Default)]
+struct Caches {
+    readers: Mutex<HashMap<PathBuf, Arc<PakMmapReader>>>,
+    by_path: Mutex<HashMap<String, Arc<PakMmapReader>>>,
+}
+
+impl fmt::Debug for Caches {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Caches").finish_non_exhaustive()
+    }
+}
+
+impl Caches {
+    /// Get the cached reader for `path`, opening (and caching) it on first use.
+    fn reader(&self, path: &Path) -> Result<Arc<PakMmapReader>, nw_pak::PakError> {
+        let mut readers = self.readers.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(reader) = readers.get(path) {
+            return Ok(reader.clone());
+        }
+        let reader = Arc::new(PakMmapReader::open(path)?);
+        readers.insert(path.to_path_buf(), reader.clone());
+        Ok(reader)
+    }
+
+    /// The reader that holds `normalized` virtual path, if indexed.
+    fn indexed(&self, normalized: &str) -> Option<Arc<PakMmapReader>> {
+        self.by_path
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(normalized)
+            .cloned()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AssetStore {
     root: PathBuf,
     catalog: Option<AssetCatalog>,
     paks: Vec<PathBuf>,
+    caches: Arc<Caches>,
 }
 
 impl AssetStore {
@@ -103,6 +150,7 @@ impl AssetStore {
             root,
             catalog,
             paks,
+            caches: Arc::new(Caches::default()),
         })
     }
 
@@ -116,6 +164,7 @@ impl AssetStore {
             root: root.into(),
             catalog,
             paks,
+            caches: Arc::new(Caches::default()),
         }
     }
 
@@ -189,9 +238,25 @@ impl AssetStore {
                 });
         }
 
+        // Fast path: a seeded path → reader index turns the read into an O(1)
+        // lookup, skipping the linear scan over every pak.
+        let normalized = normalize_virtual_path(asset.path());
+        if let Some(pak) = self.caches.indexed(&normalized)
+            && let Some(entry) = pak.entry(asset.path())
+        {
+            return pak.read_wrapped_by_index(entry.index()).map(Some).map_err(
+                |source| AssetStoreError::Pak {
+                    path: self.root.clone(),
+                    source,
+                },
+            );
+        }
+
         for pak_path in &self.paks {
-            let pak =
-                nw_pak::PakMmapReader::open(pak_path).map_err(|source| AssetStoreError::Pak {
+            let pak = self
+                .caches
+                .reader(pak_path)
+                .map_err(|source| AssetStoreError::Pak {
                     path: pak_path.clone(),
                     source,
                 })?;
@@ -207,6 +272,24 @@ impl AssetStore {
         }
 
         Ok(None)
+    }
+
+    /// Seed the fast-path index with `(virtual_path, reader)` pairs — the reader
+    /// that holds each asset. Lets a caller that has already opened the relevant
+    /// paks (e.g. during a discovery sweep) make subsequent reads O(1) and avoid
+    /// re-opening any pak. Keys are normalized to match [`AssetStore::read`].
+    pub fn seed_paths(
+        &self,
+        entries: impl IntoIterator<Item = (String, Arc<PakMmapReader>)>,
+    ) {
+        let mut by_path = self
+            .caches
+            .by_path
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (path, reader) in entries {
+            by_path.insert(normalize_virtual_path(&path), reader);
+        }
     }
 }
 

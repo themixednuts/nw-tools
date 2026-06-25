@@ -128,6 +128,147 @@ impl Ktx2 {
     }
 }
 
+/// An RGBA8 image decoded from a texture (row-major, tightly packed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Decode the largest mip of a DDS to RGBA8, assembling split sidecars first.
+///
+/// Supports the block formats New World ships (BC1–BC7) and plain 32-bit
+/// RGBA/BGRA. Other formats return [`Error::UnsupportedVulkanFormat`].
+///
+/// # Errors
+///
+/// Returns [`Error`] when the DDS is invalid, sidecars are missing/mismatched, or
+/// the encoded format cannot be decoded.
+pub fn decode_top_mip<'a>(bytes: &'a [u8], sidecars: &[Sidecar<'a>]) -> Result<DecodedImage, Error> {
+    let dds = Dds::parse(bytes)?;
+    let texture = Texture::from_dds(&dds)?;
+    let payload = dds.payload(bytes).ok_or(Error::PayloadSize {
+        expected: u64::try_from(dds.payload_bytes()).unwrap_or(u64::MAX),
+        actual: bytes.len().saturating_sub(DDS_FILE_HEADER_LEN),
+    })?;
+    let levels = Levels::from_dds(&dds, texture, payload, sidecars)?;
+    let blocks = levels.bytes.first().copied().ok_or(Error::UnsupportedShape {
+        reason: "texture has no mip levels",
+    })?;
+    let width = texture.width.max(1);
+    let height = texture.height.max(1);
+    let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
+    Ok(DecodedImage {
+        width,
+        height,
+        rgba,
+    })
+}
+
+/// Decode every mip level of a DDS to RGBA8, largest first, assembling split
+/// sidecars first. Like [`decode_top_mip`] but returns the full mip chain so a
+/// viewer can step through levels.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the DDS is invalid, sidecars are missing/mismatched, or
+/// any level's format cannot be decoded.
+pub fn decode_all_mips<'a>(
+    bytes: &'a [u8],
+    sidecars: &[Sidecar<'a>],
+) -> Result<Vec<DecodedImage>, Error> {
+    let dds = Dds::parse(bytes)?;
+    let texture = Texture::from_dds(&dds)?;
+    let payload = dds.payload(bytes).ok_or(Error::PayloadSize {
+        expected: u64::try_from(dds.payload_bytes()).unwrap_or(u64::MAX),
+        actual: bytes.len().saturating_sub(DDS_FILE_HEADER_LEN),
+    })?;
+    let levels = Levels::from_dds(&dds, texture, payload, sidecars)?;
+    let mut images = Vec::with_capacity(levels.bytes.len());
+    for (level, blocks) in levels.bytes.iter().enumerate() {
+        let level = level as u32;
+        let width = mip_extent(texture.width, level).max(1);
+        let height = mip_extent(texture.height, level).max(1);
+        let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
+        images.push(DecodedImage {
+            width,
+            height,
+            rgba,
+        });
+    }
+    Ok(images)
+}
+
+fn decode_rgba(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Error> {
+    let pixels = width.checked_mul(height).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    match vk {
+        VK_FORMAT_R8G8B8A8_UNORM | VK_FORMAT_R8G8B8A8_SRGB => return plain_rgba(data, pixels, false),
+        VK_FORMAT_B8G8R8A8_UNORM | VK_FORMAT_B8G8R8A8_SRGB => return plain_rgba(data, pixels, true),
+        _ => {}
+    }
+    let mut out = vec![0u32; pixels];
+    let unsupported = || Error::UnsupportedVulkanFormat { vk_format: vk };
+    let result = match vk {
+        VK_FORMAT_BC1_RGBA_UNORM_BLOCK | VK_FORMAT_BC1_RGBA_SRGB_BLOCK => {
+            texture2ddecoder::decode_bc1(data, width, height, &mut out)
+        }
+        VK_FORMAT_BC2_UNORM_BLOCK | VK_FORMAT_BC2_SRGB_BLOCK => {
+            texture2ddecoder::decode_bc2(data, width, height, &mut out)
+        }
+        VK_FORMAT_BC3_UNORM_BLOCK | VK_FORMAT_BC3_SRGB_BLOCK => {
+            texture2ddecoder::decode_bc3(data, width, height, &mut out)
+        }
+        VK_FORMAT_BC4_UNORM_BLOCK | VK_FORMAT_BC4_SNORM_BLOCK => {
+            texture2ddecoder::decode_bc4(data, width, height, &mut out)
+        }
+        VK_FORMAT_BC5_UNORM_BLOCK | VK_FORMAT_BC5_SNORM_BLOCK => {
+            texture2ddecoder::decode_bc5(data, width, height, &mut out)
+        }
+        VK_FORMAT_BC6H_UFLOAT_BLOCK => {
+            texture2ddecoder::decode_bc6_unsigned(data, width, height, &mut out)
+        }
+        VK_FORMAT_BC6H_SFLOAT_BLOCK => {
+            texture2ddecoder::decode_bc6_signed(data, width, height, &mut out)
+        }
+        VK_FORMAT_BC7_UNORM_BLOCK | VK_FORMAT_BC7_SRGB_BLOCK => {
+            texture2ddecoder::decode_bc7(data, width, height, &mut out)
+        }
+        _ => return Err(unsupported()),
+    };
+    result.map_err(|_| unsupported())?;
+    // texture2ddecoder yields 0xAARRGGBB per pixel; expand to RGBA bytes.
+    let mut rgba = Vec::with_capacity(pixels * 4);
+    for color in out {
+        rgba.push((color >> 16) as u8);
+        rgba.push((color >> 8) as u8);
+        rgba.push(color as u8);
+        rgba.push((color >> 24) as u8);
+    }
+    Ok(rgba)
+}
+
+fn plain_rgba(data: &[u8], pixels: usize, swap_rb: bool) -> Result<Vec<u8>, Error> {
+    let needed = pixels.checked_mul(4).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let mut rgba = data
+        .get(..needed)
+        .ok_or(Error::PayloadSize {
+            expected: needed as u64,
+            actual: data.len(),
+        })?
+        .to_vec();
+    if swap_rb {
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+    Ok(rgba)
+}
+
 impl<'a> Sidecar<'a> {
     #[must_use]
     pub const fn new(part: SplitPart, bytes: &'a [u8]) -> Self {
@@ -376,10 +517,13 @@ impl Format {
             61 => Ok(Self::plain(VK_FORMAT_R8_UNORM, 1, 1)),
             70 => Ok(Self::block(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8)),
             71 => Ok(Self::block(VK_FORMAT_BC1_RGBA_SRGB_BLOCK, 8)),
+            72 => Ok(Self::block(VK_FORMAT_BC1_RGBA_SRGB_BLOCK, 8)),
             73 => Ok(Self::block(VK_FORMAT_BC2_UNORM_BLOCK, 16)),
             74 => Ok(Self::block(VK_FORMAT_BC2_SRGB_BLOCK, 16)),
+            75 => Ok(Self::block(VK_FORMAT_BC2_SRGB_BLOCK, 16)),
             76 => Ok(Self::block(VK_FORMAT_BC3_UNORM_BLOCK, 16)),
             77 => Ok(Self::block(VK_FORMAT_BC3_SRGB_BLOCK, 16)),
+            78 => Ok(Self::block(VK_FORMAT_BC3_SRGB_BLOCK, 16)),
             80 => Ok(Self::block(VK_FORMAT_BC4_UNORM_BLOCK, 8)),
             81 => Ok(Self::block(VK_FORMAT_BC4_SNORM_BLOCK, 8)),
             83 => Ok(Self::block(VK_FORMAT_BC5_UNORM_BLOCK, 16)),
@@ -554,22 +698,32 @@ impl<'a> Levels<'a> {
             let index_usize = usize::try_from(index).map_err(|_| Error::SizeOverflow {
                 what: "DDS split mip index",
             })?;
-            if index_usize >= split_count {
+            // Split sidecars are numbered 1..=split_count, smallest mip to largest,
+            // so the highest index is the largest mip (level 0):
+            // level = split_count - index. (Cry/Lumberyard convention; the header
+            // file holds the persistent, smallest mips after the split chain.)
+            if index_usize == 0 || index_usize > split_count {
                 return Err(Error::UnexpectedSidecar {
                     part: sidecar.part(),
                 });
             }
-            if split[index_usize].is_some() {
+            let level = split_count - index_usize;
+            if split[level].is_some() {
                 return Err(Error::DuplicateSidecar { index });
             }
-            check_mip_size(index, sizes[index_usize], sidecar.bytes().len())?;
-            split[index_usize] = Some(sidecar.bytes());
+            check_mip_size(
+                u32::try_from(level).unwrap_or(u32::MAX),
+                sizes[level],
+                sidecar.bytes().len(),
+            )?;
+            split[level] = Some(sidecar.bytes());
         }
 
         let mut levels = Vec::with_capacity(mipmaps);
-        for (index, level) in split.into_iter().enumerate() {
-            levels.push(level.ok_or_else(|| Error::MissingSidecar {
-                index: u32::try_from(index).unwrap_or(u32::MAX),
+        for (level, bytes) in split.into_iter().enumerate() {
+            levels.push(bytes.ok_or_else(|| Error::MissingSidecar {
+                // Report the missing sidecar's 1-based index, not its mip level.
+                index: u32::try_from(split_count - level).unwrap_or(u32::MAX),
             })?);
         }
         levels.extend(slice_chain(payload, &sizes[split_count..], split_count)?);
@@ -711,12 +865,14 @@ mod tests {
         );
         header[124..128].copy_from_slice(&FOUR_CC_FYRC);
         header.extend_from_slice(&[0x33; 8]);
+        // Split mips are numbered smallest→largest: `.dds.2` is the largest (level
+        // 0), `.dds.1` the next. The level-2 mip is persistent (in the header).
         let mip0 = [0x11; 32];
         let mip1 = [0x22; 8];
         let sidecars = [
             Sidecar::new(
                 SplitPart::Mip {
-                    index: 0,
+                    index: 2,
                     alpha: false,
                 },
                 &mip0,
@@ -750,10 +906,12 @@ mod tests {
         put_u32(&mut header, 36, crate::CryFlags::SPLIT.bits());
         header[124..128].copy_from_slice(&FOUR_CC_FYRC);
         header.extend_from_slice(&[0x33; 8]);
+        // Provide only the largest split mip (`.dds.2`); the level-1 mip (`.dds.1`)
+        // is missing.
         let mip0 = [0x11; 32];
         let sidecars = [Sidecar::new(
             SplitPart::Mip {
-                index: 0,
+                index: 2,
                 alpha: false,
             },
             &mip0,

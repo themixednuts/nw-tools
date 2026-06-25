@@ -1,22 +1,16 @@
 [package]
-name = "nw-asset"
+name = "cry-chunk"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+description = "Borrowed parser for Cry/Lumberyard chunk-file containers (.cgf, .skin, .chr)"
 
 [lints]
 workspace = true
 
-[features]
-default = ["oodle"]
-oodle = ["nw-pak/oodle"]
-
 [dependencies]
-nw-filesystem.workspace = true
-nw-pak.workspace = true
-sha1.workspace = true
+arrayvec.workspace = true
 thiserror.workspace = true
-uuid.workspace = true
