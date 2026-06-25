@@ -1149,6 +1149,13 @@ fn message_field_shape_report(
     let rust_type = field
         .rust_type
         .clone()
+        .or_else(|| {
+            field
+                .native_type
+                .as_deref()
+                .and_then(message_native_type_rust_type)
+                .map(ToOwned::to_owned)
+        })
         .or_else(|| report.rust_value_type.clone());
     report.rust_value_type = rust_type.clone();
     report.rust_field_type = rust_type.clone();
@@ -1238,7 +1245,7 @@ fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
         "bool" => Some(SchemaWireShape::Bool),
         "u8" | "uint8_t" | "AZ::u8" => Some(SchemaWireShape::U8),
         "u16" | "uint16_t" | "AZ::u16" => Some(SchemaWireShape::U16),
-        "u32" | "uint32_t" | "AZ::u32" => Some(SchemaWireShape::U32),
+        "u32" | "uint32_t" | "AZ::u32" | "FragmentKey" => Some(SchemaWireShape::U32),
         "u64" | "uint64_t" | "AZ::u64" => Some(SchemaWireShape::U64),
         "f32" | "float" => Some(SchemaWireShape::F32),
         "f64" | "double" => Some(SchemaWireShape::F64),
@@ -1251,6 +1258,15 @@ fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
         "AZ::Aabb" => Some(SchemaWireShape::Aabb3d),
         "EntityRef" => Some(SchemaWireShape::EntityRef),
         "AZStd::string" | "std::string" | "string" => Some(SchemaWireShape::String),
+        _ => None,
+    }
+}
+
+fn message_native_type_rust_type(native_type: &str) -> Option<&'static str> {
+    match native_type.trim() {
+        "ActorRef" | "HubAddress" | "ProxyAddress" => Some("::nw_network::HubAddress"),
+        "BaselineableFragment" => Some("::nw_network::hub::BaselineableFragment"),
+        "FragmentKey" => Some("::nw_network::hub::FragmentKey"),
         _ => None,
     }
 }
@@ -1985,10 +2001,68 @@ fn type_id_literal(type_id: Uuid) -> proc_macro2::TokenStream {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use uuid::uuid;
 
-    use crate::{ir::SerializeCodegenVariant, network_schema::NetworkSchema};
+    use crate::{
+        ir::SerializeCodegenVariant,
+        network_schema::{NetworkMessageFieldSignature, NetworkMessageSignature, NetworkSchema},
+    };
 
     use super::*;
+
+    fn fragment_message_signatures() -> Vec<NetworkMessageSignature> {
+        vec![
+            NetworkMessageSignature {
+                type_id: Some(uuid!("96a58e69-7bd5-45c5-86e4-daf9f5eb1e86")),
+                type_index: Some(397),
+                name: Some("Replicate::RegisterFragmentAccessMsg".to_owned()),
+                rust_name: Some("RegisterFragmentAccessMsg".to_owned()),
+                source: None,
+                fields: fragment_access_fields(),
+            },
+            NetworkMessageSignature {
+                type_id: Some(uuid!("2b7640e0-4204-4e52-998a-c2db02e0a480")),
+                type_index: Some(399),
+                name: Some("Replicate::UnregisterFragmentAccessMsg".to_owned()),
+                rust_name: Some("UnregisterFragmentAccessMsg".to_owned()),
+                source: None,
+                fields: fragment_access_fields(),
+            },
+            NetworkMessageSignature {
+                type_id: Some(uuid!("951ef3ed-c9a0-4e3d-a6fd-7fe0673d28d2")),
+                type_index: Some(422),
+                name: Some("ReplicateClient::FragmentUpdateMsg".to_owned()),
+                rust_name: Some("FragmentUpdateMsg".to_owned()),
+                source: None,
+                fields: vec![
+                    message_signature_field(0, "TargetRef", "ActorRef"),
+                    message_signature_field(1, "Key", "FragmentKey"),
+                    message_signature_field(2, "Fragment", "BaselineableFragment"),
+                ],
+            },
+        ]
+    }
+
+    fn fragment_access_fields() -> Vec<NetworkMessageFieldSignature> {
+        vec![
+            message_signature_field(0, "ProxyRef", "ActorRef"),
+            message_signature_field(1, "Key", "FragmentKey"),
+        ]
+    }
+
+    fn message_signature_field(
+        index: u32,
+        name: &str,
+        native_type: &str,
+    ) -> NetworkMessageFieldSignature {
+        NetworkMessageFieldSignature {
+            index: Some(index),
+            name: name.to_owned(),
+            rust_type: None,
+            native_type: Some(native_type.to_owned()),
+            wire_shape: None,
+        }
+    }
 
     #[test]
     fn emits_compile_ready_descriptor_module() {
@@ -2484,6 +2558,164 @@ mod tests {
             output
                 .source
                 .contains("pub login_token: ::nw_network::LoginToken")
+        );
+    }
+
+    #[test]
+    fn emits_hub_address_for_proxy_address_message_fields() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "96A58E69-7BD5-45C5-86E4-DAF9F5EB1E86",
+                "typeIndex": 397,
+                "typeName": "Replicate::RegisterFragmentAccessMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "ProxyRef",
+                    "nativeType": "ProxyAddress",
+                    "confidence": "message-unmarshal-helper-direct-type-call"
+                }, {
+                    "index": 1,
+                    "name": "Key",
+                    "nativeType": "FragmentKey",
+                    "confidence": "message-signature-source"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.generatable_message_count, 1);
+        assert_eq!(output.report.blocked_message_count, 0);
+        assert!(
+            output
+                .source
+                .contains("pub proxy_ref: ::nw_network::HubAddress")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub key: ::nw_network::hub::FragmentKey")
+        );
+    }
+
+    #[test]
+    fn emits_baselineable_fragment_for_baselineable_fragment_message_fields() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "951EF3ED-C9A0-4E3D-A6FD-7FE0673D28D2",
+                "typeIndex": 422,
+                "typeName": "ReplicateClient::FragmentUpdateMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "Fragment",
+                    "nativeType": "BaselineableFragment",
+                    "confidence": "message-unmarshal-helper-direct-type-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.generatable_message_count, 1);
+        assert_eq!(output.report.blocked_message_count, 0);
+        assert!(
+            output
+                .source
+                .contains("pub fragment: ::nw_network::hub::BaselineableFragment")
+        );
+    }
+
+    #[test]
+    fn emits_fragment_messages_from_source_signature_merge() {
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "96A58E69-7BD5-45C5-86E4-DAF9F5EB1E86",
+                "typeIndex": 397,
+                "typeName": "Replicate::RegisterFragmentAccessMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "field_0",
+                    "nativeType": "u32",
+                    "storageExpression": "param_3 + 1",
+                    "wireShape": "u32",
+                    "confidence": "message-unmarshal-helper-wrapper"
+                }]
+            }, {
+                "uuid": "2B7640E0-4204-4E52-998A-C2DB02E0A480",
+                "typeIndex": 399,
+                "typeName": "Replicate::UnregisterFragmentAccessMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "field_0",
+                    "nativeType": "u32",
+                    "storageExpression": "param_3 + 1",
+                    "wireShape": "u32",
+                    "confidence": "message-unmarshal-helper-wrapper"
+                }]
+            }, {
+                "uuid": "951EF3ED-C9A0-4E3D-A6FD-7FE0673D28D2",
+                "typeIndex": 422,
+                "typeName": "ReplicateClient::FragmentUpdateMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "ProxyAddress",
+                    "nameSource": "message-native-type-name",
+                    "nativeType": "ProxyAddress",
+                    "confidence": "message-unmarshal-inline-direct-type-call"
+                }, {
+                    "index": 1,
+                    "name": "field_1",
+                    "nativeType": "u32",
+                    "wireShape": "u32",
+                    "confidence": "message-unmarshal-inline-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+        schema.merge_message_signatures(
+            &fragment_message_signatures(),
+            Some("message-signatures.json".to_owned()),
+        );
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.generatable_message_count, 3);
+        assert_eq!(output.report.blocked_message_count, 0);
+        assert!(
+            output
+                .source
+                .contains("pub struct RegisterFragmentAccessMsg")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub struct UnregisterFragmentAccessMsg")
+        );
+        assert!(output.source.contains("pub struct FragmentUpdateMsg"));
+        assert!(
+            output
+                .source
+                .contains("pub proxy_ref: ::nw_network::HubAddress")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub target_ref: ::nw_network::HubAddress")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub key: ::nw_network::hub::FragmentKey")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub fragment: ::nw_network::hub::BaselineableFragment")
         );
     }
 

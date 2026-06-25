@@ -595,15 +595,12 @@ impl NetworkSchema {
                 .clone()
                 .or_else(|| source_path.clone())
                 .unwrap_or_else(|| "messageSignatures".to_owned());
-            if network_type.fields.is_empty() && !signature.fields.is_empty() {
-                network_type.fields = signature
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .map(|(index, field)| {
-                        network_field_from_message_signature(index, field, source.clone())
-                    })
-                    .collect();
+            if !signature.fields.is_empty() && network_type.fields.len() < signature.fields.len() {
+                if !network_type.fields.is_empty() {
+                    report.field_count_mismatch_count += 1;
+                }
+                network_type.fields =
+                    network_fields_from_message_signature(&signature.fields, source.clone());
                 report.matched_message_count += 1;
                 report.field_name_filled_count += signature.fields.len();
                 report.native_type_filled_count += signature
@@ -635,14 +632,21 @@ impl NetworkSchema {
                     continue;
                 }
 
-                if field.name.as_deref().is_none_or(is_placeholder_field_name) {
+                if field.name.as_deref().is_none_or(is_placeholder_field_name)
+                    || field_has_native_type_name(field)
+                {
                     field.name = Some(field_signature.name.clone());
                     report.field_name_filled_count += 1;
                 } else if field.name.as_deref() != Some(field_signature.name.as_str()) {
                     report.field_name_conflict_count += 1;
                 }
 
-                if field.native_type.is_none() {
+                if field.native_type.is_none()
+                    || should_replace_native_type_from_message_signature(
+                        field.native_type.as_deref(),
+                        field_signature.native_type.as_deref(),
+                    )
+                {
                     field.native_type = field_signature.native_type.clone();
                     if field.native_type.is_some() {
                         report.native_type_filled_count += 1;
@@ -757,6 +761,17 @@ impl NetworkSchema {
                 .count(),
         }
     }
+}
+
+fn network_fields_from_message_signature(
+    fields: &[NetworkMessageFieldSignature],
+    source: String,
+) -> Vec<NetworkField> {
+    fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| network_field_from_message_signature(index, field, source.clone()))
+        .collect()
 }
 
 fn network_field_from_message_signature(
@@ -913,6 +928,30 @@ fn is_placeholder_field_name(value: &str) -> bool {
     value
         .strip_prefix("field_")
         .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn field_has_native_type_name(field: &NetworkField) -> bool {
+    field.evidence.iter().any(|evidence| {
+        evidence.kind == NetworkEvidenceKind::MessageSource
+            && evidence.source == "message-native-type-name"
+    })
+}
+
+fn should_replace_native_type_from_message_signature(
+    existing: Option<&str>,
+    signature: Option<&str>,
+) -> bool {
+    let (Some(existing), Some(signature)) = (existing, signature) else {
+        return false;
+    };
+    if existing == signature {
+        return false;
+    }
+    matches!(
+        (existing.trim(), signature.trim()),
+        ("u32" | "uint32_t" | "AZ::u32", "FragmentKey")
+            | ("ProxyAddress" | "HubAddress", "ActorRef")
+    )
 }
 
 fn network_serialize_type(item: &SerializeCodegenItem) -> NetworkSerializeType {
@@ -1146,13 +1185,12 @@ fn network_field_registration_function(
 fn network_field(field: &Map<String, Value>) -> NetworkField {
     let raw_confidence = string(field, "confidence");
     let confidence = confidence_from_raw(string_ref(field, "confidence"));
-    let evidence_kind = if raw_confidence
-        .as_deref()
-        .is_some_and(|value| value.starts_with("message-unmarshal"))
-    {
-        NetworkEvidenceKind::MessageUnmarshal
-    } else {
-        NetworkEvidenceKind::RegisterField
+    let evidence_kind = match raw_confidence.as_deref() {
+        Some(value) if value.starts_with("message-unmarshal") => {
+            NetworkEvidenceKind::MessageUnmarshal
+        }
+        Some(value) if value.starts_with("message-signature") => NetworkEvidenceKind::MessageSource,
+        _ => NetworkEvidenceKind::RegisterField,
     };
     let mut evidence = vec![NetworkEvidence {
         kind: evidence_kind,
@@ -1341,9 +1379,14 @@ fn confidence_from_raw(raw: Option<&str>) -> NetworkConfidence {
     match raw {
         Some("exact") => NetworkConfidence::Exact,
         Some(
-            "register-field-call" | "registration-hook" | "az-rtti" | "message-unmarshal-call",
+            "register-field-call"
+            | "registration-hook"
+            | "az-rtti"
+            | "message-unmarshal-call"
+            | "message-signature-source",
         ) => NetworkConfidence::High,
         Some(value) if value.starts_with("message-unmarshal-") => NetworkConfidence::High,
+        Some(value) if value.starts_with("message-signature-") => NetworkConfidence::High,
         Some("constructor-match" | "vtable-match") => NetworkConfidence::Inferred,
         Some("hint") => NetworkConfidence::Weak,
         Some(_) => NetworkConfidence::Unknown,
@@ -1459,6 +1502,67 @@ mod tests {
     use uuid::uuid;
 
     use super::*;
+
+    fn fragment_access_message_signatures() -> Vec<NetworkMessageSignature> {
+        vec![
+            NetworkMessageSignature {
+                type_id: Some(uuid!("96a58e69-7bd5-45c5-86e4-daf9f5eb1e86")),
+                type_index: Some(397),
+                name: Some("Replicate::RegisterFragmentAccessMsg".to_owned()),
+                rust_name: Some("RegisterFragmentAccessMsg".to_owned()),
+                source: None,
+                fields: fragment_access_fields(),
+            },
+            NetworkMessageSignature {
+                type_id: Some(uuid!("2b7640e0-4204-4e52-998a-c2db02e0a480")),
+                type_index: Some(399),
+                name: Some("Replicate::UnregisterFragmentAccessMsg".to_owned()),
+                rust_name: Some("UnregisterFragmentAccessMsg".to_owned()),
+                source: None,
+                fields: fragment_access_fields(),
+            },
+            NetworkMessageSignature {
+                type_id: Some(uuid!("951ef3ed-c9a0-4e3d-a6fd-7fe0673d28d2")),
+                type_index: Some(422),
+                name: Some("ReplicateClient::FragmentUpdateMsg".to_owned()),
+                rust_name: Some("FragmentUpdateMsg".to_owned()),
+                source: None,
+                fields: vec![
+                    message_field_signature(0, "TargetRef", "ActorRef"),
+                    message_field_signature(1, "Key", "FragmentKey"),
+                    message_field_signature(2, "Fragment", "BaselineableFragment"),
+                ],
+            },
+        ]
+    }
+
+    fn fragment_access_fields() -> Vec<NetworkMessageFieldSignature> {
+        vec![
+            message_field_signature(0, "ProxyRef", "ActorRef"),
+            message_field_signature(1, "Key", "FragmentKey"),
+        ]
+    }
+
+    fn message_field_signature(
+        index: u32,
+        name: &str,
+        native_type: &str,
+    ) -> NetworkMessageFieldSignature {
+        NetworkMessageFieldSignature {
+            index: Some(index),
+            name: name.to_owned(),
+            rust_type: None,
+            native_type: Some(native_type.to_owned()),
+            wire_shape: None,
+        }
+    }
+
+    fn assert_fragment_access_fields(fields: &[NetworkField]) {
+        assert_eq!(fields[0].name.as_deref(), Some("ProxyRef"));
+        assert_eq!(fields[0].native_type.as_deref(), Some("ActorRef"));
+        assert_eq!(fields[1].name.as_deref(), Some("Key"));
+        assert_eq!(fields[1].native_type.as_deref(), Some("FragmentKey"));
+    }
 
     #[test]
     fn converts_ghidra_report_to_normalized_network_schema() {
@@ -1902,6 +2006,151 @@ mod tests {
         assert_eq!(field.name.as_deref(), Some("epoch_time_send"));
         assert_eq!(field.native_type.as_deref(), Some("u64"));
         assert_eq!(field.wire_shape, Some(NetworkWireShape::U64));
+    }
+
+    #[test]
+    fn merges_message_signature_field_names_over_native_type_names() {
+        let report = json!({
+            "registryEntries": [{
+                "uuid": "96A58E69-7BD5-45C5-86E4-DAF9F5EB1E86",
+                "typeIndex": 397,
+                "typeName": "Replicate::RegisterFragmentAccessMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "ProxyAddress",
+                    "nameSource": "message-native-type-name",
+                    "nativeType": "ProxyAddress",
+                    "confidence": "message-unmarshal-helper-direct-type-call"
+                }, {
+                    "index": 1,
+                    "name": "field_1",
+                    "nativeType": "u32",
+                    "wireShape": "u32",
+                    "confidence": "message-unmarshal-helper-nested-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        });
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&report).expect("schema");
+
+        let merge = schema.merge_message_signatures(
+            &[NetworkMessageSignature {
+                type_id: Some(uuid!("96a58e69-7bd5-45c5-86e4-daf9f5eb1e86")),
+                type_index: Some(397),
+                name: Some("Replicate::RegisterFragmentAccessMsg".to_owned()),
+                rust_name: Some("RegisterFragmentAccessMsg".to_owned()),
+                source: None,
+                fields: vec![
+                    NetworkMessageFieldSignature {
+                        index: Some(0),
+                        name: "ProxyRef".to_owned(),
+                        rust_type: None,
+                        native_type: Some("ActorRef".to_owned()),
+                        wire_shape: None,
+                    },
+                    NetworkMessageFieldSignature {
+                        index: Some(1),
+                        name: "Key".to_owned(),
+                        rust_type: None,
+                        native_type: Some("FragmentKey".to_owned()),
+                        wire_shape: None,
+                    },
+                ],
+            }],
+            Some("message-signatures.json".to_owned()),
+        );
+
+        assert_eq!(merge.matched_message_count, 1);
+        assert_eq!(merge.field_name_filled_count, 2);
+        assert_eq!(merge.field_name_conflict_count, 0);
+        assert_eq!(schema.types[0].fields[0].name.as_deref(), Some("ProxyRef"));
+        assert_eq!(schema.types[0].fields[1].name.as_deref(), Some("Key"));
+        assert_eq!(
+            schema.types[0].fields[0].native_type.as_deref(),
+            Some("ActorRef")
+        );
+        assert_eq!(
+            schema.types[0].fields[1].native_type.as_deref(),
+            Some("FragmentKey")
+        );
+    }
+
+    #[test]
+    fn message_signatures_replace_partial_ghidra_fragment_message_fields() {
+        let report = json!({
+            "registryEntries": [{
+                "uuid": "96A58E69-7BD5-45C5-86E4-DAF9F5EB1E86",
+                "typeIndex": 397,
+                "typeName": "Replicate::RegisterFragmentAccessMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "field_0",
+                    "nativeType": "u32",
+                    "storageExpression": "param_3 + 1",
+                    "wireShape": "u32",
+                    "confidence": "message-unmarshal-helper-wrapper"
+                }]
+            }, {
+                "uuid": "2B7640E0-4204-4E52-998A-C2DB02E0A480",
+                "typeIndex": 399,
+                "typeName": "Replicate::UnregisterFragmentAccessMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "field_0",
+                    "nativeType": "u32",
+                    "storageExpression": "param_3 + 1",
+                    "wireShape": "u32",
+                    "confidence": "message-unmarshal-helper-wrapper"
+                }]
+            }, {
+                "uuid": "951EF3ED-C9A0-4E3D-A6FD-7FE0673D28D2",
+                "typeIndex": 422,
+                "typeName": "ReplicateClient::FragmentUpdateMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "ProxyAddress",
+                    "nameSource": "message-native-type-name",
+                    "nativeType": "ProxyAddress",
+                    "confidence": "message-unmarshal-inline-direct-type-call"
+                }, {
+                    "index": 1,
+                    "name": "field_1",
+                    "nativeType": "u32",
+                    "wireShape": "u32",
+                    "confidence": "message-unmarshal-inline-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        });
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&report).expect("schema");
+
+        let merge = schema.merge_message_signatures(
+            &fragment_access_message_signatures(),
+            Some("message-signatures.json".to_owned()),
+        );
+
+        assert_eq!(merge.matched_message_count, 3);
+        assert_eq!(merge.field_count_mismatch_count, 3);
+        assert_eq!(schema.types[0].fields.len(), 2);
+        assert_eq!(schema.types[1].fields.len(), 2);
+        assert_eq!(schema.types[2].fields.len(), 3);
+        assert_fragment_access_fields(&schema.types[0].fields);
+        assert_fragment_access_fields(&schema.types[1].fields);
+        assert_eq!(schema.types[2].fields[0].name.as_deref(), Some("TargetRef"));
+        assert_eq!(
+            schema.types[2].fields[0].native_type.as_deref(),
+            Some("ActorRef")
+        );
+        assert_eq!(schema.types[2].fields[1].name.as_deref(), Some("Key"));
+        assert_eq!(
+            schema.types[2].fields[1].native_type.as_deref(),
+            Some("FragmentKey")
+        );
+        assert_eq!(schema.types[2].fields[2].name.as_deref(), Some("Fragment"));
+        assert_eq!(
+            schema.types[2].fields[2].native_type.as_deref(),
+            Some("BaselineableFragment")
+        );
     }
 
     #[test]

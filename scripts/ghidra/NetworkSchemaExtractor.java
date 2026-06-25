@@ -39,7 +39,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
 public class NetworkSchemaExtractor extends GhidraScript {
-    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260624-linear-raw-write-pass";
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260624-direct-type-unmarshal-pass";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long QUEUE_REGISTRATION_HOOK_RVA = 0x61a95c0L;
     private static final int BACKWARD_ARGUMENT_SCAN_LIMIT = 48;
@@ -827,6 +827,19 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 "message-unmarshal-inline-call",
                 call.textIndex);
         }
+        for (ParsedUnmarshalCall call : parseDirectTypeUnmarshalCalls(text)) {
+            String storage = storageArgumentForDirectUnmarshalCall(call);
+            if (!isLikelyMessageStorage(storage)) {
+                continue;
+            }
+            addMessageField(
+                plan,
+                callsite,
+                storage,
+                call.templateType,
+                "message-unmarshal-inline-direct-type-call",
+                call.textIndex);
+        }
     }
 
     private void recoverHelperArgumentMessageFields(
@@ -851,19 +864,19 @@ public class NetworkSchemaExtractor extends GhidraScript {
             }
 
             int helperTextIndex = callTextIndexForTarget(wrapperText, helper);
+            List<String> storageArgs = likelyMessageStorageArgs(wrapperArgs);
             String directTemplateType = unmarshalTemplateType(fullFunctionName(helper));
             if (directTemplateType != null) {
-                String storage = messageStorageArgumentFromWrapperArgs(wrapperArgs);
-                if (storage != null) {
+                if (storageArgs.size() == 1) {
                     addMessageField(
                         plan,
                         instruction.getMinAddress(),
-                        storage,
+                        storageArgs.get(0),
                         directTemplateType,
                         "message-unmarshal-helper-direct",
                         helperTextIndex);
+                    continue;
                 }
-                continue;
             }
 
             String helperText = decompileC(helper);
@@ -872,13 +885,12 @@ public class NetworkSchemaExtractor extends GhidraScript {
             }
 
             String singleTemplateType = singleMarshalerUnmarshalTemplateType(helperText);
-            if (singleTemplateType != null) {
-                String storage = messageStorageArgumentFromWrapperArgs(wrapperArgs);
-                if (storage != null) {
+            if (singleTemplateType != null && storageArgs.size() == 1) {
+                if (!storageArgs.isEmpty()) {
                     addMessageField(
                         plan,
                         instruction.getMinAddress(),
-                        storage,
+                        storageArgs.get(0),
                         singleTemplateType,
                         "message-unmarshal-helper-wrapper",
                         helperTextIndex);
@@ -930,14 +942,17 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return calls.size() == 1 ? calls.get(0).templateType : null;
     }
 
-    private String messageStorageArgumentFromWrapperArgs(List<String> args) {
-        for (int i = args.size() - 1; i >= 0; i--) {
-            String arg = args.get(i);
+    private List<String> likelyMessageStorageArgs(List<String> args) {
+        ArrayList<String> result = new ArrayList<>();
+        if (args == null) {
+            return result;
+        }
+        for (String arg : args) {
             if (isLikelyMessageStorage(arg)) {
-                return arg;
+                result.add(arg);
             }
         }
-        return null;
+        return result;
     }
 
     private int relativeRecoveryOrder(int base, int offset) {
@@ -962,6 +977,18 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 field,
                 call.templateType,
                 "message-unmarshal-helper-nested-call");
+        }
+        for (ParsedUnmarshalCall call : parseDirectTypeUnmarshalCalls(helperText)) {
+            String storage = storageArgumentForDirectUnmarshalCall(call);
+            String helperParam = helperParameterFromExpression(storage, fieldsByHelperParam);
+            if (helperParam == null) {
+                continue;
+            }
+            FieldCall field = fieldsByHelperParam.get(helperParam);
+            refineMessageFieldType(
+                field,
+                call.templateType,
+                "message-unmarshal-helper-direct-type-call");
         }
     }
 
@@ -1755,8 +1782,64 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return result;
     }
 
+    private List<ParsedUnmarshalCall> parseDirectTypeUnmarshalCalls(String text) {
+        ArrayList<ParsedUnmarshalCall> result = new ArrayList<>();
+        if (text == null) {
+            return result;
+        }
+        int search = 0;
+        while (search < text.length()) {
+            int unmarshalIndex = text.indexOf("::Unmarshal(", search);
+            if (unmarshalIndex < 0) {
+                break;
+            }
+            int ownerStart = directCallOwnerStart(text, unmarshalIndex);
+            int argsStart = unmarshalIndex + "::Unmarshal".length();
+            int argsEnd = matchingIndex(text, argsStart, '(', ')');
+            if (ownerStart < 0 || argsEnd < 0) {
+                search = unmarshalIndex + "::Unmarshal(".length();
+                continue;
+            }
+
+            String owner = text.substring(ownerStart, unmarshalIndex).trim();
+            if (owner.isEmpty() || owner.contains("Marshaler<")) {
+                search = argsEnd + 1;
+                continue;
+            }
+
+            ParsedUnmarshalCall call = new ParsedUnmarshalCall();
+            call.templateType = sourceTypeLeaf(owner);
+            call.textIndex = unmarshalIndex;
+            call.args.addAll(splitTopLevel(text.substring(argsStart + 1, argsEnd)));
+            result.add(call);
+            search = argsEnd + 1;
+        }
+        return result;
+    }
+
+    private int directCallOwnerStart(String text, int unmarshalIndex) {
+        int index = unmarshalIndex - 1;
+        while (index >= 0) {
+            char c = text.charAt(index);
+            if (Character.isLetterOrDigit(c) || c == '_' || c == ':' || c == '<' ||
+                c == '>' || c == ',' || Character.isWhitespace(c)) {
+                index--;
+                continue;
+            }
+            break;
+        }
+        return index + 1;
+    }
+
     private String storageArgumentForMarshalerCall(ParsedUnmarshalCall call) {
         if (call == null || call.args.size() < 3) {
+            return null;
+        }
+        return call.args.get(call.args.size() - 2);
+    }
+
+    private String storageArgumentForDirectUnmarshalCall(ParsedUnmarshalCall call) {
+        if (call == null || call.args.size() < 2) {
             return null;
         }
         return call.args.get(call.args.size() - 2);
