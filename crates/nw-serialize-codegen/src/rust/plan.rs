@@ -1136,6 +1136,125 @@ mod tests {
     }
 
     #[test]
+    fn integrated_planner_derives_traits_for_container_recursive_values() {
+        fn named(type_id: uuid::Uuid, source_name: &str) -> ResolvedType {
+            ResolvedType::Named {
+                type_id,
+                source_name: source_name.to_owned(),
+            }
+        }
+
+        fn field(
+            source_name: &str,
+            source_type_id: uuid::Uuid,
+            resolved_type: ResolvedType,
+        ) -> SerializeCodegenField {
+            SerializeCodegenField {
+                source_name: source_name.to_owned(),
+                source_type_id,
+                resolved_type,
+                data_size: None,
+                offset: None,
+                flags: None,
+                is_base_class: false,
+                is_pointer: false,
+                is_dynamic_field: false,
+            }
+        }
+
+        fn support_item(
+            source_type_id: uuid::Uuid,
+            source_name: &str,
+            fields: Vec<SerializeCodegenField>,
+        ) -> SerializeCodegenItem {
+            SerializeCodegenItem {
+                source_type_id,
+                source_name: source_name.to_owned(),
+                role: ReflectedTypeRole::SupportType,
+                is_reflection_marker: false,
+                is_abstract: Some(false),
+                factory: None,
+                rtti_base_chain: Vec::new(),
+                kind: SerializeCodegenItemKind::Struct,
+                enum_underlying_type: None,
+                fields,
+                variants: Vec::new(),
+            }
+        }
+
+        let item_type_id = uuid!("11111111-1111-1111-1111-111111111111");
+        let version_type_id = uuid!("22222222-2222-2222-2222-222222222222");
+
+        let unit = SerializeCodegenUnit {
+            items: vec![
+                support_item(
+                    item_type_id,
+                    "Item",
+                    vec![field(
+                        "m_currentVersion",
+                        version_type_id,
+                        ResolvedType::Optional {
+                            value: Box::new(named(version_type_id, "ItemVersionData")),
+                        },
+                    )],
+                ),
+                support_item(
+                    version_type_id,
+                    "ItemVersionData",
+                    vec![field(
+                        "m_childItemLinks",
+                        uuid!("33333333-3333-3333-3333-333333333333"),
+                        ResolvedType::Map {
+                            kind: MapKind::UnorderedMap,
+                            key: Box::new(ResolvedType::Scalar(ScalarType::String)),
+                            value: Box::new(ResolvedType::Optional {
+                                value: Box::new(named(item_type_id, "Item")),
+                            }),
+                        },
+                    )],
+                ),
+            ],
+        };
+
+        let rust_unit = RustCodegenPlanner::default()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
+        let item = rust_unit
+            .items
+            .iter()
+            .find(|item| item.rust_name == "Item")
+            .expect("item plan");
+        let version = rust_unit
+            .items
+            .iter()
+            .find(|item| item.rust_name == "ItemVersionData")
+            .expect("version plan");
+
+        for item in [item, version] {
+            for derive in [
+                "Default",
+                "PartialEq",
+                "Eq",
+                "Marshaler",
+                "Serialize",
+                "Deserialize",
+                "Reflect",
+            ] {
+                assert!(
+                    item.derives.iter().any(|planned| planned == derive),
+                    "{} should derive {derive}; actual derives: {:?}",
+                    item.rust_name,
+                    item.derives
+                );
+            }
+            assert!(
+                !item.derives.iter().any(|planned| planned == "Hash"),
+                "{} should not derive Hash through HashMap fields",
+                item.rust_name
+            );
+        }
+    }
+
+    #[test]
     fn integrated_planner_resolves_unresolved_member_rtti_through_source_type_index() {
         let external_type_id = uuid!("11111111-2222-3333-4444-555555555555");
         let source_types = RustSourceTypeIndex::from_source(
@@ -1402,10 +1521,7 @@ pub struct ExternalPayload;
             .iter()
             .find(|item| item.source_type_id == client_ref_id)
             .expect("ClientRef plan");
-        assert_eq!(
-            client_ref.fields[0].rust_type,
-            "crate::refs::HubActorRef"
-        );
+        assert_eq!(client_ref.fields[0].rust_type, "crate::refs::HubActorRef");
         assert!(
             client_ref
                 .derives

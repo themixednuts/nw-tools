@@ -357,7 +357,7 @@ fn item_supports_partial_eq(
         return *supports_partial_eq;
     }
     if !visiting.insert(item.source_type_id) {
-        return false;
+        return true;
     }
 
     let supports_partial_eq = match item.kind {
@@ -384,7 +384,7 @@ fn item_supports_eq(
         return *supports_eq;
     }
     if !visiting.insert(item.source_type_id) {
-        return false;
+        return true;
     }
 
     let supports_eq = match item.kind {
@@ -411,7 +411,7 @@ fn item_supports_default(
         return *supports_default;
     }
     if !visiting.insert(item.source_type_id) {
-        return false;
+        return true;
     }
 
     let supports_default = match item.kind {
@@ -473,7 +473,7 @@ fn item_supports_reflect(
         return *supports_reflect;
     }
     if !visiting.insert(item.source_type_id) {
-        return false;
+        return true;
     }
 
     let supports_reflect = match item.kind {
@@ -507,7 +507,7 @@ fn item_supports_marshaler(
         return *supports_marshaler;
     }
     if !visiting.insert(item.source_type_id) {
-        return false;
+        return true;
     }
 
     let supports_marshaler = match item.kind {
@@ -534,7 +534,7 @@ fn item_supports_serde(
         return *supports_serde;
     }
     if !visiting.insert(item.source_type_id) {
-        return false;
+        return true;
     }
 
     let supports_serde = match item.kind {
@@ -832,9 +832,10 @@ fn resolved_type_supports_default(
             resolved_type_supports_default(first, items_by_type_id, cache, visiting, mode)
                 && resolved_type_supports_default(second, items_by_type_id, cache, visiting, mode)
         }
-        ResolvedType::RangedInteger { value, .. } | ResolvedType::Optional { value } => {
+        ResolvedType::RangedInteger { value, .. } => {
             resolved_type_supports_default(value, items_by_type_id, cache, visiting, mode)
         }
+        ResolvedType::Optional { .. } => true,
         ResolvedType::Pointer { target, .. } => {
             resolved_type_supports_default(target, items_by_type_id, cache, visiting, mode)
         }

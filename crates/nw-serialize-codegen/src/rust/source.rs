@@ -1927,8 +1927,8 @@ mod tests {
         assert!(slot.source.contains("::Item"));
         assert!(slot.source.contains("serde::Serialize"));
         assert!(slot.source.contains("serde::Deserialize"));
-        assert!(!item_record.source.contains("serde::Serialize"));
-        assert!(!item_record.source.contains("serde::Deserialize"));
+        assert!(item_record.source.contains("serde::Serialize"));
+        assert!(item_record.source.contains("serde::Deserialize"));
     }
 
     #[test]
