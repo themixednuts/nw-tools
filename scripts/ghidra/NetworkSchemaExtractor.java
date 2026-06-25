@@ -1015,7 +1015,28 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
     private String singleMarshalerUnmarshalTemplateType(String text) {
         List<ParsedUnmarshalCall> calls = parseMarshalerUnmarshalCalls(text);
+        if (isActorRefMarshalerShape(text, calls)) {
+            return "ActorRef";
+        }
         return calls.size() == 1 ? calls.get(0).templateType : null;
+    }
+
+    private boolean isActorRefMarshalerShape(String text, List<ParsedUnmarshalCall> calls) {
+        if (text == null || calls.size() != 1 ||
+            !"u32".equals(sourceTypeLeaf(calls.get(0).templateType))) {
+            return false;
+        }
+        int readRawCount = 0;
+        int search = 0;
+        while (search < text.length()) {
+            int index = text.indexOf("ReadRaw", search);
+            if (index < 0) {
+                break;
+            }
+            readRawCount++;
+            search = index + "ReadRaw".length();
+        }
+        return readRawCount == 2 && text.contains("0x10");
     }
 
     private List<String> likelyMessageStorageArgs(List<String> args) {
@@ -2928,7 +2949,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         Address provider = resolvedCodeTarget(function);
         byte[] bytes = codeBytesBeforePadding(readBytes(provider, TYPE_ID_PROVIDER_BYTES));
         if (bytes.length == 0) {
-            return null;
+            return decodeTypeIdFromReferencedStrings(function, provider);
         }
 
         for (int i = 0; i <= bytes.length - 7; i++) {
@@ -2949,6 +2970,29 @@ public class NetworkSchemaExtractor extends GhidraScript {
             }
         }
 
+        return decodeTypeIdFromReferencedStrings(function, provider);
+    }
+
+    private TypeIdDecode decodeTypeIdFromReferencedStrings(Address function, Address provider) {
+        Function providerFunction = functionAtOrContaining(provider);
+        if (providerFunction == null) {
+            return null;
+        }
+        for (Instruction instruction : functionInstructions(providerFunction)) {
+            Address target = referencedAddress(instruction);
+            String uuid = canonicalUuidFromString(readPrintableString(target));
+            if (uuid == null) {
+                continue;
+            }
+
+            TypeIdDecode decode = new TypeIdDecode();
+            decode.function = function;
+            decode.provider = provider;
+            decode.typeId = uuid;
+            decode.typeIdSource = "referencedString";
+            decode.sourceAddress = target;
+            return decode;
+        }
         return null;
     }
 
