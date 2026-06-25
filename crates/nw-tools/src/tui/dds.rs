@@ -6,12 +6,13 @@
 //! from discovery, and stale decode batches are cancelled when the view moves.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use image::{DynamicImage, RgbaImage};
+use image::{DynamicImage, ImageEncoder, RgbaImage};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Modifier, Style};
@@ -41,6 +42,11 @@ const MAX_COLS: u16 = 6;
 /// Keep this many decoded thumbnails before evicting (oldest off-screen first), so
 /// scrolling back doesn't re-decode what was just viewed.
 const THUMB_CACHE_CAP: usize = 1024;
+/// Thumbnails are decoded + cached at this size (longest edge); the protocol is
+/// then fit to whatever cell, so one cache entry serves any grid size.
+const THUMB_CACHE_PX: u32 = 512;
+/// Cap the on-disk thumbnail cache; oldest files are pruned past this.
+const THUMB_DISK_CAP: u64 = 256 * 1024 * 1024;
 
 /// Resolves a texture key (a pak virtual path) to the archive entry that holds
 /// it. Built during discovery from the readers it already opened, so reads are an
@@ -223,6 +229,99 @@ struct ThumbReq {
     cancel: CancellationToken,
 }
 
+/// Persistent, terminal-independent thumbnail cache: the decoded+downscaled image
+/// (QOI) per asset, keyed by an `Engine.pak` fingerprint so a game patch
+/// invalidates it. A hit skips the pak read + DDS decode (only re-encoding to the
+/// terminal protocol remains), making thumbnails fast across sessions and resizes.
+/// Disabled when there's no fingerprint (e.g. the loose-file browser).
+struct ThumbCache {
+    dir: Option<PathBuf>,
+    namespace: String,
+}
+
+impl ThumbCache {
+    fn open(fingerprint: Option<String>) -> Self {
+        let Some(namespace) = fingerprint else {
+            return Self { dir: None, namespace: String::new() };
+        };
+        let dir = crate::cache::default_path()
+            .parent()
+            .map(|parent| parent.join("thumbnails"));
+        if let Some(dir) = &dir {
+            let _ = std::fs::create_dir_all(dir);
+            prune_dir(dir, THUMB_DISK_CAP);
+        }
+        Self { dir, namespace }
+    }
+
+    fn path(&self, key: &str) -> Option<PathBuf> {
+        let dir = self.dir.as_ref()?;
+        let hash = fnv1a(&format!("{}:{key}", self.namespace));
+        Some(dir.join(format!("{hash:016x}.qoi")))
+    }
+
+    /// Load a cached thumbnail image, if present.
+    fn load(&self, key: &str) -> Option<RgbaImage> {
+        let bytes = std::fs::read(self.path(key)?).ok()?;
+        image::load_from_memory_with_format(&bytes, image::ImageFormat::Qoi)
+            .ok()
+            .map(|image| image.to_rgba8())
+    }
+
+    /// Persist a decoded thumbnail image (best-effort; failures are ignored).
+    fn store(&self, key: &str, image: &RgbaImage) {
+        let Some(path) = self.path(key) else {
+            return;
+        };
+        let mut bytes = Vec::new();
+        if image::codecs::qoi::QoiEncoder::new(&mut bytes)
+            .write_image(image, image.width(), image.height(), image::ExtendedColorType::Rgba8)
+            .is_ok()
+        {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+}
+
+/// Stable 64-bit FNV-1a, for cache filenames.
+fn fnv1a(text: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Delete the oldest files in `dir` until its total size is within `cap`.
+fn prune_dir(dir: &Path, cap: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            meta.is_file()
+                .then(|| Some((meta.modified().ok()?, meta.len(), entry.path())))
+                .flatten()
+        })
+        .collect();
+    let total: u64 = files.iter().map(|(_, size, _)| size).sum();
+    if total <= cap {
+        return;
+    }
+    files.sort_by_key(|(modified, _, _)| *modified);
+    let mut over = total - cap;
+    for (_, size, path) in files {
+        if over == 0 {
+            break;
+        }
+        let _ = std::fs::remove_file(path);
+        over = over.saturating_sub(size);
+    }
+}
+
 pub struct DdsBrowser {
     caps: Caps,
     /// Local snapshot of the discovered textures, grown from `catalog` on tick.
@@ -278,6 +377,7 @@ impl DdsBrowser {
     pub fn new(
         catalog: Arc<DdsCatalog>,
         store: Arc<TextureStore>,
+        fingerprint: Option<String>,
         source: String,
         runner: JobRunner,
         picker: Picker,
@@ -286,8 +386,15 @@ impl DdsBrowser {
         let cache: Arc<Cache> = Arc::new(Mutex::new(HashMap::new()));
         let tx = spawn_decoder(catalog.clone(), store.clone(), runner.clone(), cache.clone());
         let thumbs: Arc<Thumbs> = Arc::new(Mutex::new(HashMap::new()));
-        let thumb_tx =
-            spawn_thumb_decoder(catalog.clone(), store, runner, picker.clone(), thumbs.clone());
+        let thumb_cache = Arc::new(ThumbCache::open(fingerprint));
+        let thumb_tx = spawn_thumb_decoder(
+            catalog.clone(),
+            store,
+            thumb_cache,
+            runner,
+            picker.clone(),
+            thumbs.clone(),
+        );
         let mut browser = Self {
             caps,
             items: Vec::new(),
@@ -1070,12 +1177,15 @@ fn decode_loop(
 fn spawn_thumb_decoder(
     catalog: Arc<DdsCatalog>,
     store: Arc<TextureStore>,
+    cache: Arc<ThumbCache>,
     runner: JobRunner,
     picker: Picker,
     thumbs: Arc<Thumbs>,
 ) -> SyncSender<ThumbReq> {
     let (tx, rx) = sync_channel::<ThumbReq>(8);
-    std::thread::spawn(move || thumb_loop(&rx, &catalog, &store, &runner, &picker, &thumbs));
+    std::thread::spawn(move || {
+        thumb_loop(&rx, &catalog, &store, &cache, &runner, &picker, &thumbs);
+    });
     tx
 }
 
@@ -1087,6 +1197,7 @@ fn thumb_loop(
     rx: &Receiver<ThumbReq>,
     catalog: &DdsCatalog,
     store: &TextureStore,
+    cache: &ThumbCache,
     runner: &JobRunner,
     picker: &Picker,
     thumbs: &Thumbs,
@@ -1122,7 +1233,7 @@ fn thumb_loop(
         // (roughly top-to-bottom) instead of all at once after the slowest one.
         let size = req.size;
         runner.map_until_cancelled(&todo, &req.cancel, |(item, dds)| {
-            let state = match decode_thumbnail(store, dds, picker, size) {
+            let state = match decode_thumbnail(store, cache, dds, picker, size) {
                 Ok(protocol) => Thumb::Ready(protocol),
                 Err(_) => Thumb::Failed,
             };
@@ -1147,23 +1258,29 @@ fn thumb_loop(
 /// graphics protocol sized to a grid cell — all off the UI thread.
 fn decode_thumbnail(
     store: &TextureStore,
+    cache: &ThumbCache,
     item: &DdsItem,
     picker: &Picker,
     size: Size,
 ) -> Result<Protocol, String> {
-    // Decode the mip that matches the cell's pixel size so the thumbnail fills the
-    // cell — reading only the one sidecar that mip needs (not the huge top mip).
-    let header = store.read(&item.header)?;
-    let font = picker.font_size();
-    let target_px = u32::from(font.width) * u32::from(size.width);
-    let target_py = u32::from(font.height) * u32::from(size.height);
-    let max_dim = target_px.max(target_py).max(64);
-    let decoded = nw_dds::decode_mip_max(&header, max_dim, |part| {
-        item.sidecars.iter().find(|(p, _)| *p == part).and_then(|(_, key)| store.read(key).ok())
-    })
-    .map_err(|error| error.to_string())?;
-    let image = RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)
-        .ok_or_else(|| "decoded texture had an unexpected size".to_string())?;
+    // Reuse the cached image when present (skips the pak read + DDS decode); else
+    // decode the mip near the cache size, reading only the one sidecar it needs,
+    // and persist it. Either way, fit the image to the current cell.
+    let image = match cache.load(&item.header) {
+        Some(image) => image,
+        None => {
+            let header = store.read(&item.header)?;
+            let decoded = nw_dds::decode_mip_max(&header, THUMB_CACHE_PX, |part| {
+                item.sidecars.iter().find(|(p, _)| *p == part).and_then(|(_, key)| store.read(key).ok())
+            })
+            .map_err(|error| error.to_string())?;
+            let decoded = RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)
+                .ok_or_else(|| "decoded texture had an unexpected size".to_string())?;
+            let image = downscale(decoded, THUMB_CACHE_PX);
+            cache.store(&item.header, &image);
+            image
+        }
+    };
     picker
         .new_protocol(DynamicImage::ImageRgba8(image), size, Resize::Fit(None))
         .map_err(|error| error.to_string())

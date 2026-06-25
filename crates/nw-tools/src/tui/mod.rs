@@ -111,6 +111,7 @@ pub fn datasheet_browser(source: Arc<dyn SheetSource>, locale_mode: u8) -> io::R
 pub fn dds_browser(
     catalog: Arc<DdsCatalog>,
     store: Arc<TextureStore>,
+    fingerprint: Option<String>,
     source: String,
     runner: JobRunner,
 ) -> io::Result<()> {
@@ -118,7 +119,7 @@ pub fn dds_browser(
     // The graphics-protocol query must run after the alternate screen is up but
     // before the event loop reads keys; fall back to half-blocks if unsupported.
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    let mut view = DdsBrowser::new(catalog, store, source, runner, picker, theme::caps());
+    let mut view = DdsBrowser::new(catalog, store, fingerprint, source, runner, picker, theme::caps());
     session.run(&mut view)?;
     drop(session);
     if let Some(line) = view.take_result() {
