@@ -41,11 +41,12 @@ pub trait View {
     /// Called on each poll timeout while [`View::ticking`] is true.
     fn tick(&mut self) {}
 
-    /// Whether the next frame must be a full redraw (clear the whole screen first).
-    /// Needed when graphics-protocol images change in place — e.g. cycling a DDS
-    /// texture's mip — since their cells would otherwise leave residue.
-    fn needs_clear(&mut self) -> bool {
-        false
+    /// A region that must be force-repainted on the next frame (not the whole
+    /// screen). Needed when a graphics-protocol image changes in place — e.g.
+    /// cycling a DDS texture's mip — since those cells would otherwise leave
+    /// residue. Returns the area to repaint, or `None`.
+    fn needs_clear(&mut self) -> Option<ratatui::layout::Rect> {
+        None
     }
 }
 
@@ -107,8 +108,18 @@ fn leave(terminal: &mut Terminal<Backend>) -> io::Result<()> {
 
 fn event_loop<V: View>(terminal: &mut Terminal<Backend>, view: &mut V) -> io::Result<()> {
     loop {
-        if view.needs_clear() {
-            terminal.clear()?;
+        // Force just this region to repaint next frame (resetting the prior buffer
+        // there), so an in-place image change doesn't leave graphics residue —
+        // without the flicker of clearing the whole screen.
+        if let Some(area) = view.needs_clear() {
+            let buffer = terminal.current_buffer_mut();
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    if let Some(cell) = buffer.cell_mut((x, y)) {
+                        cell.reset();
+                    }
+                }
+            }
         }
         terminal.draw(|frame| view.render(frame))?;
         if view.ticking() {

@@ -237,20 +237,17 @@ struct PreviewReq {
 }
 
 /// Persistent, terminal-independent thumbnail cache: the decoded+downscaled image
-/// (QOI) per asset, keyed by an `Engine.pak` fingerprint so a game patch
-/// invalidates it. A hit skips the pak read + DDS decode (only re-encoding to the
-/// terminal protocol remains), making thumbnails fast across sessions and resizes.
-/// Disabled when there's no fingerprint (e.g. the loose-file browser).
+/// (QOI), *content-addressed* by a hash of the DDS header bytes. Because the key is
+/// the texture's own content, a cached thumbnail is reused whenever that DDS is
+/// unchanged — across sessions, resizes, and even game patches (an unchanged
+/// texture keeps its entry; a changed one gets a new hash, and the stale file is
+/// pruned). A hit skips the pak read of sidecars + the DDS decode.
 struct ThumbCache {
     dir: Option<PathBuf>,
-    namespace: String,
 }
 
 impl ThumbCache {
-    fn open(fingerprint: Option<String>) -> Self {
-        let Some(namespace) = fingerprint else {
-            return Self { dir: None, namespace: String::new() };
-        };
+    fn open() -> Self {
         let dir = crate::cache::default_path()
             .parent()
             .map(|parent| parent.join("thumbnails"));
@@ -258,26 +255,24 @@ impl ThumbCache {
             let _ = std::fs::create_dir_all(dir);
             prune_dir(dir, THUMB_DISK_CAP);
         }
-        Self { dir, namespace }
+        Self { dir }
     }
 
-    fn path(&self, key: &str) -> Option<PathBuf> {
-        let dir = self.dir.as_ref()?;
-        let hash = fnv1a(&format!("{}:{key}", self.namespace));
-        Some(dir.join(format!("{hash:016x}.qoi")))
+    fn path(&self, hash: u64) -> Option<PathBuf> {
+        Some(self.dir.as_ref()?.join(format!("{hash:016x}.qoi")))
     }
 
-    /// Load a cached thumbnail image, if present.
-    fn load(&self, key: &str) -> Option<RgbaImage> {
-        let bytes = std::fs::read(self.path(key)?).ok()?;
+    /// Load a cached thumbnail image by content hash, if present.
+    fn load(&self, hash: u64) -> Option<RgbaImage> {
+        let bytes = std::fs::read(self.path(hash)?).ok()?;
         image::load_from_memory_with_format(&bytes, image::ImageFormat::Qoi)
             .ok()
             .map(|image| image.to_rgba8())
     }
 
     /// Persist a decoded thumbnail image (best-effort; failures are ignored).
-    fn store(&self, key: &str, image: &RgbaImage) {
-        let Some(path) = self.path(key) else {
+    fn store(&self, hash: u64, image: &RgbaImage) {
+        let Some(path) = self.path(hash) else {
             return;
         };
         let mut bytes = Vec::new();
@@ -290,10 +285,10 @@ impl ThumbCache {
     }
 }
 
-/// Stable 64-bit FNV-1a, for cache filenames.
-fn fnv1a(text: &str) -> u64 {
+/// Stable 64-bit FNV-1a over bytes — content hash for cache keys.
+fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
-    for byte in text.bytes() {
+    for &byte in bytes {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -374,9 +369,11 @@ pub struct DdsBrowser {
     requested: Vec<usize>,
     /// Monotonic clock stamped onto thumbnails as they're shown, for LRU eviction.
     clock: u64,
-    /// Set when the focused image changes (cycle/enter/exit) so the next frame is a
-    /// full redraw — graphics-protocol image cells would otherwise leave residue.
+    /// Set when the focused image changes (cycle/enter/exit) so the image region is
+    /// force-repainted next frame — graphics cells would otherwise leave residue.
     dirty: bool,
+    /// The body (image) region from the last render, repainted when `dirty`.
+    body: Rect,
     picker: Picker,
     /// The encoded protocol for the focused (texture, surface, mip) at a given
     /// image-area size — rebuilt only when that key changes.
@@ -389,7 +386,6 @@ impl DdsBrowser {
     pub fn new(
         catalog: Arc<DdsCatalog>,
         store: Arc<TextureStore>,
-        fingerprint: Option<String>,
         source: String,
         runner: JobRunner,
         picker: Picker,
@@ -398,7 +394,7 @@ impl DdsBrowser {
         let cache: Arc<Cache> = Arc::new(Mutex::new(HashMap::new()));
         let tx = spawn_decoder(catalog.clone(), store.clone(), runner.clone(), cache.clone());
         let thumbs: Arc<Thumbs> = Arc::new(Mutex::new(HashMap::new()));
-        let thumb_cache = Arc::new(ThumbCache::open(fingerprint));
+        let thumb_cache = Arc::new(ThumbCache::open());
         let thumb_tx = spawn_thumb_decoder(
             catalog.clone(),
             store,
@@ -433,6 +429,7 @@ impl DdsBrowser {
             requested: Vec::new(),
             clock: 0,
             dirty: false,
+            body: Rect::default(),
             picker,
             protocol: None,
             status: None,
@@ -718,8 +715,8 @@ impl View for DdsBrowser {
         self.ingest();
     }
 
-    fn needs_clear(&mut self) -> bool {
-        std::mem::take(&mut self.dirty)
+    fn needs_clear(&mut self) -> Option<Rect> {
+        std::mem::take(&mut self.dirty).then_some(self.body)
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Flow {
@@ -777,6 +774,7 @@ impl View for DdsBrowser {
             divider.width,
         );
 
+        self.body = body;
         // Wipe the body so graphics-protocol image cells from the previous frame
         // (a scrolled-off thumbnail, or the grid when switching to focus) don't
         // leave residue behind the new content.
@@ -1302,13 +1300,14 @@ fn decode_thumbnail(
     picker: &Picker,
     size: Size,
 ) -> Result<Protocol, String> {
-    // Reuse the cached image when present (skips the pak read + DDS decode); else
-    // decode the mip near the cache size, reading only the one sidecar it needs,
-    // and persist it. Either way, fit the image to the current cell.
-    let image = match cache.load(&item.header) {
+    // The header read is cheap and identifies the texture's content; key the disk
+    // cache on its hash so an unchanged DDS reuses the cached thumbnail (even after
+    // a game patch). A hit skips the sidecar reads + DDS decode.
+    let header = store.read(&item.header)?;
+    let key = fnv1a(&header);
+    let image = match cache.load(key) {
         Some(image) => image,
         None => {
-            let header = store.read(&item.header)?;
             let decoded = nw_dds::decode_mip_max(&header, THUMB_CACHE_PX, |part| {
                 item.sidecars.iter().find(|(p, _)| *p == part).and_then(|(_, key)| store.read(key).ok())
             })
@@ -1316,7 +1315,7 @@ fn decode_thumbnail(
             let decoded = RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)
                 .ok_or_else(|| "decoded texture had an unexpected size".to_string())?;
             let image = downscale(decoded, THUMB_CACHE_PX);
-            cache.store(&item.header, &image);
+            cache.store(key, &image);
             image
         }
     };

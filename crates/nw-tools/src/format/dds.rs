@@ -115,7 +115,7 @@ impl Dds {
             let store = Arc::new(crate::tui::TextureStore::Fs);
             let source = root.display().to_string();
             let catalog = Arc::new(crate::tui::DdsCatalog::ready(items));
-            return Ok(crate::tui::dds_browser(catalog, store, None, source, ctx.runner.clone())?);
+            return Ok(crate::tui::dds_browser(catalog, store, source, ctx.runner.clone())?);
         }
 
         let paths = collect_matching(&root, |path| nw_dds::is_dds_path(path))?;
@@ -194,9 +194,7 @@ impl Dds {
         if crate::tui::interactive() {
             let (catalog, index) = spawn_dds_discovery(ctx, paks.paths());
             let store = Arc::new(crate::tui::TextureStore::Pak(index));
-            // Fingerprint Engine.pak so cached thumbnails invalidate on a game patch.
-            let fingerprint = crate::cache::file_fingerprint(&install.assets().join("Engine.pak"));
-            return Ok(crate::tui::dds_browser(catalog, store, fingerprint, source, ctx.runner.clone())?);
+            return Ok(crate::tui::dds_browser(catalog, store, source, ctx.runner.clone())?);
         }
 
         // Piped: produce the full listing up front.
