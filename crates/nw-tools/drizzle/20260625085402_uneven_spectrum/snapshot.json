@@ -1,19 +1,19 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "a8f22ac1-2ba1-46fe-bf62-543b7e762eab",
+  "id": "7421ef24-1ccc-4828-9129-f7d8f04cd8ab",
   "prevIds": [
     "00000000-0000-0000-0000-000000000000"
   ],
   "ddl": [
     {
       "entityType": "tables",
-      "name": "toc"
+      "name": "meta"
     },
     {
       "entityType": "columns",
-      "table": "toc",
-      "name": "path",
+      "table": "meta",
+      "name": "key",
       "type": "text",
       "notNull": true,
       "autoincrement": null,
@@ -23,20 +23,9 @@
     },
     {
       "entityType": "columns",
-      "table": "toc",
-      "name": "pak",
+      "table": "meta",
+      "name": "value",
       "type": "text",
-      "notNull": true,
-      "autoincrement": null,
-      "default": null,
-      "generated": null,
-      "collate": null
-    },
-    {
-      "entityType": "columns",
-      "table": "toc",
-      "name": "entry",
-      "type": "integer",
       "notNull": true,
       "autoincrement": null,
       "default": null,
@@ -45,10 +34,10 @@
     },
     {
       "entityType": "pks",
-      "table": "toc",
-      "name": "toc_pkey",
+      "table": "meta",
+      "name": "meta_pkey",
       "columns": [
-        "path"
+        "key"
       ],
       "nameExplicit": false
     },

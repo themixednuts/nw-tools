@@ -335,11 +335,15 @@ fn cgf_submaterial_names(cgf: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The install's paks plus its asset catalog. `read` resolves a virtual path through
-/// the pak table-of-contents; `material_path` resolves a GUID through the catalog.
+/// The install's paks plus its asset catalog material map. `read` resolves a
+/// virtual path through the pak table-of-contents; `material_path` resolves a
+/// `MtlName` GUID to its `.mtl` path.
+///
+/// The material map (asset-id → `.mtl` path) is cached on disk and only rebuilt
+/// from the 365 MB catalog when `Engine.pak` changes (see [`crate::cache`]).
 struct Install {
     toc: HashMap<String, (Arc<PakMmapReader>, usize)>,
-    catalog: AssetCatalog,
+    materials: HashMap<String, String>,
 }
 
 impl Install {
@@ -349,8 +353,8 @@ impl Install {
             bail!("no pak archives found in {}", assets.display());
         }
         let toc = build_toc(ctx, paks.paths());
-        let catalog = load_catalog(ctx, &toc).context("load asset catalog from Engine.pak")?;
-        Ok(Self { toc, catalog })
+        let materials = load_material_map(ctx, assets, &toc)?;
+        Ok(Self { toc, materials })
     }
 
     /// Mesh asset paths (`.cgf`/`.skin`), optionally filtered by substring.
@@ -369,10 +373,10 @@ impl Install {
 }
 
 impl Install {
-    /// Resolve a MtlName-chunk GUID to its `.mtl` path via the asset catalog.
+    /// Resolve a MtlName-chunk GUID to its `.mtl` path via the cached catalog map.
     fn material_path(&self, guid: &str) -> Option<String> {
         let id = guid_to_asset_id(guid)?;
-        self.catalog.entry_by_id(id).map(|entry| entry.path().to_string())
+        self.materials.get(&id.to_string()).cloned()
     }
 }
 
@@ -541,11 +545,50 @@ fn build_toc(ctx: &RunCtx, pak_paths: &[PathBuf]) -> HashMap<String, (Arc<PakMma
     toc
 }
 
-/// Load and parse the asset catalog from the pak TOC (rasc + raoc parsed in parallel).
-fn load_catalog(
+/// Load the catalog's material map (asset-id → `.mtl` path), reusing the on-disk
+/// cache when `Engine.pak` is unchanged and otherwise rebuilding it from the
+/// catalog.
+fn load_material_map(
+    ctx: &RunCtx,
+    assets: &Path,
+    toc: &HashMap<String, (Arc<PakMmapReader>, usize)>,
+) -> Result<HashMap<String, String>> {
+    let fingerprint = crate::cache::file_fingerprint(&assets.join("Engine.pak"));
+    let db_path = crate::cache::default_path();
+
+    // Fast path: reuse the cache while Engine.pak is unchanged.
+    if let Some(fp) = &fingerprint {
+        if let Ok(cache) = crate::cache::Cache::open(&db_path) {
+            if cache.fingerprint().as_ref() == Some(fp) {
+                let map = cache.material_map();
+                if !map.is_empty() {
+                    tracing::debug!("catalog material map: {} entries (cached)", map.len());
+                    return Ok(map);
+                }
+            }
+        }
+    }
+
+    // Rebuild from the catalog, then persist into a fresh cache file (replacing any
+    // stale one, so a game patch rebuilds cleanly).
+    let map = build_material_map(ctx, toc).context("load asset catalog from Engine.pak")?;
+    tracing::debug!("catalog material map: {} entries (rebuilt)", map.len());
+    if let Some(fp) = &fingerprint {
+        let _ = std::fs::remove_file(&db_path);
+        match crate::cache::Cache::open(&db_path).and_then(|cache| Ok(cache.store(fp, &map)?)) {
+            Ok(()) => {}
+            Err(error) => tracing::warn!("could not write catalog cache: {error}"),
+        }
+    }
+    Ok(map)
+}
+
+/// Parse the asset catalog from the pak TOC (rasc + raoc in parallel) and project
+/// it to the `.mtl` material map: `AssetId` string → asset path.
+fn build_material_map(
     ctx: &RunCtx,
     toc: &HashMap<String, (Arc<PakMmapReader>, usize)>,
-) -> Result<AssetCatalog> {
+) -> Result<HashMap<String, String>> {
     let read = |key: &str| -> Option<Vec<u8>> {
         let (reader, entry) = toc.get(key)?;
         reader.read_wrapped_by_index(*entry).ok()
@@ -558,7 +601,14 @@ fn load_catalog(
         || Rasc::parse(&rasc_bytes),
         || raoc_bytes.as_deref().map(Raoc::parse).transpose(),
     );
-    Ok(AssetCatalog::new(rasc?, raoc?))
+    let catalog = AssetCatalog::new(rasc?, raoc?);
+
+    Ok(catalog
+        .entries()
+        .iter()
+        .filter(|entry| entry.path().ends_with(".mtl"))
+        .map(|entry| (entry.asset_id().to_string(), entry.path().to_string()))
+        .collect())
 }
 
 #[derive(Debug, Default, Clone, Copy)]
