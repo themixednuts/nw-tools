@@ -550,6 +550,7 @@ fn rust_source_field_wire_shape(field: &RustSourceField) -> Option<NetworkWireSh
         "Quat" => Some(NetworkWireShape::Quat),
         "Mat3" => Some(NetworkWireShape::Mat3),
         "Affine3A" => Some(NetworkWireShape::Affine3),
+        "Aabb2d" => Some(NetworkWireShape::Aabb2d),
         "Aabb3d" => Some(NetworkWireShape::Aabb3d),
         "EntityRef" => Some(NetworkWireShape::EntityRef),
         "String" => Some(NetworkWireShape::String),

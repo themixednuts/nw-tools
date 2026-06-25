@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
-use syn::LitStr;
+use syn::{LitInt, LitStr};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -14,7 +14,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v22";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v23";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -235,10 +235,10 @@ impl NetworkRustEmitter {
                 QuatCompNorm,
                 Mat3,
                 Affine3,
+                Aabb2d,
                 Aabb3d,
                 EntityRef,
-                FixedBytes6,
-                FixedBytes16,
+                FixedBytes(u16),
                 String,
             }
 
@@ -1026,8 +1026,8 @@ fn field_wire_shape_tokens(
 ) -> proc_macro2::TokenStream {
     if let Some(shape) = field_wire_shape(field, wire_shapes) {
         report.field_wire_shape_count += 1;
-        let shape = wire_shape_ident(shape);
-        return quote!(Some(NetworkWireShape::#shape));
+        let shape = wire_shape_tokens(shape);
+        return quote!(Some(#shape));
     }
     if field.handler_vtable.is_some() {
         report.unresolved_field_wire_shape_count += 1;
@@ -1356,8 +1356,8 @@ fn state_field_shape_report(
         wire_shape_source: field_wire_shape_source(field, wire_shapes, wire_shape_sources),
         rust_value_type: rust_type
             .map(ToOwned::to_owned)
-            .or_else(|| rust_shape.map(|shape| shape.value_type.to_owned())),
-        rust_field_type: rust_shape.map(|shape| shape.field_type.to_owned()),
+            .or_else(|| rust_shape.as_ref().map(|shape| shape.value_type.clone())),
+        rust_field_type: rust_shape.map(|shape| shape.field_type),
         confidence: field.confidence,
         supported: blocked_reason.is_none(),
         blocked_reason,
@@ -1423,6 +1423,7 @@ fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
         "AZ::Quaternion" => Some(SchemaWireShape::Quat),
         "AZ::Matrix3x3" => Some(SchemaWireShape::Mat3),
         "AZ::Transform" => Some(SchemaWireShape::Affine3),
+        "AZ::Bounds" => Some(SchemaWireShape::Aabb2d),
         "AZ::Aabb" => Some(SchemaWireShape::Aabb3d),
         "EntityRef" => Some(SchemaWireShape::EntityRef),
         "AZStd::string" | "std::string" | "string" => Some(SchemaWireShape::String),
@@ -1637,99 +1638,80 @@ fn is_native_type_field_name(name: &str) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RustFieldShape {
-    value_type: &'static str,
-    field_type: &'static str,
+    value_type: String,
+    field_type: String,
 }
 
-const fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
+fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
     match shape {
-        SchemaWireShape::Bool => RustFieldShape {
-            value_type: "bool",
-            field_type: "ReplicatedFieldHandler<bool>",
+        SchemaWireShape::Bool => rust_field_shape_static("bool", "ReplicatedFieldHandler<bool>"),
+        SchemaWireShape::U8 => rust_field_shape_static("u8", "ReplicatedFieldHandler<u8>"),
+        SchemaWireShape::U16 => rust_field_shape_static("u16", "ReplicatedFieldHandler<u16>"),
+        SchemaWireShape::U32 => rust_field_shape_static("u32", "ReplicatedFieldHandler<u32>"),
+        SchemaWireShape::U64 => rust_field_shape_static("u64", "ReplicatedFieldHandler<u64>"),
+        SchemaWireShape::F32 => rust_field_shape_static("f32", "ReplicatedFieldHandler<f32>"),
+        SchemaWireShape::F64 => rust_field_shape_static("f64", "ReplicatedFieldHandler<f64>"),
+        SchemaWireShape::HalfF32 => {
+            rust_field_shape_static("f32", "ReplicatedFieldHandler<f32, HalfF32Marshaler>")
+        }
+        SchemaWireShape::VlqU32 => {
+            rust_field_shape_static("u32", "ReplicatedFieldHandler<u32, VlqU32Marshaler>")
+        }
+        SchemaWireShape::Vec2 => {
+            rust_field_shape_static("::glam::Vec2", "ReplicatedFieldHandler<::glam::Vec2>")
+        }
+        SchemaWireShape::Vec3 => {
+            rust_field_shape_static("::glam::Vec3", "ReplicatedFieldHandler<::glam::Vec3>")
+        }
+        SchemaWireShape::Vec4 => {
+            rust_field_shape_static("::glam::Vec4", "ReplicatedFieldHandler<::glam::Vec4>")
+        }
+        SchemaWireShape::Quat => {
+            rust_field_shape_static("::glam::Quat", "ReplicatedFieldHandler<::glam::Quat>")
+        }
+        SchemaWireShape::QuatCompNorm => {
+            rust_field_shape_static("QuatCompNorm", "ReplicatedFieldHandler<QuatCompNorm>")
+        }
+        SchemaWireShape::Mat3 => {
+            rust_field_shape_static("::glam::Mat3", "ReplicatedFieldHandler<::glam::Mat3>")
+        }
+        SchemaWireShape::Affine3 => rust_field_shape_static(
+            "::glam::Affine3A",
+            "ReplicatedFieldHandler<::glam::Affine3A>",
+        ),
+        SchemaWireShape::Aabb2d => rust_field_shape_static(
+            "::bevy_math::bounding::Aabb2d",
+            "ReplicatedFieldHandler<::bevy_math::bounding::Aabb2d>",
+        ),
+        SchemaWireShape::Aabb3d => rust_field_shape_static(
+            "::bevy_math::bounding::Aabb3d",
+            "ReplicatedFieldHandler<::bevy_math::bounding::Aabb3d>",
+        ),
+        SchemaWireShape::EntityRef => rust_field_shape_static(
+            "::nw_network::EntityRef",
+            "ReplicatedFieldHandler<::nw_network::EntityRef>",
+        ),
+        SchemaWireShape::FixedBytes(len) => RustFieldShape {
+            value_type: format!("[u8; {len}]"),
+            field_type: format!("ReplicatedFieldHandler<[u8; {len}]>"),
         },
-        SchemaWireShape::U8 => RustFieldShape {
-            value_type: "u8",
-            field_type: "ReplicatedFieldHandler<u8>",
-        },
-        SchemaWireShape::U16 => RustFieldShape {
-            value_type: "u16",
-            field_type: "ReplicatedFieldHandler<u16>",
-        },
-        SchemaWireShape::U32 => RustFieldShape {
-            value_type: "u32",
-            field_type: "ReplicatedFieldHandler<u32>",
-        },
-        SchemaWireShape::U64 => RustFieldShape {
-            value_type: "u64",
-            field_type: "ReplicatedFieldHandler<u64>",
-        },
-        SchemaWireShape::F32 => RustFieldShape {
-            value_type: "f32",
-            field_type: "ReplicatedFieldHandler<f32>",
-        },
-        SchemaWireShape::F64 => RustFieldShape {
-            value_type: "f64",
-            field_type: "ReplicatedFieldHandler<f64>",
-        },
-        SchemaWireShape::HalfF32 => RustFieldShape {
-            value_type: "f32",
-            field_type: "ReplicatedFieldHandler<f32, HalfF32Marshaler>",
-        },
-        SchemaWireShape::VlqU32 => RustFieldShape {
-            value_type: "u32",
-            field_type: "ReplicatedFieldHandler<u32, VlqU32Marshaler>",
-        },
-        SchemaWireShape::Vec2 => RustFieldShape {
-            value_type: "::glam::Vec2",
-            field_type: "ReplicatedFieldHandler<::glam::Vec2>",
-        },
-        SchemaWireShape::Vec3 => RustFieldShape {
-            value_type: "::glam::Vec3",
-            field_type: "ReplicatedFieldHandler<::glam::Vec3>",
-        },
-        SchemaWireShape::Vec4 => RustFieldShape {
-            value_type: "::glam::Vec4",
-            field_type: "ReplicatedFieldHandler<::glam::Vec4>",
-        },
-        SchemaWireShape::Quat => RustFieldShape {
-            value_type: "::glam::Quat",
-            field_type: "ReplicatedFieldHandler<::glam::Quat>",
-        },
-        SchemaWireShape::QuatCompNorm => RustFieldShape {
-            value_type: "QuatCompNorm",
-            field_type: "ReplicatedFieldHandler<QuatCompNorm>",
-        },
-        SchemaWireShape::Mat3 => RustFieldShape {
-            value_type: "::glam::Mat3",
-            field_type: "ReplicatedFieldHandler<::glam::Mat3>",
-        },
-        SchemaWireShape::Affine3 => RustFieldShape {
-            value_type: "::glam::Affine3A",
-            field_type: "ReplicatedFieldHandler<::glam::Affine3A>",
-        },
-        SchemaWireShape::Aabb3d => RustFieldShape {
-            value_type: "::bevy_math::bounding::Aabb3d",
-            field_type: "ReplicatedFieldHandler<::bevy_math::bounding::Aabb3d>",
-        },
-        SchemaWireShape::EntityRef => RustFieldShape {
-            value_type: "::nw_network::EntityRef",
-            field_type: "ReplicatedFieldHandler<::nw_network::EntityRef>",
-        },
-        SchemaWireShape::FixedBytes6 => RustFieldShape {
-            value_type: "[u8; 6]",
-            field_type: "ReplicatedFieldHandler<[u8; 6]>",
-        },
-        SchemaWireShape::FixedBytes16 => RustFieldShape {
-            value_type: "[u8; 16]",
-            field_type: "ReplicatedFieldHandler<[u8; 16]>",
-        },
-        SchemaWireShape::String => RustFieldShape {
-            value_type: "String",
-            field_type: "ReplicatedFieldHandler<String>",
-        },
+        SchemaWireShape::String => {
+            rust_field_shape_static("String", "ReplicatedFieldHandler<String>")
+        }
     }
+}
+
+fn rust_field_shape_static(value_type: &'static str, field_type: &'static str) -> RustFieldShape {
+    RustFieldShape {
+        value_type: value_type.to_owned(),
+        field_type: field_type.to_owned(),
+    }
+}
+
+fn unsuffixed_int_lit(value: u16) -> LitInt {
+    LitInt::new(&value.to_string(), proc_macro2::Span::call_site())
 }
 
 fn blocked_state_generation_plan(
@@ -1902,6 +1884,13 @@ fn replicated_state_field_type_tokens(
         SchemaWireShape::Affine3 => {
             quote!(::nw_network::serialize::ReplicatedFieldHandler<::glam::Affine3A>)
         }
+        SchemaWireShape::Aabb2d => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::bevy_math::bounding::Aabb2d,
+                >
+            )
+        }
         SchemaWireShape::Aabb3d => {
             quote!(
                 ::nw_network::serialize::ReplicatedFieldHandler<
@@ -1912,11 +1901,9 @@ fn replicated_state_field_type_tokens(
         SchemaWireShape::EntityRef => {
             quote!(::nw_network::serialize::ReplicatedFieldHandler<::nw_network::EntityRef>)
         }
-        SchemaWireShape::FixedBytes6 => {
-            quote!(::nw_network::serialize::ReplicatedFieldHandler<[u8; 6]>)
-        }
-        SchemaWireShape::FixedBytes16 => {
-            quote!(::nw_network::serialize::ReplicatedFieldHandler<[u8; 16]>)
+        SchemaWireShape::FixedBytes(len) => {
+            let len = unsuffixed_int_lit(len);
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<[u8; #len]>)
         }
         SchemaWireShape::String => {
             quote!(::nw_network::serialize::ReplicatedFieldHandler<String>)
@@ -2013,10 +2000,13 @@ fn message_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream
         SchemaWireShape::QuatCompNorm => quote!(::nw_network::serialize::QuatCompNorm),
         SchemaWireShape::Mat3 => quote!(::glam::Mat3),
         SchemaWireShape::Affine3 => quote!(::glam::Affine3A),
+        SchemaWireShape::Aabb2d => quote!(::bevy_math::bounding::Aabb2d),
         SchemaWireShape::Aabb3d => quote!(::bevy_math::bounding::Aabb3d),
         SchemaWireShape::EntityRef => quote!(::nw_network::EntityRef),
-        SchemaWireShape::FixedBytes6 => quote!([u8; 6]),
-        SchemaWireShape::FixedBytes16 => quote!([u8; 16]),
+        SchemaWireShape::FixedBytes(len) => {
+            let len = unsuffixed_int_lit(len);
+            quote!([u8; #len])
+        }
         SchemaWireShape::String => quote!(String),
     }
 }
@@ -2129,29 +2119,29 @@ fn confidence_ident(confidence: NetworkConfidence) -> proc_macro2::Ident {
     }
 }
 
-fn wire_shape_ident(shape: SchemaWireShape) -> proc_macro2::Ident {
+fn wire_shape_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream {
     match shape {
-        SchemaWireShape::Bool => format_ident!("Bool"),
-        SchemaWireShape::U8 => format_ident!("U8"),
-        SchemaWireShape::U16 => format_ident!("U16"),
-        SchemaWireShape::U32 => format_ident!("U32"),
-        SchemaWireShape::U64 => format_ident!("U64"),
-        SchemaWireShape::F32 => format_ident!("F32"),
-        SchemaWireShape::F64 => format_ident!("F64"),
-        SchemaWireShape::HalfF32 => format_ident!("HalfF32"),
-        SchemaWireShape::VlqU32 => format_ident!("VlqU32"),
-        SchemaWireShape::Vec2 => format_ident!("Vec2"),
-        SchemaWireShape::Vec3 => format_ident!("Vec3"),
-        SchemaWireShape::Vec4 => format_ident!("Vec4"),
-        SchemaWireShape::Quat => format_ident!("Quat"),
-        SchemaWireShape::QuatCompNorm => format_ident!("QuatCompNorm"),
-        SchemaWireShape::Mat3 => format_ident!("Mat3"),
-        SchemaWireShape::Affine3 => format_ident!("Affine3"),
-        SchemaWireShape::Aabb3d => format_ident!("Aabb3d"),
-        SchemaWireShape::EntityRef => format_ident!("EntityRef"),
-        SchemaWireShape::FixedBytes6 => format_ident!("FixedBytes6"),
-        SchemaWireShape::FixedBytes16 => format_ident!("FixedBytes16"),
-        SchemaWireShape::String => format_ident!("String"),
+        SchemaWireShape::Bool => quote!(NetworkWireShape::Bool),
+        SchemaWireShape::U8 => quote!(NetworkWireShape::U8),
+        SchemaWireShape::U16 => quote!(NetworkWireShape::U16),
+        SchemaWireShape::U32 => quote!(NetworkWireShape::U32),
+        SchemaWireShape::U64 => quote!(NetworkWireShape::U64),
+        SchemaWireShape::F32 => quote!(NetworkWireShape::F32),
+        SchemaWireShape::F64 => quote!(NetworkWireShape::F64),
+        SchemaWireShape::HalfF32 => quote!(NetworkWireShape::HalfF32),
+        SchemaWireShape::VlqU32 => quote!(NetworkWireShape::VlqU32),
+        SchemaWireShape::Vec2 => quote!(NetworkWireShape::Vec2),
+        SchemaWireShape::Vec3 => quote!(NetworkWireShape::Vec3),
+        SchemaWireShape::Vec4 => quote!(NetworkWireShape::Vec4),
+        SchemaWireShape::Quat => quote!(NetworkWireShape::Quat),
+        SchemaWireShape::QuatCompNorm => quote!(NetworkWireShape::QuatCompNorm),
+        SchemaWireShape::Mat3 => quote!(NetworkWireShape::Mat3),
+        SchemaWireShape::Affine3 => quote!(NetworkWireShape::Affine3),
+        SchemaWireShape::Aabb2d => quote!(NetworkWireShape::Aabb2d),
+        SchemaWireShape::Aabb3d => quote!(NetworkWireShape::Aabb3d),
+        SchemaWireShape::EntityRef => quote!(NetworkWireShape::EntityRef),
+        SchemaWireShape::FixedBytes(len) => quote!(NetworkWireShape::FixedBytes(#len)),
+        SchemaWireShape::String => quote!(NetworkWireShape::String),
     }
 }
 
@@ -2413,12 +2403,12 @@ mod tests {
         assert!(
             descriptor_output
                 .source
-                .contains("NetworkWireShape::FixedBytes6")
+                .contains("NetworkWireShape::FixedBytes(6")
         );
         assert!(
             descriptor_output
                 .source
-                .contains("NetworkWireShape::FixedBytes16")
+                .contains("NetworkWireShape::FixedBytes(16")
         );
 
         let state_output =
@@ -2659,6 +2649,11 @@ mod tests {
                     "name": "Extents",
                     "nativeType": "AZ::Vector2",
                     "confidence": "message-unmarshal-call"
+                }, {
+                    "index": 3,
+                    "name": "Bounds",
+                    "nativeType": "AZ::Bounds",
+                    "confidence": "message-unmarshal-call"
                 }]
             }],
             "fieldRegistrationFunctions": []
@@ -2668,7 +2663,7 @@ mod tests {
         let descriptor_output =
             NetworkRustEmitter::emit_descriptors(&schema).expect("descriptor source");
 
-        assert_eq!(descriptor_output.report.field_wire_shape_count, 3);
+        assert_eq!(descriptor_output.report.field_wire_shape_count, 4);
         assert!(
             descriptor_output
                 .source
@@ -2684,6 +2679,11 @@ mod tests {
                 .source
                 .contains("wire_shape: Some(NetworkWireShape::Vec2)")
         );
+        assert!(
+            descriptor_output
+                .source
+                .contains("wire_shape: Some(NetworkWireShape::Aabb2d)")
+        );
 
         let message_output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
@@ -2692,7 +2692,7 @@ mod tests {
         assert_eq!(message_output.report.blocked_message_count, 0);
         let plan = &message_output.report.message_generation_plans[0];
         assert_eq!(plan.missing_wire_shape_count, 0);
-        assert_eq!(plan.supported_field_count, 3);
+        assert_eq!(plan.supported_field_count, 4);
         assert_eq!(
             plan.fields[2].wire_shape_source.as_deref(),
             Some("native-type")
@@ -2704,6 +2704,11 @@ mod tests {
         );
         assert!(message_output.source.contains("pub elapsed: f32"));
         assert!(message_output.source.contains("pub extents: ::glam::Vec2"));
+        assert!(
+            message_output
+                .source
+                .contains("pub bounds: ::bevy_math::bounding::Aabb2d")
+        );
     }
 
     #[test]

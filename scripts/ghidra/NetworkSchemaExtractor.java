@@ -40,7 +40,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
 public class NetworkSchemaExtractor extends GhidraScript {
-    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260624-cache-pass";
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260625-readraw-message-pass";
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long QUEUE_REGISTRATION_HOOK_RVA = 0x61a95c0L;
@@ -50,6 +50,11 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private static final int FIELD_HANDLER_VTABLE_SLOTS = 14;
     private static final int FIELD_HANDLER_MARSHAL_SLOT = 5;
     private static final int FIELD_HANDLER_UNMARSHAL_SLOT = 6;
+    private static final int MESSAGE_HANDLER_VTABLE_SLOTS = 12;
+    private static final int MESSAGE_HANDLER_CREATE_INSTANCE_SLOT = 2;
+    private static final int MESSAGE_HANDLER_MARSHAL_SLOT = 4;
+    private static final int MESSAGE_HANDLER_UNMARSHAL_SLOT = 5;
+    private static final int MESSAGE_HANDLER_PROVIDER_SCAN_LIMIT = 512;
     private static final int TYPE_ID_PROVIDER_BYTES = 256;
     private static final int TYPE_NAME_PROVIDER_BYTES = 384;
     private static final int SOURCE_SIGNATURE_XREF_SCAN_BYTES = 0x40;
@@ -106,6 +111,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         new HashMap<>();
     private final Map<String, List<ParsedUnmarshalCall>> directTypeUnmarshalCallCache =
         new HashMap<>();
+    private final Map<String, List<ParsedReadRawCall>> readRawCallCache = new HashMap<>();
     private String cacheProgramKey;
     private DecompInterface decompiler;
 
@@ -156,7 +162,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 row.add("constructorMatches", constructorJson);
             }
             else {
-                MessageUnmarshalPlan messagePlan = recoverMessageUnmarshalPlan(entry);
+                MessageUnmarshalPlan messagePlan = recoverMessageUnmarshalPlan(entry, hookType);
                 if (messagePlan != null) {
                     row.add("messageUnmarshal", messagePlan.toJson());
                     if (!messagePlan.fields.isEmpty()) {
@@ -586,6 +592,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
             hook.registerThunk = hookFunction.getEntryPoint();
             hook.typeProvider = directTypeId.provider;
             hook.uuidSource = directTypeId.sourceAddress;
+            enrichHookMessageHandler(hook);
             return hook;
         }
 
@@ -615,6 +622,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         hook.registerThunk = registerThunk;
         hook.typeProvider = typeId.provider;
         hook.uuidSource = typeId.sourceAddress;
+        enrichHookMessageHandler(hook);
 
         String slotTypeName = registrationHookTypeNameFromSlot(helperTable, 3);
         if (isPlausibleTypeName(slotTypeName)) {
@@ -661,8 +669,82 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 hook.uuidSource = typeId.sourceAddress;
                 hook.typeDescriptor = typeDescriptor;
                 hook.slotTypeNameFunction = slotFunction.getEntryPoint();
+                enrichHookMessageHandler(hook);
                 return hook;
             }
+        }
+        return null;
+    }
+
+    private void enrichHookMessageHandler(HookTypeEvidence hook) {
+        if (hook == null || hook.typeProvider == null) {
+            return;
+        }
+        Address handlerVtable = recoverMessageHandlerVtable(hook.typeProvider);
+        if (handlerVtable == null) {
+            return;
+        }
+
+        hook.handlerVtable = handlerVtable;
+        hook.createInstance = messageHandlerSlot(handlerVtable, MESSAGE_HANDLER_CREATE_INSTANCE_SLOT);
+        hook.marshal = messageHandlerSlot(handlerVtable, MESSAGE_HANDLER_MARSHAL_SLOT);
+        hook.unmarshal = messageHandlerSlot(handlerVtable, MESSAGE_HANDLER_UNMARSHAL_SLOT);
+    }
+
+    private Address recoverMessageHandlerVtable(Address typeProvider) {
+        Function function = functionAtOrContaining(typeProvider);
+        if (function == null) {
+            return null;
+        }
+
+        int count = 0;
+        for (Instruction instruction : functionInstructions(function)) {
+            if (count++ >= MESSAGE_HANDLER_PROVIDER_SCAN_LIMIT) {
+                break;
+            }
+
+            Address candidate = referencedAddress(instruction);
+            if (isMessageHandlerVtable(candidate)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private boolean isMessageHandlerVtable(Address address) {
+        if (!isProgramAddress(address)) {
+            return false;
+        }
+
+        Address createInstance = messageHandlerSlot(address, MESSAGE_HANDLER_CREATE_INSTANCE_SLOT);
+        Address marshal = messageHandlerSlot(address, MESSAGE_HANDLER_MARSHAL_SLOT);
+        Address unmarshal = messageHandlerSlot(address, MESSAGE_HANDLER_UNMARSHAL_SLOT);
+        if (!isExecutableAddress(createInstance) ||
+            !isExecutableAddress(marshal) ||
+            !isExecutableAddress(unmarshal)) {
+            return false;
+        }
+
+        Function unmarshalFunction = functionAtOrContaining(unmarshal);
+        return looksLikeMessageUnmarshalHelper(decompileC(unmarshalFunction));
+    }
+
+    private Address messageHandlerSlot(Address vtable, int slot) {
+        if (!isProgramAddress(vtable)) {
+            return null;
+        }
+        return resolvedCodeTarget(readPointer(vtable.add(slot * 8L)));
+    }
+
+    private String messageHandlerSlotName(int slot) {
+        if (slot == MESSAGE_HANDLER_CREATE_INSTANCE_SLOT) {
+            return "CreateInstance";
+        }
+        if (slot == MESSAGE_HANDLER_MARSHAL_SLOT) {
+            return "Marshal";
+        }
+        if (slot == MESSAGE_HANDLER_UNMARSHAL_SLOT) {
+            return "Unmarshal";
         }
         return null;
     }
@@ -786,8 +868,16 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return result;
     }
 
-    private MessageUnmarshalPlan recoverMessageUnmarshalPlan(RegistryEntry entry) {
-        Address unmarshalAddress = parseCapturedAddress(entry.unmarshal);
+    private MessageUnmarshalPlan recoverMessageUnmarshalPlan(
+        RegistryEntry entry,
+        HookTypeEvidence hookType) {
+
+        Address createInstanceAddress = firstAddress(
+            parseCapturedAddress(entry.createInstance),
+            hookType == null ? null : hookType.createInstance);
+        Address unmarshalAddress = firstAddress(
+            parseCapturedAddress(entry.unmarshal),
+            hookType == null ? null : hookType.unmarshal);
         Function wrapper = functionAtOrContaining(unmarshalAddress);
         if (wrapper == null) {
             return null;
@@ -796,15 +886,23 @@ public class NetworkSchemaExtractor extends GhidraScript {
         MessageHelperCall helperCall = findMessageHelperCall(wrapper);
         String wrapperText = decompileC(wrapper);
         if (helperCall == null) {
-            return recoverFallbackMessageUnmarshalPlan(entry, wrapper, wrapperText);
+            return recoverFallbackMessageUnmarshalPlan(
+                entry,
+                wrapper,
+                wrapperText,
+                createInstanceAddress);
         }
 
         ParsedUnmarshalFieldsCall parsedCall = parseUnmarshalFieldsCall(wrapperText);
         if (parsedCall == null) {
-            return recoverFallbackMessageUnmarshalPlan(entry, wrapper, wrapperText);
+            return recoverFallbackMessageUnmarshalPlan(
+                entry,
+                wrapper,
+                wrapperText,
+                createInstanceAddress);
         }
 
-        MessageUnmarshalPlan plan = newMessageUnmarshalPlan(entry, wrapper);
+        MessageUnmarshalPlan plan = newMessageUnmarshalPlan(entry, wrapper, createInstanceAddress);
         plan.templateTypes.addAll(parsedCall.templateTypes);
         plan.helperCallsite = helperCall.callsite;
         plan.helper = helperCall.target;
@@ -853,15 +951,19 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return plan;
     }
 
-    private MessageUnmarshalPlan newMessageUnmarshalPlan(RegistryEntry entry, Function wrapper) {
+    private MessageUnmarshalPlan newMessageUnmarshalPlan(
+        RegistryEntry entry,
+        Function wrapper,
+        Address createInstance) {
+
         MessageUnmarshalPlan plan = new MessageUnmarshalPlan();
         plan.wrapper = wrapper.getEntryPoint();
         plan.wrapperName = fullFunctionName(wrapper);
-        Long instanceSize = recoverCreateInstanceSize(entry);
+        Long instanceSize = recoverCreateInstanceSize(createInstance);
         if (instanceSize != null) {
             plan.instanceSize = instanceSize;
             plan.instanceSizeSource = "create-instance-operator-new";
-            plan.createInstance = parseCapturedAddress(entry.createInstance);
+            plan.createInstance = createInstance;
         }
         return plan;
     }
@@ -869,13 +971,15 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private MessageUnmarshalPlan recoverFallbackMessageUnmarshalPlan(
         RegistryEntry entry,
         Function wrapper,
-        String wrapperText) {
+        String wrapperText,
+        Address createInstanceAddress) {
 
         if (wrapperText == null) {
             return null;
         }
 
-        MessageUnmarshalPlan plan = newMessageUnmarshalPlan(entry, wrapper);
+        MessageUnmarshalPlan plan =
+            newMessageUnmarshalPlan(entry, wrapper, createInstanceAddress);
         recoverInlineMessageFields(plan, wrapper.getEntryPoint(), wrapperText);
         recoverHelperArgumentMessageFields(plan, wrapper, wrapperText);
         if (plan.fields.isEmpty()) {
@@ -915,6 +1019,18 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 storage,
                 call.templateType,
                 "message-unmarshal-inline-direct-type-call",
+                call.textIndex);
+        }
+        for (ParsedReadRawCall call : parseReadRawCalls(text)) {
+            if (!isLikelyMessageStorage(call.storageExpression)) {
+                continue;
+            }
+            addRawMessageField(
+                plan,
+                callsite,
+                call.storageExpression,
+                call.byteLength,
+                "message-unmarshal-read-raw",
                 call.textIndex);
         }
     }
@@ -1087,6 +1203,17 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 call.templateType,
                 "message-unmarshal-helper-direct-type-call");
         }
+        for (ParsedReadRawCall call : parseReadRawCalls(helperText)) {
+            String helperParam =
+                helperParameterFromExpression(call.storageExpression, fieldsByHelperParam);
+            if (helperParam == null) {
+                continue;
+            }
+            refineMessageFieldRawLength(
+                fieldsByHelperParam.get(helperParam),
+                call.byteLength,
+                "message-unmarshal-helper-read-raw");
+        }
     }
 
     private FieldCall addMessageField(
@@ -1144,6 +1271,25 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return field;
     }
 
+    private FieldCall addRawMessageField(
+        MessageUnmarshalPlan plan,
+        Address callsite,
+        String storageExpression,
+        int byteLength,
+        String confidence,
+        int recoveryOrder) {
+
+        FieldCall field = addMessageField(
+            plan,
+            callsite,
+            storageExpression,
+            null,
+            confidence,
+            recoveryOrder);
+        refineMessageFieldRawLength(field, byteLength, confidence);
+        return field;
+    }
+
     private void sortMessageFieldsByRecoveryOrder(MessageUnmarshalPlan plan) {
         plan.fields.sort((left, right) -> {
             int order = Integer.compare(left.recoveryOrder, right.recoveryOrder);
@@ -1181,6 +1327,25 @@ public class NetworkSchemaExtractor extends GhidraScript {
             field.nativeType = "composite";
             field.wireShape = null;
             field.wireShapeSource = null;
+        }
+    }
+
+    private void refineMessageFieldRawLength(
+        FieldCall field,
+        int byteLength,
+        String source) {
+
+        if (field == null || byteLength <= 0) {
+            return;
+        }
+        field.rawByteLength = byteLength;
+        String shape = wireShapeFromRawByteLength(byteLength);
+        if (shape == null) {
+            return;
+        }
+        if (field.wireShape == null || field.wireShape.equals(shape)) {
+            field.wireShape = shape;
+            field.wireShapeSource = source;
         }
     }
 
@@ -1585,8 +1750,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return value != null && value.matches("field_\\d+");
     }
 
-    private Long recoverCreateInstanceSize(RegistryEntry entry) {
-        Address createInstance = parseCapturedAddress(entry.createInstance);
+    private Long recoverCreateInstanceSize(Address createInstance) {
         String key = createInstance == null ? null : addressCacheKey("create-instance-size", createInstance);
         if (key != null && createInstanceSizeCache.containsKey(key)) {
             return createInstanceSizeCache.get(key);
@@ -1992,6 +2156,73 @@ public class NetworkSchemaExtractor extends GhidraScript {
             search = argsEnd + 1;
         }
         return cacheParsedUnmarshalCalls(directTypeUnmarshalCallCache, text, result);
+    }
+
+    private List<ParsedReadRawCall> parseReadRawCalls(String text) {
+        ArrayList<ParsedReadRawCall> result = new ArrayList<>();
+        if (text == null) {
+            return result;
+        }
+        List<ParsedReadRawCall> cached = readRawCallCache.get(text);
+        if (cached != null) {
+            return cached;
+        }
+        int search = 0;
+        while (search < text.length()) {
+            int nameIndex = text.indexOf("ReadRaw", search);
+            if (nameIndex < 0) {
+                break;
+            }
+            int afterName = nameIndex + "ReadRaw".length();
+            if (afterName < text.length()) {
+                char next = text.charAt(afterName);
+                if (Character.isLetterOrDigit(next) || next == '_') {
+                    search = afterName;
+                    continue;
+                }
+            }
+            int argsStart = text.indexOf('(', afterName);
+            int argsEnd = matchingIndex(text, argsStart, '(', ')');
+            if (argsStart < 0 || argsEnd < 0) {
+                search = afterName;
+                continue;
+            }
+
+            List<String> args = splitTopLevel(text.substring(argsStart + 1, argsEnd));
+            int storageIndex = args.size() >= 4 ? 1 : 0;
+            int lengthIndex = storageIndex + 1;
+            if (lengthIndex < args.size()) {
+                Integer byteLength = readRawByteLength(args.get(lengthIndex));
+                if (byteLength != null && byteLength > 0) {
+                    result.add(new ParsedReadRawCall(
+                        args.get(storageIndex),
+                        byteLength,
+                        nameIndex));
+                }
+            }
+            search = argsEnd + 1;
+        }
+
+        List<ParsedReadRawCall> parsed =
+            Collections.unmodifiableList(new ArrayList<>(result));
+        readRawCallCache.put(text, parsed);
+        return parsed;
+    }
+
+    private Integer readRawByteLength(String expression) {
+        if (expression == null) {
+            return null;
+        }
+        String value = normalizedExpression(expression);
+        if (value == null) {
+            return null;
+        }
+        value = value.replaceAll("(?i)[uUlL]+$", "");
+        Long parsed = parseIntegerLiteral(value);
+        if (parsed == null || parsed <= 0 || parsed > Integer.MAX_VALUE) {
+            return null;
+        }
+        return parsed.intValue();
     }
 
     private int directCallOwnerStart(String text, int unmarshalIndex) {
@@ -2485,6 +2716,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if ("AZ::Transform".equals(nativeType)) {
             return "affine3";
         }
+        if ("AZ::Bounds".equals(nativeType)) {
+            return "aabb2d";
+        }
         if ("AZ::Aabb".equals(nativeType)) {
             return "aabb3d";
         }
@@ -2493,6 +2727,16 @@ public class NetworkSchemaExtractor extends GhidraScript {
         }
         if ("AZStd::string".equals(nativeType)) {
             return "string";
+        }
+        return null;
+    }
+
+    private String wireShapeFromRawByteLength(int byteLength) {
+        if (byteLength == 1) {
+            return "u8";
+        }
+        if (byteLength > 1) {
+            return "fixed-bytes-" + byteLength;
         }
         return null;
     }
@@ -3778,6 +4022,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return null;
     }
 
+    private Address firstAddress(Address left, Address right) {
+        return left != null ? left : right;
+    }
+
     private Address readPointer(Address address) {
         if (!isProgramAddress(address)) {
             return null;
@@ -4100,6 +4348,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         String sourceTypeName;
         String storageExpression;
         Long storageOffset;
+        Integer rawByteLength;
         String wireShape;
         String wireShapeSource;
         String confidence;
@@ -4123,6 +4372,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
             add(object, "storageExpression", storageExpression);
             if (storageOffset != null) {
                 object.addProperty("storageOffset", "0x" + Long.toHexString(storageOffset));
+            }
+            if (rawByteLength != null) {
+                object.addProperty("rawByteLength", rawByteLength);
             }
             add(object, "wireShape", wireShape);
             add(object, "wireShapeSource", wireShapeSource);
@@ -4291,6 +4543,18 @@ public class NetworkSchemaExtractor extends GhidraScript {
         String expression;
     }
 
+    private static final class ParsedReadRawCall {
+        final String storageExpression;
+        final int byteLength;
+        final int textIndex;
+
+        ParsedReadRawCall(String storageExpression, int byteLength, int textIndex) {
+            this.storageExpression = storageExpression;
+            this.byteLength = byteLength;
+            this.textIndex = textIndex;
+        }
+    }
+
     private final class FieldHandlerVtable {
         final Address address;
         int fieldCount;
@@ -4383,6 +4647,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
         Address uuidSource;
         Address typeDescriptor;
         Address slotTypeNameFunction;
+        Address handlerVtable;
+        Address createInstance;
+        Address marshal;
+        Address unmarshal;
         String typeId;
         String typeName;
         String slotTypeName;
@@ -4399,6 +4667,26 @@ public class NetworkSchemaExtractor extends GhidraScript {
             add(object, "uuidSource", formatAddress(uuidSource));
             add(object, "typeDescriptor", formatAddress(typeDescriptor));
             add(object, "slotTypeNameFunction", formatAddress(slotTypeNameFunction));
+            if (handlerVtable != null) {
+                JsonObject handler = new JsonObject();
+                add(handler, "handlerVtable", formatAddress(handlerVtable));
+                add(handler, "CreateInstance", formatAddress(createInstance));
+                add(handler, "Marshal", formatAddress(marshal));
+                add(handler, "Unmarshal", formatAddress(unmarshal));
+                JsonArray slots = new JsonArray();
+                for (int slot = 0; slot < MESSAGE_HANDLER_VTABLE_SLOTS; slot++) {
+                    Address target = readPointer(handlerVtable.add(slot * 8L));
+                    if (target == null || !isExecutableAddress(target)) {
+                        break;
+                    }
+                    slots.add(virtualFunctionSlot(
+                        slot,
+                        messageHandlerSlotName(slot),
+                        target));
+                }
+                handler.add("slots", slots);
+                object.add("messageHandler", handler);
+            }
             return object;
         }
 

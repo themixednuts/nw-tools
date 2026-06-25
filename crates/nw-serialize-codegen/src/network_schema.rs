@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
@@ -218,6 +218,8 @@ pub struct NetworkField {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_offset: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_byte_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub wire_shape: Option<NetworkWireShape>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wire_shape_source: Option<String>,
@@ -273,8 +275,7 @@ pub struct NetworkFieldHandlerVtable {
     pub evidence: Vec<NetworkEvidence>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkWireShape {
     Bool,
     U8,
@@ -292,13 +293,65 @@ pub enum NetworkWireShape {
     QuatCompNorm,
     Mat3,
     Affine3,
+    Aabb2d,
     Aabb3d,
     EntityRef,
-    #[serde(rename = "fixed-bytes-6", alias = "fixed-bytes6")]
-    FixedBytes6,
-    #[serde(rename = "fixed-bytes-16", alias = "fixed-bytes16")]
-    FixedBytes16,
+    FixedBytes(u16),
     String,
+}
+
+impl NetworkWireShape {
+    fn as_static_str(self) -> Option<&'static str> {
+        match self {
+            Self::Bool => Some("bool"),
+            Self::U8 => Some("u8"),
+            Self::U16 => Some("u16"),
+            Self::U32 => Some("u32"),
+            Self::U64 => Some("u64"),
+            Self::F32 => Some("f32"),
+            Self::F64 => Some("f64"),
+            Self::HalfF32 => Some("half-f32"),
+            Self::VlqU32 => Some("vlq-u32"),
+            Self::Vec2 => Some("vec2"),
+            Self::Vec3 => Some("vec3"),
+            Self::Vec4 => Some("vec4"),
+            Self::Quat => Some("quat"),
+            Self::QuatCompNorm => Some("quat-comp-norm"),
+            Self::Mat3 => Some("mat3"),
+            Self::Affine3 => Some("affine3"),
+            Self::Aabb2d => Some("aabb2d"),
+            Self::Aabb3d => Some("aabb3d"),
+            Self::EntityRef => Some("entity-ref"),
+            Self::FixedBytes(_) => None,
+            Self::String => Some("string"),
+        }
+    }
+}
+
+impl Serialize for NetworkWireShape {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if let Some(value) = self.as_static_str() {
+            return serializer.serialize_str(value);
+        }
+        match self {
+            Self::FixedBytes(len) => serializer.serialize_str(&format!("fixed-bytes-{len}")),
+            _ => unreachable!("non-static wire shape handled above"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkWireShape {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_network_wire_shape(&value)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown wire shape `{value}`")))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -801,6 +854,7 @@ fn network_field_from_message_signature(
         rust_type: signature.rust_type.clone(),
         storage_expression: None,
         storage_offset: None,
+        raw_byte_length: None,
         wire_shape: signature.wire_shape,
         wire_shape_source: signature.wire_shape.map(|_| source),
         callsite: None,
@@ -1220,6 +1274,7 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
         rust_type: string(field, "rustType"),
         storage_expression: string(field, "storageExpression"),
         storage_offset: hex_or_decimal_u32(field, "storageOffset"),
+        raw_byte_length: u32_value(field, "rawByteLength"),
         wire_shape: wire_shape(field, "wireShape"),
         wire_shape_source: string(field, "wireShapeSource"),
         callsite: string(field, "callsite"),
@@ -1424,7 +1479,11 @@ fn stable_address(object: &Map<String, Value>, key: &str) -> Option<String> {
 }
 
 fn wire_shape(object: &Map<String, Value>, key: &str) -> Option<NetworkWireShape> {
-    match string_ref(object, key)? {
+    string_ref(object, key).and_then(parse_network_wire_shape)
+}
+
+fn parse_network_wire_shape(value: &str) -> Option<NetworkWireShape> {
+    match value {
         "bool" => Some(NetworkWireShape::Bool),
         "u8" => Some(NetworkWireShape::U8),
         "u16" => Some(NetworkWireShape::U16),
@@ -1441,13 +1500,21 @@ fn wire_shape(object: &Map<String, Value>, key: &str) -> Option<NetworkWireShape
         "quat-comp-norm" => Some(NetworkWireShape::QuatCompNorm),
         "mat3" => Some(NetworkWireShape::Mat3),
         "affine3" => Some(NetworkWireShape::Affine3),
+        "aabb2d" => Some(NetworkWireShape::Aabb2d),
         "aabb3d" => Some(NetworkWireShape::Aabb3d),
         "entity-ref" => Some(NetworkWireShape::EntityRef),
-        "fixed-bytes-6" => Some(NetworkWireShape::FixedBytes6),
-        "fixed-bytes-16" => Some(NetworkWireShape::FixedBytes16),
         "string" => Some(NetworkWireShape::String),
-        _ => None,
+        value => fixed_bytes_wire_shape(value),
     }
+}
+
+fn fixed_bytes_wire_shape(value: &str) -> Option<NetworkWireShape> {
+    let len = value
+        .strip_prefix("fixed-bytes-")
+        .or_else(|| value.strip_prefix("fixed-bytes"))?
+        .parse::<u16>()
+        .ok()?;
+    (len > 0).then_some(NetworkWireShape::FixedBytes(len))
 }
 
 fn u32_value(object: &Map<String, Value>, key: &str) -> Option<u32> {
@@ -1774,11 +1841,11 @@ mod tests {
 
         assert_eq!(
             schema.field_handler_vtables[0].wire_shape,
-            Some(NetworkWireShape::FixedBytes6)
+            Some(NetworkWireShape::FixedBytes(6))
         );
         assert_eq!(
             schema.field_handler_vtables[1].wire_shape,
-            Some(NetworkWireShape::FixedBytes16)
+            Some(NetworkWireShape::FixedBytes(16))
         );
     }
 
