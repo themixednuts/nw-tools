@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use humansize::{DECIMAL, format_size};
+use nw_pak::PakMmapReader;
 
 use crate::jobs::{JobArgs, RunCtx};
 use crate::support::{PakSet, collect_matching, ensure_parent, guard_existing, write_guarded};
@@ -113,7 +114,8 @@ impl Dds {
             }
             let store = Arc::new(crate::tui::TextureStore::Fs);
             let source = root.display().to_string();
-            return Ok(crate::tui::dds_browser(items, store, source, ctx.runner.clone())?);
+            let catalog = Arc::new(crate::tui::DdsCatalog::ready(items));
+            return Ok(crate::tui::dds_browser(catalog, store, source, ctx.runner.clone())?);
         }
 
         let paths = collect_matching(&root, |path| nw_dds::is_dds_path(path))?;
@@ -175,9 +177,7 @@ impl Dds {
     /// TTY this opens the interactive browser; piped, it prints a texture listing
     /// so the install default is still useful in scripts.
     fn browse_install(&self, ctx: &RunCtx) -> Result<()> {
-        let install = nw_locator::Install::locate().context(
-            "no New World install found; pass a path, or run `nw-tools locate` to check detection",
-        )?;
+        let install = crate::source::locate()?;
         let paks = PakSet::collect(install.assets(), Vec::new())?;
         if paks.paths().is_empty() {
             Report::new("dds")
@@ -186,23 +186,28 @@ impl Dds {
                 .print();
             return Ok(());
         }
-        let (items, index) = dds_browser_items_pak(ctx, paks.paths())?;
+        let source = install.assets().display().to_string();
+
+        // Interactive: open the browser immediately and discover textures on a
+        // background thread, so the UI is live from the first frame and the scan
+        // never blocks it.
+        if crate::tui::interactive() {
+            let (catalog, index) = spawn_dds_discovery(ctx, paks.paths());
+            let store = Arc::new(crate::tui::TextureStore::Pak(index));
+            return Ok(crate::tui::dds_browser(catalog, store, source, ctx.runner.clone())?);
+        }
+
+        // Piped: produce the full listing up front.
+        let (items, _) = dds_browser_items_pak(ctx, paks.paths())?;
         if items.is_empty() {
             Report::new("dds")
-                .stat("install", install.assets().display())
+                .stat("install", &source)
                 .note("no DDS textures found in the install paks")
                 .print();
             return Ok(());
         }
-
-        if crate::tui::interactive() {
-            let store = Arc::new(crate::tui::TextureStore::Pak(index));
-            let source = install.assets().display().to_string();
-            return Ok(crate::tui::dds_browser(items, store, source, ctx.runner.clone())?);
-        }
-
         let mut report = Report::new("dds")
-            .stat("install", install.assets().display())
+            .stat("install", &source)
             .stat("textures", items.len())
             .stat("shown", items.len().min(self.show));
         let mut table = Table::new(["Texture", "Mips"]).right([1]);
@@ -219,6 +224,59 @@ impl Dds {
         report.print();
         Ok(())
     }
+}
+
+/// Spawn background discovery of the install's DDS textures: each pak is scanned
+/// on a worker thread, its DDS entries indexed and grouped into logical textures,
+/// and appended to the returned [`crate::tui::DdsCatalog`] as it goes. Returns
+/// immediately so the browser can open before any pak is read.
+fn spawn_dds_discovery(
+    ctx: &RunCtx,
+    pak_paths: &[PathBuf],
+) -> (Arc<crate::tui::DdsCatalog>, crate::tui::SharedIndex) {
+    let catalog = Arc::new(crate::tui::DdsCatalog::new(pak_paths.len()));
+    let index = crate::tui::shared_index();
+    let runner = ctx.runner.clone();
+    let paths = pak_paths.to_vec();
+    let (catalog_bg, index_bg) = (catalog.clone(), index.clone());
+    std::thread::spawn(move || {
+        runner.map(&paths, |path| discover_pak(path, &catalog_bg, &index_bg));
+    });
+    (catalog, index)
+}
+
+/// Scan one pak for DDS entries: index them (so the browser can read them) and
+/// group them into logical textures appended to `catalog`. Runs on a worker.
+fn discover_pak(path: &Path, catalog: &crate::tui::DdsCatalog, index: &crate::tui::SharedIndex) {
+    if let Ok(reader) = PakMmapReader::open(path) {
+        let reader = Arc::new(reader);
+        let mut classified = Vec::new();
+        let mut entries = Vec::new();
+        for entry in reader.entries() {
+            let name = entry.name().to_ascii_lowercase();
+            if nw_dds::is_dds_path(&name) {
+                if let Some(part) = nw_dds::SplitPart::from_path(&name) {
+                    classified.push((part, name.clone()));
+                }
+                entries.push((name, entry.index()));
+            }
+        }
+        // Index the entries before publishing the items, so every grouped texture
+        // is immediately readable.
+        if !entries.is_empty() {
+            let mut index = index.write().unwrap_or_else(|error| error.into_inner());
+            for (name, entry) in entries {
+                index.insert(name, (reader.clone(), entry));
+            }
+        }
+        // Group within the pak — a texture's header and split mips ship together.
+        if let Ok(items) = group_dds_items(classified, |header| header.to_string())
+            && !items.is_empty()
+        {
+            catalog.extend(items);
+        }
+    }
+    catalog.mark_pak_done();
 }
 
 /// Decode a single DDS texture (assembling its split sidecars) to an RGBA image,

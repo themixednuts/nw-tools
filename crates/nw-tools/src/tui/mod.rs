@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use app::View;
 use datasheet::DatasheetView;
-pub use dds::{AlphaSurface, DdsItem, PakIndex, TextureStore};
+pub use dds::{AlphaSurface, DdsCatalog, DdsItem, PakIndex, SharedIndex, TextureStore, shared_index};
 use dds::DdsBrowser;
 use nw_jobs::JobRunner;
 use ratatui_image::picker::Picker;
@@ -90,7 +90,7 @@ pub fn datasheet_browser(source: Arc<dyn SheetSource>, locale_mode: u8) -> io::R
 /// preview. `runner` drives the background decode fan-out. Prints the selected
 /// texture's path to stdout if the user presses Enter.
 pub fn dds_browser(
-    items: Vec<DdsItem>,
+    catalog: Arc<DdsCatalog>,
     store: Arc<TextureStore>,
     source: String,
     runner: JobRunner,
@@ -99,7 +99,7 @@ pub fn dds_browser(
     // The graphics-protocol query must run after the alternate screen is up but
     // before the event loop reads keys; fall back to half-blocks if unsupported.
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    let mut view = DdsBrowser::new(items, store, source, runner, picker, theme::caps());
+    let mut view = DdsBrowser::new(catalog, store, source, runner, picker, theme::caps());
     session.run(&mut view)?;
     drop(session);
     if let Some(line) = view.take_result() {

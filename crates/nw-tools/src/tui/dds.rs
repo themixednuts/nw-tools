@@ -5,8 +5,9 @@
 //! responsive from the first frame and scrolling pre-warms a window of neighbours.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use image::{DynamicImage, RgbaImage};
@@ -34,12 +35,23 @@ const PREVIEW_MAX: u32 = 1024;
 /// O(1) map lookup + decompress — no per-read scan over every pak.
 pub type PakIndex = HashMap<String, (Arc<nw_pak::PakMmapReader>, usize)>;
 
+/// The pak index shared between background discovery (which fills it) and the
+/// [`TextureStore`] (which reads it), so the browser can open before discovery
+/// finishes.
+pub type SharedIndex = Arc<RwLock<PakIndex>>;
+
+/// A fresh, empty [`SharedIndex`].
+#[must_use]
+pub fn shared_index() -> SharedIndex {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
 /// Where texture bytes are read from: the filesystem, or straight out of the
 /// install's pak archives (by entry index — no catalog needed, the install ships
 /// none).
 pub enum TextureStore {
     Fs,
-    Pak(PakIndex),
+    Pak(SharedIndex),
 }
 
 impl TextureStore {
@@ -47,6 +59,7 @@ impl TextureStore {
         match self {
             TextureStore::Fs => std::fs::read(key).map_err(|error| error.to_string()),
             TextureStore::Pak(index) => {
+                let index = index.read().unwrap_or_else(|error| error.into_inner());
                 let (reader, entry) = index
                     .get(key)
                     .ok_or_else(|| format!("not found in paks: {key}"))?;
@@ -56,6 +69,71 @@ impl TextureStore {
                     .map_err(|error| error.to_string())
             }
         }
+    }
+}
+
+/// Textures discovered so far, filled by a background discovery thread while the
+/// browser is already on screen. The browser ingests new items on each tick, so
+/// scanning the install never blocks the UI.
+pub struct DdsCatalog {
+    items: Mutex<Vec<DdsItem>>,
+    scanned: AtomicUsize,
+    total: usize,
+}
+
+impl DdsCatalog {
+    /// A catalog awaiting discovery of `total` paks.
+    #[must_use]
+    pub fn new(total: usize) -> Self {
+        Self {
+            items: Mutex::new(Vec::new()),
+            scanned: AtomicUsize::new(0),
+            total,
+        }
+    }
+
+    /// A fully-discovered catalog from a known item set — nothing scans in the
+    /// background (used by the filesystem browser, where discovery is cheap).
+    #[must_use]
+    pub fn ready(items: Vec<DdsItem>) -> Self {
+        Self {
+            items: Mutex::new(items),
+            scanned: AtomicUsize::new(0),
+            total: 0,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<DdsItem>> {
+        self.items.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Append a discovered pak's grouped textures.
+    pub fn extend(&self, items: Vec<DdsItem>) {
+        self.lock().extend(items);
+    }
+
+    /// Record that one more pak finished scanning.
+    pub fn mark_pak_done(&self) {
+        self.scanned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Clone the items appended since the caller already had `have` of them.
+    fn tail_from(&self, have: usize) -> Vec<DdsItem> {
+        let items = self.lock();
+        items.get(have..).map(<[DdsItem]>::to_vec).unwrap_or_default()
+    }
+
+    fn item(&self, index: usize) -> Option<DdsItem> {
+        self.lock().get(index).cloned()
+    }
+
+    /// Paks scanned so far, and the total.
+    fn progress(&self) -> (usize, usize) {
+        (self.scanned.load(Ordering::Relaxed), self.total)
+    }
+
+    fn is_scanning(&self) -> bool {
+        self.scanned.load(Ordering::Relaxed) < self.total
     }
 }
 
@@ -123,7 +201,10 @@ struct Node {
 
 pub struct DdsBrowser {
     caps: Caps,
-    items: Arc<Vec<DdsItem>>,
+    /// Local snapshot of the discovered textures, grown from `catalog` on tick.
+    items: Vec<DdsItem>,
+    /// Background discovery, ingested progressively so the UI never blocks on it.
+    catalog: Arc<DdsCatalog>,
     /// Where the textures came from — shown in the header (e.g. the install path).
     source: String,
     // Tree arena.
@@ -156,35 +237,25 @@ pub struct DdsBrowser {
 
 impl DdsBrowser {
     pub fn new(
-        items: Vec<DdsItem>,
+        catalog: Arc<DdsCatalog>,
         store: Arc<TextureStore>,
         source: String,
         runner: JobRunner,
         picker: Picker,
         caps: Caps,
     ) -> Self {
-        let items = Arc::new(items);
-        let (nodes, roots) = build_tree(&items);
-        let mut file_nodes = Vec::new();
-        let mut haystacks = Vec::new();
-        for (id, node) in nodes.iter().enumerate() {
-            if let Some(item) = node.item {
-                file_nodes.push(id);
-                haystacks.push(items[item].label.to_ascii_lowercase());
-            }
-        }
-        let file_count = file_nodes.len();
         let cache: Arc<Cache> = Arc::new(Mutex::new(HashMap::new()));
-        let tx = spawn_decoder(items.clone(), store, runner, cache.clone());
+        let tx = spawn_decoder(catalog.clone(), store, runner, cache.clone());
         let mut browser = Self {
             caps,
-            items,
+            items: Vec::new(),
+            catalog,
             source,
-            nodes,
-            roots,
-            file_nodes,
-            haystacks,
-            file_count,
+            nodes: Vec::new(),
+            roots: Vec::new(),
+            file_nodes: Vec::new(),
+            haystacks: Vec::new(),
+            file_count: 0,
             visible: Vec::new(),
             selected: 0,
             offset: 0,
@@ -199,9 +270,38 @@ impl DdsBrowser {
             status: None,
             result: None,
         };
-        browser.rebuild();
+        browser.ingest();
         browser.request();
         browser
+    }
+
+    /// Pull any textures discovered since the last ingest into the local snapshot
+    /// and rebuild the tree. Returns whether anything new arrived.
+    fn ingest(&mut self) -> bool {
+        let fresh = self.catalog.tail_from(self.items.len());
+        if fresh.is_empty() {
+            return false;
+        }
+        self.items.extend(fresh);
+        self.rebuild_tree();
+        self.rebuild();
+        true
+    }
+
+    /// Rebuild the directory tree and fuzzy haystacks from the current snapshot.
+    fn rebuild_tree(&mut self) {
+        let (nodes, roots) = build_tree(&self.items);
+        self.file_nodes.clear();
+        self.haystacks.clear();
+        for (id, node) in nodes.iter().enumerate() {
+            if let Some(item) = node.item {
+                self.file_nodes.push(id);
+                self.haystacks.push(self.items[item].label.to_ascii_lowercase());
+            }
+        }
+        self.file_count = self.file_nodes.len();
+        self.nodes = nodes;
+        self.roots = roots;
     }
 
     /// Recompute the visible rows from the tree and the active filter, keeping the
@@ -484,7 +584,11 @@ impl View for DdsBrowser {
     }
 
     fn ticking(&self) -> bool {
-        // Keep redrawing while the focused texture is still decoding.
+        // Keep ticking while discovery is still streaming in textures, or while the
+        // focused texture is still decoding.
+        if self.catalog.is_scanning() {
+            return true;
+        }
         match self.current_item() {
             Some(item) => {
                 let cache = self.cache.lock().unwrap();
@@ -494,6 +598,12 @@ impl View for DdsBrowser {
                 )
             }
             None => false,
+        }
+    }
+
+    fn tick(&mut self) {
+        if self.ingest() {
+            self.request();
         }
     }
 
@@ -615,6 +725,10 @@ impl DdsBrowser {
             Span::styled("textures ", theme::dim()),
             Span::styled(self.file_count.to_string(), theme::bold()),
         ];
+        let (scanned, total) = self.catalog.progress();
+        if scanned < total {
+            spans.push(Span::styled(format!("  scanning {scanned}/{total}"), theme::accent()));
+        }
         if !self.filter.is_empty() {
             spans.push(Span::styled(glyphs.sep.to_string(), theme::dim()));
             spans.push(Span::styled("matched ", theme::dim()));
@@ -944,19 +1058,19 @@ fn centered_image_rect(
 }
 
 fn spawn_decoder(
-    items: Arc<Vec<DdsItem>>,
+    catalog: Arc<DdsCatalog>,
     store: Arc<TextureStore>,
     runner: JobRunner,
     cache: Arc<Cache>,
 ) -> SyncSender<Vec<usize>> {
     let (tx, rx) = sync_channel::<Vec<usize>>(8);
-    std::thread::spawn(move || decode_loop(&rx, &items, &store, &runner, &cache));
+    std::thread::spawn(move || decode_loop(&rx, &catalog, &store, &runner, &cache));
     tx
 }
 
 fn decode_loop(
     rx: &Receiver<Vec<usize>>,
-    items: &[DdsItem],
+    catalog: &DdsCatalog,
     store: &TextureStore,
     runner: &JobRunner,
     cache: &Cache,
@@ -966,13 +1080,17 @@ fn decode_loop(
         while let Ok(next) = rx.try_recv() {
             want = next;
         }
-        let todo: Vec<usize> = {
+        // Claim the not-yet-decoded items and snapshot them out of the (growing)
+        // catalog, so the decode runs without holding any lock.
+        let todo: Vec<(usize, DdsItem)> = {
             let mut guard = cache.lock().unwrap();
             let mut todo = Vec::new();
             for index in want {
-                if index < items.len() && !guard.contains_key(&index) {
+                if !guard.contains_key(&index)
+                    && let Some(item) = catalog.item(index)
+                {
                     guard.insert(index, Slot::Pending);
-                    todo.push(index);
+                    todo.push((index, item));
                 }
             }
             todo
@@ -981,7 +1099,7 @@ fn decode_loop(
             continue;
         }
         // Fan the decode out across the shared job pool.
-        let decoded = runner.map(&todo, |&index| (index, decode_item(store, &items[index])));
+        let decoded = runner.map(&todo, |(index, item)| (*index, decode_item(store, item)));
         let mut guard = cache.lock().unwrap();
         for (index, result) in decoded {
             let slot = match result {
