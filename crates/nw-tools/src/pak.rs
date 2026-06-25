@@ -11,7 +11,7 @@ use nw_pak::{Compression, PakMmapReader, azcs, crypak, oodle, shape};
 use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
 use crate::progress::Job;
-use crate::support::{AssetRootArg, GlobSet, PakSet, PathSelector, ScanIssues, collect_paks};
+use crate::support::{AssetRootArg, GlobSet, PakSet, PathSelector, ScanIssues};
 use crate::ui::{Cell, Report, Table, theme};
 
 #[derive(Debug, Subcommand)]
@@ -251,7 +251,7 @@ struct EntryRow {
     pak: String,
     method: String,
     family: String,
-    azcs: String,
+    azcs: bool,
     size: String,
     name: String,
 }
@@ -285,8 +285,7 @@ struct PakExtractRow {
 impl List {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let root = self.root.resolve()?;
-        let paks = collect_paks(&root)?;
+        let paks = PakSet::collect(self.root.resolve()?, Vec::new())?;
         let filter = ListFilter {
             method: self.method,
             family: self.family,
@@ -296,9 +295,9 @@ impl List {
         let cancel = ctx.cancel.clone();
         let batch = ctx.map_results(
             "pak list",
-            &paks,
-            |pak| nw_filesystem::display_relative(&root, pak),
-            |pak, progress| scan_entries(&root, pak, &filter, &cancel, &progress),
+            paks.paths(),
+            |pak| paks.relative(pak),
+            |pak, progress| scan_entries(&paks, pak, &filter, &cancel, &progress),
         );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
@@ -318,7 +317,7 @@ impl List {
         }
 
         let stats = vec![
-            ("archives".to_string(), paks.len().to_string()),
+            ("archives".to_string(), paks.paths().len().to_string()),
             ("matched".to_string(), total_rows.to_string()),
             ("shown".to_string(), rows.len().to_string()),
         ];
@@ -328,7 +327,7 @@ impl List {
                 Cell::path(row.pak),
                 Cell::method(row.method),
                 Cell::text(row.family),
-                Cell::yes_no(row.azcs == "yes"),
+                Cell::yes_no(row.azcs),
                 Cell::size(row.size),
                 Cell::path(row.name),
             ]);
@@ -580,7 +579,7 @@ impl Update {
 }
 
 fn scan_entries(
-    root: &Path,
+    paks: &PakSet,
     pak_path: &Path,
     filter: &ListFilter,
     cancel: &CancellationToken,
@@ -588,7 +587,7 @@ fn scan_entries(
 ) -> Result<Vec<EntryRow>> {
     let pak = PakMmapReader::open(pak_path)?;
     progress.set_len(pak.len());
-    let pak_name = nw_filesystem::display_relative(root, pak_path);
+    let pak_name = paks.relative(pak_path);
     let mut rows = Vec::new();
 
     for entry in pak.entries() {
@@ -620,16 +619,16 @@ fn scan_entries(
             if !azcs::is_azcs(&wrapped) {
                 continue;
             }
-            "yes"
+            true
         } else {
-            "-"
+            false
         };
 
         rows.push(EntryRow {
             pak: pak_name.clone(),
             method: entry.compression().to_string(),
             family: family.to_string(),
-            azcs: azcs.to_string(),
+            azcs,
             size: format_size(entry.uncompressed_size(), DECIMAL),
             name: entry.name().to_string(),
         });
