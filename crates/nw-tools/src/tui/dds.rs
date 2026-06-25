@@ -31,14 +31,15 @@ const HILITE: ratatui::style::Color = ratatui::style::Color::Indexed(238);
 /// Largest preview decoded off-thread; the widget downscales further to the pane.
 const PREVIEW_MAX: u32 = 1024;
 
-/// Grid thumbnail geometry, in terminal cells: the image area per cell, plus a
-/// label row and gaps. A texture cell is `CELL_W × CELL_H`.
-const THUMB_W: u16 = 24;
-const THUMB_H: u16 = 11;
-const CELL_W: u16 = THUMB_W + 2;
-const CELL_H: u16 = THUMB_H + 2;
-/// Thumbnails decode to at most this many pixels on the long edge before encoding.
-const THUMB_PX: u32 = 320;
+/// Target grid cell width in terminal cells; columns are chosen so cells land
+/// near this, clamped to [`MIN_COLS`, `MAX_COLS`]. The thumbnail fills the cell
+/// minus a 1-cell gutter, with a label row beneath.
+const TARGET_CELL_W: u16 = 40;
+const MIN_COLS: u16 = 2;
+const MAX_COLS: u16 = 6;
+/// Thumbnails decode to at most this many pixels on the long edge before encoding,
+/// which is plenty to fill a grid cell crisply.
+const THUMB_PX: u32 = 512;
 
 /// Resolves a texture key (a pak virtual path) to the archive entry that holds
 /// it. Built during discovery from the readers it already opened, so reads are an
@@ -235,6 +236,9 @@ pub struct DdsBrowser {
     offset: usize,
     /// Grid columns from the last render (for 2-D navigation between frames).
     cols: usize,
+    /// Thumbnail image size (cells) from the last render; thumbnails are decoded to
+    /// fill it, so a terminal resize re-decodes at the new size.
+    cell: Size,
     filter: String,
     filtering: bool,
     /// Whether the single-texture focus view is open (else the grid).
@@ -285,6 +289,7 @@ impl DdsBrowser {
             selected: 0,
             offset: 0,
             cols: 1,
+            cell: Size::new(0, 0),
             filter: String::new(),
             filtering: false,
             focused: false,
@@ -396,11 +401,7 @@ impl DdsBrowser {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .retain(|item, _| keep.contains(item));
-        let _ = self.thumb_tx.try_send(ThumbReq {
-            items: window.clone(),
-            size: Size::new(THUMB_W, THUMB_H),
-            cancel,
-        });
+        let _ = self.thumb_tx.try_send(ThumbReq { items: window.clone(), size: self.cell, cancel });
         self.requested = window;
     }
 
@@ -668,13 +669,31 @@ impl DdsBrowser {
             self.center_text(frame, area, message, theme::dim());
             return;
         }
-        if area.width < CELL_W || area.height < CELL_H {
+
+        // Choose columns to land cells near the target width, then size the
+        // thumbnail to fill the cell (minus a gutter) with a label row beneath.
+        // Cells are ~twice as tall as wide in pixels, so a square-ish thumbnail
+        // uses about half as many rows as columns.
+        let cols = (area.width / TARGET_CELL_W).clamp(MIN_COLS, MAX_COLS).min(area.width.max(1));
+        let cell_w = area.width / cols;
+        let thumb_w = cell_w.saturating_sub(2).max(1);
+        let thumb_h = (thumb_w / 2).clamp(5, 24);
+        let cell_h = thumb_h + 2;
+        if cell_w == 0 || cell_h > area.height {
             return;
         }
-        let cols = (area.width / CELL_W).max(1) as usize;
+        let cols = cols as usize;
         self.cols = cols;
-        let rows_visible = (area.height / CELL_H).max(1) as usize;
 
+        // Re-decode at the new size if the cell geometry changed (terminal resize).
+        let cell = Size::new(thumb_w, thumb_h);
+        if cell != self.cell {
+            self.cell = cell;
+            self.thumbs.lock().unwrap_or_else(|error| error.into_inner()).clear();
+            self.requested.clear();
+        }
+
+        let rows_visible = (area.height / cell_h).max(1) as usize;
         // Vertical scroll: keep the selected row in view.
         let sel_row = self.selected / cols;
         if sel_row < self.offset {
@@ -694,18 +713,18 @@ impl DdsBrowser {
             let grid_index = start + slot;
             let col = (slot % cols) as u16;
             let row = (slot / cols) as u16;
-            let cell_x = area.x + col * CELL_W;
-            let cell_y = area.y + row * CELL_H;
-            let img_area = Rect { x: cell_x + 1, y: cell_y, width: THUMB_W, height: THUMB_H };
+            let cell_x = area.x + col * cell_w;
+            let cell_y = area.y + row * cell_h;
+            let img_area = Rect { x: cell_x + 1, y: cell_y, width: thumb_w, height: thumb_h };
 
             match thumbs.get(&item) {
                 Some(Thumb::Ready(protocol)) => {
                     let size = protocol.size();
-                    let w = size.width.min(THUMB_W);
-                    let h = size.height.min(THUMB_H);
+                    let w = size.width.min(thumb_w);
+                    let h = size.height.min(thumb_h);
                     let rect = Rect {
-                        x: img_area.x + (THUMB_W - w) / 2,
-                        y: img_area.y + (THUMB_H - h) / 2,
+                        x: img_area.x + (thumb_w - w) / 2,
+                        y: img_area.y + (thumb_h - h) / 2,
                         width: w,
                         height: h,
                     };
@@ -717,8 +736,8 @@ impl DdsBrowser {
 
             // Filename label under the thumbnail; highlight the selected cell.
             let name = self.items[item].label.rsplit('/').next().unwrap_or(&self.items[item].label);
-            let label = theme::fit_end(name, THUMB_W as usize, glyphs.ellipsis);
-            let label_y = cell_y + THUMB_H;
+            let label = theme::fit_end(name, thumb_w as usize, glyphs.ellipsis);
+            let label_y = cell_y + thumb_h;
             let selected = grid_index == self.selected;
             let style = if selected {
                 theme::accent().add_modifier(Modifier::BOLD)
@@ -727,10 +746,10 @@ impl DdsBrowser {
             };
             frame
                 .buffer_mut()
-                .set_line(img_area.x, label_y, &Line::from(Span::styled(label, style)), THUMB_W);
+                .set_line(img_area.x, label_y, &Line::from(Span::styled(label, style)), thumb_w);
             if selected && self.caps.color {
                 let buf = frame.buffer_mut();
-                for x in img_area.x..img_area.x + THUMB_W {
+                for x in img_area.x..img_area.x + thumb_w {
                     buf[(x, label_y)].set_bg(HILITE);
                 }
             }
@@ -832,8 +851,11 @@ impl DdsBrowser {
                     let dynamic = DynamicImage::ImageRgba8(level.image.clone());
                     self.protocol = Some((item, surface_index, mip, self.picker.new_resize_protocol(dynamic)));
                 }
+                // Anchor the display rect to the full (largest) mip so cycling mip
+                // levels keeps the image the same size and centered — not jumping.
                 let font = self.picker.font_size();
-                let rect = centered_image_rect(image_area, level.width, level.height, font);
+                let base = surface.mips.first().unwrap_or(level);
+                let rect = centered_image_rect(image_area, base.width, base.height, font);
                 if let Some((_, _, _, protocol)) = self.protocol.as_mut() {
                     frame.render_stateful_widget(StatefulImage::default(), rect, protocol);
                 }
