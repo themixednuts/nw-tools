@@ -678,17 +678,13 @@ fn render_identity_attr(
         .filter(|name| name.as_str() != item.rust_name)
         .map(|name| LitStr::new(name, Span::call_site()));
     let attr = match (identity.kind, name_override) {
-        (RustTypeIdentityKind::AzTypeInfo, Some(name)) => quote! {
-            #[az_type_info(name = #name)]
-            #[az_type_info(#type_id)]
-        },
+        (RustTypeIdentityKind::AzTypeInfo, Some(name)) => {
+            quote!(#[az_type_info(name = #name, #type_id)])
+        }
         (RustTypeIdentityKind::AzTypeInfo, None) => quote!(#[az_type_info(#type_id)]),
         (RustTypeIdentityKind::AzRtti, Some(name)) => {
             let bases = az_rtti_base_attr(item)?;
-            quote! {
-                #[az_rtti(name = #name)]
-                #[az_rtti(#type_id #bases)]
-            }
+            quote!(#[az_rtti(name = #name, #type_id #bases)])
         }
         (RustTypeIdentityKind::AzRtti, None) => {
             let bases = az_rtti_base_attr(item)?;
@@ -2418,7 +2414,8 @@ mod tests {
         assert!(source.contains("bevy::prelude::Reflect"));
         assert!(source.contains("#[az_rtti("));
         assert!(source.contains("name = \"Example::HealthComponent\""));
-        assert!(source.contains("#[az_rtti(\"BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB\", Component)]"));
+        assert!(source.contains("\"BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB\""));
+        assert!(!source.contains("base ="));
         assert!(!source.contains("AzTypeRegistration"));
         assert!(source.contains("HealthComponent"));
         assert!(source.contains("#[reflect(Component)]"));
