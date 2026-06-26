@@ -282,20 +282,15 @@ fn attr_type_id(attr: &Attribute, const_type_ids: &BTreeMap<String, Uuid>) -> Op
         .parse_args_with(Punctuated::<Expr, syn::Token![,]>::parse_terminated)
         .ok()?;
 
-    for (index, arg) in args.into_iter().enumerate() {
+    for arg in args {
         match &arg {
-            Expr::Assign(assign)
-                if expr_assign_lhs_is(&assign.left, "uuid")
-                    || expr_assign_lhs_is(&assign.left, "type_id") =>
-            {
-                return uuid_from_identity_expr(&assign.right, const_type_ids);
-            }
-            _ if index == 0 => {
+            Expr::Assign(assign) if expr_assign_lhs_is(&assign.left, "name") => {}
+            Expr::Assign(_) => {}
+            _ => {
                 if let Some(type_id) = uuid_from_identity_expr(&arg, const_type_ids) {
                     return Some(type_id);
                 }
             }
-            _ => {}
         }
     }
 
