@@ -93,6 +93,42 @@ pub struct NetworkMessageSignatureMergeReport {
     pub wire_shape_filled_count: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkFieldOverrideMergeReport {
+    pub source_field_count: usize,
+    pub matched_field_count: usize,
+    pub unmatched_type_count: usize,
+    pub ambiguous_type_count: usize,
+    pub unmatched_field_count: usize,
+    pub ambiguous_field_count: usize,
+    pub native_type_updated_count: usize,
+    pub rust_type_updated_count: usize,
+    pub wire_shape_updated_count: usize,
+    pub confidence_updated_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkFieldOverrideFile {
+    pub fields: Vec<NetworkFieldOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkFieldOverride {
+    pub type_id: Option<Uuid>,
+    pub type_index: Option<u32>,
+    pub type_name: Option<String>,
+    pub field_index: Option<u32>,
+    pub field: Option<String>,
+    pub native_type: Option<String>,
+    pub rust_type: Option<String>,
+    pub wire_shape: Option<NetworkWireShape>,
+    pub wire_shape_source: Option<String>,
+    pub confidence: Option<NetworkConfidence>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkMessageSignature {
@@ -132,6 +168,7 @@ pub enum NetworkSchemaSourceKind {
     TypeIndex,
     SerializeContext,
     MessageSignatures,
+    FieldOverrides,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,7 +313,7 @@ pub struct NetworkFieldHandlerVtable {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkWireShape {
+pub enum NetworkWireScalarShape {
     Bool,
     U8,
     U16,
@@ -286,6 +323,8 @@ pub enum NetworkWireShape {
     F64,
     HalfF32,
     VlqU32,
+    VlqU64,
+    SequenceNumber,
     Vec2,
     Vec3,
     Vec4,
@@ -300,7 +339,41 @@ pub enum NetworkWireShape {
     String,
 }
 
-impl NetworkWireShape {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkReplicatedContainerWireShape {
+    pub key: NetworkWireScalarShape,
+    pub value: NetworkWireScalarShape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkWireShape {
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    F64,
+    HalfF32,
+    VlqU32,
+    VlqU64,
+    SequenceNumber,
+    Vec2,
+    Vec3,
+    Vec4,
+    Quat,
+    QuatCompNorm,
+    Mat3,
+    Affine3,
+    Aabb2d,
+    Aabb3d,
+    EntityRef,
+    FixedBytes(u16),
+    String,
+    ReplicatedContainer(NetworkReplicatedContainerWireShape),
+}
+
+impl NetworkWireScalarShape {
     fn as_static_str(self) -> Option<&'static str> {
         match self {
             Self::Bool => Some("bool"),
@@ -312,6 +385,8 @@ impl NetworkWireShape {
             Self::F64 => Some("f64"),
             Self::HalfF32 => Some("half-f32"),
             Self::VlqU32 => Some("vlq-u32"),
+            Self::VlqU64 => Some("vlq-u64"),
+            Self::SequenceNumber => Some("sequence-number"),
             Self::Vec2 => Some("vec2"),
             Self::Vec3 => Some("vec3"),
             Self::Vec4 => Some("vec4"),
@@ -323,6 +398,81 @@ impl NetworkWireShape {
             Self::Aabb3d => Some("aabb3d"),
             Self::EntityRef => Some("entity-ref"),
             Self::FixedBytes(_) => None,
+            Self::String => Some("string"),
+        }
+    }
+
+    fn wire_string(self) -> String {
+        self.as_static_str().map_or_else(
+            || match self {
+                Self::FixedBytes(len) => format!("fixed-bytes-{len}"),
+                _ => unreachable!("non-static wire scalar handled above"),
+            },
+            ToOwned::to_owned,
+        )
+    }
+}
+
+impl From<NetworkWireScalarShape> for NetworkWireShape {
+    fn from(value: NetworkWireScalarShape) -> Self {
+        match value {
+            NetworkWireScalarShape::Bool => Self::Bool,
+            NetworkWireScalarShape::U8 => Self::U8,
+            NetworkWireScalarShape::U16 => Self::U16,
+            NetworkWireScalarShape::U32 => Self::U32,
+            NetworkWireScalarShape::U64 => Self::U64,
+            NetworkWireScalarShape::F32 => Self::F32,
+            NetworkWireScalarShape::F64 => Self::F64,
+            NetworkWireScalarShape::HalfF32 => Self::HalfF32,
+            NetworkWireScalarShape::VlqU32 => Self::VlqU32,
+            NetworkWireScalarShape::VlqU64 => Self::VlqU64,
+            NetworkWireScalarShape::SequenceNumber => Self::SequenceNumber,
+            NetworkWireScalarShape::Vec2 => Self::Vec2,
+            NetworkWireScalarShape::Vec3 => Self::Vec3,
+            NetworkWireScalarShape::Vec4 => Self::Vec4,
+            NetworkWireScalarShape::Quat => Self::Quat,
+            NetworkWireScalarShape::QuatCompNorm => Self::QuatCompNorm,
+            NetworkWireScalarShape::Mat3 => Self::Mat3,
+            NetworkWireScalarShape::Affine3 => Self::Affine3,
+            NetworkWireScalarShape::Aabb2d => Self::Aabb2d,
+            NetworkWireScalarShape::Aabb3d => Self::Aabb3d,
+            NetworkWireScalarShape::EntityRef => Self::EntityRef,
+            NetworkWireScalarShape::FixedBytes(len) => Self::FixedBytes(len),
+            NetworkWireScalarShape::String => Self::String,
+        }
+    }
+}
+
+impl NetworkWireShape {
+    #[must_use]
+    pub const fn is_replicated_container(self) -> bool {
+        matches!(self, Self::ReplicatedContainer(_))
+    }
+
+    fn as_static_str(self) -> Option<&'static str> {
+        match self {
+            Self::Bool => Some("bool"),
+            Self::U8 => Some("u8"),
+            Self::U16 => Some("u16"),
+            Self::U32 => Some("u32"),
+            Self::U64 => Some("u64"),
+            Self::F32 => Some("f32"),
+            Self::F64 => Some("f64"),
+            Self::HalfF32 => Some("half-f32"),
+            Self::VlqU32 => Some("vlq-u32"),
+            Self::VlqU64 => Some("vlq-u64"),
+            Self::SequenceNumber => Some("sequence-number"),
+            Self::Vec2 => Some("vec2"),
+            Self::Vec3 => Some("vec3"),
+            Self::Vec4 => Some("vec4"),
+            Self::Quat => Some("quat"),
+            Self::QuatCompNorm => Some("quat-comp-norm"),
+            Self::Mat3 => Some("mat3"),
+            Self::Affine3 => Some("affine3"),
+            Self::Aabb2d => Some("aabb2d"),
+            Self::Aabb3d => Some("aabb3d"),
+            Self::EntityRef => Some("entity-ref"),
+            Self::FixedBytes(_) | Self::ReplicatedContainer(_) => None,
             Self::String => Some("string"),
         }
     }
@@ -338,6 +488,11 @@ impl Serialize for NetworkWireShape {
         }
         match self {
             Self::FixedBytes(len) => serializer.serialize_str(&format!("fixed-bytes-{len}")),
+            Self::ReplicatedContainer(container) => serializer.serialize_str(&format!(
+                "replicated-container<{},{}>",
+                container.key.wire_string(),
+                container.value.wire_string()
+            )),
             _ => unreachable!("non-static wire shape handled above"),
         }
     }
@@ -443,6 +598,7 @@ pub enum NetworkEvidenceKind {
     FieldRegistrationFunction,
     MessageUnmarshal,
     MessageSource,
+    FieldOverride,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -739,6 +895,99 @@ impl NetworkSchema {
         report
     }
 
+    pub fn merge_field_overrides(
+        &mut self,
+        overrides: &NetworkFieldOverrideFile,
+        source_path: Option<String>,
+    ) -> NetworkFieldOverrideMergeReport {
+        let mut report = NetworkFieldOverrideMergeReport {
+            source_field_count: overrides.fields.len(),
+            ..NetworkFieldOverrideMergeReport::default()
+        };
+
+        for field_override in &overrides.fields {
+            let type_candidates = field_override_type_candidates(&self.types, field_override);
+            let [network_type_index] = type_candidates.as_slice() else {
+                if type_candidates.is_empty() {
+                    report.unmatched_type_count += 1;
+                } else {
+                    report.ambiguous_type_count += 1;
+                }
+                continue;
+            };
+
+            let network_type = &mut self.types[*network_type_index];
+            let field_candidates = field_override_field_candidates(network_type, field_override);
+            let [field_index] = field_candidates.as_slice() else {
+                if field_candidates.is_empty() {
+                    report.unmatched_field_count += 1;
+                } else {
+                    report.ambiguous_field_count += 1;
+                }
+                continue;
+            };
+
+            let source = source_path
+                .clone()
+                .unwrap_or_else(|| "fieldOverrides".to_owned());
+            let field = &mut network_type.fields[*field_index];
+            if let Some(native_type) = field_override.native_type.as_ref()
+                && field.native_type.as_deref() != Some(native_type.as_str())
+            {
+                field.native_type = Some(native_type.clone());
+                report.native_type_updated_count += 1;
+            }
+            if let Some(rust_type) = field_override.rust_type.as_ref()
+                && field.rust_type.as_deref() != Some(rust_type.as_str())
+            {
+                field.rust_type = Some(rust_type.clone());
+                report.rust_type_updated_count += 1;
+            }
+            if let Some(wire_shape) = field_override.wire_shape
+                && field.wire_shape != Some(wire_shape)
+            {
+                field.wire_shape = Some(wire_shape);
+                field.wire_shape_source = Some(
+                    field_override
+                        .wire_shape_source
+                        .clone()
+                        .unwrap_or_else(|| source.clone()),
+                );
+                report.wire_shape_updated_count += 1;
+            } else if let Some(wire_shape_source) = field_override.wire_shape_source.as_ref()
+                && field.wire_shape.is_some()
+                && field.wire_shape_source.as_deref() != Some(wire_shape_source.as_str())
+            {
+                field.wire_shape_source = Some(wire_shape_source.clone());
+                report.wire_shape_updated_count += 1;
+            }
+            if let Some(confidence) = field_override.confidence
+                && field.confidence != confidence
+            {
+                field.confidence = confidence;
+                report.confidence_updated_count += 1;
+            }
+            field.evidence.push(NetworkEvidence {
+                kind: NetworkEvidenceKind::FieldOverride,
+                source: source.clone(),
+                address: None,
+                detail: Some(field_override_detail(field_override)),
+                confidence: field_override.confidence.unwrap_or(NetworkConfidence::High),
+            });
+            report.matched_field_count += 1;
+        }
+
+        self.sources.push(NetworkSchemaSource {
+            kind: NetworkSchemaSourceKind::FieldOverrides,
+            path: source_path,
+            schema: None,
+            program: None,
+            image_base: None,
+        });
+        self.summary = self.build_summary();
+        report
+    }
+
     #[must_use]
     pub fn build_summary(&self) -> NetworkSchemaSummary {
         let register_field_count = self
@@ -861,6 +1110,97 @@ fn network_field_from_message_signature(
         confidence: NetworkConfidence::High,
         evidence,
     }
+}
+
+fn field_override_type_candidates(
+    types: &[NetworkType],
+    field_override: &NetworkFieldOverride,
+) -> Vec<usize> {
+    if field_override.type_id.is_none()
+        && field_override.type_index.is_none()
+        && field_override.type_name.is_none()
+    {
+        return Vec::new();
+    }
+
+    types
+        .iter()
+        .enumerate()
+        .filter_map(|(index, network_type)| {
+            field_override_matches_type(network_type, field_override).then_some(index)
+        })
+        .collect()
+}
+
+fn field_override_matches_type(
+    network_type: &NetworkType,
+    field_override: &NetworkFieldOverride,
+) -> bool {
+    field_override
+        .type_id
+        .is_none_or(|type_id| network_type.type_id == Some(type_id))
+        && field_override
+            .type_index
+            .is_none_or(|type_index| network_type.type_index == Some(type_index))
+        && field_override.type_name.as_deref().is_none_or(|type_name| {
+            network_type.name.as_deref() == Some(type_name)
+                || network_type.registration_type_name.as_deref() == Some(type_name)
+        })
+}
+
+fn field_override_field_candidates(
+    network_type: &NetworkType,
+    field_override: &NetworkFieldOverride,
+) -> Vec<usize> {
+    if field_override.field_index.is_none() && field_override.field.is_none() {
+        return Vec::new();
+    }
+
+    network_type
+        .fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            field_override_matches_field(field, field_override).then_some(index)
+        })
+        .collect()
+}
+
+fn field_override_matches_field(
+    field: &NetworkField,
+    field_override: &NetworkFieldOverride,
+) -> bool {
+    field_override
+        .field_index
+        .is_none_or(|field_index| field.index == Some(field_index))
+        && field_override
+            .field
+            .as_deref()
+            .is_none_or(|field_name| field.name.as_deref() == Some(field_name))
+}
+
+fn field_override_detail(field_override: &NetworkFieldOverride) -> String {
+    let type_part = field_override
+        .type_name
+        .as_deref()
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            field_override
+                .type_index
+                .map(|type_index| type_index.to_string())
+        })
+        .or_else(|| field_override.type_id.map(|type_id| type_id.to_string()))
+        .unwrap_or_else(|| "<unknown-type>".to_owned());
+    let field_part = field_override
+        .field
+        .clone()
+        .or_else(|| {
+            field_override
+                .field_index
+                .map(|field_index| field_index.to_string())
+        })
+        .unwrap_or_else(|| "<unknown-field>".to_owned());
+    format!("{type_part}.{field_part}")
 }
 
 fn serialize_items_by_name(
@@ -1525,38 +1865,60 @@ fn wire_shape(object: &Map<String, Value>, key: &str) -> Option<NetworkWireShape
 }
 
 fn parse_network_wire_shape(value: &str) -> Option<NetworkWireShape> {
+    if let Some(container) = parse_replicated_container_wire_shape(value) {
+        return Some(NetworkWireShape::ReplicatedContainer(container));
+    }
+    parse_network_wire_scalar_shape(value).map(Into::into)
+}
+
+fn parse_network_wire_scalar_shape(value: &str) -> Option<NetworkWireScalarShape> {
     match value {
-        "bool" => Some(NetworkWireShape::Bool),
-        "u8" => Some(NetworkWireShape::U8),
-        "u16" => Some(NetworkWireShape::U16),
-        "u32" => Some(NetworkWireShape::U32),
-        "u64" => Some(NetworkWireShape::U64),
-        "f32" => Some(NetworkWireShape::F32),
-        "f64" => Some(NetworkWireShape::F64),
-        "half-f32" => Some(NetworkWireShape::HalfF32),
-        "vlq-u32" => Some(NetworkWireShape::VlqU32),
-        "vec2" => Some(NetworkWireShape::Vec2),
-        "vec3" => Some(NetworkWireShape::Vec3),
-        "vec4" => Some(NetworkWireShape::Vec4),
-        "quat" => Some(NetworkWireShape::Quat),
-        "quat-comp-norm" => Some(NetworkWireShape::QuatCompNorm),
-        "mat3" => Some(NetworkWireShape::Mat3),
-        "affine3" => Some(NetworkWireShape::Affine3),
-        "aabb2d" => Some(NetworkWireShape::Aabb2d),
-        "aabb3d" => Some(NetworkWireShape::Aabb3d),
-        "entity-ref" => Some(NetworkWireShape::EntityRef),
-        "string" => Some(NetworkWireShape::String),
+        "bool" => Some(NetworkWireScalarShape::Bool),
+        "u8" => Some(NetworkWireScalarShape::U8),
+        "u16" => Some(NetworkWireScalarShape::U16),
+        "u32" => Some(NetworkWireScalarShape::U32),
+        "u64" => Some(NetworkWireScalarShape::U64),
+        "f32" => Some(NetworkWireScalarShape::F32),
+        "f64" => Some(NetworkWireScalarShape::F64),
+        "half-f32" => Some(NetworkWireScalarShape::HalfF32),
+        "vlq-u32" => Some(NetworkWireScalarShape::VlqU32),
+        "vlq-u64" => Some(NetworkWireScalarShape::VlqU64),
+        "sequence-number" => Some(NetworkWireScalarShape::SequenceNumber),
+        "vec2" => Some(NetworkWireScalarShape::Vec2),
+        "vec3" => Some(NetworkWireScalarShape::Vec3),
+        "vec4" => Some(NetworkWireScalarShape::Vec4),
+        "quat" => Some(NetworkWireScalarShape::Quat),
+        "quat-comp-norm" => Some(NetworkWireScalarShape::QuatCompNorm),
+        "mat3" => Some(NetworkWireScalarShape::Mat3),
+        "affine3" => Some(NetworkWireScalarShape::Affine3),
+        "aabb2d" => Some(NetworkWireScalarShape::Aabb2d),
+        "aabb3d" => Some(NetworkWireScalarShape::Aabb3d),
+        "entity-ref" => Some(NetworkWireScalarShape::EntityRef),
+        "string" => Some(NetworkWireScalarShape::String),
         value => fixed_bytes_wire_shape(value),
     }
 }
 
-fn fixed_bytes_wire_shape(value: &str) -> Option<NetworkWireShape> {
+fn fixed_bytes_wire_shape(value: &str) -> Option<NetworkWireScalarShape> {
     let len = value
         .strip_prefix("fixed-bytes-")
         .or_else(|| value.strip_prefix("fixed-bytes"))?
         .parse::<u16>()
         .ok()?;
-    (len > 0).then_some(NetworkWireShape::FixedBytes(len))
+    (len > 0).then_some(NetworkWireScalarShape::FixedBytes(len))
+}
+
+fn parse_replicated_container_wire_shape(
+    value: &str,
+) -> Option<NetworkReplicatedContainerWireShape> {
+    let inner = value
+        .strip_prefix("replicated-container<")?
+        .strip_suffix('>')?;
+    let (key, value) = inner.split_once(',')?;
+    Some(NetworkReplicatedContainerWireShape {
+        key: parse_network_wire_scalar_shape(key.trim())?,
+        value: parse_network_wire_scalar_shape(value.trim())?,
+    })
 }
 
 fn u32_value(object: &Map<String, Value>, key: &str) -> Option<u32> {
@@ -1888,6 +2250,59 @@ mod tests {
         assert_eq!(
             schema.field_handler_vtables[1].wire_shape,
             Some(NetworkWireShape::FixedBytes(16))
+        );
+    }
+
+    #[test]
+    fn parses_source_style_container_wire_shapes() {
+        let report = json!({
+            "registryEntries": [],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81b6eb8",
+                "fieldCount": 1,
+                "wireShape": "replicated-container<u32,vlq-u64>",
+                "wireShapeSource": "replicated-container-marshal-calls",
+                "slots": []
+            }, {
+                "address": "NewWorld+0x81b6ec0",
+                "fieldCount": 1,
+                "wireShape": "sequence-number",
+                "wireShapeSource": "marshal-call:sequence-number",
+                "slots": []
+            }, {
+                "address": "NewWorld+0x81b6ec8",
+                "fieldCount": 1,
+                "wireShape": "vlq-u64",
+                "wireShapeSource": "marshal-call:vlq-u64",
+                "slots": []
+            }]
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+
+        assert_eq!(
+            schema.field_handler_vtables[0].wire_shape,
+            Some(NetworkWireShape::ReplicatedContainer(
+                NetworkReplicatedContainerWireShape {
+                    key: NetworkWireScalarShape::U32,
+                    value: NetworkWireScalarShape::VlqU64,
+                }
+            ))
+        );
+        assert_eq!(
+            schema.field_handler_vtables[1].wire_shape,
+            Some(NetworkWireShape::SequenceNumber)
+        );
+        assert_eq!(
+            schema.field_handler_vtables[2].wire_shape,
+            Some(NetworkWireShape::VlqU64)
+        );
+
+        assert_eq!(
+            serde_json::to_value(schema.field_handler_vtables[0].wire_shape.unwrap()).unwrap(),
+            json!("replicated-container<u32,vlq-u64>")
         );
     }
 
@@ -2333,6 +2748,76 @@ mod tests {
         assert_eq!(field.rust_type.as_deref(), Some("::nw_network::Payload"));
         assert_eq!(field.confidence, NetworkConfidence::High);
         assert_eq!(field.evidence[0].kind, NetworkEvidenceKind::MessageSource);
+    }
+
+    #[test]
+    fn merges_field_overrides_with_source_style_container_types() {
+        let report = json!({
+            "registryEntries": [{
+                "uuid": "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+                "typeIndex": 3362,
+                "typeName": "Javelin::SlayerScriptReplicatedState",
+                "fields": [{
+                    "index": 3,
+                    "name": "spawnedEntityIdsBySpawnerId",
+                    "nativeType": "MB::ReplicatedMapFieldHandler<AZ::Crc32, AZ::EntityId>",
+                    "wireShape": "replicated-container<u32,u64>",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        });
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&report).expect("schema");
+        let overrides = NetworkFieldOverrideFile {
+            fields: vec![NetworkFieldOverride {
+                type_id: None,
+                type_index: Some(3362),
+                type_name: None,
+                field_index: Some(3),
+                field: Some("spawnedEntityIdsBySpawnerId".to_owned()),
+                native_type: Some("MB::ReplicatedMapFieldHandler<AZ::Crc32, AZ::EntityId>".to_owned()),
+                rust_type: Some("::nw_network::serialize::ReplicatedContainer<::std::collections::HashMap<::nw_network::Crc32, ::nw_network::EntityId>, { ::nw_network::serialize::WIRE_VEC_CAP }, ::nw_network::serialize::DefaultMarshaler<::nw_network::Crc32>, ::nw_network::serialize::DefaultMarshaler<::nw_network::EntityId>>".to_owned()),
+                wire_shape: Some(NetworkWireShape::ReplicatedContainer(
+                    NetworkReplicatedContainerWireShape {
+                        key: NetworkWireScalarShape::U32,
+                        value: NetworkWireScalarShape::U64,
+                    },
+                )),
+                wire_shape_source: Some("field-overrides".to_owned()),
+                confidence: Some(NetworkConfidence::High),
+            }],
+        };
+
+        let merge = schema
+            .merge_field_overrides(&overrides, Some("network-field-overrides.json".to_owned()));
+
+        assert_eq!(merge.source_field_count, 1);
+        assert_eq!(merge.matched_field_count, 1);
+        assert_eq!(merge.unmatched_type_count, 0);
+        assert_eq!(merge.unmatched_field_count, 0);
+        assert_eq!(merge.rust_type_updated_count, 1);
+        assert_eq!(merge.wire_shape_updated_count, 1);
+        assert!(schema.sources.iter().any(|source| {
+            source.kind == NetworkSchemaSourceKind::FieldOverrides
+                && source.path.as_deref() == Some("network-field-overrides.json")
+        }));
+        let field = &schema.types[0].fields[0];
+        assert!(
+            field
+                .rust_type
+                .as_deref()
+                .is_some_and(|rust_type| rust_type.contains("ReplicatedContainer<"))
+        );
+        assert!(
+            !field
+                .rust_type
+                .as_deref()
+                .is_some_and(|rust_type| rust_type.contains("ReplicatedMap<"))
+        );
+        assert_eq!(
+            field.evidence.last().map(|evidence| evidence.kind),
+            Some(NetworkEvidenceKind::FieldOverride)
+        );
     }
 
     #[test]
