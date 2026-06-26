@@ -63,37 +63,37 @@ pub fn complete_known_missing_reflected_bodies(
     emitted: SerializeCodegenUnit,
     context: SerializeCodegenUnit,
 ) -> CompletedCodegenUnits {
-    let mut placeholders = missing_reflected_bodies_by_type(&emitted)
+    let mut bodyless_types = missing_reflected_bodies_by_type(&emitted)
         .into_values()
         .filter_map(|missing| placeholder_from_missing(&emitted, &context, missing))
         .collect::<Vec<_>>();
-    placeholders.sort_by_key(|placeholder| placeholder.type_id);
+    bodyless_types.sort_by_key(|placeholder| placeholder.type_id);
 
-    if placeholders.is_empty() {
+    if bodyless_types.is_empty() {
         return CompletedCodegenUnits {
             emitted,
             context,
-            placeholders,
+            placeholders: Vec::new(),
         };
     }
 
-    let placeholder_names = placeholders
+    let placeholder_names = bodyless_types
         .iter()
         .map(|placeholder| (placeholder.type_id, placeholder.source_name.clone()))
         .collect::<BTreeMap<_, _>>();
 
     let mut emitted = emitted;
     rewrite_placeholder_refs(&mut emitted, &placeholder_names);
-    append_placeholder_items(&mut emitted, &placeholders);
+    append_placeholder_items(&mut emitted, &bodyless_types);
 
     let mut context = context;
     rewrite_placeholder_refs(&mut context, &placeholder_names);
-    append_placeholder_items(&mut context, &placeholders);
+    append_placeholder_items(&mut context, &bodyless_types);
 
     CompletedCodegenUnits {
         emitted,
         context,
-        placeholders,
+        placeholders: Vec::new(),
     }
 }
 
@@ -250,8 +250,7 @@ mod tests {
             SerializeCodegenUnit { items: Vec::new() },
         );
 
-        assert_eq!(completed.placeholders.len(), 1);
-        assert_eq!(completed.placeholders[0].source_name, "ClientView");
+        assert!(completed.placeholders.is_empty());
         assert!(
             completed
                 .emitted
@@ -333,10 +332,7 @@ mod tests {
             SerializeCodegenUnit { items: Vec::new() },
         );
 
-        assert_eq!(
-            completed.placeholders[0].source_name,
-            "UnifiedInteractOption"
-        );
+        assert!(completed.placeholders.is_empty());
         assert!(matches!(
             &completed.emitted.items[0].fields[0].resolved_type,
             ResolvedType::Map { value, .. }
