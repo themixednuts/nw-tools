@@ -124,6 +124,8 @@ pub struct NetworkMessageGenerationPlanReport {
     pub missing_wire_shape_count: usize,
     #[serde(default)]
     pub missing_field_type_count: usize,
+    #[serde(default)]
+    pub placeholder_field_name_count: usize,
     pub unsupported_wire_shape_count: usize,
     pub low_confidence_field_count: usize,
     pub can_generate: bool,
@@ -1256,7 +1258,7 @@ fn message_generation_plan(
         .count();
     let placeholder_field_name_count = fields
         .iter()
-        .filter(|field| field.blocked_reason.as_deref() == Some("placeholder-field-name"))
+        .filter(|field| is_placeholder_report_field_name(field))
         .count();
     let blocked_reasons = message_blocked_reasons(
         network_type,
@@ -1267,7 +1269,6 @@ fn message_generation_plan(
         missing_semantic_type_count,
         invalid_field_metadata_count,
         low_confidence_field_count,
-        placeholder_field_name_count,
     );
 
     NetworkMessageGenerationPlanReport {
@@ -1278,6 +1279,7 @@ fn message_generation_plan(
         supported_field_count,
         missing_wire_shape_count,
         missing_field_type_count,
+        placeholder_field_name_count,
         unsupported_wire_shape_count,
         low_confidence_field_count,
         can_generate: blocked_reasons.is_empty(),
@@ -1424,10 +1426,6 @@ fn message_field_shape_report(
     report.blocked_reason =
         message_field_blocked_reason(field, report.wire_shape, rust_type.as_deref());
     report.supported = report.blocked_reason.is_none();
-    if is_placeholder_message_field_name(field) {
-        report.supported = false;
-        report.blocked_reason = Some("placeholder-field-name".to_owned());
-    }
     report
 }
 
@@ -1665,7 +1663,6 @@ fn message_blocked_reasons(
     missing_semantic_type_count: usize,
     invalid_field_metadata_count: usize,
     low_confidence_field_count: usize,
-    placeholder_field_name_count: usize,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
     if network_type.type_id.is_none() {
@@ -1703,11 +1700,6 @@ fn message_blocked_reasons(
     }
     if low_confidence_field_count != 0 {
         reasons.push(format!("low-confidence-field:{low_confidence_field_count}"));
-    }
-    if placeholder_field_name_count != 0 {
-        reasons.push(format!(
-            "placeholder-field-name:{placeholder_field_name_count}"
-        ));
     }
     reasons
 }
@@ -1779,11 +1771,11 @@ fn is_placeholder_field_name(value: &str) -> bool {
         .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
 }
 
-fn is_placeholder_message_field_name(field: &NetworkField) -> bool {
-    let Some(name) = field.name.as_deref() else {
-        return false;
-    };
-    is_placeholder_field_name(name) || is_native_type_field_name(name)
+fn is_placeholder_report_field_name(field: &NetworkStateFieldShapeReport) -> bool {
+    field
+        .field_name
+        .as_deref()
+        .is_some_and(|name| is_placeholder_field_name(name) || is_native_type_field_name(name))
 }
 
 fn is_native_type_field_name(name: &str) -> bool {
@@ -3067,25 +3059,28 @@ mod tests {
         let summary = &output.report.message_blocker_summary;
 
         assert_eq!(summary.total_plan_count, 3);
-        assert_eq!(summary.generatable_count, 1);
-        assert_eq!(summary.blocked_count, 2);
-        assert_eq!(summary.reason_buckets.len(), 2);
+        assert_eq!(summary.generatable_count, 2);
+        assert_eq!(summary.blocked_count, 1);
+        assert_eq!(summary.reason_buckets.len(), 1);
         assert_eq!(summary.reason_buckets[0].reason, "no-message-fields");
         assert_eq!(summary.reason_buckets[0].type_count, 1);
         assert_eq!(
             summary.reason_buckets[0].examples[0].type_name.as_deref(),
             Some("Example::EmptyMsg")
         );
-        assert_eq!(summary.reason_buckets[1].reason, "placeholder-field-name");
-        assert_eq!(summary.reason_buckets[1].type_count, 1);
-        assert_eq!(summary.reason_buckets[1].blocked_field_count, 1);
+        assert_eq!(summary.combination_buckets.len(), 1);
+        let placeholder_plan = output
+            .report
+            .message_generation_plans
+            .iter()
+            .find(|plan| plan.type_name.as_deref() == Some("Example::PlaceholderMsg"))
+            .expect("placeholder message plan");
+        assert_eq!(placeholder_plan.placeholder_field_name_count, 1);
+        assert!(placeholder_plan.can_generate);
         assert_eq!(
-            summary.reason_buckets[1].examples[0].blocked_fields[0]
-                .field_name
-                .as_deref(),
+            placeholder_plan.fields[0].field_name.as_deref(),
             Some("ActorRef")
         );
-        assert_eq!(summary.combination_buckets.len(), 2);
     }
 
     #[test]
@@ -3174,7 +3169,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_message_struct_generation_for_native_type_field_names() {
+    fn emits_message_structs_with_native_type_field_names() {
         let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
                 "uuid": "77D6477C-F057-4098-A644-58D36C551989",
@@ -3204,17 +3199,18 @@ mod tests {
         let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
         assert_eq!(output.report.message_generation_plan_count, 2);
-        assert_eq!(output.report.generatable_message_count, 0);
-        assert_eq!(output.report.blocked_message_count, 2);
+        assert_eq!(output.report.generatable_message_count, 2);
+        assert_eq!(output.report.blocked_message_count, 0);
         for plan in &output.report.message_generation_plans {
-            assert_eq!(plan.blocked_reasons, vec!["placeholder-field-name:1"]);
+            assert_eq!(plan.placeholder_field_name_count, 1);
+            assert!(plan.blocked_reasons.is_empty());
         }
-        assert!(!output.source.contains("pub struct ResizeAoiObservableMsg"));
-        assert!(!output.source.contains("pub struct SetTargetsMsg"));
+        assert!(output.source.contains("pub struct ResizeAoiObservableMsg"));
+        assert!(output.source.contains("pub struct SetTargetsMsg"));
     }
 
     #[test]
-    fn blocks_message_struct_generation_for_placeholder_field_names() {
+    fn emits_message_structs_with_placeholder_field_names() {
         let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
                 "uuid": "6A379FB8-0BDD-43A1-AB3E-9843D7BE8CD3",
@@ -3235,13 +3231,19 @@ mod tests {
         let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
         assert_eq!(output.report.message_generation_plan_count, 1);
-        assert_eq!(output.report.generatable_message_count, 0);
-        assert_eq!(output.report.blocked_message_count, 1);
+        assert_eq!(output.report.generatable_message_count, 1);
+        assert_eq!(output.report.blocked_message_count, 0);
         assert_eq!(
-            output.report.message_generation_plans[0].blocked_reasons,
-            vec!["placeholder-field-name:1"]
+            output.report.message_generation_plans[0].placeholder_field_name_count,
+            1
         );
-        assert!(!output.source.contains("pub struct PingMsg"));
+        assert!(
+            output.report.message_generation_plans[0]
+                .blocked_reasons
+                .is_empty()
+        );
+        assert!(output.source.contains("pub struct PingMsg"));
+        assert!(output.source.contains("pub field_0: u64"));
     }
 
     #[test]
