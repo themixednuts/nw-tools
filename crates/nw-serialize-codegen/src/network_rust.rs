@@ -9,13 +9,13 @@ use uuid::Uuid;
 use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind};
 use crate::naming::{rust_field_ident, rust_module_ident, rust_type_ident};
 use crate::network_schema::{
-    NetworkConfidence, NetworkField, NetworkReplicatedContainerWireShape, NetworkRootKind,
-    NetworkSchema, NetworkType, NetworkWireScalarShape as SchemaWireScalarShape,
+    NetworkConfidence, NetworkField, NetworkReplicatedContainerWireShape, NetworkSchema,
+    NetworkType, NetworkTypeCapability, NetworkWireScalarShape as SchemaWireScalarShape,
     NetworkWireShape as SchemaWireShape,
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v26";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v27";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -224,11 +224,11 @@ impl NetworkRustEmitter {
             use uuid::Uuid;
 
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-            pub enum NetworkTypeKind {
+            pub enum NetworkTypeCapability {
                 ReplicatedState,
-                Message,
-                FieldRegisteredType,
-                SupportType,
+                DirectMessage,
+                RegisteredFields,
+                SupportData,
             }
 
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,8 +318,7 @@ impl NetworkRustEmitter {
                 pub type_id: Uuid,
                 pub type_index: u32,
                 pub name: Option<&'static str>,
-                pub kind: NetworkTypeKind,
-                pub is_field_registered: bool,
+                pub capabilities: &'static [NetworkTypeCapability],
                 pub instance_size: Option<u32>,
                 pub fields: &'static [NetworkFieldDescriptor],
             }
@@ -332,6 +331,26 @@ impl NetworkRustEmitter {
             }
 
             impl NetworkTypeDescriptor {
+                #[must_use]
+                pub fn has_capability(&self, capability: NetworkTypeCapability) -> bool {
+                    self.capabilities.contains(&capability)
+                }
+
+                #[must_use]
+                pub fn is_direct_message(&self) -> bool {
+                    self.has_capability(NetworkTypeCapability::DirectMessage)
+                }
+
+                #[must_use]
+                pub fn is_replicated_state(&self) -> bool {
+                    self.has_capability(NetworkTypeCapability::ReplicatedState)
+                }
+
+                #[must_use]
+                pub fn has_registered_fields(&self) -> bool {
+                    self.has_capability(NetworkTypeCapability::RegisteredFields)
+                }
+
                 #[must_use]
                 pub fn field_by_index(&self, field_index: u32) -> Option<&NetworkFieldDescriptor> {
                     self.fields.iter().find(|field| field.index == field_index)
@@ -355,7 +374,7 @@ impl NetworkRustEmitter {
                 const TYPE_ID: Uuid;
                 const TYPE_INDEX: u32;
                 const NAME: &'static str;
-                const KIND: NetworkTypeKind;
+                const CAPABILITIES: &'static [NetworkTypeCapability];
 
                 #[must_use]
                 fn descriptor() -> &'static NetworkTypeDescriptor {
@@ -399,7 +418,7 @@ impl NetworkRustEmitter {
             #[must_use]
             pub fn is_replicated_state_type_index(type_index: u32) -> bool {
                 type_by_type_index(type_index)
-                    .is_some_and(|descriptor| descriptor.kind == NetworkTypeKind::ReplicatedState)
+                    .is_some_and(NetworkTypeDescriptor::is_replicated_state)
             }
 
             #[must_use]
@@ -436,7 +455,7 @@ impl NetworkRustEmitter {
                     .into_iter()
                     .filter(|type_index| {
                         type_by_type_index(*type_index)
-                            .is_some_and(|descriptor| descriptor.kind != NetworkTypeKind::ReplicatedState)
+                            .is_some_and(|descriptor| !descriptor.is_replicated_state())
                     })
                     .collect::<BTreeSet<_>>()
                     .into_iter()
@@ -494,8 +513,8 @@ impl NetworkRustEmitter {
             .iter()
             .filter(|network_type| {
                 network_type
-                    .root_kinds
-                    .contains(&NetworkRootKind::ReplicatedState)
+                    .capabilities
+                    .contains(&NetworkTypeCapability::ReplicatedState)
             })
             .filter_map(|network_type| {
                 Some((
@@ -569,7 +588,11 @@ impl NetworkRustEmitter {
         let modules = schema
             .types
             .iter()
-            .filter(|network_type| network_type.root_kinds.contains(&NetworkRootKind::Message))
+            .filter(|network_type| {
+                network_type
+                    .capabilities
+                    .contains(&NetworkTypeCapability::DirectMessage)
+            })
             .filter_map(|network_type| {
                 let plan = message_generation_plan(network_type, &wire_shapes, &wire_shape_sources);
                 report.message_generation_plans.push(plan.clone());
@@ -873,7 +896,8 @@ fn identity_tokens(schema: &NetworkSchema) -> Vec<proc_macro2::TokenStream> {
             let ident = format_ident!("{rust_name}");
             let type_id = type_id_literal(type_id);
             let name = LitStr::new(source_name, proc_macro2::Span::call_site());
-            let kind_ident = network_type_kind_ident(root_kind(network_type));
+            let capabilities =
+                capability_slice_tokens(&network_type.capabilities, Some(quote!(super::)));
             Some(quote! {
                 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
                 pub struct #ident;
@@ -882,7 +906,7 @@ fn identity_tokens(schema: &NetworkSchema) -> Vec<proc_macro2::TokenStream> {
                     const TYPE_ID: ::uuid::Uuid = ::uuid::Uuid::from_u128(#type_id);
                     const TYPE_INDEX: u32 = #type_index;
                     const NAME: &'static str = #name;
-                    const KIND: super::NetworkTypeKind = super::NetworkTypeKind::#kind_ident;
+                    const CAPABILITIES: &'static [super::NetworkTypeCapability] = #capabilities;
                 }
             })
         })
@@ -1008,24 +1032,14 @@ fn descriptor_tokens(
         report.unnamed_descriptor_count += 1;
     }
     let name = option_str_tokens(network_type.name.as_deref());
-    let kind = root_kind(network_type);
-    let kind_ident = network_type_kind_ident(kind);
+    let capability_tokens = capability_slice_tokens(&network_type.capabilities, None);
     let instance_size = option_u32_tokens(
         network_type
             .instance
             .as_ref()
             .and_then(|instance| instance.size),
     );
-    count_kind(kind, report);
-    if network_type
-        .root_kinds
-        .contains(&NetworkRootKind::FieldRegisteredType)
-    {
-        report.field_registered_count += 1;
-    }
-    let is_field_registered = network_type
-        .root_kinds
-        .contains(&NetworkRootKind::FieldRegisteredType);
+    count_capabilities(&network_type.capabilities, report);
     let fields = network_type
         .fields
         .iter()
@@ -1038,8 +1052,7 @@ fn descriptor_tokens(
             type_id: Uuid::from_u128(#type_id),
             type_index: #type_index,
             name: #name,
-            kind: NetworkTypeKind::#kind_ident,
-            is_field_registered: #is_field_registered,
+            capabilities: #capability_tokens,
             instance_size: #instance_size,
             fields: &[
                 #(#fields),*
@@ -1117,8 +1130,8 @@ fn state_generation_plans(
         .iter()
         .filter(|network_type| {
             network_type
-                .root_kinds
-                .contains(&NetworkRootKind::ReplicatedState)
+                .capabilities
+                .contains(&NetworkTypeCapability::ReplicatedState)
         })
         .map(|network_type| state_generation_plan(network_type, wire_shapes, &wire_shape_sources))
         .collect()
@@ -1132,7 +1145,11 @@ fn message_generation_plans(
     schema
         .types
         .iter()
-        .filter(|network_type| network_type.root_kinds.contains(&NetworkRootKind::Message))
+        .filter(|network_type| {
+            network_type
+                .capabilities
+                .contains(&NetworkTypeCapability::DirectMessage)
+        })
         .map(|network_type| message_generation_plan(network_type, wire_shapes, &wire_shape_sources))
         .collect()
 }
@@ -2326,39 +2343,49 @@ const fn scalar_conversion_serialized_type(shape: SchemaWireShape) -> Option<&'s
     }
 }
 
-fn root_kind(network_type: &NetworkType) -> NetworkRootKind {
-    if network_type
-        .root_kinds
-        .contains(&NetworkRootKind::ReplicatedState)
-    {
-        NetworkRootKind::ReplicatedState
-    } else if network_type.root_kinds.contains(&NetworkRootKind::Message) {
-        NetworkRootKind::Message
-    } else if network_type
-        .root_kinds
-        .contains(&NetworkRootKind::FieldRegisteredType)
-    {
-        NetworkRootKind::FieldRegisteredType
-    } else {
-        NetworkRootKind::SupportType
+fn count_capabilities(
+    capabilities: &[NetworkTypeCapability],
+    report: &mut NetworkRustGenerationReport,
+) {
+    if capabilities.contains(&NetworkTypeCapability::ReplicatedState) {
+        report.replicated_state_count += 1;
+    }
+    if capabilities.contains(&NetworkTypeCapability::DirectMessage) {
+        report.message_count += 1;
+    }
+    if capabilities.contains(&NetworkTypeCapability::RegisteredFields) {
+        report.field_registered_count += 1;
+    }
+    if capabilities.contains(&NetworkTypeCapability::SupportData) {
+        report.support_type_count += 1;
     }
 }
 
-fn count_kind(kind: NetworkRootKind, report: &mut NetworkRustGenerationReport) {
-    match kind {
-        NetworkRootKind::ReplicatedState => report.replicated_state_count += 1,
-        NetworkRootKind::Message => report.message_count += 1,
-        NetworkRootKind::FieldRegisteredType => {}
-        NetworkRootKind::SupportType => report.support_type_count += 1,
-    }
+fn capability_slice_tokens(
+    capabilities: &[NetworkTypeCapability],
+    prefix: Option<proc_macro2::TokenStream>,
+) -> proc_macro2::TokenStream {
+    let capabilities = capabilities
+        .iter()
+        .copied()
+        .map(|kind| {
+            let ident = network_type_capability_ident(kind);
+            if let Some(prefix) = &prefix {
+                quote!(#prefix NetworkTypeCapability::#ident)
+            } else {
+                quote!(NetworkTypeCapability::#ident)
+            }
+        })
+        .collect::<Vec<_>>();
+    quote!(&[#(#capabilities),*])
 }
 
-fn network_type_kind_ident(kind: NetworkRootKind) -> proc_macro2::Ident {
+fn network_type_capability_ident(kind: NetworkTypeCapability) -> proc_macro2::Ident {
     match kind {
-        NetworkRootKind::ReplicatedState => format_ident!("ReplicatedState"),
-        NetworkRootKind::Message => format_ident!("Message"),
-        NetworkRootKind::FieldRegisteredType => format_ident!("FieldRegisteredType"),
-        NetworkRootKind::SupportType => format_ident!("SupportType"),
+        NetworkTypeCapability::ReplicatedState => format_ident!("ReplicatedState"),
+        NetworkTypeCapability::DirectMessage => format_ident!("DirectMessage"),
+        NetworkTypeCapability::RegisteredFields => format_ident!("RegisteredFields"),
+        NetworkTypeCapability::SupportData => format_ident!("SupportData"),
     }
 }
 
@@ -3035,13 +3062,13 @@ mod tests {
                 "uuid": "11111111-1111-1111-1111-111111111111",
                 "typeIndex": 1,
                 "typeName": "Example::EmptyMsg",
-                "rootKinds": ["message"],
+                "capabilities": ["direct-message"],
                 "fields": []
             }, {
                 "uuid": "22222222-2222-2222-2222-222222222222",
                 "typeIndex": 2,
                 "typeName": "Example::PlaceholderMsg",
-                "rootKinds": ["message"],
+                "capabilities": ["direct-message"],
                 "fields": [{
                     "index": 0,
                     "name": "ActorRef",
@@ -3052,7 +3079,7 @@ mod tests {
                 "uuid": "33333333-3333-3333-3333-333333333333",
                 "typeIndex": 3,
                 "typeName": "Example::ReadyMsg",
-                "rootKinds": ["message"],
+                "capabilities": ["direct-message"],
                 "fields": [{
                     "index": 0,
                     "name": "Value",
@@ -3099,7 +3126,7 @@ mod tests {
                 "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
                 "typeIndex": 6179,
                 "typeName": "Aoi::PhysicsTrait::ResizeAoiObserverMsg",
-                "rootKinds": ["message"],
+                "capabilities": ["direct-message"],
                 "fields": [{
                     "index": 0,
                     "name": "Observer",
@@ -3523,7 +3550,7 @@ mod tests {
                 "uuid": "A85DF621-DCE0-409F-8D39-A447EA0807FF",
                 "typeIndex": 28,
                 "typeName": "Javelin::GridSideReplicatedState",
-                "rootKinds": ["replicated-state"],
+                "capabilities": ["replicated-state"],
                 "fields": [{
                     "index": 0,
                     "name": "GridSide",

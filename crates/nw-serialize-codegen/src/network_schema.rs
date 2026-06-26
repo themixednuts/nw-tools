@@ -179,7 +179,7 @@ pub struct NetworkType {
     pub registry_index: Option<u32>,
     pub name: Option<String>,
     pub name_source: Option<String>,
-    pub root_kinds: Vec<NetworkRootKind>,
+    pub capabilities: Vec<NetworkTypeCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_address: Option<String>,
     pub base_vtable: Option<String>,
@@ -228,11 +228,11 @@ pub enum NetworkSerializeRole {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum NetworkRootKind {
+pub enum NetworkTypeCapability {
     ReplicatedState,
-    Message,
-    FieldRegisteredType,
-    SupportType,
+    DirectMessage,
+    RegisteredFields,
+    SupportData,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1432,7 +1432,7 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
             .iter()
             .any(|evidence| evidence.kind == NetworkEvidenceKind::RegisterField)
     });
-    let root_kinds = root_kinds(name.as_deref(), has_registered_fields);
+    let capabilities = network_type_capabilities(name.as_deref(), has_registered_fields);
     let mut evidence = Vec::new();
 
     if type_id.is_some() || entry.contains_key("typeIndex") || entry.contains_key("index") {
@@ -1481,7 +1481,7 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
         registry_index: u32_value(entry, "index"),
         name,
         name_source: string(entry, "typeNameSource"),
-        root_kinds,
+        capabilities,
         storage_address,
         base_vtable,
         vtable,
@@ -1788,24 +1788,27 @@ fn registry_entry_name(
         .or_else(|| az_rtti.and_then(|rtti| rtti.type_name.clone()))
 }
 
-fn root_kinds(name: Option<&str>, has_registered_fields: bool) -> Vec<NetworkRootKind> {
-    let mut kinds = Vec::new();
+fn network_type_capabilities(
+    name: Option<&str>,
+    has_registered_fields: bool,
+) -> Vec<NetworkTypeCapability> {
+    let mut capabilities = Vec::new();
     if name.is_some_and(|name| name.contains("ReplicatedState")) {
-        kinds.push(NetworkRootKind::ReplicatedState);
+        capabilities.push(NetworkTypeCapability::ReplicatedState);
     }
-    if name.is_some_and(is_message_name) {
-        kinds.push(NetworkRootKind::Message);
+    if name.is_some_and(is_direct_message_name) {
+        capabilities.push(NetworkTypeCapability::DirectMessage);
     }
     if has_registered_fields {
-        kinds.push(NetworkRootKind::FieldRegisteredType);
+        capabilities.push(NetworkTypeCapability::RegisteredFields);
     }
-    if kinds.is_empty() {
-        kinds.push(NetworkRootKind::SupportType);
+    if capabilities.is_empty() {
+        capabilities.push(NetworkTypeCapability::SupportData);
     }
-    kinds
+    capabilities
 }
 
-fn is_message_name(name: &str) -> bool {
+fn is_direct_message_name(name: &str) -> bool {
     name.contains("ClientMessages::")
         || name.contains("ServerMessages::")
         || name.ends_with("Msg")
@@ -2170,10 +2173,10 @@ mod tests {
         );
         assert_eq!(network_type.vtable, None);
         assert_eq!(
-            network_type.root_kinds,
+            network_type.capabilities,
             vec![
-                NetworkRootKind::ReplicatedState,
-                NetworkRootKind::FieldRegisteredType
+                NetworkTypeCapability::ReplicatedState,
+                NetworkTypeCapability::RegisteredFields
             ]
         );
         assert_eq!(
@@ -2337,7 +2340,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_message_and_support_type_classification_separate() {
+    fn assigns_direct_message_and_support_data_capabilities() {
         let report = json!({
             "registryEntries": [
                 {
@@ -2355,15 +2358,18 @@ mod tests {
         let schema =
             NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
 
-        assert_eq!(schema.types[0].root_kinds, vec![NetworkRootKind::Message]);
         assert_eq!(
-            schema.types[1].root_kinds,
-            vec![NetworkRootKind::SupportType]
+            schema.types[0].capabilities,
+            vec![NetworkTypeCapability::DirectMessage]
+        );
+        assert_eq!(
+            schema.types[1].capabilities,
+            vec![NetworkTypeCapability::SupportData]
         );
     }
 
     #[test]
-    fn imports_message_unmarshal_fields_without_field_registered_kind() {
+    fn imports_message_unmarshal_fields_without_registered_fields_capability() {
         let report = json!({
             "registryEntries": [{
                 "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
@@ -2432,7 +2438,10 @@ mod tests {
             NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
 
         assert_eq!(schema.summary.message_unmarshal_field_count, 3);
-        assert_eq!(schema.types[0].root_kinds, vec![NetworkRootKind::Message]);
+        assert_eq!(
+            schema.types[0].capabilities,
+            vec![NetworkTypeCapability::DirectMessage]
+        );
         let instance = schema.types[0].instance.as_ref().expect("instance layout");
         assert_eq!(instance.size, Some(0x470));
         assert_eq!(instance.constructor.as_deref(), Some("NewWorld+0x7e37d0"));
