@@ -1404,10 +1404,10 @@ mod tests {
         assert!(source.contains("PartialEq"));
         assert!(source.contains("Eq"));
         assert!(source.contains("Hash"));
-        assert!(source.contains("name = \"Example::CounterComponent\""));
         assert!(source.contains("#[az_type_info("));
         assert!(source.contains("name = \"Example::CounterComponent\""));
-        assert!(source.contains("uuid = \"11111111-1111-1111-1111-111111111111\""));
+        assert!(source.contains("\"11111111-1111-1111-1111-111111111111\""));
+        assert!(!source.contains("uuid = \"11111111-1111-1111-1111-111111111111\""));
         assert!(source.contains("pub struct CounterComponent"));
         assert!(source.contains("pub count: u32"));
         assert!(source.contains("Copy"));

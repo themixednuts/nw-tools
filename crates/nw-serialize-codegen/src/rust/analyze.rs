@@ -326,20 +326,15 @@ fn identity_attr(attr: &Attribute) -> Option<RustIdentityAttr> {
 }
 
 fn parse_identity_attr_args(args: Punctuated<Expr, syn::Token![,]>, parsed: &mut RustIdentityAttr) {
-    for (index, arg) in args.into_iter().enumerate() {
+    for arg in args {
         match &arg {
             Expr::Assign(assign) if expr_assign_lhs_is(&assign.left, "name") => {
                 if let Some(name) = lit_str_expr_value(&assign.right) {
                     parsed.name = Some(name);
                 }
             }
-            Expr::Assign(assign)
-                if expr_assign_lhs_is(&assign.left, "uuid")
-                    || expr_assign_lhs_is(&assign.left, "type_id") =>
-            {
-                parse_identity_type_id_expr(&assign.right, parsed);
-            }
-            _ if index == 0 => parse_identity_type_id_expr(&arg, parsed),
+            Expr::Assign(_) => {}
+            _ if parsed.type_id_expr.is_none() => parse_identity_type_id_expr(&arg, parsed),
             _ => {}
         }
     }
@@ -775,7 +770,7 @@ pub struct HealthComponent {
         };
         let source = r#"
 #[derive(AzTypeInfo, Debug)]
-#[az_type_info(name = "Mode", uuid = "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC")]
+#[az_type_info(name = "Mode", "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC")]
 pub enum Mode {
     Enabled = 6,
 }

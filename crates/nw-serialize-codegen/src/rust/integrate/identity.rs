@@ -863,7 +863,7 @@ fn az_rtti_attr_line(type_id_expr: &str) -> String {
 
 fn az_type_info_attr_line(type_id_expr: &str, name: Option<&str>) -> String {
     if let Some(name) = name {
-        format!("#[az_type_info(name = \"{name}\", uuid = {type_id_expr})]\n")
+        format!("#[az_type_info(name = \"{name}\", {type_id_expr})]\n")
     } else {
         format!("#[az_type_info({type_id_expr})]\n")
     }
@@ -1188,24 +1188,15 @@ fn line_starts_attr(line: &str, name: &str) -> bool {
 }
 
 fn parse_identity_attr_uuid(line: &str) -> Option<Uuid> {
-    parse_quoted_uuid_after_key(line, "uuid")
-        .or_else(|| parse_quoted_uuid_after_key(line, "type_id"))
-        .or_else(|| parse_positional_quoted_uuid(line))
+    parse_positional_quoted_uuid(line)
 }
 
 fn parse_identity_attr_symbol(line: &str) -> Option<String> {
-    parse_symbol_after_key(line, "uuid")
-        .or_else(|| parse_symbol_after_key(line, "type_id"))
-        .or_else(|| parse_positional_symbol(line))
+    parse_positional_symbol(line)
 }
 
 fn identity_attr_has_type_id_arg(line: &str) -> bool {
-    attr_key_start(line, "uuid").is_some()
-        || attr_key_start(line, "type_id").is_some()
-        || first_attr_arg(line).is_some_and(|arg| {
-            let arg = arg.trim();
-            !arg.is_empty() && !is_attr_key(arg, "name")
-        })
+    first_type_id_attr_arg(line).is_some()
 }
 
 fn parse_quoted_uuid_after_key(line: &str, key: &str) -> Option<Uuid> {
@@ -1242,7 +1233,7 @@ fn parse_symbol_after_key(line: &str, key: &str) -> Option<String> {
 }
 
 fn parse_positional_quoted_uuid(line: &str) -> Option<Uuid> {
-    let arg = first_attr_arg(line)?.trim();
+    let arg = first_type_id_attr_arg(line)?.trim();
     if !arg.starts_with('"') && !arg.contains("uuid!") {
         return None;
     }
@@ -1252,10 +1243,7 @@ fn parse_positional_quoted_uuid(line: &str) -> Option<Uuid> {
 }
 
 fn parse_positional_symbol(line: &str) -> Option<String> {
-    let arg = first_attr_arg(line)?.trim();
-    if arg.contains('=') {
-        return None;
-    }
+    let arg = first_type_id_attr_arg(line)?.trim();
     parse_symbol_expr(arg)
 }
 
@@ -1302,15 +1290,25 @@ fn attr_key_start(line: &str, key: &str) -> Option<usize> {
     None
 }
 
-fn first_attr_arg(line: &str) -> Option<&str> {
+fn first_type_id_attr_arg(line: &str) -> Option<&str> {
+    attr_args(line).and_then(|args| {
+        args.into_iter().find(|arg| {
+            let arg = arg.trim();
+            !arg.is_empty()
+                && !is_attr_key(arg, "name")
+                && !is_attr_key(arg, "path")
+                && !arg.contains('=')
+        })
+    })
+}
+
+fn attr_args(line: &str) -> Option<Vec<&str>> {
     let open = line.find('(')?;
     let close = line.rfind(')')?;
     if close <= open {
         return None;
     }
-    top_level_attr_args(&line[open + 1..close])
-        .into_iter()
-        .find(|arg| !arg.trim().is_empty())
+    Some(top_level_attr_args(&line[open + 1..close]))
 }
 
 fn top_level_attr_args(args: &str) -> Vec<&str> {
@@ -2203,7 +2201,7 @@ pub struct FieldUpdateMsg {
         let mut updated = text.to_owned();
         apply_az_identity_reconciliation(&mut updated, &fixes);
         assert!(updated.contains(
-            "#[az_type_info(name = \"NativeFieldUpdate\", uuid = \"11111111-2222-3333-4444-555555555555\")]"
+            "#[az_type_info(name = \"NativeFieldUpdate\", \"11111111-2222-3333-4444-555555555555\")]"
         ));
         assert!(updated.contains("#[class_desc(type_index = 42)]"));
         assert!(!updated.contains("#[class_desc(uuid"));
