@@ -132,12 +132,14 @@ pub use network_rust::{
 };
 pub use network_schema::{
     NETWORK_SCHEMA_VERSION, NetworkAzRtti, NetworkAzRttiProvider, NetworkConfidence,
-    NetworkEvidence, NetworkEvidenceKind, NetworkField, NetworkFieldRegistrationFunction,
+    NetworkEvidence, NetworkEvidenceKind, NetworkField, NetworkFieldOverride,
+    NetworkFieldOverrideFile, NetworkFieldOverrideMergeReport, NetworkFieldRegistrationFunction,
     NetworkHandler, NetworkMessageFieldSignature, NetworkMessageSignature,
-    NetworkMessageSignatureMergeReport, NetworkRegistrationHook, NetworkRootKind, NetworkSchema,
-    NetworkSchemaImportError, NetworkSchemaSource, NetworkSchemaSourceKind, NetworkSchemaSummary,
-    NetworkSerializeKind, NetworkSerializeMergeReport, NetworkSerializeRole, NetworkSerializeType,
-    NetworkType, NetworkTypeIndexMergeReport, NetworkVirtualFunction, NetworkWireShape,
+    NetworkMessageSignatureMergeReport, NetworkRegistrationHook,
+    NetworkReplicatedContainerWireShape, NetworkRootKind, NetworkSchema, NetworkSchemaImportError,
+    NetworkSchemaSource, NetworkSchemaSourceKind, NetworkSchemaSummary, NetworkSerializeKind,
+    NetworkSerializeMergeReport, NetworkSerializeRole, NetworkSerializeType, NetworkType,
+    NetworkTypeIndexMergeReport, NetworkVirtualFunction, NetworkWireScalarShape, NetworkWireShape,
 };
 pub use reference::{
     ReferenceExpansionContext, ReferenceIndex, ReferenceKey, ReferencePathSegment, ReferenceReport,

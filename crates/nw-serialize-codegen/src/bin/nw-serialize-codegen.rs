@@ -9,16 +9,17 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nw_serialize_codegen::{
     CodegenContext, CompileUnit, CompletedCodegenUnits, GoSourceEmitter, GoStandaloneProjectFile,
-    NetworkMessageFieldSignature, NetworkMessageSignature, NetworkRootKind, NetworkRustEmitter,
-    NetworkSchema, NetworkType, NetworkWireShape, ReflectedTypeCatalogSummary, RustCodegenPlanner,
-    RustSourceEmitter, RustSourceField, RustSourceInventory, RustSourceInventoryItem,
-    RustStandaloneProjectFile, SerializeCodegenRootMode, SerializeCodegenRootSelection,
-    SerializeCodegenUnit, SerializeContextCompileInputs, SerializeContextCompiler,
-    SerializeContextDocument, Severity, TypeScriptSourceEmitter, TypeScriptStandaloneProjectFile,
-    TypeScriptStandaloneProjectOptions, class_registration_trace_root_from_jsonl_str,
-    complete_known_missing_reflected_bodies, is_module_descriptor_json_name,
-    module_descriptor_capture, module_descriptors_root, module_descriptors_root_from_capture,
-    module_name_from_path, module_name_from_resource_name, resolve_codegen_root_type_ids,
+    NetworkFieldOverrideFile, NetworkMessageFieldSignature, NetworkMessageSignature,
+    NetworkRootKind, NetworkRustEmitter, NetworkSchema, NetworkType, NetworkWireShape,
+    ReflectedTypeCatalogSummary, RustCodegenPlanner, RustSourceEmitter, RustSourceField,
+    RustSourceInventory, RustSourceInventoryItem, RustStandaloneProjectFile,
+    SerializeCodegenRootMode, SerializeCodegenRootSelection, SerializeCodegenUnit,
+    SerializeContextCompileInputs, SerializeContextCompiler, SerializeContextDocument, Severity,
+    TypeScriptSourceEmitter, TypeScriptStandaloneProjectFile, TypeScriptStandaloneProjectOptions,
+    class_registration_trace_root_from_jsonl_str, complete_known_missing_reflected_bodies,
+    is_module_descriptor_json_name, module_descriptor_capture, module_descriptors_root,
+    module_descriptors_root_from_capture, module_name_from_path, module_name_from_resource_name,
+    resolve_codegen_root_type_ids,
 };
 use rust_embed::RustEmbed;
 use serde::Serialize;
@@ -129,6 +130,12 @@ struct NetworkSchemaArgs {
     /// Public label to store for the Rust message source instead of the local input path.
     #[arg(long = "message-rust-source")]
     message_rust_source: Option<String>,
+    /// Optional JSON file containing field-level semantic overrides.
+    #[arg(long = "field-overrides")]
+    field_overrides: Vec<PathBuf>,
+    /// Public label to store for field overrides instead of the local input path.
+    #[arg(long = "field-overrides-source")]
+    field_overrides_source: Option<String>,
     /// Output path for the derived network schema JSON. This does not rewrite typeregistry.json.
     #[arg(long)]
     out: PathBuf,
@@ -378,6 +385,27 @@ fn network_schema(args: &NetworkSchemaArgs) -> Result<()> {
             merge.unmatched_message_count
         );
     }
+    for overrides_path in &args.field_overrides {
+        let overrides = load_field_overrides(overrides_path)?;
+        let source = args
+            .field_overrides_source
+            .clone()
+            .unwrap_or_else(|| overrides_path.display().to_string());
+        let merge = schema.merge_field_overrides(&overrides, Some(source));
+        println!(
+            "field overrides: {} source field(s), {} matched, {} unmatched type(s), {} ambiguous type(s), {} unmatched field(s), {} ambiguous field(s), {} native type update(s), {} Rust type update(s), {} wire shape update(s), {} confidence update(s)",
+            merge.source_field_count,
+            merge.matched_field_count,
+            merge.unmatched_type_count,
+            merge.ambiguous_type_count,
+            merge.unmatched_field_count,
+            merge.ambiguous_field_count,
+            merge.native_type_updated_count,
+            merge.rust_type_updated_count,
+            merge.wire_shape_updated_count,
+            merge.confidence_updated_count
+        );
+    }
     let mut source = serde_json::to_vec_pretty(&schema).context("serialize network schema JSON")?;
     source.push(b'\n');
     if let Some(parent) = args
@@ -466,6 +494,12 @@ fn load_message_signatures(path: &Path) -> Result<Vec<NetworkMessageSignature>> 
     )
 }
 
+fn load_field_overrides(path: &Path) -> Result<NetworkFieldOverrideFile> {
+    let root = load_json_root(path, "field overrides JSON")?;
+    serde_json::from_value(root)
+        .with_context(|| format!("parse field overrides from {}", path.display()))
+}
+
 fn message_signatures_from_rust_source(
     schema: &NetworkSchema,
     inventory: &RustSourceInventory,
@@ -531,6 +565,9 @@ fn rust_source_field_wire_shape(field: &RustSourceField) -> Option<NetworkWireSh
         if compact.ends_with("VlqU32") {
             return Some(NetworkWireShape::VlqU32);
         }
+        if compact.ends_with("VlqU64") {
+            return Some(NetworkWireShape::VlqU64);
+        }
         if compact.ends_with("QuatCompNorm") {
             return Some(NetworkWireShape::QuatCompNorm);
         }
@@ -553,6 +590,7 @@ fn rust_source_field_wire_shape(field: &RustSourceField) -> Option<NetworkWireSh
         "Aabb2d" => Some(NetworkWireShape::Aabb2d),
         "Aabb3d" => Some(NetworkWireShape::Aabb3d),
         "EntityRef" => Some(NetworkWireShape::EntityRef),
+        "SequenceNumber" => Some(NetworkWireShape::SequenceNumber),
         "String" => Some(NetworkWireShape::String),
         "QuatCompNorm" => Some(NetworkWireShape::QuatCompNorm),
         _ => None,
