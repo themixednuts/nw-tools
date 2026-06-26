@@ -672,26 +672,30 @@ fn render_identity_attr(
         &identity.type_id.hyphenated().to_string().to_uppercase(),
         Span::call_site(),
     );
-    let name = identity
+    let name_override = identity
         .name
         .as_ref()
+        .filter(|name| name.as_str() != item.rust_name)
         .map(|name| LitStr::new(name, Span::call_site()));
-    let attr = match (identity.kind, name) {
+    let attr = match (identity.kind, name_override) {
         (RustTypeIdentityKind::AzTypeInfo, Some(name)) => {
             quote!(#[az_type_info(name = #name, uuid = #type_id)])
         }
         (RustTypeIdentityKind::AzTypeInfo, None) => quote!(#[az_type_info(#type_id)]),
         (RustTypeIdentityKind::AzRtti, Some(name)) => {
             let bases = az_rtti_base_attr(item)?;
-            quote!(#[az_rtti(name = #name, uuid = #type_id #bases)])
+            if bases.is_empty() {
+                quote!(#[az_rtti(name = #name, uuid = #type_id)])
+            } else {
+                quote! {
+                    #[az_rtti(name = #name)]
+                    #[az_rtti(#type_id #bases)]
+                }
+            }
         }
         (RustTypeIdentityKind::AzRtti, None) => {
             let bases = az_rtti_base_attr(item)?;
-            if bases.is_empty() {
-                quote!(#[az_rtti(#type_id)])
-            } else {
-                quote!(#[az_rtti(uuid = #type_id #bases)])
-            }
+            quote!(#[az_rtti(#type_id #bases)])
         }
     };
     Ok(attr)
@@ -709,7 +713,7 @@ fn az_rtti_base_attr(item: &RustItemPlan) -> Result<TokenStream, RustSourceEmitE
                     source,
                 }
             })?;
-            Ok(quote!(, base = #ty))
+            Ok(quote!(, #ty))
         })
         .collect::<Result<TokenStream, RustSourceEmitError>>()
 }
@@ -2417,8 +2421,7 @@ mod tests {
         assert!(source.contains("bevy::prelude::Reflect"));
         assert!(source.contains("#[az_rtti("));
         assert!(source.contains("name = \"Example::HealthComponent\""));
-        assert!(source.contains("uuid = \"BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB\""));
-        assert!(source.contains("base = Component"));
+        assert!(source.contains("#[az_rtti(\"BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB\", Component)]"));
         assert!(!source.contains("AzTypeRegistration"));
         assert!(source.contains("HealthComponent"));
         assert!(source.contains("#[reflect(Component)]"));
