@@ -115,9 +115,9 @@ fn render_component_struct(
         code,
         &reflected_struct_derive_tokens(&["Component", "AzRtti"], fields),
     );
-    code.push_str("#[az_rtti(uuid = \"");
+    code.push_str("#[az_rtti(\"");
     code.push_str(&type_id.to_string());
-    code.push_str("\", base = crate::generated::Component)]\n");
+    code.push_str("\", crate::generated::Component)]\n");
     code.push_str("#[reflect(Component)]\n");
     code.push_str("pub struct ");
     code.push_str(component_name);
@@ -135,9 +135,9 @@ fn render_facet_struct(
         code,
         &reflected_struct_derive_tokens(&["Component", "AzRtti", "Facet"], fields),
     );
-    code.push_str("#[az_rtti(uuid = \"");
+    code.push_str("#[az_rtti(\"");
     code.push_str(&type_id.to_string());
-    code.push_str("\", base = crate::generated::Component)]\n");
+    code.push_str("\", crate::generated::Component)]\n");
     code.push_str("#[reflect(Component)]\n");
     if let Some(facet_owner) = facet_owner
         && inferred_facet_owner(component_name).as_deref() != Some(facet_owner)
