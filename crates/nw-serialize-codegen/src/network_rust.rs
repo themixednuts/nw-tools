@@ -29,6 +29,26 @@ pub struct NetworkRustOutput {
     pub report: NetworkRustGenerationReport,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkReplicatedStateEmitOptions {
+    type_registry_type_indices: Option<BTreeSet<u32>>,
+}
+
+impl NetworkReplicatedStateEmitOptions {
+    #[must_use]
+    pub fn register_only(type_indices: impl IntoIterator<Item = u32>) -> Self {
+        Self {
+            type_registry_type_indices: Some(type_indices.into_iter().collect()),
+        }
+    }
+
+    fn should_derive_type_registry(&self, type_index: u32) -> bool {
+        self.type_registry_type_indices
+            .as_ref()
+            .is_none_or(|type_indices| type_indices.contains(&type_index))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkRustGenerationReport {
@@ -446,6 +466,18 @@ impl NetworkRustEmitter {
         schema: &NetworkSchema,
         type_indices: impl IntoIterator<Item = u32>,
     ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
+        Self::emit_replicated_states_with_options(
+            schema,
+            type_indices,
+            NetworkReplicatedStateEmitOptions::default(),
+        )
+    }
+
+    pub fn emit_replicated_states_with_options(
+        schema: &NetworkSchema,
+        type_indices: impl IntoIterator<Item = u32>,
+        options: NetworkReplicatedStateEmitOptions,
+    ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
         let selected = type_indices.into_iter().collect::<BTreeSet<_>>();
         let wire_shapes = wire_shapes_by_handler_vtable(schema);
         let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
@@ -500,6 +532,7 @@ impl NetworkRustEmitter {
                     network_type,
                     plan,
                     &rust_names,
+                    options.should_derive_type_registry(type_index),
                 ));
             }
         }
@@ -1918,6 +1951,7 @@ fn replicated_state_module_tokens(
     network_type: &NetworkType,
     plan: &NetworkStateGenerationPlanReport,
     rust_names: &BTreeMap<u32, String>,
+    derive_type_registry: bool,
 ) -> proc_macro2::TokenStream {
     let type_index = network_type
         .type_index
@@ -1944,14 +1978,17 @@ fn replicated_state_module_tokens(
         .iter()
         .map(replicated_state_field_tokens)
         .collect::<Vec<_>>();
+    let type_registry_import = derive_type_registry.then(|| quote!(, TypeRegistry));
+    let type_registry_derive = derive_type_registry.then(|| quote!(, TypeRegistry));
+    let type_registry_attr = derive_type_registry.then(|| quote!(#[type_registry(#type_index)]));
 
     quote! {
         pub mod #module_ident {
-            use ::nw_network::{AzRtti, ReplicatedState, TypeRegistry};
+            use ::nw_network::{AzRtti, ReplicatedState #type_registry_import};
 
-            #[derive(Debug, Clone, Default, ReplicatedState, AzRtti, TypeRegistry)]
+            #[derive(Debug, Clone, Default, ReplicatedState, AzRtti #type_registry_derive)]
             #[az_rtti(#type_id)]
-            #[type_registry(#type_index)]
+            #type_registry_attr
             pub struct #state_ident {
                 #(#fields)*
 
@@ -2618,6 +2655,25 @@ mod tests {
                 .source
                 .contains("pub use raid_data_component_replicated_state")
         );
+
+        let unregistered_state_output = NetworkRustEmitter::emit_replicated_states_with_options(
+            &schema,
+            [28],
+            NetworkReplicatedStateEmitOptions::register_only([]),
+        )
+        .expect("state source");
+        assert!(
+            unregistered_state_output
+                .source
+                .contains("pub struct RaidDataComponentReplicatedState")
+        );
+        assert!(
+            unregistered_state_output
+                .source
+                .contains("#[az_rtti(\"A85DF621-DCE0-409F-8D39-A447EA0807FF\")]")
+        );
+        assert!(!unregistered_state_output.source.contains("TypeRegistry"));
+        assert!(!unregistered_state_output.source.contains("type_registry"));
     }
 
     #[test]
