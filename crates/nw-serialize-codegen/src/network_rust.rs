@@ -9,13 +9,13 @@ use uuid::Uuid;
 use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind};
 use crate::naming::{rust_field_ident, rust_module_ident, rust_type_ident};
 use crate::network_schema::{
-    NetworkConfidence, NetworkField, NetworkReplicatedContainerWireShape, NetworkSchema,
-    NetworkType, NetworkTypeCapability, NetworkWireScalarShape as SchemaWireScalarShape,
-    NetworkWireShape as SchemaWireShape,
+    NetworkConfidence, NetworkField, NetworkFragmentMetadata,
+    NetworkReplicatedContainerWireShape, NetworkSchema, NetworkType, NetworkTypeCapability,
+    NetworkWireScalarShape as SchemaWireScalarShape, NetworkWireShape as SchemaWireShape,
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v28";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v29";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -66,6 +66,12 @@ pub struct NetworkRustGenerationReport {
 pub struct NetworkStateGenerationPlanReport {
     pub type_index: Option<u32>,
     pub type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment_category_value: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_metadata_fragment: Option<bool>,
     pub field_count: usize,
     pub shaped_field_count: usize,
     pub supported_field_count: usize,
@@ -1233,6 +1239,18 @@ fn state_generation_plan(
     NetworkStateGenerationPlanReport {
         type_index: network_type.type_index,
         type_name: network_type.name.clone(),
+        fragment_category: network_type
+            .fragment_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.category.clone()),
+        fragment_category_value: network_type
+            .fragment_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.category_value),
+        is_metadata_fragment: network_type
+            .fragment_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.is_metadata),
         field_count,
         shaped_field_count,
         supported_field_count,
@@ -2021,6 +2039,9 @@ fn blocked_state_generation_plan(
     NetworkStateGenerationPlanReport {
         type_index,
         type_name,
+        fragment_category: None,
+        fragment_category_value: None,
+        is_metadata_fragment: None,
         field_count: 0,
         shaped_field_count: 0,
         supported_field_count: 0,
@@ -2065,20 +2086,7 @@ fn replicated_state_module_tokens(
         .map(replicated_state_field_tokens)
         .collect::<Vec<_>>();
     let register_fragment = options.registers_type_index(type_index);
-    let registration_tokens = if register_fragment {
-        quote! {
-            #[replicated_state]
-            #[az_rtti(#type_id)]
-            #[type_registry(#type_index)]
-            #[derive(Debug, Clone, Default)]
-        }
-    } else {
-        quote! {
-            #[replicated_state]
-            #[az_rtti(#type_id)]
-            #[derive(Debug, Clone, Default)]
-        }
-    };
+    let type_registry_attr = register_fragment.then(|| quote! { #[type_registry(#type_index)] });
     let type_registry_entry_tokens = (!register_fragment).then(|| {
         quote! {
             impl ::nw_network::types::TypeRegistryEntry for #state_ident {
@@ -2087,12 +2095,16 @@ fn replicated_state_module_tokens(
         }
     });
     let type_registry_import = register_fragment.then(|| quote! { , type_registry });
+    let replicated_state_attr = replicated_state_attr_tokens(network_type.fragment_metadata.as_ref());
 
     quote! {
         pub mod #module_ident {
             use ::nw_network::{az_rtti, replicated_state #type_registry_import};
 
-            #registration_tokens
+            #replicated_state_attr
+            #[az_rtti(#type_id)]
+            #type_registry_attr
+            #[derive(Debug, Clone, Default)]
             pub struct #state_ident {
                 #(#fields)*
             }
@@ -2101,6 +2113,31 @@ fn replicated_state_module_tokens(
         }
 
         pub use #module_ident::#state_ident;
+    }
+}
+
+fn replicated_state_attr_tokens(
+    fragment_metadata: Option<&NetworkFragmentMetadata>,
+) -> proc_macro2::TokenStream {
+    let Some(category) = fragment_metadata
+        .and_then(|metadata| metadata.category.as_deref())
+        .and_then(fragment_category_attr_name)
+    else {
+        return quote! { #[replicated_state] };
+    };
+    quote! { #[replicated_state(category = #category)] }
+}
+
+fn fragment_category_attr_name(category: &str) -> Option<&'static str> {
+    match category {
+        "Uncategorized" | "NumCategories" => None,
+        "PlayerCharacter" => Some("player_character"),
+        "NonPlayerCharacter" => Some("non_player_character"),
+        "ImportantNonPlayerCharacter" => Some("important_non_player_character"),
+        "Spell" => Some("spell"),
+        "Projectile" => Some("projectile"),
+        "Buildable" => Some("buildable"),
+        _ => None,
     }
 }
 
@@ -2869,6 +2906,58 @@ mod tests {
         assert_eq!(output.source.matches("#[type_registry").count(), 1);
         assert!(output.source.contains("#[type_registry(28u32)]"));
         assert!(!output.source.contains("#[type_registry(29u32)]"));
+    }
+
+    #[test]
+    fn emits_native_fragment_category_attribute_from_schema_evidence() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "39B4C919-3A6D-46B5-92D0-3B4ACB284B1D",
+                "typeIndex": 16,
+                "typeName": "MB::ProjectileReplicatedState",
+                "constructorMatches": [{
+                    "fragmentMetadata": {
+                        "source": "i-fragment-vtable",
+                        "isMetadataSlot": 12,
+                        "isMetadataFunction": "NewWorld+0x294910",
+                        "isMetadata": false,
+                        "categorySlot": 13,
+                        "categoryFunction": "NewWorld+0x6840000",
+                        "categoryValue": 5,
+                        "category": "Projectile"
+                    },
+                    "fields": []
+                }],
+                "fields": [{
+                    "index": 0,
+                    "name": "projectileId",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81dad80",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81dad80",
+                "fieldCount": 1,
+                "wireShape": "u32",
+                "wireShapeSource": "marshal-call:marshal-function-name",
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [16]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        assert_eq!(plan.fragment_category.as_deref(), Some("Projectile"));
+        assert_eq!(plan.fragment_category_value, Some(5));
+        assert_eq!(plan.is_metadata_fragment, Some(false));
+        assert!(
+            output
+                .source
+                .contains("#[replicated_state(category = \"projectile\")]")
+        );
     }
 
     #[test]

@@ -17,6 +17,10 @@ pub const NETWORK_STATIC_REPORT_SCHEMA_VERSION: &str = "newworld.network_schema.
 pub enum NetworkSchemaImportError {
     #[error("network schema import expected a JSON object root")]
     ExpectedObjectRoot,
+    #[error(
+        "Ghidra network report contains private source-derived evidence; rerun NetworkSchemaExtractor without source ingestion"
+    )]
+    PrivateSourceEvidence,
     #[error("typeindex import expected a JSON object with a `typeIndex` array")]
     ExpectedTypeIndexArray,
 }
@@ -187,6 +191,8 @@ pub struct NetworkType {
     pub handler: Option<NetworkHandler>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<NetworkInstanceLayout>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment_metadata: Option<NetworkFragmentMetadata>,
     pub serialize: Option<NetworkSerializeType>,
     pub az_rtti: Option<NetworkAzRtti>,
     pub registration_type_name: Option<String>,
@@ -260,9 +266,26 @@ pub struct NetworkField {
     pub wire_shape: Option<NetworkWireShape>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wire_shape_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constructor_writes: Vec<NetworkFieldConstructorWrite>,
     pub callsite: Option<String>,
     pub confidence: NetworkConfidence,
     pub evidence: Vec<NetworkEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkFieldConstructorWrite {
+    pub write: Option<String>,
+    pub handler_offset: Option<String>,
+    pub relative_offset: Option<String>,
+    pub width_bits: Option<u32>,
+    pub byte_length: Option<u32>,
+    pub value_kind: Option<String>,
+    pub value: Option<String>,
+    pub value_hex: Option<String>,
+    pub source_operand: Option<String>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,9 +298,24 @@ pub struct NetworkFieldRegistrationFunction {
     pub owner_type_name: Option<String>,
     pub instance_vtable: Option<String>,
     pub virtual_functions: Vec<NetworkVirtualFunction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment_metadata: Option<NetworkFragmentMetadata>,
     pub az_rtti: Option<NetworkAzRtti>,
     pub fields: Vec<NetworkField>,
     pub evidence: Vec<NetworkEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkFragmentMetadata {
+    pub source: Option<String>,
+    pub is_metadata_slot: Option<u32>,
+    pub is_metadata_function: Option<String>,
+    pub is_metadata: Option<bool>,
+    pub category_slot: Option<u32>,
+    pub category_function: Option<String>,
+    pub category_value: Option<u32>,
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -599,6 +637,7 @@ pub enum NetworkEvidenceKind {
     MessageUnmarshal,
     MessageSource,
     FieldOverride,
+    FragmentMetadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -625,6 +664,9 @@ impl NetworkSchema {
         let root = report
             .as_object()
             .ok_or(NetworkSchemaImportError::ExpectedObjectRoot)?;
+        if contains_private_source_evidence(report) {
+            return Err(NetworkSchemaImportError::PrivateSourceEvidence);
+        }
         let types = array_values(root, "registryEntries")
             .filter_map(Value::as_object)
             .map(network_type_from_registry_entry)
@@ -1106,6 +1148,7 @@ fn network_field_from_message_signature(
         raw_byte_length: None,
         wire_shape: signature.wire_shape,
         wire_shape_source: signature.wire_shape.map(|_| source),
+        constructor_writes: Vec::new(),
         callsite: None,
         confidence: NetworkConfidence::High,
         evidence,
@@ -1411,6 +1454,7 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
         .get("messageUnmarshal")
         .and_then(Value::as_object)
         .map(network_instance_layout);
+    let fragment_metadata = network_type_fragment_metadata(entry);
     let az_rtti = entry
         .get("azRtti")
         .and_then(Value::as_object)
@@ -1474,6 +1518,18 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
             confidence: NetworkConfidence::High,
         });
     }
+    if let Some(metadata) = &fragment_metadata {
+        evidence.push(NetworkEvidence {
+            kind: NetworkEvidenceKind::FragmentMetadata,
+            source: metadata
+                .source
+                .clone()
+                .unwrap_or_else(|| "fragmentMetadata".to_owned()),
+            address: metadata.category_function.clone(),
+            detail: metadata.category.clone(),
+            confidence: NetworkConfidence::High,
+        });
+    }
 
     NetworkType {
         type_id,
@@ -1487,6 +1543,7 @@ fn network_type_from_registry_entry(entry: &Map<String, Value>) -> NetworkType {
         vtable,
         handler,
         instance,
+        fragment_metadata,
         serialize: None,
         az_rtti,
         registration_type_name: string(entry, "registrationTypeName"),
@@ -1536,6 +1593,10 @@ fn network_field_registration_function(
         .get("azRtti")
         .and_then(Value::as_object)
         .map(network_az_rtti);
+    let fragment_metadata = function
+        .get("fragmentMetadata")
+        .and_then(Value::as_object)
+        .map(network_fragment_metadata);
     let fields = array_values(function, "fields")
         .filter_map(Value::as_object)
         .map(network_field)
@@ -1560,6 +1621,18 @@ fn network_field_registration_function(
             confidence: NetworkConfidence::High,
         });
     }
+    if let Some(metadata) = &fragment_metadata {
+        evidence.push(NetworkEvidence {
+            kind: NetworkEvidenceKind::FragmentMetadata,
+            source: metadata
+                .source
+                .clone()
+                .unwrap_or_else(|| "fragmentMetadata".to_owned()),
+            address: metadata.category_function.clone(),
+            detail: metadata.category.clone(),
+            confidence: NetworkConfidence::High,
+        });
+    }
 
     NetworkFieldRegistrationFunction {
         address: string(function, "address"),
@@ -1570,9 +1643,40 @@ fn network_field_registration_function(
             .or_else(|| az_rtti.as_ref().and_then(|rtti| rtti.type_name.clone())),
         instance_vtable: string(function, "instanceVtable"),
         virtual_functions,
+        fragment_metadata,
         az_rtti,
         fields,
         evidence,
+    }
+}
+
+fn network_type_fragment_metadata(entry: &Map<String, Value>) -> Option<NetworkFragmentMetadata> {
+    entry
+        .get("fragmentMetadata")
+        .and_then(Value::as_object)
+        .map(network_fragment_metadata)
+        .or_else(|| {
+            array_values(entry, "constructorMatches")
+                .filter_map(Value::as_object)
+                .find_map(|constructor| {
+                    constructor
+                        .get("fragmentMetadata")
+                        .and_then(Value::as_object)
+                        .map(network_fragment_metadata)
+                })
+        })
+}
+
+fn network_fragment_metadata(metadata: &Map<String, Value>) -> NetworkFragmentMetadata {
+    NetworkFragmentMetadata {
+        source: string(metadata, "source"),
+        is_metadata_slot: u32_value(metadata, "isMetadataSlot"),
+        is_metadata_function: stable_address(metadata, "isMetadataFunction"),
+        is_metadata: bool_value(metadata, "isMetadata"),
+        category_slot: u32_value(metadata, "categorySlot"),
+        category_function: stable_address(metadata, "categoryFunction"),
+        category_value: u32_value(metadata, "categoryValue"),
+        category: string(metadata, "category"),
     }
 }
 
@@ -1632,10 +1736,52 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
         raw_byte_length,
         wire_shape,
         wire_shape_source,
+        constructor_writes: network_field_constructor_writes(field),
         callsite: string(field, "callsite"),
         confidence,
         evidence,
     }
+}
+
+fn network_field_constructor_writes(
+    field: &Map<String, Value>,
+) -> Vec<NetworkFieldConstructorWrite> {
+    array_values(field, "constructorWrites")
+        .filter_map(Value::as_object)
+        .map(|write| NetworkFieldConstructorWrite {
+            write: string(write, "write"),
+            handler_offset: string(write, "handlerOffset"),
+            relative_offset: string(write, "relativeOffset"),
+            width_bits: u32_value(write, "widthBits"),
+            byte_length: u32_value(write, "byteLength"),
+            value_kind: string(write, "valueKind"),
+            value: string(write, "value"),
+            value_hex: string(write, "valueHex"),
+            source_operand: string(write, "sourceOperand"),
+            source: string(write, "source"),
+        })
+        .collect()
+}
+
+fn contains_private_source_evidence(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            key.starts_with("sourceReplicated")
+                || contains_private_source_marker(key)
+                || contains_private_source_evidence(value)
+        }),
+        Value::Array(values) => values.iter().any(contains_private_source_evidence),
+        Value::String(value) => contains_private_source_marker(value),
+        _ => false,
+    }
+}
+
+fn contains_private_source_marker(value: &str) -> bool {
+    let normalized = value.replace('\\', "/").to_ascii_lowercase();
+    normalized == "source-replicated-field-handler"
+        || normalized.contains("resources/newworld/src")
+        || normalized.contains("new-world/gems/newworld/src")
+        || normalized.contains("newworld/src")
 }
 
 fn consistent_raw_byte_length(
@@ -1857,6 +2003,10 @@ fn string_ref<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> 
         .filter(|value| !value.is_empty())
 }
 
+fn bool_value(object: &Map<String, Value>, key: &str) -> Option<bool> {
+    object.get(key).and_then(Value::as_bool)
+}
+
 fn stable_address(object: &Map<String, Value>, key: &str) -> Option<String> {
     string_ref(object, key)
         .filter(|value| value.starts_with("NewWorld+0x"))
@@ -2036,6 +2186,69 @@ mod tests {
         assert_eq!(fields[0].native_type.as_deref(), Some("ActorRef"));
         assert_eq!(fields[1].name.as_deref(), Some("Key"));
         assert_eq!(fields[1].native_type.as_deref(), Some("FragmentKey"));
+    }
+
+    #[test]
+    fn imports_fragment_metadata_from_constructor_matches() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "39B4C919-3A6D-46B5-92D0-3B4ACB284B1D",
+                "typeIndex": 16,
+                "typeName": "MB::ProjectileReplicatedState",
+                "constructorMatches": [{
+                    "address": "NewWorld+0x683fe00",
+                    "name": "MB::ProjectileReplicatedState::ProjectileReplicatedState",
+                    "instanceVtable": "NewWorld+0x8549c70",
+                    "fragmentMetadata": {
+                        "source": "i-fragment-vtable",
+                        "isMetadataSlot": 12,
+                        "isMetadataFunction": "NewWorld+0x294910",
+                        "isMetadata": false,
+                        "categorySlot": 13,
+                        "categoryFunction": "NewWorld+0x294910",
+                        "categoryValue": 0,
+                        "category": "Uncategorized"
+                    },
+                    "fields": []
+                }]
+            }],
+            "fieldRegistrationFunctions": [{
+                "address": "NewWorld+0x683fe00",
+                "name": "MB::ProjectileReplicatedState::RegisterFields",
+                "instanceVtable": "NewWorld+0x8549c70",
+                "fragmentMetadata": {
+                    "source": "i-fragment-vtable",
+                    "isMetadataSlot": 12,
+                    "isMetadataFunction": "NewWorld+0x294910",
+                    "isMetadata": false,
+                    "categorySlot": 13,
+                    "categoryFunction": "NewWorld+0x294910",
+                    "categoryValue": 0,
+                    "category": "Uncategorized"
+                },
+                "fields": []
+            }],
+            "fieldHandlerVtables": []
+        }))
+        .expect("schema");
+
+        let metadata = schema.types[0]
+            .fragment_metadata
+            .as_ref()
+            .expect("type fragment metadata");
+        assert_eq!(metadata.is_metadata, Some(false));
+        assert_eq!(metadata.category_value, Some(0));
+        assert_eq!(metadata.category.as_deref(), Some("Uncategorized"));
+        assert_eq!(
+            metadata.category_function.as_deref(),
+            Some("NewWorld+0x294910")
+        );
+
+        let function_metadata = schema.field_registration_functions[0]
+            .fragment_metadata
+            .as_ref()
+            .expect("function fragment metadata");
+        assert_eq!(function_metadata.category.as_deref(), Some("Uncategorized"));
     }
 
     #[test]
@@ -2224,6 +2437,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_private_source_derived_ghidra_reports() {
+        let report = json!({
+            "registryEntries": [],
+            "fieldRegistrationFunctions": [{
+                "address": "NewWorld+0x3495600",
+                "fields": [{
+                    "index": 0,
+                    "name": "characterId",
+                    "wireShape": "entity-ref",
+                    "wireShapeSource": "source-replicated-field-handler",
+                    "confidence": "high"
+                }]
+            }],
+            "fieldHandlerVtables": []
+        });
+
+        let error =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect_err("tainted report");
+
+        assert!(matches!(
+            error,
+            NetworkSchemaImportError::PrivateSourceEvidence
+        ));
+    }
+
+    #[test]
     fn parses_fixed_byte_wire_shapes() {
         let report = json!({
             "registryEntries": [],
@@ -2257,7 +2496,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_source_style_container_wire_shapes() {
+    fn parses_container_wire_shapes() {
         let report = json!({
             "registryEntries": [],
             "fieldRegistrationFunctions": [],
