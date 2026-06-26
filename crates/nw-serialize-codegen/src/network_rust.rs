@@ -2048,10 +2048,10 @@ fn replicated_state_module_tokens(
 
     quote! {
         pub mod #module_ident {
-            use ::nw_network::{AzRtti, ReplicatedState #type_registry_import};
+            use ::nw_network::{AzRtti #type_registry_import};
 
-            #[::nw_network_derive::replicated_state_base]
-            #[derive(Debug, Clone, Default, ReplicatedState, AzRtti #type_registry_derive)]
+            #[::nw_network_derive::replicated_state]
+            #[derive(Debug, Clone, Default, AzRtti #type_registry_derive)]
             #[az_rtti(#type_id)]
             #type_registry_attr
             pub struct #state_ident {
@@ -2728,8 +2728,9 @@ mod tests {
         assert!(
             state_output
                 .source
-                .contains("#[::nw_network_derive::replicated_state_base]")
+                .contains("#[::nw_network_derive::replicated_state]")
         );
+        assert!(!state_output.source.contains("Default, ReplicatedState"));
         assert!(
             !state_output
                 .source
