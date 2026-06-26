@@ -1467,9 +1467,7 @@ fn state_field_shape_report(
     } else {
         field_wire_shape(field, wire_shapes)
     };
-    let rust_shape = shape
-        .filter(|shape| !shape.is_replicated_container())
-        .map(rust_field_shape);
+    let rust_shape = shape.map(rust_field_shape);
     let blocked_reason = state_field_blocked_reason(
         field,
         shape,
@@ -1579,9 +1577,17 @@ fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
         | "AZ::Crc32"
         | "FragmentKey"
         | "Amazon::Hub::FragmentKey" => Some(SchemaWireShape::U32),
-        "u64" | "uint64_t" | "AZ::u64" | "i64" | "int64_t" | "AZ::s64" | "AZ::EntityId" => {
-            Some(SchemaWireShape::U64)
-        }
+        "u64"
+        | "uint64_t"
+        | "AZ::u64"
+        | "i64"
+        | "int64_t"
+        | "AZ::s64"
+        | "AZ::EntityId"
+        | "TimePoint"
+        | "MB::TimePoint"
+        | "WallClockTimePoint"
+        | "MB::WallClockTimePoint" => Some(SchemaWireShape::U64),
         "f32" | "float" => Some(SchemaWireShape::F32),
         "f64" | "double" => Some(SchemaWireShape::F64),
         "AZ::Vector2" => Some(SchemaWireShape::Vec2),
@@ -1744,10 +1750,6 @@ fn state_field_blocked_reason(
     if shape.is_none() && explicit_field_type.is_none() {
         return Some("missing-wire-shape".to_owned());
     }
-    if shape.is_some_and(SchemaWireShape::is_replicated_container) && explicit_field_type.is_none()
-    {
-        return Some("container-codec-only".to_owned());
-    }
     None
 }
 
@@ -1896,10 +1898,9 @@ fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
         SchemaWireShape::String => {
             rust_field_shape_static("String", "ReplicatedFieldHandler<String>")
         }
-        SchemaWireShape::ReplicatedContainer(_) => RustFieldShape {
-            value_type: String::new(),
-            field_type: String::new(),
-        },
+        SchemaWireShape::ReplicatedContainer(container) => {
+            replicated_container_field_shape(container)
+        }
     }
 }
 
@@ -1907,6 +1908,60 @@ fn rust_field_shape_static(value_type: &'static str, field_type: &'static str) -
     RustFieldShape {
         value_type: value_type.to_owned(),
         field_type: field_type.to_owned(),
+    }
+}
+
+fn replicated_container_field_shape(
+    container: NetworkReplicatedContainerWireShape,
+) -> RustFieldShape {
+    let key_type = scalar_rust_type(container.key);
+    let value_type = scalar_rust_type(container.value);
+    let collection_type = format!("::std::collections::HashMap<{key_type}, {value_type}>");
+    let key_marshaler = scalar_marshaler_type(container.key);
+    let value_marshaler = scalar_marshaler_type(container.value);
+    let field_type = format!(
+        "::nw_network::serialize::ReplicatedContainer<{collection_type}, {{ ::nw_network::serialize::WIRE_VEC_CAP }}, {key_marshaler}, {value_marshaler}>"
+    );
+    RustFieldShape {
+        value_type: collection_type,
+        field_type,
+    }
+}
+
+fn scalar_rust_type(shape: SchemaWireScalarShape) -> String {
+    match shape {
+        SchemaWireScalarShape::Bool => "bool".to_owned(),
+        SchemaWireScalarShape::U8 => "u8".to_owned(),
+        SchemaWireScalarShape::U16 => "u16".to_owned(),
+        SchemaWireScalarShape::U32 | SchemaWireScalarShape::VlqU32 => "u32".to_owned(),
+        SchemaWireScalarShape::U64 | SchemaWireScalarShape::VlqU64 => "u64".to_owned(),
+        SchemaWireScalarShape::F32 | SchemaWireScalarShape::HalfF32 => "f32".to_owned(),
+        SchemaWireScalarShape::F64 => "f64".to_owned(),
+        SchemaWireScalarShape::SequenceNumber => "::nw_network::SequenceNumber".to_owned(),
+        SchemaWireScalarShape::Vec2 => "::glam::Vec2".to_owned(),
+        SchemaWireScalarShape::Vec3 => "::glam::Vec3".to_owned(),
+        SchemaWireScalarShape::Vec4 => "::glam::Vec4".to_owned(),
+        SchemaWireScalarShape::Quat => "::glam::Quat".to_owned(),
+        SchemaWireScalarShape::QuatCompNorm => "::nw_network::serialize::QuatCompNorm".to_owned(),
+        SchemaWireScalarShape::Mat3 => "::glam::Mat3".to_owned(),
+        SchemaWireScalarShape::Affine3 => "::glam::Affine3A".to_owned(),
+        SchemaWireScalarShape::Aabb2d => "::bevy_math::bounding::Aabb2d".to_owned(),
+        SchemaWireScalarShape::Aabb3d => "::bevy_math::bounding::Aabb3d".to_owned(),
+        SchemaWireScalarShape::EntityRef => "::nw_network::EntityRef".to_owned(),
+        SchemaWireScalarShape::FixedBytes(len) => format!("[u8; {len}]"),
+        SchemaWireScalarShape::String => "String".to_owned(),
+    }
+}
+
+fn scalar_marshaler_type(shape: SchemaWireScalarShape) -> String {
+    match shape {
+        SchemaWireScalarShape::HalfF32 => "::nw_network::serialize::HalfF32Marshaler".to_owned(),
+        SchemaWireScalarShape::VlqU32 => "::nw_network::serialize::VlqU32Marshaler".to_owned(),
+        SchemaWireScalarShape::VlqU64 => "::nw_network::serialize::VlqU64Marshaler".to_owned(),
+        _ => {
+            let rust_type = scalar_rust_type(shape);
+            format!("::nw_network::serialize::DefaultMarshaler<{rust_type}>")
+        }
     }
 }
 
@@ -1995,13 +2050,12 @@ fn replicated_state_module_tokens(
         pub mod #module_ident {
             use ::nw_network::{AzRtti, ReplicatedState #type_registry_import};
 
+            #[::nw_network_derive::replicated_state_base]
             #[derive(Debug, Clone, Default, ReplicatedState, AzRtti #type_registry_derive)]
             #[az_rtti(#type_id)]
             #type_registry_attr
             pub struct #state_ident {
                 #(#fields)*
-
-                pub hub: ::nw_network::hub::ReplicatedState,
             }
         }
 
@@ -2674,6 +2728,16 @@ mod tests {
         assert!(
             state_output
                 .source
+                .contains("#[::nw_network_derive::replicated_state_base]")
+        );
+        assert!(
+            !state_output
+                .source
+                .contains("pub hub: ::nw_network::hub::ReplicatedState")
+        );
+        assert!(
+            state_output
+                .source
                 .contains("#[az_rtti(\"A85DF621-DCE0-409F-8D39-A447EA0807FF\")]")
         );
         assert!(state_output.source.contains("type_registry"));
@@ -2862,7 +2926,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_container_wire_shapes_without_source_semantics() {
+    fn inferred_container_wire_shapes_emit_replicated_container_fields() {
         let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
                 "uuid": "B4DB39E2-5054-4604-9855-9A4DC75BDDE4",
@@ -2887,16 +2951,14 @@ mod tests {
         }))
         .expect("schema");
 
-        let output = NetworkRustEmitter::emit_descriptors(&schema).expect("descriptor source");
-        let plan = &output.report.state_generation_plans[0];
+        let descriptor_output =
+            NetworkRustEmitter::emit_descriptors(&schema).expect("descriptor source");
+        let plan = &descriptor_output.report.state_generation_plans[0];
 
-        assert!(!plan.can_generate);
+        assert!(plan.can_generate);
         assert_eq!(plan.shaped_field_count, 1);
-        assert_eq!(plan.supported_field_count, 0);
-        assert_eq!(
-            plan.blocked_reasons,
-            vec!["container-codec-only:1".to_owned()]
-        );
+        assert_eq!(plan.supported_field_count, 1);
+        assert!(plan.blocked_reasons.is_empty());
         assert_eq!(
             plan.fields[0].wire_shape,
             Some(SchemaWireShape::ReplicatedContainer(
@@ -2906,16 +2968,34 @@ mod tests {
                 }
             ))
         );
+        assert_eq!(plan.fields[0].blocked_reason, None);
         assert_eq!(
-            plan.fields[0].blocked_reason.as_deref(),
-            Some("container-codec-only")
+            plan.fields[0].rust_value_type.as_deref(),
+            Some("::std::collections::HashMap<u32, u64>")
+        );
+        assert_eq!(
+            plan.fields[0].rust_field_type.as_deref(),
+            Some(
+                "::nw_network::serialize::ReplicatedContainer<::std::collections::HashMap<u32, u64>, { ::nw_network::serialize::WIRE_VEC_CAP }, ::nw_network::serialize::DefaultMarshaler<u32>, ::nw_network::serialize::VlqU64Marshaler>"
+            )
         );
         assert!(
-            output
+            descriptor_output
                 .source
                 .contains("NetworkWireShape::ReplicatedContainer")
         );
-        assert!(output.source.contains("NetworkWireScalarShape::VlqU64"));
+        assert!(
+            descriptor_output
+                .source
+                .contains("NetworkWireScalarShape::VlqU64")
+        );
+
+        let state_output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
+        assert!(state_output.source.contains("ReplicatedContainer"));
+        assert!(state_output.source.contains("HashMap"));
+        assert!(state_output.source.contains("u32"));
+        assert!(state_output.source.contains("u64"));
     }
 
     #[test]
@@ -3202,6 +3282,41 @@ mod tests {
                 .source
                 .contains("pub bounds: ::bevy_math::bounding::Aabb2d")
         );
+    }
+
+    #[test]
+    fn infers_time_point_wrapper_native_types_as_u64() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
+                "typeIndex": 6179,
+                "typeName": "Example::TimerMsg",
+                "capabilities": ["direct-message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "StartedAt",
+                    "nativeType": "MB::TimePoint",
+                    "confidence": "message-unmarshal-call"
+                }, {
+                    "index": 1,
+                    "name": "WallClock",
+                    "nativeType": "MB::WallClockTimePoint",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.generatable_message_count, 1);
+        let plan = &output.report.message_generation_plans[0];
+        assert_eq!(plan.missing_wire_shape_count, 0);
+        assert_eq!(plan.fields[0].wire_shape, Some(SchemaWireShape::U64));
+        assert_eq!(plan.fields[1].wire_shape, Some(SchemaWireShape::U64));
+        assert!(output.source.contains("pub started_at: u64"));
+        assert!(output.source.contains("pub wall_clock: u64"));
     }
 
     #[test]
