@@ -14,7 +14,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v23";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v25";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -1078,12 +1078,12 @@ fn state_generation_plan(
     let field_count = fields.len();
     let shaped_field_count = fields
         .iter()
-        .filter(|field| field.wire_shape.is_some())
+        .filter(|field| state_field_has_complete_shape(field))
         .count();
     let supported_field_count = fields.iter().filter(|field| field.supported).count();
     let missing_wire_shape_count = fields
         .iter()
-        .filter(|field| field.wire_shape.is_none())
+        .filter(|field| field.blocked_reason.as_deref() == Some("missing-wire-shape"))
         .count();
     let unsupported_wire_shape_count = 0;
     let invalid_field_metadata_count = fields
@@ -1340,28 +1340,70 @@ fn state_field_shape_report(
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
 ) -> NetworkStateFieldShapeReport {
-    let shape = field_wire_shape(field, wire_shapes);
     let rust_type = field
         .rust_type
         .as_deref()
         .filter(|rust_type| syn::parse_str::<syn::Type>(rust_type).is_ok());
+    let explicit_field_type =
+        rust_type.filter(|rust_type| is_replicated_state_field_type(rust_type));
+    let shape = if explicit_field_type.is_some() {
+        field.wire_shape.or_else(|| {
+            field
+                .native_type
+                .as_deref()
+                .and_then(native_type_wire_shape)
+        })
+    } else {
+        field_wire_shape(field, wire_shapes)
+    };
     let rust_shape = shape.map(rust_field_shape);
-    let blocked_reason = field_blocked_reason(field, shape, field.rust_type.as_deref());
+    let blocked_reason = state_field_blocked_reason(
+        field,
+        shape,
+        field.rust_type.as_deref(),
+        explicit_field_type,
+    );
     NetworkStateFieldShapeReport {
         field_index: field.index,
         field_name: field.name.clone(),
         group: field.group,
         handler_vtable: field.handler_vtable.clone(),
         wire_shape: shape,
-        wire_shape_source: field_wire_shape_source(field, wire_shapes, wire_shape_sources),
-        rust_value_type: rust_type
+        wire_shape_source: if explicit_field_type.is_some() && shape.is_none() {
+            None
+        } else {
+            field_wire_shape_source(field, wire_shapes, wire_shape_sources)
+        },
+        rust_value_type: if explicit_field_type.is_some() {
+            None
+        } else {
+            rust_type
+                .map(ToOwned::to_owned)
+                .or_else(|| rust_shape.as_ref().map(|shape| shape.value_type.clone()))
+        },
+        rust_field_type: explicit_field_type
             .map(ToOwned::to_owned)
-            .or_else(|| rust_shape.as_ref().map(|shape| shape.value_type.clone())),
-        rust_field_type: rust_shape.map(|shape| shape.field_type),
+            .or_else(|| {
+                rust_type.filter(|_| shape.is_some()).map(|rust_type| {
+                    replicated_field_handler_type(
+                        shape.expect("state value override has a wire shape"),
+                        rust_type,
+                    )
+                })
+            })
+            .or_else(|| rust_shape.map(|shape| shape.field_type)),
         confidence: field.confidence,
         supported: blocked_reason.is_none(),
         blocked_reason,
     }
+}
+
+fn state_field_has_complete_shape(field: &NetworkStateFieldShapeReport) -> bool {
+    field.wire_shape.is_some()
+        || field
+            .rust_field_type
+            .as_deref()
+            .is_some_and(is_replicated_state_field_type)
 }
 
 fn field_wire_shape(
@@ -1409,12 +1451,22 @@ fn field_wire_shape_source(
 fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
     match native_type.trim() {
         "bool" => Some(SchemaWireShape::Bool),
-        "u8" | "uint8_t" | "AZ::u8" => Some(SchemaWireShape::U8),
-        "u16" | "uint16_t" | "AZ::u16" => Some(SchemaWireShape::U16),
-        "u32" | "uint32_t" | "AZ::u32" | "FragmentKey" | "Amazon::Hub::FragmentKey" => {
-            Some(SchemaWireShape::U32)
+        "u8" | "uint8_t" | "AZ::u8" | "i8" | "int8_t" | "AZ::s8" => Some(SchemaWireShape::U8),
+        "u16" | "uint16_t" | "AZ::u16" | "i16" | "int16_t" | "AZ::s16" => {
+            Some(SchemaWireShape::U16)
         }
-        "u64" | "uint64_t" | "AZ::u64" => Some(SchemaWireShape::U64),
+        "u32"
+        | "uint32_t"
+        | "AZ::u32"
+        | "i32"
+        | "int32_t"
+        | "AZ::s32"
+        | "AZ::Crc32"
+        | "FragmentKey"
+        | "Amazon::Hub::FragmentKey" => Some(SchemaWireShape::U32),
+        "u64" | "uint64_t" | "AZ::u64" | "i64" | "int64_t" | "AZ::s64" | "AZ::EntityId" => {
+            Some(SchemaWireShape::U64)
+        }
         "f32" | "float" => Some(SchemaWireShape::F32),
         "f64" | "double" => Some(SchemaWireShape::F64),
         "AZ::Vector2" => Some(SchemaWireShape::Vec2),
@@ -1540,10 +1592,11 @@ fn message_blocked_reasons(
     reasons
 }
 
-fn field_blocked_reason(
+fn state_field_blocked_reason(
     field: &NetworkField,
     shape: Option<SchemaWireShape>,
     rust_type: Option<&str>,
+    explicit_field_type: Option<&str>,
 ) -> Option<String> {
     if field.index.is_none() {
         return Some("missing-field-index".to_owned());
@@ -1554,13 +1607,13 @@ fn field_blocked_reason(
     if !field.confidence.is_high_or_exact() {
         return Some("low-confidence-field".to_owned());
     }
-    if shape.is_none() {
-        return Some("missing-wire-shape".to_owned());
-    }
     if let Some(rust_type) = rust_type
         && syn::parse_str::<syn::Type>(rust_type).is_err()
     {
         return Some("invalid-rust-field-type".to_owned());
+    }
+    if shape.is_none() && explicit_field_type.is_none() {
+        return Some("missing-wire-shape".to_owned());
     }
     None
 }
@@ -1710,6 +1763,31 @@ fn rust_field_shape_static(value_type: &'static str, field_type: &'static str) -
     }
 }
 
+fn replicated_field_handler_type(shape: SchemaWireShape, rust_type: &str) -> String {
+    if let Some(conversion) = conversion_marshal_type_string_for(shape, rust_type) {
+        return format!(
+            "::nw_network::serialize::ReplicatedFieldHandler<{rust_type}, {conversion}>"
+        );
+    }
+    format!("::nw_network::serialize::ReplicatedFieldHandler<{rust_type}>")
+}
+
+fn is_replicated_state_field_type(rust_type: &str) -> bool {
+    if syn::parse_str::<syn::Type>(rust_type).is_err() {
+        return false;
+    }
+    let rust_type = rust_type.trim().trim_start_matches("::");
+    [
+        "nw_network::serialize::ReplicatedFieldHandler",
+        "nw_network::serialize::ReplicatedContainer",
+        "nw_network::serialize::ReplicatedMap",
+        "nw_network::serialize::ReplicatedIndexMap",
+        "nw_network::serialize::ReplicatedVec",
+    ]
+    .into_iter()
+    .any(|prefix| rust_type == prefix || rust_type.starts_with(&format!("{prefix}<")))
+}
+
 fn unsuffixed_int_lit(value: u16) -> LitInt {
     LitInt::new(&value.to_string(), proc_macro2::Span::call_site())
 }
@@ -1804,6 +1882,15 @@ fn replicated_state_field_tokens(field: &NetworkStateFieldShapeReport) -> proc_m
 fn replicated_state_field_type_tokens(
     field: &NetworkStateFieldShapeReport,
 ) -> proc_macro2::TokenStream {
+    if let Some(field_type) = field
+        .rust_field_type
+        .as_deref()
+        .filter(|rust_type| is_replicated_state_field_type(rust_type))
+        .and_then(|rust_type| syn::parse_str::<syn::Type>(rust_type).ok())
+    {
+        return quote!(#field_type);
+    }
+
     let shape = field
         .wire_shape
         .expect("generatable replicated state field has a wire shape");
@@ -2046,8 +2133,13 @@ fn field_conversion_marshal_type_tokens(
 
 fn field_conversion_marshal_type_string(field: &NetworkStateFieldShapeReport) -> Option<String> {
     let shape = field.wire_shape?;
-    let serialized_type = scalar_conversion_serialized_type(shape)?;
     let rust_type = field.rust_value_type.as_deref()?.trim();
+    conversion_marshal_type_string_for(shape, rust_type)
+}
+
+fn conversion_marshal_type_string_for(shape: SchemaWireShape, rust_type: &str) -> Option<String> {
+    let serialized_type = scalar_conversion_serialized_type(shape)?;
+    let rust_type = rust_type.trim();
     if rust_type == serialized_type {
         return None;
     }
@@ -2426,6 +2518,92 @@ mod tests {
                 .contains("pub group_activity_eligibility:")
         );
         assert!(state_output.source.contains("[u8; 16]"));
+    }
+
+    #[test]
+    fn replicated_state_rust_type_override_wraps_value_type() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "B4DB39E2-5054-4604-9855-9A4DC75BDDE4",
+                "typeIndex": 3362,
+                "typeName": "MB::SlayerScriptReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "curScriptStateId",
+                    "group": 0,
+                    "nativeType": "AZ::s8",
+                    "rustType": "i8",
+                    "wireShape": "u8",
+                    "wireShapeSource": "source:field-override",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+
+        assert!(plan.can_generate);
+        assert_eq!(plan.missing_wire_shape_count, 0);
+        assert_eq!(plan.fields[0].rust_value_type.as_deref(), Some("i8"));
+        assert_eq!(
+            plan.fields[0].rust_field_type.as_deref(),
+            Some("::nw_network::serialize::ReplicatedFieldHandler<i8>")
+        );
+        assert!(output.source.contains(
+            "pub cur_script_state_id: ::nw_network::serialize::ReplicatedFieldHandler<i8>"
+        ));
+    }
+
+    #[test]
+    fn replicated_state_rust_type_override_can_be_complete_field_type() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "B4DB39E2-5054-4604-9855-9A4DC75BDDE4",
+                "typeIndex": 3362,
+                "typeName": "MB::SlayerScriptReplicatedState",
+                "fields": [{
+                    "index": 2,
+                    "name": "spawnedEntityIdsBySpawnerId",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81bf3d0",
+                    "nativeType": "MB::ReplicatedMapFieldHandler<AZ::Crc32, AZ::EntityId>",
+                    "rustType": "::nw_network::serialize::ReplicatedMap<::nw_network::Crc32, ::nw_network::EntityId>",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81bf3d0",
+                "fieldCount": 1,
+                "wireShape": "vlq-u32",
+                "wireShapeSource": "marshal-call:ambiguous-container-helper",
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+
+        assert!(plan.can_generate);
+        assert_eq!(plan.shaped_field_count, 1);
+        assert_eq!(plan.missing_wire_shape_count, 0);
+        assert_eq!(plan.fields[0].wire_shape, None);
+        assert_eq!(plan.fields[0].rust_value_type, None);
+        assert_eq!(
+            plan.fields[0].rust_field_type.as_deref(),
+            Some(
+                "::nw_network::serialize::ReplicatedMap<::nw_network::Crc32, ::nw_network::EntityId>"
+            )
+        );
+        assert!(output.source.contains("ReplicatedMap"));
+        assert!(output.source.contains("::nw_network::Crc32"));
+        assert!(output.source.contains("::nw_network::EntityId"));
     }
 
     #[test]
