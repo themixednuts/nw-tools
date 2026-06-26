@@ -532,20 +532,21 @@ fn sprite_base(label: &str) -> Option<(String, u32)> {
     if base.is_empty() {
         return None;
     }
-    if !separated {
-        // Bare `XNN` form (no `_` separator) is risky, so require ≥2 digits and
-        // reject coordinate axes like `map_l1_y000_x000` — where the digits follow a
-        // single-letter axis label (`_x`, `_y`). Those are spatial tile grids (e.g.
-        // `worldtiles/`), not animation frames.
-        if digits.len() < 2 {
-            return None;
-        }
-        let bytes = base.as_bytes();
-        if let [.., b'_', axis] = bytes
-            && axis.is_ascii_alphabetic()
-        {
-            return None;
-        }
+    // Reject coordinate tiles like `map_l1_y000_x000` (worldtiles): digits that
+    // follow a single-letter axis label (`_x`, `_y`) are a spatial grid, not frames.
+    if let [.., b'_', axis] = base.as_bytes()
+        && axis.is_ascii_alphabetic()
+    {
+        return None;
+    }
+    // A folder explicitly named for a sequence (`.../imagesequence/`, `sequence_*`)
+    // is authoritative: accept any frame numbering, including single-digit bare
+    // frames like `tension0`. Outside such a folder the bare `XNN` form is risky
+    // (e.g. LODs `tree_lod0`, variants `wood1`), so require ≥2 digits there.
+    let directory = label.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let in_sequence_dir = directory.to_ascii_lowercase().contains("sequence");
+    if !separated && !in_sequence_dir && digits.len() < 2 {
+        return None;
     }
     Some((base.to_string(), number))
 }
@@ -822,5 +823,17 @@ mod tests {
         assert_eq!(sprite_base("map_l1_y001_x017.dds"), None);
         // But an underscore-separated frame after a single letter is still a frame.
         assert_eq!(sprite_base("fx/a_07.dds"), Some(("fx/a".into(), 7)));
+    }
+
+    #[test]
+    fn sprite_base_accepts_single_digit_frames_in_sequence_dirs() {
+        // Real single-digit bare frames in a `*sequence*` folder must be grouped.
+        let dir = "lyshineui/images/hud/fishing/tensionimagesequence";
+        assert_eq!(sprite_base(&format!("{dir}/tension0.dds")), Some((format!("{dir}/tension"), 0)));
+        assert_eq!(sprite_base(&format!("{dir}/tension9.dds")), Some((format!("{dir}/tension"), 9)));
+        assert_eq!(sprite_base(&format!("{dir}/tension12.dds")), Some((format!("{dir}/tension"), 12)));
+        // Single-digit bare suffix outside a sequence folder stays a plain texture
+        // (LODs/variants, e.g. `tree_lod0`).
+        assert_eq!(sprite_base("objects/tree/tree_lod0.dds"), None);
     }
 }
