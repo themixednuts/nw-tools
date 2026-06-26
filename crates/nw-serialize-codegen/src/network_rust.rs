@@ -15,7 +15,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v27";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v28";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -108,6 +108,8 @@ pub struct NetworkStateFieldShapeReport {
     pub wire_shape_source: Option<String>,
     pub rust_value_type: Option<String>,
     pub rust_field_type: Option<String>,
+    #[serde(default)]
+    pub constructor_write_count: usize,
     pub confidence: NetworkConfidence,
     pub supported: bool,
     pub blocked_reason: Option<String>,
@@ -1505,6 +1507,7 @@ fn state_field_shape_report(
                     })
             })
             .or_else(|| rust_shape.map(|shape| shape.field_type)),
+        constructor_write_count: field.constructor_writes.len(),
         confidence: field.confidence,
         supported: blocked_reason.is_none(),
         blocked_reason,
@@ -2042,18 +2045,17 @@ fn replicated_state_module_tokens(
         .iter()
         .map(replicated_state_field_tokens)
         .collect::<Vec<_>>();
-    let type_registry_import = derive_type_registry.then(|| quote!(, TypeRegistry));
-    let type_registry_derive = derive_type_registry.then(|| quote!(, TypeRegistry));
+    let type_registry_import = derive_type_registry.then(|| quote!(, type_registry));
     let type_registry_attr = derive_type_registry.then(|| quote!(#[type_registry(#type_index)]));
 
     quote! {
         pub mod #module_ident {
-            use ::nw_network::{AzRtti #type_registry_import};
+            use ::nw_network::{az_rtti, replicated_state #type_registry_import};
 
-            #[::nw_network_derive::replicated_state]
-            #[derive(Debug, Clone, Default, AzRtti #type_registry_derive)]
+            #[replicated_state]
             #[az_rtti(#type_id)]
             #type_registry_attr
+            #[derive(Debug, Clone, Default)]
             pub struct #state_ident {
                 #(#fields)*
             }
@@ -2247,11 +2249,11 @@ fn message_module_tokens(
 
     quote! {
         pub mod #module_ident {
-            use ::nw_network::{AzRtti, Marshaler, TypeRegistry};
+            use ::nw_network::{Marshaler, az_rtti, type_registry};
 
-            #[derive(Debug, Clone, PartialEq, Marshaler, AzRtti, TypeRegistry)]
             #[az_rtti(#type_id)]
             #[type_registry(#type_index)]
+            #[derive(Debug, Clone, PartialEq, Marshaler)]
             pub struct #message_ident {
                 #(#fields)*
             }
@@ -2725,11 +2727,7 @@ mod tests {
                 .contains("pub struct RaidDataComponentReplicatedState")
         );
         assert!(state_output.source.contains("pub raid_id:"));
-        assert!(
-            state_output
-                .source
-                .contains("#[::nw_network_derive::replicated_state]")
-        );
+        assert!(state_output.source.contains("#[replicated_state]"));
         assert!(!state_output.source.contains("Default, ReplicatedState"));
         assert!(
             !state_output
@@ -3132,8 +3130,8 @@ mod tests {
         assert!(message_output.source.contains("pub status_code: u32"));
         assert!(message_output.source.contains("pub server_version: String"));
         assert!(message_output.source.contains("Marshaler"));
-        assert!(message_output.source.contains("AzRtti"));
-        assert!(message_output.source.contains("TypeRegistry"));
+        assert!(message_output.source.contains("az_rtti"));
+        assert!(message_output.source.contains("type_registry"));
     }
 
     #[test]
