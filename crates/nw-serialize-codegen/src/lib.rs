@@ -136,10 +136,11 @@ pub use network_schema::{
     NetworkFieldOverrideFile, NetworkFieldOverrideMergeReport, NetworkFieldRegistrationFunction,
     NetworkHandler, NetworkMessageFieldSignature, NetworkMessageSignature,
     NetworkMessageSignatureMergeReport, NetworkRegistrationHook,
-    NetworkReplicatedContainerWireShape, NetworkRootKind, NetworkSchema, NetworkSchemaImportError,
+    NetworkReplicatedContainerWireShape, NetworkSchema, NetworkSchemaImportError,
     NetworkSchemaSource, NetworkSchemaSourceKind, NetworkSchemaSummary, NetworkSerializeKind,
     NetworkSerializeMergeReport, NetworkSerializeRole, NetworkSerializeType, NetworkType,
-    NetworkTypeIndexMergeReport, NetworkVirtualFunction, NetworkWireScalarShape, NetworkWireShape,
+    NetworkTypeCapability, NetworkTypeIndexMergeReport, NetworkVirtualFunction,
+    NetworkWireScalarShape, NetworkWireShape,
 };
 pub use reference::{
     ReferenceExpansionContext, ReferenceIndex, ReferenceKey, ReferencePathSegment, ReferenceReport,

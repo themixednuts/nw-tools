@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use nw_serialize_codegen::{
     CodegenContext, CompileUnit, CompletedCodegenUnits, GoSourceEmitter, GoStandaloneProjectFile,
     NetworkFieldOverrideFile, NetworkMessageFieldSignature, NetworkMessageSignature,
-    NetworkRootKind, NetworkRustEmitter, NetworkSchema, NetworkType, NetworkWireShape,
+    NetworkRustEmitter, NetworkSchema, NetworkType, NetworkTypeCapability, NetworkWireShape,
     ReflectedTypeCatalogSummary, RustCodegenPlanner, RustSourceEmitter, RustSourceField,
     RustSourceInventory, RustSourceInventoryItem, RustStandaloneProjectFile,
     SerializeCodegenRootMode, SerializeCodegenRootSelection, SerializeCodegenUnit,
@@ -689,9 +689,9 @@ fn audit_network_rust_source(
 
 fn should_audit_network_source_type(network_type: &NetworkType) -> bool {
     network_type
-        .root_kinds
+        .capabilities
         .iter()
-        .any(|kind| matches!(kind, NetworkRootKind::Message))
+        .any(|kind| matches!(kind, NetworkTypeCapability::DirectMessage))
 }
 
 fn rust_source_candidate_name(schema_name: &str) -> String {
@@ -807,9 +807,9 @@ fn audit_single_network_rust_source_candidate(
 fn expected_network_source_derives(network_type: &NetworkType) -> Vec<String> {
     let mut derives = vec!["Marshaler".to_owned()];
     if network_type
-        .root_kinds
+        .capabilities
         .iter()
-        .any(|kind| matches!(kind, NetworkRootKind::Message))
+        .any(|kind| matches!(kind, NetworkTypeCapability::DirectMessage))
     {
         derives.extend(["ClassDesc".to_owned(), "Message".to_owned()]);
     }
