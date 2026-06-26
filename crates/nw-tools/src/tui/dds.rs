@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
@@ -19,7 +19,6 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Clear;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
@@ -42,8 +41,10 @@ const TARGET_CELL_W: u16 = 40;
 const MIN_COLS: u16 = 2;
 const MAX_COLS: u16 = 6;
 /// Keep this many decoded thumbnails before evicting (oldest off-screen first), so
-/// scrolling back doesn't re-decode what was just viewed.
-const THUMB_CACHE_CAP: usize = 1024;
+/// scrolling back to a recently-viewed row is instant (no re-decode/re-encode).
+/// Sized for several screens of frame-heavy sprite sequences; thumbnails are
+/// cell-sized protocols, so this stays well-bounded in memory.
+const THUMB_CACHE_CAP: usize = 2048;
 /// Thumbnails are decoded + cached at this size (longest edge); the protocol is
 /// then fit to whatever cell, so one cache entry serves any grid size.
 const THUMB_CACHE_PX: u32 = 512;
@@ -269,11 +270,12 @@ enum CellVisual {
     Pending,
 }
 
-/// The thumbnail cache: `(item, frame)` → (last-used clock, state). Most cells use
-/// frame 0; a selected sprite caches every frame so it can animate. The clock
-/// drives LRU eviction so decoded thumbnails survive scrolling away (and switching
-/// to the focus view) and are only dropped, oldest-off-screen first, past a cap.
-type Thumbs = Mutex<HashMap<(usize, usize), (u64, Thumb)>>;
+/// The thumbnail cache: `(item, frame)` → (last-used clock, state). UI-OWNED (no
+/// lock) — workers hand results back over a channel and the UI drains them. Most
+/// cells use frame 0; a selected sprite caches every frame so it can animate. The
+/// clock drives LRU eviction so decoded thumbnails survive scrolling away and are
+/// only dropped, oldest-off-screen first, past a cap.
+type Thumbs = HashMap<(usize, usize), (u64, Thumb)>;
 
 /// Identifies the focus-view protocol: (item, frame, surface, mip, area w, area h).
 type FocusKey = (usize, usize, usize, usize, u16, u16);
@@ -308,13 +310,24 @@ struct EncodeResult {
     protocol: Option<Arc<Protocol>>,
 }
 
-/// A request to decode thumbnails for a window of `(item, frame)` pairs at `size`
-/// (cells). `cancel` is tripped by the UI when the window moves, so a stale batch
-/// stops.
-struct ThumbReq {
-    items: Vec<(usize, usize)>,
+/// One thumbnail decode job for the worker pool: decode `key` = `(item, frame)` at
+/// `size` (cells). `generation` is the cell-size epoch when queued — a worker drops
+/// the job if the grid has since resized (the thumbnail would be the wrong size).
+/// There is NO per-scroll cancellation: a queued job always finishes and is cached,
+/// so scrolling back to a row is instant. Jobs are pushed item-major (all of one
+/// sprite's frames together) so each grid cell becomes smooth independently rather
+/// than the whole screen lighting up at once.
+struct ThumbJob {
+    key: (usize, usize),
     size: Size,
-    cancel: CancellationToken,
+    generation: u64,
+}
+
+/// A decoded thumbnail handed back to the UI (lock-free) via a crossbeam channel.
+struct ThumbResult {
+    key: (usize, usize),
+    generation: u64,
+    thumb: Thumb,
 }
 
 /// A request to decode focus-view previews for `(item, frame)` pairs (all of a
@@ -469,14 +482,15 @@ pub struct DdsBrowser {
     tx: SyncSender<PreviewReq>,
     /// Cancels the in-flight preview decode when the focused texture changes.
     preview_cancel: CancellationToken,
-    // Thumbnail decode (grid).
-    thumbs: Arc<Thumbs>,
-    thumb_tx: SyncSender<ThumbReq>,
-    /// Cancels the in-flight thumbnail batch when the visible window changes.
-    thumb_cancel: CancellationToken,
-    /// The `(item, frame)` window last requested, so we only re-decode (and cancel)
-    /// on change.
-    requested: Vec<(usize, usize)>,
+    // Thumbnail decode (grid) — lock-free worker pool, UI-owned cache.
+    thumbs: Thumbs,
+    /// Push decode jobs to the worker pool (item-major; no per-scroll cancel).
+    thumb_jobs: CbSender<ThumbJob>,
+    /// Drain decoded thumbnails from the pool (lock-free, non-blocking).
+    thumb_results: CbReceiver<ThumbResult>,
+    /// Cell-size epoch shared with the pool; bumped on grid resize so in-flight
+    /// jobs decoded for the old cell size are dropped instead of cached.
+    thumb_generation: Arc<AtomicU64>,
     /// Monotonic clock stamped onto thumbnails as they're shown, for LRU eviction.
     clock: u64,
     /// Whether the last grid render had a visible sprite — drives the animation
@@ -522,30 +536,24 @@ impl DdsBrowser {
         picker: Picker,
         caps: Caps,
     ) -> Self {
-        // Decode on a private pool so interactive thumbnail/preview work never
-        // queues behind (or is starved by) background pak discovery, which runs on
-        // the passed-in `runner`. Fall back to the shared runner if a private pool
-        // can't be built.
-        let decode_runner = std::thread::available_parallelism()
-            .ok()
-            .and_then(|n| JobRunner::with_workers(n.get().saturating_sub(1).max(2)).ok())
-            .unwrap_or(runner);
+        // Decode on private pools so interactive work never queues behind (or is
+        // starved by) background pak discovery, which runs on the passed-in `runner`.
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).max(2))
+            .unwrap_or(4);
+        let decode_runner =
+            JobRunner::with_workers(workers).unwrap_or_else(|_| runner.clone());
         let cache: Arc<Cache> = Arc::new(Mutex::new(HashMap::new()));
-        let tx = spawn_decoder(
-            catalog.clone(),
-            store.clone(),
-            decode_runner.clone(),
-            cache.clone(),
-        );
-        let thumbs: Arc<Thumbs> = Arc::new(Mutex::new(HashMap::new()));
+        let tx = spawn_decoder(catalog.clone(), store.clone(), decode_runner, cache.clone());
         let thumb_cache = Arc::new(ThumbCache::open());
-        let thumb_tx = spawn_thumb_decoder(
+        let thumb_generation = Arc::new(AtomicU64::new(0));
+        let (thumb_jobs, thumb_results) = spawn_thumb_pool(
+            workers,
             catalog.clone(),
             store,
             thumb_cache,
-            decode_runner,
             picker.clone(),
-            thumbs.clone(),
+            thumb_generation.clone(),
         );
         let (encode_tx, encode_rx) = spawn_encoder(picker);
         let mut browser = Self {
@@ -573,10 +581,10 @@ impl DdsBrowser {
             cache,
             tx,
             preview_cancel: CancellationToken::new(),
-            thumbs,
-            thumb_tx,
-            thumb_cancel: CancellationToken::new(),
-            requested: Vec::new(),
+            thumbs: HashMap::new(),
+            thumb_jobs,
+            thumb_results,
+            thumb_generation,
             clock: 0,
             grid_has_sprite: false,
             dirty: false,
@@ -611,6 +619,11 @@ impl DdsBrowser {
         self.order = (0..self.items.len()).collect();
         self.order.sort_by(|&a, &b| self.items[a].label.cmp(&self.items[b].label));
         self.rebuild();
+        // New items can shift grid positions; clear residue once (cheap — only
+        // while discovery is actively streaming, not on a settled grid).
+        if !self.focused {
+            self.dirty = true;
+        }
         true
     }
 
@@ -773,11 +786,13 @@ impl DdsBrowser {
         let last = (self.visible.len() - 1) as isize;
         self.selected = (self.selected as isize).saturating_add(delta).clamp(0, last) as usize;
         self.status = None;
+        self.dirty = true; // content may scroll; clear residue once next frame
     }
 
     fn select(&mut self, index: usize) {
         self.selected = index.min(self.visible.len().saturating_sub(1));
         self.status = None;
+        self.dirty = true;
     }
 
     /// Open the focus view on the current texture and request its full decode.
@@ -826,41 +841,67 @@ impl DdsBrowser {
         }
     }
 
-    /// Request thumbnail decodes for the visible grid `window`, cancelling the
-    /// previous batch. No-op when the window is unchanged, so a still grid keeps
-    /// decoding instead of being cancelled every frame; thumbnails outside the
-    /// window are evicted to bound memory.
-    fn request_thumbs(&mut self, window: Vec<(usize, usize)>) {
-        if window == self.requested {
-            return;
+    /// Queue thumbnail decodes for the visible `items` (item-major: all of one
+    /// sprite's frames together, so each cell loads as an independent unit). Skips
+    /// frames already cached or in flight, refreshes their LRU stamp, then evicts
+    /// down to the cache cap (keeping the visible window).
+    fn request_thumbs(&mut self, items: &[usize]) {
+        let generation = self.thumb_generation.load(Ordering::Relaxed);
+        let size = self.cell;
+        self.clock = self.clock.wrapping_add(1);
+        let now = self.clock;
+        let mut keep: HashSet<(usize, usize)> = HashSet::new();
+        for &item in items {
+            let frames = self.items[item].frames.len();
+            let count = if frames > 1 { frames } else { 1 };
+            for frame in 0..count {
+                let key = (item, frame);
+                keep.insert(key);
+                match self.thumbs.get_mut(&key) {
+                    Some((used, _)) => *used = now, // already cached/in-flight; keep warm
+                    None => {
+                        self.thumbs.insert(key, (now, Thumb::Pending));
+                        let _ = self.thumb_jobs.send(ThumbJob { key, size, generation });
+                    }
+                }
+            }
         }
-        self.thumb_cancel.cancel();
-        let cancel = CancellationToken::new();
-        self.thumb_cancel = cancel.clone();
-        self.evict_thumbs(&window);
-        let _ = self.thumb_tx.try_send(ThumbReq { items: window.clone(), size: self.cell, cancel });
-        self.requested = window;
+        self.evict_thumbs(&keep);
+    }
+
+    /// Drain decoded thumbnails from the worker pool into the UI-owned cache
+    /// (non-blocking). Results from a superseded cell-size generation are dropped.
+    fn drain_thumbs(&mut self) {
+        let current = self.thumb_generation.load(Ordering::Relaxed);
+        while let Ok(result) = self.thumb_results.try_recv() {
+            if result.generation == current
+                && let Some(entry) = self.thumbs.get_mut(&result.key)
+            {
+                entry.1 = result.thumb;
+            }
+        }
     }
 
     /// Bound the thumbnail cache: only when it exceeds the cap, drop the
-    /// least-recently-shown thumbnails that aren't currently visible. Off-screen
-    /// and other-screen thumbnails are kept until that pressure point, so moving
-    /// around never forces a re-decode of what was just viewed.
-    fn evict_thumbs(&self, window: &[(usize, usize)]) {
-        let mut thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
-        if thumbs.len() <= THUMB_CACHE_CAP {
+    /// least-recently-shown ready/failed thumbnails that aren't currently visible.
+    /// In-flight (pending) and visible entries are never evicted, so moving around
+    /// doesn't force a re-decode of what was just viewed.
+    fn evict_thumbs(&mut self, keep: &HashSet<(usize, usize)>) {
+        if self.thumbs.len() <= THUMB_CACHE_CAP {
             return;
         }
-        let keep: HashSet<(usize, usize)> = window.iter().copied().collect();
-        let mut evictable: Vec<(u64, (usize, usize))> = thumbs
+        let mut evictable: Vec<(u64, (usize, usize))> = self
+            .thumbs
             .iter()
-            .filter(|(key, _)| !keep.contains(key))
+            .filter(|(key, (_, thumb))| {
+                !keep.contains(*key) && matches!(thumb, Thumb::Ready(_) | Thumb::Failed)
+            })
             .map(|(key, (used, _))| (*used, *key))
             .collect();
         evictable.sort_unstable();
-        let excess = thumbs.len() - THUMB_CACHE_CAP;
+        let excess = self.thumbs.len() - THUMB_CACHE_CAP;
         for (_, key) in evictable.into_iter().take(excess) {
-            thumbs.remove(&key);
+            self.thumbs.remove(&key);
         }
     }
 
@@ -1022,17 +1063,13 @@ impl View for DdsBrowser {
             // protocol has been encoded off-thread.
             return self.focus_pending();
         }
-        let thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
-        self.requested.iter().any(|key| {
-            !matches!(
-                thumbs.get(key).map(|(_, state)| state),
-                Some(Thumb::Ready(_)) | Some(Thumb::Failed)
-            )
-        })
+        // Keep ticking while any thumbnail is still decoding (drains + redraws).
+        self.thumbs.values().any(|(_, thumb)| matches!(thumb, Thumb::Pending))
     }
 
     fn tick(&mut self) {
         self.ingest();
+        self.drain_thumbs();
         self.drain_encodes();
     }
 
@@ -1061,15 +1098,18 @@ impl View for DdsBrowser {
                     self.filter.clear();
                     self.filtering = false;
                     self.rebuild();
+                    self.dirty = true;
                 }
                 KeyCode::Enter => self.filtering = false,
                 KeyCode::Backspace => {
                     self.filter.pop();
                     self.rebuild();
+                    self.dirty = true;
                 }
                 KeyCode::Char(c) => {
                     self.filter.push(c);
                     self.rebuild();
+                    self.dirty = true;
                 }
                 _ => {}
             }
@@ -1110,10 +1150,11 @@ impl View for DdsBrowser {
         );
 
         self.body = body;
-        // Wipe the body so graphics-protocol image cells from the previous frame
-        // (a scrolled-off thumbnail, or the grid when switching to focus) don't
-        // leave residue behind the new content.
-        frame.render_widget(Clear, body);
+        // Don't wipe the body every frame — that forces every thumbnail/image to
+        // re-emit each animation tick (the multi-sprite chug). Residue from a
+        // content shift (scroll, filter, focus enter/exit) is cleared once via the
+        // `dirty` flag (see `needs_clear`); steady animation repaints only the cells
+        // whose image actually changed.
         if self.focused {
             self.render_focus(frame, body);
         } else {
@@ -1188,12 +1229,15 @@ impl DdsBrowser {
         let cols = cols as usize;
         self.cols = cols;
 
-        // Re-decode at the new size if the cell geometry changed (terminal resize).
+        // Re-decode at the new size if the cell geometry changed (terminal resize):
+        // bump the generation so in-flight jobs for the old size are dropped, and
+        // clear the cache so cells re-request at the new size.
         let cell = Size::new(thumb_w, thumb_h);
         if cell != self.cell {
             self.cell = cell;
-            self.thumbs.lock().unwrap_or_else(|error| error.into_inner()).clear();
-            self.requested.clear();
+            self.thumb_generation.fetch_add(1, Ordering::Relaxed);
+            self.thumbs.clear();
+            self.dirty = true;
         }
 
         let rows_visible = (area.height / cell_h).max(1) as usize;
@@ -1209,57 +1253,35 @@ impl DdsBrowser {
         let end = (start + cols * rows_visible).min(self.visible.len());
         let items: Vec<usize> = self.visible[start..end].to_vec();
 
-        // Every visible sprite caches all its frames so they all animate in the
-        // grid (sharing one wall-clock-derived frame index); static textures use
-        // frame 0 only.
-        let mut thumb_window: Vec<(usize, usize)> = Vec::with_capacity(items.len());
-        let mut has_sprite = false;
-        for &item in &items {
-            let frames = self.items[item].frames.len();
-            if frames > 1 {
-                has_sprite = true;
-                thumb_window.extend((0..frames).map(|frame| (item, frame)));
-            } else {
-                thumb_window.push((item, 0));
-            }
-        }
-        self.grid_has_sprite = has_sprite;
-        self.request_thumbs(thumb_window);
+        self.grid_has_sprite = items.iter().any(|&item| self.items[item].frames.len() > 1);
+        // Queue decodes for every visible cell (item-major, deduped) and refresh
+        // their LRU stamps. No per-scroll cancel: queued jobs finish and cache, so
+        // scrolling back to a row is instant.
+        self.request_thumbs(&items);
 
-        self.clock = self.clock.wrapping_add(1);
-        let now = self.clock;
         let glyphs = theme::glyphs(self.caps);
-
-        // First pass: snapshot each cell's ready protocol (cheap `Arc` clone) and
-        // stamp LRU under a brief lock. The lock is released before any rendering,
-        // so the UI never holds it across image blits (workers can keep publishing).
-        let cells: Vec<CellVisual> = {
-            let mut thumbs = self.thumbs.lock().unwrap_or_else(|error| error.into_inner());
-            items
-                .iter()
-                .map(|&item| {
-                    let frames = self.items[item].frames.len();
-                    // Show this sprite's live frame, falling back to frame 0 while it
-                    // decodes (so it never blinks to a placeholder mid-cycle).
-                    let live = if frames > 1 { self.current_frame(frames) } else { 0 };
-                    for candidate in [live, 0] {
-                        if let Some(entry) = thumbs.get_mut(&(item, candidate)) {
-                            entry.0 = now; // mark recently shown for LRU
-                            match &entry.1 {
-                                Thumb::Ready(protocol) => {
-                                    return CellVisual::Image(protocol.clone());
-                                }
-                                Thumb::Failed if candidate == 0 => return CellVisual::Failed,
-                                _ => {}
-                            }
-                        }
+        // Snapshot each cell's current-frame protocol (cheap `Arc` clone) from the
+        // UI-owned cache — no lock. Falls back to frame 0 while the live sprite frame
+        // still decodes, so a cell never blinks to a placeholder mid-cycle. Each cell
+        // is independent: it shows its image the moment ITS frames are ready,
+        // regardless of other (still-decoding) cells.
+        let cells: Vec<CellVisual> = items
+            .iter()
+            .map(|&item| {
+                let frames = self.items[item].frames.len();
+                let live = if frames > 1 { self.current_frame(frames) } else { 0 };
+                for candidate in [live, 0] {
+                    match self.thumbs.get(&(item, candidate)).map(|(_, thumb)| thumb) {
+                        Some(Thumb::Ready(protocol)) => return CellVisual::Image(protocol.clone()),
+                        Some(Thumb::Failed) if candidate == 0 => return CellVisual::Failed,
+                        _ => {}
                     }
-                    CellVisual::Pending
-                })
-                .collect()
-        };
+                }
+                CellVisual::Pending
+            })
+            .collect();
 
-        // Second pass: render the snapshot (no lock held).
+        // Render the snapshot.
         for (slot, (&item, visual)) in items.iter().zip(&cells).enumerate() {
             let grid_index = start + slot;
             let col = (slot % cols) as u16;
@@ -1775,86 +1797,58 @@ fn decode_loop(
     }
 }
 
-fn spawn_thumb_decoder(
+/// Spawn the grid thumbnail worker pool: `workers` threads that each pull one
+/// [`ThumbJob`] at a time from a shared lock-free queue, decode + encode it, and
+/// hand the result back over a channel the UI drains. Jobs are processed in
+/// roughly FIFO order, so item-major enqueue makes each sprite finish (and start
+/// playing smoothly) independently. A job whose cell-size `generation` is stale is
+/// skipped without decoding.
+fn spawn_thumb_pool(
+    workers: usize,
     catalog: Arc<DdsCatalog>,
     store: Arc<TextureStore>,
     cache: Arc<ThumbCache>,
-    runner: JobRunner,
     picker: Picker,
-    thumbs: Arc<Thumbs>,
-) -> SyncSender<ThumbReq> {
-    let (tx, rx) = sync_channel::<ThumbReq>(8);
-    std::thread::spawn(move || {
-        thumb_loop(&rx, &catalog, &store, &cache, &runner, &picker, &thumbs);
-    });
-    tx
-}
-
-/// Decode + encode grid thumbnails on a worker thread. Each request is a window
-/// of items at a cell size; the batch is cancellable (the UI trips the token when
-/// the window moves), and items are decoded straight out of the (still-growing)
-/// catalog as soon as they are discovered — never waiting for discovery to finish.
-fn thumb_loop(
-    rx: &Receiver<ThumbReq>,
-    catalog: &DdsCatalog,
-    store: &TextureStore,
-    cache: &ThumbCache,
-    runner: &JobRunner,
-    picker: &Picker,
-    thumbs: &Thumbs,
-) {
-    while let Ok(mut req) = rx.recv() {
-        // Coalesce to the most recent request so fast scrolling doesn't backlog.
-        while let Ok(next) = rx.try_recv() {
-            req = next;
-        }
-        if req.cancel.is_cancelled() {
-            continue;
-        }
-        // Claim the not-yet-decoded frames, snapshotting each out of the (growing)
-        // catalog so the decode holds no lock.
-        let todo: Vec<((usize, usize), DdsFrame)> = {
-            let mut guard = thumbs.lock().unwrap_or_else(|error| error.into_inner());
-            let mut todo = Vec::new();
-            for &(item, frame) in &req.items {
-                let key = (item, frame);
-                if !guard.contains_key(&key)
-                    && let Some(dds) = catalog.item(item)
-                    && let Some(data) = dds.frames.get(frame)
+    generation: Arc<AtomicU64>,
+) -> (CbSender<ThumbJob>, CbReceiver<ThumbResult>) {
+    let (job_tx, job_rx) = unbounded::<ThumbJob>();
+    let (res_tx, res_rx) = unbounded::<ThumbResult>();
+    for _ in 0..workers.max(1) {
+        let job_rx = job_rx.clone();
+        let res_tx = res_tx.clone();
+        let catalog = catalog.clone();
+        let store = store.clone();
+        let cache = cache.clone();
+        let picker = picker.clone();
+        let generation = generation.clone();
+        std::thread::spawn(move || {
+            while let Ok(job) = job_rx.recv() {
+                // Skip work the grid has already resized past.
+                if job.generation != generation.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let (item, frame) = job.key;
+                let thumb = match catalog.item(item).and_then(|dds| dds.frames.get(frame).cloned()) {
+                    Some(data) => match decode_thumbnail(&store, &cache, &data, &picker, job.size) {
+                        Ok(protocol) => Thumb::Ready(Arc::new(protocol)),
+                        Err(_) => Thumb::Failed,
+                    },
+                    None => Thumb::Failed,
+                };
+                if res_tx
+                    .send(ThumbResult {
+                        key: job.key,
+                        generation: job.generation,
+                        thumb,
+                    })
+                    .is_err()
                 {
-                    guard.insert(key, (0, Thumb::Pending));
-                    todo.push((key, data.clone()));
+                    break; // UI gone
                 }
             }
-            todo
-        };
-        if todo.is_empty() {
-            continue;
-        }
-        // `todo` is in display order; rayon starts it in order and each thumbnail
-        // is published the instant it decodes, so the grid fills progressively
-        // (roughly top-to-bottom) instead of all at once after the slowest one.
-        let size = req.size;
-        runner.for_each_until_cancelled(&todo, &req.cancel, |(key, data)| {
-            let state = match decode_thumbnail(store, cache, data, picker, size) {
-                Ok(protocol) => Thumb::Ready(Arc::new(protocol)),
-                Err(_) => Thumb::Failed,
-            };
-            let mut guard = thumbs.lock().unwrap_or_else(|error| error.into_inner());
-            // Only publish if still the in-flight entry (not evicted/superseded).
-            if matches!(guard.get(key), Some((_, Thumb::Pending))) {
-                guard.insert(*key, (0, state));
-            }
         });
-        // Frames left Pending by a cancelled batch: drop them so they re-decode
-        // when next requested.
-        let mut guard = thumbs.lock().unwrap_or_else(|error| error.into_inner());
-        for (key, _) in &todo {
-            if matches!(guard.get(key), Some((_, Thumb::Pending))) {
-                guard.remove(key);
-            }
-        }
     }
+    (job_tx, res_rx)
 }
 
 /// Decode a texture's top mip to a small thumbnail and encode it to a terminal
