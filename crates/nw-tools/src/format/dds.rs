@@ -529,8 +529,23 @@ fn sprite_base(label: &str) -> Option<(String, u32)> {
         Some(base) => (base, true),
         None => (head, false),
     };
-    if base.is_empty() || (!separated && digits.len() < 2) {
+    if base.is_empty() {
         return None;
+    }
+    if !separated {
+        // Bare `XNN` form (no `_` separator) is risky, so require ≥2 digits and
+        // reject coordinate axes like `map_l1_y000_x000` — where the digits follow a
+        // single-letter axis label (`_x`, `_y`). Those are spatial tile grids (e.g.
+        // `worldtiles/`), not animation frames.
+        if digits.len() < 2 {
+            return None;
+        }
+        let bytes = base.as_bytes();
+        if let [.., b'_', axis] = bytes
+            && axis.is_ascii_alphabetic()
+        {
+            return None;
+        }
     }
     Some((base.to_string(), number))
 }
@@ -794,5 +809,18 @@ mod tests {
         assert_eq!(sprite_base("00.dds"), None);
         // Not a DDS.
         assert_eq!(sprite_base("fx/spark_00.png"), None);
+    }
+
+    #[test]
+    fn sprite_base_rejects_coordinate_tiles() {
+        // World map tiles: trailing digits follow a single-letter axis (`_x`/`_y`),
+        // so they must NOT be grouped as animation frames.
+        assert_eq!(
+            sprite_base("lyshineui/worldtiles/newworld_vitaeeterna/map_l1_y000_x000.dds"),
+            None
+        );
+        assert_eq!(sprite_base("map_l1_y001_x017.dds"), None);
+        // But an underscore-separated frame after a single letter is still a frame.
+        assert_eq!(sprite_base("fx/a_07.dds"), Some(("fx/a".into(), 7)));
     }
 }
