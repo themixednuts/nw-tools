@@ -1584,7 +1584,7 @@ fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
 fn message_native_type_rust_type(native_type: &str) -> Option<&'static str> {
     match native_type.trim() {
         "ActorRef" | "Amazon::Hub::ActorRef" | "HubAddress" | "ProxyAddress" => {
-            Some("::nw_network::HubAddress")
+            Some("::nw_network::ActorRef")
         }
         "BaselineableFragment" | "Amazon::Hub::BaselineableFragment" => {
             Some("::nw_network::hub::BaselineableFragment")
@@ -2178,7 +2178,7 @@ fn message_module_tokens(
         pub mod #module_ident {
             use ::nw_network::{AzRtti, Marshaler, TypeRegistry};
 
-            #[derive(Debug, Clone, Default, PartialEq, Marshaler, AzRtti, TypeRegistry)]
+            #[derive(Debug, Clone, PartialEq, Marshaler, AzRtti, TypeRegistry)]
             #[az_rtti(#type_id)]
             #[type_registry(#type_index)]
             pub struct #message_ident {
@@ -2191,11 +2191,7 @@ fn message_module_tokens(
 }
 
 fn message_field_tokens(field: &NetworkStateFieldShapeReport) -> proc_macro2::TokenStream {
-    let field_name = field
-        .field_name
-        .as_deref()
-        .expect("generatable message field has a name");
-    let field_ident = format_ident!("{}", rust_field_ident(field_name));
+    let field_ident = format_ident!("{}", message_field_ident(field));
     let field_type = field
         .rust_field_type
         .as_deref()
@@ -2214,6 +2210,19 @@ fn message_field_tokens(field: &NetworkStateFieldShapeReport) -> proc_macro2::To
         #marshal_attr
         pub #field_ident: #field_type,
     }
+}
+
+fn message_field_ident(field: &NetworkStateFieldShapeReport) -> String {
+    let field_name = field
+        .field_name
+        .as_deref()
+        .expect("generatable message field has a name");
+    if is_placeholder_report_field_name(field) {
+        if let Some(index) = field.field_index {
+            return format!("field_{index}");
+        }
+    }
+    rust_field_ident(field_name)
 }
 
 fn message_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream {
@@ -3282,7 +3291,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_hub_address_for_proxy_address_message_fields() {
+    fn emits_actor_ref_for_proxy_address_message_fields() {
         let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
                 "uuid": "96A58E69-7BD5-45C5-86E4-DAF9F5EB1E86",
@@ -3311,7 +3320,7 @@ mod tests {
         assert!(
             output
                 .source
-                .contains("pub proxy_ref: ::nw_network::HubAddress")
+                .contains("pub proxy_ref: ::nw_network::ActorRef")
         );
         assert!(
             output
@@ -3420,12 +3429,12 @@ mod tests {
         assert!(
             output
                 .source
-                .contains("pub proxy_ref: ::nw_network::HubAddress")
+                .contains("pub proxy_ref: ::nw_network::ActorRef")
         );
         assert!(
             output
                 .source
-                .contains("pub target_ref: ::nw_network::HubAddress")
+                .contains("pub target_ref: ::nw_network::ActorRef")
         );
         assert!(
             output
