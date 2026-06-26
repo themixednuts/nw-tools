@@ -14,7 +14,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v26";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v27";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -159,24 +159,42 @@ pub struct NetworkBlockedFieldExampleReport {
 #[derive(Debug, Default)]
 pub struct NetworkRustEmitter;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkReplicatedStateEmitOptions {
     pub register_fragments: bool,
+    pub registered_type_indices: Option<BTreeSet<u32>>,
 }
 
 impl Default for NetworkReplicatedStateEmitOptions {
     fn default() -> Self {
         Self {
             register_fragments: true,
+            registered_type_indices: None,
         }
     }
 }
 
 impl NetworkReplicatedStateEmitOptions {
-    pub const fn unregistered() -> Self {
+    pub fn unregistered() -> Self {
         Self {
             register_fragments: false,
+            registered_type_indices: None,
         }
+    }
+
+    pub fn register_only(type_indices: impl IntoIterator<Item = u32>) -> Self {
+        Self {
+            register_fragments: true,
+            registered_type_indices: Some(type_indices.into_iter().collect()),
+        }
+    }
+
+    fn registers_type_index(&self, type_index: u32) -> bool {
+        self.register_fragments
+            && self
+                .registered_type_indices
+                .as_ref()
+                .is_none_or(|type_indices| type_indices.contains(&type_index))
     }
 }
 
@@ -496,7 +514,7 @@ impl NetworkRustEmitter {
                     network_type,
                     plan,
                     &rust_names,
-                    options,
+                    &options,
                 ));
             }
         }
@@ -1850,7 +1868,7 @@ fn replicated_state_module_tokens(
     network_type: &NetworkType,
     plan: &NetworkStateGenerationPlanReport,
     rust_names: &BTreeMap<u32, String>,
-    options: NetworkReplicatedStateEmitOptions,
+    options: &NetworkReplicatedStateEmitOptions,
 ) -> proc_macro2::TokenStream {
     let type_index = network_type
         .type_index
@@ -1877,7 +1895,8 @@ fn replicated_state_module_tokens(
         .iter()
         .map(replicated_state_field_tokens)
         .collect::<Vec<_>>();
-    let registration_tokens = if options.register_fragments {
+    let register_fragment = options.registers_type_index(type_index);
+    let registration_tokens = if register_fragment {
         quote! {
             #[derive(Debug, Clone, Default, ReplicatedState, AzRtti, TypeRegistry)]
             #[az_rtti(#type_id)]
@@ -1889,16 +1908,14 @@ fn replicated_state_module_tokens(
             #[az_rtti(#type_id)]
         }
     };
-    let type_registry_entry_tokens = (!options.register_fragments).then(|| {
+    let type_registry_entry_tokens = (!register_fragment).then(|| {
         quote! {
             impl ::nw_network::types::TypeRegistryEntry for #state_ident {
                 const TYPE_INDEX: u32 = #type_index;
             }
         }
     });
-    let type_registry_import = options
-        .register_fragments
-        .then(|| quote! { , TypeRegistry });
+    let type_registry_import = register_fragment.then(|| quote! { , TypeRegistry });
 
     quote! {
         pub mod #module_ident {
@@ -2523,16 +2540,72 @@ mod tests {
                 .source
                 .contains("impl ::nw_network::types::TypeRegistryEntry")
         );
-        assert!(
-            !unregistered_state_output
-                .source
-                .contains("#[type_registry")
-        );
+        assert!(!unregistered_state_output.source.contains("#[type_registry"));
         assert!(
             !unregistered_state_output
                 .source
                 .contains("AzRtti, ReplicatedState, TypeRegistry")
         );
+    }
+
+    #[test]
+    fn emits_single_generated_state_module_with_registration_allowlist() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "A85DF621-DCE0-409F-8D39-A447EA0807FF",
+                "typeIndex": 28,
+                "typeName": "Javelin::RaidDataComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "raidId",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81dad80",
+                    "confidence": "register-field-call"
+                }]
+            }, {
+                "uuid": "F9E72714-96F5-4092-8F90-136DCB98BDB3",
+                "typeIndex": 29,
+                "typeName": "Javelin::RaidGroupComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "groupId",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81dad80",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81dad80",
+                "fieldCount": 1,
+                "wireShape": "u64",
+                "wireShapeSource": "marshal-call:marshal-function-name",
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_replicated_states_with_options(
+            &schema,
+            [28, 29],
+            NetworkReplicatedStateEmitOptions::register_only([28]),
+        )
+        .expect("allowlisted state source");
+
+        assert_eq!(output.report.generatable_state_count, 2);
+        assert!(
+            output
+                .source
+                .contains("pub struct RaidDataComponentReplicatedState")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub struct RaidGroupComponentReplicatedState")
+        );
+        assert_eq!(output.source.matches("#[type_registry").count(), 1);
+        assert!(output.source.contains("#[type_registry(28u32)]"));
+        assert!(!output.source.contains("#[type_registry(29u32)]"));
     }
 
     #[test]
