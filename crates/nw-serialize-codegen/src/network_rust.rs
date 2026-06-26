@@ -14,7 +14,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v25";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v26";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -158,6 +158,27 @@ pub struct NetworkBlockedFieldExampleReport {
 
 #[derive(Debug, Default)]
 pub struct NetworkRustEmitter;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkReplicatedStateEmitOptions {
+    pub register_fragments: bool,
+}
+
+impl Default for NetworkReplicatedStateEmitOptions {
+    fn default() -> Self {
+        Self {
+            register_fragments: true,
+        }
+    }
+}
+
+impl NetworkReplicatedStateEmitOptions {
+    pub const fn unregistered() -> Self {
+        Self {
+            register_fragments: false,
+        }
+    }
+}
 
 impl NetworkRustEmitter {
     pub fn emit_descriptors(
@@ -409,6 +430,18 @@ impl NetworkRustEmitter {
         schema: &NetworkSchema,
         type_indices: impl IntoIterator<Item = u32>,
     ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
+        Self::emit_replicated_states_with_options(
+            schema,
+            type_indices,
+            NetworkReplicatedStateEmitOptions::default(),
+        )
+    }
+
+    pub fn emit_replicated_states_with_options(
+        schema: &NetworkSchema,
+        type_indices: impl IntoIterator<Item = u32>,
+        options: NetworkReplicatedStateEmitOptions,
+    ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
         let selected = type_indices.into_iter().collect::<BTreeSet<_>>();
         let wire_shapes = wire_shapes_by_handler_vtable(schema);
         let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
@@ -463,6 +496,7 @@ impl NetworkRustEmitter {
                     network_type,
                     plan,
                     &rust_names,
+                    options,
                 ));
             }
         }
@@ -1816,6 +1850,7 @@ fn replicated_state_module_tokens(
     network_type: &NetworkType,
     plan: &NetworkStateGenerationPlanReport,
     rust_names: &BTreeMap<u32, String>,
+    options: NetworkReplicatedStateEmitOptions,
 ) -> proc_macro2::TokenStream {
     let type_index = network_type
         .type_index
@@ -1842,19 +1877,41 @@ fn replicated_state_module_tokens(
         .iter()
         .map(replicated_state_field_tokens)
         .collect::<Vec<_>>();
-
-    quote! {
-        pub mod #module_ident {
-            use ::nw_network::{AzRtti, ReplicatedState, TypeRegistry};
-
+    let registration_tokens = if options.register_fragments {
+        quote! {
             #[derive(Debug, Clone, Default, ReplicatedState, AzRtti, TypeRegistry)]
             #[az_rtti(#type_id)]
             #[type_registry(#type_index)]
+        }
+    } else {
+        quote! {
+            #[derive(Debug, Clone, Default, ReplicatedState, AzRtti)]
+            #[az_rtti(#type_id)]
+        }
+    };
+    let type_registry_entry_tokens = (!options.register_fragments).then(|| {
+        quote! {
+            impl ::nw_network::types::TypeRegistryEntry for #state_ident {
+                const TYPE_INDEX: u32 = #type_index;
+            }
+        }
+    });
+    let type_registry_import = options
+        .register_fragments
+        .then(|| quote! { , TypeRegistry });
+
+    quote! {
+        pub mod #module_ident {
+            use ::nw_network::{AzRtti, ReplicatedState #type_registry_import};
+
+            #registration_tokens
             pub struct #state_ident {
                 #(#fields)*
 
                 pub hub: ::nw_network::hub::ReplicatedState,
             }
+
+            #type_registry_entry_tokens
         }
 
         pub use #module_ident::#state_ident;
@@ -2447,6 +2504,34 @@ mod tests {
             state_output
                 .source
                 .contains("pub use raid_data_component_replicated_state")
+        );
+
+        let unregistered_state_output = NetworkRustEmitter::emit_replicated_states_with_options(
+            &schema,
+            [28],
+            NetworkReplicatedStateEmitOptions::unregistered(),
+        )
+        .expect("unregistered state source");
+
+        assert!(
+            unregistered_state_output
+                .source
+                .contains("pub struct RaidDataComponentReplicatedState")
+        );
+        assert!(
+            unregistered_state_output
+                .source
+                .contains("impl ::nw_network::types::TypeRegistryEntry")
+        );
+        assert!(
+            !unregistered_state_output
+                .source
+                .contains("#[type_registry")
+        );
+        assert!(
+            !unregistered_state_output
+                .source
+                .contains("AzRtti, ReplicatedState, TypeRegistry")
         );
     }
 

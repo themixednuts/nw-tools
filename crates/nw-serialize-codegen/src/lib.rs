@@ -126,9 +126,9 @@ pub use naming::{
 };
 pub use native::{NativeSymbol, NativeSymbolIndex, NativeSymbolUse, NativeSymbolUseKind};
 pub use network_rust::{
-    NETWORK_RUST_EMITTER_VERSION, NetworkRustEmitError, NetworkRustEmitter,
-    NetworkRustGenerationReport, NetworkRustOutput, NetworkStateFieldShapeReport,
-    NetworkStateGenerationPlanReport,
+    NETWORK_RUST_EMITTER_VERSION, NetworkReplicatedStateEmitOptions, NetworkRustEmitError,
+    NetworkRustEmitter, NetworkRustGenerationReport, NetworkRustOutput,
+    NetworkStateFieldShapeReport, NetworkStateGenerationPlanReport,
 };
 pub use network_schema::{
     NETWORK_SCHEMA_VERSION, NetworkAzRtti, NetworkAzRttiProvider, NetworkConfidence,
