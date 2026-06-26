@@ -40,11 +40,14 @@ const PREVIEW_MAX: u32 = 1024;
 const TARGET_CELL_W: u16 = 40;
 const MIN_COLS: u16 = 2;
 const MAX_COLS: u16 = 6;
-/// Keep this many decoded thumbnails before evicting (oldest off-screen first), so
-/// scrolling back to a recently-viewed row is instant (no re-decode/re-encode).
-/// Sized for several screens of frame-heavy sprite sequences; thumbnails are
-/// cell-sized protocols, so this stays well-bounded in memory.
-const THUMB_CACHE_CAP: usize = 2048;
+/// In-memory thumbnail budget and the per-thumbnail estimate used to turn it into
+/// an entry cap. A generous budget keeps whole sprite sequences (and previously
+/// scrolled rows) resident, so revisiting a row never re-decodes or re-encodes.
+/// Thumbnails are cell-sized encoded protocols (~a few hundred KB each).
+const THUMB_MEM_BUDGET: u64 = 10 * 1024 * 1024 * 1024;
+const THUMB_EST_BYTES: u64 = 256 * 1024;
+/// Keep this many decoded thumbnails before evicting (oldest off-screen first).
+const THUMB_CACHE_CAP: usize = (THUMB_MEM_BUDGET / THUMB_EST_BYTES) as usize;
 /// Thumbnails are decoded + cached at this size (longest edge); the protocol is
 /// then fit to whatever cell, so one cache entry serves any grid size.
 const THUMB_CACHE_PX: u32 = 512;
@@ -55,7 +58,7 @@ const MAX_PREVIEW_ITEMS: usize = 3;
 /// Cap the on-disk thumbnail cache; oldest files are pruned past this. The disk
 /// cache is content-addressed and costs no RAM, so keep it generous — a hit skips
 /// the pak sidecar reads + DDS decode entirely, across sessions and game patches.
-const THUMB_DISK_CAP: u64 = 1024 * 1024 * 1024;
+const THUMB_DISK_CAP: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Sprite playback rate bounds and default. The `.dds` files carry no rate of
 /// their own; the engine keeps it on the `UiFlipbookAnimationComponent` in the
