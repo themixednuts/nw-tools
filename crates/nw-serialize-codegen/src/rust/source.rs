@@ -678,19 +678,16 @@ fn render_identity_attr(
         .filter(|name| name.as_str() != item.rust_name)
         .map(|name| LitStr::new(name, Span::call_site()));
     let attr = match (identity.kind, name_override) {
-        (RustTypeIdentityKind::AzTypeInfo, Some(name)) => {
-            quote!(#[az_type_info(name = #name, uuid = #type_id)])
-        }
+        (RustTypeIdentityKind::AzTypeInfo, Some(name)) => quote! {
+            #[az_type_info(name = #name)]
+            #[az_type_info(#type_id)]
+        },
         (RustTypeIdentityKind::AzTypeInfo, None) => quote!(#[az_type_info(#type_id)]),
         (RustTypeIdentityKind::AzRtti, Some(name)) => {
             let bases = az_rtti_base_attr(item)?;
-            if bases.is_empty() {
-                quote!(#[az_rtti(name = #name, uuid = #type_id)])
-            } else {
-                quote! {
-                    #[az_rtti(name = #name)]
-                    #[az_rtti(#type_id #bases)]
-                }
+            quote! {
+                #[az_rtti(name = #name)]
+                #[az_rtti(#type_id #bases)]
             }
         }
         (RustTypeIdentityKind::AzRtti, None) => {
