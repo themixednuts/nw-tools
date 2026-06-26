@@ -2064,13 +2064,13 @@ fn replicated_state_module_tokens(
     let register_fragment = options.registers_type_index(type_index);
     let registration_tokens = if register_fragment {
         quote! {
-            #[derive(Debug, Clone, Default, ReplicatedState, AzRtti, TypeRegistry)]
+            #[derive(Debug, Clone, Default, AzRtti, TypeRegistry)]
             #[az_rtti(#type_id)]
             #[type_registry(#type_index)]
         }
     } else {
         quote! {
-            #[derive(Debug, Clone, Default, ReplicatedState, AzRtti)]
+            #[derive(Debug, Clone, Default, AzRtti)]
             #[az_rtti(#type_id)]
         }
     };
@@ -2085,9 +2085,9 @@ fn replicated_state_module_tokens(
 
     quote! {
         pub mod #module_ident {
-            use ::nw_network::{AzRtti, ReplicatedState #type_registry_import};
+            use ::nw_network::{AzRtti #type_registry_import};
 
-            #[::nw_network_derive::replicated_state_base]
+            #[::nw_network_derive::replicated_state]
             #registration_tokens
             pub struct #state_ident {
                 #(#fields)*
@@ -2765,8 +2765,9 @@ mod tests {
         assert!(
             state_output
                 .source
-                .contains("#[::nw_network_derive::replicated_state_base]")
+                .contains("#[::nw_network_derive::replicated_state]")
         );
+        assert!(!state_output.source.contains("Default, ReplicatedState"));
         assert!(
             !state_output
                 .source
