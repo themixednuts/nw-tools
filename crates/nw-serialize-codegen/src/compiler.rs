@@ -352,7 +352,7 @@ mod tests {
             RustIntegrationAction::Create { target_path, source }
                 if target_path.ends_with("counter_component.rs")
                     && source.contains("AzRtti")
-                    && source.contains("Component)]")
+                    && source.contains("#[reflect(Component")
                     && source.contains("pub count: u32")
         ));
     }
@@ -880,7 +880,7 @@ pub struct ExternalPayload;
                 .any(|file| { file.path == "src/types/example/components/counter_component.ts" })
         );
         assert!(rust.contains("AzRtti"));
-        assert!(rust.contains("Component)]"));
+        assert!(rust.contains("#[reflect(Component"));
         assert!(rust.contains("pub count: u32"));
         assert!(typescript.contains("export interface CounterComponent"));
         assert!(typescript.contains("count: number;"));

@@ -258,10 +258,15 @@ impl RustFieldPlanner {
             ),
         };
 
+        let arc_type = match self.mode {
+            RustCodegenMode::Integrated => format!("::bevy::platform::sync::Arc<{rust_type}>"),
+            RustCodegenMode::Standalone => format!("bevy_platform::sync::Arc<{rust_type}>"),
+        };
+
         if is_optional {
-            Some(format!("Option<Box<{rust_type}>>"))
+            Some(format!("Option<{arc_type}>"))
         } else {
-            Some(format!("Box<{rust_type}>"))
+            Some(arc_type)
         }
     }
 

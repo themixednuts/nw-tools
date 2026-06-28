@@ -1084,7 +1084,7 @@ fn plan_reference_name(item: &RustItemPlan, name_plan: &RustNamePlan) -> String 
 }
 
 fn rust_wrappers_support_derive(rust_type: &str, derive_name: &str) -> bool {
-    if rust_type_mentions_name(rust_type, "Box") {
+    if rust_type_mentions_name(rust_type, "Arc") || rust_type_mentions_name(rust_type, "Box") {
         !matches!(derive_name, "Copy" | "Marshaler")
     } else {
         true
@@ -3041,7 +3041,7 @@ pub struct ExternalPayload;
     }
 
     #[test]
-    fn boxes_direct_recursive_polymorphic_value_fields() {
+    fn indirects_direct_recursive_polymorphic_value_fields() {
         let node_id = uuid!("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA");
         let decorator_id = uuid!("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB");
         let composite_id = uuid!("CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC");
@@ -3195,7 +3195,7 @@ pub struct ExternalPayload;
                 .iter()
                 .find(|field| field.source_name == "Child")
                 .map(|field| field.rust_type.as_str()),
-            Some("Option<Box<NodeValue>>")
+            Some("Option<bevy_platform::sync::Arc<NodeValue>>")
         );
         assert_eq!(
             composite
@@ -3210,7 +3210,7 @@ pub struct ExternalPayload;
                 .iter()
                 .find(|field| field.source_name == "Root")
                 .map(|field| field.rust_type.as_str()),
-            Some("Option<Box<NodeValue>>")
+            Some("Option<bevy_platform::sync::Arc<NodeValue>>")
         );
         assert_eq!(
             tree_reference
