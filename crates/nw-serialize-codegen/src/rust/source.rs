@@ -977,6 +977,9 @@ fn render_identity_attr(
     if matches!(options.mode, RustSourceMode::Standalone) {
         return Ok(TokenStream::new());
     }
+    if !has_az_identity_derive(item) {
+        return Ok(TokenStream::new());
+    }
 
     let identity = &item.identity;
     let type_id = LitStr::new(
@@ -1030,6 +1033,9 @@ fn render_standalone_identity_impls(
     if !matches!(options.mode, RustSourceMode::Standalone) {
         return TokenStream::new();
     }
+    if item.source_type_id.is_nil() && !has_az_identity_derive(item) {
+        return TokenStream::new();
+    }
 
     let type_id = az_uuid_expr(item.identity.type_id);
     let name = item
@@ -1055,6 +1061,12 @@ fn render_standalone_identity_impls(
             #base_type_ids
         }
     }
+}
+
+fn has_az_identity_derive(item: &RustItemPlan) -> bool {
+    item.derives
+        .iter()
+        .any(|derive| matches!(derive.as_str(), "AzTypeInfo" | "AzRtti"))
 }
 
 fn az_uuid_expr(type_id: uuid::Uuid) -> TokenStream {

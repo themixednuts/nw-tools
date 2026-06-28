@@ -687,11 +687,11 @@ fn has_az_identity(item: &RustItemPlan) -> bool {
 }
 
 fn can_register_type(item: &RustItemPlan) -> bool {
-    has_derive(item, "Reflect") && has_az_identity(item)
+    has_derive(item, "Reflect")
 }
 
 fn can_register_az_type_info(item: &RustItemPlan) -> bool {
-    can_register_type(item)
+    can_register_type(item) && has_az_identity(item)
 }
 
 fn can_register_az_rtti(item: &RustItemPlan) -> bool {
