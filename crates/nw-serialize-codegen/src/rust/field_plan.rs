@@ -230,10 +230,13 @@ impl RustFieldPlanner {
 
         let (target, is_optional) = recursive_base_field_target(&field.resolved_type)?;
         let target_item = items_by_type_id.get(&target.type_id).copied()?;
-        if target_item.is_abstract != Some(true)
-            || !target_item.fields.is_empty()
-            || !item_inherits_from(item, target.type_id)
-        {
+        let is_family_member =
+            item.source_type_id == target.type_id || item_inherits_from(item, target.type_id);
+        let needs_indirection = (target_item.is_abstract == Some(true)
+            && target_item.fields.is_empty()
+            && is_family_member)
+            || (polymorphic_value_type_names.contains_key(&target.type_id) && is_family_member);
+        if !needs_indirection {
             return None;
         }
 

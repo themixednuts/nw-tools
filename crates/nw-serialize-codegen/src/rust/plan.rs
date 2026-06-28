@@ -3041,6 +3041,128 @@ pub struct ExternalPayload;
     }
 
     #[test]
+    fn boxes_direct_recursive_polymorphic_value_fields() {
+        let node_id = uuid!("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA");
+        let decorator_id = uuid!("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB");
+        let composite_id = uuid!("CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC");
+        let children_vector_id = uuid!("DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD");
+
+        let unit = SerializeCodegenUnit {
+            items: vec![
+                facet_item(
+                    node_id,
+                    "Node",
+                    ReflectedTypeRole::SupportType,
+                    vec![scalar_member_field(
+                        "Name",
+                        type_ids::AZSTD_STRING,
+                        ScalarType::String,
+                    )],
+                ),
+                facet_item(
+                    decorator_id,
+                    "Decorator",
+                    ReflectedTypeRole::SupportType,
+                    vec![
+                        base_field(node_id, "Node"),
+                        SerializeCodegenField {
+                            source_name: "Child".to_owned(),
+                            source_type_id: node_id,
+                            resolved_type: ResolvedType::Optional {
+                                value: Box::new(ResolvedType::Named {
+                                    type_id: node_id,
+                                    source_name: "Node".to_owned(),
+                                }),
+                            },
+                            data_size: None,
+                            offset: None,
+                            flags: None,
+                            is_base_class: false,
+                            is_pointer: true,
+                            is_dynamic_field: false,
+                        },
+                    ],
+                ),
+                facet_item(
+                    composite_id,
+                    "Composite",
+                    ReflectedTypeRole::SupportType,
+                    vec![
+                        base_field(node_id, "Node"),
+                        SerializeCodegenField {
+                            source_name: "Children".to_owned(),
+                            source_type_id: children_vector_id,
+                            resolved_type: ResolvedType::Sequence {
+                                kind: SequenceKind::Vector,
+                                element: Box::new(ResolvedType::Optional {
+                                    value: Box::new(ResolvedType::Named {
+                                        type_id: node_id,
+                                        source_name: "Node".to_owned(),
+                                    }),
+                                }),
+                                capacity: None,
+                            },
+                            data_size: None,
+                            offset: None,
+                            flags: None,
+                            is_base_class: false,
+                            is_pointer: false,
+                            is_dynamic_field: false,
+                        },
+                    ],
+                ),
+            ],
+        };
+
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
+        let decorator = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == decorator_id)
+            .expect("Decorator plan");
+        let composite = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == composite_id)
+            .expect("Composite plan");
+        let value = rust_unit
+            .items
+            .iter()
+            .find(|item| item.rust_name == "NodeValue")
+            .expect("NodeValue plan");
+
+        assert_eq!(
+            decorator
+                .fields
+                .iter()
+                .find(|field| field.source_name == "Child")
+                .map(|field| field.rust_type.as_str()),
+            Some("Option<Box<NodeValue>>")
+        );
+        assert_eq!(
+            composite
+                .fields
+                .iter()
+                .find(|field| field.source_name == "Children")
+                .map(|field| field.rust_type.as_str()),
+            Some("Vec<Option<NodeValue>>")
+        );
+        assert_eq!(
+            value
+                .variants
+                .iter()
+                .map(|variant| (variant.rust_name.as_str(), variant.payload_type.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Base", Some("Node")),
+                ("Composite", Some("Composite")),
+                ("Decorator", Some("Decorator")),
+            ]
+        );
+    }
+
+    #[test]
     fn standalone_plan_scopes_field_owned_same_name_records_under_owner_module() {
         let component_id = uuid!("8B8918AB-894D-4E44-B72C-F947844A3985");
         let layer_id = uuid!("72D040D6-14F1-489E-855F-84945BD0C7EA");
