@@ -1085,7 +1085,7 @@ fn plan_reference_name(item: &RustItemPlan, name_plan: &RustNamePlan) -> String 
 
 fn rust_wrappers_support_derive(rust_type: &str, derive_name: &str) -> bool {
     if rust_type_mentions_name(rust_type, "Box") {
-        !matches!(derive_name, "Copy" | "Marshaler" | "Reflect")
+        !matches!(derive_name, "Copy" | "Marshaler")
     } else {
         true
     }
@@ -3220,6 +3220,9 @@ pub struct ExternalPayload;
                 .map(|field| field.rust_type.as_str()),
             Some("Option<Tree>")
         );
+        assert!(decorator.derives.contains(&"Reflect".to_owned()));
+        assert!(tree.derives.contains(&"Reflect".to_owned()));
+        assert!(value.derives.contains(&"Reflect".to_owned()));
         assert_eq!(
             value
                 .variants
