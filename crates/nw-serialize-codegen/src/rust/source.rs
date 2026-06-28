@@ -423,6 +423,7 @@ fn render_item(
                 #repr_attr
                 #identity_attr
                 #serde_attr
+                #reflect_attr
                 pub enum #ident {
                     #(#variants)*
                 }
@@ -444,6 +445,7 @@ fn render_item(
                 #[derive(#(#derives,)*)]
                 #identity_attr
                 #serde_attr
+                #reflect_attr
                 pub enum #ident {
                     #(#variants)*
                 }
@@ -460,6 +462,7 @@ fn render_item(
                 &derives,
                 identity_attr,
                 serde_attr,
+                reflect_attr,
                 standalone_identity,
             )?;
             Ok(raw_enum)
@@ -514,6 +517,7 @@ fn render_raw_enum_item(
     derives: &[Path],
     identity_attr: TokenStream,
     serde_attr: TokenStream,
+    reflect_attr: TokenStream,
     standalone_identity: TokenStream,
 ) -> Result<TokenStream, RustSourceEmitError> {
     let Some(raw_conversion) = &item.raw_conversion else {
@@ -546,6 +550,7 @@ fn render_raw_enum_item(
         #[repr(transparent)]
         #identity_attr
         #serde_attr
+        #reflect_attr
         pub struct #ident(pub #raw_ty);
 
         impl #ident {
@@ -1094,10 +1099,27 @@ fn reflect_attr_for_item(item: &RustItemPlan) -> TokenStream {
         .derives
         .iter()
         .any(|derive_name| derive_name == "Reflect");
-    if has_component && has_reflect {
-        quote!(#[reflect(Component)])
-    } else {
-        TokenStream::new()
+    if !has_reflect {
+        return TokenStream::new();
+    }
+
+    let has_serialize = item
+        .derives
+        .iter()
+        .any(|derive| is_serde_derive(derive, "Serialize"));
+    let has_deserialize = item
+        .derives
+        .iter()
+        .any(|derive| is_serde_derive(derive, "Deserialize"));
+    match (has_component, has_serialize, has_deserialize) {
+        (true, true, true) => quote!(#[reflect(Component, Serialize, Deserialize)]),
+        (true, true, false) => quote!(#[reflect(Component, Serialize)]),
+        (true, false, true) => quote!(#[reflect(Component, Deserialize)]),
+        (true, false, false) => quote!(#[reflect(Component)]),
+        (false, true, true) => quote!(#[reflect(Serialize, Deserialize)]),
+        (false, true, false) => quote!(#[reflect(Serialize)]),
+        (false, false, true) => quote!(#[reflect(Deserialize)]),
+        (false, false, false) => TokenStream::new(),
     }
 }
 
@@ -2805,7 +2827,7 @@ mod tests {
         assert!(!source.contains("base ="));
         assert!(!source.contains("AzTypeRegistration"));
         assert!(source.contains("HealthComponent"));
-        assert!(source.contains("#[reflect(Component)]"));
+        assert!(source.contains("#[reflect(Component, Serialize, Deserialize)]"));
         assert!(source.contains("pub struct HealthComponent"));
         assert!(source.contains("pub value: u32"));
         syn::parse_file(&source).expect("source should be parseable Rust");
@@ -2971,7 +2993,7 @@ mod tests {
         assert!(source.contains("pub struct AssetId"));
         assert!(source.contains("bevy_ecs::component::Component"));
         assert!(source.contains("bevy_reflect::Reflect"));
-        assert!(source.contains("#[reflect(Component)]"));
+        assert!(source.contains("#[reflect(Component, Serialize, Deserialize)]"));
         assert!(source.contains("pub entity: u64"));
         assert!(source.contains("pub asset: AzAssetId"));
         assert!(source.contains("pub tag: AzCrc32"));
