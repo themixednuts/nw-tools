@@ -719,47 +719,57 @@ fn render_sum_serialize_impl(
         .map(|variant| {
             let variant_ident = parse_variant_ident(item, variant)?;
             let payload_ty = parse_variant_payload_type(item, variant)?;
-            let body = if variant.payload_has_materialized_fields {
-                quote! {
-                    let mut fields = match ::serde_json::to_value(payload)
-                        .map_err(::serde::ser::Error::custom)?
-                    {
-                        ::serde_json::Value::Object(fields) => fields,
-                        ::serde_json::Value::Null => ::serde_json::Map::new(),
-                        value => {
-                            let mut fields = ::serde_json::Map::new();
-                            fields.insert("value".to_owned(), value);
-                            fields
-                        }
-                    };
-                    fields.insert(
-                        "$type".to_owned(),
-                        ::serde_json::Value::String(
-                            <#payload_ty as #type_info>::TYPE_ID.to_string(),
-                        ),
-                    );
-                    ::serde::Serialize::serialize(
-                        &::serde_json::Value::Object(fields),
-                        serializer,
-                    )
-                }
+            let (pattern, body) = if variant.payload_has_materialized_fields {
+                (
+                    quote! {
+                        Self::#variant_ident(payload)
+                    },
+                    quote! {
+                        let mut fields = match ::serde_json::to_value(payload)
+                            .map_err(::serde::ser::Error::custom)?
+                        {
+                            ::serde_json::Value::Object(fields) => fields,
+                            ::serde_json::Value::Null => ::serde_json::Map::new(),
+                            value => {
+                                let mut fields = ::serde_json::Map::new();
+                                fields.insert("value".to_owned(), value);
+                                fields
+                            }
+                        };
+                        fields.insert(
+                            "$type".to_owned(),
+                            ::serde_json::Value::String(
+                                <#payload_ty as #type_info>::TYPE_ID.to_string(),
+                            ),
+                        );
+                        ::serde::Serialize::serialize(
+                            &::serde_json::Value::Object(fields),
+                            serializer,
+                        )
+                    },
+                )
             } else {
-                quote! {
-                    let mut fields = ::serde_json::Map::new();
-                    fields.insert(
-                        "$type".to_owned(),
-                        ::serde_json::Value::String(
-                            <#payload_ty as #type_info>::TYPE_ID.to_string(),
-                        ),
-                    );
-                    ::serde::Serialize::serialize(
-                        &::serde_json::Value::Object(fields),
-                        serializer,
-                    )
-                }
+                (
+                    quote! {
+                        Self::#variant_ident(_)
+                    },
+                    quote! {
+                        let mut fields = ::serde_json::Map::new();
+                        fields.insert(
+                            "$type".to_owned(),
+                            ::serde_json::Value::String(
+                                <#payload_ty as #type_info>::TYPE_ID.to_string(),
+                            ),
+                        );
+                        ::serde::Serialize::serialize(
+                            &::serde_json::Value::Object(fields),
+                            serializer,
+                        )
+                    },
+                )
             };
             Ok(quote! {
-                Self::#variant_ident(payload) => {
+                #pattern => {
                     #body
                 }
             })
@@ -810,7 +820,7 @@ fn render_sum_deserialize_impl(
                         ::serde_json::Value::Object(source_fields),
                     );
                     return ::serde_json::from_value::<#payload_ty>(value)
-                        .map(Self::#variant_ident)
+                        .map(#ident::#variant_ident)
                         .map_err(::serde::de::Error::custom);
                 }
             } else {
@@ -819,7 +829,7 @@ fn render_sum_deserialize_impl(
                         let _ = map.next_value::<::serde::de::IgnoredAny>()?;
                         return Err(::serde::de::Error::unknown_field(&extra, &[]));
                     }
-                    return Ok(Self::#variant_ident(
+                    return Ok(#ident::#variant_ident(
                         <#payload_ty as ::core::default::Default>::default(),
                     ));
                 }
