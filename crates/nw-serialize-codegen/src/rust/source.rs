@@ -800,6 +800,37 @@ fn render_sum_deserialize_impl(
         RustSourceMode::Integrated => quote!(::uuid::Uuid::parse_str(&type_id)),
         RustSourceMode::Standalone => quote!(AzUuid::parse_str(&type_id)),
     };
+    let payload_merge_helper = if item
+        .variants
+        .iter()
+        .any(|variant| variant.payload_has_materialized_fields)
+    {
+        quote! {
+            fn merge_sum_payload_defaults(
+                value: &mut ::serde_json::Value,
+                source: ::serde_json::Value,
+            ) {
+                match (value, source) {
+                    (
+                        ::serde_json::Value::Object(value),
+                        ::serde_json::Value::Object(source),
+                    ) => {
+                        for (key, source_value) in source {
+                            match value.get_mut(&key) {
+                                Some(value) => merge_sum_payload_defaults(value, source_value),
+                                None => {
+                                    value.insert(key, source_value);
+                                }
+                            }
+                        }
+                    }
+                    (value, source) => *value = source,
+                }
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
     let variant_checks = item
         .variants
         .iter()
@@ -864,29 +895,7 @@ fn render_sum_deserialize_impl(
                     where
                         A: ::serde::de::MapAccess<'de>,
                     {
-                        fn merge_sum_payload_defaults(
-                            value: &mut ::serde_json::Value,
-                            source: ::serde_json::Value,
-                        ) {
-                            match (value, source) {
-                                (
-                                    ::serde_json::Value::Object(value),
-                                    ::serde_json::Value::Object(source),
-                                ) => {
-                                    for (key, source_value) in source {
-                                        match value.get_mut(&key) {
-                                            Some(value) => {
-                                                merge_sum_payload_defaults(value, source_value)
-                                            }
-                                            None => {
-                                                value.insert(key, source_value);
-                                            }
-                                        }
-                                    }
-                                }
-                                (value, source) => *value = source,
-                            }
-                        }
+                        #payload_merge_helper
 
                         let Some(key) = map.next_key::<String>()? else {
                             return Err(::serde::de::Error::missing_field("$type"));
