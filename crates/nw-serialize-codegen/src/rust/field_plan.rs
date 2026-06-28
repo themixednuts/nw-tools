@@ -31,6 +31,7 @@ struct IntegratedRustTypeContext<'a> {
     items_by_type_id: &'a BTreeMap<Uuid, &'a SerializeCodegenItem>,
     source_types: Option<&'a RustSourceTypeIndex>,
     current_module: &'a str,
+    polymorphic_value_type_names: Option<&'a BTreeMap<Uuid, String>>,
 }
 
 impl RustFieldPlanner {
@@ -45,6 +46,7 @@ impl RustFieldPlanner {
         name_plan: &RustNamePlan,
         source_types: Option<&RustSourceTypeIndex>,
         current_module: &str,
+        polymorphic_value_type_names: &BTreeMap<Uuid, String>,
     ) -> Vec<RustFieldPlan> {
         let mut field_counts = BTreeMap::<String, usize>::new();
         let mut seen_fields = Vec::<&SerializeCodegenField>::new();
@@ -67,6 +69,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    polymorphic_value_type_names,
                 );
                 let count = field_counts.entry(plan.rust_name.clone()).or_default();
                 if *count > 0 {
@@ -106,6 +109,7 @@ impl RustFieldPlanner {
                         items_by_type_id,
                         source_types,
                         current_module,
+                        None,
                     ),
                 })
             })
@@ -132,6 +136,7 @@ impl RustFieldPlanner {
         items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
         source_types: Option<&RustSourceTypeIndex>,
         current_module: &str,
+        polymorphic_value_type_names: &BTreeMap<Uuid, String>,
     ) -> RustFieldPlan {
         let rust_type = rust_storage_override_for_field(self.mode, item, field)
             .map(str::to_owned)
@@ -143,6 +148,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    polymorphic_value_type_names,
                 )
             })
             .unwrap_or_else(|| {
@@ -152,6 +158,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    (!field.is_base_class).then_some(polymorphic_value_type_names),
                 )
             });
         RustFieldPlan {
@@ -179,6 +186,7 @@ impl RustFieldPlanner {
         items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
         source_types: Option<&RustSourceTypeIndex>,
         current_module: &str,
+        polymorphic_value_type_names: Option<&BTreeMap<Uuid, String>>,
     ) -> String {
         match classify_codegen_field_type(field) {
             CodegenFieldTypeProjection::FixedOpaqueBytes { byte_len } => {
@@ -187,7 +195,12 @@ impl RustFieldPlanner {
             CodegenFieldTypeProjection::Reflected(resolved_type)
                 if matches!(self.mode, RustCodegenMode::Standalone) =>
             {
-                self.rust_type_for_resolved_type(resolved_type, name_plan, items_by_type_id)
+                self.rust_type_for_resolved_type(
+                    resolved_type,
+                    name_plan,
+                    items_by_type_id,
+                    polymorphic_value_type_names,
+                )
             }
             CodegenFieldTypeProjection::Reflected(resolved_type) => self
                 .integrated_rust_type_for_resolved_type(
@@ -196,6 +209,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    polymorphic_value_type_names,
                 ),
         }
     }
@@ -208,6 +222,7 @@ impl RustFieldPlanner {
         items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
         source_types: Option<&RustSourceTypeIndex>,
         current_module: &str,
+        polymorphic_value_type_names: &BTreeMap<Uuid, String>,
     ) -> Option<String> {
         if field.is_base_class {
             return None;
@@ -223,15 +238,19 @@ impl RustFieldPlanner {
         }
 
         let rust_type = match self.mode {
-            RustCodegenMode::Standalone => {
-                self.rust_type_for_resolved_type(target.resolved, name_plan, items_by_type_id)
-            }
+            RustCodegenMode::Standalone => self.rust_type_for_resolved_type(
+                target.resolved,
+                name_plan,
+                items_by_type_id,
+                Some(polymorphic_value_type_names),
+            ),
             RustCodegenMode::Integrated => self.integrated_rust_type_for_resolved_type(
                 target.resolved,
                 name_plan,
                 items_by_type_id,
                 source_types,
                 current_module,
+                Some(polymorphic_value_type_names),
             ),
         };
 
@@ -247,13 +266,18 @@ impl RustFieldPlanner {
         resolved: &ResolvedType,
         name_plan: &RustNamePlan,
         items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+        polymorphic_value_type_names: Option<&BTreeMap<Uuid, String>>,
     ) -> String {
         match resolved {
             ResolvedType::Named {
                 type_id,
                 source_name,
             } => {
-                if matches!(self.mode, RustCodegenMode::Integrated)
+                if let Some(rust_type) =
+                    polymorphic_value_type_names.and_then(|type_names| type_names.get(type_id))
+                {
+                    rust_type.clone()
+                } else if matches!(self.mode, RustCodegenMode::Integrated)
                     && let Some(rust_type) = integrated_custom_field_type(source_name)
                 {
                     rust_type.to_owned()
@@ -265,35 +289,80 @@ impl RustFieldPlanner {
                 kind,
                 element,
                 capacity,
-            } => self.rust_sequence_type(*kind, element, *capacity, name_plan, items_by_type_id),
-            ResolvedType::Map { kind, key, value } => {
-                self.rust_map_type(*kind, key, value, name_plan, items_by_type_id)
-            }
+            } => self.rust_sequence_type(
+                *kind,
+                element,
+                *capacity,
+                name_plan,
+                items_by_type_id,
+                polymorphic_value_type_names,
+            ),
+            ResolvedType::Map { kind, key, value } => self.rust_map_type(
+                *kind,
+                key,
+                value,
+                name_plan,
+                items_by_type_id,
+                polymorphic_value_type_names,
+            ),
             ResolvedType::ReplicatedField { value } => {
-                let value = self.rust_type_for_resolved_type(value, name_plan, items_by_type_id);
+                let value = self.rust_type_for_resolved_type(
+                    value,
+                    name_plan,
+                    items_by_type_id,
+                    polymorphic_value_type_names,
+                );
                 format!("Option<{value}>")
             }
-            ResolvedType::RangedInteger { value, .. } => {
-                self.rust_type_for_resolved_type(value, name_plan, items_by_type_id)
-            }
+            ResolvedType::RangedInteger { value, .. } => self.rust_type_for_resolved_type(
+                value,
+                name_plan,
+                items_by_type_id,
+                polymorphic_value_type_names,
+            ),
             ResolvedType::Pair { first, second } => {
-                let first = self.rust_type_for_resolved_type(first, name_plan, items_by_type_id);
-                let second = self.rust_type_for_resolved_type(second, name_plan, items_by_type_id);
+                let first = self.rust_type_for_resolved_type(
+                    first,
+                    name_plan,
+                    items_by_type_id,
+                    polymorphic_value_type_names,
+                );
+                let second = self.rust_type_for_resolved_type(
+                    second,
+                    name_plan,
+                    items_by_type_id,
+                    polymorphic_value_type_names,
+                );
                 format!("({first}, {second})")
             }
             ResolvedType::Pointer { target, .. } => {
-                let target = self.rust_type_for_resolved_type(target, name_plan, items_by_type_id);
+                let target = self.rust_type_for_resolved_type(
+                    target,
+                    name_plan,
+                    items_by_type_id,
+                    polymorphic_value_type_names,
+                );
                 format!("Option<{target}>")
             }
             ResolvedType::Optional { value } => {
-                let value = self.rust_type_for_resolved_type(value, name_plan, items_by_type_id);
+                let value = self.rust_type_for_resolved_type(
+                    value,
+                    name_plan,
+                    items_by_type_id,
+                    polymorphic_value_type_names,
+                );
                 format!("Option<{value}>")
             }
             ResolvedType::Tuple { elements } => {
                 let elements = elements
                     .iter()
                     .map(|element| {
-                        self.rust_type_for_resolved_type(element, name_plan, items_by_type_id)
+                        self.rust_type_for_resolved_type(
+                            element,
+                            name_plan,
+                            items_by_type_id,
+                            polymorphic_value_type_names,
+                        )
                     })
                     .collect::<Vec<_>>();
                 match elements.as_slice() {
@@ -319,6 +388,7 @@ impl RustFieldPlanner {
         items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
         source_types: Option<&RustSourceTypeIndex>,
         current_module: &str,
+        polymorphic_value_type_names: Option<&BTreeMap<Uuid, String>>,
     ) -> String {
         match resolved {
             ResolvedType::Unknown { type_id, .. } => source_types
@@ -332,8 +402,10 @@ impl RustFieldPlanner {
             ResolvedType::Named {
                 type_id,
                 source_name,
-            } => integrated_custom_field_type(source_name)
-                .map(str::to_owned)
+            } => polymorphic_value_type_names
+                .and_then(|type_names| type_names.get(type_id))
+                .cloned()
+                .or_else(|| integrated_custom_field_type(source_name).map(str::to_owned))
                 .unwrap_or_else(|| name_plan.reference_name(*type_id, source_name)),
             ResolvedType::Sequence {
                 kind,
@@ -348,6 +420,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    polymorphic_value_type_names,
                 },
             ),
             ResolvedType::Map { kind, key, value } => self.integrated_rust_map_type(
@@ -359,6 +432,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    polymorphic_value_type_names,
                 },
             ),
             ResolvedType::ReplicatedField { value } => {
@@ -368,6 +442,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    polymorphic_value_type_names,
                 );
                 format!("Option<{value}>")
             }
@@ -378,6 +453,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    polymorphic_value_type_names,
                 ),
             ResolvedType::Pair { first, second } => {
                 let first = self.integrated_rust_type_for_resolved_type(
@@ -386,6 +462,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    polymorphic_value_type_names,
                 );
                 let second = self.integrated_rust_type_for_resolved_type(
                     second,
@@ -393,6 +470,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    polymorphic_value_type_names,
                 );
                 format!("({first}, {second})")
             }
@@ -403,6 +481,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    polymorphic_value_type_names,
                 );
                 format!("Option<{target}>")
             }
@@ -413,6 +492,7 @@ impl RustFieldPlanner {
                     items_by_type_id,
                     source_types,
                     current_module,
+                    polymorphic_value_type_names,
                 );
                 format!("Option<{value}>")
             }
@@ -426,6 +506,7 @@ impl RustFieldPlanner {
                             items_by_type_id,
                             source_types,
                             current_module,
+                            polymorphic_value_type_names,
                         )
                     })
                     .collect::<Vec<_>>();
@@ -457,6 +538,7 @@ impl RustFieldPlanner {
             context.items_by_type_id,
             context.source_types,
             context.current_module,
+            context.polymorphic_value_type_names,
         );
         match (kind, capacity) {
             (SequenceKind::Array, Some(capacity)) => format!("[{element_type}; {capacity}]"),
@@ -485,6 +567,7 @@ impl RustFieldPlanner {
             context.items_by_type_id,
             context.source_types,
             context.current_module,
+            context.polymorphic_value_type_names,
         );
         let value_type = self.integrated_rust_type_for_resolved_type(
             value,
@@ -492,6 +575,7 @@ impl RustFieldPlanner {
             context.items_by_type_id,
             context.source_types,
             context.current_module,
+            context.polymorphic_value_type_names,
         );
         match kind {
             MapKind::Map => format!("std::collections::BTreeMap<{key_type}, {value_type}>"),
@@ -508,8 +592,14 @@ impl RustFieldPlanner {
         capacity: Option<usize>,
         name_plan: &RustNamePlan,
         items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+        polymorphic_value_type_names: Option<&BTreeMap<Uuid, String>>,
     ) -> String {
-        let element_type = self.rust_type_for_resolved_type(element, name_plan, items_by_type_id);
+        let element_type = self.rust_type_for_resolved_type(
+            element,
+            name_plan,
+            items_by_type_id,
+            polymorphic_value_type_names,
+        );
         match (kind, capacity) {
             (SequenceKind::Array, Some(capacity)) => format!("[{element_type}; {capacity}]"),
             (SequenceKind::BitSet, _) => rust_bitset_storage_type(capacity),
@@ -539,9 +629,15 @@ impl RustFieldPlanner {
         value: &ResolvedType,
         name_plan: &RustNamePlan,
         items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+        polymorphic_value_type_names: Option<&BTreeMap<Uuid, String>>,
     ) -> String {
-        let key_type = self.rust_type_for_resolved_type(key, name_plan, items_by_type_id);
-        let value_type = self.rust_type_for_resolved_type(value, name_plan, items_by_type_id);
+        let key_type = self.rust_type_for_resolved_type(key, name_plan, items_by_type_id, None);
+        let value_type = self.rust_type_for_resolved_type(
+            value,
+            name_plan,
+            items_by_type_id,
+            polymorphic_value_type_names,
+        );
         match kind {
             MapKind::Map if rust_type_supports_native_ordering(key, items_by_type_id) => {
                 format!("std::collections::BTreeMap<{key_type}, {value_type}>")
@@ -925,6 +1021,7 @@ mod tests {
             &RustNamePlan::default(),
             None,
             "types",
+            &BTreeMap::new(),
         );
 
         assert_eq!(fields.len(), 1);

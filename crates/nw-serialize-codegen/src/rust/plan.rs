@@ -65,6 +65,7 @@ struct RustSerializePlanContext<'a> {
     reflected_base_type_ids: &'a BTreeSet<Uuid>,
     layout_index: &'a LayoutIndex,
     abstract_value_base_type_ids: &'a BTreeSet<Uuid>,
+    polymorphic_value_type_names: &'a BTreeMap<Uuid, String>,
     emitted_type_ids: &'a BTreeSet<Uuid>,
 }
 
@@ -195,6 +196,12 @@ impl RustCodegenPlanner {
         let reflected_base_type_ids = reflected_base_type_ids(context_unit);
         let abstract_value_base_type_ids =
             abstract_value_base_type_ids(emitted_unit, context_items_by_type_id);
+        let polymorphic_value_type_names = polymorphic_value_type_names(
+            emitted_unit,
+            context_items_by_type_id,
+            &layout_index,
+            &abstract_value_base_type_ids,
+        );
         let emitted_type_ids = emitted_unit
             .items
             .iter()
@@ -222,11 +229,18 @@ impl RustCodegenPlanner {
                     reflected_base_type_ids: &reflected_base_type_ids,
                     layout_index: &layout_index,
                     abstract_value_base_type_ids: &abstract_value_base_type_ids,
+                    polymorphic_value_type_names: &polymorphic_value_type_names,
                     emitted_type_ids: &emitted_type_ids,
                 };
                 self.plan_serialize_item(item, &mut plan_context)
             },
         );
+        items.extend(self.plan_polymorphic_value_enums(
+            &polymorphic_value_type_names,
+            context_items_by_type_id,
+            &layout_index,
+            &name_plan,
+        ));
         prune_derives_for_planned_dependencies(&mut items, &name_plan);
         prune_integrated_hash_derives(&mut items, self.options.mode, &name_plan);
         RustCodegenUnit { items }
@@ -373,6 +387,7 @@ impl RustCodegenPlanner {
             plan_context.name_plan,
             self.source_types.as_ref(),
             &current_module,
+            plan_context.polymorphic_value_type_names,
         );
         let rtti_bases = self.field_planner.plan_rtti_bases(
             item,
@@ -533,6 +548,93 @@ impl RustCodegenPlanner {
         derives
     }
 
+    fn plan_polymorphic_value_enums(
+        &self,
+        polymorphic_value_type_names: &BTreeMap<Uuid, String>,
+        items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+        layout_index: &LayoutIndex,
+        name_plan: &RustNamePlan,
+    ) -> Vec<RustItemPlan> {
+        polymorphic_value_type_names
+            .iter()
+            .filter_map(|(base_type_id, value_name)| {
+                self.plan_polymorphic_value_enum(
+                    *base_type_id,
+                    value_name,
+                    items_by_type_id,
+                    layout_index,
+                    name_plan,
+                )
+            })
+            .collect()
+    }
+
+    fn plan_polymorphic_value_enum(
+        &self,
+        base_type_id: Uuid,
+        value_name: &str,
+        items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+        layout_index: &LayoutIndex,
+        name_plan: &RustNamePlan,
+    ) -> Option<RustItemPlan> {
+        let base = items_by_type_id.get(&base_type_id).copied()?;
+        let child_type_ids = layout_index
+            .direct_derived_type_ids_by_base_type_id
+            .get(&base_type_id)?;
+        let children = child_type_ids
+            .iter()
+            .filter_map(|type_id| items_by_type_id.get(type_id).copied())
+            .filter(|child| child.is_abstract != Some(true))
+            .collect::<Vec<_>>();
+        if children.len() != child_type_ids.len() {
+            return None;
+        }
+
+        let mut variants = vec![RustVariantPlan {
+            source_name: base.source_name.clone(),
+            rust_name: "Base".to_owned(),
+            discriminant: None,
+            payload_type: Some(name_plan.reference_name(base.source_type_id, &base.source_name)),
+            payload_has_materialized_fields: item_has_materialized_payload(base, items_by_type_id),
+        }];
+        variants.extend(children.iter().map(|child| RustVariantPlan {
+            source_name: child.source_name.clone(),
+            rust_name: abstract_sum_variant_name(base, child, name_plan),
+            discriminant: None,
+            payload_type: Some(name_plan.reference_name(child.source_type_id, &child.source_name)),
+            payload_has_materialized_fields: item_has_materialized_payload(child, items_by_type_id),
+        }));
+
+        let mut derives = self.plan_sum_enum_derives(&variants);
+        derives.retain(|derive| derive != "AzRtti");
+        let scope_path = layout_index.inheritance_family_scope_segments(base, items_by_type_id);
+        let file_stem = format!(
+            "{}_value",
+            type_path_file_stem(base, layout_index, items_by_type_id)
+        );
+
+        Some(RustItemPlan {
+            source_type_id: Uuid::nil(),
+            source_name: value_name.to_owned(),
+            is_reflected_base: false,
+            is_slot_owner: false,
+            has_layout_family_descendants: false,
+            is_bevy_component: false,
+            file_stem_override: Some(file_stem),
+            scope_path,
+            family_scope_path: Vec::new(),
+            rust_name: value_name.to_owned(),
+            kind: RustItemKind::SumEnum,
+            identity: RustTypeIdentityPlan::az_type_info(Uuid::nil(), None),
+            repr: None,
+            raw_conversion: None,
+            derives,
+            rtti_bases: Vec::new(),
+            fields: Vec::new(),
+            variants,
+        })
+    }
+
     fn plan_serialize_enum(
         &self,
         item: &SerializeCodegenItem,
@@ -632,6 +734,50 @@ fn abstract_value_base_type_ids(
     emitted_unit: &SerializeCodegenUnit,
     items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
 ) -> BTreeSet<Uuid> {
+    value_referenced_type_ids(emitted_unit)
+        .into_iter()
+        .filter(|type_id| {
+            items_by_type_id.get(type_id).is_some_and(|item| {
+                item.is_abstract == Some(true)
+                    && !item_has_materialized_payload(item, items_by_type_id)
+            })
+        })
+        .collect()
+}
+
+fn polymorphic_value_type_names(
+    emitted_unit: &SerializeCodegenUnit,
+    items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+    layout_index: &LayoutIndex,
+    abstract_value_base_type_ids: &BTreeSet<Uuid>,
+) -> BTreeMap<Uuid, String> {
+    let emitted_type_ids = emitted_unit
+        .items
+        .iter()
+        .map(|item| item.source_type_id)
+        .collect::<BTreeSet<_>>();
+
+    value_referenced_type_ids(emitted_unit)
+        .into_iter()
+        .filter(|type_id| !abstract_value_base_type_ids.contains(type_id))
+        .filter_map(|type_id| {
+            let item = items_by_type_id.get(&type_id).copied()?;
+            is_polymorphic_value_base(item, items_by_type_id, layout_index, &emitted_type_ids).then(
+                || {
+                    (
+                        type_id,
+                        format!(
+                            "{}Value",
+                            rust_candidate_type_name(item, abstract_value_base_type_ids)
+                        ),
+                    )
+                },
+            )
+        })
+        .collect()
+}
+
+fn value_referenced_type_ids(emitted_unit: &SerializeCodegenUnit) -> BTreeSet<Uuid> {
     let mut referenced_type_ids = BTreeSet::new();
     for item in &emitted_unit.items {
         for field in &item.fields {
@@ -645,14 +791,53 @@ fn abstract_value_base_type_ids(
     }
 
     referenced_type_ids
-        .into_iter()
-        .filter(|type_id| {
-            items_by_type_id.get(type_id).is_some_and(|item| {
-                item.is_abstract == Some(true)
-                    && !item_has_materialized_payload(item, items_by_type_id)
-            })
+}
+
+fn is_polymorphic_value_base(
+    item: &SerializeCodegenItem,
+    items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+    layout_index: &LayoutIndex,
+    emitted_type_ids: &BTreeSet<Uuid>,
+) -> bool {
+    if item.role != ReflectedTypeRole::SupportType
+        || item.is_abstract == Some(true)
+        || !item_has_materialized_payload(item, items_by_type_id)
+    {
+        return false;
+    }
+
+    let Some(child_type_ids) = layout_index
+        .direct_derived_type_ids_by_base_type_id
+        .get(&item.source_type_id)
+    else {
+        return false;
+    };
+    !child_type_ids.is_empty()
+        && child_type_ids
+            .iter()
+            .all(|type_id| emitted_type_ids.contains(type_id))
+        && child_type_ids.iter().all(|type_id| {
+            items_by_type_id
+                .get(type_id)
+                .is_some_and(|child| child.is_abstract != Some(true))
         })
-        .collect()
+        && child_type_ids.iter().any(|type_id| {
+            items_by_type_id
+                .get(type_id)
+                .is_some_and(|child| item_has_own_materialized_fields(child))
+        })
+}
+
+fn item_has_own_materialized_fields(item: &SerializeCodegenItem) -> bool {
+    item.fields.iter().any(|field| !field.is_base_class)
+}
+
+fn type_path_file_stem(
+    item: &SerializeCodegenItem,
+    layout_index: &LayoutIndex,
+    items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+) -> String {
+    layout_index.type_path(item, items_by_type_id).file_stem
 }
 
 fn rust_candidate_type_name(
@@ -2729,6 +2914,130 @@ pub struct ExternalPayload;
             Some("GatherableCondition")
         );
         assert!(condition.variants[1].payload_has_materialized_fields);
+    }
+
+    #[test]
+    fn plans_concrete_value_base_as_sibling_payload_sum_enum() {
+        let owner_id = uuid!("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA");
+        let base_id = uuid!("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB");
+        let bool_id = uuid!("CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC");
+        let strings_id = uuid!("DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD");
+        let properties_vector_id = uuid!("11111111-1111-1111-1111-111111111111");
+        let values_vector_id = uuid!("22222222-2222-2222-2222-222222222222");
+
+        let unit = SerializeCodegenUnit {
+            items: vec![
+                facet_item(
+                    owner_id,
+                    "ScriptPropertyGroup",
+                    ReflectedTypeRole::SupportType,
+                    vec![SerializeCodegenField {
+                        source_name: "Properties".to_owned(),
+                        source_type_id: properties_vector_id,
+                        resolved_type: ResolvedType::Sequence {
+                            kind: SequenceKind::Vector,
+                            element: Box::new(ResolvedType::Named {
+                                type_id: base_id,
+                                source_name: "AzFramework::ScriptProperty".to_owned(),
+                            }),
+                            capacity: None,
+                        },
+                        data_size: None,
+                        offset: None,
+                        flags: None,
+                        is_base_class: false,
+                        is_pointer: false,
+                        is_dynamic_field: false,
+                    }],
+                ),
+                facet_item(
+                    base_id,
+                    "AzFramework::ScriptProperty",
+                    ReflectedTypeRole::SupportType,
+                    vec![
+                        scalar_member_field("ID", type_ids::U64, ScalarType::U64),
+                        scalar_member_field("Name", type_ids::AZSTD_STRING, ScalarType::String),
+                    ],
+                ),
+                facet_item(
+                    bool_id,
+                    "AzFramework::ScriptPropertyBoolean",
+                    ReflectedTypeRole::SupportType,
+                    vec![
+                        base_field(base_id, "AzFramework::ScriptProperty"),
+                        scalar_member_field("value", type_ids::BOOL, ScalarType::Bool),
+                    ],
+                ),
+                facet_item(
+                    strings_id,
+                    "AzFramework::ScriptPropertyStringArray",
+                    ReflectedTypeRole::SupportType,
+                    vec![
+                        base_field(base_id, "AzFramework::ScriptProperty"),
+                        SerializeCodegenField {
+                            source_name: "values".to_owned(),
+                            source_type_id: values_vector_id,
+                            resolved_type: ResolvedType::Sequence {
+                                kind: SequenceKind::Vector,
+                                element: Box::new(ResolvedType::Scalar(ScalarType::String)),
+                                capacity: None,
+                            },
+                            data_size: None,
+                            offset: None,
+                            flags: None,
+                            is_base_class: false,
+                            is_pointer: false,
+                            is_dynamic_field: false,
+                        },
+                    ],
+                ),
+            ],
+        };
+
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
+        let group = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == owner_id)
+            .expect("ScriptPropertyGroup plan");
+        let base = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == base_id)
+            .expect("ScriptProperty plan");
+        let bool_property = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == bool_id)
+            .expect("ScriptPropertyBoolean plan");
+        let value = rust_unit
+            .items
+            .iter()
+            .find(|item| item.rust_name == "ScriptPropertyValue")
+            .expect("ScriptPropertyValue plan");
+
+        assert_eq!(base.kind, RustItemKind::Struct);
+        assert_eq!(group.fields[0].rust_type, "Vec<ScriptPropertyValue>");
+        assert_eq!(bool_property.fields[0].rust_type, "ScriptProperty");
+        assert!(bool_property.fields[0].is_base_class);
+        assert_eq!(value.kind, RustItemKind::SumEnum);
+        assert_eq!(value.source_type_id, Uuid::nil());
+        assert!(!value.derives.contains(&"AzRtti".to_owned()));
+        assert!(value.derives.contains(&"Serialize".to_owned()));
+        assert!(value.derives.contains(&"Deserialize".to_owned()));
+        assert_eq!(
+            value
+                .variants
+                .iter()
+                .map(|variant| (variant.rust_name.as_str(), variant.payload_type.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Base", Some("ScriptProperty")),
+                ("Boolean", Some("ScriptPropertyBoolean")),
+                ("StringArray", Some("ScriptPropertyStringArray")),
+            ]
+        );
     }
 
     #[test]
