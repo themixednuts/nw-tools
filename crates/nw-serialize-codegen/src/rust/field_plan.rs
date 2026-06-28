@@ -235,7 +235,8 @@ impl RustFieldPlanner {
         let needs_indirection = (target_item.is_abstract == Some(true)
             && target_item.fields.is_empty()
             && is_family_member)
-            || (polymorphic_value_type_names.contains_key(&target.type_id) && is_family_member);
+            || (polymorphic_value_type_names.contains_key(&target.type_id)
+                && (is_optional || field.is_pointer || is_family_member));
         if !needs_indirection {
             return None;
         }
