@@ -467,17 +467,18 @@ impl RustCodegenPlanner {
         let variants = children
             .iter()
             .map(|child| {
-                let has_payload =
+                let has_materialized_fields =
                     item_has_materialized_payload(child, plan_context.items_by_type_id);
                 RustVariantPlan {
                     source_name: child.source_name.clone(),
                     rust_name: abstract_sum_variant_name(item, child, plan_context.name_plan),
                     discriminant: None,
-                    payload_type: has_payload.then(|| {
+                    payload_type: Some(
                         plan_context
                             .name_plan
-                            .reference_name(child.source_type_id, &child.source_name)
-                    }),
+                            .reference_name(child.source_type_id, &child.source_name),
+                    ),
+                    payload_has_materialized_fields: has_materialized_fields,
                 }
             })
             .collect::<Vec<_>>();
@@ -525,6 +526,8 @@ impl RustCodegenPlanner {
         derives.extend([
             "Clone".to_owned(),
             "PartialEq".to_owned(),
+            "Serialize".to_owned(),
+            "Deserialize".to_owned(),
             "Reflect".to_owned(),
         ]);
         derives
@@ -683,7 +686,6 @@ fn abstract_sum_variant_name(
 fn default_sum_variant(variants: &[RustVariantPlan]) -> Option<&RustVariantPlan> {
     variants
         .iter()
-        .filter(|variant| variant.payload_type.is_none())
         .find(|variant| {
             matches!(
                 variant.rust_name.as_str(),
@@ -692,11 +694,7 @@ fn default_sum_variant(variants: &[RustVariantPlan]) -> Option<&RustVariantPlan>
                 || variant.rust_name.ends_with("Invalid")
                 || variant.rust_name.ends_with("Disabled")
         })
-        .or_else(|| {
-            variants
-                .iter()
-                .find(|variant| variant.payload_type.is_none())
-        })
+        .or_else(|| variants.first())
 }
 
 fn remove_default_derive(derives: &mut Vec<String>) {
@@ -2234,6 +2232,56 @@ pub struct ExternalPayload;
         }
     }
 
+    fn abstract_item(
+        source_type_id: uuid::Uuid,
+        source_name: &str,
+        role: ReflectedTypeRole,
+        fields: Vec<SerializeCodegenField>,
+    ) -> SerializeCodegenItem {
+        let mut item = facet_item(source_type_id, source_name, role, fields);
+        item.is_abstract = Some(true);
+        item
+    }
+
+    fn member_field(
+        source_name: &str,
+        source_type_id: uuid::Uuid,
+        type_name: &str,
+    ) -> SerializeCodegenField {
+        SerializeCodegenField {
+            source_name: source_name.to_owned(),
+            source_type_id,
+            resolved_type: ResolvedType::Named {
+                type_id: source_type_id,
+                source_name: type_name.to_owned(),
+            },
+            data_size: None,
+            offset: None,
+            flags: None,
+            is_base_class: false,
+            is_pointer: false,
+            is_dynamic_field: false,
+        }
+    }
+
+    fn scalar_member_field(
+        source_name: &str,
+        source_type_id: uuid::Uuid,
+        scalar: ScalarType,
+    ) -> SerializeCodegenField {
+        SerializeCodegenField {
+            source_name: source_name.to_owned(),
+            source_type_id,
+            resolved_type: ResolvedType::Scalar(scalar),
+            data_size: None,
+            offset: None,
+            flags: None,
+            is_base_class: false,
+            is_pointer: false,
+            is_dynamic_field: false,
+        }
+    }
+
     fn base_field(source_type_id: uuid::Uuid, source_name: &str) -> SerializeCodegenField {
         SerializeCodegenField {
             source_name: "BaseClass1".to_owned(),
@@ -2617,6 +2665,70 @@ pub struct ExternalPayload;
                 .iter()
                 .all(|file| file.path != "src/types/example/base_thing.rs")
         );
+    }
+
+    #[test]
+    fn plans_abstract_value_base_as_concrete_payload_sum_enum() {
+        let owner_id = uuid!("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA");
+        let base_id = uuid!("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB");
+        let default_id = uuid!("CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC");
+        let gather_id = uuid!("DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD");
+
+        let unit = SerializeCodegenUnit {
+            items: vec![
+                facet_item(
+                    owner_id,
+                    "Example::Interact",
+                    ReflectedTypeRole::AzComponent,
+                    vec![member_field("m_condition", base_id, "InteractCondition")],
+                ),
+                abstract_item(
+                    base_id,
+                    "InteractCondition",
+                    ReflectedTypeRole::SupportType,
+                    Vec::new(),
+                ),
+                facet_item(
+                    default_id,
+                    "DefaultCondition",
+                    ReflectedTypeRole::SupportType,
+                    vec![base_field(base_id, "InteractCondition")],
+                ),
+                facet_item(
+                    gather_id,
+                    "GatherableCondition",
+                    ReflectedTypeRole::SupportType,
+                    vec![
+                        base_field(base_id, "InteractCondition"),
+                        scalar_member_field("m_requiredLevel", type_ids::U32, ScalarType::U32),
+                    ],
+                ),
+            ],
+        };
+
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
+        let condition = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == base_id)
+            .expect("InteractCondition plan");
+
+        assert_eq!(condition.kind, RustItemKind::SumEnum);
+        assert!(condition.derives.contains(&"Serialize".to_owned()));
+        assert!(condition.derives.contains(&"Deserialize".to_owned()));
+        assert!(condition.derives.contains(&"Default".to_owned()));
+        assert_eq!(condition.variants.len(), 2);
+        assert_eq!(
+            condition.variants[0].payload_type.as_deref(),
+            Some("DefaultCondition")
+        );
+        assert!(!condition.variants[0].payload_has_materialized_fields);
+        assert_eq!(
+            condition.variants[1].payload_type.as_deref(),
+            Some("GatherableCondition")
+        );
+        assert!(condition.variants[1].payload_has_materialized_fields);
     }
 
     #[test]

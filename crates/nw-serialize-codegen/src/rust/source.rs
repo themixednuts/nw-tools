@@ -368,6 +368,7 @@ fn render_item(
     let derives = item
         .derives
         .iter()
+        .filter(|derive_name| render_derive_for_item_kind(item.kind, derive_name))
         .map(|derive_name| {
             let derive_path = standalone_derive_path(derive_name, options);
             syn::parse_str::<Path>(&derive_path).map_err(|source| RustSourceEmitError::DerivePath {
@@ -432,13 +433,13 @@ fn render_item(
             })
         }
         RustItemKind::SumEnum => {
-            let default_variant =
-                default_sum_variant(item).map(|variant| variant.rust_name.clone());
             let variants = item
                 .variants
                 .iter()
-                .map(|variant| render_variant(item, variant, default_variant.as_deref()))
+                .map(|variant| render_variant(item, variant, None))
                 .collect::<Result<Vec<_>, _>>()?;
+            let default_impl = render_sum_default_impl(item, &ident)?;
+            let serde_impls = render_sum_serde_impls(item, &ident, options)?;
             Ok(quote! {
                 #[derive(#(#derives,)*)]
                 #identity_attr
@@ -447,6 +448,8 @@ fn render_item(
                     #(#variants)*
                 }
 
+                #default_impl
+                #serde_impls
                 #standalone_identity
             })
         }
@@ -481,6 +484,16 @@ fn render_serde_container_attr(item: &RustItemPlan) -> TokenStream {
 
 fn is_serde_derive(derive: &str, name: &str) -> bool {
     derive == name || derive.strip_prefix("serde::") == Some(name)
+}
+
+fn render_derive_for_item_kind(kind: RustItemKind, derive: &str) -> bool {
+    if kind != RustItemKind::SumEnum {
+        return true;
+    }
+
+    derive != "Default"
+        && !is_serde_derive(derive, "Serialize")
+        && !is_serde_derive(derive, "Deserialize")
 }
 
 fn standalone_derive_path(derive_name: &str, options: RustSourceOptions) -> String {
@@ -645,6 +658,285 @@ fn render_range_const(
     Ok(quote! {
         pub const #ident: #ty = #start..=#last;
     })
+}
+
+fn render_sum_default_impl(
+    item: &RustItemPlan,
+    ident: &Ident,
+) -> Result<TokenStream, RustSourceEmitError> {
+    if !item.derives.iter().any(|derive| derive == "Default") {
+        return Ok(TokenStream::new());
+    }
+
+    let Some(variant) = default_sum_variant(item) else {
+        return Ok(TokenStream::new());
+    };
+    let variant_ident = parse_variant_ident(item, variant)?;
+    let payload_ty = parse_variant_payload_type(item, variant)?;
+
+    Ok(quote! {
+        impl ::core::default::Default for #ident {
+            fn default() -> Self {
+                Self::#variant_ident(<#payload_ty as ::core::default::Default>::default())
+            }
+        }
+    })
+}
+
+fn render_sum_serde_impls(
+    item: &RustItemPlan,
+    ident: &Ident,
+    options: RustSourceOptions,
+) -> Result<TokenStream, RustSourceEmitError> {
+    let serialize = item
+        .derives
+        .iter()
+        .any(|derive| is_serde_derive(derive, "Serialize"))
+        .then(|| render_sum_serialize_impl(item, ident, options))
+        .transpose()?;
+    let deserialize = item
+        .derives
+        .iter()
+        .any(|derive| is_serde_derive(derive, "Deserialize"))
+        .then(|| render_sum_deserialize_impl(item, ident, options))
+        .transpose()?;
+
+    Ok(quote! {
+        #serialize
+        #deserialize
+    })
+}
+
+fn render_sum_serialize_impl(
+    item: &RustItemPlan,
+    ident: &Ident,
+    options: RustSourceOptions,
+) -> Result<TokenStream, RustSourceEmitError> {
+    let type_info = az_type_info_trait_path(options);
+    let arms = item
+        .variants
+        .iter()
+        .map(|variant| {
+            let variant_ident = parse_variant_ident(item, variant)?;
+            let payload_ty = parse_variant_payload_type(item, variant)?;
+            let body = if variant.payload_has_materialized_fields {
+                quote! {
+                    let mut fields = match ::serde_json::to_value(payload)
+                        .map_err(::serde::ser::Error::custom)?
+                    {
+                        ::serde_json::Value::Object(fields) => fields,
+                        ::serde_json::Value::Null => ::serde_json::Map::new(),
+                        value => {
+                            let mut fields = ::serde_json::Map::new();
+                            fields.insert("value".to_owned(), value);
+                            fields
+                        }
+                    };
+                    fields.insert(
+                        "$type".to_owned(),
+                        ::serde_json::Value::String(
+                            <#payload_ty as #type_info>::TYPE_ID.to_string(),
+                        ),
+                    );
+                    ::serde::Serialize::serialize(
+                        &::serde_json::Value::Object(fields),
+                        serializer,
+                    )
+                }
+            } else {
+                quote! {
+                    let mut fields = ::serde_json::Map::new();
+                    fields.insert(
+                        "$type".to_owned(),
+                        ::serde_json::Value::String(
+                            <#payload_ty as #type_info>::TYPE_ID.to_string(),
+                        ),
+                    );
+                    ::serde::Serialize::serialize(
+                        &::serde_json::Value::Object(fields),
+                        serializer,
+                    )
+                }
+            };
+            Ok(quote! {
+                Self::#variant_ident(payload) => {
+                    #body
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, RustSourceEmitError>>()?;
+
+    Ok(quote! {
+        impl ::serde::Serialize for #ident {
+            fn serialize<S>(&self, serializer: S) -> ::core::result::Result<S::Ok, S::Error>
+            where
+                S: ::serde::Serializer,
+            {
+                match self {
+                    #(#arms)*
+                }
+            }
+        }
+    })
+}
+
+fn render_sum_deserialize_impl(
+    item: &RustItemPlan,
+    ident: &Ident,
+    options: RustSourceOptions,
+) -> Result<TokenStream, RustSourceEmitError> {
+    let type_info = az_type_info_trait_path(options);
+    let parse_type_id = match options.mode {
+        RustSourceMode::Integrated => quote!(::uuid::Uuid::parse_str(&type_id)),
+        RustSourceMode::Standalone => quote!(AzUuid::parse_str(&type_id)),
+    };
+    let variant_checks = item
+        .variants
+        .iter()
+        .map(|variant| {
+            let variant_ident = parse_variant_ident(item, variant)?;
+            let payload_ty = parse_variant_payload_type(item, variant)?;
+            let decode = if variant.payload_has_materialized_fields {
+                quote! {
+                    let source_fields = <::serde_json::Map<String, ::serde_json::Value> as ::serde::Deserialize>::deserialize(
+                        ::serde::de::value::MapAccessDeserializer::new(map),
+                    )?;
+                    let mut value = ::serde_json::to_value(
+                        <#payload_ty as ::core::default::Default>::default(),
+                    )
+                    .map_err(::serde::de::Error::custom)?;
+                    merge_sum_payload_defaults(
+                        &mut value,
+                        ::serde_json::Value::Object(source_fields),
+                    );
+                    return ::serde_json::from_value::<#payload_ty>(value)
+                        .map(Self::#variant_ident)
+                        .map_err(::serde::de::Error::custom);
+                }
+            } else {
+                quote! {
+                    if let Some(extra) = map.next_key::<String>()? {
+                        let _ = map.next_value::<::serde::de::IgnoredAny>()?;
+                        return Err(::serde::de::Error::unknown_field(&extra, &[]));
+                    }
+                    return Ok(Self::#variant_ident(
+                        <#payload_ty as ::core::default::Default>::default(),
+                    ));
+                }
+            };
+            Ok(quote! {
+                if type_id == <#payload_ty as #type_info>::TYPE_ID {
+                    #decode
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, RustSourceEmitError>>()?;
+
+    Ok(quote! {
+        impl<'de> ::serde::Deserialize<'de> for #ident {
+            fn deserialize<D>(deserializer: D) -> ::core::result::Result<Self, D::Error>
+            where
+                D: ::serde::Deserializer<'de>,
+            {
+                struct Visitor;
+
+                impl<'de> ::serde::de::Visitor<'de> for Visitor {
+                    type Value = #ident;
+
+                    fn expecting(
+                        &self,
+                        formatter: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
+                        formatter.write_str("AZ polymorphic object with a `$type` field")
+                    }
+
+                    fn visit_map<A>(self, mut map: A) -> ::core::result::Result<Self::Value, A::Error>
+                    where
+                        A: ::serde::de::MapAccess<'de>,
+                    {
+                        fn merge_sum_payload_defaults(
+                            value: &mut ::serde_json::Value,
+                            source: ::serde_json::Value,
+                        ) {
+                            match (value, source) {
+                                (
+                                    ::serde_json::Value::Object(value),
+                                    ::serde_json::Value::Object(source),
+                                ) => {
+                                    for (key, source_value) in source {
+                                        match value.get_mut(&key) {
+                                            Some(value) => {
+                                                merge_sum_payload_defaults(value, source_value)
+                                            }
+                                            None => {
+                                                value.insert(key, source_value);
+                                            }
+                                        }
+                                    }
+                                }
+                                (value, source) => *value = source,
+                            }
+                        }
+
+                        let Some(key) = map.next_key::<String>()? else {
+                            return Err(::serde::de::Error::missing_field("$type"));
+                        };
+                        if key != "$type" {
+                            return Err(::serde::de::Error::custom(format!(
+                                "expected `$type` as first field for {}, got `{}`",
+                                stringify!(#ident),
+                                key,
+                            )));
+                        }
+
+                        let type_id = map.next_value::<String>()?;
+                        let type_id = #parse_type_id.map_err(::serde::de::Error::custom)?;
+
+                        #(#variant_checks)*
+
+                        Err(::serde::de::Error::custom(format!(
+                            "unknown {} concrete type {}",
+                            stringify!(#ident),
+                            type_id,
+                        )))
+                    }
+                }
+
+                deserializer.deserialize_map(Visitor)
+            }
+        }
+    })
+}
+
+fn parse_variant_payload_type(
+    item: &RustItemPlan,
+    variant: &RustVariantPlan,
+) -> Result<Type, RustSourceEmitError> {
+    let Some(payload_type) = &variant.payload_type else {
+        return Err(RustSourceEmitError::FieldType {
+            item_name: item.rust_name.clone(),
+            field_name: variant.rust_name.clone(),
+            rust_type: String::new(),
+            source: syn::Error::new(
+                Span::call_site(),
+                "sum enum variant is missing its concrete payload type",
+            ),
+        });
+    };
+    syn::parse_str::<Type>(payload_type).map_err(|source| RustSourceEmitError::FieldType {
+        item_name: item.rust_name.clone(),
+        field_name: variant.rust_name.clone(),
+        rust_type: payload_type.clone(),
+        source,
+    })
+}
+
+fn az_type_info_trait_path(options: RustSourceOptions) -> Path {
+    let path = match options.mode {
+        RustSourceMode::Integrated => "::az_core::type_info::AzTypeInfo",
+        RustSourceMode::Standalone => "AzRtti",
+    };
+    syn::parse_str(path).expect("static AZ type-info trait path should parse")
 }
 
 fn render_repr_attr(item: &RustItemPlan) -> Result<TokenStream, RustSourceEmitError> {
@@ -1077,7 +1369,6 @@ fn default_enum_variant(item: &RustItemPlan) -> Option<&RustVariantPlan> {
 fn default_sum_variant(item: &RustItemPlan) -> Option<&RustVariantPlan> {
     item.variants
         .iter()
-        .filter(|variant| variant.payload_type.is_none())
         .find(|variant| {
             matches!(
                 variant.rust_name.as_str(),
@@ -1086,11 +1377,7 @@ fn default_sum_variant(item: &RustItemPlan) -> Option<&RustVariantPlan> {
                 || variant.rust_name.ends_with("Invalid")
                 || variant.rust_name.ends_with("Disabled")
         })
-        .or_else(|| {
-            item.variants
-                .iter()
-                .find(|variant| variant.payload_type.is_none())
-        })
+        .or_else(|| item.variants.first())
 }
 
 fn is_semantic_default_variant(variant: &RustVariantPlan) -> bool {
@@ -1601,12 +1888,14 @@ mod tests {
                         rust_name: "None".to_owned(),
                         discriminant: Some(0),
                         payload_type: None,
+                        payload_has_materialized_fields: false,
                     },
                     RustVariantPlan {
                         source_name: "Faction1".to_owned(),
                         rust_name: "Faction1".to_owned(),
                         discriminant: Some(1),
                         payload_type: None,
+                        payload_has_materialized_fields: false,
                     },
                 ],
             }],
@@ -2232,6 +2521,73 @@ mod tests {
         assert!(source.contains("OnExit = 1"));
         assert!(source.contains("OnEnterAndOnExit = 2"));
         assert!(source.contains("Self::OnExit => \"On Exit\""));
+        syn::parse_file(&source).expect("source should be parseable Rust");
+    }
+
+    #[test]
+    fn emits_sum_enum_payload_variants_with_tagged_serde_impls() {
+        let unit = RustCodegenUnit {
+            items: vec![RustItemPlan {
+                source_type_id: uuid!("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"),
+                source_name: "InteractCondition".to_owned(),
+                is_reflected_base: true,
+                is_slot_owner: false,
+                has_layout_family_descendants: true,
+                is_bevy_component: false,
+                file_stem_override: Some("mod".to_owned()),
+                scope_path: vec!["interact_conditions".to_owned()],
+                family_scope_path: vec!["interact_conditions".to_owned()],
+                rust_name: "InteractCondition".to_owned(),
+                kind: RustItemKind::SumEnum,
+                identity: RustTypeIdentityPlan::az_rtti(
+                    uuid!("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"),
+                    Some("InteractCondition".to_owned()),
+                ),
+                repr: None,
+                raw_conversion: None,
+                derives: vec![
+                    "Debug".to_owned(),
+                    "Default".to_owned(),
+                    "Clone".to_owned(),
+                    "PartialEq".to_owned(),
+                    "Serialize".to_owned(),
+                    "Deserialize".to_owned(),
+                    "Reflect".to_owned(),
+                ],
+                rtti_bases: Vec::new(),
+                fields: Vec::new(),
+                variants: vec![
+                    RustVariantPlan {
+                        source_name: "DefaultCondition".to_owned(),
+                        rust_name: "DefaultCondition".to_owned(),
+                        discriminant: None,
+                        payload_type: Some("DefaultCondition".to_owned()),
+                        payload_has_materialized_fields: false,
+                    },
+                    RustVariantPlan {
+                        source_name: "GatherableCondition".to_owned(),
+                        rust_name: "GatherableCondition".to_owned(),
+                        discriminant: None,
+                        payload_type: Some("GatherableCondition".to_owned()),
+                        payload_has_materialized_fields: true,
+                    },
+                ],
+            }],
+        };
+
+        let source =
+            RustSourceEmitter::emit_standalone_unit(&unit, &crate::CodegenContext::inline())
+                .expect("sum enum source");
+
+        assert!(source.contains("DefaultCondition(DefaultCondition),"));
+        assert!(source.contains("GatherableCondition(GatherableCondition),"));
+        assert!(source.contains("impl ::core::default::Default for InteractCondition"));
+        assert!(source.contains("impl ::serde::Serialize for InteractCondition"));
+        assert!(source.contains("impl<'de> ::serde::Deserialize<'de> for InteractCondition"));
+        assert!(source.contains("\"$type\""));
+        assert!(source.contains("MapAccessDeserializer::new(map)"));
+        assert!(source.contains("merge_sum_payload_defaults"));
+        assert!(!source.contains("#[default]"));
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
 
