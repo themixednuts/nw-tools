@@ -3046,6 +3046,8 @@ pub struct ExternalPayload;
         let decorator_id = uuid!("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB");
         let composite_id = uuid!("CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC");
         let children_vector_id = uuid!("DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD");
+        let tree_id = uuid!("EEEEEEEE-EEEE-EEEE-EEEE-EEEEEEEEEEEE");
+        let tree_reference_id = uuid!("FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF");
 
         let unit = SerializeCodegenUnit {
             items: vec![
@@ -3111,6 +3113,51 @@ pub struct ExternalPayload;
                         },
                     ],
                 ),
+                facet_item(
+                    tree_id,
+                    "Tree",
+                    ReflectedTypeRole::SupportType,
+                    vec![SerializeCodegenField {
+                        source_name: "Root".to_owned(),
+                        source_type_id: node_id,
+                        resolved_type: ResolvedType::Optional {
+                            value: Box::new(ResolvedType::Named {
+                                type_id: node_id,
+                                source_name: "Node".to_owned(),
+                            }),
+                        },
+                        data_size: None,
+                        offset: None,
+                        flags: None,
+                        is_base_class: false,
+                        is_pointer: true,
+                        is_dynamic_field: false,
+                    }],
+                ),
+                facet_item(
+                    tree_reference_id,
+                    "TreeReference",
+                    ReflectedTypeRole::SupportType,
+                    vec![
+                        base_field(node_id, "Node"),
+                        SerializeCodegenField {
+                            source_name: "SerializedTree".to_owned(),
+                            source_type_id: tree_id,
+                            resolved_type: ResolvedType::Optional {
+                                value: Box::new(ResolvedType::Named {
+                                    type_id: tree_id,
+                                    source_name: "Tree".to_owned(),
+                                }),
+                            },
+                            data_size: None,
+                            offset: None,
+                            flags: None,
+                            is_base_class: false,
+                            is_pointer: true,
+                            is_dynamic_field: false,
+                        },
+                    ],
+                ),
             ],
         };
 
@@ -3126,6 +3173,16 @@ pub struct ExternalPayload;
             .iter()
             .find(|item| item.source_type_id == composite_id)
             .expect("Composite plan");
+        let tree = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == tree_id)
+            .expect("Tree plan");
+        let tree_reference = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == tree_reference_id)
+            .expect("TreeReference plan");
         let value = rust_unit
             .items
             .iter()
@@ -3149,6 +3206,21 @@ pub struct ExternalPayload;
             Some("Vec<Option<NodeValue>>")
         );
         assert_eq!(
+            tree.fields
+                .iter()
+                .find(|field| field.source_name == "Root")
+                .map(|field| field.rust_type.as_str()),
+            Some("Option<Box<NodeValue>>")
+        );
+        assert_eq!(
+            tree_reference
+                .fields
+                .iter()
+                .find(|field| field.source_name == "SerializedTree")
+                .map(|field| field.rust_type.as_str()),
+            Some("Option<Tree>")
+        );
+        assert_eq!(
             value
                 .variants
                 .iter()
@@ -3158,6 +3230,7 @@ pub struct ExternalPayload;
                 ("Base", Some("Node")),
                 ("Composite", Some("Composite")),
                 ("Decorator", Some("Decorator")),
+                ("TreeReference", Some("TreeReference")),
             ]
         );
     }
