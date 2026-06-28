@@ -759,12 +759,14 @@ pub struct HealthComponent {
                     rust_name: "Enabled".to_owned(),
                     discriminant: Some(7),
                     payload_type: None,
+                    payload_has_materialized_fields: false,
                 },
                 RustVariantPlan {
                     source_name: "Disabled".to_owned(),
                     rust_name: "Disabled".to_owned(),
                     discriminant: Some(8),
                     payload_type: None,
+                    payload_has_materialized_fields: false,
                 },
             ],
         };

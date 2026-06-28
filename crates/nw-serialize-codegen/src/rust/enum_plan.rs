@@ -15,6 +15,7 @@ pub struct RustVariantPlan {
     pub rust_name: String,
     pub discriminant: Option<i32>,
     pub payload_type: Option<String>,
+    pub payload_has_materialized_fields: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +40,7 @@ impl RustEnumPlanner {
                     rust_name: unique_variant_name(base, variant, index, &mut used),
                     discriminant: variant.value_i32,
                     payload_type: None,
+                    payload_has_materialized_fields: false,
                 }
             })
             .collect()
