@@ -9,13 +9,13 @@ use uuid::Uuid;
 use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind};
 use crate::naming::{rust_field_ident, rust_module_ident, rust_type_ident};
 use crate::network_schema::{
-    NetworkConfidence, NetworkField, NetworkFragmentMetadata,
-    NetworkReplicatedContainerWireShape, NetworkSchema, NetworkType, NetworkTypeCapability,
+    NetworkConfidence, NetworkField, NetworkFragmentMetadata, NetworkReplicatedContainerWireShape,
+    NetworkSchema, NetworkType, NetworkTypeCapability,
     NetworkWireScalarShape as SchemaWireScalarShape, NetworkWireShape as SchemaWireShape,
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v29";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v30";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -93,6 +93,8 @@ pub struct NetworkStateGenerationPlanReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_metadata_fragment: Option<bool>,
     pub field_count: usize,
+    #[serde(default)]
+    pub attribute_count: usize,
     pub shaped_field_count: usize,
     pub supported_field_count: usize,
     pub missing_wire_shape_count: usize,
@@ -109,6 +111,14 @@ pub struct NetworkStateFieldShapeReport {
     pub field_index: Option<u32>,
     pub field_name: Option<String>,
     pub group: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_group_attribute: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type_name: Option<String>,
     pub handler_vtable: Option<String>,
     pub wire_shape: Option<SchemaWireShape>,
     pub wire_shape_source: Option<String>,
@@ -132,6 +142,10 @@ pub struct NetworkMessageGenerationPlanReport {
     pub missing_wire_shape_count: usize,
     #[serde(default)]
     pub missing_field_type_count: usize,
+    #[serde(default)]
+    pub missing_support_type_count: usize,
+    #[serde(default)]
+    pub missing_composite_support_type_count: usize,
     #[serde(default)]
     pub placeholder_field_name_count: usize,
     pub unsupported_wire_shape_count: usize,
@@ -183,6 +197,8 @@ pub struct NetworkBlockedTypeExampleReport {
 pub struct NetworkBlockedFieldExampleReport {
     pub field_index: Option<u32>,
     pub field_name: Option<String>,
+    pub native_type: Option<String>,
+    pub source_type_name: Option<String>,
     pub rust_value_type: Option<String>,
     pub blocked_reason: Option<String>,
 }
@@ -315,7 +331,9 @@ impl NetworkRustEmitter {
                 pub name: &'static str,
                 pub group: Option<u32>,
                 pub native_type: Option<&'static str>,
+                pub source_type_name: Option<&'static str>,
                 pub rust_type: Option<&'static str>,
+                pub unmarshal_target_name: Option<&'static str>,
                 pub storage_offset: Option<u32>,
                 pub wire_shape: Option<NetworkWireShape>,
                 pub confidence: NetworkFieldConfidence,
@@ -1082,7 +1100,14 @@ fn field_tokens(
     let name = LitStr::new(name, proc_macro2::Span::call_site());
     let group = option_u32_tokens(field.group);
     let native_type = option_str_tokens(field.native_type.as_deref());
-    let rust_type = option_str_tokens(field.rust_type.as_deref());
+    let source_type_name = option_str_tokens(field.source_type_name.as_deref());
+    let rust_type = option_str_tokens(resolved_field_descriptor_rust_type(field).as_deref());
+    let unmarshal_target_name = option_str_tokens(
+        field
+            .unmarshal_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.target_name.as_deref()),
+    );
     let storage_offset = option_u32_tokens(field.storage_offset);
     let wire_shape = field_wire_shape_tokens(field, wire_shapes, report);
     let confidence = confidence_ident(field.confidence);
@@ -1092,7 +1117,9 @@ fn field_tokens(
             name: #name,
             group: #group,
             native_type: #native_type,
+            source_type_name: #source_type_name,
             rust_type: #rust_type,
+            unmarshal_target_name: #unmarshal_target_name,
             storage_offset: #storage_offset,
             wire_shape: #wire_shape,
             confidence: NetworkFieldConfidence::#confidence,
@@ -1167,11 +1194,18 @@ fn state_generation_plan(
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
 ) -> NetworkStateGenerationPlanReport {
-    let fields = network_type
+    let attribute_count = network_type
         .fields
         .iter()
+        .filter(|field| is_replicated_state_attribute_field(field))
+        .count();
+    let mut fields = network_type
+        .fields
+        .iter()
+        .filter(|field| !is_replicated_state_attribute_field(field))
         .map(|field| state_field_shape_report(field, wire_shapes, wire_shape_sources))
         .collect::<Vec<_>>();
+    disambiguate_report_field_names(&mut fields);
     let field_count = fields.len();
     let shaped_field_count = fields
         .iter()
@@ -1207,16 +1241,19 @@ fn state_generation_plan(
         .iter()
         .filter(|field| !field.confidence.is_high_or_exact())
         .count();
-    let blocked_reasons = state_blocked_reasons(
-        network_type,
+    let block_counts = FieldBlockCounts {
         field_count,
         missing_wire_shape_count,
+        missing_field_type_count: 0,
+        missing_support_type_count: 0,
+        missing_composite_support_type_count: 0,
         unsupported_wire_shape_count,
         container_codec_only_count,
         missing_semantic_type_count,
         invalid_field_metadata_count,
         low_confidence_field_count,
-    );
+    };
+    let blocked_reasons = state_blocked_reasons(network_type, block_counts);
     NetworkStateGenerationPlanReport {
         type_index: network_type.type_index,
         type_name: network_type.name.clone(),
@@ -1233,6 +1270,7 @@ fn state_generation_plan(
             .as_ref()
             .and_then(|metadata| metadata.is_metadata),
         field_count,
+        attribute_count,
         shaped_field_count,
         supported_field_count,
         missing_wire_shape_count,
@@ -1244,16 +1282,21 @@ fn state_generation_plan(
     }
 }
 
+fn is_replicated_state_attribute_field(field: &NetworkField) -> bool {
+    field.registration_kind.as_deref() == Some("attribute")
+}
+
 fn message_generation_plan(
     network_type: &NetworkType,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
 ) -> NetworkMessageGenerationPlanReport {
-    let fields = network_type
+    let mut fields = network_type
         .fields
         .iter()
         .map(|field| message_field_shape_report(field, wire_shapes, wire_shape_sources))
         .collect::<Vec<_>>();
+    disambiguate_report_field_names(&mut fields);
     let field_count = fields.len();
     let shaped_field_count = fields
         .iter()
@@ -1267,6 +1310,14 @@ fn message_generation_plan(
     let missing_field_type_count = fields
         .iter()
         .filter(|field| field.blocked_reason.as_deref() == Some("missing-field-type"))
+        .count();
+    let missing_support_type_count = fields
+        .iter()
+        .filter(|field| field.blocked_reason.as_deref() == Some("missing-support-type"))
+        .count();
+    let missing_composite_support_type_count = fields
+        .iter()
+        .filter(|field| field.blocked_reason.as_deref() == Some("missing-composite-support-type"))
         .count();
     let unsupported_wire_shape_count = fields
         .iter()
@@ -1297,16 +1348,19 @@ fn message_generation_plan(
         .iter()
         .filter(|field| is_placeholder_report_field_name(field))
         .count();
-    let blocked_reasons = message_blocked_reasons(
-        network_type,
+    let block_counts = FieldBlockCounts {
         field_count,
+        missing_wire_shape_count,
         missing_field_type_count,
+        missing_support_type_count,
+        missing_composite_support_type_count,
         unsupported_wire_shape_count,
         container_codec_only_count,
         missing_semantic_type_count,
         invalid_field_metadata_count,
         low_confidence_field_count,
-    );
+    };
+    let blocked_reasons = message_blocked_reasons(network_type, block_counts);
 
     NetworkMessageGenerationPlanReport {
         type_index: network_type.type_index,
@@ -1316,12 +1370,50 @@ fn message_generation_plan(
         supported_field_count,
         missing_wire_shape_count,
         missing_field_type_count,
+        missing_support_type_count,
+        missing_composite_support_type_count,
         placeholder_field_name_count,
         unsupported_wire_shape_count,
         low_confidence_field_count,
         can_generate: blocked_reasons.is_empty(),
         blocked_reasons,
         fields,
+    }
+}
+
+fn disambiguate_report_field_names(fields: &mut [NetworkStateFieldShapeReport]) {
+    let mut seen = BTreeMap::<String, usize>::new();
+    for (ordinal, field) in fields.iter_mut().enumerate() {
+        let Some(name) = field.field_name.as_deref() else {
+            continue;
+        };
+        let ident = rust_field_ident(name);
+        if !seen.contains_key(&ident) {
+            seen.insert(ident, 1);
+            continue;
+        }
+
+        let suffix_seed = field.field_index.unwrap_or(ordinal as u32);
+        let mut attempt = 0;
+        let candidate = loop {
+            let suffix = if attempt == 0 {
+                suffix_seed.to_string()
+            } else {
+                format!("{suffix_seed}_{attempt}")
+            };
+            let candidate = format!("{name}_{suffix}");
+            let candidate_ident = rust_field_ident(&candidate);
+            if !seen.contains_key(&candidate_ident) {
+                seen.insert(candidate_ident, 1);
+                break candidate;
+            }
+            attempt += 1;
+        };
+
+        if let Some(count) = seen.get_mut(&ident) {
+            *count += 1;
+        }
+        field.field_name = Some(candidate);
     }
 }
 
@@ -1436,6 +1528,8 @@ fn blocked_field_example(field: &NetworkStateFieldShapeReport) -> NetworkBlocked
     NetworkBlockedFieldExampleReport {
         field_index: field.field_index,
         field_name: field.field_name.clone(),
+        native_type: field.native_type.clone(),
+        source_type_name: field.source_type_name.clone(),
         rust_value_type: field.rust_value_type.clone(),
         blocked_reason: field.blocked_reason.clone(),
     }
@@ -1450,6 +1544,7 @@ fn message_field_shape_report(
     let rust_type = field
         .rust_type
         .clone()
+        .or_else(|| existing_message_support_type(field).map(ToOwned::to_owned))
         .or_else(|| {
             field
                 .native_type
@@ -1498,6 +1593,10 @@ fn state_field_shape_report(
         field_index: field.index,
         field_name: field.name.clone(),
         group: field.group,
+        registration_kind: field.registration_kind.clone(),
+        filter_group_attribute: field.filter_group_attribute,
+        native_type: field.native_type.clone(),
+        source_type_name: field.source_type_name.clone(),
         handler_vtable: field.handler_vtable.clone(),
         wire_shape: shape,
         wire_shape_source: if explicit_field_type.is_some() && shape.is_none() {
@@ -1638,6 +1737,67 @@ fn message_native_type_rust_type(native_type: &str) -> Option<&'static str> {
     }
 }
 
+fn resolved_field_descriptor_rust_type(field: &NetworkField) -> Option<String> {
+    field
+        .rust_type
+        .clone()
+        .or_else(|| existing_message_support_type(field).map(ToOwned::to_owned))
+}
+
+fn existing_message_support_type(field: &NetworkField) -> Option<&'static str> {
+    let target_name = field
+        .unmarshal_evidence
+        .as_ref()
+        .and_then(|evidence| evidence.target_name.as_deref())?;
+    let target_kind = field
+        .unmarshal_evidence
+        .as_ref()
+        .and_then(|evidence| evidence.target_kind.as_deref());
+    let native_type = field.native_type.as_deref();
+    let source_type = field.source_type_name.as_deref();
+
+    if target_name.ends_with("ActorRequestId::Unmarshal")
+        && target_kind.is_none_or(|kind| kind == "direct-unmarshal" || kind.contains("direct-type"))
+        && native_type == Some("ActorRequestId")
+        && source_type.is_none_or(|source| source == "ActorRequestId")
+        && has_actor_request_id_shape(field)
+    {
+        return Some("::nw_network::ActorRequestId");
+    }
+
+    None
+}
+
+fn has_actor_request_id_shape(field: &NetworkField) -> bool {
+    let Some(shape) = field.nested_type_shape.as_ref() else {
+        return false;
+    };
+    shape.type_name.as_deref() == Some("ActorRequestId")
+        && shape
+            .type_name_full
+            .as_deref()
+            .is_some_and(|name| name.ends_with("::ActorRequestId"))
+        && shape.type_name_source.as_deref() == Some("ghidra-symbol")
+        && shape.validation.as_deref() == Some("layout-consistent-two-u64")
+        && shape.member_names_proven.is_some()
+        && shape.members.len() == 2
+        && actor_request_id_member(&shape.members[0], 0, "0x0")
+        && actor_request_id_member(&shape.members[1], 1, "0x8")
+}
+
+fn actor_request_id_member(
+    member: &crate::network_schema::NetworkNestedTypeMember,
+    index: u32,
+    offset: &str,
+) -> bool {
+    member.index == Some(index)
+        && member.offset.as_deref() == Some(offset)
+        && member.native_type.as_deref() == Some("u64")
+        && member.wire_shape.as_deref() == Some("u64")
+        && member.byte_width == Some(8)
+        && member.name_proven.is_some()
+}
+
 fn wire_shape_sources_by_handler_vtable(schema: &NetworkSchema) -> BTreeMap<&str, &str> {
     schema
         .field_handler_vtables
@@ -1651,16 +1811,21 @@ fn wire_shape_sources_by_handler_vtable(schema: &NetworkSchema) -> BTreeMap<&str
         .collect()
 }
 
-fn state_blocked_reasons(
-    network_type: &NetworkType,
+#[derive(Debug, Clone, Copy, Default)]
+struct FieldBlockCounts {
     field_count: usize,
     missing_wire_shape_count: usize,
+    missing_field_type_count: usize,
+    missing_support_type_count: usize,
+    missing_composite_support_type_count: usize,
     unsupported_wire_shape_count: usize,
     container_codec_only_count: usize,
     missing_semantic_type_count: usize,
     invalid_field_metadata_count: usize,
     low_confidence_field_count: usize,
-) -> Vec<String> {
+}
+
+fn state_blocked_reasons(network_type: &NetworkType, counts: FieldBlockCounts) -> Vec<String> {
     let mut reasons = Vec::new();
     if network_type.type_index.is_none() {
         reasons.push("missing-type-index".to_owned());
@@ -1668,46 +1833,49 @@ fn state_blocked_reasons(
     if network_type.name.is_none() {
         reasons.push("missing-type-name".to_owned());
     }
-    if field_count == 0 {
+    if counts.field_count == 0 {
         reasons.push("no-registered-fields".to_owned());
     }
-    if missing_wire_shape_count != 0 {
-        reasons.push(format!("missing-wire-shape:{missing_wire_shape_count}"));
-    }
-    if unsupported_wire_shape_count != 0 {
+    if counts.missing_wire_shape_count != 0 {
         reasons.push(format!(
-            "unsupported-wire-shape:{unsupported_wire_shape_count}"
+            "missing-wire-shape:{}",
+            counts.missing_wire_shape_count
         ));
     }
-    if container_codec_only_count != 0 {
-        reasons.push(format!("container-codec-only:{container_codec_only_count}"));
-    }
-    if missing_semantic_type_count != 0 {
+    if counts.unsupported_wire_shape_count != 0 {
         reasons.push(format!(
-            "missing-semantic-type:{missing_semantic_type_count}"
+            "unsupported-wire-shape:{}",
+            counts.unsupported_wire_shape_count
         ));
     }
-    if invalid_field_metadata_count != 0 {
+    if counts.container_codec_only_count != 0 {
         reasons.push(format!(
-            "invalid-field-metadata:{invalid_field_metadata_count}"
+            "container-codec-only:{}",
+            counts.container_codec_only_count
         ));
     }
-    if low_confidence_field_count != 0 {
-        reasons.push(format!("low-confidence-field:{low_confidence_field_count}"));
+    if counts.missing_semantic_type_count != 0 {
+        reasons.push(format!(
+            "missing-semantic-type:{}",
+            counts.missing_semantic_type_count
+        ));
+    }
+    if counts.invalid_field_metadata_count != 0 {
+        reasons.push(format!(
+            "invalid-field-metadata:{}",
+            counts.invalid_field_metadata_count
+        ));
+    }
+    if counts.low_confidence_field_count != 0 {
+        reasons.push(format!(
+            "low-confidence-field:{}",
+            counts.low_confidence_field_count
+        ));
     }
     reasons
 }
 
-fn message_blocked_reasons(
-    network_type: &NetworkType,
-    field_count: usize,
-    missing_field_type_count: usize,
-    unsupported_wire_shape_count: usize,
-    container_codec_only_count: usize,
-    missing_semantic_type_count: usize,
-    invalid_field_metadata_count: usize,
-    low_confidence_field_count: usize,
-) -> Vec<String> {
+fn message_blocked_reasons(network_type: &NetworkType, counts: FieldBlockCounts) -> Vec<String> {
     let mut reasons = Vec::new();
     if network_type.type_id.is_none() {
         reasons.push("missing-type-id".to_owned());
@@ -1718,32 +1886,56 @@ fn message_blocked_reasons(
     if network_type.name.is_none() {
         reasons.push("missing-type-name".to_owned());
     }
-    if field_count == 0 {
+    if counts.field_count == 0 {
         reasons.push("no-message-fields".to_owned());
     }
-    if missing_field_type_count != 0 {
-        reasons.push(format!("missing-field-type:{missing_field_type_count}"));
-    }
-    if unsupported_wire_shape_count != 0 {
+    if counts.missing_field_type_count != 0 {
         reasons.push(format!(
-            "unsupported-wire-shape:{unsupported_wire_shape_count}"
+            "missing-field-type:{}",
+            counts.missing_field_type_count
         ));
     }
-    if container_codec_only_count != 0 {
-        reasons.push(format!("container-codec-only:{container_codec_only_count}"));
-    }
-    if missing_semantic_type_count != 0 {
+    if counts.missing_support_type_count != 0 {
         reasons.push(format!(
-            "missing-semantic-type:{missing_semantic_type_count}"
+            "missing-support-type:{}",
+            counts.missing_support_type_count
         ));
     }
-    if invalid_field_metadata_count != 0 {
+    if counts.missing_composite_support_type_count != 0 {
         reasons.push(format!(
-            "invalid-field-metadata:{invalid_field_metadata_count}"
+            "missing-composite-support-type:{}",
+            counts.missing_composite_support_type_count
         ));
     }
-    if low_confidence_field_count != 0 {
-        reasons.push(format!("low-confidence-field:{low_confidence_field_count}"));
+    if counts.unsupported_wire_shape_count != 0 {
+        reasons.push(format!(
+            "unsupported-wire-shape:{}",
+            counts.unsupported_wire_shape_count
+        ));
+    }
+    if counts.container_codec_only_count != 0 {
+        reasons.push(format!(
+            "container-codec-only:{}",
+            counts.container_codec_only_count
+        ));
+    }
+    if counts.missing_semantic_type_count != 0 {
+        reasons.push(format!(
+            "missing-semantic-type:{}",
+            counts.missing_semantic_type_count
+        ));
+    }
+    if counts.invalid_field_metadata_count != 0 {
+        reasons.push(format!(
+            "invalid-field-metadata:{}",
+            counts.invalid_field_metadata_count
+        ));
+    }
+    if counts.low_confidence_field_count != 0 {
+        reasons.push(format!(
+            "low-confidence-field:{}",
+            counts.low_confidence_field_count
+        ));
     }
     reasons
 }
@@ -1797,12 +1989,42 @@ fn message_field_blocked_reason(
         return Some("invalid-rust-field-type".to_owned());
     }
     if shape.is_none() {
+        if has_composite_support_type_evidence(field) {
+            return Some("missing-composite-support-type".to_owned());
+        }
+        if has_support_type_evidence(field) {
+            return Some("missing-support-type".to_owned());
+        }
         return Some("missing-field-type".to_owned());
     }
     if shape.is_some_and(SchemaWireShape::is_replicated_container) {
         return Some("missing-semantic-type".to_owned());
     }
     None
+}
+
+fn has_composite_support_type_evidence(field: &NetworkField) -> bool {
+    field.native_type.as_deref() == Some("composite")
+        || field
+            .source_type_name
+            .as_deref()
+            .is_some_and(|source_type| source_type.contains(','))
+}
+
+fn has_support_type_evidence(field: &NetworkField) -> bool {
+    field
+        .source_type_name
+        .as_deref()
+        .is_some_and(is_named_support_type_evidence)
+        || field
+            .native_type
+            .as_deref()
+            .is_some_and(is_named_support_type_evidence)
+}
+
+fn is_named_support_type_evidence(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value != "unknown" && value != "composite"
 }
 
 fn is_placeholder_field_name(value: &str) -> bool {
@@ -2024,6 +2246,7 @@ fn blocked_state_generation_plan(
         fragment_category_value: None,
         is_metadata_fragment: None,
         field_count: 0,
+        attribute_count: 0,
         shaped_field_count: 0,
         supported_field_count: 0,
         missing_wire_shape_count: 0,
@@ -2068,7 +2291,8 @@ fn replicated_state_module_tokens(
         .collect::<Vec<_>>();
     let type_registry_import = derive_type_registry.then(|| quote!(, type_registry));
     let type_registry_attr = derive_type_registry.then(|| quote!(#[type_registry(#type_index)]));
-    let replicated_state_attr = replicated_state_attr_tokens(network_type.fragment_metadata.as_ref());
+    let replicated_state_attr =
+        replicated_state_attr_tokens(network_type.fragment_metadata.as_ref());
 
     quote! {
         pub mod #module_ident {
@@ -2337,10 +2561,10 @@ fn message_field_ident(field: &NetworkStateFieldShapeReport) -> String {
         .field_name
         .as_deref()
         .expect("generatable message field has a name");
-    if is_placeholder_report_field_name(field) {
-        if let Some(index) = field.field_index {
-            return format!("field_{index}");
-        }
+    if is_placeholder_report_field_name(field)
+        && let Some(index) = field.field_index
+    {
+        return format!("field_{index}");
     }
     rust_field_ident(field_name)
 }
@@ -2864,6 +3088,99 @@ mod tests {
                 .source
                 .contains("#[replicated_state(category = \"projectile\")]")
         );
+    }
+
+    #[test]
+    fn replicated_state_attributes_are_not_emitted_as_normal_fields() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "203DC8C7-0C60-454B-A46F-566114314B84",
+                "typeIndex": 10,
+                "typeName": "MB::GdeMetadataReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "AssetId",
+                    "registrationKind": "field",
+                    "handlerVtable": "NewWorld+0x8041098",
+                    "confidence": "fixed-field-table-append"
+                }, {
+                    "index": 1,
+                    "name": "ReplicationCategory",
+                    "registrationKind": "attribute",
+                    "handlerVtable": "NewWorld+0x8041028",
+                    "confidence": "fixed-attribute-table-append"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8041098",
+                "fieldCount": 1,
+                "wireShape": "u32",
+                "wireShapeSource": "handler-template-type",
+                "slots": []
+            }, {
+                "address": "NewWorld+0x8041028",
+                "fieldCount": 1,
+                "wireShape": "u8",
+                "wireShapeSource": "handler-template-type",
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        assert_eq!(
+            schema.types[0].fields[1].registration_kind.as_deref(),
+            Some("attribute")
+        );
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [10]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        assert_eq!(plan.field_count, 1);
+        assert_eq!(plan.attribute_count, 1);
+        assert!(output.source.contains("pub asset_id:"));
+        assert!(!output.source.contains("pub replication_category:"));
+    }
+
+    #[test]
+    fn disambiguates_repeated_replicated_state_field_labels_by_field_index() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "01B0664B-3AB6-44A6-87E3-8C69D40E0365",
+                "typeIndex": 11,
+                "typeName": "MB::ALCReplicatedState",
+                "capabilities": ["replicated-state"],
+                "fields": [{
+                    "index": 0,
+                    "name": "Value",
+                    "wireShape": "u8",
+                    "confidence": "fixed-field-table-append"
+                }, {
+                    "index": 1,
+                    "name": "Value",
+                    "wireShape": "u8",
+                    "confidence": "fixed-field-table-append"
+                }, {
+                    "index": 2,
+                    "name": "Value",
+                    "wireShape": "u8",
+                    "confidence": "fixed-field-table-append"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [11]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+
+        assert_eq!(plan.fields[0].field_name.as_deref(), Some("Value"));
+        assert_eq!(plan.fields[1].field_name.as_deref(), Some("Value_1"));
+        assert_eq!(plan.fields[2].field_name.as_deref(), Some("Value_2"));
+        assert!(output.source.contains("pub value:"));
+        assert!(output.source.contains("pub value_1:"));
+        assert!(output.source.contains("pub value_2:"));
     }
 
     #[test]
@@ -3527,6 +3844,176 @@ mod tests {
             output
                 .source
                 .contains("pub login_token: ::nw_network::LoginToken")
+        );
+    }
+
+    #[test]
+    fn resolves_existing_message_support_types_from_unmarshal_evidence() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "57735773-5773-4773-9773-577357735773",
+                "typeIndex": 5773,
+                "typeName": "Javelin::ClientMessages::InventoriesComponentServerFacet_UpdateItemBatch",
+                "capabilities": ["direct-message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "ActorRequestId",
+                    "nativeType": "ActorRequestId",
+                    "sourceTypeName": "ActorRequestId",
+                    "unmarshalEvidence": {
+                        "callsite": "NewWorld+0x35f48ef",
+                        "targetName": "Javelin::ClientMessages::ActorRequestId::Unmarshal",
+                        "targetKind": "direct-unmarshal",
+                        "evidenceSource": "message-unmarshal-pcode-call"
+                    },
+                    "nestedTypeShape": {
+                        "typeName": "ActorRequestId",
+                        "typeNameFull": "Javelin::ClientMessages::ActorRequestId",
+                        "typeNameSource": "ghidra-symbol",
+                        "function": "NewWorld+0x35f4000",
+                        "functionName": "Javelin::ClientMessages::ActorRequestId::Unmarshal",
+                        "memberBase": "param_1",
+                        "memberNameSource": "synthetic-offset",
+                        "memberNamesProven": false,
+                        "validation": "layout-consistent-two-u64",
+                        "members": [{
+                            "index": 0,
+                            "offset": "0x0",
+                            "name": "_0",
+                            "nameSource": "synthetic-offset",
+                            "nameProven": false,
+                            "nativeType": "u64",
+                            "wireShape": "u64",
+                            "byteWidth": 8,
+                            "evidenceSource": "pcode-call"
+                        }, {
+                            "index": 1,
+                            "offset": "0x8",
+                            "name": "_1",
+                            "nameSource": "synthetic-offset",
+                            "nameProven": false,
+                            "nativeType": "u64",
+                            "wireShape": "u64",
+                            "byteWidth": 8,
+                            "evidenceSource": "pcode-call"
+                        }]
+                    },
+                    "confidence": "message-unmarshal-pcode-call"
+                }]
+            }, {
+                "uuid": "57745774-5774-4774-9774-577457745774",
+                "typeIndex": 5774,
+                "typeName": "Javelin::ClientMessages::InventoriesComponentServerFacet_UpdateItemBatchWithoutEvidence",
+                "capabilities": ["direct-message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "ActorRequestId",
+                    "nativeType": "ActorRequestId",
+                    "sourceTypeName": "ActorRequestId",
+                    "confidence": "message-unmarshal-whole-helper-direct-type"
+                }]
+            }, {
+                "uuid": "34773477-3477-4477-9477-347734773477",
+                "typeIndex": 3477,
+                "typeName": "GroupsComponentClientFacet_OnGroupFinderAddMemberSuccessMsg",
+                "capabilities": ["direct-message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "ActorRequestIdPayload",
+                    "nativeType": "composite",
+                    "sourceTypeName": "ActorRequestIdPayload,ActorRequestId",
+                    "confidence": "message-unmarshal-pcode-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.message_generation_plan_count, 3);
+        assert_eq!(output.report.generatable_message_count, 1);
+        assert_eq!(output.report.blocked_message_count, 2);
+
+        let resolved_plan = output
+            .report
+            .message_generation_plans
+            .iter()
+            .find(|plan| plan.type_index == Some(5773))
+            .expect("resolved support type plan");
+        assert_eq!(resolved_plan.missing_support_type_count, 0);
+        assert!(resolved_plan.blocked_reasons.is_empty());
+        assert_eq!(
+            resolved_plan.fields[0].rust_value_type.as_deref(),
+            Some("::nw_network::ActorRequestId")
+        );
+        assert_eq!(resolved_plan.fields[0].blocked_reason, None);
+        assert!(
+            output
+                .source
+                .contains("pub actor_request_id: ::nw_network::ActorRequestId")
+        );
+
+        let unresolved_plan = output
+            .report
+            .message_generation_plans
+            .iter()
+            .find(|plan| plan.type_index == Some(5774))
+            .expect("support type plan");
+        assert_eq!(unresolved_plan.missing_support_type_count, 1);
+        assert_eq!(unresolved_plan.missing_composite_support_type_count, 0);
+        assert_eq!(
+            unresolved_plan.blocked_reasons,
+            vec!["missing-support-type:1"]
+        );
+        assert_eq!(
+            unresolved_plan.fields[0].source_type_name.as_deref(),
+            Some("ActorRequestId")
+        );
+        assert_eq!(
+            unresolved_plan.fields[0].blocked_reason.as_deref(),
+            Some("missing-support-type")
+        );
+
+        let composite_plan = output
+            .report
+            .message_generation_plans
+            .iter()
+            .find(|plan| plan.type_index == Some(3477))
+            .expect("composite type plan");
+        assert_eq!(composite_plan.missing_support_type_count, 0);
+        assert_eq!(composite_plan.missing_composite_support_type_count, 1);
+        assert_eq!(
+            composite_plan.blocked_reasons,
+            vec!["missing-composite-support-type:1"]
+        );
+        assert_eq!(
+            composite_plan.fields[0].source_type_name.as_deref(),
+            Some("ActorRequestIdPayload,ActorRequestId")
+        );
+        assert_eq!(
+            composite_plan.fields[0].blocked_reason.as_deref(),
+            Some("missing-composite-support-type")
+        );
+
+        let support_bucket = output
+            .report
+            .message_blocker_summary
+            .reason_buckets
+            .iter()
+            .find(|bucket| bucket.reason == "missing-support-type")
+            .expect("support blocker bucket");
+        assert_eq!(
+            support_bucket.examples[0].blocked_fields[0]
+                .source_type_name
+                .as_deref(),
+            Some("ActorRequestId")
+        );
+        assert_eq!(
+            support_bucket.examples[0].blocked_fields[0]
+                .native_type
+                .as_deref(),
+            Some("ActorRequestId")
         );
     }
 

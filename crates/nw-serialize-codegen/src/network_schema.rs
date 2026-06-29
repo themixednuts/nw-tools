@@ -248,12 +248,18 @@ pub struct NetworkField {
     pub name: Option<String>,
     pub name_address: Option<String>,
     pub group: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_group_attribute: Option<bool>,
     pub handler_offset: Option<String>,
     pub handler_expression: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handler_vtable: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -268,9 +274,57 @@ pub struct NetworkField {
     pub wire_shape_source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constructor_writes: Vec<NetworkFieldConstructorWrite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmarshal_evidence: Option<NetworkFieldUnmarshalEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested_type_shape: Option<NetworkNestedTypeShape>,
     pub callsite: Option<String>,
     pub confidence: NetworkConfidence,
     pub evidence: Vec<NetworkEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkFieldUnmarshalEvidence {
+    pub callsite: Option<String>,
+    pub target_name: Option<String>,
+    pub target_kind: Option<String>,
+    pub evidence_source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkNestedTypeShape {
+    pub type_name: Option<String>,
+    pub type_name_full: Option<String>,
+    pub type_name_source: Option<String>,
+    pub function: Option<String>,
+    pub function_name: Option<String>,
+    pub member_base: Option<String>,
+    pub member_name_source: Option<String>,
+    pub member_names_proven: Option<bool>,
+    pub datatype_path: Option<String>,
+    pub validation: Option<String>,
+    pub members: Vec<NetworkNestedTypeMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkNestedTypeMember {
+    pub index: Option<u32>,
+    pub offset: Option<String>,
+    pub native_offset: Option<String>,
+    pub name: Option<String>,
+    pub name_source: Option<String>,
+    pub name_proven: Option<bool>,
+    pub name_evidence: Option<String>,
+    pub native_type: Option<String>,
+    pub wire_shape: Option<String>,
+    pub byte_width: Option<u32>,
+    pub evidence_source: Option<String>,
+    pub callsite: Option<String>,
+    pub target: Option<String>,
+    pub target_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1138,10 +1192,13 @@ fn network_field_from_message_signature(
         name: Some(signature.name.clone()),
         name_address: None,
         group: None,
+        registration_kind: None,
+        filter_group_attribute: None,
         handler_offset: None,
         handler_expression: None,
         handler_vtable: None,
         native_type: signature.native_type.clone(),
+        source_type_name: None,
         rust_type: signature.rust_type.clone(),
         storage_expression: None,
         storage_offset: None,
@@ -1149,6 +1206,8 @@ fn network_field_from_message_signature(
         wire_shape: signature.wire_shape,
         wire_shape_source: signature.wire_shape.map(|_| source),
         constructor_writes: Vec::new(),
+        unmarshal_evidence: None,
+        nested_type_shape: None,
         callsite: None,
         confidence: NetworkConfidence::High,
         evidence,
@@ -1726,10 +1785,13 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
         name: string(field, "name"),
         name_address: string(field, "nameAddress"),
         group: u32_value(field, "group"),
+        registration_kind: string(field, "registrationKind"),
+        filter_group_attribute: bool_value(field, "filterGroupAttribute"),
         handler_offset: string(field, "handlerOffset"),
         handler_expression: string(field, "handlerExpression"),
         handler_vtable: string(field, "handlerVtable"),
         native_type,
+        source_type_name: string(field, "sourceTypeName"),
         rust_type: string(field, "rustType"),
         storage_expression: string(field, "storageExpression"),
         storage_offset: hex_or_decimal_u32(field, "storageOffset"),
@@ -1737,9 +1799,69 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
         wire_shape,
         wire_shape_source,
         constructor_writes: network_field_constructor_writes(field),
+        unmarshal_evidence: network_field_unmarshal_evidence(field),
+        nested_type_shape: network_field_nested_type_shape(field),
         callsite: string(field, "callsite"),
         confidence,
         evidence,
+    }
+}
+
+fn network_field_unmarshal_evidence(
+    field: &Map<String, Value>,
+) -> Option<NetworkFieldUnmarshalEvidence> {
+    let evidence = field.get("unmarshalEvidence")?.as_object()?;
+    Some(NetworkFieldUnmarshalEvidence {
+        callsite: string(evidence, "callsite"),
+        target_name: string(evidence, "targetName"),
+        target_kind: string(evidence, "targetKind"),
+        evidence_source: string(evidence, "evidenceSource"),
+    })
+}
+
+fn network_field_nested_type_shape(field: &Map<String, Value>) -> Option<NetworkNestedTypeShape> {
+    let shape = field.get("nestedTypeShape")?.as_object()?;
+    Some(NetworkNestedTypeShape {
+        type_name: string(shape, "typeName"),
+        type_name_full: string(shape, "typeNameFull"),
+        type_name_source: string(shape, "typeNameSource"),
+        function: string(shape, "function"),
+        function_name: string(shape, "functionName"),
+        member_base: string(shape, "memberBase"),
+        member_name_source: string(shape, "memberNameSource"),
+        member_names_proven: bool_value(shape, "memberNamesProven"),
+        datatype_path: string(shape, "datatypePath"),
+        validation: string(shape, "validation"),
+        members: shape
+            .get("members")
+            .and_then(Value::as_array)
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .map(network_nested_type_member)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn network_nested_type_member(member: &Map<String, Value>) -> NetworkNestedTypeMember {
+    NetworkNestedTypeMember {
+        index: u32_value(member, "index"),
+        offset: string(member, "offset"),
+        native_offset: string(member, "nativeOffset"),
+        name: string(member, "name"),
+        name_source: string(member, "nameSource"),
+        name_proven: bool_value(member, "nameProven"),
+        name_evidence: string(member, "nameEvidence"),
+        native_type: string(member, "nativeType"),
+        wire_shape: string(member, "wireShape"),
+        byte_width: u32_value(member, "byteWidth"),
+        evidence_source: string(member, "evidenceSource"),
+        callsite: string(member, "callsite"),
+        target: string(member, "target"),
+        target_name: string(member, "targetName"),
     }
 }
 
@@ -1939,10 +2061,11 @@ fn network_type_capabilities(
     has_registered_fields: bool,
 ) -> Vec<NetworkTypeCapability> {
     let mut capabilities = Vec::new();
-    if name.is_some_and(|name| name.contains("ReplicatedState")) {
+    let is_direct_message = name.is_some_and(is_direct_message_name);
+    if name.is_some_and(is_replicated_state_name) && !is_direct_message {
         capabilities.push(NetworkTypeCapability::ReplicatedState);
     }
-    if name.is_some_and(is_direct_message_name) {
+    if is_direct_message {
         capabilities.push(NetworkTypeCapability::DirectMessage);
     }
     if has_registered_fields {
@@ -1952,6 +2075,12 @@ fn network_type_capabilities(
         capabilities.push(NetworkTypeCapability::SupportData);
     }
     capabilities
+}
+
+fn is_replicated_state_name(name: &str) -> bool {
+    let leaf = name.rsplit("::").next().unwrap_or(name);
+    leaf != "ReplicatedState"
+        && (leaf.ends_with("ReplicatedState") || leaf.contains("ReplicatedState<"))
 }
 
 fn is_direct_message_name(name: &str) -> bool {
@@ -1973,6 +2102,8 @@ fn confidence_from_raw(raw: Option<&str>) -> NetworkConfidence {
         ) => NetworkConfidence::High,
         Some(value) if value.starts_with("message-unmarshal-") => NetworkConfidence::High,
         Some(value) if value.starts_with("message-signature-") => NetworkConfidence::High,
+        Some(value) if value.starts_with("fixed-field-table-append") => NetworkConfidence::High,
+        Some(value) if value.starts_with("fixed-attribute-table-append") => NetworkConfidence::High,
         Some("constructor-match" | "vtable-match") => NetworkConfidence::Inferred,
         Some("hint") => NetworkConfidence::Weak,
         Some(_) => NetworkConfidence::Unknown,
@@ -2608,6 +2739,59 @@ mod tests {
     }
 
     #[test]
+    fn replicated_state_capability_requires_state_leaf_name() {
+        let report = json!({
+            "registryEntries": [
+                {
+                    "uuid": "11111111-1111-4111-9111-111111111111",
+                    "typeName": "Javelin::GameModeReplicatedState"
+                },
+                {
+                    "uuid": "22222222-2222-4222-9222-222222222222",
+                    "typeName": "Javelin::ClientMessages::ObjectiveInteractorComponentServerFacet_DEBUG_RequestForceUpdateReplicatedState"
+                },
+                {
+                    "uuid": "33333333-3333-4333-9333-333333333333",
+                    "typeName": "MB::ReplicatedState"
+                },
+                {
+                    "uuid": "44444444-4444-4444-9444-444444444444",
+                    "typeName": "Amazon::Hub::ReplicatedStateBundle"
+                },
+                {
+                    "uuid": "55555555-5555-4555-9555-555555555555",
+                    "typeName": "MB::SocialReplicatedState::ChattingStateMessageType"
+                }
+            ],
+            "fieldRegistrationFunctions": []
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+
+        assert_eq!(
+            schema.types[0].capabilities,
+            vec![NetworkTypeCapability::ReplicatedState]
+        );
+        assert_eq!(
+            schema.types[1].capabilities,
+            vec![NetworkTypeCapability::DirectMessage]
+        );
+        assert_eq!(
+            schema.types[2].capabilities,
+            vec![NetworkTypeCapability::SupportData]
+        );
+        assert_eq!(
+            schema.types[3].capabilities,
+            vec![NetworkTypeCapability::SupportData]
+        );
+        assert_eq!(
+            schema.types[4].capabilities,
+            vec![NetworkTypeCapability::SupportData]
+        );
+    }
+
+    #[test]
     fn imports_message_unmarshal_fields_without_registered_fields_capability() {
         let report = json!({
             "registryEntries": [{
@@ -2644,6 +2828,12 @@ mod tests {
                     "storageOffset": "0x8",
                     "wireShape": "u32",
                     "wireShapeSource": "message-unmarshal-native-type",
+                    "unmarshalEvidence": {
+                        "callsite": "NewWorld+0x7ce955",
+                        "targetName": "GridMate::Marshaler<AZ::Crc32>::Unmarshal",
+                        "targetKind": "field-helper",
+                        "evidenceSource": "message-unmarshal-pcode-call"
+                    },
                     "confidence": "message-unmarshal-call"
                 }, {
                     "index": 2,
@@ -2689,6 +2879,10 @@ mod tests {
             Some("u32")
         );
         assert_eq!(
+            schema.types[0].fields[0].source_type_name.as_deref(),
+            Some("AZ::Crc32")
+        );
+        assert_eq!(
             schema.types[0]
                 .fields
                 .iter()
@@ -2704,6 +2898,18 @@ mod tests {
         assert_eq!(
             schema.types[0].fields[0].wire_shape,
             Some(NetworkWireShape::U32)
+        );
+        let unmarshal_evidence = schema.types[0].fields[0]
+            .unmarshal_evidence
+            .as_ref()
+            .expect("unmarshal evidence");
+        assert_eq!(
+            unmarshal_evidence.target_name.as_deref(),
+            Some("GridMate::Marshaler<AZ::Crc32>::Unmarshal")
+        );
+        assert_eq!(
+            unmarshal_evidence.evidence_source.as_deref(),
+            Some("message-unmarshal-pcode-call")
         );
         assert_eq!(
             schema.types[0].fields[0].evidence[0].kind,
