@@ -34,6 +34,15 @@ struct IntegratedRustTypeContext<'a> {
     polymorphic_value_type_names: Option<&'a BTreeMap<Uuid, String>>,
 }
 
+struct RustFieldPlanningContext<'a> {
+    item: &'a SerializeCodegenItem,
+    name_plan: &'a RustNamePlan,
+    items_by_type_id: &'a BTreeMap<Uuid, &'a SerializeCodegenItem>,
+    source_types: Option<&'a RustSourceTypeIndex>,
+    current_module: &'a str,
+    polymorphic_value_type_names: &'a BTreeMap<Uuid, String>,
+}
+
 impl RustFieldPlanner {
     pub(super) const fn new(mode: RustCodegenMode, rust_types: RustTypeRenderer) -> Self {
         Self { mode, rust_types }
@@ -50,6 +59,14 @@ impl RustFieldPlanner {
     ) -> Vec<RustFieldPlan> {
         let mut field_counts = BTreeMap::<String, usize>::new();
         let mut seen_fields = Vec::<&SerializeCodegenField>::new();
+        let context = RustFieldPlanningContext {
+            item,
+            name_plan,
+            items_by_type_id,
+            source_types,
+            current_module,
+            polymorphic_value_type_names,
+        };
         item.fields
             .iter()
             .filter(|field| {
@@ -62,15 +79,7 @@ impl RustFieldPlanner {
             })
             .filter(|field| should_materialize_rust_field(field, items_by_type_id))
             .map(|field| {
-                let mut plan = self.plan_serialize_field(
-                    item,
-                    field,
-                    name_plan,
-                    items_by_type_id,
-                    source_types,
-                    current_module,
-                    polymorphic_value_type_names,
-                );
+                let mut plan = self.plan_serialize_field(field, &context);
                 let count = field_counts.entry(plan.rust_name.clone()).or_default();
                 if *count > 0 {
                     plan.rust_name = format!("{}_{}", plan.rust_name, *count + 1);
@@ -130,35 +139,20 @@ impl RustFieldPlanner {
 
     fn plan_serialize_field(
         &self,
-        item: &SerializeCodegenItem,
         field: &SerializeCodegenField,
-        name_plan: &RustNamePlan,
-        items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
-        source_types: Option<&RustSourceTypeIndex>,
-        current_module: &str,
-        polymorphic_value_type_names: &BTreeMap<Uuid, String>,
+        context: &RustFieldPlanningContext<'_>,
     ) -> RustFieldPlan {
-        let rust_type = rust_storage_override_for_field(self.mode, item, field)
+        let rust_type = rust_storage_override_for_field(self.mode, context.item, field)
             .map(str::to_owned)
-            .or_else(|| {
-                self.recursive_base_rust_type_for_field(
-                    item,
-                    field,
-                    name_plan,
-                    items_by_type_id,
-                    source_types,
-                    current_module,
-                    polymorphic_value_type_names,
-                )
-            })
+            .or_else(|| self.recursive_base_rust_type_for_field(field, context))
             .unwrap_or_else(|| {
                 self.rust_type_for_field(
                     field,
-                    name_plan,
-                    items_by_type_id,
-                    source_types,
-                    current_module,
-                    (!field.is_base_class).then_some(polymorphic_value_type_names),
+                    context.name_plan,
+                    context.items_by_type_id,
+                    context.source_types,
+                    context.current_module,
+                    (!field.is_base_class).then_some(context.polymorphic_value_type_names),
                 )
             });
         RustFieldPlan {
@@ -170,7 +164,7 @@ impl RustFieldPlanner {
             },
             source_type_id: field.source_type_id,
             rust_type,
-            unresolved_type: self.unresolved_type_for_field(field, source_types),
+            unresolved_type: self.unresolved_type_for_field(field, context.source_types),
             integer_range: self.plan_integer_range(&field.resolved_type),
             data_size: field.data_size,
             offset: field.offset,
@@ -216,26 +210,23 @@ impl RustFieldPlanner {
 
     fn recursive_base_rust_type_for_field(
         &self,
-        item: &SerializeCodegenItem,
         field: &SerializeCodegenField,
-        name_plan: &RustNamePlan,
-        items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
-        source_types: Option<&RustSourceTypeIndex>,
-        current_module: &str,
-        polymorphic_value_type_names: &BTreeMap<Uuid, String>,
+        context: &RustFieldPlanningContext<'_>,
     ) -> Option<String> {
         if field.is_base_class {
             return None;
         }
 
         let (target, is_optional) = recursive_base_field_target(&field.resolved_type)?;
-        let target_item = items_by_type_id.get(&target.type_id).copied()?;
-        let is_family_member =
-            item.source_type_id == target.type_id || item_inherits_from(item, target.type_id);
+        let target_item = context.items_by_type_id.get(&target.type_id).copied()?;
+        let is_family_member = context.item.source_type_id == target.type_id
+            || item_inherits_from(context.item, target.type_id);
         let needs_indirection = (target_item.is_abstract == Some(true)
             && target_item.fields.is_empty()
             && is_family_member)
-            || (polymorphic_value_type_names.contains_key(&target.type_id)
+            || (context
+                .polymorphic_value_type_names
+                .contains_key(&target.type_id)
                 && (is_optional || field.is_pointer || is_family_member));
         if !needs_indirection {
             return None;
@@ -244,17 +235,17 @@ impl RustFieldPlanner {
         let rust_type = match self.mode {
             RustCodegenMode::Standalone => self.rust_type_for_resolved_type(
                 target.resolved,
-                name_plan,
-                items_by_type_id,
-                Some(polymorphic_value_type_names),
+                context.name_plan,
+                context.items_by_type_id,
+                Some(context.polymorphic_value_type_names),
             ),
             RustCodegenMode::Integrated => self.integrated_rust_type_for_resolved_type(
                 target.resolved,
-                name_plan,
-                items_by_type_id,
-                source_types,
-                current_module,
-                Some(polymorphic_value_type_names),
+                context.name_plan,
+                context.items_by_type_id,
+                context.source_types,
+                context.current_module,
+                Some(context.polymorphic_value_type_names),
             ),
         };
 
