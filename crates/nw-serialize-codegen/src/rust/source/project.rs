@@ -733,7 +733,7 @@ fn append_integrated_type_imports(
 
     let reflect_serde_imports = reflected_serde_imports_for_items(items);
     if !reflect_serde_imports.is_empty() {
-        source.push_str("use bevy::reflect::serde::");
+        source.push_str("use bevy::reflect::");
         append_import_items(source, &reflect_serde_imports);
         source.push_str(";\n");
     }
@@ -858,7 +858,7 @@ fn append_standalone_type_imports(
 
     let reflect_serde_imports = reflected_serde_imports_for_items(items);
     if !reflect_serde_imports.is_empty() {
-        source.push_str("use bevy_reflect::serde::");
+        source.push_str("use bevy_reflect::");
         append_import_items(source, &reflect_serde_imports);
         source.push_str(";\n");
         source.push('\n');
@@ -1313,9 +1313,7 @@ mod tests {
             false,
         );
 
-        assert!(
-            source.contains("use bevy::reflect::serde::{ReflectDeserialize, ReflectSerialize};")
-        );
+        assert!(source.contains("use bevy::reflect::{ReflectDeserialize, ReflectSerialize};"));
     }
 
     #[test]
@@ -1338,9 +1336,7 @@ mod tests {
             &reexported_type_names,
         );
 
-        assert!(
-            source.contains("use bevy_reflect::serde::{ReflectDeserialize, ReflectSerialize};")
-        );
+        assert!(source.contains("use bevy_reflect::{ReflectDeserialize, ReflectSerialize};"));
     }
 
     fn symbol_reexport<const N: usize>(module: &str, names: [&str; N]) -> SymbolSurfaceExport<()> {
