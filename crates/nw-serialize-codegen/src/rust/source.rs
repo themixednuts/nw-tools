@@ -861,9 +861,8 @@ fn render_sum_deserialize_impl(
                 }
             } else {
                 quote! {
-                    if let Some(extra) = map.next_key::<String>()? {
+                    while let Some(_extra) = map.next_key::<String>()? {
                         let _ = map.next_value::<::serde::de::IgnoredAny>()?;
-                        return Err(::serde::de::Error::unknown_field(&extra, &[]));
                     }
                     return Ok(#ident::#variant_ident(
                         <#payload_ty as ::core::default::Default>::default(),
@@ -2640,6 +2639,8 @@ mod tests {
         assert!(source.contains("\"$type\""));
         assert!(source.contains("MapAccessDeserializer::new(map)"));
         assert!(source.contains("merge_sum_payload_defaults"));
+        assert!(source.contains("while let Some(_extra)"));
+        assert!(!source.contains("unknown_field(&extra"));
         assert!(!source.contains("#[default]"));
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
