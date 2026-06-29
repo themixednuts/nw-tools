@@ -799,10 +799,7 @@ fn is_polymorphic_value_base(
     layout_index: &LayoutIndex,
     emitted_type_ids: &BTreeSet<Uuid>,
 ) -> bool {
-    if item.role != ReflectedTypeRole::SupportType
-        || item.is_abstract == Some(true)
-        || !item_has_materialized_payload(item, items_by_type_id)
-    {
+    if item.role != ReflectedTypeRole::SupportType || item.is_abstract == Some(true) {
         return false;
     }
 
@@ -3036,6 +3033,91 @@ pub struct ExternalPayload;
                 ("Base", Some("ScriptProperty")),
                 ("Boolean", Some("ScriptPropertyBoolean")),
                 ("StringArray", Some("ScriptPropertyStringArray")),
+            ]
+        );
+    }
+
+    #[test]
+    fn plans_data_free_concrete_value_base_as_sibling_payload_sum_enum() {
+        let owner_id = uuid!("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA");
+        let base_id = uuid!("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB");
+        let events_id = uuid!("CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC");
+
+        let unit = SerializeCodegenUnit {
+            items: vec![
+                facet_item(
+                    owner_id,
+                    "SlayerScriptDataContainer",
+                    ReflectedTypeRole::SupportType,
+                    vec![SerializeCodegenField {
+                        source_name: "m_scriptData".to_owned(),
+                        source_type_id: base_id,
+                        resolved_type: ResolvedType::Pointer {
+                            kind: crate::types::PointerKind::Unique,
+                            target: Box::new(ResolvedType::Named {
+                                type_id: base_id,
+                                source_name: "SlayerScriptData".to_owned(),
+                            }),
+                        },
+                        data_size: None,
+                        offset: None,
+                        flags: None,
+                        is_base_class: false,
+                        is_pointer: true,
+                        is_dynamic_field: false,
+                    }],
+                ),
+                facet_item(
+                    base_id,
+                    "SlayerScriptData",
+                    ReflectedTypeRole::SupportType,
+                    Vec::new(),
+                ),
+                facet_item(
+                    events_id,
+                    "AchievementEventsData",
+                    ReflectedTypeRole::SupportType,
+                    vec![
+                        base_field(base_id, "SlayerScriptData"),
+                        scalar_member_field("useVariationData", type_ids::BOOL, ScalarType::Bool),
+                    ],
+                ),
+            ],
+        };
+
+        let rust_unit = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
+        let container = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == owner_id)
+            .expect("SlayerScriptDataContainer plan");
+        let base = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == base_id)
+            .expect("SlayerScriptData plan");
+        let value = rust_unit
+            .items
+            .iter()
+            .find(|item| item.rust_name == "SlayerScriptDataValue")
+            .expect("SlayerScriptDataValue plan");
+
+        assert_eq!(base.kind, RustItemKind::Struct);
+        assert_eq!(
+            container.fields[0].rust_type,
+            "Option<bevy_platform::sync::Arc<SlayerScriptDataValue>>"
+        );
+        assert_eq!(value.kind, RustItemKind::SumEnum);
+        assert_eq!(
+            value
+                .variants
+                .iter()
+                .map(|variant| (variant.rust_name.as_str(), variant.payload_type.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Base", Some("SlayerScriptData")),
+                ("AchievementEventsData", Some("AchievementEventsData")),
             ]
         );
     }
