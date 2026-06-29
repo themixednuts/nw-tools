@@ -679,7 +679,9 @@ fn integrated_item_file_path(scope_path: &[String], file_stem: &str) -> String {
 }
 
 fn has_derive(item: &RustItemPlan, derive_name: &str) -> bool {
-    item.derives.iter().any(|name| name == derive_name)
+    item.derives
+        .iter()
+        .any(|name| name.rsplit("::").next() == Some(derive_name))
 }
 
 fn has_az_identity(item: &RustItemPlan) -> bool {
@@ -729,24 +731,19 @@ fn append_integrated_type_imports(
         source.push_str(";\n");
     }
 
-    let needs_bevy_component = items.iter().any(|item| {
-        item.derives
-            .iter()
-            .any(|derive_name| derive_name == "Component")
-    });
-    let needs_reflect = items.iter().any(|item| {
-        item.derives
-            .iter()
-            .any(|derive_name| derive_name == "Reflect")
-    });
+    let reflect_serde_imports = reflected_serde_imports_for_items(items);
+    if !reflect_serde_imports.is_empty() {
+        source.push_str("use bevy::reflect::serde::");
+        append_import_items(source, &reflect_serde_imports);
+        source.push_str(";\n");
+    }
+
+    let needs_bevy_component = items.iter().any(|item| has_derive(item, "Component"));
+    let needs_reflect = items.iter().any(|item| has_derive(item, "Reflect"));
     if needs_bevy_component && needs_reflect {
         source.push_str("use bevy::ecs::reflect::ReflectComponent;\n");
     }
-    let needs_marshaler = items.iter().any(|item| {
-        item.derives
-            .iter()
-            .any(|derive_name| derive_name == "Marshaler")
-    });
+    let needs_marshaler = items.iter().any(|item| has_derive(item, "Marshaler"));
     if needs_marshaler {
         source.push_str("use gridmate::Marshaler;\n");
     }
@@ -859,20 +856,37 @@ fn append_standalone_type_imports(
     }
     source.push('\n');
 
-    let needs_bevy_component = items.iter().any(|item| {
-        item.derives
-            .iter()
-            .any(|derive_name| derive_name == "Component")
-    });
-    let needs_reflect = items.iter().any(|item| {
-        item.derives
-            .iter()
-            .any(|derive_name| derive_name == "Reflect")
-    });
+    let reflect_serde_imports = reflected_serde_imports_for_items(items);
+    if !reflect_serde_imports.is_empty() {
+        source.push_str("use bevy_reflect::serde::");
+        append_import_items(source, &reflect_serde_imports);
+        source.push_str(";\n");
+        source.push('\n');
+    }
+
+    let needs_bevy_component = items.iter().any(|item| has_derive(item, "Component"));
+    let needs_reflect = items.iter().any(|item| has_derive(item, "Reflect"));
     if needs_bevy_component && needs_reflect {
         source.push_str("use bevy_ecs::reflect::ReflectComponent;\n");
         source.push('\n');
     }
+}
+
+fn reflected_serde_imports_for_items(items: &[&RustItemPlan]) -> BTreeSet<String> {
+    let mut imports = BTreeSet::new();
+    if items
+        .iter()
+        .any(|item| has_derive(item, "Reflect") && has_derive(item, "Serialize"))
+    {
+        imports.insert("ReflectSerialize".to_owned());
+    }
+    if items
+        .iter()
+        .any(|item| has_derive(item, "Reflect") && has_derive(item, "Deserialize"))
+    {
+        imports.insert("ReflectDeserialize".to_owned());
+    }
+    imports
 }
 
 fn standalone_support_imports_for_items(items: &[&RustItemPlan]) -> Vec<&'static str> {
@@ -1276,6 +1290,57 @@ mod tests {
         );
 
         assert!(source.contains("use bevy_ecs::reflect::ReflectComponent;"));
+    }
+
+    #[test]
+    fn integrated_imports_reflect_serde_type_data_for_reflected_serde_items() {
+        let known_type_names = BTreeSet::new();
+        let reexported_type_names = BTreeSet::new();
+        let mut item = rtti_leaf_with_base("Interact", "SerializeContext::ClassData");
+        item.derives = vec![
+            "Reflect".to_owned(),
+            "serde::Serialize".to_owned(),
+            "serde::Deserialize".to_owned(),
+        ];
+        let items = vec![&item];
+
+        let mut source = String::new();
+        append_integrated_type_imports(
+            &mut source,
+            &items,
+            &known_type_names,
+            &reexported_type_names,
+            false,
+        );
+
+        assert!(
+            source.contains("use bevy::reflect::serde::{ReflectDeserialize, ReflectSerialize};")
+        );
+    }
+
+    #[test]
+    fn standalone_imports_reflect_serde_type_data_for_reflected_serde_items() {
+        let known_type_names = BTreeSet::new();
+        let reexported_type_names = BTreeSet::new();
+        let mut item = rtti_leaf_with_base("Interact", "SerializeContext::ClassData");
+        item.derives = vec![
+            "bevy_reflect::Reflect".to_owned(),
+            "serde::Serialize".to_owned(),
+            "serde::Deserialize".to_owned(),
+        ];
+        let items = vec![&item];
+
+        let mut source = String::new();
+        append_standalone_type_imports(
+            &mut source,
+            &items,
+            &known_type_names,
+            &reexported_type_names,
+        );
+
+        assert!(
+            source.contains("use bevy_reflect::serde::{ReflectDeserialize, ReflectSerialize};")
+        );
     }
 
     fn symbol_reexport<const N: usize>(module: &str, names: [&str; N]) -> SymbolSurfaceExport<()> {
