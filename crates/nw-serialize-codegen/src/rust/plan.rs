@@ -712,7 +712,7 @@ fn prune_integrated_derives_for_rendered_fields(
     }
     if fields
         .iter()
-        .any(|field| field.rust_type.contains("az_asset::AssetReference"))
+        .any(|field| field.rust_type.contains("az_asset::UntypedAssetRef"))
     {
         derives.retain(|derive| derive != "Hash");
     }

@@ -199,7 +199,7 @@ fn rust_type_from_reflected_type(
         return eq_rust_type("Vec<az_core::ComponentId>");
     }
     if matches!(type_id, ASSET | ASSET_ID) {
-        return eq_rust_type("az_asset::AssetReference");
+        return eq_rust_type("az_asset::UntypedAssetRef");
     }
 
     if let Some(generic) = catalog.generic_type(type_id) {
@@ -216,7 +216,7 @@ fn rust_type_from_reflected_type(
     if type_name.starts_with("AzFramework::SimpleAssetReference")
         || type_name.contains("AssetReference")
     {
-        return eq_rust_type("az_asset::AssetReference");
+        return eq_rust_type("az_asset::UntypedAssetRef");
     }
     if type_name == "GDEID" {
         return copy_eq_rust_type("crate::generated::GDEID");
