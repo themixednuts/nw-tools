@@ -77,7 +77,7 @@ impl RustFieldPlanner {
                     true
                 }
             })
-            .filter(|field| should_materialize_rust_field(field, items_by_type_id))
+            .filter(|field| should_materialize_rust_field(field, items_by_type_id, source_types))
             .map(|field| {
                 let mut plan = self.plan_serialize_field(field, &context);
                 let count = field_counts.entry(plan.rust_name.clone()).or_default();
@@ -108,7 +108,7 @@ impl RustFieldPlanner {
                 if !seen.insert(type_id) {
                     return None;
                 }
-                let source_name = base_source_name(field, items_by_type_id);
+                let source_name = base_source_name(field, items_by_type_id, source_types);
                 Some(RustRttiBasePlan {
                     source_type_id: type_id,
                     source_name,
@@ -158,7 +158,7 @@ impl RustFieldPlanner {
         RustFieldPlan {
             source_name: field.source_name.clone(),
             rust_name: if field.is_base_class {
-                base_class_field_name(&field.resolved_type)
+                base_class_field_name(field, context.source_types)
             } else {
                 rust_field_ident(&field.source_name)
             },
@@ -183,9 +183,9 @@ impl RustFieldPlanner {
         polymorphic_value_type_names: Option<&BTreeMap<Uuid, String>>,
     ) -> String {
         match classify_codegen_field_type(field) {
-            CodegenFieldTypeProjection::FixedOpaqueBytes { byte_len } => {
-                format!("[u8; {byte_len}]")
-            }
+            CodegenFieldTypeProjection::FixedOpaqueBytes { byte_len } => self
+                .integrated_source_type_for_field(field, source_types, current_module)
+                .unwrap_or_else(|| format!("[u8; {byte_len}]")),
             CodegenFieldTypeProjection::Reflected(resolved_type)
                 if matches!(self.mode, RustCodegenMode::Standalone) =>
             {
@@ -206,6 +206,20 @@ impl RustFieldPlanner {
                     polymorphic_value_type_names,
                 ),
         }
+    }
+
+    fn integrated_source_type_for_field(
+        &self,
+        field: &SerializeCodegenField,
+        source_types: Option<&RustSourceTypeIndex>,
+        current_module: &str,
+    ) -> Option<String> {
+        if !matches!(self.mode, RustCodegenMode::Integrated) {
+            return None;
+        }
+
+        source_type_location_for_field(field, source_types)
+            .map(|location| location.reference_from(current_module))
     }
 
     fn recursive_base_rust_type_for_field(
@@ -708,14 +722,28 @@ impl RustFieldPlanner {
 fn should_materialize_rust_field(
     field: &SerializeCodegenField,
     items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+    source_types: Option<&RustSourceTypeIndex>,
 ) -> bool {
     classify_codegen_field(field, items_by_type_id).is_materialized()
+        || source_type_location_for_field(field, source_types).is_some()
+}
+
+fn source_type_location_for_field<'a>(
+    field: &SerializeCodegenField,
+    source_types: Option<&'a RustSourceTypeIndex>,
+) -> Option<&'a crate::rust::integrate::source_index::RustSourceTypeLocation> {
+    source_types.and_then(|source_types| source_types.location_for_type_id(field.source_type_id))
 }
 
 fn base_source_name(
     field: &SerializeCodegenField,
     items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+    source_types: Option<&RustSourceTypeIndex>,
 ) -> String {
+    if let Some(location) = source_type_location_for_field(field, source_types) {
+        return location.name.clone();
+    }
+
     items_by_type_id
         .get(&field.source_type_id)
         .map(|item| item.source_name.clone())
@@ -782,8 +810,15 @@ fn item_inherits_from(item: &SerializeCodegenItem, target_type_id: Uuid) -> bool
         })
 }
 
-fn base_class_field_name(resolved: &ResolvedType) -> String {
-    let ResolvedType::Named { source_name, .. } = resolved else {
+fn base_class_field_name(
+    field: &SerializeCodegenField,
+    source_types: Option<&RustSourceTypeIndex>,
+) -> String {
+    if let Some(location) = source_type_location_for_field(field, source_types) {
+        return rust_field_ident(&location.name);
+    }
+
+    let ResolvedType::Named { source_name, .. } = &field.resolved_type else {
         return "base".to_owned();
     };
     if source_name.contains("::") {
@@ -837,6 +872,8 @@ pub(super) fn integrated_custom_field_type(source_name: &str) -> Option<&'static
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use uuid::uuid;
 
     use crate::ir::{SerializeCodegenField, SerializeCodegenItem, SerializeCodegenItemKind};
@@ -982,6 +1019,87 @@ mod tests {
         assert_eq!(bases.len(), 1);
         assert_eq!(bases[0].source_type_id, component_type_id);
         assert_eq!(bases[0].source_name, "AZ::Component");
+    }
+
+    #[test]
+    fn integrated_fixed_opaque_base_uses_source_type_index() {
+        let patron_type_id = uuid!("d1537f05-fe34-5088-a25a-45b04d5718a7");
+        let ability_type_id = uuid!("dd164eef-7dbd-4f7c-bcef-b01a344a33f2");
+        let source_types = RustSourceTypeIndex::from_source(
+            Path::new("src"),
+            Path::new("src/animation/state.rs"),
+            r#"
+use az_derive::AzTypeInfo;
+
+#[derive(AzTypeInfo)]
+#[az_type_info(name = "TActionStatePatron<AbilityState>", "d1537f05-fe34-5088-a25a-45b04d5718a7")]
+pub struct AbilityStatePatron {
+    pub states: Vec<String>,
+}
+"#,
+        )
+        .expect("source type index");
+        let item = SerializeCodegenItem {
+            source_type_id: ability_type_id,
+            source_name: "AbilityComponent".to_owned(),
+            role: ReflectedTypeRole::FacetedComponent,
+            is_reflection_marker: false,
+            is_abstract: Some(false),
+            factory: None,
+            rtti_base_chain: Vec::new(),
+            kind: SerializeCodegenItemKind::Struct,
+            enum_underlying_type: None,
+            fields: vec![SerializeCodegenField {
+                source_name: "BaseClass2".to_owned(),
+                source_type_id: patron_type_id,
+                resolved_type: ResolvedType::Unknown {
+                    type_id: patron_type_id,
+                    reason: "source-only action state patron".to_owned(),
+                },
+                data_size: Some(224),
+                offset: Some(152),
+                flags: Some(2),
+                is_base_class: true,
+                is_pointer: false,
+                is_dynamic_field: false,
+            }],
+            variants: Vec::new(),
+        };
+        let items_by_type_id = BTreeMap::from([(item.source_type_id, &item)]);
+        let planner = RustFieldPlanner::new(
+            RustCodegenMode::Integrated,
+            RustTypeRenderer::new(RustTypeOptions::default()),
+        );
+
+        let fields = planner.plan_struct_fields(
+            &item,
+            &items_by_type_id,
+            &RustNamePlan::default(),
+            Some(&source_types),
+            "components::faceted_components::ability_component",
+            &BTreeMap::new(),
+        );
+        let bases = planner.plan_rtti_bases(
+            &item,
+            &items_by_type_id,
+            &RustNamePlan::default(),
+            Some(&source_types),
+            "components::faceted_components::ability_component",
+        );
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].rust_name, "ability_state_patron");
+        assert_eq!(
+            fields[0].rust_type,
+            "crate::animation::state::AbilityStatePatron"
+        );
+        assert!(fields[0].unresolved_type.is_none());
+        assert_eq!(bases.len(), 1);
+        assert_eq!(bases[0].source_name, "AbilityStatePatron");
+        assert_eq!(
+            bases[0].rust_type,
+            "crate::animation::state::AbilityStatePatron"
+        );
     }
 
     #[test]
