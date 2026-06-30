@@ -40,6 +40,7 @@ import ghidra.program.model.data.Structure;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.Parameter;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.PcodeOp;
@@ -53,7 +54,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
 public class NetworkSchemaExtractor extends GhidraScript {
-    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260629-direct-type-canonical-pass";
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260629-direct-unmarshal-fields-pass";
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;
@@ -231,6 +232,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final Map<String, FieldHandlerShape> fieldHandlerShapeCache = new HashMap<>();
     private final Map<String, NestedTypeShape> nestedTypeShapeCache = new HashMap<>();
     private final Map<String, List<Structure>> nestedTypeStructureCache = new HashMap<>();
+    private final Map<String, List<SerializeTypeInfo>> serializeTypesByName = new HashMap<>();
+    private final Map<String, List<SerializeTypeInfo>> serializeTypesByLeafName = new HashMap<>();
+    private final Map<String, SerializeTypeInfo> serializeTypesById = new HashMap<>();
     private final LinkedHashSet<String> registryTypeIds = new LinkedHashSet<>();
     private final Map<String, Integer> typeIdSourceCounts = new LinkedHashMap<>();
     private final Map<String, Integer> nativeUuidRejectCounts = new LinkedHashMap<>();
@@ -272,6 +276,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         try (Reader reader = new FileReader(input)) {
             root = JsonParser.parseReader(reader).getAsJsonObject();
         }
+        loadSerializeTypeIndex(input);
 
         List<RegistryEntry> registry = parseRegistry(root);
         Map<String, HookTypeEvidence> hookTypeNamesById =
@@ -536,6 +541,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
         returnedCallInputSlotCache.clear();
         fieldHandlerShapeCache.clear();
         nestedTypeShapeCache.clear();
+        serializeTypesByName.clear();
+        serializeTypesByLeafName.clear();
+        serializeTypesById.clear();
         registryTypeIds.clear();
         typeIdSourceCounts.clear();
         nativeUuidRejectCounts.clear();
@@ -612,6 +620,69 @@ public class NetworkSchemaExtractor extends GhidraScript {
             return null;
         }
         return value.trim();
+    }
+
+    private void loadSerializeTypeIndex(File typeregistryInput) {
+        File serialize = serializeJsonFile(typeregistryInput);
+        if (serialize == null || !serialize.isFile()) {
+            println("Serialize type index not loaded; set NW_NETWORK_SCHEMA_SERIALIZE_JSON for exact field type-id joins.");
+            return;
+        }
+
+        int loaded = 0;
+        try (Reader reader = new FileReader(serialize)) {
+            JsonObject root = JsonParser.parseReader(reader).getAsJsonObject();
+            JsonObject uuidMap = object(root, "uuidMap");
+            if (uuidMap == null) {
+                println("Serialize type index has no uuidMap: " + serialize);
+                return;
+            }
+            for (Map.Entry<String, JsonElement> entry : uuidMap.entrySet()) {
+                if (!entry.getValue().isJsonObject()) {
+                    continue;
+                }
+                JsonObject value = entry.getValue().getAsJsonObject();
+                String typeId = canonicalUuidFromString(
+                    firstNonEmpty(string(value, "typeId"), entry.getKey()));
+                String name = string(value, "name");
+                if (typeId == null || name == null || name.trim().isEmpty()) {
+                    continue;
+                }
+                SerializeTypeInfo info = new SerializeTypeInfo();
+                info.typeId = typeId;
+                info.name = name.trim();
+                info.factory = string(value, "factory");
+                JsonObject azRtti = object(value, "azRtti");
+                info.azRttiAddress = azRtti == null ? null : string(azRtti, "address");
+
+                serializeTypesById.put(normalizeUuid(typeId), info);
+                serializeTypesByName.computeIfAbsent(info.name, ignored -> new ArrayList<>()).add(info);
+                serializeTypesByLeafName
+                    .computeIfAbsent(sourceTypeLeaf(info.name), ignored -> new ArrayList<>())
+                    .add(info);
+                loaded++;
+            }
+            println("Loaded serialize type index: " + loaded + " types from " + serialize);
+        }
+        catch (Exception exception) {
+            println("Serialize type index load failed: " + exception.getMessage());
+        }
+    }
+
+    private File serializeJsonFile(File typeregistryInput) {
+        String explicit = envValue("NW_NETWORK_SCHEMA_SERIALIZE_JSON");
+        if (explicit != null) {
+            return new File(explicit);
+        }
+        File dir = typeregistryInput == null ? null : typeregistryInput.getParentFile();
+        for (int i = 0; i < 4 && dir != null; i++) {
+            File candidate = new File(dir, "serialize.json");
+            if (candidate.isFile()) {
+                return candidate;
+            }
+            dir = dir.getParentFile();
+        }
+        return null;
     }
 
     private List<RegistryEntry> parseRegistry(JsonObject root) {
@@ -4128,6 +4199,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
             .replace("std::string", "AZStd::string")
             .replace("std::allocator", "AZStd::allocator")
             .replace("AZStd::_", "AZStd::");
+        SerializeTypeInfo reflected = serializeTypeForTypeName(normalized);
+        if (reflected != null && reflected.typeId != null) {
+            return reflected.typeId;
+        }
         return switch (normalized) {
             case "char" -> CHAR_TYPE_ID;
             case "signed char", "i8", "int8_t", "std::int8_t", "AZ::s8", "AZ::sbyte" -> S8_TYPE_ID;
@@ -4160,6 +4235,22 @@ public class NetworkSchemaExtractor extends GhidraScript {
             case "AZ::Data::AssetId" -> AZ_DATA_ASSET_ID_TYPE_ID;
             default -> canonicalUuidFromString(normalized);
         };
+    }
+
+    private SerializeTypeInfo serializeTypeForTypeName(String typeName) {
+        if (typeName == null || typeName.trim().isEmpty()) {
+            return null;
+        }
+        String normalized = typeName.trim();
+        List<SerializeTypeInfo> exact = serializeTypesByName.get(normalized);
+        if (exact != null && exact.size() == 1) {
+            return exact.get(0);
+        }
+        List<SerializeTypeInfo> leaf = serializeTypesByLeafName.get(sourceTypeLeaf(normalized));
+        if (leaf != null && leaf.size() == 1) {
+            return leaf.get(0);
+        }
+        return null;
     }
 
     private String templateAutoTypeId(String value) {
@@ -4293,6 +4384,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (unmarshal == null) {
             return result;
         }
+        result.add(unmarshal.getEntryPoint());
         for (Instruction instruction : functionInstructions(unmarshal)) {
             if (!instruction.getFlowType().isCall()) {
                 continue;
@@ -4602,6 +4694,16 @@ public class NetworkSchemaExtractor extends GhidraScript {
         PcodeOp op,
         String nativeType) {
 
+        observePcodeTempUnmarshal(tempNativeTypes, null, op, nativeType, null);
+    }
+
+    private void observePcodeTempUnmarshal(
+        Map<String, String> tempNativeTypes,
+        Map<String, String> tempWireShapes,
+        PcodeOp op,
+        String nativeType,
+        String wireShape) {
+
         if (tempNativeTypes == null || nativeType == null || nativeType.isEmpty() ||
             op == null || op.getOpcode() != PcodeOp.CALL || op.getNumInputs() < 3) {
             return;
@@ -4610,7 +4712,11 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (!isPcodeLocalTempStorage(storage)) {
             return;
         }
-        tempNativeTypes.put(storageKey(storage), nativeType);
+        String key = storageKey(storage);
+        tempNativeTypes.put(key, nativeType);
+        if (tempWireShapes != null && wireShape != null && !wireShape.isEmpty()) {
+            tempWireShapes.put(key, wireShape);
+        }
     }
 
     private PcodeStorage pcodePreferredUnmarshalOutputStorage(PcodeOp op) {
@@ -4699,10 +4805,6 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (field == null || target == null || nativeType == null) {
             return;
         }
-        String leaf = sourceTypeLeaf(nativeType);
-        if (!"ActorRequestId".equals(leaf)) {
-            return;
-        }
         NestedTypeShape shape = recoverNestedDirectTypeShape(target, nativeType);
         if (shape != null) {
             field.nestedTypeShape = shape;
@@ -4713,10 +4815,20 @@ public class NetworkSchemaExtractor extends GhidraScript {
         Function target,
         String nativeType) {
 
-        if (target == null || nativeType == null) {
+        return recoverNestedDirectTypeShape(target, nativeType, false);
+    }
+
+    private NestedTypeShape recoverNestedDirectTypeShape(
+        Function target,
+        String nativeType,
+        boolean allowAnonymousHelper) {
+
+        if (target == null || (!allowAnonymousHelper && nativeType == null)) {
             return null;
         }
-        String key = functionCacheKey("nested-direct-type-shape:" + nativeType, target);
+        String key = functionCacheKey(
+            "nested-direct-type-shape:" + allowAnonymousHelper + ":" + nativeType,
+            target);
         if (nestedTypeShapeCache.containsKey(key)) {
             return nestedTypeShapeCache.get(key);
         }
@@ -4725,7 +4837,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
             target,
             nativeType,
             new LinkedHashSet<>(),
-            0);
+            0,
+            allowAnonymousHelper);
         nestedTypeShapeCache.put(key, shape);
         if (shape == null) {
             nestedTypeShapeFailures++;
@@ -4740,7 +4853,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
         Function target,
         String nativeType,
         Set<String> seen,
-        int depth) {
+        int depth,
+        boolean allowAnonymousHelper) {
 
         if (target == null || depth > NESTED_DIRECT_TYPE_DEPTH_LIMIT) {
             recordNestedTypeShapeReject("depth-limit");
@@ -4755,15 +4869,15 @@ public class NetworkSchemaExtractor extends GhidraScript {
         String targetName = fullFunctionName(target);
         String owner = directUnmarshalOwnerFullName(targetName);
         if (owner == null) {
+            owner = directUnmarshalOwnerFullNameFromPrototype(target);
+        }
+        if (owner == null) {
+            owner = nativeType;
+        }
+        if (owner == null && !allowAnonymousHelper) {
             recordNestedTypeShapeReject("target-not-direct-unmarshal");
             return null;
         }
-        String leaf = sourceTypeLeaf(owner);
-        if (!"ActorRequestId".equals(leaf)) {
-            recordNestedTypeShapeReject("unsupported-direct-type");
-            return null;
-        }
-
         HighFunction high = highFunction(target);
         if (high == null) {
             recordNestedTypeShapeReject("decompile-failed");
@@ -4773,23 +4887,35 @@ public class NetworkSchemaExtractor extends GhidraScript {
         LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> byBase =
             new LinkedHashMap<>();
         HashMap<String, String> tempNativeTypes = new HashMap<>();
+        HashMap<String, String> tempWireShapes = new HashMap<>();
         Iterator<PcodeOpAST> ops = high.getPcodeOps();
         while (ops.hasNext()) {
             PcodeOpAST op = ops.next();
             if (op.getOpcode() == PcodeOp.CALL) {
                 Function callTarget = pcodeCallTarget(op);
                 String memberType = unmarshalNativeTypeFromTarget(callTarget);
+                String memberWireShape = wireShapeFromNativeType(memberType);
                 String evidenceSource = "pcode-call";
-                if (memberType == null) {
-                    memberType = scalarOutputStoreNativeType(callTarget);
+                if (memberWireShape == null) {
+                    String scalarType = scalarOutputStoreNativeType(callTarget);
+                    if (memberType == null) {
+                        memberType = scalarType;
+                    }
+                    memberWireShape = wireShapeFromNativeType(scalarType);
                     evidenceSource = "pcode-call-scalar-output-store";
                 }
-                observePcodeTempUnmarshal(tempNativeTypes, op, memberType);
+                observePcodeTempUnmarshal(
+                    tempNativeTypes,
+                    tempWireShapes,
+                    op,
+                    memberType,
+                    memberWireShape);
                 PcodeStorage storage = pcodePreferredUnmarshalOutputStorage(op);
                 addNestedTypeMemberCandidate(
                     byBase,
                     storage,
                     memberType,
+                    memberWireShape,
                     op,
                     callTarget,
                     evidenceSource);
@@ -4800,10 +4926,13 @@ public class NetworkSchemaExtractor extends GhidraScript {
             }
             PcodeStorage storage = pcodeStorageExpression(op.getInput(1));
             String memberType = pcodeValueNativeType(op.getInput(2), tempNativeTypes);
+            String memberWireShape =
+                pcodeValueWireShape(op.getInput(2), tempWireShapes, tempNativeTypes);
             addNestedTypeMemberCandidate(
                 byBase,
                 storage,
                 memberType,
+                memberWireShape,
                 op,
                 pcodeValueCallTargetInfo(op.getInput(2)) == null
                     ? null
@@ -4811,21 +4940,29 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 "pcode-store");
         }
 
-        NestedTypeShape shape =
-            actorRequestIdShapeFromCandidates(owner, target, targetName, byBase);
-        return shape;
+        String leaf = sourceTypeLeaf(owner);
+        if ("ActorRequestId".equals(leaf)) {
+            return actorRequestIdShapeFromCandidates(owner, target, targetName, byBase);
+        }
+        return directTypeShapeFromCandidates(
+            owner,
+            target,
+            targetName,
+            byBase,
+            allowAnonymousHelper && owner == null);
     }
 
     private void addNestedTypeMemberCandidate(
         Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
         PcodeStorage storage,
         String nativeType,
+        String wireShape,
         PcodeOp op,
         Function target,
         String source) {
 
         if (byBase == null || storage == null || nativeType == null ||
-            wireShapeFromNativeType(nativeType) == null || isPcodeLocalTempStorage(storage)) {
+            wireShape == null || isPcodeLocalTempStorage(storage)) {
             return;
         }
         LinkedHashMap<Long, NestedTypeMember> members =
@@ -4844,8 +4981,11 @@ public class NetworkSchemaExtractor extends GhidraScript {
         NestedTypeMember member = new NestedTypeMember();
         member.offset = storage.offset;
         member.nativeType = nativeType;
-        member.wireShape = wireShapeFromNativeType(nativeType);
+        member.wireShape = wireShape;
         member.byteWidth = nativeTypeByteWidth(nativeType);
+        if (member.byteWidth == null) {
+            member.byteWidth = wireShapeByteWidth(wireShape);
+        }
         member.name = "_" + members.size();
         member.nameSource = "synthetic-offset";
         member.nameProven = false;
@@ -4854,6 +4994,82 @@ public class NetworkSchemaExtractor extends GhidraScript {
         member.target = target == null ? null : target.getEntryPoint();
         member.targetName = fullFunctionName(target);
         members.put(storage.offset, member);
+    }
+
+    private NestedTypeShape directTypeShapeFromCandidates(
+        String owner,
+        Function target,
+        String targetName,
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        boolean anonymousHelper) {
+
+        NestedTypeShape selected = null;
+        int matches = 0;
+        for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry : byBase.entrySet()) {
+            ArrayList<NestedTypeMember> members =
+                new ArrayList<>(entry.getValue().values());
+            members.sort((left, right) -> Long.compare(left.offset, right.offset));
+            if (!isGenericDirectTypeMemberShape(members)) {
+                continue;
+            }
+            matches++;
+
+            for (int i = 0; i < members.size(); i++) {
+                NestedTypeMember member = members.get(i);
+                member.index = i;
+                member.name = "_" + i;
+            }
+
+            NestedTypeShape shape = new NestedTypeShape();
+            shape.typeName = sourceTypeLeaf(owner);
+            shape.typeNameFull = owner;
+            shape.typeNameSource = anonymousHelper ? "anonymous-helper" : "ghidra-symbol";
+            shape.function = target.getEntryPoint();
+            shape.functionName = targetName;
+            applySerializeIdentity(shape, owner);
+            shape.memberBase = entry.getKey();
+            shape.memberNameSource = "synthetic-offset";
+            shape.memberNamesProven = false;
+            shape.validation = "layout-consistent-direct-type";
+            shape.members.addAll(members);
+            applyNestedTypeMemberNames(shape);
+            selected = shape;
+        }
+        if (matches > 1) {
+            recordNestedTypeShapeReject("ambiguous-member-base");
+            return null;
+        }
+        if (selected == null) {
+            recordNestedTypeShapeReject("direct-type-shape-mismatch");
+        }
+        return selected;
+    }
+
+    private boolean isGenericDirectTypeMemberShape(List<NestedTypeMember> members) {
+        if (members == null || members.size() < 2 ||
+            members.size() > NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
+            return false;
+        }
+        long end = 0;
+        for (int i = 0; i < members.size(); i++) {
+            NestedTypeMember member = members.get(i);
+            if (member == null ||
+                Boolean.TRUE.equals(member.typeConflict) ||
+                member.byteWidth == null ||
+                member.byteWidth <= 0 ||
+                member.offset < 0 ||
+                member.offset < end) {
+                return false;
+            }
+            if (i == 0 && member.offset != 0L) {
+                return false;
+            }
+            end = member.offset + member.byteWidth;
+            if (end > 0x400) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private NestedTypeShape actorRequestIdShapeFromCandidates(
@@ -4885,6 +5101,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
             shape.typeNameSource = "ghidra-symbol";
             shape.function = target.getEntryPoint();
             shape.functionName = targetName;
+            applySerializeIdentity(shape, owner);
             shape.memberBase = entry.getKey();
             shape.memberNameSource = "synthetic-offset";
             shape.memberNamesProven = false;
@@ -4902,6 +5119,98 @@ public class NetworkSchemaExtractor extends GhidraScript {
             recordNestedTypeShapeReject("actor-request-id-shape-mismatch");
         }
         return selected;
+    }
+
+    private void applySerializeIdentity(NestedTypeShape shape, String typeName) {
+        if (shape == null || typeName == null) {
+            return;
+        }
+        if (isWireNativeSourceTypeName(typeName)) {
+            return;
+        }
+        SerializeTypeInfo reflected = serializeTypeForTypeName(typeName);
+        if (reflected == null) {
+            String typeId = typeIdForTypeName(typeName);
+            if (typeId != null && !isBuiltinTypeId(typeId)) {
+                shape.typeId = typeId;
+                shape.typeIdSource = "az-type-id-fold";
+            }
+            return;
+        }
+        shape.typeId = reflected.typeId;
+        shape.typeIdSource = "serialize-context-name";
+        shape.factory = reflected.factory;
+        shape.azRttiAddress = reflected.azRttiAddress;
+    }
+
+    private boolean isBuiltinTypeId(String typeId) {
+        String normalized = normalizeUuid(typeId);
+        if (normalized == null) {
+            return false;
+        }
+        return uuidEquals(normalized, CHAR_TYPE_ID) ||
+            uuidEquals(normalized, S8_TYPE_ID) ||
+            uuidEquals(normalized, SHORT_TYPE_ID) ||
+            uuidEquals(normalized, INT_TYPE_ID) ||
+            uuidEquals(normalized, LONG_TYPE_ID) ||
+            uuidEquals(normalized, S64_TYPE_ID) ||
+            uuidEquals(normalized, U8_TYPE_ID) ||
+            uuidEquals(normalized, U16_TYPE_ID) ||
+            uuidEquals(normalized, U32_TYPE_ID) ||
+            uuidEquals(normalized, ULONG_TYPE_ID) ||
+            uuidEquals(normalized, U64_TYPE_ID) ||
+            uuidEquals(normalized, FLOAT_TYPE_ID) ||
+            uuidEquals(normalized, DOUBLE_TYPE_ID) ||
+            uuidEquals(normalized, BOOL_TYPE_ID);
+    }
+
+    private boolean isWireNativeSourceTypeName(String typeName) {
+        String normalized = normalizeNativeType(typeName);
+        if (normalized == null || normalized.isEmpty()) {
+            return false;
+        }
+        if (wireShapeFromNativeType(normalized) != null) {
+            return true;
+        }
+        if (normalized.startsWith("AZStd::fixed_vector<")
+            || normalized.startsWith("fixed_vector<")
+            || normalized.startsWith("AZStd::vector<")
+            || normalized.startsWith("vector<")
+            || normalized.startsWith("AZStd::array<")
+            || normalized.startsWith("array<")) {
+            return true;
+        }
+        String leaf = sourceTypeLeaf(normalized);
+        if (leaf == null) {
+            return false;
+        }
+        return switch (leaf) {
+            case "ActorId",
+                "ActorRef",
+                "AssetId",
+                "BaselineableFragment",
+                "BaselineableFragmentRef",
+                "ClientActorHash",
+                "ClientContextId",
+                "ComponentId",
+                "ConnTicket",
+                "Duration",
+                "FieldGroup",
+                "FieldVector",
+                "Fragment",
+                "HubAddress",
+                "HubId",
+                "InterestId",
+                "LoginToken",
+                "MovementInteractionId",
+                "ProxyAddress",
+                "SequenceNumber",
+                "SyncedTimestamp",
+                "Timestamp",
+                "TypeIndex",
+                "TypeIndexCrc" -> true;
+            default -> false;
+        };
     }
 
     private boolean isActorRequestIdMemberShape(List<NestedTypeMember> members) {
@@ -5263,6 +5572,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
     private Integer nativeTypeByteWidth(String nativeType) {
         String shape = wireShapeFromNativeType(nativeType);
+        return wireShapeByteWidth(shape);
+    }
+
+    private Integer wireShapeByteWidth(String shape) {
         if (shape == null) {
             return null;
         }
@@ -5611,6 +5924,82 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return owner;
     }
 
+    private String directUnmarshalOwnerFullNameFromPrototype(Function target) {
+        if (target == null) {
+            return null;
+        }
+        String selected = null;
+        for (Parameter parameter : target.getParameters()) {
+            String typeName = directTypeNameFromParameter(parameter);
+            if (typeName == null) {
+                continue;
+            }
+            if (selected != null && !selected.equals(typeName)) {
+                recordNestedTypeShapeReject("ambiguous-prototype-direct-type");
+                return null;
+            }
+            selected = typeName;
+        }
+        return selected;
+    }
+
+    private String directTypeNameFromParameter(Parameter parameter) {
+        if (parameter == null) {
+            return null;
+        }
+        DataType dataType = parameter.getDataType();
+        if (dataType == null) {
+            return null;
+        }
+        String name = normalizePrototypeTypeName(dataType.getDisplayName());
+        if (!isPlausibleDirectPrototypeTypeName(name)) {
+            return null;
+        }
+        return name;
+    }
+
+    private String normalizePrototypeTypeName(String value) {
+        if (value == null) {
+            return null;
+        }
+        String result = value
+            .replace(" *", "*")
+            .replace("*", "")
+            .replace(" &", "&")
+            .replace("&", "")
+            .replace("const ", "")
+            .trim();
+        return normalizeNativeType(result);
+    }
+
+    private boolean isPlausibleDirectPrototypeTypeName(String value) {
+        if (!isPlausibleTypeName(value)) {
+            return false;
+        }
+        String normalized = normalizeNativeType(value);
+        if (normalized == null ||
+            wireShapeFromNativeType(normalized) != null ||
+            normalized.startsWith("undefined") ||
+            normalized.startsWith("param_") ||
+            normalized.startsWith("FUN_")) {
+            return false;
+        }
+        String lower = normalized.toLowerCase(Locale.ROOT);
+        if (lower.contains("buffer") ||
+            lower.contains("context") ||
+            lower.contains("marshal") ||
+            lower.contains("stream") ||
+            lower.contains("allocator") ||
+            lower.contains("memory")) {
+            return false;
+        }
+        return !lower.equals("void") &&
+            !lower.equals("char") &&
+            !lower.equals("byte") &&
+            !lower.equals("longlong") &&
+            !lower.equals("ulonglong");
+    }
+
     private String directUnmarshalOwnerType(String functionName) {
         return sourceTypeLeaf(directUnmarshalOwnerFullName(functionName));
     }
@@ -5847,8 +6236,100 @@ public class NetworkSchemaExtractor extends GhidraScript {
             }
 
             refineHelperArgumentFieldTypes(helperText, fieldsByHelperParam);
+            refineHelperArgumentFieldTypesFromPcode(helper, fieldsByHelperParam);
+            attachSingleHelperArgumentNestedShape(helper, fieldsByHelperParam);
             refineDirectBoolWrites(helperText, fieldsByHelperParam);
             refineNestedBoolWrites(helper, helperText, fieldsByHelperParam);
+        }
+    }
+
+    private void refineHelperArgumentFieldTypesFromPcode(
+        Function helper,
+        Map<String, FieldCall> fieldsByHelperParam) {
+
+        if (helper == null || fieldsByHelperParam == null || fieldsByHelperParam.isEmpty()) {
+            return;
+        }
+        HighFunction high = highFunction(helper);
+        if (high == null) {
+            return;
+        }
+
+        LinkedHashSet<String> helperOutputBases = new LinkedHashSet<>(fieldsByHelperParam.keySet());
+        Iterator<PcodeOpAST> ops = high.getPcodeOps();
+        while (ops.hasNext()) {
+            PcodeOpAST op = ops.next();
+            if (op.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+
+            PcodeCallTargetInfo targetInfo = pcodeCallTargetInfo(op);
+            Function target = targetInfo == null ? null : targetInfo.target;
+            if (target == null) {
+                continue;
+            }
+
+            PcodeArgStorageSelection storageSelection =
+                pcodeStorageArgumentEvidence(op, helperOutputBases);
+            PcodeStorage storage = storageSelection == null ? null : storageSelection.storage;
+            if (storage == null || storage.offset != 0L) {
+                continue;
+            }
+
+            FieldCall field = fieldsByHelperParam.get(storage.base);
+            if (field == null) {
+                continue;
+            }
+
+            String nativeType = unmarshalNativeTypeFromTarget(target);
+            if (nativeType == null) {
+                nativeType = directUnmarshalOwnerFullNameFromPrototype(target);
+            }
+            if (nativeType != null) {
+                refineMessageFieldType(
+                    field,
+                    nativeType,
+                    "message-unmarshal-helper-pcode-call",
+                    fullFunctionName(target),
+                    "helper-pcode-call");
+            }
+
+            NestedTypeShape shape = recoverNestedDirectTypeShape(target, nativeType, true);
+            if (shape != null && field.nestedTypeShape == null) {
+                field.nestedTypeShape = shape;
+                if (field.nativeType == null && shape.typeNameFull != null) {
+                    refineMessageFieldType(
+                        field,
+                        shape.typeNameFull,
+                        "message-unmarshal-helper-pcode-nested-shape");
+                }
+            }
+        }
+    }
+
+    private void attachSingleHelperArgumentNestedShape(
+        Function helper,
+        Map<String, FieldCall> fieldsByHelperParam) {
+
+        if (helper == null || fieldsByHelperParam == null ||
+            fieldsByHelperParam.size() != 1) {
+            return;
+        }
+        FieldCall field = fieldsByHelperParam.values().iterator().next();
+        if (field == null || field.nestedTypeShape != null) {
+            return;
+        }
+        String nativeType = directUnmarshalOwnerFullNameFromPrototype(helper);
+        NestedTypeShape shape = recoverNestedDirectTypeShape(helper, nativeType, true);
+        if (shape == null) {
+            return;
+        }
+        field.nestedTypeShape = shape;
+        if (field.nativeType == null && shape.typeNameFull != null) {
+            refineMessageFieldType(
+                field,
+                shape.typeNameFull,
+                "message-unmarshal-helper-nested-shape");
         }
     }
 
@@ -6309,7 +6790,12 @@ public class NetworkSchemaExtractor extends GhidraScript {
             .compile("\\b" + Pattern.quote(baseName) +
                 "\\s*\\+\\s*(?<offset>0x[0-9a-fA-F]+|\\d+)")
             .matcher(value);
-        return matcher.find() ? parseIntegerLiteral(matcher.group("offset")) : null;
+        if (!matcher.find()) {
+            return null;
+        }
+        String offsetText = matcher.group("offset");
+        Long offset = parseIntegerLiteral(offsetText);
+        return offset == null ? null : offset * storageOffsetUnit(baseName, offsetText);
     }
 
     private String stripLeadingDereference(String expression) {
@@ -7419,8 +7905,29 @@ public class NetworkSchemaExtractor extends GhidraScript {
             return null;
         }
         String base = matcher.group("base");
-        long unit = base.startsWith("plVar") || base.startsWith("puVar") ? 8L : 1L;
+        long unit = storageOffsetUnit(base, matcher.group("offset"));
         return offset * unit;
+    }
+
+    private long storageOffsetUnit(String base, String offsetText) {
+        if (base == null) {
+            return 1L;
+        }
+        if (base.startsWith("plVar") || base.startsWith("puVar")) {
+            return 8L;
+        }
+        if (!isHexIntegerLiteral(offsetText) && isMessageObjectPointerBase(base)) {
+            return 8L;
+        }
+        return 1L;
+    }
+
+    private boolean isMessageObjectPointerBase(String base) {
+        return "this".equals(base) || "param_3".equals(base) || base.startsWith("_Dst");
+    }
+
+    private boolean isHexIntegerLiteral(String value) {
+        return value != null && value.matches("(?i)0x[0-9a-f]+");
     }
 
     private String messageStorageIdentity(String expression, PcodeStorage pcodeStorage) {
@@ -8611,6 +9118,120 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return pcodeValueNativeType(node, tempNativeTypes, new LinkedHashSet<>(), 0);
     }
 
+    private String pcodeValueWireShape(
+        Varnode node,
+        Map<String, String> tempWireShapes,
+        Map<String, String> tempNativeTypes) {
+        return pcodeValueWireShape(
+            node,
+            tempWireShapes,
+            tempNativeTypes,
+            new LinkedHashSet<>(),
+            0);
+    }
+
+    private String pcodeValueWireShape(
+        Varnode node,
+        Map<String, String> tempWireShapes,
+        Map<String, String> tempNativeTypes,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+            return null;
+        }
+        String tempShape = pcodeTempWireShape(node, tempWireShapes);
+        if (tempShape != null) {
+            return tempShape;
+        }
+        String nativeShape = wireShapeFromNativeType(pcodeTempNativeType(node, tempNativeTypes));
+        if (nativeShape != null) {
+            return nativeShape;
+        }
+        String key = "shape:" + pcodeNodeKey(node);
+        if (!seen.add(key)) {
+            return null;
+        }
+
+        PcodeOp def = node.getDef();
+        if (def == null) {
+            return wireShapeFromNativeType(pcodeValueNativeType(node, tempNativeTypes));
+        }
+
+        switch (def.getOpcode()) {
+            case PcodeOp.CALL: {
+                Function target = pcodeCallTarget(def);
+                String nativeType = unmarshalNativeTypeFromTarget(target);
+                String shape = wireShapeFromNativeType(nativeType);
+                if (shape != null) {
+                    return shape;
+                }
+                return wireShapeFromNativeType(scalarOutputStoreNativeType(target));
+            }
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.SUBPIECE:
+            case PcodeOp.INDIRECT:
+                return def.getNumInputs() == 0
+                    ? null
+                    : pcodeValueWireShape(
+                        def.getInput(0),
+                        tempWireShapes,
+                        tempNativeTypes,
+                        seen,
+                        depth + 1);
+            case PcodeOp.INT_EQUAL:
+            case PcodeOp.INT_NOTEQUAL:
+            case PcodeOp.INT_LESS:
+            case PcodeOp.INT_LESSEQUAL:
+            case PcodeOp.INT_SLESS:
+            case PcodeOp.INT_SLESSEQUAL:
+            case PcodeOp.BOOL_AND:
+            case PcodeOp.BOOL_OR:
+            case PcodeOp.BOOL_XOR:
+            case PcodeOp.BOOL_NEGATE:
+                return node.getSize() == 1 ? "bool" : null;
+            case PcodeOp.MULTIEQUAL:
+                return pcodeMergedValueWireShape(
+                    def,
+                    tempWireShapes,
+                    tempNativeTypes,
+                    seen,
+                    depth + 1);
+            default:
+                return wireShapeFromNativeType(pcodeValueNativeType(node, tempNativeTypes));
+        }
+    }
+
+    private String pcodeMergedValueWireShape(
+        PcodeOp def,
+        Map<String, String> tempWireShapes,
+        Map<String, String> tempNativeTypes,
+        Set<String> seen,
+        int depth) {
+
+        String merged = null;
+        for (int i = 0; i < def.getNumInputs(); i++) {
+            String valueShape =
+                pcodeValueWireShape(
+                    def.getInput(i),
+                    tempWireShapes,
+                    tempNativeTypes,
+                    new LinkedHashSet<>(seen),
+                    depth);
+            if (valueShape == null) {
+                return null;
+            }
+            if (merged == null) {
+                merged = valueShape;
+            }
+            else if (!merged.equals(valueShape)) {
+                return null;
+            }
+        }
+        return merged;
+    }
+
     private String pcodeValueNativeType(
         Varnode node,
         Map<String, String> tempNativeTypes,
@@ -8709,6 +9330,20 @@ public class NetworkSchemaExtractor extends GhidraScript {
             return null;
         }
         return tempNativeTypes.get(storageKey(storage));
+    }
+
+    private String pcodeTempWireShape(
+        Varnode node,
+        Map<String, String> tempWireShapes) {
+
+        if (tempWireShapes == null || tempWireShapes.isEmpty()) {
+            return null;
+        }
+        PcodeStorage storage = pcodeStorageExpression(node);
+        if (!isPcodeLocalTempStorage(storage)) {
+            return null;
+        }
+        return tempWireShapes.get(storageKey(storage));
     }
 
     private Long pcodeConstantValue(Varnode node, Set<String> seen, int depth) {
@@ -9329,7 +9964,11 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
         ArgState result = new ArgState();
         TrackedValue name = state.registers.get("RDX");
-        if (name != null && name.address != null) {
+        if (name != null && name.fieldName != null) {
+            result.nameAddress = name.fieldNameAddress;
+            result.name = name.fieldName;
+        }
+        else if (name != null && name.address != null) {
             StringDecode decoded = readFieldNameAtOrThroughPointer(name.address);
             if (decoded != null) {
                 result.nameAddress = decoded.address;
@@ -9532,6 +10171,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 return;
             }
 
+            TrackedValue formattedFieldName = formattedFieldNameCallValue(instruction, state);
+
             if (isAllocatorCall(instruction, state)) {
                 clearVolatileRegisters(state.registers);
                 clearVolatileAllocatorDispatchRegisters(state);
@@ -9552,6 +10193,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
             }
             clearVolatileRegisters(state.registers);
             clearVolatileAllocatorDispatchRegisters(state);
+            if (formattedFieldName != null) {
+                state.registers.put("RAX", formattedFieldName);
+            }
             if (addFilterGroupCall) {
                 state.registers.put(
                     "RAX",
@@ -9811,6 +10455,63 @@ public class NetworkSchemaExtractor extends GhidraScript {
             normalized.contains("_alloca_probe");
     }
 
+    private TrackedValue formattedFieldNameCallValue(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        if (!instruction.getFlowType().isCall()) {
+            return null;
+        }
+
+        TrackedValue destination = state.registers.get("RCX");
+        TrackedValue formatValue = state.registers.get("RDX");
+        TrackedValue indexValue = state.registers.get("R8");
+        if (destination == null || destination.stackOffset == null ||
+            formatValue == null || formatValue.address == null ||
+            indexValue == null || indexValue.immediate == null) {
+            return null;
+        }
+
+        String format = readPrintableString(formatValue.address);
+        String fieldName = renderFormattedFieldName(format, indexValue.immediate);
+        return fieldName == null ? null : TrackedValue.fieldName(formatValue.address, fieldName);
+    }
+
+    private String renderFormattedFieldName(String format, long index) {
+        if (!isLikelyFieldNameFormat(format) || index < 0 || index > 4096) {
+            return null;
+        }
+
+        Matcher matcher = Pattern.compile("%(?:0?\\d+)?[du]").matcher(format);
+        if (!matcher.find() || matcher.find()) {
+            return null;
+        }
+
+        String rendered = format.replaceFirst(
+            "%(?:0?\\d+)?[du]",
+            Long.toUnsignedString(index));
+        return isLikelyFieldName(rendered) ? rendered : null;
+    }
+
+    private boolean isLikelyFieldNameFormat(String value) {
+        if (value == null || value.isBlank() || value.length() > 96) {
+            return false;
+        }
+        if (!value.contains("%")) {
+            return false;
+        }
+        if (value.indexOf(' ') >= 0 || value.indexOf('\\') >= 0 || value.indexOf('/') >= 0) {
+            return false;
+        }
+        String withoutPlaceholder = value.replaceAll("%(?:0?\\d+)?[du]", "0");
+        return isLikelyFieldName(withoutPlaceholder);
+    }
+
+    private boolean isLikelyFieldName(String value) {
+        return value != null &&
+            value.matches("[A-Za-z_][A-Za-z0-9_]*");
+    }
+
     private boolean isAllocatorCall(Instruction instruction, ForwardArgState state) {
         Function target = functionAtOrContaining(callTarget(instruction));
         String targetName = fullFunctionName(target);
@@ -10004,6 +10705,25 @@ public class NetworkSchemaExtractor extends GhidraScript {
         Integer stackSlot = stackSlotOffset(memory, state);
         TrackedValue value = stackSlot == null ? null : state.valuesByStackSlot.get(stackSlot);
         return value == null ? null : value.copy();
+    }
+
+    private TrackedValue trackedFormattedFieldNamePointerLoadValue(
+        Instruction instruction,
+        int operandIndex,
+        ForwardArgState state) {
+
+        MemoryAddress memory = memoryAddress(instruction, operandIndex);
+        if (memory == null || memory.displacement != 0 || memory.terms.size() != 1) {
+            return null;
+        }
+
+        MemoryTerm term = memory.terms.get(0);
+        if (term.scale != 1) {
+            return null;
+        }
+
+        TrackedValue base = state.registers.get(term.register);
+        return base != null && base.fieldName != null ? base.copy() : null;
     }
 
     private void observeThisValueWrite(
@@ -10499,6 +11219,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (value == null) {
             return "unknown";
         }
+        if (value.fieldName != null) {
+            return "field-name";
+        }
         if (value.immediate != null) {
             return "immediate";
         }
@@ -10520,6 +11243,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private String trackedValueDisplay(TrackedValue value) {
         if (value == null) {
             return null;
+        }
+        if (value.fieldName != null) {
+            return value.fieldName;
         }
         if (value.immediate != null) {
             return Long.toUnsignedString(value.immediate);
@@ -12075,6 +12801,11 @@ public class NetworkSchemaExtractor extends GhidraScript {
             return value;
         }
 
+        value = trackedFormattedFieldNamePointerLoadValue(instruction, operandIndex, state);
+        if (value != null) {
+            return value;
+        }
+
         Address address = referencedAddress(instruction, operandIndex);
         if (address != null) {
             return TrackedValue.address(address);
@@ -13306,11 +14037,17 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private final class NestedTypeShape {
+        String typeId;
+        String typeIdSource;
         String typeName;
         String typeNameFull;
         String typeNameSource;
         Address function;
         String functionName;
+        String factory;
+        String azRttiAddress;
+        Address constructor;
+        Address vtable;
         String memberBase;
         String memberNameSource;
         Boolean memberNamesProven;
@@ -13320,11 +14057,17 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
         JsonObject toJson() {
             JsonObject object = new JsonObject();
+            add(object, "typeId", typeId);
+            add(object, "typeIdSource", typeIdSource);
             add(object, "typeName", typeName);
             add(object, "typeNameFull", typeNameFull);
             add(object, "typeNameSource", typeNameSource);
             add(object, "function", formatAddress(function));
             add(object, "functionName", functionName);
+            add(object, "factory", factory);
+            add(object, "azRttiAddress", azRttiAddress);
+            add(object, "constructor", formatAddress(constructor));
+            add(object, "vtable", formatAddress(vtable));
             add(object, "memberBase", memberBase);
             add(object, "memberNameSource", memberNameSource);
             if (memberNamesProven != null) {
@@ -13339,6 +14082,13 @@ public class NetworkSchemaExtractor extends GhidraScript {
             object.add("members", memberJson);
             return object;
         }
+    }
+
+    private final class SerializeTypeInfo {
+        String typeId;
+        String name;
+        String factory;
+        String azRttiAddress;
     }
 
     private final class NestedTypeMember {
@@ -13471,6 +14221,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
             }
             add(object, "nativeType", nativeType);
             add(object, "sourceTypeName", sourceTypeName);
+            add(object, "sourceTypeId", fieldSourceTypeId());
             if (typeEvidence != null && typeEvidence.size() != 0) {
                 object.add("typeEvidence", typeEvidence);
             }
@@ -13511,6 +14262,28 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 object.add("unmarshalEvidence", unmarshalEvidence);
             }
             return object;
+        }
+
+        private String fieldSourceTypeId() {
+            if (nestedTypeShape != null && nestedTypeShape.typeId != null) {
+                return nestedTypeShape.typeId;
+            }
+            String typeId = sourceTypeIdFromName(sourceTypeName);
+            if (typeId != null) {
+                return typeId;
+            }
+            return sourceTypeIdFromName(nativeType);
+        }
+
+        private String sourceTypeIdFromName(String typeName) {
+            if (isWireNativeSourceTypeName(typeName)) {
+                return null;
+            }
+            String typeId = typeIdForTypeName(typeName);
+            if (typeId == null || isBuiltinTypeId(typeId)) {
+                return null;
+            }
+            return typeId;
         }
 
         boolean typeConflict() {
@@ -14939,6 +15712,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
         final String baseKey;
         final Integer baseOffset;
         final Long immediate;
+        final Address fieldNameAddress;
+        final String fieldName;
         final String expression;
 
         private TrackedValue(
@@ -14948,6 +15723,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
             String baseKey,
             Integer baseOffset,
             Long immediate,
+            Address fieldNameAddress,
+            String fieldName,
             String expression) {
 
             this.address = address;
@@ -14956,19 +15733,39 @@ public class NetworkSchemaExtractor extends GhidraScript {
             this.baseKey = baseKey;
             this.baseOffset = baseOffset;
             this.immediate = immediate;
+            this.fieldNameAddress = fieldNameAddress;
+            this.fieldName = fieldName;
             this.expression = expression;
         }
 
         static TrackedValue address(Address address) {
-            return new TrackedValue(address, null, null, null, null, null, null);
+            return new TrackedValue(address, null, null, null, null, null, null, null, null);
         }
 
         static TrackedValue thisOffset(int offset) {
-            return new TrackedValue(null, offset, null, null, null, null, thisExpression(offset));
+            return new TrackedValue(
+                null,
+                offset,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                thisExpression(offset));
         }
 
         static TrackedValue stackOffset(int offset) {
-            return new TrackedValue(null, null, offset, null, null, null, stackExpression(offset));
+            return new TrackedValue(
+                null,
+                null,
+                offset,
+                null,
+                null,
+                null,
+                null,
+                null,
+                stackExpression(offset));
         }
 
         static TrackedValue baseOffset(String baseKey, int offset) {
@@ -14979,11 +15776,35 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 baseKey,
                 offset,
                 null,
+                null,
+                null,
                 baseExpression(baseKey, offset));
         }
 
         static TrackedValue immediate(long value) {
-            return new TrackedValue(null, null, null, null, null, value, Long.toUnsignedString(value));
+            return new TrackedValue(
+                null,
+                null,
+                null,
+                null,
+                null,
+                value,
+                null,
+                null,
+                Long.toUnsignedString(value));
+        }
+
+        static TrackedValue fieldName(Address formatAddress, String fieldName) {
+            return new TrackedValue(
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                formatAddress,
+                fieldName,
+                fieldName);
         }
 
         TrackedValue addOffset(int delta) {
@@ -15015,6 +15836,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 baseKey,
                 baseOffset,
                 immediate,
+                fieldNameAddress,
+                fieldName,
                 expression);
         }
 
@@ -15027,7 +15850,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 sameObject(stackOffset, other.stackOffset) &&
                 sameObject(baseKey, other.baseKey) &&
                 sameObject(baseOffset, other.baseOffset) &&
-                sameObject(immediate, other.immediate);
+                sameObject(immediate, other.immediate) &&
+                sameAddress(fieldNameAddress, other.fieldNameAddress) &&
+                sameObject(fieldName, other.fieldName);
         }
 
         private static boolean sameAddress(Address left, Address right) {

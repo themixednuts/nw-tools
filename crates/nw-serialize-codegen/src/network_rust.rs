@@ -10,12 +10,12 @@ use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind};
 use crate::naming::{rust_field_ident, rust_module_ident, rust_type_ident};
 use crate::network_schema::{
     NetworkConfidence, NetworkField, NetworkFragmentMetadata, NetworkReplicatedContainerWireShape,
-    NetworkSchema, NetworkType, NetworkTypeCapability,
+    NetworkSchema, NetworkSerializeKind, NetworkType, NetworkTypeCapability,
     NetworkWireScalarShape as SchemaWireScalarShape, NetworkWireShape as SchemaWireShape,
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v30";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v31";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -119,6 +119,10 @@ pub struct NetworkStateFieldShapeReport {
     pub native_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serialize_type_name: Option<String>,
     pub handler_vtable: Option<String>,
     pub wire_shape: Option<SchemaWireShape>,
     pub wire_shape_source: Option<String>,
@@ -199,6 +203,10 @@ pub struct NetworkBlockedFieldExampleReport {
     pub field_name: Option<String>,
     pub native_type: Option<String>,
     pub source_type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serialize_type_name: Option<String>,
     pub rust_value_type: Option<String>,
     pub blocked_reason: Option<String>,
 }
@@ -1388,8 +1396,8 @@ fn disambiguate_report_field_names(fields: &mut [NetworkStateFieldShapeReport]) 
             continue;
         };
         let ident = rust_field_ident(name);
-        if !seen.contains_key(&ident) {
-            seen.insert(ident, 1);
+        if let std::collections::btree_map::Entry::Vacant(entry) = seen.entry(ident.clone()) {
+            entry.insert(1);
             continue;
         }
 
@@ -1403,8 +1411,10 @@ fn disambiguate_report_field_names(fields: &mut [NetworkStateFieldShapeReport]) 
             };
             let candidate = format!("{name}_{suffix}");
             let candidate_ident = rust_field_ident(&candidate);
-            if !seen.contains_key(&candidate_ident) {
-                seen.insert(candidate_ident, 1);
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                seen.entry(candidate_ident)
+            {
+                entry.insert(1);
                 break candidate;
             }
             attempt += 1;
@@ -1530,6 +1540,8 @@ fn blocked_field_example(field: &NetworkStateFieldShapeReport) -> NetworkBlocked
         field_name: field.field_name.clone(),
         native_type: field.native_type.clone(),
         source_type_name: field.source_type_name.clone(),
+        source_type_id: field.source_type_id,
+        serialize_type_name: field.serialize_type_name.clone(),
         rust_value_type: field.rust_value_type.clone(),
         blocked_reason: field.blocked_reason.clone(),
     }
@@ -1541,10 +1553,12 @@ fn message_field_shape_report(
     wire_shape_sources: &BTreeMap<&str, &str>,
 ) -> NetworkStateFieldShapeReport {
     let mut report = state_field_shape_report(field, wire_shapes, wire_shape_sources);
+    let source_type = serialize_field_scalar_source_type(field, report.wire_shape);
     let rust_type = field
         .rust_type
         .clone()
         .or_else(|| existing_message_support_type(field).map(ToOwned::to_owned))
+        .or(source_type)
         .or_else(|| {
             field
                 .native_type
@@ -1582,6 +1596,7 @@ fn state_field_shape_report(
     } else {
         field_wire_shape(field, wire_shapes)
     };
+    let source_type = serialize_field_scalar_source_type(field, shape);
     let rust_shape = shape.map(rust_field_shape);
     let blocked_reason = state_field_blocked_reason(
         field,
@@ -1597,6 +1612,13 @@ fn state_field_shape_report(
         filter_group_attribute: field.filter_group_attribute,
         native_type: field.native_type.clone(),
         source_type_name: field.source_type_name.clone(),
+        source_type_id: field
+            .source_type_id
+            .or_else(|| field.serialize.as_ref().map(|serialize| serialize.type_id)),
+        serialize_type_name: field
+            .serialize
+            .as_ref()
+            .map(|serialize| serialize.name.clone()),
         handler_vtable: field.handler_vtable.clone(),
         wire_shape: shape,
         wire_shape_source: if explicit_field_type.is_some() && shape.is_none() {
@@ -1609,6 +1631,7 @@ fn state_field_shape_report(
         } else {
             rust_type
                 .map(ToOwned::to_owned)
+                .or_else(|| source_type.clone())
                 .or_else(|| rust_shape.as_ref().map(|shape| shape.value_type.clone()))
         },
         rust_field_type: explicit_field_type
@@ -1622,6 +1645,13 @@ fn state_field_shape_report(
                             rust_type,
                         )
                     })
+            })
+            .or_else(|| {
+                source_type.as_deref().and_then(|source_type| {
+                    shape
+                        .filter(|shape| !shape.is_replicated_container())
+                        .map(|shape| replicated_field_handler_type(shape, source_type))
+                })
             })
             .or_else(|| rust_shape.map(|shape| shape.field_type)),
         constructor_write_count: field.constructor_writes.len(),
@@ -2012,10 +2042,11 @@ fn has_composite_support_type_evidence(field: &NetworkField) -> bool {
 }
 
 fn has_support_type_evidence(field: &NetworkField) -> bool {
-    field
-        .source_type_name
-        .as_deref()
-        .is_some_and(is_named_support_type_evidence)
+    field.serialize.is_some()
+        || field
+            .source_type_name
+            .as_deref()
+            .is_some_and(is_named_support_type_evidence)
         || field
             .native_type
             .as_deref()
@@ -2642,6 +2673,20 @@ fn field_conversion_marshal_type_string(field: &NetworkStateFieldShapeReport) ->
     conversion_marshal_type_string_for(shape, rust_type)
 }
 
+fn serialize_field_scalar_source_type(
+    field: &NetworkField,
+    shape: Option<SchemaWireShape>,
+) -> Option<String> {
+    let serialize = field.serialize.as_ref()?;
+    if serialize.kind != NetworkSerializeKind::Enum {
+        return None;
+    }
+    scalar_conversion_serialized_type(shape?)?;
+    let rust_type = format!("::nw_network::source::{}", rust_type_ident(&serialize.name));
+    syn::parse_str::<syn::Type>(&rust_type).ok()?;
+    Some(rust_type)
+}
+
 fn conversion_marshal_type_string_for(shape: SchemaWireShape, rust_type: &str) -> Option<String> {
     let serialized_type = scalar_conversion_serialized_type(shape)?;
     let rust_type = rust_type.trim();
@@ -2828,7 +2873,7 @@ mod tests {
     use uuid::uuid;
 
     use crate::{
-        ir::SerializeCodegenVariant,
+        ir::{SerializeCodegenUnit, SerializeCodegenVariant},
         network_schema::{NetworkMessageFieldSignature, NetworkMessageSignature, NetworkSchema},
     };
 
@@ -4212,6 +4257,51 @@ mod tests {
     }
 
     #[test]
+    fn emits_selected_serialize_enum_message_field_from_source_type_id() {
+        let grid_sides_type_id = uuid!("ffe86b09-16b9-429e-9cd2-2901adbe8de3");
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
+                "typeIndex": 19,
+                "typeName": "GridSideMsg",
+                "capabilities": ["direct-message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "GridSide",
+                    "sourceTypeId": grid_sides_type_id.to_string(),
+                    "wireShape": "u8",
+                    "confidence": "message-unmarshal-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+        let unit = SerializeCodegenUnit {
+            items: vec![grid_sides_enum_item(grid_sides_type_id)],
+        };
+        schema.merge_serialize_codegen_unit(&unit, Some("selection.json".to_owned()));
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.generatable_message_count, 1);
+        let field = &output.report.message_generation_plans[0].fields[0];
+        assert_eq!(field.source_type_id, Some(grid_sides_type_id));
+        assert_eq!(field.serialize_type_name.as_deref(), Some("GridSides"));
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::nw_network::source::GridSides")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub grid_side: ::nw_network::source::GridSides")
+        );
+        assert!(output.source.contains(
+            "::nw_network::serialize::ConversionMarshaler<u8, ::nw_network::source::GridSides>"
+        ));
+    }
+
+    #[test]
     fn leaves_explicit_self_marshaling_scalar_types_unwrapped() {
         let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
@@ -4284,6 +4374,101 @@ mod tests {
     }
 
     #[test]
+    fn emits_selected_serialize_enum_replicated_state_field_from_source_type_id() {
+        let grid_sides_type_id = uuid!("ffe86b09-16b9-429e-9cd2-2901adbe8de3");
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "A85DF621-DCE0-409F-8D39-A447EA0807FF",
+                "typeIndex": 28,
+                "typeName": "Javelin::GridSideReplicatedState",
+                "capabilities": ["replicated-state"],
+                "fields": [{
+                    "index": 0,
+                    "name": "GridSide",
+                    "group": 0,
+                    "sourceTypeId": grid_sides_type_id.to_string(),
+                    "wireShape": "u8",
+                    "confidence": "exact"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+        let unit = SerializeCodegenUnit {
+            items: vec![grid_sides_enum_item(grid_sides_type_id)],
+        };
+        schema.merge_serialize_codegen_unit(&unit, Some("selection.json".to_owned()));
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [28]).expect("state source");
+
+        assert_eq!(output.report.generatable_state_count, 1);
+        let field = &output.report.state_generation_plans[0].fields[0];
+        assert_eq!(field.source_type_id, Some(grid_sides_type_id));
+        assert_eq!(field.serialize_type_name.as_deref(), Some("GridSides"));
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::nw_network::source::GridSides")
+        );
+        assert!(output.source.contains("ReplicatedFieldHandler<"));
+        assert!(output.source.contains("::nw_network::source::GridSides"));
+        assert!(output.source.contains("ConversionMarshaler<"));
+        assert!(output.source.contains("u8,"));
+    }
+
+    #[test]
+    fn keeps_selected_serialize_struct_blocked_until_marshaler_exists() {
+        let payload_type_id = uuid!("da4e5889-a65c-4480-8642-0278160125a7");
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
+                "typeIndex": 19,
+                "typeName": "PayloadMsg",
+                "capabilities": ["direct-message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "Payload",
+                    "nativeType": "PayloadData",
+                    "sourceTypeName": "PayloadData",
+                    "sourceTypeId": payload_type_id.to_string(),
+                    "confidence": "message-unmarshal-direct-type"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+        let unit = SerializeCodegenUnit {
+            items: vec![SerializeCodegenItem {
+                source_type_id: payload_type_id,
+                source_name: "PayloadData".to_owned(),
+                role: crate::role::ReflectedTypeRole::SupportType,
+                is_reflection_marker: false,
+                is_abstract: Some(false),
+                factory: None,
+                rtti_base_chain: Vec::new(),
+                kind: SerializeCodegenItemKind::Struct,
+                enum_underlying_type: None,
+                fields: Vec::new(),
+                variants: Vec::new(),
+            }],
+        };
+        schema.merge_serialize_codegen_unit(&unit, Some("selection.json".to_owned()));
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.generatable_message_count, 0);
+        let field = &output.report.message_generation_plans[0].fields[0];
+        assert_eq!(field.source_type_id, Some(payload_type_id));
+        assert_eq!(field.serialize_type_name.as_deref(), Some("PayloadData"));
+        assert_eq!(field.rust_value_type, None);
+        assert_eq!(
+            field.blocked_reason.as_deref(),
+            Some("missing-support-type")
+        );
+        assert!(!output.source.contains("pub struct PayloadMsg"));
+    }
+
+    #[test]
     fn emits_marshaler_conversions_for_compact_generated_enums() {
         let item = SerializeCodegenItem {
             source_type_id: Uuid::from_u128(0xffe86b0916b9429e9cd22901adbe8de3),
@@ -4329,6 +4514,35 @@ mod tests {
         assert!(output.source.contains("let raw = i32::from(self);"));
         assert!(output.source.contains("min: 0u64"));
         assert!(output.source.contains("max: 4u64"));
+    }
+
+    fn grid_sides_enum_item(type_id: Uuid) -> SerializeCodegenItem {
+        SerializeCodegenItem {
+            source_type_id: type_id,
+            source_name: "GridSides".to_owned(),
+            role: crate::role::ReflectedTypeRole::SupportType,
+            is_reflection_marker: false,
+            is_abstract: Some(false),
+            factory: None,
+            rtti_base_chain: Vec::new(),
+            kind: SerializeCodegenItemKind::Enum,
+            enum_underlying_type: Some(ResolvedType::Scalar(ScalarType::I32)),
+            fields: Vec::new(),
+            variants: vec![
+                SerializeCodegenVariant {
+                    source_name: "InvalidSide".to_owned(),
+                    value_u64: Some(0),
+                    value_u32: Some(0),
+                    value_i32: Some(0),
+                },
+                SerializeCodegenVariant {
+                    source_name: "Left".to_owned(),
+                    value_u64: Some(4),
+                    value_u32: Some(4),
+                    value_i32: Some(4),
+                },
+            ],
+        }
     }
 
     #[test]
