@@ -52,6 +52,8 @@ pub struct NetworkSchemaSummary {
     pub message_unmarshal_field_count: usize,
     pub type_index_evidence_count: usize,
     pub serialize_type_count: usize,
+    #[serde(default)]
+    pub serialize_field_type_count: usize,
     pub serialize_dependency_count: usize,
     #[serde(default)]
     pub field_handler_vtable_count: usize,
@@ -78,6 +80,16 @@ pub struct NetworkSerializeMergeReport {
     pub type_id_matched_count: usize,
     pub name_matched_count: usize,
     pub ambiguous_name_match_count: usize,
+    #[serde(default)]
+    pub matched_field_type_count: usize,
+    #[serde(default)]
+    pub field_type_id_matched_count: usize,
+    #[serde(default)]
+    pub field_factory_matched_count: usize,
+    #[serde(default)]
+    pub field_name_matched_count: usize,
+    #[serde(default)]
+    pub ambiguous_field_name_match_count: usize,
     pub filled_name_count: usize,
     pub unmatched_schema_type_count: usize,
 }
@@ -204,9 +216,12 @@ pub struct NetworkType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkSerializeType {
+    pub type_id: Uuid,
     pub kind: NetworkSerializeKind,
     pub name: String,
     pub role: NetworkSerializeRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factory: Option<String>,
     pub field_count: usize,
     pub variant_count: usize,
     pub direct_dependency_type_ids: Vec<Uuid>,
@@ -230,6 +245,19 @@ pub enum NetworkSerializeRole {
     ServerFacet,
     AzEntity,
     SupportType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkSerializeFieldType {
+    pub type_id: Uuid,
+    pub kind: NetworkSerializeKind,
+    pub name: String,
+    pub role: NetworkSerializeRole,
+    pub field_count: usize,
+    pub variant_count: usize,
+    pub source: String,
+    pub confidence: NetworkConfidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,6 +289,8 @@ pub struct NetworkField {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_type_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_expression: Option<String>,
@@ -278,6 +308,8 @@ pub struct NetworkField {
     pub unmarshal_evidence: Option<NetworkFieldUnmarshalEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nested_type_shape: Option<NetworkNestedTypeShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serialize: Option<NetworkSerializeFieldType>,
     pub callsite: Option<String>,
     pub confidence: NetworkConfidence,
     pub evidence: Vec<NetworkEvidence>,
@@ -295,11 +327,23 @@ pub struct NetworkFieldUnmarshalEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkNestedTypeShape {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_id_source: Option<String>,
     pub type_name: Option<String>,
     pub type_name_full: Option<String>,
     pub type_name_source: Option<String>,
     pub function: Option<String>,
     pub function_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub az_rtti_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constructor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vtable: Option<String>,
     pub member_base: Option<String>,
     pub member_name_source: Option<String>,
     pub member_names_proven: Option<bool>,
@@ -835,6 +879,7 @@ impl NetworkSchema {
     ) -> NetworkSerializeMergeReport {
         let index = unit.index();
         let name_index = serialize_items_by_name(unit);
+        let factory_index = serialize_items_by_factory(unit);
         let mut report = NetworkSerializeMergeReport {
             source_type_count: unit.items.len(),
             ..NetworkSerializeMergeReport::default()
@@ -844,6 +889,12 @@ impl NetworkSchema {
             let Some((item, confidence, source)) =
                 serialize_match(network_type, &index, &name_index, &mut report)
             else {
+                merge_field_serialize_types(
+                    network_type,
+                    &index,
+                    &factory_index,
+                    &mut report,
+                );
                 continue;
             };
             report.matched_type_count += 1;
@@ -860,6 +911,12 @@ impl NetworkSchema {
                 detail: Some(item.source_name.clone()),
                 confidence,
             });
+            merge_field_serialize_types(
+                network_type,
+                &index,
+                &factory_index,
+                &mut report,
+            );
         }
 
         self.sources.push(NetworkSchemaSource {
@@ -1139,6 +1196,12 @@ impl NetworkSchema {
                 .iter()
                 .filter(|network_type| network_type.serialize.is_some())
                 .count(),
+            serialize_field_type_count: self
+                .types
+                .iter()
+                .flat_map(|network_type| &network_type.fields)
+                .filter(|field| field.serialize.is_some())
+                .count(),
             serialize_dependency_count: self
                 .types
                 .iter()
@@ -1199,6 +1262,7 @@ fn network_field_from_message_signature(
         handler_vtable: None,
         native_type: signature.native_type.clone(),
         source_type_name: None,
+        source_type_id: None,
         rust_type: signature.rust_type.clone(),
         storage_expression: None,
         storage_offset: None,
@@ -1208,6 +1272,7 @@ fn network_field_from_message_signature(
         constructor_writes: Vec::new(),
         unmarshal_evidence: None,
         nested_type_shape: None,
+        serialize: None,
         callsite: None,
         confidence: NetworkConfidence::High,
         evidence,
@@ -1315,6 +1380,22 @@ fn serialize_items_by_name(
     index
 }
 
+fn serialize_items_by_factory(
+    unit: &SerializeCodegenUnit,
+) -> BTreeMap<String, Vec<&SerializeCodegenItem>> {
+    let mut index = BTreeMap::<String, Vec<&SerializeCodegenItem>>::new();
+    for item in &unit.items {
+        let Some(factory) = item.factory.as_deref() else {
+            continue;
+        };
+        index
+            .entry(factory.to_ascii_lowercase())
+            .or_default()
+            .push(item);
+    }
+    index
+}
+
 fn serialize_match<'a>(
     network_type: &NetworkType,
     type_index: &'a SerializeCodegenIndex<'a>,
@@ -1348,6 +1429,90 @@ fn serialize_match<'a>(
         NetworkConfidence::Inferred,
         "serializeContext:name".to_owned(),
     ))
+}
+
+fn merge_field_serialize_types(
+    network_type: &mut NetworkType,
+    type_index: &SerializeCodegenIndex<'_>,
+    factory_index: &BTreeMap<String, Vec<&SerializeCodegenItem>>,
+    report: &mut NetworkSerializeMergeReport,
+) {
+    for field in &mut network_type.fields {
+        if field.serialize.is_some() {
+            continue;
+        }
+        let Some((item, confidence, source, address)) = serialize_field_match(
+            field,
+            type_index,
+            factory_index,
+            report,
+        ) else {
+            continue;
+        };
+        report.matched_field_type_count += 1;
+        field.serialize = Some(network_serialize_field_type(
+            item,
+            source.clone(),
+            confidence,
+        ));
+        field.evidence.push(NetworkEvidence {
+            kind: NetworkEvidenceKind::SerializeContext,
+            source,
+            address,
+            detail: Some(item.source_name.clone()),
+            confidence,
+        });
+    }
+}
+
+fn serialize_field_match<'a>(
+    field: &NetworkField,
+    type_index: &'a SerializeCodegenIndex<'a>,
+    factory_index: &'a BTreeMap<String, Vec<&'a SerializeCodegenItem>>,
+    report: &mut NetworkSerializeMergeReport,
+) -> Option<(
+    &'a SerializeCodegenItem,
+    NetworkConfidence,
+    String,
+    Option<String>,
+)> {
+    if let Some(type_id) = field.source_type_id.or_else(|| {
+        field
+            .nested_type_shape
+            .as_ref()
+            .and_then(|shape| shape.type_id)
+    }) && !type_id.is_nil()
+        && let Some(item) = type_index.item_by_type_id(type_id)
+    {
+        report.field_type_id_matched_count += 1;
+        return Some((
+            item,
+            NetworkConfidence::Exact,
+            "serializeContext:field-type-id".to_owned(),
+            None,
+        ));
+    }
+
+    if let Some(factory) = field
+        .nested_type_shape
+        .as_ref()
+        .and_then(|shape| shape.factory.as_deref())
+    {
+        let key = factory.to_ascii_lowercase();
+        if let Some(candidates) = factory_index.get(&key)
+            && let [item] = candidates.as_slice()
+        {
+            report.field_factory_matched_count += 1;
+            return Some((
+                item,
+                NetworkConfidence::High,
+                "serializeContext:field-factory".to_owned(),
+                Some(factory.to_owned()),
+            ));
+        }
+    }
+
+    None
 }
 
 fn message_signature_candidates(
@@ -1457,14 +1622,33 @@ fn network_serialize_type(item: &SerializeCodegenItem) -> NetworkSerializeType {
         .collect::<Vec<_>>();
     direct_dependency_type_ids.sort_unstable();
     NetworkSerializeType {
+        type_id: item.source_type_id,
         kind: network_serialize_kind(item.kind),
         name: item.source_name.clone(),
         role: network_serialize_role(item.role),
+        factory: item.factory.clone(),
         field_count: item.fields.len(),
         variant_count: item.variants.len(),
         direct_dependency_type_ids,
         is_abstract: item.is_abstract,
         is_reflection_marker: item.is_reflection_marker,
+    }
+}
+
+fn network_serialize_field_type(
+    item: &SerializeCodegenItem,
+    source: String,
+    confidence: NetworkConfidence,
+) -> NetworkSerializeFieldType {
+    NetworkSerializeFieldType {
+        type_id: item.source_type_id,
+        kind: network_serialize_kind(item.kind),
+        name: item.source_name.clone(),
+        role: network_serialize_role(item.role),
+        field_count: item.fields.len(),
+        variant_count: item.variants.len(),
+        source,
+        confidence,
     }
 }
 
@@ -1792,6 +1976,7 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
         handler_vtable: string(field, "handlerVtable"),
         native_type,
         source_type_name: string(field, "sourceTypeName"),
+        source_type_id: uuid(field, "sourceTypeId"),
         rust_type: string(field, "rustType"),
         storage_expression: string(field, "storageExpression"),
         storage_offset: hex_or_decimal_u32(field, "storageOffset"),
@@ -1801,6 +1986,7 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
         constructor_writes: network_field_constructor_writes(field),
         unmarshal_evidence: network_field_unmarshal_evidence(field),
         nested_type_shape: network_field_nested_type_shape(field),
+        serialize: None,
         callsite: string(field, "callsite"),
         confidence,
         evidence,
@@ -1822,11 +2008,17 @@ fn network_field_unmarshal_evidence(
 fn network_field_nested_type_shape(field: &Map<String, Value>) -> Option<NetworkNestedTypeShape> {
     let shape = field.get("nestedTypeShape")?.as_object()?;
     Some(NetworkNestedTypeShape {
+        type_id: uuid(shape, "typeId"),
+        type_id_source: string(shape, "typeIdSource"),
         type_name: string(shape, "typeName"),
         type_name_full: string(shape, "typeNameFull"),
         type_name_source: string(shape, "typeNameSource"),
         function: string(shape, "function"),
         function_name: string(shape, "functionName"),
+        factory: string(shape, "factory"),
+        az_rtti_address: string(shape, "azRttiAddress"),
+        constructor: string(shape, "constructor"),
+        vtable: string(shape, "vtable"),
         member_base: string(shape, "memberBase"),
         member_name_source: string(shape, "memberNameSource"),
         member_names_proven: bool_value(shape, "memberNamesProven"),
@@ -3424,6 +3616,66 @@ mod tests {
             .expect("serialize evidence");
         assert_eq!(evidence.source, "serializeContext:name");
         assert_eq!(evidence.confidence, NetworkConfidence::Inferred);
+    }
+
+    #[test]
+    fn merges_field_serialize_type_by_nested_type_id() {
+        let network_type_id = uuid!("8673a3cc-2848-4c87-aa72-cc860589d1b5");
+        let payload_type_id = uuid!("da4e5889-a65c-4480-8642-0278160125a7");
+        let report = json!({
+            "registryEntries": [{
+                "uuid": network_type_id.to_string(),
+                "typeName": "Example::PayloadMessage",
+                "fields": [{
+                    "index": 0,
+                    "name": "payload",
+                    "nativeType": "PayloadData",
+                    "sourceTypeId": payload_type_id.to_string(),
+                    "confidence": "message-unmarshal-direct-type",
+                    "storageExpression": "param_3 + 0x8",
+                    "nestedTypeShape": {
+                        "typeId": payload_type_id.to_string(),
+                        "typeIdSource": "serialize-context-name",
+                        "typeName": "PayloadData",
+                        "typeNameFull": "Example::PayloadData",
+                        "factory": "NewWorld+0x1234",
+                        "members": []
+                    }
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        });
+        let unit = SerializeCodegenUnit {
+            items: vec![SerializeCodegenItem {
+                source_type_id: payload_type_id,
+                source_name: "Example::PayloadData".to_owned(),
+                role: ReflectedTypeRole::SupportType,
+                is_reflection_marker: false,
+                is_abstract: Some(false),
+                factory: Some("NewWorld+0x1234".to_owned()),
+                rtti_base_chain: Vec::new(),
+                kind: SerializeCodegenItemKind::Struct,
+                enum_underlying_type: None,
+                fields: Vec::new(),
+                variants: Vec::new(),
+            }],
+        };
+
+        let mut schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+        let merge = schema.merge_serialize_codegen_unit(&unit, Some("serialize.json".to_owned()));
+
+        assert_eq!(merge.matched_type_count, 0);
+        assert_eq!(merge.matched_field_type_count, 1);
+        assert_eq!(merge.field_type_id_matched_count, 1);
+        assert_eq!(schema.summary.serialize_type_count, 0);
+        assert_eq!(schema.summary.serialize_field_type_count, 1);
+        let field = &schema.types[0].fields[0];
+        let serialize = field.serialize.as_ref().expect("field serialize type");
+        assert_eq!(serialize.type_id, payload_type_id);
+        assert_eq!(serialize.name, "Example::PayloadData");
+        assert_eq!(serialize.source, "serializeContext:field-type-id");
+        assert_eq!(serialize.confidence, NetworkConfidence::Exact);
     }
 
     #[test]
