@@ -156,7 +156,7 @@ impl RustTypeRenderer {
         if self.options.use_support_aliases {
             self.options.asset_alias
         } else {
-            "az_asset::AssetReference"
+            "az_asset::UntypedAssetRef"
         }
     }
 
@@ -303,6 +303,13 @@ mod tests {
         assert_eq!(
             renderer.render(&ResolvedType::Scalar(ScalarType::ColorB)),
             "bevy::color::Srgba"
+        );
+        assert_eq!(
+            renderer.render(&ResolvedType::Asset {
+                type_id: Some(uuid!("77f3e5cc-1ff4-4758-8c36-08ac7f994d3c")),
+                asset_type_id: None,
+            }),
+            "az_asset::UntypedAssetRef"
         );
     }
 
