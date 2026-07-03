@@ -3127,7 +3127,7 @@ fn replicated_state_field_support_tokens(
             }
         });
         quote! {
-            #[derive(Debug, Clone, Default)]
+            #[derive(Debug, Clone, Default, PartialEq)]
             pub struct #value_type_ident {
                 #(#struct_fields)*
             }
