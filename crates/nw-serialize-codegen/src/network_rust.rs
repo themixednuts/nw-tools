@@ -18,7 +18,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v34";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v35";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -781,6 +781,10 @@ impl NetworkRustEmitter {
         context: &CodegenContext,
     ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
         let items = items.into_iter().collect::<Vec<_>>();
+        let items_by_type_id = items
+            .iter()
+            .map(|item| (item.source_type_id, *item))
+            .collect::<BTreeMap<_, _>>();
         let mut report = NetworkRustGenerationReport::default();
         let mut conversions = Vec::new();
         for item in items {
@@ -788,10 +792,7 @@ impl NetworkRustEmitter {
                 return Err(NetworkRustEmitError::Cancelled);
             }
             conversions.extend(enum_marshaler_conversion_tokens(item));
-            if let Some(tokens) = enum_native_marshaler_tokens(item) {
-                conversions.push(tokens);
-            }
-            if let Some(tokens) = struct_native_marshaler_tokens(item) {
+            if let Some(tokens) = struct_native_marshaler_tokens(item, &items_by_type_id) {
                 conversions.push(tokens);
             }
         }
@@ -1048,49 +1049,14 @@ fn enum_underlying_rust_type(scalar: ScalarType) -> proc_macro2::TokenStream {
     }
 }
 
-fn enum_native_marshaler_tokens(item: &SerializeCodegenItem) -> Option<proc_macro2::TokenStream> {
-    if item.kind != SerializeCodegenItemKind::Enum {
-        return None;
-    }
-    let underlying = enum_underlying_scalar(item)?;
-    let (min, max) = enum_value_range(item)?;
-    if min < 0 {
-        return None;
-    }
-
-    let enum_ident = format_ident!("{}", rust_type_ident(&item.source_name));
-    let underlying_ty = enum_underlying_rust_type(underlying);
-    let min_u64 = u64::try_from(min).ok()?;
-    let max_u64 = u64::try_from(max).ok()?;
-
-    Some(quote! {
-        impl ::nw_network::serialize::Marshaler for ::nw_network::source::#enum_ident {
-            const MARSHAL_SIZE: usize =
-                <#underlying_ty as ::nw_network::serialize::Marshaler>::MARSHAL_SIZE;
-
-            fn marshal(&self, wb: &mut ::nw_network::serialize::WriteBuffer) {
-                let raw = #underlying_ty::from(*self);
-                ::nw_network::serialize::Marshaler::marshal(&raw, wb);
-            }
-
-            fn unmarshal(
-                rb: &mut ::nw_network::serialize::ReadBuffer,
-            ) -> Result<Self, ::nw_network::serialize::MarshalerError> {
-                let raw = <#underlying_ty as ::nw_network::serialize::Marshaler>::unmarshal(rb)?;
-                Self::try_from(raw).map_err(|_| {
-                    ::nw_network::serialize::MarshalerError::InvalidRange {
-                        value: u64::try_from(raw).unwrap_or(0),
-                        min: #min_u64,
-                        max: #max_u64,
-                    }
-                })
-            }
-        }
-    })
-}
-
-fn struct_native_marshaler_tokens(item: &SerializeCodegenItem) -> Option<proc_macro2::TokenStream> {
-    if item.kind != SerializeCodegenItemKind::Struct || item.is_abstract == Some(true) {
+fn struct_native_marshaler_tokens(
+    item: &SerializeCodegenItem,
+    items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+) -> Option<proc_macro2::TokenStream> {
+    if item.kind != SerializeCodegenItemKind::Struct
+        || item.is_abstract == Some(true)
+        || item.fields.is_empty()
+    {
         return None;
     }
 
@@ -1098,27 +1064,87 @@ fn struct_native_marshaler_tokens(item: &SerializeCodegenItem) -> Option<proc_ma
     let fields = item
         .fields
         .iter()
-        .map(|field| format_ident!("{}", rust_field_ident(&field.source_name)))
-        .collect::<Vec<_>>();
+        .map(|field| struct_marshaler_field_tokens(field, items_by_type_id))
+        .collect::<Option<Vec<_>>>()?;
+    let marshal_fields = fields.iter().map(|field| &field.marshal);
+    let unmarshal_fields = fields.iter().map(|field| &field.unmarshal);
 
     Some(quote! {
         impl ::nw_network::serialize::Marshaler for ::nw_network::source::#struct_ident {
             fn marshal(&self, wb: &mut ::nw_network::serialize::WriteBuffer) {
-                #(
-                    ::nw_network::serialize::Marshaler::marshal(&self.#fields, wb);
-                )*
+                #(#marshal_fields)*
             }
 
             fn unmarshal(
                 rb: &mut ::nw_network::serialize::ReadBuffer,
             ) -> Result<Self, ::nw_network::serialize::MarshalerError> {
                 Ok(Self {
-                    #(
-                        #fields: ::nw_network::serialize::Marshaler::unmarshal(rb)?,
-                    )*
+                    #(#unmarshal_fields)*
                 })
             }
         }
+    })
+}
+
+struct StructMarshalerFieldTokens {
+    marshal: proc_macro2::TokenStream,
+    unmarshal: proc_macro2::TokenStream,
+}
+
+fn struct_marshaler_field_tokens(
+    field: &crate::ir::SerializeCodegenField,
+    items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+) -> Option<StructMarshalerFieldTokens> {
+    let field_ident = format_ident!("{}", rust_field_ident(&field.source_name));
+    if let ResolvedType::Named { type_id, .. } = &field.resolved_type
+        && let Some(enum_item) = items_by_type_id.get(type_id)
+        && enum_item.kind == SerializeCodegenItemKind::Enum
+    {
+        return struct_enum_field_marshaler_tokens(&field_ident, enum_item);
+    }
+
+    Some(StructMarshalerFieldTokens {
+        marshal: quote! {
+            ::nw_network::serialize::Marshaler::marshal(&self.#field_ident, wb);
+        },
+        unmarshal: quote! {
+            #field_ident: ::nw_network::serialize::Marshaler::unmarshal(rb)?,
+        },
+    })
+}
+
+fn struct_enum_field_marshaler_tokens(
+    field_ident: &proc_macro2::Ident,
+    enum_item: &SerializeCodegenItem,
+) -> Option<StructMarshalerFieldTokens> {
+    let underlying = enum_underlying_scalar(enum_item)?;
+    let (min, max) = enum_value_range(enum_item)?;
+    if min < 0 {
+        return None;
+    }
+    let enum_ident = format_ident!("{}", rust_type_ident(&enum_item.source_name));
+    let enum_type = quote!(::nw_network::source::#enum_ident);
+    let underlying_ty = enum_underlying_rust_type(underlying);
+    let min_u64 = u64::try_from(min).ok()?;
+    let max_u64 = u64::try_from(max).ok()?;
+
+    Some(StructMarshalerFieldTokens {
+        marshal: quote! {
+            let raw = #underlying_ty::from(self.#field_ident);
+            ::nw_network::serialize::Marshaler::marshal(&raw, wb);
+        },
+        unmarshal: quote! {
+            #field_ident: {
+                let raw = <#underlying_ty as ::nw_network::serialize::Marshaler>::unmarshal(rb)?;
+                <#enum_type as ::core::convert::TryFrom<#underlying_ty>>::try_from(raw).map_err(|_| {
+                    ::nw_network::serialize::MarshalerError::InvalidRange {
+                        value: u64::try_from(raw).unwrap_or(0),
+                        min: #min_u64,
+                        max: #max_u64,
+                    }
+                })?
+            },
+        },
     })
 }
 
@@ -6665,10 +6691,7 @@ mod tests {
         let output =
             NetworkRustEmitter::emit_marshaler_conversions([&item]).expect("conversion source");
 
-        assert_eq!(output.report.marshaler_conversion_count, 4);
-        assert!(output.source.contains(
-            "impl ::nw_network::serialize::Marshaler for ::nw_network::source::GridSides"
-        ));
+        assert_eq!(output.report.marshaler_conversion_count, 3);
         assert!(
             output
                 .source
