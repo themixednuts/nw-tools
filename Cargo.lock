@@ -1714,6 +1714,7 @@ name = "nw-objectstream"
 version = "0.1.0"
 dependencies = [
  "arcstr",
+ "arrayvec",
  "crc32fast",
  "hex",
  "nw-asset",
@@ -1767,6 +1768,8 @@ dependencies = [
  "syn",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
  "treesitter-types-cpp",
  "treesitter-types-go",
  "uuid",
@@ -1789,6 +1792,7 @@ dependencies = [
  "frizbee",
  "humansize",
  "image",
+ "memchr",
  "nw-asset",
  "nw-datasheet",
  "nw-dds",

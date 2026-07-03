@@ -1079,14 +1079,10 @@ fn az_uuid_expr(type_id: uuid::Uuid) -> TokenStream {
 }
 
 fn uuid_u128_literal(type_id: uuid::Uuid) -> LitInt {
-    let hex = format!("{:032X}", type_id.as_u128());
-    let grouped = hex
-        .as_bytes()
-        .chunks(4)
-        .map(|chunk| std::str::from_utf8(chunk).expect("hex group is ASCII"))
-        .collect::<Vec<_>>()
-        .join("_");
-    LitInt::new(&format!("0x{grouped}"), Span::call_site())
+    LitInt::new(
+        &crate::uuid_format::uuid_u128_literal_text(type_id),
+        Span::call_site(),
+    )
 }
 
 fn reflect_attr_for_item(item: &RustItemPlan) -> TokenStream {
@@ -3002,6 +2998,8 @@ mod tests {
         assert!(source.contains("impl AzRtti for TargetComponent"));
         assert!(source.contains("const NAME: &'static str = \"Example::TargetComponent\""));
         assert!(source.contains("const TYPE_ID: AzUuid = AzUuid::from_u128"));
+        assert!(source.contains("0xBBBBBBBB_BBBB_BBBB_BBBB_BBBBBBBBBBBB"));
+        assert!(!source.contains("0xBBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB"));
         assert!(source.contains("const BASE_TYPE_IDS: &'static [AzUuid]"));
         syn::parse_file(&source).expect("source should be parseable Rust");
     }

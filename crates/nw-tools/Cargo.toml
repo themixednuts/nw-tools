@@ -17,6 +17,7 @@ cry-chunk.workspace = true
 crossbeam-channel.workspace = true
 crossterm.workspace = true
 humansize.workspace = true
+memchr.workspace = true
 nw-asset = { workspace = true, features = ["oodle"] }
 nw-datasheet.workspace = true
 nw-dds.workspace = true

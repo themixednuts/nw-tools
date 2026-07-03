@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
@@ -9,7 +10,8 @@ use nw_objectstream::lookup::NameLookup;
 
 use crate::jobs::{JobArgs, RunCtx};
 use crate::support::{
-    MatchMode, PathSelector, collect_matching, load_lookup, path_ext, write_guarded,
+    MatchMode, PathSelector, collect_matching, contains_ascii_case_insensitive, load_lookup,
+    path_ext, write_guarded,
 };
 use crate::ui::{Cell, Report, Table};
 
@@ -269,8 +271,9 @@ fn convert_objectstream(
     else {
         return Ok(None);
     };
-    let converted = nw_objectstream::ObjectStream::transcode_bytes(&payload, encoding, lookup)
-        .with_context(|| format!("convert {}", path.display()))?;
+    let converted =
+        nw_objectstream::ObjectStream::transcode_bytes(payload.as_ref(), encoding, lookup)
+            .with_context(|| format!("convert {}", path.display()))?;
     let output = objectstream_output_path(root, path, out, encoding);
     write_guarded(&output, &converted, overwrite.into())?;
 
@@ -299,16 +302,16 @@ fn scan_objectstream(
     let source = path.display().to_string();
     if let Some(query) = query {
         let needle = query.to_ascii_lowercase();
-        let mut search = match_mode.is_fuzzy().then(|| crate::fuzzy::Search::new(query));
+        let mut search = match_mode
+            .is_fuzzy()
+            .then(|| crate::fuzzy::Search::new(query));
         let hits =
-            nw_objectstream::query::collect_search_matches(
-                &bytes,
-                lookup,
-                |value| match &mut search {
+            nw_objectstream::query::collect_search_matches(bytes.as_ref(), lookup, |value| {
+                match &mut search {
                     Some(search) => search.score(value).map(u32::from),
-                    None => value.to_ascii_lowercase().contains(&needle).then_some(1),
-                },
-            )
+                    None => contains_ascii_case_insensitive(value, &needle).then_some(1),
+                }
+            })
             .with_context(|| format!("search {}", path.display()))?;
         let mut hits = hits
             .into_iter()
@@ -333,7 +336,7 @@ fn scan_objectstream(
 
     match mode {
         ObjectMode::Stats => {
-            let stats = nw_objectstream::stats::Stats::from_bytes(&bytes, lookup)
+            let stats = nw_objectstream::stats::Stats::from_bytes(bytes.as_ref(), lookup)
                 .with_context(|| format!("inspect {}", path.display()))?;
             Ok(Some(ObjectScan::Stats(ObjectStatsScan {
                 source,
@@ -342,7 +345,7 @@ fn scan_objectstream(
             })))
         }
         ObjectMode::Dom { limit } => {
-            let stream = nw_objectstream::ObjectStream::from_bytes(&bytes, lookup)
+            let stream = nw_objectstream::ObjectStream::from_bytes(bytes.as_ref(), lookup)
                 .with_context(|| format!("parse {}", path.display()))?;
             Ok(Some(ObjectScan::Dom(object_dom_scan(
                 source, &stream, limit,
@@ -386,7 +389,7 @@ fn open_objectstream_tree(path: &Path, lookup: Option<&NameLookup>) -> Result<()
     else {
         bail!("{} is not an ObjectStream payload", path.display());
     };
-    let stream = nw_objectstream::ObjectStream::from_bytes(&bytes, lookup)
+    let stream = nw_objectstream::ObjectStream::from_bytes(bytes.as_ref(), lookup)
         .with_context(|| format!("parse {}", path.display()))?;
     let mut nodes = Vec::new();
     collect_tree_nodes(stream.elements(), 0, &mut nodes);
@@ -603,9 +606,9 @@ fn path_selected(root: &Path, path: &Path, selector: &PathSelector) -> bool {
     selector.matches(&path.display().to_string())
 }
 
-fn objectstream_payload(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+fn objectstream_payload(bytes: &[u8]) -> Result<Option<Cow<'_, [u8]>>> {
     if nw_objectstream::looks_like_objectstream(bytes) {
-        return Ok(Some(bytes.to_vec()));
+        return Ok(Some(Cow::Borrowed(bytes)));
     }
 
     if !nw_pak::azcs::is_azcs(bytes) {
@@ -614,9 +617,14 @@ fn objectstream_payload(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
 
     let mut cursor = Cursor::new(bytes);
     let mut reader = nw_pak::azcs::decompress(&mut cursor)?;
-    let mut decoded = Vec::new();
+    let mut decoded = Vec::with_capacity(azcs_uncompressed_size(bytes).unwrap_or_default());
     reader.read_to_end(&mut decoded)?;
-    Ok(nw_objectstream::looks_like_objectstream(&decoded).then_some(decoded))
+    Ok(nw_objectstream::looks_like_objectstream(&decoded).then_some(Cow::Owned(decoded)))
+}
+
+fn azcs_uncompressed_size(bytes: &[u8]) -> Option<usize> {
+    nw_pak::azcs::AzcsHeader::peek(bytes)
+        .and_then(|header| usize::try_from(header.uncompressed_size).ok())
 }
 
 fn object_source(scan: &ObjectScan) -> &str {
@@ -664,5 +672,14 @@ mod tests {
             ),
             PathBuf::from("in/slices/player.slice.xml")
         );
+    }
+
+    #[test]
+    fn raw_objectstream_payload_is_borrowed() -> Result<()> {
+        let bytes = nw_objectstream::ObjectStream::new(3).to_bytes();
+        let payload = objectstream_payload(&bytes)?.expect("objectstream");
+
+        assert!(matches!(payload, Cow::Borrowed(_)));
+        Ok(())
     }
 }

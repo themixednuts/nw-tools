@@ -14,7 +14,7 @@ clap = { workspace = true, features = ["derive"] }
 gofmt = { workspace = true }
 heck = { workspace = true }
 nw-jobs = { workspace = true }
-nw-objectstream = { workspace = true }
+nw-objectstream.workspace = true
 oxc_allocator = { workspace = true }
 oxc_codegen = { workspace = true }
 oxc_parser = { workspace = true }
@@ -27,6 +27,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 syn = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 treesitter-types-go = { workspace = true }
 treesitter-types-cpp = { workspace = true }
 uuid = { workspace = true }

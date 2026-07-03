@@ -93,7 +93,14 @@ impl Model {
             .mtl
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok());
-        let stats = self.convert(&source, &cgf, &heap, &MeshRef::for_file(path), mtl_override, &out)?;
+        let stats = self.convert(
+            &source,
+            &cgf,
+            &heap,
+            &MeshRef::for_file(path),
+            mtl_override,
+            &out,
+        )?;
 
         Report::new("model")
             .stat("source", path.display())
@@ -121,7 +128,9 @@ impl Model {
                 progress.step(|| {
                     let source = Tree::around(path);
                     let relative = path.strip_prefix(dir).unwrap_or(path);
-                    let out = out_dir.join(relative).with_extension(self.format.extension());
+                    let out = out_dir
+                        .join(relative)
+                        .with_extension(self.format.extension());
                     guard_existing(&out, self.overwrite.into())?;
                     ensure_parent(&out)?;
                     let cgf = std::fs::read(path)?;
@@ -143,22 +152,20 @@ impl Model {
         }
         let out_dir = self.out.clone().unwrap_or_else(|| PathBuf::from("models"));
 
-        let batch = ctx.map_results_compact(
-            "model",
-            &meshes,
-            Clone::clone,
-            |key, progress| {
-                progress.step(|| {
-                    let out = out_dir.join(key).with_extension(self.format.extension());
-                    guard_existing(&out, self.overwrite.into())?;
-                    ensure_parent(&out)?;
-                    let cgf = source.read(key).with_context(|| format!("read {key}"))?;
-                    let heap = source.read(&format!("{key}heap")).unwrap_or_default();
-                    self.convert(&source, &cgf, &heap, &MeshRef::for_key(key), None, &out)
-                })
-            },
-        );
-        report_batch(&batch.into_completed(), install.assets().display().to_string())
+        let batch = ctx.map_results_compact("model", &meshes, Clone::clone, |key, progress| {
+            progress.step(|| {
+                let out = out_dir.join(key).with_extension(self.format.extension());
+                guard_existing(&out, self.overwrite.into())?;
+                ensure_parent(&out)?;
+                let cgf = source.read(key).with_context(|| format!("read {key}"))?;
+                let heap = source.read(&format!("{key}heap")).unwrap_or_default();
+                self.convert(&source, &cgf, &heap, &MeshRef::for_key(key), None, &out)
+            })
+        });
+        report_batch(
+            &batch.into_completed(),
+            install.assets().display().to_string(),
+        )
     }
 
     /// The shared conversion: assemble the model, resolve materials/textures via the
@@ -196,8 +203,9 @@ impl Model {
                     write_glb(out, &glb)?
                 }
                 (Some(set), Container::Gltf) => {
-                    let (json, blob) =
-                        nw_model::Gltf::new(&model).materials(set).to_gltf(&bin_uri(out), &mut load);
+                    let (json, blob) = nw_model::Gltf::new(&model)
+                        .materials(set)
+                        .to_gltf(&bin_uri(out), &mut load);
                     write_gltf(out, &json, &blob)?
                 }
                 (None, Container::Glb) => write_glb(out, &nw_model::Gltf::new(&model).to_glb())?,
@@ -238,7 +246,9 @@ fn first_material(
 ) -> Option<nw_model::MaterialSet> {
     keys.into_iter().find_map(|key| {
         let xml = source.read(&key)?;
-        String::from_utf8_lossy(&xml).parse::<nw_model::MaterialSet>().ok()
+        String::from_utf8_lossy(&xml)
+            .parse::<nw_model::MaterialSet>()
+            .ok()
     })
 }
 
@@ -314,10 +324,12 @@ fn cgf_submaterial_names(cgf: &[u8]) -> Vec<String> {
     cry_chunk::CgfFile::parse(cgf)
         .ok()
         .and_then(|file| {
-            file.materials()
-                .values()
-                .next()
-                .map(|mtl| mtl.sub_material_names.iter().map(|s| s.to_string()).collect())
+            file.materials().values().next().map(|mtl| {
+                mtl.sub_material_names
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            })
         })
         .unwrap_or_default()
 }
@@ -355,7 +367,10 @@ impl MeshRef {
     /// For a filesystem path: the `.mtl` is a sibling, so the directory is empty
     /// (the [`Tree`] source resolves siblings via its roots).
     fn for_file(path: &Path) -> Self {
-        let file = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         Self {
             dir: String::new(),
             stem: mesh_stem(file).to_string(),
@@ -495,9 +510,7 @@ fn is_mesh_file(path: &Path) -> bool {
 
 /// A mesh base name with the `_mesh`/`_lod0` suffix stripped, for `.mtl` matching.
 fn mesh_stem(file: &str) -> &str {
-    let stem = file
-        .rsplit_once('.')
-        .map_or(file, |(stem, _)| stem);
+    let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
     stem.strip_suffix("_mesh")
         .or_else(|| stem.strip_suffix("_lod0"))
         .unwrap_or(stem)
@@ -506,7 +519,9 @@ fn mesh_stem(file: &str) -> &str {
 /// Map an authored texture path (usually `.tif`) to its shipped `.dds`.
 fn tif_to_dds(file: &str) -> String {
     match file.rsplit_once('.') {
-        Some((stem, ext)) if ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff") => {
+        Some((stem, ext))
+            if ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff") =>
+        {
             format!("{stem}.dds")
         }
         _ => file.to_string(),

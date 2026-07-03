@@ -336,7 +336,11 @@ impl Builder {
             normal_texture,
             emissive_texture,
             emissive_factor,
-            alpha_mode: if sub.is_transparent() { "BLEND" } else { "OPAQUE" },
+            alpha_mode: if sub.is_transparent() {
+                "BLEND"
+            } else {
+                "OPAQUE"
+            },
             double_sided: false,
         };
         let material_index = self.materials.len();
@@ -346,10 +350,8 @@ impl Builder {
 
     fn accessor_positions(&mut self, data: &[Vec3]) -> usize {
         // glTF requires POSITION accessors to carry the bounding box.
-        let aabb = Aabb3d::from_point_cloud(
-            Isometry3d::IDENTITY,
-            data.iter().map(|v| Vec3A::from(*v)),
-        );
+        let aabb =
+            Aabb3d::from_point_cloud(Isometry3d::IDENTITY, data.iter().map(|v| Vec3A::from(*v)));
         let mut bytes = Vec::with_capacity(data.len() * 12);
         for v in data {
             for value in v.to_array() {
@@ -569,9 +571,10 @@ fn build(
                 .map(|uv| builder.accessor_vec2(uv));
             // JOINTS_0 and WEIGHTS_0 must come as a pair.
             let (joints_0, weights_0) = match (&primitive.joints, &primitive.weights) {
-                (Some(j), Some(w)) if j.len() == count && w.len() == count => {
-                    (Some(builder.accessor_joints(j)), Some(builder.accessor_weights(w)))
-                }
+                (Some(j), Some(w)) if j.len() == count && w.len() == count => (
+                    Some(builder.accessor_joints(j)),
+                    Some(builder.accessor_weights(w)),
+                ),
                 _ => (None, None),
             };
             let indices = builder.accessor_indices(&primitive.indices);

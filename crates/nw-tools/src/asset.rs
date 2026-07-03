@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use humansize::{DECIMAL, format_size};
-use nw_jobs::CancellationToken;
+use nw_jobs::{CancellationToken, JobRunner};
 use nw_objectstream::lookup::NameLookup;
 use nw_objectstream::{ObjectStream, ObjectStreamEncoding};
 use nw_pak::{Compression, EntryInfo, PakMmapReader, azcs, crypak, shape};
@@ -15,7 +15,8 @@ use crate::jobs::JobArgs;
 use crate::progress::Job;
 use crate::source::{self, CatalogIndex};
 use crate::support::{
-    AssetRootArg, GlobSet, MatchMode, PakSet, PathSelector, ScanIssues, load_lookup,
+    AssetRootArg, GlobSet, MatchMode, PakSet, PathSelector, ScanIssues,
+    contains_ascii_case_insensitive, load_lookup,
 };
 use crate::ui::{Cell, Report, Table, theme};
 
@@ -365,6 +366,13 @@ struct ObjectSearchOptions<'a> {
     lookup: Option<&'a NameLookup>,
     selector: &'a PathSelector,
     cancel: &'a CancellationToken,
+    runner: &'a JobRunner,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectSearchEntry {
+    index: usize,
+    name: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -464,29 +472,49 @@ impl SearchPath {
             let cancel = ctx.cancel.clone();
             let feed_bg = feed.clone();
             std::thread::spawn(move || {
-                let catalog = with_guid.then(|| source::catalog_index(&root).ok()).flatten();
+                let catalog = with_guid
+                    .then(|| source::catalog_index(&root).ok())
+                    .flatten();
                 runner.map(paks.paths(), |pak| {
                     if let Ok(hits) =
                         Self::scan_pak(&paks, pak, &query, catalog.as_ref(), &cancel, None)
                     {
-                        feed_bg
-                            .extend(hits.into_iter().map(|hit| path_hit_cells(hit, with_guid)).collect());
+                        feed_bg.extend(
+                            hits.into_iter()
+                                .map(|hit| path_hit_cells(hit, with_guid))
+                                .collect(),
+                        );
                     }
                     feed_bg.mark_done();
                 });
             });
-            return Ok(crate::tui::browse_streaming("asset search path", stats, template, 3, feed)?);
+            return Ok(crate::tui::browse_streaming(
+                "asset search path",
+                stats,
+                template,
+                3,
+                feed,
+            )?);
         }
 
         // Piped: scan fully, then print a static report.
-        let catalog = with_guid.then(|| source::catalog_index(&root).ok()).flatten();
+        let catalog = with_guid
+            .then(|| source::catalog_index(&root).ok())
+            .flatten();
         let cancel = ctx.cancel.clone();
         let batch = ctx.map_results(
             "path search",
             paks.paths(),
             |path| paks.relative(path),
             |path, progress| {
-                Self::scan_pak(&paks, path, &query, catalog.as_ref(), &cancel, Some(&progress))
+                Self::scan_pak(
+                    &paks,
+                    path,
+                    &query,
+                    catalog.as_ref(),
+                    &cancel,
+                    Some(&progress),
+                )
             },
         );
         let skipped = batch.skipped();
@@ -542,7 +570,9 @@ impl SearchPath {
             progress.set_len(pak.len());
         }
         let pak_name = paks.relative(path);
-        let mut search = query.is_fuzzy().then(|| crate::fuzzy::Search::new(&query.raw));
+        let mut search = query
+            .is_fuzzy()
+            .then(|| crate::fuzzy::Search::new(&query.raw));
         let mut rows = Vec::new();
 
         for entry in pak.entries() {
@@ -615,7 +645,9 @@ impl SearchObjectStream {
         let paks = PakSet::collect(root, self.paks)?;
         let lookup = load_lookup(self.no_names)?;
         let mode = if self.exact {
-            MatchMode::Substring { case_sensitive: false }
+            MatchMode::Substring {
+                case_sensitive: false,
+            }
         } else {
             MatchMode::Fuzzy
         };
@@ -630,8 +662,8 @@ impl SearchObjectStream {
                 ("archives".to_string(), paks.paths().len().to_string()),
                 ("names".to_string(), names_stat),
             ];
-            let template =
-                Table::new(["Pak", "Name", "AZCS", "Kind", "Count", "Score", "Value"]).right([4, 5]);
+            let template = Table::new(["Pak", "Name", "AZCS", "Kind", "Count", "Score", "Value"])
+                .right([4, 5]);
             let feed = crate::tui::RowFeed::new(paks.paths().len());
             let runner = ctx.runner.clone();
             let cancel = ctx.cancel.clone();
@@ -643,6 +675,7 @@ impl SearchObjectStream {
                     lookup: lookup.as_ref(),
                     selector: &selector,
                     cancel: &cancel,
+                    runner: &runner,
                 };
                 runner.map(paks.paths(), |pak| {
                     if let Ok(hits) = SearchObjectStream::scan_pak(&paks, pak, &options, None) {
@@ -668,6 +701,7 @@ impl SearchObjectStream {
             lookup: lookup.as_ref(),
             selector: &selector,
             cancel: &cancel,
+            runner: &ctx.runner,
         };
         let batch = ctx.map_results(
             "objectstream search",
@@ -729,56 +763,91 @@ impl SearchObjectStream {
             progress.set_len(pak.len());
         }
         let pak_name = paks.relative(path);
-        let mut search = options
-            .query
-            .is_fuzzy()
-            .then(|| crate::fuzzy::Search::new(&options.query.raw));
-        let mut rows = Vec::new();
-
+        let progress = progress.cloned();
+        let mut entries = Vec::new();
         for entry in pak.entries() {
-            if options.cancel.is_cancelled() {
-                break;
-            }
-            if let Some(progress) = progress {
-                progress.inc(1);
-            }
             if !options.selector.matches(entry.name()) {
+                if let Some(progress) = &progress {
+                    progress.inc(1);
+                }
                 continue;
             }
             if entry.uncompressed_size() > options.max_entry_size {
+                if let Some(progress) = &progress {
+                    progress.inc(1);
+                }
                 continue;
             }
-            let Some(payload) = ObjectPayload::read(&pak, entry)
-                .with_context(|| format!("read {} from {}", entry.name(), path.display()))?
-            else {
-                continue;
-            };
+            entries.push(ObjectSearchEntry {
+                index: entry.index(),
+                name: entry.name().to_string(),
+            });
+        }
 
-            let hits = nw_objectstream::query::collect_search_matches(
-                &payload.bytes,
-                options.lookup,
-                |value| match &mut search {
-                    Some(search) => search.score(value).map(u32::from),
-                    None => options.query.score(value),
-                },
-            )
-            .with_context(|| format!("search {} in {}", entry.name(), path.display()))?;
+        let batch = options.runner.map_init_until_cancelled(
+            &entries,
+            options.cancel,
+            || {
+                options
+                    .query
+                    .is_fuzzy()
+                    .then(|| crate::fuzzy::Search::new(&options.query.raw))
+            },
+            |search, entry| {
+                if let Some(progress) = &progress {
+                    progress.inc(1);
+                }
+                scan_objectstream_entry(&pak, &pak_name, path, options, search, entry)
+            },
+        );
 
-            for (hit, stats) in hits {
-                rows.push(ObjectHit {
-                    pak: pak_name.clone(),
-                    name: entry.name().to_string(),
-                    envelope: Value::yes_no(payload.envelope),
-                    kind: hit.kind.label().to_string(),
-                    count: stats.count,
-                    score: stats.score,
-                    value: Value::trim(hit.value),
-                });
+        let mut rows = Vec::new();
+        for result in batch.into_completed() {
+            match result {
+                Ok(mut hits) => rows.append(&mut hits),
+                Err(error) => return Err(error),
             }
         }
 
         Ok(rows)
     }
+}
+
+fn scan_objectstream_entry(
+    pak: &PakMmapReader,
+    pak_name: &str,
+    path: &Path,
+    options: &ObjectSearchOptions<'_>,
+    search: &mut Option<crate::fuzzy::Search>,
+    entry: &ObjectSearchEntry,
+) -> Result<Vec<ObjectHit>> {
+    let Some(payload) = ObjectPayload::read_by_index(pak, entry.index)
+        .with_context(|| format!("read {} from {}", entry.name, path.display()))?
+    else {
+        return Ok(Vec::new());
+    };
+
+    let hits =
+        nw_objectstream::query::collect_search_matches(&payload.bytes, options.lookup, |value| {
+            match search {
+                Some(search) => search.score(value).map(u32::from),
+                None => options.query.score(value),
+            }
+        })
+        .with_context(|| format!("search {} in {}", entry.name, path.display()))?;
+
+    Ok(hits
+        .into_iter()
+        .map(|(hit, stats)| ObjectHit {
+            pak: pak_name.to_string(),
+            name: entry.name.clone(),
+            envelope: Value::yes_no(payload.envelope),
+            kind: hit.kind.label().to_string(),
+            count: stats.count,
+            score: stats.score,
+            value: Value::trim(hit.value),
+        })
+        .collect())
 }
 
 impl Extract {
@@ -1240,8 +1309,7 @@ impl TextQuery {
     fn new(raw: String, mode: MatchMode) -> Self {
         Self {
             lowered: raw.to_ascii_lowercase(),
-            glob: matches!(mode, MatchMode::Glob)
-                .then(|| GlobSet::archive(vec![raw.clone()])),
+            glob: matches!(mode, MatchMode::Glob).then(|| GlobSet::archive(vec![raw.clone()])),
             raw,
             mode,
         }
@@ -1256,10 +1324,13 @@ impl TextQuery {
     fn matches(&self, value: &str) -> bool {
         match self.mode {
             MatchMode::Glob => self.glob.as_ref().is_some_and(|glob| glob.matches(value)),
-            MatchMode::Substring { case_sensitive: true } => value.contains(&self.raw),
-            MatchMode::Substring { case_sensitive: false } | MatchMode::Fuzzy => {
-                value.to_ascii_lowercase().contains(&self.lowered)
+            MatchMode::Substring {
+                case_sensitive: true,
+            } => value.contains(&self.raw),
+            MatchMode::Substring {
+                case_sensitive: false,
             }
+            | MatchMode::Fuzzy => contains_ascii_case_insensitive(value, &self.lowered),
         }
     }
 
@@ -1270,7 +1341,11 @@ impl TextQuery {
 
 impl ObjectPayload {
     fn read(pak: &PakMmapReader, entry: EntryInfo<'_>) -> Result<Option<Self>> {
-        let bytes = pak.read_wrapped_by_index(entry.index())?;
+        Self::read_by_index(pak, entry.index())
+    }
+
+    fn read_by_index(pak: &PakMmapReader, index: usize) -> Result<Option<Self>> {
+        let bytes = pak.read_wrapped_by_index(index)?;
         Self::from_wrapped(bytes)
     }
 
@@ -1287,9 +1362,10 @@ impl ObjectPayload {
             return Ok(None);
         }
 
+        let decoded_capacity = azcs_uncompressed_size(&bytes).unwrap_or_default();
         let mut cursor = Cursor::new(bytes);
         let mut reader = azcs::decompress(&mut cursor)?;
-        let mut decoded = Vec::new();
+        let mut decoded = Vec::with_capacity(decoded_capacity);
         reader.read_to_end(&mut decoded)?;
         Ok(
             nw_objectstream::sniff_encoding(&decoded).map(|encoding| Self {
@@ -1310,6 +1386,10 @@ impl ObjectPayload {
         }
         ObjectStream::transcode_bytes(&self.bytes, encoding, lookup)
     }
+}
+
+fn azcs_uncompressed_size(bytes: &[u8]) -> Option<usize> {
+    azcs::AzcsHeader::peek(bytes).and_then(|header| usize::try_from(header.uncompressed_size).ok())
 }
 
 #[derive(Debug, Clone)]
@@ -1453,10 +1533,18 @@ mod tests {
 
     #[test]
     fn path_query_supports_case_modes_and_globs() {
-        let insensitive =
-            TextQuery::new("Player".to_string(), MatchMode::Substring { case_sensitive: false });
-        let sensitive =
-            TextQuery::new("Player".to_string(), MatchMode::Substring { case_sensitive: true });
+        let insensitive = TextQuery::new(
+            "Player".to_string(),
+            MatchMode::Substring {
+                case_sensitive: false,
+            },
+        );
+        let sensitive = TextQuery::new(
+            "Player".to_string(),
+            MatchMode::Substring {
+                case_sensitive: true,
+            },
+        );
         let glob = TextQuery::new("*/player.*".to_string(), MatchMode::Glob);
 
         assert!(insensitive.matches("slices/player.slice"));

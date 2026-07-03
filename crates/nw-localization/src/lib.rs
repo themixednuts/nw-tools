@@ -1550,7 +1550,10 @@ pub fn localization_asset_path(language: &LanguageCode, file_name: &str) -> Stri
 #[must_use]
 pub fn datatable_localization_source(datatable: &Path, language: &LanguageCode) -> Option<String> {
     let stem = datatable.file_stem()?.to_str()?;
-    Some(localization_asset_path(language, &format!("{stem}.loc.xml")))
+    Some(localization_asset_path(
+        language,
+        &format!("{stem}.loc.xml"),
+    ))
 }
 
 #[must_use]
@@ -1827,7 +1830,10 @@ mod tests {
 
         // Warm hit — resolved from the seeded catalog, no I/O.
         assert_eq!(
-            localizer.resolve_label("@quest_x_title").expect("warm hit").text(),
+            localizer
+                .resolve_label("@quest_x_title")
+                .expect("warm hit")
+                .text(),
             "Hello"
         );
         // Miss — lazy load yields nothing from the empty store, and is cached.

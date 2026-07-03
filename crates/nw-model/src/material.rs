@@ -298,6 +298,9 @@ mod tests {
         let set = MaterialSet::from_str(SINGLE).unwrap();
         assert_eq!(set.sub_materials.len(), 1);
         assert_eq!(set.sub_materials[0].name, "solo");
-        assert_eq!(set.sub_materials[0].diffuse, glam::Vec4::new(1.0, 0.0, 0.0, 1.0));
+        assert_eq!(
+            set.sub_materials[0].diffuse,
+            glam::Vec4::new(1.0, 0.0, 0.0, 1.0)
+        );
     }
 }

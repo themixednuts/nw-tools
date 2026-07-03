@@ -141,7 +141,13 @@ impl CatalogSummary {
             CatalogInput::label,
             |input, progress| {
                 progress.step(|| {
-                    scan_catalog(&input.label(), &input.bytes()?, self.show, &[], MatchMode::Fuzzy)
+                    scan_catalog(
+                        &input.label(),
+                        &input.bytes()?,
+                        self.show,
+                        &[],
+                        MatchMode::Fuzzy,
+                    )
                 })
             },
         );
@@ -160,7 +166,8 @@ impl CatalogFind {
             &inputs,
             CatalogInput::label,
             |input, progress| {
-                progress.step(|| scan_catalog(&input.label(), &input.bytes()?, self.show, &find, mode))
+                progress
+                    .step(|| scan_catalog(&input.label(), &input.bytes()?, self.show, &find, mode))
             },
         );
         print_catalog_scans(batch, inputs.len(), "catalog find")
@@ -331,10 +338,12 @@ impl CatalogInput {
     /// `path` is omitted — the catalog read straight from the located install.
     fn collect(path: Option<&Path>) -> Result<Vec<Self>> {
         match path {
-            Some(path) => Ok(collect_matching(path, |p| nw_asset::is_asset_catalog_path(p))?
-                .into_iter()
-                .map(Self::File)
-                .collect()),
+            Some(path) => Ok(
+                collect_matching(path, |p| nw_asset::is_asset_catalog_path(p))?
+                    .into_iter()
+                    .map(Self::File)
+                    .collect(),
+            ),
             None => {
                 let install = crate::source::locate()?;
                 let (rasc, raoc) = crate::source::install_catalog_bytes(&install.assets())?;

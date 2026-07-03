@@ -84,7 +84,9 @@ impl SheetPicker {
             return;
         }
         let last = (self.view.len() - 1) as isize;
-        self.selected = (self.selected as isize).saturating_add(delta).clamp(0, last) as usize;
+        self.selected = (self.selected as isize)
+            .saturating_add(delta)
+            .clamp(0, last) as usize;
     }
 }
 
@@ -138,7 +140,9 @@ impl View for SheetPicker {
             KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
             KeyCode::PageDown => self.move_by(page),
             KeyCode::PageUp => self.move_by(-page),
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => self.move_by(page),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_by(page)
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.move_by(-page)
             }

@@ -57,23 +57,47 @@ impl SerializeContextCompiler {
         inputs: SerializeContextCompileInputs<'_>,
         context: &CodegenContext,
     ) -> CompileUnit {
-        let mut diagnostics = lint_document(&document);
-        let model = SerializeContextModel::from_document(&document);
-        let schema_graph = SchemaGraph::from_model(&model);
-        let field_owner_evidence = FieldOwnerEvidenceIndex::from_model(&model);
-        let codegen_unit = SerializeCodegenPlanner::plan_model(&model);
-        diagnostics.extend(schema_graph_diagnostics(&schema_graph));
-        diagnostics.extend(lint_codegen_unit(&codegen_unit));
-        let catalog = ReflectedTypeCatalog::from_model_with_inputs(
-            &model,
-            crate::catalog::ReflectedTypeCatalogInputs {
-                module_descriptors_root: inputs.module_descriptors_root,
-                serialize_porting_root: inputs.serialize_porting_root,
-                class_registration_trace_root: inputs.class_registration_trace_root,
-            },
-            context,
+        let (mut diagnostics, model) = context.runner().join(
+            || lint_document(&document),
+            || SerializeContextModel::from_document(&document),
         );
-        let native_symbols = NativeSymbolIndex::from_model(&model);
+        let ((schema_graph, field_owner_evidence), (codegen_unit, (catalog, native_symbols))) =
+            context.runner().join(
+                || {
+                    context.runner().join(
+                        || SchemaGraph::from_model(&model),
+                        || FieldOwnerEvidenceIndex::from_model(&model),
+                    )
+                },
+                || {
+                    context.runner().join(
+                        || SerializeCodegenPlanner::plan_model_with_context(&model, context),
+                        || {
+                            context.runner().join(
+                                || {
+                                    ReflectedTypeCatalog::from_model_with_inputs(
+                                        &model,
+                                        crate::catalog::ReflectedTypeCatalogInputs {
+                                            module_descriptors_root: inputs.module_descriptors_root,
+                                            serialize_porting_root: inputs.serialize_porting_root,
+                                            class_registration_trace_root: inputs
+                                                .class_registration_trace_root,
+                                        },
+                                        context,
+                                    )
+                                },
+                                || NativeSymbolIndex::from_model(&model),
+                            )
+                        },
+                    )
+                },
+            );
+        let (schema_graph_diagnostics, codegen_unit_diagnostics) = context.runner().join(
+            || schema_graph_diagnostics(&schema_graph),
+            || lint_codegen_unit(&codegen_unit),
+        );
+        diagnostics.extend(schema_graph_diagnostics);
+        diagnostics.extend(codegen_unit_diagnostics);
         CompileUnit {
             document,
             model,

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
+use memchr::{memchr, memchr2};
 use nw_filesystem::display_relative;
 use nw_objectstream::lookup::NameLookup;
 
@@ -53,8 +54,49 @@ impl PathSelector {
         let text_matches = self
             .text
             .as_ref()
-            .is_none_or(|text| path.to_ascii_lowercase().contains(text));
+            .is_none_or(|text| contains_ascii_case_insensitive(path, text));
         text_matches && (self.globs.is_empty() || self.globs.matches(path))
+    }
+}
+
+#[must_use]
+pub fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+
+    let haystack = haystack.as_bytes();
+    if needle.len() > haystack.len() {
+        return false;
+    }
+
+    let first_lower = needle[0].to_ascii_lowercase();
+    let first_upper = needle[0].to_ascii_uppercase();
+    let last_start = haystack.len() - needle.len();
+    let mut offset = 0;
+    while let Some(found) = find_ascii_first_byte(&haystack[offset..], first_lower, first_upper) {
+        let start = offset + found;
+        if start > last_start {
+            return false;
+        }
+        if haystack[start..start + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        {
+            return true;
+        }
+        offset = start + 1;
+    }
+    false
+}
+
+fn find_ascii_first_byte(haystack: &[u8], lower: u8, upper: u8) -> Option<usize> {
+    if lower == upper {
+        memchr(lower, haystack)
+    } else {
+        memchr2(lower, upper, haystack)
     }
 }
 
@@ -212,9 +254,13 @@ impl MatchMode {
         if glob {
             Self::Glob
         } else if case_sensitive {
-            Self::Substring { case_sensitive: true }
+            Self::Substring {
+                case_sensitive: true,
+            }
         } else if exact {
-            Self::Substring { case_sensitive: false }
+            Self::Substring {
+                case_sensitive: false,
+            }
         } else {
             Self::Fuzzy
         }
@@ -260,7 +306,10 @@ pub fn guard_existing(path: &Path, overwrite: Overwrite) -> Result<()> {
 ///
 /// Returns an error if the directory cannot be created.
 pub fn ensure_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     Ok(())
@@ -382,5 +431,19 @@ mod tests {
         assert!(selector.matches("slices/characters/player.slice"));
         assert!(!selector.matches("slices/characters/player.dds"));
         assert!(!selector.matches("slices/characters/npc.slice"));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_matches_without_allocating_lowercase_text() {
+        assert!(contains_ascii_case_insensitive(
+            "Slices/Characters/Player.slice",
+            "player"
+        ));
+        assert!(contains_ascii_case_insensitive("abc", ""));
+        assert!(!contains_ascii_case_insensitive("abc", "abcd"));
+        assert!(!contains_ascii_case_insensitive(
+            "slices/npc.slice",
+            "player"
+        ));
     }
 }

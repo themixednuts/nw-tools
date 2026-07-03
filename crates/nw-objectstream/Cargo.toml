@@ -15,6 +15,7 @@ default = ["oodle"]
 oodle = ["nw-asset/oodle"]
 
 [dependencies]
+arrayvec.workspace = true
 arcstr.workspace = true
 crc32fast.workspace = true
 hex.workspace = true

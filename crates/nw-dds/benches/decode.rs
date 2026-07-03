@@ -114,8 +114,12 @@ type Builder = dyn Fn(u32, u32) -> Vec<u8>;
 fn bench_decode(c: &mut Criterion) {
     let sizes = [512u32, 1024u32];
     let cases: &[(&str, &Builder)] = &[
-        ("bc1", &|w, h| four_cc_dds(*b"DXT1", w, h, &block_payload(w, h, 8))),
-        ("bc3", &|w, h| four_cc_dds(*b"DXT5", w, h, &block_payload(w, h, 16))),
+        ("bc1", &|w, h| {
+            four_cc_dds(*b"DXT1", w, h, &block_payload(w, h, 8))
+        }),
+        ("bc3", &|w, h| {
+            four_cc_dds(*b"DXT5", w, h, &block_payload(w, h, 16))
+        }),
         ("bc7", &|w, h| dx10_dds(98, w, h, &block_payload(w, h, 16))),
         ("rgba8", &|w, h| rgba8_dds(w, h, &rgba_payload(w, h))),
     ];

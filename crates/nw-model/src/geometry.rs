@@ -253,7 +253,11 @@ fn derive_normals_from_qtangents(
     let (data, stride, base): (&[u8], usize, usize) =
         if let Some(stream) = cgf.data_streams().get(&id) {
             let stride = stream.element_size;
-            (stream.data, stride, stride.checked_mul(subset.first_vertex)?)
+            (
+                stream.data,
+                stride,
+                stride.checked_mul(subset.first_vertex)?,
+            )
         } else if let Some(data_ref) = cgf.data_refs().get(&id) {
             let stride = data_ref.stride;
             (heap, stride, data_ref.offset + stride * subset.first_vertex)
@@ -301,7 +305,11 @@ fn read_bone_mapping(
     let (data, stride, base): (&[u8], usize, usize) =
         if let Some(stream) = cgf.data_streams().get(&id) {
             let stride = stream.element_size;
-            (stream.data, stride, stride.checked_mul(subset.first_vertex)?)
+            (
+                stream.data,
+                stride,
+                stride.checked_mul(subset.first_vertex)?,
+            )
         } else if let Some(data_ref) = cgf.data_refs().get(&id) {
             let stride = data_ref.stride;
             (heap, stride, data_ref.offset + stride * subset.first_vertex)
@@ -401,8 +409,16 @@ fn read_vec3_stream(
         for i in 0..count {
             let o = base + i * size;
             let raw = match size {
-                12 => [f32_at(stream.data, o)?, f32_at(stream.data, o + 4)?, f32_at(stream.data, o + 8)?],
-                8 => [half_at(stream.data, o)?, half_at(stream.data, o + 2)?, half_at(stream.data, o + 4)?],
+                12 => [
+                    f32_at(stream.data, o)?,
+                    f32_at(stream.data, o + 4)?,
+                    f32_at(stream.data, o + 8)?,
+                ],
+                8 => [
+                    half_at(stream.data, o)?,
+                    half_at(stream.data, o + 2)?,
+                    half_at(stream.data, o + 4)?,
+                ],
                 _ => return None,
             };
             push(&mut out, raw);
@@ -413,7 +429,11 @@ fn read_vec3_stream(
         for i in 0..count {
             let o = base + i * stride;
             let raw = match stride {
-                16 => [half_at(heap, o)?, half_at(heap, o + 2)?, half_at(heap, o + 4)?],
+                16 => [
+                    half_at(heap, o)?,
+                    half_at(heap, o + 2)?,
+                    half_at(heap, o + 4)?,
+                ],
                 24 => [f32_at(heap, o)?, f32_at(heap, o + 4)?, f32_at(heap, o + 8)?],
                 _ => return None,
             };
@@ -467,7 +487,12 @@ fn read_uv_stream(
 }
 
 /// Read the subset's index list, localized to its vertex range.
-fn read_indices(cgf: &CgfFile, mesh: &MeshChunk, subset: &MeshSubset, heap: &[u8]) -> Option<Vec<u32>> {
+fn read_indices(
+    cgf: &CgfFile,
+    mesh: &MeshChunk,
+    subset: &MeshSubset,
+    heap: &[u8],
+) -> Option<Vec<u32>> {
     let id = stream_id(mesh, KIND_INDICES)?;
     let count = subset.num_indices;
     let first_vertex = subset.first_vertex as u32;

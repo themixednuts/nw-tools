@@ -72,6 +72,9 @@ pub enum Error {
     #[error("DDS payload contains {actual} bytes, expected {expected}")]
     PayloadSize { expected: u64, actual: usize },
 
+    #[error("RGBA8 pixels contain {actual} bytes, expected {expected}")]
+    RgbaSize { expected: u64, actual: usize },
+
     #[error("DDS mip level {level} contains {actual} bytes, expected {expected}")]
     MipSize {
         level: u32,
@@ -117,6 +120,57 @@ impl Ktx2 {
         Ok(Self { bytes })
     }
 
+    /// Write a single-mip RGBA8 image to a KTX2 container.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if dimensions are zero, the RGBA8 byte count is not
+    /// exactly `width * height * 4`, or the resulting KTX2 indexes would
+    /// overflow.
+    pub fn from_rgba8(width: u32, height: u32, rgba: &[u8]) -> Result<Self, Error> {
+        if width == 0 {
+            return Err(Error::UnsupportedShape {
+                reason: "zero texture width",
+            });
+        }
+        if height == 0 {
+            return Err(Error::UnsupportedShape {
+                reason: "zero texture height",
+            });
+        }
+
+        let expected = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(Error::SizeOverflow {
+                what: "RGBA8 pixels",
+            })?;
+        if u64::try_from(rgba.len()).map_err(|_| Error::SizeOverflow {
+            what: "RGBA8 pixels",
+        })? != expected
+        {
+            return Err(Error::RgbaSize {
+                expected,
+                actual: rgba.len(),
+            });
+        }
+
+        let texture = Texture {
+            format: Format::plain(VK_FORMAT_R8G8B8A8_UNORM, 4, 1),
+            width,
+            height,
+            depth: 1,
+            pixel_height: height,
+            pixel_depth: 0,
+            layer_count: 0,
+            face_count: 1,
+            level_count: 1,
+        };
+        let levels = Levels { bytes: vec![rgba] };
+        let bytes = texture.write(&levels)?;
+        Ok(Self { bytes })
+    }
+
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -145,7 +199,10 @@ pub struct DecodedImage {
 ///
 /// Returns [`Error`] when the DDS is invalid, sidecars are missing/mismatched, or
 /// the encoded format cannot be decoded.
-pub fn decode_top_mip<'a>(bytes: &'a [u8], sidecars: &[Sidecar<'a>]) -> Result<DecodedImage, Error> {
+pub fn decode_top_mip<'a>(
+    bytes: &'a [u8],
+    sidecars: &[Sidecar<'a>],
+) -> Result<DecodedImage, Error> {
     let dds = Dds::parse(bytes)?;
     let texture = Texture::from_dds(&dds)?;
     let payload = dds.payload(bytes).ok_or(Error::PayloadSize {
@@ -153,9 +210,13 @@ pub fn decode_top_mip<'a>(bytes: &'a [u8], sidecars: &[Sidecar<'a>]) -> Result<D
         actual: bytes.len().saturating_sub(DDS_FILE_HEADER_LEN),
     })?;
     let levels = Levels::from_dds(&dds, texture, payload, sidecars)?;
-    let blocks = levels.bytes.first().copied().ok_or(Error::UnsupportedShape {
-        reason: "texture has no mip levels",
-    })?;
+    let blocks = levels
+        .bytes
+        .first()
+        .copied()
+        .ok_or(Error::UnsupportedShape {
+            reason: "texture has no mip levels",
+        })?;
     let width = texture.width.max(1);
     let height = texture.height.max(1);
     let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
@@ -259,7 +320,11 @@ pub fn decode_header_mip(bytes: &[u8]) -> Result<DecodedImage, Error> {
     let width = mip_extent(texture.width, level).max(1);
     let height = mip_extent(texture.height, level).max(1);
     let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
-    Ok(DecodedImage { width, height, rgba })
+    Ok(DecodedImage {
+        width,
+        height,
+        rgba,
+    })
 }
 
 /// Decode one mip sized to cover `max_dim` pixels on its longest edge (the
@@ -292,7 +357,11 @@ pub fn decode_mip_max(
     // Levels run largest (0) to smallest. Walk down while still >= max_dim, so we
     // land on the smallest mip that still covers the target (or level 0 if the
     // whole texture is smaller).
-    let dim_at = |level: u32| mip_extent(texture.width, level).max(mip_extent(texture.height, level)).max(1);
+    let dim_at = |level: u32| {
+        mip_extent(texture.width, level)
+            .max(mip_extent(texture.height, level))
+            .max(1)
+    };
     let mut target = 0u32;
     for level in 0..mipmaps as u32 {
         if dim_at(level) >= max_dim {
@@ -319,19 +388,32 @@ pub fn decode_mip_max(
             actual: bytes.len().saturating_sub(DDS_FILE_HEADER_LEN),
         })?;
         let chain = slice_chain(payload, &sizes[split_count..], split_count)?;
-        let blocks = *chain.get(target_usize - split_count).ok_or(Error::UnsupportedShape {
-            reason: "missing header mip",
-        })?;
+        let blocks = *chain
+            .get(target_usize - split_count)
+            .ok_or(Error::UnsupportedShape {
+                reason: "missing header mip",
+            })?;
         let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
-        Ok(DecodedImage { width, height, rgba })
+        Ok(DecodedImage {
+            width,
+            height,
+            rgba,
+        })
     } else {
         // Split mip — read just this one sidecar (index = split_count - level).
         let index = u32::try_from(split_count - target_usize).unwrap_or(u32::MAX);
-        let sidecar = fetch(SplitPart::Mip { index, alpha: false })
-            .ok_or(Error::MissingSidecar { index })?;
+        let sidecar = fetch(SplitPart::Mip {
+            index,
+            alpha: false,
+        })
+        .ok_or(Error::MissingSidecar { index })?;
         check_mip_size(target, sizes[target_usize], sidecar.len())?;
         let rgba = decode_rgba(texture.format.vk, &sidecar, width as usize, height as usize)?;
-        Ok(DecodedImage { width, height, rgba })
+        Ok(DecodedImage {
+            width,
+            height,
+            rgba,
+        })
     }
 }
 
@@ -341,8 +423,12 @@ fn decode_rgba(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<
     })?;
     let unsupported = || Error::UnsupportedVulkanFormat { vk_format: vk };
     match vk {
-        VK_FORMAT_R8G8B8A8_UNORM | VK_FORMAT_R8G8B8A8_SRGB => return plain_rgba(data, pixels, false),
-        VK_FORMAT_B8G8R8A8_UNORM | VK_FORMAT_B8G8R8A8_SRGB => return plain_rgba(data, pixels, true),
+        VK_FORMAT_R8G8B8A8_UNORM | VK_FORMAT_R8G8B8A8_SRGB => {
+            return plain_rgba(data, pixels, false);
+        }
+        VK_FORMAT_B8G8R8A8_UNORM | VK_FORMAT_B8G8R8A8_SRGB => {
+            return plain_rgba(data, pixels, true);
+        }
         // BC7 decodes via bcdec_rs: it writes RGBA bytes straight into the
         // output (no 0xAARRGGBB repack pass) and benches faster than
         // texture2ddecoder, with byte-identical output (verified by test).
@@ -1060,6 +1146,26 @@ mod tests {
     }
 
     #[test]
+    fn writes_valid_ktx2_from_rgba8() {
+        let rgba = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+
+        let ktx = Ktx2::from_rgba8(2, 2, &rgba).unwrap();
+        let reader = ktx2::Reader::new(ktx.bytes()).unwrap();
+        let levels = reader.levels().collect::<Vec<_>>();
+
+        assert_eq!(reader.header().pixel_width, 2);
+        assert_eq!(reader.header().pixel_height, 2);
+        assert_eq!(
+            reader.header().format.map(|format| format.value()),
+            Some(VK_FORMAT_R8G8B8A8_UNORM)
+        );
+        assert_eq!(reader.header().level_count, 1);
+        assert_eq!(levels[0].data, rgba);
+    }
+
+    #[test]
     fn writes_valid_ktx2_from_split_mips() {
         let mut header = dds_header(*b"DXT1", 8, 8, 3, 1);
         put_u32(
@@ -1157,7 +1263,12 @@ mod tests {
 
     /// Reference decode via texture2ddecoder + 0xAARRGGBB repack, matching the
     /// pre-bcdec_rs behaviour, so we can assert the new path is equivalent.
-    fn reference_rgba(decode: Texture2dDecode, data: &[u8], width: usize, height: usize) -> Vec<u8> {
+    fn reference_rgba(
+        decode: Texture2dDecode,
+        data: &[u8],
+        width: usize,
+        height: usize,
+    ) -> Vec<u8> {
         let mut out = vec![0u32; width * height];
         decode(data, width, height, &mut out).unwrap();
         let mut rgba = vec![0u8; width * height * 4];

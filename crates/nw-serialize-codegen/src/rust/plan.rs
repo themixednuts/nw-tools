@@ -140,7 +140,10 @@ impl RustCodegenPlanner {
 
     #[must_use]
     pub fn plan(&self, model: &SerializeContextModel, context: &CodegenContext) -> RustCodegenUnit {
-        self.plan_serialize_codegen_unit(&SerializeCodegenPlanner::plan_model(model), context)
+        self.plan_serialize_codegen_unit(
+            &SerializeCodegenPlanner::plan_model_with_context(model, context),
+            context,
+        )
     }
 
     #[must_use]

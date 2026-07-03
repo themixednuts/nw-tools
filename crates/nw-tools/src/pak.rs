@@ -310,7 +310,9 @@ impl List {
                     feed_bg.mark_done();
                 });
             });
-            return Ok(crate::tui::browse_streaming("pak list", stats, template, 5, feed)?);
+            return Ok(crate::tui::browse_streaming(
+                "pak list", stats, template, 5, feed,
+            )?);
         }
 
         // Piped / non-interactive: scan fully, then print a static report.

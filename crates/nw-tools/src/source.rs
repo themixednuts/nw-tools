@@ -43,10 +43,18 @@ pub fn install_catalog_bytes(assets: &Path) -> Result<(Vec<u8>, Option<Vec<u8>>)
     let engine = assets.join("Engine.pak");
     let reader =
         PakMmapReader::open(&engine).with_context(|| format!("open {}", engine.display()))?;
-    let rasc = reader.read_wrapped(nw_asset::ASSET_CATALOG_PATH).with_context(|| {
-        format!("{} not found in {}", nw_asset::ASSET_CATALOG_PATH, engine.display())
-    })?;
-    let raoc = reader.read_wrapped(nw_asset::ASSET_CATALOG_OPTIMIZED_PATH).ok();
+    let rasc = reader
+        .read_wrapped(nw_asset::ASSET_CATALOG_PATH)
+        .with_context(|| {
+            format!(
+                "{} not found in {}",
+                nw_asset::ASSET_CATALOG_PATH,
+                engine.display()
+            )
+        })?;
+    let raoc = reader
+        .read_wrapped(nw_asset::ASSET_CATALOG_OPTIMIZED_PATH)
+        .ok();
     Ok((rasc, raoc))
 }
 
@@ -61,11 +69,7 @@ impl Toc {
     /// Enumerate every pak's entries in parallel, keeping those whose (lowercased)
     /// name satisfies `keep`. On duplicate names the last archive wins.
     #[must_use]
-    pub fn build(
-        ctx: &RunCtx,
-        pak_paths: &[PathBuf],
-        keep: impl Fn(&str) -> bool + Sync,
-    ) -> Self {
+    pub fn build(ctx: &RunCtx, pak_paths: &[PathBuf], keep: impl Fn(&str) -> bool + Sync) -> Self {
         let per_pak = ctx.runner.map(pak_paths, |path| {
             let mut found = Vec::new();
             if let Ok(reader) = PakMmapReader::open(path) {
@@ -117,7 +121,11 @@ impl Toc {
                 key.rsplit_once('.')
                     .is_some_and(|(_, ext)| extensions.contains(&ext))
             })
-            .filter(|key| filter.as_ref().is_none_or(|needle| key.contains(needle.as_str())))
+            .filter(|key| {
+                filter
+                    .as_ref()
+                    .is_none_or(|needle| key.contains(needle.as_str()))
+            })
             .map(str::to_string)
             .collect::<Vec<_>>();
         paths.sort();
@@ -189,7 +197,12 @@ impl CatalogIndex {
         let by_path = records
             .into_iter()
             .map(|record| {
-                (record.path.to_ascii_lowercase(), AssetInfo { asset_id: record.asset_id })
+                (
+                    record.path.to_ascii_lowercase(),
+                    AssetInfo {
+                        asset_id: record.asset_id,
+                    },
+                )
             })
             .collect();
         Self { by_path }
@@ -209,7 +222,9 @@ impl CatalogIndex {
 ///
 /// Returns an error if `Engine.pak` cannot be read or the catalog cannot be parsed.
 pub fn catalog_index(assets: &Path) -> Result<CatalogIndex> {
-    Ok(CatalogIndex::from_records(ensure_catalog_cache(assets)?.catalog_records()))
+    Ok(CatalogIndex::from_records(
+        ensure_catalog_cache(assets)?.catalog_records(),
+    ))
 }
 
 /// Ensure the RASC catalog cache is current for `assets`, rebuilding it from
@@ -221,8 +236,8 @@ pub fn catalog_index(assets: &Path) -> Result<CatalogIndex> {
 fn ensure_catalog_cache(assets: &Path) -> Result<Cache> {
     // The leading version forces a rebuild when the cached projection's shape
     // changes, even if Engine.pak itself is unchanged.
-    let fingerprint = crate::cache::file_fingerprint(&assets.join("Engine.pak"))
-        .map(|fp| format!("v2:{fp}"));
+    let fingerprint =
+        crate::cache::file_fingerprint(&assets.join("Engine.pak")).map(|fp| format!("v2:{fp}"));
     let db_path = crate::cache::default_path();
 
     // Fast path: reuse the cache while Engine.pak is unchanged.

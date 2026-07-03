@@ -114,7 +114,10 @@ impl fmt::Debug for Caches {
 impl Caches {
     /// Get the cached reader for `path`, opening (and caching) it on first use.
     fn reader(&self, path: &Path) -> Result<Arc<PakMmapReader>, nw_pak::PakError> {
-        let mut readers = self.readers.lock().unwrap_or_else(|error| error.into_inner());
+        let mut readers = self
+            .readers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(reader) = readers.get(path) {
             return Ok(reader.clone());
         }
@@ -244,12 +247,13 @@ impl AssetStore {
         if let Some(pak) = self.caches.indexed(&normalized)
             && let Some(entry) = pak.entry(asset.path())
         {
-            return pak.read_wrapped_by_index(entry.index()).map(Some).map_err(
-                |source| AssetStoreError::Pak {
+            return pak
+                .read_wrapped_by_index(entry.index())
+                .map(Some)
+                .map_err(|source| AssetStoreError::Pak {
                     path: self.root.clone(),
                     source,
-                },
-            );
+                });
         }
 
         for pak_path in &self.paks {
@@ -278,10 +282,7 @@ impl AssetStore {
     /// that holds each asset. Lets a caller that has already opened the relevant
     /// paks (e.g. during a discovery sweep) make subsequent reads O(1) and avoid
     /// re-opening any pak. Keys are normalized to match [`AssetStore::read`].
-    pub fn seed_paths(
-        &self,
-        entries: impl IntoIterator<Item = (String, Arc<PakMmapReader>)>,
-    ) {
+    pub fn seed_paths(&self, entries: impl IntoIterator<Item = (String, Arc<PakMmapReader>)>) {
         let mut by_path = self
             .caches
             .by_path

@@ -1,14 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::CodegenContext;
 use crate::ir::{
     SerializeCodegenIndex, SerializeCodegenItem, SerializeCodegenItemKind, SerializeCodegenUnit,
 };
 use crate::role::ReflectedTypeRole;
+use crate::types::{ResolvedType, ScalarType};
 
 pub const NETWORK_SCHEMA_VERSION: &str = "newworld.network_schema.v1";
 pub const NETWORK_STATIC_REPORT_SCHEMA_VERSION: &str = "newworld.network_schema.static.v1";
@@ -32,6 +34,8 @@ pub struct NetworkSchema {
     pub sources: Vec<NetworkSchemaSource>,
     pub summary: NetworkSchemaSummary,
     pub types: Vec<NetworkType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub serialize_types: Vec<NetworkSerializeType>,
     pub field_registration_functions: Vec<NetworkFieldRegistrationFunction>,
     #[serde(default)]
     pub field_handler_vtables: Vec<NetworkFieldHandlerVtable>,
@@ -51,6 +55,8 @@ pub struct NetworkSchemaSummary {
     #[serde(default)]
     pub message_unmarshal_field_count: usize,
     pub type_index_evidence_count: usize,
+    #[serde(default)]
+    pub serialize_source_type_count: usize,
     pub serialize_type_count: usize,
     #[serde(default)]
     pub serialize_field_type_count: usize,
@@ -225,6 +231,8 @@ pub struct NetworkSerializeType {
     pub field_count: usize,
     pub variant_count: usize,
     pub direct_dependency_type_ids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wire_shapes: Vec<NetworkWireScalarShape>,
     pub is_abstract: Option<bool>,
     pub is_reflection_marker: bool,
 }
@@ -256,6 +264,8 @@ pub struct NetworkSerializeFieldType {
     pub role: NetworkSerializeRole,
     pub field_count: usize,
     pub variant_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wire_shapes: Vec<NetworkWireScalarShape>,
     pub source: String,
     pub confidence: NetworkConfidence,
 }
@@ -444,8 +454,88 @@ pub struct NetworkFieldHandlerVtable {
     pub wire_shape: Option<NetworkWireShape>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wire_shape_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_wire_shape: Option<NetworkWireShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_wire_shape: Option<NetworkWireShape>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delta_marshal_shapes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub full_marshal_shapes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_type_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_type_info_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_type_candidates: Vec<NetworkNativeTypeInfoEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_type_shape: Option<NetworkNestedTypeShape>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embedded_value_type_shapes: Vec<NetworkNestedTypeShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_shape: Option<NetworkReplicatedContainerShape>,
     pub slots: Vec<NetworkVirtualFunction>,
     pub evidence: Vec<NetworkEvidence>,
+}
+
+impl NetworkFieldHandlerVtable {
+    fn has_structured_container_value(&self) -> bool {
+        self.value_type_shape.is_some()
+            || replicated_container_data_shape_count(&self.full_marshal_shapes) > 2
+    }
+
+    fn should_suppress_replicated_container_wire_shape(&self) -> bool {
+        self.container_shape.as_ref().is_some_and(|shape| {
+            shape.storage != NetworkReplicatedContainerStorageKind::Map
+                || shape.value_wire_shapes.len() != 1
+        }) || self.has_structured_container_value()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkNativeTypeInfoEvidence {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkReplicatedContainerStorageKind {
+    Map,
+    Vec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkReplicatedContainerShape {
+    pub storage: NetworkReplicatedContainerStorageKind,
+    pub key_wire_shape: NetworkWireScalarShape,
+    pub value_wire_shapes: Vec<NetworkWireScalarShape>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delta_value_wire_shapes: Vec<NetworkWireScalarShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_type_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_type_info_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_type_shape: Option<NetworkNestedTypeShape>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embedded_value_type_shapes: Vec<NetworkNestedTypeShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,6 +563,26 @@ pub enum NetworkWireScalarShape {
     EntityRef,
     FixedBytes(u16),
     String,
+}
+
+impl Serialize for NetworkWireScalarShape {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.wire_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkWireScalarShape {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_network_wire_scalar_shape(&value)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown wire scalar shape `{value}`")))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -759,24 +869,53 @@ impl NetworkSchema {
     pub fn from_ghidra_static_network_report(
         report: &Value,
     ) -> Result<Self, NetworkSchemaImportError> {
+        Self::from_ghidra_static_network_report_with_context(report, &CodegenContext::inline())
+    }
+
+    pub fn from_ghidra_static_network_report_with_context(
+        report: &Value,
+        context: &CodegenContext,
+    ) -> Result<Self, NetworkSchemaImportError> {
         let root = report
             .as_object()
             .ok_or(NetworkSchemaImportError::ExpectedObjectRoot)?;
         if contains_private_source_evidence(report) {
             return Err(NetworkSchemaImportError::PrivateSourceEvidence);
         }
-        let types = array_values(root, "registryEntries")
+        let registry_entries = array_values(root, "registryEntries")
             .filter_map(Value::as_object)
-            .map(network_type_from_registry_entry)
             .collect::<Vec<_>>();
-        let field_registration_functions = array_values(root, "fieldRegistrationFunctions")
+        let field_registration_function_entries = array_values(root, "fieldRegistrationFunctions")
             .filter_map(Value::as_object)
-            .map(network_field_registration_function)
             .collect::<Vec<_>>();
-        let field_handler_vtables = array_values(root, "fieldHandlerVtables")
+        let field_handler_vtable_entries = array_values(root, "fieldHandlerVtables")
             .filter_map(Value::as_object)
-            .map(network_field_handler_vtable)
             .collect::<Vec<_>>();
+        let ((types, field_registration_functions), field_handler_vtables) = context.runner().join(
+            || {
+                context.runner().join(
+                    || {
+                        context.runner().map(&registry_entries, |entry| {
+                            network_type_from_registry_entry(entry)
+                        })
+                    },
+                    || {
+                        context
+                            .runner()
+                            .map(&field_registration_function_entries, |entry| {
+                                network_field_registration_function(entry)
+                            })
+                    },
+                )
+            },
+            || {
+                context
+                    .runner()
+                    .map(&field_handler_vtable_entries, |entry| {
+                        network_field_handler_vtable(entry)
+                    })
+            },
+        );
         let mut schema = Self {
             schema: NETWORK_SCHEMA_VERSION.to_owned(),
             sources: vec![NetworkSchemaSource {
@@ -788,11 +927,38 @@ impl NetworkSchema {
             }],
             summary: NetworkSchemaSummary::default(),
             types,
+            serialize_types: Vec::new(),
             field_registration_functions,
             field_handler_vtables,
         };
+        schema.suppress_under_shaped_container_wire_shapes();
         schema.summary = schema.build_summary();
         Ok(schema)
+    }
+
+    fn suppress_under_shaped_container_wire_shapes(&mut self) {
+        let structured_container_vtables = self
+            .field_handler_vtables
+            .iter()
+            .filter(|vtable| vtable.should_suppress_replicated_container_wire_shape())
+            .filter_map(|vtable| vtable.address.as_deref())
+            .collect::<BTreeSet<_>>();
+        if structured_container_vtables.is_empty() {
+            return;
+        }
+
+        for network_type in &mut self.types {
+            suppress_field_wire_shapes_for_vtables(
+                &mut network_type.fields,
+                &structured_container_vtables,
+            );
+        }
+        for function in &mut self.field_registration_functions {
+            suppress_field_wire_shapes_for_vtables(
+                &mut function.fields,
+                &structured_container_vtables,
+            );
+        }
     }
 
     pub fn merge_typeindex_root(
@@ -880,10 +1046,13 @@ impl NetworkSchema {
         let index = unit.index();
         let name_index = serialize_items_by_name(unit);
         let factory_index = serialize_items_by_factory(unit);
+        let selected_value_types =
+            selected_value_type_info_by_handler_vtable(&self.field_handler_vtables);
         let mut report = NetworkSerializeMergeReport {
             source_type_count: unit.items.len(),
             ..NetworkSerializeMergeReport::default()
         };
+        self.merge_serialize_type_index(unit, &index);
 
         for network_type in &mut self.types {
             let Some((item, confidence, source)) =
@@ -893,6 +1062,7 @@ impl NetworkSchema {
                     network_type,
                     &index,
                     &factory_index,
+                    &selected_value_types,
                     &mut report,
                 );
                 continue;
@@ -903,7 +1073,7 @@ impl NetworkSchema {
                 network_type.name_source = Some(source.clone());
                 report.filled_name_count += 1;
             }
-            network_type.serialize = Some(network_serialize_type(item));
+            network_type.serialize = Some(network_serialize_type(item, &index));
             network_type.evidence.push(NetworkEvidence {
                 kind: NetworkEvidenceKind::SerializeContext,
                 source,
@@ -915,6 +1085,7 @@ impl NetworkSchema {
                 network_type,
                 &index,
                 &factory_index,
+                &selected_value_types,
                 &mut report,
             );
         }
@@ -928,6 +1099,25 @@ impl NetworkSchema {
         });
         self.summary = self.build_summary();
         report
+    }
+
+    fn merge_serialize_type_index(
+        &mut self,
+        unit: &SerializeCodegenUnit,
+        index: &SerializeCodegenIndex<'_>,
+    ) {
+        let mut merged = self
+            .serialize_types
+            .iter()
+            .cloned()
+            .map(|serialize| (serialize.type_id, serialize))
+            .collect::<BTreeMap<_, _>>();
+        for item in &unit.items {
+            merged
+                .entry(item.source_type_id)
+                .or_insert_with(|| network_serialize_type(item, index));
+        }
+        self.serialize_types = merged.into_values().collect();
     }
 
     pub fn merge_message_signatures(
@@ -1191,6 +1381,7 @@ impl NetworkSchema {
                 .flat_map(|network_type| &network_type.evidence)
                 .filter(|evidence| evidence.kind == NetworkEvidenceKind::TypeIndex)
                 .count(),
+            serialize_source_type_count: self.serialize_types.len(),
             serialize_type_count: self
                 .types
                 .iter()
@@ -1435,6 +1626,7 @@ fn merge_field_serialize_types(
     network_type: &mut NetworkType,
     type_index: &SerializeCodegenIndex<'_>,
     factory_index: &BTreeMap<String, Vec<&SerializeCodegenItem>>,
+    selected_value_types: &BTreeMap<String, NetworkNativeTypeInfoEvidence>,
     report: &mut NetworkSerializeMergeReport,
 ) {
     for field in &mut network_type.fields {
@@ -1445,6 +1637,7 @@ fn merge_field_serialize_types(
             field,
             type_index,
             factory_index,
+            selected_value_types,
             report,
         ) else {
             continue;
@@ -1452,6 +1645,7 @@ fn merge_field_serialize_types(
         report.matched_field_type_count += 1;
         field.serialize = Some(network_serialize_field_type(
             item,
+            type_index,
             source.clone(),
             confidence,
         ));
@@ -1469,6 +1663,7 @@ fn serialize_field_match<'a>(
     field: &NetworkField,
     type_index: &'a SerializeCodegenIndex<'a>,
     factory_index: &'a BTreeMap<String, Vec<&'a SerializeCodegenItem>>,
+    selected_value_types: &BTreeMap<String, NetworkNativeTypeInfoEvidence>,
     report: &mut NetworkSerializeMergeReport,
 ) -> Option<(
     &'a SerializeCodegenItem,
@@ -1493,6 +1688,23 @@ fn serialize_field_match<'a>(
         ));
     }
 
+    if let Some(value_type) = field
+        .handler_vtable
+        .as_deref()
+        .and_then(|handler_vtable| selected_value_types.get(handler_vtable))
+        && let Some(type_id) = value_type.type_id
+        && !type_id.is_nil()
+        && let Some(item) = type_index.item_by_type_id(type_id)
+    {
+        report.field_type_id_matched_count += 1;
+        return Some((
+            item,
+            NetworkConfidence::High,
+            "serializeContext:handler-value-type-id".to_owned(),
+            value_type.address.clone(),
+        ));
+    }
+
     if let Some(factory) = field
         .nested_type_shape
         .as_ref()
@@ -1513,6 +1725,31 @@ fn serialize_field_match<'a>(
     }
 
     None
+}
+
+fn selected_value_type_info_by_handler_vtable(
+    vtables: &[NetworkFieldHandlerVtable],
+) -> BTreeMap<String, NetworkNativeTypeInfoEvidence> {
+    vtables
+        .iter()
+        .filter_map(|vtable| {
+            let address = vtable.address.clone()?;
+            let type_id = vtable
+                .value_type_id
+                .as_deref()
+                .and_then(|type_id| Uuid::parse_str(type_id.trim_matches(['{', '}'])).ok())?;
+            Some((
+                address,
+                NetworkNativeTypeInfoEvidence {
+                    address: vtable.value_type_info_address.clone(),
+                    name: vtable.value_type_name.clone(),
+                    type_id: Some(type_id),
+                    source: Some("selected-value-type-info".to_owned()),
+                    name_source: Some("selected-value-type-info".to_owned()),
+                },
+            ))
+        })
+        .collect()
 }
 
 fn message_signature_candidates(
@@ -1615,7 +1852,10 @@ fn should_replace_native_type_from_message_signature(
     )
 }
 
-fn network_serialize_type(item: &SerializeCodegenItem) -> NetworkSerializeType {
+fn network_serialize_type(
+    item: &SerializeCodegenItem,
+    index: &SerializeCodegenIndex<'_>,
+) -> NetworkSerializeType {
     let mut direct_dependency_type_ids = item
         .direct_dependency_type_ids()
         .into_iter()
@@ -1630,6 +1870,7 @@ fn network_serialize_type(item: &SerializeCodegenItem) -> NetworkSerializeType {
         field_count: item.fields.len(),
         variant_count: item.variants.len(),
         direct_dependency_type_ids,
+        wire_shapes: serialize_item_wire_shapes(item, index).unwrap_or_default(),
         is_abstract: item.is_abstract,
         is_reflection_marker: item.is_reflection_marker,
     }
@@ -1637,6 +1878,7 @@ fn network_serialize_type(item: &SerializeCodegenItem) -> NetworkSerializeType {
 
 fn network_serialize_field_type(
     item: &SerializeCodegenItem,
+    index: &SerializeCodegenIndex<'_>,
     source: String,
     confidence: NetworkConfidence,
 ) -> NetworkSerializeFieldType {
@@ -1647,8 +1889,104 @@ fn network_serialize_field_type(
         role: network_serialize_role(item.role),
         field_count: item.fields.len(),
         variant_count: item.variants.len(),
+        wire_shapes: serialize_item_wire_shapes(item, index).unwrap_or_default(),
         source,
         confidence,
+    }
+}
+
+fn serialize_item_wire_shapes(
+    item: &SerializeCodegenItem,
+    index: &SerializeCodegenIndex<'_>,
+) -> Option<Vec<NetworkWireScalarShape>> {
+    serialize_item_wire_shapes_with_seen(item, index, &mut BTreeSet::new())
+}
+
+fn serialize_item_wire_shapes_with_seen(
+    item: &SerializeCodegenItem,
+    index: &SerializeCodegenIndex<'_>,
+    seen: &mut BTreeSet<Uuid>,
+) -> Option<Vec<NetworkWireScalarShape>> {
+    if !seen.insert(item.source_type_id) {
+        return None;
+    }
+    match item.kind {
+        SerializeCodegenItemKind::Struct => {
+            let mut shapes = Vec::new();
+            for field in item.fields.iter().filter(|field| !field.is_base_class) {
+                shapes.extend(resolved_type_wire_shapes(
+                    &field.resolved_type,
+                    index,
+                    seen,
+                )?);
+            }
+            seen.remove(&item.source_type_id);
+            Some(shapes)
+        }
+        SerializeCodegenItemKind::Enum => {
+            let shapes = item
+                .enum_underlying_type
+                .as_ref()
+                .and_then(|underlying| resolved_type_wire_shapes(underlying, index, seen));
+            seen.remove(&item.source_type_id);
+            shapes
+        }
+    }
+}
+
+fn resolved_type_wire_shapes(
+    resolved: &ResolvedType,
+    index: &SerializeCodegenIndex<'_>,
+    seen: &mut BTreeSet<Uuid>,
+) -> Option<Vec<NetworkWireScalarShape>> {
+    match resolved {
+        ResolvedType::Scalar(scalar) => scalar_wire_shape(*scalar).map(|shape| vec![shape]),
+        ResolvedType::Named { type_id, .. } => {
+            let item = index.item_by_type_id(*type_id)?;
+            serialize_item_wire_shapes_with_seen(item, index, seen)
+        }
+        ResolvedType::RangedInteger { value, .. } => resolved_type_wire_shapes(value, index, seen),
+        ResolvedType::Tuple { elements } => {
+            let mut shapes = Vec::new();
+            for element in elements {
+                shapes.extend(resolved_type_wire_shapes(element, index, seen)?);
+            }
+            Some(shapes)
+        }
+        ResolvedType::Sequence { .. }
+        | ResolvedType::Map { .. }
+        | ResolvedType::Asset { .. }
+        | ResolvedType::Uid { .. }
+        | ResolvedType::ReplicatedField { .. }
+        | ResolvedType::ByteStream
+        | ResolvedType::Pair { .. }
+        | ResolvedType::Pointer { .. }
+        | ResolvedType::Optional { .. }
+        | ResolvedType::Unknown { .. } => None,
+    }
+}
+
+const fn scalar_wire_shape(scalar: ScalarType) -> Option<NetworkWireScalarShape> {
+    match scalar {
+        ScalarType::Char | ScalarType::SignedChar | ScalarType::I8 | ScalarType::U8 => {
+            Some(NetworkWireScalarShape::U8)
+        }
+        ScalarType::I16 | ScalarType::U16 => Some(NetworkWireScalarShape::U16),
+        ScalarType::I32 | ScalarType::U32 | ScalarType::Crc32 => Some(NetworkWireScalarShape::U32),
+        ScalarType::I64 | ScalarType::U64 | ScalarType::UnsignedLong | ScalarType::EntityId => {
+            Some(NetworkWireScalarShape::U64)
+        }
+        ScalarType::F32 => Some(NetworkWireScalarShape::F32),
+        ScalarType::F64 => Some(NetworkWireScalarShape::F64),
+        ScalarType::Bool => Some(NetworkWireScalarShape::Bool),
+        ScalarType::Uuid => Some(NetworkWireScalarShape::FixedBytes(16)),
+        ScalarType::Vector2 => Some(NetworkWireScalarShape::Vec2),
+        ScalarType::Vector3 => Some(NetworkWireScalarShape::Vec3),
+        ScalarType::Vector4 => Some(NetworkWireScalarShape::Vec4),
+        ScalarType::Quaternion => Some(NetworkWireScalarShape::Quat),
+        ScalarType::Transform => Some(NetworkWireScalarShape::Affine3),
+        ScalarType::String => Some(NetworkWireScalarShape::String),
+        ScalarType::AssetId | ScalarType::Color | ScalarType::ColorF | ScalarType::ColorB => None,
     }
 }
 
@@ -1993,6 +2331,24 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
     }
 }
 
+fn suppress_field_wire_shapes_for_vtables(fields: &mut [NetworkField], vtables: &BTreeSet<&str>) {
+    for field in fields {
+        let Some(handler_vtable) = field.handler_vtable.as_deref() else {
+            continue;
+        };
+        if !vtables.contains(handler_vtable) {
+            continue;
+        }
+        if field
+            .wire_shape
+            .is_some_and(NetworkWireShape::is_replicated_container)
+        {
+            field.wire_shape = None;
+            field.wire_shape_source = None;
+        }
+    }
+}
+
 fn network_field_unmarshal_evidence(
     field: &Map<String, Value>,
 ) -> Option<NetworkFieldUnmarshalEvidence> {
@@ -2007,7 +2363,11 @@ fn network_field_unmarshal_evidence(
 
 fn network_field_nested_type_shape(field: &Map<String, Value>) -> Option<NetworkNestedTypeShape> {
     let shape = field.get("nestedTypeShape")?.as_object()?;
-    Some(NetworkNestedTypeShape {
+    Some(network_nested_type_shape(shape))
+}
+
+fn network_nested_type_shape(shape: &Map<String, Value>) -> NetworkNestedTypeShape {
+    NetworkNestedTypeShape {
         type_id: uuid(shape, "typeId"),
         type_id_source: string(shape, "typeIdSource"),
         type_name: string(shape, "typeName"),
@@ -2035,7 +2395,7 @@ fn network_field_nested_type_shape(field: &Map<String, Value>) -> Option<Network
                     .collect()
             })
             .unwrap_or_default(),
-    })
+    }
 }
 
 fn network_nested_type_member(member: &Map<String, Value>) -> NetworkNestedTypeMember {
@@ -2138,7 +2498,7 @@ fn network_virtual_function(function: &Map<String, Value>) -> NetworkVirtualFunc
 
 fn network_field_handler_vtable(vtable: &Map<String, Value>) -> NetworkFieldHandlerVtable {
     let confidence = NetworkConfidence::High;
-    NetworkFieldHandlerVtable {
+    let mut result = NetworkFieldHandlerVtable {
         address: string(vtable, "address"),
         field_count: usize_value(vtable, "fieldCount").unwrap_or_default(),
         marshal: string(vtable, "marshal"),
@@ -2147,6 +2507,23 @@ fn network_field_handler_vtable(vtable: &Map<String, Value>) -> NetworkFieldHand
         unmarshal_target: string(vtable, "unmarshalTarget"),
         wire_shape: wire_shape(vtable, "wireShape"),
         wire_shape_source: string(vtable, "wireShapeSource"),
+        delta_wire_shape: wire_shape(vtable, "deltaWireShape"),
+        full_wire_shape: wire_shape(vtable, "fullWireShape"),
+        delta_marshal_shapes: string_array(vtable, "deltaMarshalShapes"),
+        full_marshal_shapes: string_array(vtable, "fullMarshalShapes"),
+        value_type_name: string(vtable, "valueTypeName"),
+        value_type_id: string(vtable, "valueTypeId"),
+        value_type_info_address: string(vtable, "valueTypeInfoAddress"),
+        value_type_candidates: native_type_info_candidates(vtable, "valueTypeInfoCandidates"),
+        value_type_shape: vtable
+            .get("valueTypeShape")
+            .and_then(Value::as_object)
+            .map(network_nested_type_shape),
+        embedded_value_type_shapes: array_values(vtable, "embeddedValueTypeShapes")
+            .filter_map(Value::as_object)
+            .map(network_nested_type_shape)
+            .collect(),
+        container_shape: None,
         slots: array_values(vtable, "slots")
             .filter_map(Value::as_object)
             .map(network_virtual_function)
@@ -2158,6 +2535,34 @@ fn network_field_handler_vtable(vtable: &Map<String, Value>) -> NetworkFieldHand
             detail: None,
             confidence,
         }],
+    };
+    result.container_shape = replicated_container_shape_from_vtable(&result);
+    if result.should_suppress_replicated_container_wire_shape() {
+        result.wire_shape = None;
+        result.wire_shape_source = None;
+        result.delta_wire_shape = None;
+        result.full_wire_shape = None;
+    }
+    result
+}
+
+fn native_type_info_candidates(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Vec<NetworkNativeTypeInfoEvidence> {
+    array_values(object, key)
+        .filter_map(Value::as_object)
+        .map(native_type_info_evidence)
+        .collect()
+}
+
+fn native_type_info_evidence(object: &Map<String, Value>) -> NetworkNativeTypeInfoEvidence {
+    NetworkNativeTypeInfoEvidence {
+        address: string(object, "address"),
+        name: string(object, "name"),
+        type_id: uuid(object, "typeId"),
+        source: string(object, "source"),
+        name_source: string(object, "nameSource"),
     }
 }
 
@@ -2318,6 +2723,15 @@ fn string(object: &Map<String, Value>, key: &str) -> Option<String> {
     string_ref(object, key).map(ToOwned::to_owned)
 }
 
+fn string_array(object: &Map<String, Value>, key: &str) -> Vec<String> {
+    array_values(object, key)
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn string_ref<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     object
         .get(key)
@@ -2395,6 +2809,337 @@ fn parse_replicated_container_wire_shape(
         key: parse_network_wire_scalar_shape(key.trim())?,
         value: parse_network_wire_scalar_shape(value.trim())?,
     })
+}
+
+fn replicated_container_shape_from_vtable(
+    vtable: &NetworkFieldHandlerVtable,
+) -> Option<NetworkReplicatedContainerShape> {
+    let full_values_with_counts =
+        replicated_container_full_value_scalar_shapes(&vtable.full_marshal_shapes);
+    let full_data = replicated_container_data_scalar_shapes(&vtable.full_marshal_shapes);
+    let delta_key = replicated_container_delta_key_shape(&vtable.delta_marshal_shapes);
+    let delta_value_shapes = replicated_container_delta_value_shapes(&vtable.delta_marshal_shapes);
+    let whole_value_shapes =
+        if selected_structured_container_value_shape_matches(vtable, &full_values_with_counts) {
+            full_values_with_counts.clone()
+        } else if selected_structured_container_value_shape_matches(vtable, &full_data) {
+            full_data.clone()
+        } else {
+            Vec::new()
+        };
+    let whole_value_is_structured = !whole_value_shapes.is_empty();
+    let (storage, key_wire_shape, value_wire_shapes, delta_value_wire_shapes, source) =
+        if (full_data.len() == 1 || whole_value_is_structured)
+            && delta_key.is_none_or(|delta_key| delta_key == NetworkWireScalarShape::VlqU64)
+            && delta_value_shapes.as_ref().is_none_or(|delta_values| {
+                delta_values.is_empty()
+                    || delta_values == &full_data
+                    || delta_values == &whole_value_shapes
+                    || whole_value_is_structured
+            })
+        {
+            let source = if delta_key.is_some() && delta_value_shapes.is_some() {
+                "replicated-container-vector-shape"
+            } else {
+                "replicated-container-vector-full-shape"
+            };
+            (
+                NetworkReplicatedContainerStorageKind::Vec,
+                NetworkWireScalarShape::VlqU64,
+                if whole_value_is_structured {
+                    whole_value_shapes
+                } else {
+                    full_data
+                },
+                delta_value_shapes.unwrap_or_default(),
+                source,
+            )
+        } else if full_data.len() >= 2 {
+            let key = full_data[0];
+            let values_with_counts = full_values_with_counts
+                .get(1..)
+                .map_or_else(Vec::new, <[_]>::to_vec);
+            let values =
+                if selected_structured_container_value_shape_matches(vtable, &values_with_counts) {
+                    values_with_counts
+                } else {
+                    full_data[1..].to_vec()
+                };
+            if delta_key.is_some_and(|delta_key| delta_key != key) {
+                return None;
+            }
+            let delta_shape_complete = delta_key.is_some() && delta_value_shapes.is_some();
+            let delta_values = delta_value_shapes.unwrap_or_default();
+            let delta_values_match = delta_shape_complete && delta_values == values;
+            if !delta_values_match && !has_selected_structured_container_value(vtable, values.len())
+            {
+                return None;
+            }
+            (
+                NetworkReplicatedContainerStorageKind::Map,
+                key,
+                values,
+                delta_values,
+                if delta_values_match {
+                    "replicated-container-map-shape"
+                } else {
+                    "replicated-container-map-full-shape"
+                },
+            )
+        } else {
+            return None;
+        };
+
+    Some(NetworkReplicatedContainerShape {
+        storage,
+        key_wire_shape,
+        value_wire_shapes,
+        delta_value_wire_shapes,
+        value_type_name: selected_structured_container_value_type_name(vtable),
+        value_type_id: selected_structured_container_value_type_id(vtable),
+        value_type_info_address: vtable.value_type_info_address.clone(),
+        value_type_shape: vtable.value_type_shape.clone(),
+        embedded_value_type_shapes: vtable.embedded_value_type_shapes.clone(),
+        source: Some(source.to_owned()),
+    })
+}
+
+fn has_selected_structured_container_value(
+    vtable: &NetworkFieldHandlerVtable,
+    value_shape_count: usize,
+) -> bool {
+    if !selected_structured_container_value_type_name(vtable)
+        .as_deref()
+        .is_some_and(|name| {
+            let name = name.trim();
+            !name.is_empty() && name != "unknown"
+        })
+        || !has_selected_structured_container_value_identity(vtable)
+    {
+        return false;
+    }
+
+    vtable.value_type_shape.as_ref().is_some_and(|shape| {
+        !shape.members.is_empty()
+            && (shape.members.len() == value_shape_count
+                || shape
+                    .validation
+                    .as_deref()
+                    .is_some_and(|validation| validation.contains("container-value-pcode")))
+    }) || value_shape_count > 1
+}
+
+fn selected_structured_container_value_type_name(
+    vtable: &NetworkFieldHandlerVtable,
+) -> Option<String> {
+    vtable
+        .value_type_name
+        .clone()
+        .or_else(|| vtable.value_type_shape.as_ref()?.type_name_full.clone())
+        .or_else(|| vtable.value_type_shape.as_ref()?.type_name.clone())
+}
+
+fn selected_structured_container_value_type_id(vtable: &NetworkFieldHandlerVtable) -> Option<Uuid> {
+    vtable
+        .value_type_id
+        .as_deref()
+        .and_then(|type_id| Uuid::parse_str(type_id.trim_matches(['{', '}'])).ok())
+        .or_else(|| vtable.value_type_shape.as_ref()?.type_id)
+}
+
+fn has_selected_structured_container_value_identity(vtable: &NetworkFieldHandlerVtable) -> bool {
+    selected_structured_container_value_type_id(vtable).is_some()
+        || vtable
+            .value_type_shape
+            .as_ref()
+            .is_some_and(is_validated_anonymous_container_value_shape)
+}
+
+fn is_validated_anonymous_container_value_shape(shape: &NetworkNestedTypeShape) -> bool {
+    shape.type_id.is_none()
+        && !shape.members.is_empty()
+        && shape.validation.as_deref().is_some_and(|validation| {
+            validation.contains("container-value") && validation.contains("serialize-type-sequence")
+        })
+}
+
+fn replicated_container_full_value_scalar_shapes(shapes: &[String]) -> Vec<NetworkWireScalarShape> {
+    let start = shapes
+        .iter()
+        .position(|shape| shape == "sequence-number")
+        .map_or(0, |index| index + 1);
+    let mut skipped_outer_count = false;
+    shapes[start..]
+        .iter()
+        .filter_map(|shape| {
+            let shape = shape.as_str();
+            if shape == "sequence-number" {
+                return None;
+            }
+            if !skipped_outer_count && shape == "vlq-u32" {
+                skipped_outer_count = true;
+                return None;
+            }
+            parse_network_wire_scalar_shape(shape)
+        })
+        .collect()
+}
+
+fn replicated_container_data_scalar_shapes(shapes: &[String]) -> Vec<NetworkWireScalarShape> {
+    shapes
+        .iter()
+        .filter_map(|shape| {
+            let shape = shape.as_str();
+            is_replicated_container_data_shape(shape)
+                .then(|| parse_network_wire_scalar_shape(shape))
+                .flatten()
+        })
+        .collect()
+}
+
+fn replicated_container_delta_key_shape(shapes: &[String]) -> Option<NetworkWireScalarShape> {
+    let sequence_index = shapes.iter().position(|shape| shape == "sequence-number")?;
+    shapes[..sequence_index].iter().rev().find_map(|shape| {
+        let shape = shape.as_str();
+        is_replicated_container_data_shape(shape)
+            .then(|| parse_network_wire_scalar_shape(shape))
+            .flatten()
+    })
+}
+
+fn replicated_container_delta_value_shapes(
+    shapes: &[String],
+) -> Option<Vec<NetworkWireScalarShape>> {
+    let sequence_index = shapes.iter().position(|shape| shape == "sequence-number")?;
+    Some(
+        shapes[sequence_index + 1..]
+            .iter()
+            .filter_map(|shape| {
+                let shape = shape.as_str();
+                (shape != "sequence-number")
+                    .then(|| parse_network_wire_scalar_shape(shape))
+                    .flatten()
+            })
+            .collect(),
+    )
+}
+
+fn replicated_container_data_shape_count(shapes: &[String]) -> usize {
+    shapes
+        .iter()
+        .filter(|shape| is_replicated_container_data_shape(shape))
+        .count()
+}
+
+fn is_replicated_container_data_shape(shape: &str) -> bool {
+    shape != "vlq-u32" && shape != "sequence-number"
+}
+
+fn selected_structured_container_value_shape_matches(
+    vtable: &NetworkFieldHandlerVtable,
+    wire_shapes: &[NetworkWireScalarShape],
+) -> bool {
+    selected_structured_container_value_type_name(vtable)
+        .as_deref()
+        .is_some_and(|name| {
+            let name = name.trim();
+            !name.is_empty() && name != "unknown"
+        })
+        && has_selected_structured_container_value_identity(vtable)
+        && vtable
+            .value_type_shape
+            .as_ref()
+            .is_some_and(|shape| nested_type_shape_matches_wire_shapes(shape, wire_shapes))
+}
+
+fn nested_type_shape_matches_wire_shapes(
+    shape: &NetworkNestedTypeShape,
+    wire_shapes: &[NetworkWireScalarShape],
+) -> bool {
+    if shape.members.is_empty() || wire_shapes.is_empty() {
+        return false;
+    }
+    let mut index = 0;
+    for member in &shape.members {
+        let Some(wire_shape) = member.wire_shape.as_deref() else {
+            return false;
+        };
+        let Some(span) = nested_member_wire_shape_span(wire_shape, wire_shapes, index) else {
+            return false;
+        };
+        index += span;
+    }
+    index == wire_shapes.len()
+}
+
+fn nested_member_wire_shape_span(
+    observed: &str,
+    expected: &[NetworkWireScalarShape],
+    index: usize,
+) -> Option<usize> {
+    let next = *expected.get(index)?;
+    if wire_scalar_shape_from_member_name(observed) == Some(next) {
+        return Some(1);
+    }
+    if let Some(composite) = composite_member_wire_shapes(observed) {
+        let end = index.checked_add(composite.len())?;
+        let expected = expected.get(index..end)?;
+        return (expected == composite.as_slice()).then_some(composite.len());
+    }
+    match observed {
+        "vec2" if expected_shape_run(expected, index, NetworkWireScalarShape::F32, 2) => Some(2),
+        "vec3" if expected_shape_run(expected, index, NetworkWireScalarShape::F32, 3) => Some(3),
+        "vec4" | "quat" if expected_shape_run(expected, index, NetworkWireScalarShape::F32, 4) => {
+            Some(4)
+        }
+        observed => {
+            let element = vector_element_wire_shape(observed)?;
+            if next != NetworkWireScalarShape::VlqU32 {
+                return None;
+            }
+            if expected
+                .get(index + 1)
+                .is_some_and(|shape| wire_scalar_shape_from_member_name(element) == Some(*shape))
+            {
+                Some(2)
+            } else {
+                Some(1)
+            }
+        }
+    }
+}
+
+fn expected_shape_run(
+    shapes: &[NetworkWireScalarShape],
+    start: usize,
+    shape: NetworkWireScalarShape,
+    count: usize,
+) -> bool {
+    shapes
+        .get(start..start + count)
+        .is_some_and(|slice| slice.iter().all(|candidate| *candidate == shape))
+}
+
+fn vector_element_wire_shape(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("vec<")?
+        .strip_suffix('>')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn composite_member_wire_shapes(value: &str) -> Option<Vec<NetworkWireScalarShape>> {
+    value
+        .strip_prefix("composite<")?
+        .strip_suffix('>')?
+        .split(',')
+        .map(str::trim)
+        .map(parse_network_wire_scalar_shape)
+        .collect()
+}
+
+fn wire_scalar_shape_from_member_name(value: &str) -> Option<NetworkWireScalarShape> {
+    parse_network_wire_scalar_shape(value)
 }
 
 fn u32_value(object: &Map<String, Value>, key: &str) -> Option<u32> {
@@ -2783,6 +3528,273 @@ mod tests {
             error,
             NetworkSchemaImportError::PrivateSourceEvidence
         ));
+    }
+
+    #[test]
+    fn suppresses_scalar_container_shape_when_full_value_is_structured() {
+        let report = json!({
+            "registryEntries": [{
+                "uuid": "111aebb0-4f23-4914-b732-a349ccbd82d4",
+                "typeIndex": 3780,
+                "typeName": "Javelin::GlobalMapDataManagerComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "globalMapData",
+                    "handlerVtable": "NewWorld+0x8223838",
+                    "wireShape": "replicated-container<u64,u8>",
+                    "wireShapeSource": "replicated-container-marshal-calls",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [{
+                "address": "NewWorld+0x37be1f0",
+                "fields": [{
+                    "index": 0,
+                    "name": "globalMapData",
+                    "handlerVtable": "NewWorld+0x8223838",
+                    "wireShape": "replicated-container<u64,u8>",
+                    "wireShapeSource": "replicated-container-marshal-calls",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8223838",
+                "fieldCount": 1,
+                "wireShape": "replicated-container<u64,u8>",
+                "wireShapeSource": "replicated-container-marshal-calls",
+                "deltaWireShape": "replicated-container<u64,u8>",
+                "fullWireShape": "replicated-container<u64,vec2>",
+                "deltaMarshalShapes": ["vlq-u32", "u64", "sequence-number", "u8"],
+                "fullMarshalShapes": ["sequence-number", "vlq-u32", "u64", "vec2", "u16", "u32"],
+                "valueTypeName": "GlobalMapData",
+                "valueTypeId": "0DC02DD0-993E-48C0-8B60-5715D4383B0D",
+                "valueTypeInfoAddress": "NewWorld+0x82203b0",
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x82203b0",
+                    "name": "GlobalMapData",
+                    "typeId": "0DC02DD0-993E-48C0-8B60-5715D4383B0D",
+                    "source": "native-type-info-layout"
+                }, {
+                    "address": "NewWorld+0x8123450",
+                    "name": "TimePoint",
+                    "typeId": "7B883BA2-DFE0-4678-B5FB-C732FD10B7D7",
+                    "source": "rtti-provider-vtable"
+                }]
+            }]
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+
+        assert_eq!(schema.field_handler_vtables[0].wire_shape, None);
+        assert_eq!(schema.field_handler_vtables[0].delta_wire_shape, None);
+        assert_eq!(schema.field_handler_vtables[0].full_wire_shape, None);
+        assert_eq!(
+            schema.field_handler_vtables[0].value_type_name.as_deref(),
+            Some("GlobalMapData")
+        );
+        assert_eq!(
+            schema.field_handler_vtables[0].value_type_id.as_deref(),
+            Some("0DC02DD0-993E-48C0-8B60-5715D4383B0D")
+        );
+        assert_eq!(
+            schema.field_handler_vtables[0]
+                .value_type_info_address
+                .as_deref(),
+            Some("NewWorld+0x82203b0")
+        );
+        assert_eq!(
+            schema.field_handler_vtables[0].value_type_candidates.len(),
+            2
+        );
+        assert_eq!(
+            schema.field_handler_vtables[0].value_type_candidates[0]
+                .name
+                .as_deref(),
+            Some("GlobalMapData")
+        );
+        assert_eq!(
+            schema.field_handler_vtables[0].value_type_candidates[0].type_id,
+            Some(uuid!("0dc02dd0-993e-48c0-8b60-5715d4383b0d"))
+        );
+        assert_eq!(
+            schema.field_handler_vtables[0].value_type_candidates[1]
+                .source
+                .as_deref(),
+            Some("rtti-provider-vtable")
+        );
+        assert_eq!(
+            schema.field_handler_vtables[0].delta_marshal_shapes,
+            vec![
+                "vlq-u32".to_owned(),
+                "u64".to_owned(),
+                "sequence-number".to_owned(),
+                "u8".to_owned()
+            ]
+        );
+        assert_eq!(
+            schema.field_handler_vtables[0].full_marshal_shapes,
+            vec![
+                "sequence-number".to_owned(),
+                "vlq-u32".to_owned(),
+                "u64".to_owned(),
+                "vec2".to_owned(),
+                "u16".to_owned(),
+                "u32".to_owned()
+            ]
+        );
+        assert_eq!(schema.types[0].fields[0].wire_shape, None);
+        assert_eq!(
+            schema.field_registration_functions[0].fields[0].wire_shape,
+            None
+        );
+    }
+
+    #[test]
+    fn keeps_selected_structured_container_shape_when_delta_value_is_partial() {
+        let report = json!({
+            "registryEntries": [],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8223838",
+                "fieldCount": 1,
+                "wireShape": "replicated-container<u64,u8>",
+                "wireShapeSource": "replicated-container-marshal-calls",
+                "deltaMarshalShapes": ["vlq-u32", "u64", "sequence-number", "u8"],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u64",
+                    "vec2",
+                    "u16",
+                    "u32"
+                ],
+                "valueTypeName": "GlobalMapData",
+                "valueTypeId": "0DC02DD0-993E-48C0-8B60-5715D4383B0D",
+                "slots": []
+            }]
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+        let container_shape = schema.field_handler_vtables[0]
+            .container_shape
+            .as_ref()
+            .expect("selected structured value keeps full container shape");
+
+        assert_eq!(
+            container_shape.storage,
+            NetworkReplicatedContainerStorageKind::Map
+        );
+        assert_eq!(container_shape.key_wire_shape, NetworkWireScalarShape::U64);
+        assert_eq!(
+            container_shape.value_wire_shapes,
+            vec![
+                NetworkWireScalarShape::Vec2,
+                NetworkWireScalarShape::U16,
+                NetworkWireScalarShape::U32
+            ]
+        );
+        assert_eq!(
+            container_shape.delta_value_wire_shapes,
+            vec![NetworkWireScalarShape::U8]
+        );
+        assert_eq!(
+            container_shape.source.as_deref(),
+            Some("replicated-container-map-full-shape")
+        );
+        assert_eq!(schema.field_handler_vtables[0].wire_shape, None);
+    }
+
+    #[test]
+    fn marks_selected_structured_container_shape_full_only_when_delta_is_incomplete() {
+        let report = json!({
+            "registryEntries": [],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8219138",
+                "fieldCount": 1,
+                "deltaMarshalShapes": ["vlq-u32", "vlq-u32"],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u32",
+                    "u64",
+                    "u64",
+                    "u16",
+                    "u8"
+                ],
+                "valueTypeName": "LootLimitData",
+                "valueTypeId": "EC6027F0-84B8-46F1-9683-B850C37348EE",
+                "slots": []
+            }]
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+        let container_shape = schema.field_handler_vtables[0]
+            .container_shape
+            .as_ref()
+            .expect("selected structured value keeps full-only shape");
+
+        assert_eq!(container_shape.key_wire_shape, NetworkWireScalarShape::U32);
+        assert_eq!(
+            container_shape.value_wire_shapes,
+            vec![
+                NetworkWireScalarShape::U64,
+                NetworkWireScalarShape::U64,
+                NetworkWireScalarShape::U16,
+                NetworkWireScalarShape::U8
+            ]
+        );
+        assert!(container_shape.delta_value_wire_shapes.is_empty());
+        assert_eq!(
+            container_shape.source.as_deref(),
+            Some("replicated-container-map-full-shape")
+        );
+    }
+
+    #[test]
+    fn infers_vector_container_from_single_full_value_shape() {
+        let report = json!({
+            "registryEntries": [],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x803f218",
+                "fieldCount": 1,
+                "deltaMarshalShapes": ["vlq-u32", "vlq-u32"],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "string"
+                ],
+                "slots": []
+            }]
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+        let container_shape = schema.field_handler_vtables[0]
+            .container_shape
+            .as_ref()
+            .expect("one full value shape is a vector container");
+
+        assert_eq!(
+            container_shape.storage,
+            NetworkReplicatedContainerStorageKind::Vec
+        );
+        assert_eq!(
+            container_shape.key_wire_shape,
+            NetworkWireScalarShape::VlqU64
+        );
+        assert_eq!(
+            container_shape.value_wire_shapes,
+            vec![NetworkWireScalarShape::String]
+        );
+        assert_eq!(
+            container_shape.source.as_deref(),
+            Some("replicated-container-vector-full-shape")
+        );
     }
 
     #[test]
@@ -3422,7 +4434,7 @@ mod tests {
                 field_index: Some(3),
                 field: Some("spawnedEntityIdsBySpawnerId".to_owned()),
                 native_type: Some("MB::ReplicatedMapFieldHandler<AZ::Crc32, AZ::EntityId>".to_owned()),
-                rust_type: Some("::nw_network::serialize::ReplicatedContainer<::std::collections::HashMap<::nw_network::Crc32, ::nw_network::EntityId>, { ::nw_network::serialize::WIRE_VEC_CAP }, ::nw_network::serialize::DefaultMarshaler<::nw_network::Crc32>, ::nw_network::serialize::DefaultMarshaler<::nw_network::EntityId>>".to_owned()),
+                rust_type: Some("::nw_network::serialize::ReplicatedContainer<::nw_network::serialize::IndexMap<::nw_network::Crc32, ::nw_network::EntityId>, { ::nw_network::serialize::WIRE_VEC_CAP }, ::nw_network::serialize::DefaultMarshaler<::nw_network::Crc32>, ::nw_network::serialize::DefaultMarshaler<::nw_network::EntityId>>".to_owned()),
                 wire_shape: Some(NetworkWireShape::ReplicatedContainer(
                     NetworkReplicatedContainerWireShape {
                         key: NetworkWireScalarShape::U32,
@@ -3455,10 +4467,10 @@ mod tests {
                 .is_some_and(|rust_type| rust_type.contains("ReplicatedContainer<"))
         );
         assert!(
-            !field
+            field
                 .rust_type
                 .as_deref()
-                .is_some_and(|rust_type| rust_type.contains("ReplicatedMap<"))
+                .is_some_and(|rust_type| rust_type.contains("IndexMap<"))
         );
         assert_eq!(
             field.evidence.last().map(|evidence| evidence.kind),
@@ -3679,6 +4691,124 @@ mod tests {
     }
 
     #[test]
+    fn merges_field_serialize_type_by_selected_handler_value_type_id() {
+        let network_type_id = uuid!("8673a3cc-2848-4c87-aa72-cc860589d1b5");
+        let payload_type_id = uuid!("da4e5889-a65c-4480-8642-0278160125a7");
+        let report = json!({
+            "registryEntries": [{
+                "uuid": network_type_id.to_string(),
+                "typeName": "Example::ReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "payloads",
+                    "handlerVtable": "NewWorld+0x8123450",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8123450",
+                "fieldCount": 1,
+                "valueTypeName": "PayloadData",
+                "valueTypeId": payload_type_id.to_string(),
+                "valueTypeInfoAddress": "NewWorld+0x8234560",
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x8345670",
+                    "name": "NestedMember",
+                    "typeId": "11111111-1111-1111-1111-111111111111",
+                    "source": "rtti-provider-vtable",
+                    "nameSource": "rtti-helper-function-name"
+                }]
+            }]
+        });
+        let unit = SerializeCodegenUnit {
+            items: vec![SerializeCodegenItem {
+                source_type_id: payload_type_id,
+                source_name: "PayloadData".to_owned(),
+                role: ReflectedTypeRole::SupportType,
+                is_reflection_marker: false,
+                is_abstract: Some(false),
+                factory: None,
+                rtti_base_chain: Vec::new(),
+                kind: SerializeCodegenItemKind::Struct,
+                enum_underlying_type: None,
+                fields: Vec::new(),
+                variants: Vec::new(),
+            }],
+        };
+
+        let mut schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+        let merge = schema.merge_serialize_codegen_unit(&unit, Some("serialize.json".to_owned()));
+
+        assert_eq!(merge.matched_type_count, 0);
+        assert_eq!(merge.matched_field_type_count, 1);
+        assert_eq!(merge.field_type_id_matched_count, 1);
+        assert_eq!(schema.summary.serialize_type_count, 0);
+        assert_eq!(schema.summary.serialize_field_type_count, 1);
+        let field = &schema.types[0].fields[0];
+        let serialize = field.serialize.as_ref().expect("field serialize type");
+        assert_eq!(serialize.type_id, payload_type_id);
+        assert_eq!(serialize.name, "PayloadData");
+        assert_eq!(serialize.source, "serializeContext:handler-value-type-id");
+        assert_eq!(serialize.confidence, NetworkConfidence::High);
+    }
+
+    #[test]
+    fn does_not_merge_field_serialize_type_from_provider_candidate_only() {
+        let network_type_id = uuid!("8673a3cc-2848-4c87-aa72-cc860589d1b5");
+        let payload_type_id = uuid!("da4e5889-a65c-4480-8642-0278160125a7");
+        let report = json!({
+            "registryEntries": [{
+                "uuid": network_type_id.to_string(),
+                "typeName": "Example::ReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "payloads",
+                    "handlerVtable": "NewWorld+0x8123450",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8123450",
+                "fieldCount": 1,
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x8234560",
+                    "name": "PayloadData",
+                    "typeId": payload_type_id.to_string(),
+                    "source": "rtti-provider-vtable",
+                    "nameSource": "rtti-helper-function-name"
+                }]
+            }]
+        });
+        let unit = SerializeCodegenUnit {
+            items: vec![SerializeCodegenItem {
+                source_type_id: payload_type_id,
+                source_name: "PayloadData".to_owned(),
+                role: ReflectedTypeRole::SupportType,
+                is_reflection_marker: false,
+                is_abstract: Some(false),
+                factory: None,
+                rtti_base_chain: Vec::new(),
+                kind: SerializeCodegenItemKind::Struct,
+                enum_underlying_type: None,
+                fields: Vec::new(),
+                variants: Vec::new(),
+            }],
+        };
+
+        let mut schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+        let merge = schema.merge_serialize_codegen_unit(&unit, Some("serialize.json".to_owned()));
+
+        assert_eq!(merge.matched_field_type_count, 0);
+        assert_eq!(merge.field_type_id_matched_count, 0);
+        assert_eq!(schema.summary.serialize_field_type_count, 0);
+        assert!(schema.types[0].fields[0].serialize.is_none());
+    }
+
+    #[test]
     fn skips_ambiguous_serialize_codegen_name_matches() {
         let network_type_id = uuid!("8673a3cc-2848-4c87-aa72-cc860589d1b5");
         let report = json!({
@@ -3764,5 +4894,87 @@ mod tests {
         assert_eq!(merge.name_matched_count, 0);
         assert_eq!(merge.unmatched_schema_type_count, 1);
         assert_eq!(schema.summary.serialize_type_count, 0);
+    }
+
+    #[test]
+    fn structured_container_value_matching_preserves_inner_counted_vecs() {
+        let full_shapes = [
+            "sequence-number",
+            "vlq-u32",
+            "u32",
+            "f32",
+            "f32",
+            "f32",
+            "vlq-u32",
+            "u64",
+        ]
+        .map(ToOwned::to_owned);
+        let value_shapes = replicated_container_full_value_scalar_shapes(&full_shapes);
+        assert_eq!(
+            value_shapes,
+            vec![
+                NetworkWireScalarShape::U32,
+                NetworkWireScalarShape::F32,
+                NetworkWireScalarShape::F32,
+                NetworkWireScalarShape::F32,
+                NetworkWireScalarShape::VlqU32,
+                NetworkWireScalarShape::U64,
+            ]
+        );
+
+        let shape = NetworkNestedTypeShape {
+            type_id: Some(uuid!("fdda118c-1c41-48a4-af1c-b45fd6797fbe")),
+            type_id_source: Some("rtti-provider-vtable".to_owned()),
+            type_name: Some("ExampleValue".to_owned()),
+            type_name_full: Some("ExampleValue".to_owned()),
+            type_name_source: Some("az-rtti-provider-table".to_owned()),
+            function: None,
+            function_name: None,
+            factory: None,
+            az_rtti_address: Some("NewWorld+0x1000".to_owned()),
+            constructor: None,
+            vtable: None,
+            member_base: None,
+            member_name_source: Some("synthetic-pcode-wire-order".to_owned()),
+            member_names_proven: Some(false),
+            datatype_path: None,
+            validation: Some("container-value-pcode-wire-order-native-rtti".to_owned()),
+            members: vec![
+                nested_type_member(0, "u32"),
+                nested_type_member(1, "vec3"),
+                nested_type_member(2, "vec<u64>"),
+            ],
+        };
+
+        assert!(nested_type_shape_matches_wire_shapes(&shape, &value_shapes));
+        assert!(!nested_type_shape_matches_wire_shapes(
+            &shape,
+            &[
+                NetworkWireScalarShape::U32,
+                NetworkWireScalarShape::F32,
+                NetworkWireScalarShape::F32,
+                NetworkWireScalarShape::F32,
+                NetworkWireScalarShape::U64,
+            ]
+        ));
+    }
+
+    fn nested_type_member(index: u32, wire_shape: &str) -> NetworkNestedTypeMember {
+        NetworkNestedTypeMember {
+            index: Some(index),
+            offset: None,
+            native_offset: None,
+            name: Some(format!("field_{index}")),
+            name_source: Some("synthetic-pcode-wire-order".to_owned()),
+            name_proven: Some(false),
+            name_evidence: None,
+            native_type: None,
+            wire_shape: Some(wire_shape.to_owned()),
+            byte_width: None,
+            evidence_source: Some("test".to_owned()),
+            callsite: None,
+            target: None,
+            target_name: None,
+        }
     }
 }

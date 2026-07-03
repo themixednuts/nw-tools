@@ -1,6 +1,12 @@
 use std::{env, path::PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=OODLE_LIB_DIR");
+
+    if env::var_os("CARGO_FEATURE_OODLE").is_none() {
+        return;
+    }
+
     if env::var_os("CARGO_CFG_WINDOWS").is_none() {
         return;
     }

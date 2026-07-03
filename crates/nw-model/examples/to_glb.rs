@@ -2,7 +2,9 @@
 //! `cargo run -p nw-model --example to_glb -- <file.cgf> [out.glb]`.
 
 fn main() {
-    let cgf_path = std::env::args().nth(1).expect("usage: to_glb <file.cgf> [out.glb]");
+    let cgf_path = std::env::args()
+        .nth(1)
+        .expect("usage: to_glb <file.cgf> [out.glb]");
     let out_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| cgf_path.replace(".cgf", ".glb"));

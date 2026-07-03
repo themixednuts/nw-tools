@@ -134,9 +134,7 @@ impl Cache {
             .select(())
             .from(guid)
             .all()
-            .map(|rows: Vec<SelectGuid>| {
-                rows.into_iter().map(|row| (row.guid, row.path)).collect()
-            })
+            .map(|rows: Vec<SelectGuid>| rows.into_iter().map(|row| (row.guid, row.path)).collect())
             .unwrap_or_default()
     }
 
@@ -168,7 +166,11 @@ impl Cache {
     ///
     /// Returns an error if any insert fails.
     pub fn store(&mut self, fingerprint: &str, records: &[CatalogRecord]) -> drizzle::Result<()> {
-        let Schema { catalog, guid, meta } = Schema::new();
+        let Schema {
+            catalog,
+            guid,
+            meta,
+        } = Schema::new();
         let materials = records
             .iter()
             .filter(|record| record.path.ends_with(".mtl"))
@@ -259,6 +261,9 @@ mod tests {
         // Only the `.mtl` entry is projected into the material map.
         let map = cache.material_map();
         assert_eq!(map.len(), 1);
-        assert_eq!(map.get("{ABC}:0").map(String::as_str), Some("objects/foo_mat.mtl"));
+        assert_eq!(
+            map.get("{ABC}:0").map(String::as_str),
+            Some("objects/foo_mat.mtl")
+        );
     }
 }

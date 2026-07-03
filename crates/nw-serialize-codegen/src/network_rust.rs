@@ -6,21 +6,26 @@ use syn::{LitInt, LitStr};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::CodegenContext;
 use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind};
 use crate::naming::{rust_field_ident, rust_module_ident, rust_type_ident};
 use crate::network_schema::{
-    NetworkConfidence, NetworkField, NetworkFragmentMetadata, NetworkReplicatedContainerWireShape,
-    NetworkSchema, NetworkSerializeKind, NetworkType, NetworkTypeCapability,
+    NetworkConfidence, NetworkField, NetworkFragmentMetadata, NetworkNativeTypeInfoEvidence,
+    NetworkReplicatedContainerShape, NetworkReplicatedContainerStorageKind,
+    NetworkReplicatedContainerWireShape, NetworkSchema, NetworkSerializeFieldType,
+    NetworkSerializeKind, NetworkSerializeType, NetworkType, NetworkTypeCapability,
     NetworkWireScalarShape as SchemaWireScalarShape, NetworkWireShape as SchemaWireShape,
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v31";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v33";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
     #[error("generated network Rust source did not parse")]
     Parse(#[from] syn::Error),
+    #[error("network Rust source emission was cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +111,10 @@ pub struct NetworkStateFieldShapeReport {
     pub handler_vtable: Option<String>,
     pub wire_shape: Option<SchemaWireShape>,
     pub wire_shape_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_type_candidates: Vec<NetworkNativeTypeInfoEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_value_type_shape: Option<crate::network_schema::NetworkNestedTypeShape>,
     pub rust_value_type: Option<String>,
     pub rust_field_type: Option<String>,
     #[serde(default)]
@@ -187,6 +196,8 @@ pub struct NetworkBlockedFieldExampleReport {
     pub source_type_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serialize_type_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_type_candidates: Vec<NetworkNativeTypeInfoEvidence>,
     pub rust_value_type: Option<String>,
     pub blocked_reason: Option<String>,
 }
@@ -237,8 +248,18 @@ impl NetworkRustEmitter {
     pub fn emit_descriptors(
         schema: &NetworkSchema,
     ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
+        Self::emit_descriptors_with_context(schema, &CodegenContext::inline())
+    }
+
+    pub fn emit_descriptors_with_context(
+        schema: &NetworkSchema,
+        context: &CodegenContext,
+    ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
         let mut report = NetworkRustGenerationReport::default();
         let wire_shapes = wire_shapes_by_handler_vtable(schema);
+        let container_shapes = container_shapes_by_handler_vtable(schema);
+        let value_type_candidates = value_type_candidates_by_handler_vtable(schema);
+        let serialize_types = serialize_types_by_type_id(schema);
         let descriptors = schema
             .types
             .iter()
@@ -246,7 +267,14 @@ impl NetworkRustEmitter {
             .collect::<Vec<_>>();
         report.descriptor_count = descriptors.len();
         report.identity_name_collision_count = identity_name_collision_count(schema);
-        report.state_generation_plans = state_generation_plans(schema, &wire_shapes);
+        report.state_generation_plans = state_generation_plans(
+            schema,
+            &wire_shapes,
+            &container_shapes,
+            &value_type_candidates,
+            &serialize_types,
+            context,
+        )?;
         report.state_generation_plan_count = report.state_generation_plans.len();
         report.generatable_state_count = report
             .state_generation_plans
@@ -255,7 +283,8 @@ impl NetworkRustEmitter {
             .count();
         report.blocked_state_count =
             report.state_generation_plan_count - report.generatable_state_count;
-        report.message_generation_plans = message_generation_plans(schema, &wire_shapes);
+        report.message_generation_plans =
+            message_generation_plans(schema, &wire_shapes, &value_type_candidates, context)?;
         report.message_generation_plan_count = report.message_generation_plans.len();
         report.generatable_message_count = report
             .message_generation_plans
@@ -552,16 +581,33 @@ impl NetworkRustEmitter {
         type_indices: impl IntoIterator<Item = u32>,
         options: NetworkReplicatedStateEmitOptions,
     ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
+        Self::emit_replicated_states_with_options_and_context(
+            schema,
+            type_indices,
+            options,
+            &CodegenContext::inline(),
+        )
+    }
+
+    pub fn emit_replicated_states_with_options_and_context(
+        schema: &NetworkSchema,
+        type_indices: impl IntoIterator<Item = u32>,
+        options: NetworkReplicatedStateEmitOptions,
+        context: &CodegenContext,
+    ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
         let selected = type_indices.into_iter().collect::<BTreeSet<_>>();
         let wire_shapes = wire_shapes_by_handler_vtable(schema);
         let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
+        let container_shapes = container_shapes_by_handler_vtable(schema);
+        let value_type_candidates = value_type_candidates_by_handler_vtable(schema);
+        let serialize_types = serialize_types_by_type_id(schema);
         let rust_names = identity_names_by_type_index(schema);
         let types_by_type_index = schema
             .types
             .iter()
             .filter_map(|network_type| Some((network_type.type_index?, network_type)))
             .collect::<BTreeMap<_, _>>();
-        let plans_by_type_index = schema
+        let state_types = schema
             .types
             .iter()
             .filter(|network_type| {
@@ -569,17 +615,38 @@ impl NetworkRustEmitter {
                     .capabilities
                     .contains(&NetworkTypeCapability::ReplicatedState)
             })
-            .filter_map(|network_type| {
-                Some((
-                    network_type.type_index?,
-                    state_generation_plan(network_type, &wire_shapes, &wire_shape_sources),
-                ))
-            })
+            .collect::<Vec<_>>();
+        let planned =
+            context
+                .runner()
+                .map_until_cancelled(&state_types, context.cancel(), |network_type| {
+                    (
+                        network_type.type_index,
+                        state_generation_plan(
+                            network_type,
+                            &wire_shapes,
+                            &wire_shape_sources,
+                            &container_shapes,
+                            &value_type_candidates,
+                            &serialize_types,
+                        ),
+                    )
+                });
+        if planned.was_cancelled() {
+            return Err(NetworkRustEmitError::Cancelled);
+        }
+        let plans_by_type_index = planned
+            .into_completed()
+            .into_iter()
+            .filter_map(|(type_index, plan)| Some((type_index?, plan)))
             .collect::<BTreeMap<_, _>>();
 
         let mut report = NetworkRustGenerationReport::default();
         let mut modules = Vec::new();
         for type_index in selected {
+            if context.is_cancelled() {
+                return Err(NetworkRustEmitError::Cancelled);
+            }
             let Some(network_type) = types_by_type_index.get(&type_index).copied() else {
                 report
                     .state_generation_plans
@@ -634,11 +701,18 @@ impl NetworkRustEmitter {
     pub fn emit_messages(
         schema: &NetworkSchema,
     ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
+        Self::emit_messages_with_context(schema, &CodegenContext::inline())
+    }
+
+    pub fn emit_messages_with_context(
+        schema: &NetworkSchema,
+        context: &CodegenContext,
+    ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
         let wire_shapes = wire_shapes_by_handler_vtable(schema);
         let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
+        let value_type_candidates = value_type_candidates_by_handler_vtable(schema);
         let rust_names = identity_names_by_type_index(schema);
-        let mut report = NetworkRustGenerationReport::default();
-        let modules = schema
+        let message_types = schema
             .types
             .iter()
             .filter(|network_type| {
@@ -646,13 +720,34 @@ impl NetworkRustEmitter {
                     .capabilities
                     .contains(&NetworkTypeCapability::DirectMessage)
             })
-            .filter_map(|network_type| {
-                let plan = message_generation_plan(network_type, &wire_shapes, &wire_shape_sources);
-                report.message_generation_plans.push(plan.clone());
-                plan.can_generate
-                    .then(|| message_module_tokens(network_type, &plan, &rust_names))
-            })
             .collect::<Vec<_>>();
+        let plans = context.runner().map_until_cancelled(
+            &message_types,
+            context.cancel(),
+            |network_type| {
+                message_generation_plan(
+                    network_type,
+                    &wire_shapes,
+                    &wire_shape_sources,
+                    &value_type_candidates,
+                )
+            },
+        );
+        if plans.was_cancelled() {
+            return Err(NetworkRustEmitError::Cancelled);
+        }
+
+        let mut report = NetworkRustGenerationReport::default();
+        let mut modules = Vec::new();
+        for (network_type, plan) in message_types.into_iter().zip(plans.into_completed()) {
+            if context.is_cancelled() {
+                return Err(NetworkRustEmitError::Cancelled);
+            }
+            report.message_generation_plans.push(plan.clone());
+            if plan.can_generate {
+                modules.push(message_module_tokens(network_type, &plan, &rust_names));
+            }
+        }
 
         report.message_generation_plan_count = report.message_generation_plans.len();
         report.generatable_message_count = report
@@ -678,11 +773,21 @@ impl NetworkRustEmitter {
     pub fn emit_marshaler_conversions<'a>(
         items: impl IntoIterator<Item = &'a SerializeCodegenItem>,
     ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
+        Self::emit_marshaler_conversions_with_context(items, &CodegenContext::inline())
+    }
+
+    pub fn emit_marshaler_conversions_with_context<'a>(
+        items: impl IntoIterator<Item = &'a SerializeCodegenItem>,
+        context: &CodegenContext,
+    ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
         let mut report = NetworkRustGenerationReport::default();
-        let conversions = items
-            .into_iter()
-            .flat_map(enum_marshaler_conversion_tokens)
-            .collect::<Vec<_>>();
+        let mut conversions = Vec::new();
+        for item in items {
+            if context.is_cancelled() {
+                return Err(NetworkRustEmitError::Cancelled);
+            }
+            conversions.extend(enum_marshaler_conversion_tokens(item));
+        }
         report.marshaler_conversion_count = conversions.len();
 
         let tokens = quote! {
@@ -1166,6 +1271,33 @@ fn wire_shapes_by_handler_vtable(schema: &NetworkSchema) -> BTreeMap<&str, Schem
         .collect()
 }
 
+fn container_shapes_by_handler_vtable(
+    schema: &NetworkSchema,
+) -> BTreeMap<&str, &NetworkReplicatedContainerShape> {
+    schema
+        .field_handler_vtables
+        .iter()
+        .filter_map(|vtable| {
+            let address = vtable.address.as_deref()?;
+            let shape = vtable.container_shape.as_ref()?;
+            Some((address, shape))
+        })
+        .collect()
+}
+
+fn serialize_types_by_type_id(schema: &NetworkSchema) -> BTreeMap<Uuid, &NetworkSerializeType> {
+    let mut types = schema
+        .serialize_types
+        .iter()
+        .map(|serialize| (serialize.type_id, serialize))
+        .collect::<BTreeMap<_, _>>();
+    types.extend(schema.types.iter().filter_map(|network_type| {
+        let serialize = network_type.serialize.as_ref()?;
+        Some((serialize.type_id, serialize))
+    }));
+    types
+}
+
 fn field_wire_shape_tokens(
     field: &NetworkField,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
@@ -1185,9 +1317,13 @@ fn field_wire_shape_tokens(
 fn state_generation_plans(
     schema: &NetworkSchema,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
-) -> Vec<NetworkStateGenerationPlanReport> {
+    container_shapes: &BTreeMap<&str, &NetworkReplicatedContainerShape>,
+    value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+    context: &CodegenContext,
+) -> Result<Vec<NetworkStateGenerationPlanReport>, NetworkRustEmitError> {
     let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
-    schema
+    let state_types = schema
         .types
         .iter()
         .filter(|network_type| {
@@ -1195,16 +1331,34 @@ fn state_generation_plans(
                 .capabilities
                 .contains(&NetworkTypeCapability::ReplicatedState)
         })
-        .map(|network_type| state_generation_plan(network_type, wire_shapes, &wire_shape_sources))
-        .collect()
+        .collect::<Vec<_>>();
+    let plans =
+        context
+            .runner()
+            .map_until_cancelled(&state_types, context.cancel(), |network_type| {
+                state_generation_plan(
+                    network_type,
+                    wire_shapes,
+                    &wire_shape_sources,
+                    container_shapes,
+                    value_type_candidates,
+                    serialize_types,
+                )
+            });
+    if plans.was_cancelled() {
+        return Err(NetworkRustEmitError::Cancelled);
+    }
+    Ok(plans.into_completed())
 }
 
 fn message_generation_plans(
     schema: &NetworkSchema,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
-) -> Vec<NetworkMessageGenerationPlanReport> {
+    value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
+    context: &CodegenContext,
+) -> Result<Vec<NetworkMessageGenerationPlanReport>, NetworkRustEmitError> {
     let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
-    schema
+    let message_types = schema
         .types
         .iter()
         .filter(|network_type| {
@@ -1212,14 +1366,31 @@ fn message_generation_plans(
                 .capabilities
                 .contains(&NetworkTypeCapability::DirectMessage)
         })
-        .map(|network_type| message_generation_plan(network_type, wire_shapes, &wire_shape_sources))
-        .collect()
+        .collect::<Vec<_>>();
+    let plans =
+        context
+            .runner()
+            .map_until_cancelled(&message_types, context.cancel(), |network_type| {
+                message_generation_plan(
+                    network_type,
+                    wire_shapes,
+                    &wire_shape_sources,
+                    value_type_candidates,
+                )
+            });
+    if plans.was_cancelled() {
+        return Err(NetworkRustEmitError::Cancelled);
+    }
+    Ok(plans.into_completed())
 }
 
 fn state_generation_plan(
     network_type: &NetworkType,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
+    container_shapes: &BTreeMap<&str, &NetworkReplicatedContainerShape>,
+    value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> NetworkStateGenerationPlanReport {
     let attribute_count = network_type
         .fields
@@ -1230,7 +1401,16 @@ fn state_generation_plan(
         .fields
         .iter()
         .filter(|field| !is_replicated_state_attribute_field(field))
-        .map(|field| state_field_shape_report(field, wire_shapes, wire_shape_sources))
+        .map(|field| {
+            state_field_shape_report(
+                field,
+                wire_shapes,
+                wire_shape_sources,
+                container_shapes,
+                value_type_candidates,
+                serialize_types,
+            )
+        })
         .collect::<Vec<_>>();
     disambiguate_report_field_names(&mut fields);
     let field_count = fields.len();
@@ -1317,11 +1497,19 @@ fn message_generation_plan(
     network_type: &NetworkType,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
+    value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
 ) -> NetworkMessageGenerationPlanReport {
     let mut fields = network_type
         .fields
         .iter()
-        .map(|field| message_field_shape_report(field, wire_shapes, wire_shape_sources))
+        .map(|field| {
+            message_field_shape_report(
+                field,
+                wire_shapes,
+                wire_shape_sources,
+                value_type_candidates,
+            )
+        })
         .collect::<Vec<_>>();
     disambiguate_report_field_names(&mut fields);
     let field_count = fields.len();
@@ -1430,9 +1618,7 @@ fn disambiguate_report_field_names(fields: &mut [NetworkStateFieldShapeReport]) 
             };
             let candidate = format!("{name}_{suffix}");
             let candidate_ident = rust_field_ident(&candidate);
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                seen.entry(candidate_ident)
-            {
+            if let std::collections::btree_map::Entry::Vacant(entry) = seen.entry(candidate_ident) {
                 entry.insert(1);
                 break candidate;
             }
@@ -1561,6 +1747,7 @@ fn blocked_field_example(field: &NetworkStateFieldShapeReport) -> NetworkBlocked
         source_type_name: field.source_type_name.clone(),
         source_type_id: field.source_type_id,
         serialize_type_name: field.serialize_type_name.clone(),
+        value_type_candidates: field.value_type_candidates.clone(),
         rust_value_type: field.rust_value_type.clone(),
         blocked_reason: field.blocked_reason.clone(),
     }
@@ -1570,12 +1757,23 @@ fn message_field_shape_report(
     field: &NetworkField,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
+    value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
 ) -> NetworkStateFieldShapeReport {
-    let mut report = state_field_shape_report(field, wire_shapes, wire_shape_sources);
+    let container_shapes = BTreeMap::new();
+    let serialize_types = BTreeMap::new();
+    let mut report = state_field_shape_report(
+        field,
+        wire_shapes,
+        wire_shape_sources,
+        &container_shapes,
+        value_type_candidates,
+        &serialize_types,
+    );
     let source_type = serialize_field_scalar_source_type(field, report.wire_shape);
     let rust_type = field
         .rust_type
-        .clone()
+        .as_deref()
+        .map(normalize_generated_rust_type)
         .or_else(|| existing_message_support_type(field).map(ToOwned::to_owned))
         .or(source_type)
         .or_else(|| {
@@ -1598,9 +1796,16 @@ fn state_field_shape_report(
     field: &NetworkField,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
+    container_shapes_by_vtable: &BTreeMap<&str, &NetworkReplicatedContainerShape>,
+    value_type_candidates_by_vtable: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> NetworkStateFieldShapeReport {
-    let rust_type = field
+    let value_type_candidates = field_value_type_candidates(field, value_type_candidates_by_vtable);
+    let normalized_rust_type = field
         .rust_type
+        .as_deref()
+        .map(normalize_generated_rust_type);
+    let rust_type = normalized_rust_type
         .as_deref()
         .filter(|rust_type| syn::parse_str::<syn::Type>(rust_type).is_ok());
     let explicit_field_type =
@@ -1617,11 +1822,53 @@ fn state_field_shape_report(
     };
     let source_type = serialize_field_scalar_source_type(field, shape);
     let rust_shape = shape.map(rust_field_shape);
+    let container_shape = if explicit_field_type.is_none()
+        && shape.is_none_or(|shape| shape.is_replicated_container())
+    {
+        replicated_container_shape_for_field(field, container_shapes_by_vtable)
+    } else {
+        None
+    };
+    let container_rust_shape = container_shape.as_ref().and_then(|shape| {
+        replicated_container_semantic_field_shape(
+            field,
+            shape,
+            &value_type_candidates,
+            serialize_types,
+        )
+    });
+    let generated_rust_field_type = explicit_field_type
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            rust_type
+                .filter(|_| shape.is_some_and(|shape| !shape.is_replicated_container()))
+                .map(|rust_type| {
+                    replicated_field_handler_type(
+                        shape.expect("state value override has a wire shape"),
+                        rust_type,
+                    )
+                })
+        })
+        .or_else(|| {
+            source_type.as_deref().and_then(|source_type| {
+                shape
+                    .filter(|shape| !shape.is_replicated_container())
+                    .map(|shape| replicated_field_handler_type(shape, source_type))
+            })
+        })
+        .or_else(|| {
+            container_rust_shape
+                .as_ref()
+                .map(|shape| shape.field_type.clone())
+        })
+        .or_else(|| rust_shape.as_ref().map(|shape| shape.field_type.clone()));
     let blocked_reason = state_field_blocked_reason(
         field,
         shape,
-        field.rust_type.as_deref(),
+        normalized_rust_type.as_deref(),
         explicit_field_type,
+        generated_rust_field_type.is_some(),
+        !value_type_candidates.is_empty() || container_shape.is_some(),
     );
     NetworkStateFieldShapeReport {
         field_index: field.index,
@@ -1645,34 +1892,28 @@ fn state_field_shape_report(
         } else {
             field_wire_shape_source(field, wire_shapes, wire_shape_sources)
         },
+        value_type_candidates,
+        container_value_type_shape: if explicit_field_type.is_some() {
+            None
+        } else {
+            container_rust_shape
+                .as_ref()
+                .and_then(|shape| shape.container_value_type_shape.clone())
+        },
         rust_value_type: if explicit_field_type.is_some() {
             None
         } else {
             rust_type
                 .map(ToOwned::to_owned)
                 .or_else(|| source_type.clone())
+                .or_else(|| {
+                    container_rust_shape
+                        .as_ref()
+                        .map(|shape| shape.value_type.clone())
+                })
                 .or_else(|| rust_shape.as_ref().map(|shape| shape.value_type.clone()))
         },
-        rust_field_type: explicit_field_type
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                rust_type
-                    .filter(|_| shape.is_some_and(|shape| !shape.is_replicated_container()))
-                    .map(|rust_type| {
-                        replicated_field_handler_type(
-                            shape.expect("state value override has a wire shape"),
-                            rust_type,
-                        )
-                    })
-            })
-            .or_else(|| {
-                source_type.as_deref().and_then(|source_type| {
-                    shape
-                        .filter(|shape| !shape.is_replicated_container())
-                        .map(|shape| replicated_field_handler_type(shape, source_type))
-                })
-            })
-            .or_else(|| rust_shape.map(|shape| shape.field_type)),
+        rust_field_type: generated_rust_field_type,
         constructor_write_count: field.constructor_writes.len(),
         confidence: field.confidence,
         supported: blocked_reason.is_none(),
@@ -1789,8 +2030,21 @@ fn message_native_type_rust_type(native_type: &str) -> Option<&'static str> {
 fn resolved_field_descriptor_rust_type(field: &NetworkField) -> Option<String> {
     field
         .rust_type
-        .clone()
+        .as_deref()
+        .map(normalize_generated_rust_type)
         .or_else(|| existing_message_support_type(field).map(ToOwned::to_owned))
+}
+
+fn normalize_generated_rust_type(rust_type: &str) -> String {
+    rust_type
+        .replace(
+            "::std::collections::HashMap<",
+            "::nw_network::serialize::IndexMap<",
+        )
+        .replace(
+            "std::collections::HashMap<",
+            "::nw_network::serialize::IndexMap<",
+        )
 }
 
 fn existing_message_support_type(field: &NetworkField) -> Option<&'static str> {
@@ -1858,6 +2112,70 @@ fn wire_shape_sources_by_handler_vtable(schema: &NetworkSchema) -> BTreeMap<&str
             ))
         })
         .collect()
+}
+
+fn value_type_candidates_by_handler_vtable(
+    schema: &NetworkSchema,
+) -> BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>> {
+    schema
+        .field_handler_vtables
+        .iter()
+        .filter_map(|vtable| {
+            let address = vtable.address.as_deref()?;
+            let mut candidates = Vec::new();
+            if vtable.value_type_name.is_some()
+                || vtable.value_type_id.is_some()
+                || vtable.value_type_info_address.is_some()
+            {
+                candidates.push(NetworkNativeTypeInfoEvidence {
+                    address: vtable.value_type_info_address.clone(),
+                    name: vtable.value_type_name.clone(),
+                    type_id: vtable
+                        .value_type_id
+                        .as_deref()
+                        .and_then(|type_id| Uuid::parse_str(type_id.trim_matches(['{', '}'])).ok()),
+                    source: Some("selected-value-type-info".to_owned()),
+                    name_source: Some("selected-value-type-info".to_owned()),
+                });
+            }
+            for candidate in &vtable.value_type_candidates {
+                push_unique_value_type_candidate(&mut candidates, candidate.clone());
+            }
+            (!candidates.is_empty()).then_some((address, candidates))
+        })
+        .collect()
+}
+
+fn field_value_type_candidates(
+    field: &NetworkField,
+    candidates_by_vtable: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
+) -> Vec<NetworkNativeTypeInfoEvidence> {
+    field
+        .handler_vtable
+        .as_deref()
+        .and_then(|handler_vtable| candidates_by_vtable.get(handler_vtable))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn push_unique_value_type_candidate(
+    candidates: &mut Vec<NetworkNativeTypeInfoEvidence>,
+    candidate: NetworkNativeTypeInfoEvidence,
+) {
+    let duplicate = candidates.iter().any(|existing| {
+        existing
+            .type_id
+            .as_ref()
+            .zip(candidate.type_id.as_ref())
+            .is_some_and(|(lhs, rhs)| lhs == rhs)
+            || (existing.type_id.is_none()
+                && candidate.type_id.is_none()
+                && existing.address == candidate.address
+                && existing.name == candidate.name)
+    });
+    if !duplicate {
+        candidates.push(candidate);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1994,6 +2312,8 @@ fn state_field_blocked_reason(
     shape: Option<SchemaWireShape>,
     rust_type: Option<&str>,
     explicit_field_type: Option<&str>,
+    has_generated_field_type: bool,
+    has_value_type_evidence: bool,
 ) -> Option<String> {
     if field.index.is_none() {
         return Some("missing-field-index".to_owned());
@@ -2009,7 +2329,10 @@ fn state_field_blocked_reason(
     {
         return Some("invalid-rust-field-type".to_owned());
     }
-    if shape.is_none() && explicit_field_type.is_none() {
+    if shape.is_none() && explicit_field_type.is_none() && !has_generated_field_type {
+        if has_value_type_evidence {
+            return Some("missing-semantic-type".to_owned());
+        }
         return Some("missing-wire-shape".to_owned());
     }
     None
@@ -2126,6 +2449,7 @@ fn is_native_type_field_name(name: &str) -> bool {
 struct RustFieldShape {
     value_type: String,
     field_type: String,
+    container_value_type_shape: Option<crate::network_schema::NetworkNestedTypeShape>,
 }
 
 fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
@@ -2187,6 +2511,7 @@ fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
         SchemaWireShape::FixedBytes(len) => RustFieldShape {
             value_type: format!("[u8; {len}]"),
             field_type: format!("ReplicatedFieldHandler<[u8; {len}]>"),
+            container_value_type_shape: None,
         },
         SchemaWireShape::String => {
             rust_field_shape_static("String", "ReplicatedFieldHandler<String>")
@@ -2201,6 +2526,7 @@ fn rust_field_shape_static(value_type: &'static str, field_type: &'static str) -
     RustFieldShape {
         value_type: value_type.to_owned(),
         field_type: field_type.to_owned(),
+        container_value_type_shape: None,
     }
 }
 
@@ -2209,7 +2535,7 @@ fn replicated_container_field_shape(
 ) -> RustFieldShape {
     let key_type = scalar_rust_type(container.key);
     let value_type = scalar_rust_type(container.value);
-    let collection_type = format!("::std::collections::HashMap<{key_type}, {value_type}>");
+    let collection_type = keyed_replicated_container_type(&key_type, &value_type);
     let key_marshaler = scalar_marshaler_type(container.key);
     let value_marshaler = scalar_marshaler_type(container.value);
     let field_type = format!(
@@ -2218,7 +2544,353 @@ fn replicated_container_field_shape(
     RustFieldShape {
         value_type: collection_type,
         field_type,
+        container_value_type_shape: None,
     }
+}
+
+fn replicated_container_shape_for_field<'a>(
+    field: &NetworkField,
+    container_shapes: &'a BTreeMap<&str, &NetworkReplicatedContainerShape>,
+) -> Option<&'a NetworkReplicatedContainerShape> {
+    field
+        .handler_vtable
+        .as_deref()
+        .and_then(|handler_vtable| container_shapes.get(handler_vtable).copied())
+}
+
+fn replicated_container_semantic_field_shape(
+    field: &NetworkField,
+    container: &NetworkReplicatedContainerShape,
+    value_type_candidates: &[NetworkNativeTypeInfoEvidence],
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<RustFieldShape> {
+    let value = container_value_type(field, container, value_type_candidates, serialize_types)?;
+    let key_marshaler = match container.storage {
+        NetworkReplicatedContainerStorageKind::Map => {
+            scalar_marshaler_type(container.key_wire_shape)
+        }
+        NetworkReplicatedContainerStorageKind::Vec => {
+            "::nw_network::serialize::DefaultMarshaler<::nw_network::serialize::VlqU64>".to_owned()
+        }
+    };
+    let value_marshaler = value.marshaler_type;
+    let collection_type = match container.storage {
+        NetworkReplicatedContainerStorageKind::Map => {
+            let key_type = scalar_rust_type(container.key_wire_shape);
+            keyed_replicated_container_type(&key_type, &value.rust_type)
+        }
+        NetworkReplicatedContainerStorageKind::Vec => {
+            format!("::std::vec::Vec<{}>", value.rust_type)
+        }
+    };
+    let field_type = format!(
+        "::nw_network::serialize::ReplicatedContainer<{collection_type}, {{ ::nw_network::serialize::WIRE_VEC_CAP }}, {key_marshaler}, {value_marshaler}>"
+    );
+    Some(RustFieldShape {
+        value_type: collection_type,
+        field_type,
+        container_value_type_shape: value.value_type_shape,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ContainerValueType {
+    rust_type: String,
+    marshaler_type: String,
+    value_type_shape: Option<crate::network_schema::NetworkNestedTypeShape>,
+}
+
+fn container_value_type(
+    field: &NetworkField,
+    container: &NetworkReplicatedContainerShape,
+    value_type_candidates: &[NetworkNativeTypeInfoEvidence],
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<ContainerValueType> {
+    if let Some(serialize) = field.serialize.as_ref()
+        && container_value_matches_serialize(container, serialize)
+    {
+        return serialize_container_value_type(
+            serialize.kind,
+            &serialize.name,
+            &container.value_wire_shapes,
+        );
+    }
+
+    if let Some(serialize) =
+        unique_container_value_candidate(container, value_type_candidates, serialize_types)
+    {
+        return serialize_container_value_type(
+            serialize.kind,
+            &serialize.name,
+            &container.value_wire_shapes,
+        );
+    }
+
+    if let Some(shape) = container.value_type_shape.as_ref()
+        && container_value_shape_matches(shape, &container.value_wire_shapes)
+    {
+        let rust_type = container_value_shape_rust_type(field, shape, serialize_types)?;
+        let marshaler_type = container_value_shape_codec_name(field, shape)?;
+        return Some(ContainerValueType {
+            rust_type,
+            marshaler_type,
+            value_type_shape: Some(shape.clone()),
+        });
+    }
+
+    let [shape] = container.value_wire_shapes.as_slice() else {
+        return None;
+    };
+    let rust_type = scalar_rust_type(*shape);
+    let marshaler_type = scalar_marshaler_type(*shape);
+    Some(ContainerValueType {
+        rust_type,
+        marshaler_type,
+        value_type_shape: None,
+    })
+}
+
+fn container_value_shape_matches(
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+    value_wire_shapes: &[SchemaWireScalarShape],
+) -> bool {
+    if shape.members.is_empty() || value_wire_shapes.is_empty() {
+        return false;
+    }
+    let mut index = 0;
+    for member in &shape.members {
+        let Some(wire_shape) = member.wire_shape.as_deref() else {
+            return false;
+        };
+        let Some(span) = container_value_member_shape_span(wire_shape, value_wire_shapes, index)
+        else {
+            return false;
+        };
+        index += span;
+    }
+    index == value_wire_shapes.len()
+}
+
+fn scalar_shape_name_matches(value: &str, expected: SchemaWireScalarShape) -> bool {
+    wire_scalar_shape_from_name(value) == Some(expected)
+}
+
+fn container_value_member_shape_span(
+    observed: &str,
+    expected: &[SchemaWireScalarShape],
+    index: usize,
+) -> Option<usize> {
+    let next = *expected.get(index)?;
+    if scalar_shape_name_matches(observed, next) {
+        return Some(1);
+    }
+    if let Some(composite) = composite_member_wire_shapes(observed) {
+        let end = index.checked_add(composite.len())?;
+        let expected = expected.get(index..end)?;
+        return (expected == composite.as_slice()).then_some(composite.len());
+    }
+    match observed {
+        "vec2" if expected_shape_run(expected, index, SchemaWireScalarShape::F32, 2) => Some(2),
+        "vec3" if expected_shape_run(expected, index, SchemaWireScalarShape::F32, 3) => Some(3),
+        "vec4" | "quat" if expected_shape_run(expected, index, SchemaWireScalarShape::F32, 4) => {
+            Some(4)
+        }
+        observed => {
+            let element = vector_element_wire_shape(observed)?;
+            if next != SchemaWireScalarShape::VlqU32 {
+                return None;
+            }
+            if expected
+                .get(index + 1)
+                .is_some_and(|shape| scalar_shape_name_matches(element, *shape))
+            {
+                Some(2)
+            } else {
+                Some(1)
+            }
+        }
+    }
+}
+
+fn expected_shape_run(
+    shapes: &[SchemaWireScalarShape],
+    start: usize,
+    shape: SchemaWireScalarShape,
+    count: usize,
+) -> bool {
+    shapes
+        .get(start..start + count)
+        .is_some_and(|slice| slice.iter().all(|candidate| *candidate == shape))
+}
+
+fn vector_element_wire_shape(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("vec<")?
+        .strip_suffix('>')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn composite_member_wire_shapes(value: &str) -> Option<Vec<SchemaWireScalarShape>> {
+    value
+        .strip_prefix("composite<")?
+        .strip_suffix('>')?
+        .split(',')
+        .map(str::trim)
+        .map(wire_scalar_shape_from_name)
+        .collect()
+}
+
+fn wire_scalar_shape_from_name(value: &str) -> Option<SchemaWireScalarShape> {
+    match value {
+        "bool" => Some(SchemaWireScalarShape::Bool),
+        "u8" => Some(SchemaWireScalarShape::U8),
+        "u16" => Some(SchemaWireScalarShape::U16),
+        "u32" => Some(SchemaWireScalarShape::U32),
+        "u64" => Some(SchemaWireScalarShape::U64),
+        "f32" => Some(SchemaWireScalarShape::F32),
+        "f64" => Some(SchemaWireScalarShape::F64),
+        "half-f32" => Some(SchemaWireScalarShape::HalfF32),
+        "vlq-u32" => Some(SchemaWireScalarShape::VlqU32),
+        "vlq-u64" => Some(SchemaWireScalarShape::VlqU64),
+        "sequence-number" => Some(SchemaWireScalarShape::SequenceNumber),
+        "vec2" => Some(SchemaWireScalarShape::Vec2),
+        "vec3" => Some(SchemaWireScalarShape::Vec3),
+        "vec4" => Some(SchemaWireScalarShape::Vec4),
+        "quat" => Some(SchemaWireScalarShape::Quat),
+        "quat-comp-norm" => Some(SchemaWireScalarShape::QuatCompNorm),
+        "mat3" => Some(SchemaWireScalarShape::Mat3),
+        "affine3" => Some(SchemaWireScalarShape::Affine3),
+        "aabb2d" => Some(SchemaWireScalarShape::Aabb2d),
+        "aabb3d" => Some(SchemaWireScalarShape::Aabb3d),
+        "entity-ref" => Some(SchemaWireScalarShape::EntityRef),
+        "string" => Some(SchemaWireScalarShape::String),
+        value => value
+            .strip_prefix("fixed-bytes-")
+            .and_then(|len| len.parse::<u16>().ok())
+            .map(SchemaWireScalarShape::FixedBytes),
+    }
+}
+
+fn container_value_shape_codec_name(
+    field: &NetworkField,
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+) -> Option<String> {
+    let field_name = field.name.as_deref()?;
+    let type_name = shape.type_name.as_deref()?;
+    let field_name = rust_field_ident(field_name);
+    Some(format!(
+        "{}{}Marshaler",
+        rust_type_ident(&field_name),
+        rust_type_ident(type_name)
+    ))
+}
+
+fn container_value_shape_rust_type(
+    field: &NetworkField,
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<String> {
+    if container_value_shape_uses_source_type(shape, serialize_types) {
+        return shape
+            .type_name_full
+            .as_deref()
+            .or(shape.type_name.as_deref())
+            .and_then(serialize_source_rust_type_name);
+    }
+    Some(container_value_shape_support_type_name(
+        field.name.as_deref()?,
+        shape,
+    )?)
+}
+
+fn container_value_shape_uses_source_type(
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+    _serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> bool {
+    shape.member_names_proven == Some(true)
+        && !shape
+            .validation
+            .as_deref()
+            .is_some_and(|validation| validation.contains("native-rtti"))
+}
+
+fn container_value_shape_support_type_name(
+    field_name: &str,
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+) -> Option<String> {
+    let type_name = shape.type_name.as_deref()?;
+    Some(format!(
+        "{}{}",
+        rust_type_ident(&rust_field_ident(field_name)),
+        rust_type_ident(type_name)
+    ))
+}
+
+fn keyed_replicated_container_type(key_type: &str, value_type: &str) -> String {
+    format!("::nw_network::serialize::IndexMap<{key_type}, {value_type}>")
+}
+
+fn unique_container_value_candidate<'a>(
+    container: &NetworkReplicatedContainerShape,
+    value_type_candidates: &[NetworkNativeTypeInfoEvidence],
+    serialize_types: &'a BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<&'a NetworkSerializeType> {
+    let mut matches = Vec::new();
+    let mut seen = BTreeSet::new();
+    for candidate in value_type_candidates {
+        let Some(type_id) = candidate.type_id else {
+            continue;
+        };
+        if !seen.insert(type_id) {
+            continue;
+        }
+        let Some(serialize) = serialize_types.get(&type_id).copied() else {
+            continue;
+        };
+        if serialize.wire_shapes == container.value_wire_shapes {
+            matches.push(serialize);
+        }
+    }
+    let [matched] = matches.as_slice() else {
+        return None;
+    };
+    Some(*matched)
+}
+
+fn serialize_container_value_type(
+    kind: NetworkSerializeKind,
+    name: &str,
+    wire_shapes: &[SchemaWireScalarShape],
+) -> Option<ContainerValueType> {
+    let rust_type = serialize_source_rust_type_name(name)?;
+    let marshaler_type = if kind == NetworkSerializeKind::Enum && wire_shapes.len() == 1 {
+        conversion_marshal_type_string_for(wire_shapes[0].into(), &rust_type)
+            .unwrap_or_else(|| format!("::nw_network::serialize::DefaultMarshaler<{rust_type}>"))
+    } else {
+        format!("::nw_network::serialize::DefaultMarshaler<{rust_type}>")
+    };
+    Some(ContainerValueType {
+        rust_type,
+        marshaler_type,
+        value_type_shape: None,
+    })
+}
+
+fn container_value_matches_serialize(
+    container: &NetworkReplicatedContainerShape,
+    serialize: &NetworkSerializeFieldType,
+) -> bool {
+    container
+        .value_type_id
+        .is_none_or(|type_id| type_id == serialize.type_id)
+        && container.value_wire_shapes == serialize.wire_shapes
+}
+
+fn serialize_source_rust_type_name(name: &str) -> Option<String> {
+    let rust_type = format!("::nw_network::source::{}", rust_type_ident(name));
+    syn::parse_str::<syn::Type>(&rust_type).ok()?;
+    Some(rust_type)
 }
 
 fn scalar_rust_type(shape: SchemaWireScalarShape) -> String {
@@ -2339,6 +3011,12 @@ fn replicated_state_module_tokens(
         .iter()
         .map(replicated_state_field_tokens)
         .collect::<Vec<_>>();
+    let mut support_names = BTreeSet::new();
+    let support_items = plan
+        .fields
+        .iter()
+        .filter_map(|field| replicated_state_field_support_tokens(field, &mut support_names))
+        .collect::<Vec<_>>();
     let register_fragment = options.registers_type_index(type_index);
     let type_registry_attr = register_fragment.then(|| quote! { #[type_registry(#type_index)] });
     let type_registry_entry_tokens = (!register_fragment).then(|| {
@@ -2356,6 +3034,8 @@ fn replicated_state_module_tokens(
         pub mod #module_ident {
             use ::nw_network::{az_rtti, replicated_state #type_registry_import};
 
+            #(#support_items)*
+
             #replicated_state_attr
             #[az_rtti(#type_id)]
             #type_registry_attr
@@ -2369,6 +3049,239 @@ fn replicated_state_module_tokens(
 
         pub use #module_ident::#state_ident;
     }
+}
+
+fn replicated_state_field_support_tokens(
+    field: &NetworkStateFieldShapeReport,
+    emitted_names: &mut BTreeSet<String>,
+) -> Option<proc_macro2::TokenStream> {
+    let shape = field.container_value_type_shape.as_ref()?;
+    let codec_name = container_value_shape_report_codec_name(field, shape)?;
+    if !emitted_names.insert(codec_name.clone()) {
+        return None;
+    }
+
+    let codec_ident = format_ident!("{codec_name}");
+    let local_value_type_name = field
+        .field_name
+        .as_deref()
+        .and_then(|field_name| container_value_shape_support_type_name(field_name, shape));
+    let value_type_string = if container_value_shape_report_uses_source_type(shape) {
+        shape
+            .type_name_full
+            .as_deref()
+            .or(shape.type_name.as_deref())
+            .and_then(serialize_source_rust_type_name)?
+    } else {
+        local_value_type_name.clone()?
+    };
+    let value_type = syn::parse_str::<syn::Type>(&value_type_string).ok()?;
+
+    let members = shape
+        .members
+        .iter()
+        .map(container_value_member_tokens)
+        .collect::<Option<Vec<_>>>()?;
+    if members.is_empty() {
+        return None;
+    }
+    let marshal_size_terms = members.iter().map(|member| {
+        let codec = &member.codec_type;
+        let ty = &member.rust_type;
+        quote!(<#codec as ::nw_network::serialize::Codec<#ty>>::MARSHAL_SIZE)
+    });
+    let marshal_fields = members.iter().map(|member| {
+        let codec = &member.codec_type;
+        let ty = &member.rust_type;
+        let access = &member.access;
+        quote! {
+            <#codec as ::nw_network::serialize::Codec<#ty>>::marshal(&value.#access, wb);
+        }
+    });
+    let decode_fields = members.iter().map(|member| {
+        let binding = &member.binding;
+        let codec = &member.codec_type;
+        let ty = &member.rust_type;
+        quote! {
+            let #binding = <#codec as ::nw_network::serialize::Codec<#ty>>::unmarshal(rb)?;
+        }
+    });
+    let assign_fields = members.iter().map(|member| {
+        let binding = &member.binding;
+        let access = &member.access;
+        quote! {
+            value.#access = #binding;
+        }
+    });
+    let support_struct = if container_value_shape_report_uses_source_type(shape) {
+        quote! {}
+    } else {
+        let value_type_ident = local_value_type_name
+            .as_deref()
+            .map(|name| format_ident!("{name}"))?;
+        let struct_fields = members.iter().map(|member| {
+            let field_ident = &member.field_ident;
+            let rust_type = &member.rust_type;
+            quote! {
+                pub #field_ident: #rust_type,
+            }
+        });
+        quote! {
+            #[derive(Debug, Clone, Default)]
+            pub struct #value_type_ident {
+                #(#struct_fields)*
+            }
+        }
+    };
+
+    Some(quote! {
+        #support_struct
+
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct #codec_ident;
+
+        impl ::nw_network::serialize::Codec<#value_type> for #codec_ident {
+            const MARSHAL_SIZE: usize = 0 #( + #marshal_size_terms )*;
+
+            fn marshal(value: &#value_type, wb: &mut ::nw_network::serialize::WriteBuffer) {
+                #(#marshal_fields)*
+            }
+
+            fn unmarshal(
+                rb: &mut ::nw_network::serialize::ReadBuffer,
+            ) -> Result<#value_type, ::nw_network::serialize::MarshalerError> {
+                #(#decode_fields)*
+                let mut value = <#value_type as ::core::default::Default>::default();
+                #(#assign_fields)*
+                Ok(value)
+            }
+        }
+    })
+}
+
+struct ContainerValueMemberTokens {
+    binding: proc_macro2::Ident,
+    access: proc_macro2::TokenStream,
+    field_ident: proc_macro2::Ident,
+    rust_type: syn::Type,
+    codec_type: syn::Type,
+}
+
+fn container_value_member_tokens(
+    member: &crate::network_schema::NetworkNestedTypeMember,
+) -> Option<ContainerValueMemberTokens> {
+    let name = member.name.as_deref()?;
+    let binding = format_ident!("field_{}", rust_field_ident(&name.replace('.', "_")));
+    let access = member_access_tokens(name)?;
+    let field_ident = format_ident!("{}", rust_field_ident(name));
+    let rust_type_string = container_value_member_rust_type(member)?;
+    let rust_type = syn::parse_str::<syn::Type>(&rust_type_string).ok()?;
+    let codec_type_string = container_value_member_codec_type(member, &rust_type_string)?;
+    let codec_type = syn::parse_str::<syn::Type>(&codec_type_string).ok()?;
+    Some(ContainerValueMemberTokens {
+        binding,
+        access,
+        field_ident,
+        rust_type,
+        codec_type,
+    })
+}
+
+fn container_value_shape_report_uses_source_type(
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+) -> bool {
+    shape.member_names_proven == Some(true)
+        && shape
+            .member_name_source
+            .as_deref()
+            .is_some_and(|source| source.contains("serialize") || source == "ghidra-datatype")
+        && !shape
+            .validation
+            .as_deref()
+            .is_some_and(|validation| validation.contains("native-rtti"))
+}
+
+fn member_access_tokens(name: &str) -> Option<proc_macro2::TokenStream> {
+    let mut parts = name
+        .split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(rust_field_ident)
+        .map(|part| format_ident!("{part}"))
+        .collect::<Vec<_>>();
+    let first = parts.first()?.clone();
+    parts.remove(0);
+    Some(quote!(#first #(.#parts)*))
+}
+
+fn container_value_member_rust_type(
+    member: &crate::network_schema::NetworkNestedTypeMember,
+) -> Option<String> {
+    if let Some(native_type) = member.native_type.as_deref()
+        && let Some(rust_type) = container_member_source_rust_type(native_type)
+    {
+        return Some(rust_type);
+    }
+    let shape = member.wire_shape.as_deref()?;
+    if composite_member_wire_shapes(shape).is_some() {
+        return None;
+    }
+    if let Some(element_shape) = vector_element_wire_shape(shape) {
+        let element_shape = wire_scalar_shape_from_name(element_shape)?;
+        let element_type = scalar_rust_type(element_shape);
+        return Some(format!("::std::vec::Vec<{element_type}>"));
+    }
+    let shape = wire_scalar_shape_from_name(shape)?;
+    Some(scalar_rust_type(shape))
+}
+
+fn container_member_source_rust_type(native_type: &str) -> Option<String> {
+    let native_type = native_type.trim();
+    if native_type == "bool" {
+        return Some("bool".to_owned());
+    }
+    let leaf = native_type.rsplit("::").next().unwrap_or(native_type);
+    let first = leaf.chars().next()?;
+    if !first.is_ascii_uppercase()
+        || native_type.starts_with("AZ::")
+        || matches!(leaf, "EntityRef" | "FragmentKey")
+    {
+        return None;
+    }
+    serialize_source_rust_type_name(leaf)
+}
+
+fn container_value_member_codec_type(
+    member: &crate::network_schema::NetworkNestedTypeMember,
+    rust_type: &str,
+) -> Option<String> {
+    let wire_shape = member.wire_shape.as_deref()?;
+    if vector_element_wire_shape(wire_shape).is_some()
+        || composite_member_wire_shapes(wire_shape).is_some()
+    {
+        return Some(format!(
+            "::nw_network::serialize::DefaultMarshaler<{rust_type}>"
+        ));
+    }
+    let shape = wire_scalar_shape_from_name(wire_shape)?;
+    Some(
+        conversion_marshal_type_string_for(shape.into(), rust_type)
+            .unwrap_or_else(|| format!("::nw_network::serialize::DefaultMarshaler<{rust_type}>")),
+    )
+}
+
+fn container_value_shape_report_codec_name(
+    field: &NetworkStateFieldShapeReport,
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+) -> Option<String> {
+    let field_name = field.field_name.as_deref()?;
+    let type_name = shape.type_name.as_deref()?;
+    let field_name = rust_field_ident(field_name);
+    Some(format!(
+        "{}{}Marshaler",
+        rust_type_ident(&field_name),
+        rust_type_ident(type_name)
+    ))
 }
 
 fn replicated_state_attr_tokens(
@@ -2891,9 +3804,9 @@ fn option_str_tokens(value: Option<&str>) -> proc_macro2::TokenStream {
 }
 
 fn type_id_literal(type_id: Uuid) -> proc_macro2::TokenStream {
-    format!("0x{:032x}", type_id.as_u128())
-        .parse()
-        .expect("formatted UUID u128 literal is valid Rust")
+    let literal = crate::uuid_format::uuid_u128_literal_text(type_id);
+    let literal = LitInt::new(&literal, proc_macro2::Span::call_site());
+    quote!(#literal)
 }
 
 #[cfg(test)]
@@ -2902,7 +3815,7 @@ mod tests {
     use uuid::uuid;
 
     use crate::{
-        ir::{SerializeCodegenUnit, SerializeCodegenVariant},
+        ir::{SerializeCodegenField, SerializeCodegenUnit, SerializeCodegenVariant},
         network_schema::{NetworkMessageFieldSignature, NetworkMessageSignature, NetworkSchema},
     };
 
@@ -3046,6 +3959,16 @@ mod tests {
             output
                 .source
                 .contains("name: Some(\"Javelin::RaidDataComponentReplicatedState\")")
+        );
+        assert!(
+            output
+                .source
+                .contains("0xA85DF621_DCE0_409F_8D39_A447EA0807FF")
+        );
+        assert!(
+            !output
+                .source
+                .contains("0xA85D_F621_DCE0_409F_8D39_A447_EA08_07FF")
         );
         assert!(output.source.contains("raidId"));
         assert!(
@@ -3418,7 +4341,7 @@ mod tests {
             NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
         let plan = &output.report.state_generation_plans[0];
 
-        assert!(plan.can_generate);
+        assert!(plan.can_generate, "{plan:#?}");
         assert_eq!(plan.missing_wire_shape_count, 0);
         assert_eq!(plan.fields[0].rust_value_type.as_deref(), Some("i8"));
         assert_eq!(
@@ -3462,7 +4385,7 @@ mod tests {
             NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
         let plan = &output.report.state_generation_plans[0];
 
-        assert!(plan.can_generate);
+        assert!(plan.can_generate, "{plan:#?}");
         assert_eq!(plan.shaped_field_count, 1);
         assert_eq!(plan.missing_wire_shape_count, 0);
         assert_eq!(plan.fields[0].wire_shape, None);
@@ -3510,7 +4433,7 @@ mod tests {
             NetworkRustEmitter::emit_descriptors(&schema).expect("descriptor source");
         let plan = &descriptor_output.report.state_generation_plans[0];
 
-        assert!(plan.can_generate);
+        assert!(plan.can_generate, "{plan:#?}");
         assert_eq!(plan.shaped_field_count, 1);
         assert_eq!(plan.supported_field_count, 1);
         assert!(plan.blocked_reasons.is_empty());
@@ -3526,12 +4449,12 @@ mod tests {
         assert_eq!(plan.fields[0].blocked_reason, None);
         assert_eq!(
             plan.fields[0].rust_value_type.as_deref(),
-            Some("::std::collections::HashMap<u32, u64>")
+            Some("::nw_network::serialize::IndexMap<u32, u64>")
         );
         assert_eq!(
             plan.fields[0].rust_field_type.as_deref(),
             Some(
-                "::nw_network::serialize::ReplicatedContainer<::std::collections::HashMap<u32, u64>, { ::nw_network::serialize::WIRE_VEC_CAP }, ::nw_network::serialize::DefaultMarshaler<u32>, ::nw_network::serialize::VlqU64Marshaler>"
+                "::nw_network::serialize::ReplicatedContainer<::nw_network::serialize::IndexMap<u32, u64>, { ::nw_network::serialize::WIRE_VEC_CAP }, ::nw_network::serialize::DefaultMarshaler<u32>, ::nw_network::serialize::VlqU64Marshaler>"
             )
         );
         assert!(
@@ -3548,9 +4471,1075 @@ mod tests {
         let state_output =
             NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
         assert!(state_output.source.contains("ReplicatedContainer"));
-        assert!(state_output.source.contains("HashMap"));
+        assert!(state_output.source.contains("IndexMap"));
         assert!(state_output.source.contains("u32"));
         assert!(state_output.source.contains("u64"));
+    }
+
+    #[test]
+    fn selected_struct_container_shape_emits_full_replicated_container_type() {
+        let value_type_id = uuid!("da4e5889-a65c-4480-8642-0278160125a7");
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "B4DB39E2-5054-4604-9855-9A4DC75BDDE4",
+                "typeIndex": 3362,
+                "typeName": "MB::StructuredMapReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "valuesById",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81bf3d0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81bf3d0",
+                "fieldCount": 1,
+                "wireShape": "replicated-container<u32,u8>",
+                "wireShapeSource": "replicated-container-marshal-calls",
+                "deltaMarshalShapes": ["vlq-u32", "vlq-u32"],
+                "fullMarshalShapes": ["sequence-number", "vlq-u32", "u32", "u8", "u64"],
+                "valueTypeName": "ExampleValue",
+                "valueTypeId": value_type_id.to_string(),
+                "valueTypeInfoAddress": "NewWorld+0x8123450",
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+        schema.merge_serialize_codegen_unit(
+            &SerializeCodegenUnit {
+                items: vec![example_value_item(
+                    value_type_id,
+                    [ScalarType::U8, ScalarType::U64],
+                )],
+            },
+            Some("selection.json".to_owned()),
+        );
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(field.wire_shape, None);
+        assert_eq!(field.serialize_type_name.as_deref(), Some("ExampleValue"));
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::nw_network::serialize::IndexMap<u32, ::nw_network::source::ExampleValue>")
+        );
+        assert!(
+            field
+                .rust_field_type
+                .as_deref()
+                .is_some_and(|ty| ty.contains("ReplicatedContainer<"))
+        );
+        assert!(
+            output
+                .source
+                .contains("IndexMap<u32, ::nw_network::source::ExampleValue>")
+        );
+        assert!(output.source.contains(
+            "::nw_network::serialize::DefaultMarshaler<::nw_network::source::ExampleValue>"
+        ));
+    }
+
+    #[test]
+    fn selected_struct_container_shape_mismatch_stays_blocked() {
+        let value_type_id = uuid!("da4e5889-a65c-4480-8642-0278160125a7");
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "B4DB39E2-5054-4604-9855-9A4DC75BDDE4",
+                "typeIndex": 3362,
+                "typeName": "MB::StructuredMapReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "valuesById",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81bf3d0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81bf3d0",
+                "fieldCount": 1,
+                "deltaMarshalShapes": ["vlq-u32", "u32", "sequence-number", "u8", "u64"],
+                "fullMarshalShapes": ["sequence-number", "vlq-u32", "u32", "u8", "u64"],
+                "valueTypeName": "ExampleValue",
+                "valueTypeId": value_type_id.to_string(),
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+        schema.merge_serialize_codegen_unit(
+            &SerializeCodegenUnit {
+                items: vec![example_value_item(
+                    value_type_id,
+                    [ScalarType::U64, ScalarType::U8],
+                )],
+            },
+            Some("selection.json".to_owned()),
+        );
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(!plan.can_generate);
+        assert_eq!(plan.blocked_reasons, vec!["missing-semantic-type:1"]);
+        assert_eq!(field.serialize_type_name.as_deref(), Some("ExampleValue"));
+        assert_eq!(field.rust_field_type, None);
+        assert_eq!(
+            field.blocked_reason.as_deref(),
+            Some("missing-semantic-type")
+        );
+    }
+
+    #[test]
+    fn container_value_type_shape_emits_order_specific_codec() {
+        let value_type_id = uuid!("022d0c83-ee04-4e4d-9776-4dfbdaa90923");
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "FD24C20B-FB95-49F8-9BB0-DEC472F0B6EA",
+                "typeIndex": 205,
+                "typeName": "MB::CraftingComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "m_cooldowns",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x8153630",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8153630",
+                "fieldCount": 1,
+                "deltaMarshalShapes": ["vlq-u32", "u32", "sequence-number", "u8", "u64"],
+                "fullMarshalShapes": ["sequence-number", "vlq-u32", "u32", "u8", "u64"],
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x814f838",
+                    "name": "RecipeCooldownData",
+                    "typeId": value_type_id.to_string(),
+                    "source": "rtti-provider-vtable",
+                    "nameSource": "rtti-helper-function-name"
+                }],
+                "valueTypeShape": {
+                    "typeId": value_type_id.to_string(),
+                    "typeIdSource": "rtti-provider-vtable",
+                    "typeName": "RecipeCooldownData",
+                    "typeNameFull": "RecipeCooldownData",
+                    "typeNameSource": "rtti-helper-function-name",
+                    "azRttiAddress": "NewWorld+0x814f838",
+                    "memberNameSource": "ghidra-datatype",
+                    "memberNamesProven": true,
+                    "datatypePath": "/RecipeCooldownData",
+                    "validation": "container-value-datatype-layout",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x8",
+                        "name": "m_count",
+                        "nameSource": "ghidra-datatype",
+                        "nameProven": true,
+                        "nativeType": "unsigned_char",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "container-value-datatype-member"
+                    }, {
+                        "index": 1,
+                        "offset": "0x10",
+                        "nativeOffset": "0x18",
+                        "name": "m_cooldownEnd",
+                        "nameSource": "ghidra-datatype",
+                        "nameProven": true,
+                        "nameEvidence": "m_nanosecondsSinceEpoc",
+                        "nativeType": "WallClockTimePoint",
+                        "wireShape": "u64",
+                        "byteWidth": 16,
+                        "evidenceSource": "container-value-nested-datatype-member"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [205]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some(
+                "::nw_network::serialize::IndexMap<u32, ::nw_network::source::RecipeCooldownData>"
+            )
+        );
+        assert!(
+            field
+                .rust_field_type
+                .as_deref()
+                .is_some_and(|ty| ty.contains("CooldownsRecipeCooldownDataMarshaler"))
+        );
+        assert_eq!(
+            field
+                .container_value_type_shape
+                .as_ref()
+                .map(|shape| shape.validation.as_deref()),
+            Some(Some("container-value-datatype-layout"))
+        );
+        assert!(
+            output
+                .source
+                .contains("pub struct CooldownsRecipeCooldownDataMarshaler")
+        );
+        let compact_source = output.source.split_whitespace().collect::<String>();
+        assert!(output.source.contains("value.count"));
+        assert!(output.source.contains("value.cooldown_end"));
+        assert!(compact_source.contains("::nw_network::source::WallClockTimePoint"));
+        assert!(
+            compact_source.contains(
+                "as::nw_network::serialize::Codec<::nw_network::source::WallClockTimePoint"
+            )
+        );
+        assert!(!compact_source.contains(
+            "::nw_network::serialize::DefaultMarshaler<::nw_network::source::RecipeCooldownData>"
+        ));
+    }
+
+    #[test]
+    fn single_member_container_value_shape_is_not_flattened_to_scalar() {
+        let value_type_id = uuid!("24fbf222-8cf9-4539-b313-34726b8fc675");
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "5E1977B4-E4C7-4F2A-8337-4BE775A9014C",
+                "typeIndex": 3312,
+                "typeName": "Javelin::GameModeParticipantReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "queueEligibleTimesForGameModes",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81b6fc8",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81b6fc8",
+                "fieldCount": 1,
+                "wireShape": "replicated-container<u32,u64>",
+                "wireShapeSource": "replicated-container-marshal-calls",
+                "deltaMarshalShapes": ["vlq-u32", "vlq-u32"],
+                "fullMarshalShapes": ["sequence-number", "vlq-u32", "u32", "u64", "vlq-u32"],
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x802f940",
+                    "name": "WallClockTimePoint",
+                    "typeId": value_type_id.to_string(),
+                    "source": "rtti-provider-vtable",
+                    "nameSource": "rtti-helper-function-name"
+                }],
+                "valueTypeShape": {
+                    "typeId": value_type_id.to_string(),
+                    "typeIdSource": "rtti-provider-vtable",
+                    "typeName": "WallClockTimePoint",
+                    "typeNameFull": "WallClockTimePoint",
+                    "typeNameSource": "rtti-helper-function-name",
+                    "azRttiAddress": "NewWorld+0x802f940",
+                    "memberNameSource": "serialize-json-offset-match",
+                    "memberNamesProven": true,
+                    "validation": "container-value-pcode-wire-order-serialize-layout",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x8",
+                        "nativeOffset": "0x8",
+                        "name": "m_nanosecondsSinceEpoc",
+                        "nameSource": "serialize-json-offset-match",
+                        "nameProven": true,
+                        "nativeType": "AZStd::ranged_int",
+                        "wireShape": "u64",
+                        "byteWidth": 8,
+                        "evidenceSource": "container-value-pcode-call-scalar-output-store+serialize-json-field"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3312]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some(
+                "::nw_network::serialize::IndexMap<u32, ::nw_network::source::WallClockTimePoint>"
+            )
+        );
+        assert!(field.rust_field_type.as_deref().is_some_and(|ty| {
+            ty.contains("QueueEligibleTimesForGameModesWallClockTimePointMarshaler")
+        }));
+        assert!(
+            field
+                .container_value_type_shape
+                .as_ref()
+                .is_some_and(|shape| shape.type_name.as_deref() == Some("WallClockTimePoint"))
+        );
+        assert!(!output.source.contains("IndexMap<u32, u64>"));
+    }
+
+    #[test]
+    fn bool_backed_container_value_member_keeps_bool_rust_field() {
+        let value_type_id = uuid!("b715b520-5fc0-4245-84e7-7d974b8410f8");
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "C5021E27-01D8-4E31-87E8-51E00506E07B",
+                "typeIndex": 1525,
+                "typeName": "MB::StatMultiplierTableComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "multiplierTable",
+                    "group": 1,
+                    "handlerVtable": "NewWorld+0x82f3038",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x82f3038",
+                "fieldCount": 2,
+                "deltaMarshalShapes": ["vlq-u32", "vlq-u32"],
+                "fullMarshalShapes": ["sequence-number", "vlq-u32", "u8", "u32", "u8", "vlq-u32"],
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x82f2710",
+                    "name": "StatMultiplierData",
+                    "typeId": value_type_id.to_string(),
+                    "source": "rtti-provider-vtable",
+                    "nameSource": "rtti-helper-function-name"
+                }],
+                "valueTypeShape": {
+                    "typeId": value_type_id.to_string(),
+                    "typeIdSource": "rtti-provider-vtable",
+                    "typeName": "StatMultiplierData",
+                    "typeNameFull": "StatMultiplierData",
+                    "typeNameSource": "rtti-helper-function-name",
+                    "azRttiAddress": "NewWorld+0x82f2710",
+                    "memberNameSource": "serialize-json-offset-match",
+                    "memberNamesProven": true,
+                    "validation": "container-value-pcode-wire-order-serialize-layout",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0xc",
+                        "nativeOffset": "0xc",
+                        "name": "m_value",
+                        "nameSource": "serialize-json-offset-match",
+                        "nameProven": true,
+                        "nativeType": "int",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "container-value-pcode-call+serialize-json-field"
+                    }, {
+                        "index": 1,
+                        "offset": "0x8",
+                        "nativeOffset": "0x8",
+                        "name": "m_syncVitals",
+                        "nameSource": "serialize-json-offset-match",
+                        "nameProven": true,
+                        "nativeType": "bool",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "container-value-pcode-call+serialize-json-field"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [1525]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::nw_network::serialize::IndexMap<u8, ::nw_network::source::StatMultiplierData>")
+        );
+        assert!(
+            field
+                .rust_field_type
+                .as_deref()
+                .is_some_and(|ty| { ty.contains("MultiplierTableStatMultiplierDataMarshaler") })
+        );
+        let compact_source = output.source.split_whitespace().collect::<String>();
+        assert!(compact_source.contains("value.sync_vitals"));
+        assert!(compact_source.contains("DefaultMarshaler<bool"));
+        assert!(compact_source.contains("value.value=field_value"));
+    }
+
+    #[test]
+    fn vector_container_shape_emits_vec_storage() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "B4DB39E2-5054-4604-9855-9A4DC75BDDE4",
+                "typeIndex": 3362,
+                "typeName": "MB::ScalarVecReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "values",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81bf3d0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81bf3d0",
+                "fieldCount": 1,
+                "wireShape": "replicated-container<vlq-u64,u64>",
+                "wireShapeSource": "replicated-container-marshal-calls",
+                "deltaMarshalShapes": ["vlq-u32", "vlq-u64", "sequence-number", "u64"],
+                "fullMarshalShapes": ["sequence-number", "vlq-u32", "u64"],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(field.wire_shape, None);
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::std::vec::Vec<u64>")
+        );
+        assert!(
+            field
+                .rust_field_type
+                .as_deref()
+                .is_some_and(|ty| ty.contains("ReplicatedContainer<::std::vec::Vec<u64>"))
+        );
+    }
+
+    #[test]
+    fn native_only_structured_vector_container_emits_local_value_type() {
+        let value_type_id = uuid!("fdda118c-1c41-48a4-af1c-b45fd6797fbe");
+        let beam_value_shapes = [
+            "u8", "u32", "u64", "f32", "f32", "f32", "f32", "f32", "f32", "f32", "f32", "f32",
+            "f32", "f32", "f32", "f32", "f32", "f32", "vlq-u32",
+        ];
+        let dynamic_value_shapes = [
+            "u32", "u8", "u32", "u64", "f32", "f32", "f32", "f32", "f32", "f32", "f32", "f32",
+            "f32", "f32", "f32", "f32", "f32", "f32", "f32", "vlq-u32",
+        ];
+        let mut beam_delta_shapes = vec!["vlq-u32", "vlq-u64", "sequence-number"];
+        beam_delta_shapes.extend(beam_value_shapes);
+        let mut beam_full_shapes = vec!["sequence-number", "vlq-u32"];
+        beam_full_shapes.extend(beam_value_shapes);
+        let mut dynamic_delta_shapes = vec!["vlq-u32", "vlq-u64", "sequence-number"];
+        dynamic_delta_shapes.extend(dynamic_value_shapes);
+        let mut dynamic_full_shapes = vec!["sequence-number", "vlq-u32"];
+        dynamic_full_shapes.extend(dynamic_value_shapes);
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "CB9D9BE8-9C90-494C-9324-F17689B1B635",
+                "typeIndex": 2947,
+                "typeName": "MB::BeamAttackComponentReplicatedState",
+                "fragmentMetadata": {
+                    "category": "Uncategorized",
+                    "categoryValue": 0,
+                    "isMetadata": false
+                },
+                "fields": [{
+                    "index": 0,
+                    "name": "beamData",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x854e440",
+                    "confidence": "register-field-call"
+                }, {
+                    "index": 1,
+                    "name": "dynamicBeamData",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x854e4e0",
+                    "confidence": "register-field-call"
+                }, {
+                    "index": 2,
+                    "name": "aiTargetGDERef",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x818cee8",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x854e440",
+                "fieldCount": 1,
+                "handlerKind": "replicated-container",
+                "deltaMarshalShapes": beam_delta_shapes,
+                "fullMarshalShapes": beam_full_shapes,
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x8540380",
+                    "name": "BeamAttackData_Replicated",
+                    "typeId": value_type_id.to_string(),
+                    "source": "rtti-provider-vtable",
+                    "nameSource": "az-rtti-provider-table"
+                }],
+                "valueTypeShape": {
+                    "typeId": value_type_id.to_string(),
+                    "typeIdSource": "rtti-provider-vtable",
+                    "typeName": "BeamAttackData_Replicated",
+                    "typeNameFull": "BeamAttackData_Replicated",
+                    "typeNameSource": "az-rtti-provider-table",
+                    "azRttiAddress": "NewWorld+0x8540380",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "container-value-pcode-wire-order-native-rtti",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x10",
+                        "nativeOffset": "0x10",
+                        "name": "field_0",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "bool",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 1,
+                        "offset": "0x20",
+                        "nativeOffset": "0x20",
+                        "name": "field_1",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 2,
+                        "offset": "0x18",
+                        "nativeOffset": "0x18",
+                        "name": "field_2",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u64",
+                        "wireShape": "u64",
+                        "byteWidth": 8,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 3,
+                        "offset": "0x30",
+                        "nativeOffset": "0x30",
+                        "name": "field_3",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "byteWidth": 12,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 4,
+                        "offset": "0x40",
+                        "nativeOffset": "0x40",
+                        "name": "field_4",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "byteWidth": 12,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 5,
+                        "offset": "0x50",
+                        "nativeOffset": "0x50",
+                        "name": "field_5",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "byteWidth": 12,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 6,
+                        "offset": "0x60",
+                        "nativeOffset": "0x60",
+                        "name": "field_6",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "byteWidth": 12,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 7,
+                        "offset": "0x70",
+                        "nativeOffset": "0x70",
+                        "name": "field_7",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "byteWidth": 12,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 8,
+                        "offset": "0x80",
+                        "nativeOffset": "0x80",
+                        "name": "field_8",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZStd::vector<AZ::u64>",
+                        "wireShape": "vec<u64>",
+                        "byteWidth": 24,
+                        "evidenceSource": "container-value-pcode-collection-output+native-rtti-synthetic-field"
+                    }]
+                },
+                "slots": []
+            }, {
+                "address": "NewWorld+0x854e4e0",
+                "fieldCount": 1,
+                "handlerKind": "replicated-container",
+                "deltaMarshalShapes": dynamic_delta_shapes,
+                "fullMarshalShapes": dynamic_full_shapes,
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x8540380",
+                    "name": "BeamAttackData_Replicated",
+                    "typeId": value_type_id.to_string(),
+                    "source": "rtti-provider-vtable",
+                    "nameSource": "az-rtti-provider-table"
+                }],
+                "valueTypeShape": {
+                    "typeId": value_type_id.to_string(),
+                    "typeIdSource": "rtti-provider-vtable",
+                    "typeName": "BeamAttackData_Replicated",
+                    "typeNameFull": "BeamAttackData_Replicated",
+                    "typeNameSource": "az-rtti-provider-table",
+                    "azRttiAddress": "NewWorld+0x8540380",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "container-value-pcode-wire-order-native-rtti",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "nativeOffset": "0x0",
+                        "name": "field_0",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 1,
+                        "offset": "0x10",
+                        "nativeOffset": "0x10",
+                        "name": "field_1",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "bool",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 2,
+                        "offset": "0x20",
+                        "nativeOffset": "0x20",
+                        "name": "field_2",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 3,
+                        "offset": "0x18",
+                        "nativeOffset": "0x18",
+                        "name": "field_3",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u64",
+                        "wireShape": "u64",
+                        "byteWidth": 8,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 4,
+                        "offset": "0x30",
+                        "nativeOffset": "0x30",
+                        "name": "field_4",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "byteWidth": 12,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 5,
+                        "offset": "0x40",
+                        "nativeOffset": "0x40",
+                        "name": "field_5",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "byteWidth": 12,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 6,
+                        "offset": "0x50",
+                        "nativeOffset": "0x50",
+                        "name": "field_6",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "byteWidth": 12,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 7,
+                        "offset": "0x60",
+                        "nativeOffset": "0x60",
+                        "name": "field_7",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "byteWidth": 12,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 8,
+                        "offset": "0x70",
+                        "nativeOffset": "0x70",
+                        "name": "field_8",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "byteWidth": 12,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 9,
+                        "offset": "0x80",
+                        "nativeOffset": "0x80",
+                        "name": "field_9",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZStd::vector<AZ::u64>",
+                        "wireShape": "vec<u64>",
+                        "byteWidth": 24,
+                        "evidenceSource": "container-value-pcode-collection-output+native-rtti-synthetic-field"
+                    }]
+                },
+                "slots": []
+            }, {
+                "address": "NewWorld+0x818cee8",
+                "fieldCount": 1,
+                "wireShape": "u64",
+                "wireShapeSource": "marshal-call:marshal-function-name",
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [2947]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(plan.fields[0].field_name.as_deref(), Some("beamData"));
+        assert_eq!(
+            plan.fields[0].rust_value_type.as_deref(),
+            Some("::std::vec::Vec<BeamDataBeamAttackDataReplicated>")
+        );
+        assert_eq!(
+            plan.fields[1].rust_value_type.as_deref(),
+            Some("::std::vec::Vec<DynamicBeamDataBeamAttackDataReplicated>")
+        );
+        let compact_source = output.source.split_whitespace().collect::<String>();
+        assert!(
+            output
+                .source
+                .contains("pub struct BeamDataBeamAttackDataReplicated")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub struct DynamicBeamDataBeamAttackDataReplicated")
+        );
+        assert!(compact_source.contains("pubfield_3:::glam::Vec3"));
+        assert!(compact_source.contains("pubfield_8:::std::vec::Vec<u64>"));
+        assert!(compact_source.contains("DefaultMarshaler<::std::vec::Vec<u64>"));
+        assert!(!output.source.contains("[f32; 3]"));
+        assert!(!compact_source.contains("[f32;3]"));
+        assert!(
+            !output
+                .source
+                .contains("::nw_network::source::BeamAttackDataReplicated")
+        );
+        assert!(
+            compact_source
+                .contains("ReplicatedContainer<::std::vec::Vec<BeamDataBeamAttackDataReplicated>")
+        );
+    }
+
+    #[test]
+    fn provider_value_type_candidates_do_not_force_container_generation() {
+        let recipe_cooldown_id = uuid!("022d0c83-ee04-4e4d-9776-4dfbdaa90923");
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "B4DB39E2-5054-4604-9855-9A4DC75BDDE4",
+                "typeIndex": 3362,
+                "typeName": "MB::CraftingComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "recipeCooldowns",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81bf3d0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81bf3d0",
+                "fieldCount": 1,
+                "wireShape": "replicated-container<u32,u8>",
+                "wireShapeSource": "replicated-container-marshal-calls",
+                "deltaMarshalShapes": ["vlq-u32", "u32", "sequence-number", "u8"],
+                "fullMarshalShapes": ["sequence-number", "vlq-u32", "u32", "u8", "u64", "u16"],
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x8123450",
+                    "name": "RecipeCooldownData",
+                    "typeId": recipe_cooldown_id.to_string(),
+                    "source": "rtti-provider-vtable"
+                }],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(!plan.can_generate);
+        assert_eq!(plan.blocked_reasons, vec!["missing-semantic-type:1"]);
+        assert_eq!(field.wire_shape, None);
+        assert_eq!(
+            field.blocked_reason.as_deref(),
+            Some("missing-semantic-type")
+        );
+        assert_eq!(field.value_type_candidates.len(), 1);
+        assert_eq!(
+            field.value_type_candidates[0].name.as_deref(),
+            Some("RecipeCooldownData")
+        );
+        assert_eq!(
+            field.value_type_candidates[0].type_id,
+            Some(recipe_cooldown_id)
+        );
+        assert_eq!(field.rust_value_type, None);
+        assert_eq!(field.rust_field_type, None);
+        assert!(!output.source.contains("CraftingComponentReplicatedState"));
+    }
+
+    #[test]
+    fn provider_value_type_candidate_matching_serialize_shape_emits_container_generation() {
+        let recipe_cooldown_id = uuid!("022d0c83-ee04-4e4d-9776-4dfbdaa90923");
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "B4DB39E2-5054-4604-9855-9A4DC75BDDE4",
+                "typeIndex": 3362,
+                "typeName": "MB::CraftingComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "recipeCooldowns",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81bf3d0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81bf3d0",
+                "fieldCount": 1,
+                "deltaMarshalShapes": ["vlq-u32", "u32", "sequence-number", "u8", "u64"],
+                "fullMarshalShapes": ["sequence-number", "vlq-u32", "u32", "u8", "u64"],
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x8123450",
+                    "name": "RecipeCooldownData",
+                    "typeId": recipe_cooldown_id.to_string(),
+                    "source": "rtti-provider-vtable"
+                }],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+        schema.merge_serialize_codegen_unit(
+            &SerializeCodegenUnit {
+                items: vec![named_value_item(
+                    recipe_cooldown_id,
+                    "RecipeCooldownData",
+                    [ScalarType::U8, ScalarType::U64],
+                )],
+            },
+            Some("selection.json".to_owned()),
+        );
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate);
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some(
+                "::nw_network::serialize::IndexMap<u32, ::nw_network::source::RecipeCooldownData>"
+            )
+        );
+        assert!(field.rust_field_type.as_deref().is_some_and(|ty| {
+            ty.contains("DefaultMarshaler<::nw_network::source::RecipeCooldownData>")
+        }));
+    }
+
+    #[test]
+    fn selected_structured_container_with_partial_delta_uses_full_value_codec() {
+        let value_type_id = uuid!("0dc02dd0-993e-48c0-8b60-5715d4383b0d");
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "111AEBB0-4F23-4914-B732-A349CCBD82D4",
+                "typeIndex": 3780,
+                "typeName": "Javelin::GlobalMapDataManagerComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "globalMapData",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x8223838",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8223838",
+                "fieldCount": 1,
+                "deltaMarshalShapes": ["vlq-u32", "u64", "sequence-number", "u8"],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u64",
+                    "vec2",
+                    "u16",
+                    "u32"
+                ],
+                "valueTypeName": "GlobalMapData",
+                "valueTypeId": value_type_id.to_string(),
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+        schema.merge_serialize_codegen_unit(
+            &SerializeCodegenUnit {
+                items: vec![named_value_item(
+                    value_type_id,
+                    "GlobalMapData",
+                    [ScalarType::Vector2, ScalarType::U16, ScalarType::U32],
+                )],
+            },
+            Some("selection.json".to_owned()),
+        );
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3780]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate);
+        assert!(plan.blocked_reasons.is_empty());
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::nw_network::serialize::IndexMap<u64, ::nw_network::source::GlobalMapData>")
+        );
+        assert!(field.rust_field_type.as_deref().is_some_and(|ty| {
+            ty.contains("DefaultMarshaler<::nw_network::source::GlobalMapData>")
+        }));
+    }
+
+    #[test]
+    fn ambiguous_provider_value_type_shape_matches_stay_blocked() {
+        let first_type_id = uuid!("022d0c83-ee04-4e4d-9776-4dfbdaa90923");
+        let second_type_id = uuid!("80a9e3d4-2cf6-44b1-b05e-c44a6f36b5db");
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "B4DB39E2-5054-4604-9855-9A4DC75BDDE4",
+                "typeIndex": 3362,
+                "typeName": "MB::CraftingComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "recipeCooldowns",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81bf3d0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81bf3d0",
+                "fieldCount": 1,
+                "deltaMarshalShapes": ["vlq-u32", "u32", "sequence-number", "u8", "u64"],
+                "fullMarshalShapes": ["sequence-number", "vlq-u32", "u32", "u8", "u64"],
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x8123450",
+                    "name": "RecipeCooldownData",
+                    "typeId": first_type_id.to_string(),
+                    "source": "rtti-provider-vtable"
+                }, {
+                    "address": "NewWorld+0x8123460",
+                    "name": "OtherCooldownData",
+                    "typeId": second_type_id.to_string(),
+                    "source": "rtti-provider-vtable"
+                }],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+        schema.merge_serialize_codegen_unit(
+            &SerializeCodegenUnit {
+                items: vec![
+                    named_value_item(
+                        first_type_id,
+                        "RecipeCooldownData",
+                        [ScalarType::U8, ScalarType::U64],
+                    ),
+                    named_value_item(
+                        second_type_id,
+                        "OtherCooldownData",
+                        [ScalarType::U8, ScalarType::U64],
+                    ),
+                ],
+            },
+            Some("selection.json".to_owned()),
+        );
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3362]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(!plan.can_generate);
+        assert_eq!(plan.blocked_reasons, vec!["missing-semantic-type:1"]);
+        assert_eq!(field.rust_field_type, None);
     }
 
     #[test]
@@ -4637,6 +6626,47 @@ mod tests {
                     value_i32: Some(4),
                 },
             ],
+        }
+    }
+
+    fn example_value_item<const N: usize>(
+        type_id: Uuid,
+        fields: [ScalarType; N],
+    ) -> SerializeCodegenItem {
+        named_value_item(type_id, "ExampleValue", fields)
+    }
+
+    fn named_value_item<const N: usize>(
+        type_id: Uuid,
+        source_name: &str,
+        fields: [ScalarType; N],
+    ) -> SerializeCodegenItem {
+        SerializeCodegenItem {
+            source_type_id: type_id,
+            source_name: source_name.to_owned(),
+            role: crate::role::ReflectedTypeRole::SupportType,
+            is_reflection_marker: false,
+            is_abstract: Some(false),
+            factory: None,
+            rtti_base_chain: Vec::new(),
+            kind: SerializeCodegenItemKind::Struct,
+            enum_underlying_type: None,
+            fields: fields
+                .into_iter()
+                .enumerate()
+                .map(|(index, scalar)| SerializeCodegenField {
+                    source_name: format!("m_field{index}"),
+                    source_type_id: Uuid::nil(),
+                    resolved_type: ResolvedType::Scalar(scalar),
+                    data_size: None,
+                    offset: None,
+                    flags: None,
+                    is_base_class: false,
+                    is_pointer: false,
+                    is_dynamic_field: false,
+                })
+                .collect(),
+            variants: Vec::new(),
         }
     }
 

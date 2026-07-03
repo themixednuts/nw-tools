@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::Result;
 use nw_localization::{
-    KeyFileIndex, LANGUAGE_MANIFEST_ASSET_PATH, LanguageCode, LanguageManifest, LocalizationCatalog,
-    LocalizationCatalogBuilder, LocalizationDocument, LocalizationKey, LocalizationLoader,
-    LocalizationTag, localization_asset_path,
+    KeyFileIndex, LANGUAGE_MANIFEST_ASSET_PATH, LanguageCode, LanguageManifest,
+    LocalizationCatalog, LocalizationCatalogBuilder, LocalizationDocument, LocalizationKey,
+    LocalizationLoader, LocalizationTag, localization_asset_path,
 };
 use nw_pak::PakMmapReader;
 
@@ -178,7 +178,9 @@ impl DatasheetWorkspace {
     }
 
     fn sheet_lock(&self) -> std::sync::MutexGuard<'_, Discovered> {
-        self.sheets.lock().unwrap_or_else(|error| error.into_inner())
+        self.sheets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     fn len(&self) -> usize {
@@ -227,7 +229,11 @@ impl DatasheetWorkspace {
             .loc_index
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        store.seed_paths(index.iter().map(|(path, reader)| (path.clone(), reader.clone())));
+        store.seed_paths(
+            index
+                .iter()
+                .map(|(path, reader)| (path.clone(), reader.clone())),
+        );
         Some(store)
     }
 
@@ -382,19 +388,15 @@ impl DatasheetWorkspace {
             let document = LocalizationDocument::parse_bytes(&bytes).ok()?;
             Some((name.clone(), document))
         });
-        let mut langs = self
-            .langs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut langs = self.langs.lock().unwrap_or_else(|error| error.into_inner());
         let state = langs
             .entry(code.to_string())
             .or_insert_with(|| LangState::new(language.clone()));
         for entry in documents.into_iter().flatten() {
             let (name, document) = entry;
-            let _ =
-                state
-                    .builder
-                    .add_document(name.into(), &LocalizationTag::init(), &document);
+            let _ = state
+                .builder
+                .add_document(name.into(), &LocalizationTag::init(), &document);
         }
         // Mark every requested file loaded (even absent ones) so we never retry it.
         state.loaded.extend(names);

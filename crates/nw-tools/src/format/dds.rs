@@ -115,7 +115,12 @@ impl Dds {
             let store = Arc::new(crate::tui::TextureStore::Fs);
             let source = root.display().to_string();
             let catalog = Arc::new(crate::tui::DdsCatalog::ready(items));
-            return Ok(crate::tui::dds_browser(catalog, store, source, ctx.runner.clone())?);
+            return Ok(crate::tui::dds_browser(
+                catalog,
+                store,
+                source,
+                ctx.runner.clone(),
+            )?);
         }
 
         let paths = collect_matching(&root, |path| nw_dds::is_dds_path(path))?;
@@ -194,7 +199,12 @@ impl Dds {
         if crate::tui::interactive() {
             let (catalog, index) = spawn_dds_discovery(ctx, paks.paths());
             let store = Arc::new(crate::tui::TextureStore::Pak(index));
-            return Ok(crate::tui::dds_browser(catalog, store, source, ctx.runner.clone())?);
+            return Ok(crate::tui::dds_browser(
+                catalog,
+                store,
+                source,
+                ctx.runner.clone(),
+            )?);
         }
 
         // Piped: produce the full listing up front.
@@ -354,7 +364,12 @@ fn fit_image(image: &image::RgbaImage, max: u32) -> image::RgbaImage {
     let scale = f64::from(max) / f64::from(width.max(height));
     let target_w = ((f64::from(width) * scale) as u32).max(1);
     let target_h = ((f64::from(height) * scale) as u32).max(1);
-    image::imageops::resize(image, target_w, target_h, image::imageops::FilterType::Triangle)
+    image::imageops::resize(
+        image,
+        target_w,
+        target_h,
+        image::imageops::FilterType::Triangle,
+    )
 }
 
 fn convert_dds_to_ktx2(ctx: &RunCtx, path: &Path, out: &Path, overwrite: bool) -> Result<()> {
@@ -403,9 +418,14 @@ fn dds_browser_items_fs(ctx: &RunCtx, root: &Path) -> Result<Vec<crate::tui::Dds
     let classified = ctx
         .runner
         .try_map(&paths, |path| -> Result<(nw_dds::SplitPart, String)> {
-            Ok((split_part_for_path(path)?, path.to_string_lossy().into_owned()))
+            Ok((
+                split_part_for_path(path)?,
+                path.to_string_lossy().into_owned(),
+            ))
         })?;
-    let mut items = group_sprites(group_dds_items(classified, |header| relative_label(root, header))?);
+    let mut items = group_sprites(group_dds_items(classified, |header| {
+        relative_label(root, header)
+    })?);
     items.sort_by(|left, right| left.label.cmp(&right.label));
     Ok(items)
 }
@@ -458,8 +478,7 @@ fn group_dds_items(
         }
     }
 
-    let by_index =
-        |(part, _): &(nw_dds::SplitPart, String)| part.mip_index().unwrap_or(0);
+    let by_index = |(part, _): &(nw_dds::SplitPart, String)| part.mip_index().unwrap_or(0);
     Ok(groups
         .into_iter()
         .map(|(base, mut group)| {
@@ -507,7 +526,10 @@ fn group_sprites(items: Vec<crate::tui::DdsItem>) -> Vec<crate::tui::DdsItem> {
             .into_iter()
             .flat_map(|(_, item)| item.frames)
             .collect::<Vec<_>>();
-        out.push(crate::tui::DdsItem { label: format!("{base}_*.dds"), frames });
+        out.push(crate::tui::DdsItem {
+            label: format!("{base}_*.dds"),
+            frames,
+        });
     }
     out
 }
@@ -829,9 +851,18 @@ mod tests {
     fn sprite_base_accepts_single_digit_frames_in_sequence_dirs() {
         // Real single-digit bare frames in a `*sequence*` folder must be grouped.
         let dir = "lyshineui/images/hud/fishing/tensionimagesequence";
-        assert_eq!(sprite_base(&format!("{dir}/tension0.dds")), Some((format!("{dir}/tension"), 0)));
-        assert_eq!(sprite_base(&format!("{dir}/tension9.dds")), Some((format!("{dir}/tension"), 9)));
-        assert_eq!(sprite_base(&format!("{dir}/tension12.dds")), Some((format!("{dir}/tension"), 12)));
+        assert_eq!(
+            sprite_base(&format!("{dir}/tension0.dds")),
+            Some((format!("{dir}/tension"), 0))
+        );
+        assert_eq!(
+            sprite_base(&format!("{dir}/tension9.dds")),
+            Some((format!("{dir}/tension"), 9))
+        );
+        assert_eq!(
+            sprite_base(&format!("{dir}/tension12.dds")),
+            Some((format!("{dir}/tension"), 12))
+        );
         // Single-digit bare suffix outside a sequence folder stays a plain texture
         // (LODs/variants, e.g. `tree_lod0`).
         assert_eq!(sprite_base("objects/tree/tree_lod0.dds"), None);

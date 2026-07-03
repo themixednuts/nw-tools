@@ -17,6 +17,7 @@ use std::fmt::Write as _;
 use std::io;
 
 use arcstr::ArcStr;
+use arrayvec::ArrayString;
 use uuid::Uuid;
 
 use crate::ObjectStreamError;
@@ -137,6 +138,7 @@ where
         path: Vec::new(),
         next_child_indices: vec![0],
         ancestors: Vec::new(),
+        scratch: String::new(),
     };
     match StreamTag::from_byte(tag) {
         Some(StreamTag::BINARY) => {
@@ -499,15 +501,13 @@ fn type_name_from_header(header: &ElementHeader<'_>) -> String {
         .map_or_else(|| header.id.to_string(), ToString::to_string)
 }
 
-fn format_path(path: &[usize]) -> String {
-    let mut out = String::new();
+fn format_path_into(path: &[usize], out: &mut String) {
     for (index, value) in path.iter().enumerate() {
         if index > 0 {
             out.push('.');
         }
-        let _ = write!(&mut out, "{value}");
+        let _ = write!(out, "{value}");
     }
-    out
 }
 
 // --- internal visitors ---
@@ -515,6 +515,7 @@ fn format_path(path: &[usize]) -> String {
 #[derive(Debug, Clone)]
 struct AncestorSearchFrame {
     label: String,
+    score: Option<u32>,
 }
 
 impl AncestorSearchFrame {
@@ -524,6 +525,7 @@ impl AncestorSearchFrame {
             .unwrap_or_default();
         Self {
             label: format!("{path} {type_name} id={type_id}{field}"),
+            score: None,
         }
     }
 }
@@ -534,6 +536,7 @@ struct ObjectStreamSearchVisitor<F> {
     path: Vec<usize>,
     next_child_indices: Vec<usize>,
     ancestors: Vec<AncestorSearchFrame>,
+    scratch: String,
 }
 
 impl<F> ObjectStreamSearchVisitor<F>
@@ -548,15 +551,15 @@ where
 
     fn record_dom_element(&mut self, element: &Element, index: usize) {
         self.path.push(index);
-        self.record_element(element);
-        let path = format_path(&self.path);
+        let path = self.current_path();
+        self.record_element(element, &path);
         let type_name = type_name_from_element(element);
-        self.ancestors.push(AncestorSearchFrame::new(
+        self.push_ancestor(
             &path,
             &type_name,
             *element.id(),
             element.field().map(ArcStr::as_str),
-        ));
+        );
         for (child_index, child) in element.children().iter().enumerate() {
             self.record_dom_element(child, child_index);
         }
@@ -564,26 +567,23 @@ where
         self.path.pop();
     }
 
-    fn record_element(&mut self, element: &Element) {
-        self.record_if_match(ObjectStreamSearchKind::Path, &format_path(&self.path));
+    fn record_element(&mut self, element: &Element, path: &str) {
+        self.record_if_match(ObjectStreamSearchKind::Path, path);
         if !element.name().is_empty() {
             self.record_if_match(ObjectStreamSearchKind::Type, element.name().as_str());
         }
         if let Some(field) = element.field() {
             self.record_if_match(ObjectStreamSearchKind::Field, field.as_str());
         }
-        self.record_if_match(ObjectStreamSearchKind::TypeId, &element.id().to_string());
+        self.record_uuid_if_match(ObjectStreamSearchKind::TypeId, *element.id());
         if let Some(specialization) = element.specialization() {
-            self.record_if_match(
-                ObjectStreamSearchKind::SpecializationId,
-                &specialization.to_string(),
-            );
+            self.record_uuid_if_match(ObjectStreamSearchKind::SpecializationId, *specialization);
         }
         if let Some(crc) = element.name_crc() {
             self.record_field_crc_if_match(crc);
         }
         if let Some(version) = element.version() {
-            self.record_if_match(ObjectStreamSearchKind::Version, &version.to_string());
+            self.record_u8_if_match(ObjectStreamSearchKind::Version, version);
         }
         self.record_flags_if_match(element.flags);
         if let Some(data) = element.data() {
@@ -592,26 +592,23 @@ where
         self.record_parent_matches();
     }
 
-    fn record_header(&mut self, header: &ElementHeader<'_>) {
-        self.record_if_match(ObjectStreamSearchKind::Path, &format_path(&self.path));
+    fn record_header(&mut self, header: &ElementHeader<'_>, path: &str) {
+        self.record_if_match(ObjectStreamSearchKind::Path, path);
         if let Some(name) = header.name {
             self.record_if_match(ObjectStreamSearchKind::Type, name.as_str());
         }
         if let Some(field) = header.field {
             self.record_if_match(ObjectStreamSearchKind::Field, field.as_str());
         }
-        self.record_if_match(ObjectStreamSearchKind::TypeId, &header.id.to_string());
+        self.record_uuid_if_match(ObjectStreamSearchKind::TypeId, header.id);
         if let Some(specialization) = header.specialization {
-            self.record_if_match(
-                ObjectStreamSearchKind::SpecializationId,
-                &specialization.to_string(),
-            );
+            self.record_uuid_if_match(ObjectStreamSearchKind::SpecializationId, specialization);
         }
         if let Some(crc) = header.name_crc {
             self.record_field_crc_if_match(crc);
         }
         if let Some(version) = header.version {
-            self.record_if_match(ObjectStreamSearchKind::Version, &version.to_string());
+            self.record_u8_if_match(ObjectStreamSearchKind::Version, version);
         }
         self.record_flags_if_match(header.flags);
         if !header.data.is_empty() {
@@ -624,7 +621,7 @@ where
     where
         E: ElementValue + ?Sized,
     {
-        self.record_if_match(ObjectStreamSearchKind::DataLength, &data.len().to_string());
+        self.record_usize_if_match(ObjectStreamSearchKind::DataLength, data.len());
         if let Some(value) = value::read_leaf_text(element) {
             self.record_if_match(ObjectStreamSearchKind::Value, &value);
         }
@@ -640,12 +637,31 @@ where
         let Some(score) = (self.score_match)(value) else {
             return;
         };
+        self.insert_hit(kind, value.to_string(), score);
+    }
+
+    fn record_uuid_if_match(&mut self, kind: ObjectStreamSearchKind, value: Uuid) {
+        let mut buffer = Uuid::encode_buffer();
+        let value = value.hyphenated().encode_lower(&mut buffer);
+        self.record_if_match(kind, value);
+    }
+
+    fn record_u8_if_match(&mut self, kind: ObjectStreamSearchKind, value: u8) {
+        let mut decimal = ArrayString::<3>::new();
+        let _ = write!(&mut decimal, "{value}");
+        self.record_if_match(kind, &decimal);
+    }
+
+    fn record_usize_if_match(&mut self, kind: ObjectStreamSearchKind, value: usize) {
+        let mut decimal = ArrayString::<20>::new();
+        let _ = write!(&mut decimal, "{value}");
+        self.record_if_match(kind, &decimal);
+    }
+
+    fn insert_hit(&mut self, kind: ObjectStreamSearchKind, value: String, score: u32) {
         let stats = self
             .hits
-            .entry(ObjectStreamSearchHit {
-                kind,
-                value: value.to_string(),
-            })
+            .entry(ObjectStreamSearchHit { kind, value })
             .or_default();
         stats.count += 1;
         stats.score = stats.score.max(score);
@@ -653,28 +669,22 @@ where
 
     fn record_parent_matches(&mut self) {
         for index in 0..self.ancestors.len() {
-            let score = {
-                let label = &self.ancestors[index].label;
-                (self.score_match)(label)
-            };
-            let Some(score) = score else {
+            let Some(score) = self.ancestors[index].score else {
                 continue;
             };
-            let stats = self
-                .hits
-                .entry(ObjectStreamSearchHit {
-                    kind: ObjectStreamSearchKind::Parent,
-                    value: self.ancestors[index].label.clone(),
-                })
-                .or_default();
-            stats.count += 1;
-            stats.score = stats.score.max(score);
+            self.insert_hit(
+                ObjectStreamSearchKind::Parent,
+                self.ancestors[index].label.clone(),
+                score,
+            );
         }
     }
 
     fn record_field_crc_if_match(&mut self, crc: u32) {
-        let hex = format!("0x{crc:08x}");
-        let decimal = crc.to_string();
+        let mut hex = ArrayString::<10>::new();
+        let mut decimal = ArrayString::<10>::new();
+        let _ = write!(&mut hex, "0x{crc:08x}");
+        let _ = write!(&mut decimal, "{crc}");
         let score = if let Some(score) = (self.score_match)(&hex) {
             Some(score)
         } else {
@@ -695,8 +705,10 @@ where
     }
 
     fn record_flags_if_match(&mut self, flags: u8) {
-        let hex = format!("0x{flags:02x}");
-        let decimal = flags.to_string();
+        let mut hex = ArrayString::<4>::new();
+        let mut decimal = ArrayString::<3>::new();
+        let _ = write!(&mut hex, "0x{flags:02x}");
+        let _ = write!(&mut decimal, "{flags}");
         let score = if let Some(score) = (self.score_match)(&hex) {
             Some(score)
         } else {
@@ -748,6 +760,18 @@ where
         stats.count += 1;
         stats.score = stats.score.max(score);
     }
+
+    fn current_path(&mut self) -> String {
+        self.scratch.clear();
+        format_path_into(&self.path, &mut self.scratch);
+        self.scratch.clone()
+    }
+
+    fn push_ancestor(&mut self, path: &str, type_name: &str, type_id: Uuid, field: Option<&str>) {
+        let mut frame = AncestorSearchFrame::new(path, type_name, type_id, field);
+        frame.score = (self.score_match)(&frame.label);
+        self.ancestors.push(frame);
+    }
 }
 
 impl<F> ElementVisitor for ObjectStreamSearchVisitor<F>
@@ -764,15 +788,15 @@ where
             .expect("ObjectStream traversal always has a sibling counter");
         self.path.push(*index);
         *index += 1;
-        self.record_header(header);
-        let path = format_path(&self.path);
+        let path = self.current_path();
+        self.record_header(header, &path);
         let type_name = type_name_from_header(header);
-        self.ancestors.push(AncestorSearchFrame::new(
+        self.push_ancestor(
             &path,
             &type_name,
             header.id,
             header.field.map(ArcStr::as_str),
-        ));
+        );
         self.next_child_indices.push(0);
         Ok(VisitFlow::Continue)
     }

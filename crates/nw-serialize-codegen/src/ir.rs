@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use uuid::Uuid;
 
+use crate::CodegenContext;
 use crate::layout::LayoutIndex;
 use crate::model::{ReflectedClass, ReflectedEnum, ReflectedMember, SerializeContextModel};
 use crate::role::{ReflectedTypeRole, SerializeRoleClassifier};
@@ -334,43 +335,98 @@ impl SerializeCodegenPlanner {
     }
 
     #[must_use]
+    pub fn plan_model_with_context(
+        model: &SerializeContextModel,
+        context: &CodegenContext,
+    ) -> SerializeCodegenUnit {
+        Self.plan_with_context(model, context)
+    }
+
+    #[must_use]
     pub fn plan(&self, model: &SerializeContextModel) -> SerializeCodegenUnit {
+        self.plan_serial(model)
+    }
+
+    #[must_use]
+    pub fn plan_with_context(
+        &self,
+        model: &SerializeContextModel,
+        context: &CodegenContext,
+    ) -> SerializeCodegenUnit {
+        let (role_classifier, resolver) = context.runner().join(
+            || SerializeRoleClassifier::from_model(model),
+            || TypeResolver::new(model),
+        );
+        let classes = model
+            .classes
+            .values()
+            .filter(|class| class.type_id.is_nil() || !model.enums.contains_key(&class.type_id))
+            .collect::<Vec<_>>();
+        let enums = model.enums.values().collect::<Vec<_>>();
+        let ((mut class_items, enum_items), bodyless_items) = context.runner().join(
+            || {
+                context.runner().join(
+                    || {
+                        context.runner().map(&classes, |class| {
+                            self.plan_class(class, model, &role_classifier, &resolver)
+                        })
+                    },
+                    || {
+                        context.runner().map(&enums, |enumeration| {
+                            self.plan_enum(enumeration, model, &resolver)
+                        })
+                    },
+                )
+            },
+            || self.plan_bodyless_rtti_types(model),
+        );
+        let mut items =
+            Vec::with_capacity(class_items.len() + enum_items.len() + bodyless_items.len());
+        items.append(&mut class_items);
+        items.extend(enum_items);
+        items.extend(bodyless_items);
+        sort_codegen_items(&mut items);
+        SerializeCodegenUnit { items }
+    }
+
+    fn plan_serial(&self, model: &SerializeContextModel) -> SerializeCodegenUnit {
         let role_classifier = SerializeRoleClassifier::from_model(model);
         let resolver = TypeResolver::new(model);
-        let mut items =
-            model
-                .classes
-                .values()
-                .filter(|class| class.type_id.is_nil() || !model.enums.contains_key(&class.type_id))
-                .map(|class| self.plan_class(class, model, &role_classifier, &resolver))
-                .chain(
-                    model
-                        .enums
-                        .values()
-                        .map(|enumeration| self.plan_enum(enumeration, model, &resolver)),
-                )
-                .chain(model.bodyless_rtti_types().into_values().map(|bodyless| {
-                    SerializeCodegenItem {
-                        source_type_id: bodyless.type_id,
-                        source_name: bodyless.name,
-                        role: ReflectedTypeRole::SupportType,
-                        is_reflection_marker: false,
-                        is_abstract: bodyless.is_abstract,
-                        factory: None,
-                        rtti_base_chain: Vec::new(),
-                        kind: SerializeCodegenItemKind::Struct,
-                        enum_underlying_type: None,
-                        fields: Vec::new(),
-                        variants: Vec::new(),
-                    }
-                }))
-                .collect::<Vec<_>>();
-        items.sort_by(|left, right| {
-            left.source_name
-                .cmp(&right.source_name)
-                .then_with(|| left.source_type_id.cmp(&right.source_type_id))
-        });
+        let mut items = model
+            .classes
+            .values()
+            .filter(|class| class.type_id.is_nil() || !model.enums.contains_key(&class.type_id))
+            .map(|class| self.plan_class(class, model, &role_classifier, &resolver))
+            .chain(
+                model
+                    .enums
+                    .values()
+                    .map(|enumeration| self.plan_enum(enumeration, model, &resolver)),
+            )
+            .chain(self.plan_bodyless_rtti_types(model))
+            .collect::<Vec<_>>();
+        sort_codegen_items(&mut items);
         SerializeCodegenUnit { items }
+    }
+
+    fn plan_bodyless_rtti_types(&self, model: &SerializeContextModel) -> Vec<SerializeCodegenItem> {
+        model
+            .bodyless_rtti_types()
+            .into_values()
+            .map(|bodyless| SerializeCodegenItem {
+                source_type_id: bodyless.type_id,
+                source_name: bodyless.name,
+                role: ReflectedTypeRole::SupportType,
+                is_reflection_marker: false,
+                is_abstract: bodyless.is_abstract,
+                factory: None,
+                rtti_base_chain: Vec::new(),
+                kind: SerializeCodegenItemKind::Struct,
+                enum_underlying_type: None,
+                fields: Vec::new(),
+                variants: Vec::new(),
+            })
+            .collect()
     }
 
     fn plan_class(
@@ -482,6 +538,14 @@ fn rtti_base_chain(
         .collect::<Vec<_>>();
     bases.reverse();
     bases
+}
+
+fn sort_codegen_items(items: &mut [SerializeCodegenItem]) {
+    items.sort_by(|left, right| {
+        left.source_name
+            .cmp(&right.source_name)
+            .then_with(|| left.source_type_id.cmp(&right.source_type_id))
+    });
 }
 
 #[cfg(test)]

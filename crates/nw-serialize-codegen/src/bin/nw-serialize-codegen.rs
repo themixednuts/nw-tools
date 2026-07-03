@@ -1,14 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Read},
+    io::{self, IsTerminal, Read, Write},
     path::{Component, Path, PathBuf},
+    sync::Mutex,
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nw_serialize_codegen::{
-    CodegenContext, CompileUnit, CompletedCodegenUnits, GoSourceEmitter, GoStandaloneProjectFile,
+    CodegenContext, CodegenStatus, CodegenStatusEvent, CodegenStatusKind, CodegenStatusSink,
+    CompileUnit, CompletedCodegenUnits, GoSourceEmitter, GoStandaloneProjectFile,
     NetworkFieldOverrideFile, NetworkMessageFieldSignature, NetworkMessageSignature,
     NetworkRustEmitter, NetworkSchema, NetworkType, NetworkTypeCapability, NetworkWireShape,
     ReflectedTypeCatalogSummary, RustCodegenPlanner, RustSourceEmitter, RustSourceField,
@@ -24,6 +26,7 @@ use nw_serialize_codegen::{
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use serde_json::Value;
+use tracing_subscriber::EnvFilter;
 
 const EMBEDDED_SERIALIZE_CONTEXT: &[u8] = include_bytes!("../../../../resources/serialize.json");
 
@@ -34,6 +37,9 @@ struct EmbeddedModuleDescriptors;
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Cli {
+    /// Status rendering. `auto` uses terminal progress on TTY stderr and trace events otherwise.
+    #[arg(long, global = true, value_enum, default_value_t = StatusMode::Auto)]
+    status: StatusMode,
     #[command(subcommand)]
     command: Command,
 }
@@ -158,6 +164,9 @@ struct NetworkRustArgs {
     /// Optional JSON path for the Rust source audit report.
     #[arg(long = "rust-source-audit")]
     rust_source_audit: Option<PathBuf>,
+    /// Worker count. Omit for Rayon default; use 0 to run on the caller thread.
+    #[arg(long)]
+    jobs: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -167,6 +176,15 @@ enum Language {
     Go,
     #[value(name = "typescript")]
     TypeScript,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum StatusMode {
+    Auto,
+    Quiet,
+    Progress,
+    Trace,
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -228,17 +246,120 @@ struct WriteSummary {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let status = init_status(cli.status)?;
     match cli.command {
-        Command::Summary(args) => summary(&args),
-        Command::Generate(args) => generate(&args),
-        Command::NetworkSchema(args) => network_schema(&args),
-        Command::NetworkRust(args) => network_rust(&args),
+        Command::Summary(args) => summary(&args, status),
+        Command::Generate(args) => generate(&args, status),
+        Command::NetworkSchema(args) => network_schema(&args, status),
+        Command::NetworkRust(args) => network_rust(&args, status),
     }
 }
 
-fn summary(args: &CatalogArgs) -> Result<()> {
-    let context = CodegenContext::from_jobs(args.jobs).context("build codegen worker pool")?;
+fn init_status(mode: StatusMode) -> Result<CodegenStatus> {
+    let mode = effective_status_mode(mode);
+    match mode {
+        StatusMode::Auto => unreachable!("auto is resolved before status initialization"),
+        StatusMode::Quiet => Ok(CodegenStatus::default()),
+        StatusMode::Progress => Ok(CodegenStatus::new(ProgressStatusSink::default())),
+        StatusMode::Trace => {
+            init_tracing();
+            Ok(CodegenStatus::default())
+        }
+        StatusMode::Json => Ok(CodegenStatus::new(JsonStatusSink::default())),
+    }
+}
+
+fn effective_status_mode(mode: StatusMode) -> StatusMode {
+    match mode {
+        StatusMode::Auto if io::stderr().is_terminal() => StatusMode::Progress,
+        StatusMode::Auto => StatusMode::Trace,
+        mode => mode,
+    }
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("nw_serialize_codegen::status=info,nw_jobs=warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .with_target(false)
+        .with_ansi(io::stderr().is_terminal())
+        .compact()
+        .try_init();
+}
+
+fn codegen_context(jobs: Option<usize>, status: CodegenStatus) -> Result<CodegenContext> {
+    CodegenContext::from_jobs(jobs)
+        .map(|context| context.with_status(status))
+        .context("build codegen worker pool")
+}
+
+const fn enabled_step(enabled: bool) -> u64 {
+    if enabled { 1 } else { 0 }
+}
+
+#[derive(Debug, Default)]
+struct ProgressStatusSink {
+    state: Mutex<ProgressStatusState>,
+}
+
+#[derive(Debug, Default)]
+struct ProgressStatusState {
+    last_len: usize,
+}
+
+impl CodegenStatusSink for ProgressStatusSink {
+    fn emit(&self, event: &CodegenStatusEvent) {
+        let line = status_line(event);
+        let mut state = self.state.lock().expect("status mutex");
+        let padding = " ".repeat(state.last_len.saturating_sub(line.len()));
+        let mut stderr = io::stderr().lock();
+        match event.kind {
+            CodegenStatusKind::Started | CodegenStatusKind::Progress => {
+                let _ = write!(stderr, "\r{line}{padding}");
+                let _ = stderr.flush();
+                state.last_len = line.len();
+            }
+            CodegenStatusKind::Finished => {
+                let _ = writeln!(stderr, "\r{line}{padding}");
+                state.last_len = 0;
+            }
+        }
+    }
+}
+
+fn status_line(event: &CodegenStatusEvent) -> String {
+    let message = event.message.as_deref().unwrap_or(match event.kind {
+        CodegenStatusKind::Started => "started",
+        CodegenStatusKind::Progress => "working",
+        CodegenStatusKind::Finished => "finished",
+    });
+    match event.percent {
+        Some(percent) => format!("{percent:>3}% {} - {message}", event.phase),
+        None => format!("{} - {message}", event.phase),
+    }
+}
+
+#[derive(Debug, Default)]
+struct JsonStatusSink {
+    lock: Mutex<()>,
+}
+
+impl CodegenStatusSink for JsonStatusSink {
+    fn emit(&self, event: &CodegenStatusEvent) {
+        let _guard = self.lock.lock().expect("status mutex");
+        let mut stderr = io::stderr().lock();
+        let _ = serde_json::to_writer(&mut stderr, event);
+        let _ = writeln!(stderr);
+    }
+}
+
+fn summary(args: &CatalogArgs, status: CodegenStatus) -> Result<()> {
+    let context = codegen_context(args.jobs, status)?;
+    let progress = context.status().phase("summary", Some(2));
     let compile_unit = context.install(|context| compile_catalog(args, context))?;
+    progress.advance_with_message(1, Some("compiled catalog".to_owned()));
     let catalog_summary = compile_unit.catalog.summary();
     let field_summary = compile_unit.field_owner_evidence.summary();
     let (errors, warnings) = diagnostic_counts(&compile_unit);
@@ -252,21 +373,29 @@ fn summary(args: &CatalogArgs) -> Result<()> {
         field_summary.ambiguous_exact_key_count
     );
     println!("diagnostics: {errors} error(s), {warnings} warning(s)");
+    progress.finish_with_message(Some("summary complete".to_owned()));
     Ok(())
 }
 
-fn generate(args: &GenerateArgs) -> Result<()> {
-    let context =
-        CodegenContext::from_jobs(args.catalog.jobs).context("build codegen worker pool")?;
+fn generate(args: &GenerateArgs, status: CodegenStatus) -> Result<()> {
+    let context = codegen_context(args.catalog.jobs, status)?;
     context.install(|context| generate_with_context(args, context))
 }
 
 fn generate_with_context(args: &GenerateArgs, context: &CodegenContext) -> Result<()> {
+    let language_count = match args.language {
+        Language::All => 3,
+        _ => 1,
+    };
+    let progress = context.status().phase("generate", Some(4 + language_count));
     let compile_unit = compile_catalog(&args.catalog, context)?;
+    progress.advance_with_message(1, Some("compiled catalog".to_owned()));
     reject_compile_errors(&compile_unit)?;
     let root_selection = codegen_root_selection(&compile_unit.codegen_unit, args)?;
     let selected = root_selection.select_unit(&compile_unit.codegen_unit);
+    progress.advance_with_message(1, Some("selected roots".to_owned()));
     let completed = completed_codegen_units(selected, compile_unit.codegen_unit.clone());
+    progress.advance_with_message(1, Some("completed missing bodies".to_owned()));
 
     match args.language {
         Language::All => {
@@ -285,29 +414,47 @@ fn generate_with_context(args: &GenerateArgs, context: &CodegenContext) -> Resul
                 },
             ];
             context.runner().try_map(&tasks, |task| {
-                generate_language(&completed, args, task.language, &task.out, context)
+                generate_language(&completed, args, task.language, &task.out, context)?;
+                progress.advance_with_message(1, Some(format!("generated {}", task.language)));
+                Ok::<(), anyhow::Error>(())
             })?;
         }
-        language => generate_language(&completed, args, language, &args.out, context)?,
+        language => {
+            generate_language(&completed, args, language, &args.out, context)?;
+            progress.advance_with_message(1, Some(format!("generated {language}")));
+        }
     }
 
     let (errors, warnings) = diagnostic_counts(&compile_unit);
     println!("diagnostics: {errors} error(s), {warnings} warning(s)");
+    progress.finish_with_message(Some("generation complete".to_owned()));
     Ok(())
 }
 
-fn network_schema(args: &NetworkSchemaArgs) -> Result<()> {
-    let report = load_json_root(&args.ghidra_report, "Ghidra static network report")?;
-    let mut schema = NetworkSchema::from_ghidra_static_network_report(&report)
-        .context("normalize Ghidra static report into network schema")?;
+fn network_schema(args: &NetworkSchemaArgs, status: CodegenStatus) -> Result<()> {
+    let context = codegen_context(args.catalog.jobs, status)?;
+    let step_count = 4
+        + enabled_step(args.typeindex.is_some())
+        + args.message_signatures.len() as u64
+        + enabled_step(args.message_rust_source_root.is_some())
+        + args.field_overrides.len() as u64;
+    let progress = context.status().phase("network schema", Some(step_count));
+    let (report, compile_unit) = context.runner().join(
+        || load_json_root(&args.ghidra_report, "Ghidra static network report"),
+        || compile_catalog(&args.catalog, &context),
+    );
+    let report = report?;
+    let compile_unit = compile_unit?;
+    progress.advance_with_message(1, Some("loaded inputs".to_owned()));
+    let mut schema =
+        NetworkSchema::from_ghidra_static_network_report_with_context(&report, &context)
+            .context("normalize Ghidra static report into network schema")?;
+    progress.advance_with_message(1, Some("normalized Ghidra report".to_owned()));
     if let Some(source) = &args.typeregistry_source
         && let Some(ghidra_source) = schema.sources.first_mut()
     {
         ghidra_source.path = Some(source.clone());
     }
-    let context =
-        CodegenContext::from_jobs(args.catalog.jobs).context("build codegen worker pool")?;
-    let compile_unit = context.install(|context| compile_catalog(&args.catalog, context))?;
     reject_compile_errors(&compile_unit)?;
     let serialize_merge = schema.merge_serialize_codegen_unit(
         &compile_unit.codegen_unit,
@@ -325,6 +472,7 @@ fn network_schema(args: &NetworkSchemaArgs) -> Result<()> {
         serialize_merge.ambiguous_name_match_count,
         serialize_merge.filled_name_count
     );
+    progress.advance_with_message(1, Some("merged serialize context".to_owned()));
     if let Some(typeindex_path) = &args.typeindex {
         let typeindex = load_json_root(typeindex_path, "typeindex JSON")?;
         let merge = schema
@@ -344,9 +492,12 @@ fn network_schema(args: &NetworkSchemaArgs) -> Result<()> {
             merge.filled_type_index_count,
             merge.conflicting_type_index_count
         );
+        progress.advance_with_message(1, Some("merged typeindex".to_owned()));
     }
-    for signatures_path in &args.message_signatures {
-        let signatures = load_message_signatures(signatures_path)?;
+    let signature_inputs = context.runner().try_map(&args.message_signatures, |path| {
+        load_message_signatures(path).map(|signatures| (path.clone(), signatures))
+    })?;
+    for (signatures_path, signatures) in signature_inputs {
         let source = args
             .message_signatures_source
             .clone()
@@ -363,6 +514,7 @@ fn network_schema(args: &NetworkSchemaArgs) -> Result<()> {
             merge.ambiguous_message_count,
             merge.unmatched_message_count
         );
+        progress.advance_with_message(1, Some("merged message signatures".to_owned()));
     }
     if let Some(root) = &args.message_rust_source_root {
         let inventory = RustSourceInventory::from_root(root, &context)
@@ -384,9 +536,12 @@ fn network_schema(args: &NetworkSchemaArgs) -> Result<()> {
             merge.ambiguous_message_count,
             merge.unmatched_message_count
         );
+        progress.advance_with_message(1, Some("merged message source".to_owned()));
     }
-    for overrides_path in &args.field_overrides {
-        let overrides = load_field_overrides(overrides_path)?;
+    let override_inputs = context.runner().try_map(&args.field_overrides, |path| {
+        load_field_overrides(path).map(|overrides| (path.clone(), overrides))
+    })?;
+    for (overrides_path, overrides) in override_inputs {
         let source = args
             .field_overrides_source
             .clone()
@@ -405,6 +560,7 @@ fn network_schema(args: &NetworkSchemaArgs) -> Result<()> {
             merge.wire_shape_updated_count,
             merge.confidence_updated_count
         );
+        progress.advance_with_message(1, Some("merged field overrides".to_owned()));
     }
     let mut source = serde_json::to_vec_pretty(&schema).context("serialize network schema JSON")?;
     source.push(b'\n');
@@ -428,24 +584,33 @@ fn network_schema(args: &NetworkSchemaArgs) -> Result<()> {
     } else {
         println!("unchanged {}", args.out.display());
     }
+    progress.finish_with_message(Some("network schema complete".to_owned()));
     Ok(())
 }
 
-fn network_rust(args: &NetworkRustArgs) -> Result<()> {
+fn network_rust(args: &NetworkRustArgs, status: CodegenStatus) -> Result<()> {
+    let context = codegen_context(args.jobs, status)?;
+    let step_count = 4 + enabled_step(args.rust_source_root.is_some());
+    let progress = context.status().phase("network rust", Some(step_count));
     let root = load_json_root(&args.schema, "network schema JSON")?;
     let schema = serde_json::from_value::<NetworkSchema>(root)
         .with_context(|| format!("parse network schema from {}", args.schema.display()))?;
+    progress.advance_with_message(1, Some("loaded schema".to_owned()));
     let source_audit = match &args.rust_source_root {
         Some(root) => {
-            let inventory = RustSourceInventory::from_root(root, &CodegenContext::inline())
+            let inventory = RustSourceInventory::from_root(root, &context)
                 .with_context(|| format!("scan Rust source root {}", root.display()))?;
-            Some(audit_network_rust_source(&schema, &inventory))
+            let audit = audit_network_rust_source(&schema, &inventory);
+            progress.advance_with_message(1, Some("audited Rust source".to_owned()));
+            Some(audit)
         }
         None => None,
     };
-    let output = NetworkRustEmitter::emit_descriptors(&schema)
+    let output = NetworkRustEmitter::emit_descriptors_with_context(&schema, &context)
         .context("emit network Rust descriptor source")?;
+    progress.advance_with_message(1, Some("emitted descriptors".to_owned()));
     write_path_if_changed(&args.out, output.source.as_bytes())?;
+    progress.advance_with_message(1, Some("wrote source".to_owned()));
     if let Some(report_path) = &args.report {
         let mut report =
             serde_json::to_vec_pretty(&output.report).context("serialize network Rust report")?;
@@ -475,6 +640,7 @@ fn network_rust(args: &NetworkRustArgs) -> Result<()> {
         output.report.field_descriptor_count,
         output.report.unnamed_descriptor_count
     );
+    progress.finish_with_message(Some("network rust complete".to_owned()));
     Ok(())
 }
 
@@ -963,6 +1129,9 @@ fn load_module_descriptor_directory(path: &Path, context: &CodegenContext) -> Re
     });
     entries.sort();
 
+    let progress = context
+        .status()
+        .phase("load module descriptors", Some(entries.len() as u64));
     let modules = context.runner().try_map(&entries, |entry| {
         let root = load_json_root(entry, "AZ::Module descriptor capture")?;
         if root.get("descriptors").is_none() {
@@ -971,11 +1140,11 @@ fn load_module_descriptor_directory(path: &Path, context: &CodegenContext) -> Re
                 entry.display()
             );
         }
-        Ok(module_descriptor_capture(
-            module_name_from_path(entry),
-            root,
-        ))
+        let module = module_descriptor_capture(module_name_from_path(entry), root);
+        progress.advance(1);
+        Ok(module)
     })?;
+    progress.finish();
     Ok(module_descriptors_root(modules))
 }
 
@@ -986,6 +1155,9 @@ fn load_embedded_module_descriptors(context: &CodegenContext) -> Result<Value> {
         .collect::<Vec<_>>();
     names.sort();
 
+    let progress = context
+        .status()
+        .phase("load embedded module descriptors", Some(names.len() as u64));
     let modules = context.runner().try_map(&names, |name| {
         let embedded = EmbeddedModuleDescriptors::get(name)
             .with_context(|| format!("read embedded AZ::Module descriptor capture {name}"))?;
@@ -994,11 +1166,11 @@ fn load_embedded_module_descriptors(context: &CodegenContext) -> Result<Value> {
         if root.get("descriptors").is_none() {
             bail!("embedded AZ::Module descriptor capture {name} does not contain `descriptors`");
         }
-        Ok(module_descriptor_capture(
-            module_name_from_resource_name(name),
-            root,
-        ))
+        let module = module_descriptor_capture(module_name_from_resource_name(name), root);
+        progress.advance(1);
+        Ok(module)
     })?;
+    progress.finish();
     Ok(module_descriptors_root(modules))
 }
 
@@ -1236,10 +1408,15 @@ fn write_output_files(
         bail!("cancelled while creating output directories");
     }
 
+    let write_progress = context
+        .status()
+        .phase("write output files", Some(tasks.len() as u64));
     let writes = context
         .runner()
         .try_map_until_cancelled(&tasks, context.cancel(), |task| {
-            write_file_if_changed(&task.path, task.source.as_bytes())
+            let changed = write_file_if_changed(&task.path, task.source.as_bytes())?;
+            write_progress.advance(1);
+            Ok::<bool, anyhow::Error>(changed)
         })?;
     let mut summary = WriteSummary::default();
     for changed in writes.completed() {
@@ -1252,6 +1429,7 @@ fn write_output_files(
     if writes.was_cancelled() {
         bail!("cancelled while writing output files");
     }
+    write_progress.finish();
     Ok(summary)
 }
 

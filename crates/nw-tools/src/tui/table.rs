@@ -57,7 +57,9 @@ impl RowFeed {
 
     fn tail_from(&self, have: usize) -> Vec<Vec<Cell>> {
         let rows = self.lock();
-        rows.get(have..).map(<[Vec<Cell>]>::to_vec).unwrap_or_default()
+        rows.get(have..)
+            .map(<[Vec<Cell>]>::to_vec)
+            .unwrap_or_default()
     }
 
     fn progress(&self) -> (usize, usize) {

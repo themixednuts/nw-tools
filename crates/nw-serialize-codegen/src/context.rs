@@ -1,9 +1,12 @@
 use nw_jobs::{CancellationToken, JobRunner, JobRunnerBuildError};
 
+use crate::status::CodegenStatus;
+
 #[derive(Debug, Clone)]
 pub struct CodegenContext {
     runner: JobRunner,
     cancel: CancellationToken,
+    status: CodegenStatus,
 }
 
 impl CodegenContext {
@@ -12,6 +15,7 @@ impl CodegenContext {
         Self {
             runner: JobRunner::automatic(),
             cancel: CancellationToken::new(),
+            status: CodegenStatus::default(),
         }
     }
 
@@ -20,6 +24,7 @@ impl CodegenContext {
         Self {
             runner: JobRunner::inline(),
             cancel: CancellationToken::new(),
+            status: CodegenStatus::default(),
         }
     }
 
@@ -27,12 +32,23 @@ impl CodegenContext {
         Ok(Self {
             runner: JobRunner::from_jobs(jobs)?,
             cancel: nw_jobs::cancellation_token_with_signal_handlers(),
+            status: CodegenStatus::default(),
         })
     }
 
     #[must_use]
     pub fn new(runner: JobRunner, cancel: CancellationToken) -> Self {
-        Self { runner, cancel }
+        Self {
+            runner,
+            cancel,
+            status: CodegenStatus::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_status(mut self, status: CodegenStatus) -> Self {
+        self.status = status;
+        self
     }
 
     #[must_use]
@@ -43,6 +59,11 @@ impl CodegenContext {
     #[must_use]
     pub fn cancel(&self) -> &CancellationToken {
         &self.cancel
+    }
+
+    #[must_use]
+    pub fn status(&self) -> &CodegenStatus {
+        &self.status
     }
 
     #[must_use]

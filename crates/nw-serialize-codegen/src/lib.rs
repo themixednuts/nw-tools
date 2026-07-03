@@ -34,10 +34,12 @@ pub mod role;
 pub mod rust;
 pub mod schema;
 pub mod selection;
+pub mod status;
 pub mod support_usage;
 pub mod symbol_surface;
 pub mod types;
 pub mod typescript;
+mod uuid_format;
 mod value;
 
 pub use catalog::{
@@ -135,7 +137,7 @@ pub use network_schema::{
     NetworkEvidence, NetworkEvidenceKind, NetworkField, NetworkFieldOverride,
     NetworkFieldOverrideFile, NetworkFieldOverrideMergeReport, NetworkFieldRegistrationFunction,
     NetworkHandler, NetworkMessageFieldSignature, NetworkMessageSignature,
-    NetworkMessageSignatureMergeReport, NetworkRegistrationHook,
+    NetworkMessageSignatureMergeReport, NetworkNativeTypeInfoEvidence, NetworkRegistrationHook,
     NetworkReplicatedContainerWireShape, NetworkSchema, NetworkSchemaImportError,
     NetworkSchemaSource, NetworkSchemaSourceKind, NetworkSchemaSummary, NetworkSerializeKind,
     NetworkSerializeMergeReport, NetworkSerializeRole, NetworkSerializeType, NetworkType,
@@ -179,6 +181,9 @@ pub use rust::types::{RustTypeOptions, RustTypeRenderer};
 pub use selection::{
     SerializeCodegenRootMode, SerializeCodegenRootResolveError, SerializeCodegenRootSelection,
     resolve_codegen_root_type_id, resolve_codegen_root_type_ids,
+};
+pub use status::{
+    CodegenStatus, CodegenStatusEvent, CodegenStatusKind, CodegenStatusPhase, CodegenStatusSink,
 };
 pub use support_usage::{CodegenContainerSupportUsage, CodegenSupportUsage};
 pub use types::{

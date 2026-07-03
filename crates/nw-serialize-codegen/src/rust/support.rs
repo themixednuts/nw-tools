@@ -178,7 +178,7 @@ impl Uuid {
 
 impl AzRtti for Uuid {
 	const NAME: &'static str = "AZ::Uuid";
-	const TYPE_ID: Self = Self::from_u128(0xE152_C105_A133_4D03_BBF8_3D4B_2FBA_3E2A);
+	const TYPE_ID: Self = Self::from_u128(0xE152C105_A133_4D03_BBF8_3D4B2FBA3E2A);
 }
 
 impl From<::uuid::Uuid> for Uuid {
@@ -222,14 +222,14 @@ impl core::str::FromStr for Uuid {
 pub mod type_ids {
 	use super::Uuid;
 
-	pub const INT: Uuid = Uuid::from_u128(0x7203_9442_EB38_4D42_A1AD_CB68_F7E0_EEF6);
-	pub const U8: Uuid = Uuid::from_u128(0x72B9_409A_7D1A_4831_9CFE_FCB3_FADD_3426);
-	pub const AZ_UUID: Uuid = Uuid::from_u128(0xE152_C105_A133_4D03_BBF8_3D4B_2FBA_3E2A);
-	pub const ENTITY_ID: Uuid = Uuid::from_u128(0x6383_F1D3_BB27_4E6B_A49A_6409_B205_9EAA);
-	pub const COMPONENT_ID: Uuid = Uuid::from_u128(0xD659_7933_47CD_4FC8_B911_63F3_E2B0_993A);
-	pub const COMPONENT_ID_VECTOR: Uuid = Uuid::from_u128(0xE778_1CB0_E712_5E6A_948D_92FD_4FE8_7F0D);
-	pub const CRC32: Uuid = Uuid::from_u128(0x9F4E_062E_06A0_46D4_85DF_E0DA_9646_7D3A);
-	pub const ASSET_ID: Uuid = Uuid::from_u128(0x652E_D536_3402_439B_AEBE_4A5D_BC55_4085);
+	pub const INT: Uuid = Uuid::from_u128(0x72039442_EB38_4D42_A1AD_CB68F7E0EEF6);
+	pub const U8: Uuid = Uuid::from_u128(0x72B9409A_7D1A_4831_9CFE_FCB3FADD3426);
+	pub const AZ_UUID: Uuid = Uuid::from_u128(0xE152C105_A133_4D03_BBF8_3D4B2FBA3E2A);
+	pub const ENTITY_ID: Uuid = Uuid::from_u128(0x6383F1D3_BB27_4E6B_A49A_6409B2059EAA);
+	pub const COMPONENT_ID: Uuid = Uuid::from_u128(0xD6597933_47CD_4FC8_B911_63F3E2B0993A);
+	pub const COMPONENT_ID_VECTOR: Uuid = Uuid::from_u128(0xE7781CB0_E712_5E6A_948D_92FD4FE87F0D);
+	pub const CRC32: Uuid = Uuid::from_u128(0x9F4E062E_06A0_46D4_85DF_E0DA96467D3A);
+	pub const ASSET_ID: Uuid = Uuid::from_u128(0x652ED536_3402_439B_AEBE_4A5DBC554085);
 }
 "#;
 
@@ -338,7 +338,7 @@ impl From<Crc32> for u32 {
 
 impl AzRtti for Crc32 {
 	const NAME: &'static str = "AZ::Crc32";
-	const TYPE_ID: Uuid = Uuid::from_u128(0x9F4E_062E_06A0_46D4_85DF_E0DA_9646_7D3A);
+	const TYPE_ID: Uuid = Uuid::from_u128(0x9F4E062E_06A0_46D4_85DF_E0DA96467D3A);
 }
 "#;
 
@@ -453,7 +453,7 @@ impl core::str::FromStr for AssetId {
 
 impl AzRtti for AssetId {
 	const NAME: &'static str = "AZ::Data::AssetId";
-	const TYPE_ID: Uuid = Uuid::from_u128(0x652E_D536_3402_439B_AEBE_4A5D_BC55_4085);
+	const TYPE_ID: Uuid = Uuid::from_u128(0x652ED536_3402_439B_AEBE_4A5DBC554085);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Reflect)]
@@ -531,7 +531,7 @@ impl Default for Asset {
 
 impl AzRtti for Asset {
 	const NAME: &'static str = "AZ::Data::Asset";
-	const TYPE_ID: Uuid = Uuid::from_u128(0xC891_BF19_B60C_45E2_BFD0_027D_15DD_C939);
+	const TYPE_ID: Uuid = Uuid::from_u128(0xC891BF19_B60C_45E2_BFD0_027D15DDC939);
 }
 "#;
 
@@ -549,6 +549,8 @@ mod tests {
         assert!(uuid.contains("pub fn aggregate_type_ids"));
         assert!(uuid.contains("pub fn aggregate_type_ids_right"));
         assert!(uuid.contains("pub fn specialized_template_prefix"));
+        assert!(uuid.contains("0xE152C105_A133_4D03_BBF8_3D4B2FBA3E2A"));
+        assert!(!uuid.contains("0xE152_C105_A133_4D03_BBF8_3D4B_2FBA_3E2A"));
         assert!(crc.contains("pub struct Crc32(pub u32);"));
         assert!(crc.contains("pub const fn from_str_lower"));
         assert!(crc.contains("0xEDB8_8320"));

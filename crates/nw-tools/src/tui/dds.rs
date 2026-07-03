@@ -159,7 +159,10 @@ impl DdsCatalog {
     /// Clone the items appended since the caller already had `have` of them.
     fn tail_from(&self, have: usize) -> Vec<DdsItem> {
         let items = self.lock();
-        items.get(have..).map(<[DdsItem]>::to_vec).unwrap_or_default()
+        items
+            .get(have..)
+            .map(<[DdsItem]>::to_vec)
+            .unwrap_or_default()
     }
 
     fn item(&self, index: usize) -> Option<DdsItem> {
@@ -202,7 +205,10 @@ impl DdsItem {
     /// A single-frame entry.
     #[must_use]
     pub fn single(label: String, frame: DdsFrame) -> Self {
-        Self { label, frames: vec![frame] }
+        Self {
+            label,
+            frames: vec![frame],
+        }
     }
 
     /// The frame at `index`, wrapping — for animation.
@@ -384,7 +390,12 @@ impl ThumbCache {
         };
         let mut bytes = Vec::new();
         if image::codecs::qoi::QoiEncoder::new(&mut bytes)
-            .write_image(image, image.width(), image.height(), image::ExtendedColorType::Rgba8)
+            .write_image(
+                image,
+                image.width(),
+                image.height(),
+                image::ExtendedColorType::Rgba8,
+            )
             .is_ok()
         {
             // Write to a sibling temp file then rename, so a concurrent reader (or a
@@ -544,8 +555,7 @@ impl DdsBrowser {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(1).max(2))
             .unwrap_or(4);
-        let decode_runner =
-            JobRunner::with_workers(workers).unwrap_or_else(|_| runner.clone());
+        let decode_runner = JobRunner::with_workers(workers).unwrap_or_else(|_| runner.clone());
         let cache: Arc<Cache> = Arc::new(Mutex::new(HashMap::new()));
         let tx = spawn_decoder(catalog.clone(), store.clone(), decode_runner, cache.clone());
         let thumb_cache = Arc::new(ThumbCache::open());
@@ -620,7 +630,8 @@ impl DdsBrowser {
         }
         self.items.extend(fresh);
         self.order = (0..self.items.len()).collect();
-        self.order.sort_by(|&a, &b| self.items[a].label.cmp(&self.items[b].label));
+        self.order
+            .sort_by(|&a, &b| self.items[a].label.cmp(&self.items[b].label));
         self.rebuild();
         // New items can shift grid positions; clear residue once (cheap — only
         // while discovery is actively streaming, not on a settled grid).
@@ -659,7 +670,8 @@ impl DdsBrowser {
 
     /// Frame count of the focused texture (1 for a non-sprite).
     fn focused_frames(&self) -> usize {
-        self.current_item().map_or(1, |item| self.items[item].frames.len())
+        self.current_item()
+            .map_or(1, |item| self.items[item].frames.len())
     }
 
     /// The frame to show now — derived from wall-clock time while playing, so it's
@@ -787,7 +799,9 @@ impl DdsBrowser {
             return;
         }
         let last = (self.visible.len() - 1) as isize;
-        self.selected = (self.selected as isize).saturating_add(delta).clamp(0, last) as usize;
+        self.selected = (self.selected as isize)
+            .saturating_add(delta)
+            .clamp(0, last) as usize;
         self.status = None;
         self.dirty = true; // content may scroll; clear residue once next frame
     }
@@ -824,8 +838,13 @@ impl DdsBrowser {
             self.preview_cancel.cancel();
             let cancel = CancellationToken::new();
             self.preview_cancel = cancel.clone();
-            let frames = (0..self.items[item].frames.len()).map(|frame| (item, frame)).collect();
-            let _ = self.tx.try_send(PreviewReq { items: frames, cancel });
+            let frames = (0..self.items[item].frames.len())
+                .map(|frame| (item, frame))
+                .collect();
+            let _ = self.tx.try_send(PreviewReq {
+                items: frames,
+                cancel,
+            });
         }
     }
 
@@ -864,7 +883,11 @@ impl DdsBrowser {
                     Some((used, _)) => *used = now, // already cached/in-flight; keep warm
                     None => {
                         self.thumbs.insert(key, (now, Thumb::Pending));
-                        let _ = self.thumb_jobs.send(ThumbJob { key, size, generation });
+                        let _ = self.thumb_jobs.send(ThumbJob {
+                            key,
+                            size,
+                            generation,
+                        });
                     }
                 }
             }
@@ -1067,7 +1090,9 @@ impl View for DdsBrowser {
             return self.focus_pending();
         }
         // Keep ticking while any thumbnail is still decoding (drains + redraws).
-        self.thumbs.values().any(|(_, thumb)| matches!(thumb, Thumb::Pending))
+        self.thumbs
+            .values()
+            .any(|(_, thumb)| matches!(thumb, Thumb::Pending))
     }
 
     fn tick(&mut self) {
@@ -1180,7 +1205,10 @@ impl DdsBrowser {
         ];
         let (scanned, total) = self.catalog.progress();
         if scanned < total {
-            spans.push(Span::styled(format!("  scanning {scanned}/{total}"), theme::accent()));
+            spans.push(Span::styled(
+                format!("  scanning {scanned}/{total}"),
+                theme::accent(),
+            ));
         }
         if !self.filter.is_empty() {
             spans.push(Span::styled(glyphs.sep.to_string(), theme::dim()));
@@ -1221,7 +1249,9 @@ impl DdsBrowser {
         // thumbnail to fill the cell (minus a gutter) with a label row beneath.
         // Cells are ~twice as tall as wide in pixels, so a square-ish thumbnail
         // uses about half as many rows as columns.
-        let cols = (area.width / TARGET_CELL_W).clamp(MIN_COLS, MAX_COLS).min(area.width.max(1));
+        let cols = (area.width / TARGET_CELL_W)
+            .clamp(MIN_COLS, MAX_COLS)
+            .min(area.width.max(1));
         let cell_w = area.width / cols;
         let thumb_w = cell_w.saturating_sub(2).max(1);
         let thumb_h = (thumb_w / 2).clamp(5, 24);
@@ -1272,7 +1302,11 @@ impl DdsBrowser {
             .iter()
             .map(|&item| {
                 let frames = self.items[item].frames.len();
-                let live = if frames > 1 { self.current_frame(frames) } else { 0 };
+                let live = if frames > 1 {
+                    self.current_frame(frames)
+                } else {
+                    0
+                };
                 for candidate in [live, 0] {
                     match self.thumbs.get(&(item, candidate)).map(|(_, thumb)| thumb) {
                         Some(Thumb::Ready(protocol)) => return CellVisual::Image(protocol.clone()),
@@ -1291,7 +1325,12 @@ impl DdsBrowser {
             let row = (slot / cols) as u16;
             let cell_x = area.x + col * cell_w;
             let cell_y = area.y + row * cell_h;
-            let img_area = Rect { x: cell_x + 1, y: cell_y, width: thumb_w, height: thumb_h };
+            let img_area = Rect {
+                x: cell_x + 1,
+                y: cell_y,
+                width: thumb_w,
+                height: thumb_h,
+            };
 
             match visual {
                 CellVisual::Image(protocol) => {
@@ -1327,9 +1366,12 @@ impl DdsBrowser {
             } else {
                 theme::dim()
             };
-            frame
-                .buffer_mut()
-                .set_line(img_area.x, label_y, &Line::from(Span::styled(label, style)), thumb_w);
+            frame.buffer_mut().set_line(
+                img_area.x,
+                label_y,
+                &Line::from(Span::styled(label, style)),
+                thumb_w,
+            );
             if selected && self.caps.color {
                 let buf = frame.buffer_mut();
                 for x in img_area.x..img_area.x + thumb_w {
@@ -1356,8 +1398,16 @@ impl DdsBrowser {
             if self.joined {
                 format!("⊞ {frames} frames joined   m cycle   {label}")
             } else {
-                let state = if self.playing { glyphs.play } else { glyphs.pause };
-                format!("{state} {}/{frames}  {} fps   m join   {label}", frame_index + 1, self.fps)
+                let state = if self.playing {
+                    glyphs.play
+                } else {
+                    glyphs.pause
+                };
+                format!(
+                    "{state} {}/{frames}  {} fps   m join   {label}",
+                    frame_index + 1,
+                    self.fps
+                )
             }
         } else {
             label
@@ -1453,8 +1503,14 @@ impl DdsBrowser {
                     self.focus_size = Some((image_area.width, image_area.height));
                     self.reset_focus_encodes();
                 }
-                let key: FocusKey =
-                    (item, frame_index, surface_index, mip, image_area.width, image_area.height);
+                let key: FocusKey = (
+                    item,
+                    frame_index,
+                    surface_index,
+                    mip,
+                    image_area.width,
+                    image_area.height,
+                );
                 if let Some(protocol) = self.focus_protocols.get(&key) {
                     let size = protocol.size();
                     let w = size.width.min(image_area.width);
@@ -1580,7 +1636,11 @@ impl DdsBrowser {
                 Span::styled(format!("{width}{cross}{height}"), theme::bold()),
             ]);
         }
-        let (filled, empty) = if self.caps.unicode { ("●", "·") } else { ("#", "-") };
+        let (filled, empty) = if self.caps.unicode {
+            ("●", "·")
+        } else {
+            ("#", "-")
+        };
         let mut spans = vec![
             Span::styled("mip ", theme::dim()),
             Span::styled(format!("{}/{count}", mip + 1), theme::bold()),
@@ -1596,7 +1656,10 @@ impl DdsBrowser {
             spans.push(Span::raw(" "));
         }
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(format!("{width}{cross}{height}"), theme::bold()));
+        spans.push(Span::styled(
+            format!("{width}{cross}{height}"),
+            theme::bold(),
+        ));
         spans.push(Span::styled("   [ ] cycle", theme::dim()));
         Line::from(spans)
     }
@@ -1682,9 +1745,8 @@ fn spawn_encoder(picker: Picker) -> (CbSender<EncodeReq>, CbReceiver<EncodeResul
                     .get(surface)
                     .and_then(|surface| surface.mips.get(mip))
                     .and_then(|level| encode_image(&picker, level.image.clone(), width, height)),
-                EncodeJob::Montage { frames } => {
-                    montage_sheet(&frames).and_then(|sheet| encode_image(&picker, sheet, width, height))
-                }
+                EncodeJob::Montage { frames } => montage_sheet(&frames)
+                    .and_then(|sheet| encode_image(&picker, sheet, width, height)),
             };
             if res_tx
                 .send(EncodeResult {
@@ -1702,7 +1764,12 @@ fn spawn_encoder(picker: Picker) -> (CbSender<EncodeReq>, CbReceiver<EncodeResul
 }
 
 /// Encode an RGBA image to a terminal graphics protocol fit to `width`×`height` cells.
-fn encode_image(picker: &Picker, image: RgbaImage, width: u16, height: u16) -> Option<Arc<Protocol>> {
+fn encode_image(
+    picker: &Picker,
+    image: RgbaImage,
+    width: u16,
+    height: u16,
+) -> Option<Arc<Protocol>> {
     picker
         .new_protocol(
             DynamicImage::ImageRgba8(image),
@@ -1718,7 +1785,13 @@ fn encode_image(picker: &Picker, image: RgbaImage, width: u16, height: u16) -> O
 fn montage_sheet(frames: &[Arc<Preview>]) -> Option<RgbaImage> {
     let images: Vec<&RgbaImage> = frames
         .iter()
-        .map(|preview| preview.surfaces.first().and_then(|s| s.mips.first()).map(|m| &m.image))
+        .map(|preview| {
+            preview
+                .surfaces
+                .first()
+                .and_then(|s| s.mips.first())
+                .map(|m| &m.image)
+        })
         .collect::<Option<Vec<_>>>()?;
     if images.is_empty() {
         return None;
@@ -1831,11 +1904,16 @@ fn spawn_thumb_pool(
                     continue;
                 }
                 let (item, frame) = job.key;
-                let thumb = match catalog.item(item).and_then(|dds| dds.frames.get(frame).cloned()) {
-                    Some(data) => match decode_thumbnail(&store, &cache, &data, &picker, job.size) {
-                        Ok(protocol) => Thumb::Ready(Arc::new(protocol)),
-                        Err(_) => Thumb::Failed,
-                    },
+                let thumb = match catalog
+                    .item(item)
+                    .and_then(|dds| dds.frames.get(frame).cloned())
+                {
+                    Some(data) => {
+                        match decode_thumbnail(&store, &cache, &data, &picker, job.size) {
+                            Ok(protocol) => Thumb::Ready(Arc::new(protocol)),
+                            Err(_) => Thumb::Failed,
+                        }
+                    }
                     None => Thumb::Failed,
                 };
                 if res_tx
@@ -1872,7 +1950,11 @@ fn decode_thumbnail(
         Some(image) => image,
         None => {
             let decoded = nw_dds::decode_mip_max(&header, THUMB_CACHE_PX, |part| {
-                frame.sidecars.iter().find(|(p, _)| *p == part).and_then(|(_, key)| store.read(key).ok())
+                frame
+                    .sidecars
+                    .iter()
+                    .find(|(p, _)| *p == part)
+                    .and_then(|(_, key)| store.read(key).ok())
             })
             .map_err(|error| error.to_string())?;
             let decoded = RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)
@@ -1936,12 +2018,12 @@ fn decode_chain(
         .collect::<Vec<_>>();
 
     // Abandon the chain between mip levels if the request was cancelled.
-    let decoded = match nw_dds::decode_all_mips_until(header_bytes, &parts, &|| !cancel.is_cancelled())
-    {
-        Ok(mips) if !mips.is_empty() => mips,
-        _ if cancel.is_cancelled() => return Err("cancelled".to_string()),
-        _ => vec![nw_dds::decode_top_mip(header_bytes, &parts).map_err(|e| e.to_string())?],
-    };
+    let decoded =
+        match nw_dds::decode_all_mips_until(header_bytes, &parts, &|| !cancel.is_cancelled()) {
+            Ok(mips) if !mips.is_empty() => mips,
+            _ if cancel.is_cancelled() => return Err("cancelled".to_string()),
+            _ => vec![nw_dds::decode_top_mip(header_bytes, &parts).map_err(|e| e.to_string())?],
+        };
 
     let mut mips = Vec::with_capacity(decoded.len());
     for level in decoded {
