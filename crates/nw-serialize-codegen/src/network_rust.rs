@@ -18,7 +18,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v33";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v34";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -780,6 +780,7 @@ impl NetworkRustEmitter {
         items: impl IntoIterator<Item = &'a SerializeCodegenItem>,
         context: &CodegenContext,
     ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
+        let items = items.into_iter().collect::<Vec<_>>();
         let mut report = NetworkRustGenerationReport::default();
         let mut conversions = Vec::new();
         for item in items {
@@ -787,6 +788,12 @@ impl NetworkRustEmitter {
                 return Err(NetworkRustEmitError::Cancelled);
             }
             conversions.extend(enum_marshaler_conversion_tokens(item));
+            if let Some(tokens) = enum_native_marshaler_tokens(item) {
+                conversions.push(tokens);
+            }
+            if let Some(tokens) = struct_native_marshaler_tokens(item) {
+                conversions.push(tokens);
+            }
         }
         report.marshaler_conversion_count = conversions.len();
 
@@ -1039,6 +1046,80 @@ fn enum_underlying_rust_type(scalar: ScalarType) -> proc_macro2::TokenStream {
         ScalarType::U64 | ScalarType::UnsignedLong => quote!(u64),
         _ => unreachable!("non-integer enum underlyings are skipped before emission"),
     }
+}
+
+fn enum_native_marshaler_tokens(item: &SerializeCodegenItem) -> Option<proc_macro2::TokenStream> {
+    if item.kind != SerializeCodegenItemKind::Enum {
+        return None;
+    }
+    let underlying = enum_underlying_scalar(item)?;
+    let (min, max) = enum_value_range(item)?;
+    if min < 0 {
+        return None;
+    }
+
+    let enum_ident = format_ident!("{}", rust_type_ident(&item.source_name));
+    let underlying_ty = enum_underlying_rust_type(underlying);
+    let min_u64 = u64::try_from(min).ok()?;
+    let max_u64 = u64::try_from(max).ok()?;
+
+    Some(quote! {
+        impl ::nw_network::serialize::Marshaler for ::nw_network::source::#enum_ident {
+            const MARSHAL_SIZE: usize =
+                <#underlying_ty as ::nw_network::serialize::Marshaler>::MARSHAL_SIZE;
+
+            fn marshal(&self, wb: &mut ::nw_network::serialize::WriteBuffer) {
+                let raw = #underlying_ty::from(*self);
+                ::nw_network::serialize::Marshaler::marshal(&raw, wb);
+            }
+
+            fn unmarshal(
+                rb: &mut ::nw_network::serialize::ReadBuffer,
+            ) -> Result<Self, ::nw_network::serialize::MarshalerError> {
+                let raw = <#underlying_ty as ::nw_network::serialize::Marshaler>::unmarshal(rb)?;
+                Self::try_from(raw).map_err(|_| {
+                    ::nw_network::serialize::MarshalerError::InvalidRange {
+                        value: u64::try_from(raw).unwrap_or(0),
+                        min: #min_u64,
+                        max: #max_u64,
+                    }
+                })
+            }
+        }
+    })
+}
+
+fn struct_native_marshaler_tokens(item: &SerializeCodegenItem) -> Option<proc_macro2::TokenStream> {
+    if item.kind != SerializeCodegenItemKind::Struct || item.is_abstract == Some(true) {
+        return None;
+    }
+
+    let struct_ident = format_ident!("{}", rust_type_ident(&item.source_name));
+    let fields = item
+        .fields
+        .iter()
+        .map(|field| format_ident!("{}", rust_field_ident(&field.source_name)))
+        .collect::<Vec<_>>();
+
+    Some(quote! {
+        impl ::nw_network::serialize::Marshaler for ::nw_network::source::#struct_ident {
+            fn marshal(&self, wb: &mut ::nw_network::serialize::WriteBuffer) {
+                #(
+                    ::nw_network::serialize::Marshaler::marshal(&self.#fields, wb);
+                )*
+            }
+
+            fn unmarshal(
+                rb: &mut ::nw_network::serialize::ReadBuffer,
+            ) -> Result<Self, ::nw_network::serialize::MarshalerError> {
+                Ok(Self {
+                    #(
+                        #fields: ::nw_network::serialize::Marshaler::unmarshal(rb)?,
+                    )*
+                })
+            }
+        }
+    })
 }
 
 fn identity_tokens(schema: &NetworkSchema) -> Vec<proc_macro2::TokenStream> {
@@ -6584,7 +6665,10 @@ mod tests {
         let output =
             NetworkRustEmitter::emit_marshaler_conversions([&item]).expect("conversion source");
 
-        assert_eq!(output.report.marshaler_conversion_count, 3);
+        assert_eq!(output.report.marshaler_conversion_count, 4);
+        assert!(output.source.contains(
+            "impl ::nw_network::serialize::Marshaler for ::nw_network::source::GridSides"
+        ));
         assert!(
             output
                 .source
