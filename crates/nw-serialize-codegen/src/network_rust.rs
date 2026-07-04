@@ -3467,11 +3467,18 @@ fn replicated_state_field_support_tokens(
     if members.is_empty() {
         return None;
     }
-    let marshal_size_terms = members.iter().map(|member| {
-        let codec = &member.codec_type;
-        let ty = &member.rust_type;
-        quote!(<#codec as ::nw_network::serialize::Codec<#ty>>::MARSHAL_SIZE)
-    });
+    let marshal_size_terms = members
+        .iter()
+        .map(|member| {
+            let codec = &member.codec_type;
+            let ty = &member.rust_type;
+            quote!(<#codec as ::nw_network::serialize::Codec<#ty>>::MARSHAL_SIZE)
+        })
+        .collect::<Vec<_>>();
+    let marshal_size = match marshal_size_terms.split_first() {
+        Some((first, rest)) => quote!(#first #( + #rest )*),
+        None => quote!(0),
+    };
     let marshal_fields = members.iter().map(|member| {
         let codec = &member.codec_type;
         let ty = &member.rust_type;
@@ -3488,13 +3495,41 @@ fn replicated_state_field_support_tokens(
             let #binding = <#codec as ::nw_network::serialize::Codec<#ty>>::unmarshal(rb)?;
         }
     });
-    let assign_fields = members.iter().map(|member| {
-        let binding = &member.binding;
-        let access = &member.access;
-        quote! {
-            value.#access = #binding;
+    let can_initialize_directly = members.iter().all(|member| member.is_flat_field);
+    let value_initializer = if can_initialize_directly {
+        let init_fields = members.iter().map(|member| {
+            let field_ident = &member.field_ident;
+            let binding = &member.binding;
+            quote!(#field_ident: #binding,)
+        });
+        if container_value_shape_report_uses_source_type(shape) {
+            quote! {
+                #value_type {
+                    #(#init_fields)*
+                    ..<#value_type as ::core::default::Default>::default()
+                }
+            }
+        } else {
+            quote! {
+                #value_type {
+                    #(#init_fields)*
+                }
+            }
         }
-    });
+    } else {
+        let assign_fields = members.iter().map(|member| {
+            let binding = &member.binding;
+            let access = &member.access;
+            quote! {
+                value.#access = #binding;
+            }
+        });
+        quote! {{
+            let mut value = <#value_type as ::core::default::Default>::default();
+            #(#assign_fields)*
+            value
+        }}
+    };
     let support_struct = if container_value_shape_report_uses_source_type(shape) {
         quote! {}
     } else {
@@ -3523,7 +3558,7 @@ fn replicated_state_field_support_tokens(
         pub struct #codec_ident;
 
         impl ::nw_network::serialize::Codec<#value_type> for #codec_ident {
-            const MARSHAL_SIZE: usize = 0 #( + #marshal_size_terms )*;
+            const MARSHAL_SIZE: usize = #marshal_size;
 
             fn marshal(value: &#value_type, wb: &mut ::nw_network::serialize::WriteBuffer) {
                 #(#marshal_fields)*
@@ -3533,9 +3568,7 @@ fn replicated_state_field_support_tokens(
                 rb: &mut ::nw_network::serialize::ReadBuffer,
             ) -> Result<#value_type, ::nw_network::serialize::MarshalerError> {
                 #(#decode_fields)*
-                let mut value = <#value_type as ::core::default::Default>::default();
-                #(#assign_fields)*
-                Ok(value)
+                Ok(#value_initializer)
             }
         }
     })
@@ -3547,6 +3580,7 @@ struct ContainerValueMemberTokens {
     field_ident: proc_macro2::Ident,
     rust_type: syn::Type,
     codec_type: syn::Type,
+    is_flat_field: bool,
 }
 
 fn container_value_member_tokens(
@@ -3566,6 +3600,7 @@ fn container_value_member_tokens(
         field_ident,
         rust_type,
         codec_type,
+        is_flat_field: !name.contains('.'),
     })
 }
 
@@ -5375,7 +5410,8 @@ mod tests {
         let compact_source = output.source.split_whitespace().collect::<String>();
         assert!(compact_source.contains("value.sync_vitals"));
         assert!(compact_source.contains("DefaultMarshaler<bool"));
-        assert!(compact_source.contains("value.value=field_value"));
+        assert!(compact_source.contains("value:field_value"));
+        assert!(compact_source.contains("sync_vitals:field_sync_vitals"));
     }
 
     #[test]
