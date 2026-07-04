@@ -2980,6 +2980,10 @@ fn container_value_type(
         );
     }
 
+    if let Some(value) = vector_container_value_type(container, serialize_types) {
+        return Some(value);
+    }
+
     if let Some(shape) = container.value_type_shape.as_ref()
         && container_value_shape_matches(shape, &container.value_wire_shapes)
     {
@@ -3054,6 +3058,9 @@ fn container_value_member_shape_span(
             if next != SchemaWireScalarShape::VlqU32 {
                 return None;
             }
+            if source_type_vector_element_wire_shape(element) {
+                return Some(expected.len().checked_sub(index)?);
+            }
             if expected
                 .get(index + 1)
                 .is_some_and(|shape| scalar_shape_name_matches(element, *shape))
@@ -3083,6 +3090,13 @@ fn vector_element_wire_shape(value: &str) -> Option<&str> {
         .strip_suffix('>')
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn source_type_vector_element_wire_shape(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
 }
 
 fn composite_member_wire_shapes(value: &str) -> Option<Vec<SchemaWireScalarShape>> {
@@ -3234,6 +3248,50 @@ fn serialize_container_value_type(
         marshaler_type,
         value_type_shape: None,
     })
+}
+
+fn vector_container_value_type(
+    container: &NetworkReplicatedContainerShape,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<ContainerValueType> {
+    if container.value_wire_shapes.first() != Some(&SchemaWireScalarShape::VlqU32) {
+        return None;
+    }
+    let type_name = container
+        .value_type_name
+        .as_deref()
+        .or_else(|| {
+            container
+                .value_type_shape
+                .as_ref()?
+                .type_name_full
+                .as_deref()
+        })
+        .or_else(|| container.value_type_shape.as_ref()?.type_name.as_deref())?;
+    let element_name = azstd_vector_inner_type(type_name)?;
+    let serialize = serialize_types
+        .values()
+        .copied()
+        .find(|candidate| candidate.name == element_name)?;
+    let element_rust_type = serialize_source_rust_type_name(&serialize.name)?;
+    let rust_type = format!("::std::vec::Vec<{element_rust_type}>");
+    let marshaler_type = format!("::nw_network::serialize::DefaultMarshaler<{rust_type}>");
+    Some(ContainerValueType {
+        rust_type,
+        marshaler_type,
+        value_type_shape: None,
+    })
+}
+
+fn azstd_vector_inner_type(type_name: &str) -> Option<&str> {
+    type_name
+        .trim()
+        .strip_prefix("AZStd::vector<")
+        .or_else(|| type_name.trim().strip_prefix("vector<"))
+        .or_else(|| type_name.trim().strip_prefix("Vec<"))?
+        .strip_suffix('>')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
 }
 
 fn container_value_matches_serialize(
@@ -6003,6 +6061,100 @@ mod tests {
         );
         assert!(field.rust_field_type.as_deref().is_some_and(|ty| {
             ty.contains("DefaultMarshaler<::nw_network::source::GlobalMapData>")
+        }));
+    }
+
+    #[test]
+    fn fixed_key_container_with_source_vector_value_uses_vec_codec() {
+        let persistent_item_data_id = uuid!("1be36174-fd4f-4a1c-8e52-7c28d50eec5a");
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "393D9FE0-8E0F-41E9-8FE0-A2C33EF9C7C2",
+                "typeIndex": 2938,
+                "typeName": "MB::GlobalStorageComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "m_globalItemMap",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x813bb88",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x813bb88",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "fixed-bytes-16",
+                    "sequence-number",
+                    "vlq-u32",
+                    "u64"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "fixed-bytes-16",
+                    "vlq-u32",
+                    "u64"
+                ],
+                "valueTypeShape": {
+                    "typeName": "AZStd::vector<PersistentItemData>",
+                    "typeNameFull": "AZStd::vector<PersistentItemData>",
+                    "typeNameSource": "marshal-helper-callgraph",
+                    "memberNameSource": "container-value-shape",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-serialize-type-sequence-persistent-item-data-vector",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "nativeOffset": "0x0",
+                        "name": "items",
+                        "nameSource": "synthetic-offset",
+                        "nameProven": false,
+                        "nativeType": "AZStd::vector<PersistentItemData>",
+                        "wireShape": "vec<PersistentItemData>",
+                        "evidenceSource": "persistent-item-vector-container-slot"
+                    }]
+                },
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x9f34228",
+                    "name": "PersistentItemData",
+                    "typeId": persistent_item_data_id.to_string(),
+                    "source": "serialize-registration+marshal-helper-callgraph"
+                }],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+        schema.merge_serialize_codegen_unit(
+            &SerializeCodegenUnit {
+                items: vec![named_value_item::<0>(
+                    persistent_item_data_id,
+                    "PersistentItemData",
+                    [],
+                )],
+            },
+            Some("selection.json".to_owned()),
+        );
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [2938]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some(
+                "::nw_network::serialize::IndexMap<[u8; 16], ::std::vec::Vec<::nw_network::source::PersistentItemData>>"
+            )
+        );
+        assert!(field.rust_field_type.as_deref().is_some_and(|ty| {
+            ty.contains(
+                "DefaultMarshaler<::std::vec::Vec<::nw_network::source::PersistentItemData>>",
+            )
         }));
     }
 

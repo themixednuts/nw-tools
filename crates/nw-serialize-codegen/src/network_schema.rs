@@ -3145,6 +3145,9 @@ fn nested_member_wire_shape_span(
             if next != NetworkWireScalarShape::VlqU32 {
                 return None;
             }
+            if source_type_vector_element_wire_shape(element) {
+                return Some(expected.len().checked_sub(index)?);
+            }
             if expected
                 .get(index + 1)
                 .is_some_and(|shape| wire_scalar_shape_from_member_name(element) == Some(*shape))
@@ -3174,6 +3177,13 @@ fn vector_element_wire_shape(value: &str) -> Option<&str> {
         .strip_suffix('>')
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn source_type_vector_element_wire_shape(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
 }
 
 fn composite_member_wire_shapes(value: &str) -> Option<Vec<NetworkWireScalarShape>> {
