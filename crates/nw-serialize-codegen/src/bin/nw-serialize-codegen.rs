@@ -121,6 +121,9 @@ struct NetworkSchemaArgs {
     /// Optional game typeindex.json to validate or fill type indices.
     #[arg(long)]
     typeindex: Option<PathBuf>,
+    /// Public label to store for serialize context instead of the local input path.
+    #[arg(long = "serialize-context-source")]
+    serialize_context_source: Option<String>,
     /// Public label to store for typeindex.json instead of the local input path.
     #[arg(long = "typeindex-source")]
     typeindex_source: Option<String>,
@@ -458,10 +461,12 @@ fn network_schema(args: &NetworkSchemaArgs, status: CodegenStatus) -> Result<()>
     reject_compile_errors(&compile_unit)?;
     let serialize_merge = schema.merge_serialize_codegen_unit(
         &compile_unit.codegen_unit,
-        Some(args.catalog.serialize_context.as_ref().map_or_else(
-            || "embedded:resources/serialize.json".to_owned(),
-            |path| path.display().to_string(),
-        )),
+        Some(args.serialize_context_source.clone().unwrap_or_else(|| {
+            args.catalog.serialize_context.as_ref().map_or_else(
+                || "embedded:resources/serialize.json".to_owned(),
+                |path| path.display().to_string(),
+            )
+        })),
     );
     println!(
         "serialize: {} source type(s), {} matched ({} by type id, {} by name, {} ambiguous name), {} filled name(s)",
