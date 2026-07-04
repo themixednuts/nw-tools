@@ -2913,72 +2913,85 @@ fn replicated_container_shape_from_vtable(
         } else if delta_key == Some(NetworkWireScalarShape::VlqU64)
             && !value_type_shape_wire_shapes.is_empty()
         {
-            value_type_shape_wire_shapes
+            value_type_shape_wire_shapes.clone()
         } else {
             Vec::new()
         };
     let whole_value_is_structured = !whole_value_shapes.is_empty();
-    let (storage, key_wire_shape, value_wire_shapes, delta_value_wire_shapes, source) =
-        if (full_data.len() == 1 || whole_value_is_structured)
-            && delta_key.is_none_or(|delta_key| delta_key == NetworkWireScalarShape::VlqU64)
-            && delta_value_shapes.as_ref().is_none_or(|delta_values| {
-                delta_values.is_empty()
-                    || delta_values == &full_data
-                    || delta_values == &whole_value_shapes
-                    || whole_value_is_structured
-            })
-        {
-            let source = if delta_key.is_some() && delta_value_shapes.is_some() {
-                "replicated-container-vector-shape"
-            } else {
-                "replicated-container-vector-full-shape"
-            };
-            (
-                NetworkReplicatedContainerStorageKind::Vec,
-                NetworkWireScalarShape::VlqU64,
-                if whole_value_is_structured {
-                    whole_value_shapes
-                } else {
-                    full_data
-                },
-                delta_value_shapes.unwrap_or_default(),
-                source,
-            )
-        } else if full_data.len() >= 2 {
-            let key = full_data[0];
-            let values_with_counts = full_values_with_counts
-                .get(1..)
-                .map_or_else(Vec::new, <[_]>::to_vec);
-            let values =
-                if selected_structured_container_value_shape_matches(vtable, &values_with_counts) {
-                    values_with_counts
-                } else {
-                    full_data[1..].to_vec()
-                };
-            if delta_key.is_some_and(|delta_key| delta_key != key) {
-                return None;
-            }
-            let delta_shape_complete = delta_key.is_some() && delta_value_shapes.is_some();
-            let delta_values = delta_value_shapes.unwrap_or_default();
-            let delta_values_match = delta_shape_complete && delta_values == values;
-            if !delta_values_match && !has_selected_structured_container_value(vtable, values.len())
-            {
-                return None;
-            }
-            (
-                NetworkReplicatedContainerStorageKind::Map,
-                key,
-                values,
-                delta_values,
-                if delta_values_match {
-                    "replicated-container-map-shape"
-                } else {
-                    "replicated-container-map-full-shape"
-                },
-            )
+    let (storage, key_wire_shape, value_wire_shapes, delta_value_wire_shapes, source) = if full_data
+        .is_empty()
+        && !value_type_shape_wire_shapes.is_empty()
+        && vtable
+            .value_type_shape
+            .as_ref()
+            .is_some_and(is_validated_anonymous_container_value_shape)
+    {
+        (
+            NetworkReplicatedContainerStorageKind::Map,
+            delta_key?,
+            value_type_shape_wire_shapes,
+            delta_value_shapes.unwrap_or_default(),
+            "replicated-container-map-delta-value-shape",
+        )
+    } else if (full_data.len() == 1 || whole_value_is_structured)
+        && delta_key.is_none_or(|delta_key| delta_key == NetworkWireScalarShape::VlqU64)
+        && delta_value_shapes.as_ref().is_none_or(|delta_values| {
+            delta_values.is_empty()
+                || delta_values == &full_data
+                || delta_values == &whole_value_shapes
+                || whole_value_is_structured
+        })
+    {
+        let source = if delta_key.is_some() && delta_value_shapes.is_some() {
+            "replicated-container-vector-shape"
         } else {
-            return None;
+            "replicated-container-vector-full-shape"
         };
+        (
+            NetworkReplicatedContainerStorageKind::Vec,
+            NetworkWireScalarShape::VlqU64,
+            if whole_value_is_structured {
+                whole_value_shapes
+            } else {
+                full_data
+            },
+            delta_value_shapes.unwrap_or_default(),
+            source,
+        )
+    } else if full_data.len() >= 2 {
+        let key = full_data[0];
+        let values_with_counts = full_values_with_counts
+            .get(1..)
+            .map_or_else(Vec::new, <[_]>::to_vec);
+        let values =
+            if selected_structured_container_value_shape_matches(vtable, &values_with_counts) {
+                values_with_counts
+            } else {
+                full_data[1..].to_vec()
+            };
+        if delta_key.is_some_and(|delta_key| delta_key != key) {
+            return None;
+        }
+        let delta_shape_complete = delta_key.is_some() && delta_value_shapes.is_some();
+        let delta_values = delta_value_shapes.unwrap_or_default();
+        let delta_values_match = delta_shape_complete && delta_values == values;
+        if !delta_values_match && !has_selected_structured_container_value(vtable, values.len()) {
+            return None;
+        }
+        (
+            NetworkReplicatedContainerStorageKind::Map,
+            key,
+            values,
+            delta_values,
+            if delta_values_match {
+                "replicated-container-map-shape"
+            } else {
+                "replicated-container-map-full-shape"
+            },
+        )
+    } else {
+        return None;
+    };
 
     Some(NetworkReplicatedContainerShape {
         storage,
@@ -3051,9 +3064,11 @@ fn is_validated_anonymous_container_value_shape(shape: &NetworkNestedTypeShape) 
     shape.type_id.is_none()
         && !shape.members.is_empty()
         && shape.validation.as_deref().is_some_and(|validation| {
-            validation.contains("container-value")
+            (validation.contains("container-value")
                 && (validation.contains("serialize-type-sequence")
-                    || validation.contains("wire-sequence"))
+                    || validation.contains("wire-sequence")))
+                || (validation == "custom-replicated-container-value-shape"
+                    && shape.member_names_proven == Some(true))
         })
 }
 
