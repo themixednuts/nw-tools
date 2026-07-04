@@ -56,7 +56,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
 public class NetworkSchemaExtractor extends GhidraScript {
-    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260703-status-effect-map-pass";
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260703-cooldown-container-pass";
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;
@@ -13287,6 +13287,12 @@ public class NetworkSchemaExtractor extends GhidraScript {
             return persistentStatusEffectsMapShape;
         }
 
+        ContainerWireShape recipeCooldownShape =
+            classifyRecipeCooldownDataMapContainerWireShape(vtable);
+        if (recipeCooldownShape != null) {
+            return recipeCooldownShape;
+        }
+
         Function marshalFunction = functionAtOrContaining(marshal);
         String marshalName = fullFunctionName(marshalFunction);
         if (marshalName == null ||
@@ -13448,6 +13454,151 @@ public class NetworkSchemaExtractor extends GhidraScript {
             "AZ::u8", "u8", 1, "persistent-status-effects-map-slot"));
         shape.members.add(containerValueMember(index, 0x15, "field_15",
             "AZ::u8", "u8", 1, "persistent-status-effects-map-slot"));
+        return shape;
+    }
+
+    private ContainerWireShape classifyRecipeCooldownDataMapContainerWireShape(Address vtable) {
+        Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
+        Address unmarshal = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        Address marshalFull = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_FULL_SLOT * 8L));
+        Address unmarshalFull = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_FULL_SLOT * 8L));
+        if (!isExecutableAddress(marshal) ||
+            !isExecutableAddress(unmarshal) ||
+            !isExecutableAddress(marshalFull) ||
+            !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        ArrayList<String> observedFull = new ArrayList<>();
+        collectOrderedMarshalShapes(marshalFull, 3, new LinkedHashSet<>(), observedFull);
+        if (!wireShapesContainSubsequence(
+            observedFull,
+            recipeCooldownDataMapFullWireShapes())) {
+            return null;
+        }
+
+        List<String> observedFullUnmarshal = collectOrderedUnmarshalShapes(
+            functionAtOrContaining(unmarshalFull));
+        if (!wireShapesContainSubsequence(
+            observedFullUnmarshal,
+            recipeCooldownDataMapFullWireShapes())) {
+            return null;
+        }
+
+        ArrayList<String> observedDelta = new ArrayList<>();
+        collectOrderedMarshalShapes(marshal, 3, new LinkedHashSet<>(), observedDelta);
+        List<String> observedDeltaUnmarshal = collectOrderedUnmarshalShapes(
+            functionAtOrContaining(unmarshal));
+        if (!recipeCooldownDataMapDeltaShapeMatches(observedDelta) ||
+            !wireShapesContainSubsequence(
+                observedDeltaUnmarshal,
+                recipeCooldownDataMapDeltaWireShapes())) {
+            return null;
+        }
+
+        NativeTypeInfoEvidence valueTypeInfo = recipeCooldownDataTypeInfo();
+        NestedTypeShape valueTypeShape = recipeCooldownDataValueTypeShape(
+            vtable,
+            functionAtOrContaining(unmarshalFull),
+            valueTypeInfo);
+
+        return new ContainerWireShape(
+            null,
+            null,
+            null,
+            recipeCooldownDataMapDeltaWireShapes(),
+            recipeCooldownDataMapFullWireShapes(),
+            valueTypeInfo,
+            valueTypeShape,
+            valueTypeInfo == null ? Collections.emptyList() : List.of(valueTypeInfo),
+            Collections.emptyList());
+    }
+
+    private boolean recipeCooldownDataMapDeltaShapeMatches(List<String> observed) {
+        return observed != null &&
+            observed.contains("vlq-u32") &&
+            observed.contains("u8") &&
+            observed.contains("u32") &&
+            observed.contains("sequence-number") &&
+            wireShapesContainSubsequence(
+                observed,
+                recipeCooldownDataValueWireShapes());
+    }
+
+    private List<String> recipeCooldownDataMapFullWireShapes() {
+        return List.of(
+            "sequence-number",
+            "vlq-u32",
+            "u32",
+            "u8",
+            "u64");
+    }
+
+    private List<String> recipeCooldownDataMapDeltaWireShapes() {
+        return List.of(
+            "vlq-u32",
+            "u8",
+            "u32",
+            "sequence-number",
+            "u8",
+            "u64");
+    }
+
+    private List<String> recipeCooldownDataValueWireShapes() {
+        return List.of("u8", "u64");
+    }
+
+    private NativeTypeInfoEvidence recipeCooldownDataTypeInfo() {
+        SerializeTypeInfo info = serializeTypeForTypeName("RecipeCooldownData");
+        if (info == null) {
+            return null;
+        }
+        return new NativeTypeInfoEvidence(
+            parseCapturedAddress(info.factory),
+            info.name,
+            info.typeId,
+            "serialize-registration+container-slot-shape",
+            "serialize-json-class-name");
+    }
+
+    private NestedTypeShape recipeCooldownDataValueTypeShape(
+        Address vtable,
+        Function evidenceFunction,
+        NativeTypeInfoEvidence valueTypeInfo) {
+
+        NestedTypeShape shape = new NestedTypeShape();
+        if (valueTypeInfo != null) {
+            shape.typeId = valueTypeInfo.typeId;
+            shape.typeIdSource = valueTypeInfo.source;
+            shape.typeName = valueTypeInfo.name;
+            shape.typeNameFull = valueTypeInfo.name;
+            shape.typeNameSource = valueTypeInfo.nameSource;
+            shape.factory = formatAddress(valueTypeInfo.address);
+        }
+        else {
+            shape.typeName = "RecipeCooldownData";
+            shape.typeNameFull = "RecipeCooldownData";
+            shape.typeNameSource = "container-slot-shape";
+        }
+        shape.function = evidenceFunction == null ? null : evidenceFunction.getEntryPoint();
+        shape.functionName = fullFunctionName(evidenceFunction);
+        shape.vtable = vtable;
+        shape.memberBase = "value";
+        shape.memberNameSource = "serialize-json-field";
+        shape.memberNamesProven = valueTypeInfo != null;
+        shape.validation = "custom-container-value-pcode-serialize-type-sequence-recipe-cooldown-data";
+
+        int index = 0;
+        shape.members.add(containerValueMember(index++, 0x08, "m_count",
+            "AZ::u8", "u8", 1, "recipe-cooldown-container-slot"));
+        shape.members.add(containerValueMember(index, 0x10, "m_cooldownEnd",
+            "WallClockTimePoint", "u64", 16, "recipe-cooldown-container-slot"));
+        if (valueTypeInfo != null) {
+            applySerializeMemberNames(
+                valueTypeInfo,
+                shape.members,
+                recipeCooldownDataValueWireShapes());
+        }
         return shape;
     }
 
