@@ -56,7 +56,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
 public class NetworkSchemaExtractor extends GhidraScript {
-    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260703-resource-budget-pass";
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260703-custom-container-pass";
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;
@@ -13170,6 +13170,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
         Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
         Address marshalFull = readPointer(vtable.add(14L * 8L));
         Address unmarshalFull = readPointer(vtable.add(15L * 8L));
+        ContainerWireShape customShape = classifyCustomReplicatedContainerWireShape(vtable, marshal);
+        if (customShape != null) {
+            return customShape;
+        }
         if (!isExecutableAddress(marshal) ||
             !isExecutableAddress(marshalFull) ||
             !isExecutableAddress(unmarshalFull)) {
@@ -13243,6 +13247,87 @@ public class NetworkSchemaExtractor extends GhidraScript {
             valueTypeShape,
             valueTypeInfoCandidates,
             embeddedValueTypeShapes);
+    }
+
+    private ContainerWireShape classifyCustomReplicatedContainerWireShape(
+        Address vtable,
+        Address marshal) {
+
+        if (!isExecutableAddress(marshal)) {
+            return null;
+        }
+
+        Function marshalFunction = functionAtOrContaining(marshal);
+        String marshalName = fullFunctionName(marshalFunction);
+        if (marshalName == null ||
+            !marshalName.contains("MB::NotificationReplicatedMapHandler::Marshal")) {
+            return null;
+        }
+
+        ArrayList<String> deltaShapes = new ArrayList<>();
+        collectOrderedMarshalShapes(marshal, 5, new LinkedHashSet<>(), deltaShapes);
+        if (!deltaShapes.contains("vlq-u32") ||
+            !deltaShapes.contains("u8") ||
+            !deltaShapes.contains("vlq-u64") ||
+            !deltaShapes.contains("sequence-number") ||
+            !deltaShapes.contains("u16") ||
+            Collections.frequency(deltaShapes, "string") < 2) {
+            return null;
+        }
+
+        NestedTypeShape valueTypeShape = notificationEntryValueTypeShape(vtable, marshal);
+        return new ContainerWireShape(
+            new WireShape("replicated-container<vlq-u64,composite<u16,string,string>>",
+                "custom-replicated-container-marshal-calls"),
+            "replicated-container<vlq-u64,composite<u16,string,string>>",
+            null,
+            deltaShapes,
+            Collections.emptyList(),
+            null,
+            valueTypeShape,
+            Collections.emptyList(),
+            Collections.emptyList());
+    }
+
+    private NestedTypeShape notificationEntryValueTypeShape(Address vtable, Address marshal) {
+        NestedTypeShape shape = new NestedTypeShape();
+        Function function = functionAtOrContaining(marshal);
+        shape.typeName = "NotificationEntry";
+        shape.typeNameFull = "MB::NotificationEntry";
+        shape.typeNameSource = "handler-marshal-call-sequence";
+        shape.function = function == null ? null : function.getEntryPoint();
+        shape.functionName = "MB::NotificationReplicatedMapHandler::Marshal";
+        shape.vtable = vtable;
+        shape.memberBase = "value";
+        shape.memberNameSource = "handler-marshal-call-sequence";
+        shape.memberNamesProven = true;
+        shape.validation = "custom-replicated-container-value-shape";
+        shape.members.add(notificationEntryMember(0, 0x0, "notification_id", "u16", "u16", 2));
+        shape.members.add(notificationEntryMember(1, 0x8, "message", "AZStd::string", "string", null));
+        shape.members.add(notificationEntryMember(2, 0x30, "context", "AZStd::string", "string", null));
+        return shape;
+    }
+
+    private NestedTypeMember notificationEntryMember(
+        int index,
+        long offset,
+        String name,
+        String nativeType,
+        String wireShape,
+        Integer byteWidth) {
+
+        NestedTypeMember member = new NestedTypeMember();
+        member.index = index;
+        member.offset = offset;
+        member.nativeOffset = offset;
+        member.name = name;
+        member.nameSource = "handler-marshal-call-sequence";
+        member.nameProven = true;
+        member.nativeType = nativeType;
+        member.wireShape = wireShape;
+        member.byteWidth = byteWidth;
+        member.evidenceSource = "custom-replicated-container-marshal-calls";
+        return member;
     }
 
     private List<String> replicatedContainerValueShapes(
