@@ -338,6 +338,14 @@ impl NetworkRustEmitter {
                 Vec4,
                 Quat,
                 QuatCompNorm,
+                Vec2Comp,
+                Vec3Comp,
+                Vec3CompNorm,
+                QuatComp,
+                NonUniformScaleComp,
+                PositionAnchor,
+                TransformCompressor,
+                PackedSize,
                 Mat3,
                 Affine3,
                 Aabb2d,
@@ -371,6 +379,14 @@ impl NetworkRustEmitter {
                 Vec4,
                 Quat,
                 QuatCompNorm,
+                Vec2Comp,
+                Vec3Comp,
+                Vec3CompNorm,
+                QuatComp,
+                NonUniformScaleComp,
+                PositionAnchor,
+                TransformCompressor,
+                PackedSize,
                 Mat3,
                 Affine3,
                 Aabb2d,
@@ -711,6 +727,7 @@ impl NetworkRustEmitter {
         let wire_shapes = wire_shapes_by_handler_vtable(schema);
         let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
         let value_type_candidates = value_type_candidates_by_handler_vtable(schema);
+        let support_evidence = message_support_evidence(schema);
         let rust_names = identity_names_by_type_index(schema);
         let message_types = schema
             .types
@@ -730,6 +747,7 @@ impl NetworkRustEmitter {
                     &wire_shapes,
                     &wire_shape_sources,
                     &value_type_candidates,
+                    &support_evidence,
                 )
             },
         );
@@ -1465,6 +1483,7 @@ fn message_generation_plans(
     context: &CodegenContext,
 ) -> Result<Vec<NetworkMessageGenerationPlanReport>, NetworkRustEmitError> {
     let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
+    let support_evidence = message_support_evidence(schema);
     let message_types = schema
         .types
         .iter()
@@ -1483,6 +1502,7 @@ fn message_generation_plans(
                     wire_shapes,
                     &wire_shape_sources,
                     value_type_candidates,
+                    &support_evidence,
                 )
             });
     if plans.was_cancelled() {
@@ -1605,6 +1625,7 @@ fn message_generation_plan(
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
     value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
+    support_evidence: &MessageSupportEvidence,
 ) -> NetworkMessageGenerationPlanReport {
     let mut fields = network_type
         .fields
@@ -1615,6 +1636,7 @@ fn message_generation_plan(
                 wire_shapes,
                 wire_shape_sources,
                 value_type_candidates,
+                support_evidence,
             )
         })
         .collect::<Vec<_>>();
@@ -1865,6 +1887,7 @@ fn message_field_shape_report(
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
     value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
+    support_evidence: &MessageSupportEvidence,
 ) -> NetworkStateFieldShapeReport {
     let container_shapes = BTreeMap::new();
     let serialize_types = BTreeMap::new();
@@ -1881,7 +1904,7 @@ fn message_field_shape_report(
         .rust_type
         .as_deref()
         .map(normalize_generated_rust_type)
-        .or_else(|| existing_message_support_type(field).map(ToOwned::to_owned))
+        .or_else(|| existing_message_support_type(field, support_evidence).map(ToOwned::to_owned))
         .or(source_type)
         .or_else(|| {
             field
@@ -2139,7 +2162,10 @@ fn resolved_field_descriptor_rust_type(field: &NetworkField) -> Option<String> {
         .rust_type
         .as_deref()
         .map(normalize_generated_rust_type)
-        .or_else(|| existing_message_support_type(field).map(ToOwned::to_owned))
+        .or_else(|| {
+            existing_message_support_type(field, &MessageSupportEvidence::default())
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn normalize_generated_rust_type(rust_type: &str) -> String {
@@ -2154,28 +2180,163 @@ fn normalize_generated_rust_type(rust_type: &str) -> String {
         )
 }
 
-fn existing_message_support_type(field: &NetworkField) -> Option<&'static str> {
-    let target_name = field
+#[derive(Debug, Default)]
+struct MessageSupportEvidence {
+    actor_request_id_payload_targets: BTreeSet<String>,
+}
+
+fn message_support_evidence(schema: &NetworkSchema) -> MessageSupportEvidence {
+    let mut evidence = MessageSupportEvidence::default();
+    for field in schema
+        .types
+        .iter()
+        .flat_map(|network_type| &network_type.fields)
+    {
+        let Some(target_name) = field
+            .unmarshal_evidence
+            .as_ref()
+            .and_then(|unmarshal| unmarshal.target_name.as_deref())
+        else {
+            continue;
+        };
+        if field.native_type.as_deref() == Some("composite")
+            && field.source_type_name.as_deref().is_some_and(|source| {
+                let parts = source
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>();
+                parts.first() == Some(&"ActorRequestIdPayload")
+                    && parts.last() == Some(&"ActorRequestId")
+            })
+            && target_name.ends_with("ActorRequestIdPayload::Unmarshal")
+            && has_actor_request_id_shape(field)
+        {
+            evidence
+                .actor_request_id_payload_targets
+                .insert(target_name.to_owned());
+        }
+    }
+    evidence
+}
+
+fn existing_message_support_type(
+    field: &NetworkField,
+    support_evidence: &MessageSupportEvidence,
+) -> Option<&'static str> {
+    if field_native_or_source_type_is(field, "ClientVersionTokenMap")
+        || field_native_or_source_type_is(field, "Amazon::Configuration::ClientVersionTokenMap")
+    {
+        return Some("::nw_network::ClientVersionTokenMap");
+    }
+    if field_native_or_source_type_is(field, "LoginToken")
+        || field_native_or_source_type_is(field, "Amazon::REP::LoginToken")
+    {
+        return Some("::nw_network::LoginToken");
+    }
+    if field_native_or_source_type_is(field, "AuthToken")
+        || field_native_or_source_type_is(field, "Amazon::REP::AuthToken")
+    {
+        return Some("::nw_network::AuthToken");
+    }
+    if field_native_or_source_type_is(field, "ImpersonatedValues")
+        || field_native_or_source_type_is(field, "Amazon::REP::ImpersonatedValues")
+    {
+        return Some("::nw_network::ImpersonatedValues");
+    }
+
+    if is_actor_request_id_field(field)
+        || is_proven_actor_request_id_payload_target(field, support_evidence)
+    {
+        return Some("::nw_network::ActorRequestId");
+    }
+    if is_actor_ref_composite_field(field) {
+        return Some("::nw_network::ActorRef");
+    }
+
+    None
+}
+
+fn field_native_or_source_type_is(field: &NetworkField, expected: &str) -> bool {
+    [
+        field.native_type.as_deref(),
+        field.source_type_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.trim() == expected)
+}
+
+fn is_proven_actor_request_id_payload_target(
+    field: &NetworkField,
+    support_evidence: &MessageSupportEvidence,
+) -> bool {
+    if !field_native_or_source_type_is(field, "ActorRequestIdPayload") {
+        return false;
+    }
+    let Some(evidence) = field.unmarshal_evidence.as_ref() else {
+        return false;
+    };
+    if !evidence
+        .target_kind
+        .as_deref()
+        .is_none_or(|kind| kind == "direct-unmarshal" || kind.contains("direct-type"))
+    {
+        return false;
+    }
+    let Some(target_name) = evidence.target_name.as_deref() else {
+        return false;
+    };
+    target_name.ends_with("ActorRequestIdPayload::Unmarshal")
+        && support_evidence
+            .actor_request_id_payload_targets
+            .contains(target_name)
+}
+
+fn is_actor_request_id_field(field: &NetworkField) -> bool {
+    let native_type = field.native_type.as_deref();
+    let source_type = field.source_type_name.as_deref();
+    let direct_type = native_type == Some("ActorRequestId")
+        && source_type.is_none_or(|source| source == "ActorRequestId");
+    let direct_payload_type = field_native_or_source_type_is(field, "ActorRequestIdPayload")
+        && has_actor_request_id_payload_shape(field);
+    let composite_type = native_type == Some("composite")
+        && composite_support_tail(source_type) == Some("ActorRequestId");
+    if !direct_type && !direct_payload_type && !composite_type {
+        return false;
+    }
+
+    let Some(target_name) = field
         .unmarshal_evidence
         .as_ref()
-        .and_then(|evidence| evidence.target_name.as_deref())?;
+        .and_then(|evidence| evidence.target_name.as_deref())
+    else {
+        return false;
+    };
     let target_kind = field
         .unmarshal_evidence
         .as_ref()
         .and_then(|evidence| evidence.target_kind.as_deref());
-    let native_type = field.native_type.as_deref();
-    let source_type = field.source_type_name.as_deref();
+    let target_matches = target_name.ends_with("ActorRequestId::Unmarshal")
+        || (direct_payload_type && target_name.ends_with("ActorRequestIdPayload::Unmarshal"))
+        || (composite_type
+            && field
+                .nested_type_shape
+                .as_ref()
+                .and_then(|shape| shape.function_name.as_deref())
+                .is_some_and(|function| function.ends_with("ActorRequestId::Unmarshal")));
 
-    if target_name.ends_with("ActorRequestId::Unmarshal")
+    target_matches
         && target_kind.is_none_or(|kind| kind == "direct-unmarshal" || kind.contains("direct-type"))
-        && native_type == Some("ActorRequestId")
-        && source_type.is_none_or(|source| source == "ActorRequestId")
-        && has_actor_request_id_shape(field)
-    {
-        return Some("::nw_network::ActorRequestId");
-    }
+        && (has_actor_request_id_shape(field)
+            || (direct_payload_type && has_actor_request_id_payload_shape(field)))
+}
 
-    None
+fn composite_support_tail(source_type: Option<&str>) -> Option<&str> {
+    source_type?
+        .split(',')
+        .map(str::trim)
+        .rfind(|part| !part.is_empty())
 }
 
 fn has_actor_request_id_shape(field: &NetworkField) -> bool {
@@ -2188,11 +2349,69 @@ fn has_actor_request_id_shape(field: &NetworkField) -> bool {
             .as_deref()
             .is_some_and(|name| name.ends_with("::ActorRequestId"))
         && shape.type_name_source.as_deref() == Some("ghidra-symbol")
-        && shape.validation.as_deref() == Some("layout-consistent-two-u64")
-        && shape.member_names_proven.is_some()
+        && has_two_u64_member_shape(field)
+}
+
+fn has_actor_request_id_payload_shape(field: &NetworkField) -> bool {
+    let Some(shape) = field.nested_type_shape.as_ref() else {
+        return false;
+    };
+    shape.type_name.as_deref() == Some("ActorRequestIdPayload")
+        && shape
+            .type_name_full
+            .as_deref()
+            .is_some_and(|name| name.ends_with("::ActorRequestIdPayload"))
+        && shape.type_name_source.as_deref() == Some("ghidra-symbol")
+        && has_two_u64_member_shape(field)
+}
+
+fn has_two_u64_member_shape(field: &NetworkField) -> bool {
+    let Some(shape) = field.nested_type_shape.as_ref() else {
+        return false;
+    };
+    matches!(
+        shape.validation.as_deref(),
+        Some("layout-consistent-two-u64" | "layout-consistent-direct-type")
+    ) && shape.member_names_proven.is_some()
         && shape.members.len() == 2
         && actor_request_id_member(&shape.members[0], 0, "0x0")
         && actor_request_id_member(&shape.members[1], 1, "0x8")
+}
+
+fn is_actor_ref_composite_field(field: &NetworkField) -> bool {
+    field.native_type.as_deref() == Some("composite")
+        && field.source_type_name.as_deref() == Some("ProxyAddress,ActorRef")
+        && has_proxy_address_actor_ref_shape(field)
+}
+
+fn has_proxy_address_actor_ref_shape(field: &NetworkField) -> bool {
+    let Some(shape) = field.nested_type_shape.as_ref() else {
+        return false;
+    };
+    shape.type_name.as_deref() == Some("ProxyAddress")
+        && shape
+            .type_name_full
+            .as_deref()
+            .is_some_and(|name| name.ends_with("::ProxyAddress"))
+        && shape.type_name_source.as_deref() == Some("ghidra-symbol")
+        && shape.validation.as_deref() == Some("layout-consistent-direct-type")
+        && shape.members.len() == 3
+        && actor_ref_member(&shape.members[0], 0, "0x0", "u32", 4)
+        && actor_ref_member(&shape.members[1], 1, "0x4", "fixed-bytes-16", 16)
+        && actor_ref_member(&shape.members[2], 2, "0x14", "fixed-bytes-16", 16)
+}
+
+fn actor_ref_member(
+    member: &crate::network_schema::NetworkNestedTypeMember,
+    index: u32,
+    offset: &str,
+    wire_shape: &str,
+    byte_width: u32,
+) -> bool {
+    member.index == Some(index)
+        && member.offset.as_deref() == Some(offset)
+        && member.wire_shape.as_deref() == Some(wire_shape)
+        && member.byte_width == Some(byte_width)
 }
 
 fn actor_request_id_member(
@@ -2359,9 +2578,6 @@ fn message_blocked_reasons(network_type: &NetworkType, counts: FieldBlockCounts)
     }
     if network_type.name.is_none() {
         reasons.push("missing-type-name".to_owned());
-    }
-    if counts.field_count == 0 {
-        reasons.push("no-message-fields".to_owned());
     }
     if counts.missing_field_type_count != 0 {
         reasons.push(format!(
@@ -2595,6 +2811,37 @@ fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
         }
         SchemaWireShape::QuatCompNorm => {
             rust_field_shape_static("QuatCompNorm", "ReplicatedFieldHandler<QuatCompNorm>")
+        }
+        SchemaWireShape::Vec2Comp => rust_field_shape_static(
+            "::glam::Vec2",
+            "ReplicatedFieldHandler<::glam::Vec2, Vec2CompMarshaler>",
+        ),
+        SchemaWireShape::Vec3Comp => rust_field_shape_static(
+            "::glam::Vec3",
+            "ReplicatedFieldHandler<::glam::Vec3, Vec3CompMarshaler>",
+        ),
+        SchemaWireShape::Vec3CompNorm => rust_field_shape_static(
+            "::glam::Vec3",
+            "ReplicatedFieldHandler<::glam::Vec3, Vec3CompNormMarshaler>",
+        ),
+        SchemaWireShape::QuatComp => rust_field_shape_static(
+            "::glam::Quat",
+            "ReplicatedFieldHandler<::glam::Quat, QuatCompMarshaler>",
+        ),
+        SchemaWireShape::NonUniformScaleComp => rust_field_shape_static(
+            "::glam::Vec3",
+            "ReplicatedFieldHandler<::glam::Vec3, NonUniformScaleCompMarshaler>",
+        ),
+        SchemaWireShape::PositionAnchor => rust_field_shape_static(
+            "(f32, f32, f32)",
+            "ReplicatedFieldHandler<(f32, f32, f32), PositionAnchorMarshaler>",
+        ),
+        SchemaWireShape::TransformCompressor => rust_field_shape_static(
+            "::glam::Affine3A",
+            "ReplicatedFieldHandler<::glam::Affine3A, TransformCompressor>",
+        ),
+        SchemaWireShape::PackedSize => {
+            rust_field_shape_static("PackedSize", "ReplicatedFieldHandler<PackedSize>")
         }
         SchemaWireShape::Mat3 => {
             rust_field_shape_static("::glam::Mat3", "ReplicatedFieldHandler<::glam::Mat3>")
@@ -2866,6 +3113,14 @@ fn wire_scalar_shape_from_name(value: &str) -> Option<SchemaWireScalarShape> {
         "vec4" => Some(SchemaWireScalarShape::Vec4),
         "quat" => Some(SchemaWireScalarShape::Quat),
         "quat-comp-norm" => Some(SchemaWireScalarShape::QuatCompNorm),
+        "vec2-comp" => Some(SchemaWireScalarShape::Vec2Comp),
+        "vec3-comp" => Some(SchemaWireScalarShape::Vec3Comp),
+        "vec3-comp-norm" => Some(SchemaWireScalarShape::Vec3CompNorm),
+        "quat-comp" => Some(SchemaWireScalarShape::QuatComp),
+        "non-uniform-scale-comp" => Some(SchemaWireScalarShape::NonUniformScaleComp),
+        "position-anchor" => Some(SchemaWireScalarShape::PositionAnchor),
+        "transform-compressor" => Some(SchemaWireScalarShape::TransformCompressor),
+        "packed-size" => Some(SchemaWireScalarShape::PackedSize),
         "mat3" => Some(SchemaWireScalarShape::Mat3),
         "affine3" => Some(SchemaWireScalarShape::Affine3),
         "aabb2d" => Some(SchemaWireScalarShape::Aabb2d),
@@ -2905,10 +3160,7 @@ fn container_value_shape_rust_type(
             .or(shape.type_name.as_deref())
             .and_then(serialize_source_rust_type_name);
     }
-    Some(container_value_shape_support_type_name(
-        field.name.as_deref()?,
-        shape,
-    )?)
+    container_value_shape_support_type_name(field.name.as_deref()?, shape)
 }
 
 fn container_value_shape_uses_source_type(
@@ -3015,6 +3267,14 @@ fn scalar_rust_type(shape: SchemaWireScalarShape) -> String {
         SchemaWireScalarShape::Vec4 => "::glam::Vec4".to_owned(),
         SchemaWireScalarShape::Quat => "::glam::Quat".to_owned(),
         SchemaWireScalarShape::QuatCompNorm => "::nw_network::serialize::QuatCompNorm".to_owned(),
+        SchemaWireScalarShape::Vec2Comp => "::glam::Vec2".to_owned(),
+        SchemaWireScalarShape::Vec3Comp
+        | SchemaWireScalarShape::Vec3CompNorm
+        | SchemaWireScalarShape::NonUniformScaleComp => "::glam::Vec3".to_owned(),
+        SchemaWireScalarShape::QuatComp => "::glam::Quat".to_owned(),
+        SchemaWireScalarShape::PositionAnchor => "(f32, f32, f32)".to_owned(),
+        SchemaWireScalarShape::TransformCompressor => "::glam::Affine3A".to_owned(),
+        SchemaWireScalarShape::PackedSize => "::nw_network::serialize::PackedSize".to_owned(),
         SchemaWireScalarShape::Mat3 => "::glam::Mat3".to_owned(),
         SchemaWireScalarShape::Affine3 => "::glam::Affine3A".to_owned(),
         SchemaWireScalarShape::Aabb2d => "::bevy_math::bounding::Aabb2d".to_owned(),
@@ -3030,6 +3290,21 @@ fn scalar_marshaler_type(shape: SchemaWireScalarShape) -> String {
         SchemaWireScalarShape::HalfF32 => "::nw_network::serialize::HalfF32Marshaler".to_owned(),
         SchemaWireScalarShape::VlqU32 => "::nw_network::serialize::VlqU32Marshaler".to_owned(),
         SchemaWireScalarShape::VlqU64 => "::nw_network::serialize::VlqU64Marshaler".to_owned(),
+        SchemaWireScalarShape::Vec2Comp => "::nw_network::serialize::Vec2CompMarshaler".to_owned(),
+        SchemaWireScalarShape::Vec3Comp => "::nw_network::serialize::Vec3CompMarshaler".to_owned(),
+        SchemaWireScalarShape::Vec3CompNorm => {
+            "::nw_network::serialize::Vec3CompNormMarshaler".to_owned()
+        }
+        SchemaWireScalarShape::QuatComp => "::nw_network::serialize::QuatCompMarshaler".to_owned(),
+        SchemaWireScalarShape::NonUniformScaleComp => {
+            "::nw_network::serialize::NonUniformScaleCompMarshaler".to_owned()
+        }
+        SchemaWireScalarShape::PositionAnchor => {
+            "::nw_network::serialize::PositionAnchorMarshaler".to_owned()
+        }
+        SchemaWireScalarShape::TransformCompressor => {
+            "::nw_network::serialize::TransformCompressor".to_owned()
+        }
         _ => {
             let rust_type = scalar_rust_type(shape);
             format!("::nw_network::serialize::DefaultMarshaler<{rust_type}>")
@@ -3531,6 +3806,69 @@ fn replicated_state_field_type_tokens(
                 >
             )
         }
+        SchemaWireShape::Vec2Comp => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::glam::Vec2,
+                    ::nw_network::serialize::Vec2CompMarshaler,
+                >
+            )
+        }
+        SchemaWireShape::Vec3Comp => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::glam::Vec3,
+                    ::nw_network::serialize::Vec3CompMarshaler,
+                >
+            )
+        }
+        SchemaWireShape::Vec3CompNorm => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::glam::Vec3,
+                    ::nw_network::serialize::Vec3CompNormMarshaler,
+                >
+            )
+        }
+        SchemaWireShape::QuatComp => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::glam::Quat,
+                    ::nw_network::serialize::QuatCompMarshaler,
+                >
+            )
+        }
+        SchemaWireShape::NonUniformScaleComp => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::glam::Vec3,
+                    ::nw_network::serialize::NonUniformScaleCompMarshaler,
+                >
+            )
+        }
+        SchemaWireShape::PositionAnchor => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    (f32, f32, f32),
+                    ::nw_network::serialize::PositionAnchorMarshaler,
+                >
+            )
+        }
+        SchemaWireShape::TransformCompressor => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::glam::Affine3A,
+                    ::nw_network::serialize::TransformCompressor,
+                >
+            )
+        }
+        SchemaWireShape::PackedSize => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::nw_network::serialize::PackedSize,
+                >
+            )
+        }
         SchemaWireShape::Mat3 => {
             quote!(::nw_network::serialize::ReplicatedFieldHandler<::glam::Mat3>)
         }
@@ -3664,6 +4002,14 @@ fn message_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream
         SchemaWireShape::Vec4 => quote!(::glam::Vec4),
         SchemaWireShape::Quat => quote!(::glam::Quat),
         SchemaWireShape::QuatCompNorm => quote!(::nw_network::serialize::QuatCompNorm),
+        SchemaWireShape::Vec2Comp => quote!(::glam::Vec2),
+        SchemaWireShape::Vec3Comp
+        | SchemaWireShape::Vec3CompNorm
+        | SchemaWireShape::NonUniformScaleComp => quote!(::glam::Vec3),
+        SchemaWireShape::QuatComp => quote!(::glam::Quat),
+        SchemaWireShape::PositionAnchor => quote!((f32, f32, f32)),
+        SchemaWireShape::TransformCompressor => quote!(::glam::Affine3A),
+        SchemaWireShape::PackedSize => quote!(::nw_network::serialize::PackedSize),
         SchemaWireShape::Mat3 => quote!(::glam::Mat3),
         SchemaWireShape::Affine3 => quote!(::glam::Affine3A),
         SchemaWireShape::Aabb2d => quote!(::bevy_math::bounding::Aabb2d),
@@ -3704,6 +4050,27 @@ fn message_wire_shape_marshal_attr_tokens(shape: SchemaWireShape) -> proc_macro2
         }
         SchemaWireShape::VlqU64 => {
             quote!(#[marshal(as = "::nw_network::serialize::VlqU64")])
+        }
+        SchemaWireShape::Vec2Comp => {
+            quote!(#[marshal(codec = "::nw_network::serialize::Vec2CompMarshaler")])
+        }
+        SchemaWireShape::Vec3Comp => {
+            quote!(#[marshal(codec = "::nw_network::serialize::Vec3CompMarshaler")])
+        }
+        SchemaWireShape::Vec3CompNorm => {
+            quote!(#[marshal(codec = "::nw_network::serialize::Vec3CompNormMarshaler")])
+        }
+        SchemaWireShape::QuatComp => {
+            quote!(#[marshal(codec = "::nw_network::serialize::QuatCompMarshaler")])
+        }
+        SchemaWireShape::NonUniformScaleComp => {
+            quote!(#[marshal(codec = "::nw_network::serialize::NonUniformScaleCompMarshaler")])
+        }
+        SchemaWireShape::PositionAnchor => {
+            quote!(#[marshal(codec = "::nw_network::serialize::PositionAnchorMarshaler")])
+        }
+        SchemaWireShape::TransformCompressor => {
+            quote!(#[marshal(codec = "::nw_network::serialize::TransformCompressor")])
         }
         _ => quote! {},
     }
@@ -3838,6 +4205,14 @@ fn wire_shape_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream {
         SchemaWireShape::Vec4 => quote!(NetworkWireShape::Vec4),
         SchemaWireShape::Quat => quote!(NetworkWireShape::Quat),
         SchemaWireShape::QuatCompNorm => quote!(NetworkWireShape::QuatCompNorm),
+        SchemaWireShape::Vec2Comp => quote!(NetworkWireShape::Vec2Comp),
+        SchemaWireShape::Vec3Comp => quote!(NetworkWireShape::Vec3Comp),
+        SchemaWireShape::Vec3CompNorm => quote!(NetworkWireShape::Vec3CompNorm),
+        SchemaWireShape::QuatComp => quote!(NetworkWireShape::QuatComp),
+        SchemaWireShape::NonUniformScaleComp => quote!(NetworkWireShape::NonUniformScaleComp),
+        SchemaWireShape::PositionAnchor => quote!(NetworkWireShape::PositionAnchor),
+        SchemaWireShape::TransformCompressor => quote!(NetworkWireShape::TransformCompressor),
+        SchemaWireShape::PackedSize => quote!(NetworkWireShape::PackedSize),
         SchemaWireShape::Mat3 => quote!(NetworkWireShape::Mat3),
         SchemaWireShape::Affine3 => quote!(NetworkWireShape::Affine3),
         SchemaWireShape::Aabb2d => quote!(NetworkWireShape::Aabb2d),
@@ -3881,6 +4256,18 @@ fn wire_scalar_shape_tokens(shape: SchemaWireScalarShape) -> proc_macro2::TokenS
         SchemaWireScalarShape::Vec4 => quote!(NetworkWireScalarShape::Vec4),
         SchemaWireScalarShape::Quat => quote!(NetworkWireScalarShape::Quat),
         SchemaWireScalarShape::QuatCompNorm => quote!(NetworkWireScalarShape::QuatCompNorm),
+        SchemaWireScalarShape::Vec2Comp => quote!(NetworkWireScalarShape::Vec2Comp),
+        SchemaWireScalarShape::Vec3Comp => quote!(NetworkWireScalarShape::Vec3Comp),
+        SchemaWireScalarShape::Vec3CompNorm => quote!(NetworkWireScalarShape::Vec3CompNorm),
+        SchemaWireScalarShape::QuatComp => quote!(NetworkWireScalarShape::QuatComp),
+        SchemaWireScalarShape::NonUniformScaleComp => {
+            quote!(NetworkWireScalarShape::NonUniformScaleComp)
+        }
+        SchemaWireScalarShape::PositionAnchor => quote!(NetworkWireScalarShape::PositionAnchor),
+        SchemaWireScalarShape::TransformCompressor => {
+            quote!(NetworkWireScalarShape::TransformCompressor)
+        }
+        SchemaWireScalarShape::PackedSize => quote!(NetworkWireScalarShape::PackedSize),
         SchemaWireScalarShape::Mat3 => quote!(NetworkWireScalarShape::Mat3),
         SchemaWireScalarShape::Affine3 => quote!(NetworkWireScalarShape::Affine3),
         SchemaWireScalarShape::Aabb2d => quote!(NetworkWireScalarShape::Aabb2d),
@@ -5826,16 +6213,11 @@ mod tests {
         let summary = &output.report.message_blocker_summary;
 
         assert_eq!(summary.total_plan_count, 3);
-        assert_eq!(summary.generatable_count, 2);
-        assert_eq!(summary.blocked_count, 1);
-        assert_eq!(summary.reason_buckets.len(), 1);
-        assert_eq!(summary.reason_buckets[0].reason, "no-message-fields");
-        assert_eq!(summary.reason_buckets[0].type_count, 1);
-        assert_eq!(
-            summary.reason_buckets[0].examples[0].type_name.as_deref(),
-            Some("Example::EmptyMsg")
-        );
-        assert_eq!(summary.combination_buckets.len(), 1);
+        assert_eq!(summary.generatable_count, 3);
+        assert_eq!(summary.blocked_count, 0);
+        assert!(summary.reason_buckets.is_empty());
+        assert!(summary.combination_buckets.is_empty());
+        assert!(output.source.contains("pub struct EmptyMsg"));
         let placeholder_plan = output
             .report
             .message_generation_plans
@@ -6158,6 +6540,53 @@ mod tests {
                     "name": "ActorRequestIdPayload",
                     "nativeType": "composite",
                     "sourceTypeName": "ActorRequestIdPayload,ActorRequestId",
+                    "unmarshalEvidence": {
+                        "callsite": "NewWorld+0x340e9b1",
+                        "targetName": "Javelin::ClientMessages::ActorRequestIdPayload::Unmarshal",
+                        "targetKind": "direct-unmarshal",
+                        "evidenceSource": "message-unmarshal-pcode-call"
+                    },
+                    "nestedTypeShape": {
+                        "typeName": "ActorRequestId",
+                        "typeNameFull": "Javelin::ClientMessages::ActorRequestId",
+                        "typeNameSource": "ghidra-symbol",
+                        "functionName": "Javelin::ClientMessages::ActorRequestId::Unmarshal",
+                        "memberNamesProven": false,
+                        "validation": "layout-consistent-two-u64",
+                        "members": [{
+                            "index": 0,
+                            "offset": "0x0",
+                            "nativeType": "u64",
+                            "wireShape": "u64",
+                            "byteWidth": 8,
+                            "nameProven": true
+                        }, {
+                            "index": 1,
+                            "offset": "0x8",
+                            "nativeType": "u64",
+                            "wireShape": "u64",
+                            "byteWidth": 8,
+                            "nameProven": false
+                        }]
+                    },
+                    "confidence": "message-unmarshal-pcode-call"
+                }]
+            }, {
+                "uuid": "34783478-3478-4478-9478-347834783478",
+                "typeIndex": 3478,
+                "typeName": "GroupsComponentClientFacet_OnGroupFinderClearMemberSuccessMsg",
+                "capabilities": ["direct-message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "ActorRequestIdPayload",
+                    "nativeType": "ActorRequestIdPayload",
+                    "sourceTypeName": "ActorRequestIdPayload",
+                    "unmarshalEvidence": {
+                        "callsite": "NewWorld+0x340e9e1",
+                        "targetName": "Javelin::ClientMessages::ActorRequestIdPayload::Unmarshal",
+                        "targetKind": "direct-unmarshal",
+                        "evidenceSource": "message-unmarshal-pcode-call"
+                    },
                     "confidence": "message-unmarshal-pcode-call"
                 }]
             }],
@@ -6167,9 +6596,9 @@ mod tests {
 
         let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
-        assert_eq!(output.report.message_generation_plan_count, 3);
-        assert_eq!(output.report.generatable_message_count, 1);
-        assert_eq!(output.report.blocked_message_count, 2);
+        assert_eq!(output.report.message_generation_plan_count, 4);
+        assert_eq!(output.report.generatable_message_count, 3);
+        assert_eq!(output.report.blocked_message_count, 1);
 
         let resolved_plan = output
             .report
@@ -6218,18 +6647,35 @@ mod tests {
             .find(|plan| plan.type_index == Some(3477))
             .expect("composite type plan");
         assert_eq!(composite_plan.missing_support_type_count, 0);
-        assert_eq!(composite_plan.missing_composite_support_type_count, 1);
-        assert_eq!(
-            composite_plan.blocked_reasons,
-            vec!["missing-composite-support-type:1"]
-        );
+        assert_eq!(composite_plan.missing_composite_support_type_count, 0);
+        assert!(composite_plan.blocked_reasons.is_empty());
         assert_eq!(
             composite_plan.fields[0].source_type_name.as_deref(),
             Some("ActorRequestIdPayload,ActorRequestId")
         );
         assert_eq!(
-            composite_plan.fields[0].blocked_reason.as_deref(),
-            Some("missing-composite-support-type")
+            composite_plan.fields[0].rust_value_type.as_deref(),
+            Some("::nw_network::ActorRequestId")
+        );
+        assert_eq!(composite_plan.fields[0].blocked_reason, None);
+        assert!(
+            output
+                .source
+                .contains("pub actor_request_id_payload: ::nw_network::ActorRequestId")
+        );
+
+        let direct_payload_plan = output
+            .report
+            .message_generation_plans
+            .iter()
+            .find(|plan| plan.type_index == Some(3478))
+            .expect("direct payload plan");
+        assert_eq!(direct_payload_plan.missing_support_type_count, 0);
+        assert_eq!(direct_payload_plan.missing_composite_support_type_count, 0);
+        assert!(direct_payload_plan.blocked_reasons.is_empty());
+        assert_eq!(
+            direct_payload_plan.fields[0].rust_value_type.as_deref(),
+            Some("::nw_network::ActorRequestId")
         );
 
         let support_bucket = output
@@ -6271,6 +6717,42 @@ mod tests {
                     "nativeType": "FragmentKey",
                     "confidence": "message-signature-source"
                 }]
+            }, {
+                "uuid": "17117117-1711-4711-9711-171171171171",
+                "typeIndex": 171,
+                "typeName": "ConfigOverridesDebugTrait::SendConfigOverridesMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "ProxyAddress",
+                    "nativeType": "composite",
+                    "sourceTypeName": "ProxyAddress,ActorRef",
+                    "confidence": "message-unmarshal-pcode-call",
+                    "nestedTypeShape": {
+                        "typeName": "ProxyAddress",
+                        "typeNameFull": "Amazon::Hub::ProxyAddress",
+                        "typeNameSource": "ghidra-symbol",
+                        "validation": "layout-consistent-direct-type",
+                        "members": [{
+                            "index": 0,
+                            "offset": "0x0",
+                            "nativeType": "u32",
+                            "wireShape": "u32",
+                            "byteWidth": 4
+                        }, {
+                            "index": 1,
+                            "offset": "0x4",
+                            "nativeType": "fixed-bytes-16",
+                            "wireShape": "fixed-bytes-16",
+                            "byteWidth": 16
+                        }, {
+                            "index": 2,
+                            "offset": "0x14",
+                            "nativeType": "fixed-bytes-16",
+                            "wireShape": "fixed-bytes-16",
+                            "byteWidth": 16
+                        }]
+                    }
+                }]
             }],
             "fieldRegistrationFunctions": []
         }))
@@ -6278,12 +6760,17 @@ mod tests {
 
         let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
-        assert_eq!(output.report.generatable_message_count, 1);
+        assert_eq!(output.report.generatable_message_count, 2);
         assert_eq!(output.report.blocked_message_count, 0);
         assert!(
             output
                 .source
                 .contains("pub proxy_ref: ::nw_network::ActorRef")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub field_0: ::nw_network::ActorRef")
         );
         assert!(
             output

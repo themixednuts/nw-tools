@@ -162,6 +162,7 @@ Useful resolver diagnostics:
 cargo run -p nw-serialize-codegen -- network-schema `
   --ghidra-report E:\Projects\new-world\resources\network-schema.static.json `
   --typeindex "E:\Games\steamapps\common\New World\typeindex.json" `
+  --message-signatures E:\Projects\nw-network\crates\nw-network-types\codegen\message-signatures.json `
   --field-overrides E:\Projects\nw-network\codegen\network-field-overrides.json `
   --out tmp\network-schema.v1.json
 
