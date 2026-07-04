@@ -56,7 +56,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
 public class NetworkSchemaExtractor extends GhidraScript {
-    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260703-persistent-item-container-pass";
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260703-status-effect-map-pass";
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;
@@ -115,6 +115,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
         envInt("NW_NETWORK_SCHEMA_INSTRUCTION_CACHE_LIMIT", 8192);
     private static final int FUNCTION_LOOKUP_CACHE_LIMIT =
         envInt("NW_NETWORK_SCHEMA_FUNCTION_CACHE_LIMIT", 32768);
+    private static final int TEXT_PARSE_CACHE_LIMIT =
+        envInt("NW_NETWORK_SCHEMA_TEXT_PARSE_CACHE_LIMIT", 2048);
     private static final String[] FIELD_HANDLER_SLOT_NAMES = {
         "Destructor",
         "IsDefaultValue",
@@ -226,16 +228,20 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final Map<String, ForwardArgState> inheritedForwardStateCache = new HashMap<>();
     private final Map<String, String> decompileCache = lruCache(DECOMPILE_CACHE_LIMIT);
     private final Map<String, Long> createInstanceSizeCache = new HashMap<>();
-    private final Map<String, List<String>> parameterNameCache = new HashMap<>();
-    private final Map<String, Set<Integer>> boolParameterIndicesCache = new HashMap<>();
+    private final Map<String, List<String>> parameterNameCache =
+        lruCache(TEXT_PARSE_CACHE_LIMIT);
+    private final Map<String, Set<Integer>> boolParameterIndicesCache =
+        lruCache(TEXT_PARSE_CACHE_LIMIT);
     private final Map<String, Map<String, Set<Integer>>> nestedBoolParameterIndicesCache =
         new HashMap<>();
-    private final Map<String, List<ParsedUnmarshalCall>> unmarshalCallCache = new HashMap<>();
+    private final Map<String, List<ParsedUnmarshalCall>> unmarshalCallCache =
+        lruCache(TEXT_PARSE_CACHE_LIMIT);
     private final Map<String, List<ParsedUnmarshalCall>> marshalerUnmarshalCallCache =
-        new HashMap<>();
+        lruCache(TEXT_PARSE_CACHE_LIMIT);
     private final Map<String, List<ParsedUnmarshalCall>> directTypeUnmarshalCallCache =
-        new HashMap<>();
-    private final Map<String, List<ParsedReadRawCall>> readRawCallCache = new HashMap<>();
+        lruCache(TEXT_PARSE_CACHE_LIMIT);
+    private final Map<String, List<ParsedReadRawCall>> readRawCallCache =
+        lruCache(TEXT_PARSE_CACHE_LIMIT);
     private final Map<String, HighFunction> highFunctionCache =
         lruCache(HIGH_FUNCTION_CACHE_LIMIT);
     private final Map<String, Integer> returnedCallInputSlotCache = new HashMap<>();
@@ -561,7 +567,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 FUNCTION_INSTRUCTION_CACHE_LIMIT) +
             ", functions=" + cacheSizeWithLimit(
                 functionLookupCache.size(),
-                FUNCTION_LOOKUP_CACHE_LIMIT));
+                FUNCTION_LOOKUP_CACHE_LIMIT) +
+            ", textParsers=" + cacheSizeWithLimit(
+                textParseCacheSize(),
+                TEXT_PARSE_CACHE_LIMIT * 6));
         releaseDecompilerResources();
     }
 
@@ -614,6 +623,15 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
     private static String cacheSizeWithLimit(int size, int limit) {
         return limit == 0 ? Integer.toString(size) : size + "/" + limit;
+    }
+
+    private int textParseCacheSize() {
+        return parameterNameCache.size() +
+            boolParameterIndicesCache.size() +
+            unmarshalCallCache.size() +
+            marshalerUnmarshalCallCache.size() +
+            directTypeUnmarshalCallCache.size() +
+            readRawCallCache.size();
     }
 
     private void releaseDecompilerResources() {
@@ -13263,6 +13281,12 @@ public class NetworkSchemaExtractor extends GhidraScript {
             return persistentItemDataShape;
         }
 
+        ContainerWireShape persistentStatusEffectsMapShape =
+            classifyPersistentStatusEffectsMapContainerWireShape(vtable);
+        if (persistentStatusEffectsMapShape != null) {
+            return persistentStatusEffectsMapShape;
+        }
+
         Function marshalFunction = functionAtOrContaining(marshal);
         String marshalName = fullFunctionName(marshalFunction);
         if (marshalName == null ||
@@ -13293,6 +13317,138 @@ public class NetworkSchemaExtractor extends GhidraScript {
             valueTypeShape,
             Collections.emptyList(),
             Collections.emptyList());
+    }
+
+    private ContainerWireShape classifyPersistentStatusEffectsMapContainerWireShape(Address vtable) {
+        Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
+        Address unmarshal = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        Address marshalFull = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_FULL_SLOT * 8L));
+        Address unmarshalFull = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_FULL_SLOT * 8L));
+        if (!isExecutableAddress(marshal) ||
+            !isExecutableAddress(unmarshal) ||
+            !isExecutableAddress(marshalFull) ||
+            !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        ArrayList<String> observedFull = new ArrayList<>();
+        collectOrderedMarshalShapes(marshalFull, 3, new LinkedHashSet<>(), observedFull);
+        if (!wireShapesContainSubsequence(
+            observedFull,
+            persistentStatusEffectsMapFullWireShapes())) {
+            return null;
+        }
+
+        List<String> observedFullUnmarshal = collectOrderedUnmarshalShapes(
+            functionAtOrContaining(unmarshalFull));
+        if (!wireShapesContainSubsequence(
+            observedFullUnmarshal,
+            persistentStatusEffectsMapFullWireShapes())) {
+            return null;
+        }
+
+        ArrayList<String> observedDelta = new ArrayList<>();
+        collectOrderedMarshalShapes(marshal, 3, new LinkedHashSet<>(), observedDelta);
+        if (!observedDelta.contains("vlq-u32") ||
+            !observedDelta.contains("u8") ||
+            !observedDelta.contains("u16") ||
+            !observedDelta.contains("sequence-number") ||
+            !wireShapesContainSubsequence(
+                observedDelta,
+                persistentStatusEffectsMapValueWireShapes())) {
+            return null;
+        }
+
+        NestedTypeShape valueTypeShape =
+            persistentStatusEffectsMapValueTypeShape(vtable, functionAtOrContaining(unmarshalFull));
+        NativeTypeInfoEvidence containerTypeInfo =
+            persistentStatusEffectsMapTypeInfo();
+        List<NativeTypeInfoEvidence> candidates = containerTypeInfo == null
+            ? Collections.emptyList()
+            : List.of(containerTypeInfo);
+
+        return new ContainerWireShape(
+            null,
+            null,
+            null,
+            persistentStatusEffectsMapDeltaWireShapes(),
+            persistentStatusEffectsMapFullWireShapes(),
+            null,
+            valueTypeShape,
+            candidates,
+            Collections.emptyList());
+    }
+
+    private List<String> persistentStatusEffectsMapFullWireShapes() {
+        return List.of(
+            "sequence-number",
+            "vlq-u32",
+            "u16",
+            "u64",
+            "half-f32",
+            "u8",
+            "u8");
+    }
+
+    private List<String> persistentStatusEffectsMapDeltaWireShapes() {
+        return List.of(
+            "vlq-u32",
+            "u8",
+            "u16",
+            "sequence-number",
+            "u64",
+            "half-f32",
+            "u8",
+            "u8");
+    }
+
+    private List<String> persistentStatusEffectsMapValueWireShapes() {
+        return List.of(
+            "u64",
+            "half-f32",
+            "u8",
+            "u8");
+    }
+
+    private NativeTypeInfoEvidence persistentStatusEffectsMapTypeInfo() {
+        SerializeTypeInfo info = serializeTypeForTypeName("PersistentStatusEffectsMap");
+        if (info == null) {
+            return null;
+        }
+        return new NativeTypeInfoEvidence(
+            parseCapturedAddress(info.factory),
+            info.name,
+            info.typeId,
+            "serialize-registration+container-slot-shape",
+            "serialize-json-class-name");
+    }
+
+    private NestedTypeShape persistentStatusEffectsMapValueTypeShape(
+        Address vtable,
+        Function evidenceFunction) {
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeName = "PersistentStatusEffectsMapEntry";
+        shape.typeNameFull = "PersistentStatusEffectsMapEntry";
+        shape.typeNameSource = "container-slot-shape";
+        shape.function = evidenceFunction == null ? null : evidenceFunction.getEntryPoint();
+        shape.functionName = fullFunctionName(evidenceFunction);
+        shape.vtable = vtable;
+        shape.memberBase = "value";
+        shape.memberNameSource = "synthetic-offsets-from-container-slot";
+        shape.memberNamesProven = false;
+        shape.validation = "custom-container-value-pcode-serialize-type-sequence-persistent-status-effects-map";
+
+        int index = 0;
+        shape.members.add(containerValueMember(index++, 0x08, "field_08",
+            "WallClockTimePoint", "u64", 8, "persistent-status-effects-map-slot"));
+        shape.members.add(containerValueMember(index++, 0x10, "field_10",
+            "f32", "half-f32", 4, "persistent-status-effects-map-slot"));
+        shape.members.add(containerValueMember(index++, 0x14, "field_14",
+            "AZ::u8", "u8", 1, "persistent-status-effects-map-slot"));
+        shape.members.add(containerValueMember(index, 0x15, "field_15",
+            "AZ::u8", "u8", 1, "persistent-status-effects-map-slot"));
+        return shape;
     }
 
     private ContainerWireShape classifyPersistentItemDataVectorContainerWireShape(Address vtable) {
