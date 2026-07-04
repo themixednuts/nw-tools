@@ -1,0 +1,25 @@
+[package]
+name = "nw-lua"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bstr.workspace = true
+byteorder.workspace = true
+clap.workspace = true
+full_moon.workspace = true
+heck.workspace = true
+petgraph.workspace = true
+stylua.workspace = true
+thiserror.workspace = true
+
+[[bin]]
+name = "nw-lua"
+path = "src/bin/nw-lua.rs"

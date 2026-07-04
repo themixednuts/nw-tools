@@ -1,0 +1,65 @@
+# Idle Heroes (libcocos2dlua.so) shuffled Lua 5.1 opcode table
+# Extracted from modified VM switch-case in the .so binary
+#
+# Standard Lua 5.1 instruction layout: op:6 | A:8 | C:9 | B:9
+# Opcodes are shuffled but the bit layout is unchanged.
+#
+# Missing from this table:
+#   NOT       - not found in the 0-37 range
+#   GETGLOBAL - listed as 255 in the binary (unreachable with 6-bit opcode)
+#   CLOSE     - not found in the 0-37 range
+#
+# Duplicate mappings (obfuscation technique - two ordinals → same op):
+#   1 & 4  → LOADK
+#   3 & 14 → SETTABLE
+#   9 & 23 → LOADBOOL
+#   13 & 36 → CLOSURE
+#   22 & 24 → SETLIST
+
+VERSION 51
+OPBITS 6
+ABITS 8
+BBITS 9
+CBITS 9
+HASKFLAG FALSE
+
+# ordinal  semantic_op  format
+0   SUB        ABC
+1   LOADK      ABX
+2   TEST       ABC
+3   SETTABLE   ABC
+4   LOADK      ABX
+5   LOADNIL    ABC
+6   CALL       ABC
+7   JMP        ASBX
+8   SELF       ABC
+9   LOADBOOL   ABC
+10  LEN        ABC
+11  NEWTABLE   ABC
+12  LE         ABC
+13  CLOSURE    ABX
+14  SETTABLE   ABC
+15  TESTSET    ABC
+16  MOD        ABC
+17  GETUPVAL   ABC
+18  FORPREP    ASBX
+19  MUL        ABC
+20  CONCAT     ABC
+21  GETTABLE   ABC
+22  SETLIST    ABC
+23  LOADBOOL   ABC
+24  SETLIST    ABC
+25  UNM        ABC
+26  RETURN     ABC
+27  DIV        ABC
+28  MOVE       ABC
+29  SETGLOBAL  ABX
+30  ADD        ABC
+31  EQ         ABC
+32  FORLOOP    ASBX
+33  LT         ABC
+34  POW        ABC
+35  SETUPVAL   ABC
+36  CLOSURE    ABX
+37  VARARG     ABC
+63  GETGLOBAL  ABX
