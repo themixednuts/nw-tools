@@ -3085,7 +3085,7 @@ fn container_value_member_shape_span(
                 return None;
             }
             if source_type_vector_element_wire_shape(element) {
-                return Some(expected.len().checked_sub(index)?);
+                return expected.len().checked_sub(index);
             }
             if expected
                 .get(index + 1)

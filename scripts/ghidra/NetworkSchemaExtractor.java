@@ -56,7 +56,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
 public class NetworkSchemaExtractor extends GhidraScript {
-    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260704-uuid-key-container-pass";
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260704-container-value-candidates-pass";
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;
@@ -954,6 +954,24 @@ public class NetworkSchemaExtractor extends GhidraScript {
             templatedTypeIds.size() > 0) {
             return wireShapeFromSerializeTypeId(
                 canonicalUuidFromString(stringValue(templatedTypeIds.get(0))));
+        }
+        if ("AZStd::array".equals(className) &&
+            templatedTypeIds != null &&
+            templatedTypeIds.size() > 0) {
+            String elementShape = wireShapeFromSerializeTypeId(
+                canonicalUuidFromString(stringValue(templatedTypeIds.get(0))));
+            JsonObject arguments = object(generic, "nonTypeTemplateArguments");
+            Long capacity = longValue(arguments, "capacity");
+            if (elementShape != null &&
+                capacity != null &&
+                capacity > 0 &&
+                capacity <= 64) {
+                ArrayList<String> shapes = new ArrayList<>();
+                for (int i = 0; i < capacity; i++) {
+                    shapes.add(elementShape);
+                }
+                return compositeWireShape(shapes);
+            }
         }
         return null;
     }
@@ -13262,25 +13280,32 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 unmarshalFull);
         NativeTypeInfoEvidence valueTypeInfo =
             selectedReplicatedContainerValueTypeInfo(valueTypeInfoCandidates);
-        List<String> valueShapes = replicatedContainerValueShapes(deltaShapes, fullShapes);
+        List<List<String>> valueShapeCandidates =
+            replicatedContainerValueShapeCandidates(deltaShapes, fullShapes);
         NestedTypeShape valueTypeShape = structuredValue
             ? replicatedContainerStackSequenceValueTypeShape(
                 valueTypeInfoCandidates,
-                reflectedSequenceContainerValueShapeCandidates(valueShapes, fullShapes),
+                reflectedSequenceContainerValueShapeCandidates(valueShapeCandidates, fullShapes),
                 unmarshalFull,
                 vtable)
             : null;
         if (valueTypeShape == null) {
-            valueTypeShape = replicatedContainerValueTypeShape(
+            valueTypeShape = replicatedContainerValueTypeShapeFromCandidates(
                 valueTypeInfoCandidates,
-                valueShapes,
+                valueShapeCandidates,
+                unmarshalFull,
+                vtable);
+        }
+        if (valueTypeShape == null) {
+            valueTypeShape = replicatedContainerValueTypeShapeFromSerializeFieldFlow(
+                valueTypeInfoCandidates,
                 unmarshalFull,
                 vtable);
         }
         if (valueTypeShape == null) {
             valueTypeShape = replicatedContainerReflectedSequenceValueTypeShape(
                 valueTypeInfoCandidates,
-                reflectedSequenceContainerValueShapeCandidates(valueShapes, fullShapes),
+                reflectedSequenceContainerValueShapeCandidates(valueShapeCandidates, fullShapes),
                 unmarshalFull,
                 vtable);
         }
@@ -15881,21 +15906,50 @@ public class NetworkSchemaExtractor extends GhidraScript {
         List<String> deltaShapes,
         List<String> fullShapes) {
 
+        List<List<String>> candidates =
+            replicatedContainerValueShapeCandidates(deltaShapes, fullShapes);
+        return candidates.isEmpty() ? Collections.emptyList() : candidates.get(0);
+    }
+
+    private List<List<String>> replicatedContainerValueShapeCandidates(
+        List<String> deltaShapes,
+        List<String> fullShapes) {
+
+        ArrayList<List<String>> candidates = new ArrayList<>();
         List<String> fullValues = replicatedContainerFullValueShapes(fullShapes);
         if (fullValues.isEmpty()) {
-            return Collections.emptyList();
+            return candidates;
         }
 
         String deltaKey = replicatedContainerDeltaKeyShape(deltaShapes);
         List<String> deltaValues = replicatedContainerDeltaValueShapes(deltaShapes);
-        if ("vlq-u64".equals(deltaKey) &&
-            (deltaValues.isEmpty() || deltaValues.equals(fullValues))) {
-            return fullValues;
+        if ("vlq-u64".equals(deltaKey)) {
+            addUniqueShapeCandidate(candidates, stripTrailingContainerCount(fullValues));
+            addUniqueShapeCandidate(candidates, fullValues);
+            if (!deltaValues.isEmpty()) {
+                addUniqueShapeCandidate(candidates, stripTrailingContainerCount(deltaValues));
+                addUniqueShapeCandidate(candidates, deltaValues);
+            }
         }
         if (fullValues.size() < 2) {
-            return Collections.emptyList();
+            addUniqueShapeCandidate(candidates, stripTrailingContainerCount(fullValues));
+            addUniqueShapeCandidate(candidates, fullValues);
+            return candidates;
         }
-        return new ArrayList<>(fullValues.subList(1, fullValues.size()));
+        List<String> withoutKey = new ArrayList<>(fullValues.subList(1, fullValues.size()));
+        addUniqueShapeCandidate(candidates, stripTrailingContainerCount(withoutKey));
+        addUniqueShapeCandidate(candidates, withoutKey);
+        addUniqueShapeCandidate(candidates, stripTrailingContainerCount(fullValues));
+        addUniqueShapeCandidate(candidates, fullValues);
+        List<String> fullData = replicatedContainerFullDataShapes(fullShapes);
+        if (fullData.size() >= 2) {
+            List<String> fullDataWithoutKey = new ArrayList<>(fullData.subList(1, fullData.size()));
+            addUniqueShapeCandidate(candidates, stripTrailingContainerCount(fullDataWithoutKey));
+            addUniqueShapeCandidate(candidates, fullDataWithoutKey);
+        }
+        addUniqueShapeCandidate(candidates, stripTrailingContainerCount(fullData));
+        addUniqueShapeCandidate(candidates, fullData);
+        return candidates;
     }
 
     private List<String> replicatedContainerFullValueShapes(List<String> fullShapes) {
@@ -15921,7 +15975,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private List<List<String>> reflectedSequenceContainerValueShapeCandidates(
-        List<String> valueWireShapes,
+        List<List<String>> valueWireShapeCandidates,
         List<String> fullShapes) {
 
         ArrayList<List<String>> candidates = new ArrayList<>();
@@ -15931,10 +15985,14 @@ public class NetworkSchemaExtractor extends GhidraScript {
         addUniqueShapeCandidate(
             candidates,
             replicatedContainerFullDataShapes(fullShapes));
-        addUniqueShapeCandidate(
-            candidates,
-            stripTrailingContainerCount(valueWireShapes));
-        addUniqueShapeCandidate(candidates, valueWireShapes);
+        if (valueWireShapeCandidates != null) {
+            for (List<String> valueWireShapes : valueWireShapeCandidates) {
+                addUniqueShapeCandidate(
+                    candidates,
+                    stripTrailingContainerCount(valueWireShapes));
+                addUniqueShapeCandidate(candidates, valueWireShapes);
+            }
+        }
         return candidates;
     }
 
@@ -16004,11 +16062,243 @@ public class NetworkSchemaExtractor extends GhidraScript {
         return result;
     }
 
+    private NestedTypeShape replicatedContainerValueTypeShapeFromCandidates(
+        List<NativeTypeInfoEvidence> candidates,
+        List<List<String>> valueWireShapeCandidates,
+        Address unmarshalFull,
+        Address vtable) {
+
+        if (valueWireShapeCandidates == null || valueWireShapeCandidates.isEmpty()) {
+            return null;
+        }
+
+        NestedTypeShape selected = null;
+        String selectedKey = null;
+        for (List<String> valueWireShapes : valueWireShapeCandidates) {
+            NestedTypeShape shape = replicatedContainerValueTypeShape(
+                candidates,
+                valueWireShapes,
+                unmarshalFull,
+                vtable,
+                false);
+            if (shape == null) {
+                continue;
+            }
+            String key = reflectedSequenceValueShapeKey(shape);
+            if (selected == null) {
+                selected = shape;
+                selectedKey = key;
+                continue;
+            }
+            if (!Objects.equals(selectedKey, key)) {
+                recordNestedTypeShapeReject("ambiguous-container-value-shape-candidate");
+                return null;
+            }
+        }
+        if (selected != null) {
+            return selected;
+        }
+
+        return replicatedContainerValueTypeShape(
+            candidates,
+            valueWireShapeCandidates.get(0),
+            unmarshalFull,
+            vtable,
+            true);
+    }
+
+    private NestedTypeShape replicatedContainerValueTypeShapeFromSerializeFieldFlow(
+        List<NativeTypeInfoEvidence> candidates,
+        Address unmarshalFull,
+        Address vtable) {
+
+        if (candidates == null || candidates.isEmpty() || !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        Address targetAddress = resolvedCodeTarget(unmarshalFull);
+        Function target = functionAtOrContaining(targetAddress);
+        if (target == null) {
+            return null;
+        }
+
+        LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> byBase =
+            new LinkedHashMap<>();
+        collectContainerValuePcodeMemberCandidates(
+            byBase,
+            target,
+            new LinkedHashSet<>(),
+            0,
+            Collections.emptyMap());
+
+        NestedTypeShape selected = null;
+        String selectedKey = null;
+        for (NativeTypeInfoEvidence candidate : candidates) {
+            if (candidate == null ||
+                candidate.typeId == null ||
+                !isPlausibleTypeName(candidate.name)) {
+                continue;
+            }
+            SerializeTypeInfo reflected =
+                serializeTypesById.get(normalizeUuid(candidate.typeId));
+            if (reflected == null || reflected.fields.isEmpty()) {
+                continue;
+            }
+            for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry :
+                byBase.entrySet()) {
+                ArrayList<NestedTypeMember> callOrderMembers =
+                    new ArrayList<>(entry.getValue().values());
+                NestedTypeShape shape =
+                    containerValueTypeShapeFromSerializeFieldFlow(
+                        candidate,
+                        reflected,
+                        target,
+                        entry.getKey(),
+                        callOrderMembers,
+                        vtable);
+                if (shape == null) {
+                    continue;
+                }
+                String key = reflectedSequenceValueShapeKey(shape);
+                if (selected == null) {
+                    selected = shape;
+                    selectedKey = key;
+                    continue;
+                }
+                if (!Objects.equals(selectedKey, key)) {
+                    recordNestedTypeShapeReject(
+                        "ambiguous-container-value-serialize-field-flow");
+                    return null;
+                }
+            }
+        }
+        return selected;
+    }
+
+    private NestedTypeShape containerValueTypeShapeFromSerializeFieldFlow(
+        NativeTypeInfoEvidence candidate,
+        SerializeTypeInfo reflected,
+        Function target,
+        String base,
+        List<NestedTypeMember> callOrderMembers,
+        Address vtable) {
+
+        if (callOrderMembers == null || callOrderMembers.isEmpty()) {
+            return null;
+        }
+
+        LinkedHashSet<Long> baseShiftCandidates = new LinkedHashSet<>();
+        for (NestedTypeMember member : callOrderMembers) {
+            for (SerializeFieldInfo field : reflected.fields) {
+                baseShiftCandidates.addAll(serializeFieldBaseShiftCandidates(field, member));
+            }
+        }
+
+        NestedTypeShape selected = null;
+        String selectedKey = null;
+        for (Long baseShift : baseShiftCandidates) {
+            if (baseShift == null || baseShift < 0 || baseShift > 0x4000) {
+                continue;
+            }
+
+            HashSet<String> usedFields = new HashSet<>();
+            ArrayList<NestedTypeMember> selectedMembers = new ArrayList<>();
+            for (NestedTypeMember source : callOrderMembers) {
+                SerializeFieldInfo field =
+                    serializeFieldForMemberAtBase(reflected, source, baseShift, usedFields);
+                if (field == null) {
+                    continue;
+                }
+                NestedTypeMember member = copyNestedTypeMember(source);
+                applySerializeFieldName(member, field, baseShift);
+                member.nameSource = "serialize-json-pcode-base-shift-match";
+                member.nameEvidence =
+                    "Ghidra pcode wrote reflected field at embedded base +0x" +
+                    Long.toHexString(baseShift);
+                member.evidenceSource = member.evidenceSource == null
+                    ? "container-value-pcode+serialize-json-field-flow"
+                    : member.evidenceSource + "+serialize-json-field-flow";
+                usedFields.add(serializeFieldKey(field));
+                selectedMembers.add(member);
+            }
+
+            if (selectedMembers.size() < 2 ||
+                selectedMembers.size() > NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
+                continue;
+            }
+
+            NestedTypeShape shape =
+                containerValueTypeShapeFromSerializeFieldFlowMembers(
+                    candidate,
+                    target,
+                    base,
+                    selectedMembers,
+                    vtable);
+            String key = reflectedSequenceValueShapeKey(shape);
+            if (selected == null) {
+                selected = shape;
+                selectedKey = key;
+                continue;
+            }
+            if (!Objects.equals(selectedKey, key)) {
+                recordNestedTypeShapeReject("ambiguous-container-value-field-flow-base");
+                return null;
+            }
+        }
+        return selected;
+    }
+
+    private NestedTypeShape containerValueTypeShapeFromSerializeFieldFlowMembers(
+        NativeTypeInfoEvidence candidate,
+        Function target,
+        String base,
+        ArrayList<NestedTypeMember> selectedMembers,
+        Address vtable) {
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeId = candidate.typeId;
+        shape.typeIdSource = candidate.source;
+        shape.typeName = sourceTypeLeaf(candidate.name);
+        shape.typeNameFull = candidate.name;
+        shape.typeNameSource = candidate.nameSource == null
+            ? candidate.source
+            : candidate.nameSource;
+        shape.azRttiAddress = formatAddress(candidate.address);
+        shape.function = target == null ? null : target.getEntryPoint();
+        shape.functionName = fullFunctionName(target);
+        shape.vtable = vtable;
+        shape.memberBase = base;
+        shape.memberNameSource = "ghidra-pcode+serialize-json-field-flow";
+        shape.memberNamesProven = true;
+        shape.validation = "container-value-pcode-serialize-field-flow";
+        for (int i = 0; i < selectedMembers.size(); i++) {
+            NestedTypeMember member = selectedMembers.get(i);
+            member.index = i;
+            shape.members.add(member);
+        }
+        return shape;
+    }
+
     private NestedTypeShape replicatedContainerValueTypeShape(
         List<NativeTypeInfoEvidence> candidates,
         List<String> valueWireShapes,
         Address unmarshalFull,
         Address vtable) {
+
+        return replicatedContainerValueTypeShape(
+            candidates,
+            valueWireShapes,
+            unmarshalFull,
+            vtable,
+            true);
+    }
+
+    private NestedTypeShape replicatedContainerValueTypeShape(
+        List<NativeTypeInfoEvidence> candidates,
+        List<String> valueWireShapes,
+        Address unmarshalFull,
+        Address vtable,
+        boolean recordRejectSample) {
 
         if (candidates == null || candidates.isEmpty() ||
             valueWireShapes == null || valueWireShapes.isEmpty()) {
@@ -16024,7 +16314,12 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 continue;
             }
             NestedTypeShape shape =
-                replicatedContainerValueTypeShape(candidate, valueWireShapes, unmarshalFull, vtable);
+                replicatedContainerValueTypeShape(
+                    candidate,
+                    valueWireShapes,
+                    unmarshalFull,
+                    vtable,
+                    recordRejectSample);
             if (shape == null) {
                 continue;
             }
@@ -16800,6 +17095,21 @@ public class NetworkSchemaExtractor extends GhidraScript {
         Address unmarshalFull,
         Address vtable) {
 
+        return replicatedContainerValueTypeShape(
+            candidate,
+            valueWireShapes,
+            unmarshalFull,
+            vtable,
+            true);
+    }
+
+    private NestedTypeShape replicatedContainerValueTypeShape(
+        NativeTypeInfoEvidence candidate,
+        List<String> valueWireShapes,
+        Address unmarshalFull,
+        Address vtable,
+        boolean recordRejectSample) {
+
         NestedTypeShape shape = new NestedTypeShape();
         shape.typeId = candidate.typeId;
         shape.typeIdSource = candidate.source;
@@ -16855,7 +17165,11 @@ public class NetworkSchemaExtractor extends GhidraScript {
             candidate,
             valueWireShapes,
             unmarshalFull,
-            vtable);
+            vtable,
+            new LinkedHashSet<>(),
+            0,
+            recordRejectSample,
+            Collections.emptyMap());
     }
 
     private NestedTypeShape replicatedContainerValueTypeShapeFromPcode(
@@ -17774,9 +18088,6 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (reflected == null) {
             return false;
         }
-        if (reflected.fields.size() != members.size()) {
-            return false;
-        }
         if (applyExactSerializeMemberNames(reflected, members, valueWireShapes)) {
             return true;
         }
@@ -17784,62 +18095,261 @@ public class NetworkSchemaExtractor extends GhidraScript {
         fields.sort((left, right) -> Long.compare(
             left.offset == null ? Long.MAX_VALUE : left.offset,
             right.offset == null ? Long.MAX_VALUE : right.offset));
-        if (fields.size() != members.size()) {
+
+        if (fields.size() == members.size()) {
+            Long baseShift = null;
+            for (int i = 0; i < members.size(); i++) {
+                NestedTypeMember member = members.get(i);
+                SerializeFieldInfo field = fields.get(i);
+                if (field == null ||
+                    field.offset == null ||
+                    field.wireShape == null ||
+                    !serializeWireShapeMatchesObserved(field.wireShape, member.wireShape)) {
+                    baseShift = null;
+                    break;
+                }
+                long shift = member.offset - field.offset;
+                if (shift < 0 || shift > 0x400) {
+                    baseShift = null;
+                    break;
+                }
+                if (baseShift == null) {
+                    baseShift = shift;
+                }
+                else if (baseShift.longValue() != shift) {
+                    baseShift = null;
+                    break;
+                }
+            }
+
+            if (baseShift != null) {
+                for (int i = 0; i < members.size(); i++) {
+                    NestedTypeMember member = members.get(i);
+                    SerializeFieldInfo field = fields.get(i);
+                    applySerializeFieldName(member, field, baseShift);
+                }
+                return true;
+            }
+        }
+
+        return applySubsetSerializeMemberNames(reflected, members);
+    }
+
+    private boolean applySubsetSerializeMemberNames(
+        SerializeTypeInfo reflected,
+        List<NestedTypeMember> members) {
+
+        if (reflected == null || reflected.fields == null ||
+            reflected.fields.isEmpty() || members == null || members.isEmpty()) {
+            return false;
+        }
+        HashSet<String> usedFields = new HashSet<>();
+        for (NestedTypeMember member : members) {
+            SerializeFieldInfo field = serializeFieldForMember(reflected, member, usedFields);
+            if (field == null) {
+                return false;
+            }
+            usedFields.add(field.name + "@" + field.offset);
+            applySerializeFieldName(member, field, 0L);
+            member.nameSource = "serialize-json-subset-offset-match";
+            member.nameEvidence = "Ghidra pcode wrote reflected field offset 0x" +
+                Long.toHexString(field.offset);
+        }
+        return true;
+    }
+
+    private SerializeFieldInfo serializeFieldForMember(
+        SerializeTypeInfo reflected,
+        NestedTypeMember member,
+        Set<String> usedFields) {
+
+        if (member == null || reflected == null || reflected.fields == null) {
+            return null;
+        }
+        for (SerializeFieldInfo field : reflected.fields) {
+            if (field == null || field.offset == null || field.wireShape == null) {
+                continue;
+            }
+            String key = field.name + "@" + field.offset;
+            if (usedFields.contains(key)) {
+                continue;
+            }
+            if (serializeFieldMatchesMember(field, member)) {
+                return field;
+            }
+        }
+        return null;
+    }
+
+    private SerializeFieldInfo serializeFieldForMemberAtBase(
+        SerializeTypeInfo reflected,
+        NestedTypeMember member,
+        Long baseShift,
+        Set<String> usedFields) {
+
+        if (member == null ||
+            reflected == null ||
+            reflected.fields == null ||
+            baseShift == null) {
+            return null;
+        }
+        for (SerializeFieldInfo field : reflected.fields) {
+            if (field == null || field.offset == null || field.wireShape == null) {
+                continue;
+            }
+            String key = serializeFieldKey(field);
+            if (usedFields.contains(key)) {
+                continue;
+            }
+            if (serializeFieldMatchesMemberAtBase(field, member, baseShift)) {
+                return field;
+            }
+        }
+        return null;
+    }
+
+    private String serializeFieldKey(SerializeFieldInfo field) {
+        if (field == null) {
+            return "<null>";
+        }
+        return (field.name == null ? "" : field.name) + "@" + field.offset;
+    }
+
+    private List<Long> serializeFieldBaseShiftCandidates(
+        SerializeFieldInfo field,
+        NestedTypeMember member) {
+
+        if (field == null ||
+            member == null ||
+            field.offset == null ||
+            field.wireShape == null ||
+            member.wireShape == null) {
+            return Collections.emptyList();
+        }
+
+        ArrayList<Long> shifts = new ArrayList<>();
+        if (serializeWireShapeMatchesObserved(field.wireShape, member.wireShape)) {
+            shifts.add(member.offset - field.offset);
+        }
+
+        List<String> fieldShapes = compositeMemberWireShapes(field.wireShape);
+        if (fieldShapes == null || member.byteWidth == null || member.byteWidth <= 0) {
+            return shifts;
+        }
+        for (int i = 0; i < fieldShapes.size(); i++) {
+            if (!serializeWireShapeMatchesObserved(fieldShapes.get(i), member.wireShape)) {
+                continue;
+            }
+            long shift = member.offset - field.offset - ((long) i * member.byteWidth);
+            if (!shifts.contains(shift)) {
+                shifts.add(shift);
+            }
+        }
+        return shifts;
+    }
+
+    private boolean serializeFieldMatchesMember(
+        SerializeFieldInfo field,
+        NestedTypeMember member) {
+
+        if (field == null || member == null ||
+            field.offset == null || field.wireShape == null ||
+            member.wireShape == null) {
+            return false;
+        }
+        if (field.offset.longValue() == member.offset &&
+            serializeWireShapeMatchesObserved(field.wireShape, member.wireShape)) {
+            return true;
+        }
+        if (field.dataSize == null || field.dataSize <= 0 ||
+            member.offset < field.offset ||
+            member.offset >= field.offset + field.dataSize) {
+            return false;
+        }
+        List<String> fieldShapes = compositeMemberWireShapes(field.wireShape);
+        if (fieldShapes == null || member.byteWidth == null || member.byteWidth <= 0) {
+            return false;
+        }
+        long relative = member.offset - field.offset;
+        if (relative % member.byteWidth != 0) {
+            return false;
+        }
+        long index = relative / member.byteWidth;
+        return index >= 0 &&
+            index < fieldShapes.size() &&
+            serializeWireShapeMatchesObserved(fieldShapes.get((int) index), member.wireShape);
+    }
+
+    private boolean serializeFieldMatchesMemberAtBase(
+        SerializeFieldInfo field,
+        NestedTypeMember member,
+        long baseShift) {
+
+        if (field == null || member == null ||
+            field.offset == null || field.wireShape == null ||
+            member.wireShape == null) {
             return false;
         }
 
-        Long baseShift = null;
-        for (int i = 0; i < members.size(); i++) {
-            NestedTypeMember member = members.get(i);
-            SerializeFieldInfo field = fields.get(i);
-            if (field == null ||
-                field.offset == null ||
-                field.wireShape == null ||
-                !serializeWireShapeMatchesObserved(field.wireShape, member.wireShape)) {
-                return false;
-            }
-            long shift = member.offset - field.offset;
-            if (shift < 0 || shift > 0x400) {
-                return false;
-            }
-            if (baseShift == null) {
-                baseShift = shift;
-            }
-            else if (baseShift.longValue() != shift) {
-                return false;
-            }
+        long shiftedFieldOffset = field.offset + baseShift;
+        if (member.offset == shiftedFieldOffset &&
+            serializeWireShapeMatchesObserved(field.wireShape, member.wireShape)) {
+            return true;
         }
 
-        for (int i = 0; i < members.size(); i++) {
-            NestedTypeMember member = members.get(i);
-            SerializeFieldInfo field = fields.get(i);
-            member.nativeOffset = member.offset;
-            member.offset = field.offset;
-            member.name = field.name;
-            member.nameSource = baseShift == null || baseShift == 0L
-                ? "serialize-json-offset-match"
-                : "serialize-json-embedded-offset-match";
-            member.nameProven = true;
-            member.nameEvidence = baseShift == null || baseShift == 0L
-                ? "serialize offset 0x" + Long.toHexString(field.offset)
-                : "serialize offset 0x" + Long.toHexString(field.offset) +
-                    " at embedded base +0x" + Long.toHexString(baseShift);
-            if (field.typeName != null) {
-                member.nativeType = field.typeName;
-            }
-            if (!serializeWireShapeMatchesObserved(field.wireShape, member.wireShape)) {
-                member.wireShape = field.wireShape;
-            }
-            if (field.dataSize != null &&
-                field.dataSize > 0 &&
-                field.dataSize <= Integer.MAX_VALUE) {
-                member.byteWidth = field.dataSize.intValue();
-            }
-            member.evidenceSource = member.evidenceSource == null
-                ? "container-value-pcode+serialize-json-field"
-                : member.evidenceSource + "+serialize-json-field";
+        if (field.dataSize == null || field.dataSize <= 0 ||
+            member.byteWidth == null || member.byteWidth <= 0 ||
+            member.offset < shiftedFieldOffset ||
+            member.offset >= shiftedFieldOffset + field.dataSize) {
+            return false;
         }
-        return true;
+
+        List<String> fieldShapes = compositeMemberWireShapes(field.wireShape);
+        if (fieldShapes == null) {
+            return false;
+        }
+        long relative = member.offset - shiftedFieldOffset;
+        if (relative % member.byteWidth != 0) {
+            return false;
+        }
+        long index = relative / member.byteWidth;
+        return index >= 0 &&
+            index < fieldShapes.size() &&
+            serializeWireShapeMatchesObserved(fieldShapes.get((int) index), member.wireShape);
+    }
+
+    private void applySerializeFieldName(
+        NestedTypeMember member,
+        SerializeFieldInfo field,
+        Long baseShift) {
+
+        member.nativeOffset = member.offset;
+        member.offset = field.offset;
+        member.name = field.name;
+        member.nameSource = baseShift == null || baseShift == 0L
+            ? "serialize-json-offset-match"
+            : "serialize-json-embedded-offset-match";
+        member.nameProven = true;
+        member.nameEvidence = baseShift == null || baseShift == 0L
+            ? "serialize offset 0x" + Long.toHexString(field.offset)
+            : "serialize offset 0x" + Long.toHexString(field.offset) +
+                " at embedded base +0x" + Long.toHexString(baseShift);
+        if (field.typeName != null) {
+            member.nativeType = field.typeName;
+        }
+        if (field.wireShape != null && !serializeWireShapeMatchesObserved(
+                field.wireShape,
+                member.wireShape)) {
+            member.wireShape = field.wireShape;
+        }
+        if (field.dataSize != null &&
+            field.dataSize > 0 &&
+            field.dataSize <= Integer.MAX_VALUE) {
+            member.byteWidth = field.dataSize.intValue();
+        }
+        member.evidenceSource = member.evidenceSource == null
+            ? "container-value-pcode+serialize-json-field"
+            : member.evidenceSource + "+serialize-json-field";
     }
 
     private boolean containerValueMembersCoverWireShapes(
@@ -17912,7 +18422,41 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private boolean serializeWireShapeMatchesObserved(String serializeShape, String observedShape) {
-        return wireShapeMatchesExpected(serializeShape, observedShape);
+        if (wireShapeMatchesExpected(serializeShape, observedShape)) {
+            return true;
+        }
+        if (serializeShape == null || observedShape == null) {
+            return false;
+        }
+        List<String> serializeComposite = compositeMemberWireShapes(serializeShape);
+        if (serializeComposite != null) {
+            List<String> observedComposite = compositeMemberWireShapes(observedShape);
+            if (observedComposite == null ||
+                observedComposite.size() != serializeComposite.size()) {
+                return false;
+            }
+            for (int i = 0; i < serializeComposite.size(); i++) {
+                if (!serializeWireShapeMatchesObserved(
+                        serializeComposite.get(i),
+                        observedComposite.get(i))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return switch (serializeShape) {
+            case "u32" -> "vlq-u32".equals(observedShape);
+            case "u64" -> "vlq-u64".equals(observedShape);
+            case "f32" -> "half-f32".equals(observedShape);
+            case "vec2" -> "vec2-comp".equals(observedShape);
+            case "vec3" -> "vec3-comp".equals(observedShape) ||
+                "vec3-comp-norm".equals(observedShape) ||
+                "non-uniform-scale-comp".equals(observedShape);
+            case "quat" -> "quat-comp".equals(observedShape) ||
+                "quat-comp-norm".equals(observedShape) ||
+                "quat-smallest-three".equals(observedShape);
+            default -> false;
+        };
     }
 
     private NestedTypeMember copyNestedTypeMember(NestedTypeMember source) {

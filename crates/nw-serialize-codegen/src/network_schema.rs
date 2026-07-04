@@ -2904,11 +2904,16 @@ fn replicated_container_shape_from_vtable(
     let full_data = replicated_container_data_scalar_shapes(&vtable.full_marshal_shapes);
     let delta_key = replicated_container_delta_key_shape(&vtable.delta_marshal_shapes);
     let delta_value_shapes = replicated_container_delta_value_shapes(&vtable.delta_marshal_shapes);
+    let value_type_shape_wire_shapes = selected_structured_container_value_wire_shapes(vtable);
     let whole_value_shapes =
         if selected_structured_container_value_shape_matches(vtable, &full_values_with_counts) {
             full_values_with_counts.clone()
         } else if selected_structured_container_value_shape_matches(vtable, &full_data) {
             full_data.clone()
+        } else if delta_key == Some(NetworkWireScalarShape::VlqU64)
+            && !value_type_shape_wire_shapes.is_empty()
+        {
+            value_type_shape_wire_shapes
         } else {
             Vec::new()
         };
@@ -3141,6 +3146,55 @@ fn selected_structured_container_value_shape_matches(
             .is_some_and(|shape| nested_type_shape_matches_wire_shapes(shape, wire_shapes))
 }
 
+fn selected_structured_container_value_wire_shapes(
+    vtable: &NetworkFieldHandlerVtable,
+) -> Vec<NetworkWireScalarShape> {
+    if selected_structured_container_value_type_name(vtable)
+        .as_deref()
+        .is_none_or(|name| {
+            let name = name.trim();
+            name.is_empty() || name == "unknown"
+        })
+        || !has_selected_structured_container_value_identity(vtable)
+    {
+        return Vec::new();
+    }
+
+    vtable
+        .value_type_shape
+        .as_ref()
+        .and_then(nested_type_shape_wire_shapes)
+        .unwrap_or_default()
+}
+
+fn nested_type_shape_wire_shapes(
+    shape: &NetworkNestedTypeShape,
+) -> Option<Vec<NetworkWireScalarShape>> {
+    if shape.members.is_empty() {
+        return None;
+    }
+
+    let mut shapes = Vec::new();
+    for member in &shape.members {
+        let wire_shape = member.wire_shape.as_deref()?;
+        if let Some(scalar) = wire_scalar_shape_from_member_name(wire_shape) {
+            shapes.push(scalar);
+            continue;
+        }
+        if let Some(composite) = composite_member_wire_shapes(wire_shape) {
+            shapes.extend(composite);
+            continue;
+        }
+        match wire_shape {
+            "vec2" => shapes.extend([NetworkWireScalarShape::F32; 2]),
+            "vec3" => shapes.extend([NetworkWireScalarShape::F32; 3]),
+            "vec4" | "quat" => shapes.extend([NetworkWireScalarShape::F32; 4]),
+            _ => return None,
+        }
+    }
+    (!shapes.is_empty()).then_some(shapes)
+}
+
 fn nested_type_shape_matches_wire_shapes(
     shape: &NetworkNestedTypeShape,
     wire_shapes: &[NetworkWireScalarShape],
@@ -3187,7 +3241,7 @@ fn nested_member_wire_shape_span(
                 return None;
             }
             if source_type_vector_element_wire_shape(element) {
-                return Some(expected.len().checked_sub(index)?);
+                return expected.len().checked_sub(index);
             }
             if expected
                 .get(index + 1)
