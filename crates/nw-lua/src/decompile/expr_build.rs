@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     analysis::{DecompileAnalysis, NodeId, ValueId, for_each_use, node_has_observable_side_effect},
-    boolean::normalize,
+    boolean::{BooleanAnalysis, ValuePlan, ValuePlanKind, ValueTerm, normalize},
     closure, multi,
     naming::{NameResolver, is_valid_identifier},
 };
@@ -26,6 +26,7 @@ pub struct ExprBuilder<'a> {
     table: &'a OpcodeTable,
     analysis: &'a DecompileAnalysis,
     names: &'a NameResolver<'a>,
+    booleans: &'a BooleanAnalysis,
     materialized: Vec<Vec<Option<Name>>>,
     visiting: Vec<Vec<bool>>,
 }
@@ -38,6 +39,7 @@ impl<'a> ExprBuilder<'a> {
         table: &'a OpcodeTable,
         analysis: &'a DecompileAnalysis,
         names: &'a NameResolver<'a>,
+        booleans: &'a BooleanAnalysis,
     ) -> Self {
         Self {
             proto,
@@ -45,6 +47,7 @@ impl<'a> ExprBuilder<'a> {
             table,
             analysis,
             names,
+            booleans,
             materialized: vec![Vec::new(); function.num_regs],
             visiting: vec![Vec::new(); function.num_regs],
         }
@@ -222,6 +225,77 @@ impl<'a> ExprBuilder<'a> {
         }
     }
 
+    /// Convert a precomputed short-circuit value plan to an expression.
+    pub(crate) fn expr_for_value_plan(&mut self, plan: &ValuePlan) -> Result<Expr, LuaError> {
+        let expr = match &plan.kind {
+            ValuePlanKind::Binary { left, op, right } => Expr::Binary {
+                op: op.ast_op(),
+                lhs: Box::new(self.expr_for_value_term(*left, plan.pc)?),
+                rhs: Box::new(self.expr_for_value_term(*right, plan.pc)?),
+            },
+            ValuePlanKind::Ternary {
+                first,
+                second,
+                fallback,
+            } => {
+                let selected = Expr::Binary {
+                    op: ast::BinOp::And,
+                    lhs: Box::new(self.expr_for_value_term(*first, plan.pc)?),
+                    rhs: Box::new(self.expr_for_value_term(*second, plan.pc)?),
+                };
+                Expr::Binary {
+                    op: ast::BinOp::Or,
+                    lhs: Box::new(selected),
+                    rhs: Box::new(self.expr_for_value_term(*fallback, plan.pc)?),
+                }
+            }
+            ValuePlanKind::Chain { terms, fallback } => {
+                let mut terms = terms.iter().copied();
+                let Some(first) = terms.next() else {
+                    return self.expr_for_value_term(*fallback, plan.pc);
+                };
+                let mut selected = self.expr_for_value_term(first, plan.pc)?;
+                for term in terms {
+                    selected = Expr::Binary {
+                        op: ast::BinOp::And,
+                        lhs: Box::new(selected),
+                        rhs: Box::new(self.expr_for_value_term(term, plan.pc)?),
+                    };
+                }
+                Expr::Binary {
+                    op: ast::BinOp::Or,
+                    lhs: Box::new(selected),
+                    rhs: Box::new(self.expr_for_value_term(*fallback, plan.pc)?),
+                }
+            }
+            ValuePlanKind::Condition { branch, inverted } => {
+                let Some(node) = self.analysis.node(self.function, *branch) else {
+                    return Ok(Expr::True);
+                };
+                self.branch_expr_from_node(node, *inverted)?
+            }
+        };
+        Ok(normalize::normalize(expr))
+    }
+
+    fn expr_for_value_term(&mut self, term: ValueTerm, pc: i32) -> Result<Expr, LuaError> {
+        match term {
+            ValueTerm::Ref(reference) => self.expr_for_ref(reference, pc),
+            ValueTerm::Node(id) => {
+                let Some(node) = self.analysis.node(self.function, id) else {
+                    return Ok(Expr::Nil);
+                };
+                self.node_expr(node)
+            }
+            ValueTerm::Condition { branch, inverted } => {
+                let Some(node) = self.analysis.node(self.function, branch) else {
+                    return Ok(Expr::True);
+                };
+                self.branch_expr_from_node(node, inverted)
+            }
+        }
+    }
+
     fn call_args_exprs(
         &mut self,
         args: &[SsaRef],
@@ -246,6 +320,16 @@ impl<'a> ExprBuilder<'a> {
     fn reg_expr(&mut self, reference: SsaRef, use_pc: i32) -> Result<Expr, LuaError> {
         if let Some(name) = self.materialized_name(reference) {
             return Ok(Expr::Name(name));
+        }
+
+        if let Some(plan) = self.booleans.value_for_phi(reference) {
+            if self.is_visiting(reference) {
+                return Ok(Expr::Name(self.names.name_for_ref(reference, use_pc)));
+            }
+            self.set_visiting(reference, true);
+            let result = self.expr_for_value_plan(plan);
+            self.set_visiting(reference, false);
+            return result;
         }
 
         let Some(node_id) = self.analysis.def_site(reference) else {
@@ -308,6 +392,9 @@ impl<'a> ExprBuilder<'a> {
     }
 
     fn phi_expr(&mut self, operands: &[SsaRef], node: &SsaNode) -> Result<Expr, LuaError> {
+        if let Some(plan) = self.booleans.value_for_phi(node.dest) {
+            return self.expr_for_value_plan(plan);
+        }
         if let Some(first) = operands.first().copied()
             && operands.iter().all(|operand| *operand == first)
         {
@@ -369,6 +456,31 @@ impl<'a> ExprBuilder<'a> {
     }
 
     fn branch_expr(
+        &mut self,
+        rel: ir::RelOp,
+        a: SsaRef,
+        b: SsaRef,
+        invert: bool,
+        pc: i32,
+    ) -> Result<Expr, LuaError> {
+        self.branch_expr_parts(rel, a, b, invert, pc)
+    }
+
+    fn branch_expr_from_node(&mut self, node: &SsaNode, invert: bool) -> Result<Expr, LuaError> {
+        let SsaOp::Branch {
+            rel,
+            a,
+            b,
+            invert: node_invert,
+            ..
+        } = node.op
+        else {
+            return Ok(Expr::True);
+        };
+        self.branch_expr_parts(rel, a, b, node_invert ^ invert, node.pc)
+    }
+
+    fn branch_expr_parts(
         &mut self,
         rel: ir::RelOp,
         a: SsaRef,
@@ -464,11 +576,16 @@ impl<'a> ExprBuilder<'a> {
     }
 
     fn constructor_plan(&self, node: &SsaNode, table_reg: u16) -> ConstructorPlan {
-        let Some((block, node_index)) = self.node_position(node) else {
+        let Some((block, node_index)) = self.node_position(node).or_else(|| {
+            self.analysis
+                .def_site(node.dest)
+                .map(|id| (id.block, id.node))
+        }) else {
             return ConstructorPlan::default();
         };
 
         let mut plan = ConstructorPlan::default();
+        let mut saw_setup_effect = false;
         for (offset, current) in self.function.blocks[block]
             .nodes
             .iter()
@@ -493,12 +610,15 @@ impl<'a> ExprBuilder<'a> {
                 continue;
             }
             if op_uses_ref(&current.op, node.dest) {
+                if saw_setup_effect && !is_parent_constructor_mutation(current, table_reg) {
+                    return ConstructorPlan::default();
+                }
                 plan.final_use = Some(current_id);
                 break;
             }
             if multi::table_list::is_constructor_setup(current, table_reg) {
                 if node_has_observable_side_effect(&current.op) {
-                    return ConstructorPlan::default();
+                    saw_setup_effect = true;
                 }
                 continue;
             }
@@ -712,6 +832,16 @@ fn constructor_mutation_table(op: &SsaOp) -> Option<SsaRef> {
     }
 }
 
+fn is_parent_constructor_mutation(node: &SsaNode, child_reg: u16) -> bool {
+    match &node.op {
+        SsaOp::SetTable { table, .. } => table.reg_index().is_some_and(|reg| reg < child_reg),
+        SsaOp::SetList { table, base, .. } => {
+            table.reg_index().is_some_and(|reg| reg < child_reg) && *base < child_reg
+        }
+        _ => false,
+    }
+}
+
 fn direct_eval_order_refs(op: &SsaOp) -> Vec<SsaRef> {
     match op {
         SsaOp::Move { src } | SsaOp::UnOp { value: src, .. } => vec![*src],
@@ -845,7 +975,8 @@ mod tests {
         let analysis = super::super::analysis::analyze(&function);
         let names = NameResolver::new(&proto, &function);
         let table = OpcodeTable::builtin(LuaVersion::V51).expect("Lua 5.1 opcode table");
-        let mut builder = ExprBuilder::new(&proto, &function, &table, &analysis, &names);
+        let booleans = BooleanAnalysis::empty();
+        let mut builder = ExprBuilder::new(&proto, &function, &table, &analysis, &names, &booleans);
 
         assert!(builder.can_inline_ref(reg(0, 1), 1));
         let expr = builder.expr_for_ref(reg(1, 1), 1).expect("expr builds");
@@ -889,7 +1020,8 @@ mod tests {
         let analysis = super::super::analysis::analyze(&function);
         let names = NameResolver::new(&proto, &function);
         let table = OpcodeTable::builtin(LuaVersion::V51).expect("Lua 5.1 opcode table");
-        let mut builder = ExprBuilder::new(&proto, &function, &table, &analysis, &names);
+        let booleans = BooleanAnalysis::empty();
+        let mut builder = ExprBuilder::new(&proto, &function, &table, &analysis, &names, &booleans);
 
         assert!(!builder.can_inline_ref(reg(0, 1), 1));
         builder.mark_materialized(reg(0, 1), Name::from("v0"));

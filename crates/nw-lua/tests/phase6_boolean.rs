@@ -1,6 +1,6 @@
 mod support;
 
-use support::run_equivalence;
+use support::{compile_source_bytes, run_equivalence};
 
 #[test]
 fn runtime_equivalence_phase6_boolean_cases() {
@@ -129,5 +129,175 @@ print(gt)
     assert!(
         !decompiled.contains("5 < x"),
         "literal-left comparison should have been normalized:\n{decompiled}"
+    );
+}
+
+#[test]
+fn reconstructs_short_circuit_values_for_non_local_consumers() {
+    let cases = [
+        (
+            "short_circuit_settable_consumer",
+            r#"
+local function show(value)
+    print(tostring(value))
+end
+local a = false
+local b = "fallback"
+local c = true
+local d = "selected"
+local t = {}
+t.x = a or b
+show(t.x)
+t.y = c and d
+show(t.y)
+"#,
+        ),
+        (
+            "short_circuit_method_field_consumer",
+            r#"
+local function show(value)
+    print(tostring(value))
+end
+local M = { y = true }
+function M:f(default)
+    self.x = self.x or default
+    show(self.x)
+    self.y = self.y and default
+    show(self.y)
+end
+M:f("method")
+"#,
+        ),
+        (
+            "short_circuit_table_constructor_consumer",
+            r#"
+local function show(value)
+    print(tostring(value))
+end
+local a = false
+local b = "field"
+local c = true
+local d = "kept"
+local t = { x = a or b, y = c and d }
+show(t.x)
+show(t.y)
+"#,
+        ),
+        (
+            "short_circuit_global_consumer",
+            r#"
+local function show(value)
+    print(tostring(value))
+end
+local a = false
+local b = true
+G = a or 1
+show(G)
+H = b and 2
+show(H)
+"#,
+        ),
+        (
+            "short_circuit_call_and_return_consumers",
+            r#"
+local function show(value)
+    print(tostring(value))
+end
+local function id(value)
+    return value
+end
+local function pick(a, b)
+    return a or b
+end
+local a = false
+local b = "call"
+show(id(a or b))
+show(pick(false, "return"))
+"#,
+        ),
+        (
+            "short_circuit_call_value_with_nil_fallback",
+            r#"
+local function show(value)
+    print(tostring(value))
+end
+local function id(value)
+    return value
+end
+local function pick(value)
+    return value and id(value) or nil
+end
+show(pick(false))
+show(pick("nil-fallback"))
+"#,
+        ),
+        (
+            "short_circuit_guard_chain_settable_consumer",
+            r#"
+local function show(value)
+    print(tostring(value))
+end
+local function pick(p)
+    local t = {}
+    t.right = p and p.right and p.right or 0
+    return t.right
+end
+show(pick(nil))
+show(pick({ right = 5 }))
+"#,
+        ),
+        (
+            "short_circuit_function_value_settable_consumer",
+            r#"
+local function show(value)
+    print(tostring(value))
+end
+local function pick(playOnce)
+    local t = {}
+    t.onComplete = not playOnce and function()
+        return "again"
+    end or nil
+    return t.onComplete
+end
+show(pick(true))
+local callback = pick(false)
+if callback then
+    show(callback())
+end
+"#,
+        ),
+    ];
+
+    for (name, source) in cases {
+        let _ = run_equivalence(name, source);
+    }
+}
+
+#[test]
+fn minimal_settable_or_reconstructs_expression_form() {
+    let bytecode = match compile_source_bytes(
+        "minimal_settable_or_form",
+        r#"
+local function make(name, mode)
+    local t = {}
+    t.name = name
+    t.mode = mode or 99
+    return t
+end
+"#,
+        false,
+    ) {
+        Some(bytecode) => bytecode,
+        None => return,
+    };
+    let decompiled = nw_lua::decompile(&bytecode).expect("minimal repro decompiles");
+
+    assert!(
+        decompiled.contains("t.mode = mode or 99"),
+        "expected SETTABLE consumer to inline short-circuit value:\n{decompiled}"
+    );
+    assert!(
+        !decompiled.contains("v3"),
+        "short-circuit SETTABLE consumer must not read undefined synthetic v3:\n{decompiled}"
     );
 }

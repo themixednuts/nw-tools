@@ -90,13 +90,14 @@ impl<'a> NameResolver<'a> {
     /// Return the local name for a use site or a deterministic fallback.
     #[must_use]
     pub fn name_for_ref(&self, reference: SsaRef, pc: i32) -> Name {
-        if let Some(name) = self.value_name(reference) {
-            return name;
-        }
         if let SsaRef::Reg { reg, .. } = reference
             && let Some(binding) = self.binding_for_use(reg, pc)
+            && !binding.name.is_synthetic()
         {
             return binding.name;
+        }
+        if let Some(name) = self.value_name(reference) {
+            return name;
         }
         self.synthetic_value_name(reference)
     }

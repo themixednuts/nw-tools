@@ -208,13 +208,6 @@ pub fn find_merge(
         return Some(true_end);
     }
 
-    if is_terminal(function, true_end) {
-        return Some(false_end);
-    }
-    if is_terminal(function, false_end) {
-        return Some(true_end);
-    }
-
     let true_dist = forward_distances(function, branch, true_end);
     let false_dist = forward_distances(function, branch, false_end);
     let mut best = None;
@@ -238,6 +231,15 @@ pub fn find_merge(
         if score < best_score {
             best_score = score;
             best = Some(candidate);
+        }
+    }
+
+    if best.is_none() {
+        if is_terminal(function, true_end) {
+            return Some(false_end);
+        }
+        if is_terminal(function, false_end) {
+            return Some(true_end);
         }
     }
 

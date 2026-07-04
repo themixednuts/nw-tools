@@ -319,11 +319,7 @@ fn lower_generic_for(
         })
     })?;
 
-    let exprs = if let Some(call) = region.info.call_node.and_then(|id| node(function, id)) {
-        vec![builder.expr_for_node(call)?]
-    } else {
-        vec![builder.expr_for_ref(SsaRef::Reg { reg: base, ver: 0 }, 0)?]
-    };
+    let exprs = generic_for_exprs(region, function, analysis, builder)?;
     let var_base = base.saturating_add(3);
     let var_names = (0..region.info.count.max(0))
         .map(|offset| {
@@ -472,6 +468,89 @@ fn expr_for_optional_node(
         return builder.expr_for_node(node);
     }
     builder.expr_for_ref(SsaRef::Reg { reg, ver: 0 }, pc)
+}
+
+fn generic_for_exprs(
+    region: &GenericForRegion,
+    function: &SsaFunction,
+    analysis: &DecompileAnalysis,
+    builder: &mut StatementBuilder<'_>,
+) -> Result<Vec<Expr>, LuaError> {
+    if let Some(call) = region.info.call_node.and_then(|id| node(function, id)) {
+        if let SsaOp::Call { func, args, .. } = &call.op {
+            let func = generic_setup_ref_expr(function, analysis, builder, *func, call.pc)?;
+            let args = args
+                .iter()
+                .copied()
+                .map(|arg| generic_setup_ref_expr(function, analysis, builder, arg, call.pc))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(vec![Expr::Call {
+                func: Box::new(func),
+                args,
+                method: None,
+            }]);
+        }
+        return Ok(vec![builder.expr_for_node(call)?]);
+    }
+
+    let base = region.info.base;
+    let mut exprs = Vec::with_capacity(3);
+    for offset in 0..3 {
+        let reg = base.saturating_add(offset);
+        let expr = if let Some(id) = generic_setup_def(function, region, reg)
+            && let Some(node) = node(function, id)
+        {
+            builder.expr_for_node(node)?
+        } else {
+            builder.expr_for_ref(SsaRef::Reg { reg, ver: 0 }, 0)?
+        };
+        exprs.push(expr);
+    }
+    Ok(exprs)
+}
+
+fn generic_setup_ref_expr(
+    function: &SsaFunction,
+    analysis: &DecompileAnalysis,
+    builder: &mut StatementBuilder<'_>,
+    reference: SsaRef,
+    pc: i32,
+) -> Result<Expr, LuaError> {
+    if let Some(id) = analysis.def_site(reference)
+        && let Some(node) = node(function, id)
+        && node.pc <= pc
+    {
+        return builder.expr_for_node(node);
+    }
+    builder.expr_for_ref(reference, pc)
+}
+
+fn generic_setup_def(
+    function: &SsaFunction,
+    region: &GenericForRegion,
+    reg: u16,
+) -> Option<NodeId> {
+    let tfor = region.info.tfor_node;
+    let start = region.info.entry.min(tfor.block);
+    for block in (start..=tfor.block).rev() {
+        let block_ref = function.blocks.get(block)?;
+        let end = if block == tfor.block {
+            tfor.node
+        } else {
+            block_ref.nodes.len()
+        };
+        if let Some((node, _)) = block_ref
+            .nodes
+            .iter()
+            .take(end)
+            .enumerate()
+            .rev()
+            .find(|(_, node)| node.dest.reg_index() == Some(reg))
+        {
+            return Some(NodeId { block, node });
+        }
+    }
+    None
 }
 
 fn loop_var_name(names: &NameResolver<'_>, reg: u16, function: &SsaFunction, block: usize) -> Name {

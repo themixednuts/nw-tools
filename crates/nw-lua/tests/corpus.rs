@@ -17,6 +17,8 @@ const LUA: &str = r"E:\Projects\lua-5.1.5\src\lua.exe";
 const LUAC: &str = r"E:\Projects\lua-5.1.5\src\luac.exe";
 const GOOD_LUA: &str = r"E:\Projects\az-rs\resources\fixtures\lua\good-lua";
 const DEMOJSON: &str = r"E:\Projects\DEMOJSON";
+const LOGGER_LUA: &str =
+    r"E:\Projects\az-rs\resources\fixtures\lua\good-lua\scripts\_common\logger.lua";
 const CORPUS_FAST_SAMPLE_LIMIT: usize = 40;
 const CORPUS_HEAVY_SAMPLE_LIMIT: usize = 300;
 const CHILD_OK: &str = "NW_LUA_CORPUS_CHILD_OK";
@@ -46,6 +48,17 @@ print(t[1], t[2], t.x, t[5])
             r#"
 local t = {select(1, "a", "b", "c")}
 print(#t)
+"#,
+        ),
+        (
+            "table_list_nested_constructor_values",
+            r#"
+local t = {
+    { a = 1 },
+    { a = 2 },
+}
+print(t[1].a)
+print(t[2].a)
 "#,
         ),
     ];
@@ -383,6 +396,35 @@ fn nw_named_regressions_decompile_and_reparse() {
 }
 
 #[test]
+fn nw_logger_create_channel_reconstructs_short_circuit_field() {
+    if !tools_available() {
+        eprintln!("skipping NW logger regression test; missing Lua 5.1 tools");
+        return;
+    }
+    let source = Path::new(LOGGER_LUA);
+    if !source.exists() {
+        eprintln!("skipping missing NW logger source {}", source.display());
+        return;
+    }
+
+    let paths = TempPaths::new("logger_short_circuit");
+    compile_lua(source, &paths.bytecode).expect("compile logger source");
+    let bytecode = fs::read(&paths.bytecode).expect("read logger bytecode");
+    let decompiled = nw_lua::decompile(&bytecode).expect("logger decompiles");
+    full_moon::parse(&decompiled)
+        .unwrap_or_else(|err| panic!("logger decompiled source failed to reparse: {err:#?}"));
+    assert!(
+        decompiled.contains("sendToConsole or self.SEND_NOTHING"),
+        "CreateChannel default mode should reconstruct as short-circuit expression:\n{decompiled}"
+    );
+    assert!(
+        !decompiled.contains("v3.sendToConsole = v4"),
+        "CreateChannel must not assign an undefined synthetic value:\n{decompiled}"
+    );
+    paths.cleanup();
+}
+
+#[test]
 fn nw_corpus_decompiles_and_recompiles_cleanly_with_structural_report() {
     run_nw_corpus_structural_sample(CORPUS_FAST_SAMPLE_LIMIT, "fast");
 }
@@ -418,6 +460,7 @@ fn run_nw_corpus_structural_sample(limit: usize, label: &str) {
     let mut structural_total_protos = 0usize;
     let mut structural_matched_ops = 0usize;
     let mut structural_total_ops = 0usize;
+    let mut undefined_synthetics = 0usize;
     let mut buckets = BTreeMap::<String, FailureBucket>::new();
     let worker = Path::new(env!("CARGO_BIN_EXE_nw-lua-corpus-child"));
 
@@ -436,6 +479,7 @@ fn run_nw_corpus_structural_sample(limit: usize, label: &str) {
                 structural_total_protos += report.total_protos;
                 structural_matched_ops += report.matched_ops;
                 structural_total_ops += report.total_ops;
+                undefined_synthetics += report.undefined_synthetics;
             }
             Err(FileResult::Err(message)) => {
                 if message.starts_with("luac:") {
@@ -464,13 +508,14 @@ fn run_nw_corpus_structural_sample(limit: usize, label: &str) {
         files.len()
     );
     eprintln!(
-        "Phase 10b structural report: exact_proto_rate={}/{} ({:.2}%) opcode_match_rate={}/{} ({:.2}%)",
+        "Phase 10b structural report: exact_proto_rate={}/{} ({:.2}%) opcode_match_rate={}/{} ({:.2}%) undefined_synthetics={}",
         structural_exact_protos,
         structural_total_protos,
         percentage(structural_exact_protos, structural_total_protos),
         structural_matched_ops,
         structural_total_ops,
-        percentage(structural_matched_ops, structural_total_ops)
+        percentage(structural_matched_ops, structural_total_ops),
+        undefined_synthetics
     );
     if !buckets.is_empty() {
         eprintln!("Phase 10b failure buckets:");
@@ -510,6 +555,10 @@ fn run_nw_corpus_structural_sample(limit: usize, label: &str) {
         recompile_ok,
         files.len(),
         "corpus recompile-clean count must be 100%"
+    );
+    assert_eq!(
+        undefined_synthetics, 0,
+        "corpus decompiled output has {undefined_synthetics} undefined synthetic reads"
     );
 }
 
@@ -579,6 +628,7 @@ fn parse_child_report_line(line: &str) -> ChildReport {
             "total_protos" => report.total_protos = value,
             "matched_ops" => report.matched_ops = value,
             "total_ops" => report.total_ops = value,
+            "undefined_synthetics" => report.undefined_synthetics = value,
             _ => {}
         }
     }
@@ -683,6 +733,7 @@ struct ChildReport {
     total_protos: usize,
     matched_ops: usize,
     total_ops: usize,
+    undefined_synthetics: usize,
 }
 
 struct FailureBucket {

@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     analysis::{DecompileAnalysis, NodeId},
-    boolean::{BooleanAnalysis, ConditionChain, ValuePlan, ValuePlanKind, normalize},
+    boolean::{BooleanAnalysis, ConditionChain, ValuePlan, normalize},
     closure,
     expr_build::{ExprBuilder, global_expr_from_name, index_expr},
     multi,
@@ -69,7 +69,7 @@ impl<'a> StatementBuilder<'a> {
             analysis,
             names,
             booleans,
-            exprs: ExprBuilder::new(proto, function, table, analysis, names),
+            exprs: ExprBuilder::new(proto, function, table, analysis, names, booleans),
             declared_locals: names.initially_declared_locals().into_iter().collect(),
             declared_synthetic_names: HashSet::new(),
             declared_phi_regs: HashSet::new(),
@@ -553,41 +553,31 @@ impl<'a> StatementBuilder<'a> {
         let Some(plan) = self.booleans.value_for_phi(node.dest) else {
             return Ok(None);
         };
+        if !self.should_materialize_boolean_phi(node) {
+            return Ok(None);
+        }
         let value = self.value_plan_expr(plan)?;
         Ok(Some(self.materialize_value(plan.dest, plan.pc, value)))
     }
 
     fn value_plan_expr(&mut self, plan: &ValuePlan) -> Result<Expr, LuaError> {
-        let expr = match &plan.kind {
-            ValuePlanKind::Binary { left, op, right } => Expr::Binary {
-                op: op.ast_op(),
-                lhs: Box::new(self.exprs.expr_for_ref(*left, plan.pc)?),
-                rhs: Box::new(self.exprs.expr_for_ref(*right, plan.pc)?),
-            },
-            ValuePlanKind::Ternary {
-                first,
-                second,
-                fallback,
-            } => {
-                let selected = Expr::Binary {
-                    op: ast::BinOp::And,
-                    lhs: Box::new(self.exprs.expr_for_ref(*first, plan.pc)?),
-                    rhs: Box::new(self.exprs.expr_for_ref(*second, plan.pc)?),
-                };
-                Expr::Binary {
-                    op: ast::BinOp::Or,
-                    lhs: Box::new(selected),
-                    rhs: Box::new(self.exprs.expr_for_ref(*fallback, plan.pc)?),
-                }
-            }
-            ValuePlanKind::Condition { branch, inverted } => {
-                let Some(node) = self.analysis.node(self.function, *branch) else {
-                    return Ok(Expr::True);
-                };
-                self.condition_for_branch(node, *inverted)?
-            }
+        self.exprs.expr_for_value_plan(plan)
+    }
+
+    fn should_materialize_boolean_phi(&self, node: &SsaNode) -> bool {
+        let Some(reg) = node.dest.reg_index() else {
+            return false;
         };
-        Ok(normalize::normalize(expr))
+        if self.forced_materialized.contains(&node.dest) {
+            return true;
+        }
+        if self.analysis.facts(node.dest).upvalue_captures > 0 {
+            return true;
+        }
+        if self.names.binding_for_def(reg, node.pc).is_some() {
+            return true;
+        }
+        self.analysis.real_use_count(node.dest) > 1
     }
 
     fn emit_value_def(&mut self, node: &SsaNode) -> Result<Option<Stmt>, LuaError> {
@@ -602,7 +592,11 @@ impl<'a> StatementBuilder<'a> {
         }
 
         let value = self.exprs.node_expr(node)?;
-        Ok(Some(self.materialize_value(node.dest, node.pc, value)))
+        Ok(Some(self.materialize_value(
+            node.dest,
+            self.materialization_pc(node),
+            value,
+        )))
     }
 
     fn emit_closure_value_def(&mut self, node: &SsaNode) -> Result<Option<Stmt>, LuaError> {
@@ -663,8 +657,9 @@ impl<'a> StatementBuilder<'a> {
         if self.analysis.facts(node.dest).upvalue_captures > 0 {
             return true;
         }
+        let materialization_pc = self.materialization_pc(node);
         if let Some(reg) = node.dest.reg_index()
-            && let Some(binding) = self.names.binding_for_def(reg, node.pc)
+            && let Some(binding) = self.names.binding_for_def(reg, materialization_pc)
         {
             if self
                 .analysis
@@ -681,6 +676,26 @@ impl<'a> StatementBuilder<'a> {
         }
         let uses = self.analysis.real_use_count(node.dest);
         uses > 0 && !self.exprs.can_inline_ref(node.dest, node.pc)
+    }
+
+    fn materialization_pc(&self, node: &SsaNode) -> i32 {
+        if !matches!(node.op, SsaOp::NewTable { .. }) {
+            return node.pc;
+        }
+        let Some(table_reg) = node.dest.reg_index() else {
+            return node.pc;
+        };
+        self.analysis
+            .real_uses(node.dest)
+            .iter()
+            .filter_map(|id| self.analysis.node(self.function, *id))
+            .filter(|use_node| {
+                multi::table_list::is_matching_settable(use_node, node.dest, table_reg)
+                    || multi::table_list::is_matching_setlist(use_node, node.dest, table_reg)
+            })
+            .map(|use_node| use_node.pc)
+            .max()
+            .unwrap_or(node.pc)
     }
 
     fn self_op_consumed_by_call(&self, node: &SsaNode) -> bool {

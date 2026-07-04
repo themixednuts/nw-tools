@@ -11,14 +11,14 @@ use crate::{
             regions::BlockSet,
         },
     },
-    ir::{SsaFunction, SsaOp, SsaRef},
+    ir::{SsaFunction, SsaNode, SsaOp, SsaRef},
 };
 
 pub mod normalize;
 mod short_circuit;
 
 pub use short_circuit::{
-    BoolConnector, ConditionChain, ConditionSegment, ValuePlan, ValuePlanKind,
+    BoolConnector, ConditionChain, ConditionSegment, ValuePlan, ValuePlanKind, ValueTerm,
 };
 
 /// Boolean reconstruction facts computed once for a function.
@@ -91,7 +91,8 @@ pub fn analyze(
             continue;
         }
 
-        if let Some(chain) = short_circuit::condition_chain(function, block, pc_map, &loop_headers)
+        if let Some(chain) =
+            short_circuit::condition_chain(function, expr_analysis, block, pc_map, &loop_headers)
         {
             analysis.condition_chains.insert(chain.start, chain);
         }
@@ -115,39 +116,42 @@ fn branch_info(
     conditionals::branch_info(function, block, pc_map)
 }
 
-fn is_condition_block(function: &SsaFunction, block: usize, loop_headers: &BlockSet) -> bool {
+fn is_condition_block(
+    function: &SsaFunction,
+    expr_analysis: &DecompileAnalysis,
+    block: usize,
+    pc_map: &[Option<usize>],
+    loop_headers: &BlockSet,
+) -> bool {
     !loop_headers.contains(block)
         && conditionals::is_pure_condition_block(function, block)
         && !crate::decompile::control_flow::loops::has_tail_body_before_branch(function, block)
+        && short_circuit::value_plan(function, expr_analysis, block, pc_map).is_none()
 }
 
-fn is_pure_value_block(function: &SsaFunction, block: usize) -> bool {
-    let Some(block_ref) = function.blocks.get(block) else {
-        return false;
-    };
-    block_ref.nodes.iter().all(|node| {
-        node.is_meta_only
-            || matches!(
-                node.op,
-                SsaOp::Phi { .. }
-                    | SsaOp::Nop
-                    | SsaOp::Jump { .. }
-                    | SsaOp::Branch { .. }
-                    | SsaOp::Move { .. }
-                    | SsaOp::LoadK { .. }
-                    | SsaOp::LoadBool { .. }
-                    | SsaOp::LoadNil { .. }
-                    | SsaOp::GetUpval { .. }
-                    | SsaOp::GetGlobal { .. }
-                    | SsaOp::GetTable { .. }
-                    | SsaOp::NewTable { .. }
-                    | SsaOp::SelfOp { .. }
-                    | SsaOp::BinOp { .. }
-                    | SsaOp::UnOp { .. }
-                    | SsaOp::Concat { .. }
-                    | SsaOp::Closure { .. }
-            )
-    })
+fn is_pure_value_node(node: &SsaNode) -> bool {
+    node.is_meta_only
+        || matches!(
+            node.op,
+            SsaOp::Phi { .. }
+                | SsaOp::Nop
+                | SsaOp::Jump { .. }
+                | SsaOp::Branch { .. }
+                | SsaOp::Move { .. }
+                | SsaOp::LoadK { .. }
+                | SsaOp::LoadBool { .. }
+                | SsaOp::LoadNil { .. }
+                | SsaOp::GetUpval { .. }
+                | SsaOp::GetGlobal { .. }
+                | SsaOp::GetTable { .. }
+                | SsaOp::NewTable { .. }
+                | SsaOp::SelfOp { .. }
+                | SsaOp::BinOp { .. }
+                | SsaOp::UnOp { .. }
+                | SsaOp::Concat { .. }
+                | SsaOp::Call { .. }
+                | SsaOp::Closure { .. }
+        )
 }
 
 fn phi_sources(function: &SsaFunction, block: usize) -> impl Iterator<Item = PhiData<'_>> {

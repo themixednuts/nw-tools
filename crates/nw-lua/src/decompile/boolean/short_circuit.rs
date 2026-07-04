@@ -9,7 +9,7 @@ use crate::{
     ir::{RelOp, SsaFunction, SsaOp, SsaRef},
 };
 
-use super::{branch_at, branch_info, is_condition_block, is_pure_value_block, phi_sources};
+use super::{branch_at, branch_info, is_condition_block, is_pure_value_node, phi_sources};
 
 /// Boolean connector between adjacent short-circuit segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,14 +67,18 @@ impl ValuePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValuePlanKind {
     Binary {
-        left: SsaRef,
+        left: ValueTerm,
         op: BoolConnector,
-        right: SsaRef,
+        right: ValueTerm,
     },
     Ternary {
-        first: SsaRef,
-        second: SsaRef,
-        fallback: SsaRef,
+        first: ValueTerm,
+        second: ValueTerm,
+        fallback: ValueTerm,
+    },
+    Chain {
+        terms: Vec<ValueTerm>,
+        fallback: ValueTerm,
     },
     Condition {
         branch: NodeId,
@@ -82,8 +86,23 @@ pub enum ValuePlanKind {
     },
 }
 
+/// One expression segment inside a short-circuit value plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueTerm {
+    Ref(SsaRef),
+    Node(NodeId),
+    Condition { branch: NodeId, inverted: bool },
+}
+
+impl From<SsaRef> for ValueTerm {
+    fn from(reference: SsaRef) -> Self {
+        Self::Ref(reference)
+    }
+}
+
 pub fn condition_chain(
     function: &SsaFunction,
+    expr_analysis: &DecompileAnalysis,
     start: usize,
     pc_map: &[Option<usize>],
     loop_headers: &BlockSet,
@@ -107,8 +126,20 @@ pub fn condition_chain(
         }
         blocks.push(current);
 
-        let true_is_cond = is_condition_block(function, info.true_block, loop_headers);
-        let false_is_cond = is_condition_block(function, info.false_block, loop_headers);
+        let true_is_cond = is_condition_block(
+            function,
+            expr_analysis,
+            info.true_block,
+            pc_map,
+            loop_headers,
+        );
+        let false_is_cond = is_condition_block(
+            function,
+            expr_analysis,
+            info.false_block,
+            pc_map,
+            loop_headers,
+        );
         match (true_is_cond, false_is_cond) {
             (true, _) => current = info.true_block,
             (false, true) => current = info.false_block,
@@ -156,6 +187,8 @@ pub fn value_plan(
 ) -> Option<ValuePlan> {
     comparison_value(function, start, pc_map)
         .or_else(|| test_value(function, expr_analysis, start, pc_map))
+        .or_else(|| guarded_chain_value(function, expr_analysis, start, pc_map))
+        .or_else(|| branch_ternary_value(function, expr_analysis, start, pc_map))
         .or_else(|| ternary_value(function, expr_analysis, start, pc_map))
         .or_else(|| testset_value(function, expr_analysis, start, pc_map))
 }
@@ -182,7 +215,7 @@ fn test_value(
     let pass_block = info.false_block;
     let merge = common_successor(function, value_block, pass_block)
         .or_else(|| conditionals::find_merge(function, start, value_block, pass_block))?;
-    if !pure_range(function, start, merge) {
+    if !pure_select_range(function, info.node, start, merge) {
         return None;
     }
 
@@ -211,7 +244,11 @@ fn test_value(
         merge,
         dest: phi.dest,
         pc: phi.pc,
-        kind: ValuePlanKind::Binary { left: a, op, right },
+        kind: ValuePlanKind::Binary {
+            left: a.into(),
+            op,
+            right,
+        },
     })
 }
 
@@ -234,7 +271,7 @@ fn testset_value(
     let pass_block = info.false_block;
     let merge = common_successor(function, value_block, pass_block)
         .or_else(|| conditionals::find_merge(function, start, value_block, pass_block))?;
-    if !pure_range(function, start, merge) {
+    if !pure_select_range(function, info.node, start, merge) {
         return None;
     }
 
@@ -258,7 +295,11 @@ fn testset_value(
         merge,
         dest: phi.dest,
         pc: phi.pc,
-        kind: ValuePlanKind::Binary { left: a, op, right },
+        kind: ValuePlanKind::Binary {
+            left: a.into(),
+            op,
+            right,
+        },
     })
 }
 
@@ -283,13 +324,21 @@ fn ternary_value(
     let inner = branch_info(function, outer.true_block, pc_map)?;
     let inner_node = branch_at(function, inner.node)?;
     let SsaOp::Branch {
-        rel: RelOp::TestSet,
+        rel,
         a: second,
         invert: true,
         ..
     } = inner_node.op
     else {
         return None;
+    };
+    if !matches!(rel, RelOp::Test | RelOp::TestSet) {
+        return None;
+    }
+    let selected_dest = if rel == RelOp::TestSet {
+        inner_node.dest
+    } else {
+        second
     };
 
     let selected_block = inner.false_block;
@@ -301,14 +350,25 @@ fn ternary_value(
 
     let merge = common_successor(function, selected_block, default_block)
         .or_else(|| conditionals::find_merge(function, start, selected_block, default_block))?;
-    if !pure_range(function, start, merge) {
+    if !pure_select_range(function, outer.node, start, merge) {
         return None;
     }
-    let phi = phi_sources(function, merge).find(|phi| same_reg(phi.dest, inner_node.dest))?;
+    let phi = phi_sources(function, merge).find(|phi| same_reg(phi.dest, selected_dest))?;
+    let second = if rel == RelOp::Test {
+        selected_operand(
+            function,
+            expr_analysis,
+            selected_dest,
+            inner.node.block,
+            second,
+        )?
+    } else {
+        second.into()
+    };
     let fallback = selected_operand(
         function,
         expr_analysis,
-        inner_node.dest,
+        selected_dest,
         default_block,
         phi.operand_from(default_block)?,
     )?;
@@ -319,11 +379,196 @@ fn ternary_value(
         dest: phi.dest,
         pc: phi.pc,
         kind: ValuePlanKind::Ternary {
-            first,
+            first: first.into(),
             second,
             fallback,
         },
     })
+}
+
+fn branch_ternary_value(
+    function: &SsaFunction,
+    expr_analysis: &DecompileAnalysis,
+    start: usize,
+    pc_map: &[Option<usize>],
+) -> Option<ValuePlan> {
+    let outer = branch_info(function, start, pc_map)?;
+    let outer_node = branch_at(function, outer.node)?;
+    if matches!(
+        outer_node.op,
+        SsaOp::Branch {
+            rel: RelOp::TestSet,
+            ..
+        }
+    ) {
+        return None;
+    }
+
+    let inner = branch_info(function, outer.true_block, pc_map)?;
+    let inner_node = branch_at(function, inner.node)?;
+    let SsaOp::Branch {
+        rel,
+        a: second,
+        invert: true,
+        ..
+    } = inner_node.op
+    else {
+        return None;
+    };
+    if !matches!(rel, RelOp::Test | RelOp::TestSet) {
+        return None;
+    }
+
+    let selected_dest = if rel == RelOp::TestSet {
+        inner_node.dest
+    } else {
+        second
+    };
+    let selected_block = inner.false_block;
+    let default_block = conditionals::follow_jmp_only(function, inner.true_block, None);
+    let outer_default = conditionals::follow_jmp_only(function, outer.false_block, None);
+    if default_block != outer_default {
+        return None;
+    }
+
+    let merge = common_successor(function, selected_block, default_block)
+        .or_else(|| conditionals::find_merge(function, start, selected_block, default_block))?;
+    if !pure_select_range(function, outer.node, start, merge) {
+        return None;
+    }
+    let phi = phi_sources(function, merge).find(|phi| same_reg(phi.dest, selected_dest))?;
+    let second = if rel == RelOp::Test {
+        selected_operand(
+            function,
+            expr_analysis,
+            selected_dest,
+            inner.node.block,
+            second,
+        )?
+    } else {
+        second.into()
+    };
+    let fallback = selected_operand(
+        function,
+        expr_analysis,
+        selected_dest,
+        default_block,
+        phi.operand_from(default_block)?,
+    )?;
+
+    Some(ValuePlan {
+        start,
+        merge,
+        dest: phi.dest,
+        pc: phi.pc,
+        kind: ValuePlanKind::Ternary {
+            first: ValueTerm::Condition {
+                branch: outer.node,
+                inverted: false,
+            },
+            second,
+            fallback,
+        },
+    })
+}
+
+fn guarded_chain_value(
+    function: &SsaFunction,
+    expr_analysis: &DecompileAnalysis,
+    start: usize,
+    pc_map: &[Option<usize>],
+) -> Option<ValuePlan> {
+    let first = branch_info(function, start, pc_map)?;
+    let first_node = branch_at(function, first.node)?;
+    let (first_term, mut current, default_block) = guard_term(function, first, first_node)?;
+    let mut terms = vec![first_term];
+    for _ in 0..16 {
+        let info = branch_info(function, current, pc_map)?;
+        let node = branch_at(function, info.node)?;
+        let SsaOp::Branch { rel, a, invert, .. } = node.op else {
+            return None;
+        };
+
+        if matches!(rel, RelOp::Test | RelOp::TestSet) && invert {
+            let selected_dest = if rel == RelOp::TestSet { node.dest } else { a };
+            let selected_block = info.false_block;
+            if conditionals::follow_jmp_only(function, info.true_block, None) != default_block {
+                return None;
+            }
+            let merge =
+                common_successor(function, selected_block, default_block).or_else(|| {
+                    conditionals::find_merge(function, start, selected_block, default_block)
+                })?;
+            if !pure_select_range(function, first.node, start, merge) {
+                return None;
+            }
+            let phi = phi_sources(function, merge).find(|phi| {
+                same_reg(phi.dest, selected_dest)
+                    && phi
+                        .operand_from(selected_block)
+                        .is_some_and(|operand| same_reg(operand, selected_dest))
+                    && phi.operand_from(default_block).is_some()
+            })?;
+            terms.push(if rel == RelOp::Test {
+                selected_operand(function, expr_analysis, selected_dest, current, a)?
+            } else {
+                a.into()
+            });
+            let fallback = selected_operand(
+                function,
+                expr_analysis,
+                selected_dest,
+                default_block,
+                phi.operand_from(default_block)?,
+            )?;
+            return Some(ValuePlan {
+                start,
+                merge,
+                dest: phi.dest,
+                pc: phi.pc,
+                kind: ValuePlanKind::Chain { terms, fallback },
+            });
+        }
+
+        if let Some((term, next, guard_default)) = guard_term(function, info, node)
+            && guard_default == default_block
+        {
+            terms.push(term);
+            current = next;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+fn guard_term(
+    function: &SsaFunction,
+    info: conditionals::BranchInfo,
+    node: &crate::ir::SsaNode,
+) -> Option<(ValueTerm, usize, usize)> {
+    let SsaOp::Branch {
+        rel: RelOp::Test,
+        a,
+        invert,
+        ..
+    } = node.op
+    else {
+        return None;
+    };
+    let term = if invert {
+        ValueTerm::Condition {
+            branch: info.node,
+            inverted: false,
+        }
+    } else {
+        a.into()
+    };
+    Some((
+        term,
+        info.true_block,
+        conditionals::follow_jmp_only(function, info.false_block, None),
+    ))
 }
 
 fn comparison_value(
@@ -350,7 +595,7 @@ fn comparison_value(
 
     let merge = common_successor(function, true_block, false_block)
         .or_else(|| conditionals::find_merge(function, start, true_block, false_block))?;
-    if !pure_range(function, start, merge) {
+    if !pure_select_range(function, info.node, start, merge) {
         return None;
     }
     let phi = phi_sources(function, merge).find(|phi| {
@@ -438,8 +683,20 @@ fn loadbool_value(function: &SsaFunction, block: usize) -> Option<(SsaRef, bool)
     })
 }
 
-fn pure_range(function: &SsaFunction, start: usize, merge: usize) -> bool {
-    start < merge && (start..merge).all(|block| is_pure_value_block(function, block))
+fn pure_select_range(function: &SsaFunction, branch: NodeId, start: usize, merge: usize) -> bool {
+    start < merge
+        && branch.block == start
+        && (start..merge).all(|block| {
+            let Some(block_ref) = function.blocks.get(block) else {
+                return false;
+            };
+            let first_node = if block == start { branch.node } else { 0 };
+            block_ref
+                .nodes
+                .iter()
+                .skip(first_node)
+                .all(is_pure_value_node)
+        })
 }
 
 fn same_reg(left: SsaRef, right: SsaRef) -> bool {
@@ -452,14 +709,16 @@ fn selected_operand(
     dest: SsaRef,
     block: usize,
     operand: SsaRef,
-) -> Option<SsaRef> {
+) -> Option<ValueTerm> {
     if !same_reg(dest, operand) {
-        return Some(operand);
+        return Some(operand.into());
     }
 
-    let node_id = expr_analysis.def_site(operand)?;
+    let Some(node_id) = expr_analysis.def_site(operand) else {
+        return Some(operand.into());
+    };
     if node_id.block != block {
-        return Some(operand);
+        return Some(operand.into());
     }
 
     let node = function
@@ -467,9 +726,23 @@ fn selected_operand(
         .get(node_id.block)
         .and_then(|block| block.nodes.get(node_id.node))?;
     match node.op {
-        SsaOp::Move { src } => Some(src),
-        SsaOp::LoadK { idx } => Some(SsaRef::Const(idx)),
-        SsaOp::LoadNil { .. } => Some(SsaRef::None),
+        SsaOp::Move { src } => Some(src.into()),
+        SsaOp::LoadK { idx } => Some(SsaRef::Const(idx).into()),
+        SsaOp::LoadNil { .. } => Some(SsaRef::None.into()),
+        SsaOp::Phi { .. }
+        | SsaOp::Nop
+        | SsaOp::Jump { .. }
+        | SsaOp::Branch { .. }
+        | SsaOp::Return { .. }
+        | SsaOp::SetGlobal { .. }
+        | SsaOp::SetUpval { .. }
+        | SsaOp::SetTable { .. }
+        | SsaOp::ForPrep { .. }
+        | SsaOp::ForLoop { .. }
+        | SsaOp::TForLoop { .. }
+        | SsaOp::SetList { .. }
+        | SsaOp::Close { .. } => None,
+        _ if is_pure_value_node(node) => Some(ValueTerm::Node(node_id)),
         _ => None,
     }
 }
