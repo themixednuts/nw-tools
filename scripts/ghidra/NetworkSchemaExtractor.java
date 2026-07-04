@@ -56,7 +56,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
 public class NetworkSchemaExtractor extends GhidraScript {
-    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260703-custom-container-pass";
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260703-persistent-item-container-pass";
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;
@@ -13257,6 +13257,12 @@ public class NetworkSchemaExtractor extends GhidraScript {
             return null;
         }
 
+        ContainerWireShape persistentItemDataShape =
+            classifyPersistentItemDataVectorContainerWireShape(vtable);
+        if (persistentItemDataShape != null) {
+            return persistentItemDataShape;
+        }
+
         Function marshalFunction = functionAtOrContaining(marshal);
         String marshalName = fullFunctionName(marshalFunction);
         if (marshalName == null ||
@@ -13287,6 +13293,263 @@ public class NetworkSchemaExtractor extends GhidraScript {
             valueTypeShape,
             Collections.emptyList(),
             Collections.emptyList());
+    }
+
+    private ContainerWireShape classifyPersistentItemDataVectorContainerWireShape(Address vtable) {
+        Address marshalFull = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_FULL_SLOT * 8L));
+        Address unmarshalFull = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_FULL_SLOT * 8L));
+        if (!isExecutableAddress(marshalFull) || !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        Function itemMarshal = persistentItemDataLeafHelper(marshalFull, "Marshal");
+        Function itemUnmarshal = persistentItemDataLeafHelper(unmarshalFull, "Unmarshal");
+        if (itemMarshal == null || itemUnmarshal == null) {
+            return null;
+        }
+
+        List<String> valueShapes = persistentItemDataValueWireShapes();
+        NativeTypeInfoEvidence valueTypeInfo = persistentItemDataTypeInfo(itemMarshal);
+        NestedTypeShape valueTypeShape =
+            persistentItemDataValueTypeShape(vtable, itemUnmarshal, valueTypeInfo);
+
+        ArrayList<String> fullShapes = new ArrayList<>();
+        fullShapes.add("sequence-number");
+        fullShapes.add("vlq-u32");
+        fullShapes.addAll(valueShapes);
+
+        ArrayList<String> deltaShapes = new ArrayList<>();
+        deltaShapes.add("vlq-u32");
+        deltaShapes.add("u8");
+        deltaShapes.add("vlq-u64");
+        deltaShapes.add("sequence-number");
+        deltaShapes.addAll(valueShapes);
+
+        return new ContainerWireShape(
+            null,
+            null,
+            null,
+            deltaShapes,
+            fullShapes,
+            valueTypeInfo,
+            valueTypeShape,
+            valueTypeInfo == null ? Collections.emptyList() : List.of(valueTypeInfo),
+            Collections.emptyList());
+    }
+
+    private Function persistentItemDataLeafHelper(Address root, String operation) {
+        for (Function helper : reachableCallFunctions(root, 3)) {
+            if (!persistentItemDataHelperNameMatches(helper, operation)) {
+                continue;
+            }
+            List<String> shapes = "Unmarshal".equals(operation)
+                ? collectOrderedUnmarshalShapes(helper)
+                : collectOrderedMarshalShapes(helper);
+            if (wireShapesContainSubsequence(shapes, persistentItemDataValueWireShapes())) {
+                return helper;
+            }
+        }
+        return null;
+    }
+
+    private boolean persistentItemDataHelperNameMatches(Function helper, String operation) {
+        String name = fullFunctionName(helper);
+        return name != null &&
+            name.contains("GridMate::Marshaler<PersistentItemData>::" + operation);
+    }
+
+    private List<String> collectOrderedMarshalShapes(Function function) {
+        if (function == null) {
+            return Collections.emptyList();
+        }
+        ArrayList<String> shapes = new ArrayList<>();
+        collectOrderedMarshalShapes(
+            function.getEntryPoint(),
+            3,
+            new LinkedHashSet<>(),
+            shapes);
+        return shapes;
+    }
+
+    private List<String> collectOrderedUnmarshalShapes(Function function) {
+        String text = decompileFunctionText(function);
+        if (text == null || text.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        ArrayList<IndexedWireShape> indexed = new ArrayList<>();
+        for (ParsedUnmarshalCall call : parseMarshalerUnmarshalCalls(text)) {
+            String shape = wireShapeFromUnmarshalCall(call);
+            if (shape != null) {
+                indexed.add(new IndexedWireShape(call.textIndex, shape));
+            }
+        }
+        for (ParsedUnmarshalCall call : parseDirectTypeUnmarshalCalls(text)) {
+            String shape = wireShapeFromUnmarshalCall(call);
+            if (shape != null) {
+                indexed.add(new IndexedWireShape(call.textIndex, shape));
+            }
+        }
+        for (ParsedReadRawCall call : parseReadRawCalls(text)) {
+            indexed.add(new IndexedWireShape(call.textIndex, rawWriteShape(call.byteLength)));
+        }
+        indexed.sort((left, right) -> Integer.compare(left.textIndex, right.textIndex));
+
+        ArrayList<String> result = new ArrayList<>();
+        for (IndexedWireShape shape : indexed) {
+            result.add(shape.shape);
+        }
+        return result;
+    }
+
+    private String wireShapeFromUnmarshalCall(ParsedUnmarshalCall call) {
+        if (call == null) {
+            return null;
+        }
+        String functionName = call.functionName == null ? "" : call.functionName;
+        if (functionName.contains("VlqU32Marshaler::Unmarshal")) {
+            return "vlq-u32";
+        }
+        if (functionName.contains("VlqU64Marshaler::Unmarshal")) {
+            return "vlq-u64";
+        }
+        if (functionName.contains("SequenceNumber>::Unmarshal")) {
+            return "sequence-number";
+        }
+        return wireShapeFromNativeType(call.templateType);
+    }
+
+    private NativeTypeInfoEvidence persistentItemDataTypeInfo(Function evidenceFunction) {
+        SerializeTypeInfo info = serializeTypeForTypeName("PersistentItemData");
+        if (info == null) {
+            return null;
+        }
+        return new NativeTypeInfoEvidence(
+            parseCapturedAddress(info.factory),
+            info.name,
+            info.typeId,
+            "serialize-registration+marshal-helper-callgraph",
+            "serialize-json-class-name");
+    }
+
+    private NestedTypeShape persistentItemDataValueTypeShape(
+        Address vtable,
+        Function evidenceFunction,
+        NativeTypeInfoEvidence valueTypeInfo) {
+
+        NestedTypeShape shape = new NestedTypeShape();
+        if (valueTypeInfo != null) {
+            shape.typeId = valueTypeInfo.typeId;
+            shape.typeIdSource = valueTypeInfo.source;
+            shape.typeName = valueTypeInfo.name;
+            shape.typeNameFull = valueTypeInfo.name;
+            shape.typeNameSource = valueTypeInfo.nameSource;
+            shape.factory = formatAddress(valueTypeInfo.address);
+        }
+        else {
+            shape.typeName = "PersistentItemData";
+            shape.typeNameFull = "PersistentItemData";
+            shape.typeNameSource = "marshal-helper-callgraph";
+        }
+        shape.function = evidenceFunction == null ? null : evidenceFunction.getEntryPoint();
+        shape.functionName = fullFunctionName(evidenceFunction);
+        shape.vtable = vtable;
+        shape.memberBase = "item";
+        shape.memberNameSource = "synthetic-offsets-from-leaf-marshaler";
+        shape.memberNamesProven = false;
+        shape.validation = "custom-container-value-pcode-persistent-item-data";
+
+        int index = 0;
+        shape.members.add(containerValueMember(index++, 0x00, "field_00", null, "u64", 8,
+            "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x34, "field_34", "AZ::u32", "vlq-u32", 4,
+            "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x3c, "field_3c", "AZ::u32", "vlq-u32", 4,
+            "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x20, "field_20", "AZ::u16", "vlq-u32", 2,
+            "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x28, "field_28", "AZ::u16", "vlq-u32", 2,
+            "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x2a, "field_2a", "AZ::u16", "vlq-u32", 2,
+            "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x2c, "field_2c", "AZ::u16", "vlq-u32", 2,
+            "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x2e, "field_2e", "AZ::u16", "vlq-u32", 2,
+            "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x30, "field_30", "AZ::u16", "vlq-u32", 2,
+            "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x48, "field_48", "DyeData",
+            "composite<u8,u8,u8,u8>", 16, "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x10, "field_10", null, "fixed-bytes-16",
+            16, "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x40, "field_40", "AZ::u8", "u8", 1,
+            "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index++, 0x58, "field_58", "AZ::u32", "u32", 4,
+            "persistent-item-leaf-marshaler"));
+        shape.members.add(containerValueMember(index, 0x60, "field_60", "DyeData",
+            "composite<u8,u8,u8,u8>", 16, "persistent-item-leaf-marshaler"));
+        return shape;
+    }
+
+    private NestedTypeMember containerValueMember(
+        int index,
+        long offset,
+        String name,
+        String nativeType,
+        String wireShape,
+        Integer byteWidth,
+        String evidenceSource) {
+
+        NestedTypeMember member = new NestedTypeMember();
+        member.index = index;
+        member.offset = offset;
+        member.nativeOffset = offset;
+        member.name = name;
+        member.nameSource = "synthetic-offset";
+        member.nameProven = false;
+        member.nativeType = nativeType;
+        member.wireShape = wireShape;
+        member.byteWidth = byteWidth;
+        member.evidenceSource = evidenceSource;
+        return member;
+    }
+
+    private List<String> persistentItemDataValueWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.add("u64");
+        for (int i = 0; i < 8; i++) {
+            shapes.add("vlq-u32");
+        }
+        for (int i = 0; i < 4; i++) {
+            shapes.add("u8");
+        }
+        shapes.add("fixed-bytes-16");
+        shapes.add("u8");
+        shapes.add("u32");
+        for (int i = 0; i < 4; i++) {
+            shapes.add("u8");
+        }
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private boolean wireShapesContainSubsequence(List<String> observed, List<String> expected) {
+        if (observed == null || expected == null || expected.isEmpty() ||
+            observed.size() < expected.size()) {
+            return false;
+        }
+        for (int start = 0; start <= observed.size() - expected.size(); start++) {
+            boolean matches = true;
+            for (int index = 0; index < expected.size(); index++) {
+                if (!Objects.equals(observed.get(start + index), expected.get(index))) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private NestedTypeShape notificationEntryValueTypeShape(Address vtable, Address marshal) {
@@ -19218,6 +19481,16 @@ public class NetworkSchemaExtractor extends GhidraScript {
             this.storageExpression = storageExpression;
             this.byteLength = byteLength;
             this.textIndex = textIndex;
+        }
+    }
+
+    private static final class IndexedWireShape {
+        final int textIndex;
+        final String shape;
+
+        IndexedWireShape(int textIndex, String shape) {
+            this.textIndex = textIndex;
+            this.shape = shape;
         }
     }
 
