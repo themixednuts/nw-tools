@@ -21,8 +21,11 @@ const VK_FORMAT_R8G8B8A8_UNORM: u32 = 37;
 const VK_FORMAT_R8G8B8A8_SRGB: u32 = 43;
 const VK_FORMAT_B8G8R8A8_UNORM: u32 = 44;
 const VK_FORMAT_B8G8R8A8_SRGB: u32 = 50;
+const VK_FORMAT_R16_UNORM: u32 = 70;
 const VK_FORMAT_R16_SFLOAT: u32 = 76;
+const VK_FORMAT_R16G16_UNORM: u32 = 77;
 const VK_FORMAT_R16G16_SFLOAT: u32 = 83;
+const VK_FORMAT_R16G16B16A16_UNORM: u32 = 91;
 const VK_FORMAT_R16G16B16A16_SFLOAT: u32 = 97;
 const VK_FORMAT_R32_SFLOAT: u32 = 100;
 const VK_FORMAT_R32G32_SFLOAT: u32 = 103;
@@ -74,6 +77,12 @@ pub enum Error {
 
     #[error("RGBA8 pixels contain {actual} bytes, expected {expected}")]
     RgbaSize { expected: u64, actual: usize },
+
+    #[error("RGBA16 pixels contain {actual} samples, expected {expected}")]
+    Rgba16Size { expected: u64, actual: usize },
+
+    #[error("RGBA32F pixels contain {actual} samples, expected {expected}")]
+    Rgba32FloatSize { expected: u64, actual: usize },
 
     #[error("DDS mip level {level} contains {actual} bytes, expected {expected}")]
     MipSize {
@@ -128,23 +137,24 @@ impl Ktx2 {
     /// exactly `width * height * 4`, or the resulting KTX2 indexes would
     /// overflow.
     pub fn from_rgba8(width: u32, height: u32, rgba: &[u8]) -> Result<Self, Error> {
-        if width == 0 {
-            return Err(Error::UnsupportedShape {
-                reason: "zero texture width",
-            });
-        }
-        if height == 0 {
-            return Err(Error::UnsupportedShape {
-                reason: "zero texture height",
-            });
-        }
+        Self::from_rgba8_with_srgb(width, height, rgba, false)
+    }
 
-        let expected = u64::from(width)
-            .checked_mul(u64::from(height))
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or(Error::SizeOverflow {
-                what: "RGBA8 pixels",
-            })?;
+    /// Write a single-mip RGBA8 image to a KTX2 container, selecting UNORM or
+    /// sRGB storage from the source color space.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if dimensions are zero, the RGBA8 byte count is not
+    /// exactly `width * height * 4`, or the resulting KTX2 indexes would
+    /// overflow.
+    pub fn from_rgba8_with_srgb(
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        srgb: bool,
+    ) -> Result<Self, Error> {
+        let expected = expected_rgba_elements(width, height, "RGBA8 pixels")?;
         if u64::try_from(rgba.len()).map_err(|_| Error::SizeOverflow {
             what: "RGBA8 pixels",
         })? != expected
@@ -155,20 +165,91 @@ impl Ktx2 {
             });
         }
 
-        let texture = Texture {
-            format: Format::plain(VK_FORMAT_R8G8B8A8_UNORM, 4, 1),
-            width,
-            height,
-            depth: 1,
-            pixel_height: height,
-            pixel_depth: 0,
-            layer_count: 0,
-            face_count: 1,
-            level_count: 1,
+        let vk = if srgb {
+            VK_FORMAT_R8G8B8A8_SRGB
+        } else {
+            VK_FORMAT_R8G8B8A8_UNORM
         };
+        let texture = single_mip_texture(Format::plain(vk, 4, 1), width, height)?;
         let levels = Levels { bytes: vec![rgba] };
         let bytes = texture.write(&levels)?;
         Ok(Self { bytes })
+    }
+
+    /// Write a single-mip RGBA16 UNORM image to a KTX2 container.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if dimensions are zero, the RGBA16 sample count is not
+    /// exactly `width * height * 4`, or the resulting KTX2 indexes would
+    /// overflow.
+    pub fn from_rgba16(width: u32, height: u32, rgba: &[u16]) -> Result<Self, Error> {
+        let expected = expected_rgba_elements(width, height, "RGBA16 pixels")?;
+        if u64::try_from(rgba.len()).map_err(|_| Error::SizeOverflow {
+            what: "RGBA16 pixels",
+        })? != expected
+        {
+            return Err(Error::Rgba16Size {
+                expected,
+                actual: rgba.len(),
+            });
+        }
+
+        let mut bytes =
+            Vec::with_capacity(rgba.len().checked_mul(2).ok_or(Error::SizeOverflow {
+                what: "RGBA16 pixels",
+            })?);
+        for sample in rgba {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        let texture = single_mip_texture(
+            Format::plain(VK_FORMAT_R16G16B16A16_UNORM, 8, 2),
+            width,
+            height,
+        )?;
+        let levels = Levels {
+            bytes: vec![bytes.as_slice()],
+        };
+        let out = texture.write(&levels)?;
+        Ok(Self { bytes: out })
+    }
+
+    /// Write a single-mip RGBA32F image to a KTX2 container.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if dimensions are zero, the RGBA float sample count is
+    /// not exactly `width * height * 4`, or the resulting KTX2 indexes would
+    /// overflow.
+    pub fn from_rgba32f(width: u32, height: u32, rgba: &[f32]) -> Result<Self, Error> {
+        let expected = expected_rgba_elements(width, height, "RGBA32F pixels")?;
+        if u64::try_from(rgba.len()).map_err(|_| Error::SizeOverflow {
+            what: "RGBA32F pixels",
+        })? != expected
+        {
+            return Err(Error::Rgba32FloatSize {
+                expected,
+                actual: rgba.len(),
+            });
+        }
+
+        let mut bytes =
+            Vec::with_capacity(rgba.len().checked_mul(4).ok_or(Error::SizeOverflow {
+                what: "RGBA32F pixels",
+            })?);
+        for sample in rgba {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        let texture = single_mip_texture(
+            Format::plain(VK_FORMAT_R32G32B32A32_SFLOAT, 16, 4),
+            width,
+            height,
+        )?;
+        let levels = Levels {
+            bytes: vec![bytes.as_slice()],
+        };
+        let out = texture.write(&levels)?;
+        Ok(Self { bytes: out })
     }
 
     #[must_use]
@@ -190,6 +271,22 @@ pub struct DecodedImage {
     pub rgba: Vec<u8>,
 }
 
+/// An RGBA16 UNORM image decoded from a texture (row-major, tightly packed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedImage16 {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u16>,
+}
+
+/// An RGBA32F image decoded from a float texture (row-major, tightly packed).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedFloatImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<f32>,
+}
+
 /// Decode the largest mip of a DDS to RGBA8, assembling split sidecars first.
 ///
 /// Supports the block formats New World ships (BC1–BC7) and plain 32-bit
@@ -203,24 +300,56 @@ pub fn decode_top_mip<'a>(
     bytes: &'a [u8],
     sidecars: &[Sidecar<'a>],
 ) -> Result<DecodedImage, Error> {
-    let dds = Dds::parse(bytes)?;
-    let texture = Texture::from_dds(&dds)?;
-    let payload = dds.payload(bytes).ok_or(Error::PayloadSize {
-        expected: u64::try_from(dds.payload_bytes()).unwrap_or(u64::MAX),
-        actual: bytes.len().saturating_sub(DDS_FILE_HEADER_LEN),
-    })?;
-    let levels = Levels::from_dds(&dds, texture, payload, sidecars)?;
-    let blocks = levels
-        .bytes
-        .first()
-        .copied()
-        .ok_or(Error::UnsupportedShape {
-            reason: "texture has no mip levels",
-        })?;
-    let width = texture.width.max(1);
-    let height = texture.height.max(1);
+    let (texture, blocks, width, height) = top_mip_blocks(bytes, sidecars)?;
     let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
     Ok(DecodedImage {
+        width,
+        height,
+        rgba,
+    })
+}
+
+/// Decode the largest mip of a DDS to RGBA16 UNORM, assembling split sidecars
+/// first.
+///
+/// Supports plain 16-bit integer DDS formats. Block-compressed and float
+/// formats return [`Error::UnsupportedVulkanFormat`].
+///
+/// # Errors
+///
+/// Returns [`Error`] when the DDS is invalid, sidecars are missing/mismatched, or
+/// the encoded format cannot be decoded to RGBA16.
+pub fn decode_top_mip_rgba16<'a>(
+    bytes: &'a [u8],
+    sidecars: &[Sidecar<'a>],
+) -> Result<DecodedImage16, Error> {
+    let (texture, blocks, width, height) = top_mip_blocks(bytes, sidecars)?;
+    let rgba = decode_rgba16(texture.format.vk, blocks, width as usize, height as usize)?;
+    Ok(DecodedImage16 {
+        width,
+        height,
+        rgba,
+    })
+}
+
+/// Decode the largest mip of a float DDS to RGBA32F, assembling split sidecars
+/// first.
+///
+/// Supports plain 16-bit and 32-bit float DDS formats. BC6H is classified as a
+/// float/HDR format by callers but is intentionally not decoded here because the
+/// available decoder path only exposes 8-bit preview pixels.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the DDS is invalid, sidecars are missing/mismatched, or
+/// the encoded format cannot be decoded to RGBA32F.
+pub fn decode_top_mip_float<'a>(
+    bytes: &'a [u8],
+    sidecars: &[Sidecar<'a>],
+) -> Result<DecodedFloatImage, Error> {
+    let (texture, blocks, width, height) = top_mip_blocks(bytes, sidecars)?;
+    let rgba = decode_float(texture.format.vk, blocks, width as usize, height as usize)?;
+    Ok(DecodedFloatImage {
         width,
         height,
         rgba,
@@ -417,12 +546,39 @@ pub fn decode_mip_max(
     }
 }
 
+fn top_mip_blocks<'a>(
+    bytes: &'a [u8],
+    sidecars: &[Sidecar<'a>],
+) -> Result<(Texture, &'a [u8], u32, u32), Error> {
+    let dds = Dds::parse(bytes)?;
+    let texture = Texture::from_dds(&dds)?;
+    let payload = dds.payload(bytes).ok_or(Error::PayloadSize {
+        expected: u64::try_from(dds.payload_bytes()).unwrap_or(u64::MAX),
+        actual: bytes.len().saturating_sub(DDS_FILE_HEADER_LEN),
+    })?;
+    let levels = Levels::from_dds(&dds, texture, payload, sidecars)?;
+    let blocks = levels
+        .bytes
+        .first()
+        .copied()
+        .ok_or(Error::UnsupportedShape {
+            reason: "texture has no mip levels",
+        })?;
+    Ok((texture, blocks, texture.width.max(1), texture.height.max(1)))
+}
+
 fn decode_rgba(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Error> {
     let pixels = width.checked_mul(height).ok_or(Error::SizeOverflow {
         what: "image dimensions",
     })?;
     let unsupported = || Error::UnsupportedVulkanFormat { vk_format: vk };
     match vk {
+        VK_FORMAT_R8_UNORM => {
+            return plain_r8(data, pixels);
+        }
+        VK_FORMAT_R8G8_UNORM => {
+            return plain_rg8(data, pixels);
+        }
         VK_FORMAT_R8G8B8A8_UNORM | VK_FORMAT_R8G8B8A8_SRGB => {
             return plain_rgba(data, pixels, false);
         }
@@ -477,6 +633,34 @@ fn decode_rgba(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<
         chunk[3] = (color >> 24) as u8;
     }
     Ok(rgba)
+}
+
+fn decode_rgba16(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<u16>, Error> {
+    let pixels = width.checked_mul(height).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    match vk {
+        VK_FORMAT_R16_UNORM => plain_r16(data, pixels),
+        VK_FORMAT_R16G16_UNORM => plain_rg16(data, pixels),
+        VK_FORMAT_R16G16B16A16_UNORM => plain_rgba16(data, pixels),
+        _ => Err(Error::UnsupportedVulkanFormat { vk_format: vk }),
+    }
+}
+
+fn decode_float(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<f32>, Error> {
+    let pixels = width.checked_mul(height).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    match vk {
+        VK_FORMAT_R16_SFLOAT => plain_r16f(data, pixels),
+        VK_FORMAT_R16G16_SFLOAT => plain_rg16f(data, pixels),
+        VK_FORMAT_R16G16B16A16_SFLOAT => plain_rgba16f(data, pixels),
+        VK_FORMAT_R32_SFLOAT => plain_r32f(data, pixels),
+        VK_FORMAT_R32G32_SFLOAT => plain_rg32f(data, pixels),
+        VK_FORMAT_R32G32B32_SFLOAT => plain_rgb32f(data, pixels),
+        VK_FORMAT_R32G32B32A32_SFLOAT => plain_rgba32f(data, pixels),
+        _ => Err(Error::UnsupportedVulkanFormat { vk_format: vk }),
+    }
 }
 
 /// Decode a BCn texture whose blocks expand to RGBA8 using a per-block `decode`
@@ -557,6 +741,267 @@ fn plain_rgba(data: &[u8], pixels: usize, swap_rb: bool) -> Result<Vec<u8>, Erro
         }
     }
     Ok(rgba)
+}
+
+fn plain_r8(data: &[u8], pixels: usize) -> Result<Vec<u8>, Error> {
+    let bytes = data.get(..pixels).ok_or(Error::PayloadSize {
+        expected: pixels as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![0u8; pixels * 4];
+    for (pixel, &r) in rgba.chunks_exact_mut(4).zip(bytes.iter()) {
+        pixel[0] = r;
+        pixel[3] = 255;
+    }
+    Ok(rgba)
+}
+
+fn plain_rg8(data: &[u8], pixels: usize) -> Result<Vec<u8>, Error> {
+    let needed = pixels.checked_mul(2).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![0u8; pixels * 4];
+    for (pixel, rg) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(2)) {
+        pixel[0] = rg[0];
+        pixel[1] = rg[1];
+        pixel[3] = 255;
+    }
+    Ok(rgba)
+}
+
+fn plain_r16(data: &[u8], pixels: usize) -> Result<Vec<u16>, Error> {
+    let needed = pixels.checked_mul(2).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![0u16; pixels * 4];
+    for (pixel, r) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(2)) {
+        pixel[0] = u16::from_le_bytes([r[0], r[1]]);
+        pixel[3] = u16::MAX;
+    }
+    Ok(rgba)
+}
+
+fn plain_rg16(data: &[u8], pixels: usize) -> Result<Vec<u16>, Error> {
+    let needed = pixels.checked_mul(4).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![0u16; pixels * 4];
+    for (pixel, rg) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
+        pixel[0] = u16::from_le_bytes([rg[0], rg[1]]);
+        pixel[1] = u16::from_le_bytes([rg[2], rg[3]]);
+        pixel[3] = u16::MAX;
+    }
+    Ok(rgba)
+}
+
+fn plain_rgba16(data: &[u8], pixels: usize) -> Result<Vec<u16>, Error> {
+    let needed = pixels.checked_mul(8).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = Vec::with_capacity(pixels * 4);
+    for sample in bytes.chunks_exact(2) {
+        rgba.push(u16::from_le_bytes([sample[0], sample[1]]));
+    }
+    Ok(rgba)
+}
+
+fn plain_r16f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
+    let needed = pixels.checked_mul(2).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![0.0f32; pixels * 4];
+    for (pixel, r) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(2)) {
+        pixel[0] = half_to_f32(u16::from_le_bytes([r[0], r[1]]));
+        pixel[3] = 1.0;
+    }
+    Ok(rgba)
+}
+
+fn plain_rg16f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
+    let needed = pixels.checked_mul(4).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![0.0f32; pixels * 4];
+    for (pixel, rg) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
+        pixel[0] = half_to_f32(u16::from_le_bytes([rg[0], rg[1]]));
+        pixel[1] = half_to_f32(u16::from_le_bytes([rg[2], rg[3]]));
+        pixel[3] = 1.0;
+    }
+    Ok(rgba)
+}
+
+fn plain_rgba16f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
+    let needed = pixels.checked_mul(8).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = Vec::with_capacity(pixels * 4);
+    for sample in bytes.chunks_exact(2) {
+        rgba.push(half_to_f32(u16::from_le_bytes([sample[0], sample[1]])));
+    }
+    Ok(rgba)
+}
+
+fn plain_r32f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
+    let needed = pixels.checked_mul(4).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![0.0f32; pixels * 4];
+    for (pixel, r) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
+        pixel[0] = f32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+        pixel[3] = 1.0;
+    }
+    Ok(rgba)
+}
+
+fn plain_rg32f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
+    let needed = pixels.checked_mul(8).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![0.0f32; pixels * 4];
+    for (pixel, rg) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(8)) {
+        pixel[0] = f32::from_le_bytes([rg[0], rg[1], rg[2], rg[3]]);
+        pixel[1] = f32::from_le_bytes([rg[4], rg[5], rg[6], rg[7]]);
+        pixel[3] = 1.0;
+    }
+    Ok(rgba)
+}
+
+fn plain_rgb32f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
+    let needed = pixels.checked_mul(12).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![0.0f32; pixels * 4];
+    for (pixel, rgb) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(12)) {
+        pixel[0] = f32::from_le_bytes([rgb[0], rgb[1], rgb[2], rgb[3]]);
+        pixel[1] = f32::from_le_bytes([rgb[4], rgb[5], rgb[6], rgb[7]]);
+        pixel[2] = f32::from_le_bytes([rgb[8], rgb[9], rgb[10], rgb[11]]);
+        pixel[3] = 1.0;
+    }
+    Ok(rgba)
+}
+
+fn plain_rgba32f(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
+    let needed = pixels.checked_mul(16).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = Vec::with_capacity(pixels * 4);
+    for sample in bytes.chunks_exact(4) {
+        rgba.push(f32::from_le_bytes([
+            sample[0], sample[1], sample[2], sample[3],
+        ]));
+    }
+    Ok(rgba)
+}
+
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = (u32::from(bits & 0x8000)) << 16;
+    let exp = (bits & 0x7c00) >> 10;
+    let mant = u32::from(bits & 0x03ff);
+    let f_bits = match exp {
+        0 if mant == 0 => sign,
+        0 => {
+            let mut mantissa = mant;
+            let mut exponent = -14i32;
+            while mantissa & 0x0400 == 0 {
+                mantissa <<= 1;
+                exponent -= 1;
+            }
+            mantissa &= 0x03ff;
+            let exp32 = u32::try_from(exponent + 127).unwrap_or(0);
+            sign | (exp32 << 23) | (mantissa << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | (mant << 13),
+        _ => {
+            let exp32 = u32::from(exp) + (127 - 15);
+            sign | (exp32 << 23) | (mant << 13)
+        }
+    };
+    f32::from_bits(f_bits)
+}
+
+fn expected_rgba_elements(width: u32, height: u32, what: &'static str) -> Result<u64, Error> {
+    if width == 0 {
+        return Err(Error::UnsupportedShape {
+            reason: "zero texture width",
+        });
+    }
+    if height == 0 {
+        return Err(Error::UnsupportedShape {
+            reason: "zero texture height",
+        });
+    }
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(Error::SizeOverflow { what })
+}
+
+fn single_mip_texture(format: Format, width: u32, height: u32) -> Result<Texture, Error> {
+    if width == 0 {
+        return Err(Error::UnsupportedShape {
+            reason: "zero texture width",
+        });
+    }
+    if height == 0 {
+        return Err(Error::UnsupportedShape {
+            reason: "zero texture height",
+        });
+    }
+    Ok(Texture {
+        format,
+        width,
+        height,
+        depth: 1,
+        pixel_height: height,
+        pixel_depth: 0,
+        layer_count: 0,
+        face_count: 1,
+        level_count: 1,
+    })
 }
 
 impl<'a> Sidecar<'a> {
@@ -797,13 +1242,16 @@ impl Format {
             2 => Ok(Self::plain(VK_FORMAT_R32G32B32A32_SFLOAT, 16, 4)),
             6 => Ok(Self::plain(VK_FORMAT_R32G32B32_SFLOAT, 12, 4)),
             10 => Ok(Self::plain(VK_FORMAT_R16G16B16A16_SFLOAT, 8, 2)),
+            11 => Ok(Self::plain(VK_FORMAT_R16G16B16A16_UNORM, 8, 2)),
             16 => Ok(Self::plain(VK_FORMAT_R32G32_SFLOAT, 8, 4)),
             28 => Ok(Self::plain(VK_FORMAT_R8G8B8A8_UNORM, 4, 1)),
             29 => Ok(Self::plain(VK_FORMAT_R8G8B8A8_SRGB, 4, 1)),
             34 => Ok(Self::plain(VK_FORMAT_R16G16_SFLOAT, 4, 2)),
+            35 => Ok(Self::plain(VK_FORMAT_R16G16_UNORM, 4, 2)),
             41 => Ok(Self::plain(VK_FORMAT_R32_SFLOAT, 4, 4)),
             49 => Ok(Self::plain(VK_FORMAT_R8G8_UNORM, 2, 1)),
             54 => Ok(Self::plain(VK_FORMAT_R16_SFLOAT, 2, 2)),
+            56 => Ok(Self::plain(VK_FORMAT_R16_UNORM, 2, 2)),
             61 => Ok(Self::plain(VK_FORMAT_R8_UNORM, 1, 1)),
             70 => Ok(Self::block(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8)),
             71 => Ok(Self::block(VK_FORMAT_BC1_RGBA_SRGB_BLOCK, 8)),

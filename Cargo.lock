@@ -1654,6 +1654,7 @@ version = "0.1.0"
 dependencies = [
  "bcdec_rs",
  "criterion",
+ "image",
  "ktx2",
  "texture2ddecoder",
  "thiserror 2.0.18",

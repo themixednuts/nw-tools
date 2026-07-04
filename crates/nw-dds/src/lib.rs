@@ -4,14 +4,16 @@
 mod container;
 
 use std::fmt;
+use std::io::Cursor;
 use std::ops::Range;
 use std::path::Path;
 
 use thiserror::Error;
 
 pub use container::{
-    DecodedImage, Error as Ktx2Error, Ktx2, Sidecar, decode_all_mips, decode_all_mips_until,
-    decode_header_mip, decode_mip_max, decode_top_mip,
+    DecodedFloatImage, DecodedImage, DecodedImage16, Error as Ktx2Error, Ktx2, Sidecar,
+    decode_all_mips, decode_all_mips_until, decode_header_mip, decode_mip_max, decode_top_mip,
+    decode_top_mip_float, decode_top_mip_rgba16,
 };
 
 pub const DDS_EXTENSION: &str = "dds";
@@ -104,6 +106,39 @@ pub struct Dx10Header {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CryFlags(u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DdsFormatCode {
+    Dxgi(u32),
+    FourCc([u8; 4]),
+    PixelMasks {
+        flags: u32,
+        rgb_bit_count: u32,
+        red_mask: u32,
+        green_mask: u32,
+        blue_mask: u32,
+        alpha_mask: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedPng {
+    Rgba8(DecodedImage),
+    Rgba16(DecodedImage16),
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum PngError {
+    #[error("RGBA8 PNG source contains {actual} bytes, expected {expected}")]
+    Rgba8Size { expected: u64, actual: usize },
+    #[error("RGBA16 PNG source contains {actual} samples, expected {expected}")]
+    Rgba16Size { expected: u64, actual: usize },
+    #[error("image dimensions are too large")]
+    SizeOverflow,
+    #[error("PNG codec: {0}")]
+    Image(#[from] image::ImageError),
+}
 
 impl Dds {
     /// Parse a DDS file header.
@@ -243,6 +278,24 @@ impl Dds {
     #[must_use]
     pub fn format_name(&self) -> String {
         self.pixel_format.format_name(self.dx10)
+    }
+
+    #[must_use]
+    pub const fn format_code(&self) -> DdsFormatCode {
+        if let Some(dx10) = self.dx10 {
+            return DdsFormatCode::Dxgi(dx10.dxgi_format);
+        }
+        if self.pixel_format.has_four_cc() {
+            return DdsFormatCode::FourCc(self.pixel_format.four_cc);
+        }
+        DdsFormatCode::PixelMasks {
+            flags: self.pixel_format.flags,
+            rgb_bit_count: self.pixel_format.rgb_bit_count,
+            red_mask: self.pixel_format.red_mask,
+            green_mask: self.pixel_format.green_mask,
+            blue_mask: self.pixel_format.blue_mask,
+            alpha_mask: self.pixel_format.alpha_mask,
+        }
     }
 
     #[must_use]
@@ -656,6 +709,96 @@ pub fn is_dds_path(path: impl AsRef<Path>) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(is_dds_name)
+}
+
+/// Write tightly packed RGBA8 pixels as PNG bytes.
+///
+/// # Errors
+///
+/// Returns [`PngError`] if the dimensions overflow, the byte count does not
+/// match `width * height * 4`, or PNG serialization fails.
+pub fn write_rgba8_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, PngError> {
+    let expected = expected_rgba_len(width, height)?;
+    if u64::try_from(rgba.len()).map_err(|_| PngError::SizeOverflow)? != expected {
+        return Err(PngError::Rgba8Size {
+            expected,
+            actual: rgba.len(),
+        });
+    }
+    let image =
+        image::RgbaImage::from_raw(width, height, rgba.to_vec()).ok_or(PngError::Rgba8Size {
+            expected,
+            actual: rgba.len(),
+        })?;
+    let mut cursor = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image).write_to(&mut cursor, image::ImageFormat::Png)?;
+    Ok(cursor.into_inner())
+}
+
+/// Write tightly packed RGBA16 pixels as PNG bytes.
+///
+/// # Errors
+///
+/// Returns [`PngError`] if the dimensions overflow, the sample count does not
+/// match `width * height * 4`, or PNG serialization fails.
+pub fn write_rgba16_png(width: u32, height: u32, rgba: &[u16]) -> Result<Vec<u8>, PngError> {
+    let expected = expected_rgba_len(width, height)?;
+    if u64::try_from(rgba.len()).map_err(|_| PngError::SizeOverflow)? != expected {
+        return Err(PngError::Rgba16Size {
+            expected,
+            actual: rgba.len(),
+        });
+    }
+    let image =
+        image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(width, height, rgba.to_vec())
+            .ok_or(PngError::Rgba16Size {
+                expected,
+                actual: rgba.len(),
+            })?;
+    let mut cursor = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba16(image).write_to(&mut cursor, image::ImageFormat::Png)?;
+    Ok(cursor.into_inner())
+}
+
+/// Read PNG bytes into tightly packed RGBA pixels, preserving 16-bit integer
+/// precision when the PNG is 16-bit.
+///
+/// # Errors
+///
+/// Returns [`PngError`] if PNG parsing fails.
+pub fn read_png(bytes: &[u8]) -> Result<DecodedPng, PngError> {
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?;
+    let color = image.color();
+    let width = image.width();
+    let height = image.height();
+    match color {
+        image::ColorType::L16
+        | image::ColorType::La16
+        | image::ColorType::Rgb16
+        | image::ColorType::Rgba16 => {
+            let rgba = image.to_rgba16().into_raw();
+            Ok(DecodedPng::Rgba16(DecodedImage16 {
+                width,
+                height,
+                rgba,
+            }))
+        }
+        _ => {
+            let rgba = image.to_rgba8().into_raw();
+            Ok(DecodedPng::Rgba8(DecodedImage {
+                width,
+                height,
+                rgba,
+            }))
+        }
+    }
+}
+
+fn expected_rgba_len(width: u32, height: u32) -> Result<u64, PngError> {
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(PngError::SizeOverflow)
 }
 
 fn four_cc_name(four_cc: [u8; 4]) -> String {
