@@ -2068,6 +2068,7 @@ dependencies = [
  "nw-jobs",
  "nw-localization",
  "nw-locator",
+ "nw-lua",
  "nw-model",
  "nw-objectstream",
  "nw-pak",

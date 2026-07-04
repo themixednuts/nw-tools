@@ -23,3 +23,7 @@ thiserror.workspace = true
 [[bin]]
 name = "nw-lua"
 path = "src/bin/nw-lua.rs"
+
+[[bench]]
+name = "decompile_hot_path"
+harness = false

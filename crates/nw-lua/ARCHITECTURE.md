@@ -303,8 +303,16 @@ Vertical, tracer-bullet slices. Each phase must `cargo build -p nw-lua`,
   must stay general for any Lua 5.1 bytecode. The NW corpus is **validation only** (diverse test
   bytecode), never a heuristic source. **Validate**: self-contained runtime-equivalence
   reproductions of each *generic* control-flow pattern + real files decompile→reparse→
-  **recompile→decompile idempotent** (fixpoint proxy, since NW files can't run standalone). Gate:
-  100% OK, 0 crashes.
+  **recompile→decompile idempotent** (fixpoint proxy, since NW files can't run standalone).
+  **Bar recalibrated (owner decision):** the goal is **100% recompile-cleanly** (luac accepts the
+  decompiled output) + **comprehensive runtime-equivalence** on generic constructs — NOT
+  instruction-identity (equivalent source compiles differently; that's an unachievable/meaningless
+  bar for a decompiler). The core (`--no-idiomatic`) structural opcode comparison is a **soft
+  bug-finder** (report the match rate; fix genuine control-flow bugs it surfaces; ignore benign
+  compilation diffs). **High-priority correctness fix:** expression inlining / local-lifetime —
+  the decompiler over-materializes (one `local` per SSA temp → 200-local overflow that won't
+  recompile, plus drift + ugly temps); inline single-use, **evaluation-order-safe** values so the
+  local count ≈ the original. Hard gate: 100% decompile-OK, 0 crashes, **100% recompile-clean**.
 - **P10c — Lua 5.1.5 spec-completeness audit.** Verify full 5.1.5 coverage (all 38 opcodes, constant
   types + number formats, chunk-format edge cases, arg modes, language constructs, string escapes)
   vs the 5.1.5 manual + `lundump.c`/`lopcodes.h`/`lvm.c`. Report in `docs/LUA51_COVERAGE.md`; finish

@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_CASE_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -44,6 +44,12 @@ impl CasePaths {
     }
 }
 
+impl Drop for CasePaths {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 #[allow(dead_code)]
 pub fn run_equivalence(name: &str, source: &str) -> Option<String> {
     run_equivalence_with_args(name, source, &[])
@@ -57,6 +63,44 @@ pub fn run_stripped_equivalence(name: &str, source: &str) -> Option<String> {
 #[allow(dead_code)]
 pub fn run_equivalence_with_args(name: &str, source: &str, args: &[&str]) -> Option<String> {
     run_equivalence_inner(name, source, args, false)
+}
+
+#[allow(dead_code)]
+pub fn compile_source_bytes(name: &str, source: &str, strip_debug: bool) -> Option<Vec<u8>> {
+    let tools = lua_tools()?;
+    let paths = CasePaths::new(name);
+
+    fs::write(&paths.source, source).expect("write Lua source");
+    compile_lua(tools.luac, &paths.source, &paths.bytecode, strip_debug);
+    let bytecode = fs::read(&paths.bytecode).expect("read compiled bytecode");
+
+    paths.cleanup();
+    Some(bytecode)
+}
+
+#[allow(dead_code)]
+pub fn run_bytecode_equivalence(name: &str, bytecode: &[u8], args: &[&str]) -> Option<String> {
+    let tools = lua_tools()?;
+    let paths = CasePaths::new(name);
+
+    fs::write(&paths.bytecode, bytecode).expect("write original bytecode");
+    let original_stdout = run_lua(tools.lua, &paths.bytecode, args, "original Lua bytecode");
+    let decompiled = nw_lua::decompile(bytecode).expect("decompile bytecode");
+    full_moon::parse(&decompiled).expect("decompiled source reparses with full_moon");
+
+    fs::write(&paths.decompiled, &decompiled).expect("write decompiled Lua source");
+    let decompiled_stdout = run_lua(tools.lua, &paths.decompiled, args, "decompiled Lua source");
+    assert_eq!(
+        original_stdout,
+        decompiled_stdout,
+        "{name} stdout differed\noriginal:\n{}\ndecompiled source:\n{}\ndecompiled stdout:\n{}",
+        String::from_utf8_lossy(&original_stdout),
+        decompiled,
+        String::from_utf8_lossy(&decompiled_stdout)
+    );
+
+    paths.cleanup();
+    Some(decompiled)
 }
 
 fn run_equivalence_inner(
@@ -108,12 +152,31 @@ fn lua_tools() -> Option<LuaTools> {
 }
 
 fn run_lua(lua: &str, source: &Path, args: &[&str], context: &str) -> Vec<u8> {
-    let output = Command::new(lua)
+    let mut child = Command::new(lua)
         .arg(source)
         .args(args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap_or_else(|err| panic!("failed to run {context}: {err}"));
-    assert_success(output, context)
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let output = child
+                    .wait_with_output()
+                    .unwrap_or_else(|err| panic!("failed to collect {context}: {err}"));
+                return assert_success(output, context);
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{context} timed out after 10s: {}", source.display());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(err) => panic!("failed to wait for {context}: {err}"),
+        }
+    }
 }
 
 fn compile_lua(luac: &str, source: &Path, bytecode: &Path, strip_debug: bool) {

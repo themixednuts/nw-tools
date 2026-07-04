@@ -111,6 +111,17 @@ impl<'a> NameResolver<'a> {
         }
     }
 
+    /// Return the canonical emitted name for a debug binding at a definition.
+    #[must_use]
+    pub fn name_for_binding_def(&self, binding: &LocalBinding, reference: SsaRef) -> Name {
+        if binding.name.is_synthetic() {
+            return self
+                .value_name(reference)
+                .unwrap_or_else(|| self.synthetic_value_name(reference));
+        }
+        binding.name.clone()
+    }
+
     /// Return a deterministic register fallback name.
     #[must_use]
     pub fn synthetic_reg_name(&self, reg: u16) -> Name {
@@ -127,15 +138,15 @@ impl<'a> NameResolver<'a> {
     #[must_use]
     pub fn upvalue_name(&self, idx: u16) -> Name {
         let idx_usize = usize::from(idx);
-        if let Some(upvalue) = self.proto.upvalues.get(idx_usize)
-            && is_valid_identifier(&upvalue.name)
-        {
-            return Name::new(upvalue.name.clone());
-        }
         if let Some(name) = self.upvalue_overrides.get(idx_usize)
             && is_valid_identifier(&name.0)
         {
             return name.clone();
+        }
+        if let Some(upvalue) = self.proto.upvalues.get(idx_usize)
+            && is_valid_identifier(&upvalue.name)
+        {
+            return name_from_debug_identifier(upvalue.name.clone());
         }
         Name::from(format!("up{idx}"))
     }
@@ -443,6 +454,9 @@ impl<'a> NamingPass<'a> {
     fn debug_names_by_root(&mut self) -> BTreeMap<usize, Name> {
         let mut names = BTreeMap::new();
         for binding in self.local_bindings {
+            if binding.name.is_synthetic() {
+                continue;
+            }
             let mut matching_id = None;
             for (id, slot) in self.values.iter().enumerate() {
                 if slot.value.reg == binding.reg && self.value_in_binding(slot, binding) {
@@ -563,7 +577,7 @@ fn parameter_name_for(proto: &Proto, overrides: &[Option<Name>], reg: u8) -> Nam
     if let Some(loc) = proto.loc_vars.get(index)
         && is_visible_local(loc)
     {
-        return Name::new(loc.name.clone());
+        return name_from_debug_identifier(loc.name.clone());
     }
     Name::from(format!("arg{}", u16::from(reg) + 1))
 }
@@ -584,7 +598,7 @@ fn local_bindings(proto: &Proto, parameter_names: &[Name]) -> Vec<LocalBinding> 
                     .cloned()
                     .unwrap_or_else(|| Name::from(format!("arg{}", index + 1)))
             } else {
-                Name::new(loc.name.clone())
+                name_from_debug_identifier(loc.name.clone())
             };
             Some(LocalBinding {
                 index,
@@ -623,10 +637,12 @@ fn reserved_names(
         used.insert(name.0.to_string());
     }
     for binding in local_bindings {
-        used.insert(binding.name.0.to_string());
+        if !binding.name.is_synthetic() {
+            used.insert(binding.name.0.to_string());
+        }
     }
     for name in upvalue_overrides {
-        if is_valid_identifier(&name.0) {
+        if is_valid_identifier(&name.0) && !name.is_synthetic() {
             used.insert(name.0.to_string());
         }
     }
@@ -646,6 +662,52 @@ fn unique_name(base: String, used: &mut BTreeSet<String>) -> Name {
 
 fn is_visible_local(loc: &LocVar) -> bool {
     !is_internal_local(loc) && is_valid_identifier(&loc.name)
+}
+
+fn name_from_debug_identifier(bytes: BString) -> Name {
+    if is_synthetic_identifier(bytes.as_slice()) {
+        Name::synthetic(bytes)
+    } else {
+        Name::new(bytes)
+    }
+}
+
+fn is_synthetic_identifier(bytes: &[u8]) -> bool {
+    has_prefixed_number(bytes, b"v", true)
+        || has_prefixed_number(bytes, b"arg", false)
+        || has_prefixed_number(bytes, b"up", false)
+        || has_prefixed_number(bytes, b"k", false)
+        || has_prefixed_number(bytes, b"__nw_lua_pack_", false)
+        || has_prefixed_number(bytes, b"__nw_lua_values_", false)
+        || has_prefixed_number(bytes, b"__nw_lua_index_", false)
+}
+
+fn has_prefixed_number(bytes: &[u8], prefix: &[u8], allow_number_suffixes: bool) -> bool {
+    let Some(rest) = bytes.strip_prefix(prefix) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    if !allow_number_suffixes {
+        return rest.iter().copied().all(|byte| byte.is_ascii_digit());
+    }
+    let mut saw_digit = false;
+    let mut previous_was_underscore = false;
+    for byte in rest {
+        match *byte {
+            b'0'..=b'9' => {
+                saw_digit = true;
+                previous_was_underscore = false;
+            }
+            b'_' if saw_digit && !previous_was_underscore => {
+                saw_digit = false;
+                previous_was_underscore = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_digit && !previous_was_underscore
 }
 
 fn is_internal_local(loc: &LocVar) -> bool {

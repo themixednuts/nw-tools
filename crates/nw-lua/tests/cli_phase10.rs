@@ -42,6 +42,11 @@ fn cli_decompiles_shopcommon_by_default_and_reparses() {
     full_moon::parse(&stdout).unwrap_or_else(|errors| {
         panic!("CLI decompiled output did not parse:\n{stdout}\n{errors:#?}")
     });
+    assert!(stdout.contains("local Shopcommon = {}"), "{stdout}");
+    assert!(stdout.contains("function Shopcommon.OpenShop("), "{stdout}");
+    assert!(stdout.contains("return Shopcommon"), "{stdout}");
+    assert!(!stdout.contains("local v4_2 = {}"), "{stdout}");
+    assert!(!stdout.contains("return v4_2"), "{stdout}");
 }
 
 #[test]

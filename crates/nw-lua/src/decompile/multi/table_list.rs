@@ -73,7 +73,7 @@ pub(crate) fn try_emit(
         .is_some_and(|binding| builder.is_local_declared(binding.index));
     let name = binding.as_ref().map_or_else(
         || builder.name_for_ref(node.dest, node.pc),
-        |binding| binding.name.clone(),
+        |binding| builder.name_for_binding_def(binding, node.dest),
     );
 
     builder.mark_materialized(node.dest, name.clone());
@@ -107,6 +107,32 @@ pub(crate) fn constructor_fields(
     setlists: &[SsaNode],
     keyed: &[SsaNode],
 ) -> Result<Vec<TableField>, LuaError> {
+    fields_from_nodes(
+        setlists.iter(),
+        keyed.iter(),
+        &mut |reference, pc, mode| match mode {
+            ConstructorValueMode::Normal => builder.expr_for_ref(reference, pc),
+            ConstructorValueMode::FixedLast => builder.expr_for_fixed_last_ref(reference, pc),
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConstructorValueMode {
+    Normal,
+    FixedLast,
+}
+
+pub(crate) fn fields_from_nodes<'a, S, K, F>(
+    setlists: S,
+    keyed: K,
+    expr_for_ref: &mut F,
+) -> Result<Vec<TableField>, LuaError>
+where
+    S: IntoIterator<Item = &'a SsaNode>,
+    K: IntoIterator<Item = &'a SsaNode>,
+    F: FnMut(SsaRef, i32, ConstructorValueMode) -> Result<Expr, LuaError>,
+{
     let mut fields = Vec::new();
     for setlist in setlists {
         let SsaOp::SetList { values, count, .. } = &setlist.op else {
@@ -116,16 +142,16 @@ pub(crate) fn constructor_fields(
         let last_index = values.len().saturating_sub(1);
         for (index, value) in values.iter().copied().enumerate() {
             let expr = if fixed_count && index == last_index {
-                builder.expr_for_fixed_last_ref(value, setlist.pc)?
+                expr_for_ref(value, setlist.pc, ConstructorValueMode::FixedLast)?
             } else {
-                builder.expr_for_ref(value, setlist.pc)?
+                expr_for_ref(value, setlist.pc, ConstructorValueMode::Normal)?
             };
             fields.push(TableField::List(expr));
         }
     }
     let list_count = fields.len();
     for settable in keyed {
-        if let Some(field) = keyed_field(builder, settable, list_count)? {
+        if let Some(field) = keyed_field(settable, list_count, expr_for_ref)? {
             fields.push(field);
         }
     }
@@ -133,15 +159,15 @@ pub(crate) fn constructor_fields(
 }
 
 fn keyed_field(
-    builder: &mut StatementBuilder<'_>,
     node: &SsaNode,
     list_count: usize,
+    expr_for_ref: &mut impl FnMut(SsaRef, i32, ConstructorValueMode) -> Result<Expr, LuaError>,
 ) -> Result<Option<TableField>, LuaError> {
     let SsaOp::SetTable { key, value, .. } = &node.op else {
         return Ok(None);
     };
-    let key_expr = builder.expr_for_fixed_last_ref(*key, node.pc)?;
-    let value = builder.expr_for_fixed_last_ref(*value, node.pc)?;
+    let key_expr = expr_for_ref(*key, node.pc, ConstructorValueMode::FixedLast)?;
+    let value = expr_for_ref(*value, node.pc, ConstructorValueMode::FixedLast)?;
     if let Some(name) = ident_from_string_expr(&key_expr) {
         return Ok(Some(TableField::Named { name, value }));
     }

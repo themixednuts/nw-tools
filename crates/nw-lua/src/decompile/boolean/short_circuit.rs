@@ -155,8 +155,64 @@ pub fn value_plan(
     pc_map: &[Option<usize>],
 ) -> Option<ValuePlan> {
     comparison_value(function, start, pc_map)
+        .or_else(|| test_value(function, expr_analysis, start, pc_map))
         .or_else(|| ternary_value(function, expr_analysis, start, pc_map))
         .or_else(|| testset_value(function, expr_analysis, start, pc_map))
+}
+
+fn test_value(
+    function: &SsaFunction,
+    expr_analysis: &DecompileAnalysis,
+    start: usize,
+    pc_map: &[Option<usize>],
+) -> Option<ValuePlan> {
+    let info = branch_info(function, start, pc_map)?;
+    let node = branch_at(function, info.node)?;
+    let SsaOp::Branch {
+        rel: RelOp::Test,
+        a,
+        invert,
+        ..
+    } = node.op
+    else {
+        return None;
+    };
+
+    let value_block = info.true_block;
+    let pass_block = info.false_block;
+    let merge = common_successor(function, value_block, pass_block)
+        .or_else(|| conditionals::find_merge(function, start, value_block, pass_block))?;
+    if !pure_range(function, start, merge) {
+        return None;
+    }
+
+    let phi = phi_sources(function, merge).find(|phi| {
+        same_reg(phi.dest, a)
+            && phi
+                .operand_from(pass_block)
+                .is_some_and(|operand| same_reg(operand, a))
+            && phi.operand_from(value_block).is_some()
+    })?;
+    let right = selected_operand(
+        function,
+        expr_analysis,
+        phi.dest,
+        value_block,
+        phi.operand_from(value_block)?,
+    )?;
+    let op = if invert {
+        BoolConnector::Or
+    } else {
+        BoolConnector::And
+    };
+
+    Some(ValuePlan {
+        start,
+        merge,
+        dest: phi.dest,
+        pc: phi.pc,
+        kind: ValuePlanKind::Binary { left: a, op, right },
+    })
 }
 
 fn testset_value(

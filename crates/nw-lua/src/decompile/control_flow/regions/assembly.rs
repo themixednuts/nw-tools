@@ -505,24 +505,37 @@ impl<'a> Structurer<'a> {
         let Some(exit) = loop_exit else {
             return Ok(None);
         };
-        let true_break = self.leads_to_exit(branch.true_block, exit);
-        let false_break = self.leads_to_exit(branch.false_block, exit);
-        if true_break == false_break {
+        let true_break = self.break_path_end(branch.true_block, exit);
+        let false_break = self.break_path_end(branch.false_block, exit);
+        if true_break.is_some() == false_break.is_some() {
             return Ok(None);
         }
 
         self.consumed[block] = true;
-        let (break_target, cont_target, inverted) = if true_break {
-            (branch.true_block, branch.false_block, false)
+        let (break_target, break_end, cont_target, inverted) = if let Some(end) = true_break {
+            (branch.true_block, end, branch.false_block, false)
         } else {
-            (branch.false_block, branch.true_block, true)
+            (
+                branch.false_block,
+                false_break.expect("one branch must be a break path"),
+                branch.true_block,
+                true,
+            )
         };
         let break_target = conditionals::follow_jmp_only(self.function, break_target, Some(exit));
         let cont_target = conditionals::follow_jmp_only(self.function, cont_target, Some(exit));
 
         let mut body_parts = Vec::new();
-        if break_target != exit && !conditionals::is_jmp_only(self.function, break_target) {
+        let break_stop = break_end.unwrap_or(exit);
+        if break_target != exit && break_target != break_stop {
+            body_parts.push(self.build_sequence(break_target, Some(break_stop), Some(exit))?);
+        } else if break_target != exit && break_end.is_none() {
             body_parts.push(self.build_sequence(break_target, Some(exit), Some(exit))?);
+        }
+        if let Some(block) = break_end
+            && let Some(slot) = self.consumed.get_mut(block)
+        {
+            *slot = true;
         }
         body_parts.push(Region::Break);
         let body = Region::Sequence(body_parts);
@@ -548,6 +561,32 @@ impl<'a> Structurer<'a> {
 
     fn leads_to_exit(&self, block: usize, exit: usize) -> bool {
         block == exit || conditionals::follow_jmp_only(self.function, block, Some(exit)) == exit
+    }
+
+    fn break_path_end(&self, start: usize, exit: usize) -> Option<Option<usize>> {
+        let mut current = start;
+        let mut first_jump = None;
+        let mut seen = BTreeSet::new();
+        loop {
+            if current == exit {
+                return Some(first_jump);
+            }
+            if current >= self.function.blocks.len() || !seen.insert(current) {
+                return None;
+            }
+            if conditionals::is_jmp_only(self.function, current) {
+                first_jump.get_or_insert(current);
+                current = self.function.blocks[current].succs.first().copied()?;
+                continue;
+            }
+            if first_jump.is_some() {
+                return None;
+            }
+            let [succ] = self.function.blocks[current].succs.as_slice() else {
+                return None;
+            };
+            current = *succ;
+        }
     }
 
     fn is_break_block(&self, block: usize, loop_exit: Option<usize>) -> bool {

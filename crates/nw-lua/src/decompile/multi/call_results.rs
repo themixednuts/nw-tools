@@ -60,7 +60,7 @@ fn result_slots(
             .is_some_and(|binding| builder.is_local_declared(binding.index));
         let name = binding.as_ref().map_or_else(
             || builder.name_for_ref(reference, node.pc),
-            |binding| binding.name.clone(),
+            |binding| builder.name_for_binding_def(binding, reference),
         );
         slots.push(ResultSlot {
             reference,

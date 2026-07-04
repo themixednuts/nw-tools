@@ -157,7 +157,8 @@ pub fn is_elseif_candidate(
             | SsaOp::Move { .. }
             | SsaOp::BinOp { .. }
             | SsaOp::UnOp { .. }
-            | SsaOp::Concat { .. } => {}
+            | SsaOp::Concat { .. }
+            | SsaOp::Call { .. } => {}
             _ => return false,
         }
     }
@@ -186,7 +187,8 @@ pub fn is_pure_condition_block(function: &SsaFunction, block: usize) -> bool {
             | SsaOp::BinOp { .. }
             | SsaOp::UnOp { .. }
             | SsaOp::Concat { .. }
-            | SsaOp::SelfOp { .. } => {}
+            | SsaOp::SelfOp { .. }
+            | SsaOp::Call { .. } => {}
             _ => return false,
         }
     }

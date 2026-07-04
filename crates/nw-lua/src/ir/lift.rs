@@ -25,7 +25,7 @@ fn lift_block(
     instructions: &[Instruction],
     block: &mut BasicBlock,
 ) {
-    let mut nodes = Vec::new();
+    let mut nodes = Vec::with_capacity(block.end_pc - block.start_pc + 1);
     let mut pc = block.start_pc;
     while pc <= block.end_pc {
         let inst = instructions[pc];

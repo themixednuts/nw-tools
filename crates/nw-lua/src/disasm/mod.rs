@@ -522,17 +522,11 @@ fn format_constant(constant: &Constant) -> String {
     match constant {
         Constant::Nil => "nil".to_string(),
         Constant::Boolean(value) => value.to_string(),
-        Constant::Number(value) => format_number(*value),
+        Constant::Number(value) => {
+            crate::number::lua51_number_literal(*value).unwrap_or_else(|| value.to_string())
+        }
         Constant::Integer(value) => value.to_string(),
         Constant::Str(bytes) => format!("\"{}\"", escape_bytes(bytes.as_slice())),
-    }
-}
-
-fn format_number(value: f64) -> String {
-    if value.is_finite() && value.fract() == 0.0 && (-1e15..=1e15).contains(&value) {
-        format!("{value:.0}")
-    } else {
-        value.to_string()
     }
 }
 

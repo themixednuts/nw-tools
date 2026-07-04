@@ -77,6 +77,13 @@ fn lower_if(
     booleans: &BooleanAnalysis,
     builder: &mut StatementBuilder<'_>,
 ) -> Result<Vec<Stmt>, LuaError> {
+    if let Some(stmts) = lower_boolean_value_if(region, function, analysis, booleans, builder)? {
+        return Ok(stmts);
+    }
+    if let Some(stmts) = lower_simple_phi_value_if(region, function, analysis, booleans, builder)? {
+        return Ok(stmts);
+    }
+
     let mut out = builder.emit_linear_region(&region.prefix)?;
     for phi in &region.phis {
         if let Some(stmt) = builder.declare_phi_local(phi.dest, phi.pc) {
@@ -102,6 +109,98 @@ fn lower_if(
 
     out.push(Stmt::If { arms, else_ });
     Ok(out)
+}
+
+fn lower_boolean_value_if(
+    region: &IfRegion,
+    function: &SsaFunction,
+    analysis: &DecompileAnalysis,
+    booleans: &BooleanAnalysis,
+    builder: &mut StatementBuilder<'_>,
+) -> Result<Option<Vec<Stmt>>, LuaError> {
+    let [phi] = region.phis.as_slice() else {
+        return Ok(None);
+    };
+    let [arm] = region.arms.as_slice() else {
+        return Ok(None);
+    };
+    let Some((true_block, false_block)) = branch_targets(function, arm.condition.branch) else {
+        return Ok(None);
+    };
+    let true_block = conditionals::follow_jmp_only(function, true_block, region.merge);
+    let false_block = conditionals::follow_jmp_only(function, false_block, region.merge);
+    let Some(true_value) = phi_bool_for_block(function, analysis, phi, true_block) else {
+        return Ok(None);
+    };
+    let Some(false_value) = phi_bool_for_block(function, analysis, phi, false_block) else {
+        return Ok(None);
+    };
+    if true_value == false_value {
+        return Ok(None);
+    }
+
+    let mut condition = arm.condition;
+    if !true_value {
+        condition.inverted = !condition.inverted;
+    }
+    let value = lower_condition(condition, function, analysis, booleans, builder)?;
+    let mut out = builder.emit_linear_region(&region.prefix)?;
+    out.push(builder.materialize_value(phi.dest, phi.pc, value));
+    Ok(Some(out))
+}
+
+fn lower_simple_phi_value_if(
+    region: &IfRegion,
+    function: &SsaFunction,
+    analysis: &DecompileAnalysis,
+    booleans: &BooleanAnalysis,
+    builder: &mut StatementBuilder<'_>,
+) -> Result<Option<Vec<Stmt>>, LuaError> {
+    let [phi] = region.phis.as_slice() else {
+        return Ok(None);
+    };
+    let [arm] = region.arms.as_slice() else {
+        return Ok(None);
+    };
+    let Some((true_block, false_block)) = branch_targets(function, arm.condition.branch) else {
+        return Ok(None);
+    };
+    let true_block = conditionals::follow_jmp_only(function, true_block, region.merge);
+    let false_block = conditionals::follow_jmp_only(function, false_block, region.merge);
+    let Some(true_operand) = phi_operand_for_block(phi, true_block) else {
+        return Ok(None);
+    };
+    let Some(false_operand) = phi_operand_for_block(phi, false_block) else {
+        return Ok(None);
+    };
+    if true_operand == false_operand
+        || !block_is_phi_value_only(function, analysis, true_block, true_operand)
+        || !block_is_phi_value_only(function, analysis, false_block, false_operand)
+    {
+        return Ok(None);
+    }
+
+    let mut out = builder.emit_linear_region(&region.prefix)?;
+    if let Some(stmt) = builder.declare_phi_local(phi.dest, phi.pc) {
+        out.push(stmt);
+    }
+    let condition = lower_condition(arm.condition, function, analysis, booleans, builder)?;
+    let true_value = phi_operand_expr(function, analysis, builder, true_operand)?;
+    let false_value = phi_operand_expr(function, analysis, builder, false_operand)?;
+    out.push(Stmt::If {
+        arms: vec![(
+            condition,
+            ast::Block::new(vec![
+                builder.materialize_value(phi.dest, phi.pc, true_value),
+            ]),
+        )],
+        else_: Some(ast::Block::new(vec![builder.materialize_value(
+            phi.dest,
+            phi.pc,
+            false_value,
+        )])),
+    });
+    Ok(Some(out))
 }
 
 fn lower_while(
@@ -383,7 +482,10 @@ fn loop_var_name(names: &NameResolver<'_>, reg: u16, function: &SsaFunction, blo
     names
         .binding_for_use(reg, pc)
         .or_else(|| names.binding_for_def(reg, pc))
-        .map_or_else(|| names.synthetic_reg_name(reg), |binding| binding.name)
+        .map_or_else(
+            || names.synthetic_reg_name(reg),
+            |binding| names.name_for_binding_def(&binding, SsaRef::Reg { reg, ver: 0 }),
+        )
 }
 
 fn generic_setup_pc_range(
@@ -413,6 +515,86 @@ fn node(function: &SsaFunction, id: NodeId) -> Option<&SsaNode> {
         .blocks
         .get(id.block)
         .and_then(|block| block.nodes.get(id.node))
+}
+
+fn branch_targets(function: &SsaFunction, id: NodeId) -> Option<(usize, usize)> {
+    let SsaOp::Branch {
+        t_true, t_false, ..
+    } = &node(function, id)?.op
+    else {
+        return None;
+    };
+    Some((
+        block_for_pc(function, *t_true)?,
+        block_for_pc(function, *t_false)?,
+    ))
+}
+
+fn block_for_pc(function: &SsaFunction, pc: i32) -> Option<usize> {
+    let pc = usize::try_from(pc).ok()?;
+    function
+        .blocks
+        .iter()
+        .find(|block| pc >= block.start_pc && pc <= block.end_pc)
+        .map(|block| block.index)
+}
+
+fn phi_bool_for_block(
+    function: &SsaFunction,
+    analysis: &DecompileAnalysis,
+    phi: &PhiSource,
+    block: usize,
+) -> Option<bool> {
+    let operand = phi_operand_for_block(phi, block)?;
+    let node = analysis
+        .def_site(operand)
+        .and_then(|id| node(function, id))?;
+    let SsaOp::LoadBool { value, .. } = &node.op else {
+        return None;
+    };
+    Some(*value)
+}
+
+fn phi_operand_for_block(phi: &PhiSource, block: usize) -> Option<SsaRef> {
+    phi.sources
+        .iter()
+        .find_map(|(source, operand)| (*source == block).then_some(*operand))
+}
+
+fn block_is_phi_value_only(
+    function: &SsaFunction,
+    analysis: &DecompileAnalysis,
+    block: usize,
+    operand: SsaRef,
+) -> bool {
+    let Some(block_ref) = function.blocks.get(block) else {
+        return false;
+    };
+    let def_site = analysis.def_site(operand);
+    block_ref
+        .nodes
+        .iter()
+        .enumerate()
+        .all(|(node_index, node)| {
+            node.is_meta_only
+                || Some(NodeId {
+                    block,
+                    node: node_index,
+                }) == def_site
+                || matches!(node.op, SsaOp::Nop | SsaOp::Jump { .. })
+        })
+}
+
+fn phi_operand_expr(
+    function: &SsaFunction,
+    analysis: &DecompileAnalysis,
+    builder: &mut StatementBuilder<'_>,
+    operand: SsaRef,
+) -> Result<Expr, LuaError> {
+    let Some(def) = analysis.def_site(operand).and_then(|id| node(function, id)) else {
+        return builder.expr_for_ref(operand, 0);
+    };
+    builder.expr_for_node(def)
 }
 
 fn is_one(expr: &Expr) -> bool {

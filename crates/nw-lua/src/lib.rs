@@ -12,7 +12,9 @@ pub mod version;
 
 pub mod decompile;
 pub mod emit;
+pub(crate) mod number;
 
+pub use decompile::DecompOptions;
 pub use emit::to_source;
 pub use error::LuaError;
 
@@ -79,8 +81,52 @@ pub fn ssa_dump_with(bytes: &[u8], table: &bytecode::OpcodeTable) -> Result<Stri
 /// Returns [`LuaError`] when parsing, SSA construction, reconstruction, or
 /// source emission fails.
 pub fn decompile(bytes: &[u8]) -> Result<String, LuaError> {
+    decompile_with_options(bytes, DecompOptions::default())
+}
+
+/// Parse and decompile a Lua binary chunk into core, bytecode-shaped Lua source.
+///
+/// This runs the full correctness pipeline but skips the idiomatic AST cleanup
+/// pass so validation can compare bytecode structure without style rewrites.
+///
+/// # Errors
+///
+/// Returns [`LuaError`] when parsing, SSA construction, reconstruction, or
+/// source emission fails.
+pub fn decompile_core(bytes: &[u8]) -> Result<String, LuaError> {
+    decompile_with_options(bytes, DecompOptions::core())
+}
+
+/// Parse and decompile a Lua binary chunk with explicit decompile options.
+///
+/// # Errors
+///
+/// Returns [`LuaError`] when parsing, SSA construction, reconstruction, or
+/// source emission fails.
+pub fn decompile_with_options(bytes: &[u8], options: DecompOptions) -> Result<String, LuaError> {
+    decompile_with_options_and_module_stem(bytes, options, None)
+}
+
+/// Parse and decompile a Lua binary chunk with an optional file-stem fallback.
+///
+/// The fallback is used only when the chunk's own source name is empty.
+///
+/// # Errors
+///
+/// Returns [`LuaError`] when parsing, SSA construction, reconstruction, or
+/// source emission fails.
+pub fn decompile_with_options_and_module_stem(
+    bytes: &[u8],
+    options: DecompOptions,
+    fallback_module_stem: Option<&str>,
+) -> Result<String, LuaError> {
     let (chunk, table) = parse_with_builtin_table(bytes)?;
-    decompile_chunk_with_table(&chunk, &table)
+    decompile_chunk_with_table_options_and_module_stem(
+        &chunk,
+        &table,
+        options,
+        fallback_module_stem,
+    )
 }
 
 /// Parse and decompile a Lua binary chunk with a caller-supplied opcode table.
@@ -90,9 +136,39 @@ pub fn decompile(bytes: &[u8]) -> Result<String, LuaError> {
 /// Returns [`LuaError`] when parsing fails, the table version does not match the
 /// chunk version, SSA/decompilation fails, or source emission fails.
 pub fn decompile_with(bytes: &[u8], table: &bytecode::OpcodeTable) -> Result<String, LuaError> {
+    decompile_with_table_options(bytes, table, DecompOptions::default())
+}
+
+/// Parse and decompile a Lua binary chunk with explicit options and opcode table.
+///
+/// # Errors
+///
+/// Returns [`LuaError`] when parsing fails, the table version does not match the
+/// chunk version, SSA/decompilation fails, or source emission fails.
+pub fn decompile_with_table_options(
+    bytes: &[u8],
+    table: &bytecode::OpcodeTable,
+    options: DecompOptions,
+) -> Result<String, LuaError> {
+    decompile_with_table_options_and_module_stem(bytes, table, options, None)
+}
+
+/// Parse and decompile a Lua binary chunk with explicit options, opcode table,
+/// and an optional file-stem fallback.
+///
+/// # Errors
+///
+/// Returns [`LuaError`] when parsing fails, the table version does not match the
+/// chunk version, SSA/decompilation fails, or source emission fails.
+pub fn decompile_with_table_options_and_module_stem(
+    bytes: &[u8],
+    table: &bytecode::OpcodeTable,
+    options: DecompOptions,
+    fallback_module_stem: Option<&str>,
+) -> Result<String, LuaError> {
     let chunk = parse_chunk(bytes)?;
     ensure_compatible_table(&chunk, table)?;
-    decompile_chunk_with_table(&chunk, table)
+    decompile_chunk_with_table_options_and_module_stem(&chunk, table, options, fallback_module_stem)
 }
 
 /// Decompile a chunk and prepend best-effort disassembly annotations as Lua comments.
@@ -152,8 +228,31 @@ fn decompile_chunk_with_table(
     chunk: &chunk::Chunk,
     table: &bytecode::OpcodeTable,
 ) -> Result<String, LuaError> {
+    decompile_chunk_with_table_options(chunk, table, DecompOptions::default())
+}
+
+fn decompile_chunk_with_table_options(
+    chunk: &chunk::Chunk,
+    table: &bytecode::OpcodeTable,
+    options: DecompOptions,
+) -> Result<String, LuaError> {
+    decompile_chunk_with_table_options_and_module_stem(chunk, table, options, None)
+}
+
+fn decompile_chunk_with_table_options_and_module_stem(
+    chunk: &chunk::Chunk,
+    table: &bytecode::OpcodeTable,
+    options: DecompOptions,
+    fallback_module_stem: Option<&str>,
+) -> Result<String, LuaError> {
     let ssa = ir::build_ssa(&chunk.root, table);
-    let block = decompile::decompile_proto(&chunk.root, &ssa, table)?;
+    let block = decompile::decompile_proto_with_options_and_module_stem(
+        &chunk.root,
+        &ssa,
+        table,
+        options,
+        fallback_module_stem,
+    )?;
     emit::to_source(&block)
 }
 

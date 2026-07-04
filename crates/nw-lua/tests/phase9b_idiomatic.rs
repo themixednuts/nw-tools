@@ -190,15 +190,15 @@ return M
         return;
     };
     assert!(
-        source_preserved.contains("local ShopCommon ="),
+        source_preserved.contains("local Shopcommon ="),
         "{source_preserved}"
     );
     assert!(
-        source_preserved.contains("function ShopCommon.add("),
+        source_preserved.contains("function Shopcommon.add("),
         "{source_preserved}"
     );
     assert!(
-        source_preserved.contains("function ShopCommon:inc("),
+        source_preserved.contains("function Shopcommon:inc("),
         "{source_preserved}"
     );
     assert!(

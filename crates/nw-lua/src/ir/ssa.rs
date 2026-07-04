@@ -39,13 +39,13 @@ pub fn collect_def_sites(blocks: &[BasicBlock], num_regs: usize) -> DefSites {
                 }
             });
 
-            for reg in defined_regs(node) {
+            for_each_defined_reg(node, |reg| {
                 let reg = usize::from(reg);
                 if reg < num_regs {
                     block_defs[reg] = true;
                     defines[block.index][reg] = true;
                 }
-            }
+            });
         }
     }
 
@@ -131,27 +131,29 @@ fn compute_live_in(
 ) -> Vec<Vec<bool>> {
     let mut live_in = use_before_def.to_vec();
     let mut live_out = vec![vec![false; num_regs]; blocks.len()];
+    let mut next_out = vec![false; num_regs];
     let mut changed = true;
     while changed {
         changed = false;
         for block in blocks.iter().rev() {
-            let mut out = vec![false; num_regs];
+            next_out.fill(false);
             for &succ in &block.succs {
                 for (reg, live) in live_in[succ].iter().copied().enumerate() {
-                    out[reg] |= live;
+                    next_out[reg] |= live;
                 }
             }
 
-            let mut input = use_before_def[block.index].clone();
             for reg in 0..num_regs {
-                if out[reg] && !defines[block.index][reg] {
-                    input[reg] = true;
+                let input = use_before_def[block.index][reg]
+                    || (next_out[reg] && !defines[block.index][reg]);
+                if live_in[block.index][reg] != input {
+                    live_in[block.index][reg] = input;
+                    changed = true;
                 }
             }
 
-            if out != live_out[block.index] || input != live_in[block.index] {
-                live_out[block.index] = out;
-                live_in[block.index] = input;
+            if live_out[block.index] != next_out {
+                live_out[block.index].copy_from_slice(&next_out);
                 changed = true;
             }
         }
@@ -191,11 +193,9 @@ fn rename_block(
         }
 
         let node = &blocks[block_index].nodes[node_index];
-        let post_defs = implicit_defs_for_node(node);
-        let loadnil_extra = loadnil_extra_defs(node);
         let pc = node.pc;
         let line = node.line;
-        for reg in post_defs {
+        for_each_implicit_def(node, |reg| {
             let mut reference = SsaRef::reg(reg);
             if let Some(def_reg) = rename_def(state, &mut reference) {
                 defs.push(def_reg);
@@ -206,8 +206,8 @@ fn rename_block(
                     node: node_index,
                 });
             }
-        }
-        for reg in loadnil_extra {
+        });
+        for_each_loadnil_extra_def(node, |reg| {
             let mut reference = SsaRef::reg(reg);
             if let Some(def_reg) = rename_def(state, &mut reference) {
                 defs.push(def_reg);
@@ -223,13 +223,13 @@ fn rename_block(
                 pseudo.is_meta_only = true;
                 pseudo_nodes.push(pseudo);
             }
-        }
+        });
     }
 
     blocks[block_index].nodes.extend(pseudo_nodes);
     fill_successor_phi_uses(blocks, block_index, state);
 
-    for child in dom.dom_children[block_index].clone() {
+    for &child in &dom.dom_children[block_index] {
         rename_block(blocks, child, dom, state, implicit_defs);
     }
 
@@ -239,8 +239,9 @@ fn rename_block(
 }
 
 fn fill_successor_phi_uses(blocks: &mut [BasicBlock], block_index: usize, state: &RenameState) {
-    let succs = blocks[block_index].succs.clone();
-    for succ in succs {
+    let succ_count = blocks[block_index].succs.len();
+    for succ_index in 0..succ_count {
+        let succ = blocks[block_index].succs[succ_index];
         let Some(pred_index) = blocks[succ]
             .preds
             .iter()
@@ -407,85 +408,89 @@ fn for_each_use(node: &SsaNode, mut f: impl FnMut(&SsaRef)) {
     }
 }
 
-fn defined_regs(node: &SsaNode) -> Vec<u16> {
-    let mut regs = Vec::new();
-    if let Some(reg) = node.dest.reg_index() {
-        push_unique(&mut regs, reg);
+fn for_each_defined_reg(node: &SsaNode, mut f: impl FnMut(u16)) {
+    let dest = node.dest.reg_index();
+    if let Some(reg) = dest {
+        f(reg);
     }
     match &node.op {
-        SsaOp::LoadNil { start, end } => push_range(&mut regs, *start, *end),
-        SsaOp::ForLoop { base, .. } => push_range(&mut regs, *base, base.saturating_add(3)),
+        SsaOp::LoadNil { start, end } => emit_range_except(&mut f, *start, *end, dest),
+        SsaOp::ForLoop { base, .. } => {
+            emit_range_except(&mut f, *base, base.saturating_add(3), dest);
+        }
         SsaOp::TForLoop { base, count } => {
             let start = base.saturating_add(3);
             let end = start.saturating_add(u16::try_from(count.saturating_sub(1)).unwrap_or(0));
-            push_range(&mut regs, start, end);
+            emit_range_except(&mut f, start, end, dest);
         }
-        SsaOp::SelfOp { self_reg, .. } => push_unique(&mut regs, *self_reg),
+        SsaOp::SelfOp { self_reg, .. } if Some(*self_reg) != dest => f(*self_reg),
         SsaOp::Call {
             base, return_count, ..
         } if *return_count >= 3 => {
             let end = base.saturating_add(u16::try_from(*return_count - 2).unwrap_or(0));
-            push_range(&mut regs, base.saturating_add(1), end);
+            emit_range_except(&mut f, base.saturating_add(1), end, dest);
         }
         SsaOp::VarArg { base, count } if *count >= 3 => {
             let end = base.saturating_add(u16::try_from(*count - 2).unwrap_or(0));
-            push_range(&mut regs, base.saturating_add(1), end);
+            emit_range_except(&mut f, base.saturating_add(1), end, dest);
         }
         _ => {}
     }
-    regs
 }
 
-fn implicit_defs_for_node(node: &SsaNode) -> Vec<u16> {
-    let mut regs = Vec::new();
+fn for_each_implicit_def(node: &SsaNode, mut f: impl FnMut(u16)) {
     match &node.op {
         SsaOp::ForLoop { base, .. } => {
             let end = base.saturating_add(2);
-            push_range(&mut regs, *base, end);
+            emit_range(&mut f, *base, end);
         }
         SsaOp::TForLoop { base, count } => {
             let start = base.saturating_add(3);
             let end = start.saturating_add(u16::try_from(count.saturating_sub(1)).unwrap_or(0));
-            push_range(&mut regs, start, end);
+            emit_range(&mut f, start, end);
         }
-        SsaOp::SelfOp { self_reg, .. } => push_unique(&mut regs, *self_reg),
+        SsaOp::SelfOp { self_reg, .. } => f(*self_reg),
         SsaOp::Call {
             base, return_count, ..
         } if *return_count >= 3 => {
             let end = base.saturating_add(u16::try_from(*return_count - 2).unwrap_or(0));
-            push_range(&mut regs, base.saturating_add(1), end);
+            emit_range(&mut f, base.saturating_add(1), end);
         }
         SsaOp::VarArg { base, count } if *count >= 3 => {
             let end = base.saturating_add(u16::try_from(*count - 2).unwrap_or(0));
-            push_range(&mut regs, base.saturating_add(1), end);
+            emit_range(&mut f, base.saturating_add(1), end);
         }
         _ => {}
     }
-    regs
 }
 
-fn loadnil_extra_defs(node: &SsaNode) -> Vec<u16> {
+fn for_each_loadnil_extra_def(node: &SsaNode, mut f: impl FnMut(u16)) {
     let SsaOp::LoadNil { start, end } = node.op else {
-        return Vec::new();
+        return;
     };
     if end <= start {
-        return Vec::new();
+        return;
     }
-    ((start + 1)..=end).collect()
+    emit_range(&mut f, start + 1, end);
 }
 
-fn push_range(regs: &mut Vec<u16>, start: u16, end: u16) {
+fn emit_range(mut f: impl FnMut(u16), start: u16, end: u16) {
     if end < start {
         return;
     }
     for reg in start..=end {
-        push_unique(regs, reg);
+        f(reg);
     }
 }
 
-fn push_unique(regs: &mut Vec<u16>, reg: u16) {
-    if !regs.contains(&reg) {
-        regs.push(reg);
+fn emit_range_except(mut f: impl FnMut(u16), start: u16, end: u16, except: Option<u16>) {
+    if end < start {
+        return;
+    }
+    for reg in start..=end {
+        if Some(reg) != except {
+            f(reg);
+        }
     }
 }
 

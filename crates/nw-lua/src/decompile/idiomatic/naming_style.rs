@@ -116,8 +116,7 @@ fn module_pascal_name(stem: &str) -> String {
 }
 
 fn normalized_module_stem(stem: &str) -> String {
-    let normalized = stem
-        .chars()
+    stem.chars()
         .map(|ch| {
             if ch == '-' || ch == '.' || ch.is_whitespace() {
                 '_'
@@ -125,25 +124,7 @@ fn normalized_module_stem(stem: &str) -> String {
                 ch
             }
         })
-        .collect::<String>();
-    if normalized.contains('_') || !normalized.bytes().all(|byte| byte.is_ascii_lowercase()) {
-        return normalized;
-    }
-    for (suffix, replacement) in [
-        ("helperfunctions", "helper_functions"),
-        ("functions", "functions"),
-        ("helpers", "helpers"),
-        ("helper", "helper"),
-        ("common", "common"),
-        ("style", "style"),
-    ] {
-        if let Some(prefix) = normalized.strip_suffix(suffix)
-            && !prefix.is_empty()
-        {
-            return format!("{prefix}_{replacement}");
-        }
-    }
-    normalized
+        .collect()
 }
 
 fn count_declarations(block: &Block, name: &[u8]) -> usize {

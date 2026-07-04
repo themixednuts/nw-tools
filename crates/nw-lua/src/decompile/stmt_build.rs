@@ -193,6 +193,10 @@ impl<'a> StatementBuilder<'a> {
         self.names.name_for_ref(reference, pc)
     }
 
+    pub(crate) fn name_for_binding_def(&self, binding: &LocalBinding, reference: SsaRef) -> Name {
+        self.names.name_for_binding_def(binding, reference)
+    }
+
     pub(crate) fn is_local_declared(&self, index: usize) -> bool {
         self.declared_locals.contains(&index)
     }
@@ -233,30 +237,20 @@ impl<'a> StatementBuilder<'a> {
         chain: &ConditionChain,
         invert: bool,
     ) -> Result<Expr, LuaError> {
-        let mut segments = chain.segments.iter();
-        let Some(first) = segments.next() else {
+        let Some(last) = chain.segments.last() else {
             return Ok(Expr::True);
         };
-        let first_node = self.analysis.node(self.function, first.node);
-        let mut expr = if let Some(node) = first_node {
-            self.condition_for_branch(node, first.inverted)?
-        } else {
-            Expr::True
-        };
+        let mut expr = self.condition_segment_expr(last)?;
 
-        for (previous, segment) in chain.segments.iter().zip(chain.segments.iter().skip(1)) {
-            let Some(connector) = previous.connector else {
-                break;
+        for segment in chain.segments.iter().rev().skip(1) {
+            let Some(connector) = segment.connector else {
+                continue;
             };
-            let rhs = if let Some(node) = self.analysis.node(self.function, segment.node) {
-                self.condition_for_branch(node, segment.inverted)?
-            } else {
-                Expr::True
-            };
+            let lhs = self.condition_segment_expr(segment)?;
             expr = Expr::Binary {
                 op: connector.ast_op(),
-                lhs: Box::new(expr),
-                rhs: Box::new(rhs),
+                lhs: Box::new(lhs),
+                rhs: Box::new(expr),
             };
         }
 
@@ -268,6 +262,16 @@ impl<'a> StatementBuilder<'a> {
         })
     }
 
+    fn condition_segment_expr(
+        &mut self,
+        segment: &crate::decompile::boolean::ConditionSegment,
+    ) -> Result<Expr, LuaError> {
+        let Some(node) = self.analysis.node(self.function, segment.node) else {
+            return Ok(Expr::True);
+        };
+        self.condition_for_branch(node, segment.inverted)
+    }
+
     pub(crate) fn declare_phi_local(&mut self, reference: SsaRef, pc: i32) -> Option<Stmt> {
         let name = self.names.collapsed_name_for_ref(reference, pc);
         self.exprs.mark_materialized(reference, name.clone());
@@ -275,8 +279,9 @@ impl<'a> StatementBuilder<'a> {
         let reg = reference.reg_index()?;
         if let Some(binding) = self.names.binding_for_def(reg, pc) {
             if self.declared_locals.insert(binding.index) {
+                let name = self.names.name_for_binding_def(&binding, reference);
                 return Some(Stmt::Local {
-                    names: vec![binding.name],
+                    names: vec![name],
                     attribs: Vec::new(),
                     values: Vec::new(),
                 });
@@ -338,6 +343,9 @@ impl<'a> StatementBuilder<'a> {
                 Ok(Some(assign_one(target, value)))
             }
             SsaOp::SetTable { table, key, value } => {
+                if self.is_inline_constructor_mutation(node) {
+                    return Ok(None);
+                }
                 let table = self.exprs.expr_for_ref(*table, node.pc)?;
                 let key = self.exprs.expr_for_ref(*key, node.pc)?;
                 let target = index_expr(table, key);
@@ -372,7 +380,12 @@ impl<'a> StatementBuilder<'a> {
                 base,
                 count,
                 batch,
-            } => self.emit_setlist_fallback(node, *table, values, *base, *count, *batch),
+            } => {
+                if self.is_inline_constructor_mutation(node) {
+                    return Ok(None);
+                }
+                self.emit_setlist_fallback(node, *table, values, *base, *count, *batch)
+            }
         }
     }
 
@@ -610,7 +623,15 @@ impl<'a> StatementBuilder<'a> {
                 continue;
             };
             if self.declared_locals.insert(binding.index) {
-                names.push(binding.name);
+                let reference = if reg == *start {
+                    node.dest
+                } else {
+                    SsaRef::Reg {
+                        reg,
+                        ver: node.dest.version().unwrap_or(0),
+                    }
+                };
+                names.push(self.names.name_for_binding_def(&binding, reference));
             }
         }
 
@@ -633,6 +654,9 @@ impl<'a> StatementBuilder<'a> {
         if !matches!(node.dest, SsaRef::Reg { .. }) {
             return false;
         }
+        if self.self_op_consumed_by_call(node) {
+            return false;
+        }
         if self.forced_materialized.contains(&node.dest) {
             return true;
         }
@@ -650,11 +674,51 @@ impl<'a> StatementBuilder<'a> {
             }
             return true;
         }
-        if self.analysis.has_mutating_table_use(node.dest) {
+        if self.analysis.has_mutating_table_use(node.dest)
+            && !self.exprs.can_inline_ref(node.dest, node.pc)
+        {
             return true;
         }
         let uses = self.analysis.real_use_count(node.dest);
         uses > 0 && !self.exprs.can_inline_ref(node.dest, node.pc)
+    }
+
+    fn self_op_consumed_by_call(&self, node: &SsaNode) -> bool {
+        if !matches!(&node.op, SsaOp::SelfOp { .. }) {
+            return false;
+        }
+        let uses = self.analysis.real_uses(node.dest);
+        let [use_id] = uses else {
+            return false;
+        };
+        self.analysis
+            .node(self.function, *use_id)
+            .is_some_and(|use_node| {
+                matches!(
+                    &use_node.op,
+                    SsaOp::Call { func, .. } | SsaOp::TailCall { func, .. } if *func == node.dest
+                )
+            })
+    }
+
+    fn is_inline_constructor_mutation(&self, node: &SsaNode) -> bool {
+        let table = match &node.op {
+            SsaOp::SetTable { table, .. } | SsaOp::SetList { table, .. } => *table,
+            _ => return false,
+        };
+        let Some(def_id) = self.analysis.def_site(table) else {
+            return false;
+        };
+        let Some(def) = self.analysis.node(self.function, def_id) else {
+            return false;
+        };
+        let Some(table_reg) = def.dest.reg_index() else {
+            return false;
+        };
+        matches!(&def.op, SsaOp::NewTable { .. })
+            && (multi::table_list::is_matching_settable(node, def.dest, table_reg)
+                || multi::table_list::is_matching_setlist(node, def.dest, table_reg))
+            && self.exprs.can_inline_ref(def.dest, node.pc)
     }
 
     fn emit_call(
@@ -754,7 +818,7 @@ impl<'a> StatementBuilder<'a> {
             .is_some_and(|binding| !self.declared_locals.contains(&binding.index));
         let name = binding.as_ref().map_or_else(
             || self.names.name_for_ref(reference, pc),
-            |binding| binding.name.clone(),
+            |binding| self.names.name_for_binding_def(binding, reference),
         );
 
         self.exprs.mark_materialized(reference, name.clone());

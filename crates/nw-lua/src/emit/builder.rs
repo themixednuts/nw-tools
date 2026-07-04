@@ -11,7 +11,10 @@ use full_moon::ast::{
 };
 use full_moon::tokenizer::{StringLiteralQuoteType, Token, TokenReference, TokenType};
 
-use crate::decompile::ast::{Attrib, FunctionName, Name};
+use crate::{
+    decompile::ast::{Attrib, FunctionName, Name},
+    number::lua51_number_literal,
+};
 
 pub(super) fn block(stmts: Vec<Stmt>, last_stmt: Option<LastStmt>) -> Block {
     let stmt_count = stmts.len();
@@ -308,15 +311,7 @@ pub(super) fn integer_expr(value: i64) -> Expression {
 }
 
 pub(super) fn number_expr(value: f64) -> Expression {
-    let text = if value.is_finite() {
-        value.to_string()
-    } else if value.is_sign_negative() {
-        "-1e9999".to_string()
-    } else {
-        "1e9999".to_string()
-    };
-
-    number_expr_text(text)
+    number_expr_text(lua51_number_literal(value).expect("NaN rejected before lowering"))
 }
 
 pub(super) fn number_expr_text(text: String) -> Expression {
@@ -447,7 +442,7 @@ fn newline() -> TokenReference {
 }
 
 fn escape_string(bytes: &BString) -> String {
-    let mut escaped = String::new();
+    let mut escaped = String::with_capacity(bytes.len());
 
     for &byte in bytes.as_slice() {
         match byte {
@@ -457,9 +452,16 @@ fn escape_string(bytes: &BString) -> String {
             b'\\' => escaped.push_str("\\\\"),
             b'"' => escaped.push_str("\\\""),
             0x20..=0x7e => escaped.push(char::from(byte)),
-            _ => escaped.push_str(&format!("\\{byte:03}")),
+            _ => push_decimal_escape(&mut escaped, byte),
         }
     }
 
     escaped
+}
+
+fn push_decimal_escape(out: &mut String, byte: u8) {
+    out.push('\\');
+    out.push(char::from(b'0' + byte / 100));
+    out.push(char::from(b'0' + (byte / 10) % 10));
+    out.push(char::from(b'0' + byte % 10));
 }

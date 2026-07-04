@@ -116,7 +116,9 @@ fn branch_info(
 }
 
 fn is_condition_block(function: &SsaFunction, block: usize, loop_headers: &BlockSet) -> bool {
-    !loop_headers.contains(block) && conditionals::is_pure_condition_block(function, block)
+    !loop_headers.contains(block)
+        && conditionals::is_pure_condition_block(function, block)
+        && !crate::decompile::control_flow::loops::has_tail_body_before_branch(function, block)
 }
 
 fn is_pure_value_block(function: &SsaFunction, block: usize) -> bool {
@@ -143,6 +145,7 @@ fn is_pure_value_block(function: &SsaFunction, block: usize) -> bool {
                     | SsaOp::BinOp { .. }
                     | SsaOp::UnOp { .. }
                     | SsaOp::Concat { .. }
+                    | SsaOp::Closure { .. }
             )
     })
 }

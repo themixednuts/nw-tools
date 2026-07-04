@@ -212,11 +212,34 @@ fn invert_condition(expr: Expr) -> Expr {
             op: UnOp::Not,
             operand,
         } => *operand,
-        Expr::Binary { op, lhs, rhs } => Expr::Binary {
-            op: invert_binop(op).unwrap_or(op),
+        Expr::Binary {
+            op: BinOp::And,
             lhs,
             rhs,
+        } => Expr::Binary {
+            op: BinOp::Or,
+            lhs: Box::new(invert_condition(*lhs)),
+            rhs: Box::new(invert_condition(*rhs)),
         },
+        Expr::Binary {
+            op: BinOp::Or,
+            lhs,
+            rhs,
+        } => Expr::Binary {
+            op: BinOp::And,
+            lhs: Box::new(invert_condition(*lhs)),
+            rhs: Box::new(invert_condition(*rhs)),
+        },
+        Expr::Binary { op, lhs, rhs } => {
+            if let Some(op) = invert_binop(op) {
+                Expr::Binary { op, lhs, rhs }
+            } else {
+                Expr::Unary {
+                    op: UnOp::Not,
+                    operand: Box::new(Expr::Binary { op, lhs, rhs }),
+                }
+            }
+        }
         expr => Expr::Unary {
             op: UnOp::Not,
             operand: Box::new(expr),

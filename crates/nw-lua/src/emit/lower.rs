@@ -1,6 +1,9 @@
 use full_moon::ast::{Expression, FunctionCall, Prefix, Stmt as MoonStmt, Suffix, Var};
 
-use crate::decompile::ast::{self, BinOp, Expr, Stmt, TableField, UnOp};
+use crate::decompile::{
+    ast::{self, BinOp, Expr, Name, Stmt, TableField, UnOp},
+    naming::is_valid_identifier,
+};
 
 use super::builder;
 
@@ -19,7 +22,7 @@ const PREC_POW: u8 = 12;
 
 /// Lowers a compact decompiler block into a `full_moon` block.
 pub fn lower_block(block: &ast::Block) -> full_moon::ast::Block {
-    let mut stmts = Vec::new();
+    let mut stmts = Vec::with_capacity(block.0.len());
     let mut last_stmt = None;
 
     for (index, stmt) in block.0.iter().enumerate() {
@@ -125,7 +128,15 @@ fn lower_expr(expr: &Expr, context: ExprContext) -> Expression {
         Expr::Integer(value) => builder::integer_expr(*value),
         Expr::Str(bytes) => builder::string_expr(bytes),
         Expr::Name(name) => builder::name_expr(builder::identifier(name)),
-        Expr::Global(name) => builder::name_expr(builder::identifier_bstring(name)),
+        Expr::Global(name) if is_valid_identifier(name) => {
+            builder::name_expr(builder::identifier_bstring(name))
+        }
+        Expr::Global(_) => {
+            let (prefix, suffixes) = lower_prefix(expr);
+            Expression::Var(Var::Expression(Box::new(builder::var_expression(
+                prefix, suffixes,
+            ))))
+        }
         Expr::Index { .. } | Expr::Field { .. } => {
             let (prefix, suffixes) = lower_prefix(expr);
             Expression::Var(Var::Expression(Box::new(builder::var_expression(
@@ -141,8 +152,14 @@ fn lower_expr(expr: &Expr, context: ExprContext) -> Expression {
                     TableField::List(value) => {
                         builder::table_list(lower_expr(value, ExprContext::default()))
                     }
-                    TableField::Named { name, value } => builder::table_named(
-                        builder::identifier(name),
+                    TableField::Named { name, value } if is_valid_name(name) => {
+                        builder::table_named(
+                            builder::identifier(name),
+                            lower_expr(value, ExprContext::default()),
+                        )
+                    }
+                    TableField::Named { name, value } => builder::table_expr_key(
+                        builder::string_expr(&name.0),
                         lower_expr(value, ExprContext::default()),
                     ),
                     TableField::ExprKey { key, value } => builder::table_expr_key(
@@ -191,7 +208,13 @@ fn lower_call(expr: &Expr) -> FunctionCall {
 fn lower_var(expr: &Expr) -> Var {
     match expr {
         Expr::Name(name) => Var::Name(builder::identifier(name)),
-        Expr::Global(name) => Var::Name(builder::identifier_bstring(name)),
+        Expr::Global(name) if is_valid_identifier(name) => {
+            Var::Name(builder::identifier_bstring(name))
+        }
+        Expr::Global(_) => {
+            let (prefix, suffixes) = lower_prefix(expr);
+            Var::Expression(Box::new(builder::var_expression(prefix, suffixes)))
+        }
         Expr::Index { .. } | Expr::Field { .. } | Expr::Call { .. } => {
             let (prefix, suffixes) = lower_prefix(expr);
             Var::Expression(Box::new(builder::var_expression(prefix, suffixes)))
@@ -209,7 +232,13 @@ fn lower_var(expr: &Expr) -> Var {
 fn lower_prefix(expr: &Expr) -> (Prefix, Vec<Suffix>) {
     match expr {
         Expr::Name(name) => (Prefix::Name(builder::identifier(name)), Vec::new()),
-        Expr::Global(name) => (Prefix::Name(builder::identifier_bstring(name)), Vec::new()),
+        Expr::Global(name) if is_valid_identifier(name) => {
+            (Prefix::Name(builder::identifier_bstring(name)), Vec::new())
+        }
+        Expr::Global(name) => (
+            Prefix::Name(builder::identifier(&Name::from("_G"))),
+            vec![builder::bracket_index(builder::string_expr(name))],
+        ),
         Expr::Index { obj, key } => {
             let (prefix, mut suffixes) = lower_prefix(obj);
             suffixes.push(builder::bracket_index(lower_expr(
@@ -218,18 +247,33 @@ fn lower_prefix(expr: &Expr) -> (Prefix, Vec<Suffix>) {
             )));
             (prefix, suffixes)
         }
-        Expr::Field { obj, name } => {
+        Expr::Field { obj, name } if is_valid_name(name) => {
             let (prefix, mut suffixes) = lower_prefix(obj);
             suffixes.push(builder::dot_index(builder::identifier(name)));
+            (prefix, suffixes)
+        }
+        Expr::Field { obj, name } => {
+            let (prefix, mut suffixes) = lower_prefix(obj);
+            suffixes.push(builder::bracket_index(builder::string_expr(&name.0)));
             (prefix, suffixes)
         }
         Expr::Call { func, args, method } => {
             let (prefix, mut suffixes) = lower_prefix(func);
             let args = lower_exprs(args);
-            suffixes.push(match method {
-                Some(name) => builder::method_call(builder::identifier(name), args),
+            let call_suffix = match method {
+                Some(name) if is_valid_name(name) => {
+                    builder::method_call(builder::identifier(name), args)
+                }
+                Some(name) => {
+                    suffixes.push(builder::bracket_index(builder::string_expr(&name.0)));
+                    let mut explicit_args = Vec::with_capacity(args.len() + 1);
+                    explicit_args.push(lower_expr(func, ExprContext::default()));
+                    explicit_args.extend(args);
+                    builder::anonymous_call(explicit_args)
+                }
                 None => builder::anonymous_call(args),
-            });
+            };
+            suffixes.push(call_suffix);
             (prefix, suffixes)
         }
         expr => (
@@ -352,4 +396,8 @@ fn precedence(op: BinOp) -> u8 {
 
 fn is_right_assoc(op: BinOp) -> bool {
     matches!(op, BinOp::Pow | BinOp::Concat)
+}
+
+fn is_valid_name(name: &Name) -> bool {
+    is_valid_identifier(&name.0)
 }

@@ -77,6 +77,7 @@ nw-datasheet = { version = "0.1.0", path = "crates/nw-datasheet" }
 nw-dds = { version = "0.1.0", path = "crates/nw-dds" }
 nw-filesystem = { version = "0.1.0", path = "crates/nw-filesystem" }
 nw-locator = { version = "0.1.0", path = "crates/nw-locator" }
+nw-lua = { version = "0.1.0", path = "crates/nw-lua" }
 nw-model = { version = "0.1.0", path = "crates/nw-model" }
 nw-jobs = { version = "0.1.0", path = "crates/nw-jobs" }
 nw-localization = { version = "0.1.0", path = "crates/nw-localization" }

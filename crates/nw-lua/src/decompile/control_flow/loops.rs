@@ -412,7 +412,7 @@ fn header_condition_chain_exits_loop(
     visited.len() > 1 && saw_body && saw_exit
 }
 
-pub(super) fn has_tail_body_before_branch(function: &SsaFunction, block: usize) -> bool {
+pub(crate) fn has_tail_body_before_branch(function: &SsaFunction, block: usize) -> bool {
     let Some(block) = function.blocks.get(block) else {
         return false;
     };

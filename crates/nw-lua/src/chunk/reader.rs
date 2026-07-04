@@ -128,7 +128,13 @@ impl<'a> ByteReader<'a> {
     /// representation.
     pub fn read_number(&mut self) -> Result<f64, LuaError> {
         if self.integral_number {
-            return Ok(self.read_signed(self.number_size)? as f64);
+            let value = self.read_signed(self.number_size)?;
+            if !integer_fits_f64_exactly(value) {
+                return Err(LuaError::Malformed(format!(
+                    "integral lua_Number value {value} cannot be represented exactly as f64"
+                )));
+            }
+            return Ok(value as f64);
         }
 
         let number_size = self.number_size;
@@ -251,6 +257,17 @@ impl<'a> ByteReader<'a> {
         };
         Ok(value)
     }
+}
+
+fn integer_fits_f64_exactly(value: i64) -> bool {
+    let abs = value.unsigned_abs();
+    if abs <= (1_u64 << f64::MANTISSA_DIGITS) {
+        return true;
+    }
+    let bits = u64::BITS - abs.leading_zeros();
+    let excess = bits.saturating_sub(f64::MANTISSA_DIGITS);
+    let mask = (1_u64 << excess) - 1;
+    abs & mask == 0
 }
 
 #[cfg(test)]

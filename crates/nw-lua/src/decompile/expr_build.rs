@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    analysis::{DecompileAnalysis, ValueId},
+    analysis::{DecompileAnalysis, NodeId, ValueId, for_each_use, node_has_observable_side_effect},
     boolean::normalize,
     closure, multi,
     naming::{NameResolver, is_valid_identifier},
@@ -71,19 +71,26 @@ impl<'a> ExprBuilder<'a> {
 
     /// Return whether a value should be inlined at its use site.
     #[must_use]
-    pub fn can_inline_ref(&self, reference: SsaRef, _use_pc: i32) -> bool {
+    pub fn can_inline_ref(&self, reference: SsaRef, use_pc: i32) -> bool {
         let Some(node_id) = self.analysis.def_site(reference) else {
             return false;
         };
         let Some(node) = self.analysis.node(self.function, node_id) else {
             return false;
         };
+
+        if self.can_inline_table_constructor(reference, node) {
+            return true;
+        }
+        if self.can_inline_new_table(reference, node) {
+            return true;
+        }
         self.analysis.use_count(reference) == 1
+            && self.analysis.real_use_count(reference) == 1
             && is_inlineable_def(&node.op)
             && !self.is_stable_named_def(node)
-            && !matches!(&node.op, SsaOp::NewTable { .. })
-            || self.can_inline_new_table(reference, node)
-            || self.can_inline_table_constructor(reference, node)
+            && !matches!(&node.op, SsaOp::NewTable { .. } | SsaOp::Phi { .. })
+            && self.inline_preserves_order(reference, node_id, node, use_pc)
     }
 
     /// Convert an SSA reference to an expression.
@@ -328,24 +335,22 @@ impl<'a> ExprBuilder<'a> {
         let Some(table_reg) = node.dest.reg_index() else {
             return Ok(Expr::Table(Vec::new()));
         };
-        let setlists = self.constructor_setlists(node, table_reg);
-
-        let mut fields = Vec::new();
-        for setlist in setlists {
-            let SsaOp::SetList { values, count, .. } = setlist.op else {
-                continue;
-            };
-            let fixed_count = count != 0;
-            let last_index = values.len().saturating_sub(1);
-            for (index, value) in values.into_iter().enumerate() {
-                let expr = if fixed_count && index == last_index {
-                    self.expr_for_fixed_last_ref(value, setlist.pc)?
-                } else {
-                    self.expr_for_ref(value, setlist.pc)?
-                };
-                fields.push(ast::TableField::List(expr));
+        let plan = if self.can_inline_table_constructor(node.dest, node) {
+            self.constructor_plan(node, table_reg)
+        } else {
+            ConstructorPlan::default()
+        };
+        let mut expr_for_ref = |reference, pc, mode| match mode {
+            multi::table_list::ConstructorValueMode::Normal => self.expr_for_ref(reference, pc),
+            multi::table_list::ConstructorValueMode::FixedLast => {
+                self.expr_for_fixed_last_ref(reference, pc)
             }
-        }
+        };
+        let fields = multi::table_list::fields_from_nodes(
+            plan.setlists.iter(),
+            plan.keyed.iter(),
+            &mut expr_for_ref,
+        )?;
         Ok(Expr::Table(fields))
     }
 
@@ -451,36 +456,133 @@ impl<'a> ExprBuilder<'a> {
         let Some(table_reg) = node.dest.reg_index() else {
             return false;
         };
-        let setlist_count = self.constructor_setlists(node, table_reg).len();
-        setlist_count > 0
-            && self.analysis.facts(reference).mutating_table_uses == setlist_count
-            && self.analysis.real_use_count(reference) == setlist_count + 1
+        let plan = self.constructor_plan(node, table_reg);
+        plan.mutation_count > 0
+            && plan.final_use.is_some()
+            && self.analysis.facts(reference).mutating_table_uses == plan.mutation_count
+            && self.analysis.real_use_count(reference) == plan.mutation_count + 1
     }
 
-    fn constructor_setlists(&self, node: &SsaNode, table_reg: u16) -> Vec<SsaNode> {
+    fn constructor_plan(&self, node: &SsaNode, table_reg: u16) -> ConstructorPlan {
         let Some((block, node_index)) = self.node_position(node) else {
-            return Vec::new();
+            return ConstructorPlan::default();
         };
 
-        let mut setlists = Vec::new();
-        for current in self.function.blocks[block]
+        let mut plan = ConstructorPlan::default();
+        for (offset, current) in self.function.blocks[block]
             .nodes
             .iter()
             .skip(node_index + 1)
+            .enumerate()
         {
             if current.is_meta_only {
                 break;
             }
+            let current_id = NodeId {
+                block,
+                node: node_index + offset + 1,
+            };
             if multi::table_list::is_matching_setlist(current, node.dest, table_reg) {
-                setlists.push(current.clone());
+                plan.setlists.push(current.clone());
+                plan.mutation_count += 1;
                 continue;
             }
+            if multi::table_list::is_matching_settable(current, node.dest, table_reg) {
+                plan.keyed.push(current.clone());
+                plan.mutation_count += 1;
+                continue;
+            }
+            if op_uses_ref(&current.op, node.dest) {
+                plan.final_use = Some(current_id);
+                break;
+            }
             if multi::table_list::is_constructor_setup(current, table_reg) {
+                if node_has_observable_side_effect(&current.op) {
+                    return ConstructorPlan::default();
+                }
                 continue;
             }
             break;
         }
-        setlists
+        plan
+    }
+
+    fn inline_preserves_order(
+        &self,
+        reference: SsaRef,
+        def_id: NodeId,
+        node: &SsaNode,
+        _use_pc: i32,
+    ) -> bool {
+        let Some(use_id) = self.analysis.single_real_use(reference) else {
+            return false;
+        };
+        let Some(use_node) = self.analysis.node(self.function, use_id) else {
+            return false;
+        };
+        if self.dependencies_redefined_before_use(&node.op, node.pc, use_node.pc) {
+            return false;
+        }
+        if is_pure_def(&node.op) || !self.analysis.has_side_effect_between(def_id, use_id) {
+            return true;
+        }
+        self.use_preserves_intervening_effects(reference, def_id, use_id, use_node)
+    }
+
+    fn dependencies_redefined_before_use(&self, op: &SsaOp, def_pc: i32, use_pc: i32) -> bool {
+        let mut redefined = false;
+        for_each_use(op, |reference| {
+            if let Some(reg) = reference.reg_index()
+                && self.analysis.has_later_def_before(reg, def_pc, use_pc)
+            {
+                redefined = true;
+            }
+        });
+        redefined
+    }
+
+    fn use_preserves_intervening_effects(
+        &self,
+        reference: SsaRef,
+        def_id: NodeId,
+        use_id: NodeId,
+        use_node: &SsaNode,
+    ) -> bool {
+        if def_id.block != use_id.block || def_id.node >= use_id.node {
+            return false;
+        }
+        let eval_refs = direct_eval_order_refs(&use_node.op);
+        let Some(reference_index) = eval_refs.iter().position(|operand| *operand == reference)
+        else {
+            return false;
+        };
+        let block = &self.function.blocks[def_id.block];
+        for current in &block.nodes[def_id.node + 1..use_id.node] {
+            if !node_has_observable_side_effect(&current.op) {
+                continue;
+            }
+            let Some(effect_index) = current.dest.reg_index().and_then(|_| {
+                eval_refs
+                    .iter()
+                    .position(|operand| *operand == current.dest)
+            }) else {
+                let Some(table) = constructor_mutation_table(&current.op) else {
+                    return false;
+                };
+                let Some(table_index) = eval_refs.iter().position(|operand| *operand == table)
+                else {
+                    return false;
+                };
+                if table_index <= reference_index {
+                    return false;
+                }
+                continue;
+            };
+            if effect_index <= reference_index {
+                return false;
+            }
+        }
+        true
     }
 
     fn is_stable_named_def(&self, node: &SsaNode) -> bool {
@@ -490,9 +592,22 @@ impl<'a> ExprBuilder<'a> {
         let Some(binding) = self.names.binding_for_def(reg, node.pc) else {
             return false;
         };
+        if self.value_used_only_before_binding(node.dest, binding.start_pc) {
+            return false;
+        }
         !self
             .analysis
             .has_later_def_before(reg, node.pc, binding.start_pc)
+    }
+
+    fn value_used_only_before_binding(&self, reference: SsaRef, binding_start_pc: i32) -> bool {
+        let uses = self.analysis.real_uses(reference);
+        !uses.is_empty()
+            && uses.iter().all(|use_id| {
+                self.analysis
+                    .node(self.function, *use_id)
+                    .is_some_and(|use_node| use_node.pc < binding_start_pc)
+            })
     }
 
     fn last_position_needs_adjustment(&self, reference: SsaRef) -> bool {
@@ -540,6 +655,14 @@ impl<'a> ExprBuilder<'a> {
     }
 }
 
+#[derive(Debug, Default)]
+struct ConstructorPlan {
+    setlists: Vec<SsaNode>,
+    keyed: Vec<SsaNode>,
+    mutation_count: usize,
+    final_use: Option<NodeId>,
+}
+
 fn is_inlineable_def(op: &SsaOp) -> bool {
     matches!(
         op,
@@ -558,6 +681,70 @@ fn is_inlineable_def(op: &SsaOp) -> bool {
             | SsaOp::Closure { .. }
             | SsaOp::VarArg { .. }
     )
+}
+
+fn is_pure_def(op: &SsaOp) -> bool {
+    matches!(
+        op,
+        SsaOp::Move { .. }
+            | SsaOp::LoadK { .. }
+            | SsaOp::LoadBool { .. }
+            | SsaOp::LoadNil { .. }
+            | SsaOp::Closure { .. }
+            | SsaOp::VarArg { .. }
+    )
+}
+
+fn op_uses_ref(op: &SsaOp, needle: SsaRef) -> bool {
+    let mut found = false;
+    for_each_use(op, |reference| {
+        if reference == needle {
+            found = true;
+        }
+    });
+    found
+}
+
+fn constructor_mutation_table(op: &SsaOp) -> Option<SsaRef> {
+    match op {
+        SsaOp::SetTable { table, .. } | SsaOp::SetList { table, .. } => Some(*table),
+        _ => None,
+    }
+}
+
+fn direct_eval_order_refs(op: &SsaOp) -> Vec<SsaRef> {
+    match op {
+        SsaOp::Move { src } | SsaOp::UnOp { value: src, .. } => vec![*src],
+        SsaOp::GetTable { table, key } => vec![*table, *key],
+        SsaOp::SetGlobal { src, .. } | SsaOp::SetUpval { src, .. } => vec![*src],
+        SsaOp::SetTable { table, key, value } => vec![*table, *key, *value],
+        SsaOp::SelfOp { table, key, .. } => vec![*table, *key],
+        SsaOp::BinOp { left, right, .. } => vec![*left, *right],
+        SsaOp::Concat { operands } => operands.clone(),
+        SsaOp::Branch { a, b, .. } => vec![*a, *b],
+        SsaOp::Call { func, args, .. } | SsaOp::TailCall { func, args, .. } => {
+            let mut refs = Vec::with_capacity(args.len() + 1);
+            refs.push(*func);
+            refs.extend(args.iter().copied());
+            refs
+        }
+        SsaOp::Return { values, .. } | SsaOp::SetList { values, .. } => values.clone(),
+        SsaOp::Phi { operands, .. } => operands.clone(),
+        SsaOp::Nop
+        | SsaOp::LoadK { .. }
+        | SsaOp::LoadBool { .. }
+        | SsaOp::LoadNil { .. }
+        | SsaOp::GetUpval { .. }
+        | SsaOp::GetGlobal { .. }
+        | SsaOp::NewTable { .. }
+        | SsaOp::Jump { .. }
+        | SsaOp::ForPrep { .. }
+        | SsaOp::ForLoop { .. }
+        | SsaOp::TForLoop { .. }
+        | SsaOp::Close { .. }
+        | SsaOp::Closure { .. }
+        | SsaOp::VarArg { .. } => Vec::new(),
+    }
 }
 
 fn map_bin_op(op: ir::BinOp) -> ast::BinOp {

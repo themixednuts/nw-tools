@@ -36,6 +36,12 @@ struct Cli {
     annotate: bool,
     #[arg(
         long,
+        action = ArgAction::SetTrue,
+        help = "skip idiomatic AST cleanup during decompilation"
+    )]
+    no_idiomatic: bool,
+    #[arg(
+        long,
         value_name = "VER",
         value_parser = parse_lua_version,
         help = "override detected version: 51|52|53|54|55 (only 51 supported now)"
@@ -90,6 +96,11 @@ fn run() -> Result<(), CliError> {
             "--annotate can only be used with decompilation".to_string(),
         ));
     }
+    if cli.no_idiomatic && mode != Mode::Decompile {
+        return Err(CliError::Message(
+            "--no-idiomatic can only be used with decompilation".to_string(),
+        ));
+    }
 
     if let Some(version) = cli.lua_version {
         ensure_supported_version(version)?;
@@ -111,7 +122,15 @@ fn run() -> Result<(), CliError> {
         }
     }
 
-    let output = render(&bytes, mode, cli.annotate, table.as_ref())?;
+    let module_stem = input_module_stem(&cli.input);
+    let output = render(
+        &bytes,
+        mode,
+        cli.annotate,
+        cli.no_idiomatic,
+        table.as_ref(),
+        module_stem.as_deref(),
+    )?;
     write_output(cli.output.as_deref(), &output)?;
     Ok(())
 }
@@ -132,18 +151,63 @@ fn render(
     bytes: &[u8],
     mode: Mode,
     annotate: bool,
+    no_idiomatic: bool,
     table: Option<&OpcodeTable>,
+    module_stem: Option<&str>,
 ) -> Result<String, LuaError> {
-    match (mode, annotate, table) {
-        (Mode::Disassemble, _, Some(table)) => nw_lua::disassemble_with(bytes, table),
-        (Mode::Disassemble, _, None) => nw_lua::disassemble(bytes),
-        (Mode::SsaDump, _, Some(table)) => nw_lua::ssa_dump_with(bytes, table),
-        (Mode::SsaDump, _, None) => nw_lua::ssa_dump(bytes),
-        (Mode::Decompile, true, Some(table)) => nw_lua::decompile_annotated_with(bytes, table),
-        (Mode::Decompile, true, None) => nw_lua::decompile_annotated(bytes),
-        (Mode::Decompile, false, Some(table)) => nw_lua::decompile_with(bytes, table),
-        (Mode::Decompile, false, None) => nw_lua::decompile(bytes),
+    let options = if no_idiomatic {
+        nw_lua::DecompOptions::core()
+    } else {
+        nw_lua::DecompOptions::default()
+    };
+    match mode {
+        Mode::Disassemble => match table {
+            Some(table) => nw_lua::disassemble_with(bytes, table),
+            None => nw_lua::disassemble(bytes),
+        },
+        Mode::SsaDump => match table {
+            Some(table) => nw_lua::ssa_dump_with(bytes, table),
+            None => nw_lua::ssa_dump(bytes),
+        },
+        Mode::Decompile => {
+            let source = match table {
+                Some(table) => nw_lua::decompile_with_table_options_and_module_stem(
+                    bytes,
+                    table,
+                    options,
+                    module_stem,
+                )?,
+                None => {
+                    nw_lua::decompile_with_options_and_module_stem(bytes, options, module_stem)?
+                }
+            };
+            if annotate {
+                let disassembly = match table {
+                    Some(table) => nw_lua::disassemble_with(bytes, table)?,
+                    None => nw_lua::disassemble(bytes)?,
+                };
+                Ok(annotate_source(&disassembly, &source))
+            } else {
+                Ok(source)
+            }
+        }
     }
+}
+
+fn annotate_source(disassembly: &str, source: &str) -> String {
+    let mut out = String::from("-- disassembly annotations\n");
+    for line in disassembly.lines() {
+        if line.is_empty() {
+            out.push_str("--\n");
+        } else {
+            out.push_str("-- ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    out.push_str(source);
+    out
 }
 
 fn load_opcode_table(cli: &Cli) -> Result<Option<OpcodeTable>, CliError> {
@@ -233,6 +297,16 @@ fn ensure_supported_version(version: LuaVersion) -> Result<(), CliError> {
 
 fn is_dash(path: &Path) -> bool {
     path.as_os_str() == OsStr::new("-")
+}
+
+fn input_module_stem(path: &Path) -> Option<String> {
+    if is_dash(path) {
+        return None;
+    }
+    path.file_stem()
+        .and_then(OsStr::to_str)
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_string)
 }
 
 fn version_label(version: LuaVersion) -> &'static str {

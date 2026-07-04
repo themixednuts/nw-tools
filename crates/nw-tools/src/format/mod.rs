@@ -3,6 +3,7 @@ mod common;
 mod datasheet;
 mod datasheet_browser;
 mod dds;
+mod lua;
 mod objectstream;
 
 use anyhow::Result;
@@ -11,6 +12,7 @@ use clap::Subcommand;
 use catalog::Catalog;
 use datasheet::Datasheet;
 use dds::Dds;
+use lua::Lua;
 use objectstream::ObjectStream;
 
 #[derive(Debug, Subcommand)]
@@ -21,6 +23,8 @@ pub enum Cmd {
     Datasheet(Datasheet),
     #[command(name = "dds", about = "Inspect or convert DDS texture files")]
     Dds(Dds),
+    #[command(name = "lua", about = "Decompile or disassemble Lua bytecode (.luac)")]
+    Lua(Lua),
     #[command(name = "model", about = "Convert CGF meshes to glTF (.glb/.gltf)")]
     Model(crate::model::Model),
     #[command(name = "objectstream", about = "Inspect ObjectStream files")]
@@ -33,6 +37,7 @@ impl Cmd {
             Self::Catalog(cmd) => cmd.run(),
             Self::Datasheet(cmd) => cmd.run(),
             Self::Dds(cmd) => cmd.run(),
+            Self::Lua(cmd) => cmd.run(),
             Self::Model(cmd) => cmd.run(),
             Self::ObjectStream(cmd) => cmd.run(),
         }

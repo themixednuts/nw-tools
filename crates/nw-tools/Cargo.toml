@@ -23,6 +23,7 @@ nw-datasheet.workspace = true
 nw-dds.workspace = true
 nw-filesystem.workspace = true
 nw-locator.workspace = true
+nw-lua.workspace = true
 nw-model.workspace = true
 nw-jobs.workspace = true
 nw-localization.workspace = true

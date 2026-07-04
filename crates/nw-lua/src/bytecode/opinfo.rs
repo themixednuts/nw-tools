@@ -197,6 +197,28 @@ pub const fn info_for(op: SemanticOp) -> OpInfo {
     }
 }
 
+/// Return whether an opcode is part of the structural faithfulness signature.
+#[must_use]
+pub const fn is_structural_faithfulness_op(op: SemanticOp) -> bool {
+    matches!(
+        op,
+        SemanticOp::Jmp
+            | SemanticOp::Eq
+            | SemanticOp::Lt
+            | SemanticOp::Le
+            | SemanticOp::Test
+            | SemanticOp::TestSet
+            | SemanticOp::ForPrep
+            | SemanticOp::ForLoop
+            | SemanticOp::TForLoop
+            | SemanticOp::Call
+            | SemanticOp::TailCall
+            | SemanticOp::Return
+            | SemanticOp::Closure
+            | SemanticOp::SetList
+    )
+}
+
 const fn opmode(
     test: bool,
     sets_a: bool,

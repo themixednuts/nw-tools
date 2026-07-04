@@ -55,10 +55,11 @@ pub(crate) fn try_local_function(
         builder.names(),
         node,
     )?;
+    let name = builder.name_for_binding_def(&binding, node.dest);
     builder.mark_local_declared(binding.index);
-    builder.mark_materialized(node.dest, binding.name.clone());
+    builder.mark_materialized(node.dest, name.clone());
     Ok(Some(Stmt::Function {
-        name: binding.name,
+        name,
         body,
         local: true,
     }))

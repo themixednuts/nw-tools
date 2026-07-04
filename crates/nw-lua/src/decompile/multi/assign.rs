@@ -148,7 +148,7 @@ fn local_value_slot(
             .def_at_reg(id, reg)
             .unwrap_or_else(|| fallback_ref(node, reg));
         refs.push(reference);
-        names.push(binding.name);
+        names.push(builder.name_for_binding_def(&binding, reference));
         local_indexes.push(binding.index);
     }
     Some(LocalValueSlot {
@@ -170,7 +170,10 @@ fn is_call_setup(
     let Some(current) = node_ids.get(cursor).and_then(|id| builder.node(*id)) else {
         return false;
     };
-    if matches!(current.op, SsaOp::Call { .. }) || current.dest.reg_index() != Some(expected) {
+    let Some(current_reg) = current.dest.reg_index() else {
+        return false;
+    };
+    if matches!(current.op, SsaOp::Call { .. }) || current_reg < expected {
         return false;
     }
 
@@ -181,17 +184,39 @@ fn is_call_setup(
         if next.is_meta_only || skip(next) {
             continue;
         }
-        if next.dest.reg_index() != Some(expected) {
-            return false;
+        if let SsaOp::Call {
+            return_count,
+            arg_count,
+            ..
+        } = next.op
+            && next.dest.reg_index() == Some(expected)
+            && return_count > 1
+        {
+            return call_setup_reg_in_frame(current_reg, expected, arg_count);
         }
-        if matches!(next.op, SsaOp::Call { return_count, .. } if return_count > 1) {
-            return true;
+        if let Some(next_reg) = next.dest.reg_index()
+            && next_reg < expected
+        {
+            return false;
         }
         if !is_direct_value_node(next) {
             return false;
         }
     }
     false
+}
+
+fn call_setup_reg_in_frame(reg: u16, base: u16, arg_count: i32) -> bool {
+    if reg < base {
+        return false;
+    }
+    if arg_count == 0 {
+        return true;
+    }
+    let Ok(arg_count) = u16::try_from(arg_count) else {
+        return false;
+    };
+    reg < base.saturating_add(arg_count)
 }
 
 fn local_result_count(node: &SsaNode) -> u16 {
@@ -256,7 +281,15 @@ pub(crate) fn try_emit_swap(
         {
             break;
         }
-        saves.push((id, current.dest));
+        let SsaOp::Move { src } = &current.op else {
+            break;
+        };
+        saves.push(SaveTemp {
+            id,
+            dest: current.dest,
+            src: *src,
+            pc: current.pc,
+        });
         cursor += 1;
     }
 
@@ -284,10 +317,11 @@ pub(crate) fn try_emit_swap(
         else {
             break;
         };
+        let name = builder.name_for_binding_def(&binding, current.dest);
         writes.push(WriteBack {
             id,
             dest: current.dest,
-            name: binding.name,
+            name,
             src: *src,
             pc: current.pc,
         });
@@ -302,7 +336,11 @@ pub(crate) fn try_emit_swap(
     let mut values = Vec::with_capacity(writes.len());
     for write in writes.iter().rev() {
         targets.push(Expr::Name(write.name.clone()));
-        values.push(builder.expr_for_ref(write.src, write.pc)?);
+        let (src, pc) = saves
+            .iter()
+            .find_map(|save| (save.dest == write.src).then_some((save.src, save.pc)))
+            .unwrap_or((write.src, write.pc));
+        values.push(builder.expr_for_ref(src, pc)?);
     }
 
     for write in &writes {
@@ -311,7 +349,7 @@ pub(crate) fn try_emit_swap(
 
     let consumed = saves
         .into_iter()
-        .map(|(id, _)| id)
+        .map(|save| save.id)
         .chain(writes.into_iter().map(|write| write.id))
         .collect();
 
@@ -329,10 +367,17 @@ struct WriteBack {
     pc: i32,
 }
 
-fn uses_saved_temp(saves: &[(NodeId, SsaRef)], writes: &[WriteBack]) -> bool {
+struct SaveTemp {
+    id: NodeId,
+    dest: SsaRef,
+    src: SsaRef,
+    pc: i32,
+}
+
+fn uses_saved_temp(saves: &[SaveTemp], writes: &[WriteBack]) -> bool {
     saves
         .iter()
-        .any(|(_, save)| writes.iter().any(|write| write.src == *save))
+        .any(|save| writes.iter().any(|write| write.src == save.dest))
 }
 
 fn is_direct_value_node(node: &SsaNode) -> bool {
