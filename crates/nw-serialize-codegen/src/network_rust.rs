@@ -342,6 +342,7 @@ impl NetworkRustEmitter {
                 Vec3Comp,
                 Vec3CompNorm,
                 QuatComp,
+                QuatSmallestThree,
                 NonUniformScaleComp,
                 PositionAnchor,
                 TransformCompressor,
@@ -383,6 +384,7 @@ impl NetworkRustEmitter {
                 Vec3Comp,
                 Vec3CompNorm,
                 QuatComp,
+                QuatSmallestThree,
                 NonUniformScaleComp,
                 PositionAnchor,
                 TransformCompressor,
@@ -2153,6 +2155,7 @@ fn message_native_type_rust_type(native_type: &str) -> Option<&'static str> {
             Some("::nw_network::hub::BaselineableFragment")
         }
         "FragmentKey" | "Amazon::Hub::FragmentKey" => Some("::nw_network::hub::FragmentKey"),
+        "EntityRef" => Some("::nw_network::EntityRef"),
         _ => None,
     }
 }
@@ -2828,6 +2831,10 @@ fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
             "::glam::Quat",
             "ReplicatedFieldHandler<::glam::Quat, QuatCompMarshaler>",
         ),
+        SchemaWireShape::QuatSmallestThree => rust_field_shape_static(
+            "::glam::Quat",
+            "ReplicatedFieldHandler<::glam::Quat, QuatSmallestThreeQuantizedMarshaler>",
+        ),
         SchemaWireShape::NonUniformScaleComp => rust_field_shape_static(
             "::glam::Vec3",
             "ReplicatedFieldHandler<::glam::Vec3, NonUniformScaleCompMarshaler>",
@@ -2920,9 +2927,7 @@ fn replicated_container_semantic_field_shape(
 ) -> Option<RustFieldShape> {
     let value = container_value_type(field, container, value_type_candidates, serialize_types)?;
     let key_marshaler = match container.storage {
-        NetworkReplicatedContainerStorageKind::Map => {
-            scalar_marshaler_type(container.key_wire_shape)
-        }
+        NetworkReplicatedContainerStorageKind::Map => container_key_marshaler_type(container),
         NetworkReplicatedContainerStorageKind::Vec => {
             "::nw_network::serialize::DefaultMarshaler<::nw_network::serialize::VlqU64>".to_owned()
         }
@@ -2930,7 +2935,7 @@ fn replicated_container_semantic_field_shape(
     let value_marshaler = value.marshaler_type;
     let collection_type = match container.storage {
         NetworkReplicatedContainerStorageKind::Map => {
-            let key_type = scalar_rust_type(container.key_wire_shape);
+            let key_type = container_key_rust_type(container);
             keyed_replicated_container_type(&key_type, &value.rust_type)
         }
         NetworkReplicatedContainerStorageKind::Vec => {
@@ -2945,6 +2950,27 @@ fn replicated_container_semantic_field_shape(
         field_type,
         container_value_type_shape: value.value_type_shape,
     })
+}
+
+fn container_key_rust_type(container: &NetworkReplicatedContainerShape) -> String {
+    if is_uuid_native_type(container.key_native_type.as_deref()) {
+        return "::uuid::Uuid".to_owned();
+    }
+    scalar_rust_type(container.key_wire_shape)
+}
+
+fn container_key_marshaler_type(container: &NetworkReplicatedContainerShape) -> String {
+    if is_uuid_native_type(container.key_native_type.as_deref()) {
+        return "::nw_network::serialize::DefaultMarshaler<::uuid::Uuid>".to_owned();
+    }
+    scalar_marshaler_type(container.key_wire_shape)
+}
+
+fn is_uuid_native_type(native_type: Option<&str>) -> bool {
+    matches!(
+        native_type.map(str::trim),
+        Some("AZ::Uuid" | "Uuid" | "uuid::Uuid" | "::uuid::Uuid")
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -3131,6 +3157,7 @@ fn wire_scalar_shape_from_name(value: &str) -> Option<SchemaWireScalarShape> {
         "vec3-comp" => Some(SchemaWireScalarShape::Vec3Comp),
         "vec3-comp-norm" => Some(SchemaWireScalarShape::Vec3CompNorm),
         "quat-comp" => Some(SchemaWireScalarShape::QuatComp),
+        "quat-smallest-three" => Some(SchemaWireScalarShape::QuatSmallestThree),
         "non-uniform-scale-comp" => Some(SchemaWireScalarShape::NonUniformScaleComp),
         "position-anchor" => Some(SchemaWireScalarShape::PositionAnchor),
         "transform-compressor" => Some(SchemaWireScalarShape::TransformCompressor),
@@ -3329,7 +3356,9 @@ fn scalar_rust_type(shape: SchemaWireScalarShape) -> String {
         SchemaWireScalarShape::Vec3Comp
         | SchemaWireScalarShape::Vec3CompNorm
         | SchemaWireScalarShape::NonUniformScaleComp => "::glam::Vec3".to_owned(),
-        SchemaWireScalarShape::QuatComp => "::glam::Quat".to_owned(),
+        SchemaWireScalarShape::QuatComp | SchemaWireScalarShape::QuatSmallestThree => {
+            "::glam::Quat".to_owned()
+        }
         SchemaWireScalarShape::PositionAnchor => "(f32, f32, f32)".to_owned(),
         SchemaWireScalarShape::TransformCompressor => "::glam::Affine3A".to_owned(),
         SchemaWireScalarShape::PackedSize => "::nw_network::serialize::PackedSize".to_owned(),
@@ -3354,6 +3383,9 @@ fn scalar_marshaler_type(shape: SchemaWireScalarShape) -> String {
             "::nw_network::serialize::Vec3CompNormMarshaler".to_owned()
         }
         SchemaWireScalarShape::QuatComp => "::nw_network::serialize::QuatCompMarshaler".to_owned(),
+        SchemaWireScalarShape::QuatSmallestThree => {
+            "::nw_network::serialize::QuatSmallestThreeQuantizedMarshaler".to_owned()
+        }
         SchemaWireScalarShape::NonUniformScaleComp => {
             "::nw_network::serialize::NonUniformScaleCompMarshaler".to_owned()
         }
@@ -3715,6 +3747,19 @@ fn container_member_source_rust_type(native_type: &str) -> Option<String> {
     if native_type == "bool" {
         return Some("bool".to_owned());
     }
+    let normalized = native_type.replace(' ', "");
+    if matches!(
+        normalized.as_str(),
+        "AZStd::array<short,3>"
+            | "AZStd::array<AZ::s16,3>"
+            | "AZStd::array<i16,3>"
+            | "std::array<i16,3>"
+    ) {
+        return Some("[i16; 3]".to_owned());
+    }
+    if matches!(native_type, "Quaternion" | "AZ::Quaternion") {
+        return Some("::glam::Quat".to_owned());
+    }
     let leaf = native_type.rsplit("::").next().unwrap_or(native_type);
     let first = leaf.chars().next()?;
     if !first.is_ascii_uppercase()
@@ -3739,9 +3784,31 @@ fn container_value_member_codec_type(
         ));
     }
     let shape = wire_scalar_shape_from_name(wire_shape)?;
-    Some(
-        conversion_marshal_type_string_for(shape.into(), rust_type)
-            .unwrap_or_else(|| format!("::nw_network::serialize::DefaultMarshaler<{rust_type}>")),
+    if let Some(conversion) = conversion_marshal_type_string_for(shape.into(), rust_type) {
+        return Some(conversion);
+    }
+    if scalar_shape_uses_custom_codec(shape) {
+        return Some(scalar_marshaler_type(shape));
+    }
+    Some(format!(
+        "::nw_network::serialize::DefaultMarshaler<{rust_type}>"
+    ))
+}
+
+fn scalar_shape_uses_custom_codec(shape: SchemaWireScalarShape) -> bool {
+    matches!(
+        shape,
+        SchemaWireScalarShape::HalfF32
+            | SchemaWireScalarShape::VlqU32
+            | SchemaWireScalarShape::VlqU64
+            | SchemaWireScalarShape::Vec2Comp
+            | SchemaWireScalarShape::Vec3Comp
+            | SchemaWireScalarShape::Vec3CompNorm
+            | SchemaWireScalarShape::QuatComp
+            | SchemaWireScalarShape::QuatSmallestThree
+            | SchemaWireScalarShape::NonUniformScaleComp
+            | SchemaWireScalarShape::PositionAnchor
+            | SchemaWireScalarShape::TransformCompressor
     )
 }
 
@@ -3931,6 +3998,14 @@ fn replicated_state_field_type_tokens(
                 >
             )
         }
+        SchemaWireShape::QuatSmallestThree => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::glam::Quat,
+                    ::nw_network::serialize::QuatSmallestThreeQuantizedMarshaler,
+                >
+            )
+        }
         SchemaWireShape::NonUniformScaleComp => {
             quote!(
                 ::nw_network::serialize::ReplicatedFieldHandler<
@@ -4099,7 +4174,7 @@ fn message_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream
         SchemaWireShape::Vec3Comp
         | SchemaWireShape::Vec3CompNorm
         | SchemaWireShape::NonUniformScaleComp => quote!(::glam::Vec3),
-        SchemaWireShape::QuatComp => quote!(::glam::Quat),
+        SchemaWireShape::QuatComp | SchemaWireShape::QuatSmallestThree => quote!(::glam::Quat),
         SchemaWireShape::PositionAnchor => quote!((f32, f32, f32)),
         SchemaWireShape::TransformCompressor => quote!(::glam::Affine3A),
         SchemaWireShape::PackedSize => quote!(::nw_network::serialize::PackedSize),
@@ -4155,6 +4230,9 @@ fn message_wire_shape_marshal_attr_tokens(shape: SchemaWireShape) -> proc_macro2
         }
         SchemaWireShape::QuatComp => {
             quote!(#[marshal(codec = "::nw_network::serialize::QuatCompMarshaler")])
+        }
+        SchemaWireShape::QuatSmallestThree => {
+            quote!(#[marshal(codec = "::nw_network::serialize::QuatSmallestThreeQuantizedMarshaler")])
         }
         SchemaWireShape::NonUniformScaleComp => {
             quote!(#[marshal(codec = "::nw_network::serialize::NonUniformScaleCompMarshaler")])
@@ -4302,6 +4380,7 @@ fn wire_shape_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream {
         SchemaWireShape::Vec3Comp => quote!(NetworkWireShape::Vec3Comp),
         SchemaWireShape::Vec3CompNorm => quote!(NetworkWireShape::Vec3CompNorm),
         SchemaWireShape::QuatComp => quote!(NetworkWireShape::QuatComp),
+        SchemaWireShape::QuatSmallestThree => quote!(NetworkWireShape::QuatSmallestThree),
         SchemaWireShape::NonUniformScaleComp => quote!(NetworkWireShape::NonUniformScaleComp),
         SchemaWireShape::PositionAnchor => quote!(NetworkWireShape::PositionAnchor),
         SchemaWireShape::TransformCompressor => quote!(NetworkWireShape::TransformCompressor),
@@ -4353,6 +4432,9 @@ fn wire_scalar_shape_tokens(shape: SchemaWireScalarShape) -> proc_macro2::TokenS
         SchemaWireScalarShape::Vec3Comp => quote!(NetworkWireScalarShape::Vec3Comp),
         SchemaWireScalarShape::Vec3CompNorm => quote!(NetworkWireScalarShape::Vec3CompNorm),
         SchemaWireScalarShape::QuatComp => quote!(NetworkWireScalarShape::QuatComp),
+        SchemaWireScalarShape::QuatSmallestThree => {
+            quote!(NetworkWireScalarShape::QuatSmallestThree)
+        }
         SchemaWireScalarShape::NonUniformScaleComp => {
             quote!(NetworkWireScalarShape::NonUniformScaleComp)
         }
@@ -4403,7 +4485,10 @@ mod tests {
 
     use crate::{
         ir::{SerializeCodegenField, SerializeCodegenUnit, SerializeCodegenVariant},
-        network_schema::{NetworkMessageFieldSignature, NetworkMessageSignature, NetworkSchema},
+        network_schema::{
+            NetworkMessageFieldSignature, NetworkMessageSignature, NetworkSchema,
+            NetworkWireScalarShape,
+        },
     };
 
     use super::*;
@@ -6156,6 +6241,1223 @@ mod tests {
                 "DefaultMarshaler<::std::vec::Vec<::nw_network::source::PersistentItemData>>",
             )
         }));
+    }
+
+    #[test]
+    fn source_backed_container_value_with_composite_member_emits_codec() {
+        let persistent_mount_data_id = uuid!("e6f4d231-af72-47b6-a817-ab1a3e413216");
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "BD597A98-A64F-4538-94B2-2479C35CB6BF",
+                "typeIndex": 5620,
+                "typeName": "MB::MountComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "m_persistentMountData",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x82378f0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x82378f0",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "u32",
+                    "sequence-number",
+                    "u8",
+                    "u8",
+                    "u8",
+                    "u8",
+                    "string"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u32",
+                    "u8",
+                    "u8",
+                    "u8",
+                    "u8",
+                    "string"
+                ],
+                "valueTypeShape": {
+                    "typeId": persistent_mount_data_id.to_string(),
+                    "typeName": "PersistentMountData",
+                    "typeNameFull": "PersistentMountData",
+                    "typeNameSource": "serialize-json-class-name",
+                    "memberNameSource": "serialize-json-field",
+                    "memberNamesProven": true,
+                    "validation": "custom-container-value-pcode-serialize-type-sequence-persistent-mount-data",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x8",
+                        "nativeOffset": "0x8",
+                        "name": "m_dyeData",
+                        "nameSource": "serialize-json-offset-match",
+                        "nameProven": true,
+                        "nativeType": "DyeData",
+                        "wireShape": "composite<u8,u8,u8,u8>",
+                        "evidenceSource": "persistent-mount-data-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x18",
+                        "nativeOffset": "0x18",
+                        "name": "m_name",
+                        "nameSource": "serialize-json-offset-match",
+                        "nameProven": true,
+                        "nativeType": "AZStd::string",
+                        "wireShape": "string",
+                        "evidenceSource": "persistent-mount-data-container-slot"
+                    }]
+                },
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x9ee6838",
+                    "name": "PersistentMountData",
+                    "typeId": persistent_mount_data_id.to_string(),
+                    "source": "serialize-registration+container-slot-shape"
+                }],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [5620]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some(
+                "::nw_network::serialize::IndexMap<u32, ::nw_network::source::PersistentMountData>"
+            )
+        );
+        assert!(
+            field
+                .rust_field_type
+                .as_deref()
+                .is_some_and(|ty| { ty.contains("PersistentMountDataMarshaler") })
+        );
+        assert!(output.source.contains("value.dye_data"));
+        assert!(output.source.contains("value.name"));
+    }
+
+    #[test]
+    fn affliction_hot_data_container_uses_source_type_subset_codec() {
+        let affliction_data_id = uuid!("99a32353-e595-4d5c-86cb-dc80318228d1");
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "F7662A54-8F1D-4F4A-A7F7-2A1B08E7AB99",
+                "typeIndex": 15,
+                "typeName": "MB::VitalsComponentReplicatedState",
+                "fields": [{
+                    "index": 3,
+                    "name": "replicatedAfflictionsHotData",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x855eab0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x855eab0",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "u8",
+                    "sequence-number",
+                    "half-f32",
+                    "half-f32",
+                    "u64",
+                    "u64"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u8",
+                    "half-f32",
+                    "half-f32",
+                    "u64",
+                    "u64"
+                ],
+                "valueTypeShape": {
+                    "typeId": affliction_data_id.to_string(),
+                    "typeName": "AfflictionData",
+                    "typeNameFull": "AfflictionData",
+                    "typeNameSource": "serialize-json-class-name",
+                    "memberNameSource": "serialize-json-field-subset",
+                    "memberNamesProven": true,
+                    "validation": "custom-container-value-pcode-serialize-type-subset-affliction-hot-data",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x8",
+                        "nativeOffset": "0x8",
+                        "name": "m_lastAmount",
+                        "nameSource": "serialize-json-field-subset",
+                        "nameProven": true,
+                        "nativeType": "float",
+                        "wireShape": "half-f32",
+                        "byteWidth": 4,
+                        "evidenceSource": "affliction-hot-data-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x20",
+                        "nativeOffset": "0x20",
+                        "name": "m_targetAmount",
+                        "nameSource": "serialize-json-field-subset",
+                        "nameProven": true,
+                        "nativeType": "float",
+                        "wireShape": "half-f32",
+                        "byteWidth": 4,
+                        "evidenceSource": "affliction-hot-data-container-slot"
+                    }, {
+                        "index": 2,
+                        "offset": "0x10",
+                        "nativeOffset": "0x10",
+                        "name": "m_lastAmountTimePoint",
+                        "nameSource": "serialize-json-field-subset",
+                        "nameProven": true,
+                        "nativeType": "TimePoint",
+                        "wireShape": "u64",
+                        "byteWidth": 16,
+                        "evidenceSource": "affliction-hot-data-container-slot"
+                    }, {
+                        "index": 3,
+                        "offset": "0x28",
+                        "nativeOffset": "0x28",
+                        "name": "m_targetAmountTimePoint",
+                        "nameSource": "serialize-json-field-subset",
+                        "nameProven": true,
+                        "nativeType": "TimePoint",
+                        "wireShape": "u64",
+                        "byteWidth": 16,
+                        "evidenceSource": "affliction-hot-data-container-slot"
+                    }]
+                },
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x9f34550",
+                    "name": "AfflictionData",
+                    "typeId": affliction_data_id.to_string(),
+                    "source": "serialize-registration+container-slot-shape"
+                }],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [15]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::nw_network::serialize::IndexMap<u8, ::nw_network::source::AfflictionData>")
+        );
+        assert!(field.rust_field_type.as_deref().is_some_and(|ty| {
+            ty.contains("ReplicatedAfflictionsHotDataAfflictionDataMarshaler")
+        }));
+        assert!(output.source.contains("value.last_amount"));
+        assert!(output.source.contains("value.target_amount"));
+        assert!(output.source.contains("value.last_amount_time_point"));
+        assert!(output.source.contains("value.target_amount_time_point"));
+        assert!(output.source.contains("HalfF32Marshaler"));
+    }
+
+    #[test]
+    fn projected_source_container_value_emits_array_and_smallest_three_codec() {
+        let housing_item_server_data_id = uuid!("d65749ab-07d4-4401-b2d4-d9282475ce59");
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "9E4B23C7-4BCB-4D98-9A4D-7D1805B43C74",
+                "typeIndex": 3663,
+                "typeName": "Javelin::HouseDataReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "housingItems",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81ebc78",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81ebc78",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "vlq-u64",
+                    "sequence-number",
+                    "u16",
+                    "u16",
+                    "u16",
+                    "quat-smallest-three",
+                    "u32",
+                    "u8"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u16",
+                    "u16",
+                    "u16",
+                    "quat-smallest-three",
+                    "u32",
+                    "u8"
+                ],
+                "valueTypeShape": {
+                    "typeId": housing_item_server_data_id.to_string(),
+                    "typeName": "HousingItemServerData",
+                    "typeNameFull": "HousingItemServerData",
+                    "typeNameSource": "serialize-json-class-name",
+                    "memberNameSource": "serialize-json-offset+ghidra-helper-offset",
+                    "memberNamesProven": true,
+                    "validation": "custom-container-value-pcode-serialize-type-sequence-housing-item-server-data",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x20",
+                        "nativeOffset": "0x20",
+                        "name": "m_positionOffset",
+                        "nameSource": "serialize-json-offset-match",
+                        "nameProven": true,
+                        "nativeType": "AZStd::array<short, 3>",
+                        "wireShape": "composite<u16,u16,u16>",
+                        "evidenceSource": "housing-item-server-data-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x10",
+                        "nativeOffset": "0x10",
+                        "name": "m_rotation",
+                        "nameSource": "serialize-json-offset-match",
+                        "nameProven": true,
+                        "nativeType": "Quaternion",
+                        "wireShape": "quat-smallest-three",
+                        "evidenceSource": "housing-item-server-data-container-slot"
+                    }, {
+                        "index": 2,
+                        "offset": "0x30",
+                        "nativeOffset": "0x30",
+                        "name": "m_itemIndex",
+                        "nameSource": "serialize-json-offset-match",
+                        "nameProven": true,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "evidenceSource": "housing-item-server-data-container-slot"
+                    }, {
+                        "index": 3,
+                        "offset": "0x2c",
+                        "nativeOffset": "0x2c",
+                        "name": "m_state",
+                        "nameSource": "serialize-json-offset-match",
+                        "nameProven": true,
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "evidenceSource": "housing-item-server-data-container-slot"
+                    }]
+                },
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x9ed8bb8",
+                    "name": "HousingItemServerData",
+                    "typeId": housing_item_server_data_id.to_string(),
+                    "source": "serialize-registration+container-slot-shape"
+                }],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3663]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::std::vec::Vec<::nw_network::source::HousingItemServerData>")
+        );
+        assert!(
+            field
+                .rust_field_type
+                .as_deref()
+                .is_some_and(|ty| { ty.contains("HousingItemServerDataMarshaler") })
+        );
+        assert!(output.source.contains("value.position_offset"));
+        assert!(output.source.contains("value.rotation"));
+        assert!(
+            output
+                .source
+                .contains("QuatSmallestThreeQuantizedMarshaler")
+        );
+    }
+
+    #[test]
+    fn native_serializer_container_value_without_fields_stays_local_support_type() {
+        let loot_limit_data_id = uuid!("ec6027f0-84b8-46f1-9683-b850c37348ee");
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "A24F4B9E-71E0-4D10-8BB6-42476298BB80",
+                "typeIndex": 982,
+                "typeName": "MB::LootTrackerComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "m_lootLimitDataMap",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x8219138",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8219138",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "u32",
+                    "sequence-number",
+                    "u64",
+                    "u64",
+                    "u16",
+                    "u8"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u32",
+                    "u64",
+                    "u64",
+                    "u16",
+                    "u8"
+                ],
+                "valueTypeShape": {
+                    "typeId": loot_limit_data_id.to_string(),
+                    "typeIdSource": "serialize-registration+container-slot-shape",
+                    "typeName": "LootLimitData",
+                    "typeNameFull": "LootLimitData",
+                    "typeNameSource": "serialize-json-class-name",
+                    "factory": "NewWorld+0x9f34270",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-native-type-sequence-loot-limit-data",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x10",
+                        "nativeOffset": "0x10",
+                        "name": "field_0",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "WallClockTimePoint",
+                        "wireShape": "u64",
+                        "byteWidth": 16,
+                        "evidenceSource": "loot-limit-data-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x20",
+                        "nativeOffset": "0x20",
+                        "name": "field_1",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "WallClockTimePoint",
+                        "wireShape": "u64",
+                        "byteWidth": 16,
+                        "evidenceSource": "loot-limit-data-container-slot"
+                    }, {
+                        "index": 2,
+                        "offset": "0x28",
+                        "nativeOffset": "0x28",
+                        "name": "field_2",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u16",
+                        "wireShape": "u16",
+                        "byteWidth": 2,
+                        "evidenceSource": "loot-limit-data-container-slot"
+                    }, {
+                        "index": 3,
+                        "offset": "0x2a",
+                        "nativeOffset": "0x2a",
+                        "name": "field_3",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "loot-limit-data-container-slot"
+                    }]
+                },
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x9f34270",
+                    "name": "LootLimitData",
+                    "typeId": loot_limit_data_id.to_string(),
+                    "source": "serialize-registration+container-slot-shape"
+                }],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [982]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::nw_network::serialize::IndexMap<u32, LootLimitDataMapLootLimitData>")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub struct LootLimitDataMapLootLimitData")
+        );
+        assert!(!output.source.contains("source::LootLimitData"));
+        assert!(
+            output
+                .source
+                .contains("::nw_network::source::WallClockTimePoint")
+        );
+    }
+
+    #[test]
+    fn replicated_vector_container_value_without_source_type_emits_vec_support_type() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "3EF03794-7831-4123-A770-821C53F29C81",
+                "typeIndex": 3681,
+                "typeName": "Javelin::ProgressionPointComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "pointEntries",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x82ae9d0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x82ae9d0",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "vlq-u64",
+                    "sequence-number",
+                    "u32",
+                    "u32",
+                    "u16"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u32",
+                    "u32",
+                    "u16"
+                ],
+                "valueTypeShape": {
+                    "typeName": "PointEntry",
+                    "typeNameFull": "PointEntry",
+                    "typeNameSource": "field-name+container-slot-shape",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-wire-sequence-progression-point-entry",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x8",
+                        "nativeOffset": "0x8",
+                        "name": "field_0",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "progression-point-entry-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0xc",
+                        "nativeOffset": "0xc",
+                        "name": "field_1",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "progression-point-entry-container-slot"
+                    }, {
+                        "index": 2,
+                        "offset": "0x10",
+                        "nativeOffset": "0x10",
+                        "name": "field_2",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u16",
+                        "wireShape": "u16",
+                        "byteWidth": 2,
+                        "evidenceSource": "progression-point-entry-container-slot"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3681]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::std::vec::Vec<PointEntriesPointEntry>")
+        );
+        assert!(output.source.contains("pub struct PointEntriesPointEntry"));
+        assert!(output.source.contains("PointEntriesPointEntryMarshaler"));
+    }
+
+    #[test]
+    fn projectile_piercing_hits_emit_vector_support_type() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "AA4DB620-9D7A-43A0-8E51-6D8D83A7EE16",
+                "typeIndex": 16,
+                "typeName": "MB::ProjectileReplicatedState",
+                "fields": [{
+                    "index": 16,
+                    "name": "m_piercingHits",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x8549bd0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8549bd0",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "vlq-u64",
+                    "sequence-number",
+                    "u64",
+                    "u8",
+                    "u16"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u64",
+                    "u8",
+                    "u16"
+                ],
+                "valueTypeShape": {
+                    "typeName": "PiercingHitData",
+                    "typeNameFull": "PiercingHitData",
+                    "typeNameSource": "field-name+container-slot-shape",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-wire-sequence-piercing-hit-data",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x8",
+                        "name": "field_0",
+                        "nativeType": "AZ::u64",
+                        "wireShape": "u64",
+                        "byteWidth": 8,
+                        "evidenceSource": "piercing-hit-data-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x10",
+                        "name": "field_1",
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "piercing-hit-data-container-slot"
+                    }, {
+                        "index": 2,
+                        "offset": "0x12",
+                        "name": "field_2",
+                        "nativeType": "AZ::u16",
+                        "wireShape": "u16",
+                        "byteWidth": 2,
+                        "evidenceSource": "piercing-hit-data-container-slot"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [16]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::std::vec::Vec<PiercingHitsPiercingHitData>")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub struct PiercingHitsPiercingHitData")
+        );
+        assert!(
+            output
+                .source
+                .contains("PiercingHitsPiercingHitDataMarshaler")
+        );
+        assert!(
+            !output
+                .source
+                .contains("IndexMap<u64, PiercingHitsPiercingHitData>")
+        );
+    }
+
+    #[test]
+    fn group_finder_applications_emit_fixed_uuid_keyed_map_support_type() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "CE526687-CA4B-4647-A599-EC026FDC0C6D",
+                "typeIndex": 1994,
+                "typeName": "Javelin::GroupsComponentReplicatedState",
+                "fields": [{
+                    "index": 7,
+                    "name": "groupFinderApplications",
+                    "group": 1,
+                    "handlerVtable": "NewWorld+0x81dadf0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81dadf0",
+                "fieldCount": 1,
+                "keyNativeType": "AZ::Uuid",
+                "keyNativeTypeSource": "replicated-container-key-marshal-shape",
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "fixed-bytes-16",
+                    "sequence-number",
+                    "u8",
+                    "u8"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "fixed-bytes-16",
+                    "u8",
+                    "u8"
+                ],
+                "valueTypeShape": {
+                    "typeName": "GroupFinderApplication",
+                    "typeNameFull": "GroupFinderApplication",
+                    "typeNameSource": "field-name+container-slot-shape",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-wire-sequence-group-finder-application",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "name": "field_0",
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "group-finder-application-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x1",
+                        "name": "field_1",
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "group-finder-application-container-slot"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [1994]).expect("state source");
+        let container_shape = schema.field_handler_vtables[0]
+            .container_shape
+            .as_ref()
+            .expect("container shape");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert_eq!(
+            container_shape.key_wire_shape,
+            NetworkWireScalarShape::FixedBytes(16)
+        );
+        assert_eq!(container_shape.key_native_type.as_deref(), Some("AZ::Uuid"));
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some(
+                "::nw_network::serialize::IndexMap<::uuid::Uuid, GroupFinderApplicationsGroupFinderApplication>"
+            )
+        );
+        assert!(
+            output
+                .source
+                .contains("pub struct GroupFinderApplicationsGroupFinderApplication")
+        );
+        assert!(
+            output
+                .source
+                .contains("GroupFinderApplicationsGroupFinderApplicationMarshaler")
+        );
+    }
+
+    #[test]
+    fn replicated_map_container_value_groups_vec3_from_f32_lanes() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "F467C4C2-B2AF-4AE6-A022-3167DE100779",
+                "typeIndex": 4103,
+                "typeName": "Javelin::SiegeWarfareDataComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "fortMajorStructureStates",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x82cb0a8",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x82cb0a8",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "u64",
+                    "sequence-number",
+                    "f32",
+                    "f32",
+                    "f32",
+                    "u32",
+                    "u8",
+                    "u8"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u64",
+                    "f32",
+                    "f32",
+                    "f32",
+                    "u32",
+                    "u8",
+                    "u8"
+                ],
+                "valueTypeShape": {
+                    "typeName": "FortMajorStructureState",
+                    "typeNameFull": "FortMajorStructureState",
+                    "typeNameSource": "field-name+container-slot-shape",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-wire-sequence-fort-major-structure-state",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x10",
+                        "nativeOffset": "0x10",
+                        "name": "field_0",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "byteWidth": 12,
+                        "evidenceSource": "fort-major-structure-state-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x20",
+                        "nativeOffset": "0x20",
+                        "name": "field_1",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "fort-major-structure-state-container-slot"
+                    }, {
+                        "index": 2,
+                        "offset": "0x24",
+                        "nativeOffset": "0x24",
+                        "name": "field_2",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "fort-major-structure-state-container-slot"
+                    }, {
+                        "index": 3,
+                        "offset": "0x25",
+                        "nativeOffset": "0x25",
+                        "name": "field_3",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "fort-major-structure-state-container-slot"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [4103]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some(
+                "::nw_network::serialize::IndexMap<u64, FortMajorStructureStatesFortMajorStructureState>"
+            )
+        );
+        assert!(output.source.contains("pub field_0: ::glam::Vec3"));
+        assert!(
+            output
+                .source
+                .contains("FortMajorStructureStatesFortMajorStructureStateMarshaler")
+        );
+    }
+
+    #[test]
+    fn replicated_map_container_can_use_fixed_bytes_key() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "A24F4B9E-71E0-4D10-8BB6-42476298BB80",
+                "typeIndex": 982,
+                "typeName": "MB::LootTrackerComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "m_slayerScriptDataMap",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x8218ff8",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8218ff8",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "fixed-bytes-16",
+                    "sequence-number",
+                    "u8",
+                    "u64"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "fixed-bytes-16",
+                    "u8",
+                    "u64"
+                ],
+                "valueTypeShape": {
+                    "typeName": "SlayerScriptDataValue",
+                    "typeNameFull": "SlayerScriptDataValue",
+                    "typeNameSource": "field-name+container-slot-shape",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-wire-sequence-loot-tracker-slayer-script-data",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "nativeOffset": "0x0",
+                        "name": "field_0",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "loot-tracker-slayer-script-data-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x8",
+                        "nativeOffset": "0x8",
+                        "name": "field_1",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "WallClockTimePoint",
+                        "wireShape": "u64",
+                        "byteWidth": 16,
+                        "evidenceSource": "loot-tracker-slayer-script-data-container-slot"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [982]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some(
+                "::nw_network::serialize::IndexMap<[u8; 16], SlayerScriptDataMapSlayerScriptDataValue>"
+            )
+        );
+        assert!(
+            output
+                .source
+                .contains("::nw_network::source::WallClockTimePoint")
+        );
+        assert!(
+            output
+                .source
+                .contains("SlayerScriptDataMapSlayerScriptDataValueMarshaler")
+        );
+    }
+
+    #[test]
+    fn objective_task_state_vector_emits_local_support_type() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "240B9B03-D3F9-497E-BF87-7056500137B4",
+                "typeIndex": 3857,
+                "typeName": "MB::ObjectivesComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "taskStates",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x82587e0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x82587e0",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "vlq-u64",
+                    "sequence-number",
+                    "u64",
+                    "u8",
+                    "u32",
+                    "u32",
+                    "u8"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u64",
+                    "u8",
+                    "u32",
+                    "u32",
+                    "u8"
+                ],
+                "valueTypeShape": {
+                    "typeName": "TaskState",
+                    "typeNameFull": "TaskState",
+                    "typeNameSource": "field-name+container-slot-shape",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-wire-sequence-objective-task-state",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x10",
+                        "nativeOffset": "0x10",
+                        "name": "field_0",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u64",
+                        "wireShape": "u64",
+                        "byteWidth": 8,
+                        "evidenceSource": "objective-task-state-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x18",
+                        "nativeOffset": "0x18",
+                        "name": "field_1",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "objective-task-state-container-slot"
+                    }, {
+                        "index": 2,
+                        "offset": "0x1c",
+                        "nativeOffset": "0x1c",
+                        "name": "field_2",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "objective-task-state-container-slot"
+                    }, {
+                        "index": 3,
+                        "offset": "0x20",
+                        "nativeOffset": "0x20",
+                        "name": "field_3",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "objective-task-state-container-slot"
+                    }, {
+                        "index": 4,
+                        "offset": "0x24",
+                        "nativeOffset": "0x24",
+                        "name": "field_4",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "objective-task-state-container-slot"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3857]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::std::vec::Vec<TaskStatesTaskState>")
+        );
+        assert!(output.source.contains("pub struct TaskStatesTaskState"));
+        assert!(output.source.contains("TaskStatesTaskStateMarshaler"));
+    }
+
+    #[test]
+    fn cooldown_timer_entry_map_emits_local_support_type() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "DD33E4A7-3D79-4BF7-B925-57134858BE9F",
+                "typeIndex": 2932,
+                "typeName": "MB::CooldownTimersComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "ccdmap",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x855d080",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x855d080",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "u32",
+                    "sequence-number",
+                    "u64",
+                    "u32",
+                    "u32"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u32",
+                    "u64",
+                    "u32",
+                    "u32"
+                ],
+                "valueTypeShape": {
+                    "typeName": "CooldownTimerEntry",
+                    "typeNameFull": "CooldownTimerEntry",
+                    "typeNameSource": "field-name+container-slot-shape",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-wire-sequence-cooldown-timer-entry",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x20",
+                        "nativeOffset": "0x20",
+                        "name": "field_0",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "WallClockTimePoint",
+                        "wireShape": "u64",
+                        "byteWidth": 16,
+                        "evidenceSource": "cooldown-timer-entry-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x1c",
+                        "nativeOffset": "0x1c",
+                        "name": "field_1",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "cooldown-timer-entry-container-slot"
+                    }, {
+                        "index": 2,
+                        "offset": "0x18",
+                        "nativeOffset": "0x18",
+                        "name": "field_2",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "cooldown-timer-entry-container-slot"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [2932]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::nw_network::serialize::IndexMap<u32, CcdmapCooldownTimerEntry>")
+        );
+        assert!(
+            output
+                .source
+                .contains("::nw_network::source::WallClockTimePoint")
+        );
+        assert!(output.source.contains("CcdmapCooldownTimerEntryMarshaler"));
     }
 
     #[test]

@@ -32,12 +32,16 @@ Set `AZ_SERIALIZE_RENAME_APPLY=true` before launching Ghidra to apply renames.
 
 `NetworkSchemaExtractor.java` builds a static JSON report for network type and
 field registration evidence. Run it against the loaded `NewWorld 3-26` program
-and point it at `typeregistry.json`.
+and point it at:
+
+```text
+resources/typeregistry.json
+```
 
 Useful environment variables:
 
 ```text
-NW_NETWORK_SCHEMA_TYPEREGISTRY_JSON=E:\Projects\new-world\resources\typeregistry.json
+NW_NETWORK_SCHEMA_TYPEREGISTRY_JSON=E:\Projects\nw-tools\resources\typeregistry.json
 NW_NETWORK_SCHEMA_OUT=E:\Projects\new-world\resources\network-schema.static.json
 ```
 

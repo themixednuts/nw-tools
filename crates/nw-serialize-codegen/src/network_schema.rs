@@ -295,6 +295,12 @@ pub struct NetworkField {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handler_vtable: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub handler_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handler_vtable_slots: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_field_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub native_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_type_name: Option<String>,
@@ -444,6 +450,12 @@ pub struct NetworkVirtualFunction {
 pub struct NetworkFieldHandlerVtable {
     pub address: Option<String>,
     pub field_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handler_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vtable_slots: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_field_count: Option<u32>,
     pub marshal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub marshal_target: Option<String>,
@@ -458,6 +470,10 @@ pub struct NetworkFieldHandlerVtable {
     pub delta_wire_shape: Option<NetworkWireShape>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_wire_shape: Option<NetworkWireShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_native_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_native_type_source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delta_marshal_shapes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -521,6 +537,10 @@ pub enum NetworkReplicatedContainerStorageKind {
 pub struct NetworkReplicatedContainerShape {
     pub storage: NetworkReplicatedContainerStorageKind,
     pub key_wire_shape: NetworkWireScalarShape,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_native_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_native_type_source: Option<String>,
     pub value_wire_shapes: Vec<NetworkWireScalarShape>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delta_value_wire_shapes: Vec<NetworkWireScalarShape>,
@@ -560,6 +580,7 @@ pub enum NetworkWireScalarShape {
     Vec3Comp,
     Vec3CompNorm,
     QuatComp,
+    QuatSmallestThree,
     NonUniformScaleComp,
     PositionAnchor,
     TransformCompressor,
@@ -621,6 +642,7 @@ pub enum NetworkWireShape {
     Vec3Comp,
     Vec3CompNorm,
     QuatComp,
+    QuatSmallestThree,
     NonUniformScaleComp,
     PositionAnchor,
     TransformCompressor,
@@ -658,6 +680,7 @@ impl NetworkWireScalarShape {
             Self::Vec3Comp => Some("vec3-comp"),
             Self::Vec3CompNorm => Some("vec3-comp-norm"),
             Self::QuatComp => Some("quat-comp"),
+            Self::QuatSmallestThree => Some("quat-smallest-three"),
             Self::NonUniformScaleComp => Some("non-uniform-scale-comp"),
             Self::PositionAnchor => Some("position-anchor"),
             Self::TransformCompressor => Some("transform-compressor"),
@@ -706,6 +729,7 @@ impl From<NetworkWireScalarShape> for NetworkWireShape {
             NetworkWireScalarShape::Vec3Comp => Self::Vec3Comp,
             NetworkWireScalarShape::Vec3CompNorm => Self::Vec3CompNorm,
             NetworkWireScalarShape::QuatComp => Self::QuatComp,
+            NetworkWireScalarShape::QuatSmallestThree => Self::QuatSmallestThree,
             NetworkWireScalarShape::NonUniformScaleComp => Self::NonUniformScaleComp,
             NetworkWireScalarShape::PositionAnchor => Self::PositionAnchor,
             NetworkWireScalarShape::TransformCompressor => Self::TransformCompressor,
@@ -749,6 +773,7 @@ impl NetworkWireShape {
             Self::Vec3Comp => Some("vec3-comp"),
             Self::Vec3CompNorm => Some("vec3-comp-norm"),
             Self::QuatComp => Some("quat-comp"),
+            Self::QuatSmallestThree => Some("quat-smallest-three"),
             Self::NonUniformScaleComp => Some("non-uniform-scale-comp"),
             Self::PositionAnchor => Some("position-anchor"),
             Self::TransformCompressor => Some("transform-compressor"),
@@ -1491,6 +1516,9 @@ fn network_field_from_message_signature(
         handler_offset: None,
         handler_expression: None,
         handler_vtable: None,
+        handler_kind: None,
+        handler_vtable_slots: None,
+        physical_field_count: None,
         native_type: signature.native_type.clone(),
         source_type_name: None,
         source_type_id: None,
@@ -2352,6 +2380,9 @@ fn network_field(field: &Map<String, Value>) -> NetworkField {
         handler_offset: string(field, "handlerOffset"),
         handler_expression: string(field, "handlerExpression"),
         handler_vtable: string(field, "handlerVtable"),
+        handler_kind: string(field, "handlerKind"),
+        handler_vtable_slots: u32_value(field, "handlerVtableSlots"),
+        physical_field_count: u32_value(field, "physicalFieldCount"),
         native_type,
         source_type_name: string(field, "sourceTypeName"),
         source_type_id: uuid(field, "sourceTypeId"),
@@ -2541,6 +2572,9 @@ fn network_field_handler_vtable(vtable: &Map<String, Value>) -> NetworkFieldHand
     let mut result = NetworkFieldHandlerVtable {
         address: string(vtable, "address"),
         field_count: usize_value(vtable, "fieldCount").unwrap_or_default(),
+        handler_kind: string(vtable, "handlerKind"),
+        vtable_slots: u32_value(vtable, "vtableSlots"),
+        physical_field_count: u32_value(vtable, "physicalFieldCount"),
         marshal: string(vtable, "marshal"),
         marshal_target: string(vtable, "marshalTarget"),
         unmarshal: string(vtable, "unmarshal"),
@@ -2549,6 +2583,8 @@ fn network_field_handler_vtable(vtable: &Map<String, Value>) -> NetworkFieldHand
         wire_shape_source: string(vtable, "wireShapeSource"),
         delta_wire_shape: wire_shape(vtable, "deltaWireShape"),
         full_wire_shape: wire_shape(vtable, "fullWireShape"),
+        key_native_type: string(vtable, "keyNativeType"),
+        key_native_type_source: string(vtable, "keyNativeTypeSource"),
         delta_marshal_shapes: string_array(vtable, "deltaMarshalShapes"),
         full_marshal_shapes: string_array(vtable, "fullMarshalShapes"),
         value_type_name: string(vtable, "valueTypeName"),
@@ -2823,6 +2859,7 @@ fn parse_network_wire_scalar_shape(value: &str) -> Option<NetworkWireScalarShape
         "vec3-comp" => Some(NetworkWireScalarShape::Vec3Comp),
         "vec3-comp-norm" => Some(NetworkWireScalarShape::Vec3CompNorm),
         "quat-comp" => Some(NetworkWireScalarShape::QuatComp),
+        "quat-smallest-three" => Some(NetworkWireScalarShape::QuatSmallestThree),
         "non-uniform-scale-comp" => Some(NetworkWireScalarShape::NonUniformScaleComp),
         "position-anchor" => Some(NetworkWireScalarShape::PositionAnchor),
         "transform-compressor" => Some(NetworkWireScalarShape::TransformCompressor),
@@ -2941,6 +2978,8 @@ fn replicated_container_shape_from_vtable(
     Some(NetworkReplicatedContainerShape {
         storage,
         key_wire_shape,
+        key_native_type: vtable.key_native_type.clone(),
+        key_native_type_source: vtable.key_native_type_source.clone(),
         value_wire_shapes,
         delta_value_wire_shapes,
         value_type_name: selected_structured_container_value_type_name(vtable),
@@ -3007,7 +3046,9 @@ fn is_validated_anonymous_container_value_shape(shape: &NetworkNestedTypeShape) 
     shape.type_id.is_none()
         && !shape.members.is_empty()
         && shape.validation.as_deref().is_some_and(|validation| {
-            validation.contains("container-value") && validation.contains("serialize-type-sequence")
+            validation.contains("container-value")
+                && (validation.contains("serialize-type-sequence")
+                    || validation.contains("wire-sequence"))
         })
 }
 

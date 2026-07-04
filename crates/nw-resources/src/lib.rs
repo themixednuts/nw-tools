@@ -1,4 +1,5 @@
 pub const SERIALIZE_JSON: &[u8] = include_bytes!("../../../resources/serialize.json");
+pub const TYPEREGISTRY_JSON: &[u8] = include_bytes!("../../../resources/typeregistry.json");
 pub const STEAM_API64_DLL: &[u8] = include_bytes!("../../../resources/steam_api64.dll");
 
 #[derive(Debug, Clone, Copy)]
@@ -167,6 +168,10 @@ pub fn all() -> impl Iterator<Item = EmbeddedResource> {
         EmbeddedResource {
             path: "serialize.json",
             bytes: SERIALIZE_JSON,
+        },
+        EmbeddedResource {
+            path: "typeregistry.json",
+            bytes: TYPEREGISTRY_JSON,
         },
         EmbeddedResource {
             path: "steam_api64.dll",
