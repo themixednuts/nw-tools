@@ -40,21 +40,6 @@ pub fn half_to_f32(bits: u16) -> f32 {
     f32::from_bits(sign | value.to_bits())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::half_to_f32;
-
-    #[test]
-    fn half_decode_applies_sign_and_magnitude() {
-        assert_eq!(half_to_f32(0x0000), 0.0);
-        assert_eq!(half_to_f32(0x3c00), 1.0); // 1.0
-        assert_eq!(half_to_f32(0xc000), -2.0); // -2.0
-        // 0xbfbf ≈ -1.9365 (the value that was collapsing to -0.0).
-        let v = half_to_f32(0xbfbf);
-        assert!((v - -1.9365).abs() < 1e-3, "got {v}");
-    }
-}
-
 /// Cry is right-handed Z-up; glTF is right-handed Y-up. Map `(x, y, z)` →
 /// `(-x, z, y)` (matches nw-buddy's `CryToGltfVec3`).
 #[must_use]
@@ -89,4 +74,19 @@ pub fn matrix34(rows: &[[f32; 4]; 3]) -> Mat4 {
 #[must_use]
 pub fn cry_to_gltf_mat(m: Mat4) -> Mat4 {
     SWAP * m * SWAP
+}
+
+#[cfg(test)]
+mod tests {
+    use super::half_to_f32;
+
+    #[test]
+    fn half_decode_applies_sign_and_magnitude() {
+        assert_eq!(half_to_f32(0x0000), 0.0);
+        assert_eq!(half_to_f32(0x3c00), 1.0); // 1.0
+        assert_eq!(half_to_f32(0xc000), -2.0); // -2.0
+        // 0xbfbf ≈ -1.9365 (the value that was collapsing to -0.0).
+        let v = half_to_f32(0xbfbf);
+        assert!((v - -1.9365).abs() < 1e-3, "got {v}");
+    }
 }
