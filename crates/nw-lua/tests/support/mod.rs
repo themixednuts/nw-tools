@@ -79,6 +79,18 @@ pub fn compile_source_bytes(name: &str, source: &str, strip_debug: bool) -> Opti
 }
 
 #[allow(dead_code)]
+pub fn compile_file_bytes(name: &str, source: &Path, strip_debug: bool) -> Option<Vec<u8>> {
+    let tools = lua_tools()?;
+    let paths = CasePaths::new(name);
+
+    compile_lua(tools.luac, source, &paths.bytecode, strip_debug);
+    let bytecode = fs::read(&paths.bytecode).expect("read compiled bytecode");
+
+    paths.cleanup();
+    Some(bytecode)
+}
+
+#[allow(dead_code)]
 pub fn run_bytecode_equivalence(name: &str, bytecode: &[u8], args: &[&str]) -> Option<String> {
     let tools = lua_tools()?;
     let paths = CasePaths::new(name);

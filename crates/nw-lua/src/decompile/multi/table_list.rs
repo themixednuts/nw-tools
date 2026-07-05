@@ -1,8 +1,10 @@
+use std::collections::HashSet;
+
 use crate::{
     LuaError,
     decompile::{
         analysis::NodeId,
-        ast::{Expr, Stmt, TableField},
+        ast::{Expr, Name, Stmt, TableField},
         expr_build::ident_from_string_expr,
         stmt_build::StatementBuilder,
     },
@@ -63,6 +65,10 @@ pub(crate) fn try_emit(
     if fields.is_empty() {
         return Ok(None);
     }
+    if fields_reference_consumed_setup(builder, &node_ids[index + 1..=last_setlist_index], &fields)
+    {
+        return Ok(None);
+    }
 
     let end_pc = setlists.last().map_or(node.pc, |setlist| setlist.pc);
     let binding = builder
@@ -100,6 +106,128 @@ pub(crate) fn try_emit(
         stmt,
         consumed: node_ids[index..=last_setlist_index].to_vec(),
     }))
+}
+
+fn fields_reference_consumed_setup(
+    builder: &StatementBuilder<'_>,
+    consumed_setup: &[NodeId],
+    fields: &[TableField],
+) -> bool {
+    let consumed_names = consumed_setup
+        .iter()
+        .filter_map(|id| builder.node(*id))
+        .filter(|node| !is_constructor_mutation(node))
+        .filter_map(|node| {
+            if matches!(node.dest, SsaRef::Reg { .. }) {
+                Some(builder.name_for_ref(node.dest, node.pc))
+            } else {
+                None
+            }
+        })
+        .collect::<HashSet<_>>();
+
+    !consumed_names.is_empty()
+        && fields
+            .iter()
+            .any(|field| table_field_contains_name(field, &consumed_names))
+}
+
+fn is_constructor_mutation(node: &SsaNode) -> bool {
+    matches!(&node.op, SsaOp::SetTable { .. } | SsaOp::SetList { .. })
+}
+
+fn table_field_contains_name(field: &TableField, names: &HashSet<Name>) -> bool {
+    match field {
+        TableField::List(value) | TableField::Named { value, .. } => {
+            expr_contains_name(value, names)
+        }
+        TableField::ExprKey { key, value } => {
+            expr_contains_name(key, names) || expr_contains_name(value, names)
+        }
+    }
+}
+
+fn expr_contains_name(expr: &Expr, names: &HashSet<Name>) -> bool {
+    match expr {
+        Expr::Name(name) => names.contains(name),
+        Expr::Index { obj, key } => {
+            expr_contains_name(obj, names) || expr_contains_name(key, names)
+        }
+        Expr::Field { obj, .. } => expr_contains_name(obj, names),
+        Expr::Call { func, args, .. } => {
+            expr_contains_name(func, names) || args.iter().any(|arg| expr_contains_name(arg, names))
+        }
+        Expr::Function(body) => body
+            .body
+            .0
+            .iter()
+            .any(|stmt| stmt_contains_name(stmt, names)),
+        Expr::Table(fields) => fields
+            .iter()
+            .any(|field| table_field_contains_name(field, names)),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_contains_name(lhs, names) || expr_contains_name(rhs, names)
+        }
+        Expr::Unary { operand, .. } | Expr::Paren(operand) => expr_contains_name(operand, names),
+        Expr::Nil
+        | Expr::True
+        | Expr::False
+        | Expr::VarArg
+        | Expr::Number(_)
+        | Expr::Integer(_)
+        | Expr::Str(_)
+        | Expr::Global(_) => false,
+    }
+}
+
+fn stmt_contains_name(stmt: &Stmt, names: &HashSet<Name>) -> bool {
+    match stmt {
+        Stmt::Local { values, .. } | Stmt::Return(values) => {
+            values.iter().any(|expr| expr_contains_name(expr, names))
+        }
+        Stmt::Assign { targets, values } => targets
+            .iter()
+            .chain(values)
+            .any(|expr| expr_contains_name(expr, names)),
+        Stmt::Call(expr) => expr_contains_name(expr, names),
+        Stmt::Do(block) => block.0.iter().any(|stmt| stmt_contains_name(stmt, names)),
+        Stmt::If { arms, else_ } => {
+            arms.iter().any(|(cond, block)| {
+                expr_contains_name(cond, names)
+                    || block.0.iter().any(|stmt| stmt_contains_name(stmt, names))
+            }) || else_
+                .as_ref()
+                .is_some_and(|block| block.0.iter().any(|stmt| stmt_contains_name(stmt, names)))
+        }
+        Stmt::While { cond, body } | Stmt::Repeat { cond, body } => {
+            expr_contains_name(cond, names)
+                || body.0.iter().any(|stmt| stmt_contains_name(stmt, names))
+        }
+        Stmt::NumericFor {
+            start,
+            stop,
+            step,
+            body,
+            ..
+        } => {
+            expr_contains_name(start, names)
+                || expr_contains_name(stop, names)
+                || step
+                    .as_ref()
+                    .is_some_and(|step| expr_contains_name(step, names))
+                || body.0.iter().any(|stmt| stmt_contains_name(stmt, names))
+        }
+        Stmt::GenericFor { exprs, body, .. } => {
+            exprs.iter().any(|expr| expr_contains_name(expr, names))
+                || body.0.iter().any(|stmt| stmt_contains_name(stmt, names))
+        }
+        Stmt::Function { body, .. } | Stmt::FunctionDecl { body, .. } => body
+            .body
+            .0
+            .iter()
+            .any(|stmt| stmt_contains_name(stmt, names)),
+        Stmt::Break | Stmt::Goto(_) | Stmt::Label(_) => false,
+    }
 }
 
 pub(crate) fn constructor_fields(

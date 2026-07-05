@@ -384,6 +384,12 @@ fn for_each_use(node: &SsaNode, mut f: impl FnMut(&SsaRef)) {
                 f(value);
             }
         }
+        SsaOp::ForPrep { base, .. } | SsaOp::ForLoop { base, .. } => {
+            for_each_numeric_for_control_ref(*base, &mut f);
+        }
+        SsaOp::TForLoop { base, .. } => {
+            for_each_numeric_for_control_ref(*base, &mut f);
+        }
         SsaOp::Phi { .. }
         | SsaOp::Nop
         | SsaOp::LoadK { .. }
@@ -393,9 +399,6 @@ fn for_each_use(node: &SsaNode, mut f: impl FnMut(&SsaRef)) {
         | SsaOp::GetGlobal { .. }
         | SsaOp::NewTable { .. }
         | SsaOp::Jump { .. }
-        | SsaOp::ForPrep { .. }
-        | SsaOp::ForLoop { .. }
-        | SsaOp::TForLoop { .. }
         | SsaOp::Close { .. }
         | SsaOp::VarArg { .. } => {}
         SsaOp::Closure { upvalues, .. } => {
@@ -435,6 +438,17 @@ fn for_each_defined_reg(node: &SsaNode, mut f: impl FnMut(u16)) {
             emit_range_except(&mut f, base.saturating_add(1), end, dest);
         }
         _ => {}
+    }
+}
+
+fn for_each_numeric_for_control_ref(base: u16, mut f: impl FnMut(&SsaRef)) {
+    let refs = [
+        SsaRef::reg(base),
+        SsaRef::reg(base.saturating_add(1)),
+        SsaRef::reg(base.saturating_add(2)),
+    ];
+    for reference in &refs {
+        f(reference);
     }
 }
 

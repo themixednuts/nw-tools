@@ -24,6 +24,10 @@ thiserror.workspace = true
 name = "nw-lua"
 path = "src/bin/nw-lua.rs"
 
+[[bin]]
+name = "nw-lua-fidelity"
+path = "src/bin/nw-lua-fidelity.rs"
+
 [[bench]]
 name = "decompile_hot_path"
 harness = false

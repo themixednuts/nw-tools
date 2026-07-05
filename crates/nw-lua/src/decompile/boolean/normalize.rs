@@ -50,6 +50,8 @@ pub fn invert(expr: Expr) -> Expr {
             op: ast::UnOp::Not,
             operand,
         } => *operand,
+        Expr::Nil | Expr::False => Expr::True,
+        Expr::True | Expr::Number(_) | Expr::Integer(_) | Expr::Str(_) => Expr::False,
         other => Expr::Unary {
             op: ast::UnOp::Not,
             operand: Box::new(other),

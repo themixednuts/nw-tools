@@ -73,7 +73,20 @@ pub fn analyze(function: &SsaFunction, pc_map: &[Option<usize>]) -> LoopAnalysis
 impl LoopAnalysis {
     #[must_use]
     pub fn natural_at(&self, header: usize) -> Option<&NaturalLoop> {
-        self.natural.iter().find(|info| info.header == header)
+        self.natural
+            .iter()
+            .filter(|info| info.header == header)
+            .max_by_key(|info| {
+                (
+                    info.blocks
+                        .iter()
+                        .next_back()
+                        .copied()
+                        .unwrap_or(info.latch),
+                    info.blocks.len(),
+                    info.latch,
+                )
+            })
     }
 
     #[must_use]
@@ -158,14 +171,14 @@ fn numeric_for_loops(function: &SsaFunction, pc_map: &[Option<usize>]) -> Vec<Nu
                 block: loop_block,
                 node: loop_index,
             },
-            start_node: def_in_block(function, block.index, base, Some(prep_index)),
-            stop_node: def_in_block(
+            start_node: reaching_def(function, block.index, base, Some(prep_index)),
+            stop_node: reaching_def(
                 function,
                 block.index,
                 base.saturating_add(1),
                 Some(prep_index),
             ),
-            step_node: def_in_block(
+            step_node: reaching_def(
                 function,
                 block.index,
                 base.saturating_add(2),
@@ -350,9 +363,10 @@ fn classify_natural(
     let exits_from_header_chain =
         header_condition_chain_exits_loop(function, pc_map, header, blocks, exit);
 
-    if (exits_from_header || exits_from_header_chain)
-        && !has_tail_body_before_branch(function, header)
-    {
+    let header_contains_repeat_tail = (header == latch
+        && has_tail_body_before_branch(function, header))
+        || has_repeat_tail_update_before_branch(function, header);
+    if (exits_from_header || exits_from_header_chain) && !header_contains_repeat_tail {
         NaturalLoopKind::While
     } else {
         let tail = blocks
@@ -410,6 +424,35 @@ fn header_condition_chain_exits_loop(
     }
 
     visited.len() > 1 && saw_body && saw_exit
+}
+
+fn has_repeat_tail_update_before_branch(function: &SsaFunction, block: usize) -> bool {
+    let Some(block) = function.blocks.get(block) else {
+        return false;
+    };
+    let Some((branch_index, branch)) = block
+        .nodes
+        .iter()
+        .enumerate()
+        .find(|(_, node)| matches!(node.op, SsaOp::Branch { .. }))
+    else {
+        return false;
+    };
+    let branch_regs = branch_operand_regs(branch);
+    let phi_regs = block
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.op, SsaOp::Phi { .. }))
+        .filter_map(|node| node.dest.reg_index())
+        .collect::<BTreeSet<_>>();
+
+    block
+        .nodes
+        .iter()
+        .take(branch_index)
+        .filter(|node| !node.is_meta_only && !matches!(node.op, SsaOp::Phi { .. }))
+        .filter_map(|node| node.dest.reg_index())
+        .any(|dest| branch_regs.contains(&dest) && phi_regs.contains(&dest))
 }
 
 pub(crate) fn has_tail_body_before_branch(function: &SsaFunction, block: usize) -> bool {
@@ -516,6 +559,49 @@ fn def_in_block(
         .rev()
         .find(|(_, node)| node.dest.reg_index() == Some(reg))
         .map(|(node, _)| NodeId { block, node })
+}
+
+fn reaching_def(
+    function: &SsaFunction,
+    block: usize,
+    reg: u16,
+    before_node: Option<usize>,
+) -> Option<NodeId> {
+    reaching_def_inner(function, block, reg, before_node, &mut BTreeSet::new())
+}
+
+fn reaching_def_inner(
+    function: &SsaFunction,
+    block: usize,
+    reg: u16,
+    before_node: Option<usize>,
+    visiting: &mut BTreeSet<(usize, u16, usize)>,
+) -> Option<NodeId> {
+    let visit_key = (block, reg, before_node.unwrap_or(usize::MAX));
+    if !visiting.insert(visit_key) {
+        return None;
+    }
+    if let Some(def) = def_in_block(function, block, reg, before_node) {
+        visiting.remove(&visit_key);
+        return Some(def);
+    }
+
+    let block_ref = function.blocks.get(block)?;
+    let mut agreed = None;
+    for pred in block_ref.preds.iter().copied() {
+        if pred == block {
+            continue;
+        }
+        let pred_def = reaching_def_inner(function, pred, reg, None, visiting)?;
+        if agreed.is_some_and(|current| current != pred_def) {
+            visiting.remove(&visit_key);
+            return None;
+        }
+        agreed = Some(pred_def);
+    }
+
+    visiting.remove(&visit_key);
+    agreed
 }
 
 fn find_iterator_call(

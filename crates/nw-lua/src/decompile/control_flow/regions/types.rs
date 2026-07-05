@@ -118,6 +118,9 @@ impl Region {
                 }
             }
             Region::Linear(linear) => {
+                for block in &linear.covered_blocks {
+                    out.insert(*block);
+                }
                 for node in &linear.nodes {
                     out.insert(node.block);
                 }

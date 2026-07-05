@@ -22,6 +22,8 @@ use super::types::{
     RepeatRegion, WhileRegion,
 };
 
+mod branch_specials;
+
 impl RegionTree {
     pub fn build(
         function: &SsaFunction,
@@ -113,6 +115,16 @@ impl<'a> Structurer<'a> {
                 continue;
             }
 
+            if self
+                .booleans
+                .value_select_covering(current)
+                .is_some_and(|plan| plan.start != current && Some(plan.merge) != stop)
+            {
+                self.consumed[current] = true;
+                current += 1;
+                continue;
+            }
+
             if self.is_break_block(current, loop_exit) {
                 self.consumed[current] = true;
                 regions.push(Region::Break);
@@ -150,6 +162,7 @@ impl<'a> Structurer<'a> {
 
             if let Some(plan) = self.booleans.value_select_start(current)
                 && stop.is_none_or(|stop| plan.merge <= stop)
+                && Some(plan.merge) != stop
                 && plan.merge > current
             {
                 for block in plan.consumed_blocks() {
@@ -157,7 +170,11 @@ impl<'a> Structurer<'a> {
                         *slot = true;
                     }
                 }
-                regions.push(Region::Linear(linear_block(self.function, current)));
+                regions.push(Region::Linear(linear_block_covering(
+                    self.function,
+                    current,
+                    plan.consumed_blocks(),
+                )));
                 current = plan.merge;
                 continue;
             }
@@ -166,7 +183,7 @@ impl<'a> Structurer<'a> {
                 && stop.is_none_or(|stop| chain.merge <= stop)
                 && chain.merge > current
             {
-                let (region, next) = self.compound_if_region(chain, loop_exit)?;
+                let (region, next) = self.compound_if_region(chain, stop, loop_exit)?;
                 regions.push(region);
                 current = next;
                 continue;
@@ -179,8 +196,15 @@ impl<'a> Structurer<'a> {
                 continue;
             }
 
-            self.consumed[current] = true;
-            regions.push(Region::Linear(linear_block(self.function, current)));
+            let linear_block_index = current;
+            self.consumed[linear_block_index] = true;
+            regions.push(Region::Linear(linear_block(
+                self.function,
+                linear_block_index,
+            )));
+            if conditionals::is_terminal_block(self.function, linear_block_index) {
+                break;
+            }
             current = self.next_linear_block(current, stop);
         }
 
@@ -230,7 +254,10 @@ impl<'a> Structurer<'a> {
                 }
             }
             let stop = Some(max_block(&info.blocks) + 1);
-            let body = self.build_sequence(chain.body, stop, info.exit)?;
+            self.active_natural_headers.push(info.header);
+            let body = self.build_sequence(chain.body, stop, info.exit);
+            self.active_natural_headers.pop();
+            let body = body?;
             let branch = chain.segments.first().map_or(
                 NodeId {
                     block: info.header,
@@ -276,7 +303,10 @@ impl<'a> Structurer<'a> {
         };
         let inverted = body_start != true_block;
         let stop = Some(max_block(&info.blocks) + 1);
-        let body = self.build_sequence(body_start, stop, info.exit)?;
+        self.active_natural_headers.push(info.header);
+        let body = self.build_sequence(body_start, stop, info.exit);
+        self.active_natural_headers.pop();
+        let body = body?;
         Ok(Region::While(Box::new(WhileRegion {
             prefix: linear_block(self.function, info.header),
             condition: Condition {
@@ -331,27 +361,29 @@ impl<'a> Structurer<'a> {
     fn compound_if_region(
         &mut self,
         chain: ConditionChain,
+        stop: Option<usize>,
         loop_exit: Option<usize>,
     ) -> Result<(Region, usize), LuaError> {
+        let merge = self.enclosing_stop_merge(chain.body, chain.false_target, chain.merge, stop);
         for block in &chain.blocks {
             if let Some(slot) = self.consumed.get_mut(*block) {
                 *slot = true;
             }
         }
 
-        let true_body = self.build_sequence(chain.body, Some(chain.merge), loop_exit)?;
+        let true_body = self.build_sequence(chain.body, Some(merge), loop_exit)?;
         let true_blocks = true_body.blocks();
-        let else_ = if chain.false_target != chain.merge
+        let else_ = if chain.false_target != merge
             && chain.false_target < self.function.blocks.len()
             && !conditionals::is_empty_structural(self.function, chain.false_target)
         {
-            Some(self.build_sequence(chain.false_target, Some(chain.merge), loop_exit)?)
+            Some(self.build_sequence(chain.false_target, Some(merge), loop_exit)?)
         } else {
             None
         };
         let else_blocks = else_.as_ref().map_or_else(Vec::new, Region::blocks);
-        let phis = if chain.merge < self.function.blocks.len() {
-            conditionals::phi_sources(self.function, chain.merge)
+        let phis = if merge < self.function.blocks.len() {
+            conditionals::phi_sources(self.function, merge)
         } else {
             Vec::new()
         };
@@ -370,10 +402,10 @@ impl<'a> Structurer<'a> {
                 }],
                 else_,
                 else_blocks,
-                merge: (chain.merge < self.function.blocks.len()).then_some(chain.merge),
+                merge: (merge < self.function.blocks.len()).then_some(merge),
                 phis,
             })),
-            chain.merge,
+            merge,
         ))
     }
 
@@ -385,6 +417,16 @@ impl<'a> Structurer<'a> {
         loop_exit: Option<usize>,
     ) -> Result<(Region, usize), LuaError> {
         if let Some((region, next)) = self.break_if_region(block, branch, loop_exit)? {
+            return Ok((region, next));
+        }
+        if let Some((region, next)) =
+            self.loop_continue_if_region(block, branch, stop, loop_exit)?
+        {
+            return Ok((region, next));
+        }
+        if let Some((region, next)) =
+            self.terminal_guard_if_region(block, branch, stop, loop_exit)?
+        {
             return Ok((region, next));
         }
 
@@ -399,6 +441,7 @@ impl<'a> Structurer<'a> {
         {
             merge = stop;
         }
+        merge = self.enclosing_stop_merge(true_block, false_block, merge, stop);
         true_block = conditionals::follow_jmp_only(self.function, true_block, Some(merge));
         false_block = conditionals::follow_jmp_only(self.function, false_block, Some(merge));
 
@@ -421,14 +464,16 @@ impl<'a> Structurer<'a> {
         let mut else_start = false_block;
         while else_start < self.function.blocks.len()
             && !self.consumed[else_start]
-            && conditionals::is_elseif_candidate(
-                self.function,
-                else_start,
-                merge,
-                self.pc_map,
-                &self.loop_headers,
-            )
+            && self.is_elseif_start(else_start, merge)
         {
+            if let Some(chain) = self.booleans.condition_chain(else_start).cloned()
+                && let Some(next) =
+                    self.push_compound_elseif_arm(&mut arms, chain, &mut merge, stop, loop_exit)?
+            {
+                else_start = next;
+                continue;
+            }
+
             let Some(elseif_branch) =
                 conditionals::branch_info(self.function, else_start, self.pc_map)
             else {
@@ -440,8 +485,24 @@ impl<'a> Structurer<'a> {
                 elseif_branch.true_block,
                 elseif_branch.false_block,
             );
-            if next_merge.is_some_and(|next_merge| next_merge != merge) {
+            let mut next_merge = next_merge.unwrap_or(merge);
+            if let Some(stop) = stop
+                && next_merge > stop
+            {
+                next_merge = stop;
+            }
+            let extends_terminal_chain = else_start == merge && next_merge > merge;
+            let shares_existing_merge = self.branch_exits_or_reaches_merge(
+                elseif_branch.true_block,
+                elseif_branch.false_block,
+                merge,
+                stop,
+            );
+            if next_merge != merge && !extends_terminal_chain && !shares_existing_merge {
                 break;
+            }
+            if extends_terminal_chain {
+                merge = next_merge;
             }
             self.consumed[else_start] = true;
             let arm_true =
@@ -472,7 +533,13 @@ impl<'a> Structurer<'a> {
             && else_start < self.function.blocks.len()
             && !conditionals::is_empty_structural(self.function, else_start)
         {
-            Some(self.build_sequence(else_start, Some(merge), loop_exit)?)
+            if self.consumed[else_start]
+                && conditionals::is_terminal_block(self.function, else_start)
+            {
+                Some(Region::Linear(linear_block(self.function, else_start)))
+            } else {
+                Some(self.build_sequence(else_start, Some(merge), loop_exit)?)
+            }
         } else {
             None
         };
@@ -496,105 +563,158 @@ impl<'a> Structurer<'a> {
         ))
     }
 
-    fn break_if_region(
+    fn push_compound_elseif_arm(
         &mut self,
-        block: usize,
-        branch: BranchInfo,
+        arms: &mut Vec<IfArm>,
+        chain: ConditionChain,
+        merge: &mut usize,
+        stop: Option<usize>,
         loop_exit: Option<usize>,
-    ) -> Result<Option<(Region, usize)>, LuaError> {
-        let Some(exit) = loop_exit else {
-            return Ok(None);
-        };
-        let true_break = self.break_path_end(branch.true_block, exit);
-        let false_break = self.break_path_end(branch.false_block, exit);
-        if true_break.is_some() == false_break.is_some() {
-            return Ok(None);
-        }
-
-        self.consumed[block] = true;
-        let (break_target, break_end, cont_target, inverted) = if let Some(end) = true_break {
-            (branch.true_block, end, branch.false_block, false)
-        } else {
-            (
-                branch.false_block,
-                false_break.expect("one branch must be a break path"),
-                branch.true_block,
-                true,
-            )
-        };
-        let break_target = conditionals::follow_jmp_only(self.function, break_target, Some(exit));
-        let cont_target = conditionals::follow_jmp_only(self.function, cont_target, Some(exit));
-
-        let mut body_parts = Vec::new();
-        let break_stop = break_end.unwrap_or(exit);
-        if break_target != exit && break_target != break_stop {
-            body_parts.push(self.build_sequence(break_target, Some(break_stop), Some(exit))?);
-        } else if break_target != exit && break_end.is_none() {
-            body_parts.push(self.build_sequence(break_target, Some(exit), Some(exit))?);
-        }
-        if let Some(block) = break_end
-            && let Some(slot) = self.consumed.get_mut(block)
+    ) -> Result<Option<usize>, LuaError> {
+        if chain.segments.is_empty()
+            || chain
+                .blocks
+                .iter()
+                .any(|block| *block >= self.function.blocks.len() || self.consumed[*block])
         {
-            *slot = true;
+            return Ok(None);
         }
-        body_parts.push(Region::Break);
-        let body = Region::Sequence(body_parts);
+
+        let mut next_merge =
+            self.enclosing_stop_merge(chain.body, chain.false_target, chain.merge, stop);
+        if let Some(stop) = stop
+            && next_merge > stop
+        {
+            next_merge = stop;
+        }
+        let extends_terminal_chain = chain.start == *merge && next_merge > *merge;
+        let shares_existing_merge =
+            self.branch_exits_or_reaches_merge(chain.body, chain.false_target, *merge, stop);
+        if next_merge != *merge && !extends_terminal_chain && !shares_existing_merge {
+            return Ok(None);
+        }
+        if extends_terminal_chain {
+            *merge = next_merge;
+        }
+
+        for block in &chain.blocks {
+            self.consumed[*block] = true;
+        }
+        let body = if chain.body == *merge {
+            Region::Sequence(Vec::new())
+        } else {
+            self.build_sequence(chain.body, Some(*merge), loop_exit)?
+        };
         let blocks = body.blocks();
-        let region = Region::If(Box::new(IfRegion {
-            prefix: linear_block(self.function, block),
-            arms: vec![IfArm {
-                condition: Condition {
-                    branch: branch.node,
-                    inverted,
-                    compound: None,
-                },
-                body,
-                blocks,
-            }],
-            else_: None,
-            else_blocks: Vec::new(),
-            merge: Some(cont_target),
-            phis: Vec::new(),
-        }));
-        Ok(Some((region, cont_target)))
+        arms.push(IfArm {
+            condition: Condition {
+                branch: chain.segments[0].node,
+                inverted: false,
+                compound: Some(chain.start),
+            },
+            body,
+            blocks,
+        });
+
+        let next = conditionals::follow_jmp_only(self.function, chain.false_target, Some(*merge));
+        Ok(Some(next))
+    }
+
+    fn enclosing_stop_merge(
+        &self,
+        true_start: usize,
+        false_start: usize,
+        current_merge: usize,
+        stop: Option<usize>,
+    ) -> usize {
+        let Some(stop) = stop else {
+            return current_merge;
+        };
+        if stop >= self.function.blocks.len() || stop <= current_merge {
+            return current_merge;
+        }
+
+        let true_terminal = self.terminal_path_end(true_start, Some(stop));
+        let false_terminal = self.terminal_path_end(false_start, Some(stop));
+        match (true_terminal, false_terminal) {
+            (Some(terminal), None) => self
+                .stop_merge_for_terminal_sibling(false_start, terminal, current_merge, stop)
+                .unwrap_or(current_merge),
+            (None, Some(terminal)) => self
+                .stop_merge_for_terminal_sibling(true_start, terminal, current_merge, stop)
+                .unwrap_or(current_merge),
+            _ => current_merge,
+        }
+    }
+
+    fn stop_merge_for_terminal_sibling(
+        &self,
+        continuation_start: usize,
+        terminal: usize,
+        current_merge: usize,
+        stop: usize,
+    ) -> Option<usize> {
+        let continuation =
+            conditionals::follow_jmp_only(self.function, continuation_start, Some(stop));
+        let merge_is_terminal = terminal == current_merge;
+        let merge_is_lua_else_body = current_merge == continuation
+            && (terminal > continuation
+                || conditionals::has_unreachable_jump_immediately_before(
+                    self.function,
+                    continuation,
+                ));
+        if (merge_is_terminal || merge_is_lua_else_body)
+            && conditionals::can_reach(self.function, continuation, stop)
+        {
+            Some(stop)
+        } else {
+            None
+        }
+    }
+
+    fn is_elseif_start(&self, block: usize, merge: usize) -> bool {
+        if block == merge
+            && !conditionals::has_unreachable_jump_immediately_before(self.function, block)
+        {
+            return false;
+        }
+        if self.booleans.value_select_start(block).is_some() {
+            return false;
+        }
+        conditionals::is_elseif_candidate(
+            self.function,
+            block,
+            if block == merge { usize::MAX } else { merge },
+            self.pc_map,
+            &self.loop_headers,
+        )
+    }
+
+    fn branch_exits_or_reaches_merge(
+        &self,
+        true_target: usize,
+        false_target: usize,
+        merge: usize,
+        stop: Option<usize>,
+    ) -> bool {
+        self.arm_exits_or_reaches_merge(true_target, merge, stop)
+            && self.arm_exits_or_reaches_merge(false_target, merge, stop)
+    }
+
+    fn arm_exits_or_reaches_merge(&self, target: usize, merge: usize, stop: Option<usize>) -> bool {
+        let start = conditionals::follow_jmp_only(self.function, target, Some(merge));
+        start == merge
+            || conditionals::can_reach(self.function, start, merge)
+            || self.terminal_path_end(target, stop).is_some()
+    }
+
+    fn terminal_path_end(&self, start: usize, stop: Option<usize>) -> Option<usize> {
+        let end = conditionals::follow_jmp_only(self.function, start, stop);
+        conditionals::is_terminal_block(self.function, end).then_some(end)
     }
 
     fn leads_to_exit(&self, block: usize, exit: usize) -> bool {
         block == exit || conditionals::follow_jmp_only(self.function, block, Some(exit)) == exit
-    }
-
-    fn break_path_end(&self, start: usize, exit: usize) -> Option<Option<usize>> {
-        let mut current = start;
-        let mut first_jump = None;
-        let mut seen = BTreeSet::new();
-        loop {
-            if current == exit {
-                return Some(first_jump);
-            }
-            if current >= self.function.blocks.len() || !seen.insert(current) {
-                return None;
-            }
-            if conditionals::is_jmp_only(self.function, current) {
-                first_jump.get_or_insert(current);
-                current = self.function.blocks[current].succs.first().copied()?;
-                continue;
-            }
-            if first_jump.is_some() {
-                return None;
-            }
-            let [succ] = self.function.blocks[current].succs.as_slice() else {
-                return None;
-            };
-            current = *succ;
-        }
-    }
-
-    fn is_break_block(&self, block: usize, loop_exit: Option<usize>) -> bool {
-        let Some(exit) = loop_exit else {
-            return false;
-        };
-        conditionals::is_jmp_only(self.function, block)
-            && self.function.blocks[block].succs.first().copied() == Some(exit)
     }
 
     fn next_linear_block(&self, block: usize, stop: Option<usize>) -> usize {
@@ -619,7 +739,20 @@ fn linear_block(function: &SsaFunction, block: usize) -> LinearRegion {
                 .collect()
         })
         .unwrap_or_default();
-    LinearRegion { nodes }
+    LinearRegion {
+        nodes,
+        covered_blocks: vec![block],
+    }
+}
+
+fn linear_block_covering(
+    function: &SsaFunction,
+    block: usize,
+    covered_blocks: impl IntoIterator<Item = usize>,
+) -> LinearRegion {
+    let mut region = linear_block(function, block);
+    region.covered_blocks = covered_blocks.into_iter().collect();
+    region
 }
 
 fn max_block(blocks: &BTreeSet<usize>) -> usize {

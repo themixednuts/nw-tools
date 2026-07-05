@@ -2,7 +2,10 @@
 
 use std::collections::VecDeque;
 
-use crate::ir::{RelOp, SsaFunction, SsaNode, SsaOp, SsaRef};
+use crate::{
+    bytecode::SemanticOp,
+    ir::{RelOp, SsaFunction, SsaNode, SsaOp, SsaRef},
+};
 
 use super::regions::BlockSet;
 use crate::decompile::analysis::NodeId;
@@ -88,6 +91,31 @@ pub fn follow_jmp_only(function: &SsaFunction, block: usize, stop: Option<usize>
 }
 
 #[must_use]
+pub fn can_reach(function: &SsaFunction, start: usize, target: usize) -> bool {
+    if start >= function.blocks.len() || target >= function.blocks.len() {
+        return false;
+    }
+    let mut visited = vec![false; function.blocks.len()];
+    let mut queue = VecDeque::new();
+    visited[start] = true;
+    queue.push_back(start);
+
+    while let Some(block) = queue.pop_front() {
+        if block == target {
+            return true;
+        }
+        for &succ in &function.blocks[block].succs {
+            if succ < function.blocks.len() && !visited[succ] {
+                visited[succ] = true;
+                queue.push_back(succ);
+            }
+        }
+    }
+
+    false
+}
+
+#[must_use]
 pub fn is_jmp_only(function: &SsaFunction, block: usize) -> bool {
     let Some(block) = function.blocks.get(block) else {
         return false;
@@ -110,13 +138,45 @@ pub fn is_empty_structural(function: &SsaFunction, block: usize) -> bool {
         node.is_meta_only
             || matches!(
                 node.op,
-                SsaOp::Jump { .. }
-                    | SsaOp::Phi { .. }
-                    | SsaOp::Nop
-                    | SsaOp::Close { .. }
-                    | SsaOp::Return { .. }
+                SsaOp::Jump { .. } | SsaOp::Phi { .. } | SsaOp::Nop | SsaOp::Close { .. }
             )
+            || is_final_empty_return(function, node)
     })
+}
+
+#[must_use]
+pub fn is_final_empty_return_block(function: &SsaFunction, block: usize) -> bool {
+    let Some(block) = function.blocks.get(block) else {
+        return false;
+    };
+    is_empty_structural(function, block.index)
+        && block
+            .nodes
+            .iter()
+            .any(|node| is_final_empty_return(function, node))
+}
+
+#[must_use]
+pub fn is_terminal_block(function: &SsaFunction, block: usize) -> bool {
+    is_terminal(function, block)
+}
+
+#[must_use]
+pub fn has_unreachable_jump_immediately_before(function: &SsaFunction, block: usize) -> bool {
+    let Some(block_ref) = function.blocks.get(block) else {
+        return false;
+    };
+    let Some(pc) = block_ref.start_pc.checked_sub(1) else {
+        return false;
+    };
+    function
+        .instructions
+        .get(pc)
+        .is_some_and(|instruction| instruction.op == SemanticOp::Jmp)
+        && function
+            .blocks
+            .iter()
+            .all(|block| pc < block.start_pc || pc > block.end_pc)
 }
 
 #[must_use]
@@ -227,6 +287,9 @@ pub fn find_merge(
         if true_only || false_only {
             continue;
         }
+        if !post_dominates(function, candidate, branch) {
+            continue;
+        }
         let score = td.max(fd);
         if score < best_score {
             best_score = score;
@@ -235,10 +298,18 @@ pub fn find_merge(
     }
 
     if best.is_none() {
-        if is_terminal(function, true_end) {
+        let true_terminal = is_terminal(function, true_end);
+        let false_terminal = is_terminal(function, false_end);
+        if true_terminal && false_terminal {
+            return Some(true_end.max(false_end).saturating_add(1));
+        }
+
+        let true_all_terminate = all_paths_terminate(function, branch, true_end);
+        let false_all_terminate = all_paths_terminate(function, branch, false_end);
+        if true_all_terminate {
             return Some(false_end);
         }
-        if is_terminal(function, false_end) {
+        if false_all_terminate {
             return Some(true_end);
         }
     }
@@ -296,6 +367,133 @@ fn forward_distances(function: &SsaFunction, branch: usize, start: usize) -> Vec
     dist
 }
 
+fn post_dominates(function: &SsaFunction, candidate: usize, block: usize) -> bool {
+    if candidate == block || candidate >= function.blocks.len() || block >= function.blocks.len() {
+        return false;
+    }
+
+    let mut state = vec![VisitState::Unseen; function.blocks.len()];
+    all_paths_reach_candidate_or_terminate(function, candidate, block, &mut state)
+}
+
+fn all_paths_reach_candidate_or_terminate(
+    function: &SsaFunction,
+    candidate: usize,
+    block: usize,
+    state: &mut [VisitState],
+) -> bool {
+    if block >= function.blocks.len() {
+        return false;
+    }
+    if block == candidate || is_terminal(function, block) {
+        return true;
+    }
+    match state[block] {
+        VisitState::Done(result) => return result,
+        VisitState::Visiting => return true,
+        VisitState::Unseen => {}
+    }
+
+    state[block] = VisitState::Visiting;
+    let result =
+        !function.blocks[block].succs.is_empty()
+            && function.blocks[block].succs.iter().copied().all(|succ| {
+                all_paths_reach_candidate_or_terminate(function, candidate, succ, state)
+            });
+    state[block] = VisitState::Done(result);
+    result
+}
+
+#[must_use]
+pub fn all_paths_terminate(function: &SsaFunction, branch: usize, start: usize) -> bool {
+    if start >= function.blocks.len() {
+        return false;
+    }
+
+    let mut state = vec![TerminationVisitState::Unseen; function.blocks.len()];
+    let result = all_paths_terminate_inner(function, branch, start, &mut state);
+    result.closed && result.reaches_terminal
+}
+
+fn all_paths_terminate_inner(
+    function: &SsaFunction,
+    branch: usize,
+    block: usize,
+    state: &mut [TerminationVisitState],
+) -> TerminationResult {
+    if block >= function.blocks.len() || block <= branch {
+        return TerminationResult::open();
+    }
+    if is_terminal(function, block) {
+        return TerminationResult::terminal();
+    }
+    match state[block] {
+        TerminationVisitState::Done(result) => return result,
+        TerminationVisitState::Visiting => return TerminationResult::cycle(),
+        TerminationVisitState::Unseen => {}
+    }
+
+    state[block] = TerminationVisitState::Visiting;
+    let mut result = if function.blocks[block].succs.is_empty() {
+        TerminationResult::open()
+    } else {
+        TerminationResult {
+            closed: true,
+            reaches_terminal: false,
+        }
+    };
+    for succ in function.blocks[block].succs.iter().copied() {
+        let succ_result = all_paths_terminate_inner(function, branch, succ, state);
+        result.closed &= succ_result.closed;
+        result.reaches_terminal |= succ_result.reaches_terminal;
+    }
+    state[block] = TerminationVisitState::Done(result);
+    result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminationResult {
+    closed: bool,
+    reaches_terminal: bool,
+}
+
+impl TerminationResult {
+    const fn open() -> Self {
+        Self {
+            closed: false,
+            reaches_terminal: false,
+        }
+    }
+
+    const fn terminal() -> Self {
+        Self {
+            closed: true,
+            reaches_terminal: true,
+        }
+    }
+
+    const fn cycle() -> Self {
+        Self {
+            closed: true,
+            reaches_terminal: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminationVisitState {
+    Unseen,
+    Visiting,
+    Done(TerminationResult),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisitState {
+    Unseen,
+    Visiting,
+    Done(bool),
+}
+
 fn strictly_dominated_by(function: &SsaFunction, block: usize, dominator: usize) -> bool {
     if block == dominator {
         return false;
@@ -324,4 +522,13 @@ fn is_terminal(function: &SsaFunction, block: usize) -> bool {
 
 fn is_return_node(node: &SsaNode) -> bool {
     matches!(node.op, SsaOp::Return { .. } | SsaOp::TailCall { .. })
+}
+
+fn is_final_empty_return(function: &SsaFunction, node: &SsaNode) -> bool {
+    let SsaOp::Return { values, count, .. } = &node.op else {
+        return false;
+    };
+    *count == 1
+        && values.is_empty()
+        && usize::try_from(node.pc).ok() == function.instructions.len().checked_sub(1)
 }

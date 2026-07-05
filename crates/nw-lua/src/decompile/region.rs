@@ -8,6 +8,7 @@ use super::analysis::NodeId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinearRegion {
     pub nodes: Vec<NodeId>,
+    pub covered_blocks: Vec<usize>,
 }
 
 /// Build a best-effort linear node stream in block order.
@@ -22,5 +23,9 @@ pub fn linearize(function: &SsaFunction, _table: &OpcodeTable) -> Result<LinearR
             node,
         }));
     }
-    Ok(LinearRegion { nodes })
+    let covered_blocks = (0..function.blocks.len()).collect();
+    Ok(LinearRegion {
+        nodes,
+        covered_blocks,
+    })
 }

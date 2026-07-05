@@ -84,9 +84,20 @@ fn lower_if(
         return Ok(stmts);
     }
 
+    let phis = visible_if_phis(region, function);
     let mut out = builder.emit_linear_region(&region.prefix)?;
-    for phi in &region.phis {
-        if let Some(stmt) = builder.declare_phi_local(phi.dest, phi.pc) {
+    let arm_blocks = region
+        .arms
+        .iter()
+        .filter_map(|arm| arm.blocks.first().copied())
+        .chain(region.else_blocks.first().copied())
+        .collect::<Vec<_>>();
+    for phi in &phis {
+        if phi_has_bool_operand_outside_blocks(function, analysis, phi, false, &arm_blocks)
+            || (phi.sources.len() > 2 && phi_has_bool_operand(function, analysis, phi, false))
+        {
+            out.push(builder.materialize_value(phi.dest, phi.pc, Expr::False));
+        } else if let Some(stmt) = builder.declare_phi_local(phi.dest, phi.pc) {
             out.push(stmt);
         }
     }
@@ -95,20 +106,52 @@ fn lower_if(
     for arm in &region.arms {
         let cond = lower_condition(arm.condition, function, analysis, booleans, builder)?;
         let mut body = lower_region(&arm.body, function, analysis, names, booleans, builder)?;
-        append_phi_assignments(&mut body, &region.phis, &arm.blocks, builder)?;
+        append_phi_assignments(&mut body, &phis, &arm.blocks, builder)?;
         arms.push((cond, ast::Block::new(body)));
     }
 
     let else_ = if let Some(else_region) = &region.else_ {
         let mut body = lower_region(else_region, function, analysis, names, booleans, builder)?;
-        append_phi_assignments(&mut body, &region.phis, &region.else_blocks, builder)?;
+        append_phi_assignments(&mut body, &phis, &region.else_blocks, builder)?;
         Some(ast::Block::new(body))
+    } else if !region.else_blocks.is_empty() {
+        let mut body = Vec::new();
+        append_phi_assignments(&mut body, &phis, &region.else_blocks, builder)?;
+        (!body.is_empty()).then(|| ast::Block::new(body))
     } else {
         None
     };
 
     out.push(Stmt::If { arms, else_ });
     Ok(out)
+}
+
+fn visible_if_phis(region: &IfRegion, function: &SsaFunction) -> Vec<PhiSource> {
+    let hidden_loop_controls = region
+        .merge
+        .and_then(|merge| numeric_for_control_range_at(function, merge));
+    region
+        .phis
+        .iter()
+        .filter(|phi| {
+            !hidden_loop_controls.is_some_and(|(start, end)| {
+                phi.dest
+                    .reg_index()
+                    .is_some_and(|reg| reg >= start && reg <= end)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn numeric_for_control_range_at(function: &SsaFunction, block: usize) -> Option<(u16, u16)> {
+    let base = function.blocks.get(block)?.nodes.iter().find_map(|node| {
+        let SsaOp::ForLoop { base, .. } = node.op else {
+            return None;
+        };
+        Some(base)
+    })?;
+    Some((base, base.saturating_add(3)))
 }
 
 fn lower_boolean_value_if(
@@ -368,6 +411,12 @@ fn append_phi_assignments(
         return Ok(());
     }
     for phi in phis {
+        if let Some(stmt) =
+            builder.phi_value_plan_assignment_if_covered(phi.dest, phi.pc, blocks)?
+        {
+            body.push(stmt);
+            continue;
+        }
         let Some(operand) = unique_phi_operand(phi, blocks) else {
             continue;
         };
@@ -632,6 +681,44 @@ fn phi_bool_for_block(
         return None;
     };
     Some(*value)
+}
+
+fn phi_has_bool_operand_outside_blocks(
+    function: &SsaFunction,
+    analysis: &DecompileAnalysis,
+    phi: &PhiSource,
+    expected: bool,
+    excluded_blocks: &[usize],
+) -> bool {
+    phi.sources.iter().any(|(block, operand)| {
+        if excluded_blocks.contains(block) {
+            return false;
+        }
+        let Some(node) = analysis
+            .def_site(*operand)
+            .and_then(|id| node(function, id))
+        else {
+            return false;
+        };
+        matches!(node.op, SsaOp::LoadBool { value, .. } if value == expected)
+    })
+}
+
+fn phi_has_bool_operand(
+    function: &SsaFunction,
+    analysis: &DecompileAnalysis,
+    phi: &PhiSource,
+    expected: bool,
+) -> bool {
+    phi.sources.iter().any(|(_, operand)| {
+        let Some(node) = analysis
+            .def_site(*operand)
+            .and_then(|id| node(function, id))
+        else {
+            return false;
+        };
+        matches!(node.op, SsaOp::LoadBool { value, .. } if value == expected)
+    })
 }
 
 fn phi_operand_for_block(phi: &PhiSource, block: usize) -> Option<SsaRef> {

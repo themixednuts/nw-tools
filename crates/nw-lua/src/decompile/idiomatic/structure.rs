@@ -37,9 +37,10 @@ pub struct DropElseAfterExit;
 
 impl Rule for DropElseAfterExit {
     fn rewrite_block(&self, block: Block, _ctx: &CleanContext) -> Rewrite<Block> {
-        let mut out = Vec::with_capacity(block.0.len());
+        let original_len = block.0.len();
+        let mut out = Vec::with_capacity(original_len);
         let mut changed = false;
-        for stmt in block.0 {
+        for (index, stmt) in block.0.into_iter().enumerate() {
             let Stmt::If { arms, else_ } = stmt else {
                 out.push(stmt);
                 continue;
@@ -48,7 +49,11 @@ impl Rule for DropElseAfterExit {
                 out.push(Stmt::If { arms, else_ });
                 continue;
             };
-            if !block_always_exits(body) || (rest.is_empty() && else_.is_none()) {
+            if !rest.is_empty()
+                || !block_always_exits(body)
+                || (else_.as_ref().is_some_and(block_always_exits) && index + 1 < original_len)
+                || (rest.is_empty() && else_.is_none())
+            {
                 out.push(Stmt::If { arms, else_ });
                 continue;
             }
@@ -114,12 +119,22 @@ impl Rule for EmptyBranchCleanup {
         let mut out = Vec::with_capacity(block.0.len());
         let mut changed = false;
         for stmt in block.0 {
-            if let Stmt::If { arms, else_: None } = &stmt
-                && arms.len() == 1
-                && arms[0].1.0.is_empty()
-                && expr_is_side_effect_free(&arms[0].0)
-            {
-                changed = true;
+            if let Stmt::If { arms, else_ } = stmt {
+                let original_arm_count = arms.len();
+                let arms = arms
+                    .into_iter()
+                    .filter(|(_, body)| !body.0.is_empty())
+                    .collect::<Vec<_>>();
+                let else_ = else_.filter(|body| !body.0.is_empty());
+                if arms.is_empty() {
+                    if let Some(else_block) = else_ {
+                        out.extend(else_block.0);
+                    }
+                    changed = true;
+                    continue;
+                }
+                changed |= arms.len() != original_arm_count;
+                out.push(Stmt::If { arms, else_ });
                 continue;
             }
             out.push(stmt);
@@ -139,15 +154,15 @@ impl Rule for EmptyBranchCleanup {
         else {
             return Rewrite::unchanged(stmt);
         };
+        if else_block.0.is_empty() {
+            return Rewrite::changed(Stmt::If { arms, else_: None });
+        }
         let [(cond, then_block)] = arms.as_slice() else {
             return Rewrite::unchanged(Stmt::If {
                 arms,
                 else_: Some(else_block),
             });
         };
-        if else_block.0.is_empty() {
-            return Rewrite::changed(Stmt::If { arms, else_: None });
-        }
         if then_block.0.is_empty() {
             return Rewrite::changed(Stmt::If {
                 arms: vec![(invert_condition(cond.clone()), else_block)],
@@ -257,20 +272,6 @@ fn invert_binop(op: BinOp) -> Option<BinOp> {
         BinOp::Ge => BinOp::Lt,
         _ => return None,
     })
-}
-
-fn expr_is_side_effect_free(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Nil
-            | Expr::True
-            | Expr::False
-            | Expr::VarArg
-            | Expr::Number(_)
-            | Expr::Integer(_)
-            | Expr::Str(_)
-            | Expr::Name(_)
-    )
 }
 
 fn block_has_local_decls(block: &Block) -> bool {
