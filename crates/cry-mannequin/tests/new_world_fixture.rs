@@ -6,8 +6,10 @@ use cry_mannequin::{
     MannequinControllerDefinitionSource, MannequinTagDefinitionEntry, MannequinTagDefinitionSource,
 };
 
-const FIXTURE_ROOT: &str = "E:/Projects/new-world/tmp/mannequin_e1c_raw";
-const BLENDSPACE_FIXTURE_ROOT: &str = "E:/Projects/new-world/tmp/blendspace_e1d_raw";
+const MANNEQUIN_FIXTURE_ROOT_ENV: &str = "NW_TOOLS_MANNEQUIN_FIXTURE_ROOT";
+const BLENDSPACE_FIXTURE_ROOT_ENV: &str = "NW_TOOLS_BLENDSPACE_FIXTURE_ROOT";
+const DEFAULT_MANNEQUIN_FIXTURE_ROOT: &str = "E:/Projects/new-world/tmp/mannequin_e1c_raw";
+const DEFAULT_BLENDSPACE_FIXTURE_ROOT: &str = "E:/Projects/new-world/tmp/blendspace_e1d_raw";
 const LOST_COMMANDER_ANIMS: &str = "animations/mannequin/adb/isleofnight/lostcommander_anims.adb";
 const LOST_COMMANDER_SWORD_ANIMS: &str =
     "animations/mannequin/adb/isleofnight/lostcommander_swordanims.adb";
@@ -21,7 +23,9 @@ const BISON_TURN_BLEND_COMB: &str =
 
 #[test]
 fn decodes_lostcommander_anims_adb_with_real_animation_options() {
-    let bytes = read_fixture(LOST_COMMANDER_ANIMS);
+    let Some(bytes) = read_mannequin_fixture(LOST_COMMANDER_ANIMS) else {
+        return;
+    };
     let source = MannequinAnimationDatabaseSource::from_legacy_with_motion_resolver(
         LOST_COMMANDER_ANIMS,
         &bytes,
@@ -60,7 +64,9 @@ fn decodes_lostcommander_anims_adb_with_real_animation_options() {
 
 #[test]
 fn decodes_lostcommander_swordanims_as_procedural_mannequin_database() {
-    let bytes = read_fixture(LOST_COMMANDER_SWORD_ANIMS);
+    let Some(bytes) = read_mannequin_fixture(LOST_COMMANDER_SWORD_ANIMS) else {
+        return;
+    };
     let source = MannequinAnimationDatabaseSource::from_legacy(LOST_COMMANDER_SWORD_ANIMS, &bytes)
         .expect("decode real lostcommander_swordanims.adb fixture");
 
@@ -72,28 +78,31 @@ fn decodes_lostcommander_swordanims_as_procedural_mannequin_database() {
 
 #[test]
 fn decodes_lostcommander_tag_and_controller_definitions() {
-    let actions = MannequinTagDefinitionSource::from_legacy(
-        LOST_COMMANDER_ACTIONS,
-        &read_fixture(LOST_COMMANDER_ACTIONS),
-    )
-    .expect("decode real LostCommander_Actions.xml fixture");
+    let Some(actions_bytes) = read_mannequin_fixture(LOST_COMMANDER_ACTIONS) else {
+        return;
+    };
+    let actions = MannequinTagDefinitionSource::from_legacy(LOST_COMMANDER_ACTIONS, &actions_bytes)
+        .expect("decode real LostCommander_Actions.xml fixture");
     assert_eq!(actions.version.as_deref(), Some("2"));
     assert_eq!(flattened_tag_count(&actions), 77);
     assert_eq!(actions.entries.len(), 77);
 
-    let tags = MannequinTagDefinitionSource::from_legacy(
-        LOST_COMMANDER_TAGS,
-        &read_fixture(LOST_COMMANDER_TAGS),
-    )
-    .expect("decode real LostCommanderTags.xml fixture");
+    let Some(tags_bytes) = read_mannequin_fixture(LOST_COMMANDER_TAGS) else {
+        return;
+    };
+    let tags = MannequinTagDefinitionSource::from_legacy(LOST_COMMANDER_TAGS, &tags_bytes)
+        .expect("decode real LostCommanderTags.xml fixture");
     assert_eq!(tags.version.as_deref(), Some("2"));
     assert_eq!(tags.entries.len(), 23);
     assert_eq!(group_count(&tags), 9);
     assert_eq!(flattened_tag_count(&tags), 57);
 
+    let Some(controller_bytes) = read_mannequin_fixture(LOST_COMMANDER_CONTROLLER) else {
+        return;
+    };
     let controller = MannequinControllerDefinitionSource::from_legacy(
         LOST_COMMANDER_CONTROLLER,
-        &read_fixture(LOST_COMMANDER_CONTROLLER),
+        &controller_bytes,
     )
     .expect("decode real LostCommander controllerdefs.xml fixture");
     assert_eq!(controller.fragment_definitions.len(), 77);
@@ -119,7 +128,9 @@ fn decodes_lostcommander_tag_and_controller_definitions() {
 
 #[test]
 fn decodes_real_mount_grunt_movement_walk_bspace_fixture() {
-    let bytes = read_blend_fixture(MOUNT_GRUNT_WALK_BLEND);
+    let Some(bytes) = read_blend_fixture(MOUNT_GRUNT_WALK_BLEND) else {
+        return;
+    };
     let source = BlendSpaceSource::from_legacy_with_motion_resolver(
         MOUNT_GRUNT_WALK_BLEND,
         &bytes,
@@ -165,7 +176,9 @@ fn decodes_real_mount_grunt_movement_walk_bspace_fixture() {
 
 #[test]
 fn decodes_real_bison_turn_comb_fixture() {
-    let bytes = read_blend_fixture(BISON_TURN_BLEND_COMB);
+    let Some(bytes) = read_blend_fixture(BISON_TURN_BLEND_COMB) else {
+        return;
+    };
     let source = CombinedBlendSpaceSource::from_legacy(BISON_TURN_BLEND_COMB, &bytes)
         .expect("decode real bison_turn_blendcomb.comb fixture");
 
@@ -203,24 +216,50 @@ fn decodes_real_bison_turn_comb_fixture() {
     );
 }
 
-fn read_fixture(relative: &str) -> Vec<u8> {
-    let path = PathBuf::from(FIXTURE_ROOT).join(relative);
-    fs::read(&path).unwrap_or_else(|error| {
-        panic!(
-            "read real New World Mannequin fixture {}: {error}; regenerate it from Steam PAKs with nw-extract assets extract",
-            path.display()
-        )
-    })
+fn read_mannequin_fixture(relative: &str) -> Option<Vec<u8>> {
+    read_external_fixture(
+        MANNEQUIN_FIXTURE_ROOT_ENV,
+        DEFAULT_MANNEQUIN_FIXTURE_ROOT,
+        relative,
+        "Mannequin",
+    )
 }
 
-fn read_blend_fixture(relative: &str) -> Vec<u8> {
-    let path = PathBuf::from(BLENDSPACE_FIXTURE_ROOT).join(relative);
-    fs::read(&path).unwrap_or_else(|error| {
-        panic!(
-            "read real New World blend-space fixture {}: {error}; regenerate it from Steam PAKs with nw-extract assets extract",
-            path.display()
-        )
-    })
+fn read_blend_fixture(relative: &str) -> Option<Vec<u8>> {
+    read_external_fixture(
+        BLENDSPACE_FIXTURE_ROOT_ENV,
+        DEFAULT_BLENDSPACE_FIXTURE_ROOT,
+        relative,
+        "blend-space",
+    )
+}
+
+fn read_external_fixture(
+    root_env: &str,
+    default_root: &str,
+    relative: &str,
+    fixture_kind: &str,
+) -> Option<Vec<u8>> {
+    let root = std::env::var_os(root_env)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(default_root));
+    let path = root.join(relative);
+    match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "skipping real New World {fixture_kind} fixture {}: {error}; set {root_env} or regenerate it from Steam PAKs with nw-extract assets extract",
+                path.display()
+            );
+            None
+        }
+        Err(error) => {
+            panic!(
+                "read real New World {fixture_kind} fixture {}: {error}; regenerate it from Steam PAKs with nw-extract assets extract",
+                path.display()
+            )
+        }
+    }
 }
 
 fn fragments(
