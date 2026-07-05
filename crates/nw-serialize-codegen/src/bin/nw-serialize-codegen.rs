@@ -598,8 +598,9 @@ fn network_rust(args: &NetworkRustArgs, status: CodegenStatus) -> Result<()> {
     let step_count = 4 + enabled_step(args.rust_source_root.is_some());
     let progress = context.status().phase("network rust", Some(step_count));
     let root = load_json_root(&args.schema, "network schema JSON")?;
-    let schema = serde_json::from_value::<NetworkSchema>(root)
+    let mut schema = serde_json::from_value::<NetworkSchema>(root)
         .with_context(|| format!("parse network schema from {}", args.schema.display()))?;
+    schema.normalize_derived_shapes();
     progress.advance_with_message(1, Some("loaded schema".to_owned()));
     let source_audit = match &args.rust_source_root {
         Some(root) => {

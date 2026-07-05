@@ -18,7 +18,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v35";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v36";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -115,6 +115,10 @@ pub struct NetworkStateFieldShapeReport {
     pub value_type_candidates: Vec<NetworkNativeTypeInfoEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_value_type_shape: Option<crate::network_schema::NetworkNestedTypeShape>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub container_embedded_value_type_shapes: Vec<crate::network_schema::NetworkNestedTypeShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested_type_shape: Option<crate::network_schema::NetworkNestedTypeShape>,
     pub rust_value_type: Option<String>,
     pub rust_field_type: Option<String>,
     #[serde(default)]
@@ -1639,6 +1643,7 @@ fn message_generation_plan(
                 wire_shape_sources,
                 value_type_candidates,
                 support_evidence,
+                network_type.name.as_deref(),
             )
         })
         .collect::<Vec<_>>();
@@ -1890,6 +1895,7 @@ fn message_field_shape_report(
     wire_shape_sources: &BTreeMap<&str, &str>,
     value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
     support_evidence: &MessageSupportEvidence,
+    message_type_name: Option<&str>,
 ) -> NetworkStateFieldShapeReport {
     let container_shapes = BTreeMap::new();
     let serialize_types = BTreeMap::new();
@@ -1907,13 +1913,14 @@ fn message_field_shape_report(
         .as_deref()
         .map(normalize_generated_rust_type)
         .or_else(|| existing_message_support_type(field, support_evidence).map(ToOwned::to_owned))
+        .or_else(|| message_serialize_source_rust_type(field))
+        .or_else(|| message_nested_shape_rust_type(field, message_type_name))
         .or(source_type)
         .or_else(|| {
             field
                 .native_type
                 .as_deref()
                 .and_then(message_native_type_rust_type)
-                .map(ToOwned::to_owned)
         })
         .or_else(|| report.rust_value_type.clone());
     report.rust_value_type = rust_type.clone();
@@ -2032,6 +2039,15 @@ fn state_field_shape_report(
                 .as_ref()
                 .and_then(|shape| shape.container_value_type_shape.clone())
         },
+        container_embedded_value_type_shapes: if explicit_field_type.is_some() {
+            Vec::new()
+        } else {
+            container_rust_shape
+                .as_ref()
+                .map(|shape| shape.container_embedded_value_type_shapes.clone())
+                .unwrap_or_default()
+        },
+        nested_type_shape: field.nested_type_shape.clone(),
         rust_value_type: if explicit_field_type.is_some() {
             None
         } else {
@@ -2146,18 +2162,111 @@ fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
     }
 }
 
-fn message_native_type_rust_type(native_type: &str) -> Option<&'static str> {
-    match native_type.trim() {
+fn message_native_type_rust_type(native_type: &str) -> Option<String> {
+    if let Some(capacity) = fixed_vector_u8_capacity(native_type) {
+        return Some(format!("::arrayvec::ArrayVec<u8, {capacity}>"));
+    }
+    let rust_type = match native_type.trim() {
         "ActorRef" | "Amazon::Hub::ActorRef" | "HubAddress" | "ProxyAddress" => {
-            Some("::nw_network::ActorRef")
+            "::nw_network::ActorRef"
         }
         "BaselineableFragment" | "Amazon::Hub::BaselineableFragment" => {
-            Some("::nw_network::hub::BaselineableFragment")
+            "::nw_network::hub::BaselineableFragment"
         }
-        "FragmentKey" | "Amazon::Hub::FragmentKey" => Some("::nw_network::hub::FragmentKey"),
-        "EntityRef" => Some("::nw_network::EntityRef"),
-        _ => None,
+        "FragmentKey" | "Amazon::Hub::FragmentKey" => "::nw_network::hub::FragmentKey",
+        "EntityRef" => "::nw_network::EntityRef",
+        _ => return None,
+    };
+    Some(rust_type.to_owned())
+}
+
+fn fixed_vector_u8_capacity(native_type: &str) -> Option<usize> {
+    let trimmed = native_type.trim();
+    let inner = trimmed
+        .strip_prefix("AZStd::fixed_vector<")?
+        .strip_suffix('>')?;
+    let (element, capacity) = inner.split_once(',')?;
+    if element.trim() != "AZ::u8" && element.trim() != "u8" {
+        return None;
     }
+    capacity.trim().parse().ok()
+}
+
+fn message_serialize_source_rust_type(field: &NetworkField) -> Option<String> {
+    let serialize = field.serialize.as_ref()?;
+    runtime_semantic_container_member_type(&serialize.name)
+        .map(ToOwned::to_owned)
+        .or_else(|| serialize_source_rust_type_name(&serialize.name))
+}
+
+fn message_nested_shape_rust_type(
+    field: &NetworkField,
+    message_type_name: Option<&str>,
+) -> Option<String> {
+    let shape = field.nested_type_shape.as_ref()?;
+    if !message_nested_shape_matches_field(field, shape) {
+        return None;
+    }
+    if message_nested_shape_uses_source_type(shape) {
+        return shape
+            .type_name_full
+            .as_deref()
+            .or(shape.type_name.as_deref())
+            .and_then(serialize_source_rust_type_name);
+    }
+    message_nested_shape_support_type_name(shape, message_type_name)
+}
+
+fn message_nested_shape_matches_field(
+    field: &NetworkField,
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+) -> bool {
+    let Some(shape_name) = shape
+        .type_name
+        .as_deref()
+        .or_else(|| shape.type_name_full.as_deref().map(type_name_leaf))
+    else {
+        return false;
+    };
+    field
+        .source_type_name
+        .as_deref()
+        .or(field.native_type.as_deref())
+        .and_then(first_source_type_leaf)
+        .is_some_and(|source_name| source_name == shape_name)
+}
+
+fn first_source_type_leaf(value: &str) -> Option<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .find(|part| !part.is_empty())
+        .map(type_name_leaf)
+}
+
+fn message_nested_shape_uses_source_type(
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+) -> bool {
+    shape.member_names_proven == Some(true)
+        && shape
+            .member_name_source
+            .as_deref()
+            .is_some_and(|source| source.contains("serialize") || source == "ghidra-datatype")
+}
+
+fn message_nested_shape_support_type_name(
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+    message_type_name: Option<&str>,
+) -> Option<String> {
+    let mut name = rust_type_ident(shape.type_name.as_deref()?);
+    if message_type_name
+        .map(rust_type_ident)
+        .is_some_and(|message_name| message_name == name)
+    {
+        name.push_str("Body");
+    }
+    syn::parse_str::<syn::Type>(&name).ok()?;
+    Some(name)
 }
 
 fn resolved_field_descriptor_rust_type(field: &NetworkField) -> Option<String> {
@@ -2169,6 +2278,7 @@ fn resolved_field_descriptor_rust_type(field: &NetworkField) -> Option<String> {
             existing_message_support_type(field, &MessageSupportEvidence::default())
                 .map(ToOwned::to_owned)
         })
+        .or_else(|| message_serialize_source_rust_type(field))
 }
 
 fn normalize_generated_rust_type(rust_type: &str) -> String {
@@ -2776,6 +2886,7 @@ struct RustFieldShape {
     value_type: String,
     field_type: String,
     container_value_type_shape: Option<crate::network_schema::NetworkNestedTypeShape>,
+    container_embedded_value_type_shapes: Vec<crate::network_schema::NetworkNestedTypeShape>,
 }
 
 fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
@@ -2873,6 +2984,7 @@ fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
             value_type: format!("[u8; {len}]"),
             field_type: format!("ReplicatedFieldHandler<[u8; {len}]>"),
             container_value_type_shape: None,
+            container_embedded_value_type_shapes: Vec::new(),
         },
         SchemaWireShape::String => {
             rust_field_shape_static("String", "ReplicatedFieldHandler<String>")
@@ -2888,6 +3000,7 @@ fn rust_field_shape_static(value_type: &'static str, field_type: &'static str) -
         value_type: value_type.to_owned(),
         field_type: field_type.to_owned(),
         container_value_type_shape: None,
+        container_embedded_value_type_shapes: Vec::new(),
     }
 }
 
@@ -2906,6 +3019,7 @@ fn replicated_container_field_shape(
         value_type: collection_type,
         field_type,
         container_value_type_shape: None,
+        container_embedded_value_type_shapes: Vec::new(),
     }
 }
 
@@ -2926,22 +3040,25 @@ fn replicated_container_semantic_field_shape(
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<RustFieldShape> {
     let value = container_value_type(field, container, value_type_candidates, serialize_types)?;
-    let key_marshaler = match container.storage {
-        NetworkReplicatedContainerStorageKind::Map => container_key_marshaler_type(container),
-        NetworkReplicatedContainerStorageKind::Vec => {
-            "::nw_network::serialize::DefaultMarshaler<::nw_network::serialize::VlqU64>".to_owned()
-        }
-    };
-    let value_marshaler = value.marshaler_type;
     let collection_type = match container.storage {
         NetworkReplicatedContainerStorageKind::Map => {
-            let key_type = container_key_rust_type(container);
+            let key = container_key_type(field, container, serialize_types)?;
+            let key_type = key.rust_type;
             keyed_replicated_container_type(&key_type, &value.rust_type)
         }
         NetworkReplicatedContainerStorageKind::Vec => {
             format!("::std::vec::Vec<{}>", value.rust_type)
         }
     };
+    let key_marshaler = match container.storage {
+        NetworkReplicatedContainerStorageKind::Map => {
+            container_key_type(field, container, serialize_types)?.marshaler_type
+        }
+        NetworkReplicatedContainerStorageKind::Vec => {
+            "::nw_network::serialize::DefaultMarshaler<::nw_network::serialize::VlqU64>".to_owned()
+        }
+    };
+    let value_marshaler = value.marshaler_type;
     let field_type = format!(
         "::nw_network::serialize::ReplicatedContainer<{collection_type}, {{ ::nw_network::serialize::WIRE_VEC_CAP }}, {key_marshaler}, {value_marshaler}>"
     );
@@ -2949,21 +3066,69 @@ fn replicated_container_semantic_field_shape(
         value_type: collection_type,
         field_type,
         container_value_type_shape: value.value_type_shape,
+        container_embedded_value_type_shapes: value.embedded_value_type_shapes,
     })
 }
 
-fn container_key_rust_type(container: &NetworkReplicatedContainerShape) -> String {
+fn container_key_type(
+    field: &NetworkField,
+    container: &NetworkReplicatedContainerShape,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<ContainerValueType> {
     if is_uuid_native_type(container.key_native_type.as_deref()) {
-        return "::uuid::Uuid".to_owned();
+        return Some(ContainerValueType {
+            rust_type: "::uuid::Uuid".to_owned(),
+            marshaler_type: "::nw_network::serialize::DefaultMarshaler<::uuid::Uuid>".to_owned(),
+            value_type_shape: None,
+            embedded_value_type_shapes: Vec::new(),
+        });
     }
-    scalar_rust_type(container.key_wire_shape)
+    let key_wire_shapes = container_key_wire_shapes(container);
+    if let Some(type_name) = container.key_native_type.as_deref()
+        && let Some(value) =
+            container_named_source_type(type_name, &key_wire_shapes, serialize_types)
+    {
+        return Some(value);
+    }
+    if let Some(type_name) = container.key_type_name.as_deref()
+        && let Some(value) =
+            container_named_source_type(type_name, &key_wire_shapes, serialize_types)
+    {
+        return Some(value);
+    }
+    if let Some(shape) = container.key_type_shape.as_ref()
+        && container_value_shape_matches(shape, &key_wire_shapes)
+    {
+        let rust_type = container_value_shape_rust_type(field, shape, serialize_types)?;
+        let marshaler_type = container_value_shape_codec_name(field, shape)?;
+        return Some(ContainerValueType {
+            rust_type,
+            marshaler_type,
+            value_type_shape: Some(shape.clone()),
+            embedded_value_type_shapes: Vec::new(),
+        });
+    }
+    let [shape] = key_wire_shapes.as_slice() else {
+        return None;
+    };
+    let rust_type = scalar_rust_type(*shape);
+    let marshaler_type = scalar_marshaler_type(*shape);
+    Some(ContainerValueType {
+        rust_type,
+        marshaler_type,
+        value_type_shape: None,
+        embedded_value_type_shapes: Vec::new(),
+    })
 }
 
-fn container_key_marshaler_type(container: &NetworkReplicatedContainerShape) -> String {
-    if is_uuid_native_type(container.key_native_type.as_deref()) {
-        return "::nw_network::serialize::DefaultMarshaler<::uuid::Uuid>".to_owned();
+fn container_key_wire_shapes(
+    container: &NetworkReplicatedContainerShape,
+) -> Vec<SchemaWireScalarShape> {
+    if container.key_wire_shapes.is_empty() {
+        vec![container.key_wire_shape]
+    } else {
+        container.key_wire_shapes.clone()
     }
-    scalar_marshaler_type(container.key_wire_shape)
 }
 
 fn is_uuid_native_type(native_type: Option<&str>) -> bool {
@@ -2978,6 +3143,7 @@ struct ContainerValueType {
     rust_type: String,
     marshaler_type: String,
     value_type_shape: Option<crate::network_schema::NetworkNestedTypeShape>,
+    embedded_value_type_shapes: Vec<crate::network_schema::NetworkNestedTypeShape>,
 }
 
 fn container_value_type(
@@ -3006,12 +3172,23 @@ fn container_value_type(
         );
     }
 
+    if let Some(type_name) = container.value_type_name.as_deref()
+        && let Some(value) =
+            container_named_source_type(type_name, &container.value_wire_shapes, serialize_types)
+    {
+        return Some(value);
+    }
+
     if let Some(value) = vector_container_value_type(container, serialize_types) {
         return Some(value);
     }
 
     if let Some(shape) = container.value_type_shape.as_ref()
-        && container_value_shape_matches(shape, &container.value_wire_shapes)
+        && container_value_shape_matches_with_embedded(
+            shape,
+            &container.value_wire_shapes,
+            &container.embedded_value_type_shapes,
+        )
     {
         let rust_type = container_value_shape_rust_type(field, shape, serialize_types)?;
         let marshaler_type = container_value_shape_codec_name(field, shape)?;
@@ -3019,6 +3196,7 @@ fn container_value_type(
             rust_type,
             marshaler_type,
             value_type_shape: Some(shape.clone()),
+            embedded_value_type_shapes: container.embedded_value_type_shapes.clone(),
         });
     }
 
@@ -3031,12 +3209,21 @@ fn container_value_type(
         rust_type,
         marshaler_type,
         value_type_shape: None,
+        embedded_value_type_shapes: Vec::new(),
     })
 }
 
 fn container_value_shape_matches(
     shape: &crate::network_schema::NetworkNestedTypeShape,
     value_wire_shapes: &[SchemaWireScalarShape],
+) -> bool {
+    container_value_shape_matches_with_embedded(shape, value_wire_shapes, &[])
+}
+
+fn container_value_shape_matches_with_embedded(
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+    value_wire_shapes: &[SchemaWireScalarShape],
+    embedded_shapes: &[crate::network_schema::NetworkNestedTypeShape],
 ) -> bool {
     if shape.members.is_empty() || value_wire_shapes.is_empty() {
         return false;
@@ -3046,8 +3233,12 @@ fn container_value_shape_matches(
         let Some(wire_shape) = member.wire_shape.as_deref() else {
             return false;
         };
-        let Some(span) = container_value_member_shape_span(wire_shape, value_wire_shapes, index)
-        else {
+        let Some(span) = container_value_member_shape_span(
+            wire_shape,
+            value_wire_shapes,
+            index,
+            embedded_shapes,
+        ) else {
             return false;
         };
         index += span;
@@ -3056,13 +3247,23 @@ fn container_value_shape_matches(
 }
 
 fn scalar_shape_name_matches(value: &str, expected: SchemaWireScalarShape) -> bool {
-    wire_scalar_shape_from_name(value) == Some(expected)
+    wire_scalar_shape_from_name(value)
+        .is_some_and(|observed| scalar_shapes_match(observed, expected))
+}
+
+fn scalar_shapes_match(observed: SchemaWireScalarShape, expected: SchemaWireScalarShape) -> bool {
+    observed == expected
+        || matches!(
+            (observed, expected),
+            (SchemaWireScalarShape::Bool, SchemaWireScalarShape::U8)
+        )
 }
 
 fn container_value_member_shape_span(
     observed: &str,
     expected: &[SchemaWireScalarShape],
     index: usize,
+    embedded_shapes: &[crate::network_schema::NetworkNestedTypeShape],
 ) -> Option<usize> {
     let next = *expected.get(index)?;
     if scalar_shape_name_matches(observed, next) {
@@ -3071,7 +3272,21 @@ fn container_value_member_shape_span(
     if let Some(composite) = composite_member_wire_shapes(observed) {
         let end = index.checked_add(composite.len())?;
         let expected = expected.get(index..end)?;
-        return (expected == composite.as_slice()).then_some(composite.len());
+        return composite
+            .iter()
+            .zip(expected.iter())
+            .all(|(observed, expected)| scalar_shapes_match(*observed, *expected))
+            .then_some(composite.len());
+    }
+    if let Some(embedded) = nested_shape_by_wire_name(observed, embedded_shapes) {
+        let embedded_shapes = nested_shape_wire_shapes(embedded, embedded_shapes)?;
+        let span = embedded_shapes.len();
+        let expected = expected.get(index..index.checked_add(span)?)?;
+        return embedded_shapes
+            .iter()
+            .zip(expected.iter())
+            .all(|(observed, expected)| scalar_shapes_match(*observed, *expected))
+            .then_some(span);
     }
     match observed {
         "vec2" if expected_shape_run(expected, index, SchemaWireScalarShape::F32, 2) => Some(2),
@@ -3084,8 +3299,15 @@ fn container_value_member_shape_span(
             if next != SchemaWireScalarShape::VlqU32 {
                 return None;
             }
-            if source_type_vector_element_wire_shape(element) {
-                return expected.len().checked_sub(index);
+            if let Some(embedded) = nested_shape_by_wire_name(element, embedded_shapes) {
+                let element_shapes = nested_shape_wire_shapes(embedded, embedded_shapes)?;
+                let span = 1usize.checked_add(element_shapes.len())?;
+                let expected = expected.get(index + 1..index + span)?;
+                return element_shapes
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(observed, expected)| scalar_shapes_match(*observed, *expected))
+                    .then_some(span);
             }
             if expected
                 .get(index + 1)
@@ -3095,6 +3317,65 @@ fn container_value_member_shape_span(
             } else {
                 Some(1)
             }
+        }
+    }
+}
+
+fn nested_shape_by_wire_name<'a>(
+    name: &str,
+    shapes: &'a [crate::network_schema::NetworkNestedTypeShape],
+) -> Option<&'a crate::network_schema::NetworkNestedTypeShape> {
+    shapes.iter().find(|shape| {
+        [shape.type_name.as_deref(), shape.type_name_full.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|candidate| type_name_leaf(candidate) == name)
+    })
+}
+
+fn type_name_leaf(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name).trim()
+}
+
+fn nested_shape_wire_shapes(
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+    embedded_shapes: &[crate::network_schema::NetworkNestedTypeShape],
+) -> Option<Vec<SchemaWireScalarShape>> {
+    if shape.members.is_empty() {
+        return None;
+    }
+
+    let mut shapes = Vec::new();
+    for member in &shape.members {
+        let wire_shape = member.wire_shape.as_deref()?;
+        shapes.extend(nested_member_wire_shapes(wire_shape, embedded_shapes)?);
+    }
+    Some(shapes)
+}
+
+fn nested_member_wire_shapes(
+    observed: &str,
+    embedded_shapes: &[crate::network_schema::NetworkNestedTypeShape],
+) -> Option<Vec<SchemaWireScalarShape>> {
+    if let Some(shape) = wire_scalar_shape_from_name(observed) {
+        return Some(vec![shape]);
+    }
+    if let Some(composite) = composite_member_wire_shapes(observed) {
+        return Some(composite);
+    }
+    if let Some(embedded) = nested_shape_by_wire_name(observed, embedded_shapes) {
+        return nested_shape_wire_shapes(embedded, embedded_shapes);
+    }
+    match observed {
+        "vec2" => Some(vec![SchemaWireScalarShape::F32; 2]),
+        "vec3" => Some(vec![SchemaWireScalarShape::F32; 3]),
+        "vec4" | "quat" => Some(vec![SchemaWireScalarShape::F32; 4]),
+        observed => {
+            let element = vector_element_wire_shape(observed)?;
+            let embedded = nested_shape_by_wire_name(element, embedded_shapes)?;
+            let mut shapes = vec![SchemaWireScalarShape::VlqU32];
+            shapes.extend(nested_shape_wire_shapes(embedded, embedded_shapes)?);
+            Some(shapes)
         }
     }
 }
@@ -3116,13 +3397,6 @@ fn vector_element_wire_shape(value: &str) -> Option<&str> {
         .strip_suffix('>')
         .map(str::trim)
         .filter(|value| !value.is_empty())
-}
-
-fn source_type_vector_element_wire_shape(value: &str) -> bool {
-    value
-        .chars()
-        .next()
-        .is_some_and(|first| first.is_ascii_uppercase())
 }
 
 fn composite_member_wire_shapes(value: &str) -> Option<Vec<SchemaWireScalarShape>> {
@@ -3194,6 +3468,14 @@ fn container_value_shape_rust_type(
     shape: &crate::network_schema::NetworkNestedTypeShape,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<String> {
+    if let Some(type_name) = shape
+        .type_name_full
+        .as_deref()
+        .or(shape.type_name.as_deref())
+        && let Some(rust_type) = runtime_semantic_container_member_type(type_name)
+    {
+        return Some(rust_type.to_owned());
+    }
     if container_value_shape_uses_source_type(shape, serialize_types) {
         return shape
             .type_name_full
@@ -3248,7 +3530,7 @@ fn unique_container_value_candidate<'a>(
         let Some(serialize) = serialize_types.get(&type_id).copied() else {
             continue;
         };
-        if serialize.wire_shapes == container.value_wire_shapes {
+        if wire_scalar_shapes_match(&container.value_wire_shapes, &serialize.wire_shapes) {
             matches.push(serialize);
         }
     }
@@ -3263,7 +3545,9 @@ fn serialize_container_value_type(
     name: &str,
     wire_shapes: &[SchemaWireScalarShape],
 ) -> Option<ContainerValueType> {
-    let rust_type = serialize_source_rust_type_name(name)?;
+    let rust_type = runtime_semantic_container_member_type(name)
+        .map(ToOwned::to_owned)
+        .or_else(|| serialize_source_rust_type_name(name))?;
     let marshaler_type = if kind == NetworkSerializeKind::Enum && wire_shapes.len() == 1 {
         conversion_marshal_type_string_for(wire_shapes[0].into(), &rust_type)
             .unwrap_or_else(|| format!("::nw_network::serialize::DefaultMarshaler<{rust_type}>"))
@@ -3274,6 +3558,7 @@ fn serialize_container_value_type(
         rust_type,
         marshaler_type,
         value_type_shape: None,
+        embedded_value_type_shapes: Vec::new(),
     })
 }
 
@@ -3281,7 +3566,10 @@ fn vector_container_value_type(
     container: &NetworkReplicatedContainerShape,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<ContainerValueType> {
-    if container.value_wire_shapes.first() != Some(&SchemaWireScalarShape::VlqU32) {
+    let vector_shape_element = container_source_vector_shape_element(container);
+    if container.value_wire_shapes.first() != Some(&SchemaWireScalarShape::VlqU32)
+        && vector_shape_element.is_none()
+    {
         return None;
     }
     let type_name = container
@@ -3295,7 +3583,7 @@ fn vector_container_value_type(
                 .as_deref()
         })
         .or_else(|| container.value_type_shape.as_ref()?.type_name.as_deref())?;
-    let element_name = azstd_vector_inner_type(type_name)?;
+    let element_name = azstd_vector_inner_type(type_name).or(vector_shape_element)?;
     let serialize = serialize_types
         .values()
         .copied()
@@ -3307,7 +3595,28 @@ fn vector_container_value_type(
         rust_type,
         marshaler_type,
         value_type_shape: None,
+        embedded_value_type_shapes: Vec::new(),
     })
+}
+
+fn container_source_vector_shape_element(
+    container: &NetworkReplicatedContainerShape,
+) -> Option<&str> {
+    let shape = container.value_type_shape.as_ref()?;
+    if !shape
+        .validation
+        .as_deref()
+        .is_some_and(|validation| validation.contains("serialize-type-sequence"))
+    {
+        return None;
+    }
+    let [member] = shape.members.as_slice() else {
+        return None;
+    };
+    member
+        .wire_shape
+        .as_deref()
+        .and_then(vector_element_wire_shape)
 }
 
 fn azstd_vector_inner_type(type_name: &str) -> Option<&str> {
@@ -3328,7 +3637,58 @@ fn container_value_matches_serialize(
     container
         .value_type_id
         .is_none_or(|type_id| type_id == serialize.type_id)
-        && container.value_wire_shapes == serialize.wire_shapes
+        && wire_scalar_shapes_match(&container.value_wire_shapes, &serialize.wire_shapes)
+}
+
+fn container_named_source_type(
+    type_name: &str,
+    wire_shapes: &[SchemaWireScalarShape],
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<ContainerValueType> {
+    let leaf_name = type_name.rsplit("::").next().unwrap_or(type_name).trim();
+    if let Some(value) = runtime_semantic_container_type(leaf_name, wire_shapes) {
+        return Some(value);
+    }
+    let serialize = serialize_types.values().copied().find(|serialize| {
+        serialize.name == leaf_name && wire_scalar_shapes_match(wire_shapes, &serialize.wire_shapes)
+    })?;
+    serialize_container_value_type(serialize.kind, &serialize.name, wire_shapes)
+}
+
+fn runtime_semantic_container_type(
+    leaf_name: &str,
+    wire_shapes: &[SchemaWireScalarShape],
+) -> Option<ContainerValueType> {
+    let rust_type = match leaf_name {
+        "RemoteTypelessServerFacetRef"
+            if wire_shapes
+                == [
+                    SchemaWireScalarShape::FixedBytes(16),
+                    SchemaWireScalarShape::U64,
+                    SchemaWireScalarShape::U64,
+                ] =>
+        {
+            "::nw_network::RemoteTypelessServerFacetRef"
+        }
+        _ => return None,
+    };
+    Some(ContainerValueType {
+        rust_type: rust_type.to_owned(),
+        marshaler_type: format!("::nw_network::serialize::DefaultMarshaler<{rust_type}>"),
+        value_type_shape: None,
+        embedded_value_type_shapes: Vec::new(),
+    })
+}
+
+fn wire_scalar_shapes_match(
+    observed: &[SchemaWireScalarShape],
+    expected: &[SchemaWireScalarShape],
+) -> bool {
+    observed.len() == expected.len()
+        && observed
+            .iter()
+            .zip(expected)
+            .all(|(observed, expected)| scalar_shapes_match(*observed, *expected))
 }
 
 fn serialize_source_rust_type_name(name: &str) -> Option<String> {
@@ -3487,7 +3847,7 @@ fn replicated_state_module_tokens(
     let support_items = plan
         .fields
         .iter()
-        .filter_map(|field| replicated_state_field_support_tokens(field, &mut support_names))
+        .flat_map(|field| replicated_state_field_support_tokens(field, &mut support_names))
         .collect::<Vec<_>>();
     let register_fragment = options.registers_type_index(type_index);
     let type_registry_attr = register_fragment.then(|| quote! { #[type_registry(#type_index)] });
@@ -3526,8 +3886,26 @@ fn replicated_state_module_tokens(
 fn replicated_state_field_support_tokens(
     field: &NetworkStateFieldShapeReport,
     emitted_names: &mut BTreeSet<String>,
+) -> Vec<proc_macro2::TokenStream> {
+    let mut items = Vec::new();
+    for shape in &field.container_embedded_value_type_shapes {
+        if let Some(tokens) = replicated_state_shape_support_tokens(field, shape, emitted_names) {
+            items.push(tokens);
+        }
+    }
+    if let Some(shape) = field.container_value_type_shape.as_ref()
+        && let Some(tokens) = replicated_state_shape_support_tokens(field, shape, emitted_names)
+    {
+        items.push(tokens);
+    }
+    items
+}
+
+fn replicated_state_shape_support_tokens(
+    field: &NetworkStateFieldShapeReport,
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+    emitted_names: &mut BTreeSet<String>,
 ) -> Option<proc_macro2::TokenStream> {
-    let shape = field.container_value_type_shape.as_ref()?;
     let codec_name = container_value_shape_report_codec_name(field, shape)?;
     if !emitted_names.insert(codec_name.clone()) {
         return None;
@@ -3552,7 +3930,7 @@ fn replicated_state_field_support_tokens(
     let members = shape
         .members
         .iter()
-        .map(container_value_member_tokens)
+        .map(|member| container_value_member_tokens(field, member))
         .collect::<Option<Vec<_>>>()?;
     if members.is_empty() {
         return None;
@@ -3640,6 +4018,26 @@ fn replicated_state_field_support_tokens(
             }
         }
     };
+    let marshaler_impl = if container_value_shape_report_uses_source_type(shape) {
+        quote! {}
+    } else {
+        quote! {
+            impl ::nw_network::serialize::Marshaler for #value_type {
+                const MARSHAL_SIZE: usize =
+                    <#codec_ident as ::nw_network::serialize::Codec<#value_type>>::MARSHAL_SIZE;
+
+                fn marshal(&self, wb: &mut ::nw_network::serialize::WriteBuffer) {
+                    <#codec_ident as ::nw_network::serialize::Codec<#value_type>>::marshal(self, wb);
+                }
+
+                fn unmarshal(
+                    rb: &mut ::nw_network::serialize::ReadBuffer,
+                ) -> Result<Self, ::nw_network::serialize::MarshalerError> {
+                    <#codec_ident as ::nw_network::serialize::Codec<#value_type>>::unmarshal(rb)
+                }
+            }
+        }
+    };
 
     Some(quote! {
         #support_struct
@@ -3661,6 +4059,8 @@ fn replicated_state_field_support_tokens(
                 Ok(#value_initializer)
             }
         }
+
+        #marshaler_impl
     })
 }
 
@@ -3674,13 +4074,14 @@ struct ContainerValueMemberTokens {
 }
 
 fn container_value_member_tokens(
+    field: &NetworkStateFieldShapeReport,
     member: &crate::network_schema::NetworkNestedTypeMember,
 ) -> Option<ContainerValueMemberTokens> {
     let name = member.name.as_deref()?;
     let binding = format_ident!("field_{}", rust_field_ident(&name.replace('.', "_")));
     let access = member_access_tokens(name)?;
     let field_ident = format_ident!("{}", rust_field_ident(name));
-    let rust_type_string = container_value_member_rust_type(member)?;
+    let rust_type_string = container_value_member_rust_type(field, member)?;
     let rust_type = syn::parse_str::<syn::Type>(&rust_type_string).ok()?;
     let codec_type_string = container_value_member_codec_type(member, &rust_type_string)?;
     let codec_type = syn::parse_str::<syn::Type>(&codec_type_string).ok()?;
@@ -3708,6 +4109,32 @@ fn container_value_shape_report_uses_source_type(
             .is_some_and(|validation| validation.contains("native-rtti"))
 }
 
+fn container_value_shape_report_rust_type(
+    field: &NetworkStateFieldShapeReport,
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+) -> Option<String> {
+    if let Some(type_name) = shape
+        .type_name_full
+        .as_deref()
+        .or(shape.type_name.as_deref())
+        && let Some(rust_type) = runtime_semantic_container_member_type(type_name)
+    {
+        return Some(rust_type.to_owned());
+    }
+    if container_value_shape_report_uses_source_type(shape) {
+        shape
+            .type_name_full
+            .as_deref()
+            .or(shape.type_name.as_deref())
+            .and_then(serialize_source_rust_type_name)
+    } else {
+        field
+            .field_name
+            .as_deref()
+            .and_then(|field_name| container_value_shape_support_type_name(field_name, shape))
+    }
+}
+
 fn member_access_tokens(name: &str) -> Option<proc_macro2::TokenStream> {
     let mut parts = name
         .split('.')
@@ -3722,20 +4149,33 @@ fn member_access_tokens(name: &str) -> Option<proc_macro2::TokenStream> {
 }
 
 fn container_value_member_rust_type(
+    field: &NetworkStateFieldShapeReport,
     member: &crate::network_schema::NetworkNestedTypeMember,
 ) -> Option<String> {
+    let shape = member.wire_shape.as_deref()?;
+    if let Some(shape) =
+        nested_shape_by_wire_name(shape, &field.container_embedded_value_type_shapes)
+    {
+        return container_value_shape_report_rust_type(field, shape);
+    }
     if let Some(native_type) = member.native_type.as_deref()
         && let Some(rust_type) = container_member_source_rust_type(native_type)
     {
         return Some(rust_type);
     }
-    let shape = member.wire_shape.as_deref()?;
     if composite_member_wire_shapes(shape).is_some() {
         return None;
     }
     if let Some(element_shape) = vector_element_wire_shape(shape) {
-        let element_shape = wire_scalar_shape_from_name(element_shape)?;
-        let element_type = scalar_rust_type(element_shape);
+        let element_type = if let Some(element_shape) = wire_scalar_shape_from_name(element_shape) {
+            scalar_rust_type(element_shape)
+        } else {
+            let shape = nested_shape_by_wire_name(
+                element_shape,
+                &field.container_embedded_value_type_shapes,
+            )?;
+            container_value_shape_report_rust_type(field, shape)?
+        };
         return Some(format!("::std::vec::Vec<{element_type}>"));
     }
     let shape = wire_scalar_shape_from_name(shape)?;
@@ -3746,6 +4186,9 @@ fn container_member_source_rust_type(native_type: &str) -> Option<String> {
     let native_type = native_type.trim();
     if native_type == "bool" {
         return Some("bool".to_owned());
+    }
+    if let Some(rust_type) = runtime_semantic_container_member_type(native_type) {
+        return Some(rust_type.to_owned());
     }
     let normalized = native_type.replace(' ', "");
     if matches!(
@@ -3771,6 +4214,30 @@ fn container_member_source_rust_type(native_type: &str) -> Option<String> {
     serialize_source_rust_type_name(leaf)
 }
 
+fn runtime_semantic_container_member_type(native_type: &str) -> Option<&'static str> {
+    match native_type.trim() {
+        "ActorRef" | "Amazon::Hub::ActorRef" | "HubAddress" | "ProxyAddress" => {
+            Some("::nw_network::ActorRef")
+        }
+        "BaselineableFragment" | "Amazon::Hub::BaselineableFragment" => {
+            Some("::nw_network::hub::BaselineableFragment")
+        }
+        "FragmentKey" | "Amazon::Hub::FragmentKey" => Some("::nw_network::hub::FragmentKey"),
+        "EntityRef" => Some("::nw_network::EntityRef"),
+        "AZ::Uuid" | "Uuid" | "uuid::Uuid" | "::uuid::Uuid" | "GuildId" | "WarId" | "RaidId" => {
+            Some("::uuid::Uuid")
+        }
+        "TimePoint" | "MB::TimePoint" => Some("::nw_network::TimePoint"),
+        "WallClockTimePoint" | "MB::WallClockTimePoint" => Some("::nw_network::WallClockTimePoint"),
+        "Duration" | "AZStd::chrono::duration" => Some("::nw_network::Duration"),
+        "GDEID" | "GdeId" => Some("::nw_network::GdeId"),
+        "RemoteServerGDERef" | "RemoteServerGdeRef" => Some("::nw_network::RemoteServerGdeRef"),
+        "RemoteServerContextRef" => Some("::nw_network::RemoteServerContextRef"),
+        "RemoteTypelessServerFacetRef" => Some("::nw_network::RemoteTypelessServerFacetRef"),
+        _ => None,
+    }
+}
+
 fn container_value_member_codec_type(
     member: &crate::network_schema::NetworkNestedTypeMember,
     rust_type: &str,
@@ -3779,6 +4246,11 @@ fn container_value_member_codec_type(
     if vector_element_wire_shape(wire_shape).is_some()
         || composite_member_wire_shapes(wire_shape).is_some()
     {
+        return Some(format!(
+            "::nw_network::serialize::DefaultMarshaler<{rust_type}>"
+        ));
+    }
+    if !wire_shape.is_empty() && wire_scalar_shape_from_name(wire_shape).is_none() {
         return Some(format!(
             "::nw_network::serialize::DefaultMarshaler<{rust_type}>"
         ));
@@ -4103,10 +4575,18 @@ fn message_module_tokens(
         .iter()
         .map(message_field_tokens)
         .collect::<Vec<_>>();
+    let mut support_names = BTreeSet::new();
+    let support_items = plan
+        .fields
+        .iter()
+        .filter_map(|field| message_field_support_tokens(field, &mut support_names))
+        .collect::<Vec<_>>();
 
     quote! {
         pub mod #module_ident {
             use ::nw_network::{Marshaler, az_rtti, type_registry};
+
+            #(#support_items)*
 
             #[az_rtti(#type_id)]
             #[type_registry(#type_index)]
@@ -4118,6 +4598,118 @@ fn message_module_tokens(
 
         pub use #module_ident::#message_ident;
     }
+}
+
+fn message_field_support_tokens(
+    field: &NetworkStateFieldShapeReport,
+    emitted_names: &mut BTreeSet<String>,
+) -> Option<proc_macro2::TokenStream> {
+    let shape = field.nested_type_shape.as_ref()?;
+    if message_nested_shape_uses_source_type(shape) {
+        return None;
+    }
+    let value_type_string = field.rust_value_type.as_deref()?;
+    if value_type_string.starts_with("::") || value_type_string.contains("::") {
+        return None;
+    }
+    if !emitted_names.insert(value_type_string.to_owned()) {
+        return None;
+    }
+    let value_type = syn::parse_str::<syn::Type>(value_type_string).ok()?;
+    let value_type_ident = format_ident!("{value_type_string}");
+    let codec_name = format!("{}Marshaler", rust_type_ident(value_type_string));
+    let codec_ident = format_ident!("{codec_name}");
+    let members = shape
+        .members
+        .iter()
+        .map(|member| container_value_member_tokens(field, member))
+        .collect::<Option<Vec<_>>>()?;
+    if members.is_empty() {
+        return None;
+    }
+
+    let struct_fields = members.iter().map(|member| {
+        let field_ident = &member.field_ident;
+        let rust_type = &member.rust_type;
+        quote! {
+            pub #field_ident: #rust_type,
+        }
+    });
+    let marshal_size_terms = members
+        .iter()
+        .map(|member| {
+            let codec = &member.codec_type;
+            let ty = &member.rust_type;
+            quote!(<#codec as ::nw_network::serialize::Codec<#ty>>::MARSHAL_SIZE)
+        })
+        .collect::<Vec<_>>();
+    let marshal_size = match marshal_size_terms.split_first() {
+        Some((first, rest)) => quote!(#first #( + #rest )*),
+        None => quote!(0),
+    };
+    let marshal_fields = members.iter().map(|member| {
+        let codec = &member.codec_type;
+        let ty = &member.rust_type;
+        let access = &member.access;
+        quote! {
+            <#codec as ::nw_network::serialize::Codec<#ty>>::marshal(&value.#access, wb);
+        }
+    });
+    let decode_fields = members.iter().map(|member| {
+        let binding = &member.binding;
+        let codec = &member.codec_type;
+        let ty = &member.rust_type;
+        quote! {
+            let #binding = <#codec as ::nw_network::serialize::Codec<#ty>>::unmarshal(rb)?;
+        }
+    });
+    let init_fields = members.iter().map(|member| {
+        let field_ident = &member.field_ident;
+        let binding = &member.binding;
+        quote!(#field_ident: #binding,)
+    });
+
+    Some(quote! {
+        #[derive(Debug, Clone, Default, PartialEq)]
+        pub struct #value_type_ident {
+            #(#struct_fields)*
+        }
+
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct #codec_ident;
+
+        impl ::nw_network::serialize::Codec<#value_type> for #codec_ident {
+            const MARSHAL_SIZE: usize = #marshal_size;
+
+            fn marshal(value: &#value_type, wb: &mut ::nw_network::serialize::WriteBuffer) {
+                #(#marshal_fields)*
+            }
+
+            fn unmarshal(
+                rb: &mut ::nw_network::serialize::ReadBuffer,
+            ) -> Result<#value_type, ::nw_network::serialize::MarshalerError> {
+                #(#decode_fields)*
+                Ok(#value_type {
+                    #(#init_fields)*
+                })
+            }
+        }
+
+        impl ::nw_network::serialize::Marshaler for #value_type {
+            const MARSHAL_SIZE: usize =
+                <#codec_ident as ::nw_network::serialize::Codec<#value_type>>::MARSHAL_SIZE;
+
+            fn marshal(&self, wb: &mut ::nw_network::serialize::WriteBuffer) {
+                <#codec_ident as ::nw_network::serialize::Codec<#value_type>>::marshal(self, wb);
+            }
+
+            fn unmarshal(
+                rb: &mut ::nw_network::serialize::ReadBuffer,
+            ) -> Result<Self, ::nw_network::serialize::MarshalerError> {
+                <#codec_ident as ::nw_network::serialize::Codec<#value_type>>::unmarshal(rb)
+            }
+        }
+    })
 }
 
 fn message_field_tokens(field: &NetworkStateFieldShapeReport) -> proc_macro2::TokenStream {
@@ -5372,11 +5964,10 @@ mod tests {
         let compact_source = output.source.split_whitespace().collect::<String>();
         assert!(output.source.contains("value.count"));
         assert!(output.source.contains("value.cooldown_end"));
-        assert!(compact_source.contains("::nw_network::source::WallClockTimePoint"));
+        assert!(compact_source.contains("::nw_network::WallClockTimePoint"));
         assert!(
-            compact_source.contains(
-                "as::nw_network::serialize::Codec<::nw_network::source::WallClockTimePoint"
-            )
+            compact_source
+                .contains("as::nw_network::serialize::Codec<::nw_network::WallClockTimePoint")
         );
         assert!(!compact_source.contains(
             "::nw_network::serialize::DefaultMarshaler<::nw_network::source::RecipeCooldownData>"
@@ -5450,9 +6041,7 @@ mod tests {
         assert!(plan.can_generate, "{plan:#?}");
         assert_eq!(
             field.rust_value_type.as_deref(),
-            Some(
-                "::nw_network::serialize::IndexMap<u32, ::nw_network::source::WallClockTimePoint>"
-            )
+            Some("::nw_network::serialize::IndexMap<u32, ::nw_network::WallClockTimePoint>")
         );
         assert!(field.rust_field_type.as_deref().is_some_and(|ty| {
             ty.contains("QueueEligibleTimesForGameModesWallClockTimePointMarshaler")
@@ -6244,6 +6833,140 @@ mod tests {
     }
 
     #[test]
+    fn embedded_vector_value_shape_emits_nested_local_marshaler() {
+        let outer_id = uuid!("2c011c80-9a5e-46fb-bf92-dac57d0cc07d");
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "26F9BF16-816C-4B55-9443-3337124D4490",
+                "typeIndex": 7000,
+                "typeName": "MB::NestedVectorComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "nestedValues",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x9000000",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x9000000",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "vlq-u64",
+                    "sequence-number",
+                    "u32",
+                    "vlq-u32",
+                    "u8",
+                    "u16"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u32",
+                    "vlq-u32",
+                    "u8",
+                    "u16"
+                ],
+                "valueTypeShape": {
+                    "typeId": outer_id.to_string(),
+                    "typeIdSource": "rtti-provider-vtable",
+                    "typeName": "OuterValue",
+                    "typeNameFull": "OuterValue",
+                    "typeNameSource": "az-rtti-provider-table",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "container-value-pcode-wire-order-native-rtti",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "nativeOffset": "0x0",
+                        "name": "field_0",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "container-value-pcode-call+native-rtti-synthetic-field"
+                    }, {
+                        "index": 1,
+                        "offset": "0x8",
+                        "nativeOffset": "0x8",
+                        "name": "field_1",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZStd::vector<InnerValue>",
+                        "wireShape": "vec<InnerValue>",
+                        "byteWidth": 24,
+                        "evidenceSource": "container-value-pcode-collection-output+native-rtti-synthetic-field"
+                    }]
+                },
+                "embeddedValueTypeShapes": [{
+                    "typeName": "InnerValue",
+                    "typeNameFull": "InnerValue",
+                    "typeNameSource": "nested-pcode-call",
+                    "memberNameSource": "synthetic-pcode-wire-order",
+                    "memberNamesProven": false,
+                    "validation": "embedded-container-value-pcode-wire-sequence",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "nativeOffset": "0x0",
+                        "name": "field_0",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "embedded-container-value-pcode-call"
+                    }, {
+                        "index": 1,
+                        "offset": "0x2",
+                        "nativeOffset": "0x2",
+                        "name": "field_1",
+                        "nameSource": "synthetic-pcode-wire-order",
+                        "nameProven": false,
+                        "nativeType": "AZ::u16",
+                        "wireShape": "u16",
+                        "byteWidth": 2,
+                        "evidenceSource": "embedded-container-value-pcode-call"
+                    }]
+                }],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [7000]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::std::vec::Vec<NestedValuesOuterValue>")
+        );
+        assert_eq!(field.container_embedded_value_type_shapes.len(), 1);
+        let inner_index = output
+            .source
+            .find("pub struct NestedValuesInnerValue")
+            .expect("inner support type");
+        let outer_index = output
+            .source
+            .find("pub struct NestedValuesOuterValue")
+            .expect("outer support type");
+        assert!(inner_index < outer_index);
+        let compact_source = output.source.split_whitespace().collect::<String>();
+        assert!(
+            compact_source
+                .contains("impl::nw_network::serialize::MarshalerforNestedValuesInnerValue")
+        );
+        assert!(compact_source.contains("pubfield_1:::std::vec::Vec<NestedValuesInnerValue>"));
+    }
+
+    #[test]
     fn source_backed_container_value_with_composite_member_emits_codec() {
         let persistent_mount_data_id = uuid!("e6f4d231-af72-47b6-a817-ab1a3e413216");
         let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
@@ -6721,11 +7444,7 @@ mod tests {
                 .contains("pub struct LootLimitDataMapLootLimitData")
         );
         assert!(!output.source.contains("source::LootLimitData"));
-        assert!(
-            output
-                .source
-                .contains("::nw_network::source::WallClockTimePoint")
-        );
+        assert!(output.source.contains("::nw_network::WallClockTimePoint"));
     }
 
     #[test]
@@ -7225,11 +7944,7 @@ mod tests {
                 "::nw_network::serialize::IndexMap<[u8; 16], SlayerScriptDataMapSlayerScriptDataValue>"
             )
         );
-        assert!(
-            output
-                .source
-                .contains("::nw_network::source::WallClockTimePoint")
-        );
+        assert!(output.source.contains("::nw_network::WallClockTimePoint"));
         assert!(
             output
                 .source
@@ -7452,11 +8167,7 @@ mod tests {
             field.rust_value_type.as_deref(),
             Some("::nw_network::serialize::IndexMap<u32, CcdmapCooldownTimerEntry>")
         );
-        assert!(
-            output
-                .source
-                .contains("::nw_network::source::WallClockTimePoint")
-        );
+        assert!(output.source.contains("::nw_network::WallClockTimePoint"));
         assert!(output.source.contains("CcdmapCooldownTimerEntryMarshaler"));
     }
 
@@ -8190,6 +8901,135 @@ mod tests {
     }
 
     #[test]
+    fn emits_message_support_structs_from_proven_nested_shapes() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "49334933-4933-4933-8933-493349334933",
+                "typeIndex": 4933,
+                "typeName": "Javelin::ClientMessages::RewardTrackComponentServerFacet_DebugRefreshRewards",
+                "capabilities": ["direct-message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "ActorRequestIdBoolPayload",
+                    "nativeType": "ActorRequestIdBoolPayload",
+                    "sourceTypeName": "ActorRequestIdBoolPayload,ActorRequestId",
+                    "unmarshalEvidence": {
+                        "callsite": "NewWorld+0x37021b5",
+                        "targetName": "Javelin::ClientMessages::ActorRequestIdBoolPayload::Unmarshal",
+                        "targetKind": "direct-unmarshal",
+                        "evidenceSource": "message-unmarshal-pcode-call"
+                    },
+                    "nestedTypeShape": {
+                        "typeName": "ActorRequestIdBoolPayload",
+                        "typeNameFull": "Javelin::ClientMessages::ActorRequestIdBoolPayload",
+                        "typeNameSource": "ghidra-symbol",
+                        "function": "NewWorld+0x25a2110",
+                        "functionName": "Javelin::ClientMessages::ActorRequestIdBoolPayload::Unmarshal",
+                        "memberBase": "param_1",
+                        "memberNameSource": "synthetic-offset",
+                        "memberNamesProven": false,
+                        "validation": "layout-consistent-direct-type",
+                        "members": [{
+                            "index": 0,
+                            "offset": "0x0",
+                            "name": "_0",
+                            "nameSource": "synthetic-offset",
+                            "nameProven": false,
+                            "nativeType": "u64",
+                            "wireShape": "u64",
+                            "byteWidth": 8
+                        }, {
+                            "index": 1,
+                            "offset": "0x8",
+                            "name": "_1",
+                            "nameSource": "synthetic-offset",
+                            "nameProven": false,
+                            "nativeType": "u64",
+                            "wireShape": "u64",
+                            "byteWidth": 8
+                        }, {
+                            "index": 2,
+                            "offset": "0x20",
+                            "name": "value",
+                            "nameSource": "synthetic-offset",
+                            "nameProven": false,
+                            "nativeType": "bool",
+                            "wireShape": "bool",
+                            "byteWidth": 1
+                        }]
+                    },
+                    "confidence": "message-unmarshal-pcode-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.generatable_message_count, 1);
+        assert_eq!(output.report.blocked_message_count, 0);
+        let plan = &output.report.message_generation_plans[0];
+        assert_eq!(plan.fields[0].blocked_reason, None);
+        assert_eq!(
+            plan.fields[0].rust_value_type.as_deref(),
+            Some("ActorRequestIdBoolPayload")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub struct ActorRequestIdBoolPayload")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub actor_request_id_bool_payload: ActorRequestIdBoolPayload")
+        );
+        assert!(
+            output
+                .source
+                .contains("impl ::nw_network::serialize::Marshaler for ActorRequestIdBoolPayload")
+        );
+    }
+
+    #[test]
+    fn emits_bounded_u8_fixed_vector_message_fields() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "18141814-1814-4814-9814-181418141814",
+                "typeIndex": 1814,
+                "typeName": "Javelin::ClientMessages::ObjectivesComponentServerFacet_AddObjectiveFromRecipe",
+                "capabilities": ["direct-message"],
+                "fields": [{
+                    "index": 0,
+                    "name": "field_1",
+                    "nativeType": "AZStd::fixed_vector<AZ::u8,64>",
+                    "unmarshalEvidence": {
+                        "callsite": "NewWorld+0x39e937d",
+                        "targetName": "GridMate::Marshaler<AZStd::fixed_vector<AZ::u8,64>>::Unmarshal",
+                        "targetKind": "whole-helper-marshaler",
+                        "evidenceSource": "message-unmarshal-whole-helper-marshaler"
+                    },
+                    "confidence": "message-unmarshal-whole-helper-marshaler"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .expect("schema");
+
+        let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+        assert_eq!(output.report.generatable_message_count, 1);
+        assert_eq!(output.report.blocked_message_count, 0);
+        let plan = &output.report.message_generation_plans[0];
+        assert_eq!(plan.fields[0].blocked_reason, None);
+        assert_eq!(
+            plan.fields[0].rust_value_type.as_deref(),
+            Some("::arrayvec::ArrayVec<u8, 64>")
+        );
+    }
+
+    #[test]
     fn emits_actor_ref_for_proxy_address_message_fields() {
         let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
@@ -8585,7 +9425,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_selected_serialize_struct_blocked_until_marshaler_exists() {
+    fn emits_selected_serialize_struct_message_field_from_source_type_id() {
         let payload_type_id = uuid!("da4e5889-a65c-4480-8642-0278160125a7");
         let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
@@ -8624,16 +9464,25 @@ mod tests {
 
         let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
-        assert_eq!(output.report.generatable_message_count, 0);
+        assert_eq!(output.report.generatable_message_count, 1);
         let field = &output.report.message_generation_plans[0].fields[0];
         assert_eq!(field.source_type_id, Some(payload_type_id));
         assert_eq!(field.serialize_type_name.as_deref(), Some("PayloadData"));
-        assert_eq!(field.rust_value_type, None);
         assert_eq!(
-            field.blocked_reason.as_deref(),
-            Some("missing-support-type")
+            field.rust_value_type.as_deref(),
+            Some("::nw_network::source::PayloadData")
         );
-        assert!(!output.source.contains("pub struct PayloadMsg"));
+        assert_eq!(field.blocked_reason, None);
+        assert_eq!(
+            field.rust_field_type.as_deref(),
+            Some("::nw_network::source::PayloadData")
+        );
+        assert!(output.source.contains("pub struct PayloadMsg"));
+        assert!(
+            output
+                .source
+                .contains("pub payload: ::nw_network::source::PayloadData")
+        );
     }
 
     #[test]
