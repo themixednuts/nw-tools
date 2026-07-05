@@ -2,7 +2,7 @@
 //! re-exports): half-float decode, the coordinate-system change, and node
 //! transforms.
 
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat4, Quat, Vec3, Vec4};
 
 /// The Cry → glTF basis change as a matrix: maps `(x, y, z) → (-x, z, y)`. It is
 /// its own inverse, so conjugating a transform is `SWAP * m * SWAP`.
@@ -45,6 +45,13 @@ pub fn half_to_f32(bits: u16) -> f32 {
 #[must_use]
 pub fn cry_to_gltf(v: Vec3) -> Vec3 {
     Vec3::new(-v.x, v.z, v.y)
+}
+
+/// Express a Cry-space quaternion in glTF space using the same basis
+/// conjugation as matrices.
+#[must_use]
+pub fn cry_to_gltf_quat(q: Quat) -> Quat {
+    Quat::from_mat4(&cry_to_gltf_mat(Mat4::from_quat(q))).normalize()
 }
 
 /// Build a transform from a raw Cry node matrix: scale the translation row from

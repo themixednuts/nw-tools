@@ -933,10 +933,9 @@ fn controller_rotation_format_size(format: u8) -> Result<usize, ChunkPayloadErro
 
 fn controller_key_time_size(format: u8, count: usize) -> Result<usize, ChunkPayloadError> {
     let element_size = match format {
-        0 => 4,
-        1 => 2,
-        2 => 1,
-        6 => 2,
+        0 | 3 => 4,
+        1 | 4 | 6 => 2,
+        2 | 5 => 1,
         _ => {
             return Err(ChunkPayloadError::UnsupportedControllerFormat {
                 field: "key time",
@@ -944,7 +943,11 @@ fn controller_key_time_size(format: u8, count: usize) -> Result<usize, ChunkPayl
             });
         }
     };
-    checked_count_bytes(count, element_size, "controller key-time bytes")
+    let element_count = match format {
+        3..=5 => 2,
+        _ => count,
+    };
+    checked_count_bytes(element_count, element_size, "controller key-time bytes")
 }
 
 fn checked_count_bytes(

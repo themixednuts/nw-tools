@@ -47,6 +47,8 @@ pub struct Mesh {
 #[derive(Debug, Clone)]
 pub struct Bone {
     pub name: String,
+    /// Cry controller ID generated from the joint name; CAF controllers bind by this ID.
+    pub controller_id: u32,
     /// Parent joint index (`None` for a root).
     pub parent: Option<usize>,
     /// Local transform relative to the parent, in glTF space.
@@ -105,7 +107,7 @@ impl From<(&CgfFile<'_>, &[u8])> for Model {
 
 /// Build a [`Skeleton`] from a CompiledBones chunk: glTF-space local transforms
 /// (relative to parent) and inverse bind matrices.
-fn build_skeleton(chunk: &cry_chunk::CompiledBonesChunk) -> Skeleton {
+pub(crate) fn build_skeleton(chunk: &cry_chunk::CompiledBonesChunk) -> Skeleton {
     let count = chunk.bones.len();
     let to_world: Vec<Mat4> = chunk
         .bones
@@ -134,6 +136,7 @@ fn build_skeleton(chunk: &cry_chunk::CompiledBonesChunk) -> Skeleton {
             };
             Bone {
                 name: bone.bone_name.to_string(),
+                controller_id: bone.controller_id,
                 parent,
                 local,
                 inverse_bind: to_bone[index],

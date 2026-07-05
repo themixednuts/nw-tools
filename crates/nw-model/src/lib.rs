@@ -8,9 +8,9 @@
 mod geometry;
 mod gltf;
 mod material;
-mod math;
+pub mod math;
 
-pub use geometry::{Mesh, Model, Primitive};
+pub use geometry::{Bone, Mesh, Model, Primitive, Skeleton};
 pub use gltf::{Gltf, NoMaterials, TextureData, WithMaterials};
 pub use material::{MapSlot, MaterialSet, SubMaterial, TextureRef};
 
@@ -21,6 +21,8 @@ pub enum Error {
     Chunk(#[from] cry_chunk::CgfParseError),
     #[error("no drawable geometry found in chunk file")]
     NoGeometry,
+    #[error("no compiled skeleton found in chunk file")]
+    NoSkeleton,
 }
 
 /// Parse a `.cgf` and its heap and assemble a [`Model`] in one step.
@@ -35,6 +37,20 @@ pub fn model_from_bytes(cgf: &[u8], heap: &[u8]) -> Result<Model, Error> {
         return Err(Error::NoGeometry);
     }
     Ok(model)
+}
+
+/// Parse a `.chr`/`.skin`/`.cdf`-style Cry chunk file and return its first
+/// compiled skeleton without requiring drawable geometry.
+///
+/// # Errors
+///
+/// Returns [`Error`] if the chunk file fails to parse or has no compiled bones.
+pub fn skeleton_from_bytes(cgf: &[u8]) -> Result<Skeleton, Error> {
+    let file = cry_chunk::CgfFile::parse(cgf)?;
+    let Some(chunk) = file.compiled_bones().first() else {
+        return Err(Error::NoSkeleton);
+    };
+    Ok(geometry::build_skeleton(chunk))
 }
 
 #[cfg(test)]

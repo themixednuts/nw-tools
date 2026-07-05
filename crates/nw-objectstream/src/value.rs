@@ -16,6 +16,9 @@ use crate::types::{
 };
 use crate::visit::ElementHeader;
 
+const ENTITY_ID_FIELD_CRC: u32 = 0xbf39_6750;
+const CRC32_VALUE_FIELD_CRC: u32 = 0x1d77_5834;
+
 #[derive(Debug, Error)]
 pub enum ObjectStreamValueError {
     #[error("field `{field}` has type {actual}, expected {expected}")]
@@ -868,7 +871,20 @@ pub fn read_entity_id(element: &Element) -> Result<u64, ObjectStreamValueError> 
     }
 
     let mut fields = ElementFields::new(element);
-    fields.required_any(&["id", "Id", "ID"]).map(|(_, id)| id)
+    match fields.required_any(&["id", "Id", "ID"]) {
+        Ok((_, id)) => Ok(id),
+        Err(ObjectStreamValueError::MissingField { .. }) => {
+            let id = element
+                .children()
+                .iter()
+                .find(|child| child.name_crc() == Some(ENTITY_ID_FIELD_CRC))
+                .ok_or_else(|| ObjectStreamValueError::MissingField {
+                    field: "id|Id|ID".to_owned(),
+                })?;
+            u64::decode_az_value(id)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Decode entity ids from the `AZ::EntityId` children of a reflected vector.
@@ -898,9 +914,20 @@ pub fn read_crc32(element: &Element) -> Result<u32, ObjectStreamValueError> {
     }
 
     let mut fields = ElementFields::new(element);
-    fields
-        .required_any(&["value", "Value"])
-        .map(|(_, value)| value)
+    match fields.required_any(&["value", "Value"]) {
+        Ok((_, value)) => Ok(value),
+        Err(ObjectStreamValueError::MissingField { .. }) => {
+            let value = element
+                .children()
+                .iter()
+                .find(|child| child.name_crc() == Some(CRC32_VALUE_FIELD_CRC))
+                .ok_or_else(|| ObjectStreamValueError::MissingField {
+                    field: "value|Value".to_owned(),
+                })?;
+            u32::decode_az_value(value)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Decode a CRC32 value serialized either as reflected `AZ::Crc32` or
@@ -1552,6 +1579,14 @@ mod tests {
             0xFACE
         );
         assert_eq!(
+            read_entity_id(&Element::new(types::ENTITY_ID).with_children([Element {
+                name_crc: Some(ENTITY_ID_FIELD_CRC),
+                ..Element::new(types::AZ_U64).with_data(0xF00D_u64.to_be_bytes())
+            }]))
+            .unwrap(),
+            0xF00D
+        );
+        assert_eq!(
             read_crc32(&Element::new(types::CRC32).with_children([leaf(
                 "Value",
                 types::UNSIGNED_INT,
@@ -1559,6 +1594,14 @@ mod tests {
             )]))
             .unwrap(),
             0x1234
+        );
+        assert_eq!(
+            read_crc32(&Element::new(types::CRC32).with_children([Element {
+                name_crc: Some(CRC32_VALUE_FIELD_CRC),
+                ..Element::new(types::UNSIGNED_INT).with_data(0xAADBEE4F_u32.to_be_bytes())
+            }]))
+            .unwrap(),
+            0xAADBEE4F
         );
         assert_eq!(
             read_crc32_or_u32(&Element::new(types::CRC32).with_children([leaf(

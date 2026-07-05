@@ -59,6 +59,7 @@ prettyplease = "0.2"
 proc-macro2 = "1"
 quick-xml = { version = "0.40.1", features = ["serialize"] }
 quote = "1"
+ron = "0.12"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 ratatui-image = { version = "11.0.5", default-features = false, features = ["crossterm"] }
 rayon = "1.12.0"

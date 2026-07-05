@@ -7,10 +7,16 @@ use std::fmt;
 pub use arrayvec::{ArrayString, ArrayVec};
 use thiserror::Error;
 
+mod animation;
 mod model;
 mod payload;
 mod scan;
 
+pub use animation::{
+    CafAnimation, CafAnimationHeader, CafAnimationHeaderSource, CafCompressedControllerScan,
+    CafController, CafControllerChunkScan, CafControllerForm, CafControllerScan,
+    CafControllerScanError, CafDecodeError, PositionKey, RotationKey,
+};
 pub use model::{CgfFile, CgfParseError};
 pub use payload::{
     AimPose, BoneAnimChunk, BoneInitialPosChunk, BoneMeshChunk, BoneMeshFace, BoneMeshLink,

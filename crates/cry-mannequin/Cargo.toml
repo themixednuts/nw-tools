@@ -1,0 +1,18 @@
+[package]
+name = "cry-mannequin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Streaming parsers for CryAction Mannequin metadata assets"
+
+[lints]
+workspace = true
+
+[dependencies]
+quick-xml = { workspace = true }
+ron = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
