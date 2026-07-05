@@ -1,3 +1,6 @@
 /target/
 **/*.rs.bk
 resources/behavior-context.json
+
+# ignore build dirs at any depth (nested crate targets)
+target/
