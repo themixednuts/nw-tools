@@ -1,0 +1,16 @@
+[package]
+name = "nw-gamedata-manager-specs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Native New World GameData manager specs used by standalone codegen"
+
+[lints]
+workspace = true
+
+[dependencies]
+heck.workspace = true
+thiserror.workspace = true

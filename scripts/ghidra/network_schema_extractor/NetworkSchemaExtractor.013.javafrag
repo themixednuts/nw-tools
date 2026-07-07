@@ -1,0 +1,900 @@
+            ("IMUL".equals(mnemonic) && operandCount(instruction) == 1)) {
+            clearConditionFlags(state);
+            state.registers.remove("RAX");
+            state.registers.remove("RDX");
+            state.allocatorDispatchRegisters.remove("RAX");
+            state.allocatorDispatchRegisters.remove("RDX");
+            return;
+        }
+
+        if ("CDQ".equals(mnemonic) || "CQO".equals(mnemonic) || "CWD".equals(mnemonic)) {
+            state.registers.remove("RDX");
+            state.allocatorDispatchRegisters.remove("RDX");
+            return;
+        }
+
+        if ("CMP".equals(mnemonic)) {
+            updateCompareFlags(
+                state,
+                trackedOperandValue(instruction, 0, state),
+                trackedOperandValue(instruction, 1, state));
+            return;
+        }
+
+        if ("TEST".equals(mnemonic)) {
+            TrackedValue left = trackedOperandValue(instruction, 0, state);
+            TrackedValue right = trackedOperandValue(instruction, 1, state);
+            updateZeroFlagFromValue(
+                state,
+                trackedBinaryIntegerValue("AND", left, right));
+            return;
+        }
+
+        String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+        if (destination != null) {
+            if (("XOR".equals(mnemonic) || "SUB".equals(mnemonic)) &&
+                destination.equals(NetworkSchemaX86.registerOperand(instruction, 1))) {
+                state.registers.put(destination, TrackedValue.immediate(0));
+                state.allocatorDispatchRegisters.remove(destination);
+                updateZeroFlagFromValue(state, TrackedValue.immediate(0));
+                return;
+            }
+
+            if ("XCHG".equals(mnemonic)) {
+                String source = NetworkSchemaX86.registerOperand(instruction, 1);
+                if (source == null) {
+                    state.registers.remove(destination);
+                    return;
+                }
+                TrackedValue left = state.registers.get(destination);
+                TrackedValue right = state.registers.get(source);
+                putOrRemove(state.registers, destination, right == null ? null : right.copy());
+                putOrRemove(state.registers, source, left == null ? null : left.copy());
+                swapAllocatorDispatchRegisters(state, destination, source);
+                return;
+            }
+
+            if ("LEA".equals(mnemonic)) {
+                TrackedValue value = trackedLeaValue(instruction, state);
+                putOrRemove(state.registers, destination, value);
+                state.allocatorDispatchRegisters.remove(destination);
+                return;
+            }
+
+            if ("MOV".equals(mnemonic)) {
+                TrackedValue value = trackedOperandValue(instruction, 1, state);
+                putOrRemove(state.registers, destination, value);
+                if (isAllocatorVtableSlotLoad(instruction)) {
+                    state.allocatorDispatchRegisters.add(destination);
+                }
+                else {
+                    state.allocatorDispatchRegisters.remove(destination);
+                }
+                return;
+            }
+
+            if ("MOVZX".equals(mnemonic) ||
+                "MOVSX".equals(mnemonic) ||
+                "MOVSXD".equals(mnemonic)) {
+                TrackedValue value = trackedOperandValue(instruction, 1, state);
+                putOrRemove(state.registers, destination,
+                    value != null && value.immediate != null ? value : null);
+                state.allocatorDispatchRegisters.remove(destination);
+                return;
+            }
+
+            if ("IMUL".equals(mnemonic)) {
+                TrackedValue value = trackedMultiplyValue(instruction, state);
+                putOrRemove(state.registers, destination, value);
+                state.allocatorDispatchRegisters.remove(destination);
+                clearConditionFlags(state);
+                return;
+            }
+
+            if ("INC".equals(mnemonic) || "DEC".equals(mnemonic)) {
+                TrackedValue current = state.registers.get(destination);
+                TrackedValue adjusted = current == null
+                    ? null
+                    : current.addOffset("INC".equals(mnemonic) ? 1 : -1);
+                putOrRemove(state.registers, destination, adjusted);
+                state.allocatorDispatchRegisters.remove(destination);
+                updateZeroFlagFromValue(state, adjusted);
+                return;
+            }
+
+            if ("NEG".equals(mnemonic) || "NOT".equals(mnemonic) || "BSWAP".equals(mnemonic)) {
+                TrackedValue current = state.registers.get(destination);
+                TrackedValue adjusted = trackedUnaryIntegerValue(mnemonic, current);
+                putOrRemove(state.registers, destination, adjusted);
+                state.allocatorDispatchRegisters.remove(destination);
+                if ("NEG".equals(mnemonic)) {
+                    updateZeroFlagFromValue(state, adjusted);
+                }
+                return;
+            }
+
+            if ("ADD".equals(mnemonic) || "SUB".equals(mnemonic)) {
+                Long immediate = literalOperandValue(instruction, 1);
+                TrackedValue trackedDelta = immediate == null
+                    ? trackedOperandValue(instruction, 1, state)
+                    : TrackedValue.immediate(immediate);
+                TrackedValue current = state.registers.get(destination);
+                TrackedValue adjusted = "ADD".equals(mnemonic)
+                    ? addTrackedValues(current, trackedDelta)
+                    : subtractTrackedValues(current, trackedDelta);
+                putOrRemove(state.registers, destination, adjusted);
+                state.allocatorDispatchRegisters.remove(destination);
+                updateZeroFlagFromValue(state, adjusted);
+                return;
+            }
+
+            if ("AND".equals(mnemonic) ||
+                "OR".equals(mnemonic) ||
+                "XOR".equals(mnemonic) ||
+                "SHL".equals(mnemonic) ||
+                "SAL".equals(mnemonic) ||
+                "SHR".equals(mnemonic) ||
+                "SAR".equals(mnemonic) ||
+                "ROL".equals(mnemonic) ||
+                "ROR".equals(mnemonic)) {
+                Long immediate = literalOperandValue(instruction, 1);
+                TrackedValue right = immediate == null
+                    ? trackedOperandValue(instruction, 1, state)
+                    : TrackedValue.immediate(immediate);
+                TrackedValue adjusted =
+                    trackedBinaryIntegerValue(mnemonic, state.registers.get(destination), right);
+                putOrRemove(state.registers, destination, adjusted);
+                state.allocatorDispatchRegisters.remove(destination);
+                if (!"ROL".equals(mnemonic) && !"ROR".equals(mnemonic)) {
+                    updateZeroFlagFromValue(state, adjusted);
+                }
+                return;
+            }
+
+            if (writesRegister(mnemonic)) {
+                state.registers.remove(destination);
+                state.allocatorDispatchRegisters.remove(destination);
+                clearConditionFlags(state);
+                return;
+            }
+        }
+
+        if (isMemoryWriteMnemonic(mnemonic)) {
+            Integer offset = trackedThisOffsetForMemoryOperand(instruction, 0, state.registers);
+            TrackedValue baseOffset = trackedBaseOffsetForMemoryOperand(instruction, 0, state.registers);
+            TrackedValue source = "MOV".equals(mnemonic)
+                ? trackedOperandValue(instruction, 1, state)
+                : null;
+            observeThisValueWrite(instruction, state, offset, source);
+            observeStackValueWrite(instruction, state, source);
+            if (offset != null && source != null &&
+                source.address != null && isVtableLike(source.address)) {
+                state.vtablesByThisOffset.put(offset, source.address);
+                state.handlerConstructionsByThisOffset.put(
+                    offset,
+                    new HandlerConstruction(
+                        "inline-vtable-write",
+                        instruction.getMinAddress(),
+                        null,
+                        null,
+                        source.address));
+            }
+            if (baseOffset != null &&
+                baseOffset.baseKey != null &&
+                baseOffset.baseOffset != null &&
+                source != null &&
+                source.address != null &&
+                isVtableLike(source.address)) {
+                recordBaseVtableWrite(
+                    state,
+                    baseOffset.baseKey,
+                    baseOffset.baseOffset,
+                    source.address,
+                    instruction,
+                    "dynamic-base-vtable-write");
+            }
+            if ("MOV".equals(mnemonic)) {
+                observeHandlerConstructorWrite(instruction, state);
+            }
+        }
+    }
+
+    private void promoteReplicatedStateConstructorReceiver(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        Address target = resolvedCodeTarget(callTarget(instruction));
+        Address replicatedStateConstructor =
+            currentProgram.getImageBase().add(REPLICATED_STATE_CONSTRUCTOR_RVA);
+        if (!replicatedStateConstructor.equals(target)) {
+            String targetName = fullFunctionName(functionAtOrContaining(target));
+            if (targetName == null ||
+                !targetName.contains("MB::ReplicatedState::ReplicatedState")) {
+                return;
+            }
+        }
+
+        TrackedValue receiver = state.registers.get("RCX");
+        if (receiver == null || receiver.baseKey == null || receiver.baseOffset == null) {
+            return;
+        }
+        promoteBaseToThis(state, receiver.baseKey, receiver.baseOffset);
+    }
+
+    private void promoteBaseToThis(ForwardArgState state, String baseKey, int baseOffset) {
+        for (Map.Entry<String, TrackedValue> entry : new ArrayList<>(state.registers.entrySet())) {
+            TrackedValue value = entry.getValue();
+            TrackedValue promoted = promoteValueBaseToThis(value, baseKey, baseOffset);
+            if (promoted != value) {
+                state.registers.put(entry.getKey(), promoted);
+            }
+        }
+
+        for (Map.Entry<Integer, TrackedValue> entry : new ArrayList<>(state.valuesByStackSlot.entrySet())) {
+            TrackedValue value = entry.getValue();
+            TrackedValue promoted = promoteValueBaseToThis(value, baseKey, baseOffset);
+            if (promoted != value) {
+                state.valuesByStackSlot.put(entry.getKey(), promoted);
+            }
+        }
+    }
+
+    private TrackedValue promoteValueBaseToThis(
+        TrackedValue value,
+        String baseKey,
+        int baseOffset) {
+
+        if (value == null ||
+            value.thisOffset != null ||
+            value.baseKey == null ||
+            value.baseOffset == null ||
+            !value.baseKey.equals(baseKey)) {
+            return value;
+        }
+        Integer promotedOffset = NetworkSchemaX86.addOffsets(value.baseOffset, -(long)baseOffset);
+        return promotedOffset == null ? value : TrackedValue.thisOffset(promotedOffset);
+    }
+
+    private boolean isAddFilterGroupCall(Instruction instruction, ForwardArgState state) {
+        Address target = resolvedCodeTarget(callTarget(instruction));
+        Address addFilterGroup = currentProgram.getImageBase().add(ADD_FILTER_GROUP_RVA);
+        if (!addFilterGroup.equals(target)) {
+            return false;
+        }
+
+        TrackedValue receiver = state.registers.get("RCX");
+        return receiver != null && receiver.thisOffset != null && receiver.thisOffset == 0;
+    }
+
+    private boolean isStackProbeCall(Instruction instruction) {
+        String targetName = fullFunctionName(functionAtOrContaining(callTarget(instruction)));
+        if (targetName == null) {
+            return false;
+        }
+        String normalized = targetName.toLowerCase(Locale.ROOT);
+        return normalized.contains("__chkstk") ||
+            normalized.contains("_chkstk") ||
+            normalized.contains("_alloca_probe");
+    }
+
+    private TrackedValue formattedFieldNameCallValue(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        if (!instruction.getFlowType().isCall()) {
+            return null;
+        }
+
+        TrackedValue destination = state.registers.get("RCX");
+        TrackedValue formatValue = state.registers.get("RDX");
+        TrackedValue indexValue = state.registers.get("R8");
+        if (destination == null || destination.stackOffset == null ||
+            formatValue == null || formatValue.address == null ||
+            indexValue == null || indexValue.immediate == null) {
+            return null;
+        }
+
+        String format = readPrintableString(formatValue.address);
+        String fieldName = renderFormattedFieldName(format, indexValue.immediate);
+        return fieldName == null ? null : TrackedValue.fieldName(formatValue.address, fieldName);
+    }
+
+    private String renderFormattedFieldName(String format, long index) {
+        if (!isLikelyFieldNameFormat(format) || index < 0 || index > 4096) {
+            return null;
+        }
+
+        Matcher matcher = Pattern.compile("%(?:0?\\d+)?[du]").matcher(format);
+        if (!matcher.find() || matcher.find()) {
+            return null;
+        }
+
+        String rendered = format.replaceFirst(
+            "%(?:0?\\d+)?[du]",
+            Long.toUnsignedString(index));
+        return isLikelyFieldName(rendered) ? rendered : null;
+    }
+
+    private boolean isLikelyFieldNameFormat(String value) {
+        if (value == null || value.isBlank() || value.length() > 96) {
+            return false;
+        }
+        if (!value.contains("%")) {
+            return false;
+        }
+        if (value.indexOf(' ') >= 0 || value.indexOf('\\') >= 0 || value.indexOf('/') >= 0) {
+            return false;
+        }
+        String withoutPlaceholder = value.replaceAll("%(?:0?\\d+)?[du]", "0");
+        return isLikelyFieldName(withoutPlaceholder);
+    }
+
+    private boolean isLikelyFieldName(String value) {
+        return value != null &&
+            value.matches("[A-Za-z_][A-Za-z0-9_]*");
+    }
+
+    private boolean isAllocatorCall(Instruction instruction, ForwardArgState state) {
+        Function target = functionAtOrContaining(callTarget(instruction));
+        String targetName = fullFunctionName(target);
+        if (isNamedAllocatorFunction(targetName)) {
+            return true;
+        }
+        if (!hasAllocatorArgumentShape(state)) {
+            return false;
+        }
+        return isAllocatorVtableDispatch(instruction, state) || isAllocatorReturnFunction(target);
+    }
+
+    private boolean isNamedAllocatorFunction(String targetName) {
+        if (targetName == null) {
+            return false;
+        }
+        String normalized = targetName.toLowerCase(Locale.ROOT);
+        return normalized.equals("operator_new") ||
+            normalized.contains("operator new") ||
+            normalized.contains("operator_new") ||
+            normalized.contains("allocatefromnamedallocator");
+    }
+
+    private boolean hasAllocatorArgumentShape(ForwardArgState state) {
+        TrackedValue byteSize = state.registers.get("RDX");
+        TrackedValue alignment = state.registers.get("R8");
+        return positiveBoundedImmediate(byteSize, 0x100000L) &&
+            powerOfTwoImmediate(alignment, 0x1000L);
+    }
+
+    private boolean positiveBoundedImmediate(TrackedValue value, long maxInclusive) {
+        return value != null &&
+            value.immediate != null &&
+            value.immediate > 0 &&
+            value.immediate <= maxInclusive;
+    }
+
+    private boolean powerOfTwoImmediate(TrackedValue value, long maxInclusive) {
+        if (value == null || value.immediate == null) {
+            return false;
+        }
+        long immediate = value.immediate;
+        return immediate > 0 &&
+            immediate <= maxInclusive &&
+            (immediate & (immediate - 1L)) == 0L;
+    }
+
+    private boolean isAllocatorReturnFunction(Function function) {
+        if (function == null) {
+            return false;
+        }
+        String key = functionCacheKey("allocator-return", function);
+        Boolean cached = allocatorReturnFunctionCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        boolean result = false;
+        int count = 0;
+        boolean sawAllocatorDispatch = false;
+        LinkedHashSet<String> allocatorDispatchRegisters = new LinkedHashSet<>();
+        for (Instruction instruction : functionInstructions(function)) {
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if (mnemonic == null) {
+                continue;
+            }
+            if (instruction.getFlowType().isCall()) {
+                String callRegister = NetworkSchemaX86.registerOperand(instruction, 0);
+                if (isAllocatorVtableDispatch(instruction)) {
+                    sawAllocatorDispatch = true;
+                }
+                else if (callRegister != null &&
+                    allocatorDispatchRegisters.contains(callRegister)) {
+                    sawAllocatorDispatch = true;
+                }
+                else if (isNamedAllocatorFunction(
+                    fullFunctionName(functionAtOrContaining(callTarget(instruction))))) {
+                    sawAllocatorDispatch = true;
+                }
+                continue;
+            }
+            if (sawAllocatorDispatch && mnemonic.startsWith("RET")) {
+                result = true;
+                break;
+            }
+            if (sawAllocatorDispatch && writesReturnRegister(instruction)) {
+                break;
+            }
+            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+            if (destination != null) {
+                if ("MOV".equals(mnemonic) && isAllocatorVtableSlotLoad(instruction)) {
+                    allocatorDispatchRegisters.add(destination);
+                }
+                else {
+                    allocatorDispatchRegisters.remove(destination);
+                }
+            }
+        }
+
+        allocatorReturnFunctionCache.put(key, result);
+        return result;
+    }
+
+    private boolean isAllocatorVtableDispatch(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        if (isAllocatorVtableDispatch(instruction)) {
+            return true;
+        }
+        String callRegister = NetworkSchemaX86.registerOperand(instruction, 0);
+        return callRegister != null && state.allocatorDispatchRegisters.contains(callRegister);
+    }
+
+    private boolean isAllocatorVtableDispatch(Instruction instruction) {
+        if (!instruction.getFlowType().isCall()) {
+            return false;
+        }
+        MemoryReference memory = NetworkSchemaX86.memoryReference(instruction, 0);
+        if (memory != null) {
+            return memory.displacement == 8;
+        }
+        MemoryAddress address = NetworkSchemaX86.memoryAddress(instruction, 0);
+        return address != null &&
+            address.displacement == 8 &&
+            !address.terms.isEmpty();
+    }
+
+    private boolean isAllocatorVtableSlotLoad(Instruction instruction) {
+        if (!"MOV".equals(NetworkSchemaX86.upperMnemonic(instruction)) ||
+            NetworkSchemaX86.registerOperand(instruction, 0) == null) {
+            return false;
+        }
+        MemoryReference memory = NetworkSchemaX86.memoryReference(instruction, 1);
+        if (memory != null) {
+            return memory.displacement == 8;
+        }
+        MemoryAddress address = NetworkSchemaX86.memoryAddress(instruction, 1);
+        return address != null &&
+            address.displacement == 8 &&
+            !address.terms.isEmpty();
+    }
+
+    private boolean writesReturnRegister(Instruction instruction) {
+        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+        if (mnemonic == null || !writesRegister(mnemonic)) {
+            return false;
+        }
+        return isReturnRegister(NetworkSchemaX86.registerOperand(instruction, 0));
+    }
+
+    private String allocationBaseKey(Address callsite) {
+        return "alloc:" + formatAddress(callsite);
+    }
+
+    private TrackedValue trackedThisLoadValue(
+        Instruction instruction,
+        int operandIndex,
+        ForwardArgState state) {
+
+        Integer offset = trackedThisOffsetForMemoryOperand(
+            instruction,
+            operandIndex,
+            state.registers);
+        if (offset == null) {
+            return null;
+        }
+        TrackedValue value = state.valuesByThisOffset.get(offset);
+        if (value != null) {
+            return value.copy();
+        }
+
+        return isQwordMemoryOperand(instruction, operandIndex)
+            ? TrackedValue.baseOffset(thisSlotBaseKey(offset), 0)
+            : null;
+    }
+
+    private TrackedValue trackedStackLoadValue(
+        Instruction instruction,
+        int operandIndex,
+        ForwardArgState state) {
+
+        MemoryReference memory = NetworkSchemaX86.memoryReference(instruction, operandIndex);
+        if (memory == null || !isStackRegister(memory.baseRegister)) {
+            return null;
+        }
+
+        Integer stackSlot = stackSlotOffset(memory, state);
+        TrackedValue value = stackSlot == null ? null : state.valuesByStackSlot.get(stackSlot);
+        return value == null ? null : value.copy();
+    }
+
+    private TrackedValue trackedFormattedFieldNamePointerLoadValue(
+        Instruction instruction,
+        int operandIndex,
+        ForwardArgState state) {
+
+        MemoryAddress memory = NetworkSchemaX86.memoryAddress(instruction, operandIndex);
+        if (memory == null || memory.displacement != 0 || memory.terms.size() != 1) {
+            return null;
+        }
+
+        MemoryTerm term = memory.terms.get(0);
+        if (term.scale != 1) {
+            return null;
+        }
+
+        TrackedValue base = state.registers.get(term.register);
+        return base != null && base.fieldName != null ? base.copy() : null;
+    }
+
+    private void observeThisValueWrite(
+        Instruction instruction,
+        ForwardArgState state,
+        Integer offset,
+        TrackedValue source) {
+
+        if (offset == null) {
+            return;
+        }
+
+        Integer widthBits = memoryWriteWidthBits(instruction);
+        if (widthBits == null || widthBits > 64) {
+            state.valuesByThisOffset.remove(offset);
+            return;
+        }
+
+        if (source == null) {
+            state.valuesByThisOffset.remove(offset);
+        }
+        else {
+            state.valuesByThisOffset.put(offset, source.copy());
+        }
+    }
+
+    private void observeStackValueWrite(
+        Instruction instruction,
+        ForwardArgState state,
+        TrackedValue source) {
+
+        MemoryReference memory = NetworkSchemaX86.memoryReference(instruction, 0);
+        if (memory == null || !isStackRegister(memory.baseRegister)) {
+            return;
+        }
+
+        Integer widthBits = memoryWriteWidthBits(instruction);
+        Integer stackSlot = stackSlotOffset(memory, state);
+        if (stackSlot == null) {
+            return;
+        }
+        writeStackValue(state, stackSlot, widthBits, source);
+    }
+
+    private void writeStackValue(
+        ForwardArgState state,
+        int stackSlot,
+        Integer widthBits,
+        TrackedValue source) {
+
+        int byteWidth = byteWidth(widthBits);
+        invalidateStackRange(state, stackSlot, byteWidth);
+        if (byteWidth == 8 && source != null) {
+            state.valuesByStackSlot.put(stackSlot, source.copy());
+        }
+    }
+
+    private int byteWidth(Integer widthBits) {
+        if (widthBits == null || widthBits <= 0) {
+            return 8;
+        }
+        return Math.max(1, (widthBits + 7) / 8);
+    }
+
+    private void invalidateStackRange(ForwardArgState state, int start, int length) {
+        long end = (long)start + Math.max(length, 1);
+        ArrayList<Integer> stale = new ArrayList<>();
+        for (Integer slot : state.valuesByStackSlot.keySet()) {
+            long slotEnd = (long)slot + 8;
+            if (slot < end && slotEnd > start) {
+                stale.add(slot);
+            }
+        }
+        for (Integer slot : stale) {
+            state.valuesByStackSlot.remove(slot);
+        }
+    }
+
+    private Integer stackSlotOffset(MemoryReference memory, ForwardArgState state) {
+        if (memory == null || memory.baseRegister == null) {
+            return null;
+        }
+        TrackedValue base = state.registers.get(memory.baseRegister);
+        if (base == null || base.stackOffset == null) {
+            return null;
+        }
+        return NetworkSchemaX86.addOffsets(base.stackOffset, memory.displacement);
+    }
+
+    private Integer stackRegisterOffset(ForwardArgState state, String register) {
+        TrackedValue value = state.registers.get(register);
+        return value == null ? null : value.stackOffset;
+    }
+
+    private boolean isQwordMemoryOperand(Instruction instruction, int operandIndex) {
+        String text = NetworkSchemaX86.operandText(instruction, operandIndex);
+        return text != null && text.toLowerCase(Locale.ROOT).contains("qword ptr");
+    }
+
+    private void recordBaseVtableWrite(
+        ForwardArgState state,
+        String baseKey,
+        int baseOffset,
+        Address vtable,
+        Instruction instruction,
+        String pattern) {
+
+        recordSingleBaseVtableWrite(
+            state,
+            baseKey,
+            baseOffset,
+            vtable,
+            instruction,
+            pattern);
+
+        VectorSlotAlias alias = vectorSlotAlias(baseKey);
+        if (alias != null && alias.slotOffset == VECTOR_CURRENT_POINTER_OFFSET) {
+            recordSingleBaseVtableWrite(
+                state,
+                thisSlotBaseKey(alias.ownerOffset),
+                baseOffset,
+                vtable,
+                instruction,
+                prefixPattern("vector-begin-alias", pattern));
+        }
+    }
+
+    private void recordSingleBaseVtableWrite(
+        ForwardArgState state,
+        String baseKey,
+        int baseOffset,
+        Address vtable,
+        Instruction instruction,
+        String pattern) {
+
+        String key = baseOffsetKey(baseKey, baseOffset);
+        state.vtablesByBaseOffset.put(key, vtable);
+        state.handlerConstructionsByBaseOffset.put(
+            key,
+            new HandlerConstruction(
+                pattern,
+                instruction.getMinAddress(),
+                null,
+                null,
+                vtable));
+    }
+
+    private VectorSlotAlias vectorSlotAlias(String baseKey) {
+        if (baseKey == null || !baseKey.startsWith("this-slot:0x")) {
+            return null;
+        }
+        Long offset = NetworkSchemaText.parseIntegerLiteral(baseKey.substring("this-slot:".length()));
+        if (offset == null ||
+            offset < Integer.MIN_VALUE ||
+            offset > Integer.MAX_VALUE ||
+            (offset % 8L) != 0L) {
+            return null;
+        }
+        long ownerOffset = offset - VECTOR_CURRENT_POINTER_OFFSET;
+        if (ownerOffset < Integer.MIN_VALUE || ownerOffset > Integer.MAX_VALUE) {
+            return null;
+        }
+        return new VectorSlotAlias((int)ownerOffset, VECTOR_CURRENT_POINTER_OFFSET);
+    }
+
+    private String thisSlotBaseKey(int offset) {
+        return "this-slot:0x" + Integer.toHexString(offset);
+    }
+
+    private String baseOffsetKey(String baseKey, int offset) {
+        return baseKey + "@0x" + Integer.toHexString(offset);
+    }
+
+    private void adjustTrackedRegister(ForwardArgState state, String register, int delta) {
+        TrackedValue current = state.registers.get(register);
+        if (current == null) {
+            state.registers.remove(register);
+            return;
+        }
+        Integer oldStackOffset = current.stackOffset;
+        TrackedValue adjusted = current.addOffset(delta);
+        if ("RSP".equals(register) && oldStackOffset != null && delta > 0) {
+            invalidateStackRange(state, oldStackOffset, delta);
+        }
+        putOrRemove(state.registers, register, adjusted);
+    }
+
+    private TrackedValue trackedMultiplyValue(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        int operands = operandCount(instruction);
+        TrackedValue left;
+        TrackedValue right;
+        if (operands >= 3) {
+            left = trackedOperandValue(instruction, 1, state);
+            Long immediate = literalOperandValue(instruction, 2);
+            right = immediate == null
+                ? trackedOperandValue(instruction, 2, state)
+                : TrackedValue.immediate(immediate);
+        }
+        else if (operands >= 2) {
+            left = state.registers.get(NetworkSchemaX86.registerOperand(instruction, 0));
+            Long immediate = literalOperandValue(instruction, 1);
+            right = immediate == null
+                ? trackedOperandValue(instruction, 1, state)
+                : TrackedValue.immediate(immediate);
+        }
+        else {
+            return null;
+        }
+
+        if (left == null || right == null ||
+            left.immediate == null || right.immediate == null) {
+            return null;
+        }
+        try {
+            return TrackedValue.immediate(Math.multiplyExact(left.immediate, right.immediate));
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private TrackedValue addTrackedValues(TrackedValue left, TrackedValue right) {
+        if (left == null || right == null) {
+            return null;
+        }
+        if (left.immediate != null && right.immediate != null) {
+            try {
+                return TrackedValue.immediate(Math.addExact(left.immediate, right.immediate));
+            }
+            catch (ArithmeticException ignored) {
+                return null;
+            }
+        }
+        if (right.immediate != null) {
+            return addTrackedOffset(left, right.immediate);
+        }
+        if (left.immediate != null) {
+            return addTrackedOffset(right, left.immediate);
+        }
+        return null;
+    }
+
+    private TrackedValue subtractTrackedValues(TrackedValue left, TrackedValue right) {
+        if (left == null || right == null || right.immediate == null) {
+            return null;
+        }
+        try {
+            return addTrackedOffset(left, Math.negateExact(right.immediate));
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private TrackedValue trackedUnaryIntegerValue(String mnemonic, TrackedValue value) {
+        if (value == null || value.immediate == null) {
+            return null;
+        }
+        try {
+            return switch (mnemonic) {
+                case "NEG" -> TrackedValue.immediate(Math.negateExact(value.immediate));
+                case "NOT" -> TrackedValue.immediate(~value.immediate);
+                case "BSWAP" -> TrackedValue.immediate(Long.reverseBytes(value.immediate));
+                default -> null;
+            };
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private TrackedValue trackedBinaryIntegerValue(
+        String mnemonic,
+        TrackedValue left,
+        TrackedValue right) {
+
+        if (left == null || right == null || right.immediate == null) {
+            return null;
+        }
+
+        if (left.immediate == null) {
+            return switch (mnemonic) {
+                case "AND" -> right.immediate == -1L ? left.copy() : null;
+                case "OR", "XOR" -> right.immediate == 0L ? left.copy() : null;
+                default -> null;
+            };
+        }
+
+        long leftValue = left.immediate;
+        long rightValue = right.immediate;
+        return switch (mnemonic) {
+            case "AND" -> TrackedValue.immediate(leftValue & rightValue);
+            case "OR" -> TrackedValue.immediate(leftValue | rightValue);
+            case "XOR" -> TrackedValue.immediate(leftValue ^ rightValue);
+            case "SHL", "SAL" -> shiftLeftTrackedImmediate(leftValue, rightValue);
+            case "SHR" -> shiftRightTrackedImmediate(leftValue, rightValue, false);
+            case "SAR" -> shiftRightTrackedImmediate(leftValue, rightValue, true);
+            case "ROL" -> rotateTrackedImmediate(leftValue, rightValue, true);
+            case "ROR" -> rotateTrackedImmediate(leftValue, rightValue, false);
+            default -> null;
+        };
+    }
+
+    private TrackedValue shiftLeftTrackedImmediate(long value, long amount) {
+        if (amount < 0 || amount > 63) {
+            return null;
+        }
+        try {
+            return TrackedValue.immediate(Math.multiplyExact(value, 1L << amount));
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private TrackedValue shiftRightTrackedImmediate(long value, long amount, boolean signed) {
+        if (amount < 0 || amount > 63) {
+            return null;
+        }
+        int shift = (int)amount;
+        return TrackedValue.immediate(signed ? value >> shift : value >>> shift);
+    }
+
+    private TrackedValue rotateTrackedImmediate(long value, long amount, boolean left) {
+        if (amount < 0 || amount > 63) {
+            return null;
+        }
+        int shift = (int)amount;
+        return TrackedValue.immediate(left
+            ? Long.rotateLeft(value, shift)
+            : Long.rotateRight(value, shift));
+    }
+
+    private TrackedValue addTrackedOffset(TrackedValue value, long delta) {
+        if (value == null || delta < Integer.MIN_VALUE || delta > Integer.MAX_VALUE) {
+            return null;
+        }
+        return value.addOffset((int)delta);
+    }
+
+    private int operandCount(Instruction instruction) {
+        try {
+            return instruction.getNumOperands();
+        }
+        catch (Exception ignored) {
+            return 0;
+        }
+    }
+

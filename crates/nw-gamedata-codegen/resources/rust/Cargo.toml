@@ -1,0 +1,10 @@
+[package]
+name = "{{PACKAGE_NAME}}"
+version = "0.0.0"
+edition = "{{RUST_EDITION}}"
+rust-version = "{{RUST_VERSION}}"
+
+[workspace]
+
+[dependencies]
+{{RUST_STANDALONE_DEPENDENCIES}}

@@ -1,0 +1,900 @@
+            List<String> fullDataWithoutKey = new ArrayList<>(fullData.subList(1, fullData.size()));
+            addUniqueShapeCandidate(candidates, stripTrailingContainerCount(fullDataWithoutKey));
+            addUniqueShapeCandidate(candidates, fullDataWithoutKey);
+        }
+        addUniqueShapeCandidate(candidates, stripTrailingContainerCount(fullData));
+        addUniqueShapeCandidate(candidates, fullData);
+        return candidates;
+    }
+
+    private List<String> replicatedContainerFullValueShapes(List<String> fullShapes) {
+        if (fullShapes == null || fullShapes.isEmpty()) {
+            return Collections.emptyList();
+        }
+        int sequenceIndex = fullShapes.indexOf("sequence-number");
+        int start = sequenceIndex < 0 ? 0 : sequenceIndex + 1;
+        boolean skippedOuterCount = false;
+        ArrayList<String> result = new ArrayList<>();
+        for (int i = start; i < fullShapes.size(); i++) {
+            String shape = fullShapes.get(i);
+            if (shape == null || "sequence-number".equals(shape)) {
+                continue;
+            }
+            if (!skippedOuterCount && "vlq-u32".equals(shape)) {
+                skippedOuterCount = true;
+                continue;
+            }
+            result.add(shape);
+        }
+        return collapseWholeFloatVectorValue(result);
+    }
+
+    private List<List<String>> reflectedSequenceContainerValueShapeCandidates(
+        List<List<String>> valueWireShapeCandidates,
+        List<String> fullShapes) {
+
+        ArrayList<List<String>> candidates = new ArrayList<>();
+        addUniqueShapeCandidate(
+            candidates,
+            stripTrailingContainerCount(replicatedContainerFullValueShapes(fullShapes)));
+        addUniqueShapeCandidate(
+            candidates,
+            replicatedContainerFullDataShapes(fullShapes));
+        if (valueWireShapeCandidates != null) {
+            for (List<String> valueWireShapes : valueWireShapeCandidates) {
+                addUniqueShapeCandidate(
+                    candidates,
+                    stripTrailingContainerCount(valueWireShapes));
+                addUniqueShapeCandidate(candidates, valueWireShapes);
+            }
+        }
+        return candidates;
+    }
+
+    private void addUniqueShapeCandidate(List<List<String>> candidates, List<String> shapes) {
+        if (shapes == null || shapes.isEmpty()) {
+            return;
+        }
+        for (List<String> existing : candidates) {
+            if (existing.equals(shapes)) {
+                return;
+            }
+        }
+        candidates.add(new ArrayList<>(shapes));
+    }
+
+    private List<String> stripTrailingContainerCount(List<String> shapes) {
+        if (shapes == null || shapes.isEmpty()) {
+            return Collections.emptyList();
+        }
+        int end = shapes.size();
+        while (end > 1 && "vlq-u32".equals(shapes.get(end - 1))) {
+            end--;
+        }
+        return new ArrayList<>(shapes.subList(0, end));
+    }
+
+    private List<String> replicatedContainerFullDataShapes(List<String> fullShapes) {
+        if (fullShapes == null || fullShapes.isEmpty()) {
+            return Collections.emptyList();
+        }
+        ArrayList<String> result = new ArrayList<>();
+        for (String shape : fullShapes) {
+            if (shape == null ||
+                "sequence-number".equals(shape) ||
+                "vlq-u32".equals(shape)) {
+                continue;
+            }
+            result.add(shape);
+        }
+        return collapseWholeFloatVectorValue(result);
+    }
+
+    private String replicatedContainerDeltaKeyShape(List<String> deltaShapes) {
+        int sequenceIndex = deltaShapes == null
+            ? -1
+            : deltaShapes.indexOf("sequence-number");
+        return previousDataShape(
+            deltaShapes == null ? Collections.emptyList() : deltaShapes,
+            sequenceIndex < 0 ? 0 : sequenceIndex);
+    }
+
+    private List<String> replicatedContainerDeltaValueShapes(List<String> deltaShapes) {
+        if (deltaShapes == null || deltaShapes.isEmpty()) {
+            return Collections.emptyList();
+        }
+        int sequenceIndex = deltaShapes.indexOf("sequence-number");
+        if (sequenceIndex < 0) {
+            return Collections.emptyList();
+        }
+        ArrayList<String> result = new ArrayList<>();
+        for (int i = sequenceIndex + 1; i < deltaShapes.size(); i++) {
+            String shape = deltaShapes.get(i);
+            if (shape != null && !"sequence-number".equals(shape)) {
+                result.add(shape);
+            }
+        }
+        return collapseWholeFloatVectorValue(result);
+    }
+
+    private NestedTypeShape replicatedContainerValueTypeShapeFromCandidates(
+        List<NativeTypeInfoEvidence> candidates,
+        List<List<String>> valueWireShapeCandidates,
+        Address unmarshalFull,
+        Address vtable) {
+
+        if (valueWireShapeCandidates == null || valueWireShapeCandidates.isEmpty()) {
+            return null;
+        }
+
+        NestedTypeShape selected = null;
+        String selectedKey = null;
+        for (List<String> valueWireShapes : valueWireShapeCandidates) {
+            NestedTypeShape shape = replicatedContainerValueTypeShape(
+                candidates,
+                valueWireShapes,
+                unmarshalFull,
+                vtable,
+                false);
+            if (shape == null) {
+                continue;
+            }
+            String key = reflectedSequenceValueShapeKey(shape);
+            if (selected == null) {
+                selected = shape;
+                selectedKey = key;
+                continue;
+            }
+            if (!Objects.equals(selectedKey, key)) {
+                recordNestedTypeShapeReject("ambiguous-container-value-shape-candidate");
+                return null;
+            }
+        }
+        if (selected != null) {
+            return selected;
+        }
+
+        return replicatedContainerValueTypeShape(
+            candidates,
+            valueWireShapeCandidates.get(0),
+            unmarshalFull,
+            vtable,
+            true);
+    }
+
+    private NestedTypeShape replicatedContainerValueTypeShapeFromSerializeFieldFlow(
+        List<NativeTypeInfoEvidence> candidates,
+        Address unmarshalFull,
+        Address vtable) {
+
+        if (candidates == null || candidates.isEmpty() || !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        Address targetAddress = resolvedCodeTarget(unmarshalFull);
+        Function target = functionAtOrContaining(targetAddress);
+        if (target == null) {
+            return null;
+        }
+
+        LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> byBase =
+            new LinkedHashMap<>();
+        collectContainerValuePcodeMemberCandidates(
+            byBase,
+            target,
+            new LinkedHashSet<>(),
+            0,
+            Collections.emptyMap());
+
+        NestedTypeShape selected = null;
+        String selectedKey = null;
+        for (NativeTypeInfoEvidence candidate : candidates) {
+            if (candidate == null ||
+                candidate.typeId == null ||
+                !isPlausibleTypeName(candidate.name)) {
+                continue;
+            }
+            SerializeTypeInfo reflected =
+                serializeTypesById.get(normalizeUuid(candidate.typeId));
+            if (reflected == null || reflected.fields.isEmpty()) {
+                continue;
+            }
+            for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry :
+                byBase.entrySet()) {
+                ArrayList<NestedTypeMember> callOrderMembers =
+                    new ArrayList<>(entry.getValue().values());
+                NestedTypeShape shape =
+                    containerValueTypeShapeFromSerializeFieldFlow(
+                        candidate,
+                        reflected,
+                        target,
+                        entry.getKey(),
+                        callOrderMembers,
+                        vtable);
+                if (shape == null) {
+                    continue;
+                }
+                String key = reflectedSequenceValueShapeKey(shape);
+                if (selected == null) {
+                    selected = shape;
+                    selectedKey = key;
+                    continue;
+                }
+                if (!Objects.equals(selectedKey, key)) {
+                    recordNestedTypeShapeReject(
+                        "ambiguous-container-value-serialize-field-flow");
+                    return null;
+                }
+            }
+        }
+        return selected;
+    }
+
+    private NestedTypeShape containerValueTypeShapeFromSerializeFieldFlow(
+        NativeTypeInfoEvidence candidate,
+        SerializeTypeInfo reflected,
+        Function target,
+        String base,
+        List<NestedTypeMember> callOrderMembers,
+        Address vtable) {
+
+        if (callOrderMembers == null || callOrderMembers.isEmpty()) {
+            return null;
+        }
+
+        LinkedHashSet<Long> baseShiftCandidates = new LinkedHashSet<>();
+        for (NestedTypeMember member : callOrderMembers) {
+            for (SerializeFieldInfo field : reflected.fields) {
+                baseShiftCandidates.addAll(serializeFieldBaseShiftCandidates(field, member));
+            }
+        }
+
+        NestedTypeShape selected = null;
+        String selectedKey = null;
+        for (Long baseShift : baseShiftCandidates) {
+            if (baseShift == null || baseShift < 0 || baseShift > 0x4000) {
+                continue;
+            }
+
+            HashSet<String> usedFields = new HashSet<>();
+            ArrayList<NestedTypeMember> selectedMembers = new ArrayList<>();
+            for (NestedTypeMember source : callOrderMembers) {
+                SerializeFieldInfo field =
+                    serializeFieldForMemberAtBase(reflected, source, baseShift, usedFields);
+                if (field == null) {
+                    continue;
+                }
+                NestedTypeMember member = copyNestedTypeMember(source);
+                applySerializeFieldName(member, field, baseShift);
+                member.nameSource = "serialize-json-pcode-base-shift-match";
+                member.nameEvidence =
+                    "Ghidra pcode wrote reflected field at embedded base +0x" +
+                    Long.toHexString(baseShift);
+                member.evidenceSource = member.evidenceSource == null
+                    ? "container-value-pcode+serialize-json-field-flow"
+                    : member.evidenceSource + "+serialize-json-field-flow";
+                usedFields.add(serializeFieldKey(field));
+                selectedMembers.add(member);
+            }
+
+            if (selectedMembers.size() < 2 ||
+                selectedMembers.size() > NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
+                continue;
+            }
+
+            NestedTypeShape shape =
+                containerValueTypeShapeFromSerializeFieldFlowMembers(
+                    candidate,
+                    target,
+                    base,
+                    selectedMembers,
+                    vtable);
+            String key = reflectedSequenceValueShapeKey(shape);
+            if (selected == null) {
+                selected = shape;
+                selectedKey = key;
+                continue;
+            }
+            if (!Objects.equals(selectedKey, key)) {
+                recordNestedTypeShapeReject("ambiguous-container-value-field-flow-base");
+                return null;
+            }
+        }
+        return selected;
+    }
+
+    private NestedTypeShape containerValueTypeShapeFromSerializeFieldFlowMembers(
+        NativeTypeInfoEvidence candidate,
+        Function target,
+        String base,
+        ArrayList<NestedTypeMember> selectedMembers,
+        Address vtable) {
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeId = candidate.typeId;
+        shape.typeIdSource = candidate.source;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(candidate.name);
+        shape.typeNameFull = candidate.name;
+        shape.typeNameSource = candidate.nameSource == null
+            ? candidate.source
+            : candidate.nameSource;
+        shape.azRttiAddress = formatAddress(candidate.address);
+        shape.function = target == null ? null : target.getEntryPoint();
+        shape.functionName = fullFunctionName(target);
+        shape.vtable = vtable;
+        shape.memberBase = base;
+        shape.memberNameSource = "ghidra-pcode+serialize-json-field-flow";
+        shape.memberNamesProven = true;
+        shape.validation = "container-value-pcode-serialize-field-flow";
+        for (int i = 0; i < selectedMembers.size(); i++) {
+            NestedTypeMember member = selectedMembers.get(i);
+            member.index = i;
+            shape.members.add(member);
+        }
+        return shape;
+    }
+
+    private NestedTypeShape replicatedContainerValueTypeShape(
+        List<NativeTypeInfoEvidence> candidates,
+        List<String> valueWireShapes,
+        Address unmarshalFull,
+        Address vtable) {
+
+        return replicatedContainerValueTypeShape(
+            candidates,
+            valueWireShapes,
+            unmarshalFull,
+            vtable,
+            true);
+    }
+
+    private NestedTypeShape replicatedContainerValueTypeShape(
+        List<NativeTypeInfoEvidence> candidates,
+        List<String> valueWireShapes,
+        Address unmarshalFull,
+        Address vtable,
+        boolean recordRejectSample) {
+
+        if (candidates == null || candidates.isEmpty() ||
+            valueWireShapes == null || valueWireShapes.isEmpty()) {
+            return null;
+        }
+
+        NestedTypeShape selected = null;
+        String selectedTypeId = null;
+        for (NativeTypeInfoEvidence candidate : candidates) {
+            if (candidate == null ||
+                candidate.typeId == null ||
+                !isPlausibleTypeName(candidate.name)) {
+                continue;
+            }
+            NestedTypeShape shape =
+                replicatedContainerValueTypeShape(
+                    candidate,
+                    valueWireShapes,
+                    unmarshalFull,
+                    vtable,
+                    recordRejectSample);
+            if (shape == null) {
+                continue;
+            }
+            if (selected == null) {
+                selected = shape;
+                selectedTypeId = normalizeUuid(candidate.typeId);
+                continue;
+            }
+            if (!Objects.equals(selectedTypeId, normalizeUuid(candidate.typeId))) {
+                recordNestedTypeShapeReject("ambiguous-container-value-type-shape");
+                return null;
+            }
+        }
+        return selected;
+    }
+
+    private List<NestedTypeShape> replicatedContainerEmbeddedValueTypeShapes(
+        List<NativeTypeInfoEvidence> candidates,
+        Address unmarshalFull,
+        Address vtable) {
+
+        if (candidates == null || candidates.isEmpty() || !isExecutableAddress(unmarshalFull)) {
+            return Collections.emptyList();
+        }
+
+        LinkedHashMap<String, NestedTypeShape> selected = new LinkedHashMap<>();
+        for (NativeTypeInfoEvidence candidate : candidates) {
+            if (candidate == null ||
+                candidate.typeId == null ||
+                !isPlausibleTypeName(candidate.name)) {
+                continue;
+            }
+            List<String> serializeWireShapes = serializeFieldWireShapes(candidate);
+            if (serializeWireShapes.isEmpty()) {
+                continue;
+            }
+            List<NestedTypeShape> shapes = replicatedContainerValueTypeShapesFromPcode(
+                candidate,
+                serializeWireShapes,
+                unmarshalFull,
+                vtable,
+                new LinkedHashSet<>(),
+                0,
+                false,
+                Collections.emptyMap());
+            for (NestedTypeShape shape : shapes) {
+                if (shape == null || shape.members.isEmpty()) {
+                    continue;
+                }
+                shape.validation = "embedded-container-value-pcode-serialize-layout";
+                selected.putIfAbsent(embeddedValueTypeShapeKey(shape), shape);
+            }
+        }
+        return new ArrayList<>(selected.values());
+    }
+
+    private String embeddedValueTypeShapeKey(NestedTypeShape shape) {
+        StringBuilder key = new StringBuilder();
+        key.append(shape.typeId == null ? "" : normalizeUuid(shape.typeId))
+            .append('|')
+            .append(shape.function == null ? "" : shape.function)
+            .append('|')
+            .append(shape.memberBase == null ? "" : shape.memberBase);
+        for (NestedTypeMember member : shape.members) {
+            key.append('|')
+                .append(member.nativeOffset == null ? member.offset : member.nativeOffset)
+                .append(':')
+                .append(member.name == null ? "" : member.name);
+        }
+        return key.toString();
+    }
+
+    private List<String> serializeFieldWireShapes(NativeTypeInfoEvidence candidate) {
+        if (candidate == null || candidate.typeId == null) {
+            return Collections.emptyList();
+        }
+        return serializeTypeWireShapes(candidate.typeId);
+    }
+
+    private List<String> serializeTypeWireShapes(String typeId) {
+        String normalized = normalizeUuid(typeId);
+        if (normalized == null) {
+            return Collections.emptyList();
+        }
+        List<String> cached = serializeTypeWireShapeCache.get(normalized);
+        if (cached != null) {
+            return cached;
+        }
+        List<String> shapes = serializeTypeWireShapes(normalized, new LinkedHashSet<>(), 0);
+        serializeTypeWireShapeCache.put(normalized, shapes);
+        return shapes;
+    }
+
+    private List<String> serializeTypeWireShapes(String typeId, Set<String> seen, int depth) {
+        String normalized = normalizeUuid(typeId);
+        if (normalized == null || depth > 8) {
+            return Collections.emptyList();
+        }
+        String scalar = wireShapeFromSerializeTypeId(normalized);
+        if (scalar != null) {
+            return Collections.singletonList(scalar);
+        }
+        if (!seen.add(normalized)) {
+            return Collections.emptyList();
+        }
+        SerializeTypeInfo reflected = serializeTypesById.get(normalized);
+        if (reflected == null || reflected.fields.isEmpty()) {
+            return Collections.emptyList();
+        }
+        ArrayList<SerializeFieldInfo> fields = new ArrayList<>(reflected.fields);
+        fields.sort((left, right) -> Long.compare(
+            left.offset == null ? Long.MAX_VALUE : left.offset,
+            right.offset == null ? Long.MAX_VALUE : right.offset));
+        ArrayList<String> shapes = new ArrayList<>();
+        for (SerializeFieldInfo field : fields) {
+            if (field.offset == null) {
+                return Collections.emptyList();
+            }
+            if (field.wireShape != null) {
+                shapes.add(field.wireShape);
+                continue;
+            }
+            List<String> nested = serializeTypeWireShapes(
+                field.typeId,
+                new LinkedHashSet<>(seen),
+                depth + 1);
+            if (nested.isEmpty()) {
+                return Collections.emptyList();
+            }
+            shapes.addAll(nested);
+        }
+        return shapes;
+    }
+
+    private NestedTypeShape replicatedContainerReflectedSequenceValueTypeShape(
+        List<NativeTypeInfoEvidence> typeInfoCandidates,
+        List<List<String>> valueWireShapeCandidates,
+        Address unmarshalFull,
+        Address vtable) {
+
+        if (valueWireShapeCandidates == null || valueWireShapeCandidates.isEmpty()) {
+            return null;
+        }
+        Set<String> preferredTypeIds = preferredReflectedTypeIds(typeInfoCandidates);
+        for (List<String> valueWireShapes : valueWireShapeCandidates) {
+            List<SerializeTypeInfo> sequence =
+                reflectedTypeSequenceForWireShapes(valueWireShapes, preferredTypeIds);
+            if (sequence.isEmpty()) {
+                continue;
+            }
+            NestedTypeShape shape = reflectedSequenceValueTypeShape(
+                sequence,
+                valueWireShapes,
+                unmarshalFull,
+                vtable);
+            if (shape != null) {
+                return shape;
+            }
+        }
+        return null;
+    }
+
+    private Set<String> preferredReflectedTypeIds(List<NativeTypeInfoEvidence> candidates) {
+        LinkedHashSet<String> result = new LinkedHashSet<>();
+        if (candidates == null) {
+            return result;
+        }
+        for (NativeTypeInfoEvidence candidate : candidates) {
+            String normalized = candidate == null ? null : normalizeUuid(candidate.typeId);
+            if (normalized != null) {
+                result.add(normalized);
+            }
+        }
+        return result;
+    }
+
+    private List<SerializeTypeInfo> reflectedTypeSequenceForWireShapes(
+        List<String> valueWireShapes,
+        Set<String> preferredTypeIds) {
+
+        if (valueWireShapes == null || valueWireShapes.isEmpty()) {
+            return Collections.emptyList();
+        }
+        ArrayList<SerializeTypeInfo> result = new ArrayList<>();
+        int index = 0;
+        while (index < valueWireShapes.size()) {
+            SerializeTypeInfo selected =
+                reflectedTypeForWireShapePrefix(valueWireShapes, index, preferredTypeIds);
+            if (selected == null) {
+                recordNestedTypeShapeReject("container-value-serialize-type-prefix-missing");
+                return Collections.emptyList();
+            }
+            List<String> shapes = serializeTypeWireShapes(selected.typeId);
+            if (shapes.isEmpty()) {
+                return Collections.emptyList();
+            }
+            result.add(selected);
+            index += shapes.size();
+        }
+        return result;
+    }
+
+    private List<String> collapseWholeFloatVectorValue(List<String> shapes) {
+        if (shapes == null || shapes.isEmpty()) {
+            return Collections.emptyList();
+        }
+        int count = shapes.size();
+        if (count < 2 || count > 4) {
+            return shapes;
+        }
+        for (String shape : shapes) {
+            if (!"f32".equals(shape)) {
+                return shapes;
+            }
+        }
+        return switch (count) {
+            case 2 -> List.of("vec2");
+            case 3 -> List.of("vec3");
+            case 4 -> List.of("vec4");
+            default -> shapes;
+        };
+    }
+
+    private SerializeTypeInfo reflectedTypeForWireShapePrefix(
+        List<String> valueWireShapes,
+        int index,
+        Set<String> preferredTypeIds) {
+
+        SerializeTypeInfo selected = null;
+        int selectedSpan = 0;
+        int selectedScore = Integer.MIN_VALUE;
+        boolean ambiguous = false;
+        for (SerializeTypeInfo candidate : serializeTypesById.values()) {
+            if (candidate == null || candidate.typeId == null || candidate.name == null) {
+                continue;
+            }
+            List<String> shapes = serializeTypeWireShapes(candidate.typeId);
+            if (shapes.isEmpty() ||
+                !wireShapePrefixMatches(valueWireShapes, index, shapes)) {
+                continue;
+            }
+            if (shapes.size() < selectedSpan) {
+                continue;
+            }
+            if (shapes.size() > selectedSpan) {
+                selected = null;
+                selectedSpan = shapes.size();
+                selectedScore = Integer.MIN_VALUE;
+                ambiguous = false;
+            }
+            int score = reflectedTypePrefixScore(candidate, shapes, preferredTypeIds);
+            if (score > selectedScore) {
+                selected = candidate;
+                selectedScore = score;
+                ambiguous = false;
+            }
+            else if (score == selectedScore && selected != null &&
+                !Objects.equals(
+                    normalizeUuid(selected.typeId),
+                    normalizeUuid(candidate.typeId))) {
+                ambiguous = true;
+            }
+        }
+        if (ambiguous) {
+            recordNestedTypeShapeReject("ambiguous-container-value-serialize-type-prefix");
+            return null;
+        }
+        return selected;
+    }
+
+    private boolean wireShapePrefixMatches(
+        List<String> expected,
+        int index,
+        List<String> observed) {
+
+        if (expected == null || observed == null ||
+            index < 0 ||
+            index + observed.size() > expected.size()) {
+            return false;
+        }
+        for (int i = 0; i < observed.size(); i++) {
+            if (!wireShapeMatchesExpected(expected.get(index + i), observed.get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private int reflectedTypePrefixScore(
+        SerializeTypeInfo candidate,
+        List<String> shapes,
+        Set<String> preferredTypeIds) {
+
+        String normalized = normalizeUuid(candidate.typeId);
+        int score = 0;
+        if (preferredTypeIds != null && preferredTypeIds.contains(normalized)) {
+            score += 1000;
+        }
+        if (firstSerializeFieldOffset(candidate) == 0L) {
+            score += 100;
+        }
+        int fieldCount = candidate.fields == null ? 0 : candidate.fields.size();
+        score += Math.min(fieldCount, 8) * 10;
+        if (fieldCount == 1 && shapes.size() > 1) {
+            score -= 80;
+        }
+        if (candidate.factory != null && !candidate.factory.trim().isEmpty()) {
+            score += 2;
+        }
+        return score;
+    }
+
+    private NestedTypeShape replicatedContainerStackSequenceValueTypeShape(
+        List<NativeTypeInfoEvidence> typeInfoCandidates,
+        List<List<String>> valueWireShapeCandidates,
+        Address unmarshalFull,
+        Address vtable) {
+
+        if (valueWireShapeCandidates == null || valueWireShapeCandidates.isEmpty() ||
+            !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        Set<String> preferredTypeIds = preferredReflectedTypeIds(typeInfoCandidates);
+        List<Function> helpers = reachableCallFunctions(unmarshalFull, 4);
+        NestedTypeShape selected = null;
+        String selectedKey = null;
+        for (List<String> valueWireShapes : valueWireShapeCandidates) {
+            List<SerializeTypeInfo> sequence =
+                reflectedTypeSequenceForWireShapes(valueWireShapes, preferredTypeIds);
+            if (sequence.isEmpty()) {
+                continue;
+            }
+            for (Function helper : helpers) {
+                LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> byBase =
+                    new LinkedHashMap<>();
+                collectContainerValuePcodeMemberCandidates(
+                    byBase,
+                    helper,
+                    new LinkedHashSet<>(),
+                    0,
+                    Collections.emptyMap());
+                NestedTypeShape shape = reflectedSequenceValueTypeShapeFromPcodeMembers(
+                    sequence,
+                    valueWireShapes,
+                    helper,
+                    vtable,
+                    byBase);
+                if (shape == null) {
+                    continue;
+                }
+                String key = reflectedSequenceValueShapeKey(shape);
+                if (selected == null) {
+                    selected = shape;
+                    selectedKey = key;
+                    continue;
+                }
+                if (!Objects.equals(selectedKey, key)) {
+                    recordNestedTypeShapeReject(
+                        "ambiguous-container-value-pcode-stack-sequence");
+                    return null;
+                }
+            }
+            if (selected != null) {
+                return selected;
+            }
+        }
+        return null;
+    }
+
+    private List<Function> reachableCallFunctions(Address root, int depth) {
+        Address entry = resolvedCodeTarget(root);
+        if (!isExecutableAddress(entry)) {
+            return Collections.emptyList();
+        }
+        Function function = functionAtOrContaining(entry);
+        if (function == null) {
+            return Collections.emptyList();
+        }
+        LinkedHashMap<String, Function> result = new LinkedHashMap<>();
+        collectReachableCallFunctions(function, depth, new LinkedHashSet<>(), result);
+        return new ArrayList<>(result.values());
+    }
+
+    private void collectReachableCallFunctions(
+        Function function,
+        int depth,
+        Set<String> seen,
+        Map<String, Function> result) {
+
+        if (function == null || depth < 0) {
+            return;
+        }
+        Address entry = function.getEntryPoint();
+        if (entry == null || !seen.add(entry.toString())) {
+            return;
+        }
+        result.putIfAbsent(entry.toString(), function);
+        if (depth == 0) {
+            return;
+        }
+
+        int count = 0;
+        for (Instruction instruction : functionInstructions(function)) {
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+            Address call = resolvedCodeTarget(callTarget(instruction));
+            if (!isExecutableAddress(call)) {
+                continue;
+            }
+            Function callee = functionAtOrContaining(call);
+            collectReachableCallFunctions(callee, depth - 1, seen, result);
+        }
+    }
+
+    private NestedTypeShape reflectedSequenceValueTypeShapeFromPcodeMembers(
+        List<SerializeTypeInfo> sequence,
+        List<String> valueWireShapes,
+        Function helper,
+        Address vtable,
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase) {
+
+        if (sequence == null || sequence.isEmpty() ||
+            valueWireShapes == null || valueWireShapes.isEmpty() ||
+            byBase == null || byBase.isEmpty()) {
+            return null;
+        }
+
+        NestedTypeShape selected = null;
+        String selectedKey = null;
+        for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry : byBase.entrySet()) {
+            ArrayList<NestedTypeMember> callOrderMembers =
+                new ArrayList<>(entry.getValue().values());
+            ArrayList<NestedTypeMember> offsetOrderMembers =
+                new ArrayList<>(callOrderMembers);
+            offsetOrderMembers.sort((left, right) -> Long.compare(left.offset, right.offset));
+
+            NestedTypeShape offsetShape =
+                reflectedSequenceValueTypeShapeFromScalarWindows(
+                    sequence,
+                    valueWireShapes,
+                    helper,
+                    vtable,
+                    entry.getKey(),
+                    offsetOrderMembers,
+                    true);
+            if (offsetShape != null) {
+                String key = reflectedSequenceValueShapeKey(offsetShape);
+                if (selected == null) {
+                    selected = offsetShape;
+                    selectedKey = key;
+                }
+                else if (!Objects.equals(selectedKey, key)) {
+                    return null;
+                }
+            }
+
+            NestedTypeShape callShape =
+                reflectedSequenceValueTypeShapeFromScalarWindows(
+                    sequence,
+                    valueWireShapes,
+                    helper,
+                    vtable,
+                    entry.getKey(),
+                    callOrderMembers,
+                    false);
+            if (callShape != null) {
+                String key = reflectedSequenceValueShapeKey(callShape);
+                if (selected == null) {
+                    selected = callShape;
+                    selectedKey = key;
+                }
+                else if (!Objects.equals(selectedKey, key)) {
+                    return null;
+                }
+            }
+        }
+        return selected;
+    }
+
+    private NestedTypeShape reflectedSequenceValueTypeShapeFromScalarWindows(
+        List<SerializeTypeInfo> sequence,
+        List<String> valueWireShapes,
+        Function helper,
+        Address vtable,
+        String base,
+        List<NestedTypeMember> scalarMembers,
+        boolean requireOffsetLayout) {
+
+        for (ArrayList<NestedTypeMember> window :
+            containerValueMemberWindows(scalarMembers, valueWireShapes, requireOffsetLayout)) {
+            NestedTypeShape shape = reflectedSequenceValueTypeShapeFromScalarWindow(
+                sequence,
+                valueWireShapes,
+                helper,
+                vtable,
+                base,
+                window);
+            if (shape != null) {
+                return shape;
+            }
+        }
+        return null;
+    }
+
+    private NestedTypeShape reflectedSequenceValueTypeShapeFromScalarWindow(
+        List<SerializeTypeInfo> sequence,
+        List<String> valueWireShapes,
+        Function helper,
+        Address vtable,
+        String base,
+        List<NestedTypeMember> scalarWindow) {
+
+        if (scalarWindow == null || scalarWindow.isEmpty()) {
+            return null;
+        }
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeName = "Value";

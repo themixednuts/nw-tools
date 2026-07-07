@@ -1,0 +1,916 @@
+        if (!isPlausibleTypeName(typeName)) {
+            TypeNameDecode providerTableName =
+                typeNameFromRttiProviderTable(providerTable, typeId);
+            if (providerTableName != null && isPlausibleTypeName(providerTableName.typeName)) {
+                typeName = providerTableName.typeName;
+                nameSource = providerTableName.typeNameSource;
+            }
+        }
+        if (!isPlausibleTypeName(typeName)) {
+            SerializeTypeInfo reflected = serializeTypesById.get(normalizeUuid(typeId));
+            if (reflected != null && isPlausibleTypeName(reflected.name)) {
+                typeName = reflected.name;
+                nameSource = "serialize-type-id";
+            }
+        }
+        if (!isPlausibleTypeName(typeName)) {
+            HookTypeEvidence hook = registrationHooksByTypeId.get(normalizeUuid(typeId));
+            if (hook != null && isPlausibleTypeName(hook.typeName)) {
+                typeName = hook.typeName;
+                nameSource = hook.typeNameSource();
+            }
+        }
+        if (!isPlausibleTypeName(typeName)) {
+            Address target = resolvedCodeTarget(provider);
+            if (!Objects.equals(target, provider)) {
+                typeName = typeNameFromRttiHelperFunctionName(target);
+                if (isPlausibleTypeName(typeName)) {
+                    nameSource = "resolved-rtti-helper-function-name";
+                }
+            }
+        }
+        if (!isPlausibleTypeName(typeName)) {
+            TypeNameDecode nearbyName =
+                typeNameNearTypeIdString(typeIdDecode.sourceAddress, provider);
+            if (nearbyName != null && isPlausibleTypeName(nearbyName.typeName)) {
+                typeName = nearbyName.typeName;
+                nameSource = nearbyName.typeNameSource;
+            }
+        }
+
+        return new NativeTypeInfoEvidence(
+            providerTable,
+            isPlausibleTypeName(typeName) ? typeName : null,
+            typeId,
+            "rtti-provider-vtable",
+            nameSource);
+    }
+
+    private TypeNameDecode typeNameFromRttiProviderTable(Address providerTable, String typeId) {
+        AzRttiEvidence evidence = decodeAzRttiFromVtable(providerTable);
+        if (evidence == null) {
+            return null;
+        }
+
+        String typeName = providerAnyTypeNameForTypeId(evidence, typeId);
+        if (!isPlausibleTypeName(typeName)) {
+            return null;
+        }
+
+        TypeNameDecode decode = new TypeNameDecode();
+        decode.provider = providerTable;
+        decode.typeName = typeName;
+        decode.typeNameSource = "az-rtti-provider-table";
+        return decode;
+    }
+
+    private TypeNameDecode typeNameNearTypeIdString(Address typeIdString, Address provider) {
+        if (!isProgramAddress(typeIdString)) {
+            return null;
+        }
+
+        TypeNameDecode best = null;
+        int bestScore = Integer.MIN_VALUE;
+        for (int delta = 1; delta <= 0x80; delta++) {
+            Address candidate = subtract(typeIdString, delta);
+            if (!isProgramAddress(candidate)) {
+                continue;
+            }
+
+            String name = readPrintableString(candidate);
+            if (!isLikelyRuntimeTypeName(name) ||
+                !isSimpleTypeNameGetterReference(candidate)) {
+                continue;
+            }
+
+            int score = runtimeTypeNameScore(name) - delta;
+            if (best != null && score <= bestScore) {
+                continue;
+            }
+
+            TypeNameDecode decode = new TypeNameDecode();
+            decode.provider = provider;
+            decode.typeName = name;
+            decode.typeNameSource = "nearby-type-name-getter";
+            decode.typeNameAddress = candidate;
+            best = decode;
+            bestScore = score;
+        }
+        return best;
+    }
+
+    private boolean isSimpleTypeNameGetterReference(Address stringAddress) {
+        if (!isProgramAddress(stringAddress)) {
+            return false;
+        }
+
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(stringAddress);
+        while (references.hasNext()) {
+            Address referenceAddress = references.next().getFromAddress();
+            if (Objects.equals(stringAddressReturnedBySimpleFunction(referenceAddress), stringAddress)) {
+                return true;
+            }
+
+            Function function = functionAtOrContaining(referenceAddress);
+            if (function != null &&
+                Objects.equals(
+                    stringAddressReturnedBySimpleFunction(function.getEntryPoint()),
+                    stringAddress)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasStructuredContainerValue(
+        List<String> deltaShapes,
+        List<String> fullShapes) {
+
+        if (pairedContainerWireShapeFromDeltaKeyAndFullValue(deltaShapes, fullShapes) != null) {
+            return false;
+        }
+        return stripTrailingContainerCount(replicatedContainerFullValueShapes(fullShapes)).size() > 1;
+    }
+
+    private WireShape scalarContainerWireShape(ContainerWireShape container) {
+        if (container == null) {
+            return null;
+        }
+        if (container.primaryShape != null) {
+            return container.primaryShape;
+        }
+        return pairedContainerWireShapeFromDeltaKeyAndFullValue(
+            container.deltaMarshalShapes,
+            container.fullMarshalShapes);
+    }
+
+    private WireShape pairedContainerWireShapeFromDeltaKeyAndFullValue(
+        List<String> deltaShapes,
+        List<String> fullShapes) {
+
+        String keyShape = replicatedContainerDeltaKeyShape(deltaShapes);
+        if (keyShape == null) {
+            return null;
+        }
+        List<String> fullValueShapes =
+            collapseWholeFloatVectorValue(stripTrailingContainerCount(
+                replicatedContainerFullValueShapes(fullShapes)));
+        if (fullValueShapes.size() != 1) {
+            if (fullValueShapes.size() >= 2 && keyShape.equals(fullValueShapes.get(0))) {
+                List<String> valuesWithoutKey = collapseWholeFloatVectorValue(
+                    stripTrailingContainerCount(
+                        fullValueShapes.subList(1, fullValueShapes.size())));
+                if (valuesWithoutKey.size() == 1) {
+                    return new WireShape(
+                        containerShape(keyShape, valuesWithoutKey.get(0)),
+                        "replicated-container-delta-key-full-key-value");
+                }
+            }
+            return null;
+        }
+        return new WireShape(
+            containerShape(keyShape, fullValueShapes.get(0)),
+            "replicated-container-delta-key-full-value");
+    }
+
+    private String containerShapeFromDeltaMarshalShapes(List<String> shapes) {
+        int sequenceIndex = shapes.indexOf("sequence-number");
+        String keyShape = previousDataShape(shapes, sequenceIndex < 0 ? shapes.size() : sequenceIndex);
+        List<String> valueShapes = replicatedContainerDeltaValueShapes(shapes);
+        String valueShape = valueShapes.size() == 1
+            ? valueShapes.get(0)
+            : nextDataShape(shapes, Math.max(0, sequenceIndex + 1));
+        return containerShape(keyShape, valueShape);
+    }
+
+    private String containerShapeFromFullMarshalShapes(List<String> shapes) {
+        List<String> valueShapes = replicatedContainerFullValueShapes(shapes);
+        String keyShape = valueShapes.size() >= 2 ? valueShapes.get(0) : null;
+        String valueShape = valueShapes.size() >= 2 ? valueShapes.get(1) : null;
+        return containerShape(keyShape, valueShape);
+    }
+
+    private String containerShape(String keyShape, String valueShape) {
+        if (keyShape == null || valueShape == null) {
+            return null;
+        }
+        return "replicated-container<" + keyShape + "," + valueShape + ">";
+    }
+
+    private void collectOrderedMarshalShapes(
+        Address address,
+        int depth,
+        Set<String> seen,
+        ArrayList<String> shapes) {
+
+        Address targetAddress = resolvedCodeTarget(address);
+        if (!isExecutableAddress(targetAddress)) {
+            return;
+        }
+
+        WireShape named = wireShapeFromFunctionName(targetAddress);
+        if (named != null) {
+            shapes.add(named.shape);
+            return;
+        }
+
+        if (looksLikeBoolMarshal(targetAddress)) {
+            shapes.add("bool");
+            return;
+        }
+
+        Integer fixedRawLength = fixedRawMarshalLength(targetAddress);
+        if (fixedRawLength != null && fixedRawLength > 0) {
+            shapes.add(rawWriteShape(fixedRawLength));
+            return;
+        }
+
+        if (!seen.add(targetAddress.toString())) {
+            return;
+        }
+
+        Function function = functionAtOrContaining(targetAddress);
+        if (function == null || depth <= 0) {
+            return;
+        }
+
+        int count = 0;
+        Integer lastR8Length = null;
+        for (Instruction instruction : functionInstructions(function)) {
+            if (instruction.getMinAddress().compareTo(targetAddress) < 0) {
+                continue;
+            }
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if ("MOV".equals(mnemonic)) {
+                String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+                Long immediate = literalOperandValue(instruction, 1);
+                if ("R8".equals(destination) && immediate != null &&
+                    immediate > 0 && immediate <= 0x1000) {
+                    lastR8Length = immediate.intValue();
+                }
+            }
+            if (!instruction.getFlowType().isCall()) {
+                if (instruction.getFlowType().isJump()) {
+                    Address jump = branchTarget(instruction);
+                    if (isExecutableAddress(jump) &&
+                        jump.compareTo(instruction.getMinAddress()) > 0) {
+                        collectOrderedMarshalShapes(jump, depth - 1, seen, shapes);
+                    }
+                    if (instruction.getFlowType().isUnConditional()) {
+                        break;
+                    }
+                }
+                if (instruction.getFlowType().isTerminal()) {
+                    break;
+                }
+                continue;
+            }
+            if (isVirtualRawWriteDispatch(instruction) && lastR8Length != null) {
+                shapes.add(rawWriteShape(lastR8Length));
+                lastR8Length = null;
+                continue;
+            }
+            Address call = callTarget(instruction);
+            if (isExecutableAddress(call)) {
+                collectOrderedMarshalShapes(call, depth - 1, seen, shapes);
+            }
+            lastR8Length = null;
+        }
+    }
+
+    private String rawWriteShape(int length) {
+        return length == 1 ? "u8" : "fixed-bytes-" + length;
+    }
+
+    private String previousDataShape(List<String> shapes, int beforeIndex) {
+        for (int i = beforeIndex - 1; i >= 0; i--) {
+            String shape = shapes.get(i);
+            if (isReplicatedContainerDataShape(shape)) {
+                return shape;
+            }
+        }
+        return null;
+    }
+
+    private String nextDataShape(List<String> shapes, int startIndex) {
+        for (int i = startIndex; i < shapes.size(); i++) {
+            String shape = shapes.get(i);
+            if (isReplicatedContainerDataShape(shape)) {
+                return shape;
+            }
+        }
+        return null;
+    }
+
+    private String firstDataShape(List<String> shapes) {
+        return nextDataShape(shapes, 0);
+    }
+
+    private String secondDataShape(List<String> shapes) {
+        String first = firstDataShape(shapes);
+        if (first == null) {
+            return null;
+        }
+        boolean sawFirst = false;
+        for (String shape : shapes) {
+            if (!isReplicatedContainerDataShape(shape)) {
+                continue;
+            }
+            if (sawFirst) {
+                return shape;
+            }
+            if (shape.equals(first)) {
+                sawFirst = true;
+            }
+        }
+        return null;
+    }
+
+    private List<String> replicatedContainerDataShapes(List<String> shapes) {
+        ArrayList<String> result = new ArrayList<>();
+        for (String shape : shapes) {
+            if (isReplicatedContainerDataShape(shape)) {
+                result.add(shape);
+            }
+        }
+        return result;
+    }
+
+    private boolean isReplicatedContainerDataShape(String shape) {
+        return shape != null &&
+            !"vlq-u32".equals(shape) &&
+            !"sequence-number".equals(shape);
+    }
+
+    private WireShape classifyMarshalPath(Address address) {
+        if (!isExecutableAddress(address)) {
+            return null;
+        }
+
+        Deque<MarshalPathFrame> stack = new ArrayDeque<>();
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        stack.push(new MarshalPathFrame(address, ""));
+
+        while (!stack.isEmpty()) {
+            MarshalPathFrame frame = stack.pop();
+            Address targetAddress = resolvedCodeTarget(frame.address);
+            if (!isExecutableAddress(targetAddress) || !seen.add(targetAddress.toString())) {
+                continue;
+            }
+
+            WireShape named = wireShapeFromFunctionName(targetAddress);
+            if (named != null) {
+                return frame.wrap(named);
+            }
+
+            if (looksLikeBoolMarshal(targetAddress)) {
+                return frame.wrap(new WireShape("bool", "marshal-bool-instructions"));
+            }
+
+            Integer fixedRawLength = fixedRawMarshalLength(targetAddress);
+            if (fixedRawLength != null) {
+                if (fixedRawLength == 1) {
+                    return frame.wrap(new WireShape("u8", "marshal-raw-write-length"));
+                }
+                if (fixedRawLength > 1) {
+                    return frame.wrap(new WireShape(
+                        "fixed-bytes-" + fixedRawLength,
+                        "marshal-raw-write-length"));
+                }
+            }
+
+            Function function = functionAtOrContaining(targetAddress);
+            if (function == null) {
+                continue;
+            }
+
+            int count = 0;
+            for (Instruction instruction : functionInstructions(function)) {
+                if (instruction.getMinAddress().compareTo(targetAddress) < 0) {
+                    continue;
+                }
+                if (count++ >= VTABLE_SCAN_LIMIT) {
+                    break;
+                }
+                if (!instruction.getFlowType().isCall()) {
+                    continue;
+                }
+                Address target = callTarget(instruction);
+                if (isExecutableAddress(target)) {
+                    stack.push(frame.nested(target));
+                }
+            }
+        }
+        return null;
+    }
+
+    private Integer fixedRawMarshalLength(Address address) {
+        Integer linearLength = fixedRawMarshalLengthFromLinearInstructions(address);
+        if (linearLength != null) {
+            return linearLength;
+        }
+
+        Function function = functionAtOrContaining(address);
+        if (function == null) {
+            return null;
+        }
+
+        Integer lastR8Length = null;
+        int count = 0;
+        for (Instruction instruction : functionInstructions(function)) {
+            if (instruction.getMinAddress().compareTo(address) < 0) {
+                continue;
+            }
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if ("MOV".equals(mnemonic)) {
+                String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+                Long immediate = literalOperandValue(instruction, 1);
+                if ("R8".equals(destination) && immediate != null &&
+                    immediate >= 0 && immediate <= 0x1000) {
+                    lastR8Length = immediate.intValue();
+                }
+            }
+            else if ("JMP".equals(mnemonic) && isVirtualRawWriteJump(instruction)) {
+                return lastR8Length;
+            }
+            else if (instruction.getFlowType().isCall()) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private Integer fixedRawMarshalLengthFromLinearInstructions(Address address) {
+        Integer lastR8Length = null;
+        int count = 0;
+        for (Instruction instruction :
+            currentProgram.getListing().getInstructions(address, true)) {
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+            Address instructionAddress = instruction.getMinAddress();
+            if (instructionAddress.compareTo(address) < 0 ||
+                !isExecutableAddress(instructionAddress)) {
+                break;
+            }
+
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if ("MOV".equals(mnemonic)) {
+                String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+                Long immediate = literalOperandValue(instruction, 1);
+                if ("R8".equals(destination) && immediate != null &&
+                    immediate > 0 && immediate <= 0x1000) {
+                    lastR8Length = immediate.intValue();
+                }
+            }
+            else if ("JMP".equals(mnemonic) && isVirtualRawWriteJump(instruction)) {
+                return lastR8Length;
+            }
+            else if ("RET".equals(mnemonic) || "CCH".equals(mnemonic)) {
+                break;
+            }
+            else if (instruction.getFlowType().isCall()) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private boolean isVirtualRawWriteJump(Instruction instruction) {
+        return "JMP".equals(NetworkSchemaX86.upperMnemonic(instruction)) && isVirtualRawWriteDispatch(instruction);
+    }
+
+    private boolean isVirtualRawWriteDispatch(Instruction instruction) {
+        String operand = NetworkSchemaX86.operandText(instruction, 0);
+        if (operand == null) {
+            return false;
+        }
+        String normalized = operand
+            .replace(" ", "")
+            .toUpperCase(Locale.ROOT);
+        return normalized.contains("[RAX+0X40]") ||
+            normalized.contains("[RAX+40H]");
+    }
+
+    private WireShape wireShapeFromFunctionName(Address address) {
+        Function function = functionAtOrContaining(address);
+        if (function == null) {
+            return null;
+        }
+        String name = fullFunctionName(function);
+        WireShape generic = wireShapeFromMarshalFunctionName(name);
+        if (generic != null) {
+            return generic;
+        }
+        if (name.contains("GridMate::Marshaler<u8>::Marshal")) {
+            return new WireShape("u8", "marshal-function-name");
+        }
+        if (name.contains("GridMate::Marshaler<u16>::Marshal")) {
+            return new WireShape("u16", "marshal-function-name");
+        }
+        if (name.contains("GridMate::Marshaler<u32>::Marshal")) {
+            return new WireShape("u32", "marshal-function-name");
+        }
+        if (name.contains("GridMate::Marshaler<u64>::Marshal")) {
+            return new WireShape("u64", "marshal-function-name");
+        }
+        if (name.contains("GridMate::Marshaler<f32>::Marshal")) {
+            return new WireShape("f32", "marshal-function-name");
+        }
+        if (name.contains("GridMate::HalfMarshaler::Marshal")) {
+            return new WireShape("half-f32", "marshal-function-name");
+        }
+        if (name.contains("GridMate::VlqU32Marshaler::Marshal")) {
+            return new WireShape("vlq-u32", "marshal-function-name");
+        }
+        if (name.contains("GridMate::VlqU64Marshaler::Marshal") ||
+            name.contains("Amazon::Pervasives::VlqU64Marshaler::Marshal")) {
+            return new WireShape("vlq-u64", "marshal-function-name");
+        }
+        if (name.contains("Amazon::Pervasives::Marshaller<Amazon::Hub::SequenceNumber>::Marshal")) {
+            return new WireShape("sequence-number", "marshal-function-name");
+        }
+        if (name.contains("GridMate::QuatCompNormMarshaler::Marshal") ||
+            name.contains("GridMate::QuatCompressSmallestThree")) {
+            return new WireShape("quat-comp-norm", "marshal-function-name");
+        }
+        if (name.contains("GridMate::QuatSmallestThreeQuantizedMarshaler::Marshal")) {
+            return new WireShape("quat-smallest-three", "marshal-function-name");
+        }
+        return null;
+    }
+
+    private WireShape wireShapeFromMarshalFunctionName(String name) {
+        if (name == null || !name.contains("::Marshal")) {
+            return null;
+        }
+
+        String custom = wireShapeFromMarshallerType(name);
+        if (custom != null) {
+            return new WireShape(custom, "marshal-function-name");
+        }
+
+        int marshaller = name.indexOf("Marshaller<");
+        if (marshaller < 0) {
+            marshaller = name.indexOf("Marshaler<");
+        }
+        if (marshaller < 0) {
+            return null;
+        }
+        int templateStart = name.indexOf('<', marshaller);
+        int templateEnd = NetworkSchemaText.matchingIndex(name, templateStart, '<', '>');
+        if (templateStart < 0 || templateEnd < 0) {
+            return null;
+        }
+
+        String nativeType = name.substring(templateStart + 1, templateEnd);
+        String shape = wireShapeFromNativeType(nativeType);
+        return shape == null ? null : new WireShape(shape, "marshal-function-name");
+    }
+
+    private boolean looksLikeBoolMarshal(Address address) {
+        Function function = functionAtOrContaining(address);
+        if (function == null) {
+            return false;
+        }
+
+        boolean sawSetcc = false;
+        boolean sawOneByteLength = false;
+        int count = 0;
+        for (Instruction instruction : functionInstructions(function)) {
+            if (instruction.getMinAddress().compareTo(address) < 0) {
+                continue;
+            }
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if (mnemonic != null && mnemonic.startsWith("SET")) {
+                sawSetcc = true;
+            }
+            if ("MOV".equals(mnemonic)) {
+                String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+                Long immediate = literalOperandValue(instruction, 1);
+                if (("R8".equals(destination) || "RDX".equals(destination)) &&
+                    immediate != null && immediate == 1L) {
+                    sawOneByteLength = true;
+                }
+            }
+            if ("RET".equals(mnemonic) || "CCH".equals(mnemonic)) {
+                break;
+            }
+        }
+        return sawSetcc && sawOneByteLength;
+    }
+
+    private Address absoluteAddress(long value) {
+        return currentProgram.getAddressFactory()
+            .getDefaultAddressSpace()
+            .getAddress(value);
+    }
+
+    private Address subtract(Address address, long value) {
+        if (address == null) {
+            return null;
+        }
+        return absoluteAddress(address.getOffset() - value);
+    }
+
+    private boolean isVtableLike(Address address) {
+        if (!isProgramAddress(address)) {
+            return false;
+        }
+        int executableSlots = 0;
+        for (int slot = 0; slot < 4; slot++) {
+            Address target = readPointer(address.add(slot * 8L));
+            if (target != null && isExecutableAddress(target)) {
+                executableSlots++;
+            }
+        }
+        return executableSlots >= 3;
+    }
+
+    private boolean isExecutableAddress(Address address) {
+        if (!isProgramAddress(address)) {
+            return false;
+        }
+        MemoryBlock block = currentProgram.getMemory().getBlock(address);
+        return block != null && block.isExecute();
+    }
+
+    private Address callTarget(Instruction instruction) {
+        Address[] flows = instruction.getFlows();
+        if (flows != null) {
+            for (Address flow : flows) {
+                if (isProgramAddress(flow)) {
+                    return flow;
+                }
+            }
+        }
+        for (Reference reference : instruction.getReferencesFrom()) {
+            if (reference.getReferenceType().isCall() && isProgramAddress(reference.getToAddress())) {
+                return reference.getToAddress();
+            }
+        }
+        return null;
+    }
+
+    private Address referencedAddress(Instruction instruction) {
+        List<Address> addresses = referencedAddresses(instruction);
+        return addresses.isEmpty() ? null : addresses.get(0);
+    }
+
+    private Address referencedAddress(Instruction instruction, int operandIndex) {
+        List<Address> addresses = referencedAddresses(instruction, operandIndex);
+        return addresses.isEmpty() ? null : addresses.get(0);
+    }
+
+    private List<Address> referencedAddresses(Instruction instruction) {
+        LinkedHashSet<Address> result = new LinkedHashSet<>();
+        for (Reference reference : instruction.getReferencesFrom()) {
+            Address to = reference.getToAddress();
+            if (isProgramAddress(to)) {
+                result.add(to);
+            }
+        }
+        for (int i = 0; i < instruction.getNumOperands(); i++) {
+            for (Object object : NetworkSchemaX86.operandObjects(instruction, i)) {
+                if (object instanceof Address address && isProgramAddress(address)) {
+                    result.add(address);
+                }
+            }
+            Address computed = computedOperandAddress(instruction, i);
+            if (isProgramAddress(computed)) {
+                result.add(computed);
+            }
+        }
+        for (Address address : pcodeConstantAddresses(instruction)) {
+            result.add(address);
+        }
+        return new ArrayList<>(result);
+    }
+
+    private List<Address> referencedAddresses(Instruction instruction, int operandIndex) {
+        LinkedHashSet<Address> result = new LinkedHashSet<>();
+        for (Reference reference : instruction.getReferencesFrom()) {
+            if (reference.getOperandIndex() != operandIndex) {
+                continue;
+            }
+            Address to = reference.getToAddress();
+            if (isProgramAddress(to)) {
+                result.add(to);
+            }
+        }
+
+        for (Object object : NetworkSchemaX86.operandObjects(instruction, operandIndex)) {
+            if (object instanceof Address address && isProgramAddress(address)) {
+                result.add(address);
+            }
+        }
+
+        Address computed = computedOperandAddress(instruction, operandIndex);
+        if (isProgramAddress(computed)) {
+            result.add(computed);
+        }
+        return new ArrayList<>(result);
+    }
+
+    private List<Address> pcodeConstantAddresses(Instruction instruction) {
+        LinkedHashSet<Address> result = new LinkedHashSet<>();
+        try {
+            for (PcodeOp op : instruction.getPcode()) {
+                collectPcodeAddress(result, op.getOutput());
+                for (int i = 0; i < op.getNumInputs(); i++) {
+                    collectPcodeAddress(result, op.getInput(i));
+                }
+            }
+        }
+        catch (Exception ignored) {
+            return List.of();
+        }
+        return new ArrayList<>(result);
+    }
+
+    private void collectPcodeAddress(Set<Address> result, Varnode node) {
+        if (node == null) {
+            return;
+        }
+        Address nodeAddress = node.getAddress();
+        if (isProgramAddress(nodeAddress)) {
+            result.add(nodeAddress);
+        }
+        if (node.isConstant()) {
+            Address address = absoluteAddress(node.getOffset());
+            if (isProgramAddress(address)) {
+                result.add(address);
+            }
+        }
+    }
+
+    private Address computedOperandAddress(Instruction instruction, int operandIndex) {
+        Object[] objects = NetworkSchemaX86.operandObjects(instruction, operandIndex);
+        boolean ripRelative = false;
+        boolean hasNonRipRegister = false;
+        long displacement = 0;
+        Address absoluteCandidate = null;
+
+        for (Object object : objects) {
+            if (object instanceof Register register) {
+                String name = NetworkSchemaX86.canonicalRegisterName(register.getName());
+                if ("RIP".equals(name) || "EIP".equals(name)) {
+                    ripRelative = true;
+                }
+                else {
+                    hasNonRipRegister = true;
+                }
+            }
+            else if (object instanceof Scalar scalar) {
+                long signed = scalar.getSignedValue();
+                displacement += signed;
+
+                Address candidate = absoluteAddress(scalar.getUnsignedValue());
+                if (isProgramAddress(candidate)) {
+                    absoluteCandidate = candidate;
+                }
+            }
+        }
+
+        if (ripRelative) {
+            long next = instruction.getMinAddress().getOffset() + instruction.getLength();
+            Address computed = absoluteAddress(next + displacement);
+            if (isProgramAddress(computed)) {
+                return computed;
+            }
+        }
+
+        return hasNonRipRegister ? null : absoluteCandidate;
+    }
+
+    private Integer memoryDisplacementForThisLikeOperand(Instruction instruction, int operandIndex) {
+        Object[] objects = NetworkSchemaX86.operandObjects(instruction, operandIndex);
+        String baseRegister = null;
+        int displacement = 0;
+        for (Object object : objects) {
+            if (object instanceof Register register) {
+                String name = NetworkSchemaX86.canonicalRegisterName(register.getName());
+                if (!"RIP".equals(name) && !"RSP".equals(name)) {
+                    if (baseRegister != null && !baseRegister.equals(name)) {
+                        return null;
+                    }
+                    baseRegister = name;
+                }
+            }
+            else if (object instanceof Scalar scalar) {
+                long value = scalar.getSignedValue();
+                if (value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE) {
+                    displacement += (int)value;
+                }
+            }
+        }
+        return baseRegister != null && displacement != 0 ? displacement : null;
+    }
+
+    private TrackedValue trackedLeaValue(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        Integer offset = trackedThisOffsetForMemoryOperand(instruction, 1, state.registers);
+        if (offset != null) {
+            return TrackedValue.thisOffset(offset);
+        }
+
+        MemoryReference memory = NetworkSchemaX86.memoryReference(instruction, 1);
+        Integer stackOffset = stackSlotOffset(memory, state);
+        if (stackOffset != null) {
+            return TrackedValue.stackOffset(stackOffset);
+        }
+
+        TrackedValue baseOffset = trackedBaseOffsetForMemoryOperand(instruction, 1, state.registers);
+        if (baseOffset != null) {
+            return baseOffset;
+        }
+
+        Long immediate = trackedImmediateForMemoryOperand(instruction, 1, state.registers);
+        if (immediate != null) {
+            return TrackedValue.immediate(immediate);
+        }
+
+        Address address = referencedAddress(instruction, 1);
+        if (address != null) {
+            return TrackedValue.address(address);
+        }
+        return null;
+    }
+
+    private TrackedValue trackedOperandValue(
+        Instruction instruction,
+        int operandIndex,
+        ForwardArgState state) {
+
+        String sourceRegister = NetworkSchemaX86.registerOperand(instruction, operandIndex);
+        if (sourceRegister != null) {
+            TrackedValue value = state.registers.get(sourceRegister);
+            return value == null ? null : value.copy();
+        }
+
+        TrackedValue value = trackedThisLoadValue(instruction, operandIndex, state);
+        if (value != null) {
+            return value;
+        }
+
+        value = trackedStackLoadValue(instruction, operandIndex, state);
+        if (value != null) {
+            return value;
+        }
+
+        value = trackedFormattedFieldNamePointerLoadValue(instruction, operandIndex, state);
+        if (value != null) {
+            return value;
+        }
+
+        Address address = referencedAddress(instruction, operandIndex);
+        if (address != null) {
+            return TrackedValue.address(address);
+        }
+
+        String sourceText = NetworkSchemaX86.operandText(instruction, operandIndex);
+        if (sourceText != null && sourceText.contains("[")) {
+            return null;
+        }
+
+        Long immediate = literalOperandValue(instruction, operandIndex);
+        return immediate == null ? null : TrackedValue.immediate(immediate);
+    }
+
+    private Integer trackedThisOffsetForMemoryOperand(
+        Instruction instruction,
+        int operandIndex,
+        Map<String, TrackedValue> registers) {
+
+        MemoryAddress memory = NetworkSchemaX86.memoryAddress(instruction, operandIndex);
+        if (memory == null) {
+            return null;
+        }
+        boolean sawThisBase = false;
+        int displacement = 0;
+        int thisBaseOffset = 0;
+        for (MemoryTerm term : memory.terms) {
+            if ("RIP".equals(term.register) || "RSP".equals(term.register)) {
+                return null;
+            }
+
+            TrackedValue value = registers.get(term.register);
+            if (value == null) {
+                return null;
+            }
+            if (value.thisOffset != null) {
+                if (sawThisBase || term.scale != 1) {

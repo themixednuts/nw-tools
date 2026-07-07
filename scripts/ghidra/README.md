@@ -31,12 +31,42 @@ Set `AZ_SERIALIZE_RENAME_APPLY=true` before launching Ghidra to apply renames.
 ## Network Schema Extractor
 
 `NetworkSchemaExtractor.java` builds a static JSON report for network type and
-field registration evidence. Run it against the loaded `NewWorld 3-26` program
-and point it at:
+field registration evidence. The file in Ghidra's script directory is generated;
+do not edit `$HOME/ghidra_scripts/NetworkSchemaExtractor.java` directly. Edit
+the small source files in this directory instead, then run the sync script.
+
+Run the generated script against the loaded `NewWorld 3-26` program and point it
+at:
 
 ```text
 resources/typeregistry.json
 ```
+
+The extractor source is split across helper files and ordered fragments for
+maintainability, but Ghidra should run a single bundled
+`NetworkSchemaExtractor.java`. Use:
+
+```powershell
+scripts/ghidra/Sync-NetworkSchemaExtractor.ps1
+```
+
+The sync script writes the bundled file to `$HOME/ghidra_scripts` by default and
+removes copied helper `.java` files from that output directory. Keeping helper
+`.java` files in the Ghidra script root makes the script manager treat them as
+standalone scripts, which can prevent `NetworkSchemaExtractor` from loading.
+The sync script also rejects network-schema source modules over 1000 lines.
+
+- `NetworkSchemaAddressFormatter.java` — address formatter callback shared by models.
+- `NetworkSchemaModels.java` — leaf model/data holders.
+- `NetworkSchemaPcode.java` — p-code evidence model holders.
+- `NetworkSchemaStack.java` — stack-state and constructor evidence models.
+- `NetworkSchemaText.java` — deterministic text/literal helpers.
+- `NetworkSchemaTextParser.java` — decompiled-text parser plus parse caches.
+- `NetworkSchemaTypeModels.java` — nested type and container-shape model holders.
+- `NetworkSchemaX86.java` — x86 operand, register, memory, and offset helpers.
+- `NetworkSchemaJson.java` — JSON helpers.
+- `network_schema_extractor/NetworkSchemaExtractor.*.javafrag` — ordered
+  fragments for the generated Ghidra script entrypoint.
 
 Useful environment variables:
 

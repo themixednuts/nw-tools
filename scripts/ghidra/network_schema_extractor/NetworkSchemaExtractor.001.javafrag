@@ -1,0 +1,900 @@
+        return serializeObjectsByRef.getOrDefault(ref, object);
+    }
+
+    private List<SerializeFieldInfo> parseSerializeFields(JsonObject type) {
+        JsonArray elements = array(type, "elements");
+        if (elements == null || elements.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        ArrayList<SerializeFieldInfo> fields = new ArrayList<>();
+        for (JsonElement element : elements) {
+            if (!element.isJsonObject()) {
+                continue;
+            }
+            JsonObject value = element.getAsJsonObject();
+            if (Boolean.TRUE.equals(bool(value, "is_base_class"))) {
+                continue;
+            }
+            String name = string(value, "name");
+            String typeId = canonicalUuidFromString(string(value, "typeId"));
+            Long offset = longValue(value, "offset");
+            if (name == null || name.trim().isEmpty() || typeId == null || offset == null) {
+                continue;
+            }
+
+            SerializeFieldInfo field = new SerializeFieldInfo();
+            field.name = name.trim();
+            field.typeId = typeId;
+            field.offset = offset;
+            field.dataSize = longValue(value, "dataSize");
+            field.typeName = serializeFieldTypeName(value, typeId);
+            field.wireShape = wireShapeFromSerializeField(value, typeId, field.typeName);
+            fields.add(field);
+        }
+        return fields;
+    }
+
+    private String serializeFieldTypeName(JsonObject field, String typeId) {
+        JsonObject azRtti = resolveSerializeObject(object(field, "azRtti"));
+        String rttiName = azRtti == null ? null : string(azRtti, "typeName");
+        if (rttiName != null) {
+            return rttiName;
+        }
+        SerializeTypeInfo reflected = serializeTypesById.get(normalizeUuid(typeId));
+        if (reflected != null && reflected.name != null) {
+            return reflected.name;
+        }
+        JsonObject generic = resolveSerializeObject(object(field, "genericClassInfo"));
+        JsonObject classData = resolveSerializeObject(object(generic, "classData"));
+        return classData == null ? null : string(classData, "name");
+    }
+
+    private String wireShapeFromSerializeField(
+        JsonObject field,
+        String typeId,
+        String typeName) {
+
+        String fromTypeId = wireShapeFromSerializeTypeId(typeId);
+        if (fromTypeId != null) {
+            return fromTypeId;
+        }
+        String fromTypeName = wireShapeFromNativeType(typeName);
+        if (fromTypeName != null) {
+            return fromTypeName;
+        }
+
+        JsonObject generic = resolveSerializeObject(object(field, "genericClassInfo"));
+        String genericShape = wireShapeFromSerializeGeneric(generic);
+        if (genericShape != null) {
+            return genericShape;
+        }
+
+        Long dataSize = longValue(field, "dataSize");
+        if (dataSize != null && dataSize == 16L) {
+            return "fixed-bytes-16";
+        }
+        return null;
+    }
+
+    private String wireShapeFromSerializeGeneric(JsonObject generic) {
+        generic = resolveSerializeObject(generic);
+        if (generic == null) {
+            return null;
+        }
+        JsonObject classData = resolveSerializeObject(object(generic, "classData"));
+        String className = classData == null ? null : string(classData, "name");
+        JsonArray templatedTypeIds = array(generic, "templatedTypeIds");
+        if (className != null &&
+            (className.equals("AZStd::ranged_int") ||
+             className.equals("AZStd::clamped_num")) &&
+            templatedTypeIds != null &&
+            templatedTypeIds.size() > 0) {
+            return wireShapeFromSerializeTypeId(
+                canonicalUuidFromString(stringValue(templatedTypeIds.get(0))));
+        }
+        if ("AZStd::array".equals(className) &&
+            templatedTypeIds != null &&
+            templatedTypeIds.size() > 0) {
+            String elementShape = wireShapeFromSerializeTypeId(
+                canonicalUuidFromString(stringValue(templatedTypeIds.get(0))));
+            JsonObject arguments = object(generic, "nonTypeTemplateArguments");
+            Long capacity = longValue(arguments, "capacity");
+            if (elementShape != null &&
+                capacity != null &&
+                capacity > 0 &&
+                capacity <= 64) {
+                ArrayList<String> shapes = new ArrayList<>();
+                for (int i = 0; i < capacity; i++) {
+                    shapes.add(elementShape);
+                }
+                return compositeWireShape(shapes);
+            }
+        }
+        return null;
+    }
+
+    private String wireShapeFromSerializeTypeId(String typeId) {
+        String normalized = normalizeUuid(typeId);
+        if (normalized == null) {
+            return null;
+        }
+        if (normalized.equals(normalizeUuid(BOOL_TYPE_ID))) {
+            return "bool";
+        }
+        if (normalized.equals(normalizeUuid(U8_TYPE_ID)) ||
+            normalized.equals(normalizeUuid(S8_TYPE_ID)) ||
+            normalized.equals(normalizeUuid(CHAR_TYPE_ID))) {
+            return "u8";
+        }
+        if (normalized.equals(normalizeUuid(U16_TYPE_ID)) ||
+            normalized.equals(normalizeUuid(SHORT_TYPE_ID))) {
+            return "u16";
+        }
+        if (normalized.equals(normalizeUuid(U32_TYPE_ID)) ||
+            normalized.equals(normalizeUuid(INT_TYPE_ID)) ||
+            normalized.equals(normalizeUuid(CRC32_TYPE_ID))) {
+            return "u32";
+        }
+        if (normalized.equals(normalizeUuid(U64_TYPE_ID)) ||
+            normalized.equals(normalizeUuid(S64_TYPE_ID)) ||
+            normalized.equals(normalizeUuid(ULONG_TYPE_ID)) ||
+            normalized.equals(normalizeUuid(ENTITY_ID_TYPE_ID))) {
+            return "u64";
+        }
+        if (normalized.equals(normalizeUuid(FLOAT_TYPE_ID))) {
+            return "f32";
+        }
+        if (normalized.equals(normalizeUuid(DOUBLE_TYPE_ID))) {
+            return "f64";
+        }
+        if (normalized.equals(normalizeUuid(AZ_UUID_TYPE_ID))) {
+            return "fixed-bytes-16";
+        }
+        if (normalized.equals(normalizeUuid(AZSTD_STRING_TYPE_ID)) ||
+            normalized.equals(normalizeUuid(AZSTD_BASIC_STRING_TYPE_ID))) {
+            return "string";
+        }
+        SerializeTypeInfo reflected = serializeTypesById.get(normalized);
+        return reflected == null ? null : wireShapeFromNativeType(reflected.name);
+    }
+
+    private File serializeJsonFile(File typeregistryInput) {
+        String explicit = envValue("NW_NETWORK_SCHEMA_SERIALIZE_JSON");
+        if (explicit != null) {
+            return new File(explicit);
+        }
+        File dir = typeregistryInput == null ? null : typeregistryInput.getParentFile();
+        for (int i = 0; i < 4 && dir != null; i++) {
+            File candidate = new File(dir, "serialize.json");
+            if (candidate.isFile()) {
+                return candidate;
+            }
+            dir = dir.getParentFile();
+        }
+        return null;
+    }
+
+    private List<RegistryEntry> parseRegistry(JsonObject root) {
+        ArrayList<RegistryEntry> result = new ArrayList<>();
+        JsonObject data = object(root, "data");
+        JsonArray list = registryDescriptorArray(data);
+        if (list == null) {
+            return result;
+        }
+
+        for (JsonElement element : list) {
+            if (!element.isJsonArray()) {
+                continue;
+            }
+            JsonArray pair = element.getAsJsonArray();
+            if (pair.size() < 2 || !pair.get(1).isJsonObject()) {
+                continue;
+            }
+            JsonObject value = pair.get(1).getAsJsonObject();
+            JsonObject handler = object(value, "handler");
+
+            RegistryEntry entry = new RegistryEntry();
+            entry.uuid = firstNonEmpty(string(value, "uuid"), stringValue(pair.get(0)));
+            entry.name = string(value, "name");
+            entry.index = firstNonNull(integer(value, "localIndex"), integer(value, "index"));
+            entry.typeIndex = integer(value, "typeIndex");
+            entry.storageAddress = string(value, "__addr");
+            entry.baseVtable = string(value, "baseVtable");
+            entry.vtable = string(value, "vtable");
+            if (handler != null) {
+                entry.destructor = string(handler, "Destructor");
+                entry.getEmptyValue = string(handler, "GetEmptyValue");
+                entry.createInstance = string(handler, "CreateInstance");
+                entry.copyValue = string(handler, "CopyValue");
+                entry.marshal = string(handler, "Marshal");
+                entry.unmarshal = string(handler, "Unmarshal");
+            }
+            result.add(entry);
+        }
+        return result;
+    }
+
+    private JsonArray registryDescriptorArray(JsonObject data) {
+        if (data == null) {
+            return null;
+        }
+
+        JsonArray typesByUuid = array(data, "typesByUuid");
+        if (typesByUuid != null) {
+            return typesByUuid;
+        }
+
+        return array(data, "m_list");
+    }
+
+    private Integer typeIndexSlotCount(JsonObject root) {
+        JsonObject data = object(root, "data");
+        JsonObject counts = object(data, "counts");
+        Integer fromCounts = integer(counts, "typeIndexSlots");
+        if (fromCounts != null) {
+            return fromCounts;
+        }
+        JsonArray typeIndex = data == null ? null : array(data, "typeIndex");
+        return typeIndex == null ? null : typeIndex.size();
+    }
+
+    private Integer registeredTypeCount(JsonObject root, int parsedRegistryEntries) {
+        JsonObject data = object(root, "data");
+        JsonObject counts = object(data, "counts");
+        Integer fromCounts = integer(counts, "registeredTypes");
+        return fromCounts == null ? parsedRegistryEntries : fromCounts;
+    }
+
+    private Integer assetOnlyTypeIndexSlotCount(JsonObject root, int parsedRegistryEntries) {
+        Integer slots = typeIndexSlotCount(root);
+        if (slots == null) {
+            return null;
+        }
+        Integer registered = registeredTypeCount(root, parsedRegistryEntries);
+        return slots - registered;
+    }
+
+    private Map<String, RegistrationFunction> collectRegistrationFunctions(Address registerField) {
+        LinkedHashMap<String, RegistrationFunction> result = new LinkedHashMap<>();
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(registerField);
+        while (references.hasNext()) {
+            Reference reference = references.next();
+            if (!reference.getReferenceType().isCall()) {
+                continue;
+            }
+            Address callsite = reference.getFromAddress();
+            Function owner = functionContaining(callsite);
+            if (owner == null) {
+                continue;
+            }
+            String key = owner.getEntryPoint().toString();
+            RegistrationFunction function = result.get(key);
+            if (function == null) {
+                function = new RegistrationFunction(owner);
+                function.instanceVtable = findInstanceVtable(owner);
+                function.azRtti = decodeAzRttiFromVtable(function.instanceVtable);
+                result.put(key, function);
+            }
+            FieldCall field = recoverFieldCall(owner, callsite, function.fields.size());
+            function.fields.add(field);
+        }
+        for (RegistrationFunction function : result.values()) {
+            List<FieldCall> executedFields = recoverExecutedRegisterFieldCalls(function.function);
+            if (executedFields.size() > function.fields.size()) {
+                registerFieldLoopRecoveredFunctionCount++;
+                registerFieldLoopRecoveredCallCount += executedFields.size() - function.fields.size();
+                function.fields.clear();
+                function.fields.addAll(executedFields);
+            }
+        }
+        return result;
+    }
+
+    private List<FieldCall> recoverExecutedRegisterFieldCalls(Function owner) {
+        ArrayList<Instruction> instructions = new ArrayList<>(functionInstructions(owner));
+        if (instructions.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        HashMap<String, Integer> indexByAddress = new HashMap<>();
+        for (int i = 0; i < instructions.size(); i++) {
+            indexByAddress.put(instructions.get(i).getMinAddress().toString(), i);
+        }
+
+        ForwardArgState state = initialForwardArgState(owner, new LinkedHashSet<>());
+        ArrayList<FieldCall> fields = new ArrayList<>();
+        HashMap<String, Integer> visitCounts = new HashMap<>();
+        int index = 0;
+        int maxSteps = Math.max(256, instructions.size() * 64);
+        for (int steps = 0; index >= 0 && index < instructions.size() && steps < maxSteps; steps++) {
+            Instruction instruction = instructions.get(index);
+            String visitKey = instruction.getMinAddress().toString();
+            int visits = visitCounts.merge(visitKey, 1, Integer::sum);
+            if (visits > 64) {
+                return Collections.emptyList();
+            }
+
+            if (isRegisterFieldCall(instruction)) {
+                ArgState args = argStateFromForwardState(state);
+                args.fillMissingFrom(recoverBackwardArgState(owner, instruction.getMinAddress()));
+                fields.add(fieldCallFromArgState(
+                    owner,
+                    instruction.getMinAddress(),
+                    fields.size(),
+                    args));
+            }
+
+            observeForwardInstruction(instruction, state);
+            Integer next = executedNextInstructionIndex(
+                instructions,
+                indexByAddress,
+                index,
+                state);
+            if (next == null) {
+                return Collections.emptyList();
+            }
+            if (next < 0) {
+                break;
+            }
+            index = next;
+        }
+        return fields;
+    }
+
+    private boolean isRegisterFieldCall(Instruction instruction) {
+        if (instruction == null || !instruction.getFlowType().isCall()) {
+            return false;
+        }
+        Address target = resolvedCodeTarget(callTarget(instruction));
+        Address registerField = currentProgram.getImageBase().add(REGISTER_FIELD_RVA);
+        return registerField.equals(target);
+    }
+
+    private Integer executedNextInstructionIndex(
+        List<Instruction> instructions,
+        Map<String, Integer> indexByAddress,
+        int index,
+        ForwardArgState state) {
+
+        Instruction instruction = instructions.get(index);
+        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+        if (mnemonic == null) {
+            return index + 1;
+        }
+        if ("RET".equals(mnemonic)) {
+            return -1;
+        }
+
+        Address target = singleFlowTarget(instruction);
+        if (target == null) {
+            if (mnemonic.startsWith("J")) {
+                return null;
+            }
+            return index + 1;
+        }
+        Integer targetIndex = indexByAddress.get(target.toString());
+        if (targetIndex == null) {
+            if (mnemonic.startsWith("J")) {
+                return null;
+            }
+            return index + 1;
+        }
+
+        if ("JMP".equals(mnemonic)) {
+            return targetIndex;
+        }
+
+        if (!mnemonic.startsWith("J")) {
+            return index + 1;
+        }
+
+        Boolean taken = conditionalBranchTaken(mnemonic, state);
+        if (taken == null) {
+            return null;
+        }
+        return taken ? targetIndex : index + 1;
+    }
+
+    private Address singleFlowTarget(Instruction instruction) {
+        Address[] flows = instruction.getFlows();
+        return flows.length == 1 ? flows[0] : null;
+    }
+
+    private Boolean conditionalBranchTaken(String mnemonic, ForwardArgState state) {
+        if ("JZ".equals(mnemonic) || "JE".equals(mnemonic)) {
+            return state.zeroFlag;
+        }
+        if ("JNZ".equals(mnemonic) || "JNE".equals(mnemonic)) {
+            return state.zeroFlag == null ? null : !state.zeroFlag;
+        }
+        if ("JA".equals(mnemonic) || "JNBE".equals(mnemonic)) {
+            return state.compareUnsigned == null ? null : state.compareUnsigned > 0;
+        }
+        if ("JAE".equals(mnemonic) || "JNB".equals(mnemonic) || "JNC".equals(mnemonic)) {
+            return state.compareUnsigned == null ? null : state.compareUnsigned >= 0;
+        }
+        if ("JB".equals(mnemonic) || "JNAE".equals(mnemonic) || "JC".equals(mnemonic)) {
+            return state.compareUnsigned == null ? null : state.compareUnsigned < 0;
+        }
+        if ("JBE".equals(mnemonic) || "JNA".equals(mnemonic)) {
+            return state.compareUnsigned == null ? null : state.compareUnsigned <= 0;
+        }
+        if ("JG".equals(mnemonic) || "JNLE".equals(mnemonic)) {
+            return state.compareSigned == null ? null : state.compareSigned > 0;
+        }
+        if ("JGE".equals(mnemonic) || "JNL".equals(mnemonic)) {
+            return state.compareSigned == null ? null : state.compareSigned >= 0;
+        }
+        if ("JL".equals(mnemonic) || "JNGE".equals(mnemonic)) {
+            return state.compareSigned == null ? null : state.compareSigned < 0;
+        }
+        if ("JLE".equals(mnemonic) || "JNG".equals(mnemonic)) {
+            return state.compareSigned == null ? null : state.compareSigned <= 0;
+        }
+        return null;
+    }
+
+    private void updateZeroFlagFromValue(ForwardArgState state, TrackedValue value) {
+        state.zeroFlag = knownZero(value);
+        state.compareSigned = null;
+        state.compareUnsigned = null;
+    }
+
+    private void updateCompareFlags(
+        ForwardArgState state,
+        TrackedValue left,
+        TrackedValue right) {
+
+        state.zeroFlag = trackedValuesEqual(left, right);
+        state.compareSigned = null;
+        state.compareUnsigned = null;
+        if (left == null || right == null ||
+            left.immediate == null || right.immediate == null) {
+            return;
+        }
+        state.compareSigned = Integer.signum(Long.compare(left.immediate, right.immediate));
+        state.compareUnsigned =
+            Integer.signum(Long.compareUnsigned(left.immediate, right.immediate));
+    }
+
+    private void clearConditionFlags(ForwardArgState state) {
+        state.zeroFlag = null;
+        state.compareSigned = null;
+        state.compareUnsigned = null;
+    }
+
+    private Boolean knownZero(TrackedValue value) {
+        return value != null && value.immediate != null
+            ? value.immediate == 0L
+            : null;
+    }
+
+    private Boolean trackedValuesEqual(TrackedValue left, TrackedValue right) {
+        if (left == null || right == null) {
+            return null;
+        }
+        if (left.immediate != null && right.immediate != null) {
+            return left.immediate.equals(right.immediate);
+        }
+        if (left.address != null && right.address != null) {
+            return left.address.equals(right.address);
+        }
+        if (left.thisOffset != null && right.thisOffset != null) {
+            return left.thisOffset.equals(right.thisOffset);
+        }
+        if (left.stackOffset != null && right.stackOffset != null) {
+            return left.stackOffset.equals(right.stackOffset);
+        }
+        if (left.baseKey != null &&
+            left.baseKey.equals(right.baseKey) &&
+            left.baseOffset != null &&
+            right.baseOffset != null) {
+            return left.baseOffset.equals(right.baseOffset);
+        }
+        return left.sameValue(right) ? Boolean.TRUE : null;
+    }
+
+    private void collectDirectFieldTableRegistrationFunctions(
+        List<RegistryEntry> registry,
+        Map<String, HookTypeEvidence> hookTypeNamesById,
+        Map<String, RegistrationFunction> registrationFunctions) {
+
+        LinkedHashSet<Address> candidates = new LinkedHashSet<>();
+        for (RegistryEntry entry : registry) {
+            HookTypeEvidence hook = registrationHookForEntry(entry, hookTypeNamesById);
+            collectConstructorCandidates(candidates, parseCapturedAddress(entry.createInstance));
+            collectConstructorCandidates(candidates, parseCapturedAddress(entry.unmarshal));
+            if (hook != null) {
+                collectConstructorCandidates(candidates, hook.createInstance);
+                collectConstructorCandidates(candidates, hook.unmarshal);
+            }
+        }
+
+        for (Address candidate : candidates) {
+            Function function = functionAtOrContaining(candidate);
+            if (function == null) {
+                continue;
+            }
+            String key = function.getEntryPoint().toString();
+            if (registrationFunctions.containsKey(key)) {
+                continue;
+            }
+
+            List<FieldCall> fields = recoverDirectFieldTableAppends(function);
+            if (fields.isEmpty()) {
+                continue;
+            }
+
+            RegistrationFunction registration = new RegistrationFunction(function);
+            registration.instanceVtable = findInstanceVtable(function);
+            registration.azRtti = decodeAzRttiFromVtable(registration.instanceVtable);
+            registration.fields.addAll(fields);
+            registrationFunctions.put(key, registration);
+        }
+    }
+
+    private void collectConstructorCandidates(Set<Address> candidates, Address seed) {
+        Address target = resolvedCodeTarget(seed);
+        if (!isExecutableAddress(target)) {
+            return;
+        }
+
+        Function function = functionAtOrContaining(target);
+        if (function == null) {
+            return;
+        }
+        candidates.add(function.getEntryPoint());
+
+        int count = 0;
+        for (Instruction instruction : functionInstructions(function)) {
+            if (instruction.getMinAddress().compareTo(target) < 0) {
+                continue;
+            }
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+            Address call = resolvedCodeTarget(callTarget(instruction));
+            if (isExecutableAddress(call)) {
+                candidates.add(call);
+            }
+        }
+    }
+
+    private List<FieldCall> recoverDirectFieldTableAppends(Function owner) {
+        ForwardArgState state = newForwardArgState();
+
+        HashMap<String, Integer> cursorOffsetByRegister = new HashMap<>();
+        HashMap<Integer, DirectFieldAppend> pendingByCursorOffset = new HashMap<>();
+        HashMap<String, FixedNamedFieldValue> fixedNamedFieldsBySimdRegister = new HashMap<>();
+        ArrayList<FieldCall> fields = new ArrayList<>();
+
+        int count = 0;
+        for (Instruction instruction : functionInstructions(owner)) {
+            if (count++ >= DIRECT_FIELD_TABLE_SCAN_LIMIT) {
+                break;
+            }
+
+            observeDirectFieldTableAppend(
+                instruction,
+                state,
+                cursorOffsetByRegister,
+                pendingByCursorOffset,
+                fixedNamedFieldsBySimdRegister,
+                fields);
+            observeForwardInstruction(instruction, state);
+        }
+
+        if (fields.isEmpty()) {
+            return fields;
+        }
+
+        LinkedHashMap<Integer, Integer> groupByCursorOffset = new LinkedHashMap<>();
+        ArrayList<Integer> cursorOffsets = new ArrayList<>();
+        for (FieldCall field : fields) {
+            if (isDirectAttributeRegistration(field)) {
+                continue;
+            }
+            if (field.groupCursorOffset != null &&
+                !cursorOffsets.contains(field.groupCursorOffset)) {
+                cursorOffsets.add(field.groupCursorOffset);
+            }
+        }
+        Collections.sort(cursorOffsets);
+        for (int i = 0; i < cursorOffsets.size(); i++) {
+            groupByCursorOffset.put(cursorOffsets.get(i), i);
+        }
+
+        for (int i = 0; i < fields.size(); i++) {
+            FieldCall field = fields.get(i);
+            field.index = i;
+            if (isDirectAttributeRegistration(field)) {
+                field.group = null;
+            }
+            else if (field.group == null && field.groupCursorOffset != null) {
+                field.group = groupByCursorOffset.get(field.groupCursorOffset);
+            }
+        }
+        return fields;
+    }
+
+    private boolean isDirectAttributeRegistration(FieldCall field) {
+        return field != null && "attribute".equals(field.registrationKind);
+    }
+
+    private void observeDirectFieldTableAppend(
+        Instruction instruction,
+        ForwardArgState state,
+        Map<String, Integer> cursorOffsetByRegister,
+        Map<Integer, DirectFieldAppend> pendingByCursorOffset,
+        Map<String, FixedNamedFieldValue> fixedNamedFieldsBySimdRegister,
+        List<FieldCall> fields) {
+
+        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+        if (mnemonic == null) {
+            return;
+        }
+
+        observeStackStagedFixedFieldAppend(
+            instruction,
+            state,
+            cursorOffsetByRegister,
+            fixedNamedFieldsBySimdRegister,
+            fields);
+
+        if (instruction.getFlowType().isCall()) {
+            clearVolatileCursorRegisters(cursorOffsetByRegister);
+            fixedNamedFieldsBySimdRegister.clear();
+            return;
+        }
+
+        String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+        if ("MOV".equals(mnemonic) && destination != null) {
+            Integer cursorOffset = directFieldCursorOffsetFromMoveSource(
+                instruction,
+                state,
+                cursorOffsetByRegister);
+            if (cursorOffset != null) {
+                cursorOffsetByRegister.put(destination, cursorOffset);
+            }
+            else {
+                cursorOffsetByRegister.remove(destination);
+            }
+        }
+        else if (destination != null && "LEA".equals(mnemonic)) {
+            TrackedValue value = trackedLeaValue(instruction, state);
+            if (value != null && value.thisOffset != null) {
+                cursorOffsetByRegister.put(destination, value.thisOffset);
+            }
+            else {
+                cursorOffsetByRegister.remove(destination);
+            }
+        }
+        else if (destination != null && ("ADD".equals(mnemonic) ||
+            "XOR".equals(mnemonic) ||
+            "SUB".equals(mnemonic))) {
+            cursorOffsetByRegister.remove(destination);
+        }
+
+        MemoryReference destinationMemory = NetworkSchemaX86.memoryReference(instruction, 0);
+        if (!"MOV".equals(mnemonic) || destinationMemory == null ||
+            destinationMemory.baseRegister == null) {
+            return;
+        }
+
+        Integer cursorOffset = cursorOffsetByRegister.get(destinationMemory.baseRegister);
+        if (cursorOffset == null) {
+            return;
+        }
+
+        DirectFieldAppend pending = pendingByCursorOffset.computeIfAbsent(
+            cursorOffset,
+            ignored -> new DirectFieldAppend(cursorOffset));
+        if (destinationMemory.displacement == 0) {
+            TrackedValue value = trackedOperandValue(instruction, 1, state);
+            Address address = value == null ? null : value.address;
+            StringDecode decoded = readFieldNameAtOrThroughPointer(address);
+            if (decoded != null) {
+                pending.nameAddress = decoded.address;
+                pending.name = decoded.value;
+                pending.nameWrite = instruction.getMinAddress();
+            }
+        }
+        else if (destinationMemory.displacement == 8) {
+            TrackedValue value = trackedOperandValue(instruction, 1, state);
+            if (value != null && value.thisOffset != null) {
+                pending.handlerOffset = value.thisOffset;
+                pending.handlerExpression = value.expression;
+                pending.handlerWrite = instruction.getMinAddress();
+            }
+        }
+        else if (destinationMemory.displacement == 0x10) {
+            TrackedValue value = trackedOperandValue(instruction, 1, state);
+            if (value != null && value.immediate != null) {
+                pending.filterGroupAttribute = value.immediate != 0;
+            }
+        }
+
+        FieldCall field = pending.toFieldCall(state);
+        if (field != null) {
+            fields.add(field);
+            pendingByCursorOffset.remove(cursorOffset);
+        }
+    }
+
+    private void observeStackStagedFixedFieldAppend(
+        Instruction instruction,
+        ForwardArgState state,
+        Map<String, Integer> cursorOffsetByRegister,
+        Map<String, FixedNamedFieldValue> fixedNamedFieldsBySimdRegister,
+        List<FieldCall> fields) {
+
+        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+        if (mnemonic == null) {
+            return;
+        }
+
+        if ("MOV".equals(mnemonic)) {
+            MemoryReference destinationMemory = NetworkSchemaX86.memoryReference(instruction, 0);
+            Integer widthBits = memoryWriteWidthBits(instruction);
+            if (destinationMemory != null && isStackRegister(destinationMemory.baseRegister) &&
+                widthBits != null && widthBits == 64) {
+                TrackedValue value = trackedOperandValue(instruction, 1, state);
+                putOrRemove(state.valuesByStackSlot, stackSlotOffset(destinationMemory, state), value);
+                return;
+            }
+        }
+
+        String destinationRegister = NetworkSchemaX86.registerOperand(instruction, 0);
+        if (!isPackedMoveMnemonic(mnemonic)) {
+            if (destinationRegister != null && destinationRegister.startsWith("XMM")) {
+                fixedNamedFieldsBySimdRegister.remove(destinationRegister);
+            }
+            return;
+        }
+
+        if (destinationRegister != null && destinationRegister.startsWith("XMM")) {
+            MemoryReference sourceMemory = NetworkSchemaX86.memoryReference(instruction, 1);
+            if (sourceMemory == null || !isStackRegister(sourceMemory.baseRegister)) {
+                fixedNamedFieldsBySimdRegister.remove(destinationRegister);
+                return;
+            }
+
+            FixedNamedFieldValue field =
+                fixedNamedFieldFromStack(sourceMemory, state, instruction.getMinAddress());
+            if (field == null) {
+                fixedNamedFieldsBySimdRegister.remove(destinationRegister);
+            }
+            else {
+                fixedNamedFieldsBySimdRegister.put(destinationRegister, field);
+            }
+            return;
+        }
+
+        MemoryReference destinationMemory = NetworkSchemaX86.memoryReference(instruction, 0);
+        String sourceRegister = NetworkSchemaX86.registerOperand(instruction, 1);
+        if (destinationMemory == null || sourceRegister == null ||
+            !sourceRegister.startsWith("XMM") ||
+            destinationMemory.baseRegister == null ||
+            destinationMemory.displacement != 0) {
+            return;
+        }
+
+        Integer cursorOffset = cursorOffsetByRegister.get(destinationMemory.baseRegister);
+        if (cursorOffset == null) {
+            return;
+        }
+
+        FixedNamedFieldValue value = fixedNamedFieldsBySimdRegister.get(sourceRegister);
+        if (value == null) {
+            return;
+        }
+
+        DirectFieldAppend append = new DirectFieldAppend(cursorOffset);
+        append.nameAddress = value.nameAddress;
+        append.name = value.name;
+        append.nameWrite = value.nameWrite;
+        append.handlerOffset = value.handlerOffset;
+        append.handlerExpression = value.handlerExpression;
+        append.handlerWrite = instruction.getMinAddress();
+
+        FieldCall field = append.toFieldCall(state);
+        if (field != null) {
+            fields.add(field);
+        }
+    }
+
+    private FixedNamedFieldValue fixedNamedFieldFromStack(
+        MemoryReference sourceMemory,
+        ForwardArgState state,
+        Address readAddress) {
+
+        Integer nameSlot = stackSlotOffset(sourceMemory, state);
+        Integer handlerSlot = nameSlot == null ? null : nameSlot + 8;
+        TrackedValue nameValue = nameSlot == null ? null : state.valuesByStackSlot.get(nameSlot);
+        TrackedValue handlerValue = handlerSlot == null ? null : state.valuesByStackSlot.get(handlerSlot);
+        if (nameValue == null || handlerValue == null ||
+            nameValue.address == null || handlerValue.thisOffset == null) {
+            return null;
+        }
+
+        StringDecode decoded = readFieldNameAtOrThroughPointer(nameValue.address);
+        if (decoded == null) {
+            return null;
+        }
+
+        FixedNamedFieldValue field = new FixedNamedFieldValue();
+        field.nameAddress = decoded.address;
+        field.name = decoded.value;
+        field.nameWrite = readAddress;
+        field.handlerOffset = handlerValue.thisOffset;
+        field.handlerExpression = handlerValue.expression;
+        return field;
+    }
+
+    private boolean isPackedMoveMnemonic(String mnemonic) {
+        return "MOVUPS".equals(mnemonic) ||
+            "MOVAPS".equals(mnemonic) ||
+            "MOVUPD".equals(mnemonic) ||
+            "MOVAPD".equals(mnemonic) ||
+            "MOVDQA".equals(mnemonic) ||
+            "MOVDQU".equals(mnemonic) ||
+            "MOVDQA32".equals(mnemonic) ||
+            "MOVDQA64".equals(mnemonic) ||
+            "MOVDQU32".equals(mnemonic) ||
+            "MOVDQU64".equals(mnemonic) ||
+            "VMOVUPS".equals(mnemonic) ||
+            "VMOVAPS".equals(mnemonic) ||
+            "VMOVUPD".equals(mnemonic) ||
+            "VMOVAPD".equals(mnemonic) ||
+            "VMOVDQA".equals(mnemonic) ||
+            "VMOVDQU".equals(mnemonic) ||
+            "VMOVDQA32".equals(mnemonic) ||
+            "VMOVDQA64".equals(mnemonic) ||
+            "VMOVDQU32".equals(mnemonic) ||
+            "VMOVDQU64".equals(mnemonic);
+    }
+
+    private boolean isMemoryWriteMnemonic(String mnemonic) {
+        return "MOV".equals(mnemonic) ||
+            "MOVD".equals(mnemonic) ||
+            "MOVQ".equals(mnemonic) ||
+            "MOVSS".equals(mnemonic) ||
+            "MOVSD".equals(mnemonic) ||
+            "VMOVD".equals(mnemonic) ||
+            "VMOVQ".equals(mnemonic) ||
+            "VMOVSS".equals(mnemonic) ||
+            "VMOVSD".equals(mnemonic) ||
+            isPackedMoveMnemonic(mnemonic);
+    }
+
+    private boolean writesRegister(String mnemonic) {
+        if (mnemonic == null) {
+            return false;
+        }
+        if (mnemonic.startsWith("SET") || mnemonic.startsWith("CMOV")) {
+            return true;
+        }
+        return "AND".equals(mnemonic) ||
+            "OR".equals(mnemonic) ||
+            "XOR".equals(mnemonic) ||
+            "IMUL".equals(mnemonic) ||
+            "MUL".equals(mnemonic) ||
+            "IDIV".equals(mnemonic) ||
+            "DIV".equals(mnemonic) ||
+            "SHL".equals(mnemonic) ||
+            "SHR".equals(mnemonic) ||
+            "SAR".equals(mnemonic) ||
+            "SAL".equals(mnemonic) ||
+            "NEG".equals(mnemonic) ||
+            "NOT".equals(mnemonic) ||
+            "INC".equals(mnemonic) ||
+            "DEC".equals(mnemonic) ||
+            "MOVZX".equals(mnemonic) ||
+            "MOVSX".equals(mnemonic) ||
+            "MOVSXD".equals(mnemonic);
+    }

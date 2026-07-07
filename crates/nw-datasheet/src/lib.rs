@@ -1,3 +1,5 @@
+pub mod game_system;
+
 use nw_localization::LocalizedTextResolver;
 use serde::{Deserialize, Serialize};
 use std::{

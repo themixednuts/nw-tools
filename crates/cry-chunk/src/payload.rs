@@ -167,6 +167,7 @@ pub struct MaterialNameChunk {
     pub sub_material_count: i32,
     pub physicalize_types: Vec<i32>,
     pub sub_material_names: Vec<ArrayString<1024>>,
+    pub opaque_tail: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -778,11 +779,11 @@ fn decode_controller_compressed<'a>(
         "rotation",
         rotation_format,
         rotation_key_count,
-        checked_count_bytes(
+        Some(checked_count_bytes(
             rotation_key_count,
             controller_rotation_format_size(rotation_format)?,
             "controller rotation bytes",
-        )?,
+        )?),
         alignment,
     )?;
     let rotation_times = read_controller_track(
@@ -790,7 +791,7 @@ fn decode_controller_compressed<'a>(
         "rotation time",
         rotation_time_format,
         rotation_key_count,
-        controller_key_time_size(rotation_time_format, rotation_key_count)?,
+        None,
         alignment,
     )?;
     let position = read_controller_track(
@@ -798,11 +799,11 @@ fn decode_controller_compressed<'a>(
         "position",
         position_format,
         position_key_count,
-        checked_count_bytes(
+        Some(checked_count_bytes(
             position_key_count,
             controller_position_format_size(position_format)?,
             "controller position bytes",
-        )?,
+        )?),
         alignment,
     )?;
     let position_times = match position_keys_info {
@@ -820,7 +821,7 @@ fn decode_controller_compressed<'a>(
             "position time",
             position_time_format,
             position_key_count,
-            controller_key_time_size(position_time_format, position_key_count)?,
+            None,
             alignment,
         )?,
         _ => {
@@ -870,7 +871,7 @@ fn read_controller_track<'a>(
     field: &'static str,
     format: u8,
     key_count: usize,
-    byte_len: usize,
+    fixed_byte_len: Option<usize>,
     alignment: usize,
 ) -> Result<Option<ControllerTrack<'a>>, ChunkPayloadError> {
     if key_count == 0 {
@@ -884,6 +885,10 @@ fn read_controller_track<'a>(
         });
     }
     reader.align_zero_padding(alignment)?;
+    let byte_len = match fixed_byte_len {
+        Some(byte_len) => byte_len,
+        None => controller_key_time_size(reader, format, key_count)?,
+    };
     let data = reader.read_bytes(byte_len)?;
     Ok(Some(ControllerTrack {
         format,
@@ -931,11 +936,16 @@ fn controller_rotation_format_size(format: u8) -> Result<usize, ChunkPayloadErro
     }
 }
 
-fn controller_key_time_size(format: u8, count: usize) -> Result<usize, ChunkPayloadError> {
+fn controller_key_time_size(
+    reader: &PayloadReader<'_>,
+    format: u8,
+    count: usize,
+) -> Result<usize, ChunkPayloadError> {
     let element_size = match format {
         0 | 3 => 4,
-        1 | 4 | 6 => 2,
+        1 | 4 => 2,
         2 | 5 => 1,
+        6 => return controller_bitset_key_time_size(reader, count),
         _ => {
             return Err(ChunkPayloadError::UnsupportedControllerFormat {
                 field: "key time",
@@ -948,6 +958,38 @@ fn controller_key_time_size(format: u8, count: usize) -> Result<usize, ChunkPayl
         _ => count,
     };
     checked_count_bytes(element_count, element_size, "controller key-time bytes")
+}
+
+fn controller_bitset_key_time_size(
+    reader: &PayloadReader<'_>,
+    count: usize,
+) -> Result<usize, ChunkPayloadError> {
+    let header = reader.peek_bytes(6)?;
+    let start = u16::from_le_bytes([header[0], header[1]]);
+    let end = u16::from_le_bytes([header[2], header[3]]);
+    let declared = u16::from_le_bytes([header[4], header[5]]) as usize;
+    if end < start {
+        return Err(ChunkPayloadError::InvalidChunkLayout {
+            chunk_type: ChunkType::Controller,
+            reason: "invalid bitset key-time range",
+        });
+    }
+    if declared != count {
+        return Err(ChunkPayloadError::InvalidChunkLayout {
+            chunk_type: ChunkType::Controller,
+            reason: "bitset key-time count does not match controller key count",
+        });
+    }
+
+    let covered_frames = usize::from(end - start) + 1;
+    let word_count = 3usize.checked_add(covered_frames.div_ceil(16)).ok_or(
+        ChunkPayloadError::CountTooLarge {
+            field: "controller bitset key-time words",
+            value: usize::MAX,
+            max: usize::MAX,
+        },
+    )?;
+    checked_count_bytes(word_count, 2, "controller bitset key-time bytes")
 }
 
 fn checked_count_bytes(
@@ -1392,6 +1434,7 @@ fn decode_material_name<'a>(
                 sub_material_count,
                 physicalize_types: vec![physicalize_type],
                 sub_material_names: Vec::new(),
+                opaque_tail: Vec::new(),
             }))
         }
         0x0802 => {
@@ -1401,39 +1444,14 @@ fn decode_material_name<'a>(
             decode_material_name_slots(reader, name, sub_material_count)
         }
         0x0804 => {
-            // New World layout: 64-byte name, child count, `count` sub-material
-            // chunk ids (skipped), then `count` variable-length child names.
+            // New World layout: 64-byte material GUID/name followed by the same
+            // physicalize-type/name continuation used by Lumberyard 0x0802.
             let mut reader = PayloadReader::new(ChunkType::MtlName, bytes);
             let short_name = reader.read_fixed_string::<64>()?;
             let mut name = ArrayString::<128>::new();
             name.push_str(&short_name);
             let sub_material_count = reader.read_i32()?;
-            if sub_material_count < 0 {
-                return Err(ChunkPayloadError::NegativeCount {
-                    field: "material sub-material count",
-                    value: sub_material_count,
-                });
-            }
-            let count = sub_material_count as usize;
-            if count > MAX_MATERIAL_SUB_MATERIALS {
-                return Err(ChunkPayloadError::CountTooLarge {
-                    field: "material sub-material count",
-                    value: count,
-                    max: MAX_MATERIAL_SUB_MATERIALS,
-                });
-            }
-            reader.skip(4 * count)?;
-            let mut sub_material_names = Vec::with_capacity(count);
-            for _ in 0..count {
-                sub_material_names.push(reader.read_c_string()?);
-            }
-            reader.finish()?;
-            Ok(ChunkPayload::MaterialName(MaterialNameChunk {
-                name,
-                sub_material_count,
-                physicalize_types: Vec::new(),
-                sub_material_names,
-            }))
+            decode_material_name_slots(reader, name, sub_material_count)
         }
         _ => Err(ChunkPayloadError::UnsupportedVersion {
             chunk_type: ChunkType::MtlName,
@@ -1475,12 +1493,13 @@ fn decode_material_name_slots<'a>(
         sub_material_names.push(reader.read_c_string()?);
     }
 
-    reader.finish()?;
+    let opaque_tail = reader.read_remaining_bytes().to_vec();
     Ok(ChunkPayload::MaterialName(MaterialNameChunk {
         name,
         sub_material_count,
         physicalize_types,
         sub_material_names,
+        opaque_tail,
     }))
 }
 
@@ -2627,6 +2646,21 @@ impl<'a> PayloadReader<'a> {
         Ok(bytes)
     }
 
+    fn peek_bytes(&self, len: usize) -> Result<&'a [u8], ChunkPayloadError> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or(ChunkPayloadError::UnexpectedEof {
+                chunk_type: self.chunk_type,
+            })?;
+        if end > self.bytes.len() {
+            return Err(ChunkPayloadError::UnexpectedEof {
+                chunk_type: self.chunk_type,
+            });
+        }
+        Ok(&self.bytes[self.pos..end])
+    }
+
     fn read_remaining_bytes(&mut self) -> &'a [u8] {
         let bytes = &self.bytes[self.pos..];
         self.pos = self.bytes.len();
@@ -2892,5 +2926,107 @@ impl<'a> PayloadReader<'a> {
             child_count: self.read_u32()?,
             children_offset: self.read_i32()?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compressed_controller_bitset_times_use_header_sized_payload() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.push(5);
+        payload.push(6);
+        payload.push(2);
+        payload.push(0);
+        payload.push(0);
+        payload.push(1);
+        payload.extend_from_slice(&[0, 0]);
+
+        payload.extend_from_slice(&[0xaa; 18]);
+        payload.extend_from_slice(&[0, 0]);
+
+        payload.extend_from_slice(&10u16.to_le_bytes());
+        payload.extend_from_slice(&26u16.to_le_bytes());
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.extend_from_slice(&0x0009u16.to_le_bytes());
+        payload.extend_from_slice(&0x0001u16.to_le_bytes());
+        payload.extend_from_slice(&[0, 0]);
+
+        let position = [0xbb; 12];
+        payload.extend_from_slice(&position);
+
+        let parsed = decode_controller_compressed(&payload, true).unwrap();
+        let ChunkPayload::Controller(ControllerChunk::Compressed(controller)) = parsed else {
+            panic!("expected compressed controller");
+        };
+
+        assert_eq!(controller.rotation.unwrap().data.len(), 18);
+        assert_eq!(controller.rotation_times.unwrap().data.len(), 10);
+        assert_eq!(controller.position.unwrap().data, position.as_slice());
+    }
+
+    #[test]
+    fn bitset_key_time_size_rejects_count_mismatch() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&10u16.to_le_bytes());
+        data.extend_from_slice(&26u16.to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        let reader = PayloadReader::new(ChunkType::Controller, &data);
+
+        let err = controller_key_time_size(&reader, 6, 3).unwrap_err();
+
+        assert!(matches!(err, ChunkPayloadError::InvalidChunkLayout { .. }));
+    }
+
+    #[test]
+    fn material_name_0804_single_material_reads_physicalize_type() {
+        let mut payload = vec![0; 64];
+        let name = b"{DAC16C37-C086-52B6-8272-45C6F2494DD1}";
+        payload[..name.len()].copy_from_slice(name);
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.extend_from_slice(&(-1i32).to_le_bytes());
+
+        let parsed = decode_material_name(0x0804, &payload).unwrap();
+        let ChunkPayload::MaterialName(material) = parsed else {
+            panic!("expected material-name chunk");
+        };
+
+        assert_eq!(
+            material.name.as_str(),
+            "{DAC16C37-C086-52B6-8272-45C6F2494DD1}"
+        );
+        assert_eq!(material.sub_material_count, 0);
+        assert_eq!(material.physicalize_types, vec![-1]);
+        assert!(material.sub_material_names.is_empty());
+        assert!(material.opaque_tail.is_empty());
+    }
+
+    #[test]
+    fn material_name_slots_preserve_loader_compatible_opaque_tail() {
+        let mut payload = vec![0; 128];
+        payload[..8].copy_from_slice(b"root.mtl");
+        payload.extend_from_slice(&1i32.to_le_bytes());
+        payload.extend_from_slice(&4096i32.to_le_bytes());
+        payload.extend_from_slice(b"child\0");
+        payload.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+        let parsed = decode_material_name(0x0802, &payload).unwrap();
+        let ChunkPayload::MaterialName(material) = parsed else {
+            panic!("expected material-name chunk");
+        };
+
+        assert_eq!(material.name.as_str(), "root.mtl");
+        assert_eq!(material.sub_material_count, 1);
+        assert_eq!(material.physicalize_types, vec![4096]);
+        assert_eq!(material.sub_material_names[0].as_str(), "child");
+        assert_eq!(material.opaque_tail, vec![0xde, 0xad, 0xbe, 0xef]);
     }
 }

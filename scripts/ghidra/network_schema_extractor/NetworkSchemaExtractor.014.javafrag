@@ -1,0 +1,900 @@
+    private void observeHandlerConstructorWrite(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        Integer writeOffset = trackedThisOffsetForMemoryOperand(instruction, 0, state.registers);
+        if (writeOffset == null) {
+            return;
+        }
+
+        TrackedValue source = trackedOperandValue(instruction, 1, state);
+        if (source != null && source.address != null && isVtableLike(source.address)) {
+            return;
+        }
+
+        Integer handlerOffset = enclosingHandlerOffset(writeOffset, state);
+        if (handlerOffset == null) {
+            return;
+        }
+
+        int relativeOffset = writeOffset - handlerOffset;
+        if (relativeOffset <= 0) {
+            return;
+        }
+
+        HandlerConstructorWrite write = new HandlerConstructorWrite(
+            instruction.getMinAddress(),
+            handlerOffset,
+            relativeOffset,
+            memoryWriteWidthBits(instruction),
+            null,
+            trackedValueKind(source),
+            trackedValueDisplay(source),
+            trackedValueHex(source),
+            NetworkSchemaX86.operandText(instruction, 1),
+            "constructor-memory-write");
+        state.constructorWritesByHandlerOffset
+            .computeIfAbsent(handlerOffset, ignored -> new ArrayList<>())
+            .add(write);
+    }
+
+    private void observeHandlerConstructorMemsetCall(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        String targetName = fullFunctionName(functionAtOrContaining(callTarget(instruction)));
+        if (targetName == null || !targetName.toLowerCase(Locale.ROOT).contains("memset")) {
+            return;
+        }
+
+        TrackedValue destination = state.registers.get("RCX");
+        TrackedValue fill = state.registers.get("RDX");
+        TrackedValue length = state.registers.get("R8");
+        if (destination == null || destination.thisOffset == null ||
+            length == null || length.immediate == null) {
+            return;
+        }
+
+        Integer handlerOffset = enclosingHandlerOffset(destination.thisOffset, state);
+        if (handlerOffset == null) {
+            return;
+        }
+
+        int relativeOffset = destination.thisOffset - handlerOffset;
+        if (relativeOffset <= 0 || length.immediate > Integer.MAX_VALUE) {
+            return;
+        }
+
+        HandlerConstructorWrite write = new HandlerConstructorWrite(
+            instruction.getMinAddress(),
+            handlerOffset,
+            relativeOffset,
+            8,
+            length.immediate.intValue(),
+            trackedValueKind(fill),
+            trackedValueDisplay(fill),
+            trackedValueHex(fill),
+            "memset",
+            "constructor-memset");
+        state.constructorWritesByHandlerOffset
+            .computeIfAbsent(handlerOffset, ignored -> new ArrayList<>())
+            .add(write);
+    }
+
+    private Integer enclosingHandlerOffset(int writeOffset, ForwardArgState state) {
+        Integer best = null;
+        Integer next = null;
+        for (Integer candidate : state.vtablesByThisOffset.keySet()) {
+            if (candidate < writeOffset && (best == null || candidate > best)) {
+                best = candidate;
+            }
+            else if (candidate > writeOffset && (next == null || candidate < next)) {
+                next = candidate;
+            }
+        }
+        if (best == null) {
+            return null;
+        }
+
+        int relativeOffset = writeOffset - best;
+        int maxSpan = FIELD_HANDLER_CONSTRUCTOR_WRITE_SPAN;
+        if (next != null) {
+            maxSpan = Math.min(maxSpan, next - best - 1);
+        }
+        return relativeOffset <= maxSpan ? best : null;
+    }
+
+    private Integer memoryWriteWidthBits(Instruction instruction) {
+        String text = NetworkSchemaX86.operandText(instruction, 0);
+        if (text == null) {
+            return null;
+        }
+        String normalized = text.toLowerCase(Locale.ROOT);
+        if (normalized.contains("zmmword ptr")) {
+            return 512;
+        }
+        if (normalized.contains("ymmword ptr")) {
+            return 256;
+        }
+        if (normalized.contains("xmmword ptr")) {
+            return 128;
+        }
+        if (normalized.contains("oword ptr") || normalized.contains("dqword ptr")) {
+            return 128;
+        }
+        if (normalized.contains("qword ptr")) {
+            return 64;
+        }
+        if (normalized.contains("dword ptr")) {
+            return 32;
+        }
+        if (normalized.contains("word ptr")) {
+            return 16;
+        }
+        if (normalized.contains("byte ptr")) {
+            return 8;
+        }
+        return null;
+    }
+
+    private String trackedValueKind(TrackedValue value) {
+        if (value == null) {
+            return "unknown";
+        }
+        if (value.fieldName != null) {
+            return "field-name";
+        }
+        if (value.immediate != null) {
+            return "immediate";
+        }
+        if (value.address != null) {
+            return "address";
+        }
+        if (value.thisOffset != null) {
+            return "this-offset";
+        }
+        if (value.stackOffset != null) {
+            return "stack-offset";
+        }
+        if (value.baseKey != null) {
+            return "base-offset";
+        }
+        return "unknown";
+    }
+
+    private String trackedValueDisplay(TrackedValue value) {
+        if (value == null) {
+            return null;
+        }
+        if (value.fieldName != null) {
+            return value.fieldName;
+        }
+        if (value.immediate != null) {
+            return Long.toUnsignedString(value.immediate);
+        }
+        if (value.address != null) {
+            return formatAddress(value.address);
+        }
+        if (value.thisOffset != null) {
+            return value.expression;
+        }
+        if (value.stackOffset != null) {
+            return value.expression;
+        }
+        if (value.baseKey != null) {
+            return value.expression;
+        }
+        return value.expression;
+    }
+
+    private String trackedValueHex(TrackedValue value) {
+        if (value == null || value.immediate == null) {
+            return null;
+        }
+        return "0x" + Long.toHexString(value.immediate);
+    }
+
+    private void observeVectorFieldHandlerConstructorCall(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        Address call = resolvedCodeTarget(callTarget(instruction));
+        if (!isVectorConstructorIteratorCall(call)) {
+            return;
+        }
+
+        TrackedValue base = state.registers.get("RCX");
+        TrackedValue elementSize = state.registers.get("RDX");
+        TrackedValue elementCount = state.registers.get("R8");
+        TrackedValue constructorValue = state.registers.get("R9");
+        if (base == null || base.thisOffset == null ||
+            elementSize == null || elementSize.immediate == null ||
+            elementCount == null || elementCount.immediate == null ||
+            constructorValue == null || constructorValue.address == null) {
+            return;
+        }
+
+        long count = elementCount.immediate;
+        long size = elementSize.immediate;
+        if (count <= 0 || count > 256 || size <= 0 || size > 0x1000) {
+            return;
+        }
+
+        Address constructor = resolvedCodeTarget(constructorValue.address);
+        List<VtableWrite> writes = constructorVtableWrites(constructor);
+        if (writes.isEmpty()) {
+            return;
+        }
+
+        for (long i = 0; i < count; i++) {
+            long elementOffset = base.thisOffset.longValue() + (i * size);
+            if (elementOffset < Integer.MIN_VALUE || elementOffset > Integer.MAX_VALUE) {
+                continue;
+            }
+            for (VtableWrite write : writes) {
+                if (write.thisOffset == null) {
+                    continue;
+                }
+                Integer fieldOffset = NetworkSchemaX86.addOffsets((int)elementOffset, write.thisOffset.longValue());
+                if (fieldOffset == null) {
+                    continue;
+                }
+                state.vtablesByThisOffset.put(fieldOffset, write.vtable);
+                Address writeConstructor = write.function == null ? constructor : write.function;
+                state.handlerConstructionsByThisOffset.put(
+                    fieldOffset,
+                    new HandlerConstruction(
+                        prefixPattern("vector-constructor", write.pattern),
+                        instruction.getMinAddress(),
+                        writeConstructor,
+                        fullFunctionName(functionAtOrContaining(writeConstructor)),
+                        write.vtable));
+            }
+        }
+    }
+
+    private void observeFieldHandlerConstructorCall(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        TrackedValue receiver = state.registers.get("RCX");
+        if (receiver == null || receiver.thisOffset == null) {
+            return;
+        }
+
+        Address constructor = resolvedCodeTarget(callTarget(instruction));
+        List<VtableWrite> writes = constructorVtableWrites(constructor);
+        if (writes.isEmpty()) {
+            return;
+        }
+
+        for (VtableWrite write : writes) {
+            if (write.thisOffset == null) {
+                continue;
+            }
+            Integer fieldOffset = NetworkSchemaX86.addOffsets(receiver.thisOffset, write.thisOffset.longValue());
+            if (fieldOffset == null) {
+                continue;
+            }
+            state.vtablesByThisOffset.put(fieldOffset, write.vtable);
+            Address writeConstructor = write.function == null ? constructor : write.function;
+            state.handlerConstructionsByThisOffset.put(
+                fieldOffset,
+                new HandlerConstruction(
+                    prefixPattern("constructor-call", write.pattern),
+                    instruction.getMinAddress(),
+                    writeConstructor,
+                    fullFunctionName(functionAtOrContaining(writeConstructor)),
+                    write.vtable));
+        }
+    }
+
+    private Address fieldHandlerConstructorVtable(Address address) {
+        Address target = resolvedCodeTarget(address);
+        if (!isExecutableAddress(target)) {
+            return null;
+        }
+
+        String key = addressCacheKey("field-handler-constructor-vtable", target);
+        if (fieldHandlerConstructorVtableCache.containsKey(key)) {
+            return fieldHandlerConstructorVtableCache.get(key);
+        }
+
+        Address result = recoverFieldHandlerConstructorVtable(target);
+        fieldHandlerConstructorVtableCache.put(key, result);
+        return result;
+    }
+
+    private Address recoverFieldHandlerConstructorVtable(Address target) {
+        for (VtableWrite write : constructorVtableWrites(target)) {
+            if (write.thisOffset != null && write.thisOffset == 0) {
+                return write.vtable;
+            }
+        }
+        return null;
+    }
+
+    private Address vtableWrittenToTrackedThis(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        if (!"MOV".equals(NetworkSchemaX86.upperMnemonic(instruction))) {
+            return null;
+        }
+
+        Integer offset = trackedThisOffsetForMemoryOperand(instruction, 0, state.registers);
+        TrackedValue source = trackedOperandValue(instruction, 1, state);
+        if (offset != null && offset == 0 && source != null &&
+            source.address != null && isVtableLike(source.address)) {
+            return source.address;
+        }
+        return null;
+    }
+
+    private void observeArgumentAssignment(Instruction instruction, ArgState state) {
+        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+        if (mnemonic == null) {
+            return;
+        }
+
+        String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+        if (destination != null) {
+            if ("RDX".equals(destination) && state.nameAddress == null) {
+            Address address = referencedAddress(instruction, 1);
+                StringDecode decoded = readFieldNameAtOrThroughPointer(address);
+                if (decoded != null) {
+                    state.nameAddress = decoded.address;
+                    state.name = decoded.value;
+                }
+            }
+            else if ("R8".equals(destination) && !state.handlerKnown) {
+                state.handlerKnown = true;
+                Integer offset = memoryDisplacementForThisLikeOperand(instruction, 1);
+                if (offset != null) {
+                    state.handlerOffset = offset;
+                    state.handlerExpression = "this+0x" + Integer.toHexString(offset);
+                }
+                else {
+                    Address address = referencedAddress(instruction, 1);
+                    if (address != null) {
+                        state.handlerExpression = formatAddress(address);
+                    }
+                    else {
+                        state.handlerExpression = NetworkSchemaX86.operandText(instruction, 1);
+                    }
+                }
+            }
+            else if ("R9".equals(destination) && !state.groupKnown) {
+                Long immediate = literalOperandValue(instruction, 1);
+                if (immediate != null) {
+                    state.group = immediate.intValue();
+                    state.groupKnown = true;
+                }
+            }
+        }
+
+        if (!state.groupKnown &&
+            ("XOR".equals(mnemonic) || "SUB".equals(mnemonic)) &&
+            "R9".equals(NetworkSchemaX86.registerOperand(instruction, 0)) &&
+            "R9".equals(NetworkSchemaX86.registerOperand(instruction, 1))) {
+            state.group = 0;
+            state.groupKnown = true;
+        }
+    }
+
+    private Address findInstanceVtable(Function function) {
+        HashMap<String, Address> registerAddresses = new HashMap<>();
+        int count = 0;
+        for (Instruction instruction : functionInstructions(function)) {
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+            if ("LEA".equals(mnemonic) && destination != null) {
+                Address address = referencedAddress(instruction, 1);
+                if (address != null && isVtableLike(address)) {
+                    registerAddresses.put(destination, address);
+                }
+                else {
+                    registerAddresses.remove(destination);
+                }
+                continue;
+            }
+
+            if ("MOV".equals(mnemonic)) {
+                String source = NetworkSchemaX86.registerOperand(instruction, 1);
+                if (destination != null) {
+                    if (source != null && registerAddresses.containsKey(source)) {
+                        registerAddresses.put(destination, registerAddresses.get(source));
+                    }
+                    else {
+                        registerAddresses.remove(destination);
+                    }
+                }
+
+                if (source != null && registerAddresses.containsKey(source) &&
+                    isZeroDisplacementMemoryOperand(instruction, 0)) {
+                    return registerAddresses.get(source);
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean isZeroDisplacementMemoryOperand(Instruction instruction, int operandIndex) {
+        Object[] objects = NetworkSchemaX86.operandObjects(instruction, operandIndex);
+        boolean hasRegister = false;
+        int displacement = 0;
+        for (Object object : objects) {
+            if (object instanceof Register register) {
+                String name = NetworkSchemaX86.canonicalRegisterName(register.getName());
+                if (!"RSP".equals(name) && !"RIP".equals(name)) {
+                    hasRegister = true;
+                }
+            }
+            else if (object instanceof Scalar scalar) {
+                long value = scalar.getSignedValue();
+                if (value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE) {
+                    displacement += (int)value;
+                }
+            }
+        }
+        return hasRegister && displacement == 0;
+    }
+
+    private JsonArray virtualFunctionSlots(Address vtable) {
+        JsonArray result = new JsonArray();
+        if (vtable == null) {
+            return result;
+        }
+        for (int i = 0; i < I_FRAGMENT_VTABLE_SCAN_SLOTS; i++) {
+            Address slotAddress = vtable.add(i * 8L);
+            Address target = readPointer(slotAddress);
+            if (target == null || !isExecutableAddress(target)) {
+                break;
+            }
+            result.add(virtualFunctionSlot(i, null, target));
+        }
+        return result;
+    }
+
+    private JsonObject virtualFunctionSlot(int slotIndex, String slotName, Address target) {
+        JsonObject slot = new JsonObject();
+        slot.addProperty("slot", slotIndex);
+        slot.addProperty("slotOffset", "0x" + Integer.toHexString(slotIndex * 8));
+        NetworkSchemaJson.add(slot, "name", slotName);
+        slot.addProperty("address", formatAddress(target));
+        Address resolvedTarget = resolvedCodeTarget(target);
+        if (target != null && resolvedTarget != null && !target.equals(resolvedTarget)) {
+            NetworkSchemaJson.add(slot, "target", formatAddress(resolvedTarget));
+        }
+        else {
+            Address tailTarget = terminalJumpTarget(target);
+            if (tailTarget != null && !tailTarget.equals(target)) {
+                NetworkSchemaJson.add(slot, "target", formatAddress(tailTarget));
+            }
+        }
+        Function function = functionAtOrContaining(target);
+        if (function != null) {
+            slot.addProperty("function", fullFunctionName(function));
+        }
+        return slot;
+    }
+
+    private JsonObject vtableDiagnostics(
+        Address vtable,
+        FieldHandlerShape handlerShape,
+        int maxSlots,
+        FragmentMetadataEvidence fragmentMetadata) {
+
+        JsonObject object = new JsonObject();
+        NetworkSchemaJson.add(object, "symbol", primarySymbolName(vtable));
+        object.addProperty("executableSlotCount", countExecutableVtableSlots(vtable, maxSlots));
+
+        String role = null;
+        String roleSource = null;
+        if (handlerShape != null) {
+            role = handlerShape.kind;
+            roleSource = handlerShape.containerWireShape == null
+                ? "field-handler-shape"
+                : "replicated-container-shape";
+        }
+        else if (fragmentMetadata != null) {
+            role = "fragment";
+            roleSource = "fragment-metadata-vtable-slots";
+        }
+        else {
+            role = vtableRoleFromSymbol(primarySymbolName(vtable));
+            roleSource = role == null ? null : "vtable-symbol";
+        }
+
+        if (role == null) {
+            role = "unknown";
+            roleSource = "unclassified";
+        }
+        object.addProperty("role", role);
+        object.addProperty("roleSource", roleSource);
+        return object;
+    }
+
+    private int countExecutableVtableSlots(Address vtable, int maxSlots) {
+        if (vtable == null || maxSlots <= 0) {
+            return 0;
+        }
+        int count = 0;
+        for (int slot = 0; slot < maxSlots; slot++) {
+            Address target = readPointer(vtable.add(slot * 8L));
+            if (target == null || !isExecutableAddress(target)) {
+                break;
+            }
+            count++;
+        }
+        return count;
+    }
+
+    private String primarySymbolName(Address address) {
+        if (!isProgramAddress(address)) {
+            return null;
+        }
+        Symbol symbol = currentProgram.getSymbolTable().getPrimarySymbol(address);
+        return symbol == null ? null : symbol.getName(true);
+    }
+
+    private String vtableRoleFromSymbol(String symbolName) {
+        if (symbolName == null || symbolName.isBlank()) {
+            return null;
+        }
+        String normalized = normalizeQualifiedNetworkTypeName(symbolName);
+        if (normalized == null) {
+            normalized = symbolName;
+        }
+        if (normalized.contains("ReplicatedContainer") ||
+            normalized.contains("ReplicatedMapFieldHandler") ||
+            normalized.contains("ReplicatedVectorFieldHandler") ||
+            normalized.contains("ReplicatedSetFieldHandler")) {
+            return "replicated-container";
+        }
+        if (normalized.contains("ReplicatedFieldHandler") ||
+            normalized.contains("DeltaCompressedReplicatedFieldHandler") ||
+            normalized.contains("DeltaCompressedCounterHandler") ||
+            normalized.contains("FloatTimerDeltaReplicatedField") ||
+            normalized.contains("DynamicDeltaReplicatedFieldHandler")) {
+            return "replicated-field";
+        }
+        if (normalized.contains("FixedReplicatedState")) {
+            return "fixed-replicated-state";
+        }
+        if (normalized.contains("IFragment")) {
+            return "fragment";
+        }
+        if (normalized.contains("IMessage")) {
+            return "message";
+        }
+        return null;
+    }
+
+    private FragmentMetadataEvidence fragmentMetadataEvidence(Address vtable) {
+        if (vtable == null) {
+            return null;
+        }
+
+        Address isMetadataTarget = readPointer(vtable.add(I_FRAGMENT_IS_METADATA_SLOT * 8L));
+        Address categoryTarget = readPointer(vtable.add(I_FRAGMENT_GET_CATEGORY_SLOT * 8L));
+        Address isMetadataFunction = resolvedCodeTarget(isMetadataTarget);
+        Address categoryFunction = resolvedCodeTarget(categoryTarget);
+        Long isMetadataValue = constantReturnValue(isMetadataFunction);
+        Long categoryValue = constantReturnValue(categoryFunction);
+        if (isMetadataValue == null && categoryValue == null) {
+            return null;
+        }
+
+        FragmentMetadataEvidence evidence = new FragmentMetadataEvidence();
+        evidence.isMetadataFunction = isMetadataFunction;
+        evidence.isMetadata = isMetadataValue == null ? null : isMetadataValue != 0;
+        evidence.categoryFunction = categoryFunction;
+        if (categoryValue != null && categoryValue >= 0 && categoryValue <= 0xff) {
+            evidence.categoryValue = categoryValue.intValue();
+            evidence.category = fragmentCategoryName(evidence.categoryValue);
+        }
+        return evidence;
+    }
+
+    private Long constantReturnValue(Address address) {
+        if (!isExecutableAddress(address)) {
+            return null;
+        }
+
+        Long returnValue = null;
+        int count = 0;
+        for (Instruction instruction : linearInstructions(address, CONSTANT_RETURN_SCAN_LIMIT)) {
+            if (count++ >= CONSTANT_RETURN_SCAN_LIMIT) {
+                break;
+            }
+
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if (mnemonic == null) {
+                return null;
+            }
+            if ("RET".equals(mnemonic)) {
+                return returnValue;
+            }
+            if ("CCH".equals(mnemonic) || "NOP".equals(mnemonic)) {
+                continue;
+            }
+
+            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+            if (("XOR".equals(mnemonic) || "SUB".equals(mnemonic)) &&
+                isReturnRegister(destination) &&
+                destination.equals(NetworkSchemaX86.registerOperand(instruction, 1))) {
+                returnValue = 0L;
+                continue;
+            }
+
+            if ("MOV".equals(mnemonic) && isReturnRegister(destination)) {
+            Long immediate = literalOperandValue(instruction, 1);
+                if (immediate == null) {
+                    return null;
+                }
+                returnValue = immediate;
+                continue;
+            }
+
+            if ("MOVZX".equals(mnemonic) && isReturnRegister(destination)) {
+                String source = NetworkSchemaX86.registerOperand(instruction, 1);
+                if (!isReturnRegister(source) || returnValue == null) {
+                    return null;
+                }
+                continue;
+            }
+
+            if ("ADD".equals(mnemonic) || "SUB".equals(mnemonic)) {
+                String stackRegister = NetworkSchemaX86.registerOperand(instruction, 0);
+                if ("RSP".equals(stackRegister) && literalOperandValue(instruction, 1) != null) {
+                    continue;
+                }
+            }
+
+            return null;
+        }
+        return null;
+    }
+
+    private boolean isReturnRegister(String register) {
+        return "AL".equals(register) || "RAX".equals(register);
+    }
+
+    private String fragmentCategoryName(Integer value) {
+        if (value == null) {
+            return null;
+        }
+        return switch (value) {
+            case 0 -> "Uncategorized";
+            case 1 -> "PlayerCharacter";
+            case 2 -> "NonPlayerCharacter";
+            case 3 -> "ImportantNonPlayerCharacter";
+            case 4 -> "Spell";
+            case 5 -> "Projectile";
+            case 6 -> "Buildable";
+            case 7 -> "NumCategories";
+            default -> null;
+        };
+    }
+
+    private AzRttiEvidence decodeAzRttiFromVtable(Address vtable) {
+        if (vtable == null) {
+            return null;
+        }
+
+        AzRttiEvidence evidence = new AzRttiEvidence();
+        evidence.source = "instance-vtable";
+        evidence.address = formatAddress(vtable);
+
+        for (int slot = 0; slot < AZ_RTTI_VTABLE_SCAN_SLOTS; slot++) {
+            if (isVtableSlotBoundary(vtable, slot)) {
+                break;
+            }
+            Address slotPointer = readPointer(vtable.add(slot * 8L));
+            Address body = resolvedCodeTarget(slotPointer);
+            if (!isExecutableAddress(body)) {
+                break;
+            }
+
+            TypeIdDecode typeId = decodeAzRttiTypeIdProvider(slotPointer);
+            if (typeId != null) {
+                if (evidence.typeId == null) {
+                    evidence.typeId = typeId.typeId;
+                }
+                evidence.providers.add(typeId.toJson(slot));
+            }
+
+            TypeNameDecode typeName = decodeAzRttiTypeNameProvider(slotPointer);
+            if (typeName != null) {
+                if (evidence.typeName == null) {
+                    evidence.typeName = typeName.typeName;
+                    evidence.typeNameSource = typeName.typeNameSource;
+                }
+                evidence.providers.add(typeName.toJson(slot));
+            }
+        }
+
+        String preferredTypeId = preferredAzRttiTypeId(evidence);
+        if (preferredTypeId != null) {
+            evidence.typeId = preferredTypeId;
+        }
+        return evidence.hasIdentity() ? evidence : null;
+    }
+
+    private String preferredAzRttiTypeId(AzRttiEvidence evidence) {
+        if (evidence == null) {
+            return null;
+        }
+
+        String typeName = providerTypeNameAtSlot(evidence, 1);
+        String isTypeOfTypeId = providerTypeIdAtSlot(evidence, 2);
+        if (isLikelyRuntimeTypeName(typeName) && isTypeOfTypeId != null) {
+            return isTypeOfTypeId;
+        }
+
+        String actualTypeId = providerTypeIdAtSlot(evidence, 0);
+        if (actualTypeId != null) {
+            return actualTypeId;
+        }
+        return evidence.typeId;
+    }
+
+    private boolean isVtableSlotBoundary(Address vtable, int slot) {
+        if (slot <= 0 || vtable == null) {
+            return false;
+        }
+
+        Address slotAddress = vtable.add(slot * 8L);
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(slotAddress);
+        return references.hasNext();
+    }
+
+    private TypeIdDecode decodeAzRttiTypeIdProvider(Address function) {
+        Address provider = resolvedCodeTarget(function);
+        return decodeTypeIdFromReferencedStrings(function, provider, true);
+    }
+
+    private TypeIdDecode decodeDirectTypeIdProvider(Address function) {
+        Address provider = resolvedCodeTarget(function);
+        return decodeTypeIdFromReferencedStrings(function, provider, true);
+    }
+
+    private TypeIdDecode decodeTypeIdFromReferencedStrings(
+        Address function,
+        Address provider,
+        boolean followProviderCalls) {
+        Deque<HandlerScanFrame> stack = new ArrayDeque<>();
+        stack.addFirst(new HandlerScanFrame(provider, 0));
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        LinkedHashSet<String> seenTypeIds = new LinkedHashSet<>();
+        TypeIdDecode result = null;
+
+        while (!stack.isEmpty()) {
+            HandlerScanFrame frame = stack.removeFirst();
+            Address current = resolvedCodeTarget(frame.address);
+            if (!isExecutableAddress(current) || !seen.add(current.toString())) {
+                continue;
+            }
+
+            List<Instruction> instructions =
+                reachableInstructions(current, REGISTRY_HANDLER_RTTI_SCAN_LIMIT);
+            if (instructions.isEmpty()) {
+                continue;
+            }
+
+            ArrayList<Address> callees = new ArrayList<>();
+            boolean foundUuidInFrame = false;
+            for (Instruction instruction : instructions) {
+                for (Address target : referencedAddresses(instruction)) {
+                    String sourceKind = "referencedString";
+                    String uuid = canonicalUuidFromExactString(readPrintableString(target));
+                    if (uuid == null && isNativeUuidLiteralReference(instruction, target)) {
+                        uuid = canonicalUuidFromNativeUuidLiteral(target);
+                        if (uuid == null) {
+                            incrementCount(nativeUuidRejectCounts, "bad-layout");
+                        }
+                        else if (!registryTypeIds.contains(normalizeUuid(uuid))) {
+                            incrementCount(nativeUuidRejectCounts, "not-in-registry");
+                            uuid = null;
+                        }
+                        sourceKind = "nativeUuidLiteral";
+                    }
+                    if (uuid == null) {
+                        continue;
+                    }
+
+                    foundUuidInFrame = true;
+                    String source = frame.depth == 0
+                        ? sourceKind
+                        : "providerCall" + Character.toUpperCase(sourceKind.charAt(0)) +
+                            sourceKind.substring(1);
+                    incrementCount(typeIdSourceCounts, source);
+                    if (result == null) {
+                        result = new TypeIdDecode();
+                        result.function = function;
+                        result.provider = current;
+                        result.typeId = uuid;
+                        result.typeIdSource = source;
+                        result.sourceAddress = target;
+                    }
+                    if (seenTypeIds.add(uuid)) {
+                        int chainIndex = result.typeIdChain.size();
+                        result.typeIdChain.add(typeIdChainEntry(
+                            current,
+                            uuid,
+                            source,
+                            target,
+                            frame.depth,
+                            chainIndex));
+                    }
+                }
+
+                if (!followProviderCalls || frame.depth >= REGISTRY_HANDLER_RTTI_CALL_DEPTH ||
+                    foundUuidInFrame ||
+                    !instruction.getFlowType().isCall()) {
+                    continue;
+                }
+                Address target = resolvedCodeTarget(callTarget(instruction));
+                if (isExecutableAddress(target)) {
+                    callees.add(target);
+                }
+            }
+            for (int i = callees.size() - 1; i >= 0; i--) {
+                stack.addFirst(new HandlerScanFrame(callees.get(i), frame.depth + 1));
+            }
+        }
+        return result;
+    }
+
+    private JsonObject typeIdChainEntry(
+        Address provider,
+        String typeId,
+        String source,
+        Address sourceAddress,
+        int depth,
+        int chainIndex) {
+
+        JsonObject object = new JsonObject();
+        NetworkSchemaJson.add(object, "provider", formatAddress(provider));
+        NetworkSchemaJson.add(object, "typeId", typeId);
+        NetworkSchemaJson.add(object, "typeIdSource", source);
+        NetworkSchemaJson.add(object, "sourceAddress", formatAddress(sourceAddress));
+        object.addProperty("depth", depth);
+        object.addProperty("chainIndex", chainIndex);
+        object.addProperty("azRttiRole", chainIndex == 0 ? "self" : "baseOrInterface");
+        return object;
+    }
+
+    private TypeNameDecode decodeTypeNameFromReferencedStrings(Address function, Address provider) {
+        List<Instruction> instructions =
+            linearInstructions(provider, REGISTRY_HANDLER_RTTI_SCAN_LIMIT);
+        if (instructions.isEmpty()) {
+            return null;
+        }
+
+        TypeNameDecode best = null;
+        int bestScore = Integer.MIN_VALUE;
+        for (Instruction instruction : instructions) {
+            for (Address target : referencedAddresses(instruction)) {
+                String name = readPrintableString(target);
+                if (!isLikelyRuntimeTypeName(name)) {
+                    continue;
+                }
+                int score = runtimeTypeNameScore(name);
+                if (best != null && score < bestScore) {
+                    continue;
+                }
+
+                TypeNameDecode decode = new TypeNameDecode();
+                decode.function = function;
+                decode.provider = provider;
+                decode.typeName = name;
+                decode.typeNameSource = "referencedString";
+                decode.typeNameAddress = target;
+                best = decode;

@@ -193,6 +193,8 @@ pub struct BlendSpace {
     pub dimensions: Vec<BlendSpaceDimension>,
     pub examples: Vec<BlendSpaceExample>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timewarp_groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pseudo_examples: Vec<BlendSpacePseudoExample>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_extraction: Vec<BlendSpaceAdditionalExtraction>,
@@ -224,6 +226,8 @@ impl BlendSpace {
 pub struct CombinedBlendSpace {
     pub idle_to_move: bool,
     pub dimensions: Vec<CombinedBlendSpaceDimension>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timewarp_groups: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_extraction: Vec<BlendSpaceAdditionalExtraction>,
     pub blend_spaces: Vec<BlendSpaceReference>,
@@ -267,6 +271,10 @@ pub struct CombinedBlendSpaceDimension {
     pub parameter_id: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unresolved_parameter_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f32>,
     pub locked: bool,
     pub parameter_scale: f32,
     pub choose_blend_space: bool,
@@ -417,26 +425,32 @@ impl BlendSpaceSourceTransform {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        let kind = BlendSpaceXmlKind::from_source_path(input.source_path).ok_or_else(|| {
+        let _source_kind = BlendSpaceXmlKind::from_source_path(input.source_path).ok_or_else(|| {
             BlendSpaceSourceTransformError::UnsupportedPath {
                 path: normalize_source_path(input.source_path),
             }
         })?;
+        let source_path = normalize_source_path(input.source_path);
 
-        let bytes = match kind {
-            BlendSpaceXmlKind::BlendSpace => BlendSpaceSource::from_legacy_with_motion_resolver(
-                input.source_path,
-                input.bytes,
-                resolver,
-            )?
-            .to_ron_bytes()?,
-            BlendSpaceXmlKind::CombinedBlendSpace => {
-                CombinedBlendSpaceSource::from_legacy_with_motion_resolver(
-                    input.source_path,
-                    input.bytes,
-                    resolver,
-                )?
-                .to_ron_bytes()?
+        let (kind, bytes) = match parse_blend_space_document(input.bytes)? {
+            BlendSpaceDocument::BlendSpace(blend_space) => {
+                let mut source = BlendSpaceSource {
+                    source_path: source_path.clone(),
+                    blend_space,
+                };
+                source.resolve_animation_references(resolver);
+                (BlendSpaceXmlKind::BlendSpace, source.to_ron_bytes()?)
+            }
+            BlendSpaceDocument::CombinedBlendSpace(combined_blend_space) => {
+                let mut source = CombinedBlendSpaceSource {
+                    source_path,
+                    combined_blend_space,
+                };
+                source.resolve_animation_references(resolver);
+                (
+                    BlendSpaceXmlKind::CombinedBlendSpace,
+                    source.to_ron_bytes()?,
+                )
             }
         };
 
@@ -598,6 +612,7 @@ impl BlendSpaceParseState {
                     idle_to_move: false,
                     dimensions: Vec::new(),
                     examples: Vec::new(),
+                    timewarp_groups: Vec::new(),
                     pseudo_examples: Vec::new(),
                     additional_extraction: Vec::new(),
                     annotations: Vec::new(),
@@ -610,6 +625,7 @@ impl BlendSpaceParseState {
                 self.combined_blend_space = Some(CombinedBlendSpace {
                     idle_to_move: false,
                     dimensions: Vec::new(),
+                    timewarp_groups: Vec::new(),
                     additional_extraction: Vec::new(),
                     blend_spaces: Vec::new(),
                     motion_combinations: Vec::new(),
@@ -657,6 +673,21 @@ impl BlendSpaceParseState {
                     }
                 }
                 Ok(BlendSpaceElement::VegParams)
+            }
+            "TimewarpGroup" => {
+                ensure_attributes(reader, event, "TimewarpGroup", &[b"Name"])?;
+                let group_name = attr_required_string_ci(reader, event, b"Name", "Name")?;
+                match kind {
+                    BlendSpaceXmlKind::BlendSpace => {
+                        self.blend_space_mut()?.timewarp_groups.push(group_name);
+                    }
+                    BlendSpaceXmlKind::CombinedBlendSpace => {
+                        self.combined_blend_space_mut()?
+                            .timewarp_groups
+                            .push(group_name);
+                    }
+                }
+                Ok(BlendSpaceElement::TimewarpGroup)
             }
             "ExampleList" if matches!(kind, BlendSpaceXmlKind::BlendSpace) => {
                 ensure_no_attributes(reader, event, "ExampleList")?;
@@ -758,6 +789,10 @@ impl BlendSpaceParseState {
                         b"Name",
                         b"locked",
                         b"Locked",
+                        b"min",
+                        b"Min",
+                        b"max",
+                        b"Max",
                         b"ParaScale",
                         b"paraScale",
                         b"ChooseBlendSpace",
@@ -775,6 +810,8 @@ impl BlendSpaceParseState {
                         ),
                         name,
                         parameter_id,
+                        min: attr_f32_ci(reader, event, b"min", "min")?,
+                        max: attr_f32_ci(reader, event, b"max", "max")?,
                         locked: attr_bool_ci(reader, event, b"locked", "locked")?.unwrap_or(false),
                         parameter_scale: attr_f32_ci(reader, event, b"ParaScale", "ParaScale")?
                             .unwrap_or(1.0),
@@ -1080,6 +1117,7 @@ enum BlendSpaceElement {
     Joint,
     Threshold,
     VegParams,
+    TimewarpGroup,
     Unknown,
 }
 
@@ -1106,6 +1144,7 @@ impl BlendSpaceElement {
             Self::Joint => "Joint",
             Self::Threshold => "THRESHOLD",
             Self::VegParams => "VEGPARAMS",
+            Self::TimewarpGroup => "TimewarpGroup",
             Self::Unknown => "unknown",
         }
     }
@@ -1706,6 +1745,67 @@ mod tests {
                 dimension_count: 1
             } if attribute == "SetPara1"
         ));
+    }
+
+    #[test]
+    fn parametric_blend_space_preserves_nested_timewarp_groups() {
+        let source = BlendSpaceSource::from_legacy(
+            "animations/test.bspace",
+            br#"<ParaGroup>
+ <Dimensions><Param Name="MoveSpeed"/></Dimensions>
+ <ExampleList><Example AName="idle" SetPara0="0"/></ExampleList>
+ <TimewarpGroup Name="legacy_locomotion"/>
+</ParaGroup>"#,
+        )
+        .unwrap();
+
+        assert_eq!(source.blend_space.timewarp_groups, ["legacy_locomotion"]);
+    }
+
+    #[test]
+    fn combined_blend_space_preserves_legacy_dimension_bounds() {
+        let source = CombinedBlendSpaceSource::from_legacy(
+            "animations/test.comb",
+            br#"<CombinedBlendSpace>
+ <Dimensions><Param name="DesiredFacing" min="-3.15" max="3.15" ChooseBlendSpace="1" locked="1"/></Dimensions>
+ <BlendSpaces>
+  <BlendSpace AName="animations/test_left.bspace"/>
+  <BlendSpace AName="animations/test_right.bspace"/>
+ </BlendSpaces>
+</CombinedBlendSpace>"#,
+        )
+        .unwrap();
+
+        let dimension = &source.combined_blend_space.dimensions[0];
+        assert_eq!(dimension.min, Some(-3.15));
+        assert_eq!(dimension.max, Some(3.15));
+        assert!(dimension.choose_blend_space);
+        assert!(dimension.locked);
+    }
+
+    #[test]
+    fn transform_accepts_parametric_blend_space_with_comb_extension() {
+        let artifact = BlendSpaceSourceTransform
+            .transform(BlendSpaceSourceInput {
+                source_path: "animations/scorpion_turn_comb_blend.comb",
+                bytes: br#"<ParaGroup>
+ <Dimensions><Param Name="DesiredFacing" Min="-3.1500001" Max="3.1500001" Cells="20" locked="1"/></Dimensions>
+ <ExampleList>
+  <Example SetPara0="0" AName="scorpion_combat_idle_short"/>
+ </ExampleList>
+</ParaGroup>"#,
+            })
+            .unwrap();
+
+        assert_eq!(
+            artifact.path,
+            "animations/scorpion_turn_comb_blend.bspace.ron"
+        );
+        assert_eq!(artifact.schema, BLEND_SPACE_SOURCE_SCHEMA);
+
+        let source = BlendSpaceSource::from_ron_bytes(&artifact.bytes).unwrap();
+        assert_eq!(source.blend_space.dimensions[0].name, "DesiredFacing");
+        assert_eq!(source.blend_space.examples.len(), 1);
     }
 
     fn sample_bspace() -> &'static [u8] {

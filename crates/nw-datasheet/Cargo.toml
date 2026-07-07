@@ -11,6 +11,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+crc32fast.workspace = true
+nw-asset.workspace = true
 nw-localization.workspace = true
 serde.workspace = true
 thiserror.workspace = true

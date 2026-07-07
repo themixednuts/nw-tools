@@ -1,0 +1,900 @@
+                    return null;
+                }
+                sawThisBase = true;
+                thisBaseOffset = value.thisOffset;
+            }
+            else if (value.immediate != null) {
+                Long scaled = scaledImmediate(value.immediate, term.scale);
+                if (scaled == null || scaled < Integer.MIN_VALUE || scaled > Integer.MAX_VALUE) {
+                    return null;
+                }
+                Integer nextDisplacement = NetworkSchemaX86.addOffsets(displacement, scaled);
+                if (nextDisplacement == null) {
+                    return null;
+                }
+                displacement = nextDisplacement;
+            }
+            else {
+                return null;
+            }
+        }
+
+        if (!sawThisBase) {
+            return null;
+        }
+        Integer withMemoryDisplacement = NetworkSchemaX86.addOffsets(thisBaseOffset, memory.displacement);
+        return withMemoryDisplacement == null
+            ? null
+            : NetworkSchemaX86.addOffsets(withMemoryDisplacement, displacement);
+    }
+
+    private TrackedValue trackedBaseOffsetForMemoryOperand(
+        Instruction instruction,
+        int operandIndex,
+        Map<String, TrackedValue> registers) {
+
+        MemoryAddress memory = NetworkSchemaX86.memoryAddress(instruction, operandIndex);
+        if (memory == null) {
+            return null;
+        }
+        String trackedBaseKey = null;
+        int trackedBaseOffset = 0;
+        int displacement = 0;
+        for (MemoryTerm term : memory.terms) {
+            if ("RIP".equals(term.register) || "RSP".equals(term.register)) {
+                return null;
+            }
+
+            TrackedValue value = registers.get(term.register);
+            if (value == null) {
+                return null;
+            }
+            if (value.baseKey != null && value.baseOffset != null) {
+                if (trackedBaseKey != null || term.scale != 1) {
+                    return null;
+                }
+                trackedBaseKey = value.baseKey;
+                trackedBaseOffset = value.baseOffset;
+            }
+            else if (value.immediate != null) {
+                Long scaled = scaledImmediate(value.immediate, term.scale);
+                if (scaled == null || scaled < Integer.MIN_VALUE || scaled > Integer.MAX_VALUE) {
+                    return null;
+                }
+                Integer nextDisplacement = NetworkSchemaX86.addOffsets(displacement, scaled);
+                if (nextDisplacement == null) {
+                    return null;
+                }
+                displacement = nextDisplacement;
+            }
+            else {
+                return null;
+            }
+        }
+
+        if (trackedBaseKey == null) {
+            return null;
+        }
+        Integer withMemoryDisplacement = NetworkSchemaX86.addOffsets(trackedBaseOffset, memory.displacement);
+        Integer totalOffset = withMemoryDisplacement == null
+            ? null
+            : NetworkSchemaX86.addOffsets(withMemoryDisplacement, displacement);
+        return totalOffset == null
+            ? null
+            : TrackedValue.baseOffset(trackedBaseKey, totalOffset);
+    }
+
+    private Long trackedImmediateForMemoryOperand(
+        Instruction instruction,
+        int operandIndex,
+        Map<String, TrackedValue> registers) {
+
+        MemoryAddress memory = NetworkSchemaX86.memoryAddress(instruction, operandIndex);
+        if (memory == null) {
+            return null;
+        }
+        long result = memory.displacement;
+        for (MemoryTerm term : memory.terms) {
+            if ("RIP".equals(term.register) || "RSP".equals(term.register)) {
+                return null;
+            }
+
+            TrackedValue value = registers.get(term.register);
+            if (value == null || value.immediate == null) {
+                return null;
+            }
+            Long scaled = scaledImmediate(value.immediate, term.scale);
+            if (scaled == null) {
+                return null;
+            }
+            try {
+                result = Math.addExact(result, scaled);
+            }
+            catch (ArithmeticException ignored) {
+                return null;
+            }
+        }
+        return result;
+    }
+
+    private Long scaledImmediate(long value, int scale) {
+        try {
+            return Math.multiplyExact(value, (long)scale);
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private <K, V> void putOrRemove(
+        Map<K, V> map,
+        K key,
+        V value) {
+
+        if (key == null) {
+            return;
+        }
+        if (value == null) {
+            map.remove(key);
+        }
+        else {
+            map.put(key, value);
+        }
+    }
+
+    private void clearVolatileRegisters(Map<String, TrackedValue> registers) {
+        registers.remove("RAX");
+        registers.remove("RCX");
+        registers.remove("RDX");
+        registers.remove("R8");
+        registers.remove("R9");
+        registers.remove("R10");
+        registers.remove("R11");
+    }
+
+    private void clearVolatileAllocatorDispatchRegisters(ForwardArgState state) {
+        state.allocatorDispatchRegisters.remove("RAX");
+        state.allocatorDispatchRegisters.remove("RCX");
+        state.allocatorDispatchRegisters.remove("RDX");
+        state.allocatorDispatchRegisters.remove("R8");
+        state.allocatorDispatchRegisters.remove("R9");
+        state.allocatorDispatchRegisters.remove("R10");
+        state.allocatorDispatchRegisters.remove("R11");
+    }
+
+    private void swapAllocatorDispatchRegisters(
+        ForwardArgState state,
+        String left,
+        String right) {
+
+        boolean leftTracked = state.allocatorDispatchRegisters.contains(left);
+        boolean rightTracked = state.allocatorDispatchRegisters.contains(right);
+        if (rightTracked) {
+            state.allocatorDispatchRegisters.add(left);
+        }
+        else {
+            state.allocatorDispatchRegisters.remove(left);
+        }
+        if (leftTracked) {
+            state.allocatorDispatchRegisters.add(right);
+        }
+        else {
+            state.allocatorDispatchRegisters.remove(right);
+        }
+    }
+
+    private Long literalOperandValue(Instruction instruction, int operandIndex) {
+        String text = NetworkSchemaX86.operandText(instruction, operandIndex);
+        if (text != null && text.contains("[")) {
+            return null;
+        }
+        return NetworkSchemaX86.immediateValue(instruction, operandIndex);
+    }
+
+    private Function functionContaining(Address address) {
+        if (address == null) {
+            return null;
+        }
+        String key = addressCacheKey("function-containing", address);
+        if (functionLookupCache.containsKey(key)) {
+            return functionLookupCache.get(key);
+        }
+        Function function = currentProgram.getFunctionManager().getFunctionContaining(address);
+        functionLookupCache.put(key, function);
+        return function;
+    }
+
+    private Function functionAtOrContaining(Address address) {
+        if (address == null) {
+            return null;
+        }
+        String key = addressCacheKey("function-at-or-containing", address);
+        if (functionLookupCache.containsKey(key)) {
+            return functionLookupCache.get(key);
+        }
+        Function function = currentProgram.getFunctionManager().getFunctionAt(address);
+        if (function != null) {
+            functionLookupCache.put(key, function);
+            return function;
+        }
+        function = currentProgram.getFunctionManager().getFunctionContaining(address);
+        if (function == null) {
+            function = createKnownFunction(address);
+        }
+        functionLookupCache.put(key, function);
+        return function;
+    }
+
+    private Function functionExactlyAt(Address address) {
+        if (address == null) {
+            return null;
+        }
+        String key = addressCacheKey("function-exactly-at", address);
+        if (functionLookupCache.containsKey(key)) {
+            return functionLookupCache.get(key);
+        }
+        Function function = currentProgram.getFunctionManager().getFunctionAt(address);
+        if (function == null) {
+            function = createKnownFunction(address);
+        }
+        functionLookupCache.put(key, function);
+        return function;
+    }
+
+    private Function functionByFullName(String name) {
+        if (name == null || name.isEmpty()) {
+            return null;
+        }
+        ensureFunctionByFullNameCacheLoaded();
+        Address address = functionByFullNameCache.get(name);
+        return address == null ? null : functionExactlyAt(address);
+    }
+
+    private Function directTypeUnmarshalFunction(String nativeType, String functionName) {
+        Function exact = functionByFullName(functionName);
+        if (exact != null) {
+            return exact;
+        }
+
+        Function readBufferVariant = directTypeReadBufferUnmarshalFunction(functionName);
+        if (readBufferVariant != null) {
+            return readBufferVariant;
+        }
+
+        String leaf = NetworkSchemaText.sourceTypeLeaf(nativeType);
+        if (leaf == null || leaf.isEmpty()) {
+            return null;
+        }
+        ensureFunctionByFullNameCacheLoaded();
+
+        Function selected = null;
+        for (Map.Entry<String, Address> entry : functionByFullNameCache.entrySet()) {
+            String owner = directUnmarshalOwnerFullName(entry.getKey());
+            if (!leaf.equals(NetworkSchemaText.sourceTypeLeaf(owner))) {
+                continue;
+            }
+            Function candidate = functionExactlyAt(entry.getValue());
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.getEntryPoint().equals(candidate.getEntryPoint())) {
+                recordNestedTypeShapeReject("ambiguous-direct-type-unmarshal-function");
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Function directTypeReadBufferUnmarshalFunction(String functionName) {
+        if (functionName == null || !functionName.endsWith("::Unmarshal")) {
+            return null;
+        }
+        String readBufferName = functionName + "FromReadBuffer";
+        Function exact = functionByFullName(readBufferName);
+        if (exact != null) {
+            return exact;
+        }
+
+        String owner = directUnmarshalOwnerFullName(readBufferName);
+        String ownerLeaf = NetworkSchemaText.sourceTypeLeaf(owner);
+        if (ownerLeaf == null || ownerLeaf.isEmpty()) {
+            return null;
+        }
+        ensureFunctionByFullNameCacheLoaded();
+
+        Function selected = null;
+        for (Map.Entry<String, Address> entry : functionByFullNameCache.entrySet()) {
+            String candidateName = entry.getKey();
+            if (!candidateName.endsWith("::UnmarshalFromReadBuffer")) {
+                continue;
+            }
+            String candidateOwner = directUnmarshalOwnerFullName(candidateName);
+            if (!ownerLeaf.equals(NetworkSchemaText.sourceTypeLeaf(candidateOwner))) {
+                continue;
+            }
+            Function candidate = functionExactlyAt(entry.getValue());
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.getEntryPoint().equals(candidate.getEntryPoint())) {
+                recordNestedTypeShapeReject("ambiguous-direct-type-read-buffer-unmarshal-function");
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private void ensureFunctionByFullNameCacheLoaded() {
+        if (functionByFullNameCacheLoaded) {
+            return;
+        }
+        Iterator<Function> functions = currentProgram.getFunctionManager().getFunctions(true);
+        while (functions.hasNext()) {
+            Function function = functions.next();
+            String fullName = functionFullName(function);
+            if (fullName != null && !functionByFullNameCache.containsKey(fullName)) {
+                functionByFullNameCache.put(fullName, function.getEntryPoint());
+            }
+        }
+        functionByFullNameCacheLoaded = true;
+    }
+
+    private Function createKnownFunction(Address address) {
+        if (!isExecutableAddress(address)) {
+            return null;
+        }
+        try {
+            if (currentProgram.getListing().getInstructionAt(address) == null) {
+                disassemble(address);
+            }
+            Function existing = currentProgram.getFunctionManager().getFunctionAt(address);
+            if (existing != null) {
+                return existing;
+            }
+            String name = "FUN_" + Long.toHexString(address.getOffset());
+            Function created = createFunction(address, name);
+            if (created != null) {
+                recoveredFunctionCount++;
+            }
+            return created;
+        }
+        catch (Exception ignored) {
+            recoveredFunctionFailureCount++;
+            return null;
+        }
+    }
+
+    private List<Instruction> functionInstructions(Function function) {
+        if (function == null) {
+            return List.of();
+        }
+        String key = functionCacheKey("instructions", function);
+        List<Instruction> cached = functionInstructionsCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        ArrayList<Instruction> instructions = new ArrayList<>();
+        for (Instruction instruction :
+            currentProgram.getListing().getInstructions(function.getBody(), true)) {
+            instructions.add(instruction);
+        }
+        List<Instruction> cachedInstructions = Collections.unmodifiableList(instructions);
+        functionInstructionsCache.put(key, cachedInstructions);
+        return cachedInstructions;
+    }
+
+    private List<Instruction> linearInstructions(Address address, int limit) {
+        if (!isExecutableAddress(address) || limit <= 0) {
+            return List.of();
+        }
+
+        ArrayList<Instruction> instructions = new ArrayList<>();
+        Address cursor = address;
+        for (int i = 0; i < limit; i++) {
+            Instruction instruction = currentProgram.getListing().getInstructionAt(cursor);
+            if (instruction == null) {
+                break;
+            }
+            instructions.add(instruction);
+
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if (mnemonic != null &&
+                (mnemonic.startsWith("RET") ||
+                    mnemonic.startsWith("INT") ||
+                    "CCH".equals(mnemonic))) {
+                break;
+            }
+
+            Address fallThrough = instruction.getFallThrough();
+            if (fallThrough == null || !isProgramAddress(fallThrough)) {
+                break;
+            }
+            cursor = fallThrough;
+        }
+        return instructions;
+    }
+
+    private List<Instruction> reachableInstructions(Address address, int limit) {
+        if (!isExecutableAddress(address) || limit <= 0) {
+            return List.of();
+        }
+
+        ArrayList<Instruction> instructions = new ArrayList<>();
+        Deque<Address> pending = new ArrayDeque<>();
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        pending.add(address);
+
+        while (!pending.isEmpty() && instructions.size() < limit) {
+            Address cursor = pending.removeFirst();
+            while (instructions.size() < limit) {
+                if (!isExecutableAddress(cursor) || !seen.add(cursor.toString())) {
+                    break;
+                }
+
+                Instruction instruction = currentProgram.getListing().getInstructionAt(cursor);
+                if (instruction == null) {
+                    break;
+                }
+                instructions.add(instruction);
+
+                String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+                if (mnemonic != null &&
+                    (mnemonic.startsWith("RET") ||
+                        mnemonic.startsWith("INT") ||
+                        "CCH".equals(mnemonic))) {
+                    break;
+                }
+
+                Address fallThrough = instruction.getFallThrough();
+                boolean branch = false;
+                boolean unconditionalJump = false;
+                if (!instruction.getFlowType().isCall()) {
+                    Address[] flows = instruction.getFlows();
+                    if (flows != null) {
+                        for (Address flow : flows) {
+                            if (!isExecutableAddress(flow) || flow.equals(fallThrough)) {
+                                continue;
+                            }
+                            branch = true;
+                            if (!seen.contains(flow.toString())) {
+                                pending.addFirst(flow);
+                            }
+                        }
+                    }
+                    unconditionalJump = mnemonic != null && mnemonic.startsWith("JMP");
+                }
+
+                if (fallThrough == null ||
+                    !isProgramAddress(fallThrough) ||
+                    unconditionalJump ||
+                    (branch && fallThrough.equals(cursor))) {
+                    break;
+                }
+                cursor = fallThrough;
+            }
+        }
+        return instructions;
+    }
+
+    private Address parseCapturedAddress(String value) {
+        if (value == null || value.isEmpty()) {
+            return null;
+        }
+        Matcher moduleMatch = MODULE_ADDR_RE.matcher(value);
+        if (moduleMatch.matches()) {
+            long offset = Long.parseUnsignedLong(moduleMatch.group("offset"), 16);
+            return currentProgram.getImageBase().add(offset);
+        }
+        Matcher hexMatch = HEX_ADDR_RE.matcher(value);
+        if (hexMatch.matches()) {
+            long address = Long.parseUnsignedLong(hexMatch.group("addr"), 16);
+            return currentProgram.getAddressFactory()
+                .getDefaultAddressSpace()
+                .getAddress(address);
+        }
+        return null;
+    }
+
+    private Address firstAddress(Address left, Address right) {
+        return left != null ? left : right;
+    }
+
+    private Address readPointer(Address address) {
+        if (!isProgramAddress(address)) {
+            return null;
+        }
+        String key = addressCacheKey("pointer", address);
+        if (pointerReadCache.containsKey(key)) {
+            return pointerReadCache.get(key);
+        }
+        try {
+            long value = getLong(address);
+            Address pointer = value == 0
+                ? null
+                : currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(value);
+            pointerReadCache.put(key, pointer);
+            return pointer;
+        }
+        catch (Exception ignored) {
+            pointerReadCache.put(key, null);
+            return null;
+        }
+    }
+
+    private boolean isProgramAddress(Address address) {
+        return address != null && currentProgram.getMemory().contains(address);
+    }
+
+    private String readPrintableString(Address address) {
+        if (!isProgramAddress(address)) {
+            return null;
+        }
+        try {
+            StringBuilder builder = new StringBuilder();
+            for (int i = 0; i < 512; i++) {
+                int value = getByte(address.add(i)) & 0xff;
+                if (value == 0) {
+                    return builder.toString();
+                }
+                if (value < 0x20 || value > 0x7e) {
+                    return null;
+                }
+                builder.append((char)value);
+            }
+        }
+        catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private StringDecode readFieldNameAtOrThroughPointer(Address address) {
+        if (!isProgramAddress(address)) {
+            return null;
+        }
+
+        String direct = readPrintableString(address);
+        if (isFieldName(direct)) {
+            return new StringDecode(address, direct);
+        }
+
+        Address pointer = readPointer(address);
+        if (isProgramAddress(pointer)) {
+            String indirect = readPrintableString(pointer);
+            if (isFieldName(indirect)) {
+                return new StringDecode(pointer, indirect);
+            }
+        }
+
+        return null;
+    }
+
+    private boolean isFieldName(String value) {
+        if (value == null || value.isEmpty() || value.length() > 160) {
+            return false;
+        }
+        if (value.contains("::") || value.contains("AZStd::")) {
+            return false;
+        }
+        char first = value.charAt(0);
+        return Character.isLetter(first) || first == '_' || first == '[';
+    }
+
+    private boolean isPlausibleTypeName(String value) {
+        if (value == null || value.isEmpty() || value.length() > 512) {
+            return false;
+        }
+        if (isAllocatorTypeName(value)) {
+            return false;
+        }
+        if (canonicalUuidFromString(value) != null) {
+            return false;
+        }
+        if (isUuidLikeFragment(value)) {
+            return false;
+        }
+        if (value.startsWith("{") || value.indexOf('/') >= 0 || value.indexOf('\\') >= 0) {
+            return false;
+        }
+        if (value.indexOf(' ') >= 0 && value.indexOf('<') < 0) {
+            return false;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) < 0x20) {
+                return false;
+            }
+        }
+        return value.matches(".*[A-Za-z_].*");
+    }
+
+    private boolean isUuidLikeFragment(String value) {
+        if (value == null || value.length() < 32 || value.length() > 38) {
+            return false;
+        }
+
+        int hyphens = 0;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '-') {
+                hyphens++;
+                continue;
+            }
+            boolean hex =
+                (c >= '0' && c <= '9') ||
+                    (c >= 'a' && c <= 'f') ||
+                    (c >= 'A' && c <= 'F');
+            if (!hex) {
+                return false;
+            }
+        }
+        return hyphens >= 4;
+    }
+
+    private String canonicalUuidFromString(String value) {
+        if (value == null) {
+            return null;
+        }
+        Matcher matcher = UUID_RE.matcher(value);
+        return matcher.find() ? matcher.group(1).toUpperCase(Locale.ROOT) : null;
+    }
+
+    private String canonicalUuidFromExactString(String value) {
+        if (value == null) {
+            return null;
+        }
+        Matcher matcher = UUID_RE.matcher(value.trim());
+        return matcher.matches() ? matcher.group(1).toUpperCase(Locale.ROOT) : null;
+    }
+
+    private boolean isNativeUuidLiteralReference(Instruction instruction, Address target) {
+        if (!"LEA".equals(NetworkSchemaX86.upperMnemonic(instruction)) || target == null) {
+            return false;
+        }
+        Address source = referencedAddress(instruction, 1);
+        return target.equals(source);
+    }
+
+    private String canonicalUuidFromNativeUuidLiteral(Address address) {
+        if (!isProgramAddress(address)) {
+            return null;
+        }
+
+        byte[] uuid = new byte[16];
+        try {
+            boolean braced = (getByte(address) & 0xff) == '{';
+            int start = braced ? 1 : 0;
+            int nibble = 0;
+            for (int i = 0; i < 36; i++) {
+                int value = getByte(address.add(start + (long)i)) & 0xff;
+                if (isUuidDashOffset(i)) {
+                    if (value != '-') {
+                        return null;
+                    }
+                    continue;
+                }
+                int parsed = nativeUuidNibble(value);
+                if (parsed < 0) {
+                    return null;
+                }
+                int index = nibble / 2;
+                if ((nibble & 1) == 0) {
+                    uuid[index] = (byte)(parsed << 4);
+                }
+                else {
+                    uuid[index] |= (byte)parsed;
+                }
+                nibble++;
+            }
+            if (nibble != 32) {
+                return null;
+            }
+            if (braced) {
+                if ((getByte(address.add(37L)) & 0xff) != '}') {
+                    return null;
+                }
+                int terminator = getByte(address.add(38L)) & 0xff;
+                if (terminator != 0) {
+                    return null;
+                }
+            }
+            else {
+                int terminator = getByte(address.add(36L)) & 0xff;
+                if (terminator != 0) {
+                    return null;
+                }
+            }
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+
+        return uuidToString(uuid).toUpperCase(Locale.ROOT);
+    }
+
+    private boolean isUuidDashOffset(int offset) {
+        return offset == 8 || offset == 13 || offset == 18 || offset == 23;
+    }
+
+    private int nativeUuidNibble(int value) {
+        if (value >= '0' && value <= '9') {
+            return value - '0';
+        }
+        if (value >= 'A' && value <= 'F') {
+            return value - 'A' + 10;
+        }
+        if (value >= 'a' && value <= 'f') {
+            return value - 'a' + 10;
+        }
+        return -1;
+    }
+
+    private String uuidToString(byte[] uuid) {
+        return String.format(
+            Locale.ROOT,
+            "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            uuid[0] & 0xff,
+            uuid[1] & 0xff,
+            uuid[2] & 0xff,
+            uuid[3] & 0xff,
+            uuid[4] & 0xff,
+            uuid[5] & 0xff,
+            uuid[6] & 0xff,
+            uuid[7] & 0xff,
+            uuid[8] & 0xff,
+            uuid[9] & 0xff,
+            uuid[10] & 0xff,
+            uuid[11] & 0xff,
+            uuid[12] & 0xff,
+            uuid[13] & 0xff,
+            uuid[14] & 0xff,
+            uuid[15] & 0xff);
+    }
+
+    private String normalizeUuid(String value) {
+        String uuid = canonicalUuidFromString(value);
+        return uuid == null ? null : uuid.toUpperCase(Locale.ROOT);
+    }
+
+    private boolean uuidEquals(String left, String right) {
+        String lhs = normalizeUuid(left);
+        String rhs = normalizeUuid(right);
+        return lhs != null && lhs.equals(rhs);
+    }
+
+    private String formatAddress(Address address) {
+        if (address == null) {
+            return null;
+        }
+        long base = currentProgram.getImageBase().getOffset();
+        long value = address.getOffset();
+        if (Long.compareUnsigned(value, base) >= 0) {
+            return "NewWorld+0x" + Long.toHexString(value - base);
+        }
+        return "0x" + Long.toHexString(value);
+    }
+
+    private String fullFunctionName(Function function) {
+        if (function == null) {
+            return null;
+        }
+        String key = functionCacheKey("function-name", function);
+        String cached = functionNameCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        String name = functionFullName(function);
+        functionNameCache.put(key, name);
+        return name;
+    }
+
+    private String functionFullName(Function function) {
+        if (function == null) {
+            return null;
+        }
+        String namespace = function.getParentNamespace() == null
+            ? null
+            : function.getParentNamespace().getName(true);
+        if (namespace == null || namespace.isEmpty() || "Global".equals(namespace)) {
+            return function.getName();
+        }
+        return namespace + "::" + function.getName();
+    }
+
+    private JsonObject object(JsonObject object, String name) {
+        if (object == null) {
+            return null;
+        }
+        JsonElement element = object.get(name);
+        return element != null && element.isJsonObject() ? element.getAsJsonObject() : null;
+    }
+
+    private JsonArray array(JsonObject object, String name) {
+        if (object == null) {
+            return null;
+        }
+        JsonElement element = object.get(name);
+        return element != null && element.isJsonArray() ? element.getAsJsonArray() : null;
+    }
+
+    private String string(JsonObject object, String name) {
+        if (object == null) {
+            return null;
+        }
+        JsonElement element = object.get(name);
+        return stringValue(element);
+    }
+
+    private String stringValue(JsonElement element) {
+        if (element == null || element.isJsonNull()) {
+            return null;
+        }
+        String value = element.getAsString();
+        return value == null || value.isEmpty() ? null : value;
+    }
+
+    private Integer integer(JsonObject object, String name) {
+        if (object == null) {
+            return null;
+        }
+        JsonElement element = object.get(name);
+        if (element == null || element.isJsonNull()) {
+            return null;
+        }
+        return element.getAsInt();
+    }
+
+    private Long longValue(JsonObject object, String name) {
+        if (object == null) {
+            return null;
+        }
+        JsonElement element = object.get(name);
+        if (element == null || element.isJsonNull()) {
+            return null;
+        }
+        try {
+            return element.getAsLong();
+        }
+        catch (Exception ignored) {
+            try {
+                return Long.parseLong(element.getAsString());
+            }
+            catch (Exception ignoredAgain) {
+                return null;
+            }
+        }
+    }
+
+    private Boolean bool(JsonObject object, String name) {
+        if (object == null) {
+            return null;
+        }
+        JsonElement element = object.get(name);
+        if (element == null || element.isJsonNull()) {
+            return null;
+        }
+        try {
+            return element.getAsBoolean();
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private String firstNonEmpty(String left, String right) {
+        return left != null && !left.isEmpty() ? left : right;
+    }
+
+    private Integer firstNonNull(Integer left, Integer right) {
+        return left != null ? left : right;
+    }
+
+    private final class RegistryEntry {
+        String uuid;
+        String name;
+        Integer index;
+        Integer typeIndex;
+        String storageAddress;
+        String baseVtable;
+        String vtable;
+        String destructor;

@@ -892,6 +892,27 @@ mod tests {
         assert!((times[2] - (2.0 / 30.0)).abs() < 0.000001);
     }
 
+    #[test]
+    fn decodes_bitset_times_to_seconds() {
+        let data = [
+            10u16.to_le_bytes(),
+            26u16.to_le_bytes(),
+            3u16.to_le_bytes(),
+            0x0009u16.to_le_bytes(),
+            0x0001u16.to_le_bytes(),
+        ]
+        .concat();
+        let track = ControllerTrack {
+            format: 6,
+            key_count: 3,
+            data: &data,
+        };
+
+        let times = decode_times(track, 1.0, 0.0).unwrap();
+
+        assert_eq!(times, [10.0, 13.0, 26.0]);
+    }
+
     fn assert_quat_close(actual: [f32; 4], expected: [f32; 4], epsilon: f32) {
         for (actual, expected) in actual.into_iter().zip(expected) {
             assert!(

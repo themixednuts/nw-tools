@@ -370,13 +370,14 @@ pub enum LayerKind {
     Procedural,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LayerBlend {
     pub exit_time: Option<f32>,
     pub start_time: Option<f32>,
     pub duration: Option<f32>,
     pub curve_type: Option<i32>,
     pub terminal: Option<bool>,
+    pub flags: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -938,6 +939,7 @@ fn parse_layer_blend(
             b"Duration",
             b"CurveType",
             b"terminal",
+            b"flags",
         ],
     )?;
     Ok(LayerBlend {
@@ -946,6 +948,7 @@ fn parse_layer_blend(
         duration: attr_f32(reader, event, &[b"Duration"], "Duration")?,
         curve_type: attr_i32(reader, event, &[b"CurveType"], "CurveType")?,
         terminal: attr_bool(reader, event, &[b"terminal"], "terminal")?,
+        flags: attr_value(reader, event, &[b"flags"])?.map(Cow::into_owned),
     })
 }
 

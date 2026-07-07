@@ -1,0 +1,900 @@
+// Extract network type and field registration evidence from typeregistry.json and Ghidra.
+//@category NewWorld
+
+import java.io.File;
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.DataTypeComponent;
+import ghidra.program.model.data.Structure;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.Parameter;
+import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.pcode.HighFunction;
+import ghidra.program.model.pcode.PcodeOp;
+import ghidra.program.model.pcode.PcodeOpAST;
+import ghidra.program.model.pcode.Varnode;
+import ghidra.program.model.pcode.VarnodeAST;
+import ghidra.program.model.scalar.Scalar;
+import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.ReferenceIterator;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolIterator;
+
+public class NetworkSchemaExtractor extends GhidraScript {
+    private final NetworkSchemaAddressFormatter addressFormatter = this::formatAddress;
+    private final NetworkSchemaTextParser textParser;
+
+    public NetworkSchemaExtractor() {
+        textParser = new NetworkSchemaTextParser(TEXT_PARSE_CACHE_LIMIT);
+    }
+
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260707-landclaim-progression-shape-pass";
+    private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
+    private static final long REGISTER_FIELD_RVA = 0x1775c60L;
+    private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;
+    private static final long FIND_ACTOR_FACET_TARGET_RVA = 0x16bcba0L;
+    private static final long FIND_ACTOR_FACET_TARGET_MESSAGE_COPY_RVA = 0x16bcbc2L;
+    private static final long FIND_ACTOR_FACET_TARGET_TARGET_OFFSET_RVA = 0x16bcc0aL;
+    private static final long FIND_ACTOR_FACET_TARGET_TARGET_ADD_RVA = 0x16bcc10L;
+    private static final long FIND_ACTOR_FACET_TARGET_TARGET_LOAD_RVA = 0x16bcd01L;
+    private static final long FIND_ACTOR_FACET_TARGET_TARGET_NAME_RVA = 0x16bcd04L;
+    private static final long REPLICATED_STATE_CONSTRUCTOR_RVA = 0x162f3e0L;
+    private static final long TYPE_REGISTRY_REGISTER_TYPE_RVA = 0x61a9740L;
+    private static final long QUEUE_REGISTRATION_HOOK_RVA = 0x61a95c0L;
+    private static final int BACKWARD_ARGUMENT_SCAN_LIMIT = 48;
+    private static final int VTABLE_SCAN_LIMIT = 96;
+    private static final int DIRECT_FIELD_TABLE_SCAN_LIMIT = 12000;
+    private static final int FIXED_FIELD_TABLE_ENTRY_SIZE = 0x10;
+    private static final int REPLICATED_STATE_ATTRIBUTE_VECTOR_OFFSET = 0x680;
+    private static final int VECTOR_CURRENT_POINTER_OFFSET = 0x8;
+    private static final int AZ_RTTI_VTABLE_SCAN_SLOTS = 24;
+    private static final int FIELD_HANDLER_SCALAR_VTABLE_SLOTS = 14;
+    private static final int FIELD_HANDLER_CONTAINER_VTABLE_SLOTS = 20;
+    private static final int FIELD_HANDLER_CONSTRUCTOR_WRITE_SPAN = 0x200;
+    private static final int FIELD_HANDLER_MARSHAL_SLOT = 5;
+    private static final int FIELD_HANDLER_UNMARSHAL_SLOT = 6;
+    private static final int FIELD_HANDLER_MARSHAL_FULL_SLOT = 14;
+    private static final int FIELD_HANDLER_UNMARSHAL_FULL_SLOT = 15;
+    private static final int MESSAGE_HANDLER_VTABLE_SLOTS = 12;
+    private static final int MESSAGE_HANDLER_CREATE_INSTANCE_SLOT = 2;
+    private static final int MESSAGE_HANDLER_MARSHAL_SLOT = 4;
+    private static final int MESSAGE_HANDLER_UNMARSHAL_SLOT = 5;
+    private static final int MESSAGE_HANDLER_PROVIDER_SCAN_LIMIT = 512;
+    private static final int I_FRAGMENT_IS_METADATA_SLOT = 12;
+    private static final int I_FRAGMENT_GET_CATEGORY_SLOT = 13;
+    private static final int I_FRAGMENT_VTABLE_SCAN_SLOTS = 24;
+    private static final int CONSTANT_RETURN_SCAN_LIMIT = 12;
+    private static final int REGISTRY_HANDLER_RTTI_CALL_DEPTH = 3;
+    private static final int REGISTRY_HANDLER_RTTI_FUNCTION_LIMIT = 96;
+    private static final int REGISTRY_HANDLER_RTTI_SCAN_LIMIT = 160;
+    private static final int REGISTRATION_FAILURE_SAMPLE_LIMIT = 256;
+    private static final int SOURCE_SIGNATURE_XREF_SCAN_BYTES = 0x40;
+    private static final int SOURCE_SIGNATURE_CALL_GRAPH_DEPTH = 2;
+    private static final int SOURCE_SIGNATURE_CALL_GRAPH_LIMIT = 32;
+    private static final int PCODE_VALUE_DEPTH_LIMIT = 16;
+    private static final int PCODE_ALIAS_DESCENDANT_LIMIT = 96;
+    private static final int NESTED_DIRECT_TYPE_DEPTH_LIMIT = 4;
+    private static final int NESTED_DIRECT_TYPE_MEMBER_LIMIT = 32;
+    private static final int CONTAINER_VALUE_SHAPE_REJECT_SAMPLE_LIMIT = 96;
+    private static final int FIELD_WIRE_SHAPE_SAMPLE_LIMIT = 96;
+    private static final int CONSTRUCTOR_VTABLE_RECURSION_LIMIT = 48;
+    private static final int INHERITED_FORWARD_STATE_RECURSION_LIMIT = 48;
+    private static final int DECOMPILE_CACHE_LIMIT =
+        envInt("NW_NETWORK_SCHEMA_DECOMPILE_CACHE_LIMIT", 2048);
+    private static final int HIGH_FUNCTION_CACHE_LIMIT =
+        envInt("NW_NETWORK_SCHEMA_HIGH_FUNCTION_CACHE_LIMIT", 512);
+    private static final int FUNCTION_INSTRUCTION_CACHE_LIMIT =
+        envInt("NW_NETWORK_SCHEMA_INSTRUCTION_CACHE_LIMIT", 8192);
+    private static final int FUNCTION_LOOKUP_CACHE_LIMIT =
+        envInt("NW_NETWORK_SCHEMA_FUNCTION_CACHE_LIMIT", 32768);
+    private static final int TEXT_PARSE_CACHE_LIMIT =
+        envInt("NW_NETWORK_SCHEMA_TEXT_PARSE_CACHE_LIMIT", 2048);
+    private static final String[] FIELD_HANDLER_SLOT_NAMES = {
+        "Destructor",
+        "IsDefaultValue",
+        "SetCurrentValueAsDefault",
+        "IsDirty",
+        "HasValue",
+        "Marshal",
+        "Unmarshal",
+        "MergeAndUpdateSequence",
+        "ResetHasNewNetworkData",
+        "GetLastModified",
+        "SetLastModified",
+        "IsFieldValid",
+        "HasNewNetworkData",
+        "LogToStream",
+        "MarshalFull",
+        "UnmarshalFull",
+        "CopyContainer",
+        "ApplyChangeSet",
+        "SummarizeChanges",
+        "GetSize",
+    };
+    private static final Pattern MODULE_ADDR_RE =
+        Pattern.compile("(?i)^NewWorld\\+0x(?<offset>[0-9a-f]+)$");
+    private static final Pattern HEX_ADDR_RE =
+        Pattern.compile("(?i)^0x(?<addr>[0-9a-f]+)$");
+    private static final Pattern UUID_RE = Pattern.compile(
+        "(?i)\\{?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\}?");
+    private static final Pattern RTTI_HELPER_NAME_RE =
+        Pattern.compile("AZ::Internal::RttiHelper<(?<type>.+)>::");
+    private static final Pattern STORAGE_OFFSET_RE =
+        Pattern.compile("\\b(?<base>[A-Za-z_][A-Za-z0-9_]*)\\s*\\+\\s*(?<offset>0x[0-9a-fA-F]+|\\d+)");
+    private static final Pattern POINTER_STORE_RE =
+        Pattern.compile("\\*\\((?<type>[^)]*\\*)\\)\\s*(?<target>[^=;]+?)\\s*=\\s*(?<rhs>[^;]+);");
+    private static final String NIL_TYPE_ID = "00000000-0000-0000-0000-000000000000";
+    private static final String CHAR_TYPE_ID = "3AB0037F-AF8D-48CE-BCA0-A170D18B2C03";
+    private static final String S8_TYPE_ID = "58422C0E-1E47-4854-98E6-34098F6FE12D";
+    private static final String SHORT_TYPE_ID = "B8A56D56-A10D-4DCE-9F63-405EE243DD3C";
+    private static final String INT_TYPE_ID = "72039442-EB38-4D42-A1AD-CB68F7E0EEF6";
+    private static final String LONG_TYPE_ID = "8F24B9AD-7C51-46CF-B2F8-277356957325";
+    private static final String S64_TYPE_ID = "70D8A282-A1EA-462D-9D04-51EDE81FAC2F";
+    private static final String U8_TYPE_ID = "72B9409A-7D1A-4831-9CFE-FCB3FADD3426";
+    private static final String U16_TYPE_ID = "ECA0B403-C4F8-4B86-95FC-81688D046E40";
+    private static final String U32_TYPE_ID = "43DA906B-7DEF-4CA8-9790-854106D3F983";
+    private static final String ULONG_TYPE_ID = "5EC2D6F7-6859-400F-9215-C106F5B10E53";
+    private static final String U64_TYPE_ID = "D6597933-47CD-4FC8-B911-63F3E2B0993A";
+    private static final String FLOAT_TYPE_ID = "EA2C3E90-AFBE-44D4-A90D-FAAF79BAF93D";
+    private static final String DOUBLE_TYPE_ID = "110C4B14-11A8-4E9D-8638-5051013A56AC";
+    private static final String BOOL_TYPE_ID = "A0CA880C-AFE4-43CB-926C-59AC48496112";
+    private static final String AZ_UUID_TYPE_ID = "E152C105-A133-4D03-BBF8-3D4B2FBA3E2A";
+    private static final String ENTITY_ID_TYPE_ID = "6383F1D3-BB27-4E6B-A49A-6409B2059EAA";
+    private static final String CRC32_TYPE_ID = "9F4E062E-06A0-46D4-85DF-E0DA96467D3A";
+    private static final String VECTOR2_TYPE_ID = "3D80F623-C85C-4741-90D0-E4E66164E6BF";
+    private static final String VECTOR3_TYPE_ID = "8379EB7D-01FA-4538-B64B-A6543B4BE73D";
+    private static final String VECTOR4_TYPE_ID = "0CE9FA36-1E3A-4C06-9254-B7C73A732053";
+    private static final String TRANSFORM_TYPE_ID = "5D9958E9-9F1E-4985-B532-FFFDE75FEDFD";
+    private static final String QUATERNION_TYPE_ID = "73103120-3DD3-4873-BAB3-9713FA2804FB";
+    private static final String COLOR_TYPE_ID = "7894072A-9050-4F0F-901B-34B1A0D29417";
+    private static final String COLORF_TYPE_ID = "63782551-A309-463B-A301-3A360800DF1E";
+    private static final String COLORB_TYPE_ID = "6F0CC2C0-0CC6-4DBF-9297-B043F270E6A4";
+    private static final String AABB_TYPE_ID = "A54C2B36-D5B8-46A1-A529-4EBDBD2450E7";
+    private static final String AZSTD_ALLOCATOR_TYPE_NAME = "AZStd::allocator";
+    private static final String AZSTD_ALLOCATOR_TYPE_ID = "E9F5A3BE-2B3D-4C62-9E6B-4E00A13AB452";
+    private static final String AZSTD_LESS_TYPE_ID = "41B40AFC-68FD-4ED9-9EC7-BA9992802E1B";
+    private static final String AZSTD_EQUAL_TO_TYPE_ID = "4377BCED-F78C-4016-80BB-6AFACE6E5137";
+    private static final String AZSTD_HASH_TYPE_ID = "EFA74E54-BDFA-47BE-91A7-5A05DA0306D7";
+    private static final String AZSTD_CHAR_TRAITS_TYPE_ID = "9B018C0C-022E-4BA4-AE91-2C1E8592DBB2";
+    private static final String AZSTD_BASIC_STRING_TYPE_ID = "C26397ED-8F60-4DF6-8320-0D0C592DA3CD";
+    private static final String AZSTD_STRING_TYPE_ID = "03AAAB3F-5C47-5A66-9EBC-D5FA4DB353C9";
+    private static final String AZSTD_PAIR_TYPE_ID = "919645C1-E464-482B-A69B-04AA688B6847";
+    private static final String AZSTD_VECTOR_TYPE_ID = "A60E3E61-1FF6-4982-B6B8-9E4350C4C679";
+    private static final String AZSTD_LIST_TYPE_ID = "E1E05843-BB02-4F43-B7DC-3ADB28DF42AC";
+    private static final String AZSTD_FORWARD_LIST_TYPE_ID = "D7E91EA3-326F-4019-87F0-6F45924B909A";
+    private static final String AZSTD_SET_TYPE_ID = "6C51837F-B0C9-40A3-8D52-2143341EDB07";
+    private static final String AZSTD_UNORDERED_SET_TYPE_ID = "8D60408E-DA65-4670-99A2-8ABB574625AE";
+    private static final String AZSTD_MAP_TYPE_ID = "F8ECF58D-D33E-49DC-BF34-8FA499AC3AE1";
+    private static final String AZSTD_UNORDERED_MAP_TYPE_ID = "41171F6F-9E5E-4227-8420-289F1DD5D005";
+    private static final String AZSTD_SHARED_PTR_TYPE_ID = "FE61C84E-149D-43FD-88BA-1C3DB7E548B4";
+    private static final String AZSTD_INTRUSIVE_PTR_TYPE_ID = "530F8502-309E-4EE1-9AEF-5C0456B1F502";
+    private static final String AZSTD_UNIQUE_PTR_TYPE_ID = "B55F90DA-C21E-4EB4-9857-87BE6529BA6D";
+    private static final String AZSTD_OPTIONAL_TYPE_ID = "AB8C50C0-23A7-4333-81CD-46F648938B1C";
+    private static final String AZSTD_FIXED_VECTOR_TYPE_ID = "74044B6F-E922-4FD7-915D-EFC5D1DC59AE";
+    private static final String AZSTD_ARRAY_TYPE_ID = "911B2EA8-CCB1-4F0C-A535-540AD00173AE";
+    private static final String AZSTD_BITSET_TYPE_ID = "6BAE9836-EC49-466A-85F2-F4B1B70839FB";
+    private static final String AZSTD_TUPLE_TYPE_ID = "F99F9308-DC3E-4384-9341-89CBF1ABD51E";
+    private static final String AZSTD_UNORDERED_FLAT_MAP_TYPE_ID = "AA6CB2BA-A6FA-43A3-B08C-4B6E0D751068";
+    private static final String AZ_DATA_ASSET_TYPE_ID = "C891BF19-B60C-45E2-BFD0-027D15DDC939";
+    private static final String AZ_DATA_ASSET_ID_TYPE_ID = "652ED536-3402-439B-AEBE-4A5DBC554085";
+    private static final String AZ_INTERNAL_RVALUE_TO_LVALUE_WRAPPER_TYPE_ID =
+        "2590807F-5748-4CD0-A475-83EF5FD216CF";
+    private static final String MB_REPLICATED_FIELD_TYPE_ID = "5C059EC7-44B0-4666-9FC9-674192338F39";
+    private static final String AMAZON_PERVASIVES_UID_TYPE_ID = "DFE50973-EA0B-4616-833A-B60B5E2E71DF";
+
+    private final Gson gson = createGson();
+
+    private final Map<String, Address> pointerReadCache = new HashMap<>();
+    private final Map<String, List<Address>> asciiStringSearchCache = new HashMap<>();
+    private final Map<String, Address> fieldHandlerConstructorVtableCache = new HashMap<>();
+    private final Map<String, List<VtableWrite>> constructorVtableWritesCache = new HashMap<>();
+    private final Map<String, Function> functionLookupCache =
+        lruCache(FUNCTION_LOOKUP_CACHE_LIMIT);
+    private final Map<String, Address> functionByFullNameCache = new HashMap<>();
+    private final Map<String, String> functionNameCache = new HashMap<>();
+    private final Map<String, List<Instruction>> functionInstructionsCache =
+        lruCache(FUNCTION_INSTRUCTION_CACHE_LIMIT);
+    private final Map<String, Boolean> allocatorReturnFunctionCache = new HashMap<>();
+    private final Map<String, ForwardArgState> inheritedForwardStateCache = new HashMap<>();
+    private final Map<String, String> decompileCache = lruCache(DECOMPILE_CACHE_LIMIT);
+    private final Map<String, Long> createInstanceSizeCache = new HashMap<>();
+    private final Map<String, Map<String, Set<Integer>>> nestedBoolParameterIndicesCache =
+        new HashMap<>();
+    private final Map<String, HighFunction> highFunctionCache =
+        lruCache(HIGH_FUNCTION_CACHE_LIMIT);
+    private final Map<String, Integer> returnedCallInputSlotCache = new HashMap<>();
+    private final Map<String, FieldHandlerShape> fieldHandlerShapeCache = new HashMap<>();
+    private final Map<String, NestedTypeShape> nestedTypeShapeCache = new HashMap<>();
+    private final Map<String, List<Structure>> nestedTypeStructureCache = new HashMap<>();
+    private final Map<String, List<SerializeTypeInfo>> serializeTypesByName = new HashMap<>();
+    private final Map<String, List<SerializeTypeInfo>> serializeTypesByLeafName = new HashMap<>();
+    private final Map<String, SerializeTypeInfo> serializeTypesById = new HashMap<>();
+    private final Map<String, List<String>> serializeTypeWireShapeCache = new HashMap<>();
+    private final Map<String, JsonObject> serializeObjectsByRef = new HashMap<>();
+    private final Map<String, HookTypeEvidence> registrationHooksByTypeId = new HashMap<>();
+    private final LinkedHashSet<String> registryTypeIds = new LinkedHashSet<>();
+    private final Map<String, Integer> typeIdSourceCounts = new LinkedHashMap<>();
+    private final Map<String, Integer> nativeUuidRejectCounts = new LinkedHashMap<>();
+    private String cacheProgramKey;
+    private DecompInterface decompiler;
+    private boolean functionByFullNameCacheLoaded;
+    private int pcodeMessageFieldCandidateCount;
+    private int pcodeMessageFieldAcceptedCount;
+    private int pcodeMessageFieldRejectedCount;
+    private final Map<String, Integer> pcodeMessageFieldRejectCounts = new LinkedHashMap<>();
+    private int nestedTypeShapesRecovered;
+    private int nestedTypeShapeFailures;
+    private final Map<String, Integer> nestedTypeShapeRejectCounts = new LinkedHashMap<>();
+    private JsonArray containerValueShapeRejectSamples = new JsonArray();
+    private int recoveredFunctionCount;
+    private int recoveredFunctionFailureCount;
+    private int registerFieldLoopRecoveredFunctionCount;
+    private int registerFieldLoopRecoveredCallCount;
+    private int queuedRegistrationReferenceCount;
+    private int queuedRegistrationDecodedCount;
+    private int queuedRegistrationNoFunctionCount;
+    private int queuedRegistrationNoHelperCount;
+    private int queuedRegistrationNoTypeIdCount;
+    private int directRegisterTypeReferenceCount;
+    private int directRegisterTypeDecodedCount;
+    private int directRegisterTypeNoFunctionCount;
+    private int directRegisterTypeNoTypeIdCount;
+    private JsonArray queuedRegistrationFailureSamples = new JsonArray();
+    private JsonArray directRegisterTypeFailureSamples = new JsonArray();
+
+    @Override
+    protected void run() throws Exception {
+        resetAnalysisCachesForRun();
+        println("NetworkSchemaExtractor version: " + EXTRACTOR_VERSION);
+        File input = inputFile();
+        File output = outputFile(input);
+        Address registerField = currentProgram.getImageBase().add(REGISTER_FIELD_RVA);
+        decompiler = new DecompInterface();
+        decompiler.openProgram(currentProgram);
+
+        JsonObject root;
+        try (Reader reader = new FileReader(input)) {
+            root = JsonParser.parseReader(reader).getAsJsonObject();
+        }
+        loadSerializeTypeIndex(input);
+
+        List<RegistryEntry> registry = parseRegistry(root);
+        Map<String, HookTypeEvidence> hookTypeNamesById =
+            collectRegistrationHookTypeNames(registry);
+        registrationHooksByTypeId.clear();
+        registrationHooksByTypeId.putAll(hookTypeNamesById);
+        Map<String, RegistrationFunction> registrationFunctions =
+            collectRegistrationFunctions(registerField);
+        collectDirectFieldTableRegistrationFunctions(
+            registry,
+            hookTypeNamesById,
+            registrationFunctions);
+
+        JsonArray registryJson = new JsonArray();
+        int mappedRegistryEntries = 0;
+        int mappedFieldCount = 0;
+        int mappedMessageEntries = 0;
+        int mappedMessageFields = 0;
+        int registryEntriesWithAzRtti = 0;
+        int registryEntriesWithValueAzRtti = 0;
+        int registryEntriesWithRegistrationTypeName = 0;
+        int registryEntriesWithRecoveredTypeName = 0;
+        int baseOrInterfaceRegistryEntries = 0;
+        JsonArray identityFallbackJson = new JsonArray();
+        JsonArray identityBlockerJson = new JsonArray();
+        LinkedHashMap<String, Integer> identityBlockerCounts = new LinkedHashMap<>();
+        for (RegistryEntry entry : registry) {
+            List<RegistrationFunction> matches =
+                constructorMatches(entry, registrationFunctions);
+            AzRttiEvidence resolvedRtti =
+                resolvedAzRtti(entry, matches);
+            HookTypeEvidence hookType = registrationHookForEntry(entry, hookTypeNamesById);
+            TypeNameEvidence recoveredTypeName =
+                resolvedTypeName(entry, resolvedRtti, hookType, matches);
+            AzRttiEvidence valueRtti =
+                resolvedValueAzRtti(entry, resolvedRtti, hookType, recoveredTypeName);
+            if (resolvedRtti != null) {
+                registryEntriesWithAzRtti++;
+            }
+            if (valueRtti != null) {
+                registryEntriesWithValueAzRtti++;
+            }
+            if (hookType != null && isPlausibleTypeName(hookType.typeName)) {
+                registryEntriesWithRegistrationTypeName++;
+            }
+            if (recoveredTypeName != null &&
+                isPlausibleTypeName(recoveredTypeName.typeName)) {
+                registryEntriesWithRecoveredTypeName++;
+            }
+            if (isBaseOrInterfaceRegistryEntry(entry, resolvedRtti)) {
+                baseOrInterfaceRegistryEntries++;
+            }
+            if (isRegistryTypeNameFallback(hookType)) {
+                identityFallbackJson.add(identityFallbackJson(
+                    entry,
+                    resolvedRtti,
+                    hookType,
+                    recoveredTypeName,
+                    matches));
+            }
+            String identityBlockerReason =
+                identityBlockerReason(
+                    entry,
+                    resolvedRtti,
+                    valueRtti,
+                    hookType,
+                    recoveredTypeName,
+                    matches);
+            if (identityBlockerReason != null) {
+                incrementCount(identityBlockerCounts, identityBlockerReason);
+                identityBlockerJson.add(identityBlockerJson(
+                    entry,
+                    resolvedRtti,
+                    valueRtti,
+                    hookType,
+                    recoveredTypeName,
+                    matches,
+                    identityBlockerReason));
+            }
+            JsonObject row = entry.toJson(resolvedRtti, valueRtti, hookType, recoveredTypeName);
+            if (!matches.isEmpty()) {
+                mappedRegistryEntries++;
+                JsonArray constructorJson = new JsonArray();
+                JsonArray fieldJson = new JsonArray();
+                for (RegistrationFunction match : matches) {
+                    mappedFieldCount += match.fields.size();
+                    constructorJson.add(match.toJson());
+                    for (FieldCall field : match.fields) {
+                        fieldJson.add(field.toJson());
+                    }
+                }
+                row.add("fields", fieldJson);
+                row.add("constructorMatches", constructorJson);
+            }
+            else {
+                MessageUnmarshalPlan messagePlan = recoverMessageUnmarshalPlan(entry, hookType);
+                if (messagePlan != null) {
+                    row.add("messageUnmarshal", messagePlan.toJson());
+                    if (!messagePlan.fields.isEmpty()) {
+                        mappedMessageEntries++;
+                        mappedMessageFields += messagePlan.fields.size();
+                        JsonArray fieldJson = new JsonArray();
+                        for (FieldCall field : messagePlan.fields) {
+                            fieldJson.add(field.toJson());
+                        }
+                        row.add("fields", fieldJson);
+                    }
+                }
+            }
+            registryJson.add(row);
+        }
+
+        JsonArray functionJson = new JsonArray();
+        int dynamicFieldCount = 0;
+        for (RegistrationFunction function : registrationFunctions.values()) {
+            dynamicFieldCount += function.fields.size();
+            functionJson.add(function.toJson());
+        }
+        JsonArray fieldHandlerVtableJson = fieldHandlerVtablesJson(registrationFunctions);
+        JsonObject fieldWireShapeDiagnostics = fieldWireShapeDiagnostics(registryJson);
+
+        JsonObject report = new JsonObject();
+        report.addProperty("schema", "newworld.network_schema.static.v1");
+        report.addProperty("extractorVersion", EXTRACTOR_VERSION);
+        report.addProperty("cacheSchemaVersion", CACHE_SCHEMA_VERSION);
+        report.addProperty("program", currentProgram.getName());
+        report.addProperty("imageBase", formatAddress(currentProgram.getImageBase()));
+        report.addProperty("input", input.getAbsolutePath());
+        report.addProperty("registerField", formatAddress(registerField));
+
+        JsonObject summary = new JsonObject();
+        summary.addProperty("typeregistryEntries", registry.size());
+        NetworkSchemaJson.add(summary, "typeIndexSlots", typeIndexSlotCount(root));
+        NetworkSchemaJson.add(summary, "registeredTypes", registeredTypeCount(root, registry.size()));
+        Integer assetOnlyTypeIndexSlots = assetOnlyTypeIndexSlotCount(root, registry.size());
+        NetworkSchemaJson.add(summary, "assetOnlyTypeIndexSlots", assetOnlyTypeIndexSlots);
+        summary.addProperty("installRegistrationHooks", hookTypeNamesById.size());
+        summary.addProperty("fieldRegistrationFunctions", registrationFunctions.size());
+        summary.addProperty("fieldRegistrationCalls", dynamicFieldCount);
+        summary.addProperty("fieldHandlerVtables", fieldHandlerVtableJson.size());
+        summary.addProperty("mappedRegistryEntries", mappedRegistryEntries);
+        summary.addProperty("mappedRegistryFields", mappedFieldCount);
+        summary.addProperty("mappedMessageEntries", mappedMessageEntries);
+        summary.addProperty("mappedMessageFields", mappedMessageFields);
+        summary.addProperty("pcodeMessageFieldCandidates", pcodeMessageFieldCandidateCount);
+        summary.addProperty("pcodeMessageFieldsAccepted", pcodeMessageFieldAcceptedCount);
+        summary.addProperty("pcodeMessageFieldsRejected", pcodeMessageFieldRejectedCount);
+        summary.add("pcodeMessageFieldRejectSummary", countMapJson(pcodeMessageFieldRejectCounts));
+        summary.addProperty("nestedTypeShapesRecovered", nestedTypeShapesRecovered);
+        summary.addProperty("nestedTypeShapeFailures", nestedTypeShapeFailures);
+        summary.add("nestedTypeShapeRejectSummary", countMapJson(nestedTypeShapeRejectCounts));
+        summary.addProperty(
+            "fieldsMissingWireShape",
+            integer(fieldWireShapeDiagnostics, "missingWireShapeFields"));
+        summary.addProperty(
+            "fieldsMissingWireShapeWithNestedTypeShape",
+            integer(fieldWireShapeDiagnostics, "missingWireShapeWithNestedTypeShape"));
+        summary.addProperty(
+            "fieldsMissingWireShapeWithoutNestedTypeShape",
+            integer(fieldWireShapeDiagnostics, "missingWireShapeWithoutNestedTypeShape"));
+        summary.addProperty("recoveredFunctions", recoveredFunctionCount);
+        summary.addProperty("recoveredFunctionFailures", recoveredFunctionFailureCount);
+        summary.addProperty("registryEntriesWithAzRtti", registryEntriesWithAzRtti);
+        summary.addProperty("registryEntriesWithValueAzRtti", registryEntriesWithValueAzRtti);
+        summary.addProperty(
+            "registryEntriesWithRegistrationTypeName",
+            registryEntriesWithRegistrationTypeName);
+        summary.addProperty(
+            "registryEntriesWithRecoveredTypeName",
+            registryEntriesWithRecoveredTypeName);
+        summary.addProperty(
+            "baseOrInterfaceRegistryEntries",
+            baseOrInterfaceRegistryEntries);
+        summary.addProperty("registryTypeNameFallbacks", identityFallbackJson.size());
+        summary.addProperty("identityBlockers", identityBlockerJson.size());
+        report.add("summary", summary);
+
+        JsonObject identityDiagnostics = new JsonObject();
+        identityDiagnostics.add("registryTypeNameFallbacks", identityFallbackJson);
+        identityDiagnostics.add("identityBlockers", identityBlockerJson);
+        identityDiagnostics.add("identityBlockerSummary", countMapJson(identityBlockerCounts));
+        report.add("identityDiagnostics", identityDiagnostics);
+
+        JsonObject containerValueShapeDiagnostics = new JsonObject();
+        containerValueShapeDiagnostics.add(
+            "rejectSamples",
+            containerValueShapeRejectSamples);
+        report.add("containerValueShapeDiagnostics", containerValueShapeDiagnostics);
+        report.add("fieldWireShapeDiagnostics", fieldWireShapeDiagnostics);
+
+        JsonObject registrationEvidenceDiagnostics = new JsonObject();
+        registrationEvidenceDiagnostics.addProperty(
+            "queuedReferenceCount",
+            queuedRegistrationReferenceCount);
+        registrationEvidenceDiagnostics.addProperty(
+            "queuedDecodedCount",
+            queuedRegistrationDecodedCount);
+        registrationEvidenceDiagnostics.addProperty(
+            "queuedNoFunctionCount",
+            queuedRegistrationNoFunctionCount);
+        registrationEvidenceDiagnostics.addProperty(
+            "queuedNoHelperCount",
+            queuedRegistrationNoHelperCount);
+        registrationEvidenceDiagnostics.addProperty(
+            "queuedNoTypeIdCount",
+            queuedRegistrationNoTypeIdCount);
+        registrationEvidenceDiagnostics.add("queuedFailureSamples", queuedRegistrationFailureSamples);
+        registrationEvidenceDiagnostics.addProperty(
+            "directReferenceCount",
+            directRegisterTypeReferenceCount);
+        registrationEvidenceDiagnostics.addProperty(
+            "directDecodedCount",
+            directRegisterTypeDecodedCount);
+        registrationEvidenceDiagnostics.addProperty(
+            "directNoFunctionCount",
+            directRegisterTypeNoFunctionCount);
+        registrationEvidenceDiagnostics.addProperty(
+            "directNoTypeIdCount",
+            directRegisterTypeNoTypeIdCount);
+        registrationEvidenceDiagnostics.addProperty(
+            "registerFieldLoopRecoveredFunctionCount",
+            registerFieldLoopRecoveredFunctionCount);
+        registrationEvidenceDiagnostics.addProperty(
+            "registerFieldLoopRecoveredAdditionalCallCount",
+            registerFieldLoopRecoveredCallCount);
+        registrationEvidenceDiagnostics.add(
+            "directFailureSamples",
+            directRegisterTypeFailureSamples);
+        report.add("registrationEvidenceDiagnostics", registrationEvidenceDiagnostics);
+
+        JsonObject registrationInvariants =
+            registrationInvariants(hookTypeNamesById, registry);
+        report.add("registrationInvariants", registrationInvariants);
+
+        report.add("registryEntries", registryJson);
+        report.add("installRegistrationHooks", hookTypeNamesJson(hookTypeNamesById));
+        report.add("fieldRegistrationFunctions", functionJson);
+        report.add("fieldHandlerVtables", fieldHandlerVtableJson);
+
+        File actualOutput = writeReportFile(output, report, gson);
+
+        println("Wrote network schema static report: " + actualOutput.getAbsolutePath());
+        println("RegisterField functions: " + registrationFunctions.size() +
+            ", calls: " + dynamicFieldCount +
+            ", mapped registry entries: " + mappedRegistryEntries);
+        println("RegisterField loop recovery: functions=" +
+            registerFieldLoopRecoveredFunctionCount +
+            ", additional calls=" + registerFieldLoopRecoveredCallCount);
+        println("Registration invariants: hook UUIDs not in registry=" +
+            registrationInvariants.get("hookUuidsNotInRegistryCount").getAsInt() +
+            ", zero UUIDs=" +
+            registrationInvariants.get("zeroUuidDecodedCount").getAsInt() +
+            ", name mismatches=" +
+            registrationInvariants.get("decodedButNameMismatchCount").getAsInt() +
+            ", native rejects=" + countMapJson(nativeUuidRejectCounts));
+        println("Extractor caches: decompile=" + cacheSizeWithLimit(
+                decompileCache.size(),
+                DECOMPILE_CACHE_LIMIT) +
+            ", highFunctions=" + cacheSizeWithLimit(
+                highFunctionCache.size(),
+                HIGH_FUNCTION_CACHE_LIMIT) +
+            ", instructions=" + cacheSizeWithLimit(
+                functionInstructionsCache.size(),
+                FUNCTION_INSTRUCTION_CACHE_LIMIT) +
+            ", functions=" + cacheSizeWithLimit(
+                functionLookupCache.size(),
+                FUNCTION_LOOKUP_CACHE_LIMIT) +
+            ", textParsers=" + cacheSizeWithLimit(
+                textParseCacheSize(),
+                textParser.cacheLimit()));
+        releaseDecompilerResources();
+    }
+
+    private static Gson createGson() {
+        GsonBuilder builder = new GsonBuilder()
+            .disableHtmlEscaping();
+        if (envFlag("NW_NETWORK_SCHEMA_PRETTY")) {
+            builder.setPrettyPrinting();
+        }
+        return builder.create();
+    }
+
+    private static boolean envFlag(String name) {
+        String value = System.getenv(name);
+        if (value == null) {
+            return false;
+        }
+        value = value.trim();
+        return !value.isEmpty() &&
+            !"0".equals(value) &&
+            !"false".equalsIgnoreCase(value) &&
+            !"no".equalsIgnoreCase(value);
+    }
+
+    private static int envInt(String name, int defaultValue) {
+        String value = System.getenv(name);
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+        try {
+            int parsed = Integer.parseInt(value.trim());
+            return parsed < 0 ? defaultValue : parsed;
+        }
+        catch (NumberFormatException ignored) {
+            return defaultValue;
+        }
+    }
+
+    private static <K, V> Map<K, V> lruCache(int maxEntries) {
+        if (maxEntries == 0) {
+            return new HashMap<>();
+        }
+        return new LinkedHashMap<K, V>(Math.min(1024, maxEntries), 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+                return size() > maxEntries;
+            }
+        };
+    }
+
+    private static String cacheSizeWithLimit(int size, int limit) {
+        return limit == 0 ? Integer.toString(size) : size + "/" + limit;
+    }
+
+    private int textParseCacheSize() {
+        return textParser.cacheSize();
+    }
+
+    private void releaseDecompilerResources() {
+        clearAnalysisCaches();
+        if (decompiler != null) {
+            decompiler.dispose();
+            decompiler = null;
+        }
+    }
+
+    private void resetAnalysisCachesForRun() {
+        if (decompiler != null) {
+            decompiler.dispose();
+            decompiler = null;
+        }
+        clearAnalysisCaches();
+        cacheProgramKey = currentProgramCacheKey();
+    }
+
+    private void clearAnalysisCaches() {
+        pointerReadCache.clear();
+        asciiStringSearchCache.clear();
+        fieldHandlerConstructorVtableCache.clear();
+        constructorVtableWritesCache.clear();
+        functionLookupCache.clear();
+        functionByFullNameCache.clear();
+        functionNameCache.clear();
+        functionInstructionsCache.clear();
+        allocatorReturnFunctionCache.clear();
+        inheritedForwardStateCache.clear();
+        decompileCache.clear();
+        createInstanceSizeCache.clear();
+        nestedBoolParameterIndicesCache.clear();
+        textParser.clear();
+        highFunctionCache.clear();
+        returnedCallInputSlotCache.clear();
+        fieldHandlerShapeCache.clear();
+        nestedTypeShapeCache.clear();
+        serializeTypesByName.clear();
+        serializeTypesByLeafName.clear();
+        serializeTypesById.clear();
+        serializeObjectsByRef.clear();
+        registrationHooksByTypeId.clear();
+        registryTypeIds.clear();
+        typeIdSourceCounts.clear();
+        nativeUuidRejectCounts.clear();
+        functionByFullNameCacheLoaded = false;
+        pcodeMessageFieldCandidateCount = 0;
+        pcodeMessageFieldAcceptedCount = 0;
+        pcodeMessageFieldRejectedCount = 0;
+        pcodeMessageFieldRejectCounts.clear();
+        nestedTypeShapesRecovered = 0;
+        nestedTypeShapeFailures = 0;
+        nestedTypeShapeRejectCounts.clear();
+        containerValueShapeRejectSamples = new JsonArray();
+        recoveredFunctionCount = 0;
+        recoveredFunctionFailureCount = 0;
+        registerFieldLoopRecoveredFunctionCount = 0;
+        registerFieldLoopRecoveredCallCount = 0;
+    }
+
+    private void ensureAnalysisCachesValid() {
+        String key = currentProgramCacheKey();
+        if (key.equals(cacheProgramKey)) {
+            return;
+        }
+        clearAnalysisCaches();
+        cacheProgramKey = key;
+        if (decompiler != null && currentProgram != null) {
+            decompiler.openProgram(currentProgram);
+        }
+    }
+
+    private String currentProgramCacheKey() {
+        if (currentProgram == null) {
+            return "<no-program>";
+        }
+        return CACHE_SCHEMA_VERSION + ":" + System.identityHashCode(currentProgram) + ":" +
+            currentProgram.getName() + "@" + currentProgram.getImageBase();
+    }
+
+    private String addressCacheKey(String kind, Address address) {
+        ensureAnalysisCachesValid();
+        return kind + "|" + address.getOffset();
+    }
+
+    private String functionCacheKey(String kind, Function function) {
+        ensureAnalysisCachesValid();
+        return kind + "|" + function.getEntryPoint().getOffset();
+    }
+
+    private String programTextCacheKey(String kind, String value) {
+        ensureAnalysisCachesValid();
+        return kind + "|" + value;
+    }
+
+    private File inputFile() throws Exception {
+        String explicit = envValue("NW_NETWORK_SCHEMA_TYPEREGISTRY_JSON");
+        if (explicit != null) {
+            return new File(explicit);
+        }
+        return askFile("Select New World typeregistry.json", "Open");
+    }
+
+    private File outputFile(File input) {
+        String explicit = envValue("NW_NETWORK_SCHEMA_OUT");
+        if (explicit != null) {
+            return new File(explicit);
+        }
+        File parent = input.getParentFile();
+        if (parent == null) {
+            parent = new File(".");
+        }
+        return new File(parent, "network-schema.static.json");
+    }
+
+    private File writeReportFile(File output, JsonObject report, Gson gson) throws IOException {
+        Path outputPath = output.toPath();
+        Path absoluteOutput = outputPath.toAbsolutePath();
+        Path parent = absoluteOutput.getParent();
+        if (parent == null) {
+            parent = new File(".").toPath().toAbsolutePath();
+        }
+
+        Path temp = Files.createTempFile(parent, output.getName() + ".", ".tmp");
+        try {
+            try (Writer writer = Files.newBufferedWriter(temp, StandardCharsets.UTF_8)) {
+                gson.toJson(report, writer);
+            }
+
+            try {
+                Files.move(
+                    temp,
+                    absoluteOutput,
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+                return absoluteOutput.toFile();
+            }
+            catch (IOException atomicFailure) {
+                try {
+                    Files.move(temp, absoluteOutput, StandardCopyOption.REPLACE_EXISTING);
+                    return absoluteOutput.toFile();
+                }
+                catch (IOException replaceFailure) {
+                    Path fallback = lockedFallbackOutputPath(absoluteOutput);
+                    Files.move(temp, fallback, StandardCopyOption.REPLACE_EXISTING);
+                    println(
+                        "Primary report path is locked; wrote fallback report: " +
+                        fallback.toFile().getAbsolutePath());
+                    return fallback.toFile();
+                }
+            }
+        }
+        finally {
+            Files.deleteIfExists(temp);
+        }
+    }
+
+    private Path lockedFallbackOutputPath(Path output) {
+        Path fileName = output.getFileName();
+        String name = fileName == null ? "network-schema.static.json" : fileName.toString();
+        String base = name.endsWith(".json")
+            ? name.substring(0, name.length() - ".json".length())
+            : name;
+        String fallbackName =
+            base + ".locked-" + Long.toUnsignedString(System.currentTimeMillis()) + ".json";
+        Path parent = output.getParent();
+        return parent == null ? new File(fallbackName).toPath() : parent.resolve(fallbackName);
+    }
+
+    private String envValue(String name) {
+        String value = System.getenv(name);
+        if (value == null || value.trim().isEmpty()) {
+            return null;
+        }
+        return value.trim();
+    }
+
+    private void loadSerializeTypeIndex(File typeregistryInput) {
+        File serialize = serializeJsonFile(typeregistryInput);
+        if (serialize == null || !serialize.isFile()) {
+            println("Serialize type index not loaded; set NW_NETWORK_SCHEMA_SERIALIZE_JSON for exact field type-id joins.");
+            return;
+        }
+
+        int loaded = 0;
+        try (Reader reader = new FileReader(serialize)) {
+            JsonObject root = JsonParser.parseReader(reader).getAsJsonObject();
+            collectSerializeObjectRefs(root);
+            JsonObject uuidMap = object(root, "uuidMap");
+            if (uuidMap == null) {
+                println("Serialize type index has no uuidMap: " + serialize);
+                return;
+            }
+            for (Map.Entry<String, JsonElement> entry : uuidMap.entrySet()) {
+                if (!entry.getValue().isJsonObject()) {
+                    continue;
+                }
+                JsonObject value = entry.getValue().getAsJsonObject();
+                String typeId = canonicalUuidFromString(
+                    firstNonEmpty(string(value, "typeId"), entry.getKey()));
+                String name = string(value, "name");
+                if (typeId == null || name == null || name.trim().isEmpty()) {
+                    continue;
+                }
+                SerializeTypeInfo info = new SerializeTypeInfo();
+                info.typeId = typeId;
+                info.name = name.trim();
+                info.factory = string(value, "factory");
+                JsonObject azRtti = object(value, "azRtti");
+                info.azRttiAddress = azRtti == null ? null : string(azRtti, "address");
+
+                serializeTypesById.put(normalizeUuid(typeId), info);
+                serializeTypesByName.computeIfAbsent(info.name, ignored -> new ArrayList<>()).add(info);
+                serializeTypesByLeafName
+                    .computeIfAbsent(NetworkSchemaText.sourceTypeLeaf(info.name), ignored -> new ArrayList<>())
+                    .add(info);
+                loaded++;
+            }
+            for (Map.Entry<String, JsonElement> entry : uuidMap.entrySet()) {
+                if (!entry.getValue().isJsonObject()) {
+                    continue;
+                }
+                JsonObject value = entry.getValue().getAsJsonObject();
+                String typeId = canonicalUuidFromString(
+                    firstNonEmpty(string(value, "typeId"), entry.getKey()));
+                SerializeTypeInfo info = typeId == null
+                    ? null
+                    : serializeTypesById.get(normalizeUuid(typeId));
+                if (info == null) {
+                    continue;
+                }
+                info.fields.addAll(parseSerializeFields(value));
+                info.fields.sort((left, right) -> {
+                    int offset = Long.compare(left.offset, right.offset);
+                    return offset != 0 ? offset : left.name.compareTo(right.name);
+                });
+            }
+            println("Loaded serialize type index: " + loaded + " types from " + serialize);
+        }
+        catch (Exception exception) {
+            println("Serialize type index load failed: " + exception.getMessage());
+        }
+    }
+
+    private void collectSerializeObjectRefs(JsonElement element) {
+        if (element == null || element.isJsonNull()) {
+            return;
+        }
+        if (element.isJsonArray()) {
+            for (JsonElement child : element.getAsJsonArray()) {
+                collectSerializeObjectRefs(child);
+            }
+            return;
+        }
+        if (!element.isJsonObject()) {
+            return;
+        }
+
+        JsonObject object = element.getAsJsonObject();
+        JsonElement id = object.get("$id");
+        if (id != null && !id.isJsonNull()) {
+            serializeObjectsByRef.put("#" + id.getAsString(), object);
+        }
+        for (Map.Entry<String, JsonElement> entry : object.entrySet()) {
+            collectSerializeObjectRefs(entry.getValue());
+        }
+    }
+
+    private JsonObject resolveSerializeObject(JsonObject object) {
+        if (object == null) {
+            return null;
+        }
+        String ref = string(object, "$ref");
+        if (ref == null) {
+            return object;
+        }

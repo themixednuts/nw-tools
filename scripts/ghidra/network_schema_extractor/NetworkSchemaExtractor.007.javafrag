@@ -1,0 +1,900 @@
+        if (callTarget == null ||
+            (current != null && callTarget.getEntryPoint().equals(current.getEntryPoint()))) {
+            return null;
+        }
+
+        String callTargetName = fullFunctionName(callTarget);
+        String owner = directUnmarshalOwnerFullName(callTargetName);
+        if (owner == null) {
+            owner = unmarshalTemplateType(callTargetName);
+        }
+        if (owner == null) {
+            owner = directUnmarshalOwnerFullNameFromPrototype(callTarget);
+        }
+        if (owner == null) {
+            return null;
+        }
+
+        return recoverNestedDirectTypeShape(callTarget, owner);
+    }
+
+    private boolean addNestedDirectTypeMemberCandidates(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        PcodeStorage storage,
+        NestedTypeShape shape,
+        PcodeOp op,
+        Function target,
+        String source) {
+
+        if (byBase == null || storage == null || shape == null ||
+            shape.members.isEmpty()) {
+            return false;
+        }
+
+        boolean added = false;
+        for (NestedTypeMember member : shape.members) {
+            if (member.nativeType == null || member.wireShape == null) {
+                continue;
+            }
+            LinkedHashMap<Long, NestedTypeMember> members = byBase.get(storage.base);
+            int before = members == null ? 0 : members.size();
+            addNestedTypeMemberCandidate(
+                byBase,
+                storage.plus(member.offset),
+                member.nativeType,
+                member.wireShape,
+                op,
+                target,
+                source == null ? "pcode-nested-direct-type-call" : source);
+            members = byBase.get(storage.base);
+            int after = members == null ? 0 : members.size();
+            added = added || after > before;
+        }
+        return added;
+    }
+
+    private void addNestedTypeMemberCandidate(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        PcodeStorage storage,
+        String nativeType,
+        String wireShape,
+        PcodeOp op,
+        Function target,
+        String source) {
+
+        boolean allowLocalTempStorage =
+            source != null && source.startsWith("container-value-pcode");
+        if (byBase == null || storage == null || nativeType == null ||
+            wireShape == null ||
+            (!allowLocalTempStorage && isPcodeLocalTempStorage(storage))) {
+            return;
+        }
+        LinkedHashMap<Long, NestedTypeMember> members =
+            byBase.computeIfAbsent(storage.base, ignored -> new LinkedHashMap<>());
+        if (members.size() >= NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
+            return;
+        }
+        NestedTypeMember existing = members.get(storage.offset);
+        if (existing != null) {
+            if (!existing.nativeType.equals(nativeType)) {
+                existing.typeConflict = true;
+            }
+            return;
+        }
+
+        NestedTypeMember member = new NestedTypeMember();
+        member.offset = storage.offset;
+        member.nativeType = nativeType;
+        member.wireShape = wireShape;
+        member.byteWidth = nativeTypeByteWidth(nativeType);
+        if (member.byteWidth == null) {
+            member.byteWidth = wireShapeByteWidth(wireShape);
+        }
+        member.name = "_" + members.size();
+        member.nameSource = "synthetic-offset";
+        member.nameProven = false;
+        member.evidenceSource = source;
+        member.callsite = op == null ? null : op.getSeqnum().getTarget();
+        member.target = target == null ? null : target.getEntryPoint();
+        member.targetName = fullFunctionName(target);
+        members.put(storage.offset, member);
+    }
+
+    private NestedTypeShape directTypeShapeFromCandidates(
+        String owner,
+        Function target,
+        String targetName,
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        boolean anonymousHelper) {
+
+        NestedTypeShape selected = null;
+        int matches = 0;
+        for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry : byBase.entrySet()) {
+            ArrayList<NestedTypeMember> members =
+                new ArrayList<>(entry.getValue().values());
+            members.sort((left, right) -> Long.compare(left.offset, right.offset));
+            if (!isGenericDirectTypeMemberShape(members)) {
+                continue;
+            }
+            matches++;
+            normalizeGenericDirectTypeMemberOffsets(members);
+
+            for (int i = 0; i < members.size(); i++) {
+                NestedTypeMember member = members.get(i);
+                member.index = i;
+                member.name = "_" + i;
+            }
+
+            NestedTypeShape shape = new NestedTypeShape();
+            shape.typeName = NetworkSchemaText.sourceTypeLeaf(owner);
+            shape.typeNameFull = owner;
+            shape.typeNameSource = anonymousHelper ? "anonymous-helper" : "ghidra-symbol";
+            shape.function = target.getEntryPoint();
+            shape.functionName = targetName;
+            applySerializeIdentity(shape, owner);
+            shape.memberBase = entry.getKey();
+            shape.memberNameSource = "synthetic-offset";
+            shape.memberNamesProven = false;
+            shape.validation = "layout-consistent-direct-type";
+            shape.members.addAll(members);
+            applyNestedTypeMemberNames(shape);
+            selected = shape;
+        }
+        if (matches > 1) {
+            recordNestedTypeShapeReject("ambiguous-member-base");
+            return null;
+        }
+        if (selected == null) {
+            recordNestedTypeShapeReject("direct-type-shape-mismatch");
+        }
+        return selected;
+    }
+
+    private boolean isGenericDirectTypeMemberShape(List<NestedTypeMember> members) {
+        if (members == null || members.size() < 2 ||
+            members.size() > NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
+            return false;
+        }
+        long end = 0;
+        for (int i = 0; i < members.size(); i++) {
+            NestedTypeMember member = members.get(i);
+            if (member == null ||
+                Boolean.TRUE.equals(member.typeConflict) ||
+                member.byteWidth == null ||
+                member.byteWidth <= 0 ||
+                member.offset < 0 ||
+                member.offset < end) {
+                return false;
+            }
+            end = member.offset + member.byteWidth;
+            if (end > 0x400) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void normalizeGenericDirectTypeMemberOffsets(List<NestedTypeMember> members) {
+        if (members == null || members.isEmpty()) {
+            return;
+        }
+        long baseOffset = members.get(0).offset;
+        if (baseOffset <= 0L) {
+            return;
+        }
+        for (NestedTypeMember member : members) {
+            member.nativeOffset = member.offset;
+            member.offset -= baseOffset;
+        }
+    }
+
+    private NestedTypeShape actorRequestIdShapeFromCandidates(
+        String owner,
+        Function target,
+        String targetName,
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase) {
+
+        NestedTypeShape selected = null;
+        int matches = 0;
+        for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry : byBase.entrySet()) {
+            ArrayList<NestedTypeMember> members =
+                new ArrayList<>(entry.getValue().values());
+            members.sort((left, right) -> Long.compare(left.offset, right.offset));
+            if (!isActorRequestIdMemberShape(members)) {
+                continue;
+            }
+            matches++;
+            normalizeActorRequestIdMemberOffsets(members);
+
+            for (int i = 0; i < members.size(); i++) {
+                members.get(i).index = i;
+                members.get(i).name = "_" + i;
+            }
+
+            NestedTypeShape shape = new NestedTypeShape();
+            shape.typeName = NetworkSchemaText.sourceTypeLeaf(owner);
+            shape.typeNameFull = owner;
+            shape.typeNameSource = "ghidra-symbol";
+            shape.function = target.getEntryPoint();
+            shape.functionName = targetName;
+            applySerializeIdentity(shape, owner);
+            shape.memberBase = entry.getKey();
+            shape.memberNameSource = "synthetic-offset";
+            shape.memberNamesProven = false;
+            shape.validation = "layout-consistent-two-u64";
+            shape.members.addAll(members);
+            applyNestedTypeMemberNames(shape);
+            applyActorRequestIdNativeMemberNames(shape);
+            selected = shape;
+        }
+        if (matches > 1) {
+            recordNestedTypeShapeReject("ambiguous-member-base");
+            return null;
+        }
+        if (selected == null) {
+            recordNestedTypeShapeReject("actor-request-id-shape-mismatch");
+        }
+        return selected;
+    }
+
+    private void applySerializeIdentity(NestedTypeShape shape, String typeName) {
+        if (shape == null || typeName == null) {
+            return;
+        }
+        if (isWireNativeSourceTypeName(typeName)) {
+            return;
+        }
+        SerializeTypeInfo reflected = serializeTypeForTypeName(typeName);
+        if (reflected == null) {
+            String typeId = typeIdForTypeName(typeName);
+            if (typeId != null && !isBuiltinTypeId(typeId)) {
+                shape.typeId = typeId;
+                shape.typeIdSource = "az-type-id-fold";
+            }
+            return;
+        }
+        shape.typeId = reflected.typeId;
+        shape.typeIdSource = "serialize-context-name";
+        shape.factory = reflected.factory;
+        shape.azRttiAddress = reflected.azRttiAddress;
+    }
+
+    private boolean isBuiltinTypeId(String typeId) {
+        String normalized = normalizeUuid(typeId);
+        if (normalized == null) {
+            return false;
+        }
+        return uuidEquals(normalized, CHAR_TYPE_ID) ||
+            uuidEquals(normalized, S8_TYPE_ID) ||
+            uuidEquals(normalized, SHORT_TYPE_ID) ||
+            uuidEquals(normalized, INT_TYPE_ID) ||
+            uuidEquals(normalized, LONG_TYPE_ID) ||
+            uuidEquals(normalized, S64_TYPE_ID) ||
+            uuidEquals(normalized, U8_TYPE_ID) ||
+            uuidEquals(normalized, U16_TYPE_ID) ||
+            uuidEquals(normalized, U32_TYPE_ID) ||
+            uuidEquals(normalized, ULONG_TYPE_ID) ||
+            uuidEquals(normalized, U64_TYPE_ID) ||
+            uuidEquals(normalized, FLOAT_TYPE_ID) ||
+            uuidEquals(normalized, DOUBLE_TYPE_ID) ||
+            uuidEquals(normalized, BOOL_TYPE_ID);
+    }
+
+    private boolean isWireNativeSourceTypeName(String typeName) {
+        String normalized = normalizeNativeType(typeName);
+        if (normalized == null || normalized.isEmpty()) {
+            return false;
+        }
+        if (wireShapeFromNativeType(normalized) != null) {
+            return true;
+        }
+        if (normalized.startsWith("AZStd::fixed_vector<")
+            || normalized.startsWith("fixed_vector<")
+            || normalized.startsWith("AZStd::vector<")
+            || normalized.startsWith("vector<")
+            || normalized.startsWith("AZStd::array<")
+            || normalized.startsWith("array<")) {
+            return true;
+        }
+        String leaf = NetworkSchemaText.sourceTypeLeaf(normalized);
+        if (leaf == null) {
+            return false;
+        }
+        return switch (leaf) {
+            case "ActorId",
+                "ActorRef",
+                "AssetId",
+                "BaselineableFragment",
+                "BaselineableFragmentRef",
+                "ClientActorHash",
+                "ClientContextId",
+                "ComponentId",
+                "ConnTicket",
+                "Duration",
+                "FieldGroup",
+                "FieldVector",
+                "Fragment",
+                "HubAddress",
+                "HubId",
+                "InterestId",
+                "LoginToken",
+                "MovementInteractionId",
+                "ProxyAddress",
+                "SequenceNumber",
+                "SyncedTimestamp",
+                "Timestamp",
+                "TypeIndex",
+                "TypeIndexCrc" -> true;
+            default -> false;
+        };
+    }
+
+    private boolean isActorRequestIdMemberShape(List<NestedTypeMember> members) {
+        if (members == null || members.size() != 2) {
+            return false;
+        }
+        NestedTypeMember first = members.get(0);
+        NestedTypeMember second = members.get(1);
+        boolean wireRelative = first.offset == 0L && second.offset == 8L;
+        boolean nativeBaseObject = first.offset == 8L && second.offset == 16L;
+        return (wireRelative || nativeBaseObject) &&
+            "u64".equals(wireShapeFromNativeType(first.nativeType)) &&
+            "u64".equals(wireShapeFromNativeType(second.nativeType)) &&
+            !Boolean.TRUE.equals(first.typeConflict) &&
+            !Boolean.TRUE.equals(second.typeConflict);
+    }
+
+    private void normalizeActorRequestIdMemberOffsets(List<NestedTypeMember> members) {
+        if (members == null || members.size() != 2) {
+            return;
+        }
+        NestedTypeMember first = members.get(0);
+        NestedTypeMember second = members.get(1);
+        if (first.offset == 8L && second.offset == 16L) {
+            first.nativeOffset = first.offset;
+            second.nativeOffset = second.offset;
+            first.offset = 0L;
+            second.offset = 8L;
+        }
+    }
+
+    private void applyNestedTypeMemberNames(NestedTypeShape shape) {
+        if (shape == null || shape.members.isEmpty()) {
+            return;
+        }
+
+        List<Structure> structures = nestedTypeStructures(shape);
+        if (structures.isEmpty()) {
+            recordNestedTypeShapeReject("datatype-member-structure-missing");
+            return;
+        }
+
+        Structure selected = null;
+        ArrayList<String> selectedNames = null;
+        int matches = 0;
+        for (Structure structure : structures) {
+            ArrayList<String> names = datatypeMemberNamesForShape(structure, shape);
+            if (names == null) {
+                continue;
+            }
+            matches++;
+            if (selected == null) {
+                selected = structure;
+                selectedNames = names;
+                continue;
+            }
+            if (!selectedNames.equals(names)) {
+                recordNestedTypeShapeReject("ambiguous-datatype-member-names");
+                return;
+            }
+        }
+
+        if (selected == null || selectedNames == null) {
+            recordNestedTypeShapeReject("datatype-member-names-missing");
+            return;
+        }
+
+        for (int i = 0; i < shape.members.size(); i++) {
+            NestedTypeMember member = shape.members.get(i);
+            member.name = selectedNames.get(i);
+            member.nameSource = "ghidra-datatype";
+            member.nameProven = true;
+        }
+        shape.memberNameSource = "ghidra-datatype";
+        shape.memberNamesProven = true;
+        shape.datatypePath = selected.getPathName();
+    }
+
+    private void applyActorRequestIdNativeMemberNames(NestedTypeShape shape) {
+        if (shape == null ||
+            !"ActorRequestId".equals(shape.typeName) ||
+            !isActorRequestIdMemberShape(shape.members)) {
+            return;
+        }
+        if (!hasActorRequestIdTargetLocalIdProof()) {
+            return;
+        }
+
+        NestedTypeMember targetLocalId = shape.members.get(0);
+        targetLocalId.name = "targetLocalId";
+        targetLocalId.nameSource = "rmidispatch-targetLocalId-xref";
+        targetLocalId.nameProven = true;
+        targetLocalId.nameEvidence =
+            "Amazon::Hub::FindActorFacetTarget logs qword [message+0x08] with native string targetLocalId";
+
+        if (!Boolean.TRUE.equals(shape.memberNamesProven)) {
+            shape.memberNameSource = "partial-rmidispatch-xref";
+            shape.memberNamesProven = false;
+        }
+    }
+
+    private boolean hasActorRequestIdTargetLocalIdProof() {
+        Address functionAddress = currentProgram.getImageBase().add(FIND_ACTOR_FACET_TARGET_RVA);
+        Function function = functionAtOrContaining(functionAddress);
+        if (function == null || !function.getEntryPoint().equals(functionAddress)) {
+            recordNestedTypeShapeReject("targetLocalId-proof-missing-dispatch-function");
+            return false;
+        }
+
+        if (!instructionContains(
+                FIND_ACTOR_FACET_TARGET_MESSAGE_COPY_RVA,
+                "mov",
+                "rsi",
+                "rcx") ||
+            !instructionContains(
+                FIND_ACTOR_FACET_TARGET_TARGET_OFFSET_RVA,
+                "mov",
+                "r14d",
+                "8") ||
+            !instructionContains(
+                FIND_ACTOR_FACET_TARGET_TARGET_ADD_RVA,
+                "add",
+                "r14",
+                "rsi") ||
+            !instructionContains(
+                FIND_ACTOR_FACET_TARGET_TARGET_LOAD_RVA,
+                "mov",
+                "r8",
+                "[r14]")) {
+            recordNestedTypeShapeReject("targetLocalId-proof-instruction-mismatch");
+            return false;
+        }
+
+        Address targetLocalId = exactAsciiStringAddress("targetLocalId");
+        if (targetLocalId == null) {
+            recordNestedTypeShapeReject("targetLocalId-proof-string-missing");
+            return false;
+        }
+        Instruction nameInstruction =
+            instructionAtRva(FIND_ACTOR_FACET_TARGET_TARGET_NAME_RVA);
+        if (nameInstruction == null ||
+            !instructionReferences(nameInstruction, targetLocalId) ||
+            !instructionContains(
+                FIND_ACTOR_FACET_TARGET_TARGET_NAME_RVA,
+                "lea",
+                "rdx")) {
+            recordNestedTypeShapeReject("targetLocalId-proof-xref-missing");
+            return false;
+        }
+        return true;
+    }
+
+    private Address exactAsciiStringAddress(String value) {
+        Address selected = null;
+        for (Address address : asciiStringsContaining(value)) {
+            if (!value.equals(readPrintableString(address))) {
+                continue;
+            }
+            if (selected != null && !selected.equals(address)) {
+                return null;
+            }
+            selected = address;
+        }
+        return selected;
+    }
+
+    private Instruction instructionAtRva(long rva) {
+        Address address = currentProgram.getImageBase().add(rva);
+        Instruction instruction = currentProgram.getListing().getInstructionAt(address);
+        if (instruction != null) {
+            return instruction;
+        }
+        try {
+            disassemble(address);
+        }
+        catch (Exception ignored) {
+        }
+        return currentProgram.getListing().getInstructionAt(address);
+    }
+
+    private boolean instructionReferences(Instruction instruction, Address target) {
+        if (instruction == null || target == null) {
+            return false;
+        }
+        for (Reference reference : instruction.getReferencesFrom()) {
+            if (target.equals(reference.getToAddress())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean instructionContains(long rva, String mnemonic, String... tokens) {
+        Instruction instruction = instructionAtRva(rva);
+        if (instruction == null) {
+            return false;
+        }
+        String text = instructionText(instruction);
+        if (!text.startsWith(mnemonic.toLowerCase(Locale.ROOT) + " ")) {
+            return false;
+        }
+        for (String token : tokens) {
+            if (!text.contains(token.toLowerCase(Locale.ROOT))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String instructionText(Instruction instruction) {
+        StringBuilder text = new StringBuilder(
+            instruction.getMnemonicString().toLowerCase(Locale.ROOT));
+        for (int i = 0; i < instruction.getNumOperands(); i++) {
+            text.append(i == 0 ? ' ' : ',');
+            text.append(
+                instruction.getDefaultOperandRepresentation(i).toLowerCase(Locale.ROOT));
+        }
+        return text.toString()
+            .replace("qword ptr ", "")
+            .replace("byte ptr ", "")
+            .replace("dword ptr ", "")
+            .replace("0x08", "8")
+            .replace("0x8", "8");
+    }
+
+    private List<Structure> nestedTypeStructures(NestedTypeShape shape) {
+        if (shape == null || currentProgram == null) {
+            return Collections.emptyList();
+        }
+        String qualifiedName = shape.typeNameFull != null ? shape.typeNameFull : shape.typeName;
+        String leafName = shape.typeName != null ? shape.typeName : NetworkSchemaText.sourceTypeLeaf(qualifiedName);
+        if (leafName == null || leafName.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        String key = qualifiedName + "|" + leafName;
+        if (nestedTypeStructureCache.containsKey(key)) {
+            return nestedTypeStructureCache.get(key);
+        }
+
+        ArrayList<Structure> exact = new ArrayList<>();
+        ArrayList<Structure> leaf = new ArrayList<>();
+        Iterator<DataType> iterator = currentProgram.getDataTypeManager().getAllDataTypes();
+        while (iterator.hasNext()) {
+            DataType dataType = iterator.next();
+            if (!(dataType instanceof Structure)) {
+                continue;
+            }
+            Structure structure = (Structure) dataType;
+            if (qualifiedName != null && datatypeMatchesQualifiedName(dataType, qualifiedName)) {
+                exact.add(structure);
+                continue;
+            }
+            if (leafName.equals(dataType.getName())) {
+                leaf.add(structure);
+            }
+        }
+
+        List<Structure> result = exact.isEmpty() ? leaf : exact;
+        nestedTypeStructureCache.put(key, result);
+        return result;
+    }
+
+    private boolean datatypeMatchesQualifiedName(DataType dataType, String qualifiedName) {
+        if (dataType == null || qualifiedName == null || qualifiedName.isBlank()) {
+            return false;
+        }
+        String leaf = NetworkSchemaText.sourceTypeLeaf(qualifiedName);
+        String path = dataType.getPathName();
+        String categoryPath = dataType.getCategoryPath() == null
+            ? ""
+            : dataType.getCategoryPath().getPath();
+        if (qualifiedName.equals(dataType.getName()) || qualifiedName.equals(path)) {
+            return true;
+        }
+
+        String qualifiedPath = "/" + qualifiedName.replace("::", "/");
+        String normalizedPath = path == null ? "" : path.replace('\\', '/');
+        String normalizedCategory = categoryPath.replace('\\', '/');
+        if (normalizedPath.equals(qualifiedPath) || normalizedPath.endsWith(qualifiedPath)) {
+            return true;
+        }
+        if (normalizedCategory.equals(qualifiedPath) || normalizedCategory.endsWith(qualifiedPath)) {
+            return true;
+        }
+        return leaf != null &&
+            leaf.equals(dataType.getName()) &&
+            normalizedCategory.endsWith("/" + qualifiedName.replace("::", "/"));
+    }
+
+    private ArrayList<String> datatypeMemberNamesForShape(
+        Structure structure,
+        NestedTypeShape shape) {
+
+        if (structure == null || shape == null || shape.members.isEmpty()) {
+            return null;
+        }
+        int requiredLength = nestedTypeRequiredLength(shape);
+        if (requiredLength <= 0 || structure.getLength() != requiredLength) {
+            return null;
+        }
+
+        ArrayList<String> names = new ArrayList<>();
+        for (NestedTypeMember member : shape.members) {
+            DataTypeComponent component = datatypeComponentAtOffset(structure, member.offset);
+            if (component == null) {
+                return null;
+            }
+            if (member.byteWidth != null && component.getLength() != member.byteWidth) {
+                return null;
+            }
+            String name = component.getFieldName();
+            if (!isProvenDatatypeMemberName(name)) {
+                return null;
+            }
+            names.add(name);
+        }
+        return names;
+    }
+
+    private int nestedTypeRequiredLength(NestedTypeShape shape) {
+        long length = 0;
+        for (NestedTypeMember member : shape.members) {
+            if (member.byteWidth == null || member.byteWidth <= 0) {
+                return -1;
+            }
+            length = Math.max(length, member.offset + member.byteWidth);
+        }
+        return length > Integer.MAX_VALUE ? -1 : (int) length;
+    }
+
+    private DataTypeComponent datatypeComponentAtOffset(Structure structure, long offset) {
+        if (structure == null || offset < 0 || offset > Integer.MAX_VALUE) {
+            return null;
+        }
+        for (DataTypeComponent component : structure.getDefinedComponents()) {
+            if (component.getOffset() == (int) offset) {
+                return component;
+            }
+        }
+        return null;
+    }
+
+    private boolean isProvenDatatypeMemberName(String name) {
+        if (name == null) {
+            return false;
+        }
+        String trimmed = name.trim();
+        if (trimmed.isEmpty()) {
+            return false;
+        }
+        String lower = trimmed.toLowerCase(Locale.ROOT);
+        return !lower.equals("field") &&
+            !lower.matches("field_?\\d+") &&
+            !lower.matches("undefined\\d*") &&
+            !lower.matches("padding_?\\d*") &&
+            !lower.startsWith("unnamed");
+    }
+
+    private Integer nativeTypeByteWidth(String nativeType) {
+        String shape = wireShapeFromNativeType(nativeType);
+        return wireShapeByteWidth(shape);
+    }
+
+    private Integer wireShapeByteWidth(String shape) {
+        if (shape == null) {
+            return null;
+        }
+        if (shape.startsWith("fixed-bytes-")) {
+            Long byteLength = NetworkSchemaText.parseIntegerLiteral(shape.substring("fixed-bytes-".length()));
+            return byteLength == null ||
+                byteLength <= 0 ||
+                byteLength > Integer.MAX_VALUE
+                    ? null
+                    : byteLength.intValue();
+        }
+        if (vectorElementWireShape(shape) != null) {
+            return 24;
+        }
+        return switch (shape) {
+            case "bool", "u8" -> 1;
+            case "u16" -> 2;
+            case "u32", "f32" -> 4;
+            case "u64", "f64", "vec2" -> 8;
+            case "uuid", "vec4" -> 16;
+            case "vec3" -> 12;
+            case "transform" -> 48;
+            default -> null;
+        };
+    }
+
+    private String scalarOutputStoreNativeType(Function target) {
+        if (target == null) {
+            return null;
+        }
+
+        String pcodeType = scalarOutputStoreNativeTypeFromPcode(target);
+        if (pcodeType != null) {
+            return pcodeType;
+        }
+        return scalarOutputStoreNativeTypeFromInstructionFlow(target);
+    }
+
+    private String scalarOutputStoreNativeTypeFromPcode(Function target) {
+        HighFunction high = highFunction(target);
+        if (high == null) {
+            return null;
+        }
+
+        LinkedHashMap<String, String> candidateTypes = new LinkedHashMap<>();
+        Iterator<PcodeOpAST> ops = high.getPcodeOps();
+        while (ops.hasNext()) {
+            PcodeOpAST op = ops.next();
+            if (op.getOpcode() != PcodeOp.STORE || op.getNumInputs() < 3) {
+                continue;
+            }
+            PcodeStorage storage = pcodeStorageExpression(op.getInput(1));
+            if (!isScalarOutputPointerStorage(storage)) {
+                continue;
+            }
+            String nativeType = scalarNativeTypeFromByteWidth(op.getInput(2).getSize());
+            if (nativeType == null) {
+                continue;
+            }
+            String previous = candidateTypes.putIfAbsent(storage.base, nativeType);
+            if (previous != null && !previous.equals(nativeType)) {
+                return null;
+            }
+        }
+        return selectedScalarOutputCandidate(candidateTypes);
+    }
+
+    private String scalarOutputStoreNativeTypeFromInstructionFlow(Function target) {
+        ForwardArgState state = new ForwardArgState();
+        state.registers.put("RCX", TrackedValue.baseOffset("arg:RCX", 0));
+        state.registers.put("RDX", TrackedValue.baseOffset("arg:RDX", 0));
+        state.registers.put("R8", TrackedValue.baseOffset("arg:R8", 0));
+        state.registers.put("R9", TrackedValue.baseOffset("arg:R9", 0));
+        state.registers.put("RSP", TrackedValue.stackOffset(0));
+
+        LinkedHashMap<String, String> candidateTypes = new LinkedHashMap<>();
+        for (Instruction instruction : functionInstructions(target)) {
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if ("MOV".equals(mnemonic) && isMemoryWriteMnemonic(mnemonic)) {
+                TrackedValue storage =
+                    trackedBaseOffsetForMemoryOperand(instruction, 0, state.registers);
+                if (isInstructionScalarOutputPointerStorage(storage)) {
+                    String nativeType =
+                        scalarNativeTypeFromByteWidth(instructionMemoryWriteByteWidth(instruction));
+                    if (nativeType != null) {
+                        String previous = candidateTypes.putIfAbsent(storage.baseKey, nativeType);
+                        if (previous != null && !previous.equals(nativeType)) {
+                            return null;
+                        }
+                    }
+                }
+            }
+            observeForwardInstruction(instruction, state, false);
+        }
+        return selectedScalarOutputCandidate(candidateTypes);
+    }
+
+    private String selectedScalarOutputCandidate(Map<String, String> candidateTypes) {
+        if (candidateTypes == null || candidateTypes.isEmpty()) {
+            return null;
+        }
+        for (String preferred : List.of("param_3", "arg:R8", "R8")) {
+            String nativeType = candidateTypes.get(preferred);
+            if (nativeType != null) {
+                return nativeType;
+            }
+        }
+        if (candidateTypes.size() == 1) {
+            return candidateTypes.values().iterator().next();
+        }
+        return null;
+    }
+
+    private boolean isScalarOutputPointerStorage(PcodeStorage storage) {
+        return storage != null &&
+            storage.offset == 0L &&
+            (storage.base.matches("param_[3-9]") ||
+                storage.base.matches("p[lub]?Var\\d*"));
+    }
+
+    private boolean isInstructionScalarOutputPointerStorage(TrackedValue storage) {
+        return storage != null &&
+            storage.baseKey != null &&
+            storage.baseOffset != null &&
+            storage.baseOffset == 0 &&
+            storage.baseKey.matches("arg:(R8|R9)");
+    }
+
+    private int instructionMemoryWriteByteWidth(Instruction instruction) {
+        String text = NetworkSchemaX86.operandText(instruction, 0);
+        if (text == null) {
+            return -1;
+        }
+        String lower = text.toLowerCase(Locale.ROOT);
+        if (lower.contains("byte ptr")) {
+            return 1;
+        }
+        if (lower.contains("word ptr")) {
+            return 2;
+        }
+        if (lower.contains("dword ptr")) {
+            return 4;
+        }
+        if (lower.contains("qword ptr")) {
+            return 8;
+        }
+        return -1;
+    }
+
+    private String scalarNativeTypeFromByteWidth(int byteWidth) {
+        return switch (byteWidth) {
+            case 1 -> "u8";
+            case 2 -> "u16";
+            case 4 -> "u32";
+            case 8 -> "u64";
+            default -> null;
+        };
+    }
+
+    private void recordNestedTypeShapeReject(String reason) {
+        nestedTypeShapeRejectCounts.merge(reason, 1, Integer::sum);
+    }
+
+    private Set<String> pcodeMessageStorageBases(HighFunction high) {
+        LinkedHashSet<String> bases = new LinkedHashSet<>();
+        bases.add("this");
+        bases.add("_Dst");
+        bases.add("param_3");
+
+        Iterator<PcodeOpAST> ops = high.getPcodeOps();
+        while (ops.hasNext()) {
+            PcodeOpAST op = ops.next();
+            if (op.getOpcode() != PcodeOp.CALL || op.getOutput() == null) {
+                continue;
+            }
+            Function target = pcodeCallTarget(op);
+            Integer returnedCallInputSlot = returnedCallInputSlot(target);
+            if (returnedCallInputSlot != null && returnedCallInputSlot < op.getNumInputs()) {
+                PcodeStorage inputStorage = pcodeStorageExpression(op.getInput(returnedCallInputSlot));
+                if (isPcodeMessageStorage(inputStorage, bases)) {
+                    addPcodeAliasStorageBases(bases, op.getOutput());
+                    continue;
+                }
+            }
+            if (isLikelyConstructorTarget(target)) {
+                String name = pcodeHighName(op.getOutput());
+                if (name != null) {
+                    bases.add(name);
+                }
+            }
+        }
+        return bases;
+    }
+
+    private boolean isPcodeMessageStorage(PcodeStorage storage, Set<String> messageBases) {
+        return storage != null &&
+            messageBases != null &&
+            messageBases.contains(storage.base) &&
+            isLikelyMessageStorage(storage.expression());
+    }
+
+    private void addPcodeAliasStorageBases(Set<String> bases, Varnode seed) {
+        if (bases == null || seed == null) {
+            return;
+        }
+        ArrayDeque<Varnode> pending = new ArrayDeque<>();

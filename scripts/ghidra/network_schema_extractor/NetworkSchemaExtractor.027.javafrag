@@ -1,0 +1,225 @@
+                return Integer.compare(leftSlot, rightSlot);
+            });
+            return entries;
+        }
+
+        private Integer firstProviderSlot(JsonObject node) {
+            JsonArray slots = array(node, "slots");
+            if (slots == null || slots.size() == 0) {
+                return null;
+            }
+
+            Integer result = null;
+            for (JsonElement element : slots) {
+                Integer slot = intStringValue(element);
+                if (slot != null && (result == null || slot < result)) {
+                    result = slot;
+                }
+            }
+            return result;
+        }
+
+        private Integer intStringValue(JsonElement element) {
+            String value = stringValue(element);
+            if (value == null) {
+                return null;
+            }
+            try {
+                return Integer.parseInt(value);
+            }
+            catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+
+        private JsonObject providerGraphNode(
+            Map<String, JsonObject> nodes,
+            String key) {
+
+            JsonObject node = nodes.get(key);
+            if (node == null) {
+                node = new JsonObject();
+                node.add("names", new JsonArray());
+                node.add("slots", new JsonArray());
+                nodes.put(key, node);
+            }
+            return node;
+        }
+
+        private void addProviderName(JsonObject node, String name) {
+            if (name == null) {
+                return;
+            }
+            JsonArray names = array(node, "names");
+            if (!jsonArrayContains(names, name)) {
+                names.add(name);
+            }
+        }
+
+        private void addProviderSlot(JsonObject node, JsonObject provider) {
+            Integer slot = integer(provider, "slot");
+            if (slot == null) {
+                return;
+            }
+            JsonArray slots = array(node, "slots");
+            String value = Integer.toString(slot);
+            if (!jsonArrayContains(slots, value)) {
+                slots.add(value);
+            }
+        }
+
+        private boolean jsonArrayContains(JsonArray array, String value) {
+            if (array == null || value == null) {
+                return false;
+            }
+            for (JsonElement element : array) {
+                if (value.equals(stringValue(element))) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private String providerGraphNodeRole(JsonObject node) {
+            JsonArray names = array(node, "names");
+            if (names != null) {
+                for (JsonElement element : names) {
+                    if (isBaseNetworkTypeName(stringValue(element))) {
+                        return "base-or-interface";
+                    }
+                }
+            }
+            return "provider";
+        }
+    }
+
+    private final class TypeNameEvidence {
+        String source;
+        Address function;
+        Address typeNameAddress;
+        String typeName;
+
+        JsonObject toJson() {
+            JsonObject object = new JsonObject();
+            NetworkSchemaJson.add(object, "source", source);
+            NetworkSchemaJson.add(object, "function", formatAddress(function));
+            NetworkSchemaJson.add(object, "typeName", typeName);
+            NetworkSchemaJson.add(object, "typeNameAddress", formatAddress(typeNameAddress));
+            return object;
+        }
+    }
+
+    private final class HookTypeEvidence {
+        Address hookFunction;
+        Address helperTable;
+        Address registerThunk;
+        Address typeProvider;
+        Address uuidSource;
+        Address typeDescriptor;
+        Address slotTypeNameFunction;
+        Address handlerVtable;
+        Address createInstance;
+        Address marshal;
+        Address unmarshal;
+        String typeId;
+        String typeName;
+        String slotTypeName;
+        String source;
+
+        String typeNameSource() {
+            return source == null ? "registrationHook" : source;
+        }
+
+        JsonObject toJson() {
+            JsonObject object = new JsonObject();
+            NetworkSchemaJson.add(object, "source", source == null ? "install-registration-hook" : source);
+            NetworkSchemaJson.add(object, "typeId", typeId);
+            NetworkSchemaJson.add(object, "typeName", typeName);
+            NetworkSchemaJson.add(object, "slotTypeName", slotTypeName);
+            NetworkSchemaJson.add(object, "hookFunction", formatAddress(hookFunction));
+            NetworkSchemaJson.add(object, "helperTable", formatAddress(helperTable));
+            NetworkSchemaJson.add(object, "registerThunk", formatAddress(registerThunk));
+            NetworkSchemaJson.add(object, "typeProvider", formatAddress(typeProvider));
+            NetworkSchemaJson.add(object, "uuidSource", formatAddress(uuidSource));
+            NetworkSchemaJson.add(object, "typeDescriptor", formatAddress(typeDescriptor));
+            NetworkSchemaJson.add(object, "slotTypeNameFunction", formatAddress(slotTypeNameFunction));
+            if (handlerVtable != null) {
+                JsonObject handler = new JsonObject();
+                NetworkSchemaJson.add(handler, "handlerVtable", formatAddress(handlerVtable));
+                NetworkSchemaJson.add(handler, "CreateInstance", formatAddress(createInstance));
+                NetworkSchemaJson.add(handler, "Marshal", formatAddress(marshal));
+                NetworkSchemaJson.add(handler, "Unmarshal", formatAddress(unmarshal));
+                JsonArray slots = new JsonArray();
+                for (int slot = 0; slot < MESSAGE_HANDLER_VTABLE_SLOTS; slot++) {
+                    Address target = readPointer(handlerVtable.add(slot * 8L));
+                    if (target == null || !isExecutableAddress(target)) {
+                        break;
+                    }
+                    slots.add(virtualFunctionSlot(
+                        slot,
+                        messageHandlerSlotName(slot),
+                        target));
+                }
+                handler.add("slots", slots);
+                object.add("messageHandler", handler);
+            }
+            return object;
+        }
+
+        JsonObject toProviderJson() {
+            JsonObject object = toJson();
+            object.addProperty("kind", "typeName");
+            object.addProperty("source", source == null ? "install-registration-hook" : source);
+            return object;
+        }
+    }
+
+    private final class TypeIdDecode {
+        Address function;
+        Address provider;
+        Address sourceAddress;
+        String typeId;
+        String typeIdSource;
+        final JsonArray typeIdChain = new JsonArray();
+
+        JsonObject toJson(int slot) {
+            JsonObject object = new JsonObject();
+            object.addProperty("kind", "typeId");
+            object.addProperty("slot", slot);
+            object.addProperty("slotOffset", "0x" + Integer.toHexString(slot * 8));
+            object.addProperty("function", formatAddress(function));
+            object.addProperty("provider", formatAddress(provider));
+            object.addProperty("typeId", typeId);
+            object.addProperty("typeIdSource", typeIdSource);
+            object.addProperty("sourceAddress", formatAddress(sourceAddress));
+            if (typeIdChain.size() != 0) {
+                object.add("typeIdChain", typeIdChain);
+            }
+            return object;
+        }
+    }
+
+    private final class TypeNameDecode {
+        Address function;
+        Address provider;
+        Address typeNameAddress;
+        String typeName;
+        String typeNameSource;
+
+        JsonObject toJson(int slot) {
+            JsonObject object = new JsonObject();
+            object.addProperty("kind", "typeName");
+            if (slot >= 0) {
+                object.addProperty("slot", slot);
+                object.addProperty("slotOffset", "0x" + Integer.toHexString(slot * 8));
+            }
+            object.addProperty("function", formatAddress(function));
+            object.addProperty("provider", formatAddress(provider));
+            object.addProperty("typeName", typeName);
+            object.addProperty("typeNameSource", typeNameSource);
+            object.addProperty("typeNameAddress", formatAddress(typeNameAddress));
+            return object;
+        }
+    }
+
+}

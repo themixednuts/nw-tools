@@ -355,6 +355,7 @@ impl NetworkRustEmitter {
                 Affine3,
                 Aabb2d,
                 Aabb3d,
+                ActorRef,
                 EntityRef,
                 FixedBytes(u16),
                 String,
@@ -397,6 +398,7 @@ impl NetworkRustEmitter {
                 Affine3,
                 Aabb2d,
                 Aabb3d,
+                ActorRef,
                 EntityRef,
                 FixedBytes(u16),
                 String,
@@ -2095,6 +2097,12 @@ fn field_wire_shape(
                 .as_deref()
                 .and_then(native_type_wire_shape)
         })
+        .or_else(|| {
+            field
+                .source_type_name
+                .as_deref()
+                .and_then(source_type_name_wire_shape)
+        })
 }
 
 fn field_wire_shape_source(
@@ -2115,6 +2123,13 @@ fn field_wire_shape_source(
                 .as_deref()
                 .and_then(native_type_wire_shape)
                 .map(|_| "native-type".to_owned())
+                .or_else(|| {
+                    field
+                        .source_type_name
+                        .as_deref()
+                        .and_then(source_type_name_wire_shape)
+                        .map(|_| "source-type-name".to_owned())
+                })
         })
     })
 }
@@ -2156,15 +2171,32 @@ fn native_type_wire_shape(native_type: &str) -> Option<SchemaWireShape> {
         "AZ::Transform" => Some(SchemaWireShape::Affine3),
         "AZ::Bounds" => Some(SchemaWireShape::Aabb2d),
         "AZ::Aabb" => Some(SchemaWireShape::Aabb3d),
+        "ActorRef" | "Amazon::Hub::ActorRef" | "HubAddress" | "ProxyAddress" => {
+            Some(SchemaWireShape::ActorRef)
+        }
         "EntityRef" => Some(SchemaWireShape::EntityRef),
         "AZStd::string" | "std::string" | "string" => Some(SchemaWireShape::String),
         _ => None,
     }
 }
 
+fn source_type_name_wire_shape(source_type_name: &str) -> Option<SchemaWireShape> {
+    source_type_name
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && *part != "composite")
+        .find_map(native_type_wire_shape)
+}
+
 fn message_native_type_rust_type(native_type: &str) -> Option<String> {
     if let Some(capacity) = fixed_vector_u8_capacity(native_type) {
         return Some(format!("::arrayvec::ArrayVec<u8, {capacity}>"));
+    }
+    if let Some(vector_type) = native_vector_rust_type(native_type) {
+        return Some(vector_type);
+    }
+    if let Some(map_type) = native_map_rust_type(native_type) {
+        return Some(map_type);
     }
     let rust_type = match native_type.trim() {
         "ActorRef" | "Amazon::Hub::ActorRef" | "HubAddress" | "ProxyAddress" => {
@@ -2178,6 +2210,78 @@ fn message_native_type_rust_type(native_type: &str) -> Option<String> {
         _ => return None,
     };
     Some(rust_type.to_owned())
+}
+
+fn native_vector_rust_type(native_type: &str) -> Option<String> {
+    let inner = native_type
+        .trim()
+        .strip_prefix("AZStd::vector<")
+        .or_else(|| native_type.trim().strip_prefix("vector<"))?
+        .strip_suffix('>')?;
+    let element = first_template_argument(inner)?;
+    let element_type = native_vector_element_rust_type(element)?;
+    Some(format!("::std::vec::Vec<{element_type}>"))
+}
+
+fn native_map_rust_type(native_type: &str) -> Option<String> {
+    let inner = native_type
+        .trim()
+        .strip_prefix("AZStd::unordered_map<")
+        .or_else(|| native_type.trim().strip_prefix("std::unordered_map<"))
+        .or_else(|| native_type.trim().strip_prefix("unordered_map<"))?
+        .strip_suffix('>')?;
+    let (key, value) = first_two_template_arguments(inner)?;
+    let key_type = native_collection_element_rust_type(key)?;
+    let value_type = native_collection_element_rust_type(value)?;
+    Some(format!(
+        "::nw_network::serialize::IndexMap<{key_type}, {value_type}>"
+    ))
+}
+
+fn native_vector_element_rust_type(native_type: &str) -> Option<String> {
+    native_collection_element_rust_type(native_type)
+}
+
+fn native_collection_element_rust_type(native_type: &str) -> Option<String> {
+    native_type_wire_shape(native_type)
+        .map(|shape| rust_field_shape(shape).value_type)
+        .or_else(|| message_native_type_rust_type(native_type))
+        .or_else(|| serialize_source_rust_type_name(native_type.rsplit("::").next()?))
+}
+
+fn first_template_argument(value: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => return non_empty_trimmed(&value[..index]),
+            _ => {}
+        }
+    }
+    non_empty_trimmed(value)
+}
+
+fn first_two_template_arguments(value: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                let first = non_empty_trimmed(&value[..index])?;
+                let rest = non_empty_trimmed(&value[index + 1..])?;
+                return Some((first, first_template_argument(rest)?));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 fn fixed_vector_u8_capacity(native_type: &str) -> Option<usize> {
@@ -2976,6 +3080,10 @@ fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
             "::bevy_math::bounding::Aabb3d",
             "ReplicatedFieldHandler<::bevy_math::bounding::Aabb3d>",
         ),
+        SchemaWireShape::ActorRef => rust_field_shape_static(
+            "::nw_network::ActorRef",
+            "ReplicatedFieldHandler<::nw_network::ActorRef>",
+        ),
         SchemaWireShape::EntityRef => rust_field_shape_static(
             "::nw_network::EntityRef",
             "ReplicatedFieldHandler<::nw_network::EntityRef>",
@@ -3440,6 +3548,7 @@ fn wire_scalar_shape_from_name(value: &str) -> Option<SchemaWireScalarShape> {
         "affine3" => Some(SchemaWireScalarShape::Affine3),
         "aabb2d" => Some(SchemaWireScalarShape::Aabb2d),
         "aabb3d" => Some(SchemaWireScalarShape::Aabb3d),
+        "actor-ref" => Some(SchemaWireScalarShape::ActorRef),
         "entity-ref" => Some(SchemaWireScalarShape::EntityRef),
         "string" => Some(SchemaWireScalarShape::String),
         value => value
@@ -3726,6 +3835,7 @@ fn scalar_rust_type(shape: SchemaWireScalarShape) -> String {
         SchemaWireScalarShape::Affine3 => "::glam::Affine3A".to_owned(),
         SchemaWireScalarShape::Aabb2d => "::bevy_math::bounding::Aabb2d".to_owned(),
         SchemaWireScalarShape::Aabb3d => "::bevy_math::bounding::Aabb3d".to_owned(),
+        SchemaWireScalarShape::ActorRef => "::nw_network::ActorRef".to_owned(),
         SchemaWireScalarShape::EntityRef => "::nw_network::EntityRef".to_owned(),
         SchemaWireScalarShape::FixedBytes(len) => format!("[u8; {len}]"),
         SchemaWireScalarShape::String => "String".to_owned(),
@@ -4529,6 +4639,9 @@ fn replicated_state_field_type_tokens(
                 >
             )
         }
+        SchemaWireShape::ActorRef => {
+            quote!(::nw_network::serialize::ReplicatedFieldHandler<::nw_network::ActorRef>)
+        }
         SchemaWireShape::EntityRef => {
             quote!(::nw_network::serialize::ReplicatedFieldHandler<::nw_network::EntityRef>)
         }
@@ -4774,6 +4887,7 @@ fn message_field_type_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream
         SchemaWireShape::Affine3 => quote!(::glam::Affine3A),
         SchemaWireShape::Aabb2d => quote!(::bevy_math::bounding::Aabb2d),
         SchemaWireShape::Aabb3d => quote!(::bevy_math::bounding::Aabb3d),
+        SchemaWireShape::ActorRef => quote!(::nw_network::ActorRef),
         SchemaWireShape::EntityRef => quote!(::nw_network::EntityRef),
         SchemaWireShape::FixedBytes(len) => {
             let len = unsuffixed_int_lit(len);
@@ -4981,6 +5095,7 @@ fn wire_shape_tokens(shape: SchemaWireShape) -> proc_macro2::TokenStream {
         SchemaWireShape::Affine3 => quote!(NetworkWireShape::Affine3),
         SchemaWireShape::Aabb2d => quote!(NetworkWireShape::Aabb2d),
         SchemaWireShape::Aabb3d => quote!(NetworkWireShape::Aabb3d),
+        SchemaWireShape::ActorRef => quote!(NetworkWireShape::ActorRef),
         SchemaWireShape::EntityRef => quote!(NetworkWireShape::EntityRef),
         SchemaWireShape::FixedBytes(len) => quote!(NetworkWireShape::FixedBytes(#len)),
         SchemaWireShape::String => quote!(NetworkWireShape::String),
@@ -5039,6 +5154,7 @@ fn wire_scalar_shape_tokens(shape: SchemaWireScalarShape) -> proc_macro2::TokenS
         SchemaWireScalarShape::Affine3 => quote!(NetworkWireScalarShape::Affine3),
         SchemaWireScalarShape::Aabb2d => quote!(NetworkWireScalarShape::Aabb2d),
         SchemaWireScalarShape::Aabb3d => quote!(NetworkWireScalarShape::Aabb3d),
+        SchemaWireScalarShape::ActorRef => quote!(NetworkWireScalarShape::ActorRef),
         SchemaWireScalarShape::EntityRef => quote!(NetworkWireScalarShape::EntityRef),
         SchemaWireScalarShape::FixedBytes(len) => {
             quote!(NetworkWireScalarShape::FixedBytes(#len))
@@ -6964,6 +7080,182 @@ mod tests {
                 .contains("impl::nw_network::serialize::MarshalerforNestedValuesInnerValue")
         );
         assert!(compact_source.contains("pubfield_1:::std::vec::Vec<NestedValuesInnerValue>"));
+    }
+
+    #[test]
+    fn nested_progression_value_shape_emits_two_vector_members() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "ABBA1776-6E4C-4BA6-A831-6F4052AFC9C0",
+                "typeIndex": 3086,
+                "typeName": "MB::LandClaimManagerComponentReplicatedState",
+                "fields": [{
+                    "index": 15,
+                    "name": "replicatedProgression",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81685d0",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81685d0",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "vlq-u32",
+                    "u8",
+                    "vlq-u64",
+                    "sequence-number",
+                    "u8"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "vlq-u32",
+                    "u32",
+                    "u8",
+                    "vlq-u32",
+                    "u32",
+                    "u8",
+                    "u32",
+                    "u8"
+                ],
+                "valueTypeShape": {
+                    "typeName": "Value",
+                    "typeNameSource": "container-slot-shape",
+                    "memberNameSource": "ghidra-stack-wire-sequence",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-wire-sequence-land-claim-progression",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "nativeOffset": "0x0",
+                        "name": "field_00",
+                        "nameSource": "synthetic-offset",
+                        "nameProven": false,
+                        "nativeType": "AZStd::vector<FirstElement>",
+                        "wireShape": "vec<FirstElement>",
+                        "evidenceSource": "land-claim-progression-container-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x20",
+                        "nativeOffset": "0x20",
+                        "name": "field_20",
+                        "nameSource": "synthetic-offset",
+                        "nameProven": false,
+                        "nativeType": "AZStd::vector<SecondElement>",
+                        "wireShape": "vec<SecondElement>",
+                        "evidenceSource": "land-claim-progression-container-slot"
+                    }, {
+                        "index": 2,
+                        "offset": "0x40",
+                        "nativeOffset": "0x40",
+                        "name": "field_40",
+                        "nameSource": "synthetic-offset",
+                        "nameProven": false,
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "land-claim-progression-container-slot"
+                    }]
+                },
+                "embeddedValueTypeShapes": [{
+                    "typeName": "FirstElement",
+                    "typeNameSource": "container-slot-shape",
+                    "memberNameSource": "ghidra-stack-wire-sequence",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-wire-sequence-land-claim-progression-first-element",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "nativeOffset": "0x0",
+                        "name": "field_00",
+                        "nameSource": "synthetic-offset",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "land-claim-progression-first-vector-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x4",
+                        "nativeOffset": "0x4",
+                        "name": "field_04",
+                        "nameSource": "synthetic-offset",
+                        "nameProven": false,
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "land-claim-progression-first-vector-slot"
+                    }]
+                }, {
+                    "typeName": "SecondElement",
+                    "typeNameSource": "container-slot-shape",
+                    "memberNameSource": "ghidra-stack-wire-sequence",
+                    "memberNamesProven": false,
+                    "validation": "custom-container-value-pcode-wire-sequence-land-claim-progression-second-element",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "nativeOffset": "0x0",
+                        "name": "field_00",
+                        "nameSource": "synthetic-offset",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "land-claim-progression-second-vector-slot"
+                    }, {
+                        "index": 1,
+                        "offset": "0x4",
+                        "nativeOffset": "0x4",
+                        "name": "field_04",
+                        "nameSource": "synthetic-offset",
+                        "nameProven": false,
+                        "nativeType": "AZ::u8",
+                        "wireShape": "u8",
+                        "byteWidth": 1,
+                        "evidenceSource": "land-claim-progression-second-vector-slot"
+                    }, {
+                        "index": 2,
+                        "offset": "0x8",
+                        "nativeOffset": "0x8",
+                        "name": "field_08",
+                        "nameSource": "synthetic-offset",
+                        "nameProven": false,
+                        "nativeType": "AZ::u32",
+                        "wireShape": "u32",
+                        "byteWidth": 4,
+                        "evidenceSource": "land-claim-progression-second-vector-slot"
+                    }]
+                }],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3086]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::std::vec::Vec<ReplicatedProgressionValue>")
+        );
+        assert_eq!(field.container_embedded_value_type_shapes.len(), 2);
+        let compact_source = output.source.split_whitespace().collect::<String>();
+        assert!(
+            compact_source
+                .contains("pubfield_00:::std::vec::Vec<ReplicatedProgressionFirstElement>")
+        );
+        assert!(
+            compact_source
+                .contains("pubfield_20:::std::vec::Vec<ReplicatedProgressionSecondElement>")
+        );
+        assert!(compact_source.contains("pubfield_40:u8"));
     }
 
     #[test]

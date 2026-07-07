@@ -1,0 +1,900 @@
+
+    private boolean isStackRegister(String register) {
+        return "RBP".equals(register) || "RSP".equals(register);
+    }
+
+    private Integer directFieldCursorOffsetFromMoveSource(
+        Instruction instruction,
+        ForwardArgState state,
+        Map<String, Integer> cursorOffsetByRegister) {
+
+        String sourceRegister = NetworkSchemaX86.registerOperand(instruction, 1);
+        if (sourceRegister != null && cursorOffsetByRegister.containsKey(sourceRegister)) {
+            return cursorOffsetByRegister.get(sourceRegister);
+        }
+
+        MemoryReference sourceMemory = NetworkSchemaX86.memoryReference(instruction, 1);
+        if (sourceMemory != null) {
+            Integer cursorOffset = cursorOffsetByRegister.get(sourceMemory.baseRegister);
+            if (cursorOffset != null &&
+                sourceMemory.displacement == VECTOR_CURRENT_POINTER_OFFSET) {
+                return cursorOffset;
+            }
+
+            TrackedValue base = state.registers.get(sourceMemory.baseRegister);
+            if (base != null && base.thisOffset != null &&
+                sourceMemory.displacement == VECTOR_CURRENT_POINTER_OFFSET) {
+                return base.thisOffset;
+            }
+        }
+
+        return trackedThisOffsetForMemoryOperand(instruction, 1, state.registers);
+    }
+
+    private void clearVolatileCursorRegisters(Map<String, Integer> cursorOffsetByRegister) {
+        cursorOffsetByRegister.remove("RAX");
+        cursorOffsetByRegister.remove("RCX");
+        cursorOffsetByRegister.remove("RDX");
+        cursorOffsetByRegister.remove("R8");
+        cursorOffsetByRegister.remove("R9");
+        cursorOffsetByRegister.remove("R10");
+        cursorOffsetByRegister.remove("R11");
+    }
+
+    private List<RegistrationFunction> constructorMatches(
+        RegistryEntry entry,
+        Map<String, RegistrationFunction> registrationFunctions) {
+
+        ArrayList<RegistrationFunction> result = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (Address target : unmarshalCallTargets(entry)) {
+            Function function = functionAtOrContaining(target);
+            if (function == null) {
+                continue;
+            }
+            RegistrationFunction match = registrationFunctions.get(function.getEntryPoint().toString());
+            if (match == null) {
+                continue;
+            }
+            if (seen.add(function.getEntryPoint().toString())) {
+                result.add(match);
+            }
+        }
+        return result;
+    }
+
+    private AzRttiEvidence resolvedAzRtti(
+        RegistryEntry entry,
+        List<RegistrationFunction> matches) {
+
+        String registryTypeId = canonicalUuidFromString(entry.uuid);
+        for (RegistrationFunction match : matches) {
+            if (match.azRtti == null || match.azRtti.typeId == null) {
+                continue;
+            }
+            if (registryTypeId == null || uuidEquals(registryTypeId, match.azRtti.typeId)) {
+                enrichAzRttiWithConstructorName(match.azRtti, match);
+                keepOnlyPairedAzRttiTypeName(match.azRtti, registryTypeId);
+                return match.azRtti;
+            }
+        }
+
+        return decodeAzRttiFromRegistryHandler(entry, registryTypeId, true);
+    }
+
+    private void keepOnlyPairedAzRttiTypeName(AzRttiEvidence evidence, String typeId) {
+        if (evidence == null || typeId == null) {
+            return;
+        }
+
+        String pairedTypeName = providerTypeNameForTypeId(evidence, typeId);
+        if (isConcreteNetworkTypeName(pairedTypeName)) {
+            evidence.typeName = pairedTypeName;
+            evidence.typeNameSource = "rtti-provider-graph";
+            return;
+        }
+
+        if (isPlausibleTypeName(evidence.typeName)) {
+            evidence.rejectedTypeName = evidence.typeName;
+            evidence.rejectedTypeNameSource = evidence.typeNameSource;
+            evidence.rejectedTypeNameReason = "unpaired-provider-name";
+        }
+        evidence.typeName = null;
+        evidence.typeNameSource = null;
+    }
+
+    private AzRttiEvidence resolvedValueAzRtti(
+        RegistryEntry entry,
+        AzRttiEvidence identityRtti,
+        HookTypeEvidence hookType,
+        TypeNameEvidence recoveredTypeName) {
+
+        String registryTypeId = canonicalUuidFromString(entry.uuid);
+        String expectedTypeName =
+            expectedRuntimeTypeName(entry, identityRtti, hookType, recoveredTypeName);
+        AzRttiEvidence valueRtti =
+            decodeValueAzRttiFromUnmarshal(entry, registryTypeId, expectedTypeName);
+        if (valueRtti == null || valueRtti.typeId == null) {
+            return null;
+        }
+        if (identityRtti != null && uuidEquals(identityRtti.typeId, valueRtti.typeId)) {
+            return null;
+        }
+        if (registryTypeId != null && uuidEquals(registryTypeId, valueRtti.typeId)) {
+            return null;
+        }
+        return valueRtti;
+    }
+
+    private String expectedRuntimeTypeName(
+        RegistryEntry entry,
+        AzRttiEvidence identityRtti,
+        HookTypeEvidence hookType,
+        TypeNameEvidence recoveredTypeName) {
+
+        if (identityRtti != null && isLikelyRuntimeTypeName(identityRtti.typeName)) {
+            return identityRtti.typeName;
+        }
+        if (hookType != null && isLikelyRuntimeTypeName(hookType.typeName)) {
+            return hookType.typeName;
+        }
+        if (recoveredTypeName != null && isLikelyRuntimeTypeName(recoveredTypeName.typeName)) {
+            return recoveredTypeName.typeName;
+        }
+        return isLikelyRuntimeTypeName(entry.name) ? entry.name : null;
+    }
+
+    private AzRttiEvidence decodeValueAzRttiFromUnmarshal(
+        RegistryEntry entry,
+        String registryTypeId,
+        String expectedTypeName) {
+
+        Address unmarshal = parseCapturedAddress(entry.unmarshal);
+        if (!isExecutableAddress(unmarshal)) {
+            return null;
+        }
+
+        AzRttiEvidence best =
+            decodeValueAzRttiFromVptrWrites(
+                unmarshal,
+                registryTypeId,
+                expectedTypeName,
+                "unmarshal-vptr-write-value",
+                0);
+        int bestScore = best == null
+            ? Integer.MIN_VALUE
+            : valueAzRttiEvidenceScore(best, registryTypeId, expectedTypeName, 0, 0);
+
+        int callOrder = 0;
+        for (Instruction instruction : linearInstructions(unmarshal, REGISTRY_HANDLER_RTTI_SCAN_LIMIT)) {
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+
+            Address target = resolvedCodeTarget(callTarget(instruction));
+            if (!isExecutableAddress(target)) {
+                continue;
+            }
+
+            AzRttiEvidence candidate =
+                decodeValueAzRttiFromVptrWrites(
+                    target,
+                    registryTypeId,
+                    expectedTypeName,
+                    "unmarshal-constructor-vtable-write-value",
+                    1);
+            if (candidate == null || candidate.typeId == null) {
+                callOrder++;
+                continue;
+            }
+
+            int score =
+                valueAzRttiEvidenceScore(candidate, registryTypeId, expectedTypeName, 1, callOrder);
+            if (score >= bestScore) {
+                best = candidate;
+                bestScore = score;
+            }
+            callOrder++;
+        }
+
+        return best;
+    }
+
+    private AzRttiEvidence decodeValueAzRttiFromVptrWrites(
+        Address functionAddress,
+        String registryTypeId,
+        String expectedTypeName,
+        String source,
+        int depth) {
+
+        AzRttiEvidence best = null;
+        int bestScore = Integer.MIN_VALUE;
+        ArrayList<JsonObject> vptrWriteObjects = new ArrayList<>();
+        for (VtableWrite write : handlerVtableWrites(functionAddress)) {
+            AzRttiEvidence evidence = decodeAzRttiFromVtable(write.vtable);
+            if (evidence == null || evidence.typeId == null) {
+                continue;
+            }
+            vptrWriteObjects.add(vptrWriteJson(write, evidence, expectedTypeName));
+            if (expectedTypeName != null &&
+                isLikelyRuntimeTypeName(evidence.typeName) &&
+                !typeNamesMatch(expectedTypeName, evidence.typeName)) {
+                continue;
+            }
+
+            int score =
+                valueAzRttiEvidenceScore(evidence, registryTypeId, expectedTypeName, depth, write.order);
+            if (score >= bestScore) {
+                evidence.source = source;
+                evidence.sourceInstruction = write.instruction;
+                best = evidence;
+                bestScore = score;
+            }
+        }
+        JsonArray vptrWrites = constructorVptrChainJson(vptrWriteObjects);
+        if (best != null && vptrWrites.size() != 0) {
+            best.constructorVptrWrites = vptrWrites;
+        }
+        return best;
+    }
+
+    private JsonArray constructorVptrChainJson(List<JsonObject> writes) {
+        JsonArray array = new JsonArray();
+        for (int i = 0; i < writes.size(); i++) {
+            JsonObject object = writes.get(i);
+            object.addProperty(
+                "constructorRole",
+                i + 1 == writes.size() ? "concrete" : "base-or-intermediate");
+            array.add(object);
+        }
+        return array;
+    }
+
+    private JsonObject vptrWriteJson(
+        VtableWrite write,
+        AzRttiEvidence evidence,
+        String expectedTypeName) {
+
+        JsonObject object = new JsonObject();
+        object.addProperty("order", write.order);
+        NetworkSchemaJson.add(object, "constructorFunction", formatAddress(write.function));
+        NetworkSchemaJson.add(object, "constructorFunctionName", fullFunctionName(functionAtOrContaining(write.function)));
+        NetworkSchemaJson.add(object, "sourceInstruction", formatAddress(write.instruction));
+        NetworkSchemaJson.add(object, "vtable", formatAddress(write.vtable));
+        if (write.thisOffset != null) {
+            object.addProperty("thisOffset", "0x" + Integer.toHexString(write.thisOffset));
+        }
+        NetworkSchemaJson.add(object, "baseKey", write.baseKey);
+        if (write.baseOffset != null) {
+            object.addProperty("baseOffset", "0x" + Integer.toHexString(write.baseOffset));
+        }
+        NetworkSchemaJson.add(object, "pattern", write.pattern);
+        NetworkSchemaJson.add(object, "typeId", evidence.typeId);
+        NetworkSchemaJson.add(object, "typeName", evidence.typeName);
+        if (expectedTypeName != null) {
+            object.addProperty("matchesExpectedTypeName",
+                typeNamesMatch(expectedTypeName, evidence.typeName));
+        }
+        if (evidence.providers.size() != 0) {
+            object.add("providers", evidence.providers.deepCopy());
+        }
+        return object;
+    }
+
+    private int valueAzRttiEvidenceScore(
+        AzRttiEvidence evidence,
+        String registryTypeId,
+        String expectedTypeName,
+        int depth,
+        int order) {
+
+        int score = order * 20 - depth * 100;
+        if (evidence.typeId != null) {
+            score += 40;
+        }
+        if (isLikelyRuntimeTypeName(evidence.typeName)) {
+            score += 100 + runtimeTypeNameScore(evidence.typeName);
+        }
+        if (expectedTypeName != null && typeNamesMatch(expectedTypeName, evidence.typeName)) {
+            score += 10_000;
+        }
+        if (registryTypeId != null && uuidEquals(registryTypeId, evidence.typeId)) {
+            score -= 500;
+        }
+        return score;
+    }
+
+    private void enrichAzRttiWithConstructorName(
+        AzRttiEvidence evidence,
+        RegistrationFunction match) {
+
+        if (evidence == null) {
+            return;
+        }
+
+        String typeName = match.constructorTypeName();
+        if (!isLikelyRuntimeTypeName(typeName)) {
+            return;
+        }
+        if (isPlausibleTypeName(evidence.typeName)) {
+            return;
+        }
+
+        TypeNameDecode decode = new TypeNameDecode();
+        decode.function = match.function.getEntryPoint();
+        decode.provider = match.function.getEntryPoint();
+        decode.typeName = typeName;
+        decode.typeNameSource = "constructorFunctionName";
+        evidence.typeName = typeName;
+        evidence.typeNameSource = decode.typeNameSource;
+        evidence.providers.add(decode.toJson(-1));
+    }
+
+    private AzRttiEvidence decodeAzRttiFromRegistryHandler(
+        RegistryEntry entry,
+        String registryTypeId,
+        boolean identityOnly) {
+
+        return decodeAzRttiFromHandlerAddresses(
+            registryHandlerFunctionAddresses(entry),
+            registryTypeId,
+            identityOnly);
+    }
+
+    private AzRttiEvidence decodeAzRttiFromHandlerAddresses(
+        List<Address> handlers,
+        String registryTypeId,
+        boolean identityOnly) {
+
+        AzRttiEvidence bestExact = null;
+        int bestExactScore = Integer.MIN_VALUE;
+        AzRttiEvidence bestNameOnly = null;
+        int bestNameOnlyScore = Integer.MIN_VALUE;
+        for (Address handler : handlers) {
+            AzRttiScanResult result =
+                decodeAzRttiFromHandlerRoot(handler, registryTypeId, identityOnly);
+            if (result.exact != null && result.exactScore >= bestExactScore) {
+                bestExact = result.exact;
+                bestExactScore = result.exactScore;
+            }
+            if (result.nameOnly != null && result.nameOnlyScore >= bestNameOnlyScore) {
+                bestNameOnly = result.nameOnly;
+                bestNameOnlyScore = result.nameOnlyScore;
+            }
+        }
+
+        if (bestExact != null) {
+            return bestExact;
+        }
+        return bestNameOnly;
+    }
+
+    private AzRttiScanResult decodeAzRttiFromHandlerRoot(
+        Address handler,
+        String registryTypeId,
+        boolean identityOnly) {
+
+        AzRttiScanResult result = new AzRttiScanResult();
+        Deque<HandlerScanFrame> stack = new ArrayDeque<>();
+        stack.addFirst(new HandlerScanFrame(handler, 0));
+
+        LinkedHashSet<String> seenFunctions = new LinkedHashSet<>();
+        int bestNameOnlyScore = Integer.MIN_VALUE;
+
+        while (!stack.isEmpty() && seenFunctions.size() < REGISTRY_HANDLER_RTTI_FUNCTION_LIMIT) {
+            HandlerScanFrame frame = stack.removeFirst();
+            Address functionAddress = resolvedCodeTarget(frame.address);
+            if (!isExecutableAddress(functionAddress) ||
+                !seenFunctions.add(functionAddress.toString())) {
+                continue;
+            }
+
+            for (VtableWrite write : handlerVtableWrites(functionAddress)) {
+                AzRttiEvidence evidence = decodeAzRttiFromVtable(write.vtable);
+                if (evidence == null || !evidence.hasIdentity()) {
+                    continue;
+                }
+                boolean matchesRegistryTypeId =
+                    registryTypeId != null && evidenceHasTypeId(evidence, registryTypeId);
+                if (identityOnly && registryTypeId != null &&
+                    !matchesRegistryTypeId) {
+                    continue;
+                }
+                if (identityOnly && matchesRegistryTypeId) {
+                    evidence.typeId = registryTypeId;
+                    String foldedTypeName = providerTypeNameForTypeId(evidence, registryTypeId);
+                    if (isConcreteNetworkTypeName(foldedTypeName)) {
+                        evidence.typeName = foldedTypeName;
+                        evidence.typeNameSource = "rtti-provider-graph";
+                    }
+                    else {
+                        evidence.typeName = null;
+                        evidence.typeNameSource = null;
+                    }
+                }
+                if (evidence.typeId != null) {
+                    int score = azRttiEvidenceScore(
+                        evidence,
+                        write,
+                        registryTypeId,
+                        frame.depth);
+                    if (score >= result.exactScore) {
+                        evidence.source =
+                            azRttiSourceForWrite(identityOnly, false, write);
+                        evidence.sourceInstruction = write.instruction;
+                        evidence.constructorVptrWrites =
+                            singleVptrWriteChain(write, evidence, null);
+                        result.exact = evidence;
+                        result.exactScore = score;
+                    }
+                    continue;
+                }
+
+                if (isLikelyRuntimeTypeName(evidence.typeName)) {
+                    int score = azRttiEvidenceScore(
+                        evidence,
+                        write,
+                        registryTypeId,
+                        frame.depth);
+                    if (score >= bestNameOnlyScore) {
+                        evidence.source =
+                            azRttiSourceForWrite(identityOnly, true, write);
+                        evidence.sourceInstruction = write.instruction;
+                        evidence.constructorVptrWrites =
+                            singleVptrWriteChain(write, evidence, null);
+                        result.nameOnly = evidence;
+                        result.nameOnlyScore = score;
+                        bestNameOnlyScore = score;
+                    }
+                }
+            }
+
+            if (frame.depth >= REGISTRY_HANDLER_RTTI_CALL_DEPTH) {
+                continue;
+            }
+
+            ArrayList<Address> callees = new ArrayList<>();
+            for (Instruction instruction :
+                linearInstructions(functionAddress, REGISTRY_HANDLER_RTTI_SCAN_LIMIT)) {
+                if (!instruction.getFlowType().isCall()) {
+                    continue;
+                }
+
+                Address target = resolvedCodeTarget(callTarget(instruction));
+                if (isExecutableAddress(target)) {
+                    callees.add(target);
+                }
+            }
+            for (int i = callees.size() - 1; i >= 0; i--) {
+                stack.addFirst(new HandlerScanFrame(callees.get(i), frame.depth + 1));
+            }
+        }
+
+        return result;
+    }
+
+    private String azRttiSourceForWrite(
+        boolean identityOnly,
+        boolean nameOnly,
+        VtableWrite write) {
+
+        String source = write != null &&
+            write.pattern != null &&
+            write.pattern.contains("argument-object-vtable-write")
+            ? "argument-object-vtable-write"
+            : "constructor-vtable-write";
+        if (!identityOnly) {
+            source += "-value";
+        }
+        if (nameOnly) {
+            source += "-name-only";
+        }
+        return source;
+    }
+
+    private JsonArray singleVptrWriteChain(
+        VtableWrite write,
+        AzRttiEvidence evidence,
+        String expectedTypeName) {
+
+        ArrayList<JsonObject> writes = new ArrayList<>();
+        writes.add(vptrWriteJson(write, evidence, expectedTypeName));
+        return constructorVptrChainJson(writes);
+    }
+
+    private boolean evidenceHasTypeId(AzRttiEvidence evidence, String typeId) {
+        if (evidence == null || typeId == null) {
+            return false;
+        }
+        if (uuidEquals(typeId, evidence.typeId)) {
+            return true;
+        }
+        for (JsonElement element : evidence.providers) {
+            if (!element.isJsonObject()) {
+                continue;
+            }
+            String providerTypeId = string(element.getAsJsonObject(), "typeId");
+            if (uuidEquals(typeId, providerTypeId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String providerTypeNameForTypeId(AzRttiEvidence evidence, String typeId) {
+        if (evidence == null || typeId == null) {
+            return null;
+        }
+
+        LinkedHashSet<Integer> matchingSlots = providerSlotsForTypeId(evidence, typeId);
+
+        for (Integer slot : matchingSlots) {
+            String sameSlotName = providerTypeNameAtSlot(evidence, slot);
+            if (isConcreteNetworkTypeName(sameSlotName)) {
+                return sameSlotName;
+            }
+        }
+
+        if (matchingSlots.contains(2)) {
+            String actualTypeName = providerTypeNameAtSlot(evidence, 1);
+            if (isConcreteNetworkTypeName(actualTypeName)) {
+                return actualTypeName;
+            }
+        }
+        if (matchingSlots.contains(0)) {
+            String actualTypeName = providerTypeNameAtSlot(evidence, 1);
+            if (isConcreteNetworkTypeName(actualTypeName)) {
+                return actualTypeName;
+            }
+        }
+        return null;
+    }
+
+    private String providerAnyTypeNameForTypeId(AzRttiEvidence evidence, String typeId) {
+        if (evidence == null || typeId == null) {
+            return null;
+        }
+
+        LinkedHashSet<Integer> matchingSlots = providerSlotsForTypeId(evidence, typeId);
+        for (Integer slot : matchingSlots) {
+            String sameSlotName = providerTypeNameAtSlot(evidence, slot);
+            if (isLikelyRuntimeTypeName(sameSlotName)) {
+                return sameSlotName;
+            }
+        }
+
+        if (matchingSlots.contains(2)) {
+            String actualTypeName = providerTypeNameAtSlot(evidence, 1);
+            if (isLikelyRuntimeTypeName(actualTypeName)) {
+                return actualTypeName;
+            }
+        }
+        if (matchingSlots.contains(0)) {
+            String actualTypeName = providerTypeNameAtSlot(evidence, 1);
+            if (isLikelyRuntimeTypeName(actualTypeName)) {
+                return actualTypeName;
+            }
+        }
+        return null;
+    }
+
+    private LinkedHashSet<Integer> providerSlotsForTypeId(
+        AzRttiEvidence evidence,
+        String typeId) {
+
+        LinkedHashSet<Integer> slots = new LinkedHashSet<>();
+        if (evidence == null || typeId == null) {
+            return slots;
+        }
+        for (JsonElement element : evidence.providers) {
+            if (!element.isJsonObject()) {
+                continue;
+            }
+            JsonObject provider = element.getAsJsonObject();
+            if (uuidEquals(typeId, string(provider, "typeId"))) {
+                Integer slot = integer(provider, "slot");
+                if (slot != null) {
+                    slots.add(slot);
+                }
+            }
+        }
+        return slots;
+    }
+
+    private String providerTypeNameAtSlot(AzRttiEvidence evidence, int slot) {
+        if (evidence == null) {
+            return null;
+        }
+        for (JsonElement element : evidence.providers) {
+            if (!element.isJsonObject()) {
+                continue;
+            }
+            JsonObject provider = element.getAsJsonObject();
+            Integer providerSlot = integer(provider, "slot");
+            if (providerSlot != null && providerSlot == slot) {
+                String typeName = string(provider, "typeName");
+                if (typeName != null) {
+                    return typeName;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String providerTypeIdAtSlot(AzRttiEvidence evidence, int slot) {
+        if (evidence == null) {
+            return null;
+        }
+        for (JsonElement element : evidence.providers) {
+            if (!element.isJsonObject()) {
+                continue;
+            }
+            JsonObject provider = element.getAsJsonObject();
+            Integer providerSlot = integer(provider, "slot");
+            if (providerSlot != null && providerSlot == slot) {
+                String providerTypeId = string(provider, "typeId");
+                if (providerTypeId != null) {
+                    return providerTypeId;
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean isBaseOrInterfaceRegistryEntry(
+        RegistryEntry entry,
+        AzRttiEvidence resolvedRtti) {
+
+        String registryTypeId = canonicalUuidFromString(entry.uuid);
+        if (registryTypeId == null || resolvedRtti == null ||
+            !evidenceHasTypeId(resolvedRtti, registryTypeId)) {
+            return false;
+        }
+        return isBaseNetworkTypeName(
+            providerAnyTypeNameForTypeId(resolvedRtti, registryTypeId));
+    }
+
+    private int azRttiEvidenceScore(
+        AzRttiEvidence evidence,
+        VtableWrite write,
+        String registryTypeId,
+        int frameDepth) {
+
+        int score = write.order * 20 - frameDepth * 200;
+        if (evidence.typeId != null) {
+            score += 40;
+        }
+        if (isLikelyRuntimeTypeName(evidence.typeName)) {
+            score += 100 + runtimeTypeNameScore(evidence.typeName);
+        }
+        if (registryTypeId != null && uuidEquals(registryTypeId, evidence.typeId)) {
+            score += 1000;
+        }
+        return score;
+    }
+
+    private List<VtableWrite> constructorVtableWrites(Address functionAddress) {
+        return constructorVtableWrites(functionAddress, new LinkedHashSet<>(), false);
+    }
+
+    private List<VtableWrite> handlerVtableWrites(Address functionAddress) {
+        return constructorVtableWrites(functionAddress, new LinkedHashSet<>(), true);
+    }
+
+    private List<VtableWrite> constructorVtableWrites(
+        Address functionAddress,
+        Set<String> activeConstructors,
+        boolean includeArgumentObjectWrites) {
+
+        Address target = resolvedCodeTarget(functionAddress);
+        if (!isExecutableAddress(target)) {
+            return List.of();
+        }
+
+        String key = addressCacheKey(
+            includeArgumentObjectWrites
+                ? "handler-vtable-writes"
+                : "constructor-vtable-writes",
+            target);
+        List<VtableWrite> cached = constructorVtableWritesCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        if (activeConstructors.size() >= CONSTRUCTOR_VTABLE_RECURSION_LIMIT) {
+            return List.of();
+        }
+
+        String activeKey = target.toString();
+        if (!activeConstructors.add(activeKey)) {
+            return List.of();
+        }
+        try {
+            List<VtableWrite> recovered =
+                recoverConstructorVtableWrites(
+                    target,
+                    activeConstructors,
+                    includeArgumentObjectWrites);
+            List<VtableWrite> immutable =
+                Collections.unmodifiableList(new ArrayList<>(recovered));
+            constructorVtableWritesCache.put(key, immutable);
+            return immutable;
+        }
+        finally {
+            activeConstructors.remove(activeKey);
+        }
+    }
+
+    private List<VtableWrite> recoverConstructorVtableWrites(
+        Address functionAddress,
+        Set<String> activeConstructors,
+        boolean includeArgumentObjectWrites) {
+
+        functionAtOrContaining(functionAddress);
+        ArrayList<VtableWrite> result = new ArrayList<>();
+        ForwardArgState state = newForwardArgState();
+
+        for (Instruction instruction :
+            linearInstructions(functionAddress, REGISTRY_HANDLER_RTTI_SCAN_LIMIT)) {
+
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if (mnemonic == null) {
+                continue;
+            }
+
+            if (instruction.getFlowType().isCall()) {
+                collectVectorConstructorVtableWrites(
+                    instruction,
+                    state,
+                    result,
+                    activeConstructors);
+                collectDirectConstructorCallVtableWrites(
+                    instruction,
+                    state,
+                    result,
+                    activeConstructors);
+                observeForwardInstruction(instruction, state, false);
+                continue;
+            }
+
+            if (isMemoryWriteMnemonic(mnemonic)) {
+                Integer offset =
+                    trackedThisOffsetForMemoryOperand(instruction, 0, state.registers);
+                TrackedValue baseOffset = includeArgumentObjectWrites
+                    ? trackedBaseOffsetForMemoryOperand(instruction, 0, state.registers)
+                    : null;
+                TrackedValue source = "MOV".equals(mnemonic)
+                    ? trackedOperandValue(instruction, 1, state)
+                    : null;
+                if (offset != null && source != null &&
+                    source.address != null && isVtableLike(source.address)) {
+                    result.add(new VtableWrite(
+                        functionAddress,
+                        instruction.getMinAddress(),
+                        source.address,
+                        result.size(),
+                        offset,
+                        "constructor-vtable-write"));
+                }
+                else if (source != null &&
+                    source.address != null &&
+                    isVtableLike(source.address) &&
+                    isArgumentObjectVtableWrite(baseOffset)) {
+                    result.add(new VtableWrite(
+                        functionAddress,
+                        instruction.getMinAddress(),
+                        source.address,
+                        result.size(),
+                        null,
+                        baseOffset.baseKey,
+                        baseOffset.baseOffset,
+                        "argument-object-vtable-write"));
+                }
+            }
+
+            observeForwardInstruction(instruction, state, false);
+        }
+
+        return result;
+    }
+
+    private boolean isArgumentObjectVtableWrite(TrackedValue value) {
+        return value != null &&
+            "arg:R8".equals(value.baseKey) &&
+            value.baseOffset != null &&
+            value.baseOffset >= 0 &&
+            value.baseOffset <= 0x1000 &&
+            value.baseOffset % 8 == 0;
+    }
+
+    private void collectDirectConstructorCallVtableWrites(
+        Instruction instruction,
+        ForwardArgState state,
+        List<VtableWrite> result,
+        Set<String> activeConstructors) {
+
+        TrackedValue receiver = state.registers.get("RCX");
+        if (receiver == null || receiver.thisOffset == null) {
+            return;
+        }
+
+        Address constructor = resolvedCodeTarget(callTarget(instruction));
+        if (!isExecutableAddress(constructor)) {
+            return;
+        }
+        if (isVectorConstructorIteratorCall(constructor)) {
+            return;
+        }
+
+        for (VtableWrite write : constructorVtableWrites(
+            constructor,
+            activeConstructors,
+            false)) {
+            if (write.thisOffset == null) {
+                continue;
+            }
+            Integer projected =
+                NetworkSchemaX86.addOffsets(receiver.thisOffset, write.thisOffset.longValue());
+            if (projected == null) {
+                continue;
+            }
+            result.add(new VtableWrite(
+                write.function,
+                write.instruction,
+                write.vtable,
+                result.size(),
+                projected,
+                prefixPattern("constructor-call", write.pattern)));
+        }
+    }
+
+    private void collectVectorConstructorVtableWrites(
+        Instruction instruction,
+        ForwardArgState state,
+        List<VtableWrite> result,
+        Set<String> activeConstructors) {
+
+        Address call = resolvedCodeTarget(callTarget(instruction));
+        if (!isVectorConstructorIteratorCall(call)) {
+            return;
+        }
+
+        TrackedValue base = state.registers.get("RCX");
+        TrackedValue elementSize = state.registers.get("RDX");
+        TrackedValue elementCount = state.registers.get("R8");
+        TrackedValue constructorValue = state.registers.get("R9");
+        if (base == null || base.thisOffset == null ||
+            elementSize == null || elementSize.immediate == null ||
+            elementCount == null || elementCount.immediate == null ||
+            constructorValue == null || constructorValue.address == null) {
+            return;
+        }
+
+        long count = elementCount.immediate;
+        long size = elementSize.immediate;
+        if (count <= 0 || count > 256 || size <= 0 || size > 0x1000) {
+            return;
+        }
+
+        Address constructor = resolvedCodeTarget(constructorValue.address);
+        List<VtableWrite> writes = constructorVtableWrites(
+            constructor,
+            activeConstructors,
+            false);
+        if (writes.isEmpty()) {
+            return;
+        }
+
+        for (long i = 0; i < count; i++) {
+            long elementOffset = base.thisOffset.longValue() + (i * size);
+            if (elementOffset < Integer.MIN_VALUE || elementOffset > Integer.MAX_VALUE) {
+                continue;
+            }
+            for (VtableWrite write : writes) {
+                if (write.thisOffset == null) {
+                    continue;
+                }
+                Integer projected = NetworkSchemaX86.addOffsets((int)elementOffset, write.thisOffset.longValue());
+                if (projected == null) {
+                    continue;
+                }
+                result.add(new VtableWrite(

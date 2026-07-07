@@ -1,0 +1,900 @@
+            default:
+                return null;
+        }
+    }
+
+    private String pcodeMergedValueNativeType(
+        PcodeOp def,
+        Map<String, String> tempNativeTypes,
+        Set<String> seen,
+        int depth) {
+
+        String merged = null;
+        for (int i = 0; i < def.getNumInputs(); i++) {
+            String valueType =
+                pcodeValueNativeType(
+                    def.getInput(i),
+                    tempNativeTypes,
+                    new LinkedHashSet<>(seen),
+                    depth);
+            if (valueType == null) {
+                return null;
+            }
+            if (merged == null) {
+                merged = valueType;
+            }
+            else if (!merged.equals(valueType)) {
+                return null;
+            }
+        }
+        return merged;
+    }
+
+    private String pcodeTempNativeType(
+        Varnode node,
+        Map<String, String> tempNativeTypes) {
+
+        if (tempNativeTypes == null || tempNativeTypes.isEmpty()) {
+            return null;
+        }
+        PcodeStorage storage = pcodeStorageExpression(node);
+        if (!isPcodeLocalTempStorage(storage)) {
+            storage = pcodeLoadedStorageExpression(node);
+        }
+        if (!isPcodeLocalTempStorage(storage)) {
+            return null;
+        }
+        return tempNativeTypes.get(storageKey(storage));
+    }
+
+    private String pcodeTempWireShape(
+        Varnode node,
+        Map<String, String> tempWireShapes) {
+
+        if (tempWireShapes == null || tempWireShapes.isEmpty()) {
+            return null;
+        }
+        PcodeStorage storage = pcodeStorageExpression(node);
+        if (!isPcodeLocalTempStorage(storage)) {
+            storage = pcodeLoadedStorageExpression(node);
+        }
+        if (!isPcodeLocalTempStorage(storage)) {
+            return null;
+        }
+        return tempWireShapes.get(storageKey(storage));
+    }
+
+    private Long pcodeConstantValue(Varnode node, Set<String> seen, int depth) {
+        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+            return null;
+        }
+        if (node.isConstant()) {
+            return node.getOffset();
+        }
+        String key = "constant:" + pcodeNodeKey(node);
+        if (!seen.add(key)) {
+            return null;
+        }
+        PcodeOp def = node.getDef();
+        if (def == null || def.getNumInputs() == 0) {
+            return null;
+        }
+        switch (def.getOpcode()) {
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.INT_ZEXT:
+            case PcodeOp.INT_SEXT:
+            case PcodeOp.SUBPIECE:
+                return pcodeConstantValue(def.getInput(0), seen, depth + 1);
+            case PcodeOp.INT_ADD: {
+                Long left =
+                    pcodeConstantValue(def.getInput(0), new LinkedHashSet<>(seen), depth + 1);
+                Long right =
+                    pcodeConstantValue(def.getInput(1), new LinkedHashSet<>(seen), depth + 1);
+                return left == null || right == null ? null : left + right;
+            }
+            case PcodeOp.INT_SUB: {
+                Long left =
+                    pcodeConstantValue(def.getInput(0), new LinkedHashSet<>(seen), depth + 1);
+                Long right =
+                    pcodeConstantValue(def.getInput(1), new LinkedHashSet<>(seen), depth + 1);
+                return left == null || right == null ? null : left - right;
+            }
+            default:
+                return null;
+        }
+    }
+
+    private String pcodeHighName(Varnode node) {
+        if (!(node instanceof VarnodeAST ast) || ast.getHigh() == null) {
+            return null;
+        }
+        try {
+            String name = ast.getHigh().getName();
+            if (name == null || name.isBlank() || name.startsWith("UNNAMED")) {
+                return null;
+            }
+            return name;
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private boolean isPcodeStorageBase(String name) {
+        return name != null &&
+            (name.equals("this") ||
+                name.equals("_Dst") ||
+                name.matches("param_\\d+") ||
+                name.matches("p[lub]?Var\\d*"));
+    }
+
+    private String pcodeNodeKey(Varnode node) {
+        if (node == null) {
+            return "<null>";
+        }
+        return node.getAddress() + ":" + node.getOffset() + ":" + node.getSize() +
+            ":" + node.isConstant();
+    }
+
+    private MessageHelperCall findMessageHelperCall(Function wrapper) {
+        for (Instruction instruction : functionInstructions(wrapper)) {
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+            Address target = callTarget(instruction);
+            Function function = functionAtOrContaining(target);
+            if (function == null) {
+                continue;
+            }
+            String name = fullFunctionName(function);
+            if (name.contains("UnmarshalFields<")) {
+                MessageHelperCall call = new MessageHelperCall();
+                call.callsite = instruction.getMinAddress();
+                call.target = function.getEntryPoint();
+                call.targetName = name;
+                return call;
+            }
+        }
+        return null;
+    }
+
+    private String nativeTypeFromCast(String castType) {
+        if (castType == null) {
+            return null;
+        }
+        String normalized = castType
+            .replace("AZStd::", "")
+            .replace("_string", "string")
+            .replace(" *", "*")
+            .trim();
+        if (normalized.contains("unordered_map") &&
+            normalized.contains("u32") &&
+            normalized.contains("string")) {
+            return "unordered_map<u32,string>";
+        }
+        if (normalized.contains("string")) {
+            return "AZStd::string";
+        }
+        if (normalized.startsWith("bool")) {
+            return "bool";
+        }
+        if (normalized.startsWith("byte") || normalized.startsWith("undefined1")) {
+            return "u8";
+        }
+        if (normalized.startsWith("undefined2")) {
+            return "u16";
+        }
+        if (normalized.startsWith("undefined4")) {
+            return "u32";
+        }
+        if (normalized.startsWith("undefined8")) {
+            return "u64";
+        }
+        return normalized.replace("*", "").trim();
+    }
+
+    private boolean shouldUseTemplateType(String nativeType, String templateType) {
+        if (templateType == null || templateType.isEmpty()) {
+            return false;
+        }
+        if (nativeType == null) {
+            return true;
+        }
+        if ("u32".equals(nativeType)) {
+            return templateType.endsWith("Token") ||
+                templateType.endsWith("Values") ||
+                templateType.endsWith("Info") ||
+                templateType.endsWith("Data");
+        }
+        return false;
+    }
+
+    private boolean templateMatchesCast(String templateType, String nativeType) {
+        if (templateType == null || nativeType == null) {
+            return false;
+        }
+        if ("ClientVersionTokenMap".equals(templateType) &&
+            nativeType.contains("unordered_map<u32,string>")) {
+            return true;
+        }
+        if ("AZStd::string".equals(nativeType) && templateType.endsWith("String")) {
+            return true;
+        }
+        return false;
+    }
+
+    private String wireShapeFromNativeType(String nativeType) {
+        if (nativeType == null) {
+            return null;
+        }
+        String normalized = normalizeNativeType(nativeType);
+        String marshallerShape = wireShapeFromMarshallerType(normalized);
+        if (marshallerShape != null) {
+            return marshallerShape;
+        }
+        if ("bool".equals(normalized)) {
+            return "bool";
+        }
+        if ("Amazon::Hub::ActorRef".equals(normalized) ||
+            "ActorRef".equals(normalized) ||
+            "HubAddress".equals(normalized) ||
+            "ProxyAddress".equals(normalized)) {
+            return "actor-ref";
+        }
+        if ("EntityRef".equals(normalized)) {
+            return "entity-ref";
+        }
+        if ("u8".equals(normalized) ||
+            "uint8_t".equals(normalized) ||
+            "std::uint8_t".equals(normalized) ||
+            "AZ::u8".equals(normalized) ||
+            "i8".equals(normalized) ||
+            "int8_t".equals(normalized) ||
+            "std::int8_t".equals(normalized) ||
+            "AZ::s8".equals(normalized) ||
+            "unsigned char".equals(normalized) ||
+            "char".equals(normalized)) {
+            return "u8";
+        }
+        if ("u16".equals(normalized) ||
+            "uint16_t".equals(normalized) ||
+            "std::uint16_t".equals(normalized) ||
+            "AZ::u16".equals(normalized) ||
+            "i16".equals(normalized) ||
+            "int16_t".equals(normalized) ||
+            "std::int16_t".equals(normalized) ||
+            "AZ::s16".equals(normalized)) {
+            return "u16";
+        }
+        if ("u32".equals(normalized) ||
+            "uint32_t".equals(normalized) ||
+            "std::uint32_t".equals(normalized) ||
+            "AZ::u32".equals(normalized) ||
+            "i32".equals(normalized) ||
+            "int32_t".equals(normalized) ||
+            "std::int32_t".equals(normalized) ||
+            "AZ::s32".equals(normalized) ||
+            "AZ::Crc32".equals(normalized) ||
+            "FragmentKey".equals(normalized) ||
+            "Amazon::Hub::FragmentKey".equals(normalized)) {
+            return "u32";
+        }
+        if ("u64".equals(normalized) ||
+            "uint64_t".equals(normalized) ||
+            "std::uint64_t".equals(normalized) ||
+            "AZ::u64".equals(normalized) ||
+            "i64".equals(normalized) ||
+            "int64_t".equals(normalized) ||
+            "std::int64_t".equals(normalized) ||
+            "AZ::s64".equals(normalized) ||
+            "AZ::EntityId".equals(normalized) ||
+            "TimePoint".equals(normalized) ||
+            "MB::TimePoint".equals(normalized) ||
+            "WallClockTimePoint".equals(normalized) ||
+            "MB::WallClockTimePoint".equals(normalized)) {
+            return "u64";
+        }
+        if ("Amazon::Hub::SequenceNumber".equals(normalized) ||
+            "SequenceNumber".equals(normalized)) {
+            return "sequence-number";
+        }
+        if ("f32".equals(normalized) || "float".equals(normalized)) {
+            return "f32";
+        }
+        if ("f64".equals(normalized) || "double".equals(normalized)) {
+            return "f64";
+        }
+        if ("AZ::Uuid".equals(normalized) ||
+            "AZ::TypeId".equals(normalized) ||
+            "Uuid".equals(normalized)) {
+            return "fixed-bytes-16";
+        }
+        if (normalized.matches("fixed-bytes-[1-9][0-9]*")) {
+            return normalized;
+        }
+        if ("AZ::Vector2".equals(normalized)) {
+            return "vec2";
+        }
+        if ("AZ::Vector3".equals(normalized)) {
+            return "vec3";
+        }
+        if ("AZ::Vector4".equals(normalized)) {
+            return "vec4";
+        }
+        if ("AZ::Quaternion".equals(normalized)) {
+            return "quat";
+        }
+        if ("AZ::Matrix3x3".equals(normalized)) {
+            return "mat3";
+        }
+        if ("AZ::Transform".equals(normalized)) {
+            return "affine3";
+        }
+        if ("AZ::Bounds".equals(normalized)) {
+            return "aabb2d";
+        }
+        if ("AZ::Aabb".equals(normalized)) {
+            return "aabb3d";
+        }
+        if ("EntityRef".equals(normalized)) {
+            return "entity-ref";
+        }
+        if ("AZStd::string".equals(normalized) ||
+            "std::string".equals(normalized) ||
+            "string".equals(normalized)) {
+            return "string";
+        }
+        return null;
+    }
+
+    private String wireShapeFromRawByteLength(int byteLength) {
+        if (byteLength == 1) {
+            return "u8";
+        }
+        if (byteLength > 1) {
+            return "fixed-bytes-" + byteLength;
+        }
+        return null;
+    }
+
+    private String normalizeNativeType(String value) {
+        if (value == null) {
+            return null;
+        }
+        String result = value
+            .replace('\r', ' ')
+            .replace('\n', ' ')
+            .replace('\t', ' ')
+            .replaceAll("\\s+", " ")
+            .replace(" ,", ",")
+            .replace(", ", ",")
+            .replace(" <", "<")
+            .replace("< ", "<")
+            .replace(" >", ">")
+            .trim();
+        return result.isEmpty() ? null : result;
+    }
+
+    private FieldCall recoverFieldCall(Function owner, Address callsite, int index) {
+        ArgState state = recoverForwardArgState(owner, callsite);
+        ArgState fallback = recoverBackwardArgState(owner, callsite);
+        state.fillMissingFrom(fallback);
+
+        return fieldCallFromArgState(owner, callsite, index, state);
+    }
+
+    private FieldCall fieldCallFromArgState(
+        Function owner,
+        Address callsite,
+        int index,
+        ArgState state) {
+
+        FieldCall field = new FieldCall();
+        field.index = index;
+        field.callsite = callsite;
+        field.nameAddress = state.nameAddress;
+        field.name = state.name;
+        field.group = state.groupKnown ? state.group : null;
+        field.handlerOffset = state.handlerOffset;
+        field.handlerExpression = state.handlerExpression;
+        field.handlerVtable = state.handlerVtable;
+        field.handlerConstruction = state.handlerConstruction;
+        field.constructorWrites = state.handlerConstructorWrites;
+        field.registrationKind = "field";
+        applyFieldHandlerShape(field, fieldHandlerShape(field.handlerVtable));
+        field.handlerTypeName = fieldHandlerTypeName(field.handlerConstruction, field.handlerVtable);
+        enrichFieldFromHandlerType(field);
+        field.confidence = field.name == null
+            ? "register-field-call-unresolved-name"
+            : "register-field-call";
+        return field;
+    }
+
+    private void applyFieldHandlerShape(FieldCall field, FieldHandlerShape shape) {
+        if (field == null || shape == null) {
+            return;
+        }
+
+        field.handlerKind = shape.kind;
+        field.handlerVtableSlots = shape.vtableSlots;
+        field.physicalFieldCount = shape.physicalFieldCount;
+        if (shape.wireShape != null) {
+            field.wireShape = shape.wireShape.shape;
+            field.wireShapeSource = shape.wireShape.source;
+        }
+
+        ContainerWireShape container = shape.containerWireShape;
+        if (container == null) {
+            return;
+        }
+        if (field.nestedTypeShape == null && container.valueTypeShape != null) {
+            field.nestedTypeShape = container.valueTypeShape;
+        }
+        if (field.wireShape == null) {
+            WireShape derivedShape = scalarContainerWireShape(container);
+            if (derivedShape != null) {
+                field.wireShape = derivedShape.shape;
+                field.wireShapeSource = derivedShape.source;
+            }
+        }
+    }
+
+    private void enrichFieldFromHandlerType(FieldCall field) {
+        if (field == null || field.handlerTypeName == null) {
+            return;
+        }
+
+        if (field.nativeType == null) {
+            field.nativeType = field.handlerTypeName;
+        }
+        if (field.sourceTypeName == null) {
+            field.sourceTypeName = field.handlerTypeName;
+        }
+        if (field.wireShape == null) {
+            WireShape wireShape = wireShapeFromHandlerTypeName(field.handlerTypeName);
+            if (wireShape != null) {
+                field.wireShape = wireShape.shape;
+                field.wireShapeSource = wireShape.source;
+            }
+        }
+    }
+
+    private WireShape wireShapeFromHandlerTypeName(String handlerTypeName) {
+        NetworkTemplateType type = parseNetworkTemplateType(handlerTypeName);
+        if (type == null) {
+            return null;
+        }
+
+        if (type.simpleName.equals("ReplicatedFieldHandler") && !type.args.isEmpty()) {
+            String shape = wireShapeFromReplicatedFieldHandlerArgs(type.args);
+            return shape == null ? null : new WireShape(shape, "handler-template-type");
+        }
+
+        if (type.simpleName.equals("ReplicatedMapFieldHandler") ||
+            type.simpleName.equals("ReplicatedContainer")) {
+            String shape = wireShapeFromKeyValueHandlerArgs(type.args);
+            return shape == null ? null : new WireShape(shape, "handler-template-type");
+        }
+
+        if (type.simpleName.equals("ReplicatedVectorFieldHandler") && !type.args.isEmpty()) {
+            String valueShape = wireShapeFromNativeTypeOrMarshaller(type.args.get(0), null);
+            return valueShape == null
+                ? null
+                : new WireShape(containerShape("u32", valueShape), "handler-template-type");
+        }
+
+        if (type.simpleName.equals("ReplicatedSetFieldHandler") && !type.args.isEmpty()) {
+            String keyShape = wireShapeFromNativeTypeOrMarshaller(type.args.get(0), null);
+            return keyShape == null
+                ? null
+                : new WireShape(containerShape(keyShape, keyShape), "handler-template-type");
+        }
+
+        if ((type.simpleName.equals("DeltaCompressedReplicatedFieldHandler") ||
+            type.simpleName.equals("DeltaCompressedReplicatedFieldHandlerBase") ||
+            type.simpleName.equals("DeltaCompressedCounterHandler") ||
+            type.simpleName.equals("DynamicDeltaReplicatedFieldHandler")) &&
+            !type.args.isEmpty()) {
+            String shape = wireShapeFromNativeTypeOrMarshaller(type.args.get(0), null);
+            return shape == null ? null : new WireShape(shape, "handler-template-type");
+        }
+
+        if (type.simpleName.equals("FloatTimerDeltaReplicatedField")) {
+            return new WireShape("u8", "handler-template-type-physical-lane");
+        }
+        return null;
+    }
+
+    private String wireShapeFromSourceTypeName(String sourceTypeName) {
+        if (sourceTypeName == null) {
+            return null;
+        }
+        for (String part : sourceTypeName.split(",")) {
+            String trimmed = part.trim();
+            if (!trimmed.isEmpty() && !"composite".equals(trimmed)) {
+                String shape = wireShapeFromNativeType(trimmed);
+                if (shape != null) {
+                    return shape;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String wireShapeFromReplicatedFieldHandlerArgs(List<String> args) {
+        String nativeType = args.isEmpty() ? null : args.get(0);
+        String marshallerType = args.size() > 1 ? args.get(1) : null;
+        return wireShapeFromNativeTypeOrMarshaller(nativeType, marshallerType);
+    }
+
+    private String wireShapeFromKeyValueHandlerArgs(List<String> args) {
+        if (args.size() < 2) {
+            return null;
+        }
+
+        String keyMarshaller = args.size() >= 4 ? args.get(args.size() - 2) : null;
+        String valueMarshaller = args.size() >= 4 ? args.get(args.size() - 1) : null;
+        String keyShape = wireShapeFromNativeTypeOrMarshaller(args.get(0), keyMarshaller);
+        String valueShape = wireShapeFromNativeTypeOrMarshaller(args.get(1), valueMarshaller);
+        return containerShape(keyShape, valueShape);
+    }
+
+    private String wireShapeFromNativeTypeOrMarshaller(String nativeType, String marshallerType) {
+        String fromMarshaller = wireShapeFromMarshallerType(marshallerType);
+        if (fromMarshaller != null) {
+            return fromMarshaller;
+        }
+        return wireShapeFromNativeType(nativeType);
+    }
+
+    private String wireShapeFromMarshallerType(String marshallerType) {
+        String normalized = normalizeNativeType(marshallerType);
+        if (normalized == null) {
+            return null;
+        }
+        if (normalized.contains("HalfMarshaler")) {
+            return "half-f32";
+        }
+        if (normalized.contains("PositionAnchorMarshaler")) {
+            return "position-anchor";
+        }
+        if (normalized.contains("NonUniformScaleCompMarshaler")) {
+            return "non-uniform-scale-comp";
+        }
+        if (normalized.contains("Vec2CompMarshaler")) {
+            return "vec2-comp";
+        }
+        if (normalized.contains("Vec3CompNormMarshaler") ||
+            normalized.contains("PackedNormalizedVec3Marshaller")) {
+            return "vec3-comp-norm";
+        }
+        if (normalized.contains("Vec3CompMarshaler")) {
+            return "vec3-comp";
+        }
+        if (normalized.contains("Marshaler<Amazon::Hub::ActorRef>") ||
+            normalized.contains("Marshaller<Amazon::Hub::ActorRef>")) {
+            return "actor-ref";
+        }
+        if (normalized.contains("Marshaler<EntityRef>") ||
+            normalized.contains("Marshaller<EntityRef>")) {
+            return "entity-ref";
+        }
+        if (normalized.contains("VlqU32Marshaler")) {
+            return "vlq-u32";
+        }
+        if (normalized.contains("VlqU64Marshaler")) {
+            return "vlq-u64";
+        }
+        if (normalized.contains("QuatSmallestThreeQuantizedMarshaler")) {
+            return "quat-smallest-three";
+        }
+        if (normalized.contains("PackedQuaternionMarshaller") ||
+            normalized.contains("QuatCompNormMarshaler") ||
+            normalized.contains("QuatCompressSmallestThree")) {
+            return "quat-comp-norm";
+        }
+        if (normalized.contains("QuatCompMarshaler") ||
+            normalized.contains("PackedQuaternionMarshaller")) {
+            return "quat-comp";
+        }
+        if (normalized.contains("TransformCompressor")) {
+            return "transform-compressor";
+        }
+        if (normalized.contains("PackedSize")) {
+            return "packed-size";
+        }
+        return null;
+    }
+
+    private String unmarshalWireShapeFromTarget(Function target) {
+        String name = fullFunctionName(target);
+        if (name == null) {
+            return null;
+        }
+        String custom = wireShapeFromMarshallerType(name);
+        if (custom != null) {
+            return custom;
+        }
+        if (name.contains("SequenceNumber>::Unmarshal")) {
+            return "sequence-number";
+        }
+        return null;
+    }
+
+    private ArgState recoverBackwardArgState(Function owner, Address callsite) {
+        ArgState state = new ArgState();
+        Instruction cursor = currentProgram.getListing().getInstructionBefore(callsite);
+        for (int i = 0; i < BACKWARD_ARGUMENT_SCAN_LIMIT && cursor != null; i++) {
+            if (!owner.getBody().contains(cursor.getMinAddress())) {
+                break;
+            }
+            observeArgumentAssignment(cursor, state);
+            if (state.nameAddress != null && state.groupKnown && state.handlerKnown) {
+                break;
+            }
+            if (cursor.getFlowType().isCall()) {
+                break;
+            }
+            cursor = cursor.getPrevious();
+        }
+        return state;
+    }
+
+    private ArgState recoverForwardArgState(Function owner, Address callsite) {
+        ForwardArgState state = initialForwardArgState(owner, new LinkedHashSet<>());
+        for (Instruction instruction : functionInstructions(owner)) {
+            if (instruction.getMinAddress().compareTo(callsite) >= 0) {
+                break;
+            }
+            observeForwardInstruction(instruction, state);
+        }
+
+        return argStateFromForwardState(state);
+    }
+
+    private ArgState argStateFromForwardState(ForwardArgState state) {
+        ArgState result = new ArgState();
+        TrackedValue name = state.registers.get("RDX");
+        if (name != null && name.fieldName != null) {
+            result.nameAddress = name.fieldNameAddress;
+            result.name = name.fieldName;
+        }
+        else if (name != null && name.address != null) {
+            StringDecode decoded = readFieldNameAtOrThroughPointer(name.address);
+            if (decoded != null) {
+                result.nameAddress = decoded.address;
+                result.name = decoded.value;
+            }
+        }
+
+        TrackedValue handler = state.registers.get("R8");
+        if (handler != null) {
+            result.handlerKnown = true;
+            if (handler.thisOffset != null) {
+                result.handlerOffset = handler.thisOffset;
+                result.handlerExpression = handler.expression;
+                result.handlerVtable = state.vtablesByThisOffset.get(handler.thisOffset);
+                result.handlerConstruction =
+                    state.handlerConstructionsByThisOffset.get(handler.thisOffset);
+                result.handlerConstructorWrites =
+                    state.constructorWritesByHandlerOffset.get(handler.thisOffset);
+            }
+            else if (handler.baseKey != null && handler.baseOffset != null) {
+                String key = baseOffsetKey(handler.baseKey, handler.baseOffset);
+                result.handlerExpression = handler.expression;
+                result.handlerVtable = state.vtablesByBaseOffset.get(key);
+                result.handlerConstruction = state.handlerConstructionsByBaseOffset.get(key);
+                result.handlerConstructorWrites =
+                    state.constructorWritesByBaseOffset.get(key);
+            }
+            else if (handler.address != null) {
+                result.handlerExpression = formatAddress(handler.address);
+            }
+            else {
+                result.handlerExpression = handler.expression;
+            }
+        }
+
+        TrackedValue group = state.registers.get("R9");
+        if (group != null && group.immediate != null) {
+            result.groupKnown = true;
+            result.group = group.immediate.intValue();
+        }
+        return result;
+    }
+
+    private ForwardArgState initialForwardArgState(
+        Function owner,
+        Set<String> activeFunctions) {
+
+        ForwardArgState inherited = inheritedForwardArgState(owner, activeFunctions);
+        return inherited == null ? newForwardArgState() : inherited.copy();
+    }
+
+    private ForwardArgState inheritedForwardArgState(
+        Function owner,
+        Set<String> activeFunctions) {
+
+        if (owner == null) {
+            return null;
+        }
+        String key = functionCacheKey("inherited-forward-state", owner);
+        if (inheritedForwardStateCache.containsKey(key)) {
+            ForwardArgState cached = inheritedForwardStateCache.get(key);
+            return cached == null ? null : cached.copy();
+        }
+        if (activeFunctions.size() >= INHERITED_FORWARD_STATE_RECURSION_LIMIT) {
+            return null;
+        }
+
+        String activeKey = owner.getEntryPoint().toString();
+        if (!activeFunctions.add(activeKey)) {
+            return null;
+        }
+        try {
+            ForwardArgState result = recoverInheritedForwardArgState(owner, activeFunctions);
+            inheritedForwardStateCache.put(key, result == null ? null : result.copy());
+            return result;
+        }
+        finally {
+            activeFunctions.remove(activeKey);
+        }
+    }
+
+    private ForwardArgState recoverInheritedForwardArgState(
+        Function callee,
+        Set<String> activeFunctions) {
+
+        ForwardArgState mergedState = null;
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(callee.getEntryPoint());
+        while (references.hasNext()) {
+            Reference reference = references.next();
+            if (!reference.getReferenceType().isCall()) {
+                continue;
+            }
+            Address callsite = reference.getFromAddress();
+            Instruction callInstruction =
+                currentProgram.getListing().getInstructionAt(callsite);
+            if (callInstruction == null ||
+                !callee.getEntryPoint().equals(resolvedCodeTarget(callTarget(callInstruction)))) {
+                continue;
+            }
+
+            Function caller = functionAtOrContaining(callsite);
+            if (caller == null || caller.getEntryPoint().equals(callee.getEntryPoint())) {
+                continue;
+            }
+
+            ForwardArgState callerState =
+                initialForwardArgState(caller, activeFunctions);
+            for (Instruction instruction : functionInstructions(caller)) {
+                if (instruction.getMinAddress().compareTo(callsite) >= 0) {
+                    break;
+                }
+                observeForwardInstruction(instruction, callerState);
+            }
+
+            TrackedValue receiver = callerState.registers.get("RCX");
+            if (receiver == null || receiver.thisOffset == null) {
+                continue;
+            }
+
+            ForwardArgState calleeState = newForwardArgState();
+            calleeState.copyObjectEvidenceFrom(callerState);
+            calleeState.registers.put("RCX", receiver.copy());
+            copyCallArgument(calleeState, callerState, "RDX");
+            copyCallArgument(calleeState, callerState, "R8");
+            copyCallArgument(calleeState, callerState, "R9");
+            if (mergedState == null) {
+                mergedState = calleeState;
+            }
+            else if (!mergedState.mergeCompatibleObjectEvidenceFrom(calleeState)) {
+                return null;
+            }
+        }
+        return mergedState;
+    }
+
+    private void copyCallArgument(
+        ForwardArgState calleeState,
+        ForwardArgState callerState,
+        String register) {
+
+        TrackedValue value = callerState.registers.get(register);
+        if (value != null) {
+            calleeState.registers.put(register, value.copy());
+        }
+    }
+
+    private ForwardArgState newForwardArgState() {
+        ForwardArgState state = new ForwardArgState();
+        state.registers.put("RCX", TrackedValue.thisOffset(0));
+        state.registers.put("RDX", TrackedValue.baseOffset("arg:RDX", 0));
+        state.registers.put("R8", TrackedValue.baseOffset("arg:R8", 0));
+        state.registers.put("R9", TrackedValue.baseOffset("arg:R9", 0));
+        state.registers.put("RSP", TrackedValue.stackOffset(0));
+        return state;
+    }
+
+    private void observeForwardInstruction(Instruction instruction, ForwardArgState state) {
+        observeForwardInstruction(instruction, state, true);
+    }
+
+    private void observeForwardInstruction(
+        Instruction instruction,
+        ForwardArgState state,
+        boolean observeConstructors) {
+
+        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+        if (mnemonic == null) {
+            return;
+        }
+
+        if ("PUSH".equals(mnemonic)) {
+            TrackedValue source = trackedOperandValue(instruction, 0, state);
+            adjustTrackedRegister(state, "RSP", -8);
+            Integer stackSlot = stackRegisterOffset(state, "RSP");
+            if (stackSlot != null) {
+                writeStackValue(state, stackSlot, 64, source);
+            }
+            return;
+        }
+
+        if ("POP".equals(mnemonic)) {
+            Integer stackSlot = stackRegisterOffset(state, "RSP");
+            TrackedValue value = stackSlot == null ? null : state.valuesByStackSlot.get(stackSlot);
+            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+            if (destination != null) {
+                putOrRemove(state.registers, destination, value == null ? null : value.copy());
+            }
+            if (stackSlot != null) {
+                invalidateStackRange(state, stackSlot, 8);
+            }
+            adjustTrackedRegister(state, "RSP", 8);
+            return;
+        }
+
+        if (instruction.getFlowType().isCall()) {
+            clearConditionFlags(state);
+            if (isStackProbeCall(instruction)) {
+                state.registers.remove("R10");
+                state.registers.remove("R11");
+                return;
+            }
+
+            TrackedValue formattedFieldName = formattedFieldNameCallValue(instruction, state);
+
+            if (isAllocatorCall(instruction, state)) {
+                clearVolatileRegisters(state.registers);
+                clearVolatileAllocatorDispatchRegisters(state);
+                state.registers.put(
+                    "RAX",
+                    TrackedValue.baseOffset(
+                        allocationBaseKey(instruction.getMinAddress()),
+                        0));
+                return;
+            }
+
+            boolean addFilterGroupCall = isAddFilterGroupCall(instruction, state);
+            promoteReplicatedStateConstructorReceiver(instruction, state);
+            if (observeConstructors) {
+                observeHandlerConstructorMemsetCall(instruction, state);
+                observeVectorFieldHandlerConstructorCall(instruction, state);
+                observeFieldHandlerConstructorCall(instruction, state);
+            }
+            clearVolatileRegisters(state.registers);
+            clearVolatileAllocatorDispatchRegisters(state);
+            if (formattedFieldName != null) {
+                state.registers.put("RAX", formattedFieldName);
+            }
+            if (addFilterGroupCall) {
+                state.registers.put(
+                    "RAX",
+                    TrackedValue.immediate(state.nextFilterGroupIndex++));
+            }
+            return;
+        }
+
+        if ("MUL".equals(mnemonic) || "DIV".equals(mnemonic) || "IDIV".equals(mnemonic) ||

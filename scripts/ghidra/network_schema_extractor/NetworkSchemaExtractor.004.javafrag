@@ -1,0 +1,900 @@
+
+    private boolean isZeroUuid(String uuid) {
+        String normalized = normalizeUuid(uuid);
+        return NIL_TYPE_ID.equals(normalized);
+    }
+
+    private void collectQueuedRegistrationHooks(Map<String, HookTypeEvidence> result) {
+        queuedRegistrationReferenceCount = 0;
+        queuedRegistrationDecodedCount = 0;
+        queuedRegistrationNoFunctionCount = 0;
+        queuedRegistrationNoHelperCount = 0;
+        queuedRegistrationNoTypeIdCount = 0;
+        queuedRegistrationFailureSamples = new JsonArray();
+        Address queueRegistrationHook =
+            currentProgram.getImageBase().add(QUEUE_REGISTRATION_HOOK_RVA);
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(queueRegistrationHook);
+        while (references.hasNext()) {
+            Reference reference = references.next();
+            queuedRegistrationReferenceCount++;
+
+            Function owner = functionContaining(reference.getFromAddress());
+            if (owner == null) {
+                queuedRegistrationNoFunctionCount++;
+                recordRegistrationFailure(
+                    queuedRegistrationFailureSamples,
+                    "queued-hook",
+                    "no-function",
+                    reference,
+                    null,
+                    null,
+                    null);
+                continue;
+            }
+            Address helperTable =
+                findRegistrationHelperTable(owner, reference.getFromAddress());
+            if (helperTable == null) {
+                queuedRegistrationNoHelperCount++;
+                recordRegistrationFailure(
+                    queuedRegistrationFailureSamples,
+                    "queued-hook",
+                    "no-helper-table",
+                    reference,
+                    owner,
+                    null,
+                    null);
+                continue;
+            }
+            HookTypeEvidence hook = decodeRegistrationHelperTable(
+                owner.getEntryPoint(),
+                helperTable,
+                registrationHookTypeNameFromSlot(helperTable, 3));
+            if (hook == null || hook.typeId == null) {
+                queuedRegistrationNoTypeIdCount++;
+                recordRegistrationFailure(
+                    queuedRegistrationFailureSamples,
+                    "queued-hook",
+                    "no-type-id",
+                    reference,
+                    owner,
+                    helperTable,
+                    hook);
+                continue;
+            }
+            queuedRegistrationDecodedCount++;
+            result.putIfAbsent(normalizeUuid(hook.typeId), hook);
+        }
+    }
+
+    private void collectDirectRegisterTypeProviders(Map<String, HookTypeEvidence> result) {
+        directRegisterTypeReferenceCount = 0;
+        directRegisterTypeDecodedCount = 0;
+        directRegisterTypeNoFunctionCount = 0;
+        directRegisterTypeNoTypeIdCount = 0;
+        directRegisterTypeFailureSamples = new JsonArray();
+        Address registerType =
+            currentProgram.getImageBase().add(TYPE_REGISTRY_REGISTER_TYPE_RVA);
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(registerType);
+        while (references.hasNext()) {
+            Reference reference = references.next();
+            directRegisterTypeReferenceCount++;
+
+            Function owner = functionContaining(reference.getFromAddress());
+            if (owner == null) {
+                directRegisterTypeNoFunctionCount++;
+                recordRegistrationFailure(
+                    directRegisterTypeFailureSamples,
+                    "direct-register-type",
+                    "no-function",
+                    reference,
+                    null,
+                    null,
+                    null);
+                continue;
+            }
+
+            HookTypeEvidence hook =
+                decodeDirectRegisterTypeProvider(owner, reference.getFromAddress());
+            if (hook == null || hook.typeId == null) {
+                directRegisterTypeNoTypeIdCount++;
+                HookTypeEvidence partialHook =
+                    hook == null ? partialDirectRegisterTypeProvider(owner, reference.getFromAddress()) : hook;
+                recordRegistrationFailure(
+                    directRegisterTypeFailureSamples,
+                    "direct-register-type",
+                    "no-type-id",
+                    reference,
+                    owner,
+                    null,
+                    partialHook);
+                continue;
+            }
+
+            directRegisterTypeDecodedCount++;
+            result.putIfAbsent(normalizeUuid(hook.typeId), hook);
+        }
+    }
+
+    private void recordRegistrationFailure(
+        JsonArray samples,
+        String scan,
+        String reason,
+        Reference reference,
+        Function owner,
+        Address helperTable,
+        HookTypeEvidence partialHook) {
+
+        if (samples.size() >= REGISTRATION_FAILURE_SAMPLE_LIMIT) {
+            return;
+        }
+
+        JsonObject object = new JsonObject();
+        object.addProperty("scan", scan);
+        object.addProperty("reason", reason);
+        if (reference != null) {
+            NetworkSchemaJson.add(object, "callsite", formatAddress(reference.getFromAddress()));
+            NetworkSchemaJson.add(object, "target", formatAddress(reference.getToAddress()));
+        }
+        if (owner != null) {
+            NetworkSchemaJson.add(object, "owner", formatAddress(owner.getEntryPoint()));
+            NetworkSchemaJson.add(object, "ownerName", fullFunctionName(owner));
+        }
+        NetworkSchemaJson.add(object, "helperTable", formatAddress(helperTable));
+        if (partialHook != null) {
+            NetworkSchemaJson.add(object, "partialTypeName", partialHook.typeName);
+            NetworkSchemaJson.add(object, "partialSlotTypeName", partialHook.slotTypeName);
+            NetworkSchemaJson.add(object, "partialTypeProvider", formatAddress(partialHook.typeProvider));
+            NetworkSchemaJson.add(object, "partialUuidSource", formatAddress(partialHook.uuidSource));
+            NetworkSchemaJson.add(object, "partialTypeDescriptor", formatAddress(partialHook.typeDescriptor));
+        }
+        samples.add(object);
+    }
+
+    private HookTypeEvidence decodeDirectRegisterTypeProvider(
+        Function owner,
+        Address registerTypeCallsite) {
+
+        List<Instruction> instructions = functionInstructions(owner);
+        int registerTypeInstruction = -1;
+        for (int i = 0; i < instructions.size(); i++) {
+            Address instructionAddress = instructions.get(i).getMinAddress();
+            if (instructionAddress.equals(registerTypeCallsite)) {
+                registerTypeInstruction = i;
+                break;
+            }
+            if (instructionAddress.compareTo(registerTypeCallsite) > 0) {
+                break;
+            }
+        }
+        if (registerTypeInstruction < 0) {
+            return null;
+        }
+
+        int firstCandidate =
+            Math.max(0, registerTypeInstruction - BACKWARD_ARGUMENT_SCAN_LIMIT);
+        for (int i = registerTypeInstruction - 1; i >= firstCandidate; i--) {
+            Instruction instruction = instructions.get(i);
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+
+            Address target = callTarget(instruction);
+            TypeIdDecode typeId = decodeDirectTypeIdProvider(target);
+            if (typeId == null) {
+                continue;
+            }
+
+            TypeNameDecode typeName = decodeTypeNameFromReferencedStrings(
+                typeId.function,
+                typeId.provider);
+
+            HookTypeEvidence hook = new HookTypeEvidence();
+            hook.source = "direct-register-type";
+            hook.typeId = typeId.typeId;
+            hook.typeName = typeName == null ? null : typeName.typeName;
+            hook.hookFunction = owner.getEntryPoint();
+            hook.registerThunk = owner.getEntryPoint();
+            hook.typeProvider = typeId.provider;
+            hook.uuidSource = typeId.sourceAddress;
+            enrichHookMessageHandler(hook);
+            return hook;
+        }
+        return null;
+    }
+
+    private HookTypeEvidence partialDirectRegisterTypeProvider(
+        Function owner,
+        Address registerTypeCallsite) {
+
+        Address typeProvider = typeProviderCandidateBeforeRegisterType(
+            owner == null ? null : owner.getEntryPoint(),
+            registerTypeCallsite);
+        if (typeProvider == null) {
+            return null;
+        }
+
+        HookTypeEvidence hook = new HookTypeEvidence();
+        hook.source = "direct-register-type-partial";
+        hook.hookFunction = owner.getEntryPoint();
+        hook.registerThunk = owner.getEntryPoint();
+        hook.typeProvider = typeProvider;
+        return hook;
+    }
+
+    private String registrationHookTypeName(Symbol symbol) {
+        String qualifiedName = symbol.getName(true);
+        String parsed = parseInstallRegistrationHookTypeName(qualifiedName);
+        if (parsed != null) {
+            return parsed;
+        }
+
+        if (!"InstallRegistrationHook".equals(symbol.getName())) {
+            return null;
+        }
+
+        Function function = currentProgram.getFunctionManager().getFunctionAt(symbol.getAddress());
+        if (function == null) {
+            return null;
+        }
+        String namespace = function.getParentNamespace() == null
+            ? null
+            : function.getParentNamespace().getName(true);
+        if (namespace == null || namespace.isEmpty() ||
+            "Global".equals(namespace) || "Amazon::Hub".equals(namespace)) {
+            return null;
+        }
+        return namespace;
+    }
+
+    private String parseInstallRegistrationHookTypeName(String value) {
+        if (value == null) {
+            return null;
+        }
+
+        String marker = "InstallRegistrationHook<";
+        int start = value.indexOf(marker);
+        if (start < 0) {
+            return null;
+        }
+        start += marker.length();
+
+        int depth = 1;
+        for (int index = start; index < value.length(); index++) {
+            char ch = value.charAt(index);
+            if (ch == '<') {
+                depth++;
+            }
+            else if (ch == '>') {
+                depth--;
+                if (depth == 0) {
+                    String typeName =
+                        stripNativeTypeQualifier(value.substring(start, index).trim());
+                    return isPlausibleTypeName(typeName) ? typeName : null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String stripNativeTypeQualifier(String typeName) {
+        if (typeName == null) {
+            return null;
+        }
+        String result = typeName.trim();
+        boolean changed;
+        do {
+            changed = false;
+            if (result.startsWith("class ")) {
+                result = result.substring("class ".length()).trim();
+                changed = true;
+            }
+            else if (result.startsWith("struct ")) {
+                result = result.substring("struct ".length()).trim();
+                changed = true;
+            }
+            else if (result.startsWith("class_")) {
+                result = result.substring("class_".length()).trim();
+                changed = true;
+            }
+            else if (result.startsWith("struct_")) {
+                result = result.substring("struct_".length()).trim();
+                changed = true;
+            }
+        } while (changed);
+        return result;
+    }
+
+    private HookTypeEvidence decodeRegistrationHook(Function hookFunction, String typeName) {
+        Address helperTable = findRegistrationHelperTable(hookFunction);
+        if (helperTable == null) {
+            TypeIdDecode directTypeId =
+                decodeRegistrationThunkTypeId(hookFunction.getEntryPoint());
+            if (directTypeId == null) {
+                return null;
+            }
+
+            HookTypeEvidence hook = new HookTypeEvidence();
+            hook.typeName = typeName;
+            hook.typeId = directTypeId.typeId;
+            hook.hookFunction = hookFunction.getEntryPoint();
+            hook.registerThunk = hookFunction.getEntryPoint();
+            hook.typeProvider = directTypeId.provider;
+            hook.uuidSource = directTypeId.sourceAddress;
+            enrichHookMessageHandler(hook);
+            return hook;
+        }
+
+        return decodeRegistrationHelperTable(hookFunction.getEntryPoint(), helperTable, typeName);
+    }
+
+    private HookTypeEvidence decodeRegistrationHelperTable(
+        Address hookFunction,
+        Address helperTable,
+        String typeName) {
+
+        if (helperTable == null || !isPlausibleTypeName(typeName)) {
+            return null;
+        }
+
+        Address registerThunk = resolvedCodeTarget(readPointer(helperTable.add(0x10)));
+        TypeIdDecode typeId = decodeRegistrationThunkTypeId(registerThunk);
+        if (typeId == null) {
+            HookTypeEvidence hook = new HookTypeEvidence();
+            hook.typeName = typeName;
+            hook.hookFunction = hookFunction;
+            hook.helperTable = helperTable;
+            hook.registerThunk = registerThunk;
+            hook.typeProvider = typeProviderCandidateBeforeRegisterType(registerThunk, null);
+            String slotTypeName = registrationHookTypeNameFromSlot(helperTable, 3);
+            if (isPlausibleTypeName(slotTypeName)) {
+                hook.slotTypeName = slotTypeName;
+            }
+            return hook;
+        }
+
+        HookTypeEvidence hook = new HookTypeEvidence();
+        hook.typeName = typeName;
+        hook.typeId = typeId.typeId;
+        hook.hookFunction = hookFunction;
+        hook.helperTable = helperTable;
+        hook.registerThunk = registerThunk;
+        hook.typeProvider = typeId.provider;
+        hook.uuidSource = typeId.sourceAddress;
+        enrichHookMessageHandler(hook);
+
+        String slotTypeName = registrationHookTypeNameFromSlot(helperTable, 3);
+        if (isPlausibleTypeName(slotTypeName)) {
+            hook.slotTypeName = slotTypeName;
+        }
+        return hook;
+    }
+
+    private HookTypeEvidence decodeRegistrationHookTypeDescriptor(
+        Address typeDescriptor,
+        String typeName) {
+
+        ReferenceIterator descriptorReferences =
+            currentProgram.getReferenceManager().getReferencesTo(typeDescriptor);
+        while (descriptorReferences.hasNext()) {
+            Reference descriptorReference = descriptorReferences.next();
+            Function slotFunction = functionContaining(descriptorReference.getFromAddress());
+            if (slotFunction == null) {
+                continue;
+            }
+
+            ReferenceIterator slotReferences =
+                currentProgram.getReferenceManager().getReferencesTo(slotFunction.getEntryPoint());
+            while (slotReferences.hasNext()) {
+                Reference slotReference = slotReferences.next();
+                Address helperTable = subtract(slotReference.getFromAddress(), 0x18L);
+                if (!isRegistrationHelperTable(helperTable)) {
+                    continue;
+                }
+
+                Address registerThunk = resolvedCodeTarget(readPointer(helperTable.add(0x10)));
+                TypeIdDecode typeId = decodeRegistrationThunkTypeId(registerThunk);
+                if (typeId == null) {
+                    continue;
+                }
+
+                HookTypeEvidence hook = new HookTypeEvidence();
+                hook.typeName = typeName;
+                hook.slotTypeName = registrationHookTypeNameFromSlot(helperTable, 3);
+                hook.typeId = typeId.typeId;
+                hook.helperTable = helperTable;
+                hook.registerThunk = registerThunk;
+                hook.typeProvider = typeId.provider;
+                hook.uuidSource = typeId.sourceAddress;
+                hook.typeDescriptor = typeDescriptor;
+                hook.slotTypeNameFunction = slotFunction.getEntryPoint();
+                enrichHookMessageHandler(hook);
+                return hook;
+            }
+        }
+        return null;
+    }
+
+    private Address typeProviderCandidateBeforeRegisterType(
+        Address registerThunk,
+        Address registerTypeCallsite) {
+
+        Function function = functionAtOrContaining(registerThunk);
+        if (function == null) {
+            return null;
+        }
+
+        List<Instruction> instructions = functionInstructions(function);
+        int registerTypeInstruction = -1;
+        Address registerType = currentProgram.getImageBase().add(TYPE_REGISTRY_REGISTER_TYPE_RVA);
+        for (int i = 0; i < instructions.size(); i++) {
+            Instruction instruction = instructions.get(i);
+            if (registerTypeCallsite != null && instruction.getMinAddress().equals(registerTypeCallsite)) {
+                registerTypeInstruction = i;
+                break;
+            }
+            if (instruction.getFlowType().isCall() &&
+                registerType.equals(resolvedCodeTarget(callTarget(instruction)))) {
+                registerTypeInstruction = i;
+                break;
+            }
+        }
+
+        if (registerTypeInstruction >= 0) {
+            int firstCandidate =
+                Math.max(0, registerTypeInstruction - BACKWARD_ARGUMENT_SCAN_LIMIT);
+            for (int i = registerTypeInstruction - 1; i >= firstCandidate; i--) {
+                Instruction instruction = instructions.get(i);
+                if (!instruction.getFlowType().isCall()) {
+                    continue;
+                }
+                Address target = resolvedCodeTarget(callTarget(instruction));
+                if (isExecutableAddress(target)) {
+                    return target;
+                }
+            }
+        }
+
+        int count = 0;
+        for (Instruction instruction : instructions) {
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+            Address target = resolvedCodeTarget(callTarget(instruction));
+            if (isExecutableAddress(target)) {
+                return target;
+            }
+        }
+        return null;
+    }
+
+    private void enrichHookMessageHandler(HookTypeEvidence hook) {
+        if (hook == null || hook.typeProvider == null) {
+            return;
+        }
+        Address handlerVtable = recoverMessageHandlerVtable(hook.typeProvider);
+        if (handlerVtable == null) {
+            return;
+        }
+
+        hook.handlerVtable = handlerVtable;
+        hook.createInstance = messageHandlerSlot(handlerVtable, MESSAGE_HANDLER_CREATE_INSTANCE_SLOT);
+        hook.marshal = messageHandlerSlot(handlerVtable, MESSAGE_HANDLER_MARSHAL_SLOT);
+        hook.unmarshal = messageHandlerSlot(handlerVtable, MESSAGE_HANDLER_UNMARSHAL_SLOT);
+    }
+
+    private Address recoverMessageHandlerVtable(Address typeProvider) {
+        Function function = functionAtOrContaining(typeProvider);
+        if (function == null) {
+            return null;
+        }
+
+        int count = 0;
+        for (Instruction instruction : functionInstructions(function)) {
+            if (count++ >= MESSAGE_HANDLER_PROVIDER_SCAN_LIMIT) {
+                break;
+            }
+
+            for (Address candidate : referencedAddresses(instruction)) {
+                if (isMessageHandlerVtable(candidate)) {
+                    return candidate;
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean isMessageHandlerVtable(Address address) {
+        if (!isProgramAddress(address)) {
+            return false;
+        }
+
+        Address createInstance = messageHandlerSlot(address, MESSAGE_HANDLER_CREATE_INSTANCE_SLOT);
+        Address marshal = messageHandlerSlot(address, MESSAGE_HANDLER_MARSHAL_SLOT);
+        Address unmarshal = messageHandlerSlot(address, MESSAGE_HANDLER_UNMARSHAL_SLOT);
+        if (!isExecutableAddress(createInstance) ||
+            !isExecutableAddress(marshal) ||
+            !isExecutableAddress(unmarshal)) {
+            return false;
+        }
+
+        Function unmarshalFunction = functionAtOrContaining(unmarshal);
+        return looksLikeMessageUnmarshalHelper(decompileC(unmarshalFunction));
+    }
+
+    private Address messageHandlerSlot(Address vtable, int slot) {
+        if (!isProgramAddress(vtable)) {
+            return null;
+        }
+        return resolvedCodeTarget(readPointer(vtable.add(slot * 8L)));
+    }
+
+    private String messageHandlerSlotName(int slot) {
+        if (slot == MESSAGE_HANDLER_CREATE_INSTANCE_SLOT) {
+            return "CreateInstance";
+        }
+        if (slot == MESSAGE_HANDLER_MARSHAL_SLOT) {
+            return "Marshal";
+        }
+        if (slot == MESSAGE_HANDLER_UNMARSHAL_SLOT) {
+            return "Unmarshal";
+        }
+        return null;
+    }
+
+    private Address findRegistrationHelperTable(Function function) {
+        int count = 0;
+        for (Instruction instruction : functionInstructions(function)) {
+            if (count++ >= BACKWARD_ARGUMENT_SCAN_LIMIT) {
+                break;
+            }
+            if (!"LEA".equals(NetworkSchemaX86.upperMnemonic(instruction))) {
+                continue;
+            }
+            for (Address address : referencedAddresses(instruction)) {
+                if (isRegistrationHelperTable(address)) {
+                    return address;
+                }
+            }
+        }
+        return null;
+    }
+
+    private Address findRegistrationHelperTable(Function function, Address callsite) {
+        List<Instruction> instructions = functionInstructions(function);
+        int callIndex = instructionIndexAtOrBefore(instructions, callsite);
+        if (callIndex < 0) {
+            return findRegistrationHelperTable(function);
+        }
+
+        int first = Math.max(0, callIndex - BACKWARD_ARGUMENT_SCAN_LIMIT);
+        for (int i = callIndex; i >= first; i--) {
+            Instruction instruction = instructions.get(i);
+            for (Address address : referencedAddresses(instruction)) {
+                if (isRegistrationHelperTable(address)) {
+                    return address;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private int instructionIndexAtOrBefore(List<Instruction> instructions, Address address) {
+        if (address == null) {
+            return -1;
+        }
+        for (int i = 0; i < instructions.size(); i++) {
+            Instruction instruction = instructions.get(i);
+            Address start = instruction.getMinAddress();
+            Address end = instruction.getMaxAddress();
+            if (start.compareTo(address) <= 0 && end.compareTo(address) >= 0) {
+                return i;
+            }
+            if (start.compareTo(address) > 0) {
+                break;
+            }
+        }
+        return -1;
+    }
+
+    private boolean isRegistrationHelperTable(Address address) {
+        if (!isProgramAddress(address)) {
+            return false;
+        }
+        Address slot2 = resolvedCodeTarget(readPointer(address.add(0x10)));
+        Address slot3 = resolvedCodeTarget(readPointer(address.add(0x18)));
+        Address slot4 = resolvedCodeTarget(readPointer(address.add(0x20)));
+        return isExecutableAddress(slot2) &&
+            isExecutableAddress(slot3) &&
+            isExecutableAddress(slot4) &&
+            isPlausibleTypeName(registrationHookTypeNameFromSlot(address, 3));
+    }
+
+    private String registrationHookTypeNameFromSlot(Address helperTable, int slot) {
+        Address target = resolvedCodeTarget(readPointer(helperTable.add(slot * 8L)));
+        Address typeDescriptor = stringAddressReturnedBySimpleFunction(target);
+        if (!isProgramAddress(typeDescriptor)) {
+            return null;
+        }
+        Symbol symbol = currentProgram.getSymbolTable().getPrimarySymbol(typeDescriptor);
+        if (symbol != null) {
+            String typeName = parseInstallRegistrationHookTypeName(symbol.getName(true));
+            if (typeName != null) {
+                return typeName;
+            }
+        }
+
+        return parseMsvcInstallRegistrationHookTypeDescriptor(typeDescriptor);
+    }
+
+    private String parseMsvcInstallRegistrationHookTypeDescriptor(Address typeDescriptor) {
+        if (!isProgramAddress(typeDescriptor)) {
+            return null;
+        }
+
+        String descriptorName = readPrintableString(typeDescriptor.add(0x10L));
+        if (descriptorName == null) {
+            return null;
+        }
+
+        String marker = "InstallRegistrationHook@";
+        int markerIndex = descriptorName.indexOf(marker);
+        if (markerIndex < 0) {
+            return null;
+        }
+        int start = markerIndex + marker.length();
+        int end = descriptorName.indexOf("@Hub@Amazon@@", start);
+        if (end < 0 || end <= start) {
+            return null;
+        }
+
+        String encoded = descriptorName.substring(start, end);
+        if (encoded.startsWith("V") || encoded.startsWith("U")) {
+            encoded = encoded.substring(1);
+        }
+        while (encoded.endsWith("@")) {
+            encoded = encoded.substring(0, encoded.length() - 1);
+        }
+        if (encoded.isEmpty()) {
+            return null;
+        }
+
+        String[] parts = encoded.split("@");
+        ArrayList<String> names = new ArrayList<>();
+        for (int i = parts.length - 1; i >= 0; i--) {
+            if (!parts[i].isEmpty()) {
+                names.add(parts[i]);
+            }
+        }
+        if (names.isEmpty()) {
+            return null;
+        }
+
+        String typeName = String.join("::", names);
+        return isPlausibleTypeName(typeName) ? typeName : null;
+    }
+
+    private TypeIdDecode decodeRegistrationThunkTypeId(Address registerThunk) {
+        Function function = functionAtOrContaining(registerThunk);
+        if (function == null) {
+            return null;
+        }
+
+        int count = 0;
+        for (Instruction instruction : functionInstructions(function)) {
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+            Address target = callTarget(instruction);
+            TypeIdDecode typeId = decodeDirectTypeIdProvider(target);
+            if (typeId != null) {
+                return typeId;
+            }
+        }
+        return null;
+    }
+
+    private JsonArray hookTypeNamesJson(Map<String, HookTypeEvidence> hooksById) {
+        JsonArray array = new JsonArray();
+        for (HookTypeEvidence hook : hooksById.values()) {
+            array.add(hook.toJson());
+        }
+        return array;
+    }
+
+    private JsonArray fieldHandlerVtablesJson(
+        Map<String, RegistrationFunction> registrationFunctions) {
+
+        LinkedHashMap<String, Address> vtableAddresses = new LinkedHashMap<>();
+        LinkedHashMap<String, Integer> fieldCounts = new LinkedHashMap<>();
+        for (RegistrationFunction function : registrationFunctions.values()) {
+            for (FieldCall field : function.fields) {
+                if (field.handlerVtable == null) {
+                    continue;
+                }
+                String key = field.handlerVtable.toString();
+                vtableAddresses.putIfAbsent(key, field.handlerVtable);
+                fieldCounts.put(key, fieldCounts.getOrDefault(key, 0) + 1);
+            }
+        }
+
+        JsonArray array = new JsonArray();
+        for (Map.Entry<String, Address> entry : vtableAddresses.entrySet()) {
+            int fieldCount = fieldCounts.getOrDefault(entry.getKey(), 0);
+            array.add(fieldHandlerVtableJson(entry.getValue(), fieldCount));
+        }
+        return array;
+    }
+
+    private JsonObject fieldHandlerVtableJson(Address address, int fieldCount) {
+        JsonObject object = new JsonObject();
+        object.addProperty("address", formatAddress(address));
+        object.addProperty("fieldCount", fieldCount);
+        FieldHandlerShape shape = fieldHandlerShape(address);
+        if (shape != null) {
+            object.addProperty("handlerKind", shape.kind);
+            object.addProperty("vtableSlots", shape.vtableSlots);
+            object.addProperty("physicalFieldCount", shape.physicalFieldCount);
+        }
+
+        JsonArray slots = new JsonArray();
+        Address marshal = null;
+        Address marshalTarget = null;
+        int slotCount = shape == null
+            ? FIELD_HANDLER_CONTAINER_VTABLE_SLOTS
+            : shape.vtableSlots;
+        for (int slot = 0; slot < slotCount; slot++) {
+            Address target = readPointer(address.add(slot * 8L));
+            if (target == null || !isExecutableAddress(target)) {
+                continue;
+            }
+            String name = slot < FIELD_HANDLER_SLOT_NAMES.length
+                ? FIELD_HANDLER_SLOT_NAMES[slot]
+                : null;
+            slots.add(virtualFunctionSlot(slot, name, target));
+            if (slot == FIELD_HANDLER_MARSHAL_SLOT) {
+                marshal = target;
+                marshalTarget = terminalJumpTarget(target);
+                object.addProperty("marshal", formatAddress(marshal));
+                NetworkSchemaJson.add(object, "marshalTarget", formatAddress(marshalTarget));
+            }
+            else if (slot == FIELD_HANDLER_UNMARSHAL_SLOT) {
+                Address unmarshal = target;
+                Address unmarshalTarget = terminalJumpTarget(target);
+                object.addProperty("unmarshal", formatAddress(unmarshal));
+                NetworkSchemaJson.add(object, "unmarshalTarget", formatAddress(unmarshalTarget));
+            }
+        }
+        ContainerWireShape containerWireShape = shape == null ? null : shape.containerWireShape;
+        WireShape wireShape = shape == null ? classifyWireShape(marshal, marshalTarget) : shape.wireShape;
+        if (wireShape != null) {
+            object.addProperty("wireShape", wireShape.shape);
+            object.addProperty("wireShapeSource", wireShape.source);
+        }
+        if (containerWireShape != null) {
+            NetworkSchemaJson.add(object, "deltaWireShape", containerWireShape.deltaShape);
+            NetworkSchemaJson.add(object, "fullWireShape", containerWireShape.fullShape);
+            NetworkSchemaJson.add(object, "keyNativeType", containerWireShape.keyNativeType);
+            NetworkSchemaJson.add(object, "keyNativeTypeSource", containerWireShape.keyNativeTypeSource);
+            object.add("deltaMarshalShapes", NetworkSchemaJson.stringArray(containerWireShape.deltaMarshalShapes));
+            object.add("fullMarshalShapes", NetworkSchemaJson.stringArray(containerWireShape.fullMarshalShapes));
+            if (containerWireShape.valueTypeInfo != null) {
+                object.add(
+                    "valueTypeInfo",
+                    containerWireShape.valueTypeInfo.toJson(addressFormatter));
+                NetworkSchemaJson.add(object, "valueTypeName", containerWireShape.valueTypeInfo.name);
+                NetworkSchemaJson.add(object, "valueTypeId", containerWireShape.valueTypeInfo.typeId);
+                NetworkSchemaJson.add(object, "valueTypeInfoAddress", formatAddress(containerWireShape.valueTypeInfo.address));
+            }
+            if (containerWireShape.valueTypeShape != null) {
+                object.add(
+                    "valueTypeShape",
+                    containerWireShape.valueTypeShape.toJson(addressFormatter));
+            }
+            if (!containerWireShape.embeddedValueTypeShapes.isEmpty()) {
+                JsonArray shapes = new JsonArray();
+                for (NestedTypeShape embeddedShape : containerWireShape.embeddedValueTypeShapes) {
+                    shapes.add(embeddedShape.toJson(addressFormatter));
+                }
+                object.add("embeddedValueTypeShapes", shapes);
+            }
+            if (!containerWireShape.valueTypeInfoCandidates.isEmpty()) {
+                JsonArray candidates = new JsonArray();
+                for (NativeTypeInfoEvidence candidate : containerWireShape.valueTypeInfoCandidates) {
+                    candidates.add(candidate.toJson(addressFormatter));
+                }
+                object.add("valueTypeInfoCandidates", candidates);
+            }
+        }
+        object.add("vtableDiagnostics", vtableDiagnostics(
+            address,
+            shape,
+            slotCount,
+            null));
+        object.add("slots", slots);
+        return object;
+    }
+
+    private FieldHandlerShape fieldHandlerShape(Address vtable) {
+        if (!isProgramAddress(vtable)) {
+            return null;
+        }
+
+        String key = addressCacheKey("field-handler-shape", vtable);
+        if (fieldHandlerShapeCache.containsKey(key)) {
+            return fieldHandlerShapeCache.get(key);
+        }
+
+        FieldHandlerShape result = recoverFieldHandlerShape(vtable);
+        fieldHandlerShapeCache.put(key, result);
+        return result;
+    }
+
+    private FieldHandlerShape recoverFieldHandlerShape(Address vtable) {
+        String handlerTypeName = fieldHandlerTypeName(null, vtable);
+        NetworkTemplateType handlerType = parseNetworkTemplateType(handlerTypeName);
+        WireShape templateWireShape = wireShapeFromHandlerTypeName(handlerTypeName);
+
+        ContainerWireShape container = classifyReplicatedContainerWireShape(vtable);
+        if (container != null) {
+            return new FieldHandlerShape(
+                "replicated-container",
+                FIELD_HANDLER_CONTAINER_VTABLE_SLOTS,
+                container.primaryShape,
+                container,
+                1);
+        }
+
+        if (isReplicatedContainerHandlerType(handlerType)) {
+            return new FieldHandlerShape(
+                "replicated-container",
+                FIELD_HANDLER_CONTAINER_VTABLE_SLOTS,
+                templateWireShape,
+                null,
+                1);
+        }
+
+        Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
+        Address marshalTarget = terminalJumpTarget(marshal);
+        WireShape wireShape = classifyWireShape(marshal, marshalTarget);
+        if (wireShape == null) {
+            wireShape = templateWireShape;
+        }
+        return new FieldHandlerShape(
+            fieldHandlerKindFromType(handlerType),
+            FIELD_HANDLER_SCALAR_VTABLE_SLOTS,
+            wireShape,
+            null,
+            physicalFieldCountFromHandlerType(handlerType));
+    }
+
+    private boolean isReplicatedContainerHandlerType(NetworkTemplateType type) {
+        return type != null &&
+            (type.simpleName.equals("ReplicatedContainer") ||
+                type.simpleName.equals("ReplicatedMapFieldHandler") ||
+                type.simpleName.equals("ReplicatedVectorFieldHandler") ||
+                type.simpleName.equals("ReplicatedSetFieldHandler"));
+    }
+
+    private String fieldHandlerKindFromType(NetworkTemplateType type) {
+        if (type == null) {
+            return "replicated-field";
+        }
+        if (type.simpleName.equals("DeltaCompressedReplicatedFieldHandler") ||
+            type.simpleName.equals("DeltaCompressedReplicatedFieldHandlerBase") ||
+            type.simpleName.equals("DeltaCompressedCounterHandler")) {
+            return "delta-compressed-replicated-field";
+        }
+        if (type.simpleName.equals("DynamicDeltaReplicatedFieldHandler")) {
+            return "dynamic-delta-replicated-field";
+        }
+        if (type.simpleName.equals("FloatTimerDeltaReplicatedField")) {
+            return "float-timer-delta-replicated-field";

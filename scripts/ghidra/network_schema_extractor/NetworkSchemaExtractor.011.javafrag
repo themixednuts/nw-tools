@@ -1,0 +1,900 @@
+    private List<String> callArgumentsForTarget(String text, Function target) {
+        return callArgumentsForTarget(text, target, 0);
+    }
+
+    private List<String> callArgumentsForTarget(
+        String text,
+        Function target,
+        int occurrence) {
+
+        if (text == null || target == null) {
+            return List.of();
+        }
+        for (String name : functionCallNameCandidates(target)) {
+            List<String> args = callArgumentsForName(text, name, occurrence);
+            if (!args.isEmpty()) {
+                return args;
+            }
+        }
+        return List.of();
+    }
+
+    private int callTextIndexForTarget(String text, Function target) {
+        return callTextIndexForTarget(text, target, 0);
+    }
+
+    private int callTextIndexForTarget(String text, Function target, int occurrence) {
+        if (text == null || target == null) {
+            return Integer.MAX_VALUE;
+        }
+        for (String name : functionCallNameCandidates(target)) {
+            int index = callTextIndexForName(text, name, occurrence);
+            if (index >= 0) {
+                return index;
+            }
+        }
+        return Integer.MAX_VALUE;
+    }
+
+    private int callTextIndexForName(String text, String name) {
+        return callTextIndexForName(text, name, 0);
+    }
+
+    private int callTextIndexForName(String text, String name, int occurrence) {
+        if (text == null || name == null || name.isEmpty()) {
+            return -1;
+        }
+        int matched = 0;
+        int search = 0;
+        while (search < text.length()) {
+            int nameIndex = text.indexOf(name, search);
+            if (nameIndex < 0) {
+                return -1;
+            }
+            int argsStart = text.indexOf('(', nameIndex + name.length());
+            if (argsStart < 0) {
+                return -1;
+            }
+            String between = text.substring(nameIndex + name.length(), argsStart).trim();
+            if (!between.isEmpty()) {
+                search = nameIndex + name.length();
+                continue;
+            }
+            if (matched++ == occurrence) {
+                return nameIndex;
+            }
+            int argsEnd = NetworkSchemaText.matchingIndex(text, argsStart, '(', ')');
+            search = argsEnd < 0 ? nameIndex + name.length() : argsEnd + 1;
+        }
+        return -1;
+    }
+
+    private List<String> functionCallNameCandidates(Function function) {
+        ArrayList<String> result = new ArrayList<>();
+        String fullName = fullFunctionName(function);
+        addDistinct(result, fullName);
+        String plainName = function.getName();
+        if (!isGenericCallName(plainName)) {
+            addDistinct(result, plainName);
+        }
+        String leaf = NetworkSchemaText.sourceTypeLeaf(fullName);
+        if (!isGenericCallName(leaf)) {
+            addDistinct(result, leaf);
+        }
+        return result;
+    }
+
+    private boolean isGenericCallName(String value) {
+        return value == null ||
+            value.isEmpty() ||
+            "Unmarshal".equals(value) ||
+            "Marshal".equals(value) ||
+            "CopyValue".equals(value) ||
+            "CreateInstance".equals(value) ||
+            "GetEmptyValue".equals(value) ||
+            "Destructor".equals(value);
+    }
+
+    private void addDistinct(List<String> values, String value) {
+        if (value == null || value.isEmpty() || values.contains(value)) {
+            return;
+        }
+        values.add(value);
+    }
+
+    private List<String> callArgumentsForName(String text, String name) {
+        return callArgumentsForName(text, name, 0);
+    }
+
+    private List<String> callArgumentsForName(String text, String name, int occurrence) {
+        if (text == null || name == null || name.isEmpty()) {
+            return List.of();
+        }
+        int matched = 0;
+        int search = 0;
+        while (search < text.length()) {
+            int nameIndex = text.indexOf(name, search);
+            if (nameIndex < 0) {
+                return List.of();
+            }
+            int argsStart = text.indexOf('(', nameIndex + name.length());
+            if (argsStart < 0) {
+                return List.of();
+            }
+            String between = text.substring(nameIndex + name.length(), argsStart).trim();
+            if (!between.isEmpty()) {
+                search = nameIndex + name.length();
+                continue;
+            }
+            int argsEnd = NetworkSchemaText.matchingIndex(text, argsStart, '(', ')');
+            if (argsEnd < 0) {
+                return List.of();
+            }
+            if (matched++ == occurrence) {
+                return NetworkSchemaText.splitTopLevel(text.substring(argsStart + 1, argsEnd));
+            }
+            search = argsEnd + 1;
+        }
+        return List.of();
+    }
+
+    private int callOccurrenceIndex(
+        Function owner,
+        Instruction currentInstruction,
+        Function target) {
+
+        if (owner == null || currentInstruction == null || target == null) {
+            return 0;
+        }
+        int occurrence = 0;
+        Address currentAddress = currentInstruction.getMinAddress();
+        Address targetAddress = target.getEntryPoint();
+        for (Instruction instruction : functionInstructions(owner)) {
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+            Function candidate = functionAtOrContaining(callTarget(instruction));
+            if (candidate == null ||
+                !candidate.getEntryPoint().equals(targetAddress)) {
+                continue;
+            }
+            if (instruction.getMinAddress().equals(currentAddress)) {
+                return occurrence;
+            }
+            occurrence++;
+        }
+        return 0;
+    }
+
+    private boolean isLeafUnmarshalTarget(Function target) {
+        String name = fullFunctionName(target);
+        if (name == null) {
+            return false;
+        }
+        return name.contains("::Unmarshal") ||
+            name.contains("Marshaler<") ||
+            name.contains("Marshaller<");
+    }
+
+    private String unmarshalTemplateType(String functionName) {
+        if (functionName == null) {
+            return null;
+        }
+        int nameIndex = functionName.indexOf("Unmarshal<");
+        if (nameIndex < 0) {
+            return null;
+        }
+        int start = functionName.indexOf('<', nameIndex);
+        int end = NetworkSchemaText.matchingIndex(functionName, start, '<', '>');
+        if (start < 0 || end < 0) {
+            return null;
+        }
+        return functionName.substring(start + 1, end).trim();
+    }
+
+    private String bareArgumentName(String argument) {
+        if (argument == null) {
+            return null;
+        }
+        ParsedArgument parsed = textParser.parseArgument(argument);
+        String value = parsed.expression == null ? argument : parsed.expression;
+        value = value.trim();
+        while (value.startsWith("&")) {
+            value = value.substring(1).trim();
+        }
+        if (!value.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+            return null;
+        }
+        return value;
+    }
+
+    private String decompileC(Function function) {
+        if (function == null || decompiler == null) {
+            return null;
+        }
+        String key = functionCacheKey("decompile", function);
+        if (decompileCache.containsKey(key)) {
+            return decompileCache.get(key);
+        }
+        try {
+            DecompileResults results = decompiler.decompileFunction(function, 30, monitor);
+            if (!results.decompileCompleted() || results.getDecompiledFunction() == null) {
+                decompileCache.put(key, null);
+                return null;
+            }
+            String text = results.getDecompiledFunction().getC();
+            decompileCache.put(key, text);
+            return text;
+        }
+        catch (Exception ignored) {
+            decompileCache.put(key, null);
+            return null;
+        }
+    }
+
+    private HighFunction highFunction(Function function) {
+        if (function == null || decompiler == null) {
+            return null;
+        }
+        String key = functionCacheKey("high-function", function);
+        if (highFunctionCache.containsKey(key)) {
+            return highFunctionCache.get(key);
+        }
+        try {
+            DecompileResults results = decompiler.decompileFunction(function, 30, monitor);
+            if (!results.decompileCompleted() || results.getHighFunction() == null) {
+                highFunctionCache.put(key, null);
+                return null;
+            }
+            HighFunction high = results.getHighFunction();
+            highFunctionCache.put(key, high);
+            return high;
+        }
+        catch (Exception ignored) {
+            highFunctionCache.put(key, null);
+            return null;
+        }
+    }
+
+    private Function pcodeCallTarget(PcodeOp op) {
+        PcodeCallTargetInfo info = pcodeCallTargetInfo(op);
+        return info == null ? null : info.target;
+    }
+
+    private PcodeCallTargetInfo pcodeCallTargetInfo(PcodeOp op) {
+        if (op == null || op.getOpcode() != PcodeOp.CALL || op.getNumInputs() == 0) {
+            return null;
+        }
+        Address rawAddress = pcodeAddress(op.getInput(0));
+        Address resolvedAddress = resolvedCodeTarget(rawAddress);
+        Function exact = functionExactlyAt(resolvedAddress);
+        Function containing = exact == null ? functionContaining(resolvedAddress) : null;
+        PcodeCallTargetInfo info = new PcodeCallTargetInfo();
+        info.rawTarget = rawAddress;
+        info.resolvedTarget = resolvedAddress;
+        info.target = exact;
+        info.targetExactStart = exact != null;
+        info.containing = containing;
+        return info;
+    }
+
+    private PcodeCallTargetInfo pcodeValueCallTargetInfo(Varnode node) {
+        return pcodeValueCallTargetInfo(node, new LinkedHashSet<>(), 0);
+    }
+
+    private PcodeCallTargetInfo pcodeValueCallTargetInfo(
+        Varnode node,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+            return null;
+        }
+        String key = pcodeNodeKey(node);
+        if (!seen.add(key)) {
+            return null;
+        }
+        PcodeOp def = node.getDef();
+        if (def == null) {
+            return null;
+        }
+        switch (def.getOpcode()) {
+            case PcodeOp.CALL:
+                return pcodeCallTargetInfo(def);
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.INT_ZEXT:
+            case PcodeOp.INT_SEXT:
+            case PcodeOp.SUBPIECE:
+            case PcodeOp.INDIRECT:
+                return def.getNumInputs() == 0
+                    ? null
+                    : pcodeValueCallTargetInfo(def.getInput(0), seen, depth + 1);
+            case PcodeOp.MULTIEQUAL:
+                PcodeCallTargetInfo merged = null;
+                for (int i = 0; i < def.getNumInputs(); i++) {
+                    PcodeCallTargetInfo value =
+                        pcodeValueCallTargetInfo(def.getInput(i), seen, depth + 1);
+                    if (value == null) {
+                        continue;
+                    }
+                    if (merged == null) {
+                        merged = value;
+                    }
+                    else if (!sameAddressValue(merged.resolvedTarget, value.resolvedTarget)) {
+                        return null;
+                    }
+                }
+                return merged;
+            default:
+                return null;
+        }
+    }
+
+    private Address pcodeAddress(Varnode node) {
+        if (node == null) {
+            return null;
+        }
+        Address address = node.getAddress();
+        if (isProgramAddress(address)) {
+            return address;
+        }
+        if (node.isConstant()) {
+            address = absoluteAddress(node.getOffset());
+            if (isProgramAddress(address)) {
+                return address;
+            }
+        }
+        return null;
+    }
+
+    private Integer returnedCallInputSlot(Function target) {
+        if (target == null) {
+            return null;
+        }
+        String key = functionCacheKey("returned-call-input-slot", target);
+        if (returnedCallInputSlotCache.containsKey(key)) {
+            return returnedCallInputSlotCache.get(key);
+        }
+
+        HighFunction high = highFunction(target);
+        if (high == null) {
+            returnedCallInputSlotCache.put(key, null);
+            return null;
+        }
+
+        Integer merged = null;
+        Iterator<PcodeOpAST> ops = high.getPcodeOps();
+        while (ops.hasNext()) {
+            PcodeOpAST op = ops.next();
+            if (op.getOpcode() != PcodeOp.RETURN || op.getNumInputs() < 2) {
+                continue;
+            }
+            Integer slot =
+                returnedCallInputSlotFromValue(op.getInput(1), new LinkedHashSet<>(), 0);
+            if (slot == null) {
+                returnedCallInputSlotCache.put(key, null);
+                return null;
+            }
+            if (merged == null) {
+                merged = slot;
+            }
+            else if (!merged.equals(slot)) {
+                returnedCallInputSlotCache.put(key, null);
+                return null;
+            }
+        }
+        returnedCallInputSlotCache.put(key, merged);
+        return merged;
+    }
+
+    private Integer returnedCallInputSlotFromValue(
+        Varnode node,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+            return null;
+        }
+        String key = "return-slot:" + pcodeNodeKey(node);
+        if (!seen.add(key)) {
+            return null;
+        }
+
+        Integer direct = callInputSlotForRegister(node);
+        if (direct != null) {
+            return direct;
+        }
+
+        PcodeOp def = node.getDef();
+        if (def == null) {
+            return null;
+        }
+        switch (def.getOpcode()) {
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.INT_ZEXT:
+            case PcodeOp.INT_SEXT:
+            case PcodeOp.SUBPIECE:
+            case PcodeOp.INDIRECT:
+                return def.getNumInputs() == 0
+                    ? null
+                    : returnedCallInputSlotFromValue(def.getInput(0), seen, depth + 1);
+            case PcodeOp.MULTIEQUAL:
+                Integer merged = null;
+                for (int i = 0; i < def.getNumInputs(); i++) {
+                    Integer slot = returnedCallInputSlotFromValue(
+                        def.getInput(i),
+                        new LinkedHashSet<>(seen),
+                        depth + 1);
+                    if (slot == null) {
+                        return null;
+                    }
+                    if (merged == null) {
+                        merged = slot;
+                    }
+                    else if (!merged.equals(slot)) {
+                        return null;
+                    }
+                }
+                return merged;
+            default:
+                return null;
+        }
+    }
+
+    private Integer callInputSlotForRegister(Varnode node) {
+        String register = pcodeBaseRegisterName(node);
+        if (register == null) {
+            return null;
+        }
+        return switch (register) {
+            case "RCX" -> 1;
+            case "RDX" -> 2;
+            case "R8" -> 3;
+            case "R9" -> 4;
+            default -> null;
+        };
+    }
+
+    private String pcodeBaseRegisterName(Varnode node) {
+        if (node == null || !node.isRegister() || node.getAddress() == null) {
+            return null;
+        }
+        try {
+            Register register =
+                currentProgram.getLanguage().getRegister(node.getAddress(), node.getSize());
+            if (register == null) {
+                return null;
+            }
+            Register base = register.getBaseRegister();
+            return (base == null ? register : base)
+                .getName()
+                .toUpperCase(Locale.ROOT);
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private boolean isStackPointerVarnode(Varnode node) {
+        String registerName = pcodeBaseRegisterName(node);
+        if (registerName == null) {
+            return false;
+        }
+        try {
+            Register stackPointer = currentProgram.getCompilerSpec().getStackPointer();
+            if (stackPointer != null) {
+                Register stackBase = stackPointer.getBaseRegister();
+                String stackName = (stackBase == null ? stackPointer : stackBase)
+                    .getName()
+                    .toUpperCase(Locale.ROOT);
+                return registerName.equals(stackName);
+            }
+        }
+        catch (Exception ignored) {
+        }
+        return "RSP".equals(registerName) ||
+            "ESP".equals(registerName) ||
+            "SP".equals(registerName);
+    }
+
+    private boolean sameAddressValue(Address left, Address right) {
+        if (left == null || right == null) {
+            return left == right;
+        }
+        return left.equals(right);
+    }
+
+    private PcodeStorage pcodeStorageExpression(Varnode node) {
+        return pcodeStorageExpression(node, new LinkedHashSet<>(), 0);
+    }
+
+    private PcodeStorage pcodeLoadedStorageExpression(Varnode node) {
+        return pcodeLoadedStorageExpression(node, new LinkedHashSet<>(), 0);
+    }
+
+    private PcodeStorage pcodeLoadedStorageExpression(
+        Varnode node,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+            return null;
+        }
+        String key = "loaded:" + pcodeNodeKey(node);
+        if (!seen.add(key)) {
+            return null;
+        }
+
+        PcodeOp def = node.getDef();
+        if (def != null) {
+            switch (def.getOpcode()) {
+                case PcodeOp.LOAD:
+                    return def.getNumInputs() < 2
+                        ? null
+                        : pcodeStorageExpression(def.getInput(1), new LinkedHashSet<>(), 0);
+                case PcodeOp.COPY:
+                case PcodeOp.CAST:
+                case PcodeOp.INT_ZEXT:
+                case PcodeOp.INT_SEXT:
+                case PcodeOp.SUBPIECE:
+                case PcodeOp.INDIRECT:
+                    return def.getNumInputs() == 0
+                        ? null
+                        : pcodeLoadedStorageExpression(def.getInput(0), seen, depth + 1);
+                case PcodeOp.MULTIEQUAL:
+                    return pcodeMergedLoadedStorageExpression(def, seen, depth + 1);
+                default:
+                    break;
+            }
+        }
+        return pcodeStorageExpression(node);
+    }
+
+    private PcodeStorage pcodeMergedLoadedStorageExpression(
+        PcodeOp def,
+        Set<String> seen,
+        int depth) {
+
+        PcodeStorage merged = null;
+        for (int i = 0; i < def.getNumInputs(); i++) {
+            PcodeStorage storage = pcodeLoadedStorageExpression(
+                def.getInput(i),
+                new LinkedHashSet<>(seen),
+                depth);
+            if (storage == null) {
+                return null;
+            }
+            if (merged == null) {
+                merged = storage;
+            }
+            else if (!merged.sameLocation(storage)) {
+                return null;
+            }
+        }
+        return merged;
+    }
+
+    private PcodeStorage pcodeStorageExpression(
+        Varnode node,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+            return null;
+        }
+        String key = pcodeNodeKey(node);
+        if (!seen.add(key)) {
+            return null;
+        }
+
+        PcodeOp def = node.getDef();
+        if (def != null) {
+            PcodeStorage storage = pcodeStorageFromDef(def, seen, depth + 1);
+            if (storage != null) {
+                return storage;
+            }
+        }
+
+        if (node.getAddress() != null && node.getAddress().isStackAddress()) {
+            return new PcodeStorage("stack", node.getOffset());
+        }
+        if (isStackPointerVarnode(node)) {
+            return new PcodeStorage("stack", 0L);
+        }
+
+        String name = pcodeHighName(node);
+        if (isPcodeStorageBase(name)) {
+            return new PcodeStorage(name, 0L);
+        }
+        return null;
+    }
+
+    private PcodeStorage pcodeStorageFromDef(
+        PcodeOp def,
+        Set<String> seen,
+        int depth) {
+
+        switch (def.getOpcode()) {
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.SUBPIECE:
+            case PcodeOp.INDIRECT:
+                return def.getNumInputs() == 0
+                    ? null
+                    : pcodeStorageExpression(def.getInput(0), seen, depth);
+            case PcodeOp.PTRADD:
+                return pcodePointerAddExpression(def, seen, depth);
+            case PcodeOp.PTRSUB:
+                return pcodePointerSubExpression(def, seen, depth);
+            case PcodeOp.INT_ADD:
+                return pcodeAddExpression(def, seen, depth, true);
+            case PcodeOp.INT_SUB:
+                return pcodeAddExpression(def, seen, depth, false);
+            case PcodeOp.MULTIEQUAL:
+                return pcodeMergedStorageExpression(def, seen, depth);
+            default:
+                return null;
+        }
+    }
+
+    private PcodeStorage pcodePointerAddExpression(
+        PcodeOp def,
+        Set<String> seen,
+        int depth) {
+
+        if (def.getNumInputs() < 3) {
+            return null;
+        }
+        PcodeStorage base =
+            pcodeStorageExpression(def.getInput(0), new LinkedHashSet<>(seen), depth);
+        Long index = pcodeConstantValue(def.getInput(1), new LinkedHashSet<>(seen), depth);
+        Long elementSize =
+            pcodeConstantValue(def.getInput(2), new LinkedHashSet<>(seen), depth);
+        if (base == null || index == null || elementSize == null) {
+            return null;
+        }
+        return base.plus(index * elementSize);
+    }
+
+    private PcodeStorage pcodePointerSubExpression(
+        PcodeOp def,
+        Set<String> seen,
+        int depth) {
+
+        if (def.getNumInputs() < 2) {
+            return null;
+        }
+        PcodeStorage base =
+            pcodeStorageExpression(def.getInput(0), new LinkedHashSet<>(seen), depth);
+        Long offset = pcodeConstantValue(def.getInput(1), new LinkedHashSet<>(seen), depth);
+        if (base == null || offset == null) {
+            return null;
+        }
+        return base.plus(offset);
+    }
+
+    private PcodeStorage pcodeAddExpression(
+        PcodeOp def,
+        Set<String> seen,
+        int depth,
+        boolean add) {
+
+        if (def.getNumInputs() < 2) {
+            return null;
+        }
+        PcodeStorage left =
+            pcodeStorageExpression(def.getInput(0), new LinkedHashSet<>(seen), depth);
+        Long right = pcodeConstantValue(def.getInput(1), new LinkedHashSet<>(seen), depth);
+        if (left != null && right != null) {
+            return left.plus(add ? right : -right);
+        }
+        if (add) {
+            PcodeStorage rightStorage =
+                pcodeStorageExpression(def.getInput(1), new LinkedHashSet<>(seen), depth);
+            Long leftConstant =
+                pcodeConstantValue(def.getInput(0), new LinkedHashSet<>(seen), depth);
+            if (rightStorage != null && leftConstant != null) {
+                return rightStorage.plus(leftConstant);
+            }
+        }
+        return null;
+    }
+
+    private PcodeStorage pcodeMergedStorageExpression(
+        PcodeOp def,
+        Set<String> seen,
+        int depth) {
+
+        PcodeStorage merged = null;
+        for (int i = 0; i < def.getNumInputs(); i++) {
+            PcodeStorage storage =
+                pcodeStorageExpression(def.getInput(i), new LinkedHashSet<>(seen), depth);
+            if (storage == null) {
+                return null;
+            }
+            if (merged == null) {
+                merged = storage;
+            }
+            else if (!merged.sameLocation(storage)) {
+                return null;
+            }
+        }
+        return merged;
+    }
+
+    private String pcodeValueNativeType(
+        Varnode node,
+        Map<String, String> tempNativeTypes) {
+        return pcodeValueNativeType(node, tempNativeTypes, new LinkedHashSet<>(), 0);
+    }
+
+    private String pcodeValueWireShape(
+        Varnode node,
+        Map<String, String> tempWireShapes,
+        Map<String, String> tempNativeTypes) {
+        return pcodeValueWireShape(
+            node,
+            tempWireShapes,
+            tempNativeTypes,
+            new LinkedHashSet<>(),
+            0);
+    }
+
+    private String pcodeValueWireShape(
+        Varnode node,
+        Map<String, String> tempWireShapes,
+        Map<String, String> tempNativeTypes,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+            return null;
+        }
+        String tempShape = pcodeTempWireShape(node, tempWireShapes);
+        if (tempShape != null) {
+            return tempShape;
+        }
+        String nativeShape = wireShapeFromNativeType(pcodeTempNativeType(node, tempNativeTypes));
+        if (nativeShape != null) {
+            return nativeShape;
+        }
+        String key = "shape:" + pcodeNodeKey(node);
+        if (!seen.add(key)) {
+            return null;
+        }
+
+        PcodeOp def = node.getDef();
+        if (def == null) {
+            return wireShapeFromNativeType(pcodeValueNativeType(node, tempNativeTypes));
+        }
+
+        switch (def.getOpcode()) {
+            case PcodeOp.CALL: {
+                Function target = pcodeCallTarget(def);
+                String nativeType = unmarshalNativeTypeFromTarget(target);
+                String shape = wireShapeFromNativeType(nativeType);
+                if (shape != null) {
+                    return shape;
+                }
+                return wireShapeFromNativeType(scalarOutputStoreNativeType(target));
+            }
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.SUBPIECE:
+            case PcodeOp.INDIRECT:
+                return def.getNumInputs() == 0
+                    ? null
+                    : pcodeValueWireShape(
+                        def.getInput(0),
+                        tempWireShapes,
+                        tempNativeTypes,
+                        seen,
+                        depth + 1);
+            case PcodeOp.INT_EQUAL:
+            case PcodeOp.INT_NOTEQUAL:
+            case PcodeOp.INT_LESS:
+            case PcodeOp.INT_LESSEQUAL:
+            case PcodeOp.INT_SLESS:
+            case PcodeOp.INT_SLESSEQUAL:
+            case PcodeOp.BOOL_AND:
+            case PcodeOp.BOOL_OR:
+            case PcodeOp.BOOL_XOR:
+            case PcodeOp.BOOL_NEGATE:
+                return node.getSize() == 1 ? "bool" : null;
+            case PcodeOp.MULTIEQUAL:
+                return pcodeMergedValueWireShape(
+                    def,
+                    tempWireShapes,
+                    tempNativeTypes,
+                    seen,
+                    depth + 1);
+            default:
+                return wireShapeFromNativeType(pcodeValueNativeType(node, tempNativeTypes));
+        }
+    }
+
+    private String pcodeMergedValueWireShape(
+        PcodeOp def,
+        Map<String, String> tempWireShapes,
+        Map<String, String> tempNativeTypes,
+        Set<String> seen,
+        int depth) {
+
+        String merged = null;
+        for (int i = 0; i < def.getNumInputs(); i++) {
+            String valueShape =
+                pcodeValueWireShape(
+                    def.getInput(i),
+                    tempWireShapes,
+                    tempNativeTypes,
+                    new LinkedHashSet<>(seen),
+                    depth);
+            if (valueShape == null) {
+                return null;
+            }
+            if (merged == null) {
+                merged = valueShape;
+            }
+            else if (!merged.equals(valueShape)) {
+                return null;
+            }
+        }
+        return merged;
+    }
+
+    private String pcodeValueNativeType(
+        Varnode node,
+        Map<String, String> tempNativeTypes,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+            return null;
+        }
+        String tempType = pcodeTempNativeType(node, tempNativeTypes);
+        if (tempType != null) {
+            return tempType;
+        }
+        String key = "type:" + pcodeNodeKey(node);
+        if (!seen.add(key)) {
+            return null;
+        }
+
+        PcodeOp def = node.getDef();
+        if (def == null) {
+            return null;
+        }
+
+        switch (def.getOpcode()) {
+            case PcodeOp.CALL:
+                return unmarshalNativeTypeFromTarget(pcodeCallTarget(def));
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.SUBPIECE:
+            case PcodeOp.INDIRECT:
+                return def.getNumInputs() == 0
+                    ? null
+                    : pcodeValueNativeType(
+                        def.getInput(0),
+                        tempNativeTypes,
+                        seen,
+                        depth + 1);
+            case PcodeOp.INT_EQUAL:
+            case PcodeOp.INT_NOTEQUAL:
+            case PcodeOp.INT_LESS:
+            case PcodeOp.INT_LESSEQUAL:
+            case PcodeOp.INT_SLESS:
+            case PcodeOp.INT_SLESSEQUAL:
+            case PcodeOp.BOOL_AND:
+            case PcodeOp.BOOL_OR:
+            case PcodeOp.BOOL_XOR:
+            case PcodeOp.BOOL_NEGATE:
+                return node.getSize() == 1 ? "bool" : null;
+            case PcodeOp.MULTIEQUAL:
+                return pcodeMergedValueNativeType(
+                    def,
+                    tempNativeTypes,
+                    seen,
+                    depth + 1);

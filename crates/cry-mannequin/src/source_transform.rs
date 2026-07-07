@@ -241,6 +241,8 @@ pub struct MannequinLayerBlend {
     pub duration: Option<f32>,
     pub curve_type: Option<i32>,
     pub terminal: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flags: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -943,6 +945,7 @@ impl From<LayerBlend> for MannequinLayerBlend {
             duration: blend.duration,
             curve_type: blend.curve_type,
             terminal: blend.terminal,
+            flags: blend.flags,
         }
     }
 }
@@ -1887,6 +1890,29 @@ mod tests {
                 attribute
             } if attribute == "unknown"
         ));
+    }
+
+    #[test]
+    fn transforms_animation_database_layer_blend_flags() {
+        let source = MannequinAnimationDatabaseSource::from_legacy(
+            "animations/mannequin/adb/npc_example_anims.adb",
+            br#"<AnimDB FragDef="actions.xml" TagDef="tags.xml">
+ <FragmentList>
+  <Idle>
+   <Fragment>
+    <AnimLayer>
+     <Blend ExitTime="0" Duration="0.25" flags="Interrupt"/>
+     <Animation name="idle"/>
+    </AnimLayer>
+   </Fragment>
+  </Idle>
+ </FragmentList>
+</AnimDB>"#,
+        )
+        .unwrap();
+
+        let blend = &source.database.fragment_groups[0].fragments[0].animation_layers[0].blends[0];
+        assert_eq!(blend.flags.as_deref(), Some("Interrupt"));
     }
 
     fn sample_animation_database() -> &'static [u8] {

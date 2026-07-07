@@ -1,0 +1,900 @@
+        }
+        if (type.simpleName.equals("FixedReplicatedState")) {
+            return "fixed-replicated-state";
+        }
+        return "replicated-field";
+    }
+
+    private int physicalFieldCountFromHandlerType(NetworkTemplateType type) {
+        if (type == null) {
+            return 1;
+        }
+        if (type.simpleName.equals("DeltaCompressedReplicatedFieldHandler") ||
+            type.simpleName.equals("DeltaCompressedReplicatedFieldHandlerBase") ||
+            type.simpleName.equals("DeltaCompressedCounterHandler")) {
+            return 2;
+        }
+        if (type.simpleName.equals("DynamicDeltaReplicatedFieldHandler")) {
+            return 3;
+        }
+        if (type.simpleName.equals("FloatTimerDeltaReplicatedField")) {
+            return 4;
+        }
+        return 1;
+    }
+
+    private String fieldHandlerTypeName(
+        HandlerConstruction construction,
+        Address vtable) {
+
+        if (construction != null) {
+            String typeName = handlerTypeNameFromQualifiedName(construction.constructorName);
+            if (typeName != null) {
+                return typeName;
+            }
+        }
+
+        if (isProgramAddress(vtable)) {
+            Symbol symbol = currentProgram.getSymbolTable().getPrimarySymbol(vtable);
+            if (symbol != null) {
+                String typeName = handlerTypeNameFromQualifiedName(symbol.getName(true));
+                if (typeName != null) {
+                    return typeName;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String handlerTypeNameFromQualifiedName(String qualifiedName) {
+        if (qualifiedName == null || qualifiedName.isBlank()) {
+            return null;
+        }
+
+        String name = normalizeQualifiedNetworkTypeName(qualifiedName);
+        if (name == null) {
+            return null;
+        }
+        int vftableIndex = name.indexOf("::vftable");
+        if (vftableIndex > 0) {
+            name = name.substring(0, vftableIndex);
+        }
+
+        NetworkTemplateType networkType = parseNetworkTemplateType(name);
+        if (networkType != null) {
+            return networkType.qualifiedName;
+        }
+
+        if (name.contains("ReplicatedFieldHandlerBase")) {
+            return "MB::ReplicatedFieldHandlerBase";
+        }
+        if (name.contains("Amazon::Hub::IFragment") || name.endsWith("IFragment")) {
+            return "Amazon::Hub::IFragment";
+        }
+        if (name.contains("Amazon::Hub::IMessage") || name.endsWith("IMessage")) {
+            return "Amazon::Hub::IMessage";
+        }
+
+        if (!isNetworkTemplateOwnerName(name)) {
+            return null;
+        }
+
+        int split = name.lastIndexOf("::");
+        if (split > 0) {
+            String owner = name.substring(0, split);
+            String leaf = name.substring(split + 2);
+            NetworkTemplateType ownerType = parseNetworkTemplateType(owner);
+            if (ownerType != null && !leaf.contains("<")) {
+                return ownerType.qualifiedName;
+            }
+            if (owner.endsWith("<") || leaf.contains("<")) {
+                return name;
+            }
+            int ownerLeaf = owner.lastIndexOf("::");
+            String ownerSimple = ownerLeaf < 0 ? owner : owner.substring(ownerLeaf + 2);
+            if (leaf.equals(ownerSimple) ||
+                "vftable".equals(leaf) ||
+                leaf.startsWith("~")) {
+                name = owner;
+            }
+        }
+
+        return isPlausibleTypeName(name) ? name : null;
+    }
+
+    private String normalizeQualifiedNetworkTypeName(String value) {
+        String result = normalizeNativeType(value);
+        if (result == null) {
+            return null;
+        }
+        result = result
+            .replace("class ", "")
+            .replace("struct ", "")
+            .replace("enum ", "")
+            .replace("const ", "")
+            .replace(" volatile", "")
+            .replace("&", "")
+            .replace("*", "")
+            .trim();
+        return normalizeNativeType(result);
+    }
+
+    private boolean isNetworkTemplateOwnerName(String name) {
+        return name != null &&
+            (name.contains("ReplicatedFieldHandler") ||
+                name.contains("DeltaCompressedReplicatedFieldHandler") ||
+                name.contains("DeltaCompressedCounterHandler") ||
+                name.contains("DynamicDeltaReplicatedFieldHandler") ||
+                name.contains("FloatTimerDeltaReplicatedField") ||
+                name.contains("ReplicatedContainer") ||
+                name.contains("ReplicatedMapFieldHandler") ||
+                name.contains("ReplicatedVectorFieldHandler") ||
+                name.contains("ReplicatedSetFieldHandler") ||
+                name.contains("FixedReplicatedState") ||
+                name.contains("ReplicatedStateBundle") ||
+                name.contains("IFragment") ||
+                name.contains("IMessage"));
+    }
+
+    private NetworkTemplateType parseNetworkTemplateType(String qualifiedName) {
+        String normalized = normalizeQualifiedNetworkTypeName(qualifiedName);
+        if (normalized == null) {
+            return null;
+        }
+
+        int end = normalized.lastIndexOf('>');
+        if (end < 0) {
+            return null;
+        }
+        int start = matchingTemplateStart(normalized, end);
+        if (start < 0) {
+            return null;
+        }
+
+        String owner = normalized.substring(0, start);
+        String simple = simpleTypeName(owner);
+        if (!isNetworkTemplateSimpleName(simple)) {
+            return null;
+        }
+
+        String argumentText = normalized.substring(start + 1, end);
+        List<String> args = NetworkSchemaText.splitTopLevel(argumentText);
+        if (args.isEmpty()) {
+            return null;
+        }
+
+        String qualifiedOwner = owner;
+        return new NetworkTemplateType(
+            qualifiedOwner + "<" + String.join(",", args) + ">",
+            qualifiedOwner,
+            simple,
+            args);
+    }
+
+    private GenericType parseGenericTemplateType(String qualifiedName) {
+        String normalized = normalizeQualifiedNetworkTypeName(qualifiedName);
+        if (normalized == null) {
+            return null;
+        }
+
+        int end = normalized.lastIndexOf('>');
+        if (end < 0) {
+            return null;
+        }
+        int start = matchingTemplateStart(normalized, end);
+        if (start < 0) {
+            return null;
+        }
+
+        String owner = normalized.substring(0, start);
+        String argumentText = normalized.substring(start + 1, end);
+        List<String> args = NetworkSchemaText.splitTopLevel(argumentText);
+        if (args.isEmpty()) {
+            return null;
+        }
+        return new GenericType(
+            owner + "<" + String.join(",", args) + ">",
+            owner,
+            simpleTypeName(owner),
+            args);
+    }
+
+    private JsonObject foldEvidenceForCandidates(
+        String expectedTypeId,
+        String expectedKind,
+        String... typeNames) {
+
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        for (String typeName : typeNames) {
+            if (typeName == null || !seen.add(typeName)) {
+                continue;
+            }
+            JsonObject evidence = foldEvidenceForTypeName(typeName, expectedTypeId, expectedKind);
+            if (evidence != null) {
+                return evidence;
+            }
+        }
+        return null;
+    }
+
+    private JsonObject foldEvidenceForTypeName(
+        String typeName,
+        String expectedTypeId,
+        String expectedKind) {
+
+        FoldedTypeId folded = foldedTypeIdForTypeName(typeName);
+        if (folded == null) {
+            return null;
+        }
+
+        JsonObject object = new JsonObject();
+        NetworkSchemaJson.add(object, "sourceTypeName", folded.sourceTypeName);
+        NetworkSchemaJson.add(object, "formula", folded.formula);
+        NetworkSchemaJson.add(object, "computedTypeId", folded.typeId);
+        JsonArray operands = new JsonArray();
+        for (int i = 0; i < folded.operandTypeIds.size(); i++) {
+            JsonObject operand = new JsonObject();
+            NetworkSchemaJson.add(operand, "typeName", folded.operandTypeNames.get(i));
+            NetworkSchemaJson.add(operand, "typeId", folded.operandTypeIds.get(i));
+            operands.add(operand);
+        }
+        if (operands.size() != 0) {
+            object.add("operands", operands);
+        }
+
+        String expected = canonicalUuidFromString(expectedTypeId);
+        if (expected != null) {
+            NetworkSchemaJson.add(object, expectedKind + "TypeId", expected);
+            object.addProperty(
+                "matches" + Character.toUpperCase(expectedKind.charAt(0)) + expectedKind.substring(1),
+                uuidEquals(folded.typeId, expected));
+        }
+        return object;
+    }
+
+    private FoldedTypeId foldedTypeIdForTypeName(String typeName) {
+        String normalized = normalizeQualifiedNetworkTypeName(typeName);
+        if (normalized == null) {
+            return null;
+        }
+
+        GenericType type = parseGenericTemplateType(normalized);
+        if (type == null) {
+            return null;
+        }
+
+        String simple = type.simpleName;
+        List<String> args = type.args;
+        if ("less".equals(simple) && args.size() == 1) {
+            return postfixFold(type, "AZStd::less<T>", AZSTD_LESS_TYPE_ID, typeIds(args));
+        }
+        if ("hash".equals(simple) && args.size() == 1) {
+            return postfixFold(type, "AZStd::hash<T>", AZSTD_HASH_TYPE_ID, typeIds(args));
+        }
+        if ("equal_to".equals(simple) && args.size() == 1) {
+            return postfixFold(type, "AZStd::equal_to<T>", AZSTD_EQUAL_TO_TYPE_ID, typeIds(args));
+        }
+        if ("char_traits".equals(simple) && args.size() == 1) {
+            return postfixFold(type, "AZStd::char_traits<T>", AZSTD_CHAR_TRAITS_TYPE_ID, typeIds(args));
+        }
+        if ("basic_string".equals(simple) && args.size() >= 3) {
+            return postfixFold(
+                type,
+                "AZStd::basic_string<C,Traits,Allocator>",
+                AZSTD_BASIC_STRING_TYPE_ID,
+                typeIds(args.subList(0, 3)));
+        }
+        if ("pair".equals(simple) && args.size() >= 2) {
+            return postfixFold(type, "AZStd::pair<K,V>", AZSTD_PAIR_TYPE_ID, typeIds(args.subList(0, 2)));
+        }
+        if ("vector".equals(simple) && !args.isEmpty()) {
+            ArrayList<String> operands = new ArrayList<>();
+            operands.add(args.get(0));
+            operands.add(args.size() >= 2 ? args.get(1) : AZSTD_ALLOCATOR_TYPE_NAME);
+            return postfixFold(type, "AZStd::vector<T,Allocator>", AZSTD_VECTOR_TYPE_ID, typeIds(operands));
+        }
+        if ("list".equals(simple) && !args.isEmpty()) {
+            ArrayList<String> operands = new ArrayList<>();
+            operands.add(args.get(0));
+            operands.add(args.size() >= 2 ? args.get(1) : AZSTD_ALLOCATOR_TYPE_NAME);
+            return postfixFold(type, "AZStd::list<T,Allocator>", AZSTD_LIST_TYPE_ID, typeIds(operands));
+        }
+        if ("forward_list".equals(simple) && !args.isEmpty()) {
+            ArrayList<String> operands = new ArrayList<>();
+            operands.add(args.get(0));
+            operands.add(args.size() >= 2 ? args.get(1) : AZSTD_ALLOCATOR_TYPE_NAME);
+            return postfixFold(
+                type,
+                "AZStd::forward_list<T,Allocator>",
+                AZSTD_FORWARD_LIST_TYPE_ID,
+                typeIds(operands));
+        }
+        if ("set".equals(simple) && !args.isEmpty()) {
+            ArrayList<String> operands = new ArrayList<>();
+            operands.add(args.get(0));
+            operands.add(args.size() >= 2 ? args.get(1) : "AZStd::less<" + args.get(0) + ">");
+            operands.add(args.size() >= 3 ? args.get(2) : AZSTD_ALLOCATOR_TYPE_NAME);
+            return postfixFold(type, "AZStd::set<K,Compare,Allocator>", AZSTD_SET_TYPE_ID, typeIds(operands));
+        }
+        if ("unordered_set".equals(simple) && !args.isEmpty()) {
+            ArrayList<String> operands = new ArrayList<>();
+            operands.add(args.get(0));
+            operands.add(args.size() >= 2 ? args.get(1) : "AZStd::hash<" + args.get(0) + ">");
+            operands.add(args.size() >= 3 ? args.get(2) : "AZStd::equal_to<" + args.get(0) + ">");
+            operands.add(args.size() >= 4 ? args.get(3) : AZSTD_ALLOCATOR_TYPE_NAME);
+            return postfixFold(
+                type,
+                "AZStd::unordered_set<K,Hash,Equal,Allocator>",
+                AZSTD_UNORDERED_SET_TYPE_ID,
+                typeIds(operands));
+        }
+        if ("map".equals(simple) && args.size() >= 2) {
+            ArrayList<String> operands = new ArrayList<>();
+            operands.add(args.get(0));
+            operands.add(args.get(1));
+            operands.add(args.size() >= 3 ? args.get(2) : "AZStd::less<" + args.get(0) + ">");
+            operands.add(args.size() >= 4 ? args.get(3) : AZSTD_ALLOCATOR_TYPE_NAME);
+            return postfixFold(type, "AZStd::map<K,V,Compare,Allocator>", AZSTD_MAP_TYPE_ID, typeIds(operands));
+        }
+        if (("unordered_map".equals(simple) || "unordered_flat_map".equals(simple)) && args.size() >= 2) {
+            ArrayList<String> operands = new ArrayList<>();
+            operands.add(args.get(0));
+            operands.add(args.get(1));
+            operands.add(args.size() >= 3 ? args.get(2) : "AZStd::hash<" + args.get(0) + ">");
+            operands.add(args.size() >= 4 ? args.get(3) : "AZStd::equal_to<" + args.get(0) + ">");
+            operands.add(args.size() >= 5 ? args.get(4) : AZSTD_ALLOCATOR_TYPE_NAME);
+            String baseTypeId = "unordered_flat_map".equals(simple)
+                ? AZSTD_UNORDERED_FLAT_MAP_TYPE_ID
+                : AZSTD_UNORDERED_MAP_TYPE_ID;
+            return postfixFold(
+                type,
+                "AZStd::" + simple + "<K,V,Hash,Equal,Allocator>",
+                baseTypeId,
+                typeIds(operands));
+        }
+        if ("shared_ptr".equals(simple) && !args.isEmpty()) {
+            return postfixFold(type, "AZStd::shared_ptr<T>", AZSTD_SHARED_PTR_TYPE_ID, typeIds(args.subList(0, 1)));
+        }
+        if ("intrusive_ptr".equals(simple) && !args.isEmpty()) {
+            return postfixFold(
+                type,
+                "AZStd::intrusive_ptr<T>",
+                AZSTD_INTRUSIVE_PTR_TYPE_ID,
+                typeIds(args.subList(0, 1)));
+        }
+        if ("unique_ptr".equals(simple) && !args.isEmpty()) {
+            return postfixFold(type, "AZStd::unique_ptr<T>", AZSTD_UNIQUE_PTR_TYPE_ID, typeIds(args.subList(0, 1)));
+        }
+        if ("optional".equals(simple) && !args.isEmpty()) {
+            return postfixFold(type, "AZStd::optional<T>", AZSTD_OPTIONAL_TYPE_ID, typeIds(args.subList(0, 1)));
+        }
+        if ("fixed_vector".equals(simple) && args.size() >= 2) {
+            String capacity = templateAutoTypeId(args.get(1));
+            if (capacity == null) {
+                return null;
+            }
+            return postfixFold(
+                type,
+                "AZStd::fixed_vector<T,Capacity>",
+                AZSTD_FIXED_VECTOR_TYPE_ID,
+                typeIdsWithAuto(args.get(0), args.get(1), capacity));
+        }
+        if ("array".equals(simple) && args.size() >= 2) {
+            String size = templateAutoTypeId(args.get(1));
+            if (size == null) {
+                return null;
+            }
+            return postfixFold(
+                type,
+                "AZStd::array<T,Size>",
+                AZSTD_ARRAY_TYPE_ID,
+                typeIdsWithAuto(args.get(0), args.get(1), size));
+        }
+        if ("bitset".equals(simple) && !args.isEmpty()) {
+            String bits = templateAutoTypeId(args.get(0));
+            if (bits == null) {
+                return null;
+            }
+            return postfixFold(
+                type,
+                "AZStd::bitset<Bits>",
+                AZSTD_BITSET_TYPE_ID,
+                new TypeIdOperands(
+                    List.of(args.get(0)),
+                    List.of(bits)));
+        }
+        if ("tuple".equals(simple)) {
+            TypeIdOperands operands = typeIds(args);
+            if (operands == null || operands.typeIds.isEmpty()) {
+                return null;
+            }
+            String aggregate = aggregateTypeIdsRight(operands.typeIds);
+            if (aggregate == null) {
+                return null;
+            }
+            return new FoldedTypeId(
+                type.qualifiedName,
+                "AZStd::tuple<T...>",
+                combineTypeIds(AZSTD_TUPLE_TYPE_ID, aggregate),
+                operands.typeNames,
+                operands.typeIds);
+        }
+        if ("Asset".equals(simple) && type.ownerName.endsWith("Data::Asset") && !args.isEmpty()) {
+            return prefixFold(type, "AZ::Data::Asset<T>", AZ_DATA_ASSET_TYPE_ID, typeIds(args.subList(0, 1)));
+        }
+        if ("RValueToLValueWrapper".equals(simple) && !args.isEmpty()) {
+            return postfixFold(
+                type,
+                "AZ::Internal::RValueToLValueWrapper<T>",
+                AZ_INTERNAL_RVALUE_TO_LVALUE_WRAPPER_TYPE_ID,
+                typeIds(args.subList(0, 1)));
+        }
+        if ("ReplicatedField".equals(simple) && !args.isEmpty()) {
+            return prefixFold(type, "MB::ReplicatedField<T>", MB_REPLICATED_FIELD_TYPE_ID, typeIds(args.subList(0, 1)));
+        }
+        if ("UID".equals(simple) && type.ownerName.endsWith("Pervasives::UID") && !args.isEmpty()) {
+            String bits = templateAutoTypeId(args.get(0));
+            if (bits == null) {
+                return null;
+            }
+            return new FoldedTypeId(
+                type.qualifiedName,
+                "Amazon::Pervasives::UID<Bits>",
+                combineTypeIds(bits, AMAZON_PERVASIVES_UID_TYPE_ID),
+                List.of(args.get(0)),
+                List.of(bits));
+        }
+
+        return null;
+    }
+
+    private FoldedTypeId prefixFold(
+        GenericType type,
+        String formula,
+        String templateBase,
+        TypeIdOperands operands) {
+
+        if (operands == null || operands.typeIds.isEmpty()) {
+            return null;
+        }
+        String aggregate = aggregateTypeIds(operands.typeIds);
+        if (aggregate == null) {
+            return null;
+        }
+        return new FoldedTypeId(
+            type.qualifiedName,
+            formula,
+            combineTypeIds(templateBase, aggregate),
+            operands.typeNames,
+            operands.typeIds);
+    }
+
+    private FoldedTypeId postfixFold(
+        GenericType type,
+        String formula,
+        String templateBase,
+        TypeIdOperands operands) {
+
+        if (operands == null || operands.typeIds.isEmpty()) {
+            return null;
+        }
+        String aggregate = aggregateTypeIds(operands.typeIds);
+        if (aggregate == null) {
+            return null;
+        }
+        return new FoldedTypeId(
+            type.qualifiedName,
+            formula,
+            combineTypeIds(aggregate, templateBase),
+            operands.typeNames,
+            operands.typeIds);
+    }
+
+    private TypeIdOperands typeIds(List<String> typeNames) {
+        ArrayList<String> names = new ArrayList<>();
+        ArrayList<String> ids = new ArrayList<>();
+        for (String typeName : typeNames) {
+            String typeId = typeIdForTypeName(typeName);
+            if (typeId == null) {
+                return null;
+            }
+            names.add(typeName);
+            ids.add(typeId);
+        }
+        return new TypeIdOperands(names, ids);
+    }
+
+    private TypeIdOperands typeIdsWithAuto(String valueTypeName, String autoName, String autoTypeId) {
+        String valueTypeId = typeIdForTypeName(valueTypeName);
+        if (valueTypeId == null) {
+            return null;
+        }
+        return new TypeIdOperands(
+            List.of(valueTypeName, autoName),
+            List.of(valueTypeId, autoTypeId));
+    }
+
+    private String typeIdForTypeName(String typeName) {
+        String direct = directTypeIdForTypeName(typeName);
+        if (direct != null) {
+            return direct;
+        }
+        FoldedTypeId folded = foldedTypeIdForTypeName(typeName);
+        return folded == null ? null : folded.typeId;
+    }
+
+    private String directTypeIdForTypeName(String typeName) {
+        String normalized = normalizeQualifiedNetworkTypeName(typeName);
+        if (normalized == null) {
+            return null;
+        }
+        normalized = normalized
+            .replace("std::string", "AZStd::string")
+            .replace("std::allocator", "AZStd::allocator")
+            .replace("AZStd::_", "AZStd::");
+        SerializeTypeInfo reflected = serializeTypeForTypeName(normalized);
+        if (reflected != null && reflected.typeId != null) {
+            return reflected.typeId;
+        }
+        return switch (normalized) {
+            case "char" -> CHAR_TYPE_ID;
+            case "signed char", "i8", "int8_t", "std::int8_t", "AZ::s8", "AZ::sbyte" -> S8_TYPE_ID;
+            case "unsigned char", "u8", "uint8_t", "std::uint8_t", "AZ::u8", "AZ::byte" -> U8_TYPE_ID;
+            case "short", "i16", "int16_t", "std::int16_t", "AZ::s16" -> SHORT_TYPE_ID;
+            case "unsigned short", "u16", "uint16_t", "std::uint16_t", "AZ::u16" -> U16_TYPE_ID;
+            case "int", "i32", "int32_t", "std::int32_t", "AZ::s32" -> INT_TYPE_ID;
+            case "unsigned int", "u32", "uint32_t", "std::uint32_t", "AZ::u32" -> U32_TYPE_ID;
+            case "long", "AZ::long" -> LONG_TYPE_ID;
+            case "unsigned long", "AZ::ulong" -> ULONG_TYPE_ID;
+            case "i64", "int64_t", "std::int64_t", "AZ::s64" -> S64_TYPE_ID;
+            case "u64", "uint64_t", "std::uint64_t", "AZ::u64" -> U64_TYPE_ID;
+            case "float", "f32" -> FLOAT_TYPE_ID;
+            case "double", "f64" -> DOUBLE_TYPE_ID;
+            case "bool" -> BOOL_TYPE_ID;
+            case "AZ::Uuid", "AZ::TypeId" -> AZ_UUID_TYPE_ID;
+            case "AZ::EntityId" -> ENTITY_ID_TYPE_ID;
+            case "AZ::Crc32" -> CRC32_TYPE_ID;
+            case "AZ::Vector2" -> VECTOR2_TYPE_ID;
+            case "AZ::Vector3" -> VECTOR3_TYPE_ID;
+            case "AZ::Vector4" -> VECTOR4_TYPE_ID;
+            case "AZ::Transform" -> TRANSFORM_TYPE_ID;
+            case "AZ::Quaternion" -> QUATERNION_TYPE_ID;
+            case "AZ::Color" -> COLOR_TYPE_ID;
+            case "AZ::ColorF" -> COLORF_TYPE_ID;
+            case "AZ::ColorB" -> COLORB_TYPE_ID;
+            case "AZ::Aabb" -> AABB_TYPE_ID;
+            case "AZStd::allocator" -> AZSTD_ALLOCATOR_TYPE_ID;
+            case "AZStd::string", "string" -> AZSTD_STRING_TYPE_ID;
+            case "AZ::Data::AssetId" -> AZ_DATA_ASSET_ID_TYPE_ID;
+            default -> canonicalUuidFromString(normalized);
+        };
+    }
+
+    private SerializeTypeInfo serializeTypeForTypeName(String typeName) {
+        if (typeName == null || typeName.trim().isEmpty()) {
+            return null;
+        }
+        String normalized = typeName.trim();
+        List<SerializeTypeInfo> exact = serializeTypesByName.get(normalized);
+        if (exact != null && exact.size() == 1) {
+            return exact.get(0);
+        }
+        List<SerializeTypeInfo> leaf = serializeTypesByLeafName.get(NetworkSchemaText.sourceTypeLeaf(normalized));
+        if (leaf != null && leaf.size() == 1) {
+            return leaf.get(0);
+        }
+        return null;
+    }
+
+    private String templateAutoTypeId(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            long parsed = Long.parseUnsignedLong(value.trim());
+            return createData(Long.toUnsignedString(parsed).getBytes(StandardCharsets.US_ASCII));
+        }
+        catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private String aggregateTypeIds(List<String> typeIds) {
+        if (typeIds == null || typeIds.isEmpty()) {
+            return null;
+        }
+        String acc = typeIds.get(0);
+        for (int i = 1; i < typeIds.size(); i++) {
+            acc = combineTypeIds(acc, typeIds.get(i));
+        }
+        return acc;
+    }
+
+    private String aggregateTypeIdsRight(List<String> typeIds) {
+        if (typeIds == null || typeIds.isEmpty()) {
+            return null;
+        }
+        String acc = typeIds.get(typeIds.size() - 1);
+        for (int i = typeIds.size() - 2; i >= 0; i--) {
+            acc = combineTypeIds(typeIds.get(i), acc);
+        }
+        return acc;
+    }
+
+    private String combineTypeIds(String lhs, String rhs) {
+        byte[] lhsBytes = uuidBytes(lhs);
+        byte[] rhsBytes = uuidBytes(rhs);
+        if (lhsBytes == null || rhsBytes == null) {
+            return null;
+        }
+        byte[] bytes = new byte[32];
+        System.arraycopy(lhsBytes, 0, bytes, 0, 16);
+        System.arraycopy(rhsBytes, 0, bytes, 16, 16);
+        return createData(bytes);
+    }
+
+    private String createData(byte[] bytes) {
+        if (bytes == null || bytes.length == 0) {
+            return NIL_TYPE_ID;
+        }
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-1").digest(bytes);
+            byte[] data = new byte[16];
+            System.arraycopy(digest, 0, data, 0, data.length);
+            data[8] = (byte)((data[8] & 0xbf) | 0x80);
+            data[6] = (byte)((data[6] & 0x5f) | 0x50);
+            return uuidFromBytes(data);
+        }
+        catch (Exception exception) {
+            throw new IllegalStateException("SHA-1 is unavailable", exception);
+        }
+    }
+
+    private byte[] uuidBytes(String uuid) {
+        String normalized = normalizeUuid(uuid);
+        if (normalized == null) {
+            return null;
+        }
+        String hex = normalized.replace("-", "");
+        if (hex.length() != 32) {
+            return null;
+        }
+        byte[] bytes = new byte[16];
+        for (int i = 0; i < bytes.length; i++) {
+            int value = Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+            bytes[i] = (byte)value;
+        }
+        return bytes;
+    }
+
+    private String uuidFromBytes(byte[] bytes) {
+        StringBuilder builder = new StringBuilder(36);
+        for (int i = 0; i < bytes.length; i++) {
+            if (i == 4 || i == 6 || i == 8 || i == 10) {
+                builder.append('-');
+            }
+            int value = bytes[i] & 0xff;
+            builder.append(Character.toUpperCase(Character.forDigit(value >>> 4, 16)));
+            builder.append(Character.toUpperCase(Character.forDigit(value & 0xf, 16)));
+        }
+        return builder.toString();
+    }
+
+    private int matchingTemplateStart(String value, int end) {
+        int depth = 0;
+        for (int i = end; i >= 0; i--) {
+            char c = value.charAt(i);
+            if (c == '>') {
+                depth++;
+            }
+            else if (c == '<') {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private boolean isNetworkTemplateSimpleName(String simple) {
+        return simple != null &&
+            (simple.equals("ReplicatedFieldHandler") ||
+                simple.equals("DeltaCompressedReplicatedFieldHandler") ||
+                simple.equals("DeltaCompressedReplicatedFieldHandlerBase") ||
+                simple.equals("DynamicDeltaReplicatedFieldHandler") ||
+                simple.equals("ReplicatedContainer") ||
+                simple.equals("ReplicatedMapFieldHandler") ||
+                simple.equals("ReplicatedVectorFieldHandler") ||
+                simple.equals("ReplicatedSetFieldHandler") ||
+                simple.equals("FixedReplicatedState"));
+    }
+
+    private List<Address> unmarshalCallTargets(RegistryEntry entry) {
+        ArrayList<Address> result = new ArrayList<>();
+        Address unmarshalAddress = parseCapturedAddress(entry.unmarshal);
+        Function unmarshal = functionAtOrContaining(unmarshalAddress);
+        if (unmarshal == null) {
+            return result;
+        }
+        result.add(unmarshal.getEntryPoint());
+        for (Instruction instruction : functionInstructions(unmarshal)) {
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+            Address target = callTarget(instruction);
+            if (target != null) {
+                result.add(target);
+            }
+        }
+        return result;
+    }
+
+    private MessageUnmarshalPlan recoverMessageUnmarshalPlan(
+        RegistryEntry entry,
+        HookTypeEvidence hookType) {
+
+        Address createInstanceAddress = firstAddress(
+            parseCapturedAddress(entry.createInstance),
+            hookType == null ? null : hookType.createInstance);
+        Address unmarshalAddress = firstAddress(
+            parseCapturedAddress(entry.unmarshal),
+            hookType == null ? null : hookType.unmarshal);
+        Function wrapper = functionAtOrContaining(unmarshalAddress);
+        if (wrapper == null) {
+            return null;
+        }
+
+        MessageHelperCall helperCall = findMessageHelperCall(wrapper);
+        String wrapperText = decompileC(wrapper);
+        if (helperCall == null) {
+            return recoverFallbackMessageUnmarshalPlan(
+                entry,
+                wrapper,
+                wrapperText,
+                createInstanceAddress);
+        }
+
+        ParsedUnmarshalFieldsCall parsedCall = textParser.parseUnmarshalFieldsCall(wrapperText);
+        if (parsedCall == null) {
+            return recoverFallbackMessageUnmarshalPlan(
+                entry,
+                wrapper,
+                wrapperText,
+                createInstanceAddress);
+        }
+
+        MessageUnmarshalPlan plan = newMessageUnmarshalPlan(entry, wrapper, createInstanceAddress);
+        plan.templateTypes.addAll(parsedCall.templateTypes);
+        plan.helperCallsite = helperCall.callsite;
+        plan.helper = helperCall.target;
+        plan.helperName = helperCall.targetName;
+        MessageConstructorCall constructor = findMessageConstructorCall(wrapper, helperCall.callsite);
+        if (constructor != null) {
+            plan.instanceConstructorCallsite = constructor.callsite;
+            plan.instanceConstructor = constructor.target;
+            plan.instanceConstructorName = constructor.targetName;
+        }
+
+        int templateIndex = 0;
+        for (int i = 0; i < parsedCall.fieldArgs.size(); i++) {
+            ParsedArgument arg = parsedCall.fieldArgs.get(i);
+            String castNativeType = nativeTypeFromCast(arg.castType);
+            String nativeType = castNativeType;
+            if (templateIndex < parsedCall.templateTypes.size()) {
+                String templateType = parsedCall.templateTypes.get(templateIndex);
+                if (shouldUseTemplateType(castNativeType, templateType)) {
+                    nativeType = templateType;
+                    templateIndex++;
+                }
+                else if (castNativeType != null &&
+                    templateMatchesCast(templateType, castNativeType)) {
+                    nativeType = templateType;
+                    templateIndex++;
+                }
+            }
+
+            FieldCall field = new FieldCall();
+            field.index = i;
+            field.callsite = plan.helperCallsite;
+            field.name = "field_" + i;
+            field.nativeType = nativeType;
+            field.storageExpression = arg.expression;
+            field.storageOffset = storageByteOffsetFromExpression(arg.expression);
+            field.wireShape = wireShapeFromNativeType(nativeType);
+            field.wireShapeSource = field.wireShape == null
+                ? null
+                : "message-unmarshal-native-type";
+            field.confidence = "message-unmarshal-call";
+            plan.fields.add(field);
+        }
+        refineMessageFieldsFromHelper(plan);
+        enrichMessageFieldsFromSourceSignatures(entry, plan);
+        return plan;
+    }
+
+    private MessageUnmarshalPlan newMessageUnmarshalPlan(
+        RegistryEntry entry,
+        Function wrapper,
+        Address createInstance) {
+
+        MessageUnmarshalPlan plan = new MessageUnmarshalPlan();
+        plan.wrapper = wrapper.getEntryPoint();
+        plan.wrapperName = fullFunctionName(wrapper);
+        Long instanceSize = recoverCreateInstanceSize(createInstance);
+        if (instanceSize != null) {
+            plan.instanceSize = instanceSize;
+            plan.instanceSizeSource = "create-instance-operator-new";
+            plan.createInstance = createInstance;
+        }
+        return plan;
+    }
+
+    private MessageUnmarshalPlan recoverFallbackMessageUnmarshalPlan(
+        RegistryEntry entry,
+        Function wrapper,
+        String wrapperText,
+        Address createInstanceAddress) {
+
+        if (wrapperText == null) {
+            return null;
+        }
+
+        MessageUnmarshalPlan plan =
+            newMessageUnmarshalPlan(entry, wrapper, createInstanceAddress);
+        recoverPcodeMessageFields(plan, wrapper);
+        recoverInlineMessageFields(plan, wrapper.getEntryPoint(), wrapperText);
+        recoverHelperArgumentMessageFields(plan, wrapper, wrapperText);
+        recoverDirectObjectStoreMessageFields(plan, wrapper.getEntryPoint(), wrapperText);
+        if (plan.fields.isEmpty()) {
+            return null;
+        }
+        sortMessageFieldsByRecoveryOrder(plan);
+        enrichMessageFieldsFromSourceSignatures(entry, plan);
+        return plan;
+    }
+
+    private void recoverPcodeMessageFields(MessageUnmarshalPlan plan, Function wrapper) {
+        HighFunction high = highFunction(wrapper);
+        if (high == null) {
+            return;
+        }
+
+        Set<String> messageBases = pcodeMessageStorageBases(high);
+        HashMap<String, String> tempNativeTypes = new HashMap<>();
+        HashMap<String, String> tempWireShapes = new HashMap<>();
+        int recoveryOrder = 0;
+        Iterator<PcodeOpAST> ops = high.getPcodeOps();
+        while (ops.hasNext()) {
+            PcodeOpAST op = ops.next();
+            if (op.getOpcode() != PcodeOp.CALL) {
+                if (op.getOpcode() == PcodeOp.STORE) {
+                    recoverPcodeMessageStore(
+                        plan,
+                        op,
+                        messageBases,
+                        tempNativeTypes,
+                        tempWireShapes,
+                        recoveryOrder++);
+                }
+                continue;
+            }
+
+            PcodeCallTargetInfo targetInfo = pcodeCallTargetInfo(op);
+            Function target = targetInfo == null ? null : targetInfo.target;
+            if (target == null) {
+                recordPcodeMessageReject(
+                    plan,
+                    "pcode-call",
+                    "call-target-unresolved",
+                    op,
+                    targetInfo,
+                    null,
+                    null);
+                continue;
+            }
+            String nativeType = unmarshalNativeTypeFromTarget(target);
+            String targetWireShape = unmarshalWireShapeFromTarget(target);
+            if (nativeType == null && targetWireShape != null) {
+                nativeType = nativeTypeFromWireShape(targetWireShape);
+            }

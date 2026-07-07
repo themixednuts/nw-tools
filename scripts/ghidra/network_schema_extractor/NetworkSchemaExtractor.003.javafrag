@@ -1,0 +1,900 @@
+                    write.function,
+                    write.instruction,
+                    write.vtable,
+                    result.size(),
+                    projected,
+                    prefixPattern("vector-constructor", write.pattern)));
+            }
+        }
+    }
+
+    private String prefixPattern(String prefix, String pattern) {
+        return pattern == null ? prefix : prefix + ":" + pattern;
+    }
+
+    private boolean isVectorConstructorIteratorCall(Address target) {
+        Address resolved = resolvedCodeTarget(target);
+        if (!isExecutableAddress(resolved)) {
+            return false;
+        }
+        String name = fullFunctionName(functionAtOrContaining(resolved));
+        return name != null &&
+            name.toLowerCase(Locale.ROOT).contains("eh_vector_constructor_iterator");
+    }
+
+    private boolean isMemoryOperand(Instruction instruction, int operandIndex) {
+        String text = NetworkSchemaX86.operandText(instruction, operandIndex);
+        return text != null && text.contains("[") && text.contains("]");
+    }
+
+    private void clearVolatileAddressRegisters(Map<String, Address> registers) {
+        registers.remove("RAX");
+        registers.remove("RCX");
+        registers.remove("RDX");
+        registers.remove("R8");
+        registers.remove("R9");
+        registers.remove("R10");
+        registers.remove("R11");
+    }
+
+    private TypeNameEvidence resolvedTypeName(
+        RegistryEntry entry,
+        AzRttiEvidence resolvedRtti,
+        HookTypeEvidence hookType,
+        List<RegistrationFunction> matches) {
+
+        if ((hookType != null && isPlausibleTypeName(hookType.typeName)) ||
+            (resolvedRtti != null && isConcreteNetworkTypeName(resolvedRtti.typeName))) {
+            return null;
+        }
+
+        for (RegistrationFunction match : matches) {
+            String typeName = match.constructorTypeName();
+            if (!isLikelyRuntimeTypeName(typeName)) {
+                continue;
+            }
+            TypeNameEvidence evidence = new TypeNameEvidence();
+            evidence.source = "constructorFunctionName";
+            evidence.function = match.function.getEntryPoint();
+            evidence.typeName = typeName;
+            return evidence;
+        }
+
+        return typeNameFromCreateInstanceAllocation(entry);
+    }
+
+    private TypeNameEvidence typeNameFromCreateInstanceAllocation(RegistryEntry entry) {
+        Address createInstance = parseCapturedAddress(entry.createInstance);
+        if (!isExecutableAddress(createInstance)) {
+            return null;
+        }
+
+        String bestName = null;
+        String bestSource = null;
+        int bestScore = Integer.MIN_VALUE;
+        Address bestAddress = null;
+        for (Instruction instruction :
+            linearInstructions(createInstance, REGISTRY_HANDLER_RTTI_SCAN_LIMIT)) {
+
+            for (Address target : referencedAddresses(instruction)) {
+                String name = readPrintableString(target);
+                TypeNameCandidate candidate =
+                    typeNameCandidate(name, "createInstanceAllocationLabel", target);
+                if (candidate == null || candidate.score < bestScore) {
+                    continue;
+                }
+                bestName = candidate.typeName;
+                bestSource = candidate.source;
+                bestAddress = candidate.address;
+                bestScore = candidate.score;
+            }
+        }
+
+        TypeNameCandidate decompiledCandidate =
+            typeNameFromCreateInstanceDecompile(createInstance);
+        if (decompiledCandidate != null && decompiledCandidate.score >= bestScore) {
+            bestName = decompiledCandidate.typeName;
+            bestSource = decompiledCandidate.source;
+            bestAddress = decompiledCandidate.address;
+            bestScore = decompiledCandidate.score;
+        }
+
+        if (bestName == null) {
+            return null;
+        }
+
+        TypeNameEvidence evidence = new TypeNameEvidence();
+        evidence.source = bestSource == null ? "createInstanceAllocationLabel" : bestSource;
+        evidence.function = createInstance;
+        evidence.typeName = bestName;
+        evidence.typeNameAddress = bestAddress;
+        return evidence;
+    }
+
+    private TypeNameCandidate typeNameFromCreateInstanceDecompile(Address createInstance) {
+        Function function = functionAtOrContaining(createInstance);
+        String text = decompileC(function);
+        if (text == null) {
+            return null;
+        }
+
+        TypeNameCandidate best = null;
+        Matcher matcher = Pattern
+            .compile("\"(?<value>[A-Za-z_][A-Za-z0-9_:<>.$-]{0,255})\"")
+            .matcher(text);
+        while (matcher.find()) {
+            TypeNameCandidate candidate =
+                typeNameCandidate(matcher.group("value"), "createInstanceAllocationLiteral", null);
+            if (candidate == null || (best != null && candidate.score < best.score)) {
+                continue;
+            }
+            best = candidate;
+        }
+        return best;
+    }
+
+    private TypeNameCandidate typeNameCandidate(String name, String source, Address address) {
+        if (!isLikelyRuntimeTypeName(name)) {
+            return null;
+        }
+
+        return new TypeNameCandidate(name, source, address, runtimeTypeNameScore(name));
+    }
+
+    private boolean isLikelyRuntimeTypeName(String name) {
+        if (!isPlausibleTypeName(name)) {
+            return false;
+        }
+        if (isAllocatorTypeName(name)) {
+            return false;
+        }
+        if (name.startsWith("m_") || name.startsWith("[") || name.startsWith("FUN_")) {
+            return false;
+        }
+        return Character.isUpperCase(name.charAt(0)) ||
+            name.contains("::") ||
+            hasRuntimeTypeSuffix(name);
+    }
+
+    private boolean isConcreteNetworkTypeName(String name) {
+        if (!isLikelyRuntimeTypeName(name)) {
+            return false;
+        }
+        return !isBaseNetworkTypeName(name);
+    }
+
+    private boolean isBaseNetworkTypeName(String name) {
+        if (name == null) {
+            return false;
+        }
+        String simple = simpleTypeName(name);
+        return "IMessage".equals(simple) ||
+            "IFragment".equals(simple) ||
+            "TraitState".equals(simple) ||
+            "ReplicatedState".equals(simple) ||
+            "ReplicatedFieldHandlerBase".equals(simple);
+    }
+
+    private int runtimeTypeNameScore(String name) {
+        if (name == null) {
+            return Integer.MIN_VALUE;
+        }
+
+        int score = 0;
+        if (name.contains("::")) {
+            score += 80;
+        }
+        if (!name.isEmpty() && Character.isUpperCase(name.charAt(0))) {
+            score += 20;
+        }
+        if (hasRuntimeTypeSuffix(name)) {
+            score += 40;
+        }
+        score += Math.min(name.length(), 80);
+        return score;
+    }
+
+    private boolean isAllocatorTypeName(String name) {
+        if (name == null) {
+            return false;
+        }
+        String lower = name.toLowerCase(Locale.ROOT);
+        return "systemallocator".equals(lower) ||
+            "az::systemallocator".equals(lower) ||
+            lower.startsWith("azstd::allocator") ||
+            lower.startsWith("azstd::static_buffer_allocator") ||
+            lower.contains("allocator_deallocate");
+    }
+
+    private boolean typeNamesMatch(String expected, String actual) {
+        if (expected == null || actual == null) {
+            return false;
+        }
+        if (expected.equals(actual)) {
+            return true;
+        }
+        return simpleTypeName(expected).equals(simpleTypeName(actual));
+    }
+
+    private String simpleTypeName(String name) {
+        if (name == null) {
+            return "";
+        }
+        String value = name;
+        int namespace = value.lastIndexOf("::");
+        if (namespace >= 0) {
+            value = value.substring(namespace + 2);
+        }
+        int dot = value.lastIndexOf('.');
+        if (dot >= 0) {
+            value = value.substring(dot + 1);
+        }
+        return value;
+    }
+
+    private boolean hasRuntimeTypeSuffix(String name) {
+        if (name == null) {
+            return false;
+        }
+        String[] suffixes = {
+            "Msg",
+            "State",
+            "Trait",
+            "Fragment",
+            "Component",
+            "ReplicatedState",
+            "Params",
+            "Data",
+            "Request",
+            "Response",
+            "Notification",
+        };
+        for (String suffix : suffixes) {
+            if (name.endsWith(suffix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String typeNameFromRttiHelperFunctionName(Address function) {
+        Function providerFunction = functionAtOrContaining(function);
+        if (providerFunction == null) {
+            return null;
+        }
+
+        Matcher matcher = RTTI_HELPER_NAME_RE.matcher(fullFunctionName(providerFunction));
+        if (!matcher.find()) {
+            return null;
+        }
+
+        String typeName = matcher.group("type");
+        return isLikelyRuntimeTypeName(typeName) ? typeName : null;
+    }
+
+    private TypeNameDecode typeNameDecodeFromFunctionName(Address function, Address provider) {
+        String typeName = typeNameFromRttiHelperFunctionName(provider);
+        if (typeName == null) {
+            typeName = typeNameFromRttiHelperFunctionName(function);
+        }
+        if (typeName == null) {
+            return null;
+        }
+
+        TypeNameDecode decode = new TypeNameDecode();
+        decode.function = function;
+        decode.provider = provider;
+        decode.typeName = typeName;
+        decode.typeNameSource = "rttiHelperFunctionName";
+        return decode;
+    }
+
+    private List<Address> registryHandlerFunctionAddresses(RegistryEntry entry) {
+        ArrayList<Address> result = new ArrayList<>();
+        addRegistryHandlerAddress(result, entry.unmarshal);
+        addRegistryHandlerAddress(result, entry.marshal);
+        addRegistryHandlerAddress(result, entry.destructor);
+        addRegistryHandlerAddress(result, entry.createInstance);
+        return result;
+    }
+
+    private void addRegistryHandlerAddress(List<Address> result, String value) {
+        Address address = parseCapturedAddress(value);
+        if (isExecutableAddress(address)) {
+            result.add(address);
+        }
+    }
+
+    private HookTypeEvidence registrationHookForEntry(
+        RegistryEntry entry,
+        Map<String, HookTypeEvidence> hookTypeNamesById) {
+
+        String registryTypeId = canonicalUuidFromString(entry.uuid);
+        return registryTypeId == null ? null : hookTypeNamesById.get(normalizeUuid(registryTypeId));
+    }
+
+    private boolean isRegistryTypeNameFallback(HookTypeEvidence hookType) {
+        return hookType != null && "typeregistry-entry".equals(hookType.source);
+    }
+
+    private JsonObject identityFallbackJson(
+        RegistryEntry entry,
+        AzRttiEvidence resolvedRtti,
+        HookTypeEvidence hookType,
+        TypeNameEvidence recoveredTypeName,
+        List<RegistrationFunction> matches) {
+
+        JsonObject object = registryIdentityJson(entry);
+        object.addProperty("typeName", hookType.typeName);
+        object.addProperty("typeNameSource", hookType.typeNameSource());
+        object.addProperty(
+            "reason",
+            "no install-registration-hook evidence matched this UUID; using the registry/typeindex name");
+        object.addProperty("constructorMatchCount", matches.size());
+        object.addProperty(
+            "handlerAddressCount",
+            registryHandlerFunctionAddresses(entry).size());
+        NetworkSchemaJson.add(object, "azRttiSource", resolvedRtti == null ? null : resolvedRtti.source);
+        NetworkSchemaJson.add(object, "azRttiTypeId", resolvedRtti == null ? null : resolvedRtti.typeId);
+        NetworkSchemaJson.add(object, "azRttiTypeName", resolvedRtti == null ? null : resolvedRtti.typeName);
+        NetworkSchemaJson.add(object, "azRttiTypeNameSource",
+            resolvedRtti == null ? null : resolvedRtti.typeNameSource);
+        if (recoveredTypeName != null) {
+            object.add("recoveredTypeName", recoveredTypeName.toJson());
+        }
+        object.add("missingEvidence", fallbackMissingEvidence(entry, resolvedRtti, matches));
+        object.add("handler", registryHandlerJson(entry));
+        object.add("constructorMatches", constructorMatchAddressesJson(matches));
+        return object;
+    }
+
+    private JsonObject identityBlockerJson(
+        RegistryEntry entry,
+        AzRttiEvidence resolvedRtti,
+        AzRttiEvidence valueRtti,
+        HookTypeEvidence hookType,
+        TypeNameEvidence recoveredTypeName,
+        List<RegistrationFunction> matches,
+        String reason) {
+
+        JsonObject object = registryIdentityJson(entry);
+        object.addProperty("reason", reason);
+        object.addProperty("hasRegistryName", isPlausibleTypeName(entry.name));
+        object.addProperty("hasHookEvidence", hookType != null);
+        object.addProperty(
+            "hasHookTypeName",
+            hookType != null && isPlausibleTypeName(hookType.typeName));
+        object.addProperty("hasAzRtti", resolvedRtti != null);
+        object.addProperty(
+            "hasAzRttiTypeId",
+            resolvedRtti != null && resolvedRtti.typeId != null);
+        object.addProperty(
+            "hasAzRttiTypeName",
+            resolvedRtti != null && isPlausibleTypeName(resolvedRtti.typeName));
+        object.addProperty(
+            "hasConcreteAzRttiTypeName",
+            resolvedRtti != null && isConcreteNetworkTypeName(resolvedRtti.typeName));
+        object.addProperty(
+            "hasRecoveredTypeName",
+            recoveredTypeName != null && isPlausibleTypeName(recoveredTypeName.typeName));
+        object.addProperty("hasValueAzRtti", valueRtti != null);
+        object.addProperty(
+            "hasConcreteValueTypeName",
+            valueRtti != null && isConcreteNetworkTypeName(valueRtti.typeName));
+        object.addProperty("constructorMatchCount", matches.size());
+        object.addProperty(
+            "handlerAddressCount",
+            registryHandlerFunctionAddresses(entry).size());
+        NetworkSchemaJson.add(object, "hookSource", hookType == null ? null : hookType.typeNameSource());
+        NetworkSchemaJson.add(object, "hookTypeName", hookType == null ? null : hookType.typeName);
+        NetworkSchemaJson.add(object, "azRttiSource", resolvedRtti == null ? null : resolvedRtti.source);
+        NetworkSchemaJson.add(object, "azRttiTypeId", resolvedRtti == null ? null : resolvedRtti.typeId);
+        NetworkSchemaJson.add(object, "azRttiTypeName", resolvedRtti == null ? null : resolvedRtti.typeName);
+        NetworkSchemaJson.add(object, "azRttiTypeNameSource",
+            resolvedRtti == null ? null : resolvedRtti.typeNameSource);
+        NetworkSchemaJson.add(object, "azRttiSelectedProviderTypeName",
+            providerAnyTypeNameForTypeId(
+                resolvedRtti,
+                canonicalUuidFromString(entry.uuid)));
+        NetworkSchemaJson.add(object, "valueAzRttiSource", valueRtti == null ? null : valueRtti.source);
+        NetworkSchemaJson.add(object, "valueAzRttiTypeId", valueRtti == null ? null : valueRtti.typeId);
+        NetworkSchemaJson.add(object, "valueAzRttiTypeName", valueRtti == null ? null : valueRtti.typeName);
+        NetworkSchemaJson.add(object, "valueAzRttiTypeNameSource",
+            valueRtti == null ? null : valueRtti.typeNameSource);
+        if (valueRtti != null) {
+            object.add("valueAzRtti", valueRtti.toJson());
+        }
+        if (recoveredTypeName != null) {
+            object.add("recoveredTypeName", recoveredTypeName.toJson());
+        }
+        object.add("missingEvidence", blockerMissingEvidence(
+            entry,
+            resolvedRtti,
+            valueRtti,
+            hookType,
+            recoveredTypeName,
+            matches));
+        object.add("handler", registryHandlerJson(entry));
+        object.add("constructorMatches", constructorMatchAddressesJson(matches));
+        return object;
+    }
+
+    private String identityBlockerReason(
+        RegistryEntry entry,
+        AzRttiEvidence resolvedRtti,
+        AzRttiEvidence valueRtti,
+        HookTypeEvidence hookType,
+        TypeNameEvidence recoveredTypeName,
+        List<RegistrationFunction> matches) {
+
+        if ((hookType != null && isPlausibleTypeName(hookType.typeName)) ||
+            (resolvedRtti != null && isConcreteNetworkTypeName(resolvedRtti.typeName)) ||
+            (recoveredTypeName != null && isPlausibleTypeName(recoveredTypeName.typeName)) ||
+            (valueRtti != null && isConcreteNetworkTypeName(valueRtti.typeName))) {
+            return null;
+        }
+
+        String registryTypeId = canonicalUuidFromString(entry.uuid);
+        if (registryTypeId == null) {
+            return "missing-or-invalid-uuid";
+        }
+        if (isZeroUuid(registryTypeId)) {
+            return "zero-uuid";
+        }
+        if (isBaseOrInterfaceRegistryEntry(entry, resolvedRtti)) {
+            return null;
+        }
+        if (hookType != null && !isPlausibleTypeName(hookType.typeName)) {
+            return "hook-evidence-without-semantic-type-name";
+        }
+        if (resolvedRtti != null && resolvedRtti.typeId != null &&
+            !isPlausibleTypeName(resolvedRtti.typeName)) {
+            return "az-rtti-uuid-only";
+        }
+        if (!isPlausibleTypeName(entry.name)) {
+            if (matches.isEmpty()) {
+                if (registryHandlerFunctionAddresses(entry).isEmpty()) {
+                    return "no-registry-name-no-hook-no-constructor-match-no-handler-address";
+                }
+                return "no-registry-name-no-hook-no-constructor-match-handler-rtti-missing";
+            }
+            return "no-registry-name-constructor-rtti-missing-or-mismatch";
+        }
+        if (matches.isEmpty()) {
+            if (registryHandlerFunctionAddresses(entry).isEmpty()) {
+                return "registry-name-no-hook-no-constructor-match-no-handler-address";
+            }
+            return "registry-name-no-hook-no-constructor-match-handler-rtti-missing";
+        }
+        return "registry-name-constructor-rtti-missing-or-mismatch";
+    }
+
+    private JsonObject registryIdentityJson(RegistryEntry entry) {
+        JsonObject object = new JsonObject();
+        NetworkSchemaJson.add(object, "uuid", entry.uuid);
+        NetworkSchemaJson.add(object, "name", entry.name);
+        NetworkSchemaJson.add(object, "index", entry.index);
+        NetworkSchemaJson.add(object, "typeIndex", entry.typeIndex);
+        NetworkSchemaJson.add(object, "storageAddress", entry.storageAddress);
+        NetworkSchemaJson.add(object, "baseVtable", entry.baseVtable);
+        NetworkSchemaJson.add(object, "vtable", entry.vtable);
+        return object;
+    }
+
+    private JsonObject registryHandlerJson(RegistryEntry entry) {
+        JsonObject handler = new JsonObject();
+        NetworkSchemaJson.add(handler, "Destructor", entry.destructor);
+        NetworkSchemaJson.add(handler, "GetEmptyValue", entry.getEmptyValue);
+        NetworkSchemaJson.add(handler, "CreateInstance", entry.createInstance);
+        NetworkSchemaJson.add(handler, "CopyValue", entry.copyValue);
+        NetworkSchemaJson.add(handler, "Marshal", entry.marshal);
+        NetworkSchemaJson.add(handler, "Unmarshal", entry.unmarshal);
+
+        JsonArray parsed = new JsonArray();
+        for (Address address : registryHandlerFunctionAddresses(entry)) {
+            parsed.add(formatAddress(address));
+        }
+        handler.add("parsedFunctionAddresses", parsed);
+        return handler;
+    }
+
+    private JsonArray constructorMatchAddressesJson(List<RegistrationFunction> matches) {
+        JsonArray array = new JsonArray();
+        for (RegistrationFunction match : matches) {
+            JsonObject object = new JsonObject();
+            object.addProperty("address", formatAddress(match.function.getEntryPoint()));
+            object.addProperty("name", fullFunctionName(match.function));
+            if (match.azRtti != null) {
+                object.add("azRtti", match.azRtti.toJson());
+            }
+            array.add(object);
+        }
+        return array;
+    }
+
+    private JsonArray fallbackMissingEvidence(
+        RegistryEntry entry,
+        AzRttiEvidence resolvedRtti,
+        List<RegistrationFunction> matches) {
+
+        JsonArray array = new JsonArray();
+        array.add("install-registration-hook");
+        if (resolvedRtti == null) {
+            if (matches.isEmpty()) {
+                array.add("constructor-register-field-match");
+            }
+            if (registryHandlerFunctionAddresses(entry).isEmpty()) {
+                array.add("registry-handler-address");
+            }
+            else {
+                array.add("constructor-vtable-write-az-rtti");
+            }
+        }
+        else if (!isConcreteNetworkTypeName(resolvedRtti.typeName)) {
+            array.add("az-rtti-semantic-type-name");
+        }
+        return array;
+    }
+
+    private JsonArray blockerMissingEvidence(
+        RegistryEntry entry,
+        AzRttiEvidence resolvedRtti,
+        AzRttiEvidence valueRtti,
+        HookTypeEvidence hookType,
+        TypeNameEvidence recoveredTypeName,
+        List<RegistrationFunction> matches) {
+
+        JsonArray array = new JsonArray();
+        String registryTypeId = canonicalUuidFromString(entry.uuid);
+        if (registryTypeId == null || isZeroUuid(registryTypeId)) {
+            array.add("usable-uuid");
+        }
+        if (!isPlausibleTypeName(entry.name)) {
+            array.add("registry-debug-name");
+        }
+        if (hookType == null) {
+            array.add("install-registration-hook");
+        }
+        else if (!isPlausibleTypeName(hookType.typeName)) {
+            array.add("registration-hook-semantic-type-name");
+        }
+        if (matches.isEmpty()) {
+            array.add("constructor-register-field-match");
+        }
+        if (registryHandlerFunctionAddresses(entry).isEmpty()) {
+            array.add("registry-handler-address");
+        }
+        if (resolvedRtti == null) {
+            array.add("az-rtti");
+        }
+        else if (!isConcreteNetworkTypeName(resolvedRtti.typeName)) {
+            array.add("az-rtti-semantic-type-name");
+        }
+        if (recoveredTypeName == null) {
+            array.add("recovered-type-name");
+        }
+        if (valueRtti == null) {
+            array.add("value-az-rtti");
+        }
+        else if (!isConcreteNetworkTypeName(valueRtti.typeName)) {
+            array.add("concrete-value-type-name");
+        }
+        return array;
+    }
+
+    private JsonObject countMapJson(Map<String, Integer> counts) {
+        JsonObject object = new JsonObject();
+        for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+            object.addProperty(entry.getKey(), entry.getValue());
+        }
+        return object;
+    }
+
+    private JsonObject fieldWireShapeDiagnostics(JsonArray entries) {
+        JsonObject object = new JsonObject();
+        LinkedHashMap<String, Integer> reasonCounts = new LinkedHashMap<>();
+        JsonArray unresolvedSamples = new JsonArray();
+        JsonArray nestedTypeSamples = new JsonArray();
+        int missingWireShapeFields = 0;
+        int missingWireShapeWithNestedTypeShape = 0;
+        int missingWireShapeWithoutNestedTypeShape = 0;
+
+        if (entries != null) {
+            for (JsonElement entryElement : entries) {
+                if (entryElement == null || !entryElement.isJsonObject()) {
+                    continue;
+                }
+                JsonObject entry = entryElement.getAsJsonObject();
+                JsonArray fields = array(entry, "fields");
+                if (fields == null) {
+                    continue;
+                }
+                for (JsonElement fieldElement : fields) {
+                    if (fieldElement == null || !fieldElement.isJsonObject()) {
+                        continue;
+                    }
+                    JsonObject field = fieldElement.getAsJsonObject();
+                    if (string(field, "wireShape") != null) {
+                        continue;
+                    }
+                    missingWireShapeFields++;
+                    JsonObject nestedTypeShape = object(field, "nestedTypeShape");
+                    boolean hasNestedTypeShape = nestedTypeShape != null;
+                    String reason = missingWireShapeReason(field, hasNestedTypeShape);
+                    incrementCount(reasonCounts, reason);
+                    JsonObject sample =
+                        missingWireShapeSample(entry, field, reason, hasNestedTypeShape);
+                    if (hasNestedTypeShape) {
+                        missingWireShapeWithNestedTypeShape++;
+                        addBoundedSample(nestedTypeSamples, sample, FIELD_WIRE_SHAPE_SAMPLE_LIMIT);
+                    }
+                    else {
+                        missingWireShapeWithoutNestedTypeShape++;
+                        addBoundedSample(unresolvedSamples, sample, FIELD_WIRE_SHAPE_SAMPLE_LIMIT);
+                    }
+                }
+            }
+        }
+
+        object.addProperty("missingWireShapeFields", missingWireShapeFields);
+        object.addProperty(
+            "missingWireShapeWithNestedTypeShape",
+            missingWireShapeWithNestedTypeShape);
+        object.addProperty(
+            "missingWireShapeWithoutNestedTypeShape",
+            missingWireShapeWithoutNestedTypeShape);
+        object.add("missingWireShapeReasonSummary", countMapJson(reasonCounts));
+        object.add("unresolvedSamples", unresolvedSamples);
+        object.add("nestedTypeShapeSamples", nestedTypeSamples);
+        return object;
+    }
+
+    private String missingWireShapeReason(JsonObject field, boolean hasNestedTypeShape) {
+        if (hasNestedTypeShape) {
+            return "composite-nested-type-shape";
+        }
+        if (string(field, "handlerTypeName") != null) {
+            return "handler-type-without-wire-shape";
+        }
+        if (string(field, "nativeType") != null || string(field, "sourceTypeName") != null) {
+            return "native-type-without-wire-shape";
+        }
+        JsonObject unmarshalEvidence = object(field, "unmarshalEvidence");
+        if (unmarshalEvidence != null && string(unmarshalEvidence, "targetName") != null) {
+            return "unmarshal-target-without-wire-shape";
+        }
+        return "no-type-evidence";
+    }
+
+    private JsonObject missingWireShapeSample(
+        JsonObject entry,
+        JsonObject field,
+        String reason,
+        boolean hasNestedTypeShape) {
+
+        JsonObject sample = new JsonObject();
+        NetworkSchemaJson.add(sample, "reason", reason);
+        NetworkSchemaJson.add(sample, "typeIndex", integer(entry, "typeIndex"));
+        NetworkSchemaJson.add(sample, "typeName", string(entry, "typeName"));
+        NetworkSchemaJson.add(sample, "entryName", string(entry, "name"));
+        NetworkSchemaJson.add(sample, "field", string(field, "name"));
+        NetworkSchemaJson.add(sample, "callsite", string(field, "callsite"));
+        NetworkSchemaJson.add(sample, "nativeType", string(field, "nativeType"));
+        NetworkSchemaJson.add(sample, "sourceTypeName", string(field, "sourceTypeName"));
+        NetworkSchemaJson.add(sample, "handlerTypeName", string(field, "handlerTypeName"));
+        NetworkSchemaJson.add(sample, "evidenceKind", entryFieldEvidenceKind(entry));
+        sample.addProperty("hasNestedTypeShape", hasNestedTypeShape);
+        JsonObject nestedTypeShape = object(field, "nestedTypeShape");
+        if (nestedTypeShape != null) {
+            NetworkSchemaJson.add(sample, "nestedTypeName", string(nestedTypeShape, "typeName"));
+            NetworkSchemaJson.add(sample, "nestedTypeNameFull", string(nestedTypeShape, "typeNameFull"));
+            NetworkSchemaJson.add(sample, "nestedValidation", string(nestedTypeShape, "validation"));
+        }
+        JsonObject unmarshalEvidence = object(field, "unmarshalEvidence");
+        if (unmarshalEvidence != null) {
+            NetworkSchemaJson.add(sample, "unmarshalTargetName", string(unmarshalEvidence, "targetName"));
+            NetworkSchemaJson.add(sample, "unmarshalTargetKind", string(unmarshalEvidence, "targetKind"));
+            NetworkSchemaJson.add(sample, "unmarshalEvidenceSource", string(unmarshalEvidence, "evidenceSource"));
+        }
+        return sample;
+    }
+
+    private String entryFieldEvidenceKind(JsonObject entry) {
+        if (array(entry, "constructorMatches") != null) {
+            return "registered-field-constructor";
+        }
+        if (object(entry, "messageUnmarshal") != null) {
+            return "message-unmarshal";
+        }
+        return null;
+    }
+
+    private void addBoundedSample(JsonArray samples, JsonObject sample, int limit) {
+        if (samples != null && sample != null && samples.size() < limit) {
+            samples.add(sample);
+        }
+    }
+
+    private JsonObject registrationInvariants(
+        Map<String, HookTypeEvidence> hooksById,
+        List<RegistryEntry> registry) {
+
+        LinkedHashMap<String, String> registryNamesById = new LinkedHashMap<>();
+        for (RegistryEntry entry : registry) {
+            String typeId = normalizeUuid(entry.uuid);
+            if (typeId != null) {
+                registryNamesById.put(typeId, entry.name);
+            }
+        }
+
+        JsonArray hookUuidsNotInRegistry = new JsonArray();
+        JsonArray zeroUuidDecoded = new JsonArray();
+        JsonArray decodedButNameMismatch = new JsonArray();
+        int hookUuidsNotInRegistryCount = 0;
+        int zeroUuidDecodedCount = 0;
+        int decodedButNameMismatchCount = 0;
+        int unresolvedHookNameCount = 0;
+        for (HookTypeEvidence hook : hooksById.values()) {
+            if (hook == null || "typeregistry-entry".equals(hook.source)) {
+                continue;
+            }
+            String typeId = normalizeUuid(hook.typeId);
+            if (typeId == null) {
+                continue;
+            }
+            if (isZeroUuid(typeId)) {
+                zeroUuidDecodedCount++;
+                addInvariantSample(zeroUuidDecoded, hook, null);
+                continue;
+            }
+            if (!registryTypeIds.contains(typeId)) {
+                hookUuidsNotInRegistryCount++;
+                addInvariantSample(hookUuidsNotInRegistry, hook, null);
+                continue;
+            }
+
+            String registryName = registryNamesById.get(typeId);
+            if (registryName == null || registryName.isEmpty()) {
+                continue;
+            }
+            if (!isPlausibleTypeName(hook.typeName) &&
+                !isPlausibleTypeName(hook.slotTypeName)) {
+                unresolvedHookNameCount++;
+                continue;
+            }
+            if (!semanticTypeNameMatches(registryName, hook.typeName) &&
+                !semanticTypeNameMatches(registryName, hook.slotTypeName)) {
+                decodedButNameMismatchCount++;
+                addInvariantSample(decodedButNameMismatch, hook, registryName);
+            }
+        }
+
+        JsonObject object = new JsonObject();
+        object.addProperty("hookUuidsNotInRegistryCount", hookUuidsNotInRegistryCount);
+        object.add("hookUuidsNotInRegistry", hookUuidsNotInRegistry);
+        object.addProperty("zeroUuidDecodedCount", zeroUuidDecodedCount);
+        object.add("zeroUuidDecoded", zeroUuidDecoded);
+        object.addProperty("decodedButNameMismatchCount", decodedButNameMismatchCount);
+        object.add("decodedButNameMismatch", decodedButNameMismatch);
+        object.addProperty("unresolvedHookNameCount", unresolvedHookNameCount);
+        object.add("typeIdSourceStats", countMapJson(typeIdSourceCounts));
+        object.add("nativeUuidRejectSummary", countMapJson(nativeUuidRejectCounts));
+        object.addProperty("registryTypeIdCount", registryTypeIds.size());
+        return object;
+    }
+
+    private void addInvariantSample(
+        JsonArray samples,
+        HookTypeEvidence hook,
+        String registryName) {
+
+        if (samples.size() >= REGISTRATION_FAILURE_SAMPLE_LIMIT) {
+            return;
+        }
+        JsonObject object = new JsonObject();
+        NetworkSchemaJson.add(object, "typeId", hook.typeId);
+        NetworkSchemaJson.add(object, "typeName", hook.typeName);
+        NetworkSchemaJson.add(object, "slotTypeName", hook.slotTypeName);
+        NetworkSchemaJson.add(object, "registryName", registryName);
+        NetworkSchemaJson.add(object, "source", hook.source == null ? "install-registration-hook" : hook.source);
+        NetworkSchemaJson.add(object, "helperTable", formatAddress(hook.helperTable));
+        NetworkSchemaJson.add(object, "registerThunk", formatAddress(hook.registerThunk));
+        NetworkSchemaJson.add(object, "typeProvider", formatAddress(hook.typeProvider));
+        NetworkSchemaJson.add(object, "uuidSource", formatAddress(hook.uuidSource));
+        samples.add(object);
+    }
+
+    private boolean semanticTypeNameMatches(String expected, String observed) {
+        if (expected == null || observed == null) {
+            return false;
+        }
+        if (expected.equals(observed)) {
+            return true;
+        }
+        return observed.endsWith("::" + expected) || expected.endsWith("::" + observed);
+    }
+
+    private void incrementCount(Map<String, Integer> counts, String key) {
+        counts.put(key, counts.getOrDefault(key, 0) + 1);
+    }
+
+    private Map<String, HookTypeEvidence> collectRegistrationHookTypeNames(
+        List<RegistryEntry> registry) {
+
+        LinkedHashMap<String, HookTypeEvidence> result = new LinkedHashMap<>();
+        seedRegistryTypeIds(registry);
+        collectQueuedRegistrationHooks(result);
+        int queuedHookEvidenceCount = result.size();
+
+        SymbolIterator symbols = currentProgram.getSymbolTable().getAllSymbols(true);
+        while (symbols.hasNext()) {
+            Symbol symbol = symbols.next();
+            String typeName = registrationHookTypeName(symbol);
+            if (!isPlausibleTypeName(typeName)) {
+                continue;
+            }
+
+            Function function = currentProgram.getFunctionManager().getFunctionAt(symbol.getAddress());
+            HookTypeEvidence hook = function == null
+                ? decodeRegistrationHookTypeDescriptor(symbol.getAddress(), typeName)
+                : decodeRegistrationHook(function, typeName);
+            if (hook == null || hook.typeId == null) {
+                continue;
+            }
+
+            result.putIfAbsent(normalizeUuid(hook.typeId), hook);
+        }
+        int installHookEvidenceCount = result.size();
+        collectDirectRegisterTypeProviders(result);
+        int directRegisterTypeEvidenceCount = result.size() - installHookEvidenceCount;
+        int hookEvidenceCount = result.size();
+        seedRegistryTypeIdentities(result, registry);
+        println("Recovered registration type names: " + result.size() +
+            " (hook evidence: " + hookEvidenceCount +
+            ", queued hooks: " + queuedHookEvidenceCount +
+            ", direct RegisterType: " + directRegisterTypeEvidenceCount +
+            ", registry fallback: " + (result.size() - hookEvidenceCount) + ")");
+        println("Registration evidence xrefs: queued refs=" + queuedRegistrationReferenceCount +
+            ", queued decoded=" + queuedRegistrationDecodedCount +
+            ", queued no function=" + queuedRegistrationNoFunctionCount +
+            ", queued no helper=" + queuedRegistrationNoHelperCount +
+            ", queued no type-id=" + queuedRegistrationNoTypeIdCount +
+            ", direct refs=" + directRegisterTypeReferenceCount +
+            ", direct decoded=" + directRegisterTypeDecodedCount +
+            ", direct no function=" + directRegisterTypeNoFunctionCount +
+            ", direct no type-id=" + directRegisterTypeNoTypeIdCount);
+        return result;
+    }
+
+    private void seedRegistryTypeIds(List<RegistryEntry> registry) {
+        registryTypeIds.clear();
+        for (RegistryEntry entry : registry) {
+            String registryTypeId = canonicalUuidFromString(entry.uuid);
+            if (registryTypeId != null) {
+                registryTypeIds.add(normalizeUuid(registryTypeId));
+            }
+        }
+    }
+
+    private void seedRegistryTypeIdentities(
+        Map<String, HookTypeEvidence> result,
+        List<RegistryEntry> registry) {
+
+        for (RegistryEntry entry : registry) {
+            String typeId = canonicalUuidFromString(entry.uuid);
+            if (typeId == null || isZeroUuid(typeId) || !isPlausibleTypeName(entry.name)) {
+                continue;
+            }
+
+            String key = normalizeUuid(typeId);
+            if (result.containsKey(key)) {
+                continue;
+            }
+
+            HookTypeEvidence hook = new HookTypeEvidence();
+            hook.typeId = typeId;
+            hook.typeName = entry.name;
+            hook.source = "typeregistry-entry";
+            result.put(key, hook);
+        }
+    }

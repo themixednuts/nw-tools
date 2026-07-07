@@ -1,8 +1,8 @@
 use thiserror::Error as ThisError;
 
 use crate::{
-    DDPF_ALPHA_PIXELS, DDPF_LUMINANCE, DDPF_RGB, DDS_FILE_HEADER_LEN, Dds, DdsError, PixelFormat,
-    SplitPart,
+    DDPF_ALPHA, DDPF_ALPHA_PIXELS, DDPF_LUMINANCE, DDPF_RGB, DDS_FILE_HEADER_LEN, Dds, DdsError,
+    PixelFormat, SplitPart,
 };
 
 const KTX2_ID: &[u8; 12] = b"\xABKTX 20\xBB\r\n\x1A\n";
@@ -1319,7 +1319,9 @@ impl Format {
         flags: crate::CryFlags,
         name: String,
     ) -> Result<Self, Error> {
-        if format.flags() & DDPF_LUMINANCE != 0 && format.rgb_bit_count() == 8 {
+        if (format.flags() & DDPF_LUMINANCE != 0 || format.flags() & DDPF_ALPHA != 0)
+            && format.rgb_bit_count() == 8
+        {
             return Ok(Self::plain(VK_FORMAT_R8_UNORM, 1, 1));
         }
         if format.flags() & DDPF_RGB == 0 || format.rgb_bit_count() != 32 {
@@ -1449,12 +1451,20 @@ impl<'a> Levels<'a> {
             if split[level].is_some() {
                 return Err(Error::DuplicateSidecar { index });
             }
+            let expected = sizes[level];
             check_mip_size(
                 u32::try_from(level).unwrap_or(u32::MAX),
-                sizes[level],
+                expected,
                 sidecar.bytes().len(),
             )?;
-            split[level] = Some(sidecar.bytes());
+            let expected_len = usize::try_from(expected).map_err(|_| Error::SizeOverflow {
+                what: "DDS mip level",
+            })?;
+            split[level] = Some(sidecar.bytes().get(..expected_len).ok_or(Error::MipSize {
+                level: u32::try_from(level).unwrap_or(u32::MAX),
+                expected,
+                actual: sidecar.bytes().len(),
+            })?);
         }
 
         let mut levels = Vec::with_capacity(mipmaps);
@@ -1475,10 +1485,10 @@ fn slice_chain<'a>(
     start_level: usize,
 ) -> Result<Vec<&'a [u8]>, Error> {
     let expected = checked_sum(sizes)?;
-    if u64::try_from(payload.len()).map_err(|_| Error::SizeOverflow {
+    let actual_len = u64::try_from(payload.len()).map_err(|_| Error::SizeOverflow {
         what: "DDS payload length",
-    })? != expected
-    {
+    })?;
+    if actual_len < expected {
         return Err(Error::PayloadSize {
             expected,
             actual: payload.len(),
@@ -1513,7 +1523,7 @@ fn check_mip_size(level: u32, expected: u64, actual: usize) -> Result<(), Error>
     let actual_u64 = u64::try_from(actual).map_err(|_| Error::SizeOverflow {
         what: "DDS mip length",
     })?;
-    if actual_u64 == expected {
+    if actual_u64 >= expected {
         Ok(())
     } else {
         Err(Error::MipSize {
@@ -1575,7 +1585,9 @@ fn four_cc_name(four_cc: [u8; 4]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DDPF_FOUR_CC, DDS_HEADER_SIZE, DDS_MAGIC, DDS_PIXEL_FORMAT_SIZE, FOUR_CC_FYRC};
+    use crate::{
+        DDPF_ALPHA, DDPF_FOUR_CC, DDS_HEADER_SIZE, DDS_MAGIC, DDS_PIXEL_FORMAT_SIZE, FOUR_CC_FYRC,
+    };
 
     #[test]
     fn writes_valid_ktx2_for_single_bc1_dds() {
@@ -1659,6 +1671,54 @@ mod tests {
     }
 
     #[test]
+    fn dds_payload_chain_ignores_trailing_bytes() {
+        let mut bytes = dds_header(*b"DXT1", 4, 4, 1, 0);
+        bytes.extend_from_slice(&[0x55; 8]);
+        bytes.extend_from_slice(&[0xaa; 8]);
+
+        let ktx = Ktx2::from_dds(&bytes, &[]).unwrap();
+        let reader = ktx2::Reader::new(ktx.bytes()).unwrap();
+        let levels = reader.levels().collect::<Vec<_>>();
+
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].data, &[0x55; 8]);
+    }
+
+    #[test]
+    fn split_sidecar_chain_ignores_trailing_bytes() {
+        let mut header = dds_header(*b"DXT1", 8, 8, 3, 1);
+        put_u32(&mut header, 36, crate::CryFlags::SPLIT.bits());
+        header[124..128].copy_from_slice(&FOUR_CC_FYRC);
+        header.extend_from_slice(&[0x33; 8]);
+        let mip0 = [0x11; 40];
+        let mip1 = [0x22; 16];
+        let sidecars = [
+            Sidecar::new(
+                SplitPart::Mip {
+                    index: 2,
+                    alpha: false,
+                },
+                &mip0,
+            ),
+            Sidecar::new(
+                SplitPart::Mip {
+                    index: 1,
+                    alpha: false,
+                },
+                &mip1,
+            ),
+        ];
+
+        let ktx = Ktx2::from_dds(&header, &sidecars).unwrap();
+        let reader = ktx2::Reader::new(ktx.bytes()).unwrap();
+        let levels = reader.levels().collect::<Vec<_>>();
+
+        assert_eq!(levels[0].data, &[0x11; 32]);
+        assert_eq!(levels[1].data, &[0x22; 8]);
+        assert_eq!(levels[2].data, &[0x33; 8]);
+    }
+
+    #[test]
     fn split_conversion_requires_all_external_mips() {
         let mut header = dds_header(*b"DXT1", 8, 8, 3, 1);
         put_u32(&mut header, 36, crate::CryFlags::SPLIT.bits());
@@ -1681,6 +1741,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decodes_alpha_only_pixel_mask_as_r8_plane() {
+        let mut bytes = dds_alpha8_header(2, 2);
+        bytes.extend_from_slice(&[0, 64, 128, 255]);
+
+        let decoded = decode_top_mip(&bytes, &[]).unwrap();
+
+        assert_eq!(decoded.width, 2);
+        assert_eq!(decoded.height, 2);
+        assert_eq!(
+            decoded.rgba,
+            vec![0, 0, 0, 255, 64, 0, 0, 255, 128, 0, 0, 255, 255, 0, 0, 255,]
+        );
+    }
+
     fn dds_header(
         four_cc: [u8; 4],
         width: u32,
@@ -1700,6 +1775,21 @@ mod tests {
         bytes[84..88].copy_from_slice(&four_cc);
         put_u32(&mut bytes, 108, 0x1000);
         bytes[116] = persistent_mips;
+        bytes
+    }
+
+    fn dds_alpha8_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0; DDS_FILE_HEADER_LEN];
+        bytes[0..4].copy_from_slice(DDS_MAGIC);
+        put_u32(&mut bytes, 4, DDS_HEADER_SIZE);
+        put_u32(&mut bytes, 8, 0x1 | 0x2 | 0x4 | 0x1000);
+        put_u32(&mut bytes, 12, height);
+        put_u32(&mut bytes, 16, width);
+        put_u32(&mut bytes, 28, 1);
+        put_u32(&mut bytes, 76, DDS_PIXEL_FORMAT_SIZE);
+        put_u32(&mut bytes, 80, DDPF_ALPHA);
+        put_u32(&mut bytes, 88, 8);
+        put_u32(&mut bytes, 108, 0x1000);
         bytes
     }
 

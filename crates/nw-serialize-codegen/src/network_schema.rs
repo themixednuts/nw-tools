@@ -595,6 +595,7 @@ pub enum NetworkWireScalarShape {
     Affine3,
     Aabb2d,
     Aabb3d,
+    ActorRef,
     EntityRef,
     FixedBytes(u16),
     String,
@@ -657,6 +658,7 @@ pub enum NetworkWireShape {
     Affine3,
     Aabb2d,
     Aabb3d,
+    ActorRef,
     EntityRef,
     FixedBytes(u16),
     String,
@@ -695,6 +697,7 @@ impl NetworkWireScalarShape {
             Self::Affine3 => Some("affine3"),
             Self::Aabb2d => Some("aabb2d"),
             Self::Aabb3d => Some("aabb3d"),
+            Self::ActorRef => Some("actor-ref"),
             Self::EntityRef => Some("entity-ref"),
             Self::FixedBytes(_) => None,
             Self::String => Some("string"),
@@ -744,6 +747,7 @@ impl From<NetworkWireScalarShape> for NetworkWireShape {
             NetworkWireScalarShape::Affine3 => Self::Affine3,
             NetworkWireScalarShape::Aabb2d => Self::Aabb2d,
             NetworkWireScalarShape::Aabb3d => Self::Aabb3d,
+            NetworkWireScalarShape::ActorRef => Self::ActorRef,
             NetworkWireScalarShape::EntityRef => Self::EntityRef,
             NetworkWireScalarShape::FixedBytes(len) => Self::FixedBytes(len),
             NetworkWireScalarShape::String => Self::String,
@@ -788,6 +792,7 @@ impl NetworkWireShape {
             Self::Affine3 => Some("affine3"),
             Self::Aabb2d => Some("aabb2d"),
             Self::Aabb3d => Some("aabb3d"),
+            Self::ActorRef => Some("actor-ref"),
             Self::EntityRef => Some("entity-ref"),
             Self::FixedBytes(_) | Self::ReplicatedContainer(_) => None,
             Self::String => Some("string"),
@@ -2894,6 +2899,7 @@ fn parse_network_wire_scalar_shape(value: &str) -> Option<NetworkWireScalarShape
         "affine3" => Some(NetworkWireScalarShape::Affine3),
         "aabb2d" => Some(NetworkWireScalarShape::Aabb2d),
         "aabb3d" => Some(NetworkWireScalarShape::Aabb3d),
+        "actor-ref" => Some(NetworkWireScalarShape::ActorRef),
         "entity-ref" => Some(NetworkWireScalarShape::EntityRef),
         "string" => Some(NetworkWireScalarShape::String),
         value => fixed_bytes_wire_shape(value),
@@ -2928,6 +2934,9 @@ fn replicated_container_shape_from_vtable(
     let full_values_with_counts =
         replicated_container_full_value_scalar_shapes(&vtable.full_marshal_shapes);
     let full_data = replicated_container_data_scalar_shapes(&vtable.full_marshal_shapes);
+    let full_values_match_data = full_values_with_counts == full_data
+        || without_terminal_overflow_count(&full_values_with_counts).as_deref()
+            == Some(full_data.as_slice());
     let delta_key_shapes = replicated_container_delta_key_shapes(&vtable.delta_marshal_shapes);
     let delta_key = replicated_container_delta_key_shape(&vtable.delta_marshal_shapes);
     let delta_value_shapes = replicated_container_delta_value_shapes(&vtable.delta_marshal_shapes);
@@ -2993,10 +3002,12 @@ fn replicated_container_shape_from_vtable(
             delta_value_shapes.unwrap_or_default(),
             "replicated-container-map-delta-value-shape",
         )
-    } else if (full_data.len() == 1 || whole_value_is_structured)
-        && delta_key.is_none_or(|delta_key| delta_key == NetworkWireScalarShape::VlqU64)
+    } else if ((!full_data.is_empty() && full_values_match_data) || whole_value_is_structured)
+        && (delta_key == Some(NetworkWireScalarShape::VlqU64)
+            || (delta_key.is_none() && full_data.len() == 1 && !whole_value_is_structured))
         && delta_value_shapes.as_ref().is_none_or(|delta_values| {
-            delta_values.is_empty()
+            delta_key == Some(NetworkWireScalarShape::VlqU64)
+                || delta_values.is_empty()
                 || delta_values == &full_data
                 || delta_values == &whole_value_shapes
                 || whole_value_is_structured
@@ -3007,20 +3018,25 @@ fn replicated_container_shape_from_vtable(
         } else {
             "replicated-container-vector-full-shape"
         };
+        let value_wire_shapes = if whole_value_is_structured {
+            whole_value_shapes
+        } else {
+            full_data
+        };
+        let value_type_shape = selected_vector_value_type_shape(vtable, &value_wire_shapes);
         (
             NetworkReplicatedContainerStorageKind::Vec,
             NetworkWireScalarShape::VlqU64,
             vec![NetworkWireScalarShape::VlqU64],
             None,
             None,
-            if whole_value_is_structured {
-                whole_value_shapes
-            } else {
-                full_data
-            },
-            selected_structured_container_value_type_name(vtable),
+            value_wire_shapes,
+            value_type_shape
+                .as_ref()
+                .and_then(nested_shape_source_type_name)
+                .or_else(|| selected_structured_container_value_type_name(vtable)),
             selected_structured_container_value_type_id(vtable),
-            vtable.value_type_shape.clone(),
+            value_type_shape,
             delta_value_shapes.unwrap_or_default(),
             source,
         )
@@ -3029,8 +3045,12 @@ fn replicated_container_shape_from_vtable(
         let values_with_counts = full_values_with_counts
             .get(1..)
             .map_or_else(Vec::new, <[_]>::to_vec);
+        let value_shape_is_vector = container_value_shape_is_vector(vtable);
         let values =
-            if selected_structured_container_value_shape_matches(vtable, &values_with_counts) {
+            if selected_structured_container_value_shape_matches(vtable, &values_with_counts)
+                || (value_shape_is_vector
+                    && values_with_counts.first() == Some(&NetworkWireScalarShape::VlqU32))
+            {
                 values_with_counts
             } else {
                 full_data[1..].to_vec()
@@ -3039,9 +3059,28 @@ fn replicated_container_shape_from_vtable(
             return None;
         }
         let delta_shape_complete = delta_key.is_some() && delta_value_shapes.is_some();
+        let mut value_type_shape =
+            selected_map_value_type_shape(vtable, &[key], &values, &full_data)?;
+        if value_type_shape.is_none() && value_shape_is_vector {
+            value_type_shape = vtable.value_type_shape.clone();
+        }
+        if value_type_shape.is_none()
+            && values.len() > 1
+            && full_values_match_data
+            && !has_explicit_container_value_evidence(vtable)
+        {
+            value_type_shape = Some(synthetic_container_value_shape_from_wire_shapes(
+                "replicated-container-map-value-shape",
+                &values,
+            ));
+        }
         let delta_values = delta_value_shapes.unwrap_or_default();
         let delta_values_match = delta_shape_complete && delta_values == values;
-        if !delta_values_match && !has_selected_structured_container_value(vtable, values.len()) {
+        if !delta_values_match
+            && value_type_shape.is_none()
+            && values.len() != 1
+            && !has_selected_structured_container_value_identity(vtable)
+        {
             return None;
         }
         (
@@ -3051,9 +3090,12 @@ fn replicated_container_shape_from_vtable(
             None,
             None,
             values,
-            selected_structured_container_value_type_name(vtable),
+            value_type_shape
+                .as_ref()
+                .and_then(nested_shape_source_type_name)
+                .or_else(|| selected_structured_container_value_type_name(vtable)),
             selected_structured_container_value_type_id(vtable),
-            vtable.value_type_shape.clone(),
+            value_type_shape,
             delta_values,
             if delta_values_match {
                 "replicated-container-map-shape"
@@ -3082,6 +3124,120 @@ fn replicated_container_shape_from_vtable(
         embedded_value_type_shapes: vtable.embedded_value_type_shapes.clone(),
         source: Some(source.to_owned()),
     })
+}
+
+fn without_terminal_overflow_count(
+    shapes: &[NetworkWireScalarShape],
+) -> Option<Vec<NetworkWireScalarShape>> {
+    if shapes.len() <= 1
+        || shapes.last() != Some(&NetworkWireScalarShape::VlqU32)
+        || !shapes[..shapes.len() - 1]
+            .iter()
+            .any(|shape| *shape != NetworkWireScalarShape::VlqU32)
+    {
+        return None;
+    }
+    Some(shapes[..shapes.len() - 1].to_vec())
+}
+
+fn has_explicit_container_value_evidence(vtable: &NetworkFieldHandlerVtable) -> bool {
+    vtable.value_type_shape.is_some()
+        || vtable.value_type_name.is_some()
+        || vtable.value_type_id.is_some()
+        || !vtable.value_type_candidates.is_empty()
+}
+
+fn container_value_shape_is_vector(vtable: &NetworkFieldHandlerVtable) -> bool {
+    vtable.value_type_shape.as_ref().is_some_and(|shape| {
+        shape.members.iter().any(|member| {
+            member
+                .wire_shape
+                .as_deref()
+                .is_some_and(|wire_shape| vector_element_wire_shape(wire_shape).is_some())
+        })
+    })
+}
+
+fn selected_vector_value_type_shape(
+    vtable: &NetworkFieldHandlerVtable,
+    value_wire_shapes: &[NetworkWireScalarShape],
+) -> Option<NetworkNestedTypeShape> {
+    if value_wire_shapes.len() <= 1 {
+        return None;
+    }
+    if let Some(shape) = vtable.value_type_shape.as_ref()
+        && nested_type_shape_matches_wire_shapes(
+            shape,
+            value_wire_shapes,
+            &vtable.embedded_value_type_shapes,
+        )
+    {
+        return Some(shape.clone());
+    }
+    Some(synthetic_container_value_shape_from_wire_shapes(
+        "replicated-container-vector-value-shape",
+        value_wire_shapes,
+    ))
+}
+
+fn selected_map_value_type_shape(
+    vtable: &NetworkFieldHandlerVtable,
+    key_wire_shapes: &[NetworkWireScalarShape],
+    value_wire_shapes: &[NetworkWireScalarShape],
+    full_wire_shapes: &[NetworkWireScalarShape],
+) -> Option<Option<NetworkNestedTypeShape>> {
+    let Some(shape) = vtable.value_type_shape.as_ref() else {
+        return Some(None);
+    };
+    if nested_type_shape_matches_wire_shapes(
+        shape,
+        value_wire_shapes,
+        &vtable.embedded_value_type_shapes,
+    ) {
+        return Some(Some(shape.clone()));
+    }
+    if !nested_type_shape_matches_wire_shapes(
+        shape,
+        full_wire_shapes,
+        &vtable.embedded_value_type_shapes,
+    ) {
+        return Some(None);
+    }
+    split_nested_type_shape_after_wire_prefix(
+        shape,
+        key_wire_shapes,
+        &vtable.embedded_value_type_shapes,
+    )
+    .map(Some)
+}
+
+fn synthetic_container_value_shape_from_wire_shapes(
+    validation: &str,
+    value_wire_shapes: &[NetworkWireScalarShape],
+) -> NetworkNestedTypeShape {
+    NetworkNestedTypeShape {
+        type_id: None,
+        type_id_source: None,
+        type_name: Some("Value".to_owned()),
+        type_name_full: None,
+        type_name_source: Some(validation.to_owned()),
+        function: None,
+        function_name: None,
+        factory: None,
+        az_rtti_address: None,
+        constructor: None,
+        vtable: None,
+        member_base: Some("value".to_owned()),
+        member_name_source: Some(validation.to_owned()),
+        member_names_proven: Some(false),
+        datatype_path: None,
+        validation: Some(validation.to_owned()),
+        members: value_wire_shapes
+            .iter()
+            .enumerate()
+            .map(|(index, shape)| synthetic_split_member(*shape, index))
+            .collect(),
+    }
 }
 
 struct StructuredContainerMapSplit {
@@ -3137,6 +3293,78 @@ fn structured_container_map_split(
         });
     }
     None
+}
+
+fn split_nested_type_shape_after_wire_prefix(
+    shape: &NetworkNestedTypeShape,
+    prefix: &[NetworkWireScalarShape],
+    embedded_shapes: &[NetworkNestedTypeShape],
+) -> Option<NetworkNestedTypeShape> {
+    if prefix.is_empty() {
+        return Some(shape.clone());
+    }
+
+    let mut remaining_prefix = prefix;
+    let mut members = Vec::new();
+    for member in &shape.members {
+        let member_wire_shape = member.wire_shape.as_deref()?;
+        let member_shapes = nested_member_wire_shapes(member_wire_shape, embedded_shapes)?;
+        if !remaining_prefix.is_empty() {
+            if remaining_prefix.len() >= member_shapes.len()
+                && remaining_prefix.starts_with(&member_shapes)
+            {
+                remaining_prefix = &remaining_prefix[member_shapes.len()..];
+                continue;
+            }
+            if member_shapes.starts_with(remaining_prefix) {
+                for shape in &member_shapes[remaining_prefix.len()..] {
+                    members.push(synthetic_split_member(*shape, members.len()));
+                }
+                remaining_prefix = &[];
+                continue;
+            }
+            return None;
+        }
+
+        let mut member = member.clone();
+        member.index = u32::try_from(members.len()).ok();
+        members.push(member);
+    }
+
+    if !remaining_prefix.is_empty() || members.is_empty() {
+        return None;
+    }
+
+    let mut split = shape.clone();
+    split.type_id = None;
+    split.type_id_source = None;
+    split.type_name_full = None;
+    split.type_name = shape.type_name.clone().or_else(|| Some("Value".to_owned()));
+    split.type_name_source = Some("container-value-prefix-split".to_owned());
+    split.member_name_source = Some("container-value-prefix-split".to_owned());
+    split.member_names_proven = Some(false);
+    split.validation = Some("container-value-shape-prefix-split".to_owned());
+    split.members = members;
+    Some(split)
+}
+
+fn synthetic_split_member(shape: NetworkWireScalarShape, index: usize) -> NetworkNestedTypeMember {
+    NetworkNestedTypeMember {
+        index: u32::try_from(index).ok(),
+        offset: None,
+        native_offset: None,
+        name: Some(format!("field_{index}")),
+        name_source: Some("container-value-prefix-split".to_owned()),
+        name_proven: Some(false),
+        name_evidence: Some("scalar suffix after replicated-container key split".to_owned()),
+        native_type: None,
+        wire_shape: Some(shape.wire_string()),
+        byte_width: None,
+        evidence_source: Some("container-value-shape-prefix-split".to_owned()),
+        callsite: None,
+        target: None,
+        target_name: None,
+    }
 }
 
 fn nested_type_member_wire_shapes(
@@ -3197,31 +3425,6 @@ fn nested_shape_source_type_name(shape: &NetworkNestedTypeShape) -> Option<Strin
         .next()
         .is_some_and(|first| first.is_ascii_uppercase())
         .then(|| leaf.to_owned())
-}
-
-fn has_selected_structured_container_value(
-    vtable: &NetworkFieldHandlerVtable,
-    value_shape_count: usize,
-) -> bool {
-    if !selected_structured_container_value_type_name(vtable)
-        .as_deref()
-        .is_some_and(|name| {
-            let name = name.trim();
-            !name.is_empty() && name != "unknown"
-        })
-        || !has_selected_structured_container_value_identity(vtable)
-    {
-        return false;
-    }
-
-    vtable.value_type_shape.as_ref().is_some_and(|shape| {
-        !shape.members.is_empty()
-            && (shape.members.len() == value_shape_count
-                || shape
-                    .validation
-                    .as_deref()
-                    .is_some_and(|validation| validation.contains("container-value-pcode")))
-    }) || value_shape_count > 1
 }
 
 fn selected_structured_container_value_type_name(
@@ -4233,6 +4436,124 @@ mod tests {
         assert_eq!(
             container_shape.source.as_deref(),
             Some("replicated-container-vector-full-shape")
+        );
+    }
+
+    #[test]
+    fn infers_vector_container_when_full_shape_includes_overflow_count_branch() {
+        let report = json!({
+            "registryEntries": [],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81b81c0",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "vlq-u32",
+                    "u8",
+                    "vlq-u64",
+                    "sequence-number",
+                    "u8",
+                    "u8",
+                    "u8",
+                    "sequence-number",
+                    "vlq-u64",
+                    "sequence-number",
+                    "vlq-u32"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u32",
+                    "vec2",
+                    "vlq-u32"
+                ],
+                "slots": []
+            }]
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+        let container_shape = schema.field_handler_vtables[0]
+            .container_shape
+            .as_ref()
+            .expect("full-shape vector container");
+
+        assert_eq!(
+            container_shape.storage,
+            NetworkReplicatedContainerStorageKind::Vec
+        );
+        assert_eq!(
+            container_shape.value_wire_shapes,
+            vec![NetworkWireScalarShape::U32, NetworkWireScalarShape::Vec2]
+        );
+        assert_eq!(
+            container_shape.source.as_deref(),
+            Some("replicated-container-vector-shape")
+        );
+    }
+
+    #[test]
+    fn infers_map_value_shape_when_full_shape_includes_overflow_count_branch() {
+        let report = json!({
+            "registryEntries": [],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81c1258",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "vlq-u32",
+                    "u8",
+                    "u32",
+                    "sequence-number",
+                    "u8",
+                    "u8",
+                    "u8",
+                    "sequence-number",
+                    "u32",
+                    "sequence-number",
+                    "vlq-u32"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u32",
+                    "u32",
+                    "u32",
+                    "u32",
+                    "vlq-u32"
+                ],
+                "slots": []
+            }]
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+        let container_shape = schema.field_handler_vtables[0]
+            .container_shape
+            .as_ref()
+            .expect("full-shape map container");
+
+        assert_eq!(
+            container_shape.storage,
+            NetworkReplicatedContainerStorageKind::Map
+        );
+        assert_eq!(container_shape.key_wire_shape, NetworkWireScalarShape::U32);
+        assert_eq!(
+            container_shape.value_wire_shapes,
+            vec![
+                NetworkWireScalarShape::U32,
+                NetworkWireScalarShape::U32,
+                NetworkWireScalarShape::U32
+            ]
+        );
+        assert_eq!(
+            container_shape
+                .value_type_shape
+                .as_ref()
+                .and_then(|shape| shape.validation.as_deref()),
+            Some("replicated-container-map-value-shape")
         );
     }
 

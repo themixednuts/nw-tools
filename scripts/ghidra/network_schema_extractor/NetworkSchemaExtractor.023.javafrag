@@ -1,0 +1,900 @@
+                : member.evidenceSource + "+serialize-json-field";
+        }
+        return true;
+    }
+
+    private boolean serializeWireShapeMatchesObserved(String serializeShape, String observedShape) {
+        if (wireShapeMatchesExpected(serializeShape, observedShape)) {
+            return true;
+        }
+        if (serializeShape == null || observedShape == null) {
+            return false;
+        }
+        List<String> serializeComposite = compositeMemberWireShapes(serializeShape);
+        if (serializeComposite != null) {
+            List<String> observedComposite = compositeMemberWireShapes(observedShape);
+            if (observedComposite == null ||
+                observedComposite.size() != serializeComposite.size()) {
+                return false;
+            }
+            for (int i = 0; i < serializeComposite.size(); i++) {
+                if (!serializeWireShapeMatchesObserved(
+                        serializeComposite.get(i),
+                        observedComposite.get(i))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return switch (serializeShape) {
+            case "u32" -> "vlq-u32".equals(observedShape);
+            case "u64" -> "vlq-u64".equals(observedShape);
+            case "f32" -> "half-f32".equals(observedShape);
+            case "vec2" -> "vec2-comp".equals(observedShape);
+            case "vec3" -> "vec3-comp".equals(observedShape) ||
+                "vec3-comp-norm".equals(observedShape) ||
+                "non-uniform-scale-comp".equals(observedShape);
+            case "quat" -> "quat-comp".equals(observedShape) ||
+                "quat-comp-norm".equals(observedShape) ||
+                "quat-smallest-three".equals(observedShape);
+            default -> false;
+        };
+    }
+
+    private void recordContainerValueShapeRejectSample(
+        String reason,
+        NativeTypeInfoEvidence candidate,
+        Address vtable,
+        Address unmarshalFull,
+        Function target,
+        List<String> valueWireShapes,
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase) {
+
+        if (containerValueShapeRejectSamples.size() >=
+            CONTAINER_VALUE_SHAPE_REJECT_SAMPLE_LIMIT) {
+            return;
+        }
+
+        JsonObject sample = new JsonObject();
+        sample.addProperty("reason", reason);
+        NetworkSchemaJson.add(sample, "handlerVtable", formatAddress(vtable));
+        NetworkSchemaJson.add(sample, "unmarshalFull", formatAddress(unmarshalFull));
+        if (target != null) {
+            NetworkSchemaJson.add(sample, "function", formatAddress(target.getEntryPoint()));
+            NetworkSchemaJson.add(sample, "functionName", fullFunctionName(target));
+        }
+        if (candidate != null) {
+            sample.add("candidate", candidate.toJson(addressFormatter));
+        }
+        sample.add("expectedWireShapes", NetworkSchemaJson.stringArray(valueWireShapes));
+        if (target != null) {
+            sample.add("pcodeOps", containerValuePcodeOpsDiagnostic(target));
+        }
+
+        JsonArray bases = new JsonArray();
+        int baseCount = 0;
+        int emittedBases = 0;
+        for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry : byBase.entrySet()) {
+            baseCount++;
+            if (emittedBases >= 8) {
+                continue;
+            }
+            JsonObject base = new JsonObject();
+            NetworkSchemaJson.add(base, "base", entry.getKey());
+            ArrayList<NestedTypeMember> callOrderMembers =
+                new ArrayList<>(entry.getValue().values());
+            ArrayList<NestedTypeMember> offsetOrderMembers =
+                new ArrayList<>(callOrderMembers);
+            offsetOrderMembers.sort((left, right) -> Long.compare(left.offset, right.offset));
+            int matchingOffsetWindowCount =
+                containerValueMemberWindows(offsetOrderMembers, valueWireShapes, true).size();
+            int matchingCallWindowCount =
+                containerValueMemberWindows(callOrderMembers, valueWireShapes, false).size();
+            base.addProperty("memberCount", offsetOrderMembers.size());
+            base.addProperty("matchingOffsetWindowCount", matchingOffsetWindowCount);
+            base.addProperty("matchingCallOrderWindowCount", matchingCallWindowCount);
+            base.addProperty(
+                "shapeMatchesExpected",
+                isContainerValueMemberShape(offsetOrderMembers, valueWireShapes));
+            JsonArray memberJson = new JsonArray();
+            for (int i = 0; i < offsetOrderMembers.size() && i < 16; i++) {
+                NestedTypeMember member = offsetOrderMembers.get(i);
+                JsonObject object = member.toJson(addressFormatter);
+                object.addProperty("expectedWireShape",
+                    i < valueWireShapes.size() ? valueWireShapes.get(i) : "<none>");
+                memberJson.add(object);
+            }
+            base.add("members", memberJson);
+            JsonArray callOrderJson = new JsonArray();
+            for (int i = 0; i < callOrderMembers.size() && i < 16; i++) {
+                NestedTypeMember member = callOrderMembers.get(i);
+                JsonObject object = member.toJson(addressFormatter);
+                object.addProperty("expectedWireShape",
+                    i < valueWireShapes.size() ? valueWireShapes.get(i) : "<none>");
+                callOrderJson.add(object);
+            }
+            base.add("callOrderMembers", callOrderJson);
+            bases.add(base);
+            emittedBases++;
+        }
+        sample.addProperty("observedBaseCount", baseCount);
+        sample.add("observedBases", bases);
+        containerValueShapeRejectSamples.add(sample);
+    }
+
+    private JsonArray containerValuePcodeOpsDiagnostic(Function target) {
+        return containerValuePcodeOpsDiagnostic(
+            target,
+            new LinkedHashSet<>(),
+            0,
+            Collections.emptyMap());
+    }
+
+    private JsonArray containerValuePcodeOpsDiagnostic(
+        Function target,
+        Set<String> seen,
+        int depth,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        JsonArray result = new JsonArray();
+        if (target == null || depth > 2) {
+            return result;
+        }
+        if (!seen.add(target.getEntryPoint().toString())) {
+            return result;
+        }
+        HighFunction high = highFunction(target);
+        if (high == null) {
+            return result;
+        }
+
+        HashMap<String, String> tempNativeTypes = new HashMap<>();
+        HashMap<String, String> tempWireShapes = new HashMap<>();
+        Iterator<PcodeOpAST> ops = high.getPcodeOps();
+        int emitted = 0;
+        while (ops.hasNext() && emitted < 80) {
+            PcodeOpAST op = ops.next();
+            if (op.getOpcode() == PcodeOp.CALL) {
+                Function callTarget = pcodeCallTarget(op);
+                String nativeType = unmarshalNativeTypeFromTarget(callTarget);
+                String wireShape = wireShapeFromNativeType(nativeType);
+                String evidenceSource = "container-value-pcode-call";
+                if (wireShape == null) {
+                    String scalarType = scalarOutputStoreNativeType(callTarget);
+                    if (nativeType == null) {
+                        nativeType = scalarType;
+                    }
+                    wireShape = wireShapeFromNativeType(scalarType);
+                    evidenceSource = "container-value-pcode-call-scalar-output-store";
+                }
+                observePcodeTempUnmarshal(
+                    tempNativeTypes,
+                    tempWireShapes,
+                    op,
+                    nativeType,
+                    wireShape);
+                PcodeStorage pcodeOutput = pcodePreferredUnmarshalOutputStorage(op);
+                PcodeStorage instructionOutput =
+                    instructionCallRegisterStorage(target, op, callTarget, "R8");
+                PcodeStorage storage = wireShape == null || instructionOutput == null
+                    ? pcodeOutput
+                    : instructionOutput;
+                if (nativeType == null && wireShape == null && pcodeOutput == null &&
+                    instructionOutput == null) {
+                    continue;
+                }
+                Map<String, PcodeStorage> helperParamStorage =
+                    callArgumentStorageMap(target, op, callerParamStorage);
+                JsonObject object = new JsonObject();
+                object.addProperty("op", "CALL");
+                NetworkSchemaJson.add(object, "callsite", formatAddress(op.getSeqnum().getTarget()));
+                NetworkSchemaJson.add(object, "target", formatAddress(callTarget == null ? null : callTarget.getEntryPoint()));
+                NetworkSchemaJson.add(object, "targetName", fullFunctionName(callTarget));
+                NetworkSchemaJson.add(object, "nativeType", nativeType);
+                NetworkSchemaJson.add(object, "wireShape", wireShape);
+                addPcodeStorageDiagnostic(object, "output", storage);
+                addPcodeStorageDiagnostic(object, "pcodeOutput", pcodeOutput);
+                addPcodeStorageDiagnostic(object, "instructionR8Output", instructionOutput);
+                NetworkSchemaJson.add(object, "outputSource", instructionOutput == null
+                    ? "pcode-call-input"
+                    : "instruction-r8-call-arg");
+                addTranslatedPcodeStorageDiagnostics(
+                    object,
+                    "output",
+                    storage,
+                    callerParamStorage);
+                object.add("arguments", pcodeCallArgumentsDiagnostic(
+                    op,
+                    tempNativeTypes,
+                    tempWireShapes,
+                    callerParamStorage));
+                addPcodeArgumentMapDiagnostic(object, helperParamStorage);
+                if (shouldRecurseContainerValueHelper(
+                        callTarget,
+                        nativeType,
+                        wireShape,
+                        evidenceSource,
+                        List.of("u8", "u8"))) {
+                    JsonArray helperOps = containerValuePcodeOpsDiagnostic(
+                        callTarget,
+                        new LinkedHashSet<>(seen),
+                        depth + 1,
+                        helperParamStorage);
+                    if (helperOps.size() > 0) {
+                        object.add("helperPcodeOps", helperOps);
+                    }
+                }
+                result.add(object);
+                emitted++;
+                continue;
+            }
+            if (op.getOpcode() != PcodeOp.STORE || op.getNumInputs() < 3) {
+                continue;
+            }
+
+            PcodeStorage storage = pcodeStorageExpression(op.getInput(1));
+            PcodeStorage valueStorage = pcodeLoadedStorageExpression(op.getInput(2));
+            String nativeType = pcodeValueNativeType(op.getInput(2), tempNativeTypes);
+            String wireShape = pcodeValueWireShape(op.getInput(2), tempWireShapes, tempNativeTypes);
+            PcodeCallTargetInfo targetInfo = pcodeValueCallTargetInfo(op.getInput(2));
+            if (storage == null && valueStorage == null && nativeType == null &&
+                wireShape == null && targetInfo == null) {
+                continue;
+            }
+            JsonObject object = new JsonObject();
+            object.addProperty("op", "STORE");
+            NetworkSchemaJson.add(object, "callsite", formatAddress(op.getSeqnum().getTarget()));
+            addPcodeStorageDiagnostic(object, "storage", storage);
+            addPcodeStorageDiagnostic(object, "valueStorage", valueStorage);
+            addTranslatedPcodeStorageDiagnostics(
+                object,
+                "storage",
+                storage,
+                callerParamStorage);
+            addTranslatedPcodeStorageDiagnostics(
+                object,
+                "valueStorage",
+                valueStorage,
+                callerParamStorage);
+            NetworkSchemaJson.add(object, "nativeType", nativeType);
+            NetworkSchemaJson.add(object, "wireShape", wireShape);
+            if (targetInfo != null) {
+                NetworkSchemaJson.add(object, "valueTarget", formatAddress(targetInfo.targetAddress()));
+                NetworkSchemaJson.add(object, "valueTargetName", fullFunctionName(targetInfo.target));
+            }
+            result.add(object);
+            emitted++;
+        }
+        return result;
+    }
+
+    private PcodeStorage containerValueUnmarshalOutputStorage(
+        Function owner,
+        PcodeOp op,
+        Function callTarget,
+        boolean allowInstructionOutput) {
+
+        if (!allowInstructionOutput) {
+            return pcodePreferredUnmarshalOutputStorage(op);
+        }
+        PcodeStorage instructionOutput =
+            instructionCallRegisterStorage(owner, op, callTarget, "R8");
+        return instructionOutput == null
+            ? pcodePreferredUnmarshalOutputStorage(op)
+            : instructionOutput;
+    }
+
+    private JsonArray pcodeCallArgumentsDiagnostic(
+        PcodeOp op,
+        Map<String, String> tempNativeTypes,
+        Map<String, String> tempWireShapes,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        JsonArray result = new JsonArray();
+        if (op == null || op.getOpcode() != PcodeOp.CALL) {
+            return result;
+        }
+        for (int i = 1; i < op.getNumInputs(); i++) {
+            Varnode input = op.getInput(i);
+            JsonObject object = new JsonObject();
+            object.addProperty("slot", i);
+            PcodeStorage storage = pcodeStorageExpression(input);
+            addPcodeStorageDiagnostic(object, "storage", storage);
+            addTranslatedPcodeStorageDiagnostics(
+                object,
+                "storage",
+                storage,
+                callerParamStorage);
+            NetworkSchemaJson.add(object, "nativeType", pcodeValueNativeType(input, tempNativeTypes));
+            NetworkSchemaJson.add(object, "wireShape", pcodeValueWireShape(input, tempWireShapes, tempNativeTypes));
+            Long constant = pcodeConstantValue(input, new LinkedHashSet<>(), 0);
+            if (constant != null) {
+                object.addProperty("constant", "0x" + Long.toHexString(constant));
+            }
+            result.add(object);
+        }
+        return result;
+    }
+
+    private Map<String, PcodeStorage> callArgumentStorageMap(
+        Function owner,
+        PcodeOp op,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        if (op == null || op.getOpcode() != PcodeOp.CALL || op.getNumInputs() < 2) {
+            return Collections.emptyMap();
+        }
+        LinkedHashMap<String, PcodeStorage> result = new LinkedHashMap<>();
+        result.putAll(instructionCallArgumentStorageMap(owner, op, callerParamStorage));
+        for (int i = 1; i < op.getNumInputs(); i++) {
+            String param = "param_" + i;
+            if (result.containsKey(param)) {
+                continue;
+            }
+            PcodeStorage storage = pcodeStorageExpression(op.getInput(i));
+            storage = translatedAbsoluteHelperStorage(storage, callerParamStorage);
+            if (storage != null) {
+                result.put(param, storage);
+            }
+        }
+        return result;
+    }
+
+    private Map<String, PcodeStorage> instructionCallArgumentStorageMap(
+        Function owner,
+        PcodeOp op,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        if (owner == null || op == null || op.getOpcode() != PcodeOp.CALL) {
+            return Collections.emptyMap();
+        }
+
+        ForwardArgState state = instructionStateBeforeCall(owner, op, null);
+        if (state == null) {
+            return Collections.emptyMap();
+        }
+
+        LinkedHashMap<String, PcodeStorage> result = new LinkedHashMap<>();
+        addInstructionCallArgumentStorage(
+            result,
+            "param_1",
+            state.registers.get("RCX"),
+            callerParamStorage);
+        addInstructionCallArgumentStorage(
+            result,
+            "param_2",
+            state.registers.get("RDX"),
+            callerParamStorage);
+        addInstructionCallArgumentStorage(
+            result,
+            "param_3",
+            state.registers.get("R8"),
+            callerParamStorage);
+        addInstructionCallArgumentStorage(
+            result,
+            "param_4",
+            state.registers.get("R9"),
+            callerParamStorage);
+        return result;
+    }
+
+    private void addInstructionCallArgumentStorage(
+        Map<String, PcodeStorage> result,
+        String param,
+        TrackedValue value,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        PcodeStorage storage = pcodeStorageFromTrackedValue(value);
+        storage = translatedAbsoluteHelperStorage(storage, callerParamStorage);
+        if (storage != null) {
+            result.put(param, storage);
+        }
+    }
+
+    private PcodeStorage instructionCallRegisterStorage(
+        Function owner,
+        PcodeOp op,
+        Function callTarget,
+        String register) {
+
+        ForwardArgState state = instructionStateBeforeCall(owner, op, callTarget);
+        return state == null ? null : pcodeStorageFromTrackedValue(state.registers.get(register));
+    }
+
+    private ForwardArgState instructionStateBeforeCall(
+        Function owner,
+        PcodeOp op,
+        Function expectedTarget) {
+
+        if (owner == null || op == null || op.getOpcode() != PcodeOp.CALL ||
+            op.getSeqnum() == null) {
+            return null;
+        }
+
+        Address callsite = op.getSeqnum().getTarget();
+        Instruction callInstruction = currentProgram.getListing().getInstructionAt(callsite);
+        if (callInstruction == null || !callInstruction.getFlowType().isCall()) {
+            return null;
+        }
+        if (expectedTarget != null) {
+            Address actualTarget = resolvedCodeTarget(callTarget(callInstruction));
+            if (actualTarget == null ||
+                !actualTarget.equals(expectedTarget.getEntryPoint())) {
+                return null;
+            }
+        }
+
+        ForwardArgState state = newAbiParamForwardArgState();
+        for (Instruction instruction : functionInstructions(owner)) {
+            if (instruction.getMinAddress().equals(callsite)) {
+                return state;
+            }
+            if (instruction.getMinAddress().compareTo(callsite) > 0) {
+                return null;
+            }
+            observeForwardInstruction(instruction, state, false);
+        }
+        return null;
+    }
+
+    private ForwardArgState newAbiParamForwardArgState() {
+        ForwardArgState state = new ForwardArgState();
+        state.registers.put("RCX", TrackedValue.baseOffset("param_1", 0));
+        state.registers.put("RDX", TrackedValue.baseOffset("param_2", 0));
+        state.registers.put("R8", TrackedValue.baseOffset("param_3", 0));
+        state.registers.put("R9", TrackedValue.baseOffset("param_4", 0));
+        state.registers.put("RSP", TrackedValue.stackOffset(0));
+        return state;
+    }
+
+    private PcodeStorage pcodeStorageFromTrackedValue(TrackedValue value) {
+        if (value == null) {
+            return null;
+        }
+        if (value.thisOffset != null) {
+            return new PcodeStorage("this", value.thisOffset);
+        }
+        if (value.stackOffset != null) {
+            return new PcodeStorage("stack", value.stackOffset);
+        }
+        if (value.baseKey != null && value.baseOffset != null) {
+            return new PcodeStorage(value.baseKey, value.baseOffset);
+        }
+        return null;
+    }
+
+    private void addPcodeArgumentMapDiagnostic(
+        JsonObject object,
+        Map<String, PcodeStorage> argumentMap) {
+
+        if (object == null || argumentMap == null || argumentMap.isEmpty()) {
+            return;
+        }
+        JsonArray json = new JsonArray();
+        for (Map.Entry<String, PcodeStorage> entry : argumentMap.entrySet()) {
+            JsonObject item = new JsonObject();
+            NetworkSchemaJson.add(item, "param", entry.getKey());
+            addPcodeStorageDiagnostic(item, "storage", entry.getValue());
+            json.add(item);
+        }
+        object.add("argumentMap", json);
+    }
+
+    private void addTranslatedPcodeStorageDiagnostics(
+        JsonObject object,
+        String prefix,
+        PcodeStorage storage,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        if (object == null || storage == null || callerParamStorage == null ||
+            callerParamStorage.isEmpty()) {
+            return;
+        }
+        addPcodeStorageDiagnostic(
+            object,
+            "translated" + capitalizeAscii(prefix),
+            translatedRelativeHelperStorage(storage, callerParamStorage));
+        addPcodeStorageDiagnostic(
+            object,
+            "translatedAbsolute" + capitalizeAscii(prefix),
+            translatedAbsoluteHelperStorage(storage, callerParamStorage));
+    }
+
+    private PcodeStorage translatedRelativeHelperStorage(
+        PcodeStorage storage,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        if (storage == null || callerParamStorage == null || callerParamStorage.isEmpty()) {
+            return storage;
+        }
+        PcodeStorage callerBase = callerParamStorage.get(storage.base);
+        if (callerBase == null) {
+            return storage;
+        }
+        return new PcodeStorage(callerBase.expression(), storage.offset);
+    }
+
+    private PcodeStorage translatedAbsoluteHelperStorage(
+        PcodeStorage storage,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        if (storage == null || callerParamStorage == null || callerParamStorage.isEmpty()) {
+            return storage;
+        }
+        PcodeStorage callerBase = callerParamStorage.get(storage.base);
+        if (callerBase == null) {
+            return storage;
+        }
+        return callerBase.plus(storage.offset);
+    }
+
+    private String capitalizeAscii(String value) {
+        if (value == null || value.isEmpty()) {
+            return "";
+        }
+        return value.substring(0, 1).toUpperCase(Locale.ROOT) + value.substring(1);
+    }
+
+    private void addPcodeStorageDiagnostic(JsonObject object, String prefix, PcodeStorage storage) {
+        if (object == null || storage == null) {
+            return;
+        }
+        NetworkSchemaJson.add(object, prefix + "Base", storage.base);
+        NetworkSchemaJson.add(object, prefix + "Offset", "0x" + Long.toHexString(storage.offset));
+        NetworkSchemaJson.add(object, prefix + "Expression", storage.expression());
+    }
+
+    private boolean isContainerValueMemberShape(
+        List<NestedTypeMember> members,
+        List<String> valueWireShapes) {
+
+        if (members == null || valueWireShapes == null ||
+            members.size() > NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
+            return false;
+        }
+        ArrayList<NestedTypeMember> window =
+            containerValueMemberWindow(members, valueWireShapes, 0, true);
+        return window != null && window.size() == members.size();
+    }
+
+    private boolean isContainerValueWireOrderShape(
+        List<NestedTypeMember> members,
+        List<String> valueWireShapes) {
+
+        if (members == null || valueWireShapes == null ||
+            members.size() > NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
+            return false;
+        }
+        ArrayList<NestedTypeMember> window =
+            containerValueMemberWindow(members, valueWireShapes, 0, false);
+        return window != null && window.size() == members.size();
+    }
+
+    private boolean wireShapeMatchesExpected(String expectedShape, String observedShape) {
+        if (expectedShape == null || observedShape == null) {
+            return false;
+        }
+        if (expectedShape.equals(observedShape)) {
+            return true;
+        }
+        return isBoolByteWireShape(expectedShape) && isBoolByteWireShape(observedShape);
+    }
+
+    private boolean isBoolByteWireShape(String shape) {
+        return "bool".equals(shape) || "u8".equals(shape);
+    }
+
+    private ArrayList<NestedTypeMember> datatypeValueMembersForWireShapes(
+        Structure structure,
+        List<String> valueWireShapes) {
+
+        if (structure == null || valueWireShapes == null || valueWireShapes.isEmpty()) {
+            return null;
+        }
+
+        ArrayList<NestedTypeMember> members = new ArrayList<>();
+        for (DataTypeComponent component : structure.getDefinedComponents()) {
+            if (members.size() >= valueWireShapes.size()) {
+                break;
+            }
+            if (!isProvenDatatypeMemberName(component.getFieldName())) {
+                continue;
+            }
+
+            NestedTypeMember member = datatypeValueMember(component);
+            if (member == null) {
+                return null;
+            }
+            String expected = valueWireShapes.get(members.size());
+            if (!wireShapeMatchesExpected(expected, member.wireShape)) {
+                return null;
+            }
+            member.index = members.size();
+            members.add(member);
+        }
+
+        return members.size() == valueWireShapes.size() ? members : null;
+    }
+
+    private NestedTypeMember datatypeValueMember(DataTypeComponent component) {
+        if (component == null || component.getDataType() == null) {
+            return null;
+        }
+
+        DataType dataType = component.getDataType();
+        String nativeType = normalizePrototypeTypeName(dataType.getDisplayName());
+        NestedDatatypeScalar nestedScalar = dataType instanceof Structure
+            ? singleNestedDatatypeScalar((Structure) dataType)
+            : null;
+        String wireShape = nestedScalar == null
+            ? wireShapeFromNativeType(nativeType)
+            : nestedScalar.wireShape;
+        if (wireShape == null) {
+            return null;
+        }
+
+        NestedTypeMember member = new NestedTypeMember();
+        member.offset = component.getOffset();
+        if (nestedScalar != null && nestedScalar.offset != 0L) {
+            member.nativeOffset = (long) component.getOffset() + nestedScalar.offset;
+        }
+        member.name = component.getFieldName();
+        member.nameSource = "ghidra-datatype";
+        member.nameProven = true;
+        if (nestedScalar != null && nestedScalar.path != null) {
+            member.nameEvidence = nestedScalar.path;
+        }
+        member.nativeType = nativeType;
+        member.wireShape = wireShape;
+        member.byteWidth = component.getLength();
+        member.evidenceSource = nestedScalar == null
+            ? "container-value-datatype-member"
+            : "container-value-nested-datatype-member";
+        return member;
+    }
+
+    private NestedDatatypeScalar singleNestedDatatypeScalar(Structure structure) {
+        List<NestedDatatypeScalar> scalars = nestedDatatypeScalars(structure, 0L, "");
+        return scalars.size() == 1 ? scalars.get(0) : null;
+    }
+
+    private List<NestedDatatypeScalar> nestedDatatypeScalars(
+        Structure structure,
+        long baseOffset,
+        String pathPrefix) {
+
+        if (structure == null) {
+            return Collections.emptyList();
+        }
+        ArrayList<NestedDatatypeScalar> scalars = new ArrayList<>();
+        for (DataTypeComponent component : structure.getDefinedComponents()) {
+            if (!isProvenDatatypeMemberName(component.getFieldName()) ||
+                component.getDataType() == null) {
+                continue;
+            }
+            String path = pathPrefix.isEmpty()
+                ? component.getFieldName()
+                : pathPrefix + "." + component.getFieldName();
+            DataType dataType = component.getDataType();
+            if (dataType instanceof Structure) {
+                scalars.addAll(nestedDatatypeScalars(
+                    (Structure) dataType,
+                    baseOffset + component.getOffset(),
+                    path));
+                continue;
+            }
+
+            String nativeType = normalizePrototypeTypeName(dataType.getDisplayName());
+            String wireShape = wireShapeFromNativeType(nativeType);
+            if (wireShape == null) {
+                continue;
+            }
+            scalars.add(new NestedDatatypeScalar(
+                baseOffset + component.getOffset(),
+                path,
+                nativeType,
+                wireShape));
+        }
+        return scalars;
+    }
+
+    private List<NativeTypeInfoEvidence> collectReplicatedContainerValueTypeInfoCandidates(
+        Address marshal,
+        Address marshalFull,
+        Address unmarshal,
+        Address unmarshalFull) {
+
+        LinkedHashMap<String, NativeTypeInfoEvidence> candidates = new LinkedHashMap<>();
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        collectNativeTypeInfoRefs(marshal, 2, seen, candidates);
+        collectNativeTypeInfoRefs(marshalFull, 2, seen, candidates);
+        collectNativeTypeInfoRefs(unmarshal, 2, seen, candidates);
+        collectNativeTypeInfoRefs(unmarshalFull, 2, seen, candidates);
+        return new ArrayList<>(candidates.values());
+    }
+
+    private NativeTypeInfoEvidence selectedReplicatedContainerValueTypeInfo(
+        List<NativeTypeInfoEvidence> candidates) {
+
+        if (candidates.isEmpty()) {
+            return null;
+        }
+        NativeTypeInfoEvidence selected = null;
+        for (NativeTypeInfoEvidence candidate : candidates) {
+            if (!isDirectNativeTypeInfoEvidence(candidate)) {
+                continue;
+            }
+            if (selected == null) {
+                selected = candidate;
+                continue;
+            }
+            if (!uuidEquals(selected.typeId, candidate.typeId)) {
+                return null;
+            }
+        }
+        return selected;
+    }
+
+    private boolean isDirectNativeTypeInfoEvidence(NativeTypeInfoEvidence evidence) {
+        return evidence != null &&
+            evidence.source != null &&
+            !"rtti-provider-vtable".equals(evidence.source);
+    }
+
+    private void collectNativeTypeInfoRefs(
+        Address address,
+        int depth,
+        Set<String> seen,
+        Map<String, NativeTypeInfoEvidence> candidates) {
+
+        Address targetAddress = resolvedCodeTarget(address);
+        if (!isExecutableAddress(targetAddress) || !seen.add(targetAddress.toString())) {
+            return;
+        }
+
+        Function function = functionAtOrContaining(targetAddress);
+        if (function == null || depth < 0) {
+            return;
+        }
+
+        int count = 0;
+        for (Instruction instruction : functionInstructions(function)) {
+            if (instruction.getMinAddress().compareTo(targetAddress) < 0) {
+                continue;
+            }
+            if (count++ >= VTABLE_SCAN_LIMIT) {
+                break;
+            }
+            for (Address referenced : referencedAddresses(instruction)) {
+                NativeTypeInfoEvidence typeInfo = nativeTypeInfoAt(referenced);
+                if (typeInfo != null) {
+                    putNativeTypeInfoCandidate(candidates, typeInfo);
+                }
+                NativeTypeInfoEvidence rttiProvider = rttiProviderTypeInfoAt(referenced);
+                if (rttiProvider != null) {
+                    putNativeTypeInfoCandidate(candidates, rttiProvider);
+                }
+                NativeTypeInfoEvidence objectVtableTypeInfo =
+                    nativeTypeInfoFromObjectVtable(referenced);
+                if (objectVtableTypeInfo != null) {
+                    putNativeTypeInfoCandidate(candidates, objectVtableTypeInfo);
+                }
+            }
+            if (depth == 0 || !instruction.getFlowType().isCall()) {
+                continue;
+            }
+            Address call = callTarget(instruction);
+            if (isExecutableAddress(call)) {
+                collectNativeTypeInfoRefs(call, depth - 1, seen, candidates);
+            }
+        }
+    }
+
+    private void putNativeTypeInfoCandidate(
+        Map<String, NativeTypeInfoEvidence> candidates,
+        NativeTypeInfoEvidence candidate) {
+
+        if (candidate == null || candidate.typeId == null) {
+            return;
+        }
+        NativeTypeInfoEvidence existing = candidates.get(candidate.typeId);
+        if (existing == null ||
+            (!isPlausibleTypeName(existing.name) && isPlausibleTypeName(candidate.name))) {
+            candidates.put(candidate.typeId, candidate);
+        }
+    }
+
+    private NativeTypeInfoEvidence nativeTypeInfoAt(Address address) {
+        if (!isProgramAddress(address)) {
+            return null;
+        }
+        String name = readPrintableString(address.add(0x30L));
+        String typeId = canonicalUuidFromString(readPrintableString(address.add(0x40L)));
+        if (!isPlausibleTypeName(name) || typeId == null) {
+            return null;
+        }
+
+        Symbol symbol = currentProgram.getSymbolTable().getPrimarySymbol(address);
+        if (symbol != null && symbol.getName() != null && symbol.getName().contains("TypeInfo")) {
+            return new NativeTypeInfoEvidence(
+                address,
+                name,
+                typeId,
+                symbol.getName(true),
+                "native-type-info-layout");
+        }
+        return new NativeTypeInfoEvidence(
+            address,
+            name,
+            typeId,
+            "native-type-info-layout",
+            "native-type-info-layout");
+    }
+
+    private NativeTypeInfoEvidence nativeTypeInfoFromObjectVtable(Address vtable) {
+        if (!isVtableLike(vtable)) {
+            return null;
+        }
+
+        NativeTypeInfoEvidence embedded =
+            nativeTypeInfoFromObjectVtable(vtable, 0x48L, 0x58L);
+        if (embedded != null) {
+            return embedded;
+        }
+        return nativeTypeInfoFromObjectVtable(vtable, 0x30L, 0x40L);
+    }
+
+    private NativeTypeInfoEvidence nativeTypeInfoFromObjectVtable(
+        Address vtable,
+        long nameOffset,
+        long typeIdOffset) {
+
+        String name = readPrintableString(vtable.add(nameOffset));
+        String typeId = canonicalUuidFromString(readPrintableString(vtable.add(typeIdOffset)));
+        if (!isPlausibleTypeName(name) || typeId == null ||
+            !nativeTypeInfoNameMatchesKnownIdentity(name, typeId)) {
+            return null;
+        }
+        return new NativeTypeInfoEvidence(
+            vtable,
+            name,
+            typeId,
+            "object-vtable-type-info",
+            "object-vtable-type-info");
+    }
+
+    private boolean nativeTypeInfoNameMatchesKnownIdentity(String name, String typeId) {
+        String normalizedTypeId = normalizeUuid(typeId);
+        SerializeTypeInfo reflected = serializeTypesById.get(normalizedTypeId);
+        if (reflected != null && sameTypeLeaf(reflected.name, name)) {
+            return true;
+        }
+        HookTypeEvidence hook = registrationHooksByTypeId.get(normalizedTypeId);
+        return hook != null && sameTypeLeaf(hook.typeName, name);
+    }
+
+    private boolean sameTypeLeaf(String left, String right) {
+        if (left == null || right == null) {
+            return false;
+        }
+        return NetworkSchemaText.sourceTypeLeaf(left).equals(NetworkSchemaText.sourceTypeLeaf(right));
+    }
+
+    private NativeTypeInfoEvidence rttiProviderTypeInfoAt(Address providerTable) {
+        if (!isProgramAddress(providerTable)) {
+            return null;
+        }
+
+        Address provider = readPointer(providerTable);
+        if (!isExecutableAddress(provider)) {
+            return null;
+        }
+
+        TypeIdDecode typeIdDecode = decodeDirectTypeIdProvider(provider);
+        if (typeIdDecode == null || typeIdDecode.typeId == null) {
+            return null;
+        }
+        String typeId = typeIdDecode.typeId;
+
+        String typeName = typeNameFromRttiHelperFunctionName(provider);
+        String nameSource = isPlausibleTypeName(typeName) ? "rtti-helper-function-name" : null;

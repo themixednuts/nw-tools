@@ -1,0 +1,900 @@
+        shape.memberNamesProven = false;
+        shape.validation = "custom-container-value-pcode-wire-sequence-progression-point-entry";
+
+        int index = 0;
+        shape.members.add(containerValueMember(index++, 0x8, "field_0",
+            "AZ::u32", "u32", 4, "progression-point-entry-container-slot"));
+        shape.members.add(containerValueMember(index++, 0xc, "field_1",
+            "AZ::u32", "u32", 4, "progression-point-entry-container-slot"));
+        shape.members.add(containerValueMember(index, 0x10, "field_2",
+            "AZ::u16", "u16", 2, "progression-point-entry-container-slot"));
+        return shape;
+    }
+
+    private ContainerWireShape classifyCapturePointStateColdDataMapContainerWireShape(Address vtable) {
+        Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
+        Address unmarshal = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        Address marshalFull = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_FULL_SLOT * 8L));
+        Address unmarshalFull = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_FULL_SLOT * 8L));
+        if (!isExecutableAddress(marshal) ||
+            !isExecutableAddress(unmarshal) ||
+            !isExecutableAddress(marshalFull) ||
+            !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        ArrayList<String> observedFull = new ArrayList<>();
+        collectOrderedMarshalShapes(marshalFull, 4, new LinkedHashSet<>(), observedFull);
+        if (!wireShapesContainSubsequence(
+            observedFull,
+            capturePointStateColdDataMapFullWireShapes())) {
+            return null;
+        }
+
+        List<String> observedFullUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshalFull));
+        if (!wireShapesContainSubsequence(
+            observedFullUnmarshal,
+            capturePointStateColdDataMapFullPrefixWireShapes())) {
+            return null;
+        }
+        Function valueUnmarshal = functionContainingWireShapeSubsequence(
+            unmarshalFull,
+            5,
+            capturePointStateColdDataValueWireShapes());
+        if (valueUnmarshal == null) {
+            return null;
+        }
+
+        ArrayList<String> observedDelta = new ArrayList<>();
+        collectOrderedMarshalShapes(marshal, 4, new LinkedHashSet<>(), observedDelta);
+        if (!containerDeltaPrefixShapeMatches(
+            observedDelta,
+            capturePointStateColdDataMapDeltaWireShapes(),
+            capturePointStateColdDataValueWireShapes())) {
+            return null;
+        }
+
+        List<String> observedDeltaUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshal));
+        if (!containerDeltaPrefixShapeMatches(
+            observedDeltaUnmarshal,
+            capturePointStateColdDataMapDeltaWireShapes(),
+            capturePointStateColdDataValueWireShapes())) {
+            return null;
+        }
+
+        NestedTypeShape valueTypeShape =
+            capturePointStateColdDataValueTypeShape(vtable, valueUnmarshal);
+
+        return new ContainerWireShape(
+            null,
+            null,
+            null,
+            capturePointStateColdDataMapDeltaWireShapes(),
+            capturePointStateColdDataMapFullWireShapes(),
+            null,
+            valueTypeShape,
+            Collections.emptyList(),
+            Collections.emptyList());
+    }
+
+    private List<String> capturePointStateColdDataMapFullWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(capturePointStateColdDataMapFullPrefixWireShapes());
+        shapes.addAll(capturePointStateColdDataValueWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> capturePointStateColdDataMapFullPrefixWireShapes() {
+        return List.of("sequence-number", "vlq-u32", "u64");
+    }
+
+    private List<String> capturePointStateColdDataMapDeltaWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(capturePointStateColdDataMapDeltaPrefixWireShapes());
+        shapes.addAll(capturePointStateColdDataValueWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> capturePointStateColdDataMapDeltaPrefixWireShapes() {
+        return List.of("vlq-u32", "u8", "u64", "sequence-number");
+    }
+
+    private List<String> capturePointStateColdDataValueWireShapes() {
+        return List.of("f32", "f32", "f32", "u32", "u8", "u64", "u8");
+    }
+
+    private NestedTypeShape capturePointStateColdDataValueTypeShape(
+        Address vtable,
+        Function evidenceFunction) {
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeName = "CapturePointStateColdData";
+        shape.typeNameFull = "CapturePointStateColdData";
+        shape.typeNameSource = "field-name+container-slot-shape";
+        shape.function = evidenceFunction == null ? null : evidenceFunction.getEntryPoint();
+        shape.functionName = fullFunctionName(evidenceFunction);
+        shape.vtable = vtable;
+        shape.memberBase = "value";
+        shape.memberNameSource = "synthetic-pcode-wire-order";
+        shape.memberNamesProven = false;
+        shape.validation = "custom-container-value-pcode-wire-sequence-capture-point-state-cold-data";
+
+        int index = 0;
+        shape.members.add(containerValueMember(index++, 0x10, "field_0",
+            "AZ::Vector3", "vec3", 12, "capture-point-state-cold-data-container-slot"));
+        shape.members.add(containerValueMember(index++, 0x20, "field_1",
+            "AZ::u32", "u32", 4, "capture-point-state-cold-data-container-slot"));
+        shape.members.add(containerValueMember(index++, 0x24, "field_2",
+            "AZ::u8", "u8", 1, "capture-point-state-cold-data-container-slot"));
+        shape.members.add(containerValueMember(index++, 0x30, "field_3",
+            "AZ::u64", "u64", 8, "capture-point-state-cold-data-container-slot"));
+        shape.members.add(containerValueMember(index, 0x38, "field_4",
+            "AZ::u8", "u8", 1, "capture-point-state-cold-data-container-slot"));
+        return shape;
+    }
+
+    private ContainerWireShape classifyFortMajorStructureStateMapContainerWireShape(Address vtable) {
+        Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
+        Address unmarshal = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        Address marshalFull = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_FULL_SLOT * 8L));
+        Address unmarshalFull = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_FULL_SLOT * 8L));
+        if (!isExecutableAddress(marshal) ||
+            !isExecutableAddress(unmarshal) ||
+            !isExecutableAddress(marshalFull) ||
+            !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        ArrayList<String> observedFull = new ArrayList<>();
+        collectOrderedMarshalShapes(marshalFull, 4, new LinkedHashSet<>(), observedFull);
+        if (!wireShapesContainSubsequence(
+            observedFull,
+            fortMajorStructureStateMapFullWireShapes())) {
+            return null;
+        }
+
+        List<String> observedFullUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshalFull));
+        if (!wireShapesContainSubsequence(
+            observedFullUnmarshal,
+            fortMajorStructureStateMapFullPrefixWireShapes())) {
+            return null;
+        }
+        Function valueUnmarshal = functionContainingWireShapeSubsequence(
+            unmarshalFull,
+            4,
+            fortMajorStructureStateValueWireShapes());
+        if (valueUnmarshal == null) {
+            return null;
+        }
+
+        ArrayList<String> observedDelta = new ArrayList<>();
+        collectOrderedMarshalShapes(marshal, 4, new LinkedHashSet<>(), observedDelta);
+        if (!containerDeltaPrefixShapeMatches(
+            observedDelta,
+            fortMajorStructureStateMapDeltaWireShapes(),
+            fortMajorStructureStateValueWireShapes())) {
+            return null;
+        }
+
+        List<String> observedDeltaUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshal));
+        if (!containerDeltaPrefixShapeMatches(
+            observedDeltaUnmarshal,
+            fortMajorStructureStateMapDeltaWireShapes(),
+            fortMajorStructureStateValueWireShapes())) {
+            return null;
+        }
+
+        NestedTypeShape valueTypeShape =
+            fortMajorStructureStateValueTypeShape(vtable, valueUnmarshal);
+
+        return new ContainerWireShape(
+            null,
+            null,
+            null,
+            fortMajorStructureStateMapDeltaWireShapes(),
+            fortMajorStructureStateMapFullWireShapes(),
+            null,
+            valueTypeShape,
+            Collections.emptyList(),
+            Collections.emptyList());
+    }
+
+    private List<String> fortMajorStructureStateMapFullWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(fortMajorStructureStateMapFullPrefixWireShapes());
+        shapes.addAll(fortMajorStructureStateValueWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> fortMajorStructureStateMapFullPrefixWireShapes() {
+        return List.of("sequence-number", "vlq-u32", "u64");
+    }
+
+    private List<String> fortMajorStructureStateMapDeltaWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(fortMajorStructureStateMapDeltaPrefixWireShapes());
+        shapes.addAll(fortMajorStructureStateValueWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> fortMajorStructureStateMapDeltaPrefixWireShapes() {
+        return List.of("vlq-u32", "u8", "u64", "sequence-number");
+    }
+
+    private List<String> fortMajorStructureStateValueWireShapes() {
+        return List.of("f32", "f32", "f32", "u32", "u8", "u8");
+    }
+
+    private NestedTypeShape fortMajorStructureStateValueTypeShape(
+        Address vtable,
+        Function evidenceFunction) {
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeName = "FortMajorStructureState";
+        shape.typeNameFull = "FortMajorStructureState";
+        shape.typeNameSource = "field-name+container-slot-shape";
+        shape.function = evidenceFunction == null ? null : evidenceFunction.getEntryPoint();
+        shape.functionName = fullFunctionName(evidenceFunction);
+        shape.vtable = vtable;
+        shape.memberBase = "value";
+        shape.memberNameSource = "synthetic-pcode-wire-order";
+        shape.memberNamesProven = false;
+        shape.validation = "custom-container-value-pcode-wire-sequence-fort-major-structure-state";
+
+        int index = 0;
+        shape.members.add(containerValueMember(index++, 0x10, "field_0",
+            "AZ::Vector3", "vec3", 12, "fort-major-structure-state-container-slot"));
+        shape.members.add(containerValueMember(index++, 0x20, "field_1",
+            "AZ::u32", "u32", 4, "fort-major-structure-state-container-slot"));
+        shape.members.add(containerValueMember(index++, 0x24, "field_2",
+            "AZ::u8", "u8", 1, "fort-major-structure-state-container-slot"));
+        shape.members.add(containerValueMember(index, 0x25, "field_3",
+            "AZ::u8", "u8", 1, "fort-major-structure-state-container-slot"));
+        return shape;
+    }
+
+    private ContainerWireShape classifyObjectiveTaskStateVectorContainerWireShape(Address vtable) {
+        Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
+        Address unmarshal = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        Address marshalFull = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_FULL_SLOT * 8L));
+        Address unmarshalFull = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_FULL_SLOT * 8L));
+        if (!isExecutableAddress(marshal) ||
+            !isExecutableAddress(unmarshal) ||
+            !isExecutableAddress(marshalFull) ||
+            !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        ArrayList<String> observedFull = new ArrayList<>();
+        collectOrderedMarshalShapes(marshalFull, 4, new LinkedHashSet<>(), observedFull);
+        if (!wireShapesContainSubsequence(
+            observedFull,
+            objectiveTaskStateVectorFullWireShapes())) {
+            return null;
+        }
+
+        List<String> observedFullUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshalFull));
+        if (!wireShapesContainSubsequence(
+            observedFullUnmarshal,
+            objectiveTaskStateVectorFullPrefixWireShapes())) {
+            return null;
+        }
+        Function valueUnmarshal = functionContainingWireShapeSubsequence(
+            unmarshalFull,
+            4,
+            objectiveTaskStateValueWireShapes());
+        if (valueUnmarshal == null) {
+            return null;
+        }
+
+        ArrayList<String> observedDelta = new ArrayList<>();
+        collectOrderedMarshalShapes(marshal, 4, new LinkedHashSet<>(), observedDelta);
+        if (!containerDeltaPrefixShapeMatches(
+            observedDelta,
+            objectiveTaskStateVectorDeltaWireShapes(),
+            objectiveTaskStateValueWireShapes())) {
+            return null;
+        }
+
+        List<String> observedDeltaUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshal));
+        if (!containerDeltaPrefixShapeMatches(
+            observedDeltaUnmarshal,
+            objectiveTaskStateVectorDeltaWireShapes(),
+            objectiveTaskStateValueWireShapes())) {
+            return null;
+        }
+
+        NestedTypeShape valueTypeShape =
+            objectiveTaskStateValueTypeShape(vtable, valueUnmarshal);
+
+        return new ContainerWireShape(
+            null,
+            null,
+            null,
+            objectiveTaskStateVectorDeltaWireShapes(),
+            objectiveTaskStateVectorFullWireShapes(),
+            null,
+            valueTypeShape,
+            Collections.emptyList(),
+            Collections.emptyList());
+    }
+
+    private List<String> objectiveTaskStateVectorFullWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(objectiveTaskStateVectorFullPrefixWireShapes());
+        shapes.addAll(objectiveTaskStateValueWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> objectiveTaskStateVectorFullPrefixWireShapes() {
+        return List.of("sequence-number", "vlq-u32");
+    }
+
+    private List<String> objectiveTaskStateVectorDeltaWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(objectiveTaskStateVectorDeltaPrefixWireShapes());
+        shapes.addAll(objectiveTaskStateValueWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> objectiveTaskStateVectorDeltaPrefixWireShapes() {
+        return List.of("vlq-u32", "u8", "vlq-u64", "sequence-number");
+    }
+
+    private List<String> objectiveTaskStateValueWireShapes() {
+        return List.of("u64", "u8", "u32", "u32", "u8");
+    }
+
+    private NestedTypeShape objectiveTaskStateValueTypeShape(
+        Address vtable,
+        Function evidenceFunction) {
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeName = "TaskState";
+        shape.typeNameFull = "TaskState";
+        shape.typeNameSource = "field-name+container-slot-shape";
+        shape.function = evidenceFunction == null ? null : evidenceFunction.getEntryPoint();
+        shape.functionName = fullFunctionName(evidenceFunction);
+        shape.vtable = vtable;
+        shape.memberBase = "value";
+        shape.memberNameSource = "synthetic-pcode-wire-order";
+        shape.memberNamesProven = false;
+        shape.validation = "custom-container-value-pcode-wire-sequence-objective-task-state";
+
+        int index = 0;
+        shape.members.add(containerValueMember(index++, 0x10, "field_0",
+            "AZ::u64", "u64", 8, "objective-task-state-container-slot"));
+        shape.members.add(containerValueMember(index++, 0x18, "field_1",
+            "AZ::u8", "u8", 1, "objective-task-state-container-slot"));
+        shape.members.add(containerValueMember(index++, 0x1c, "field_2",
+            "AZ::u32", "u32", 4, "objective-task-state-container-slot"));
+        shape.members.add(containerValueMember(index++, 0x20, "field_3",
+            "AZ::u32", "u32", 4, "objective-task-state-container-slot"));
+        shape.members.add(containerValueMember(index, 0x24, "field_4",
+            "AZ::u8", "u8", 1, "objective-task-state-container-slot"));
+        return shape;
+    }
+
+    private ContainerWireShape classifyObjectiveTaskStartTimeMapContainerWireShape(Address vtable) {
+        Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
+        Address unmarshal = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        Address marshalFull = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_FULL_SLOT * 8L));
+        Address unmarshalFull = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_FULL_SLOT * 8L));
+        if (!isExecutableAddress(marshal) ||
+            !isExecutableAddress(unmarshal) ||
+            !isExecutableAddress(marshalFull) ||
+            !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        ArrayList<String> observedFull = new ArrayList<>();
+        collectOrderedMarshalShapes(marshalFull, 4, new LinkedHashSet<>(), observedFull);
+        if (!wireShapesContainSubsequence(
+            observedFull,
+            objectiveTaskStartTimeMapFullWireShapes())) {
+            return null;
+        }
+
+        List<String> observedFullUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshalFull));
+        if (!wireShapesContainSubsequence(
+            observedFullUnmarshal,
+            objectiveTaskStartTimeMapFullWrapperWireShapes())) {
+            return null;
+        }
+        Function fullKeyUnmarshal = functionContainingWireShapeSubsequence(
+            unmarshalFull,
+            4,
+            objectiveTaskInstanceIdWireShapes());
+        if (fullKeyUnmarshal == null) {
+            return null;
+        }
+
+        List<String> observedDeltaUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshal));
+        if (!wireShapesContainSubsequence(
+            observedDeltaUnmarshal,
+            objectiveTaskStartTimeMapDeltaWrapperWireShapes())) {
+            return null;
+        }
+        Function deltaKeyUnmarshal = functionContainingWireShapeSubsequence(
+            unmarshal,
+            5,
+            objectiveTaskInstanceIdWireShapes());
+        if (deltaKeyUnmarshal == null) {
+            return null;
+        }
+
+        ArrayList<String> observedDeltaMarshal = new ArrayList<>();
+        collectOrderedMarshalShapes(marshal, 4, new LinkedHashSet<>(), observedDeltaMarshal);
+        if (!wireShapesContainOrderedSubsequence(
+            observedDeltaMarshal,
+            objectiveTaskStartTimeMapDeltaMarshalEvidenceWireShapes())) {
+            return null;
+        }
+
+        NestedTypeShape valueTypeShape =
+            objectiveTaskStartTimeEntryTypeShape(vtable, functionAtOrContaining(unmarshalFull));
+
+        return new ContainerWireShape(
+            null,
+            null,
+            null,
+            "ObjectiveTaskInstanceId",
+            "serialize-json+key-helper-wire-shape",
+            objectiveTaskStartTimeMapDeltaWireShapes(),
+            objectiveTaskStartTimeMapFullWireShapes(),
+            null,
+            valueTypeShape,
+            Collections.emptyList(),
+            Collections.emptyList());
+    }
+
+    private List<String> objectiveTaskStartTimeMapFullWireShapes() {
+        return List.of("sequence-number", "vlq-u32", "u64", "u8", "u64");
+    }
+
+    private List<String> objectiveTaskStartTimeMapDeltaWireShapes() {
+        return List.of("vlq-u32", "u8", "u64", "u8", "sequence-number", "u64");
+    }
+
+    private List<String> objectiveTaskStartTimeMapFullWrapperWireShapes() {
+        return List.of("sequence-number", "vlq-u32", "u64");
+    }
+
+    private List<String> objectiveTaskStartTimeMapDeltaWrapperWireShapes() {
+        return List.of("vlq-u32", "u8", "sequence-number", "u64");
+    }
+
+    private List<String> objectiveTaskInstanceIdWireShapes() {
+        return List.of("u64", "u8");
+    }
+
+    private List<String> objectiveTaskStartTimeMapDeltaMarshalEvidenceWireShapes() {
+        return List.of("vlq-u32", "u64", "u8", "sequence-number", "u64", "u8");
+    }
+
+    private NestedTypeShape objectiveTaskStartTimeEntryTypeShape(
+        Address vtable,
+        Function evidenceFunction) {
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeName = "ObjectiveTaskStartTimeEntry";
+        shape.typeNameFull = "ObjectiveTaskStartTimeEntry";
+        shape.typeNameSource = "container-wire-shape";
+        shape.function = evidenceFunction == null ? null : evidenceFunction.getEntryPoint();
+        shape.functionName = fullFunctionName(evidenceFunction);
+        shape.vtable = vtable;
+        shape.memberBase = "entry";
+        shape.memberNameSource = "serialize-json-offset-match+wire-order";
+        shape.memberNamesProven = false;
+        shape.validation = "custom-container-value-wire-sequence-objective-task-start-time";
+
+        NestedTypeMember key = containerValueMember(
+            0,
+            0x00,
+            "m_objectiveTaskInstanceId",
+            "ObjectiveTaskInstanceId",
+            "composite<u64,u8>",
+            24,
+            "objective-task-start-time-key-helper");
+        key.nameSource = "serialize-json-type";
+        key.nameProven = true;
+        key.nameEvidence =
+            "ObjectiveTaskInstanceId key helper writes ObjectiveInstanceId payload and task index";
+        shape.members.add(key);
+
+        NestedTypeMember value = containerValueMember(
+            1,
+            0x28,
+            "m_startTime",
+            "WallClockTimePoint",
+            "u64",
+            16,
+            "objective-task-start-time-value-marshal");
+        value.nameSource = "field-name+wire-order";
+        value.nameProven = false;
+        value.nameEvidence = "Field role inferred from container field name and u64 time payload";
+        shape.members.add(value);
+
+        return shape;
+    }
+
+    private ContainerWireShape classifyRewardTrackRolledRewardContainerWireShape(Address vtable) {
+        Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
+        Address unmarshal = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        Address marshalFull = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_FULL_SLOT * 8L));
+        Address unmarshalFull = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_FULL_SLOT * 8L));
+        if (!isExecutableAddress(marshal) ||
+            !isExecutableAddress(unmarshal) ||
+            !isExecutableAddress(marshalFull) ||
+            !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        Function itemMarshal = persistentItemDataLeafHelper(marshalFull, "Marshal");
+        Function itemUnmarshal = persistentItemDataLeafHelper(unmarshalFull, "Unmarshal");
+        if (itemMarshal == null || itemUnmarshal == null) {
+            return null;
+        }
+
+        ArrayList<String> observedFull = new ArrayList<>();
+        collectOrderedMarshalShapes(marshalFull, 4, new LinkedHashSet<>(), observedFull);
+        if (!wireShapesContainSubsequence(
+            observedFull,
+            rewardTrackRolledRewardFullMatchWireShapes())) {
+            return null;
+        }
+
+        List<String> observedFullUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshalFull));
+        if (!wireShapesContainSubsequence(
+            observedFullUnmarshal,
+            rewardTrackRolledRewardFullPrefixWireShapes())) {
+            return null;
+        }
+        Function valueUnmarshal = functionContainingWireShapeSubsequence(
+            unmarshalFull,
+            4,
+            rewardTrackRolledRewardValueMatchWireShapes());
+        if (valueUnmarshal == null) {
+            return null;
+        }
+
+        ArrayList<String> observedDelta = new ArrayList<>();
+        collectOrderedMarshalShapes(marshal, 4, new LinkedHashSet<>(), observedDelta);
+        if (!containerDeltaPrefixShapeMatches(
+            observedDelta,
+            rewardTrackRolledRewardDeltaWireShapes(),
+            rewardTrackRolledRewardValueWireShapes())) {
+            return null;
+        }
+
+        List<String> observedDeltaUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshal));
+        if (!containerDeltaPrefixShapeMatches(
+            observedDeltaUnmarshal,
+            rewardTrackRolledRewardDeltaWireShapes(),
+            rewardTrackRolledRewardValueWireShapes())) {
+            return null;
+        }
+
+        NativeTypeInfoEvidence itemTypeInfo = persistentItemDataTypeInfo(itemMarshal);
+        NestedTypeShape itemTypeShape =
+            persistentItemDataValueTypeShape(vtable, itemUnmarshal, itemTypeInfo);
+        NestedTypeShape valueTypeShape =
+            rewardTrackRolledRewardValueTypeShape(vtable, valueUnmarshal);
+
+        return new ContainerWireShape(
+            null,
+            null,
+            null,
+            rewardTrackRolledRewardDeltaWireShapes(),
+            rewardTrackRolledRewardFullWireShapes(),
+            null,
+            valueTypeShape,
+            Collections.emptyList(),
+            List.of(itemTypeShape));
+    }
+
+    private List<String> rewardTrackRolledRewardFullWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(rewardTrackRolledRewardFullPrefixWireShapes());
+        shapes.addAll(rewardTrackRolledRewardValueWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> rewardTrackRolledRewardFullMatchWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(rewardTrackRolledRewardFullPrefixWireShapes());
+        shapes.addAll(rewardTrackRolledRewardValueMatchWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> rewardTrackRolledRewardFullPrefixWireShapes() {
+        return List.of("sequence-number", "vlq-u32");
+    }
+
+    private List<String> rewardTrackRolledRewardDeltaWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(rewardTrackRolledRewardDeltaPrefixWireShapes());
+        shapes.addAll(rewardTrackRolledRewardValueWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> rewardTrackRolledRewardDeltaPrefixWireShapes() {
+        return List.of("vlq-u32", "u8", "vlq-u64", "sequence-number");
+    }
+
+    private List<String> rewardTrackRolledRewardValueWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(rewardTrackRolledRewardValueMatchWireShapes());
+        shapes.add("u8");
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> rewardTrackRolledRewardValueMatchWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.add("u32");
+        shapes.add("u32");
+        shapes.addAll(persistentItemDataValueWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private NestedTypeShape rewardTrackRolledRewardValueTypeShape(
+        Address vtable,
+        Function evidenceFunction) {
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeName = "RewardTrackRolledRewardEntry";
+        shape.typeNameFull = "RewardTrackRolledRewardEntry";
+        shape.typeNameSource = "field-name+container-slot-shape";
+        shape.function = evidenceFunction == null ? null : evidenceFunction.getEntryPoint();
+        shape.functionName = fullFunctionName(evidenceFunction);
+        shape.vtable = vtable;
+        shape.memberBase = "value";
+        shape.memberNameSource = "serialize-field-vocabulary+wire-order";
+        shape.memberNamesProven = false;
+        shape.validation = "custom-container-value-pcode-wire-sequence-reward-track-rolled-reward";
+
+        NestedTypeMember rewardId = containerValueMember(
+            0,
+            0x00,
+            "m_rewardId",
+            "AZ::Crc32",
+            "u32",
+            4,
+            "reward-track-rolled-reward-container-slot");
+        rewardId.nameSource = "serialize-field-vocabulary+wire-order";
+        rewardId.nameEvidence =
+            "PersistentRewardTrackEntry registers m_rewardId, but replicated codec stores it before m_item";
+        shape.members.add(rewardId);
+
+        NestedTypeMember quantity = containerValueMember(
+            1,
+            0x04,
+            "m_quantity",
+            "AZ::u32",
+            "u32",
+            4,
+            "reward-track-rolled-reward-container-slot");
+        quantity.nameSource = "serialize-field-vocabulary+wire-order";
+        quantity.nameEvidence =
+            "PersistentRewardTrackEntry registers m_quantity, but replicated codec stores it before m_item";
+        shape.members.add(quantity);
+
+        NestedTypeMember item = containerValueMember(
+            2,
+            0x10,
+            "m_item",
+            "PersistentItemData",
+            "PersistentItemData",
+            null,
+            "reward-track-rolled-reward-container-slot");
+        item.nameSource = "serialize-field-vocabulary+wire-order";
+        item.nameEvidence =
+            "Replicated codec delegates this member to GridMate::Marshaler<PersistentItemData>";
+        shape.members.add(item);
+
+        NestedTypeMember stage = containerValueMember(
+            3,
+            0x80,
+            "m_stage",
+            "AZ::u8",
+            "u8",
+            1,
+            "reward-track-rolled-reward-container-slot");
+        stage.nameSource = "serialize-field-vocabulary+wire-order";
+        stage.nameEvidence =
+            "PersistentRewardTrackEntry registers m_stage; replicated codec emits a single trailing u8 and no m_available byte";
+        shape.members.add(stage);
+
+        return shape;
+    }
+
+    private ContainerWireShape classifyWarDataContainerWireShape(Address vtable) {
+        Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
+        Address unmarshal = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        Address marshalFull = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_FULL_SLOT * 8L));
+        Address unmarshalFull = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_FULL_SLOT * 8L));
+        if (!isExecutableAddress(marshal) ||
+            !isExecutableAddress(unmarshal) ||
+            !isExecutableAddress(marshalFull) ||
+            !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+
+        ArrayList<String> observedFull = new ArrayList<>();
+        collectOrderedMarshalShapes(marshalFull, 5, new LinkedHashSet<>(), observedFull);
+        if (!wireShapesContainSubsequence(observedFull, warDataFullMatchWireShapes())) {
+            return null;
+        }
+
+        List<String> observedFullUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshalFull));
+        if (!wireShapesContainSubsequence(
+            observedFullUnmarshal,
+            warDataFullPrefixWireShapes())) {
+            return null;
+        }
+        Function valueUnmarshal = functionContainingWireShapeSubsequence(
+            unmarshalFull,
+            5,
+            warDataValueMatchWireShapes());
+        if (valueUnmarshal == null) {
+            return null;
+        }
+
+        ArrayList<String> observedDelta = new ArrayList<>();
+        collectOrderedMarshalShapes(marshal, 5, new LinkedHashSet<>(), observedDelta);
+        if (!containerDeltaPrefixShapeMatches(
+            observedDelta,
+            warDataDeltaWireShapes(),
+            warDataValueWireShapes())) {
+            return null;
+        }
+
+        List<String> observedDeltaUnmarshal =
+            collectOrderedUnmarshalShapes(functionAtOrContaining(unmarshal));
+        if (!containerDeltaPrefixShapeMatches(
+            observedDeltaUnmarshal,
+            warDataDeltaWireShapes(),
+            warDataValueWireShapes())) {
+            return null;
+        }
+
+        NestedTypeShape guildRefShape = warDataGuildRefShape(vtable, valueUnmarshal);
+        NestedTypeShape middleShape = warDataMiddleShape(vtable, valueUnmarshal);
+        NestedTypeShape block3b0Shape = warDataBlock3b0Shape(vtable, valueUnmarshal);
+        NestedTypeShape tailShape = warDataTailShape(vtable, valueUnmarshal);
+        NestedTypeShape valueTypeShape = warDataValueTypeShape(vtable, valueUnmarshal);
+
+        return new ContainerWireShape(
+            null,
+            null,
+            null,
+            warDataDeltaWireShapes(),
+            warDataFullWireShapes(),
+            null,
+            valueTypeShape,
+            Collections.emptyList(),
+            List.of(guildRefShape, middleShape, block3b0Shape, tailShape));
+    }
+
+    private List<String> warDataFullWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(warDataFullPrefixWireShapes());
+        shapes.addAll(warDataValueWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> warDataFullMatchWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(warDataFullPrefixWireShapes());
+        shapes.addAll(warDataValueMatchWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> warDataFullPrefixWireShapes() {
+        return List.of("sequence-number", "vlq-u32");
+    }
+
+    private List<String> warDataDeltaWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.add("vlq-u32");
+        shapes.add("u8");
+        shapes.add("vlq-u64");
+        shapes.add("sequence-number");
+        shapes.addAll(warDataValueWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> warDataValueWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(warDataValueMatchWireShapes());
+        shapes.addAll(warDataTailWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> warDataValueMatchWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.add("fixed-bytes-16");
+        shapes.add("fixed-bytes-16");
+        shapes.addAll(warDataMiddleWireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> warDataMiddleWireShapes() {
+        return List.of(
+            "u64",
+            "vlq-u32",
+            "fixed-bytes-16",
+            "fixed-bytes-16",
+            "u64");
+    }
+
+    private List<String> warDataTailWireShapes() {
+        ArrayList<String> shapes = new ArrayList<>();
+        shapes.addAll(warDataMiddleWireShapes());
+        shapes.add("u8");
+        shapes.add("u8");
+        shapes.add("u16");
+        shapes.add("u32");
+        shapes.add("fixed-bytes-16");
+        shapes.add("u64");
+        shapes.addAll(warDataBlock3b0WireShapes());
+        return Collections.unmodifiableList(shapes);
+    }
+
+    private List<String> warDataBlock3b0WireShapes() {
+        return List.of(
+            "fixed-bytes-16",
+            "u8",
+            "u32",
+            "fixed-bytes-1",
+            "fixed-bytes-1",
+            "u32",
+            "u64",
+            "u32",
+            "fixed-bytes-16",
+            "fixed-bytes-16");
+    }
+
+    private NestedTypeShape warDataGuildRefShape(Address vtable, Function evidenceFunction) {
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeName = "WarDataValueGuildRef";
+        shape.typeNameFull = "WarDataValueGuildRef";
+        shape.typeNameSource = "container-slot-shape";
+        shape.function = evidenceFunction == null ? null : evidenceFunction.getEntryPoint();
+        shape.functionName = fullFunctionName(evidenceFunction);
+        shape.vtable = vtable;
+        shape.memberBase = "guild_ref";
+        shape.memberNameSource = "ghidra-stack-wire-sequence";
+        shape.memberNamesProven = false;
+        shape.validation = "custom-container-value-pcode-wire-sequence-war-data-guild-ref";
+        shape.members.add(containerValueMember(
+            0,
+            0x10,
+            "id",
+            "GuildId",
+            "fixed-bytes-16",
+            16,
+            "war-data-container-slot"));
+        return shape;
+    }
+
+    private NestedTypeShape warDataMiddleShape(Address vtable, Function evidenceFunction) {
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeName = "WarDataValueMiddle";
+        shape.typeNameFull = "WarDataValueMiddle";
+        shape.typeNameSource = "container-slot-shape";
+        shape.function = evidenceFunction == null ? null : evidenceFunction.getEntryPoint();
+        shape.functionName = fullFunctionName(evidenceFunction);
+        shape.vtable = vtable;
+        shape.memberBase = "middle";

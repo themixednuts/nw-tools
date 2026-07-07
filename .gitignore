@@ -1,6 +1,10 @@
 /target/
 **/*.rs.bk
 resources/behavior-context.json
+resources/gamedata/
+node_modules/
+dist/
+bun.lockb
 
 # ignore build dirs at any depth (nested crate targets)
 target/

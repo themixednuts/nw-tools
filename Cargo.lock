@@ -1906,6 +1906,8 @@ dependencies = [
 name = "nw-datasheet"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
+ "nw-asset",
  "nw-localization",
  "serde",
  "thiserror 2.0.18",
@@ -1928,6 +1930,45 @@ dependencies = [
 name = "nw-filesystem"
 version = "0.1.0"
 dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nw-gamedata-codegen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap 4.6.1",
+ "flate2",
+ "gofmt",
+ "heck 0.5.0",
+ "nw-asset",
+ "nw-datasheet",
+ "nw-gamedata-manager-specs",
+ "nw-pak",
+ "nw-serialize-codegen",
+ "oxc_allocator",
+ "oxc_codegen",
+ "oxc_parser",
+ "oxc_span",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "sha2",
+ "syn 2.0.118",
+ "tempfile",
+ "thiserror 2.0.18",
+ "treesitter-types-go",
+ "uuid",
+]
+
+[[package]]
+name = "nw-gamedata-manager-specs"
+version = "0.1.0"
+dependencies = [
+ "heck 0.5.0",
  "thiserror 2.0.18",
 ]
 

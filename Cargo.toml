@@ -31,6 +31,7 @@ heck = "0.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha1 = "0.11.0"
+sha2 = "0.10.9"
 stylua = { version = "=2.5.2", default-features = false, features = ["lua54"] }
 thiserror = "2.0.18"
 time = { version = "0.3.49", features = ["local-offset"] }
@@ -85,3 +86,4 @@ nw-localization = { version = "0.1.0", path = "crates/nw-localization" }
 nw-objectstream = { version = "0.1.0", path = "crates/nw-objectstream", default-features = false }
 nw-pak = { version = "0.1.0", path = "crates/nw-pak", default-features = false }
 nw-resources = { version = "0.1.0", path = "crates/nw-resources" }
+nw-serialize-codegen = { version = "0.1.0", path = "crates/nw-serialize-codegen" }
