@@ -11,10 +11,10 @@ use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind};
 use crate::naming::{rust_field_ident, rust_module_ident, rust_type_ident};
 use crate::network_schema::{
     NetworkConfidence, NetworkField, NetworkFragmentMetadata, NetworkNativeTypeInfoEvidence,
-    NetworkNestedTypeMember, NetworkNestedTypeShape, NetworkReplicatedContainerShape,
-    NetworkReplicatedContainerStorageKind, NetworkReplicatedContainerWireShape, NetworkSchema,
-    NetworkSerializeFieldType, NetworkSerializeKind, NetworkSerializeRole, NetworkSerializeType,
-    NetworkType, NetworkTypeCapability, NetworkWireScalarShape as SchemaWireScalarShape,
+    NetworkReplicatedContainerShape, NetworkReplicatedContainerStorageKind,
+    NetworkReplicatedContainerWireShape, NetworkSchema, NetworkSerializeFieldType,
+    NetworkSerializeKind, NetworkSerializeRole, NetworkSerializeType, NetworkType,
+    NetworkTypeCapability, NetworkWireScalarShape as SchemaWireScalarShape,
     NetworkWireShape as SchemaWireShape,
 };
 use crate::types::{ResolvedType, ScalarType};
@@ -1491,13 +1491,9 @@ fn candidate_backed_container_shape_from_vtable(
         Some(serialize.type_id),
     )
     .map(|serialize| serialize.name.clone());
-    let key_type_shape = (key_type_name.is_none() && key_wire_shapes.len() > 1).then(|| {
-        synthetic_container_shape_from_wire_shapes(
-            "Key",
-            "candidate-backed-container-key",
-            key_wire_shapes,
-        )
-    });
+    if key_type_name.is_none() && key_wire_shapes.len() > 1 {
+        return None;
+    }
 
     Some(NetworkReplicatedContainerShape {
         storage: NetworkReplicatedContainerStorageKind::Map,
@@ -1505,12 +1501,8 @@ fn candidate_backed_container_shape_from_vtable(
         key_wire_shapes: key_wire_shapes.clone(),
         key_native_type: None,
         key_native_type_source: None,
-        key_type_name: key_type_name.or_else(|| {
-            key_type_shape
-                .as_ref()
-                .and_then(|shape| shape.type_name.clone())
-        }),
-        key_type_shape,
+        key_type_name,
+        key_type_shape: None,
         value_wire_shapes: serialize.wire_shapes.clone(),
         delta_value_wire_shapes: Vec::new(),
         value_type_name: Some(serialize.name.clone()),
@@ -1587,51 +1579,6 @@ fn replicated_container_full_data_shape_candidates_from_names(
         }
     }
     candidates
-}
-
-fn synthetic_container_shape_from_wire_shapes(
-    type_name: &str,
-    validation: &str,
-    wire_shapes: &[SchemaWireScalarShape],
-) -> NetworkNestedTypeShape {
-    NetworkNestedTypeShape {
-        type_id: None,
-        type_id_source: None,
-        type_name: Some(type_name.to_owned()),
-        type_name_full: None,
-        type_name_source: Some("candidate-backed-container-shape".to_owned()),
-        function: None,
-        function_name: None,
-        factory: None,
-        constructor: None,
-        vtable: None,
-        az_rtti_address: None,
-        member_base: None,
-        member_name_source: Some("synthetic-wire-order".to_owned()),
-        member_names_proven: Some(false),
-        datatype_path: None,
-        validation: Some(validation.to_owned()),
-        members: wire_shapes
-            .iter()
-            .enumerate()
-            .map(|(index, shape)| NetworkNestedTypeMember {
-                index: u32::try_from(index).ok(),
-                offset: None,
-                native_offset: None,
-                name: Some(format!("field_{index}")),
-                name_source: Some("synthetic-wire-order".to_owned()),
-                name_proven: Some(false),
-                name_evidence: None,
-                native_type: None,
-                wire_shape: Some(wire_scalar_shape_name(*shape)),
-                byte_width: None,
-                evidence_source: Some("candidate-backed-container-key".to_owned()),
-                callsite: None,
-                target: None,
-                target_name: None,
-            })
-            .collect(),
-    }
 }
 
 fn serialize_types_by_type_id(schema: &NetworkSchema) -> BTreeMap<Uuid, &NetworkSerializeType> {
