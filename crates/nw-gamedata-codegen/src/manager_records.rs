@@ -1655,6 +1655,30 @@ mod tests {
                 surface.manager_name
             );
         }
+        let product_backed_names = surfaces
+            .iter()
+            .filter_map(|surface| match surface {
+                ManagerSurface::ProductBacked(surface) => Some(surface.manager_name.clone()),
+                ManagerSurface::Direct(_)
+                | ManagerSurface::Semantic(_)
+                | ManagerSurface::ItemData(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            product_backed_names,
+            BTreeSet::from([
+                "ArmorOffsetDataManager".to_owned(),
+                "CameraSettingsDataManager".to_owned(),
+                "EquipTypesDataManager".to_owned(),
+                "GameDebugSettingsManager".to_owned(),
+                "GatherableDataManager".to_owned(),
+                "PlayerDataManager".to_owned(),
+                "RecipeDataManager".to_owned(),
+                "SocialDataManager".to_owned(),
+                "UiDataManager".to_owned(),
+            ]),
+            "standalone product-backed manager set should match the documented parsed product surfaces"
+        );
 
         assert!(
             !emitted_names.contains("CurrencyExchangeMappingManager"),

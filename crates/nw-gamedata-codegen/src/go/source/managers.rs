@@ -485,6 +485,57 @@ mod tests {
             ColumnType::Number
         );
     }
+
+    #[test]
+    fn semantic_materializer_tracks_duplicate_keys_across_all_tables() {
+        let record = SemanticManagerRecord {
+            manager_name: "ExampleDataManager".to_owned(),
+            manager_class_name: "ExampleDataManager".to_owned(),
+            record_type_name: "ExampleData".to_owned(),
+            tables: vec![
+                crate::manager_records::SemanticManagerTable {
+                    table_name: "ExampleA".to_owned(),
+                },
+                crate::manager_records::SemanticManagerTable {
+                    table_name: "ExampleB".to_owned(),
+                },
+            ],
+            key: Some(SemanticManagerKey::Crc {
+                key_field: "example_id".to_owned(),
+                crc_field: "example_id_crc".to_owned(),
+                key_column: "ExampleID".to_owned(),
+                skip_empty_key: true,
+                trim_key: true,
+                reject_zero_crc: true,
+                duplicate_key_policy: crate::manager::NativeDuplicateKeyPolicy::FirstWins,
+            }),
+            source_row_field: Some("source_row".to_owned()),
+            source_row_method: Some("source_row".to_owned()),
+            row_filters: Vec::new(),
+            fields: Vec::new(),
+            lookup_methods: Vec::new(),
+            ids_method: None,
+            rows_method: Some("rows".to_owned()),
+            len_method: Some("len".to_owned()),
+            is_empty_method: Some("is_empty".to_owned()),
+        };
+        let mut source = String::new();
+        push_go_semantic_materializer(&mut source, &record);
+
+        let seen_index = source
+            .find("\tseen := map[any]struct{}{}")
+            .expect("materializer should track duplicate keys");
+        let table_loop_index = source
+            .find("\tfor _, tableName := range []string{")
+            .expect("materializer should iterate tables");
+        let row_loop_index = source
+            .find("\t\tfor _, sourceRow := range table.Rows {")
+            .expect("materializer should iterate rows");
+        assert!(
+            seen_index < table_loop_index && table_loop_index < row_loop_index,
+            "duplicate-key tracking must be scoped across every table and row"
+        );
+    }
 }
 
 fn manifest_source(unit: &GameDataCompileUnit, surfaces: &[ManagerSurface]) -> Result<String> {
@@ -1650,6 +1701,13 @@ fn push_go_semantic_materializer(source: &mut String, record: &SemanticManagerRe
     source.push_str(&format!(
         r#"func materialize{manager_type}(instance *managerInstance) ([]{record_type}, error) {{
 	rows := []{record_type}{{}}
+"#
+    ));
+    if record.key.is_some() {
+        source.push_str("\tseen := map[any]struct{}{}\n");
+    }
+    source.push_str(&format!(
+        r#"
 	for _, tableName := range []string{{{}}} {{
 		table := instance.table(tableName)
 		if table == nil {{
@@ -1665,9 +1723,6 @@ fn push_go_semantic_materializer(source: &mut String, record: &SemanticManagerRe
             .join(", "),
         record.manager_name
     ));
-    if record.key.is_some() {
-        source.push_str("\tseen := map[any]struct{}{}\n");
-    }
     push_go_key_materializer(source, record);
     for (filter_index, filter) in record.row_filters.iter().enumerate() {
         let column = go_string(&filter.column);

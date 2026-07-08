@@ -280,6 +280,20 @@ mod tests {
         assert!(managers.contains("type ArmorOffsetDataManager struct"));
         assert!(managers.contains("ArmorOffsetDataManager"));
         assert!(managers.contains("PlayerDataManager"));
+        for manager in [
+            "CameraSettingsDataManager",
+            "ArmorOffsetDataManager",
+            "EquipTypesDataManager",
+            "GameDebugSettingsManager",
+            "UiDataManager",
+            "PlayerDataManager",
+            "SocialDataManager",
+        ] {
+            assert!(
+                managers.contains(&format!("type {manager} struct")),
+                "{manager} should be emitted as a standalone product-backed manager"
+            );
+        }
         assert!(managers.contains("Kind: managerDependencyAsset"));
         assert!(managers.contains("managerDependencyTable"));
         assert!(!managers.contains("ProductPath"));
@@ -291,6 +305,21 @@ mod tests {
         assert!(
             managers.contains("func (manager *ArmorOffsetDataManager) FurthestAttachmentOffset")
         );
+        assert!(managers.contains("func (manager *CameraSettingsDataManager) Settings"));
+        assert!(managers.contains("func (manager *CameraSettingsDataManager) CameraStates"));
+        assert!(managers.contains("func (manager *EquipTypesDataManager) Database"));
+        assert!(managers.contains("func (manager *EquipTypesDataManager) EquipTypes"));
+        assert!(managers.contains("func (manager *GameDebugSettingsManager) Settings"));
+        assert!(
+            managers.contains("func (manager *GameDebugSettingsManager) DisabledCombatToggleCount")
+        );
+        assert!(managers.contains("func (manager *UiDataManager) Database"));
+        assert!(managers.contains("func (manager *UiDataManager) InteractOptions"));
+        assert!(managers.contains("func (manager *PlayerDataManager) PlayerBaseAttributes"));
+        assert!(managers.contains("func (manager *PlayerDataManager) MaxPerks"));
+        assert!(managers.contains("func (manager *PlayerDataManager) CategoricalProgressionID"));
+        assert!(managers.contains("func (manager *SocialDataManager) RankDatabase"));
+        assert!(managers.contains("func (manager *SocialDataManager) Ranks"));
         assert!(!managers.contains("type ObjectiveTasksDataManager struct"));
         assert!(
             output

@@ -190,6 +190,20 @@ mod tests {
         assert!(managers.contains("export class ArmorOffsetDataManager"));
         assert!(managers.contains("ArmorOffsetDataManager"));
         assert!(managers.contains("PlayerDataManager"));
+        for manager in [
+            "CameraSettingsDataManager",
+            "ArmorOffsetDataManager",
+            "EquipTypesDataManager",
+            "GameDebugSettingsManager",
+            "UiDataManager",
+            "PlayerDataManager",
+            "SocialDataManager",
+        ] {
+            assert!(
+                managers.contains(&format!("export class {manager}")),
+                "{manager} should be emitted as a standalone product-backed manager"
+            );
+        }
         assert!(managers.contains("kind: \"asset\""));
         assert!(managers.contains("kind: \"table\""));
         assert!(!managers.contains("productPath"));
@@ -199,6 +213,19 @@ mod tests {
         assert!(managers.contains("armorOffset(name: string)"));
         assert!(managers.contains("furthestAttachmentOffset("));
         assert!(managers.contains("database(): ArmorOffsetDatabase"));
+        assert!(managers.contains("settings(): GameCameraSettings"));
+        assert!(managers.contains("cameraStates(): readonly CameraStateSettings[]"));
+        assert!(managers.contains("database(): EquipTypesDatabase"));
+        assert!(managers.contains("equipTypes(): readonly EquipTypeData[]"));
+        assert!(managers.contains("settings(): GameDebugSettings"));
+        assert!(managers.contains("disabledCombatToggleCount(): number"));
+        assert!(managers.contains("database(): UiDatabase"));
+        assert!(managers.contains("interactOptions(): readonly InteractOptionData[]"));
+        assert!(managers.contains("playerBaseAttributes(): PlayerBaseAttributes"));
+        assert!(managers.contains("maxPerks(rarityLevel: number): number | undefined"));
+        assert!(managers.contains("categoricalProgressionId(tradeskill: string | number)"));
+        assert!(managers.contains("rankDatabase(): SocialRankDatabase"));
+        assert!(managers.contains("ranks(): readonly SocialRankData[]"));
         assert!(!managers.contains("export class ObjectiveTasksDataManager"));
         assert!(
             output
