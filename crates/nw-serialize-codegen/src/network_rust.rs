@@ -4030,13 +4030,14 @@ fn container_embedded_shape_is_referenced(
         return false;
     };
     parent.members.iter().any(|member| {
-        member
-            .wire_shape
-            .as_deref()
-            .and_then(|wire_shape| {
-                nested_shape_by_wire_name(wire_shape, core::slice::from_ref(shape))
-            })
-            .is_some()
+        member.wire_shape.as_deref().is_some_and(|wire_shape| {
+            nested_shape_by_wire_name(wire_shape, core::slice::from_ref(shape)).is_some()
+                || vector_element_wire_shape(wire_shape)
+                    .and_then(|element| {
+                        nested_shape_by_wire_name(element, core::slice::from_ref(shape))
+                    })
+                    .is_some()
+        })
     })
 }
 
