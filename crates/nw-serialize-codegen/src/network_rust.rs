@@ -19,7 +19,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v44";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v45";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -114,6 +114,10 @@ pub struct NetworkStateFieldShapeReport {
     pub wire_shape_source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub value_type_candidates: Vec<NetworkNativeTypeInfoEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_key_type_shape: Option<crate::network_schema::NetworkNestedTypeShape>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub container_embedded_key_type_shapes: Vec<crate::network_schema::NetworkNestedTypeShape>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_value_type_shape: Option<crate::network_schema::NetworkNestedTypeShape>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2235,6 +2239,21 @@ fn state_field_shape_report(
             field_wire_shape_source(field, wire_shapes, wire_shape_sources)
         },
         value_type_candidates,
+        container_key_type_shape: if explicit_field_type.is_some() {
+            None
+        } else {
+            container_rust_shape
+                .as_ref()
+                .and_then(|shape| shape.container_key_type_shape.clone())
+        },
+        container_embedded_key_type_shapes: if explicit_field_type.is_some() {
+            Vec::new()
+        } else {
+            container_rust_shape
+                .as_ref()
+                .map(|shape| shape.container_embedded_key_type_shapes.clone())
+                .unwrap_or_default()
+        },
         container_value_type_shape: if explicit_field_type.is_some() {
             None
         } else {
@@ -3194,6 +3213,8 @@ fn is_native_type_field_name(name: &str) -> bool {
 struct RustFieldShape {
     value_type: String,
     field_type: String,
+    container_key_type_shape: Option<crate::network_schema::NetworkNestedTypeShape>,
+    container_embedded_key_type_shapes: Vec<crate::network_schema::NetworkNestedTypeShape>,
     container_value_type_shape: Option<crate::network_schema::NetworkNestedTypeShape>,
     container_embedded_value_type_shapes: Vec<crate::network_schema::NetworkNestedTypeShape>,
 }
@@ -3296,6 +3317,8 @@ fn rust_field_shape(shape: SchemaWireShape) -> RustFieldShape {
         SchemaWireShape::FixedBytes(len) => RustFieldShape {
             value_type: format!("[u8; {len}]"),
             field_type: format!("ReplicatedFieldHandler<[u8; {len}]>"),
+            container_key_type_shape: None,
+            container_embedded_key_type_shapes: Vec::new(),
             container_value_type_shape: None,
             container_embedded_value_type_shapes: Vec::new(),
         },
@@ -3312,6 +3335,8 @@ fn rust_field_shape_static(value_type: &'static str, field_type: &'static str) -
     RustFieldShape {
         value_type: value_type.to_owned(),
         field_type: field_type.to_owned(),
+        container_key_type_shape: None,
+        container_embedded_key_type_shapes: Vec::new(),
         container_value_type_shape: None,
         container_embedded_value_type_shapes: Vec::new(),
     }
@@ -3331,6 +3356,8 @@ fn replicated_container_field_shape(
     RustFieldShape {
         value_type: collection_type,
         field_type,
+        container_key_type_shape: None,
+        container_embedded_key_type_shapes: Vec::new(),
         container_value_type_shape: None,
         container_embedded_value_type_shapes: Vec::new(),
     }
@@ -3353,20 +3380,23 @@ fn replicated_container_semantic_field_shape(
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<RustFieldShape> {
     let value = container_value_type(field, container, value_type_candidates, serialize_types)?;
+    let key = match container.storage {
+        NetworkReplicatedContainerStorageKind::Map => {
+            Some(container_key_type(field, container, serialize_types)?)
+        }
+        NetworkReplicatedContainerStorageKind::Vec => None,
+    };
     let collection_type = match container.storage {
         NetworkReplicatedContainerStorageKind::Map => {
-            let key = container_key_type(field, container, serialize_types)?;
-            let key_type = key.rust_type;
-            keyed_replicated_container_type(&key_type, &value.rust_type)
+            let key_type = &key.as_ref()?.rust_type;
+            keyed_replicated_container_type(key_type, &value.rust_type)
         }
         NetworkReplicatedContainerStorageKind::Vec => {
             format!("::std::vec::Vec<{}>", value.rust_type)
         }
     };
     let key_marshaler = match container.storage {
-        NetworkReplicatedContainerStorageKind::Map => {
-            container_key_type(field, container, serialize_types)?.marshaler_type
-        }
+        NetworkReplicatedContainerStorageKind::Map => key.as_ref()?.marshaler_type.clone(),
         NetworkReplicatedContainerStorageKind::Vec => {
             "::nw_network::serialize::DefaultMarshaler<::nw_network::serialize::VlqU64>".to_owned()
         }
@@ -3378,6 +3408,11 @@ fn replicated_container_semantic_field_shape(
     Some(RustFieldShape {
         value_type: collection_type,
         field_type,
+        container_key_type_shape: key.as_ref().and_then(|key| key.value_type_shape.clone()),
+        container_embedded_key_type_shapes: key
+            .as_ref()
+            .map(|key| key.embedded_value_type_shapes.clone())
+            .unwrap_or_default(),
         container_value_type_shape: value.value_type_shape,
         container_embedded_value_type_shapes: value.embedded_value_type_shapes,
     })
@@ -4264,17 +4299,56 @@ fn replicated_state_field_support_tokens(
     emitted_names: &mut BTreeSet<String>,
 ) -> Vec<proc_macro2::TokenStream> {
     let mut items = Vec::new();
-    for shape in &field.container_embedded_value_type_shapes {
-        if !container_embedded_shape_is_referenced(field, shape) {
+    for shape in &field.container_embedded_key_type_shapes {
+        if !container_embedded_shape_is_referenced(field.container_key_type_shape.as_ref(), shape) {
             continue;
         }
-        if let Some(tokens) = replicated_state_shape_support_tokens(field, shape, emitted_names) {
+        if let Some(tokens) = replicated_state_shape_support_tokens(
+            field,
+            shape,
+            &field.container_embedded_key_type_shapes,
+            true,
+            emitted_names,
+        ) {
+            items.push(tokens);
+        }
+    }
+    if let Some(shape) = field.container_key_type_shape.as_ref()
+        && field_references_container_shape_codec(field, shape)
+        && let Some(tokens) = replicated_state_shape_support_tokens(
+            field,
+            shape,
+            &field.container_embedded_key_type_shapes,
+            true,
+            emitted_names,
+        )
+    {
+        items.push(tokens);
+    }
+    for shape in &field.container_embedded_value_type_shapes {
+        if !container_embedded_shape_is_referenced(field.container_value_type_shape.as_ref(), shape)
+        {
+            continue;
+        }
+        if let Some(tokens) = replicated_state_shape_support_tokens(
+            field,
+            shape,
+            &field.container_embedded_value_type_shapes,
+            false,
+            emitted_names,
+        ) {
             items.push(tokens);
         }
     }
     if let Some(shape) = field.container_value_type_shape.as_ref()
-        && field_references_container_value_shape_codec(field, shape)
-        && let Some(tokens) = replicated_state_shape_support_tokens(field, shape, emitted_names)
+        && field_references_container_shape_codec(field, shape)
+        && let Some(tokens) = replicated_state_shape_support_tokens(
+            field,
+            shape,
+            &field.container_embedded_value_type_shapes,
+            false,
+            emitted_names,
+        )
     {
         items.push(tokens);
     }
@@ -4282,10 +4356,10 @@ fn replicated_state_field_support_tokens(
 }
 
 fn container_embedded_shape_is_referenced(
-    field: &NetworkStateFieldShapeReport,
+    parent: Option<&crate::network_schema::NetworkNestedTypeShape>,
     shape: &crate::network_schema::NetworkNestedTypeShape,
 ) -> bool {
-    let Some(parent) = field.container_value_type_shape.as_ref() else {
+    let Some(parent) = parent else {
         return false;
     };
     parent.members.iter().any(|member| {
@@ -4300,7 +4374,7 @@ fn container_embedded_shape_is_referenced(
     })
 }
 
-fn field_references_container_value_shape_codec(
+fn field_references_container_shape_codec(
     field: &NetworkStateFieldShapeReport,
     shape: &crate::network_schema::NetworkNestedTypeShape,
 ) -> bool {
@@ -4316,6 +4390,8 @@ fn field_references_container_value_shape_codec(
 fn replicated_state_shape_support_tokens(
     field: &NetworkStateFieldShapeReport,
     shape: &crate::network_schema::NetworkNestedTypeShape,
+    embedded_shapes: &[crate::network_schema::NetworkNestedTypeShape],
+    derive_key_traits: bool,
     emitted_names: &mut BTreeSet<String>,
 ) -> Option<proc_macro2::TokenStream> {
     let codec_name = container_value_shape_report_codec_name(field, shape)?;
@@ -4342,7 +4418,7 @@ fn replicated_state_shape_support_tokens(
     let members = shape
         .members
         .iter()
-        .map(|member| container_value_member_tokens(field, member))
+        .map(|member| container_value_member_tokens(field, member, embedded_shapes))
         .collect::<Option<Vec<_>>>()?;
     if members.is_empty() {
         return None;
@@ -4416,6 +4492,7 @@ fn replicated_state_shape_support_tokens(
         let value_type_ident = local_value_type_name
             .as_deref()
             .map(|name| format_ident!("{name}"))?;
+        let key_derives = derive_key_traits.then(|| quote! { , Eq, Hash });
         let struct_fields = members.iter().map(|member| {
             let field_ident = &member.field_ident;
             let rust_type = &member.rust_type;
@@ -4424,7 +4501,7 @@ fn replicated_state_shape_support_tokens(
             }
         });
         quote! {
-            #[derive(Debug, Clone, Default, PartialEq)]
+            #[derive(Debug, Clone, Default, PartialEq #key_derives)]
             pub struct #value_type_ident {
                 #(#struct_fields)*
             }
@@ -4488,12 +4565,13 @@ struct ContainerValueMemberTokens {
 fn container_value_member_tokens(
     field: &NetworkStateFieldShapeReport,
     member: &crate::network_schema::NetworkNestedTypeMember,
+    embedded_shapes: &[crate::network_schema::NetworkNestedTypeShape],
 ) -> Option<ContainerValueMemberTokens> {
     let name = member.name.as_deref()?;
     let binding = format_ident!("field_{}", rust_field_ident(&name.replace('.', "_")));
     let access = member_access_tokens(name)?;
     let field_ident = format_ident!("{}", rust_field_ident(name));
-    let rust_type_string = container_value_member_rust_type(field, member)?;
+    let rust_type_string = container_value_member_rust_type(field, member, embedded_shapes)?;
     let rust_type = syn::parse_str::<syn::Type>(&rust_type_string).ok()?;
     let codec_type_string = container_value_member_codec_type(member, &rust_type_string)?;
     let codec_type = syn::parse_str::<syn::Type>(&codec_type_string).ok()?;
@@ -4563,11 +4641,10 @@ fn member_access_tokens(name: &str) -> Option<proc_macro2::TokenStream> {
 fn container_value_member_rust_type(
     field: &NetworkStateFieldShapeReport,
     member: &crate::network_schema::NetworkNestedTypeMember,
+    embedded_shapes: &[crate::network_schema::NetworkNestedTypeShape],
 ) -> Option<String> {
     let shape = member.wire_shape.as_deref()?;
-    if let Some(shape) =
-        nested_shape_by_wire_name(shape, &field.container_embedded_value_type_shapes)
-    {
+    if let Some(shape) = nested_shape_by_wire_name(shape, embedded_shapes) {
         return container_value_shape_report_rust_type(field, shape);
     }
     if let Some(native_type) = member.native_type.as_deref()
@@ -4582,10 +4659,7 @@ fn container_value_member_rust_type(
         let element_type = if let Some(element_shape) = wire_scalar_shape_from_name(element_shape) {
             scalar_rust_type(element_shape)
         } else {
-            let shape = nested_shape_by_wire_name(
-                element_shape,
-                &field.container_embedded_value_type_shapes,
-            )?;
+            let shape = nested_shape_by_wire_name(element_shape, embedded_shapes)?;
             container_value_shape_report_rust_type(field, shape)?
         };
         return Some(format!("::std::vec::Vec<{element_type}>"));
@@ -5059,7 +5133,7 @@ fn message_field_support_tokens(
     let members = shape
         .members
         .iter()
-        .map(|member| container_value_member_tokens(field, member))
+        .map(|member| container_value_member_tokens(field, member, &[]))
         .collect::<Option<Vec<_>>>()?;
     if members.is_empty() {
         return None;
@@ -6445,6 +6519,87 @@ mod tests {
         assert!(!compact_source.contains(
             "::nw_network::serialize::DefaultMarshaler<::nw_network::source::RecipeCooldownData>"
         ));
+    }
+
+    #[test]
+    fn container_key_type_shape_emits_key_codec() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "5E1977B4-E4C7-4F2A-8337-4BE775A9014C",
+                "typeIndex": 3312,
+                "typeName": "Javelin::GameModeParticipantReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "activeGameModes",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81b6fc8",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81b6fc8",
+                "fieldCount": 1,
+                "wireShape": "replicated-container<u32,u64>",
+                "wireShapeSource": "replicated-container-marshal-calls",
+                "containerShape": {
+                    "storage": "map",
+                    "keyWireShape": "u32",
+                    "keyWireShapes": ["u32", "u8"],
+                    "keyTypeShape": {
+                        "typeName": "Key",
+                        "typeNameSource": "container-structured-member-split",
+                        "memberNameSource": "container-value-wire-sequence",
+                        "memberNamesProven": true,
+                        "validation": "custom-replicated-container-value-shape",
+                        "members": [{
+                            "index": 0,
+                            "name": "game_mode_id",
+                            "nameProven": true,
+                            "wireShape": "u32"
+                        }, {
+                            "index": 1,
+                            "name": "queue_index",
+                            "nameProven": true,
+                            "wireShape": "u8"
+                        }]
+                    },
+                    "valueWireShapes": ["u64"],
+                    "source": "replicated-container-map-structured-key-shape"
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3312]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::nw_network::serialize::IndexMap<ActiveGameModesKey, u64>")
+        );
+        assert!(field.rust_field_type.as_deref().is_some_and(|ty| {
+            ty.contains("ActiveGameModesKeyMarshaler")
+                && ty.contains("::nw_network::serialize::DefaultMarshaler<u64>")
+        }));
+        assert!(
+            field
+                .container_key_type_shape
+                .as_ref()
+                .is_some_and(|shape| shape.type_name.as_deref() == Some("Key"))
+        );
+        assert!(output.source.contains("pub struct ActiveGameModesKey"));
+        assert!(
+            output
+                .source
+                .contains("pub struct ActiveGameModesKeyMarshaler")
+        );
+        let compact_source = output.source.split_whitespace().collect::<String>();
+        assert!(compact_source.contains("#[derive(Debug,Clone,Default,PartialEq,Eq,Hash)]"));
     }
 
     #[test]
