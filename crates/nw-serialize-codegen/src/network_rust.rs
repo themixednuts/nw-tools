@@ -4729,7 +4729,7 @@ fn message_field_support_tokens(
         return None;
     }
     let value_type = syn::parse_str::<syn::Type>(value_type_string).ok()?;
-    let value_type_ident = format_ident!("{value_type_string}");
+    let value_type_ident = syn::parse_str::<syn::Ident>(value_type_string).ok()?;
     let codec_name = format!("{}Marshaler", rust_type_ident(value_type_string));
     let codec_ident = format_ident!("{codec_name}");
     let members = shape

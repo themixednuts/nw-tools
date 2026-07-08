@@ -611,14 +611,21 @@
             return null;
         }
 
+        ArrayList<String> observedFull = new ArrayList<>();
+        collectOrderedMarshalShapes(marshalFull, 6, new LinkedHashSet<>(), observedFull);
+        if (!wireShapesContainSubsequence(
+                observedFull,
+                landClaimProgressionMarshalEvidenceWireShapes())) {
+            return null;
+        }
+
         Function fullValueMarshal = functionContainingMarshalShapeSubsequence(
             marshalFull,
             4,
-            landClaimProgressionValueWireShapes());
-        Function valueUnmarshal = functionContainingWireShapeSubsequence(
-            unmarshalFull,
-            4,
-            landClaimProgressionValueWireShapes());
+            landClaimProgressionMarshalEvidenceWireShapes());
+        if (fullValueMarshal == null) {
+            fullValueMarshal = functionAtOrContaining(marshalFull);
+        }
         Function firstVectorEvidence = functionContainingWireShapeSubsequence(
             unmarshalFull,
             4,
@@ -627,13 +634,9 @@
             unmarshalFull,
             4,
             landClaimProgressionSecondVectorWireShapes());
-        if (fullValueMarshal == null &&
-            (valueUnmarshal == null || firstVectorEvidence == null || secondVectorEvidence == null)) {
-            return null;
-        }
 
         ArrayList<String> observedDelta = new ArrayList<>();
-        collectOrderedMarshalShapes(marshal, 4, new LinkedHashSet<>(), observedDelta);
+        collectOrderedMarshalShapes(marshal, 5, new LinkedHashSet<>(), observedDelta);
         if (!containerDeltaPrefixShapeMatches(
             observedDelta,
             landClaimProgressionContainerDeltaWireShapes(),
@@ -642,7 +645,7 @@
         }
 
         Function firstElementEvidence = firstVectorEvidence == null
-            ? valueUnmarshal == null ? fullValueMarshal : valueUnmarshal
+            ? fullValueMarshal
             : firstVectorEvidence;
         Function secondElementEvidence = secondVectorEvidence == null
             ? fullValueMarshal
@@ -653,7 +656,7 @@
             landClaimProgressionSecondElementShape(vtable, secondElementEvidence);
         NestedTypeShape valueTypeShape = landClaimProgressionValueTypeShape(
             vtable,
-            valueUnmarshal == null ? fullValueMarshal : valueUnmarshal,
+            firstElementEvidence,
             firstElementShape,
             secondElementShape);
 
@@ -713,8 +716,20 @@
             "u8");
     }
 
+    private List<String> landClaimProgressionMarshalEvidenceWireShapes() {
+        return List.of(
+            "vlq-u32",
+            "u32",
+            "u8",
+            "u32",
+            "u8",
+            "vlq-u32",
+            "u32",
+            "u8");
+    }
+
     private List<String> landClaimProgressionFirstVectorWireShapes() {
-        return List.of("vlq-u32", "u32", "u8", "vlq-u32", "u8");
+        return List.of("vlq-u32", "u32", "u8", "vlq-u32");
     }
 
     private List<String> landClaimProgressionSecondVectorWireShapes() {
