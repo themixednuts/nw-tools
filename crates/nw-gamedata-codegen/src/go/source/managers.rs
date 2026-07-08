@@ -527,7 +527,7 @@ mod tests {
         GameSystemColumnSchema, GameSystemColumnValueShape, GameSystemDataTablesSchemaReport,
         GameSystemTableSchema,
     };
-    use crate::manager_records::{DirectManagerTable, ItemDataManagerTable};
+    use crate::manager_records::{DirectManagerTable, ItemDataManagerTable, SemanticLookupMethod};
     use crate::plan::GameDataCodegenPlan;
     use crate::schema::GameDataCompileMode;
     use crate::target::{GameDataTargetLanguage, GameDataTargetPlan};
@@ -658,6 +658,20 @@ mod tests {
         assert!(source.contains("func (manager *ItemDataManager) Items() []ItemData"));
     }
 
+    #[test]
+    fn semantic_into_crc_lookup_accepts_string_or_crc_key() {
+        let mut source = String::new();
+        push_semantic_manager_type(&mut source, &semantic_lookup_record());
+
+        assert!(source.contains(
+            "func (manager *StaticBackstoryDataManager) Backstory(backstoryId any) *StaticBackstoryData"
+        ));
+        assert!(source.contains("key, ok := crc32LookupKey(backstoryId)"));
+        assert!(source.contains(
+            "func (manager *StaticBackstoryDataManager) BackstoryByKey(backstoryKey string) *StaticBackstoryData"
+        ));
+    }
+
     fn damage_compile_unit() -> GameDataCompileUnit {
         let schema_report = damage_schema_report();
         let codegen_plan = GameDataCodegenPlan::from_schema_report(
@@ -701,6 +715,36 @@ mod tests {
                 variant_name: "Master".to_owned(),
                 table_name: "MasterItemDefinitions".to_owned(),
             }],
+        }
+    }
+
+    fn semantic_lookup_record() -> SemanticManagerRecord {
+        SemanticManagerRecord {
+            manager_name: "StaticBackstoryDataManager".to_owned(),
+            manager_class_name: "StaticBackstoryDataManager".to_owned(),
+            record_type_name: "StaticBackstoryData".to_owned(),
+            tables: Vec::new(),
+            key: None,
+            source_row_field: None,
+            source_row_method: None,
+            row_filters: Vec::new(),
+            fields: Vec::new(),
+            lookup_methods: vec![
+                SemanticLookupMethod {
+                    name: "backstory".to_owned(),
+                    parameter: "backstory_id".to_owned(),
+                    kind: SemanticLookupKind::IntoCrcKey,
+                },
+                SemanticLookupMethod {
+                    name: "backstory_by_key".to_owned(),
+                    parameter: "backstory_key".to_owned(),
+                    kind: SemanticLookupKind::CrcStringKey,
+                },
+            ],
+            ids_method: None,
+            rows_method: None,
+            len_method: None,
+            is_empty_method: None,
         }
     }
 
@@ -1946,6 +1990,21 @@ func new{manager_type}FromInstance(instance *managerInstance) (*{manager_type}, 
             SemanticLookupKind::CrcKey => source.push_str(&format!(
                 r#"func (manager *{manager_type}) {method_name}({parameter_name} uint32) *{record_type} {{
 	index, ok := manager.{by_key_field}[{parameter_name}]
+	if !ok {{
+		return nil
+	}}
+	return &manager.entries[index]
+}}
+
+"#
+            )),
+            SemanticLookupKind::IntoCrcKey => source.push_str(&format!(
+                r#"func (manager *{manager_type}) {method_name}({parameter_name} any) *{record_type} {{
+	key, ok := crc32LookupKey({parameter_name})
+	if !ok {{
+		return nil
+	}}
+	index, ok := manager.{by_key_field}[key]
 	if !ok {{
 		return nil
 	}}
@@ -3290,6 +3349,56 @@ func crc32Lowercase(value string) uint32 {
 		crc = crc32Table[(crc^uint32(b))&0xff] ^ (crc >> 8)
 	}
 	return crc ^ 0xffffffff
+}
+
+func crc32LookupKey(value any) (uint32, bool) {
+	switch typed := value.(type) {
+	case uint32:
+		return typed, true
+	case uint:
+		if uint64(typed) > 4294967295 {
+			return 0, false
+		}
+		return uint32(typed), true
+	case uint64:
+		if typed > 4294967295 {
+			return 0, false
+		}
+		return uint32(typed), true
+	case uint16:
+		return uint32(typed), true
+	case uint8:
+		return uint32(typed), true
+	case int:
+		if typed < 0 || uint64(typed) > math.MaxUint32 {
+			return 0, false
+		}
+		return uint32(typed), true
+	case int64:
+		if typed < 0 || typed > 4294967295 {
+			return 0, false
+		}
+		return uint32(typed), true
+	case int32:
+		if typed < 0 {
+			return 0, false
+		}
+		return uint32(typed), true
+	case int16:
+		if typed < 0 {
+			return 0, false
+		}
+		return uint32(typed), true
+	case int8:
+		if typed < 0 {
+			return 0, false
+		}
+		return uint32(typed), true
+	case string:
+		return crc32Lowercase(typed), true
+	default:
+		return 0, false
+	}
 }
 
 "#;

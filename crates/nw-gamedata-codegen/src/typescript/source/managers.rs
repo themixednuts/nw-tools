@@ -533,7 +533,7 @@ mod tests {
         GameSystemColumnSchema, GameSystemColumnValueShape, GameSystemDataTablesSchemaReport,
         GameSystemTableSchema,
     };
-    use crate::manager_records::{DirectManagerTable, ItemDataManagerTable};
+    use crate::manager_records::{DirectManagerTable, ItemDataManagerTable, SemanticLookupMethod};
     use crate::plan::GameDataCodegenPlan;
     use crate::schema::GameDataCompileMode;
     use crate::target::{GameDataTargetLanguage, GameDataTargetPlan};
@@ -599,6 +599,23 @@ mod tests {
         assert!(!source.contains("items(): readonly ItemData[]"));
     }
 
+    #[test]
+    fn semantic_into_crc_lookup_accepts_string_or_crc_key() {
+        let mut source = String::new();
+        push_semantic_manager_class(&mut source, &semantic_lookup_record());
+
+        assert!(
+            source.contains(
+                "backstory(backstoryId: string | number): StaticBackstoryData | undefined"
+            )
+        );
+        assert!(source.contains("this.rowsByKey.get(crc32LookupKey(backstoryId))"));
+        assert!(
+            source
+                .contains("backstoryByKey(backstoryKey: string): StaticBackstoryData | undefined")
+        );
+    }
+
     fn damage_compile_unit() -> GameDataCompileUnit {
         let schema_report = damage_schema_report();
         let codegen_plan = GameDataCodegenPlan::from_schema_report(
@@ -644,6 +661,36 @@ mod tests {
                 variant_name: "Master".to_owned(),
                 table_name: "MasterItemDefinitions".to_owned(),
             }],
+        }
+    }
+
+    fn semantic_lookup_record() -> SemanticManagerRecord {
+        SemanticManagerRecord {
+            manager_name: "StaticBackstoryDataManager".to_owned(),
+            manager_class_name: "StaticBackstoryDataManager".to_owned(),
+            record_type_name: "StaticBackstoryData".to_owned(),
+            tables: Vec::new(),
+            key: None,
+            source_row_field: None,
+            source_row_method: None,
+            row_filters: Vec::new(),
+            fields: Vec::new(),
+            lookup_methods: vec![
+                SemanticLookupMethod {
+                    name: "backstory".to_owned(),
+                    parameter: "backstory_id".to_owned(),
+                    kind: SemanticLookupKind::IntoCrcKey,
+                },
+                SemanticLookupMethod {
+                    name: "backstory_by_key".to_owned(),
+                    parameter: "backstory_key".to_owned(),
+                    kind: SemanticLookupKind::CrcStringKey,
+                },
+            ],
+            ids_method: None,
+            rows_method: None,
+            len_method: None,
+            is_empty_method: None,
         }
     }
 
@@ -1828,6 +1875,13 @@ export class {manager_class} implements Rows<{record_type}> {{
 
 "#
             )),
+            SemanticLookupKind::IntoCrcKey => source.push_str(&format!(
+                r#"  {method_name}({parameter_name}: string | number): {record_type} | undefined {{
+    return this.{by_key_field}.get(crc32LookupKey({parameter_name}));
+  }}
+
+"#
+            )),
             SemanticLookupKind::NumericKey(_) => source.push_str(&format!(
                 r#"  {method_name}({parameter_name}: number): {record_type} | undefined {{
     return this.{by_key_field}.get(normalizeNumericKey({parameter_name}));
@@ -2845,6 +2899,10 @@ function normalizeInt32(value: number): number {
 
 function normalizeCrcKey(value: number): number {
   return value >>> 0;
+}
+
+function crc32LookupKey(value: string | number): number {
+  return typeof value === "number" ? normalizeCrcKey(value) : crc32Lowercase(value);
 }
 
 function normalizeNumericKey(value: number): number {

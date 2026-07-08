@@ -243,6 +243,7 @@ pub(crate) struct SemanticLookupMethod {
 pub(crate) enum SemanticLookupKind {
     CrcStringKey,
     CrcKey,
+    IntoCrcKey,
     NumericKey(SemanticNumericKeyType),
     StringKey,
 }
@@ -1354,8 +1355,8 @@ fn crc_lookup_methods(methods: &[NativeCrcIndexLookupMethod]) -> Vec<SemanticLoo
             let kind = match parameter.kind() {
                 NativeCrcIndexLookupParameterKind::StrRef
                 | NativeCrcIndexLookupParameterKind::AsRefStr => SemanticLookupKind::CrcStringKey,
-                NativeCrcIndexLookupParameterKind::Crc32
-                | NativeCrcIndexLookupParameterKind::IntoCrc32 => SemanticLookupKind::CrcKey,
+                NativeCrcIndexLookupParameterKind::Crc32 => SemanticLookupKind::CrcKey,
+                NativeCrcIndexLookupParameterKind::IntoCrc32 => SemanticLookupKind::IntoCrcKey,
             };
             SemanticLookupMethod {
                 name: method.name().as_str().to_owned(),
@@ -1700,6 +1701,33 @@ mod tests {
         assert!(
             !emitted_names.contains("CurrencyExchangeMappingManager"),
             "manager-composition algorithms without generated semantic methods must not emit empty direct surfaces"
+        );
+
+        let backstory = surfaces
+            .iter()
+            .find_map(|surface| match surface {
+                ManagerSurface::Semantic(record)
+                    if record.manager_name == "StaticBackstoryDataManager" =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("StaticBackstoryDataManager semantic surface");
+        let backstory_lookup = backstory
+            .lookup_methods
+            .iter()
+            .find(|method| method.name == "backstory")
+            .expect("backstory lookup");
+        assert_eq!(backstory_lookup.kind, SemanticLookupKind::IntoCrcKey);
+        let backstory_by_key_lookup = backstory
+            .lookup_methods
+            .iter()
+            .find(|method| method.name == "backstory_by_key")
+            .expect("backstory_by_key lookup");
+        assert_eq!(
+            backstory_by_key_lookup.kind,
+            SemanticLookupKind::CrcStringKey
         );
     }
 }

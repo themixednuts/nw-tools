@@ -124,6 +124,25 @@ pub trait Rows {
     }
 }
 
+pub trait IntoCrc32Key {
+    fn into_crc32_key(self) -> u32;
+}
+
+impl IntoCrc32Key for u32 {
+    fn into_crc32_key(self) -> u32 {
+        self
+    }
+}
+
+impl<T> IntoCrc32Key for T
+where
+    T: AsRef<str>,
+{
+    fn into_crc32_key(self) -> u32 {
+        crc32_lowercase(self.as_ref())
+    }
+}
+
 "#,
     );
     push_rust_standalone_manager_definitions(&mut runtime_source, context, &surfaces);
@@ -457,7 +476,7 @@ mod tests {
         GameSystemColumnSchema, GameSystemColumnValueShape, GameSystemDataTablesSchemaReport,
         GameSystemTableSchema,
     };
-    use crate::manager_records::{DirectManagerTable, ItemDataManagerTable};
+    use crate::manager_records::{DirectManagerTable, ItemDataManagerTable, SemanticLookupMethod};
 
     use super::*;
 
@@ -527,6 +546,19 @@ mod tests {
         assert!(source.contains("type Row = ItemData"));
     }
 
+    #[test]
+    fn semantic_into_crc_lookup_accepts_string_or_crc_key() {
+        let methods = rust_semantic_lookup_methods(&semantic_lookup_record());
+
+        assert!(methods.contains(
+            "pub fn backstory(&self, backstory_id: impl IntoCrc32Key) -> Option<&StaticBackstoryData>"
+        ));
+        assert!(methods.contains("let key = backstory_id.into_crc32_key();"));
+        assert!(methods.contains(
+            "pub fn backstory_by_key(&self, backstory_key: impl AsRef<str>) -> Option<&StaticBackstoryData>"
+        ));
+    }
+
     fn damage_manager_surface() -> DirectManagerSurface {
         DirectManagerSurface {
             manager_name: "DamageDataManager".to_owned(),
@@ -560,6 +592,36 @@ mod tests {
                 variant_name: "Master".to_owned(),
                 table_name: "MasterItemDefinitions".to_owned(),
             }],
+        }
+    }
+
+    fn semantic_lookup_record() -> SemanticManagerRecord {
+        SemanticManagerRecord {
+            manager_name: "StaticBackstoryDataManager".to_owned(),
+            manager_class_name: "StaticBackstoryDataManager".to_owned(),
+            record_type_name: "StaticBackstoryData".to_owned(),
+            tables: Vec::new(),
+            key: None,
+            source_row_field: None,
+            source_row_method: None,
+            row_filters: Vec::new(),
+            fields: Vec::new(),
+            lookup_methods: vec![
+                SemanticLookupMethod {
+                    name: "backstory".to_owned(),
+                    parameter: "backstory_id".to_owned(),
+                    kind: SemanticLookupKind::IntoCrcKey,
+                },
+                SemanticLookupMethod {
+                    name: "backstory_by_key".to_owned(),
+                    parameter: "backstory_key".to_owned(),
+                    kind: SemanticLookupKind::CrcStringKey,
+                },
+            ],
+            ids_method: None,
+            rows_method: None,
+            len_method: None,
+            is_empty_method: None,
         }
     }
 
@@ -1890,6 +1952,14 @@ fn rust_semantic_lookup_methods(record: &SemanticManagerRecord) -> String {
             SemanticLookupKind::CrcKey => source.push_str(&format!(
                 r#"    pub fn {method_name}(&self, {parameter_name}: u32) -> Option<&{record_type}> {{
         self.entries_by_key.get(&{parameter_name}).map(|index| &self.entries[*index])
+    }}
+
+"#
+            )),
+            SemanticLookupKind::IntoCrcKey => source.push_str(&format!(
+                r#"    pub fn {method_name}(&self, {parameter_name}: impl IntoCrc32Key) -> Option<&{record_type}> {{
+        let key = {parameter_name}.into_crc32_key();
+        self.entries_by_key.get(&key).map(|index| &self.entries[*index])
     }}
 
 "#
