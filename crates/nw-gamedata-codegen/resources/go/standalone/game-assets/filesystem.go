@@ -1,14 +1,19 @@
 package gameassets
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 )
 
 func LoadLooseDatasheets(root string) ([]DatasheetAsset, error) {
+	resolvedRoot, err := canonicalPath(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve datasheet root %s: %w", root, err)
+	}
 	var assets []DatasheetAsset
-	if err := collectLooseDatasheets(root, root, &assets); err != nil {
+	if err := collectLooseDatasheets(resolvedRoot, resolvedRoot, &assets); err != nil {
 		return nil, err
 	}
 	return assets, nil
@@ -41,6 +46,9 @@ func collectLooseDatasheets(root string, dir string, assets *[]DatasheetAsset) e
 		relative, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
+		}
+		if relativePathEscapesRoot(relative) {
+			return fmt.Errorf("datasheet path %s is outside root %s", path, root)
 		}
 		*assets = append(*assets, DatasheetAsset{
 			Path:  NormalizeVirtualPath(relative),

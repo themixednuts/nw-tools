@@ -223,7 +223,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
+    let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) else {
+        println!("cargo:warning=CARGO_MANIFEST_DIR was not set; skipping Oodle DLL copy");
+        return;
+    };
     let bin_dir = manifest_dir.join("bin");
     println!("cargo:rerun-if-changed={}", bin_dir.display());
     println!("cargo:rustc-link-search={}", bin_dir.display());
@@ -239,11 +242,21 @@ fn copy_runtime_dlls(bin_dir: &Path) {
         if !source.is_file() {
             continue;
         }
-        let _ = fs::copy(&source, profile_dir.join(name));
+        copy_runtime_dll(&source, &profile_dir.join(name));
         let deps_dir = profile_dir.join("deps");
         if deps_dir.is_dir() {
-            let _ = fs::copy(&source, deps_dir.join(name));
+            copy_runtime_dll(&source, &deps_dir.join(name));
         }
+    }
+}
+
+fn copy_runtime_dll(source: &Path, target: &Path) {
+    if let Err(error) = fs::copy(source, target) {
+        println!(
+            "cargo:warning=failed to copy {} to {}: {error}",
+            source.display(),
+            target.display()
+        );
     }
 }
 
@@ -322,8 +335,9 @@ struct PakEntryRef {
 
 impl AssetLoader {
     pub fn from_dir(asset_root: impl AsRef<Path>) -> Result<Self> {
-        let asset_root = asset_root.as_ref();
-        let pak_paths = collect_pak_paths(asset_root)?;
+        let asset_root = canonical_path(asset_root.as_ref())
+            .with_context(|| format!("resolve asset root {}", asset_root.as_ref().display()))?;
+        let pak_paths = collect_pak_paths(&asset_root)?;
         if pak_paths.is_empty() {
             bail!("no .pak files found under {}", asset_root.display());
         }
@@ -337,7 +351,7 @@ impl AssetLoader {
                 PakReader::open(&pak_path)
                     .with_context(|| format!("open pak {}", pak_path.display()))?,
             );
-            let mount_root = pak_mount_root(asset_root, &pak_path)?;
+            let mount_root = pak_mount_root(&asset_root, &pak_path)?;
             for entry in reader.entries() {
                 let path = normalize_data_path(&mounted_entry_path(&mount_root, entry.name()));
                 if claimed_paths.insert(path.clone()) {
@@ -450,14 +464,24 @@ fn collect_pak_paths(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn collect_pak_paths_inner(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    if path.is_file() {
+    let metadata =
+        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_file() {
         if path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("pak"))
         {
-            out.push(path.to_path_buf());
+            out.push(
+                canonical_path(path).with_context(|| format!("resolve pak {}", path.display()))?,
+            );
         }
+        return Ok(());
+    }
+    if !metadata.is_dir() {
         return Ok(());
     }
 
@@ -478,6 +502,10 @@ fn pak_mount_root(asset_root: &Path, pak_path: &Path) -> Result<String> {
         )
     })?;
     Ok(normalize_data_path(&relative.to_string_lossy()))
+}
+
+fn canonical_path(path: &Path) -> Result<PathBuf> {
+    std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))
 }
 
 fn mounted_entry_path(mount_root: &str, entry_name: &str) -> String {
@@ -585,6 +613,9 @@ mod tests {
             .expect("build.rs")
             .source();
         assert!(build_rs.contains("manifest_dir.join(\"bin\")"));
+        assert!(build_rs.contains("env::var_os(\"CARGO_MANIFEST_DIR\").map(PathBuf::from)"));
+        assert!(build_rs.contains("cargo:warning=failed to copy"));
+        assert!(!build_rs.contains("let _ = fs::copy"));
         assert!(
             project
                 .files()
@@ -668,6 +699,9 @@ mod tests {
         assert!(assets.contains("pub(crate) struct PakDatasheetSource"));
         assert!(assets.contains("pub(crate) fn datasheet_source"));
         assert!(assets.contains("pub(crate) fn load_pak_datasheet_source"));
+        assert!(assets.contains("std::fs::canonicalize(path)"));
+        assert!(assets.contains("std::fs::symlink_metadata(path)"));
+        assert!(assets.contains("pak {} is not under asset root {}"));
         assert!(!assets.contains("pub struct PakDatasheetSource"));
         assert!(!assets.contains("pub fn datasheet_source"));
         assert!(

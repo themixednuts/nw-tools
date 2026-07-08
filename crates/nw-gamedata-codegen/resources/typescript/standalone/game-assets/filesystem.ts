@@ -1,12 +1,13 @@
-import { readdir, readFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { readdir, readFile, realpath } from "node:fs/promises";
+import { isAbsolute, join, relative, sep } from "node:path";
 
 import { normalizeVirtualPath } from "./catalog.js";
 import { type DatasheetAsset, isDatasheetBytes, isDatasheetPath } from "./datasheet.js";
 
 export async function loadLooseDatasheets(root: string): Promise<DatasheetAsset[]> {
+  const resolvedRoot = await realpath(root);
   const assets: DatasheetAsset[] = [];
-  await collectLooseDatasheets(root, root, assets);
+  await collectLooseDatasheets(resolvedRoot, resolvedRoot, assets);
   return assets;
 }
 
@@ -26,9 +27,17 @@ async function collectLooseDatasheets(root: string, dir: string, assets: Datashe
     if (!isDatasheetBytes(bytes)) {
       continue;
     }
+    const relativePath = relative(root, path);
+    if (isOutsideRelativePath(relativePath)) {
+      throw new Error(`datasheet path ${path} is outside root ${root}`);
+    }
     assets.push({
-      path: normalizeVirtualPath(relative(root, path)),
+      path: normalizeVirtualPath(relativePath),
       bytes
     });
   }
+}
+
+function isOutsideRelativePath(path: string): boolean {
+  return path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path);
 }

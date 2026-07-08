@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
-import { open, readdir, readFile, type FileHandle } from "node:fs/promises";
-import { delimiter, dirname, join, relative } from "node:path";
+import { open, readdir, readFile, realpath, type FileHandle } from "node:fs/promises";
+import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { inflateRawSync, inflateSync } from "node:zlib";
 
@@ -142,12 +142,17 @@ export class PakArchive {
   }
 
   static async open(path: string): Promise<PakArchive> {
-    const file = await open(path, "r");
+    const resolvedPath = await realpath(path);
+    const file = await open(resolvedPath, "r");
     try {
-      const entries = await parsePakEntriesFromFile(path, file);
-      return new PakArchive(path, entries, { file });
+      const entries = await parsePakEntriesFromFile(resolvedPath, file);
+      return new PakArchive(resolvedPath, entries, { file });
     } catch (error) {
-      await file.close();
+      try {
+        await file.close();
+      } catch (closeError) {
+        throw new AggregateError([error, closeError], `failed to open pak archive ${resolvedPath} and close its file handle`);
+      }
       throw error;
     }
   }
@@ -228,9 +233,11 @@ export class AssetLoader {
   }
 
   static async fromDir(assetRoot: string, options: AssetLoaderOptions = {}): Promise<AssetLoader> {
-    const pakPaths = [...(options.pakPaths ?? (await collectPakPaths(assetRoot)))].sort((left, right) => left.localeCompare(right));
+    const root = await realpath(assetRoot);
+    const pakPaths = await canonicalPakPaths(options.pakPaths ?? (await collectPakPaths(root)));
+    pakPaths.sort((left, right) => left.localeCompare(right));
     if (pakPaths.length === 0) {
-      throw new Error(`no .pak files found under ${assetRoot}`);
+      throw new Error(`no .pak files found under ${root}`);
     }
 
     const mountedArchives: MountedPakArchive[] = [];
@@ -240,7 +247,7 @@ export class AssetLoader {
 
       for (const pakPath of pakPaths) {
         const archive = await openPakArchive(pakPath);
-        const mountRoot = pakMountRoot(assetRoot, pakPath);
+        const mountRoot = pakMountRoot(root, pakPath);
         mountedArchives.push({ mountRoot, archive });
 
         for (const entry of archive.entries) {
@@ -256,13 +263,17 @@ export class AssetLoader {
       const catalog = await loadCatalogFromPaks(mountedArchives);
       return new AssetLoader(catalog, mountedArchives, entriesByPath, options);
     } catch (error) {
-      await Promise.all(mountedArchives.map((mounted) => mounted.archive.close()));
+      try {
+        await closeMountedArchives(mountedArchives);
+      } catch (closeError) {
+        throw new AggregateError([error, closeError], `failed to open asset loader and close opened pak archives`);
+      }
       throw error;
     }
   }
 
   async close(): Promise<void> {
-    await Promise.all(this.mountedArchives.map((mounted) => mounted.archive.close()));
+    await closeMountedArchives(this.mountedArchives);
   }
 
   async read(path: string, options: PakReadOptions = {}): Promise<Uint8Array> {
@@ -357,12 +368,45 @@ async function collectPakPathsInto(dir: string, out: string[]): Promise<void> {
   }
 }
 
+async function canonicalPakPaths(paths: readonly string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const path of paths) {
+    out.push(await realpath(path));
+  }
+  return out;
+}
+
+async function closeMountedArchives(mountedArchives: readonly MountedPakArchive[]): Promise<void> {
+  const errors: unknown[] = [];
+  for (const mounted of mountedArchives) {
+    try {
+      await mounted.archive.close();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length === 1) {
+    throw errors[0];
+  }
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "failed to close pak archives");
+  }
+}
+
 function pakMountRoot(assetRoot: string, pakPath: string): string {
-  const relativePakDir = dirname(relative(assetRoot, pakPath));
+  const relativePakPath = relative(assetRoot, pakPath);
+  if (isOutsideRelativePath(relativePakPath)) {
+    throw new Error(`pak path ${pakPath} is outside asset root ${assetRoot}`);
+  }
+  const relativePakDir = dirname(relativePakPath);
   if (relativePakDir === ".") {
     return "";
   }
   return normalizeVirtualPath(relativePakDir);
+}
+
+function isOutsideRelativePath(path: string): boolean {
+  return path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path);
 }
 
 function mountedEntryPath(mountRoot: string, entry: string): string {

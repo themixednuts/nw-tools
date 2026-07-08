@@ -427,9 +427,22 @@ mod tests {
             .find(|file| file.path() == Path::new("gameassets/pak.go"))
             .expect("pak asset loader")
             .contents();
+        assert!(pak.contains("filepath.EvalSymlinks"));
+        assert!(pak.contains("canonicalPakPaths"));
+        assert!(pak.contains("pak path %s is outside asset root %s"));
+        assert!(pak.contains("errors.Join(err, closeErr)"));
         assert!(!pak.contains("type PakDatasheetSource struct"));
         assert!(!pak.contains("func (loader *AssetLoader) DatasheetSource"));
         assert!(!pak.contains("func LoadPakDatasheetSource"));
+
+        let filesystem = output
+            .files()
+            .iter()
+            .find(|file| file.path() == Path::new("gameassets/filesystem.go"))
+            .expect("filesystem asset loader")
+            .contents();
+        assert!(filesystem.contains("resolve datasheet root %s"));
+        assert!(filesystem.contains("relativePathEscapesRoot(relative)"));
     }
 
     fn manager_definition_names(source: &str) -> BTreeSet<String> {

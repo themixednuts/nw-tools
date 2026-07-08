@@ -65,7 +65,12 @@ func (err UnsupportedPakCompressionError) Error() string {
 }
 
 func OpenPakArchive(path string) (*PakArchive, error) {
-	reader, err := zip.OpenReader(path)
+	resolvedPath, err := canonicalPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve pak path %s: %w", path, err)
+	}
+
+	reader, err := zip.OpenReader(resolvedPath)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +92,7 @@ func OpenPakArchive(path string) (*PakArchive, error) {
 	}
 
 	return &PakArchive{
-		Path:    path,
+		Path:    resolvedPath,
 		reader:  reader,
 		entries: entries,
 		byName:  byName,
@@ -147,16 +152,25 @@ func (archive *PakArchive) ReadEntry(entry PakEntryInfo) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer stream.Close()
 
 	bytes, err := io.ReadAll(stream)
+	closeErr := stream.Close()
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, closeErr)
+	}
+	if closeErr != nil {
+		return nil, closeErr
 	}
 	return peelAzcs(bytes)
 }
 
-func OpenDir(assetRoot string, pakPaths ...string) (*AssetLoader, error) {
+func OpenDir(assetRoot string, pakPaths ...string) (_ *AssetLoader, err error) {
+	originalRoot := assetRoot
+	assetRoot, err = canonicalPath(assetRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve asset root %s: %w", originalRoot, err)
+	}
+
 	if len(pakPaths) == 0 {
 		collected, err := CollectPakPaths(assetRoot)
 		if err != nil {
@@ -164,8 +178,10 @@ func OpenDir(assetRoot string, pakPaths ...string) (*AssetLoader, error) {
 		}
 		pakPaths = collected
 	} else {
-		pakPaths = append([]string(nil), pakPaths...)
-		sort.Strings(pakPaths)
+		pakPaths, err = canonicalPakPaths(pakPaths)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(pakPaths) == 0 {
 		return nil, fmt.Errorf("no .pak files found under %s", assetRoot)
@@ -175,8 +191,8 @@ func OpenDir(assetRoot string, pakPaths ...string) (*AssetLoader, error) {
 	closeOnError := true
 	defer func() {
 		if closeOnError {
-			for _, mounted := range mountedArchives {
-				_ = mounted.archive.Close()
+			if closeErr := closeMountedArchives(mountedArchives); closeErr != nil {
+				err = errors.Join(err, closeErr)
 			}
 		}
 	}()
@@ -191,7 +207,9 @@ func OpenDir(assetRoot string, pakPaths ...string) (*AssetLoader, error) {
 		}
 		mountRoot, err := pakMountRoot(assetRoot, pakPath)
 		if err != nil {
-			_ = archive.Close()
+			if closeErr := archive.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
 			return nil, err
 		}
 		mountedArchives = append(mountedArchives, mountedPakArchive{
@@ -223,13 +241,7 @@ func OpenDir(assetRoot string, pakPaths ...string) (*AssetLoader, error) {
 }
 
 func (loader *AssetLoader) Close() error {
-	var closeErr error
-	for _, mounted := range loader.mountedArchives {
-		if err := mounted.archive.Close(); err != nil && closeErr == nil {
-			closeErr = err
-		}
-	}
-	return closeErr
+	return closeMountedArchives(loader.mountedArchives)
 }
 
 func (loader *AssetLoader) Read(path string) ([]byte, error) {
@@ -276,8 +288,13 @@ func LoadRascCatalogFromLooseFile(path string) (AssetCatalog, error) {
 }
 
 func CollectPakPaths(root string) ([]string, error) {
+	resolvedRoot, err := canonicalPath(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve pak root %s: %w", root, err)
+	}
+
 	var paths []string
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+	err = filepath.WalkDir(resolvedRoot, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -310,16 +327,54 @@ func loadCatalogFromPaks(mountedArchives []mountedPakArchive) (AssetCatalog, err
 	return AssetCatalog{}, fmt.Errorf("asset catalog %s was not found in selected paks", AssetCatalogPath)
 }
 
+func canonicalPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(absolute)
+}
+
+func canonicalPakPaths(paths []string) ([]string, error) {
+	resolved := make([]string, 0, len(paths))
+	for _, path := range paths {
+		resolvedPath, err := canonicalPath(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve pak path %s: %w", path, err)
+		}
+		resolved = append(resolved, resolvedPath)
+	}
+	sort.Strings(resolved)
+	return resolved, nil
+}
+
+func closeMountedArchives(mountedArchives []mountedPakArchive) error {
+	var closeErr error
+	for _, mounted := range mountedArchives {
+		if err := mounted.archive.Close(); err != nil {
+			closeErr = errors.Join(closeErr, err)
+		}
+	}
+	return closeErr
+}
+
 func pakMountRoot(assetRoot string, pakPath string) (string, error) {
 	relative, err := filepath.Rel(assetRoot, pakPath)
 	if err != nil {
 		return "", err
+	}
+	if relativePathEscapesRoot(relative) {
+		return "", fmt.Errorf("pak path %s is outside asset root %s", pakPath, assetRoot)
 	}
 	dir := filepath.Dir(relative)
 	if dir == "." {
 		return "", nil
 	}
 	return NormalizeVirtualPath(dir), nil
+}
+
+func relativePathEscapesRoot(relative string) bool {
+	return relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative)
 }
 
 func mountedEntryPath(mountRoot string, entry string) string {

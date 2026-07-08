@@ -323,9 +323,22 @@ mod tests {
             .contents();
         assert!(pak.contains("export interface AssetLoaderOptions"));
         assert!(pak.contains("Symbol.for(\"@nw-tools/asset-loader/source\")"));
+        assert!(pak.contains("realpath(assetRoot)"));
+        assert!(pak.contains("canonicalPakPaths"));
+        assert!(pak.contains("pak path ${pakPath} is outside asset root ${assetRoot}"));
+        assert!(pak.contains("closeMountedArchives"));
         assert!(!pak.contains("export interface PakDatasheetSource"));
         assert!(!pak.contains("export interface BinaryAsset"));
         assert!(!pak.contains("export async function loadPakDatasheetSource"));
+
+        let filesystem = output
+            .files()
+            .iter()
+            .find(|file| file.path() == Path::new("src/game-assets/filesystem.ts"))
+            .expect("filesystem asset loader")
+            .contents();
+        assert!(filesystem.contains("realpath(root)"));
+        assert!(filesystem.contains("datasheet path ${path} is outside root ${root}"));
     }
 
     fn manager_definition_names(source: &str) -> BTreeSet<String> {
