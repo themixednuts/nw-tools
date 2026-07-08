@@ -19,7 +19,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v45";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v46";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -1438,7 +1438,14 @@ fn candidate_backed_container_shape_from_vtable(
     vtable: &crate::network_schema::NetworkFieldHandlerVtable,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<NetworkReplicatedContainerShape> {
-    if vtable.handler_kind.as_deref() != Some("replicated-container") {
+    if vtable
+        .handler_kind
+        .as_deref()
+        .is_some_and(|kind| kind != "replicated-container")
+    {
+        return None;
+    }
+    if vtable.handler_kind.is_none() && !has_container_marshal_sequence(vtable) {
         return None;
     }
 
@@ -1516,6 +1523,22 @@ fn candidate_backed_container_shape_from_vtable(
         embedded_value_type_shapes: Vec::new(),
         source: Some("replicated-container-map-candidate-value-suffix".to_owned()),
     })
+}
+
+fn has_container_marshal_sequence(
+    vtable: &crate::network_schema::NetworkFieldHandlerVtable,
+) -> bool {
+    vtable.full_marshal_shapes.first().map(String::as_str) == Some("sequence-number")
+        && vtable
+            .full_marshal_shapes
+            .iter()
+            .skip(1)
+            .any(|shape| shape == "vlq-u32")
+        && vtable
+            .delta_marshal_shapes
+            .iter()
+            .position(|shape| shape == "sequence-number")
+            .is_some_and(|sequence_index| sequence_index > 0)
 }
 
 fn unique_candidate_serialize_type_for_wire_shapes<'a>(
@@ -7407,7 +7430,22 @@ mod tests {
             "fieldHandlerVtables": [{
                 "address": "NewWorld+0x8258560",
                 "fieldCount": 1,
-                "handlerKind": "replicated-container",
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "vlq-u32",
+                    "u8",
+                    "u64",
+                    "u8",
+                    "sequence-number",
+                    "u8",
+                    "u64",
+                    "u8",
+                    "u64",
+                    "u8",
+                    "sequence-number",
+                    "sequence-number",
+                    "vlq-u32"
+                ],
                 "fullMarshalShapes": [
                     "sequence-number",
                     "vlq-u32",
