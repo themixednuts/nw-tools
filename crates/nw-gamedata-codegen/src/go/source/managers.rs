@@ -10,9 +10,9 @@ use crate::go::source::format_go_source;
 use crate::manager_records::{
     DirectManagerSurface, ItemDataManagerSurface, ManagerSurface, ManagerSurfaceDependency,
     SemanticLookupKind, SemanticManagerKey, SemanticManagerRecord, SemanticNumericKeyType,
-    SemanticProjectionTransform, SemanticRowFilterPredicate, go_field_name, go_method_name,
-    lower_camel, manager_surface_dependencies, manager_surface_name, manager_surfaces,
-    semantic_manager_record_unit,
+    SemanticProjectionTransform, SemanticRowFilterPredicate, default_direct_manager_row_type,
+    go_field_name, go_method_name, lower_camel, manager_surface_dependencies, manager_surface_name,
+    manager_surfaces, semantic_manager_record_unit,
 };
 use crate::naming::{to_snake_ident, to_upper_camel_ident};
 use nw_serialize_codegen::{
@@ -145,6 +145,10 @@ type assetSource struct {{
 type binaryAsset struct {{
 	Path  string
 	Bytes []byte
+}}
+
+type Rows[T any] interface {{
+	Rows() ([]T, error)
 }}
 
 "#,
@@ -491,6 +495,17 @@ fn go_schema_row_type_name(row_type: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use nw_datasheet::game_system::Crc32;
+
+    use crate::game_system_schema::{
+        GameSystemColumnSchema, GameSystemColumnValueShape, GameSystemDataTablesSchemaReport,
+        GameSystemTableSchema,
+    };
+    use crate::manager_records::{DirectManagerTable, ItemDataManagerTable};
+    use crate::plan::GameDataCodegenPlan;
+    use crate::schema::GameDataCompileMode;
+    use crate::target::{GameDataTargetLanguage, GameDataTargetPlan};
+
     use super::*;
 
     #[test]
@@ -558,6 +573,163 @@ mod tests {
             seen_index < table_loop_index && table_loop_index < row_loop_index,
             "duplicate-key tracking must be scoped across every table and row"
         );
+    }
+
+    #[test]
+    fn direct_schema_manager_uses_rows_contract_for_primary_row_type() {
+        let unit = damage_compile_unit();
+        let manager = damage_manager_surface();
+        let methods = direct_go_schema_methods(&unit, &manager);
+
+        assert!(
+            methods.contains(
+                "func (manager *DamageDataManager) Rows() ([]DamageDataSchemaRow, error)"
+            )
+        );
+        assert!(methods.contains(
+            "func (manager *DamageDataManager) Get(key string) (*DamageDataSchemaRow, error)"
+        ));
+        assert!(methods.contains(
+            "func (manager *DamageDataManager) AfflictionDataRows() ([]AfflictionDataSchemaRow, error)"
+        ));
+        assert!(methods.contains(
+            "func (manager *DamageDataManager) DamageTypeDataRows() ([]DamageTypeDataSchemaRow, error)"
+        ));
+        assert!(!methods.contains(
+            "func (manager *DamageDataManager) DamageDataRows() ([]DamageDataSchemaRow, error)"
+        ));
+        assert!(!methods.contains(
+            "func (manager *DamageDataManager) DamageData(key string) (*DamageDataSchemaRow, error)"
+        ));
+    }
+
+    #[test]
+    fn item_data_manager_uses_rows_contract() {
+        let mut source = String::new();
+        push_item_data_manager_type(&mut source, &item_data_manager_surface());
+
+        assert!(source.contains("func (manager *ItemDataManager) Rows() ([]ItemData, error)"));
+        assert!(source.contains("func (manager *ItemDataManager) Items() []ItemData"));
+    }
+
+    fn damage_compile_unit() -> GameDataCompileUnit {
+        let schema_report = damage_schema_report();
+        let codegen_plan = GameDataCodegenPlan::from_schema_report(
+            GameDataCompileMode::SourceFormat,
+            &schema_report,
+            vec![GameDataTargetPlan::standalone(GameDataTargetLanguage::Go)],
+        );
+        GameDataCompileUnit::new(schema_report.clone(), schema_report, codegen_plan)
+    }
+
+    fn damage_manager_surface() -> DirectManagerSurface {
+        DirectManagerSurface {
+            manager_name: "DamageDataManager".to_owned(),
+            manager_class_name: "DamageDataManager".to_owned(),
+            tables: vec![
+                DirectManagerTable {
+                    table_name: "DamageData".to_owned(),
+                    row_type_name: "DamageData".to_owned(),
+                },
+                DirectManagerTable {
+                    table_name: "AfflictionData".to_owned(),
+                    row_type_name: "AfflictionData".to_owned(),
+                },
+                DirectManagerTable {
+                    table_name: "DamageTypeData".to_owned(),
+                    row_type_name: "DamageTypeData".to_owned(),
+                },
+            ],
+            products: Vec::new(),
+        }
+    }
+
+    fn item_data_manager_surface() -> ItemDataManagerSurface {
+        ItemDataManagerSurface {
+            manager_name: "ItemDataManager".to_owned(),
+            manager_class_name: "ItemDataManager".to_owned(),
+            table_type_name: "ItemDataTable".to_owned(),
+            handle_type_name: "ItemDataHandle".to_owned(),
+            data_type_name: "ItemData".to_owned(),
+            tables: vec![ItemDataManagerTable {
+                variant_name: "Master".to_owned(),
+                table_name: "MasterItemDefinitions".to_owned(),
+            }],
+        }
+    }
+
+    fn damage_schema_report() -> GameSystemDataTablesSchemaReport {
+        GameSystemDataTablesSchemaReport {
+            tables: vec![
+                schema_table(
+                    "DamageData",
+                    "DamageData",
+                    vec![
+                        schema_column("DamageID", ColumnType::String, true),
+                        schema_column("BaseDamage", ColumnType::Number, false),
+                    ],
+                ),
+                schema_table(
+                    "AfflictionData",
+                    "AfflictionData",
+                    vec![
+                        schema_column("AfflictionID", ColumnType::String, true),
+                        schema_column("DisplayName", ColumnType::String, false),
+                    ],
+                ),
+                schema_table(
+                    "DamageTypeData",
+                    "DamageTypeData",
+                    vec![
+                        schema_column("DamageTypeID", ColumnType::String, true),
+                        schema_column("IsElemental", ColumnType::Boolean, false),
+                    ],
+                ),
+            ],
+            diagnostics: Vec::new(),
+            type_affinities: Vec::new(),
+        }
+    }
+
+    fn schema_table(
+        table_name: &str,
+        row_type_name: &str,
+        columns: Vec<GameSystemColumnSchema>,
+    ) -> GameSystemTableSchema {
+        GameSystemTableSchema {
+            table_name: table_name.to_owned(),
+            table_name_crc: Crc32::from_str_lower(table_name).value(),
+            row_type_name: row_type_name.to_owned(),
+            row_type_crc: Crc32::from_str_lower(row_type_name).value(),
+            row_count: 1,
+            sources: vec![format!("{table_name}.datasheet")],
+            columns,
+        }
+    }
+
+    fn schema_column(
+        name: &str,
+        declared_type: ColumnType,
+        row_key: bool,
+    ) -> GameSystemColumnSchema {
+        GameSystemColumnSchema {
+            name: name.to_owned(),
+            crc: Crc32::from_str_lower(name).value(),
+            declared_type,
+            row_key,
+            required: row_key,
+            non_empty_rows: usize::from(row_key),
+            empty_rows: usize::from(!row_key),
+            distinct_values: usize::from(row_key),
+            value_shape: GameSystemColumnValueShape::String {
+                identifier_like: true,
+                localized_key_like: false,
+                asset_path_like: false,
+                expression_like: false,
+                list: None,
+                foreign_keys: Vec::new(),
+            },
+        }
     }
 }
 
@@ -824,14 +996,16 @@ fn direct_go_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerS
         return String::new();
     }
 
-    let single_row_type = row_types.len() == 1;
+    let default_row_type =
+        default_direct_manager_row_type(&manager.manager_name, &row_types).map(str::to_owned);
     let mut source = String::new();
     for row_type in row_types {
         let Some(row_spec) = row_specs.iter().find(|row| row.source_row_type == row_type) else {
             continue;
         };
         let type_name = &row_spec.type_name;
-        let rows_method = if single_row_type {
+        let is_default_row_type = default_row_type.as_deref() == Some(row_type.as_str());
+        let rows_method = if is_default_row_type {
             "Rows".to_owned()
         } else {
             format!("{}Rows", go_method_name(&row_type))
@@ -846,13 +1020,14 @@ fn direct_go_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerS
             reader = go_schema_reader_name(&row_type),
         ));
         if let Some(key_field) = row_spec.fields.iter().find(|field| field.row_key) {
-            let lookup_method = if single_row_type {
+            let lookup_method = if is_default_row_type {
                 "Get".to_owned()
             } else {
                 go_method_name(&row_type)
             };
+            let key_type = go_schema_field_type(key_field.column_type, true);
             source.push_str(&format!(
-                r#"func (manager *{manager_type}) {lookup_method}(key any) (*{type_name}, error) {{
+                r#"func (manager *{manager_type}) {lookup_method}(key {key_type}) (*{type_name}, error) {{
 	return schemaRow(manager.instance, {row_type:?}, key, {reader}, func(row {type_name}) any {{ return row.{key_field} }})
 }}
 
@@ -1338,6 +1513,10 @@ func (manager *{manager_type}) ByIndex(index uint32) *{data_type} {{
 	return &manager.items[zeroBased]
 }}
 
+func (manager *{manager_type}) Rows() ([]{data_type}, error) {{
+	return manager.items, nil
+}}
+
 func (manager *{manager_type}) Items() []{data_type} {{
 	return manager.items
 }}
@@ -1607,15 +1786,24 @@ func new{manager_type}FromInstance(instance *managerInstance) (*{manager_type}, 
 "#
         ));
     }
+    source.push_str(&format!(
+        r#"func (manager *{manager_type}) Rows() ([]{record_type}, error) {{
+	return manager.entries, nil
+}}
+
+"#
+    ));
     if let Some(method) = &record.rows_method {
         let method_name = go_method_name(method);
-        source.push_str(&format!(
-            r#"func (manager *{manager_type}) {method_name}() []{record_type} {{
+        if method_name != "Rows" {
+            source.push_str(&format!(
+                r#"func (manager *{manager_type}) {method_name}() []{record_type} {{
 	return manager.entries
 }}
 
 "#
-        ));
+            ));
+        }
     }
     if let Some(method) = &record.len_method {
         let method_name = go_method_name(method);

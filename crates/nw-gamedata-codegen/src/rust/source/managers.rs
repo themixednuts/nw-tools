@@ -10,7 +10,8 @@ use crate::manager_records::{
     DirectManagerSurface, ItemDataManagerSurface, ManagerSurface, ManagerSurfaceDependency,
     SemanticLookupKind, SemanticManagerKey, SemanticManagerRecord, SemanticNumericKeyType,
     SemanticProjectionTransform, SemanticRecordField, SemanticRowFilterPredicate,
-    manager_surface_dependencies, manager_surface_name, manager_surfaces_from_managers,
+    default_direct_manager_row_type, manager_surface_dependencies, manager_surface_name,
+    manager_surfaces_from_managers,
 };
 use crate::naming::{to_snake_ident, to_upper_camel_ident};
 use crate::native::NativeCodegenFile;
@@ -108,6 +109,16 @@ enum ManagerDependency {
 struct ManagerDefinition {
     name: &'static str,
     dependencies: &'static [ManagerDependency],
+}
+
+pub trait Rows {
+    type Row;
+
+    fn rows(&self) -> Result<Vec<Self::Row>>;
+
+    fn iter(&self) -> Result<std::vec::IntoIter<Self::Row>> {
+        Ok(self.rows()?.into_iter())
+    }
 }
 
 "#,
@@ -436,6 +447,14 @@ fn rust_standalone_schema_row_type_name(row_type: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use nw_datasheet::game_system::Crc32;
+
+    use crate::game_system_schema::{
+        GameSystemColumnSchema, GameSystemColumnValueShape, GameSystemDataTablesSchemaReport,
+        GameSystemTableSchema,
+    };
+    use crate::manager_records::{DirectManagerTable, ItemDataManagerTable};
+
     use super::*;
 
     #[test]
@@ -452,6 +471,155 @@ mod tests {
             merge_schema_column_type(ColumnType::Boolean, ColumnType::Number),
             ColumnType::Number
         );
+    }
+
+    #[test]
+    fn direct_schema_manager_uses_rows_contract_for_primary_row_type() {
+        let schema_report = damage_schema_report();
+        let manager = damage_manager_surface();
+        let methods = rust_direct_schema_methods(&manager, &schema_report);
+        let rows_trait_impl = rust_direct_rows_trait_impl(&manager, &schema_report);
+
+        assert!(methods.contains("pub fn rows(&self) -> Result<Vec<DamageDataSchemaRow>>"));
+        assert!(methods.contains(
+            "pub fn get(&self, key: impl ToString) -> Result<Option<DamageDataSchemaRow>>"
+        ));
+        assert!(methods.contains(
+            "pub fn iter(&self) -> Result<impl ExactSizeIterator<Item = DamageDataSchemaRow>>"
+        ));
+        assert!(methods.contains(
+            "pub fn affliction_data_rows(&self) -> Result<Vec<AfflictionDataSchemaRow>>"
+        ));
+        assert!(methods.contains(
+            "pub fn damage_type_data_rows(&self) -> Result<Vec<DamageTypeDataSchemaRow>>"
+        ));
+        assert!(!methods.contains("pub fn damage_data_rows"));
+        assert!(rows_trait_impl.contains("impl Rows for DamageDataManager"));
+        assert!(rows_trait_impl.contains("type Row = DamageDataSchemaRow"));
+    }
+
+    #[test]
+    fn item_data_manager_uses_rows_contract() {
+        let mut source = String::new();
+        push_rust_item_data_manager_wrapper(&mut source, &item_data_manager_surface());
+
+        assert!(source.contains("pub fn rows(&self) -> Result<Vec<ItemData>>"));
+        assert!(
+            source
+                .contains("pub fn iter(&self) -> Result<impl ExactSizeIterator<Item = ItemData>>")
+        );
+        assert!(source.contains("impl Rows for ItemDataManager"));
+        assert!(source.contains("type Row = ItemData"));
+    }
+
+    fn damage_manager_surface() -> DirectManagerSurface {
+        DirectManagerSurface {
+            manager_name: "DamageDataManager".to_owned(),
+            manager_class_name: "DamageDataManager".to_owned(),
+            tables: vec![
+                DirectManagerTable {
+                    table_name: "DamageData".to_owned(),
+                    row_type_name: "DamageData".to_owned(),
+                },
+                DirectManagerTable {
+                    table_name: "AfflictionData".to_owned(),
+                    row_type_name: "AfflictionData".to_owned(),
+                },
+                DirectManagerTable {
+                    table_name: "DamageTypeData".to_owned(),
+                    row_type_name: "DamageTypeData".to_owned(),
+                },
+            ],
+            products: Vec::new(),
+        }
+    }
+
+    fn item_data_manager_surface() -> ItemDataManagerSurface {
+        ItemDataManagerSurface {
+            manager_name: "ItemDataManager".to_owned(),
+            manager_class_name: "ItemDataManager".to_owned(),
+            table_type_name: "ItemDataTable".to_owned(),
+            handle_type_name: "ItemDataHandle".to_owned(),
+            data_type_name: "ItemData".to_owned(),
+            tables: vec![ItemDataManagerTable {
+                variant_name: "Master".to_owned(),
+                table_name: "MasterItemDefinitions".to_owned(),
+            }],
+        }
+    }
+
+    fn damage_schema_report() -> GameSystemDataTablesSchemaReport {
+        GameSystemDataTablesSchemaReport {
+            tables: vec![
+                schema_table(
+                    "DamageData",
+                    "DamageData",
+                    vec![
+                        schema_column("DamageID", ColumnType::String, true),
+                        schema_column("BaseDamage", ColumnType::Number, false),
+                    ],
+                ),
+                schema_table(
+                    "AfflictionData",
+                    "AfflictionData",
+                    vec![
+                        schema_column("AfflictionID", ColumnType::String, true),
+                        schema_column("DisplayName", ColumnType::String, false),
+                    ],
+                ),
+                schema_table(
+                    "DamageTypeData",
+                    "DamageTypeData",
+                    vec![
+                        schema_column("DamageTypeID", ColumnType::String, true),
+                        schema_column("IsElemental", ColumnType::Boolean, false),
+                    ],
+                ),
+            ],
+            diagnostics: Vec::new(),
+            type_affinities: Vec::new(),
+        }
+    }
+
+    fn schema_table(
+        table_name: &str,
+        row_type_name: &str,
+        columns: Vec<GameSystemColumnSchema>,
+    ) -> GameSystemTableSchema {
+        GameSystemTableSchema {
+            table_name: table_name.to_owned(),
+            table_name_crc: Crc32::from_str_lower(table_name).value(),
+            row_type_name: row_type_name.to_owned(),
+            row_type_crc: Crc32::from_str_lower(row_type_name).value(),
+            row_count: 1,
+            sources: vec![format!("{table_name}.datasheet")],
+            columns,
+        }
+    }
+
+    fn schema_column(
+        name: &str,
+        declared_type: ColumnType,
+        row_key: bool,
+    ) -> GameSystemColumnSchema {
+        GameSystemColumnSchema {
+            name: name.to_owned(),
+            crc: Crc32::from_str_lower(name).value(),
+            declared_type,
+            row_key,
+            required: row_key,
+            non_empty_rows: usize::from(row_key),
+            empty_rows: usize::from(!row_key),
+            distinct_values: usize::from(row_key),
+            value_shape: GameSystemColumnValueShape::String {
+                identifier_like: true,
+                localized_key_like: false,
+                asset_path_like: false,
+                expression_like: false,
+                list: None,
+                foreign_keys: Vec::new(),
+            },
+        }
     }
 }
 
@@ -607,6 +775,7 @@ fn push_rust_direct_manager_wrapper(
     let mut product_methods = rust_direct_product_methods(manager);
     product_methods.push_str(rust_standalone_special_manager_extra_methods(manager_name));
     let row_methods = rust_direct_schema_methods(manager, schema_report);
+    let rows_trait_impl = rust_direct_rows_trait_impl(manager, schema_report);
     source.push_str(&format!(
         r#"
 #[derive(Debug, Clone)]
@@ -632,8 +801,48 @@ impl {manager_name} {{
 pub(super) fn {factory}(cache: &mut ManagerCache) -> Result<{manager_name}> {{
     {manager_name}::from_cache(cache)
 }}
+{rows_trait_impl}
 "#
     ));
+}
+
+fn rust_direct_rows_trait_impl(
+    manager: &DirectManagerSurface,
+    schema_report: &GameSystemDataTablesSchemaReport,
+) -> String {
+    let row_specs = rust_standalone_schema_rows(schema_report);
+    let mut seen = BTreeSet::new();
+    let row_types = manager
+        .tables
+        .iter()
+        .filter_map(|table| {
+            seen.insert(table.row_type_name.clone())
+                .then_some(table.row_type_name.clone())
+        })
+        .collect::<Vec<_>>();
+    let Some(default_row_type) = default_direct_manager_row_type(&manager.manager_name, &row_types)
+    else {
+        return String::new();
+    };
+    let Some(row_spec) = row_specs
+        .iter()
+        .find(|row| row.source_row_type == default_row_type)
+    else {
+        return String::new();
+    };
+    let manager_name = &manager.manager_class_name;
+    let row_type = &row_spec.type_name;
+    format!(
+        r#"
+impl Rows for {manager_name} {{
+    type Row = {row_type};
+
+    fn rows(&self) -> Result<Vec<Self::Row>> {{
+        {manager_name}::rows(self)
+    }}
+}}
+"#
+    )
 }
 
 fn push_rust_product_backed_manager_wrapper(source: &mut String, manager: &DirectManagerSurface) {
@@ -879,8 +1088,12 @@ impl {manager_name} {{
         self.items.get(zero_based)
     }}
 
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = &{data_type}> + '_ {{
-        self.items.iter()
+    pub fn rows(&self) -> Result<Vec<{data_type}>> {{
+        Ok(self.items.as_ref().clone())
+    }}
+
+    pub fn iter(&self) -> Result<impl ExactSizeIterator<Item = {data_type}>> {{
+        Ok(self.rows()?.into_iter())
     }}
 
     #[must_use]
@@ -901,6 +1114,14 @@ impl {manager_name} {{
 
 pub(super) fn {factory}(cache: &mut ManagerCache) -> Result<{manager_name}> {{
     {manager_name}::from_cache(cache)
+}}
+
+impl Rows for {manager_name} {{
+    type Row = {data_type};
+
+    fn rows(&self) -> Result<Vec<Self::Row>> {{
+        {manager_name}::rows(self)
+    }}
 }}
 
 fn materialize_{factory}(instance: &ManagerInstance) -> Result<Vec<{data_type}>> {{
@@ -982,7 +1203,8 @@ fn rust_direct_schema_methods(
         return String::new();
     }
 
-    let single_row_type = row_types.len() == 1;
+    let default_row_type =
+        default_direct_manager_row_type(&manager.manager_name, &row_types).map(str::to_owned);
     let mut source = String::new();
     for source_row_type in row_types {
         let Some(row_spec) = row_specs
@@ -992,7 +1214,8 @@ fn rust_direct_schema_methods(
             continue;
         };
         let row_type = &row_spec.type_name;
-        let rows_method = if single_row_type {
+        let is_default_row_type = default_row_type.as_deref() == Some(source_row_type.as_str());
+        let rows_method = if is_default_row_type {
             "rows".to_owned()
         } else {
             format!("{}_rows", to_snake_ident(&source_row_type, "rows"))
@@ -1006,7 +1229,7 @@ fn rust_direct_schema_methods(
             reader = rust_standalone_schema_reader_name(&source_row_type),
         ));
         if let Some(key_field) = row_spec.fields.iter().find(|field| field.row_key) {
-            let lookup_method = if single_row_type {
+            let lookup_method = if is_default_row_type {
                 "get".to_owned()
             } else {
                 to_snake_ident(&source_row_type, "row")
@@ -1019,6 +1242,15 @@ fn rust_direct_schema_methods(
 "#,
                 reader = rust_standalone_schema_reader_name(&source_row_type),
                 key_field = key_field.field_name,
+            ));
+        }
+        if is_default_row_type {
+            source.push_str(&format!(
+                r#"    pub fn iter(&self) -> Result<impl ExactSizeIterator<Item = {row_type}>> {{
+        Ok(self.rows()?.into_iter())
+    }}
+
+"#
             ));
         }
     }
@@ -1351,6 +1583,14 @@ pub(super) fn {factory}(cache: &mut ManagerCache) -> Result<{manager_name}> {{
     {manager_name}::from_cache(cache)
 }}
 
+impl Rows for {manager_name} {{
+    type Row = {record_type};
+
+    fn rows(&self) -> Result<Vec<Self::Row>> {{
+        {manager_name}::rows(self)
+    }}
+}}
+
 "#
     ));
     push_rust_semantic_materializer(source, record);
@@ -1493,12 +1733,27 @@ fn rust_semantic_rows_method(record: &SemanticManagerRecord) -> String {
         .map(|method| to_snake_ident(method, "rows"))
         .unwrap_or_else(|| "rows".to_owned());
     let record_type = &record.record_type_name;
-    format!(
-        r#"    pub fn {method_name}(&self) -> &[{record_type}] {{
+    let alias_method = if method_name == "rows" {
+        String::new()
+    } else {
+        format!(
+            r#"    pub fn {method_name}(&self) -> &[{record_type}] {{
         self.entries.as_slice()
     }}
 
 "#
+        )
+    };
+    format!(
+        r#"    pub fn rows(&self) -> Result<Vec<{record_type}>> {{
+        Ok(self.entries.as_ref().clone())
+    }}
+
+    pub fn iter(&self) -> Result<impl ExactSizeIterator<Item = {record_type}>> {{
+        Ok(self.rows()?.into_iter())
+    }}
+
+{alias_method}"#
     )
 }
 

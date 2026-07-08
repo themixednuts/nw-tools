@@ -66,6 +66,18 @@ pub(crate) struct DirectProductAsset {
     pub manager_getter: String,
 }
 
+pub(crate) fn default_direct_manager_row_type<'a>(
+    manager_name: &str,
+    row_types: &'a [String],
+) -> Option<&'a str> {
+    let manager_base = manager_name.strip_suffix("Manager").unwrap_or(manager_name);
+    row_types
+        .iter()
+        .find(|row_type| row_type.as_str() == manager_base)
+        .or_else(|| (row_types.len() == 1).then(|| &row_types[0]))
+        .map(String::as_str)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ManagerSurfaceDependency {
     Table { name: String, row: String },

@@ -272,6 +272,8 @@ mod tests {
         assert_eq!(manager_definitions, public_managers);
         assert!(managers.contains("var managers = []managerDefinition"));
         assert!(managers.contains("type Managers struct"));
+        assert!(managers.contains("type Rows[T any] interface"));
+        assert!(managers.contains("Rows() ([]T, error)"));
         assert!(managers.contains("func Open(loader *gameassets.AssetLoader) (*Managers, error)"));
         assert!(managers.contains("func assetSourceFromLoader(loader *gameassets.AssetLoader)"));
         assert!(!managers.contains("loader.DatasheetSource()"));
@@ -391,6 +393,8 @@ mod tests {
         assert!(managers.contains("type DatasheetCellKind string"));
         assert!(managers.contains("type TableSchema struct"));
         assert!(managers.contains("type ColumnSchema struct"));
+        assert!(managers.contains("type Rows[T any] interface"));
+        assert!(managers.contains("Rows() ([]T, error)"));
         assert!(managers.contains("var TableSchemas = []TableSchema"));
         assert!(managers.contains("type managerCache struct"));
         assert!(!managers.contains("NewManagerRuntimeFromPakSource"));

@@ -9,9 +9,9 @@ use crate::game_system_schema::GameSystemTableSchema;
 use crate::manager_records::{
     DirectManagerSurface, ItemDataManagerSurface, ManagerSurface, ManagerSurfaceDependency,
     SemanticLookupKind, SemanticManagerKey, SemanticManagerRecord, SemanticNumericKeyType,
-    SemanticProjectionTransform, SemanticRowFilterPredicate, manager_surface_dependencies,
-    manager_surface_name, manager_surfaces, semantic_manager_record_unit, ts_field_name,
-    ts_method_name,
+    SemanticProjectionTransform, SemanticRowFilterPredicate, default_direct_manager_row_type,
+    manager_surface_dependencies, manager_surface_name, manager_surfaces,
+    semantic_manager_record_unit, ts_field_name, ts_method_name,
 };
 use crate::naming::{to_snake_ident, to_upper_camel_ident};
 use crate::typescript::source::{format_typescript_source, typescript_string_literal};
@@ -129,6 +129,14 @@ type ManagerDependency =
 interface ManagerDefinition {
   readonly name: string;
   readonly dependencies: readonly ManagerDependency[];
+}
+
+export interface Rows<Row> extends Iterable<Row> {
+  readonly rows: readonly Row[];
+}
+
+export interface RowLookup<Key, Row> extends Rows<Row> {
+  readonly get: (key: Key) => Row | undefined;
 }
 
 const MANAGER_INSTANCE = Symbol("managerInstance");
@@ -512,6 +520,17 @@ fn ts_schema_row_type_name(row_type: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use nw_datasheet::game_system::Crc32;
+
+    use crate::game_system_schema::{
+        GameSystemColumnSchema, GameSystemColumnValueShape, GameSystemDataTablesSchemaReport,
+        GameSystemTableSchema,
+    };
+    use crate::manager_records::{DirectManagerTable, ItemDataManagerTable};
+    use crate::plan::GameDataCodegenPlan;
+    use crate::schema::GameDataCompileMode;
+    use crate::target::{GameDataTargetLanguage, GameDataTargetPlan};
+
     use super::*;
 
     #[test]
@@ -528,6 +547,161 @@ mod tests {
             merge_schema_column_type(ColumnType::Boolean, ColumnType::Number),
             ColumnType::Number
         );
+    }
+
+    #[test]
+    fn direct_schema_manager_uses_rows_contract_for_primary_row_type() {
+        let unit = damage_compile_unit();
+        let manager = damage_manager_surface();
+        let rows_interface = direct_ts_rows_interface(&unit, &manager);
+        let methods = direct_ts_schema_methods(&unit, &manager);
+
+        assert_eq!(
+            rows_interface,
+            " implements RowLookup<DamageDataSchemaRow[\"damageId\"], DamageDataSchemaRow>"
+        );
+        assert!(methods.contains("get rows(): readonly DamageDataSchemaRow[]"));
+        assert!(methods.contains("get(key: DamageDataSchemaRow[\"damageId\"])"));
+        assert!(methods.contains("[Symbol.iterator](): Iterator<DamageDataSchemaRow>"));
+        assert!(methods.contains("afflictionDataRows(): readonly AfflictionDataSchemaRow[]"));
+        assert!(methods.contains("damageTypeDataRows(): readonly DamageTypeDataSchemaRow[]"));
+        assert!(!methods.contains("damageDataRows(): readonly DamageDataSchemaRow[]"));
+        assert!(!methods.contains("damageData(key: DamageDataSchemaRow"));
+    }
+
+    #[test]
+    fn item_data_manager_uses_rows_contract() {
+        let mut source = String::new();
+        push_item_data_manager_class(&mut source, &item_data_manager_surface());
+
+        assert!(
+            source.contains("export class ItemDataManager implements RowLookup<string, ItemData>")
+        );
+        assert!(source.contains("get rows(): readonly ItemData[]"));
+        assert!(source.contains("[Symbol.iterator](): Iterator<ItemData>"));
+        assert!(!source.contains("items(): readonly ItemData[]"));
+    }
+
+    fn damage_compile_unit() -> GameDataCompileUnit {
+        let schema_report = damage_schema_report();
+        let codegen_plan = GameDataCodegenPlan::from_schema_report(
+            GameDataCompileMode::SourceFormat,
+            &schema_report,
+            vec![GameDataTargetPlan::standalone(
+                GameDataTargetLanguage::TypeScript,
+            )],
+        );
+        GameDataCompileUnit::new(schema_report.clone(), schema_report, codegen_plan)
+    }
+
+    fn damage_manager_surface() -> DirectManagerSurface {
+        DirectManagerSurface {
+            manager_name: "DamageDataManager".to_owned(),
+            manager_class_name: "DamageDataManager".to_owned(),
+            tables: vec![
+                DirectManagerTable {
+                    table_name: "DamageData".to_owned(),
+                    row_type_name: "DamageData".to_owned(),
+                },
+                DirectManagerTable {
+                    table_name: "AfflictionData".to_owned(),
+                    row_type_name: "AfflictionData".to_owned(),
+                },
+                DirectManagerTable {
+                    table_name: "DamageTypeData".to_owned(),
+                    row_type_name: "DamageTypeData".to_owned(),
+                },
+            ],
+            products: Vec::new(),
+        }
+    }
+
+    fn item_data_manager_surface() -> ItemDataManagerSurface {
+        ItemDataManagerSurface {
+            manager_name: "ItemDataManager".to_owned(),
+            manager_class_name: "ItemDataManager".to_owned(),
+            table_type_name: "ItemDataTable".to_owned(),
+            handle_type_name: "ItemDataHandle".to_owned(),
+            data_type_name: "ItemData".to_owned(),
+            tables: vec![ItemDataManagerTable {
+                variant_name: "Master".to_owned(),
+                table_name: "MasterItemDefinitions".to_owned(),
+            }],
+        }
+    }
+
+    fn damage_schema_report() -> GameSystemDataTablesSchemaReport {
+        GameSystemDataTablesSchemaReport {
+            tables: vec![
+                schema_table(
+                    "DamageData",
+                    "DamageData",
+                    vec![
+                        schema_column("DamageID", ColumnType::String, true),
+                        schema_column("BaseDamage", ColumnType::Number, false),
+                    ],
+                ),
+                schema_table(
+                    "AfflictionData",
+                    "AfflictionData",
+                    vec![
+                        schema_column("AfflictionID", ColumnType::String, true),
+                        schema_column("DisplayName", ColumnType::String, false),
+                    ],
+                ),
+                schema_table(
+                    "DamageTypeData",
+                    "DamageTypeData",
+                    vec![
+                        schema_column("DamageTypeID", ColumnType::String, true),
+                        schema_column("IsElemental", ColumnType::Boolean, false),
+                    ],
+                ),
+            ],
+            diagnostics: Vec::new(),
+            type_affinities: Vec::new(),
+        }
+    }
+
+    fn schema_table(
+        table_name: &str,
+        row_type_name: &str,
+        columns: Vec<GameSystemColumnSchema>,
+    ) -> GameSystemTableSchema {
+        GameSystemTableSchema {
+            table_name: table_name.to_owned(),
+            table_name_crc: Crc32::from_str_lower(table_name).value(),
+            row_type_name: row_type_name.to_owned(),
+            row_type_crc: Crc32::from_str_lower(row_type_name).value(),
+            row_count: 1,
+            sources: vec![format!("{table_name}.datasheet")],
+            columns,
+        }
+    }
+
+    fn schema_column(
+        name: &str,
+        declared_type: ColumnType,
+        row_key: bool,
+    ) -> GameSystemColumnSchema {
+        GameSystemColumnSchema {
+            name: name.to_owned(),
+            crc: Crc32::from_str_lower(name).value(),
+            declared_type,
+            row_key,
+            required: row_key,
+            non_empty_rows: usize::from(row_key),
+            empty_rows: usize::from(!row_key),
+            distinct_values: usize::from(row_key),
+            value_shape: GameSystemColumnValueShape::String {
+                identifier_like: true,
+                localized_key_like: false,
+                asset_path_like: false,
+                expression_like: false,
+                list: None,
+                foreign_keys: Vec::new(),
+            },
+        }
     }
 }
 
@@ -799,6 +973,7 @@ fn push_direct_manager_class(
     let mut product_methods = direct_ts_product_methods(manager);
     product_methods.push_str(&special_ts_manager_extra_methods(manager_class));
     let row_methods = direct_ts_schema_methods(unit, manager);
+    let rows_interface = direct_ts_rows_interface(unit, manager);
     let constructor = if row_methods.trim().is_empty() && product_methods.trim().is_empty() {
         "constructor(instance: ManagerInstance) { void instance; }"
     } else {
@@ -806,7 +981,7 @@ fn push_direct_manager_class(
     };
     source.push_str(&format!(
         r#"
-export class {manager_class} {{
+export class {manager_class}{rows_interface} {{
   {constructor}
 
   static fromCache(cache: ManagerCache): {manager_class} {{
@@ -825,6 +1000,36 @@ export function {runtime_factory}(managers: Managers): {manager_class} {{
     ));
 }
 
+fn direct_ts_rows_interface(unit: &GameDataCompileUnit, manager: &DirectManagerSurface) -> String {
+    let row_specs = ts_schema_rows(unit);
+    let mut seen = BTreeSet::new();
+    let row_types = manager
+        .tables
+        .iter()
+        .filter_map(|table| {
+            seen.insert(table.row_type_name.clone())
+                .then_some(table.row_type_name.clone())
+        })
+        .collect::<Vec<_>>();
+    let Some(default_row_type) = default_direct_manager_row_type(&manager.manager_name, &row_types)
+    else {
+        return String::new();
+    };
+    let Some(row_spec) = row_specs
+        .iter()
+        .find(|row| row.source_row_type == default_row_type)
+    else {
+        return String::new();
+    };
+    if let Some(key_field) = row_spec.fields.iter().find(|field| field.row_key) {
+        return format!(
+            " implements RowLookup<{}[{:?}], {}>",
+            row_spec.type_name, key_field.field_name, row_spec.type_name
+        );
+    }
+    format!(" implements Rows<{}>", row_spec.type_name)
+}
+
 fn direct_ts_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerSurface) -> String {
     let row_specs = ts_schema_rows(unit);
     let mut seen = BTreeSet::new();
@@ -840,28 +1045,37 @@ fn direct_ts_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerS
         return String::new();
     }
 
-    let single_row_type = row_types.len() == 1;
+    let default_row_type =
+        default_direct_manager_row_type(&manager.manager_name, &row_types).map(str::to_owned);
     let mut source = String::new();
     for row_type in row_types {
         let Some(row_spec) = row_specs.iter().find(|row| row.source_row_type == row_type) else {
             continue;
         };
         let type_name = &row_spec.type_name;
-        let rows_method = if single_row_type {
-            "rows".to_owned()
-        } else {
-            format!("{}Rows", ts_method_name(&row_type))
-        };
-        source.push_str(&format!(
-            r#"  {rows_method}(): readonly {type_name}[] {{
+        let is_default_row_type = default_row_type.as_deref() == Some(row_type.as_str());
+        if is_default_row_type {
+            source.push_str(&format!(
+                r#"  get rows(): readonly {type_name}[] {{
     return this.instance.schemaRows({row_type:?}, {reader});
   }}
 
 "#,
-            reader = ts_schema_reader_name(&row_type),
-        ));
+                reader = ts_schema_reader_name(&row_type),
+            ));
+        } else {
+            let rows_method = format!("{}Rows", ts_method_name(&row_type));
+            source.push_str(&format!(
+                r#"  {rows_method}(): readonly {type_name}[] {{
+    return this.instance.schemaRows({row_type:?}, {reader});
+  }}
+
+"#,
+                reader = ts_schema_reader_name(&row_type),
+            ));
+        }
         if let Some(key_field) = row_spec.fields.iter().find(|field| field.row_key) {
-            let lookup_method = if single_row_type {
+            let lookup_method = if is_default_row_type {
                 "get".to_owned()
             } else {
                 ts_method_name(&row_type)
@@ -875,6 +1089,15 @@ fn direct_ts_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerS
                 key_field = key_field.field_name.as_str(),
                 key_member = key_field.field_name.as_str(),
                 reader = ts_schema_reader_name(&row_type),
+            ));
+        }
+        if is_default_row_type {
+            source.push_str(&format!(
+                r#"  [Symbol.iterator](): Iterator<{type_name}> {{
+    return this.rows[Symbol.iterator]();
+  }}
+
+"#
             ));
         }
     }
@@ -1226,7 +1449,7 @@ export interface {data_type} {{
 const ITEM_DATA_MANAGER_TABLES: readonly {table_type}[] = [
 {table_list}];
 
-export class {manager_class} {{
+export class {manager_class} implements RowLookup<string, {data_type}> {{
   private readonly rowsCache: readonly {data_type}[];
   private readonly rowsById = new Map<number, {data_type}>();
 
@@ -1256,8 +1479,12 @@ export class {manager_class} {{
     return this.rowsCache[index - 1];
   }}
 
-  items(): readonly {data_type}[] {{
+  get rows(): readonly {data_type}[] {{
     return this.rowsCache;
+  }}
+
+  [Symbol.iterator](): Iterator<{data_type}> {{
+    return this.rows[Symbol.iterator]();
   }}
 
   len(): number {{
@@ -1346,7 +1573,7 @@ fn push_semantic_manager_class(source: &mut String, record: &SemanticManagerReco
     });
     source.push_str(&format!(
         r#"
-export class {manager_class} {{
+export class {manager_class} implements Rows<{record_type}> {{
   private readonly {entries_field}: readonly {record_type}[];
 "#
     ));
@@ -1452,24 +1679,32 @@ export class {manager_class} {{
 "#
         ));
     }
+    source.push_str(&format!(
+        r#"  get rows(): readonly {record_type}[] {{
+    return this.{entries_field};
+  }}
+
+"#
+    ));
     if let Some(method) = &record.rows_method {
         let method_name = ts_method_name(method);
-        source.push_str(&format!(
-            r#"  {method_name}(): readonly {record_type}[] {{
-    return this.{entries_field};
+        if method_name != "rows" {
+            source.push_str(&format!(
+                r#"  {method_name}(): readonly {record_type}[] {{
+    return this.rows;
   }}
 
 "#
-        ));
-    } else {
-        source.push_str(&format!(
-            r#"  rows(): readonly {record_type}[] {{
-    return this.{entries_field};
-  }}
-
-"#
-        ));
+            ));
+        }
     }
+    source.push_str(&format!(
+        r#"  [Symbol.iterator](): Iterator<{record_type}> {{
+    return this.rows[Symbol.iterator]();
+  }}
+
+"#
+    ));
     if let Some(method) = &record.len_method {
         let method_name = ts_method_name(method);
         source.push_str(&format!(

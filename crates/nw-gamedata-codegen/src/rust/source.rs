@@ -143,3 +143,44 @@ pub(crate) fn format_rust_source(source: &str) -> Result<String, RustSourceEmitE
         syn::parse_file(source).map_err(|source| RustSourceEmitError::File(source.to_string()))?;
     Ok(prettyplease::unparse(&file))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use nw_datasheet::game_system::GameSystemDataTables;
+
+    use crate::compiler::GameDataCompiler;
+    use crate::emit::GameDataEmitter;
+    use crate::target::GameDataDataFormat;
+
+    use super::*;
+
+    #[test]
+    fn standalone_manager_output_emits_rows_contracts() {
+        let catalog = GameSystemDataTables::default();
+        let unit = GameDataCompiler::source_format().compile_unit(&catalog);
+        let target =
+            RustSourceEmitter::standalone_target().with_data_format(GameDataDataFormat::Datasheet);
+        let output = RustSourceEmitter::new(target)
+            .expect("rust datasheet emitter")
+            .emit(&unit)
+            .expect("rust output");
+        let managers = output
+            .files()
+            .iter()
+            .find(|file| file.path() == Path::new("src/managers/mod.rs"))
+            .expect("manager runtime")
+            .contents();
+        let surfaces = output
+            .files()
+            .iter()
+            .find(|file| file.path() == Path::new("src/managers/surfaces.rs"))
+            .expect("manager surfaces")
+            .contents();
+
+        assert!(managers.contains("pub trait Rows"));
+        assert!(managers.contains("fn rows(&self) -> Result<Vec<Self::Row>>"));
+        assert!(!surfaces.contains("pub fn damage_data_rows"));
+    }
+}

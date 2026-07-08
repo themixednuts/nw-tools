@@ -188,6 +188,7 @@ mod tests {
         assert!(!managers.contains("export function managerByName"));
         assert!(managers.contains("export class Managers"));
         assert!(managers.contains("static async open(loader: AssetLoader): Promise<Managers>"));
+        assert!(managers.contains("export interface Rows<Row> extends Iterable<Row>"));
         assert!(!managers.contains("PakDatasheetSource } from \"../game-assets/pak.js\""));
         assert!(managers.contains("playerData(): PlayerDataManager"));
         assert!(managers.contains("armorOffsetData(): ArmorOffsetDataManager"));
@@ -286,6 +287,7 @@ mod tests {
         );
         assert!(managers.contains("export interface TableSchema"));
         assert!(managers.contains("export interface ColumnSchema"));
+        assert!(managers.contains("export interface Rows<Row> extends Iterable<Row>"));
         assert!(managers.contains("export const TABLE_SCHEMAS: readonly TableSchema[]"));
         assert!(managers.contains("export class Managers"));
         assert!(managers.contains("class ManagerCache"));
