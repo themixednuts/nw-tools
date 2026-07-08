@@ -243,7 +243,7 @@ fn is_go_keyword(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{collections::BTreeSet, path::Path};
 
     use nw_datasheet::game_system::GameSystemDataTables;
 
@@ -267,10 +267,9 @@ mod tests {
             .expect("manager manifest")
             .contents();
 
-        assert_eq!(
-            managers.matches("\t\tDependencies:").count(),
-            unit.codegen_plan_ref().managers().len()
-        );
+        let manager_definitions = manager_definition_names(managers);
+        let public_managers = public_manager_type_names(managers);
+        assert_eq!(manager_definitions, public_managers);
         assert!(managers.contains("var managers = []managerDefinition"));
         assert!(!managers.contains("var Managers"));
         assert!(!managers.contains("type ManagerDefinition"));
@@ -280,11 +279,9 @@ mod tests {
         assert!(managers.contains("type ManagerRuntime struct"));
         assert!(managers.contains("type ArmorOffsetDataManager struct"));
         assert!(managers.contains("ArmorOffsetDataManager"));
-        assert!(managers.contains("CurrencyExchangeMappingManager"));
-        assert!(managers.contains("ManaDataManager"));
+        assert!(managers.contains("PlayerDataManager"));
         assert!(managers.contains("Kind: managerDependencyAsset"));
         assert!(managers.contains("managerDependencyTable"));
-        assert!(managers.contains("Kind: managerDependencyManager"));
         assert!(!managers.contains("ProductPath"));
         assert!(!managers.contains(".aztbl"));
         assert!(managers.contains("sharedassets/genericassets/items/armoroffsets.aoffdb"));
@@ -294,6 +291,7 @@ mod tests {
         assert!(
             managers.contains("func (manager *ArmorOffsetDataManager) FurthestAttachmentOffset")
         );
+        assert!(!managers.contains("type ObjectiveTasksDataManager struct"));
         assert!(
             output
                 .files()
@@ -359,7 +357,8 @@ mod tests {
         assert!(managers.contains("NewManagerRuntimeFromPakSource"));
         assert!(managers.contains("gameassets.ParseDatasheet"));
         assert!(managers.contains("type dynamicTable struct"));
-        assert!(managers.contains("DuplicateKeys map[string][]dynamicTableRow"));
+        assert!(managers.contains("DuplicateKeys"));
+        assert!(managers.contains("map[string][]dynamicTableRow"));
         assert!(managers.contains("RowsByLookupKey map[string]dynamicTableRow"));
         assert!(!managers.contains("type DynamicTable struct"));
         assert!(!managers.contains("type DynamicTableRow struct"));
@@ -381,5 +380,48 @@ mod tests {
         assert!(!managers.contains("ProjectionTransform"));
         assert!(!managers.contains("Native"));
         assert!(!managers.contains("RuntimeResource"));
+    }
+
+    fn manager_definition_names(source: &str) -> BTreeSet<String> {
+        const MANAGERS_PREFIX: &str = "var managers = []managerDefinition{";
+        let Some((_, managers)) = source.split_once(MANAGERS_PREFIX) else {
+            return BTreeSet::new();
+        };
+        let managers = managers
+            .split_once("\n}\n")
+            .map_or(managers, |(block, _)| block);
+        let mut depth = 0usize;
+        let mut names = BTreeSet::new();
+        const NAME_PREFIX: &str = "Name: \"";
+        for line in managers.lines() {
+            let trimmed = line.trim();
+            depth = depth.saturating_add(trimmed.matches('{').count());
+            if depth == 1 {
+                if let Some(rest) = trimmed.strip_prefix(NAME_PREFIX) {
+                    if let Some(end) = rest.find('"') {
+                        let name = &rest[..end];
+                        if name.ends_with("Manager") {
+                            names.insert(name.to_owned());
+                        }
+                    }
+                }
+            }
+            depth = depth.saturating_sub(trimmed.matches('}').count());
+        }
+        names
+    }
+
+    fn public_manager_type_names(source: &str) -> BTreeSet<String> {
+        const PREFIX: &str = "type ";
+        source
+            .match_indices(PREFIX)
+            .filter_map(|(index, _)| {
+                let rest = &source[index + PREFIX.len()..];
+                let name = rest
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                    .next()?;
+                name.ends_with("Manager").then(|| name.to_owned())
+            })
+            .collect()
     }
 }

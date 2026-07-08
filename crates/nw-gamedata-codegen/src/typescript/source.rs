@@ -153,7 +153,7 @@ pub(crate) fn typescript_string_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{collections::BTreeSet, path::Path};
 
     use nw_datasheet::game_system::GameSystemDataTables;
 
@@ -177,10 +177,9 @@ mod tests {
             .expect("manager manifest")
             .contents();
 
-        assert_eq!(
-            managers.matches("    dependencies:").count(),
-            unit.codegen_plan_ref().managers().len()
-        );
+        let manager_definitions = manager_definition_names(managers);
+        let public_managers = public_manager_class_names(managers);
+        assert_eq!(manager_definitions, public_managers);
         assert!(managers.contains("const MANAGERS"));
         assert!(!managers.contains("export const MANAGERS"));
         assert!(!managers.contains("export type ManagerDependencyKind"));
@@ -190,11 +189,9 @@ mod tests {
         assert!(managers.contains("export class ManagerRuntime"));
         assert!(managers.contains("export class ArmorOffsetDataManager"));
         assert!(managers.contains("ArmorOffsetDataManager"));
-        assert!(managers.contains("CurrencyExchangeMappingManager"));
-        assert!(managers.contains("ManaDataManager"));
+        assert!(managers.contains("PlayerDataManager"));
         assert!(managers.contains("kind: \"asset\""));
         assert!(managers.contains("kind: \"table\""));
-        assert!(managers.contains("kind: \"manager\""));
         assert!(!managers.contains("productPath"));
         assert!(!managers.contains(".aztbl"));
         assert!(managers.contains("sharedassets/genericassets/items/armoroffsets.aoffdb"));
@@ -202,6 +199,7 @@ mod tests {
         assert!(managers.contains("armorOffset(name: string)"));
         assert!(managers.contains("furthestAttachmentOffset("));
         assert!(managers.contains("database(): ArmorOffsetDatabase"));
+        assert!(!managers.contains("export class ObjectiveTasksDataManager"));
         assert!(
             output
                 .files()
@@ -281,5 +279,48 @@ mod tests {
         assert!(!managers.contains("ProjectionTransform"));
         assert!(!managers.contains("native"));
         assert!(!managers.contains("runtimeResource"));
+    }
+
+    fn manager_definition_names(source: &str) -> BTreeSet<String> {
+        const MANAGERS_PREFIX: &str = "const MANAGERS: readonly ManagerDefinition[] = [";
+        let Some((_, managers)) = source.split_once(MANAGERS_PREFIX) else {
+            return BTreeSet::new();
+        };
+        let managers = managers
+            .split_once("];")
+            .map_or(managers, |(block, _)| block);
+        let mut depth = 0usize;
+        let mut names = BTreeSet::new();
+        const NAME_PREFIX: &str = "name: \"";
+        for line in managers.lines() {
+            let trimmed = line.trim();
+            depth = depth.saturating_add(trimmed.matches('{').count());
+            if depth == 1 {
+                if let Some(rest) = trimmed.strip_prefix(NAME_PREFIX) {
+                    if let Some(end) = rest.find('"') {
+                        let name = &rest[..end];
+                        if name.ends_with("Manager") {
+                            names.insert(name.to_owned());
+                        }
+                    }
+                }
+            }
+            depth = depth.saturating_sub(trimmed.matches('}').count());
+        }
+        names
+    }
+
+    fn public_manager_class_names(source: &str) -> BTreeSet<String> {
+        const PREFIX: &str = "export class ";
+        source
+            .match_indices(PREFIX)
+            .filter_map(|(index, _)| {
+                let rest = &source[index + PREFIX.len()..];
+                let name = rest
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                    .next()?;
+                name.ends_with("Manager").then(|| name.to_owned())
+            })
+            .collect()
     }
 }

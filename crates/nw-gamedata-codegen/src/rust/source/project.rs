@@ -469,7 +469,7 @@ pub(super) fn standalone_system_source() -> Result<String, RustSourceEmitError> 
     )
 }
 
-const RUST_STANDALONE_CARGO_TOML: &str = include_str!("../../../resources/rust/Cargo.toml");
+const RUST_STANDALONE_CARGO_TOML: &str = include_str!("../../../resources/rust/Cargo.toml.in");
 
 #[cfg(test)]
 mod tests {

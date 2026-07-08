@@ -6,11 +6,11 @@ use nw_datasheet::ColumnType;
 use crate::compiler::GameDataCompileUnit;
 use crate::emit::GameDataCodegenFile;
 use crate::game_system_schema::GameSystemTableSchema;
-use crate::manager::ManagerContractInput;
 use crate::manager_records::{
-    DirectManagerSurface, ManagerSurface, SemanticLookupKind, SemanticManagerKey,
-    SemanticManagerRecord, SemanticNumericKeyType, SemanticProjectionTransform,
-    SemanticRowFilterPredicate, manager_surfaces, semantic_manager_record_unit, ts_field_name,
+    DirectManagerSurface, ItemDataManagerSurface, ManagerSurface, ManagerSurfaceDependency,
+    SemanticLookupKind, SemanticManagerKey, SemanticManagerRecord, SemanticNumericKeyType,
+    SemanticProjectionTransform, SemanticRowFilterPredicate, manager_surface_dependencies,
+    manager_surface_name, manager_surfaces, semantic_manager_record_unit, ts_field_name,
     ts_method_name,
 };
 use crate::naming::{to_snake_ident, to_upper_camel_ident};
@@ -21,9 +21,10 @@ use nw_serialize_codegen::{
 };
 
 pub(super) fn emit_manager_files(unit: &GameDataCompileUnit) -> Result<Vec<GameDataCodegenFile>> {
+    let surfaces = manager_surfaces(unit)?;
     Ok(vec![GameDataCodegenFile::new(
         "src/managers/index.ts",
-        manager_index_source(unit, false, &[])?,
+        manager_index_source(unit, false, &surfaces)?,
     )])
 }
 
@@ -51,7 +52,7 @@ fn manager_index_source(
     surfaces: &[ManagerSurface],
 ) -> Result<String> {
     if !dynamic_assets {
-        return manager_manifest_source(unit);
+        return manager_manifest_source(unit, surfaces);
     }
 
     let mut source = String::from(
@@ -121,15 +122,9 @@ interface AssetDependency {
   readonly path: string;
 }
 
-interface ManagerReferenceDependency {
-  readonly kind: "manager";
-  readonly name: string;
-}
-
 type ManagerDependency =
   | TableDependency
-  | AssetDependency
-  | ManagerReferenceDependency;
+  | AssetDependency;
 
 interface ManagerDefinition {
   readonly name: string;
@@ -161,7 +156,7 @@ interface DynamicTable {
     let readable_row_types = direct_schema_row_types(surfaces);
     push_schema_row_types(&mut source, unit, &readable_row_types);
     push_table_schemas(&mut source, unit);
-    push_managers(&mut source, unit);
+    push_managers(&mut source, unit, surfaces);
     push_manager_surface_classes(&mut source, unit, surfaces);
     source.push_str(PRODUCT_MANAGER_RUNTIME_TS);
     source.push_str(DYNAMIC_MANAGER_RUNTIME_TS);
@@ -174,7 +169,9 @@ fn semantic_records(surfaces: &[ManagerSurface]) -> Vec<SemanticManagerRecord> {
         .iter()
         .filter_map(|surface| match surface {
             ManagerSurface::Semantic(record) => Some(record.clone()),
-            ManagerSurface::Direct(_) => None,
+            ManagerSurface::Direct(_)
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::ProductBacked(_) => None,
         })
         .collect()
 }
@@ -424,7 +421,8 @@ function optionalCellBoolText(
 fn ts_schema_rows(unit: &GameDataCompileUnit) -> Vec<TsSchemaRow> {
     let mut rows = BTreeMap::<String, Vec<TsSchemaField>>::new();
     for table in &unit.schema_report().tables {
-        let fields = rows.entry(table.row_type_name.clone()).or_default();
+        let row_type = table.row_type_name.clone();
+        let fields = rows.entry(row_type.clone()).or_default();
         for column in &table.columns {
             let field_name = ts_field_name(&column.name);
             if let Some(existing) = fields
@@ -432,14 +430,16 @@ fn ts_schema_rows(unit: &GameDataCompileUnit) -> Vec<TsSchemaRow> {
                 .find(|field| field.field_name == field_name)
             {
                 existing.row_key |= column.row_key;
-                existing.required = (existing.required && column.required) || existing.row_key;
+                existing.required = existing.row_key;
+                existing.column_type =
+                    merge_schema_column_type(existing.column_type, column.declared_type);
                 continue;
             }
             fields.push(TsSchemaField {
                 source_name: column.name.clone(),
                 field_name,
                 column_type: column.declared_type,
-                required: column.required || column.row_key,
+                required: column.row_key,
                 row_key: column.row_key,
             });
         }
@@ -451,6 +451,14 @@ fn ts_schema_rows(unit: &GameDataCompileUnit) -> Vec<TsSchemaRow> {
             fields,
         })
         .collect()
+}
+
+fn merge_schema_column_type(left: ColumnType, right: ColumnType) -> ColumnType {
+    match (left, right) {
+        (ColumnType::String, _) | (_, ColumnType::String) => ColumnType::String,
+        (ColumnType::Number, _) | (_, ColumnType::Number) => ColumnType::Number,
+        (ColumnType::Boolean, ColumnType::Boolean) => ColumnType::Boolean,
+    }
 }
 
 fn ts_schema_field_type(column_type: ColumnType) -> &'static str {
@@ -481,7 +489,31 @@ fn ts_schema_row_type_name(row_type: &str) -> String {
     format!("{}SchemaRow", to_upper_camel_ident(row_type, "Schema"))
 }
 
-fn manager_manifest_source(unit: &GameDataCompileUnit) -> Result<String> {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merged_schema_column_type_is_lossless_for_mixed_source_columns() {
+        assert_eq!(
+            merge_schema_column_type(ColumnType::Number, ColumnType::String),
+            ColumnType::String
+        );
+        assert_eq!(
+            merge_schema_column_type(ColumnType::Boolean, ColumnType::String),
+            ColumnType::String
+        );
+        assert_eq!(
+            merge_schema_column_type(ColumnType::Boolean, ColumnType::Number),
+            ColumnType::Number
+        );
+    }
+}
+
+fn manager_manifest_source(
+    unit: &GameDataCompileUnit,
+    surfaces: &[ManagerSurface],
+) -> Result<String> {
     let mut source = String::from(
         r#"
 interface TableDependency {
@@ -495,15 +527,9 @@ interface AssetDependency {
   readonly path: string;
 }
 
-interface ManagerReferenceDependency {
-  readonly kind: "manager";
-  readonly name: string;
-}
-
 type ManagerDependency =
   | TableDependency
-  | AssetDependency
-  | ManagerReferenceDependency;
+  | AssetDependency;
 
 interface ManagerDefinition {
   readonly name: string;
@@ -513,7 +539,7 @@ interface ManagerDefinition {
 "#,
     );
 
-    push_managers(&mut source, unit);
+    push_managers(&mut source, unit, surfaces);
     source.push_str(
         r#"
 function managerByName(
@@ -602,24 +628,33 @@ fn push_table_schema(source: &mut String, table: &GameSystemTableSchema) {
     source.push_str("  },\n");
 }
 
-fn push_managers(source: &mut String, unit: &GameDataCompileUnit) {
+fn push_managers(source: &mut String, unit: &GameDataCompileUnit, surfaces: &[ManagerSurface]) {
     source.push_str("const MANAGERS: readonly ManagerDefinition[] = [\n");
-    for manager in unit.codegen_plan_ref().managers().contracts() {
+    let contracts = unit.codegen_plan_ref().managers().contracts();
+    for surface in surfaces {
+        let manager_name = manager_surface_name(surface);
+        let Some(contract) = contracts
+            .iter()
+            .find(|contract| semantic_type_name(contract.manager().as_str()) == manager_name)
+        else {
+            continue;
+        };
+        let dependencies = manager_surface_dependencies(surface, contract.inputs());
         source.push_str("  {\n");
         source.push_str(&format!(
             "    name: {},\n",
-            typescript_string_literal(semantic_type_name(manager.manager().as_str()))
+            typescript_string_literal(manager_name)
         ));
         source.push_str(&format!(
             "    dependencies: [{}],\n",
-            manager_dependencies(manager.inputs())
+            manager_dependencies(&dependencies)
         ));
         source.push_str("  },\n");
     }
     source.push_str("];\n\n");
 }
 
-fn manager_dependencies(dependencies: &[ManagerContractInput<'_>]) -> String {
+fn manager_dependencies(dependencies: &[ManagerSurfaceDependency]) -> String {
     dependencies
         .iter()
         .map(manager_dependency)
@@ -627,27 +662,16 @@ fn manager_dependencies(dependencies: &[ManagerContractInput<'_>]) -> String {
         .join(", ")
 }
 
-fn manager_dependency(input: &ManagerContractInput<'_>) -> String {
+fn manager_dependency(input: &ManagerSurfaceDependency) -> String {
     match input {
-        ManagerContractInput::Table {
-            name,
-            row,
-            product_path: _,
-        } => format!(
+        ManagerSurfaceDependency::Table { name, row } => format!(
             "{{ kind: \"table\", name: {}, row: {} }}",
-            typescript_string_literal(name.as_str()),
-            typescript_string_literal(row.as_str()),
+            typescript_string_literal(name),
+            typescript_string_literal(row),
         ),
-        ManagerContractInput::Asset {
-            path,
-            asset_type: _,
-        } => format!(
+        ManagerSurfaceDependency::Asset { path } => format!(
             "{{ kind: \"asset\", path: {} }}",
-            typescript_string_literal(path.as_str()),
-        ),
-        ManagerContractInput::Manager { manager } => format!(
-            "{{ kind: \"manager\", name: {} }}",
-            typescript_string_literal(semantic_type_name(manager.as_str())),
+            typescript_string_literal(path),
         ),
     }
 }
@@ -688,6 +712,10 @@ fn push_manager_surface_classes(
         match surface {
             ManagerSurface::Direct(manager) => push_direct_manager_class(source, unit, manager),
             ManagerSurface::Semantic(record) => push_semantic_manager_class(source, record),
+            ManagerSurface::ItemData(manager) => push_item_data_manager_class(source, manager),
+            ManagerSurface::ProductBacked(manager) => {
+                push_product_backed_manager_class(source, manager)
+            }
         }
     }
     source.push_str(SEMANTIC_MANAGER_RUNTIME_TS);
@@ -702,7 +730,7 @@ fn push_direct_manager_class(
     let manager_name = typescript_string_literal(&manager.manager_name);
     let runtime_factory = ts_method_name(&manager.manager_name);
     let mut product_methods = direct_ts_product_methods(manager);
-    product_methods.push_str(&special_ts_manager_product_methods(manager_class));
+    product_methods.push_str(&special_ts_manager_extra_methods(manager_class));
     let row_methods = direct_ts_schema_methods(unit, manager);
     let constructor = if row_methods.trim().is_empty() && product_methods.trim().is_empty() {
         "constructor(instance: ManagerInstance) { void instance; }"
@@ -957,10 +985,277 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
                     path = path,
                 ));
             }
+            "newworld_plugin::assets::gathering_database::GatheringDatabase" => {
+                source.push_str(&format!(
+                    r#"  private parsedGatheringDatabase?: GatheringDatabase;
+
+  {getter}(): GatheringDatabase {{
+    this.parsedGatheringDatabase ??= parseGatheringDatabase(this.instance.requiredAssetBytes({path}));
+    return this.parsedGatheringDatabase;
+  }}
+
+  gatheringData(): GatheringData {{
+    return this.{getter}().gatheringData;
+  }}
+
+  gatheringTypes(): readonly GatheringTypeData[] {{
+    return this.gatheringData().gatheringTypes;
+  }}
+
+  gatheringActions(): readonly GatheringAction[] {{
+    return this.gatheringData().gatheringActions;
+  }}
+
+"#,
+                    getter = getter,
+                    path = path,
+                ));
+            }
+            "newworld_plugin::assets::gathering_database::GatheringActionDatabase" => {
+                source.push_str(&format!(
+                    r#"  private parsedGatheringActionDatabase?: GatheringActionDatabase;
+
+  {getter}(): GatheringActionDatabase {{
+    this.parsedGatheringActionDatabase ??= parseGatheringActionDatabase(this.instance.requiredAssetBytes({path}));
+    return this.parsedGatheringActionDatabase;
+  }}
+
+  gatheringActionData(): readonly GatheringActionData[] {{
+    return this.{getter}().gatheringActions;
+  }}
+
+"#,
+                    getter = getter,
+                    path = path,
+                ));
+            }
+            "newworld_plugin::assets::crafting_station_database::CraftingStationDatabase" => {
+                source.push_str(&format!(
+                    r#"  private parsedCraftingStationDatabase?: CraftingStationDatabase;
+
+  {getter}(): CraftingStationDatabase {{
+    this.parsedCraftingStationDatabase ??= parseCraftingStationDatabase(this.instance.requiredAssetBytes({path}));
+    return this.parsedCraftingStationDatabase;
+  }}
+
+  craftingStations(): readonly CraftingStationData[] {{
+    return this.{getter}().craftingStations;
+  }}
+
+"#,
+                    getter = getter,
+                    path = path,
+                ));
+            }
+            "newworld_plugin::assets::rank_database::SocialRankDatabase" => {
+                source.push_str(&format!(
+                    r#"  private parsedSocialRankDatabase?: SocialRankDatabase;
+
+  {getter}(): SocialRankDatabase {{
+    this.parsedSocialRankDatabase ??= parseSocialRankDatabase(this.instance.requiredAssetBytes({path}));
+    return this.parsedSocialRankDatabase;
+  }}
+
+  ranks(): readonly SocialRankData[] {{
+    return this.{getter}().ranks;
+  }}
+
+"#,
+                    getter = getter,
+                    path = path,
+                ));
+            }
             _ => {}
         }
     }
     source
+}
+
+fn push_product_backed_manager_class(source: &mut String, manager: &DirectManagerSurface) {
+    let manager_class = &manager.manager_class_name;
+    let manager_name = typescript_string_literal(&manager.manager_name);
+    let runtime_factory = ts_method_name(&manager.manager_name);
+    let mut product_methods = direct_ts_product_methods(manager);
+    product_methods.push_str(&special_ts_manager_extra_methods(manager_class));
+    let constructor = if product_methods.trim().is_empty() {
+        "constructor(instance: ManagerInstance) { void instance; }"
+    } else {
+        "constructor(private readonly instance: ManagerInstance) {}"
+    };
+    source.push_str(&format!(
+        r#"
+export class {manager_class} {{
+  {constructor}
+
+  static fromRuntime(runtime: ManagerRuntime): {manager_class} {{
+    return new {manager_class}(runtime[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
+  }}
+
+{product_methods}
+}}
+
+export function {runtime_factory}(runtime: ManagerRuntime): {manager_class} {{
+  return {manager_class}.fromRuntime(runtime);
+}}
+
+"#
+    ));
+}
+
+fn push_item_data_manager_class(source: &mut String, manager: &ItemDataManagerSurface) {
+    let manager_class = &manager.manager_class_name;
+    let manager_name = typescript_string_literal(&manager.manager_name);
+    let runtime_factory = ts_method_name(&manager.manager_name);
+    let table_type = &manager.table_type_name;
+    let handle_type = &manager.handle_type_name;
+    let data_type = &manager.data_type_name;
+    let table_entries = manager
+        .tables
+        .iter()
+        .map(|table| {
+            format!(
+                "  {}: {},\n",
+                table.variant_name,
+                typescript_string_literal(&table.table_name)
+            )
+        })
+        .collect::<String>();
+    let table_list = manager
+        .tables
+        .iter()
+        .map(|table| format!("  {table_type}.{},\n", table.variant_name))
+        .collect::<String>();
+
+    source.push_str(&format!(
+        r#"
+export const {table_type} = {{
+{table_entries}}} as const;
+
+export type {table_type} = (typeof {table_type})[keyof typeof {table_type}];
+
+export interface {handle_type} {{
+  readonly table: {table_type};
+  readonly row: number;
+}}
+
+export interface {data_type} {{
+  readonly sourceHandle: {handle_type};
+  readonly itemId: string;
+  readonly itemIdCrc: number;
+  readonly name: string | null;
+  readonly description: string | null;
+  readonly itemType: string | null;
+  readonly itemTypeDisplayName: string | null;
+  readonly uiItemClass: string | null;
+  readonly heartgemRuneTooltipTitle: string | null;
+  readonly confirmBeforeUse: boolean;
+  readonly consumeOnUse: boolean;
+  readonly bindOnPickup: boolean;
+  readonly deathDropPercentage: number;
+}}
+
+const ITEM_DATA_MANAGER_TABLES: readonly {table_type}[] = [
+{table_list}];
+
+export class {manager_class} {{
+  private readonly rowsCache: readonly {data_type}[];
+  private readonly rowsById = new Map<number, {data_type}>();
+
+  constructor(instance: ManagerInstance) {{
+    this.rowsCache = materialize{manager_class}(instance);
+    for (const row of this.rowsCache) {{
+      this.rowsById.set(row.itemIdCrc, row);
+    }}
+  }}
+
+  static fromRuntime(runtime: ManagerRuntime): {manager_class} {{
+    return new {manager_class}(runtime[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
+  }}
+
+  get(itemId: string): {data_type} | undefined {{
+    return this.getFromId(crc32Lowercase(itemId));
+  }}
+
+  getFromId(itemId: number): {data_type} | undefined {{
+    return this.rowsById.get(normalizeCrcKey(itemId));
+  }}
+
+  byIndex(index: number): {data_type} | undefined {{
+    if (!Number.isInteger(index) || index <= 0) {{
+      return undefined;
+    }}
+    return this.rowsCache[index - 1];
+  }}
+
+  items(): readonly {data_type}[] {{
+    return this.rowsCache;
+  }}
+
+  len(): number {{
+    return this.rowsCache.length;
+  }}
+
+  isEmpty(): boolean {{
+    return this.rowsCache.length === 0;
+  }}
+}}
+
+export function {runtime_factory}(runtime: ManagerRuntime): {manager_class} {{
+  return {manager_class}.fromRuntime(runtime);
+}}
+
+function materialize{manager_class}(instance: ManagerInstance): {data_type}[] {{
+  const items: {data_type}[] = [];
+  const seen = new Set<number>();
+  for (const tableName of ITEM_DATA_MANAGER_TABLES) {{
+    const table = instance.table(tableName);
+    if (table === undefined) {{
+      throw new Error(`manager {manager_class} table ${{tableName}} was not loaded`);
+    }}
+    cache{manager_class}Rows(items, seen, tableName, table);
+  }}
+  return items;
+}}
+
+function cache{manager_class}Rows(
+  items: {data_type}[],
+  seen: Set<number>,
+  tableName: {table_type},
+  table: DynamicTable,
+): void {{
+  for (const sourceRow of table.rows) {{
+    const itemId = requiredStringCell(table, sourceRow, "ItemID").trim();
+    if (itemId.length === 0) {{
+      continue;
+    }}
+    const itemIdCrc = crc32Lowercase(itemId);
+    if (itemIdCrc === 0 || seen.has(itemIdCrc)) {{
+      continue;
+    }}
+    seen.add(itemIdCrc);
+    items.push({{
+      sourceHandle: {{
+        table: tableName,
+        row: sourceRow.rowIndex + 1,
+      }},
+      itemId,
+      itemIdCrc,
+      name: optionalStringCell(table, sourceRow, "Name"),
+      description: optionalStringCell(table, sourceRow, "Description"),
+      itemType: optionalStringCell(table, sourceRow, "ItemType"),
+      itemTypeDisplayName: optionalStringCell(table, sourceRow, "ItemTypeDisplayName"),
+      uiItemClass: optionalStringCell(table, sourceRow, "UiItemClass"),
+      heartgemRuneTooltipTitle: optionalStringCell(table, sourceRow, "HeartgemRuneTooltipTitle"),
+      confirmBeforeUse: optionalBoolCell(table, sourceRow, "ConfirmBeforeUse") ?? false,
+      consumeOnUse: optionalBoolCell(table, sourceRow, "ConsumeOnUse") ?? false,
+      bindOnPickup: optionalBoolCell(table, sourceRow, "BindOnPickup") ?? false,
+      deathDropPercentage: optionalNumberCell(table, sourceRow, "DeathDropPercentage") ?? 0,
+    }});
+  }}
+}}
+
+"#
+    ));
 }
 
 fn push_semantic_manager_class(source: &mut String, record: &SemanticManagerRecord) {
@@ -1125,7 +1420,7 @@ export class {manager_class} {{
 "#
         ));
     }
-    source.push_str(&special_ts_manager_product_methods(manager_class));
+    source.push_str(&special_ts_manager_extra_methods(manager_class));
     source.push_str("}\n\n");
     source.push_str(&format!(
         r#"export function {runtime_factory}(runtime: ManagerRuntime): {manager_class} {{
@@ -1137,38 +1432,10 @@ export class {manager_class} {{
     push_semantic_materializer(source, record);
 }
 
-fn special_ts_manager_product_methods(manager_class_name: &str) -> String {
+fn special_ts_manager_extra_methods(manager_class_name: &str) -> String {
     match manager_class_name {
-        "PlayerDataManager" => r#"  private parsedPlayerBaseAttributes?: PlayerBaseAttributes;
-  private parsedSettlementProgressionData?: SettlementProgressionData;
-
-  playerBaseAttributes(): PlayerBaseAttributes {
-    this.parsedPlayerBaseAttributes ??= parsePlayerBaseAttributes(
-      this.instance.requiredAssetBytes("sharedassets/genericassets/playerbaseattributes.pbadb"),
-    );
-    return this.parsedPlayerBaseAttributes;
-  }
-
-  playerAttributeData(): PlayerAttributeData {
-    return this.playerBaseAttributes().playerAttributeData;
-  }
-
-  maxPerks(rarityLevel: number): number | undefined {
-    return this.playerAttributeData().itemRarityData[rarityLevel]?.maxPerkCount;
-  }
-
-  settlementProgressionData(): SettlementProgressionData {
-    this.parsedSettlementProgressionData ??= parseSettlementProgressionData(
-      this.instance.requiredAssetBytes("sharedassets/genericassets/settlementprogression.sprd"),
-    );
-    return this.parsedSettlementProgressionData;
-  }
-
-  settlementProgressionCategories(): readonly ProgressionCategoryEntry[] {
-    return this.settlementProgressionData().settlementProgressionCategories;
-  }
-
-  categoricalProgressionId(tradeskill: string | number): number | undefined {
+        "PlayerDataManager" => {
+            r#"  categoricalProgressionId(tradeskill: string | number): number | undefined {
     const normalized = normalizeTradeskillType(tradeskill);
     if (normalized === "None" || normalized === "WildernessSurvival") {
       return undefined;
@@ -1177,72 +1444,8 @@ fn special_ts_manager_product_methods(manager_class_name: &str) -> String {
   }
 
 "#
-        .to_owned(),
-        "GatherableDataManager" => r#"  private parsedGatheringDatabase?: GatheringDatabase;
-  private parsedGatheringActionDatabase?: GatheringActionDatabase;
-
-  gatheringDatabase(): GatheringDatabase {
-    this.parsedGatheringDatabase ??= parseGatheringDatabase(
-      this.instance.requiredAssetBytes("sharedassets/genericassets/gathering/gatheringdatabase.gdb"),
-    );
-    return this.parsedGatheringDatabase;
-  }
-
-  gatheringData(): GatheringData {
-    return this.gatheringDatabase().gatheringData;
-  }
-
-  gatheringTypes(): readonly GatheringTypeData[] {
-    return this.gatheringData().gatheringTypes;
-  }
-
-  gatheringActions(): readonly GatheringAction[] {
-    return this.gatheringData().gatheringActions;
-  }
-
-  gatheringActionDatabase(): GatheringActionDatabase {
-    this.parsedGatheringActionDatabase ??= parseGatheringActionDatabase(
-      this.instance.requiredAssetBytes("sharedassets/genericassets/gatheringactiondatabase.gactdb"),
-    );
-    return this.parsedGatheringActionDatabase;
-  }
-
-  gatheringActionData(): readonly GatheringActionData[] {
-    return this.gatheringActionDatabase().gatheringActions;
-  }
-
-"#
-        .to_owned(),
-        "RecipeDataManager" => r#"  private parsedCraftingStationDatabase?: CraftingStationDatabase;
-
-  craftingStationDatabase(): CraftingStationDatabase {
-    this.parsedCraftingStationDatabase ??= parseCraftingStationDatabase(
-      this.instance.requiredAssetBytes("sharedassets/genericassets/craftingstations.craftstationdb"),
-    );
-    return this.parsedCraftingStationDatabase;
-  }
-
-  craftingStations(): readonly CraftingStationData[] {
-    return this.craftingStationDatabase().craftingStations;
-  }
-
-"#
-        .to_owned(),
-        "SocialDataManager" => r#"  private parsedSocialRankDatabase?: SocialRankDatabase;
-
-  rankDatabase(): SocialRankDatabase {
-    this.parsedSocialRankDatabase ??= parseSocialRankDatabase(
-      this.instance.requiredAssetBytes("sharedassets/genericassets/rankdatabase.rankdb"),
-    );
-    return this.parsedSocialRankDatabase;
-  }
-
-  ranks(): readonly SocialRankData[] {
-    return this.rankDatabase().ranks;
-  }
-
-"#
-        .to_owned(),
+            .to_owned()
+        }
         _ => String::new(),
     }
 }
@@ -1781,10 +1984,10 @@ function requiredStringCell(
   columnName: string,
 ): string {
   const value = rowCell(table, row, columnName);
-  if (value?.kind !== "string") {
+  if (value === undefined) {
     throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} missing string ${columnName}`);
   }
-  return value.value;
+  return stringCellValue(value);
 }
 
 function optionalStringCell(
@@ -1796,10 +1999,19 @@ function optionalStringCell(
   if (value === undefined) {
     return null;
   }
-  if (value.kind !== "string") {
-    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} has non-string ${columnName}`);
+  const text = stringCellValue(value);
+  return text.length === 0 ? null : text;
+}
+
+function stringCellValue(value: DatasheetCellValue): string {
+  switch (value.kind) {
+    case "string":
+      return value.value;
+    case "number":
+      return String(value.value);
+    case "boolean":
+      return String(value.value);
   }
-  return value.value.length === 0 ? null : value.value;
 }
 
 function requiredBoolCell(
@@ -1808,10 +2020,14 @@ function requiredBoolCell(
   columnName: string,
 ): boolean {
   const value = rowCell(table, row, columnName);
-  if (value?.kind !== "boolean") {
+  if (value === undefined) {
     throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} missing bool ${columnName}`);
   }
-  return value.value;
+  const bool = boolCellValue(value, row, columnName);
+  if (bool === null) {
+    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} missing bool ${columnName}`);
+  }
+  return bool;
 }
 
 function optionalBoolCell(
@@ -1823,10 +2039,38 @@ function optionalBoolCell(
   if (value === undefined) {
     return null;
   }
-  if (value.kind !== "boolean") {
-    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} has non-bool ${columnName}`);
+  return boolCellValue(value, row, columnName);
+}
+
+function boolCellValue(
+  value: DatasheetCellValue,
+  row: DynamicTableRow,
+  columnName: string,
+): boolean | null {
+  if (value.kind === "boolean") {
+    return value.value;
   }
-  return value.value;
+  if (value.kind === "number") {
+    if (value.value === 0) {
+      return false;
+    }
+    if (value.value === 1) {
+      return true;
+    }
+  }
+  if (value.kind === "string") {
+    const text = value.value.trim().toLowerCase();
+    if (text.length === 0) {
+      return null;
+    }
+    if (text === "false" || text === "0" || text === "no") {
+      return false;
+    }
+    if (text === "true" || text === "1" || text === "yes") {
+      return true;
+    }
+  }
+  throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} has non-bool ${columnName}`);
 }
 
 function requiredNumberCell(
@@ -1835,10 +2079,14 @@ function requiredNumberCell(
   columnName: string,
 ): number {
   const value = rowCell(table, row, columnName);
-  if (value?.kind !== "number") {
+  if (value === undefined) {
     throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} missing number ${columnName}`);
   }
-  return value.value;
+  const number = numberCellValue(value, row, columnName);
+  if (number === null) {
+    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} missing number ${columnName}`);
+  }
+  return number;
 }
 
 function optionalNumberCell(
@@ -1850,10 +2098,35 @@ function optionalNumberCell(
   if (value === undefined) {
     return null;
   }
-  if (value.kind !== "number") {
-    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} has non-number ${columnName}`);
+  return numberCellValue(value, row, columnName);
+}
+
+function numberCellValue(
+  value: DatasheetCellValue,
+  row: DynamicTableRow,
+  columnName: string,
+): number | null {
+  if (value.kind === "number") {
+    return value.value;
   }
-  return value.value;
+  if (value.kind === "boolean") {
+    return value.value ? 1 : 0;
+  }
+  const text = value.value.trim().toLowerCase();
+  if (text.length === 0) {
+    return null;
+  }
+  if (text === "false" || text === "no") {
+    return 0;
+  }
+  if (text === "true" || text === "yes") {
+    return 1;
+  }
+  const parsed = Number(text.replace(/f$/i, ""));
+  if (Number.isFinite(parsed)) {
+    return parsed;
+  }
+  throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} has non-number ${columnName}`);
 }
 
 function requiredUint8Cell(
@@ -3593,16 +3866,6 @@ export class ManagerRuntime {
             this.requiredAssetBytes(dependency.path),
           );
           break;
-        case "manager": {
-          const nested = managerByName(dependency.name);
-          if (nested === undefined) {
-            throw new Error(
-              `manager ${definition.name} depends on unknown manager ${dependency.name}`,
-            );
-          }
-          this.buildManager(nested, stack);
-          break;
-        }
       }
     }
 

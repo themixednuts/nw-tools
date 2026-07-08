@@ -4,13 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::game_system_schema::GameSystemDataTablesSchemaReport;
 use crate::manager::{
-    ManagerCodegenOutput, ManagerContractInput, ManagerEmissionContext, ManagerEmitter,
-    NativeDuplicateKeyPolicy,
+    ManagerCodegenOutput, ManagerEmissionContext, ManagerEmitter, NativeDuplicateKeyPolicy,
 };
 use crate::manager_records::{
-    DirectManagerSurface, ManagerSurface, SemanticLookupKind, SemanticManagerKey,
-    SemanticManagerRecord, SemanticNumericKeyType, SemanticProjectionTransform,
-    SemanticRecordField, SemanticRowFilterPredicate, manager_surfaces_from_managers,
+    DirectManagerSurface, ItemDataManagerSurface, ManagerSurface, ManagerSurfaceDependency,
+    SemanticLookupKind, SemanticManagerKey, SemanticManagerRecord, SemanticNumericKeyType,
+    SemanticProjectionTransform, SemanticRecordField, SemanticRowFilterPredicate,
+    manager_surface_dependencies, manager_surface_name, manager_surfaces_from_managers,
 };
 use crate::naming::{to_snake_ident, to_upper_camel_ident};
 use crate::native::NativeCodegenFile;
@@ -102,9 +102,6 @@ enum ManagerDependency {
     Asset {
         path: &'static str,
     },
-    Manager {
-        name: &'static str,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +112,7 @@ struct ManagerDefinition {
 
 "#,
     );
-    push_rust_standalone_manager_definitions(&mut runtime_source, context);
+    push_rust_standalone_manager_definitions(&mut runtime_source, context, &surfaces);
     runtime_source.push_str(
         r#"
 mod rows;
@@ -160,7 +157,9 @@ fn rust_semantic_records(surfaces: &[ManagerSurface]) -> Vec<SemanticManagerReco
         .iter()
         .filter_map(|surface| match surface {
             ManagerSurface::Semantic(record) => Some(record.clone()),
-            ManagerSurface::Direct(_) => None,
+            ManagerSurface::Direct(_)
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::ProductBacked(_) => None,
         })
         .collect()
 }
@@ -383,7 +382,8 @@ fn rust_standalone_schema_rows(
 ) -> Vec<RustStandaloneSchemaRow> {
     let mut rows = BTreeMap::<String, Vec<RustStandaloneSchemaField>>::new();
     for table in &schema_report.tables {
-        let fields = rows.entry(table.row_type_name.clone()).or_default();
+        let row_type = table.row_type_name.clone();
+        let fields = rows.entry(row_type.clone()).or_default();
         for column in &table.columns {
             let field_name = to_snake_ident(&column.name, "field");
             if let Some(existing) = fields
@@ -391,14 +391,16 @@ fn rust_standalone_schema_rows(
                 .find(|field| field.field_name == field_name)
             {
                 existing.row_key |= column.row_key;
-                existing.required = (existing.required && column.required) || existing.row_key;
+                existing.required = existing.row_key;
+                existing.column_type =
+                    merge_schema_column_type(existing.column_type, column.declared_type);
                 continue;
             }
             fields.push(RustStandaloneSchemaField {
                 source_name: column.name.clone(),
                 field_name,
                 column_type: column.declared_type,
-                required: column.required || column.row_key,
+                required: column.row_key,
                 row_key: column.row_key,
             });
         }
@@ -412,8 +414,37 @@ fn rust_standalone_schema_rows(
         .collect()
 }
 
+fn merge_schema_column_type(left: ColumnType, right: ColumnType) -> ColumnType {
+    match (left, right) {
+        (ColumnType::String, _) | (_, ColumnType::String) => ColumnType::String,
+        (ColumnType::Number, _) | (_, ColumnType::Number) => ColumnType::Number,
+        (ColumnType::Boolean, ColumnType::Boolean) => ColumnType::Boolean,
+    }
+}
+
 fn rust_standalone_schema_row_type_name(row_type: &str) -> String {
     format!("{}SchemaRow", to_upper_camel_ident(row_type, "Schema"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merged_schema_column_type_is_lossless_for_mixed_source_columns() {
+        assert_eq!(
+            merge_schema_column_type(ColumnType::Number, ColumnType::String),
+            ColumnType::String
+        );
+        assert_eq!(
+            merge_schema_column_type(ColumnType::Boolean, ColumnType::String),
+            ColumnType::String
+        );
+        assert_eq!(
+            merge_schema_column_type(ColumnType::Boolean, ColumnType::Number),
+            ColumnType::Number
+        );
+    }
 }
 
 fn rust_standalone_schema_field_type(column_type: ColumnType, required: bool) -> &'static str {
@@ -431,10 +462,10 @@ fn rust_standalone_schema_field_read_expression(field: &RustStandaloneSchemaFiel
     let column = rust_string_literal(&field.source_name);
     match (field.column_type, field.required) {
         (ColumnType::String, true) => {
-            format!("required_string_cell(table, row, {column})?.to_owned()")
+            format!("required_schema_string_cell(table, row, {column})?")
         }
         (ColumnType::String, false) => {
-            format!("optional_string_cell(table, row, {column})?.map(str::to_owned)")
+            format!("optional_schema_string_cell(table, row, {column})?")
         }
         (ColumnType::Number, true) => format!("required_number_cell(table, row, {column})?"),
         (ColumnType::Number, false) => format!("optional_number_cell(table, row, {column})?"),
@@ -450,12 +481,27 @@ fn rust_standalone_schema_reader_name(row_type: &str) -> String {
 fn push_rust_standalone_manager_definitions(
     source: &mut String,
     context: ManagerEmissionContext<'_>,
+    surfaces: &[ManagerSurface],
 ) {
-    for (index, manager) in context.plan().contracts().iter().enumerate() {
+    let contracts = context.plan().contracts();
+    let managers = surfaces
+        .iter()
+        .filter_map(|surface| {
+            let manager_name = manager_surface_name(surface);
+            let contract = contracts.iter().find(|contract| {
+                semantic_manager_type_name(contract.manager().as_str()) == manager_name
+            })?;
+            Some((
+                manager_name,
+                manager_surface_dependencies(surface, contract.inputs()),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (index, (_, dependencies)) in managers.iter().enumerate() {
         source.push_str(&format!(
             "const MANAGER_{index:03}_DEPENDENCIES: &[ManagerDependency] = &[\n"
         ));
-        for input in manager.inputs() {
+        for input in dependencies {
             source.push_str("    ");
             source.push_str(&rust_standalone_manager_dependency(input));
             source.push_str(",\n");
@@ -463,11 +509,11 @@ fn push_rust_standalone_manager_definitions(
         source.push_str("];\n");
     }
     source.push_str("\nconst MANAGERS: &[ManagerDefinition] = &[\n");
-    for (index, manager) in context.plan().contracts().iter().enumerate() {
+    for (index, (manager_name, _)) in managers.iter().enumerate() {
         source.push_str("    ManagerDefinition {\n");
         source.push_str(&format!(
             "        name: {},\n",
-            rust_string_literal(semantic_manager_type_name(manager.manager().as_str()))
+            rust_string_literal(manager_name)
         ));
         source.push_str(&format!(
             "        dependencies: MANAGER_{index:03}_DEPENDENCIES,\n"
@@ -488,6 +534,12 @@ fn push_rust_standalone_manager_surfaces(
                 push_rust_direct_manager_wrapper(source, manager, schema_report);
             }
             ManagerSurface::Semantic(record) => push_rust_semantic_manager_wrapper(source, record),
+            ManagerSurface::ItemData(manager) => {
+                push_rust_item_data_manager_wrapper(source, manager)
+            }
+            ManagerSurface::ProductBacked(manager) => {
+                push_rust_product_backed_manager_wrapper(source, manager)
+            }
         }
     }
 }
@@ -499,7 +551,8 @@ fn push_rust_direct_manager_wrapper(
 ) {
     let manager_name = &manager.manager_class_name;
     let factory = to_snake_ident(manager_name, "manager");
-    let special_methods = rust_standalone_special_manager_methods(manager_name);
+    let mut product_methods = rust_direct_product_methods(manager);
+    product_methods.push_str(rust_standalone_special_manager_extra_methods(manager_name));
     let row_methods = rust_direct_schema_methods(manager, schema_report);
     source.push_str(&format!(
         r#"
@@ -520,12 +573,340 @@ impl {manager_name} {{
     }}
 
 {row_methods}
-{special_methods}
+{product_methods}
 }}
 
 pub fn {factory}(runtime: &mut ManagerRuntime) -> Result<{manager_name}> {{
     {manager_name}::from_runtime(runtime)
 }}
+"#
+    ));
+}
+
+fn push_rust_product_backed_manager_wrapper(source: &mut String, manager: &DirectManagerSurface) {
+    let manager_name = &manager.manager_class_name;
+    let factory = to_snake_ident(manager_name, "manager");
+    let mut product_methods = rust_direct_product_methods(manager);
+    product_methods.push_str(rust_standalone_special_manager_extra_methods(manager_name));
+    source.push_str(&format!(
+        r#"
+#[derive(Debug, Clone)]
+pub struct {manager_name} {{
+    instance: Arc<ManagerInstance>,
+}}
+
+impl {manager_name} {{
+    pub fn from_runtime(runtime: &mut ManagerRuntime) -> Result<Self> {{
+        Ok(Self {{
+            instance: runtime.manager({manager_name:?})?,
+        }})
+    }}
+
+{product_methods}
+}}
+
+pub fn {factory}(runtime: &mut ManagerRuntime) -> Result<{manager_name}> {{
+    {manager_name}::from_runtime(runtime)
+}}
+"#
+    ));
+}
+
+fn push_rust_item_data_manager_wrapper(source: &mut String, manager: &ItemDataManagerSurface) {
+    let manager_name = &manager.manager_class_name;
+    let factory = to_snake_ident(manager_name, "manager");
+    let table_type = &manager.table_type_name;
+    let handle_type = &manager.handle_type_name;
+    let data_type = &manager.data_type_name;
+    let table_variants = manager
+        .tables
+        .iter()
+        .map(|table| format!("    {},\n", table.variant_name))
+        .collect::<String>();
+    let table_name_arms = manager
+        .tables
+        .iter()
+        .map(|table| {
+            format!(
+                "            Self::{} => {},\n",
+                table.variant_name,
+                rust_string_literal(&table.table_name)
+            )
+        })
+        .collect::<String>();
+    let table_list = manager
+        .tables
+        .iter()
+        .map(|table| format!("    {table_type}::{},\n", table.variant_name))
+        .collect::<String>();
+    let manager_name_literal = rust_string_literal(&manager.manager_name);
+
+    source.push_str(&format!(
+        r#"
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum {table_type} {{
+{table_variants}}}
+
+impl {table_type} {{
+    #[must_use]
+    pub const fn table_name(self) -> &'static str {{
+        match self {{
+{table_name_arms}        }}
+    }}
+}}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct {handle_type} {{
+    table: {table_type},
+    row: u32,
+}}
+
+impl {handle_type} {{
+    #[must_use]
+    pub const fn new(table: {table_type}, row: u32) -> Self {{
+        Self {{ table, row }}
+    }}
+
+    #[must_use]
+    pub const fn table(self) -> {table_type} {{
+        self.table
+    }}
+
+    #[must_use]
+    pub const fn table_name(self) -> &'static str {{
+        self.table.table_name()
+    }}
+
+    #[must_use]
+    pub const fn row(self) -> u32 {{
+        self.row
+    }}
+
+    #[must_use]
+    pub const fn row_index(self) -> u32 {{
+        self.row
+    }}
+}}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct {data_type} {{
+    source_handle: {handle_type},
+    item_id: String,
+    item_id_crc: u32,
+    name: Option<String>,
+    description: Option<String>,
+    item_type: Option<String>,
+    item_type_display_name: Option<String>,
+    ui_item_class: Option<String>,
+    heartgem_rune_tooltip_title: Option<String>,
+    confirm_before_use: bool,
+    consume_on_use: bool,
+    bind_on_pickup: bool,
+    death_drop_percentage: f32,
+}}
+
+impl {data_type} {{
+    #[must_use]
+    pub const fn source_handle(&self) -> {handle_type} {{
+        self.source_handle
+    }}
+
+    #[must_use]
+    pub const fn source_table(&self) -> {table_type} {{
+        self.source_handle.table()
+    }}
+
+    #[must_use]
+    pub const fn source_row(&self) -> u32 {{
+        self.source_handle.row()
+    }}
+
+    #[must_use]
+    pub fn item_id(&self) -> &str {{
+        &self.item_id
+    }}
+
+    #[must_use]
+    pub const fn item_id_crc(&self) -> u32 {{
+        self.item_id_crc
+    }}
+
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {{
+        self.name.as_deref()
+    }}
+
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {{
+        self.description.as_deref()
+    }}
+
+    #[must_use]
+    pub fn item_type(&self) -> Option<&str> {{
+        self.item_type.as_deref()
+    }}
+
+    #[must_use]
+    pub fn item_type_display_name(&self) -> Option<&str> {{
+        self.item_type_display_name.as_deref()
+    }}
+
+    #[must_use]
+    pub fn ui_item_class(&self) -> Option<&str> {{
+        self.ui_item_class.as_deref()
+    }}
+
+    #[must_use]
+    pub fn heartgem_rune_tooltip_title(&self) -> Option<&str> {{
+        self.heartgem_rune_tooltip_title.as_deref()
+    }}
+
+    #[must_use]
+    pub const fn confirm_before_use(&self) -> bool {{
+        self.confirm_before_use
+    }}
+
+    #[must_use]
+    pub const fn consume_on_use(&self) -> bool {{
+        self.consume_on_use
+    }}
+
+    #[must_use]
+    pub const fn bind_on_pickup(&self) -> bool {{
+        self.bind_on_pickup
+    }}
+
+    #[must_use]
+    pub const fn death_drop_percentage(&self) -> f32 {{
+        self.death_drop_percentage
+    }}
+}}
+
+const ITEM_DATA_MANAGER_TABLES: &[{table_type}] = &[
+{table_list}];
+
+#[derive(Debug, Clone)]
+pub struct {manager_name} {{
+    instance: Arc<ManagerInstance>,
+    items: Arc<Vec<{data_type}>>,
+    items_by_id: Arc<HashMap<u32, usize>>,
+}}
+
+impl {manager_name} {{
+    pub fn from_runtime(runtime: &mut ManagerRuntime) -> Result<Self> {{
+        Self::from_instance(runtime.manager({manager_name_literal})?)
+    }}
+
+    fn from_instance(instance: Arc<ManagerInstance>) -> Result<Self> {{
+        let items = materialize_{factory}(&instance)?;
+        let mut items_by_id = HashMap::new();
+        for (index, item) in items.iter().enumerate() {{
+            items_by_id.insert(item.item_id_crc, index);
+        }}
+        Ok(Self {{
+            instance,
+            items: Arc::new(items),
+            items_by_id: Arc::new(items_by_id),
+        }})
+    }}
+
+    #[must_use]
+    pub fn get(&self, item_id: impl AsRef<str>) -> Option<&{data_type}> {{
+        self.get_from_id(crc32_lowercase(item_id.as_ref()))
+    }}
+
+    #[must_use]
+    pub fn get_from_id(&self, item_id: u32) -> Option<&{data_type}> {{
+        self.items.get(*self.items_by_id.get(&item_id)?)
+    }}
+
+    #[must_use]
+    pub fn by_index(&self, index: std::num::NonZeroU32) -> Option<&{data_type}> {{
+        let zero_based = usize::try_from(index.get() - 1).ok()?;
+        self.items.get(zero_based)
+    }}
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &{data_type}> + '_ {{
+        self.items.iter()
+    }}
+
+    #[must_use]
+    pub fn items(&self) -> &[{data_type}] {{
+        &self.items
+    }}
+
+    #[must_use]
+    pub fn len(&self) -> usize {{
+        self.items.len()
+    }}
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {{
+        self.items.is_empty()
+    }}
+}}
+
+pub fn {factory}(runtime: &mut ManagerRuntime) -> Result<{manager_name}> {{
+    {manager_name}::from_runtime(runtime)
+}}
+
+fn materialize_{factory}(instance: &ManagerInstance) -> Result<Vec<{data_type}>> {{
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for table_id in ITEM_DATA_MANAGER_TABLES {{
+        let table = instance.table(table_id.table_name()).with_context(|| {{
+            format!(
+                "manager {{}} table {{}} was not loaded",
+                instance.definition.name,
+                table_id.table_name()
+            )
+        }})?;
+        cache_item_data_rows(&mut items, &mut seen, *table_id, table)?;
+    }}
+    Ok(items)
+}}
+
+fn cache_item_data_rows(
+    items: &mut Vec<{data_type}>,
+    seen: &mut HashSet<u32>,
+    table_id: {table_type},
+    table: &DynamicTable,
+) -> Result<()> {{
+    for source_row in &table.rows {{
+        let item_id = required_string_cell(table, source_row, "ItemID")?.trim();
+        if item_id.is_empty() {{
+            continue;
+        }}
+        let item_id_crc = crc32_lowercase(item_id);
+        if item_id_crc == 0 || !seen.insert(item_id_crc) {{
+            continue;
+        }}
+        let row = u32::try_from(source_row.row_index + 1).with_context(|| {{
+            format!(
+                "row {{}}:{{}} source row exceeds u32",
+                source_row.source_path,
+                source_row.row_index + 1
+            )
+        }})?;
+        items.push({data_type} {{
+            source_handle: {handle_type}::new(table_id, row),
+            item_id: item_id.to_owned(),
+            item_id_crc,
+            name: optional_string_cell(table, source_row, "Name")?.map(str::to_owned),
+            description: optional_string_cell(table, source_row, "Description")?.map(str::to_owned),
+            item_type: optional_string_cell(table, source_row, "ItemType")?.map(str::to_owned),
+            item_type_display_name: optional_string_cell(table, source_row, "ItemTypeDisplayName")?.map(str::to_owned),
+            ui_item_class: optional_string_cell(table, source_row, "UiItemClass")?.map(str::to_owned),
+            heartgem_rune_tooltip_title: optional_string_cell(table, source_row, "HeartgemRuneTooltipTitle")?.map(str::to_owned),
+            confirm_before_use: optional_bool_cell(table, source_row, "ConfirmBeforeUse")?.unwrap_or(false),
+            consume_on_use: optional_bool_cell(table, source_row, "ConsumeOnUse")?.unwrap_or(false),
+            bind_on_pickup: optional_bool_cell(table, source_row, "BindOnPickup")?.unwrap_or(false),
+            death_drop_percentage: optional_number_cell(table, source_row, "DeathDropPercentage")?.unwrap_or(0.0),
+        }});
+    }}
+    Ok(())
+}}
+
 "#
     ));
 }
@@ -586,6 +967,205 @@ fn rust_direct_schema_methods(
                 reader = rust_standalone_schema_reader_name(&source_row_type),
                 key_field = key_field.field_name,
             ));
+        }
+    }
+    source
+}
+
+fn rust_direct_product_methods(manager: &DirectManagerSurface) -> String {
+    let mut source = String::new();
+    for product in &manager.products {
+        let path = rust_string_literal(&product.path);
+        let getter = to_snake_ident(&product.manager_getter, "asset");
+        match product.value_type.as_str() {
+            "newworld_plugin::assets::armor_offset_database::ArmorOffsetDatabase" => {
+                source.push_str(&format!(
+                    r#"    pub fn {getter}(&self) -> Result<ArmorOffsetDatabase> {{
+        parse_armor_offset_database(self.instance.required_asset_bytes({path})?)
+    }}
+
+    pub fn armor_offset(&self, name: &str) -> Result<Option<ArmorOffsetData>> {{
+        Ok(armor_offset_by_name(&self.{getter}()?, name).cloned())
+    }}
+
+    pub fn furthest_attachment_offset(
+        &self,
+        armor_offset_names: &[String],
+        attachment_name: &str,
+        current_position: Vec3,
+    ) -> Result<Option<AttachmentOffsetData>> {{
+        Ok(furthest_armor_attachment_offset(
+            &self.{getter}()?,
+            armor_offset_names,
+            attachment_name,
+            current_position,
+        )
+        .cloned())
+    }}
+
+"#
+                ));
+            }
+            "newworld_plugin::assets::equip_types_database::EquipTypesDatabase" => {
+                source.push_str(&format!(
+                    r#"    pub fn {getter}(&self) -> Result<EquipTypesDatabase> {{
+        parse_equip_types_database(self.instance.required_asset_bytes({path})?)
+    }}
+
+    pub fn equip_types(&self) -> Result<Vec<EquipTypeData>> {{
+        Ok(self.{getter}()?.equip_types)
+    }}
+
+"#
+                ));
+            }
+            "newworld_plugin::assets::game_debug_settings::GameDebugSettings" => {
+                source.push_str(&format!(
+                    r#"    pub fn {getter}(&self) -> Result<GameDebugSettings> {{
+        parse_game_debug_settings(self.instance.required_asset_bytes({path})?)
+    }}
+
+    pub fn combat(&self) -> Result<CombatDebugSettings> {{
+        Ok(self.{getter}()?.combat_settings)
+    }}
+
+    pub fn disabled_combat_toggle_count(&self) -> Result<usize> {{
+        Ok(disabled_combat_toggle_count(&self.combat()?))
+    }}
+
+"#
+                ));
+            }
+            "newworld_plugin::assets::player_base_attributes::PlayerBaseAttributes" => {
+                source.push_str(&format!(
+                    r#"    pub fn {getter}(&self) -> Result<PlayerBaseAttributes> {{
+        parse_player_base_attributes(self.instance.required_asset_bytes({path})?)
+    }}
+
+    pub fn player_attribute_data(&self) -> Result<PlayerAttributeData> {{
+        Ok(self.{getter}()?.player_attribute_data)
+    }}
+
+    pub fn max_perks(&self, rarity_level: usize) -> Result<Option<i32>> {{
+        Ok(self
+            .player_attribute_data()?
+            .item_rarity_data
+            .get(rarity_level)
+            .map(|rarity| rarity.max_perk_count))
+    }}
+
+"#
+                ));
+            }
+            "newworld_plugin::assets::settlement_progression_data::SettlementProgressionData" => {
+                source.push_str(&format!(
+                    r#"    pub fn {getter}(&self) -> Result<SettlementProgressionData> {{
+        parse_settlement_progression_data(self.instance.required_asset_bytes({path})?)
+    }}
+
+    pub fn settlement_progression_categories(&self) -> Result<Vec<ProgressionCategoryEntry>> {{
+        Ok(self.{getter}()?.settlement_progression_categories)
+    }}
+
+"#
+                ));
+            }
+            "newworld_plugin::assets::ui_database::UiDatabase" => {
+                source.push_str(&format!(
+                    r#"    pub fn {getter}(&self) -> Result<UiDatabase> {{
+        parse_ui_database(self.instance.required_asset_bytes({path})?)
+    }}
+
+    pub fn interact_options(&self) -> Result<Vec<InteractOptionData>> {{
+        Ok(self.{getter}()?.unified_interact_data.interact_options)
+    }}
+
+    pub fn interact_option(&self, id: impl ToString) -> Result<Option<InteractOptionData>> {{
+        let key = crc32_lowercase(&id.to_string());
+        Ok(interact_option_by_crc(&self.interact_options()?, key).cloned())
+    }}
+
+    pub fn interact_options_by_category(&self, category: i32) -> Result<Vec<InteractOptionData>> {{
+        Ok(interact_options_by_category(&self.interact_options()?, category))
+    }}
+
+"#
+                ));
+            }
+            "newworld_plugin::assets::camera_settings::GameCameraSettings" => {
+                source.push_str(&format!(
+                    r#"    pub fn {getter}(&self) -> Result<GameCameraSettings> {{
+        parse_game_camera_settings(self.instance.required_asset_bytes({path})?)
+    }}
+
+    pub fn camera_states(&self) -> Result<Vec<CameraStateSettings>> {{
+        Ok(self.{getter}()?.camera_states)
+    }}
+
+"#
+                ));
+            }
+            "newworld_plugin::assets::gathering_database::GatheringDatabase" => {
+                source.push_str(&format!(
+                    r#"    pub fn {getter}(&self) -> Result<GatheringDatabase> {{
+        parse_gathering_database(self.instance.required_asset_bytes({path})?)
+    }}
+
+    pub fn gathering_data(&self) -> Result<GatheringData> {{
+        Ok(self.{getter}()?.gathering_data)
+    }}
+
+    pub fn gathering_types(&self) -> Result<Vec<GatheringTypeData>> {{
+        Ok(self.gathering_data()?.gathering_types)
+    }}
+
+    pub fn gathering_actions(&self) -> Result<Vec<GatheringAction>> {{
+        Ok(self.gathering_data()?.gathering_actions)
+    }}
+
+"#
+                ));
+            }
+            "newworld_plugin::assets::gathering_database::GatheringActionDatabase" => {
+                source.push_str(&format!(
+                    r#"    pub fn {getter}(&self) -> Result<GatheringActionDatabase> {{
+        parse_gathering_action_database(self.instance.required_asset_bytes({path})?)
+    }}
+
+    pub fn gathering_action_data(&self) -> Result<Vec<GatheringActionData>> {{
+        Ok(self.{getter}()?.gathering_actions)
+    }}
+
+"#
+                ));
+            }
+            "newworld_plugin::assets::crafting_station_database::CraftingStationDatabase" => {
+                source.push_str(&format!(
+                    r#"    pub fn {getter}(&self) -> Result<CraftingStationDatabase> {{
+        parse_crafting_station_database(self.instance.required_asset_bytes({path})?)
+    }}
+
+    pub fn crafting_stations(&self) -> Result<Vec<CraftingStationData>> {{
+        Ok(self.{getter}()?.crafting_stations)
+    }}
+
+"#
+                ));
+            }
+            "newworld_plugin::assets::rank_database::SocialRankDatabase" => {
+                source.push_str(&format!(
+                    r#"    pub fn {getter}(&self) -> Result<SocialRankDatabase> {{
+        parse_social_rank_database(self.instance.required_asset_bytes({path})?)
+    }}
+
+    pub fn ranks(&self) -> Result<Vec<SocialRankData>> {{
+        Ok(self.{getter}()?.ranks)
+    }}
+
+"#
+                ));
+            }
+            _ => {}
         }
     }
     source
@@ -678,7 +1258,7 @@ fn push_rust_semantic_manager_wrapper(source: &mut String, record: &SemanticMana
     let rows_method = rust_semantic_rows_method(record);
     let len_method = rust_semantic_len_method(record);
     let is_empty_method = rust_semantic_is_empty_method(record);
-    let special_methods = rust_standalone_special_manager_methods(manager_name);
+    let special_methods = rust_standalone_special_manager_extra_methods(manager_name);
     let key_index_insert = rust_semantic_key_index_insert(record);
     let source_row_index_insert = rust_semantic_source_row_index_insert(record);
 
@@ -1415,124 +1995,10 @@ fn rust_projection_value(field: &SemanticRecordField) -> String {
     }
 }
 
-fn rust_standalone_special_manager_methods(manager_name: &str) -> &'static str {
+fn rust_standalone_special_manager_extra_methods(manager_name: &str) -> &'static str {
     match manager_name {
-        "CameraSettingsDataManager" => {
-            r#"    pub fn settings(&self) -> Result<GameCameraSettings> {
-        parse_game_camera_settings(self.instance.required_asset_bytes("libs/camera/gamecamera.xml")?)
-    }
-
-    pub fn camera_states(&self) -> Result<Vec<CameraStateSettings>> {
-        Ok(self.settings()?.camera_states)
-    }
-"#
-        }
-        "ArmorOffsetDataManager" => {
-            r#"    pub fn database(&self) -> Result<ArmorOffsetDatabase> {
-        parse_armor_offset_database(
-            self.instance.required_asset_bytes("sharedassets/genericassets/items/armoroffsets.aoffdb")?,
-        )
-    }
-
-    pub fn armor_offset(&self, name: &str) -> Result<Option<ArmorOffsetData>> {
-        Ok(armor_offset_by_name(&self.database()?, name).cloned())
-    }
-
-    pub fn furthest_attachment_offset(
-        &self,
-        armor_offset_names: &[String],
-        attachment_name: &str,
-        current_position: Vec3,
-    ) -> Result<Option<AttachmentOffsetData>> {
-        Ok(furthest_armor_attachment_offset(
-            &self.database()?,
-            armor_offset_names,
-            attachment_name,
-            current_position,
-        )
-        .cloned())
-    }
-"#
-        }
-        "EquipTypesDataManager" => {
-            r#"    pub fn database(&self) -> Result<EquipTypesDatabase> {
-        parse_equip_types_database(
-            self.instance.required_asset_bytes("sharedassets/genericassets/items/equiptypesdatabase.equipdb")?,
-        )
-    }
-
-    pub fn equip_types(&self) -> Result<Vec<EquipTypeData>> {
-        Ok(self.database()?.equip_types)
-    }
-"#
-        }
-        "GameDebugSettingsManager" => {
-            r#"    pub fn settings(&self) -> Result<GameDebugSettings> {
-        parse_game_debug_settings(
-            self.instance.required_asset_bytes("sharedassets/genericassets/debug/gamedebugsettings.gds")?,
-        )
-    }
-
-    pub fn combat(&self) -> Result<CombatDebugSettings> {
-        Ok(self.settings()?.combat_settings)
-    }
-
-    pub fn disabled_combat_toggle_count(&self) -> Result<usize> {
-        Ok(disabled_combat_toggle_count(&self.combat()?))
-    }
-"#
-        }
-        "UiDataManager" => {
-            r#"    pub fn database(&self) -> Result<UiDatabase> {
-        parse_ui_database(self.instance.required_asset_bytes("sharedassets/genericassets/ui/uidatabase.uidb")?)
-    }
-
-    pub fn interact_options(&self) -> Result<Vec<InteractOptionData>> {
-        Ok(self.database()?.unified_interact_data.interact_options)
-    }
-
-    pub fn interact_option(&self, id: impl ToString) -> Result<Option<InteractOptionData>> {
-        let key = crc32_lowercase(&id.to_string());
-        Ok(interact_option_by_crc(&self.interact_options()?, key).cloned())
-    }
-
-    pub fn interact_options_by_category(&self, category: i32) -> Result<Vec<InteractOptionData>> {
-        Ok(interact_options_by_category(&self.interact_options()?, category))
-    }
-"#
-        }
         "PlayerDataManager" => {
-            r#"    pub fn player_base_attributes(&self) -> Result<PlayerBaseAttributes> {
-        parse_player_base_attributes(
-            self.instance.required_asset_bytes("sharedassets/genericassets/playerbaseattributes.pbadb")?,
-        )
-    }
-
-    pub fn player_attribute_data(&self) -> Result<PlayerAttributeData> {
-        Ok(self.player_base_attributes()?.player_attribute_data)
-    }
-
-    pub fn max_perks(&self, rarity_level: usize) -> Result<Option<i32>> {
-        Ok(self
-            .player_attribute_data()?
-            .item_rarity_data
-            .get(rarity_level)
-            .map(|rarity| rarity.max_perk_count))
-    }
-
-    pub fn settlement_progression_data(&self) -> Result<SettlementProgressionData> {
-        parse_settlement_progression_data(
-            self.instance.required_asset_bytes("sharedassets/genericassets/settlementprogression.sprd")?,
-        )
-    }
-
-    pub fn settlement_progression_categories(&self) -> Result<Vec<ProgressionCategoryEntry>> {
-        Ok(self
-            .settlement_progression_data()?
-            .settlement_progression_categories)
-    }
-
-    pub fn categorical_progression_id(&self, tradeskill: impl ToString) -> Option<u32> {
+            r#"    pub fn categorical_progression_id(&self, tradeskill: impl ToString) -> Option<u32> {
         let normalized = tradeskill.to_string();
         if normalized == "None" || normalized == "WildernessSurvival" {
             return None;
@@ -1541,85 +2007,20 @@ fn rust_standalone_special_manager_methods(manager_name: &str) -> &'static str {
     }
 "#
         }
-        "GatherableDataManager" => {
-            r#"    pub fn gathering_database(&self) -> Result<GatheringDatabase> {
-        parse_gathering_database(
-            self.instance.required_asset_bytes("sharedassets/genericassets/gathering/gatheringdatabase.gdb")?,
-        )
-    }
-
-    pub fn gathering_data(&self) -> Result<GatheringData> {
-        Ok(self.gathering_database()?.gathering_data)
-    }
-
-    pub fn gathering_types(&self) -> Result<Vec<GatheringTypeData>> {
-        Ok(self.gathering_data()?.gathering_types)
-    }
-
-    pub fn gathering_actions(&self) -> Result<Vec<GatheringAction>> {
-        Ok(self.gathering_data()?.gathering_actions)
-    }
-
-    pub fn gathering_action_database(&self) -> Result<GatheringActionDatabase> {
-        parse_gathering_action_database(
-            self.instance.required_asset_bytes("sharedassets/genericassets/gatheringactiondatabase.gactdb")?,
-        )
-    }
-
-    pub fn gathering_action_data(&self) -> Result<Vec<GatheringActionData>> {
-        Ok(self.gathering_action_database()?.gathering_actions)
-    }
-"#
-        }
-        "RecipeDataManager" => {
-            r#"    pub fn crafting_station_database(&self) -> Result<CraftingStationDatabase> {
-        parse_crafting_station_database(
-            self.instance.required_asset_bytes("sharedassets/genericassets/craftingstations.craftstationdb")?,
-        )
-    }
-
-    pub fn crafting_stations(&self) -> Result<Vec<CraftingStationData>> {
-        Ok(self.crafting_station_database()?.crafting_stations)
-    }
-"#
-        }
-        "SocialDataManager" => {
-            r#"    pub fn rank_database(&self) -> Result<SocialRankDatabase> {
-        parse_social_rank_database(
-            self.instance.required_asset_bytes("sharedassets/genericassets/rankdatabase.rankdb")?,
-        )
-    }
-
-    pub fn ranks(&self) -> Result<Vec<SocialRankData>> {
-        Ok(self.rank_database()?.ranks)
-    }
-"#
-        }
         _ => "",
     }
 }
 
-fn rust_standalone_manager_dependency(input: &ManagerContractInput<'_>) -> String {
+fn rust_standalone_manager_dependency(input: &ManagerSurfaceDependency) -> String {
     match input {
-        ManagerContractInput::Table {
-            name,
-            row,
-            product_path: _,
-        } => format!(
+        ManagerSurfaceDependency::Table { name, row } => format!(
             "ManagerDependency::Table {{ name: {}, row: {} }}",
-            rust_string_literal(name.as_str()),
-            rust_string_literal(row.as_str())
+            rust_string_literal(name),
+            rust_string_literal(row)
         ),
-        ManagerContractInput::Asset {
-            path,
-            asset_type: _,
-        } => format!(
+        ManagerSurfaceDependency::Asset { path } => format!(
             "ManagerDependency::Asset {{ path: {} }}",
-            rust_string_literal(path.as_str())
-        ),
-        ManagerContractInput::Manager { manager } => format!(
-            "ManagerDependency::Manager {{ name: {} }}",
-            rust_string_literal(semantic_manager_type_name(manager.as_str()))
+            rust_string_literal(path)
         ),
     }
 }
@@ -3230,12 +3631,6 @@ impl ManagerRuntime {
                 ManagerDependency::Asset { path } => {
                     assets.insert(normalize_data_path(path), self.required_asset_bytes(path)?.to_vec());
                 }
-                ManagerDependency::Manager { name } => {
-                    let nested = manager_by_name(name).with_context(|| {
-                        format!("manager {} depends on unknown manager {name}", definition.name)
-                    })?;
-                    self.build_manager(nested, stack)?;
-                }
             }
         }
 
@@ -3525,14 +3920,56 @@ fn optional_string_cell<'a>(
     }
 }
 
+fn required_schema_string_cell(
+    table: &DynamicTable,
+    row: &DynamicTableRow,
+    column_name: &str,
+) -> Result<String> {
+    match row_cell(table, row, column_name) {
+        Some(value) => Ok(schema_string_cell_value(value)),
+        None => bail!(
+            "row {}:{} missing string {column_name}",
+            row.source_path,
+            row.row_index + 1
+        ),
+    }
+}
+
+fn optional_schema_string_cell(
+    table: &DynamicTable,
+    row: &DynamicTableRow,
+    column_name: &str,
+) -> Result<Option<String>> {
+    match row_cell(table, row, column_name) {
+        None => Ok(None),
+        Some(DatasheetCellValue::String(value)) if value.is_empty() => Ok(None),
+        Some(value) => Ok(Some(schema_string_cell_value(value))),
+    }
+}
+
+fn schema_string_cell_value(value: &DatasheetCellValue) -> String {
+    match value {
+        DatasheetCellValue::String(value) => value.clone(),
+        DatasheetCellValue::Number(value) => value.to_string(),
+        DatasheetCellValue::Boolean(value) => value.to_string(),
+    }
+}
+
 fn required_number_cell(
     table: &DynamicTable,
     row: &DynamicTableRow,
     column_name: &str,
 ) -> Result<f32> {
-    match row_cell(table, row, column_name) {
-        Some(DatasheetCellValue::Number(value)) => Ok(*value),
-        _ => bail!(
+    let Some(value) = row_cell(table, row, column_name) else {
+        bail!(
+            "row {}:{} missing number {column_name}",
+            row.source_path,
+            row.row_index + 1
+        );
+    };
+    match number_cell_value(value, row, column_name)? {
+        Some(value) => Ok(value),
+        None => bail!(
             "row {}:{} missing number {column_name}",
             row.source_path,
             row.row_index + 1
@@ -3547,12 +3984,34 @@ fn optional_number_cell(
 ) -> Result<Option<f32>> {
     match row_cell(table, row, column_name) {
         None => Ok(None),
-        Some(DatasheetCellValue::Number(value)) => Ok(Some(*value)),
-        Some(_) => bail!(
-            "row {}:{} has non-number {column_name}",
-            row.source_path,
-            row.row_index + 1
-        ),
+        Some(value) => number_cell_value(value, row, column_name),
+    }
+}
+
+fn number_cell_value(
+    value: &DatasheetCellValue,
+    row: &DynamicTableRow,
+    column_name: &str,
+) -> Result<Option<f32>> {
+    match value {
+        DatasheetCellValue::Number(value) => Ok(Some(*value)),
+        DatasheetCellValue::Boolean(value) => Ok(Some(if *value { 1.0 } else { 0.0 })),
+        DatasheetCellValue::String(value) => {
+            let text = value.trim().to_ascii_lowercase();
+            match text.as_str() {
+                "" => Ok(None),
+                "false" | "no" => Ok(Some(0.0)),
+                "true" | "yes" => Ok(Some(1.0)),
+                _ => match text.strip_suffix('f').unwrap_or(&text).parse::<f32>() {
+                    Ok(value) => Ok(Some(value)),
+                    Err(_) => bail!(
+                        "row {}:{} has non-number {column_name}",
+                        row.source_path,
+                        row.row_index + 1
+                    ),
+                },
+            }
+        }
     }
 }
 
@@ -3561,9 +4020,16 @@ fn required_bool_cell(
     row: &DynamicTableRow,
     column_name: &str,
 ) -> Result<bool> {
-    match row_cell(table, row, column_name) {
-        Some(DatasheetCellValue::Boolean(value)) => Ok(*value),
-        _ => bail!(
+    let Some(value) = row_cell(table, row, column_name) else {
+        bail!(
+            "row {}:{} missing bool {column_name}",
+            row.source_path,
+            row.row_index + 1
+        );
+    };
+    match bool_cell_value(value, row, column_name)? {
+        Some(value) => Ok(value),
+        None => bail!(
             "row {}:{} missing bool {column_name}",
             row.source_path,
             row.row_index + 1
@@ -3578,8 +4044,30 @@ fn optional_bool_cell(
 ) -> Result<Option<bool>> {
     match row_cell(table, row, column_name) {
         None => Ok(None),
-        Some(DatasheetCellValue::Boolean(value)) => Ok(Some(*value)),
-        Some(_) => bail!(
+        Some(value) => bool_cell_value(value, row, column_name),
+    }
+}
+
+fn bool_cell_value(
+    value: &DatasheetCellValue,
+    row: &DynamicTableRow,
+    column_name: &str,
+) -> Result<Option<bool>> {
+    match value {
+        DatasheetCellValue::Boolean(value) => Ok(Some(*value)),
+        DatasheetCellValue::Number(value) if *value == 0.0 => Ok(Some(false)),
+        DatasheetCellValue::Number(value) if *value == 1.0 => Ok(Some(true)),
+        DatasheetCellValue::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(None),
+            "false" | "0" | "no" => Ok(Some(false)),
+            "true" | "1" | "yes" => Ok(Some(true)),
+            _ => bail!(
+                "row {}:{} has non-bool {column_name}",
+                row.source_path,
+                row.row_index + 1
+            ),
+        },
+        _ => bail!(
             "row {}:{} has non-bool {column_name}",
             row.source_path,
             row.row_index + 1

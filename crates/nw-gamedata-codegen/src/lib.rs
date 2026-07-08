@@ -20,7 +20,6 @@ pub mod schema;
 pub mod source;
 pub mod symbols;
 pub mod system;
-mod table;
 pub mod target;
 pub mod typescript;
 
@@ -88,7 +87,6 @@ pub use symbols::{
 pub use system::{
     NativeSystemSpec, SystemCodegenFile, SystemCodegenOutput, SystemCodegenPlan, SystemEmitter,
 };
-pub use table::GameDataTableSourceFormat;
 pub use target::{
     GameAssetSupport, GameDataAssetSourcePlan, GameDataDataFormat, GameDataProduct,
     GameDataRuntimeProfile, GameDataTargetLanguage, GameDataTargetPlan, GameDataTargetPlanError,

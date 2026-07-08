@@ -107,7 +107,7 @@ fn print_reference_evidence(
         bail!("reference evidence requires exactly one --column");
     }
     let source_column = &cli.columns[0];
-    let source_index = source_table.column_index(source_column).with_context(|| {
+    let source_column_index = source_table.column_index(source_column).with_context(|| {
         format!(
             "source table `{}` has no column `{source_column}`",
             source_table.name()
@@ -120,7 +120,7 @@ fn print_reference_evidence(
         )
     })?;
 
-    let source_values = string_column_values(source_table, source_index);
+    let source_values = string_column_values(source_table, source_column_index);
     let target_values = string_column_values(target_table, target_index);
     let matched = source_values
         .iter()

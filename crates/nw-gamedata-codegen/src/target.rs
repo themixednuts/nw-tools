@@ -18,7 +18,6 @@ pub enum GameDataProduct {
     CookedTableManifest,
     SemanticManagers,
     TableManifest,
-    SourceIndex,
     Systems,
     GameAssetAccess,
 }
@@ -287,14 +286,12 @@ fn default_products_for(
         GameDataRuntimeProfile::Standalone => match language {
             GameDataTargetLanguage::Rust => vec![
                 GameDataProduct::TableManifest,
-                GameDataProduct::SourceIndex,
                 GameDataProduct::SemanticManagers,
                 GameDataProduct::Systems,
                 GameDataProduct::GameAssetAccess,
             ],
             GameDataTargetLanguage::TypeScript | GameDataTargetLanguage::Go => vec![
                 GameDataProduct::TableManifest,
-                GameDataProduct::SourceIndex,
                 GameDataProduct::SemanticManagers,
                 GameDataProduct::Systems,
                 GameDataProduct::GameAssetAccess,

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result, bail};
 use nw_serialize_codegen::{
     ReflectedTypeRole, ResolvedType, ScalarType, SequenceKind, SerializeCodegenField,
@@ -8,15 +10,17 @@ use uuid::Uuid;
 
 use crate::compiler::GameDataCompileUnit;
 use crate::manager::{
+    ManagerContractInput, NativeComposedResourceArgument, NativeComposedResourceManager,
     NativeCrcIndexLookupMethod, NativeCrcIndexLookupParameterKind, NativeCrcProjectionRowFilter,
-    NativeCrcProjectionRowFilterPredicate, NativeDuplicateKeyPolicy, NativeManagerInput,
-    NativeManagerShape, NativeManagerSpec, NativeNumericKeyType, NativeNumericLookupMethod,
-    NativeNumericLookupParameterKind, NativeOneTableCrcIndexManager,
-    NativeOneTableCrcKeyProjectionManager, NativeOneTableEnumKeyProjectionManager,
-    NativeOneTableNumericKeyProjectionManager, NativeOneTableOwnedStringCrcIndexManager,
-    NativeOneTableRowProjectionManager, NativeOneTableStringKeyProjectionManager,
-    NativeProductAssetResource, NativeProjectionField, NativeProjectionTransform,
-    NativeStringLookupMethod, NativeTableFamilyCrcIndexManager,
+    NativeCrcProjectionRowFilterPredicate, NativeDuplicateKeyPolicy, NativeGatherableDataManager,
+    NativeItemDataManager, NativeManagerInput, NativeManagerShape, NativeManagerSpec,
+    NativeNumericKeyType, NativeNumericLookupMethod, NativeNumericLookupParameterKind,
+    NativeOneTableCrcIndexManager, NativeOneTableCrcKeyProjectionManager,
+    NativeOneTableEnumKeyProjectionManager, NativeOneTableNumericKeyProjectionManager,
+    NativeOneTableOwnedStringCrcIndexManager, NativeOneTableRowProjectionManager,
+    NativeOneTableStringKeyProjectionManager, NativePlayerDataManager, NativeProductAssetResource,
+    NativeProjectionField, NativeProjectionTransform, NativeRecipeDataManager,
+    NativeSocialDataManager, NativeStringLookupMethod, NativeTableFamilyCrcIndexManager,
     NativeTableFamilyCrcKeyProjectionManager, NativeTableFamilyFallbackCrcKeyProjectionManager,
     NativeTableFamilyNumericKeyProjectionManager, NativeTableFamilyOwnedStringCrcIndexManager,
     NativeTableFamilyPartitionedCrcKeyProjectionManager, NativeTableFamilyTable,
@@ -26,6 +30,18 @@ use crate::manager::{
 pub(crate) enum ManagerSurface {
     Direct(DirectManagerSurface),
     Semantic(SemanticManagerRecord),
+    ItemData(ItemDataManagerSurface),
+    ProductBacked(DirectManagerSurface),
+}
+
+pub(crate) fn manager_surface_name(surface: &ManagerSurface) -> &str {
+    match surface {
+        ManagerSurface::Direct(manager) | ManagerSurface::ProductBacked(manager) => {
+            &manager.manager_name
+        }
+        ManagerSurface::Semantic(manager) => &manager.manager_name,
+        ManagerSurface::ItemData(manager) => &manager.manager_name,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +64,28 @@ pub(crate) struct DirectProductAsset {
     pub product_type: String,
     pub value_type: String,
     pub manager_getter: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManagerSurfaceDependency {
+    Table { name: String, row: String },
+    Asset { path: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ItemDataManagerSurface {
+    pub manager_name: String,
+    pub manager_class_name: String,
+    pub table_type_name: String,
+    pub handle_type_name: String,
+    pub data_type_name: String,
+    pub tables: Vec<ItemDataManagerTable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ItemDataManagerTable {
+    pub variant_name: String,
+    pub table_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +247,87 @@ pub(crate) fn manager_surfaces_from_managers(
         .collect()
 }
 
+pub(crate) fn manager_surface_dependencies(
+    surface: &ManagerSurface,
+    inputs: &[ManagerContractInput<'_>],
+) -> Vec<ManagerSurfaceDependency> {
+    let table_keys = surface_table_dependencies(surface);
+    let table_names = surface_table_name_dependencies(surface);
+    let asset_paths = surface_asset_dependencies(surface);
+
+    inputs
+        .iter()
+        .filter_map(|input| match input {
+            ManagerContractInput::Table {
+                name,
+                row,
+                product_path: _,
+            } => {
+                let name = name.as_str();
+                let row = row.as_str();
+                (table_keys.contains(&(name.to_owned(), row.to_owned()))
+                    || table_names.contains(name))
+                .then(|| ManagerSurfaceDependency::Table {
+                    name: name.to_owned(),
+                    row: row.to_owned(),
+                })
+            }
+            ManagerContractInput::Asset {
+                path,
+                asset_type: _,
+            } => {
+                let path = path.as_str();
+                asset_paths
+                    .contains(path)
+                    .then(|| ManagerSurfaceDependency::Asset {
+                        path: path.to_owned(),
+                    })
+            }
+            ManagerContractInput::Manager { manager: _ } => None,
+        })
+        .collect()
+}
+
+fn surface_table_dependencies(surface: &ManagerSurface) -> BTreeSet<(String, String)> {
+    match surface {
+        ManagerSurface::Direct(manager) => manager
+            .tables
+            .iter()
+            .map(|table| (table.table_name.clone(), table.row_type_name.clone()))
+            .collect(),
+        ManagerSurface::Semantic(_)
+        | ManagerSurface::ItemData(_)
+        | ManagerSurface::ProductBacked(_) => BTreeSet::new(),
+    }
+}
+
+fn surface_table_name_dependencies(surface: &ManagerSurface) -> BTreeSet<&str> {
+    match surface {
+        ManagerSurface::Semantic(record) => record
+            .tables
+            .iter()
+            .map(|table| table.table_name.as_str())
+            .collect(),
+        ManagerSurface::ItemData(manager) => manager
+            .tables
+            .iter()
+            .map(|table| table.table_name.as_str())
+            .collect(),
+        ManagerSurface::Direct(_) | ManagerSurface::ProductBacked(_) => BTreeSet::new(),
+    }
+}
+
+fn surface_asset_dependencies(surface: &ManagerSurface) -> BTreeSet<&str> {
+    match surface {
+        ManagerSurface::Direct(manager) | ManagerSurface::ProductBacked(manager) => manager
+            .products
+            .iter()
+            .map(|product| product.path.as_str())
+            .collect(),
+        ManagerSurface::Semantic(_) | ManagerSurface::ItemData(_) => BTreeSet::new(),
+    }
+}
+
 pub(crate) fn semantic_manager_record_unit(
     records: &[SemanticManagerRecord],
 ) -> SerializeCodegenUnit {
@@ -293,46 +412,160 @@ fn is_identifier(value: &str) -> bool {
 fn manager_surface(manager: &NativeManagerSpec) -> Result<Option<ManagerSurface>> {
     let manager_name = semantic_type_name(manager.rust_type().as_str()).to_owned();
     let Some(shape) = manager.shape() else {
-        return Ok(Some(direct_manager_surface(
-            manager_name,
-            manager,
-            Vec::new(),
-        )));
+        return Ok(None);
     };
+    if let NativeManagerShape::ItemData(shape) = shape {
+        return Ok(Some(ManagerSurface::ItemData(item_data_manager_surface(
+            manager_name,
+            shape,
+        ))));
+    }
     if let Some(record) = semantic_manager_record(&manager_name, manager, shape) {
         return Ok(Some(ManagerSurface::Semantic(record?)));
     }
-    Ok(Some(direct_manager_surface(
+    let products = direct_products(manager, shape)?;
+    if is_product_backed_surface(shape, &products) {
+        return Ok(Some(ManagerSurface::ProductBacked(
+            product_backed_manager_surface(manager_name, products),
+        )));
+    }
+    let direct = direct_manager_surface(manager_name, manager, products);
+    if direct.tables.is_empty() && direct.products.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ManagerSurface::Direct(direct)))
+}
+
+fn is_product_backed_surface(shape: &NativeManagerShape, products: &[DirectProductAsset]) -> bool {
+    !products.is_empty()
+        && matches!(
+            shape,
+            NativeManagerShape::ProductAssetResource(_)
+                | NativeManagerShape::RecipeData(_)
+                | NativeManagerShape::GatherableData(_)
+                | NativeManagerShape::SocialData(_)
+                | NativeManagerShape::PlayerData(_)
+        )
+}
+
+fn product_backed_manager_surface(
+    manager_name: String,
+    products: Vec<DirectProductAsset>,
+) -> DirectManagerSurface {
+    DirectManagerSurface {
+        manager_class_name: manager_name.clone(),
         manager_name,
-        manager,
-        direct_products(manager, shape)?,
-    )))
+        tables: Vec::new(),
+        products,
+    }
 }
 
 fn direct_manager_surface(
     manager_name: String,
     manager: &NativeManagerSpec,
     products: Vec<DirectProductAsset>,
-) -> ManagerSurface {
-    ManagerSurface::Direct(DirectManagerSurface {
+) -> DirectManagerSurface {
+    DirectManagerSurface {
         manager_class_name: manager_name.clone(),
         manager_name,
         tables: direct_manager_tables(manager),
         products,
-    })
+    }
+}
+
+fn item_data_manager_surface(
+    manager_name: String,
+    shape: &NativeItemDataManager,
+) -> ItemDataManagerSurface {
+    ItemDataManagerSurface {
+        manager_class_name: manager_name.clone(),
+        manager_name,
+        table_type_name: shape.table_type().as_str().to_owned(),
+        handle_type_name: shape.handle_type().as_str().to_owned(),
+        data_type_name: shape.data_type().as_str().to_owned(),
+        tables: shape.tables().iter().map(item_data_manager_table).collect(),
+    }
+}
+
+fn item_data_manager_table(table: &NativeTableFamilyTable) -> ItemDataManagerTable {
+    ItemDataManagerTable {
+        variant_name: table.variant().as_str().to_owned(),
+        table_name: table.table_name().as_str().to_owned(),
+    }
 }
 
 fn direct_products(
     manager: &NativeManagerSpec,
     shape: &NativeManagerShape,
 ) -> Result<Vec<DirectProductAsset>> {
-    let NativeManagerShape::ProductAssetResource(shape) = shape else {
-        return Ok(Vec::new());
+    let products = match shape {
+        NativeManagerShape::ProductAssetResource(shape) => {
+            shape.products().iter().collect::<Vec<_>>()
+        }
+        NativeManagerShape::RecipeData(shape) => recipe_data_products(shape),
+        NativeManagerShape::GatherableData(shape) => gatherable_data_products(shape),
+        NativeManagerShape::SocialData(shape) => social_data_products(shape),
+        NativeManagerShape::PlayerData(shape) => player_data_products(shape),
+        NativeManagerShape::ComposedResource(shape) => composed_resource_products(shape),
+        _ => return Ok(Vec::new()),
     };
-    shape
-        .products()
-        .iter()
+    products
+        .into_iter()
+        .filter(|product| supported_product_value_type(product.value_type().as_str()))
         .map(|product| direct_product(manager, product))
+        .collect()
+}
+
+fn supported_product_value_type(value_type: &str) -> bool {
+    matches!(
+        value_type,
+        "newworld_plugin::assets::armor_offset_database::ArmorOffsetDatabase"
+            | "newworld_plugin::assets::equip_types_database::EquipTypesDatabase"
+            | "newworld_plugin::assets::game_debug_settings::GameDebugSettings"
+            | "newworld_plugin::assets::player_base_attributes::PlayerBaseAttributes"
+            | "newworld_plugin::assets::settlement_progression_data::SettlementProgressionData"
+            | "newworld_plugin::assets::ui_database::UiDatabase"
+            | "newworld_plugin::assets::camera_settings::GameCameraSettings"
+            | "newworld_plugin::assets::gathering_database::GatheringDatabase"
+            | "newworld_plugin::assets::gathering_database::GatheringActionDatabase"
+            | "newworld_plugin::assets::crafting_station_database::CraftingStationDatabase"
+            | "newworld_plugin::assets::rank_database::SocialRankDatabase"
+    )
+}
+
+fn recipe_data_products(shape: &NativeRecipeDataManager) -> Vec<&NativeProductAssetResource> {
+    vec![shape.product()]
+}
+
+fn gatherable_data_products(
+    shape: &NativeGatherableDataManager,
+) -> Vec<&NativeProductAssetResource> {
+    vec![
+        shape.gathering_database(),
+        shape.gathering_action_database(),
+    ]
+}
+
+fn social_data_products(shape: &NativeSocialDataManager) -> Vec<&NativeProductAssetResource> {
+    vec![shape.rank_database()]
+}
+
+fn player_data_products(shape: &NativePlayerDataManager) -> Vec<&NativeProductAssetResource> {
+    shape.product_assets().products().iter().collect()
+}
+
+fn composed_resource_products(
+    shape: &NativeComposedResourceManager,
+) -> Vec<&NativeProductAssetResource> {
+    shape
+        .arguments()
+        .iter()
+        .filter_map(|argument| match argument {
+            NativeComposedResourceArgument::Product(product) => Some(product),
+            NativeComposedResourceArgument::Tables | NativeComposedResourceArgument::Manager(_) => {
+                None
+            }
+        })
         .collect()
 }
 
@@ -1354,74 +1587,78 @@ fn semantic_type_name(path: &str) -> &str {
 mod tests {
     use std::collections::BTreeSet;
 
-    use nw_datasheet::game_system::GameSystemDataTables;
-
-    use crate::compiler::GameDataCompiler;
+    use crate::manager::validated_native_manager_specs;
 
     use super::*;
 
     #[test]
     fn manager_surfaces_emit_direct_or_implemented_semantic_apis_without_selection_lists() {
-        let catalog = GameSystemDataTables::default();
-        let unit = GameDataCompiler::source_format().compile_unit(&catalog);
-        let surfaces = manager_surfaces(&unit).expect("manager surfaces");
-        let managers = unit.codegen_plan_ref().managers().managers();
+        let managers = validated_native_manager_specs();
+        let surfaces = manager_surfaces_from_managers(&managers).expect("manager surfaces");
 
         let emitted_names = surfaces
             .iter()
             .map(|surface| match surface {
                 ManagerSurface::Direct(manager) => manager.manager_name.clone(),
                 ManagerSurface::Semantic(manager) => manager.manager_name.clone(),
+                ManagerSurface::ItemData(manager) => manager.manager_name.clone(),
+                ManagerSurface::ProductBacked(manager) => manager.manager_name.clone(),
             })
             .collect::<BTreeSet<_>>();
-        let expected_names = managers
-            .iter()
-            .map(|manager| semantic_type_name(manager.rust_type().as_str()).to_owned())
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(emitted_names, expected_names);
+        assert!(!emitted_names.is_empty());
         assert!(
             surfaces
                 .iter()
                 .any(|surface| matches!(surface, ManagerSurface::Direct(_)))
         );
-
-        let direct_names = surfaces
-            .iter()
-            .filter_map(|surface| match surface {
-                ManagerSurface::Direct(manager) => Some(manager.manager_name.clone()),
-                ManagerSurface::Semantic(_) => None,
-            })
-            .collect::<BTreeSet<_>>();
-        for manager in managers {
-            let manager_name = semantic_type_name(manager.rust_type().as_str()).to_owned();
-            let expected_direct = semantic_manager_record_for(manager).is_none();
-            assert_eq!(
-                direct_names.contains(&manager_name),
-                expected_direct,
-                "`{manager_name}` direct surface classification should mean no DTO record"
+        for surface in surfaces.iter().filter_map(|surface| match surface {
+            ManagerSurface::Direct(surface) | ManagerSurface::ProductBacked(surface) => {
+                Some(surface)
+            }
+            ManagerSurface::Semantic(_) | ManagerSurface::ItemData(_) => None,
+        }) {
+            assert!(
+                !surface.tables.is_empty() || !surface.products.is_empty(),
+                "`{}` emitted an empty manager surface",
+                surface.manager_name
             );
         }
 
-        let missing_managers = managers
-            .iter()
-            .filter_map(|manager| {
-                let manager_name = semantic_type_name(manager.rust_type().as_str()).to_owned();
-                (!emitted_names.contains(&manager_name)).then_some(manager_name)
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            missing_managers.is_empty(),
-            "validated standalone managers missing a surface: {missing_managers:?}"
-        );
-    }
+        for surface in surfaces.iter().filter_map(|surface| match surface {
+            ManagerSurface::ProductBacked(surface) => Some(surface),
+            ManagerSurface::Direct(_)
+            | ManagerSurface::Semantic(_)
+            | ManagerSurface::ItemData(_) => None,
+        }) {
+            let manager = managers
+                .iter()
+                .find(|manager| {
+                    semantic_type_name(manager.rust_type().as_str()) == surface.manager_name
+                })
+                .expect("product-backed surface manager exists in plan");
+            assert!(
+                manager
+                    .shape()
+                    .is_some_and(|shape| is_product_backed_surface(shape, &surface.products)),
+                "`{}` product-backed surface should only be used for validated product-backed manager shapes",
+                surface.manager_name
+            );
+            let dependencies = manager_surface_dependencies(
+                &ManagerSurface::ProductBacked(surface.clone()),
+                &manager.contract().inputs(),
+            );
+            assert!(
+                dependencies
+                    .iter()
+                    .all(|dependency| matches!(dependency, ManagerSurfaceDependency::Asset { .. })),
+                "`{}` product-backed surface must not load table dependencies",
+                surface.manager_name
+            );
+        }
 
-    fn semantic_manager_record_for(
-        manager: &NativeManagerSpec,
-    ) -> Option<Result<SemanticManagerRecord>> {
-        let manager_name = semantic_type_name(manager.rust_type().as_str()).to_owned();
-        manager
-            .shape()
-            .and_then(|shape| semantic_manager_record(&manager_name, manager, shape))
+        assert!(
+            !emitted_names.contains("CurrencyExchangeMappingManager"),
+            "manager-composition algorithms without generated semantic methods must not emit empty direct surfaces"
+        );
     }
 }

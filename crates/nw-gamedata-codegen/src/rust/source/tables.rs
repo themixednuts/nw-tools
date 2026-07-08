@@ -136,6 +136,12 @@ impl RequiredSchemas {
                         .table_names
                         .extend(record.tables.into_iter().map(|table| table.table_name));
                 }
+                ManagerSurface::ItemData(manager) => {
+                    required
+                        .table_names
+                        .extend(manager.tables.into_iter().map(|table| table.table_name));
+                }
+                ManagerSurface::ProductBacked(_) => {}
             }
         }
         Ok(required)

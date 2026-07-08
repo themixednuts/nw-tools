@@ -16,9 +16,6 @@ use crate::target::{GameDataTargetLanguage, GameDataTargetPlan};
 
 pub use nw_gamedata_manager_specs::manager::*;
 
-#[cfg(any())]
-mod spec_tests;
-
 pub type ManagerCodegenFile = NativeCodegenFile;
 pub type ManagerCodegenOutput = NativeCodegenOutput;
 
@@ -48,13 +45,7 @@ pub fn validated_native_manager_plan_for_schema(
         .collect::<BTreeSet<_>>();
     let managers = validated_native_manager_specs()
         .into_iter()
-        .map(|manager| {
-            if manager_table_inputs_available(&manager, &available_tables) {
-                manager
-            } else {
-                manager.without_shape()
-            }
-        })
+        .filter(|manager| manager_table_inputs_available(manager, &available_tables))
         .collect();
     ManagerCodegenPlan::from_native_managers(managers)
 }
