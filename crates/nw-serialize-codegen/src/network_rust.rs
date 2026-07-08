@@ -3600,6 +3600,10 @@ fn container_value_shape_uses_source_type(
     _serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> bool {
     shape.member_names_proven == Some(true)
+        && shape
+            .member_name_source
+            .as_deref()
+            .is_some_and(|source| source.contains("serialize") || source == "ghidra-datatype")
         && !shape
             .validation
             .as_deref()
@@ -4273,8 +4277,8 @@ fn container_value_member_rust_type(
     {
         return Some(rust_type);
     }
-    if composite_member_wire_shapes(shape).is_some() {
-        return None;
+    if let Some(shapes) = composite_member_wire_shapes(shape) {
+        return composite_member_rust_type(member.native_type.as_deref(), &shapes);
     }
     if let Some(element_shape) = vector_element_wire_shape(shape) {
         let element_type = if let Some(element_shape) = wire_scalar_shape_from_name(element_shape) {
@@ -4290,6 +4294,28 @@ fn container_value_member_rust_type(
     }
     let shape = wire_scalar_shape_from_name(shape)?;
     Some(scalar_rust_type(shape))
+}
+
+fn composite_member_rust_type(
+    native_type: Option<&str>,
+    shapes: &[SchemaWireScalarShape],
+) -> Option<String> {
+    let [first, rest @ ..] = shapes else {
+        return None;
+    };
+    if !rest.iter().all(|shape| shape == first) {
+        return None;
+    }
+    let scalar = *first;
+    let mut element_type = scalar_rust_type(scalar);
+    if native_type
+        .map(str::trim)
+        .is_some_and(|native_type| native_type == "AZStd::array")
+        && scalar == SchemaWireScalarShape::U16
+    {
+        element_type = "i16".to_owned();
+    }
+    Some(format!("[{element_type}; {}]", shapes.len()))
 }
 
 fn container_member_source_rust_type(native_type: &str) -> Option<String> {
@@ -4326,6 +4352,12 @@ fn container_member_source_rust_type(native_type: &str) -> Option<String> {
 
 fn runtime_semantic_container_member_type(native_type: &str) -> Option<&'static str> {
     match native_type.trim() {
+        "AZ::Vector2" | "Vector2" | "Vec2" => Some("::glam::Vec2"),
+        "AZ::Vector3" | "Vector3" | "Vec3" => Some("::glam::Vec3"),
+        "AZ::Vector4" | "Vector4" | "Vec4" => Some("::glam::Vec4"),
+        "AZ::Quaternion" | "Quaternion" | "Quat" => Some("::glam::Quat"),
+        "AZ::Matrix3x3" | "Matrix3x3" | "Mat3" => Some("::glam::Mat3"),
+        "AZ::Transform" | "Transform" => Some("::glam::Affine3A"),
         "ActorRef" | "Amazon::Hub::ActorRef" | "HubAddress" | "ProxyAddress" => {
             Some("::nw_network::ActorRef")
         }
@@ -4337,6 +4369,7 @@ fn runtime_semantic_container_member_type(native_type: &str) -> Option<&'static 
         "AZ::Uuid" | "Uuid" | "uuid::Uuid" | "::uuid::Uuid" | "GuildId" | "WarId" | "RaidId" => {
             Some("::uuid::Uuid")
         }
+        "Amazon::Pervasives::UID" | "UID" => Some("::uuid::Uuid"),
         "TimePoint" | "MB::TimePoint" => Some("::nw_network::TimePoint"),
         "WallClockTimePoint" | "MB::WallClockTimePoint" => Some("::nw_network::WallClockTimePoint"),
         "Duration" | "AZStd::chrono::duration" => Some("::nw_network::Duration"),
