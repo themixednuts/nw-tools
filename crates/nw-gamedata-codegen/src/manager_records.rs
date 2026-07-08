@@ -82,6 +82,7 @@ pub(crate) fn default_direct_manager_row_type<'a>(
 pub(crate) enum ManagerSurfaceDependency {
     Table { name: String, row: String },
     Asset { path: String },
+    Manager { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,7 +296,10 @@ pub(crate) fn manager_surface_dependencies(
                         path: path.to_owned(),
                     })
             }
-            ManagerContractInput::Manager { manager: _ } => None,
+            ManagerContractInput::Manager { manager } => {
+                let manager = semantic_type_name(manager.as_str()).to_owned();
+                Some(ManagerSurfaceDependency::Manager { name: manager })
+            }
         })
         .collect()
 }
@@ -1660,9 +1664,10 @@ mod tests {
                 &manager.contract().inputs(),
             );
             assert!(
-                dependencies
-                    .iter()
-                    .all(|dependency| matches!(dependency, ManagerSurfaceDependency::Asset { .. })),
+                dependencies.iter().all(|dependency| !matches!(
+                    dependency,
+                    ManagerSurfaceDependency::Table { .. }
+                )),
                 "`{}` product-backed surface must not load table dependencies",
                 surface.manager_name
             );

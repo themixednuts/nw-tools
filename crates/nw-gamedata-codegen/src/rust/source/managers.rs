@@ -103,6 +103,9 @@ enum ManagerDependency {
     Asset {
         path: &'static str,
     },
+    Manager {
+        name: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +147,7 @@ pub use surfaces::*;
     push_rust_semantic_record_types(&mut rows_source, &records);
 
     let mut surfaces_source = String::from("use super::*;\nuse super::rows::*;\n\n");
+    push_rust_direct_row_family_types(&mut surfaces_source, &surfaces, schema_report);
     push_rust_standalone_manager_surfaces(&mut surfaces_source, &surfaces, schema_report);
 
     Ok(vec![
@@ -480,22 +484,33 @@ mod tests {
         let methods = rust_direct_schema_methods(&manager, &schema_report);
         let rows_trait_impl = rust_direct_rows_trait_impl(&manager, &schema_report);
 
-        assert!(methods.contains("pub fn rows(&self) -> Result<Vec<DamageDataSchemaRow>>"));
+        assert!(methods.contains("pub fn rows(&self) -> Result<Vec<DamageDataEntry>>"));
+        assert!(
+            methods
+                .contains("pub fn table(&self, table: impl Into<String>) -> DamageDataTableRows")
+        );
         assert!(methods.contains(
+            "pub fn get(&self, reference: DamageDataRef) -> Result<Option<DamageDataSchemaRow>>"
+        ));
+        assert!(methods.contains(
+            "pub fn row_by_index(&self, slot: DamageDataSlot) -> Result<Option<DamageDataSchemaRow>>"
+        ));
+        assert!(methods.contains(
+            "pub fn iter(&self) -> Result<impl ExactSizeIterator<Item = DamageDataEntry>>"
+        ));
+        assert!(methods.contains("pub fn affliction_data(&self) -> AfflictionDataRows"));
+        assert!(methods.contains("pub fn damage_type_data(&self) -> DamageTypeDataRows"));
+        assert!(!methods.contains("pub fn affliction_data_rows"));
+        assert!(!methods.contains("pub fn damage_type_data_rows"));
+        assert!(!methods.contains(
+            "pub fn affliction_data(&self, key: impl ToString) -> Result<Option<AfflictionDataSchemaRow>>"
+        ));
+        assert!(!methods.contains(
             "pub fn get(&self, key: impl ToString) -> Result<Option<DamageDataSchemaRow>>"
-        ));
-        assert!(methods.contains(
-            "pub fn iter(&self) -> Result<impl ExactSizeIterator<Item = DamageDataSchemaRow>>"
-        ));
-        assert!(methods.contains(
-            "pub fn affliction_data_rows(&self) -> Result<Vec<AfflictionDataSchemaRow>>"
-        ));
-        assert!(methods.contains(
-            "pub fn damage_type_data_rows(&self) -> Result<Vec<DamageTypeDataSchemaRow>>"
         ));
         assert!(!methods.contains("pub fn damage_data_rows"));
         assert!(rows_trait_impl.contains("impl Rows for DamageDataManager"));
-        assert!(rows_trait_impl.contains("type Row = DamageDataSchemaRow"));
+        assert!(rows_trait_impl.contains("type Row = DamageDataEntry"));
     }
 
     #[test]
@@ -810,32 +825,15 @@ fn rust_direct_rows_trait_impl(
     manager: &DirectManagerSurface,
     schema_report: &GameSystemDataTablesSchemaReport,
 ) -> String {
-    let row_specs = rust_standalone_schema_rows(schema_report);
-    let mut seen = BTreeSet::new();
-    let row_types = manager
-        .tables
-        .iter()
-        .filter_map(|table| {
-            seen.insert(table.row_type_name.clone())
-                .then_some(table.row_type_name.clone())
-        })
-        .collect::<Vec<_>>();
-    let Some(default_row_type) = default_direct_manager_row_type(&manager.manager_name, &row_types)
-    else {
-        return String::new();
-    };
-    let Some(row_spec) = row_specs
-        .iter()
-        .find(|row| row.source_row_type == default_row_type)
-    else {
+    let Some(row_spec) = rust_direct_default_row_spec(manager, schema_report) else {
         return String::new();
     };
     let manager_name = &manager.manager_class_name;
-    let row_type = &row_spec.type_name;
+    let entry_type = rust_direct_entry_type(&row_spec.source_row_type);
     format!(
         r#"
 impl Rows for {manager_name} {{
-    type Row = {row_type};
+    type Row = {entry_type};
 
     fn rows(&self) -> Result<Vec<Self::Row>> {{
         {manager_name}::rows(self)
@@ -1189,65 +1187,20 @@ fn rust_direct_schema_methods(
     manager: &DirectManagerSurface,
     schema_report: &GameSystemDataTablesSchemaReport,
 ) -> String {
-    let row_specs = rust_standalone_schema_rows(schema_report);
-    let mut seen = BTreeSet::new();
-    let row_types = manager
-        .tables
-        .iter()
-        .filter_map(|table| {
-            seen.insert(table.row_type_name.clone())
-                .then_some(table.row_type_name.clone())
-        })
-        .collect::<Vec<_>>();
-    if row_types.is_empty() {
-        return String::new();
-    }
-
     let default_row_type =
-        default_direct_manager_row_type(&manager.manager_name, &row_types).map(str::to_owned);
+        rust_direct_default_row_spec(manager, schema_report).map(|row| row.source_row_type);
     let mut source = String::new();
-    for source_row_type in row_types {
-        let Some(row_spec) = row_specs
-            .iter()
-            .find(|row| row.source_row_type == source_row_type)
-        else {
-            continue;
-        };
-        let row_type = &row_spec.type_name;
+    for row_spec in rust_direct_row_specs(manager, schema_report) {
+        let source_row_type = &row_spec.source_row_type;
         let is_default_row_type = default_row_type.as_deref() == Some(source_row_type.as_str());
-        let rows_method = if is_default_row_type {
-            "rows".to_owned()
-        } else {
-            format!("{}_rows", to_snake_ident(&source_row_type, "rows"))
-        };
-        source.push_str(&format!(
-            r#"    pub fn {rows_method}(&self) -> Result<Vec<{row_type}>> {{
-        self.instance.schema_rows({source_row_type:?}, {reader})
-    }}
-
-"#,
-            reader = rust_standalone_schema_reader_name(&source_row_type),
-        ));
-        if let Some(key_field) = row_spec.fields.iter().find(|field| field.row_key) {
-            let lookup_method = if is_default_row_type {
-                "get".to_owned()
-            } else {
-                to_snake_ident(&source_row_type, "row")
-            };
-            source.push_str(&format!(
-                r#"    pub fn {lookup_method}(&self, key: impl ToString) -> Result<Option<{row_type}>> {{
-        self.instance.schema_row({source_row_type:?}, key, {reader}, |row| row.{key_field}.to_string())
-    }}
-
-"#,
-                reader = rust_standalone_schema_reader_name(&source_row_type),
-                key_field = key_field.field_name,
-            ));
-        }
         if is_default_row_type {
+            source.push_str(&rust_direct_primary_row_family_methods(&row_spec));
+        } else {
+            let accessor = to_snake_ident(source_row_type, "rows");
+            let family_type = rust_direct_row_family_type(source_row_type);
             source.push_str(&format!(
-                r#"    pub fn iter(&self) -> Result<impl ExactSizeIterator<Item = {row_type}>> {{
-        Ok(self.rows()?.into_iter())
+                r#"    pub fn {accessor}(&self) -> {family_type} {{
+        {family_type}::new(self.instance.clone())
     }}
 
 "#
@@ -1255,6 +1208,278 @@ fn rust_direct_schema_methods(
         }
     }
     source
+}
+
+fn rust_direct_row_specs(
+    manager: &DirectManagerSurface,
+    schema_report: &GameSystemDataTablesSchemaReport,
+) -> Vec<RustStandaloneSchemaRow> {
+    let row_specs = rust_standalone_schema_rows(schema_report);
+    let mut seen = BTreeSet::new();
+    manager
+        .tables
+        .iter()
+        .filter_map(|table| {
+            seen.insert(table.row_type_name.clone())
+                .then_some(table.row_type_name.as_str())
+        })
+        .filter_map(|row_type| {
+            row_specs
+                .iter()
+                .find(|row| row.source_row_type == row_type)
+                .cloned()
+        })
+        .collect()
+}
+
+fn rust_direct_default_row_spec(
+    manager: &DirectManagerSurface,
+    schema_report: &GameSystemDataTablesSchemaReport,
+) -> Option<RustStandaloneSchemaRow> {
+    let row_specs = rust_direct_row_specs(manager, schema_report);
+    let row_types = row_specs
+        .iter()
+        .map(|row| row.source_row_type.clone())
+        .collect::<Vec<_>>();
+    let default_row_type = default_direct_manager_row_type(&manager.manager_name, &row_types)?;
+    row_specs
+        .into_iter()
+        .find(|row| row.source_row_type == default_row_type)
+}
+
+fn push_rust_direct_row_family_types(
+    source: &mut String,
+    surfaces: &[ManagerSurface],
+    schema_report: &GameSystemDataTablesSchemaReport,
+) {
+    let mut emitted = BTreeSet::new();
+    for surface in surfaces {
+        let ManagerSurface::Direct(manager) = surface else {
+            continue;
+        };
+        for row_spec in rust_direct_row_specs(manager, schema_report) {
+            if emitted.insert(row_spec.source_row_type.clone()) {
+                push_rust_direct_row_family_type(source, &row_spec);
+            }
+        }
+    }
+}
+
+fn push_rust_direct_row_family_type(source: &mut String, row_spec: &RustStandaloneSchemaRow) {
+    let source_row_type = &row_spec.source_row_type;
+    let row_type = &row_spec.type_name;
+    let ref_type = rust_direct_row_ref_type(source_row_type);
+    let slot_type = rust_direct_row_slot_type(source_row_type);
+    let entry_type = rust_direct_entry_type(source_row_type);
+    let family_type = rust_direct_row_family_type(source_row_type);
+    let table_rows_type = rust_direct_table_rows_type(source_row_type);
+    let reader = rust_standalone_schema_reader_name(source_row_type);
+    let entry_fn = rust_direct_entry_fn(source_row_type);
+    source.push_str(&format!(
+        r#"
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct {ref_type} {{
+    pub table: String,
+    pub row: String,
+}}
+
+impl {ref_type} {{
+    pub fn new(table: impl Into<String>, row: impl Into<String>) -> Self {{
+        Self {{
+            table: table.into(),
+            row: row.into(),
+        }}
+    }}
+}}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct {slot_type} {{
+    pub table: String,
+    pub row_index: usize,
+}}
+
+impl {slot_type} {{
+    pub fn new(table: impl Into<String>, row_index: usize) -> Self {{
+        Self {{
+            table: table.into(),
+            row_index,
+        }}
+    }}
+}}
+
+#[derive(Debug, Clone)]
+pub struct {entry_type} {{
+    pub reference: {ref_type},
+    pub row_index: usize,
+    pub row: {row_type},
+}}
+
+#[derive(Debug, Clone)]
+pub struct {family_type} {{
+    instance: Arc<ManagerInstance>,
+}}
+
+impl {family_type} {{
+    fn new(instance: Arc<ManagerInstance>) -> Self {{
+        Self {{ instance }}
+    }}
+
+    pub fn rows(&self) -> Result<Vec<{entry_type}>> {{
+        self.instance
+            .schema_family_entries({source_row_type:?}, {reader}, {entry_fn})
+    }}
+
+    pub fn table(&self, table: impl Into<String>) -> {table_rows_type} {{
+        {table_rows_type} {{
+            instance: self.instance.clone(),
+            table: table.into(),
+        }}
+    }}
+
+    pub fn get(&self, reference: {ref_type}) -> Result<Option<{row_type}>> {{
+        self.table(reference.table).get(reference.row)
+    }}
+
+    pub fn row_by_index(&self, slot: {slot_type}) -> Result<Option<{row_type}>> {{
+        self.table(slot.table).row_by_index(slot.row_index)
+    }}
+
+    pub fn row_key_by_index(&self, slot: {slot_type}) -> Option<String> {{
+        self.table(slot.table)
+            .row_key_by_index(slot.row_index)
+            .map(str::to_owned)
+    }}
+
+    pub fn iter(&self) -> Result<impl ExactSizeIterator<Item = {entry_type}>> {{
+        Ok(self.rows()?.into_iter())
+    }}
+}}
+
+impl Rows for {family_type} {{
+    type Row = {entry_type};
+
+    fn rows(&self) -> Result<Vec<Self::Row>> {{
+        {family_type}::rows(self)
+    }}
+}}
+
+#[derive(Debug, Clone)]
+pub struct {table_rows_type} {{
+    instance: Arc<ManagerInstance>,
+    table: String,
+}}
+
+impl {table_rows_type} {{
+    pub fn table_name(&self) -> &str {{
+        &self.table
+    }}
+
+    pub fn get(&self, key: impl ToString) -> Result<Option<{row_type}>> {{
+        self.instance.schema_table_row(&self.table, {source_row_type:?}, key, {reader})
+    }}
+
+    pub fn row_by_index(&self, row_index: usize) -> Result<Option<{row_type}>> {{
+        self.instance
+            .schema_table_row_by_index(&self.table, {source_row_type:?}, row_index, {reader})
+    }}
+
+    pub fn row_key_by_index(&self, row_index: usize) -> Option<&str> {{
+        self.instance
+            .schema_table_row_key_by_index(&self.table, {source_row_type:?}, row_index)
+    }}
+
+    pub fn iter(&self) -> Result<impl ExactSizeIterator<Item = {entry_type}>> {{
+        Ok(self.rows()?.into_iter())
+    }}
+}}
+
+impl Rows for {table_rows_type} {{
+    type Row = {entry_type};
+
+    fn rows(&self) -> Result<Vec<Self::Row>> {{
+        self.instance
+            .schema_table_entries(&self.table, {source_row_type:?}, {reader}, {entry_fn})
+    }}
+}}
+
+fn {entry_fn}(
+    table: &DynamicTable,
+    row: &DynamicTableRow,
+    data: {row_type},
+) -> {entry_type} {{
+    {entry_type} {{
+        reference: {ref_type} {{
+            table: table.schema.name.to_owned(),
+            row: row.key.clone(),
+        }},
+        row_index: row.row_index,
+        row: data,
+    }}
+}}
+
+"#
+    ));
+}
+
+fn rust_direct_primary_row_family_methods(row_spec: &RustStandaloneSchemaRow) -> String {
+    let source_row_type = &row_spec.source_row_type;
+    let row_type = &row_spec.type_name;
+    let ref_type = rust_direct_row_ref_type(source_row_type);
+    let slot_type = rust_direct_row_slot_type(source_row_type);
+    let entry_type = rust_direct_entry_type(source_row_type);
+    let family_type = rust_direct_row_family_type(source_row_type);
+    let table_rows_type = rust_direct_table_rows_type(source_row_type);
+    format!(
+        r#"    pub fn rows(&self) -> Result<Vec<{entry_type}>> {{
+        {family_type}::new(self.instance.clone()).rows()
+    }}
+
+    pub fn table(&self, table: impl Into<String>) -> {table_rows_type} {{
+        {family_type}::new(self.instance.clone()).table(table)
+    }}
+
+    pub fn get(&self, reference: {ref_type}) -> Result<Option<{row_type}>> {{
+        {family_type}::new(self.instance.clone()).get(reference)
+    }}
+
+    pub fn row_by_index(&self, slot: {slot_type}) -> Result<Option<{row_type}>> {{
+        {family_type}::new(self.instance.clone()).row_by_index(slot)
+    }}
+
+    pub fn row_key_by_index(&self, slot: {slot_type}) -> Option<String> {{
+        {family_type}::new(self.instance.clone()).row_key_by_index(slot)
+    }}
+
+    pub fn iter(&self) -> Result<impl ExactSizeIterator<Item = {entry_type}>> {{
+        Ok(self.rows()?.into_iter())
+    }}
+
+"#
+    )
+}
+
+fn rust_direct_row_ref_type(source_row_type: &str) -> String {
+    format!("{}Ref", to_upper_camel_ident(source_row_type, "Row"))
+}
+
+fn rust_direct_row_slot_type(source_row_type: &str) -> String {
+    format!("{}Slot", to_upper_camel_ident(source_row_type, "Row"))
+}
+
+fn rust_direct_entry_type(source_row_type: &str) -> String {
+    format!("{}Entry", to_upper_camel_ident(source_row_type, "Row"))
+}
+
+fn rust_direct_row_family_type(source_row_type: &str) -> String {
+    format!("{}Rows", to_upper_camel_ident(source_row_type, "Rows"))
+}
+
+fn rust_direct_table_rows_type(source_row_type: &str) -> String {
+    format!("{}TableRows", to_upper_camel_ident(source_row_type, "Rows"))
+}
+
+fn rust_direct_entry_fn(source_row_type: &str) -> String {
+    format!("{}_entry", to_snake_ident(source_row_type, "entry"))
 }
 
 fn rust_direct_product_methods(manager: &DirectManagerSurface) -> String {
@@ -2329,6 +2554,10 @@ fn rust_standalone_manager_dependency(input: &ManagerSurfaceDependency) -> Strin
         ManagerSurfaceDependency::Asset { path } => format!(
             "ManagerDependency::Asset {{ path: {} }}",
             rust_string_literal(path)
+        ),
+        ManagerSurfaceDependency::Manager { name } => format!(
+            "ManagerDependency::Manager {{ name: {} }}",
+            rust_string_literal(name)
         ),
     }
 }
@@ -3863,6 +4092,7 @@ struct ManagerInstance {
     definition: &'static ManagerDefinition,
     tables: HashMap<String, Arc<DynamicTable>>,
     assets: HashMap<String, Vec<u8>>,
+    managers: HashMap<String, Arc<ManagerInstance>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3926,6 +4156,7 @@ impl ManagerCache {
 
         let mut tables = HashMap::new();
         let mut assets = HashMap::new();
+        let mut managers = HashMap::new();
         for dependency in definition.dependencies {
             match dependency {
                 ManagerDependency::Table { name, row } => {
@@ -3943,6 +4174,12 @@ impl ManagerCache {
                 ManagerDependency::Asset { path } => {
                     assets.insert(normalize_data_path(path), self.required_asset_bytes(path)?.to_vec());
                 }
+                ManagerDependency::Manager { name } => {
+                    let dependency_definition = manager_by_name(name)
+                        .with_context(|| format!("manager {} depends on unknown manager {name}", definition.name))?;
+                    let manager = self.build_manager(dependency_definition, stack)?;
+                    managers.insert((*name).to_owned(), manager);
+                }
             }
         }
 
@@ -3951,6 +4188,7 @@ impl ManagerCache {
             definition,
             tables,
             assets,
+            managers,
         });
         self.manager_cache
             .insert(definition.name, instance.clone());
@@ -4068,6 +4306,11 @@ impl ManagerInstance {
     }
 
     #[must_use]
+    fn manager(&self, name: &str) -> Option<&ManagerInstance> {
+        self.managers.get(name).map(Arc::as_ref)
+    }
+
+    #[must_use]
     fn asset_bytes(&self, path: &str) -> Option<&[u8]> {
         let normalized = normalize_data_path(path);
         self.assets.get(&normalized).map(Vec::as_slice).or_else(|| {
@@ -4101,6 +4344,41 @@ impl ManagerInstance {
         Ok(rows)
     }
 
+    fn schema_family_entries<T, Entry>(
+        &self,
+        row_type: &str,
+        read: fn(&DynamicTable, &DynamicTableRow) -> Result<T>,
+        entry: fn(&DynamicTable, &DynamicTableRow, T) -> Entry,
+    ) -> Result<Vec<Entry>> {
+        let mut entries = Vec::new();
+        for table in self.all_tables() {
+            if table.schema.row_type != row_type {
+                continue;
+            }
+            for row in &table.rows {
+                entries.push(entry(table, row, read(table, row)?));
+            }
+        }
+        Ok(entries)
+    }
+
+    fn schema_table_entries<T, Entry>(
+        &self,
+        table_name: &str,
+        row_type: &str,
+        read: fn(&DynamicTable, &DynamicTableRow) -> Result<T>,
+        entry: fn(&DynamicTable, &DynamicTableRow, T) -> Entry,
+    ) -> Result<Vec<Entry>> {
+        let Some(table) = self.table_by_name_and_row(table_name, row_type) else {
+            return Ok(Vec::new());
+        };
+        let mut entries = Vec::with_capacity(table.rows.len());
+        for row in &table.rows {
+            entries.push(entry(table, row, read(table, row)?));
+        }
+        Ok(entries)
+    }
+
     fn schema_row<T>(
         &self,
         row_type: &str,
@@ -4115,6 +4393,64 @@ impl ManagerInstance {
             }
         }
         Ok(None)
+    }
+
+    fn schema_table_row<T>(
+        &self,
+        table_name: &str,
+        row_type: &str,
+        key: impl ToString,
+        read: fn(&DynamicTable, &DynamicTableRow) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let Some((table, row)) = self.schema_table_dynamic_row(table_name, row_type, key) else {
+            return Ok(None);
+        };
+        Ok(Some(read(table, row)?))
+    }
+
+    fn schema_table_row_by_index<T>(
+        &self,
+        table_name: &str,
+        row_type: &str,
+        row_index: usize,
+        read: fn(&DynamicTable, &DynamicTableRow) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let Some(table) = self.table_by_name_and_row(table_name, row_type) else {
+            return Ok(None);
+        };
+        let Some(row) = table.rows.get(row_index) else {
+            return Ok(None);
+        };
+        Ok(Some(read(table, row)?))
+    }
+
+    fn schema_table_row_key_by_index(
+        &self,
+        table_name: &str,
+        row_type: &str,
+        row_index: usize,
+    ) -> Option<&str> {
+        self.table_by_name_and_row(table_name, row_type)?
+            .rows
+            .get(row_index)
+            .map(|row| row.key.as_str())
+    }
+
+    fn schema_table_dynamic_row(
+        &self,
+        table_name: &str,
+        row_type: &str,
+        key: impl ToString,
+    ) -> Option<(&DynamicTable, &DynamicTableRow)> {
+        let table = self.table_by_name_and_row(table_name, row_type)?;
+        let row_index = *table.rows_by_lookup_key.get(&normalize_lookup_key(&key.to_string()))?;
+        let row = table.rows.get(row_index)?;
+        Some((table, row))
+    }
+
+    fn table_by_name_and_row(&self, table_name: &str, row_type: &str) -> Option<&DynamicTable> {
+        let table = self.table(table_name)?;
+        (table.schema.row_type == row_type).then_some(table)
     }
 
     fn all_tables(&self) -> Vec<&DynamicTable> {

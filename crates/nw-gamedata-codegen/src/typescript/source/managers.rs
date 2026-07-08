@@ -122,9 +122,15 @@ interface AssetDependency {
   readonly path: string;
 }
 
+interface ManagerDependencyRef {
+  readonly kind: "manager";
+  readonly name: string;
+}
+
 type ManagerDependency =
   | TableDependency
-  | AssetDependency;
+  | AssetDependency
+  | ManagerDependencyRef;
 
 interface ManagerDefinition {
   readonly name: string;
@@ -181,6 +187,7 @@ type AssetLoaderSourceAccessor = {
     push_schema_row_types(&mut source, unit, &readable_row_types);
     push_table_schemas(&mut source, unit);
     push_managers(&mut source, unit, surfaces);
+    push_direct_row_family_types(&mut source, unit, surfaces);
     push_manager_surface_classes(&mut source, unit, surfaces);
     source.push_str(PRODUCT_MANAGER_RUNTIME_TS);
     source.push_str(DYNAMIC_MANAGER_RUNTIME_TS);
@@ -556,15 +563,25 @@ mod tests {
         let rows_interface = direct_ts_rows_interface(&unit, &manager);
         let methods = direct_ts_schema_methods(&unit, &manager);
 
-        assert_eq!(
-            rows_interface,
-            " implements RowLookup<DamageDataSchemaRow[\"damageId\"], DamageDataSchemaRow>"
+        assert_eq!(rows_interface, " implements DamageDataRows");
+        assert!(methods.contains("get rows(): readonly DamageDataEntry[]"));
+        assert!(methods.contains("table(table: string): DamageDataTableRows"));
+        assert!(methods.contains("get(ref: DamageDataRef): DamageDataSchemaRow | undefined"));
+        assert!(
+            methods.contains("rowByIndex(slot: DamageDataSlot): DamageDataSchemaRow | undefined")
         );
-        assert!(methods.contains("get rows(): readonly DamageDataSchemaRow[]"));
-        assert!(methods.contains("get(key: DamageDataSchemaRow[\"damageId\"])"));
-        assert!(methods.contains("[Symbol.iterator](): Iterator<DamageDataSchemaRow>"));
-        assert!(methods.contains("afflictionDataRows(): readonly AfflictionDataSchemaRow[]"));
-        assert!(methods.contains("damageTypeDataRows(): readonly DamageTypeDataSchemaRow[]"));
+        assert!(methods.contains("[Symbol.iterator](): Iterator<DamageDataEntry>"));
+        assert!(methods.contains("afflictionData(): AfflictionDataRows"));
+        assert!(methods.contains("damageTypeData(): DamageTypeDataRows"));
+        assert!(!methods.contains("afflictionDataRows(): readonly AfflictionDataSchemaRow[]"));
+        assert!(!methods.contains("damageTypeDataRows(): readonly DamageTypeDataSchemaRow[]"));
+        assert!(
+            !methods.contains("afflictionData(key: AfflictionDataSchemaRow[\"afflictionId\"])")
+        );
+        assert!(
+            !methods.contains("damageTypeData(key: DamageTypeDataSchemaRow[\"damageTypeId\"])")
+        );
+        assert!(!methods.contains("get(key: DamageDataSchemaRow"));
         assert!(!methods.contains("damageDataRows(): readonly DamageDataSchemaRow[]"));
         assert!(!methods.contains("damageData(key: DamageDataSchemaRow"));
     }
@@ -868,6 +885,10 @@ fn manager_dependency(input: &ManagerSurfaceDependency) -> String {
             "{{ kind: \"asset\", path: {} }}",
             typescript_string_literal(path),
         ),
+        ManagerSurfaceDependency::Manager { name } => format!(
+            "{{ kind: \"manager\", name: {} }}",
+            typescript_string_literal(name),
+        ),
     }
 }
 
@@ -1001,100 +1022,29 @@ export function {runtime_factory}(managers: Managers): {manager_class} {{
 }
 
 fn direct_ts_rows_interface(unit: &GameDataCompileUnit, manager: &DirectManagerSurface) -> String {
-    let row_specs = ts_schema_rows(unit);
-    let mut seen = BTreeSet::new();
-    let row_types = manager
-        .tables
-        .iter()
-        .filter_map(|table| {
-            seen.insert(table.row_type_name.clone())
-                .then_some(table.row_type_name.clone())
-        })
-        .collect::<Vec<_>>();
-    let Some(default_row_type) = default_direct_manager_row_type(&manager.manager_name, &row_types)
-    else {
+    let Some(row_spec) = ts_direct_default_row_spec(unit, manager) else {
         return String::new();
     };
-    let Some(row_spec) = row_specs
-        .iter()
-        .find(|row| row.source_row_type == default_row_type)
-    else {
-        return String::new();
-    };
-    if let Some(key_field) = row_spec.fields.iter().find(|field| field.row_key) {
-        return format!(
-            " implements RowLookup<{}[{:?}], {}>",
-            row_spec.type_name, key_field.field_name, row_spec.type_name
-        );
-    }
-    format!(" implements Rows<{}>", row_spec.type_name)
+    format!(
+        " implements {}",
+        ts_direct_row_family_type(&row_spec.source_row_type)
+    )
 }
 
 fn direct_ts_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerSurface) -> String {
-    let row_specs = ts_schema_rows(unit);
-    let mut seen = BTreeSet::new();
-    let row_types = manager
-        .tables
-        .iter()
-        .filter_map(|table| {
-            seen.insert(table.row_type_name.clone())
-                .then_some(table.row_type_name.clone())
-        })
-        .collect::<Vec<_>>();
-    if row_types.is_empty() {
-        return String::new();
-    }
-
-    let default_row_type =
-        default_direct_manager_row_type(&manager.manager_name, &row_types).map(str::to_owned);
+    let default_row_type = ts_direct_default_row_spec(unit, manager).map(|row| row.source_row_type);
     let mut source = String::new();
-    for row_type in row_types {
-        let Some(row_spec) = row_specs.iter().find(|row| row.source_row_type == row_type) else {
-            continue;
-        };
-        let type_name = &row_spec.type_name;
+    for row_spec in ts_direct_row_specs(unit, manager) {
+        let row_type = &row_spec.source_row_type;
         let is_default_row_type = default_row_type.as_deref() == Some(row_type.as_str());
         if is_default_row_type {
-            source.push_str(&format!(
-                r#"  get rows(): readonly {type_name}[] {{
-    return this.instance.schemaRows({row_type:?}, {reader});
-  }}
-
-"#,
-                reader = ts_schema_reader_name(&row_type),
-            ));
+            source.push_str(&ts_direct_primary_row_family_methods(&row_spec));
         } else {
-            let rows_method = format!("{}Rows", ts_method_name(&row_type));
+            let accessor = ts_method_name(row_type);
+            let family_type = ts_direct_row_family_type(row_type);
             source.push_str(&format!(
-                r#"  {rows_method}(): readonly {type_name}[] {{
-    return this.instance.schemaRows({row_type:?}, {reader});
-  }}
-
-"#,
-                reader = ts_schema_reader_name(&row_type),
-            ));
-        }
-        if let Some(key_field) = row_spec.fields.iter().find(|field| field.row_key) {
-            let lookup_method = if is_default_row_type {
-                "get".to_owned()
-            } else {
-                ts_method_name(&row_type)
-            };
-            source.push_str(&format!(
-                r#"  {lookup_method}(key: {type_name}[{key_field:?}]): {type_name} | undefined {{
-    return this.instance.schemaRow({row_type:?}, key, {reader}, (row) => row.{key_member});
-  }}
-
-"#,
-                key_field = key_field.field_name.as_str(),
-                key_member = key_field.field_name.as_str(),
-                reader = ts_schema_reader_name(&row_type),
-            ));
-        }
-        if is_default_row_type {
-            source.push_str(&format!(
-                r#"  [Symbol.iterator](): Iterator<{type_name}> {{
-    return this.rows[Symbol.iterator]();
+                r#"  {accessor}(): {family_type} {{
+    return new {family_type}View(this.instance);
   }}
 
 "#
@@ -1102,6 +1052,243 @@ fn direct_ts_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerS
         }
     }
     source
+}
+
+fn ts_direct_row_specs(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+) -> Vec<TsSchemaRow> {
+    let row_specs = ts_schema_rows(unit);
+    let mut seen = BTreeSet::new();
+    manager
+        .tables
+        .iter()
+        .filter_map(|table| {
+            seen.insert(table.row_type_name.clone())
+                .then_some(table.row_type_name.as_str())
+        })
+        .filter_map(|row_type| {
+            row_specs
+                .iter()
+                .find(|row| row.source_row_type == row_type)
+                .cloned()
+        })
+        .collect()
+}
+
+fn ts_direct_default_row_spec(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+) -> Option<TsSchemaRow> {
+    let row_specs = ts_direct_row_specs(unit, manager);
+    let row_types = row_specs
+        .iter()
+        .map(|row| row.source_row_type.clone())
+        .collect::<Vec<_>>();
+    let default_row_type = default_direct_manager_row_type(&manager.manager_name, &row_types)?;
+    row_specs
+        .into_iter()
+        .find(|row| row.source_row_type == default_row_type)
+}
+
+fn push_direct_row_family_types(
+    source: &mut String,
+    unit: &GameDataCompileUnit,
+    surfaces: &[ManagerSurface],
+) {
+    let mut emitted = BTreeSet::new();
+    for surface in surfaces {
+        let ManagerSurface::Direct(manager) = surface else {
+            continue;
+        };
+        for row_spec in ts_direct_row_specs(unit, manager) {
+            if emitted.insert(row_spec.source_row_type.clone()) {
+                push_direct_row_family_type(source, &row_spec);
+            }
+        }
+    }
+}
+
+fn push_direct_row_family_type(source: &mut String, row_spec: &TsSchemaRow) {
+    let row_type = &row_spec.type_name;
+    let source_row_type = &row_spec.source_row_type;
+    let ref_type = ts_direct_row_ref_type(source_row_type);
+    let slot_type = ts_direct_row_slot_type(source_row_type);
+    let entry_type = ts_direct_entry_type(source_row_type);
+    let family_type = ts_direct_row_family_type(source_row_type);
+    let table_rows_type = ts_direct_table_rows_type(source_row_type);
+    let reader = ts_schema_reader_name(source_row_type);
+    let entry_fn = ts_direct_entry_fn(source_row_type);
+    source.push_str(&format!(
+        r#"
+export interface {ref_type} {{
+  readonly table: string;
+  readonly row: string;
+}}
+
+export interface {slot_type} {{
+  readonly table: string;
+  readonly rowIndex: number;
+}}
+
+export interface {entry_type} {{
+  readonly ref: {ref_type};
+  readonly rowIndex: number;
+  readonly row: {row_type};
+}}
+
+export interface {family_type} extends Rows<{entry_type}> {{
+  table(table: string): {table_rows_type};
+  get(ref: {ref_type}): {row_type} | undefined;
+  rowByIndex(slot: {slot_type}): {row_type} | undefined;
+  rowKeyByIndex(slot: {slot_type}): string | undefined;
+}}
+
+class {family_type}View implements {family_type} {{
+  constructor(private readonly instance: ManagerInstance) {{}}
+
+  get rows(): readonly {entry_type}[] {{
+    return this.instance.schemaFamilyEntries({source_row_type:?}, {reader}, {entry_fn});
+  }}
+
+  table(table: string): {table_rows_type} {{
+    return new {table_rows_type}View(this.instance, table);
+  }}
+
+  get(ref: {ref_type}): {row_type} | undefined {{
+    return this.table(ref.table).get(ref.row);
+  }}
+
+  rowByIndex(slot: {slot_type}): {row_type} | undefined {{
+    return this.table(slot.table).rowByIndex(slot.rowIndex);
+  }}
+
+  rowKeyByIndex(slot: {slot_type}): string | undefined {{
+    return this.table(slot.table).rowKeyByIndex(slot.rowIndex);
+  }}
+
+  [Symbol.iterator](): Iterator<{entry_type}> {{
+    return this.rows[Symbol.iterator]();
+  }}
+}}
+
+export interface {table_rows_type} extends Rows<{entry_type}> {{
+  readonly table: string;
+  get(key: string): {row_type} | undefined;
+  rowByIndex(rowIndex: number): {row_type} | undefined;
+  rowKeyByIndex(rowIndex: number): string | undefined;
+}}
+
+class {table_rows_type}View implements {table_rows_type} {{
+  constructor(
+    private readonly instance: ManagerInstance,
+    readonly table: string,
+  ) {{}}
+
+  get rows(): readonly {entry_type}[] {{
+    return this.instance.schemaTableEntries(
+      this.table,
+      {source_row_type:?},
+      {reader},
+      {entry_fn},
+    );
+  }}
+
+  get(key: string): {row_type} | undefined {{
+    return this.instance.schemaTableRow(this.table, {source_row_type:?}, key, {reader});
+  }}
+
+  rowByIndex(rowIndex: number): {row_type} | undefined {{
+    return this.instance.schemaTableRowByIndex(this.table, {source_row_type:?}, rowIndex, {reader});
+  }}
+
+  rowKeyByIndex(rowIndex: number): string | undefined {{
+    return this.instance.schemaTableRowKeyByIndex(this.table, {source_row_type:?}, rowIndex);
+  }}
+
+  [Symbol.iterator](): Iterator<{entry_type}> {{
+    return this.rows[Symbol.iterator]();
+  }}
+}}
+
+function {entry_fn}(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  data: {row_type},
+): {entry_type} {{
+  return {{
+    ref: {{
+      table: table.schema.name,
+      row: row.key,
+    }},
+    rowIndex: row.rowIndex,
+    row: data,
+  }};
+}}
+
+"#
+    ));
+}
+
+fn ts_direct_primary_row_family_methods(row_spec: &TsSchemaRow) -> String {
+    let row_type = &row_spec.type_name;
+    let source_row_type = &row_spec.source_row_type;
+    let ref_type = ts_direct_row_ref_type(source_row_type);
+    let slot_type = ts_direct_row_slot_type(source_row_type);
+    let entry_type = ts_direct_entry_type(source_row_type);
+    let family_type = ts_direct_row_family_type(source_row_type);
+    let table_rows_type = ts_direct_table_rows_type(source_row_type);
+    format!(
+        r#"  get rows(): readonly {entry_type}[] {{
+    return new {family_type}View(this.instance).rows;
+  }}
+
+  table(table: string): {table_rows_type} {{
+    return new {family_type}View(this.instance).table(table);
+  }}
+
+  get(ref: {ref_type}): {row_type} | undefined {{
+    return new {family_type}View(this.instance).get(ref);
+  }}
+
+  rowByIndex(slot: {slot_type}): {row_type} | undefined {{
+    return new {family_type}View(this.instance).rowByIndex(slot);
+  }}
+
+  rowKeyByIndex(slot: {slot_type}): string | undefined {{
+    return new {family_type}View(this.instance).rowKeyByIndex(slot);
+  }}
+
+  [Symbol.iterator](): Iterator<{entry_type}> {{
+    return this.rows[Symbol.iterator]();
+  }}
+
+"#
+    )
+}
+
+fn ts_direct_row_ref_type(source_row_type: &str) -> String {
+    format!("{}Ref", to_upper_camel_ident(source_row_type, "Row"))
+}
+
+fn ts_direct_row_slot_type(source_row_type: &str) -> String {
+    format!("{}Slot", to_upper_camel_ident(source_row_type, "Row"))
+}
+
+fn ts_direct_entry_type(source_row_type: &str) -> String {
+    format!("{}Entry", to_upper_camel_ident(source_row_type, "Row"))
+}
+
+fn ts_direct_row_family_type(source_row_type: &str) -> String {
+    format!("{}Rows", to_upper_camel_ident(source_row_type, "Rows"))
+}
+
+fn ts_direct_table_rows_type(source_row_type: &str) -> String {
+    format!("{}TableRows", to_upper_camel_ident(source_row_type, "Rows"))
+}
+
+fn ts_direct_entry_fn(source_row_type: &str) -> String {
+    ts_method_name(&format!("{source_row_type}Entry"))
 }
 
 fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
@@ -4042,10 +4229,15 @@ class ManagerInstance {
     private readonly tables: ReadonlyMap<string, DynamicTable>,
     private readonly assets: readonly string[],
     private readonly assetBytesByPath: ReadonlyMap<string, Uint8Array>,
+    private readonly managers: ReadonlyMap<string, ManagerInstance>,
   ) {}
 
   table(name: string): DynamicTable | undefined {
     return this.tables.get(name);
+  }
+
+  manager(name: string): ManagerInstance | undefined {
+    return this.managers.get(name);
   }
 
   private assetBytes(path?: string): Uint8Array | undefined {
@@ -4090,6 +4282,36 @@ class ManagerInstance {
     return out;
   }
 
+  schemaFamilyEntries<T, Entry>(
+    rowType: string,
+    read: (table: DynamicTable, row: DynamicTableRow) => T,
+    entry: (table: DynamicTable, row: DynamicTableRow, data: T) => Entry,
+  ): readonly Entry[] {
+    const out: Entry[] = [];
+    for (const table of this.allTables()) {
+      if (table.schema.rowType !== rowType) {
+        continue;
+      }
+      for (const row of table.rows) {
+        out.push(entry(table, row, read(table, row)));
+      }
+    }
+    return out;
+  }
+
+  schemaTableEntries<T, Entry>(
+    tableName: string,
+    rowType: string,
+    read: (table: DynamicTable, row: DynamicTableRow) => T,
+    entry: (table: DynamicTable, row: DynamicTableRow, data: T) => Entry,
+  ): readonly Entry[] {
+    const table = this.tableByNameAndRow(tableName, rowType);
+    if (table === undefined) {
+      return [];
+    }
+    return table.rows.map((row) => entry(table, row, read(table, row)));
+  }
+
   schemaRow<T>(
     rowType: string,
     key: string | number | boolean | null,
@@ -4098,6 +4320,66 @@ class ManagerInstance {
   ): T | undefined {
     const lookupKey = normalizeLookupKey(key);
     return this.schemaRows(rowType, read).find((row) => normalizeLookupKey(keyOf(row)) === lookupKey);
+  }
+
+  schemaTableRow<T>(
+    tableName: string,
+    rowType: string,
+    key: string | number | boolean | null,
+    read: (table: DynamicTable, row: DynamicTableRow) => T,
+  ): T | undefined {
+    const row = this.schemaTableDynamicRow(tableName, rowType, key);
+    if (row === undefined) {
+      return undefined;
+    }
+    return read(row.table, row.row);
+  }
+
+  schemaTableRowByIndex<T>(
+    tableName: string,
+    rowType: string,
+    rowIndex: number,
+    read: (table: DynamicTable, row: DynamicTableRow) => T,
+  ): T | undefined {
+    const table = this.tableByNameAndRow(tableName, rowType);
+    if (table === undefined || rowIndex < 0 || rowIndex >= table.rows.length) {
+      return undefined;
+    }
+    const row = table.rows[rowIndex];
+    return read(table, row);
+  }
+
+  schemaTableRowKeyByIndex(
+    tableName: string,
+    rowType: string,
+    rowIndex: number,
+  ): string | undefined {
+    const table = this.tableByNameAndRow(tableName, rowType);
+    if (table === undefined || rowIndex < 0 || rowIndex >= table.rows.length) {
+      return undefined;
+    }
+    return table.rows[rowIndex].key;
+  }
+
+  private schemaTableDynamicRow(
+    tableName: string,
+    rowType: string,
+    key: string | number | boolean | null,
+  ): { table: DynamicTable; row: DynamicTableRow } | undefined {
+    const table = this.tableByNameAndRow(tableName, rowType);
+    const row = table?.rowsByLookupKey.get(normalizeLookupKey(key));
+    if (table === undefined || row === undefined) {
+      return undefined;
+    }
+    return { table, row };
+  }
+
+  private tableByNameAndRow(tableName: string, rowType: string): DynamicTable | undefined {
+    const table = this.table(tableName);
+    if (table === undefined || table.schema.rowType !== rowType) {
+      return undefined;
+    }
+    return table;
   }
 
   private allTables(): readonly DynamicTable[] {
@@ -4144,6 +4426,7 @@ class ManagerCache {
     const tables = new Map<string, DynamicTable>();
     const assets: string[] = [];
     const assetBytesByPath = new Map<string, Uint8Array>();
+    const managers = new Map<string, ManagerInstance>();
 
     for (const dependency of definition.dependencies) {
       switch (dependency.kind) {
@@ -4167,11 +4450,24 @@ class ManagerCache {
             this.requiredAssetBytes(dependency.path),
           );
           break;
+        case "manager": {
+          const dependencyDefinition = managerByName(dependency.name);
+          if (dependencyDefinition === undefined) {
+            throw new Error(
+              `manager ${definition.name} depends on unknown manager ${dependency.name}`,
+            );
+          }
+          managers.set(
+            dependency.name,
+            this.buildManager(dependencyDefinition, stack),
+          );
+          break;
+        }
       }
     }
 
     stack.delete(definition.name);
-    const instance = new ManagerInstance(definition, tables, assets, assetBytesByPath);
+    const instance = new ManagerInstance(definition, tables, assets, assetBytesByPath, managers);
     this.managerCache.set(definition.name, instance);
     return instance;
   }

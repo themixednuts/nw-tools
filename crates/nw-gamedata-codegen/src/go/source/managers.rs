@@ -105,6 +105,7 @@ type managerDependencyKind string
 const (
 	managerDependencyTable   managerDependencyKind = "table"
 	managerDependencyAsset   managerDependencyKind = "asset"
+	managerDependencyManager managerDependencyKind = "manager"
 )
 
 type managerDependency struct {{
@@ -155,9 +156,11 @@ type Rows[T any] interface {{
         DEFAULT_GO_GAMEASSETS_IMPORT,
     );
 
-    push_schema_row_types(&mut source, unit);
+    let readable_row_types = direct_schema_row_types(surfaces);
+    push_schema_row_types(&mut source, unit, &readable_row_types);
     push_table_schemas(&mut source, unit);
     push_managers(&mut source, unit, surfaces);
+    push_direct_row_family_types(&mut source, unit, surfaces);
     push_manager_surface_types(&mut source, unit, surfaces);
     source.push_str(PRODUCT_MANAGER_RUNTIME_GO);
     source.push_str(DYNAMIC_MANAGER_RUNTIME_GO);
@@ -176,6 +179,22 @@ fn semantic_records(surfaces: &[ManagerSurface]) -> Vec<SemanticManagerRecord> {
             | ManagerSurface::ProductBacked(_) => None,
         })
         .collect()
+}
+
+fn direct_schema_row_types(surfaces: &[ManagerSurface]) -> BTreeSet<String> {
+    let mut row_types = BTreeSet::new();
+    for surface in surfaces {
+        let ManagerSurface::Direct(manager) = surface else {
+            continue;
+        };
+        row_types.extend(
+            manager
+                .tables
+                .iter()
+                .map(|table| table.row_type_name.clone()),
+        );
+    }
+    row_types
 }
 
 fn go_manager_accessor_name(manager_name: &str) -> String {
@@ -205,8 +224,15 @@ struct GoSchemaField {
     row_key: bool,
 }
 
-fn push_schema_row_types(source: &mut String, unit: &GameDataCompileUnit) {
+fn push_schema_row_types(
+    source: &mut String,
+    unit: &GameDataCompileUnit,
+    readable_row_types: &BTreeSet<String>,
+) {
     for row in go_schema_rows(unit) {
+        if !readable_row_types.contains(&row.source_row_type) {
+            continue;
+        }
         if row.source_row_type == "LootBucketData" {
             push_loot_bucket_schema_row_type(source);
             continue;
@@ -582,18 +608,38 @@ mod tests {
         let methods = direct_go_schema_methods(&unit, &manager);
 
         assert!(
+            methods.contains("func (manager *DamageDataManager) Rows() ([]DamageDataEntry, error)")
+        );
+        assert!(
             methods.contains(
-                "func (manager *DamageDataManager) Rows() ([]DamageDataSchemaRow, error)"
+                "func (manager *DamageDataManager) Table(table string) DamageDataTableRows"
             )
         );
         assert!(methods.contains(
-            "func (manager *DamageDataManager) Get(key string) (*DamageDataSchemaRow, error)"
+            "func (manager *DamageDataManager) Get(ref DamageDataRef) (*DamageDataSchemaRow, error)"
         ));
         assert!(methods.contains(
+            "func (manager *DamageDataManager) RowByIndex(slot DamageDataSlot) (*DamageDataSchemaRow, error)"
+        ));
+        assert!(
+            methods
+                .contains("func (manager *DamageDataManager) AfflictionData() AfflictionDataRows")
+        );
+        assert!(
+            methods
+                .contains("func (manager *DamageDataManager) DamageTypeData() DamageTypeDataRows")
+        );
+        assert!(!methods.contains(
             "func (manager *DamageDataManager) AfflictionDataRows() ([]AfflictionDataSchemaRow, error)"
         ));
-        assert!(methods.contains(
+        assert!(!methods.contains(
             "func (manager *DamageDataManager) DamageTypeDataRows() ([]DamageTypeDataSchemaRow, error)"
+        ));
+        assert!(!methods.contains(
+            "func (manager *DamageDataManager) AfflictionData(key string) (*AfflictionDataSchemaRow, error)"
+        ));
+        assert!(!methods.contains(
+            "func (manager *DamageDataManager) Get(key string) (*DamageDataSchemaRow, error)"
         ));
         assert!(!methods.contains(
             "func (manager *DamageDataManager) DamageDataRows() ([]DamageDataSchemaRow, error)"
@@ -743,6 +789,7 @@ type managerDependencyKind string
 const (
 	managerDependencyTable   managerDependencyKind = "table"
 	managerDependencyAsset   managerDependencyKind = "asset"
+	managerDependencyManager managerDependencyKind = "manager"
 )
 
 type managerDependency struct {
@@ -897,6 +944,12 @@ fn push_manager_dependency(source: &mut String, input: &ManagerSurfaceDependency
             source.push_str(&format!("\t\t\t\tPath: {},\n", go_string(path)));
             source.push_str("\t\t\t},\n");
         }
+        ManagerSurfaceDependency::Manager { name } => {
+            source.push_str("\t\t\t{\n");
+            source.push_str("\t\t\t\tKind: managerDependencyManager,\n");
+            source.push_str(&format!("\t\t\t\tName: {},\n", go_string(name)));
+            source.push_str("\t\t\t},\n");
+        }
     }
 }
 
@@ -982,63 +1035,235 @@ func {constructor}(cache *managerCache) (*{manager_type}, error) {{
 }
 
 fn direct_go_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerSurface) -> String {
-    let row_specs = go_schema_rows(unit);
-    let mut seen = BTreeSet::new();
-    let row_types = manager
-        .tables
-        .iter()
-        .filter_map(|table| {
-            seen.insert(table.row_type_name.clone())
-                .then_some(table.row_type_name.clone())
-        })
-        .collect::<Vec<_>>();
-    if row_types.is_empty() {
-        return String::new();
-    }
-
-    let default_row_type =
-        default_direct_manager_row_type(&manager.manager_name, &row_types).map(str::to_owned);
+    let default_row_type = go_direct_default_row_spec(unit, manager).map(|row| row.source_row_type);
     let mut source = String::new();
-    for row_type in row_types {
-        let Some(row_spec) = row_specs.iter().find(|row| row.source_row_type == row_type) else {
-            continue;
-        };
-        let type_name = &row_spec.type_name;
+    for row_spec in go_direct_row_specs(unit, manager) {
+        let row_type = &row_spec.source_row_type;
         let is_default_row_type = default_row_type.as_deref() == Some(row_type.as_str());
-        let rows_method = if is_default_row_type {
-            "Rows".to_owned()
+        if is_default_row_type {
+            source.push_str(&go_direct_primary_row_family_methods(manager, &row_spec));
         } else {
-            format!("{}Rows", go_method_name(&row_type))
-        };
-        source.push_str(&format!(
-            r#"func (manager *{manager_type}) {rows_method}() ([]{type_name}, error) {{
-	return schemaRows(manager.instance, {row_type:?}, {reader})
-}}
-
-"#,
-            manager_type = manager.manager_class_name,
-            reader = go_schema_reader_name(&row_type),
-        ));
-        if let Some(key_field) = row_spec.fields.iter().find(|field| field.row_key) {
-            let lookup_method = if is_default_row_type {
-                "Get".to_owned()
-            } else {
-                go_method_name(&row_type)
-            };
-            let key_type = go_schema_field_type(key_field.column_type, true);
+            let accessor = go_method_name(row_type);
+            let family_type = go_direct_row_family_type(row_type);
             source.push_str(&format!(
-                r#"func (manager *{manager_type}) {lookup_method}(key {key_type}) (*{type_name}, error) {{
-	return schemaRow(manager.instance, {row_type:?}, key, {reader}, func(row {type_name}) any {{ return row.{key_field} }})
+                r#"func (manager *{manager_type}) {accessor}() {family_type} {{
+	return {family_type}{{instance: manager.instance}}
 }}
 
 "#,
-                manager_type = manager.manager_class_name,
-                key_field = key_field.field_name.as_str(),
-                reader = go_schema_reader_name(&row_type),
+                manager_type = manager.manager_class_name
             ));
         }
     }
     source
+}
+
+fn go_direct_row_specs(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+) -> Vec<GoSchemaRow> {
+    let row_specs = go_schema_rows(unit);
+    let mut seen = BTreeSet::new();
+    manager
+        .tables
+        .iter()
+        .filter_map(|table| {
+            seen.insert(table.row_type_name.clone())
+                .then_some(table.row_type_name.as_str())
+        })
+        .filter_map(|row_type| {
+            row_specs
+                .iter()
+                .find(|row| row.source_row_type == row_type)
+                .cloned()
+        })
+        .collect()
+}
+
+fn go_direct_default_row_spec(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+) -> Option<GoSchemaRow> {
+    let row_specs = go_direct_row_specs(unit, manager);
+    let row_types = row_specs
+        .iter()
+        .map(|row| row.source_row_type.clone())
+        .collect::<Vec<_>>();
+    let default_row_type = default_direct_manager_row_type(&manager.manager_name, &row_types)?;
+    row_specs
+        .into_iter()
+        .find(|row| row.source_row_type == default_row_type)
+}
+
+fn push_direct_row_family_types(
+    source: &mut String,
+    unit: &GameDataCompileUnit,
+    surfaces: &[ManagerSurface],
+) {
+    let mut emitted = BTreeSet::new();
+    for surface in surfaces {
+        let ManagerSurface::Direct(manager) = surface else {
+            continue;
+        };
+        for row_spec in go_direct_row_specs(unit, manager) {
+            if emitted.insert(row_spec.source_row_type.clone()) {
+                push_direct_row_family_type(source, &row_spec);
+            }
+        }
+    }
+}
+
+fn push_direct_row_family_type(source: &mut String, row_spec: &GoSchemaRow) {
+    let source_row_type = &row_spec.source_row_type;
+    let row_type = &row_spec.type_name;
+    let ref_type = go_direct_row_ref_type(source_row_type);
+    let slot_type = go_direct_row_slot_type(source_row_type);
+    let entry_type = go_direct_entry_type(source_row_type);
+    let family_type = go_direct_row_family_type(source_row_type);
+    let table_rows_type = go_direct_table_rows_type(source_row_type);
+    let reader = go_schema_reader_name(source_row_type);
+    let entry_fn = go_direct_entry_fn(source_row_type);
+    source.push_str(&format!(
+        r#"
+type {ref_type} struct {{
+	Table string
+	Row   string
+}}
+
+type {slot_type} struct {{
+	Table    string
+	RowIndex int
+}}
+
+type {entry_type} struct {{
+	Ref      {ref_type}
+	RowIndex int
+	Row      {row_type}
+}}
+
+type {family_type} struct {{
+	instance *managerInstance
+}}
+
+func (view {family_type}) Rows() ([]{entry_type}, error) {{
+	return schemaFamilyEntries(view.instance, {source_row_type:?}, {reader}, {entry_fn})
+}}
+
+func (view {family_type}) Table(table string) {table_rows_type} {{
+	return {table_rows_type}{{instance: view.instance, table: table}}
+}}
+
+func (view {family_type}) Get(ref {ref_type}) (*{row_type}, error) {{
+	return view.Table(ref.Table).Get(ref.Row)
+}}
+
+func (view {family_type}) RowByIndex(slot {slot_type}) (*{row_type}, error) {{
+	return view.Table(slot.Table).RowByIndex(slot.RowIndex)
+}}
+
+func (view {family_type}) RowKeyByIndex(slot {slot_type}) *string {{
+	return view.Table(slot.Table).RowKeyByIndex(slot.RowIndex)
+}}
+
+type {table_rows_type} struct {{
+	instance *managerInstance
+	table   string
+}}
+
+func (view {table_rows_type}) TableName() string {{
+	return view.table
+}}
+
+func (view {table_rows_type}) Rows() ([]{entry_type}, error) {{
+	return schemaTableEntries(view.instance, view.table, {source_row_type:?}, {reader}, {entry_fn})
+}}
+
+func (view {table_rows_type}) Get(key string) (*{row_type}, error) {{
+	return schemaTableRow(view.instance, view.table, {source_row_type:?}, key, {reader})
+}}
+
+func (view {table_rows_type}) RowByIndex(rowIndex int) (*{row_type}, error) {{
+	return schemaTableRowByIndex(view.instance, view.table, {source_row_type:?}, rowIndex, {reader})
+}}
+
+func (view {table_rows_type}) RowKeyByIndex(rowIndex int) *string {{
+	return schemaTableRowKeyByIndex(view.instance, view.table, {source_row_type:?}, rowIndex)
+}}
+
+func {entry_fn}(table *dynamicTable, row dynamicTableRow, data {row_type}) {entry_type} {{
+	return {entry_type}{{
+		Ref: {ref_type}{{
+			Table: table.Schema.Name,
+			Row:   row.Key,
+		}},
+		RowIndex: row.RowIndex,
+		Row:      data,
+	}}
+}}
+
+"#
+    ));
+}
+
+fn go_direct_primary_row_family_methods(
+    manager: &DirectManagerSurface,
+    row_spec: &GoSchemaRow,
+) -> String {
+    let source_row_type = &row_spec.source_row_type;
+    let row_type = &row_spec.type_name;
+    let ref_type = go_direct_row_ref_type(source_row_type);
+    let slot_type = go_direct_row_slot_type(source_row_type);
+    let entry_type = go_direct_entry_type(source_row_type);
+    let family_type = go_direct_row_family_type(source_row_type);
+    let table_rows_type = go_direct_table_rows_type(source_row_type);
+    format!(
+        r#"func (manager *{manager_type}) Rows() ([]{entry_type}, error) {{
+	return {family_type}{{instance: manager.instance}}.Rows()
+}}
+
+func (manager *{manager_type}) Table(table string) {table_rows_type} {{
+	return {family_type}{{instance: manager.instance}}.Table(table)
+}}
+
+func (manager *{manager_type}) Get(ref {ref_type}) (*{row_type}, error) {{
+	return {family_type}{{instance: manager.instance}}.Get(ref)
+}}
+
+func (manager *{manager_type}) RowByIndex(slot {slot_type}) (*{row_type}, error) {{
+	return {family_type}{{instance: manager.instance}}.RowByIndex(slot)
+}}
+
+func (manager *{manager_type}) RowKeyByIndex(slot {slot_type}) *string {{
+	return {family_type}{{instance: manager.instance}}.RowKeyByIndex(slot)
+}}
+
+"#,
+        manager_type = manager.manager_class_name
+    )
+}
+
+fn go_direct_row_ref_type(source_row_type: &str) -> String {
+    format!("{}Ref", to_upper_camel_ident(source_row_type, "Row"))
+}
+
+fn go_direct_row_slot_type(source_row_type: &str) -> String {
+    format!("{}Slot", to_upper_camel_ident(source_row_type, "Row"))
+}
+
+fn go_direct_entry_type(source_row_type: &str) -> String {
+    format!("{}Entry", to_upper_camel_ident(source_row_type, "Row"))
+}
+
+fn go_direct_row_family_type(source_row_type: &str) -> String {
+    format!("{}Rows", to_upper_camel_ident(source_row_type, "Rows"))
+}
+
+fn go_direct_table_rows_type(source_row_type: &str) -> String {
+    format!("{}TableRows", to_upper_camel_ident(source_row_type, "Rows"))
+}
+
+fn go_direct_entry_fn(source_row_type: &str) -> String {
+    lower_camel(&format!("{source_row_type}Entry"))
 }
 
 fn direct_go_product_methods(manager: &DirectManagerSurface) -> String {
@@ -4803,10 +5028,15 @@ type managerInstance struct {
 	tables           map[string]*dynamicTable
 	assets           []string
 	assetBytesByPath map[string][]byte
+	managers         map[string]*managerInstance
 }
 
 func (instance *managerInstance) table(name string) *dynamicTable {
 	return instance.tables[name]
+}
+
+func (instance *managerInstance) manager(name string) *managerInstance {
+	return instance.managers[name]
 }
 
 func (instance *managerInstance) assetBytes(path ...string) ([]byte, bool) {
@@ -4861,6 +5091,39 @@ func schemaRows[T any](instance *managerInstance, rowType string, read func(*dyn
 	return rows, nil
 }
 
+func schemaFamilyEntries[T any, Entry any](instance *managerInstance, rowType string, read func(*dynamicTable, dynamicTableRow) (T, error), entry func(*dynamicTable, dynamicTableRow, T) Entry) ([]Entry, error) {
+	entries := []Entry{}
+	for _, table := range instance.allTables() {
+		if table.Schema.RowType != rowType {
+			continue
+		}
+		for _, sourceRow := range table.Rows {
+			row, err := read(table, sourceRow)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, entry(table, sourceRow, row))
+		}
+	}
+	return entries, nil
+}
+
+func schemaTableEntries[T any, Entry any](instance *managerInstance, tableName string, rowType string, read func(*dynamicTable, dynamicTableRow) (T, error), entry func(*dynamicTable, dynamicTableRow, T) Entry) ([]Entry, error) {
+	table := instance.tableByNameAndRow(tableName, rowType)
+	if table == nil {
+		return []Entry{}, nil
+	}
+	entries := make([]Entry, 0, len(table.Rows))
+	for _, sourceRow := range table.Rows {
+		row, err := read(table, sourceRow)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry(table, sourceRow, row))
+	}
+	return entries, nil
+}
+
 func schemaRow[T any](instance *managerInstance, rowType string, key any, read func(*dynamicTable, dynamicTableRow) (T, error), keyOf func(T) any) (*T, error) {
 	lookupKey := normalizeLookupKey(key)
 	rows, err := schemaRows(instance, rowType, read)
@@ -4873,6 +5136,59 @@ func schemaRow[T any](instance *managerInstance, rowType string, key any, read f
 		}
 	}
 	return nil, nil
+}
+
+func schemaTableRow[T any](instance *managerInstance, tableName string, rowType string, key any, read func(*dynamicTable, dynamicTableRow) (T, error)) (*T, error) {
+	table, row := instance.schemaTableDynamicRow(tableName, rowType, key)
+	if table == nil || row == nil {
+		return nil, nil
+	}
+	out, err := read(table, *row)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func schemaTableRowByIndex[T any](instance *managerInstance, tableName string, rowType string, rowIndex int, read func(*dynamicTable, dynamicTableRow) (T, error)) (*T, error) {
+	table := instance.tableByNameAndRow(tableName, rowType)
+	if table == nil || rowIndex < 0 || rowIndex >= len(table.Rows) {
+		return nil, nil
+	}
+	out, err := read(table, table.Rows[rowIndex])
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func schemaTableRowKeyByIndex(instance *managerInstance, tableName string, rowType string, rowIndex int) *string {
+	table := instance.tableByNameAndRow(tableName, rowType)
+	if table == nil || rowIndex < 0 || rowIndex >= len(table.Rows) {
+		return nil
+	}
+	key := table.Rows[rowIndex].Key
+	return &key
+}
+
+func (instance *managerInstance) schemaTableDynamicRow(tableName string, rowType string, key any) (*dynamicTable, *dynamicTableRow) {
+	table := instance.tableByNameAndRow(tableName, rowType)
+	if table == nil {
+		return nil, nil
+	}
+	row, ok := table.RowsByLookupKey[normalizeLookupKey(key)]
+	if !ok {
+		return table, nil
+	}
+	return table, &row
+}
+
+func (instance *managerInstance) tableByNameAndRow(tableName string, rowType string) *dynamicTable {
+	table := instance.table(tableName)
+	if table == nil || table.Schema.RowType != rowType {
+		return nil
+	}
+	return table
 }
 
 func (instance *managerInstance) allTables() []*dynamicTable {
@@ -4967,6 +5283,7 @@ func (runtime *managerCache) buildManager(definition *managerDefinition, stack m
 		tables:           map[string]*dynamicTable{},
 		assets:           []string{},
 		assetBytesByPath: map[string][]byte{},
+		managers:         map[string]*managerInstance{},
 	}
 
 	for _, dependency := range definition.Dependencies {
@@ -4990,6 +5307,16 @@ func (runtime *managerCache) buildManager(definition *managerDefinition, stack m
 				return nil, fmt.Errorf("asset %s was not loaded", dependency.Path)
 			}
 			instance.assetBytesByPath[normalizeDataPath(dependency.Path)] = bytes
+		case managerDependencyManager:
+			dependencyDefinition := managerByName(dependency.Name)
+			if dependencyDefinition == nil {
+				return nil, fmt.Errorf("manager %s depends on unknown manager %s", definition.Name, dependency.Name)
+			}
+			manager, err := runtime.buildManager(dependencyDefinition, stack)
+			if err != nil {
+				return nil, err
+			}
+			instance.managers[dependency.Name] = manager
 		}
 	}
 

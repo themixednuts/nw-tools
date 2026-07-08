@@ -299,7 +299,7 @@ mod tests {
         assert!(managers.contains("readonly duplicateKeys"));
         assert!(managers.contains("readonly rowsByLookupKey"));
         assert!(!managers.contains("managerInstance(name: string)"));
-        assert!(!managers.contains("manager(name: string)"));
+        assert!(managers.contains("manager(name: string): ManagerInstance | undefined"));
         assert!(!managers.contains("export function managerByName"));
         assert!(!managers.contains("export const MANAGERS"));
         assert!(!managers.contains("export interface ManagerDefinition"));
