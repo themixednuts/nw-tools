@@ -18,7 +18,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v36";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v37";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
