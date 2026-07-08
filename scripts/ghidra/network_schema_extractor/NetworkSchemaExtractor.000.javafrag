@@ -66,7 +66,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         textParser = new NetworkSchemaTextParser(TEXT_PARSE_CACHE_LIMIT);
     }
 
-    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260708-landclaim-progress-depth-fix-pass";
+    private static final String EXTRACTOR_VERSION = "network-schema-extractor-20260708-full-template-value-type-pass";
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;

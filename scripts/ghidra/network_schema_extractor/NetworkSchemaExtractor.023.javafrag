@@ -706,10 +706,10 @@
 
         LinkedHashMap<String, NativeTypeInfoEvidence> candidates = new LinkedHashMap<>();
         LinkedHashSet<String> seen = new LinkedHashSet<>();
-        collectNativeTypeInfoRefs(marshal, 2, seen, candidates);
-        collectNativeTypeInfoRefs(marshalFull, 2, seen, candidates);
-        collectNativeTypeInfoRefs(unmarshal, 2, seen, candidates);
-        collectNativeTypeInfoRefs(unmarshalFull, 2, seen, candidates);
+        collectNativeTypeInfoRefs(marshal, 2, seen, candidates, "delta", 0);
+        collectNativeTypeInfoRefs(marshalFull, 2, seen, candidates, "full", 0);
+        collectNativeTypeInfoRefs(unmarshal, 2, seen, candidates, "delta", 0);
+        collectNativeTypeInfoRefs(unmarshalFull, 2, seen, candidates, "full", 0);
         return new ArrayList<>(candidates.values());
     }
 
@@ -719,9 +719,25 @@
         if (candidates.isEmpty()) {
             return null;
         }
+        NativeTypeInfoEvidence selected = selectedReplicatedContainerValueTypeInfo(
+            candidates,
+            true);
+        if (selected != null) {
+            return selected;
+        }
+        return selectedReplicatedContainerValueTypeInfo(candidates, false);
+    }
+
+    private NativeTypeInfoEvidence selectedReplicatedContainerValueTypeInfo(
+        List<NativeTypeInfoEvidence> candidates,
+        boolean fullTemplateOnly) {
+
         NativeTypeInfoEvidence selected = null;
         for (NativeTypeInfoEvidence candidate : candidates) {
             if (!isDirectNativeTypeInfoEvidence(candidate)) {
+                continue;
+            }
+            if (fullTemplateOnly && !isFullMarshalTemplateEvidence(candidate)) {
                 continue;
             }
             if (selected == null) {
@@ -735,9 +751,16 @@
         return selected;
     }
 
+    private boolean isFullMarshalTemplateEvidence(NativeTypeInfoEvidence evidence) {
+        return evidence != null &&
+            evidence.source != null &&
+            evidence.source.startsWith("full-direct-marshal-template");
+    }
+
     private boolean isDirectNativeTypeInfoEvidence(NativeTypeInfoEvidence evidence) {
         return evidence != null &&
             evidence.source != null &&
+            !evidence.source.endsWith("-nested-marshal-template") &&
             !"rtti-provider-vtable".equals(evidence.source);
     }
 
@@ -745,11 +768,19 @@
         Address address,
         int depth,
         Set<String> seen,
-        Map<String, NativeTypeInfoEvidence> candidates) {
+        Map<String, NativeTypeInfoEvidence> candidates,
+        String phase,
+        int helperDepth) {
 
         Address targetAddress = resolvedCodeTarget(address);
         if (!isExecutableAddress(targetAddress) || !seen.add(targetAddress.toString())) {
             return;
+        }
+
+        NativeTypeInfoEvidence marshalTemplate =
+            nativeTypeInfoFromMarshalFunction(targetAddress, phase, helperDepth);
+        if (marshalTemplate != null) {
+            putNativeTypeInfoCandidate(candidates, marshalTemplate);
         }
 
         Function function = functionAtOrContaining(targetAddress);
@@ -785,9 +816,48 @@
             }
             Address call = callTarget(instruction);
             if (isExecutableAddress(call)) {
-                collectNativeTypeInfoRefs(call, depth - 1, seen, candidates);
+                collectNativeTypeInfoRefs(
+                    call,
+                    depth - 1,
+                    seen,
+                    candidates,
+                    phase,
+                    helperDepth + 1);
             }
         }
+    }
+
+    private NativeTypeInfoEvidence nativeTypeInfoFromMarshalFunction(
+        Address address,
+        String phase,
+        int helperDepth) {
+
+        Address targetAddress = resolvedCodeTarget(address);
+        Function function = functionAtOrContaining(targetAddress);
+        if (function == null) {
+            return null;
+        }
+
+        String functionName = fullFunctionName(function);
+        String nativeType = marshalFunctionTemplateType(functionName);
+        if (!isPlausibleTypeName(nativeType) || wireShapeFromNativeType(nativeType) != null) {
+            return null;
+        }
+
+        SerializeTypeInfo reflected = serializeTypeForTypeName(nativeType);
+        if (reflected == null || reflected.typeId == null) {
+            return null;
+        }
+
+        String source = (phase == null ? "unknown" : phase) +
+            (helperDepth <= 1 ? "-direct" : "-nested") +
+            "-marshal-template";
+        return new NativeTypeInfoEvidence(
+            function.getEntryPoint(),
+            reflected.name,
+            reflected.typeId,
+            source,
+            "marshal-function-template");
     }
 
     private void putNativeTypeInfoCandidate(
@@ -798,10 +868,40 @@
             return;
         }
         NativeTypeInfoEvidence existing = candidates.get(candidate.typeId);
-        if (existing == null ||
-            (!isPlausibleTypeName(existing.name) && isPlausibleTypeName(candidate.name))) {
+        if (existing == null || nativeTypeInfoCandidatePriority(candidate) >
+            nativeTypeInfoCandidatePriority(existing) ||
+            (nativeTypeInfoCandidatePriority(candidate) ==
+                nativeTypeInfoCandidatePriority(existing) &&
+                !isPlausibleTypeName(existing.name) &&
+                isPlausibleTypeName(candidate.name))) {
             candidates.put(candidate.typeId, candidate);
         }
+    }
+
+    private int nativeTypeInfoCandidatePriority(NativeTypeInfoEvidence evidence) {
+        if (evidence == null || evidence.source == null) {
+            return 0;
+        }
+        String source = evidence.source;
+        if (source.startsWith("full-direct-marshal-template")) {
+            return 50;
+        }
+        if (source.endsWith("-direct-marshal-template")) {
+            return 45;
+        }
+        if (source.endsWith("-nested-marshal-template")) {
+            return 35;
+        }
+        if ("native-type-info-layout".equals(source)) {
+            return 30;
+        }
+        if ("object-vtable-type-info".equals(source)) {
+            return 25;
+        }
+        if ("rtti-provider-vtable".equals(source)) {
+            return 10;
+        }
+        return 20;
     }
 
     private NativeTypeInfoEvidence nativeTypeInfoAt(Address address) {

@@ -558,6 +558,17 @@
             return new WireShape(custom, "marshal-function-name");
         }
 
+        String nativeType = marshalFunctionTemplateType(name);
+        String shape = wireShapeFromNativeType(nativeType);
+        return shape == null ? null : new WireShape(shape, "marshal-function-name");
+    }
+
+    private String marshalFunctionTemplateType(String name) {
+        if (name == null ||
+            (!name.contains("::Marshal") && !name.contains("::Unmarshal"))) {
+            return null;
+        }
+
         int marshaller = name.indexOf("Marshaller<");
         if (marshaller < 0) {
             marshaller = name.indexOf("Marshaler<");
@@ -565,15 +576,15 @@
         if (marshaller < 0) {
             return null;
         }
+
         int templateStart = name.indexOf('<', marshaller);
         int templateEnd = NetworkSchemaText.matchingIndex(name, templateStart, '<', '>');
         if (templateStart < 0 || templateEnd < 0) {
             return null;
         }
 
-        String nativeType = name.substring(templateStart + 1, templateEnd);
-        String shape = wireShapeFromNativeType(nativeType);
-        return shape == null ? null : new WireShape(shape, "marshal-function-name");
+        String nativeType = name.substring(templateStart + 1, templateEnd).trim();
+        return nativeType.isEmpty() ? null : nativeType;
     }
 
     private boolean looksLikeBoolMarshal(Address address) {
