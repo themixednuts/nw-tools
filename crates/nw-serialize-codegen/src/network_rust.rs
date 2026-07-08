@@ -4725,11 +4725,11 @@ fn message_field_support_tokens(
     if value_type_string.starts_with("::") || value_type_string.contains("::") {
         return None;
     }
+    let value_type_ident = message_support_type_ident(value_type_string)?;
     if !emitted_names.insert(value_type_string.to_owned()) {
         return None;
     }
     let value_type = syn::parse_str::<syn::Type>(value_type_string).ok()?;
-    let value_type_ident = syn::parse_str::<syn::Ident>(value_type_string).ok()?;
     let codec_name = format!("{}Marshaler", rust_type_ident(value_type_string));
     let codec_ident = format_ident!("{codec_name}");
     let members = shape
@@ -4823,6 +4823,39 @@ fn message_field_support_tokens(
             }
         }
     })
+}
+
+fn message_support_type_ident(value: &str) -> Option<syn::Ident> {
+    let ident = syn::parse_str::<syn::Ident>(value).ok()?;
+    let ident_text = ident.to_string();
+    if ident_text != value || is_builtin_rust_type_ident(&ident_text) {
+        return None;
+    }
+    Some(ident)
+}
+
+fn is_builtin_rust_type_ident(value: &str) -> bool {
+    matches!(
+        value,
+        "bool"
+            | "char"
+            | "str"
+            | "String"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+    )
 }
 
 fn message_field_tokens(field: &NetworkStateFieldShapeReport) -> proc_macro2::TokenStream {
