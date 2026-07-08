@@ -3799,6 +3799,12 @@ fn container_value_member_wire_shape_is_emittable(
     if wire_scalar_shape_from_name(wire_shape).is_some() {
         return true;
     }
+    if native_type
+        .and_then(container_member_source_rust_type)
+        .is_some()
+    {
+        return true;
+    }
     if let Some(shapes) = composite_member_wire_shapes(wire_shape) {
         return composite_member_rust_type(native_type, &shapes).is_some();
     }
@@ -3817,6 +3823,15 @@ fn runtime_semantic_container_type(
     wire_shapes: &[SchemaWireScalarShape],
 ) -> Option<ContainerValueType> {
     let rust_type = match leaf_name {
+        "RemoteServerGDERef" | "RemoteServerGdeRef"
+            if wire_shapes
+                == [
+                    SchemaWireScalarShape::FixedBytes(16),
+                    SchemaWireScalarShape::U64,
+                ] =>
+        {
+            "::nw_network::RemoteServerGdeRef"
+        }
         "RemoteTypelessServerFacetRef"
             if wire_shapes
                 == [
@@ -8040,6 +8055,156 @@ mod tests {
         );
         assert!(output.source.contains("pub struct PointEntriesPointEntry"));
         assert!(output.source.contains("PointEntriesPointEntryMarshaler"));
+    }
+
+    #[test]
+    fn replicated_vector_container_value_can_use_runtime_semantic_composite_type() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "F0D09F5A-A67D-4B8C-88F1-FA96442165F2",
+                "typeIndex": 5980,
+                "typeName": "MB::TransformLinkComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "m_childGDEVector",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x847c718",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x847c718",
+                "fieldCount": 1,
+                "valueTypeName": "RemoteServerGDERef",
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "vlq-u64",
+                    "sequence-number",
+                    "fixed-bytes-16",
+                    "u64"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "fixed-bytes-16",
+                    "u64"
+                ],
+                "valueTypeShape": {
+                    "typeName": "Value",
+                    "typeNameSource": "synthetic-container-value",
+                    "memberNameSource": "synthetic-serialize-type-sequence",
+                    "memberNamesProven": false,
+                    "validation": "container-value-serialize-type-sequence",
+                    "members": [{
+                        "index": 0,
+                        "name": "remote_server_gderef",
+                        "nativeType": "RemoteServerGDERef",
+                        "wireShape": "composite<fixed-bytes-16,u64>"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [5980]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::std::vec::Vec<::nw_network::RemoteServerGdeRef>")
+        );
+        assert!(!output.source.contains("pub struct ChildGdevectorValue"));
+    }
+
+    #[test]
+    fn replicated_vector_container_value_support_type_can_hold_runtime_semantic_composites() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "E2D1863A-2BBE-4434-AFFB-D75BD68BDE5B",
+                "typeIndex": 3451,
+                "typeName": "Javelin::GroupDataComponentReplicatedState",
+                "fields": [{
+                    "index": 43,
+                    "name": "groupMemberHouseIds",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x81ce260",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x81ce260",
+                "fieldCount": 1,
+                "deltaMarshalShapes": [
+                    "vlq-u32",
+                    "u8",
+                    "vlq-u64",
+                    "sequence-number",
+                    "fixed-bytes-16",
+                    "u64",
+                    "u64",
+                    "fixed-bytes-16",
+                    "u64"
+                ],
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "fixed-bytes-16",
+                    "u64",
+                    "u64",
+                    "fixed-bytes-16",
+                    "u64"
+                ],
+                "valueTypeShape": {
+                    "typeName": "Value",
+                    "typeNameSource": "synthetic-container-value",
+                    "memberNameSource": "ghidra-stack-serialize-type-sequence",
+                    "memberNamesProven": false,
+                    "validation": "container-value-pcode-stack-wire-order-serialize-type-sequence",
+                    "members": [{
+                        "index": 0,
+                        "name": "remote_typeless_server_facet_ref",
+                        "nativeType": "RemoteTypelessServerFacetRef",
+                        "wireShape": "composite<fixed-bytes-16,u64,u64>"
+                    }, {
+                        "index": 1,
+                        "name": "remote_server_gderef",
+                        "nativeType": "RemoteServerGDERef",
+                        "wireShape": "composite<fixed-bytes-16,u64>"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3451]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::std::vec::Vec<GroupMemberHouseIdsValue>")
+        );
+        assert!(
+            output
+                .source
+                .contains("pub struct GroupMemberHouseIdsValue")
+        );
+        assert!(
+            output
+                .source
+                .contains("::nw_network::RemoteTypelessServerFacetRef")
+        );
+        assert!(output.source.contains("::nw_network::RemoteServerGdeRef"));
     }
 
     #[test]
