@@ -1146,13 +1146,10 @@ fn struct_enum_field_marshaler_tokens(
 ) -> Option<StructMarshalerFieldTokens> {
     let underlying = enum_underlying_scalar(enum_item)?;
     let (min, max) = enum_value_range(enum_item)?;
-    if min < 0 {
-        return None;
-    }
     let enum_ident = format_ident!("{}", rust_type_ident(&enum_item.source_name));
     let enum_type = quote!(::nw_network::source::#enum_ident);
     let underlying_ty = enum_underlying_rust_type(underlying);
-    let min_u64 = u64::try_from(min).ok()?;
+    let min_u64 = u64::try_from(min).unwrap_or(0);
     let max_u64 = u64::try_from(max).ok()?;
 
     Some(StructMarshalerFieldTokens {
@@ -1165,7 +1162,7 @@ fn struct_enum_field_marshaler_tokens(
                 let raw = <#underlying_ty as ::nw_network::serialize::Marshaler>::unmarshal(rb)?;
                 <#enum_type as ::core::convert::TryFrom<#underlying_ty>>::try_from(raw).map_err(|_| {
                     ::nw_network::serialize::MarshalerError::InvalidRange {
-                        value: u64::try_from(raw).unwrap_or(0),
+                        value: raw as u64,
                         min: #min_u64,
                         max: #max_u64,
                     }
@@ -9951,6 +9948,90 @@ mod tests {
         assert!(output.source.contains("let raw = i32::from(self);"));
         assert!(output.source.contains("min: 0u64"));
         assert!(output.source.contains("max: 4u64"));
+    }
+
+    #[test]
+    fn emits_struct_marshaler_for_signed_enum_fields() {
+        let enum_type_id = uuid!("99ffbb9b-34a3-44a1-a576-1d13d732b0aa");
+        let enum_item = SerializeCodegenItem {
+            source_type_id: enum_type_id,
+            source_name: "SettlementProgressionCategory".to_owned(),
+            role: crate::role::ReflectedTypeRole::SupportType,
+            is_reflection_marker: false,
+            is_abstract: None,
+            factory: None,
+            rtti_base_chain: Vec::new(),
+            kind: SerializeCodegenItemKind::Enum,
+            enum_underlying_type: Some(ResolvedType::Scalar(ScalarType::I32)),
+            fields: Vec::new(),
+            variants: vec![
+                SerializeCodegenVariant {
+                    source_name: "None".to_owned(),
+                    value_u64: None,
+                    value_u32: None,
+                    value_i32: Some(-1),
+                },
+                SerializeCodegenVariant {
+                    source_name: "Blacksmithing".to_owned(),
+                    value_u64: Some(0),
+                    value_u32: Some(0),
+                    value_i32: Some(0),
+                },
+            ],
+        };
+        let struct_item = SerializeCodegenItem {
+            source_type_id: uuid!("27362f56-9317-40ce-8caa-69d5d8f75450"),
+            source_name: "TerritoryUpgradeData".to_owned(),
+            role: crate::role::ReflectedTypeRole::SupportType,
+            is_reflection_marker: false,
+            is_abstract: Some(false),
+            factory: None,
+            rtti_base_chain: Vec::new(),
+            kind: SerializeCodegenItemKind::Struct,
+            enum_underlying_type: None,
+            fields: vec![
+                SerializeCodegenField {
+                    source_name: "m_category".to_owned(),
+                    source_type_id: enum_type_id,
+                    resolved_type: ResolvedType::Named {
+                        type_id: enum_type_id,
+                        source_name: "SettlementProgressionCategory".to_owned(),
+                    },
+                    data_size: None,
+                    offset: None,
+                    flags: None,
+                    is_base_class: false,
+                    is_pointer: false,
+                    is_dynamic_field: false,
+                },
+                SerializeCodegenField {
+                    source_name: "m_level".to_owned(),
+                    source_type_id: Uuid::nil(),
+                    resolved_type: ResolvedType::Scalar(ScalarType::U8),
+                    data_size: None,
+                    offset: None,
+                    flags: None,
+                    is_base_class: false,
+                    is_pointer: false,
+                    is_dynamic_field: false,
+                },
+            ],
+            variants: Vec::new(),
+        };
+
+        let output = NetworkRustEmitter::emit_marshaler_conversions([&enum_item, &struct_item])
+            .expect("conversion source");
+
+        assert!(output.source.contains(
+            "impl ::nw_network::serialize::Marshaler for ::nw_network::source::TerritoryUpgradeData"
+        ));
+        assert!(
+            output
+                .source
+                .contains("let raw = i32::from(self.category);")
+        );
+        assert!(output.source.contains("min: 0u64"));
+        assert!(output.source.contains("max: 0u64"));
     }
 
     fn grid_sides_enum_item(type_id: Uuid) -> SerializeCodegenItem {
