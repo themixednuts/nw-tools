@@ -19,7 +19,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v43";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v44";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -1406,17 +1406,28 @@ fn container_shapes_by_handler_vtable<'a>(
     schema: &'a NetworkSchema,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> BTreeMap<&'a str, NetworkReplicatedContainerShape> {
-    schema
-        .field_handler_vtables
-        .iter()
-        .filter_map(|vtable| {
-            let address = vtable.address.as_deref()?;
-            let shape = vtable.container_shape.clone().or_else(|| {
-                candidate_backed_container_shape_from_vtable(vtable, serialize_types)
-            })?;
-            Some((address, shape))
-        })
-        .collect()
+    let mut shapes: BTreeMap<&'a str, NetworkReplicatedContainerShape> = BTreeMap::new();
+    for vtable in &schema.field_handler_vtables {
+        let Some(address) = vtable.address.as_deref() else {
+            continue;
+        };
+        let candidate_shape = candidate_backed_container_shape_from_vtable(vtable, serialize_types);
+        let Some(shape) = candidate_shape
+            .clone()
+            .or_else(|| vtable.container_shape.clone())
+        else {
+            continue;
+        };
+        if candidate_shape.is_some()
+            || shapes.get(address).is_none_or(|existing| {
+                existing.source.as_deref()
+                    != Some("replicated-container-map-candidate-value-suffix")
+            })
+        {
+            shapes.insert(address, shape);
+        }
+    }
+    shapes
 }
 
 fn candidate_backed_container_shape_from_vtable(
@@ -1427,40 +1438,60 @@ fn candidate_backed_container_shape_from_vtable(
         return None;
     }
 
-    let full_data = replicated_container_full_data_shapes_from_names(&vtable.full_marshal_shapes);
-    if full_data.len() < 2 || vtable.value_type_candidates.is_empty() {
+    let full_data_candidates =
+        replicated_container_full_data_shape_candidates_from_names(&vtable.full_marshal_shapes);
+    if full_data_candidates.is_empty() || vtable.value_type_candidates.is_empty() {
         return None;
     }
 
     let mut matches = Vec::new();
-    let mut seen = BTreeSet::new();
-    for candidate in &vtable.value_type_candidates {
-        let Some(type_id) = candidate.type_id else {
-            continue;
-        };
-        if !seen.insert(type_id) {
-            continue;
-        }
-        let Some(serialize) = serialize_types.get(&type_id).copied() else {
-            continue;
-        };
-        if serialize.role != NetworkSerializeRole::SupportType || serialize.wire_shapes.is_empty() {
-            continue;
-        }
-        if full_data.len() <= serialize.wire_shapes.len() {
-            continue;
-        }
-        let split = full_data.len() - serialize.wire_shapes.len();
-        if wire_scalar_shapes_match(&full_data[split..], &serialize.wire_shapes) {
-            matches.push((serialize, full_data[..split].to_vec()));
+    for full_data in full_data_candidates {
+        let mut seen = BTreeSet::new();
+        for candidate in &vtable.value_type_candidates {
+            let Some(type_id) = candidate.type_id else {
+                continue;
+            };
+            if !seen.insert(type_id) {
+                continue;
+            }
+            let Some(serialize) = serialize_types.get(&type_id).copied() else {
+                continue;
+            };
+            if serialize.role != NetworkSerializeRole::SupportType
+                || serialize.wire_shapes.is_empty()
+                || full_data.len() <= serialize.wire_shapes.len()
+            {
+                continue;
+            }
+            let split = full_data.len() - serialize.wire_shapes.len();
+            if wire_scalar_shapes_match(&full_data[split..], &serialize.wire_shapes) {
+                matches.push((serialize, full_data[..split].to_vec()));
+            }
         }
     }
+    matches.sort_by_key(|(serialize, key_wire_shapes)| {
+        (
+            serialize.type_id,
+            key_wire_shapes
+                .iter()
+                .map(|shape| wire_scalar_shape_name(*shape))
+                .collect::<Vec<_>>(),
+        )
+    });
+    matches.dedup_by(|left, right| left.0.type_id == right.0.type_id && left.1 == right.1);
 
     let [(serialize, key_wire_shapes)] = matches.as_slice() else {
         return None;
     };
     let key_wire_shape = *key_wire_shapes.first()?;
-    let key_type_shape = (key_wire_shapes.len() > 1).then(|| {
+    let key_type_name = unique_candidate_serialize_type_for_wire_shapes(
+        &vtable.value_type_candidates,
+        key_wire_shapes,
+        serialize_types,
+        Some(serialize.type_id),
+    )
+    .map(|serialize| serialize.name.clone());
+    let key_type_shape = (key_type_name.is_none() && key_wire_shapes.len() > 1).then(|| {
         synthetic_container_shape_from_wire_shapes(
             "Key",
             "candidate-backed-container-key",
@@ -1474,9 +1505,11 @@ fn candidate_backed_container_shape_from_vtable(
         key_wire_shapes: key_wire_shapes.clone(),
         key_native_type: None,
         key_native_type_source: None,
-        key_type_name: key_type_shape
-            .as_ref()
-            .and_then(|shape| shape.type_name.clone()),
+        key_type_name: key_type_name.or_else(|| {
+            key_type_shape
+                .as_ref()
+                .and_then(|shape| shape.type_name.clone())
+        }),
         key_type_shape,
         value_wire_shapes: serialize.wire_shapes.clone(),
         delta_value_wire_shapes: Vec::new(),
@@ -1489,15 +1522,45 @@ fn candidate_backed_container_shape_from_vtable(
     })
 }
 
-fn replicated_container_full_data_shapes_from_names(
+fn unique_candidate_serialize_type_for_wire_shapes<'a>(
+    candidates: &[NetworkNativeTypeInfoEvidence],
+    wire_shapes: &[SchemaWireScalarShape],
+    serialize_types: &'a BTreeMap<Uuid, &NetworkSerializeType>,
+    except_type_id: Option<Uuid>,
+) -> Option<&'a NetworkSerializeType> {
+    let mut matches = Vec::new();
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        let Some(type_id) = candidate.type_id else {
+            continue;
+        };
+        if Some(type_id) == except_type_id || !seen.insert(type_id) {
+            continue;
+        }
+        let Some(serialize) = serialize_types.get(&type_id).copied() else {
+            continue;
+        };
+        if serialize.role == NetworkSerializeRole::SupportType
+            && wire_scalar_shapes_match(wire_shapes, &serialize.wire_shapes)
+        {
+            matches.push(serialize);
+        }
+    }
+    let [matched] = matches.as_slice() else {
+        return None;
+    };
+    Some(*matched)
+}
+
+fn replicated_container_full_data_shape_candidates_from_names(
     shapes: &[String],
-) -> Vec<SchemaWireScalarShape> {
+) -> Vec<Vec<SchemaWireScalarShape>> {
     let start = shapes
         .iter()
         .position(|shape| shape == "sequence-number")
         .map_or(0, |index| index + 1);
     let mut skipped_outer_count = false;
-    shapes[start..]
+    let full_data = shapes[start..]
         .iter()
         .filter_map(|shape| {
             let shape = shape.as_str();
@@ -1510,7 +1573,20 @@ fn replicated_container_full_data_shapes_from_names(
             }
             wire_scalar_shape_from_name(shape)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if full_data.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut candidates = vec![full_data.clone()];
+    if full_data.last() == Some(&SchemaWireScalarShape::VlqU32) {
+        let mut stripped = full_data;
+        stripped.pop();
+        if stripped.len() >= 2 {
+            candidates.push(stripped);
+        }
+    }
+    candidates
 }
 
 fn synthetic_container_shape_from_wire_shapes(
@@ -7205,6 +7281,99 @@ mod tests {
         );
         assert!(field.rust_field_type.as_deref().is_some_and(|ty| {
             ty.contains("DefaultMarshaler<::nw_network::source::RecipeCooldownData>")
+        }));
+    }
+
+    #[test]
+    fn provider_candidates_can_split_key_value_around_terminal_count() {
+        let task_id = uuid!("e1838273-034d-47fb-b535-95ff1d52d8ee");
+        let time_id = uuid!("24fbf222-8cf9-4539-b313-34726b8fc675");
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "AEFEDE43-4D48-42ED-81F8-7FF1E8D4D120",
+                "typeIndex": 3857,
+                "typeName": "Javelin::ObjectivesComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "taskStartTimes",
+                    "group": 0,
+                    "handlerVtable": "NewWorld+0x8258560",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x8258560",
+                "fieldCount": 1,
+                "handlerKind": "replicated-container",
+                "fullMarshalShapes": [
+                    "sequence-number",
+                    "vlq-u32",
+                    "u64",
+                    "u8",
+                    "u64",
+                    "vlq-u32"
+                ],
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x802f940",
+                    "name": "WallClockTimePoint",
+                    "typeId": time_id.to_string(),
+                    "source": "rtti-provider-vtable"
+                }, {
+                    "address": "NewWorld+0x80cb690",
+                    "name": "ObjectiveTaskInstanceId",
+                    "typeId": task_id.to_string(),
+                    "source": "rtti-provider-vtable"
+                }],
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+        schema.merge_serialize_codegen_unit(
+            &SerializeCodegenUnit {
+                items: vec![
+                    named_value_item(
+                        task_id,
+                        "ObjectiveTaskInstanceId",
+                        [ScalarType::U64, ScalarType::U8],
+                    ),
+                    named_value_item(time_id, "WallClockTimePoint", [ScalarType::U64]),
+                ],
+            },
+            Some("selection.json".to_owned()),
+        );
+        let serialize_types = serialize_types_by_type_id(&schema);
+        let vtable = schema
+            .field_handler_vtables
+            .iter()
+            .find(|vtable| vtable.address.as_deref() == Some("NewWorld+0x8258560"))
+            .expect("handler vtable");
+        let inferred = candidate_backed_container_shape_from_vtable(vtable, &serialize_types)
+            .expect("candidate-backed container shape");
+        assert_eq!(
+            inferred.key_type_name.as_deref(),
+            Some("ObjectiveTaskInstanceId")
+        );
+        assert_eq!(
+            inferred.value_type_name.as_deref(),
+            Some("WallClockTimePoint")
+        );
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [3857]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some(
+                "::nw_network::serialize::IndexMap<::nw_network::source::ObjectiveTaskInstanceId, ::nw_network::WallClockTimePoint>"
+            )
+        );
+        assert!(field.rust_field_type.as_deref().is_some_and(|ty| {
+            ty.contains("DefaultMarshaler<::nw_network::source::ObjectiveTaskInstanceId>")
+                && ty.contains("DefaultMarshaler<::nw_network::WallClockTimePoint>")
         }));
     }
 
