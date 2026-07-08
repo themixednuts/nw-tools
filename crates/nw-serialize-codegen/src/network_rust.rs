@@ -11,15 +11,15 @@ use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind};
 use crate::naming::{rust_field_ident, rust_module_ident, rust_type_ident};
 use crate::network_schema::{
     NetworkConfidence, NetworkField, NetworkFragmentMetadata, NetworkNativeTypeInfoEvidence,
-    NetworkReplicatedContainerShape, NetworkReplicatedContainerStorageKind,
-    NetworkReplicatedContainerWireShape, NetworkSchema, NetworkSerializeFieldType,
-    NetworkSerializeKind, NetworkSerializeRole, NetworkSerializeType, NetworkType,
-    NetworkTypeCapability, NetworkWireScalarShape as SchemaWireScalarShape,
+    NetworkNestedTypeMember, NetworkNestedTypeShape, NetworkReplicatedContainerShape,
+    NetworkReplicatedContainerStorageKind, NetworkReplicatedContainerWireShape, NetworkSchema,
+    NetworkSerializeFieldType, NetworkSerializeKind, NetworkSerializeRole, NetworkSerializeType,
+    NetworkType, NetworkTypeCapability, NetworkWireScalarShape as SchemaWireScalarShape,
     NetworkWireShape as SchemaWireShape,
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v42";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v43";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -262,9 +262,9 @@ impl NetworkRustEmitter {
     ) -> Result<NetworkRustOutput, NetworkRustEmitError> {
         let mut report = NetworkRustGenerationReport::default();
         let wire_shapes = wire_shapes_by_handler_vtable(schema);
-        let container_shapes = container_shapes_by_handler_vtable(schema);
         let value_type_candidates = value_type_candidates_by_handler_vtable(schema);
         let serialize_types = serialize_types_by_type_id(schema);
+        let container_shapes = container_shapes_by_handler_vtable(schema, &serialize_types);
         let descriptors = schema
             .types
             .iter()
@@ -623,9 +623,9 @@ impl NetworkRustEmitter {
         let selected = type_indices.into_iter().collect::<BTreeSet<_>>();
         let wire_shapes = wire_shapes_by_handler_vtable(schema);
         let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
-        let container_shapes = container_shapes_by_handler_vtable(schema);
         let value_type_candidates = value_type_candidates_by_handler_vtable(schema);
         let serialize_types = serialize_types_by_type_id(schema);
+        let container_shapes = container_shapes_by_handler_vtable(schema, &serialize_types);
         let rust_names = identity_names_by_type_index(schema);
         let types_by_type_index = schema
             .types
@@ -1402,18 +1402,160 @@ fn wire_shapes_by_handler_vtable(schema: &NetworkSchema) -> BTreeMap<&str, Schem
         .collect()
 }
 
-fn container_shapes_by_handler_vtable(
-    schema: &NetworkSchema,
-) -> BTreeMap<&str, &NetworkReplicatedContainerShape> {
+fn container_shapes_by_handler_vtable<'a>(
+    schema: &'a NetworkSchema,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> BTreeMap<&'a str, NetworkReplicatedContainerShape> {
     schema
         .field_handler_vtables
         .iter()
         .filter_map(|vtable| {
             let address = vtable.address.as_deref()?;
-            let shape = vtable.container_shape.as_ref()?;
+            let shape = vtable.container_shape.clone().or_else(|| {
+                candidate_backed_container_shape_from_vtable(vtable, serialize_types)
+            })?;
             Some((address, shape))
         })
         .collect()
+}
+
+fn candidate_backed_container_shape_from_vtable(
+    vtable: &crate::network_schema::NetworkFieldHandlerVtable,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<NetworkReplicatedContainerShape> {
+    if vtable.handler_kind.as_deref() != Some("replicated-container") {
+        return None;
+    }
+
+    let full_data = replicated_container_full_data_shapes_from_names(&vtable.full_marshal_shapes);
+    if full_data.len() < 2 || vtable.value_type_candidates.is_empty() {
+        return None;
+    }
+
+    let mut matches = Vec::new();
+    let mut seen = BTreeSet::new();
+    for candidate in &vtable.value_type_candidates {
+        let Some(type_id) = candidate.type_id else {
+            continue;
+        };
+        if !seen.insert(type_id) {
+            continue;
+        }
+        let Some(serialize) = serialize_types.get(&type_id).copied() else {
+            continue;
+        };
+        if serialize.role != NetworkSerializeRole::SupportType || serialize.wire_shapes.is_empty() {
+            continue;
+        }
+        if full_data.len() <= serialize.wire_shapes.len() {
+            continue;
+        }
+        let split = full_data.len() - serialize.wire_shapes.len();
+        if wire_scalar_shapes_match(&full_data[split..], &serialize.wire_shapes) {
+            matches.push((serialize, full_data[..split].to_vec()));
+        }
+    }
+
+    let [(serialize, key_wire_shapes)] = matches.as_slice() else {
+        return None;
+    };
+    let key_wire_shape = *key_wire_shapes.first()?;
+    let key_type_shape = (key_wire_shapes.len() > 1).then(|| {
+        synthetic_container_shape_from_wire_shapes(
+            "Key",
+            "candidate-backed-container-key",
+            key_wire_shapes,
+        )
+    });
+
+    Some(NetworkReplicatedContainerShape {
+        storage: NetworkReplicatedContainerStorageKind::Map,
+        key_wire_shape,
+        key_wire_shapes: key_wire_shapes.clone(),
+        key_native_type: None,
+        key_native_type_source: None,
+        key_type_name: key_type_shape
+            .as_ref()
+            .and_then(|shape| shape.type_name.clone()),
+        key_type_shape,
+        value_wire_shapes: serialize.wire_shapes.clone(),
+        delta_value_wire_shapes: Vec::new(),
+        value_type_name: Some(serialize.name.clone()),
+        value_type_id: Some(serialize.type_id),
+        value_type_info_address: None,
+        value_type_shape: None,
+        embedded_value_type_shapes: Vec::new(),
+        source: Some("replicated-container-map-candidate-value-suffix".to_owned()),
+    })
+}
+
+fn replicated_container_full_data_shapes_from_names(
+    shapes: &[String],
+) -> Vec<SchemaWireScalarShape> {
+    let start = shapes
+        .iter()
+        .position(|shape| shape == "sequence-number")
+        .map_or(0, |index| index + 1);
+    let mut skipped_outer_count = false;
+    shapes[start..]
+        .iter()
+        .filter_map(|shape| {
+            let shape = shape.as_str();
+            if shape == "sequence-number" {
+                return None;
+            }
+            if !skipped_outer_count && shape == "vlq-u32" {
+                skipped_outer_count = true;
+                return None;
+            }
+            wire_scalar_shape_from_name(shape)
+        })
+        .collect()
+}
+
+fn synthetic_container_shape_from_wire_shapes(
+    type_name: &str,
+    validation: &str,
+    wire_shapes: &[SchemaWireScalarShape],
+) -> NetworkNestedTypeShape {
+    NetworkNestedTypeShape {
+        type_id: None,
+        type_id_source: None,
+        type_name: Some(type_name.to_owned()),
+        type_name_full: None,
+        type_name_source: Some("candidate-backed-container-shape".to_owned()),
+        function: None,
+        function_name: None,
+        factory: None,
+        constructor: None,
+        vtable: None,
+        az_rtti_address: None,
+        member_base: None,
+        member_name_source: Some("synthetic-wire-order".to_owned()),
+        member_names_proven: Some(false),
+        datatype_path: None,
+        validation: Some(validation.to_owned()),
+        members: wire_shapes
+            .iter()
+            .enumerate()
+            .map(|(index, shape)| NetworkNestedTypeMember {
+                index: u32::try_from(index).ok(),
+                offset: None,
+                native_offset: None,
+                name: Some(format!("field_{index}")),
+                name_source: Some("synthetic-wire-order".to_owned()),
+                name_proven: Some(false),
+                name_evidence: None,
+                native_type: None,
+                wire_shape: Some(wire_scalar_shape_name(*shape)),
+                byte_width: None,
+                evidence_source: Some("candidate-backed-container-key".to_owned()),
+                callsite: None,
+                target: None,
+                target_name: None,
+            })
+            .collect(),
+    }
 }
 
 fn serialize_types_by_type_id(schema: &NetworkSchema) -> BTreeMap<Uuid, &NetworkSerializeType> {
@@ -1427,6 +1569,44 @@ fn serialize_types_by_type_id(schema: &NetworkSchema) -> BTreeMap<Uuid, &Network
         Some((serialize.type_id, serialize))
     }));
     types
+}
+
+fn wire_scalar_shape_name(shape: SchemaWireScalarShape) -> String {
+    match shape {
+        SchemaWireScalarShape::Bool => "bool".to_owned(),
+        SchemaWireScalarShape::U8 => "u8".to_owned(),
+        SchemaWireScalarShape::U16 => "u16".to_owned(),
+        SchemaWireScalarShape::U32 => "u32".to_owned(),
+        SchemaWireScalarShape::U64 => "u64".to_owned(),
+        SchemaWireScalarShape::F32 => "f32".to_owned(),
+        SchemaWireScalarShape::F64 => "f64".to_owned(),
+        SchemaWireScalarShape::HalfF32 => "half-f32".to_owned(),
+        SchemaWireScalarShape::VlqU32 => "vlq-u32".to_owned(),
+        SchemaWireScalarShape::VlqU64 => "vlq-u64".to_owned(),
+        SchemaWireScalarShape::SequenceNumber => "sequence-number".to_owned(),
+        SchemaWireScalarShape::Vec2 => "vec2".to_owned(),
+        SchemaWireScalarShape::Vec3 => "vec3".to_owned(),
+        SchemaWireScalarShape::Vec4 => "vec4".to_owned(),
+        SchemaWireScalarShape::Quat => "quat".to_owned(),
+        SchemaWireScalarShape::QuatCompNorm => "quat-comp-norm".to_owned(),
+        SchemaWireScalarShape::Vec2Comp => "vec2-comp".to_owned(),
+        SchemaWireScalarShape::Vec3Comp => "vec3-comp".to_owned(),
+        SchemaWireScalarShape::Vec3CompNorm => "vec3-comp-norm".to_owned(),
+        SchemaWireScalarShape::QuatComp => "quat-comp".to_owned(),
+        SchemaWireScalarShape::QuatSmallestThree => "quat-smallest-three".to_owned(),
+        SchemaWireScalarShape::NonUniformScaleComp => "non-uniform-scale-comp".to_owned(),
+        SchemaWireScalarShape::PositionAnchor => "position-anchor".to_owned(),
+        SchemaWireScalarShape::TransformCompressor => "transform-compressor".to_owned(),
+        SchemaWireScalarShape::PackedSize => "packed-size".to_owned(),
+        SchemaWireScalarShape::Mat3 => "mat3".to_owned(),
+        SchemaWireScalarShape::Affine3 => "affine3".to_owned(),
+        SchemaWireScalarShape::Aabb2d => "aabb2d".to_owned(),
+        SchemaWireScalarShape::Aabb3d => "aabb3d".to_owned(),
+        SchemaWireScalarShape::ActorRef => "actor-ref".to_owned(),
+        SchemaWireScalarShape::EntityRef => "entity-ref".to_owned(),
+        SchemaWireScalarShape::FixedBytes(len) => format!("fixed-bytes-{len}"),
+        SchemaWireScalarShape::String => "string".to_owned(),
+    }
 }
 
 fn field_wire_shape_tokens(
@@ -1448,7 +1628,7 @@ fn field_wire_shape_tokens(
 fn state_generation_plans(
     schema: &NetworkSchema,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
-    container_shapes: &BTreeMap<&str, &NetworkReplicatedContainerShape>,
+    container_shapes: &BTreeMap<&str, NetworkReplicatedContainerShape>,
     value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
     context: &CodegenContext,
@@ -1521,7 +1701,7 @@ fn state_generation_plan(
     network_type: &NetworkType,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
-    container_shapes: &BTreeMap<&str, &NetworkReplicatedContainerShape>,
+    container_shapes: &BTreeMap<&str, NetworkReplicatedContainerShape>,
     value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> NetworkStateGenerationPlanReport {
@@ -1935,7 +2115,7 @@ fn state_field_shape_report(
     field: &NetworkField,
     wire_shapes: &BTreeMap<&str, SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
-    container_shapes_by_vtable: &BTreeMap<&str, &NetworkReplicatedContainerShape>,
+    container_shapes_by_vtable: &BTreeMap<&str, NetworkReplicatedContainerShape>,
     value_type_candidates_by_vtable: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> NetworkStateFieldShapeReport {
@@ -3135,12 +3315,12 @@ fn replicated_container_field_shape(
 
 fn replicated_container_shape_for_field<'a>(
     field: &NetworkField,
-    container_shapes: &'a BTreeMap<&str, &NetworkReplicatedContainerShape>,
+    container_shapes: &'a BTreeMap<&str, NetworkReplicatedContainerShape>,
 ) -> Option<&'a NetworkReplicatedContainerShape> {
     field
         .handler_vtable
         .as_deref()
-        .and_then(|handler_vtable| container_shapes.get(handler_vtable).copied())
+        .and_then(|handler_vtable| container_shapes.get(handler_vtable))
 }
 
 fn replicated_container_semantic_field_shape(
