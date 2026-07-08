@@ -19,7 +19,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v41";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v42";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -4070,6 +4070,7 @@ fn replicated_state_field_support_tokens(
         }
     }
     if let Some(shape) = field.container_value_type_shape.as_ref()
+        && field_references_container_value_shape_codec(field, shape)
         && let Some(tokens) = replicated_state_shape_support_tokens(field, shape, emitted_names)
     {
         items.push(tokens);
@@ -4094,6 +4095,19 @@ fn container_embedded_shape_is_referenced(
                     .is_some()
         })
     })
+}
+
+fn field_references_container_value_shape_codec(
+    field: &NetworkStateFieldShapeReport,
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+) -> bool {
+    let Some(codec_name) = container_value_shape_report_codec_name(field, shape) else {
+        return false;
+    };
+    field
+        .rust_field_type
+        .as_deref()
+        .is_some_and(|field_type| field_type.contains(&codec_name))
 }
 
 fn replicated_state_shape_support_tokens(
@@ -8135,6 +8149,12 @@ mod tests {
                     "group": 0,
                     "handlerVtable": "NewWorld+0x81ce260",
                     "confidence": "register-field-call"
+                }, {
+                    "index": 50,
+                    "name": "groupMemberHouseIds",
+                    "group": 1,
+                    "handlerVtable": "NewWorld+0x81ce260",
+                    "confidence": "register-field-call"
                 }]
             }],
             "fieldRegistrationFunctions": [],
@@ -8198,6 +8218,11 @@ mod tests {
             output
                 .source
                 .contains("pub struct GroupMemberHouseIdsValue")
+        );
+        assert!(
+            !output
+                .source
+                .contains("pub struct GroupMemberHouseIds50Value")
         );
         assert!(
             output
