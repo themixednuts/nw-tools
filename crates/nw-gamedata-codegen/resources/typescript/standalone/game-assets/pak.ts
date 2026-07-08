@@ -27,6 +27,7 @@ const OODLE_DLL_NAMES = ["oo2core_9_win64.dll", "oo2core_8_win64.dll"] as const;
 
 const UTF8_DECODER = new TextDecoder();
 const dynamicImport = (specifier: string): Promise<unknown> => import(specifier);
+const ASSET_LOADER_SOURCE = Symbol.for("@nw-tools/asset-loader/source");
 
 export enum PakCompressionMethod {
   Stored = 0,
@@ -43,18 +44,18 @@ export interface PakEntryInfo {
   readonly localHeaderOffset: number;
 }
 
-export interface PakDatasheetSource {
+interface PakDatasheetSource {
   readonly catalog: AssetCatalog;
   readonly datasheets: readonly DatasheetAsset[];
   readonly assets: readonly BinaryAsset[];
 }
 
-export interface BinaryAsset {
+interface BinaryAsset {
   readonly path: string;
   readonly bytes: Uint8Array;
 }
 
-export interface LoadPakDatasheetSourceOptions extends PakReadOptions {
+export interface AssetLoaderOptions extends PakReadOptions {
   readonly pakPaths?: readonly string[];
 }
 
@@ -213,46 +214,89 @@ export async function openPakArchive(path: string): Promise<PakArchive> {
   return PakArchive.open(path);
 }
 
-export async function loadPakDatasheetSource(assetRoot: string, options: LoadPakDatasheetSourceOptions = {}): Promise<PakDatasheetSource> {
-  const pakPaths = [...(options.pakPaths ?? (await collectPakPaths(assetRoot)))].sort((left, right) => left.localeCompare(right));
-  if (pakPaths.length === 0) {
-    throw new Error(`no .pak files found under ${assetRoot}`);
+export class AssetLoader {
+  readonly catalog: AssetCatalog;
+  private readonly mountedArchives: readonly MountedPakArchive[];
+  private readonly entriesByPath: ReadonlyMap<string, PakEntryRef>;
+  private readonly options: PakReadOptions;
+
+  private constructor(catalog: AssetCatalog, mountedArchives: readonly MountedPakArchive[], entriesByPath: ReadonlyMap<string, PakEntryRef>, options: PakReadOptions) {
+    this.catalog = catalog;
+    this.mountedArchives = mountedArchives;
+    this.entriesByPath = entriesByPath;
+    this.options = options;
   }
 
-  const mountedArchives: MountedPakArchive[] = [];
-  try {
-    const entriesByPath = new Map<string, PakEntryRef>();
-    const claimedPaths = new Set<string>();
-
-    for (const pakPath of pakPaths) {
-      const archive = await openPakArchive(pakPath);
-      const mountRoot = pakMountRoot(assetRoot, pakPath);
-      mountedArchives.push({ mountRoot, archive });
-
-      for (const entry of archive.entries) {
-        const path = normalizeVirtualPath(mountedEntryPath(mountRoot, entry.name));
-        if (claimedPaths.has(path)) {
-          continue;
-        }
-        claimedPaths.add(path);
-        entriesByPath.set(path, { archive, entry });
-      }
+  static async fromDir(assetRoot: string, options: AssetLoaderOptions = {}): Promise<AssetLoader> {
+    const pakPaths = [...(options.pakPaths ?? (await collectPakPaths(assetRoot)))].sort((left, right) => left.localeCompare(right));
+    if (pakPaths.length === 0) {
+      throw new Error(`no .pak files found under ${assetRoot}`);
     }
 
-    const catalog = await loadCatalogFromPaks(mountedArchives);
+    const mountedArchives: MountedPakArchive[] = [];
+    try {
+      const entriesByPath = new Map<string, PakEntryRef>();
+      const claimedPaths = new Set<string>();
+
+      for (const pakPath of pakPaths) {
+        const archive = await openPakArchive(pakPath);
+        const mountRoot = pakMountRoot(assetRoot, pakPath);
+        mountedArchives.push({ mountRoot, archive });
+
+        for (const entry of archive.entries) {
+          const path = normalizeVirtualPath(mountedEntryPath(mountRoot, entry.name));
+          if (claimedPaths.has(path)) {
+            continue;
+          }
+          claimedPaths.add(path);
+          entriesByPath.set(path, { archive, entry });
+        }
+      }
+
+      const catalog = await loadCatalogFromPaks(mountedArchives);
+      return new AssetLoader(catalog, mountedArchives, entriesByPath, options);
+    } catch (error) {
+      await Promise.all(mountedArchives.map((mounted) => mounted.archive.close()));
+      throw error;
+    }
+  }
+
+  async close(): Promise<void> {
+    await Promise.all(this.mountedArchives.map((mounted) => mounted.archive.close()));
+  }
+
+  async read(path: string, options: PakReadOptions = {}): Promise<Uint8Array> {
+    const located = this.entry(path);
+    if (located === undefined) {
+      throw new Error(`asset ${path} was not present in selected paks`);
+    }
+    return located.archive.readEntry(located.entry, { ...this.options, ...options });
+  }
+
+  private entry(path: string): PakEntryRef | undefined {
+    const normalized = normalizeVirtualPath(path);
+    const exact = this.entriesByPath.get(normalized);
+    if (exact !== undefined) {
+      return exact;
+    }
+    for (const [candidate, located] of this.entriesByPath) {
+      if (candidate.endsWith(`/${normalized}`)) {
+        return located;
+      }
+    }
+    return undefined;
+  }
+
+  async [ASSET_LOADER_SOURCE](): Promise<PakDatasheetSource> {
     const datasheets: DatasheetAsset[] = [];
     const assets: BinaryAsset[] = [];
-    for (const entry of catalog.entries) {
+    for (const entry of this.catalog.entries) {
       if (!isDatasheetPath(entry.relativePath) && !isManagerAssetPath(entry.relativePath)) {
         continue;
       }
       const path = normalizeVirtualPath(entry.relativePath);
-      const located = entriesByPath.get(path);
-      if (located === undefined) {
-        throw new Error(`catalog asset ${path} was not present in selected paks`);
-      }
-      const bytes = await located.archive.readEntry(located.entry, options);
-      if (isDatasheetPath(entry.relativePath)) {
+      const bytes = await this.read(path);
+      if (isDatasheetPath(path)) {
         datasheets.push({
           path,
           bytes
@@ -264,10 +308,7 @@ export async function loadPakDatasheetSource(assetRoot: string, options: LoadPak
         });
       }
     }
-
-    return { catalog, datasheets, assets };
-  } finally {
-    await Promise.all(mountedArchives.map((mounted) => mounted.archive.close()));
+    return { catalog: this.catalog, datasheets, assets };
   }
 }
 

@@ -51,10 +51,7 @@ impl super::GoSourceEmitter {
 
         let mut files = vec![
             GoStandaloneProjectFile::new("go.mod", go_mod_source(options.module_path())),
-            GoStandaloneProjectFile::new(
-                "gamedata.go",
-                format_go_source(&format!("package {}\n", options.package_name()))?,
-            ),
+            GoStandaloneProjectFile::new("gamedata.go", gamedata_root_source(options)?),
         ];
         if options.include_product_placeholders {
             if self
@@ -189,6 +186,33 @@ fn go_mod_source(module_path: &str) -> String {
     format!("module {module_path}\n\ngo {GO_VERSION}\n\ntoolchain {GO_TOOLCHAIN}\n")
 }
 
+fn gamedata_root_source(options: &GoStandaloneProjectOptions) -> Result<String, GoSourceEmitError> {
+    format_go_source(&format!(
+        r#"
+package {}
+
+import (
+	"{}/gameassets"
+	"{}/managers"
+)
+
+type AssetLoader = gameassets.AssetLoader
+type Managers = managers.Managers
+
+func OpenDir(assetRoot string, pakPaths ...string) (*AssetLoader, error) {{
+	return gameassets.OpenDir(assetRoot, pakPaths...)
+}}
+
+func OpenManagers(loader *AssetLoader) (*Managers, error) {{
+	return managers.Open(loader)
+}}
+"#,
+        options.package_name(),
+        options.module_path(),
+        options.module_path(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,7 +242,17 @@ mod tests {
         assert!(go_mod.contains("module example.com/acme/newworld-gamedata"));
         assert!(go_mod.contains("go 1.26"));
         assert!(go_mod.contains("toolchain go1.26.4"));
-        assert_eq!(root.trim(), "package nwgamedata");
+        assert!(root.contains("package nwgamedata"));
+        assert!(root.contains("\"example.com/acme/newworld-gamedata/gameassets\""));
+        assert!(root.contains("\"example.com/acme/newworld-gamedata/managers\""));
+        assert!(root.contains("type AssetLoader = gameassets.AssetLoader"));
+        assert!(root.contains("type Managers = managers.Managers"));
+        assert!(
+            root.contains(
+                "func OpenDir(assetRoot string, pakPaths ...string) (*AssetLoader, error)"
+            )
+        );
+        assert!(root.contains("func OpenManagers(loader *AssetLoader) (*Managers, error)"));
         assert!(
             project
                 .files()

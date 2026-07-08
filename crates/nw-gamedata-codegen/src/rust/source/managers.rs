@@ -123,6 +123,7 @@ pub use surfaces::*;
 
 "#,
     );
+    push_rust_managers_facade(&mut runtime_source, &surfaces);
     runtime_source.push_str(RUST_STANDALONE_PRODUCT_MANAGER_RUNTIME);
     runtime_source.push_str(RUST_STANDALONE_DYNAMIC_MANAGER_RUNTIME);
 
@@ -178,6 +179,13 @@ fn rust_direct_schema_row_types(surfaces: &[ManagerSurface]) -> BTreeSet<String>
         );
     }
     row_types
+}
+
+fn rust_manager_accessor_name(manager_name: &str) -> String {
+    to_snake_ident(
+        manager_name.strip_suffix("Manager").unwrap_or(manager_name),
+        "manager",
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -544,6 +552,51 @@ fn push_rust_standalone_manager_surfaces(
     }
 }
 
+fn push_rust_managers_facade(source: &mut String, surfaces: &[ManagerSurface]) {
+    source.push_str(
+        r#"
+#[derive(Debug, Clone)]
+pub struct Managers {
+    cache: ManagerCache,
+}
+
+impl Managers {
+    pub fn open(loader: &crate::assets::AssetLoader) -> Result<Self> {
+        Ok(Self {
+            cache: ManagerCache::from_asset_loader(loader)?,
+        })
+    }
+
+"#,
+    );
+
+    let mut seen = BTreeSet::new();
+    for surface in surfaces {
+        let manager_name = manager_surface_name(surface);
+        if !seen.insert(manager_name) {
+            continue;
+        }
+        let manager_type = match surface {
+            ManagerSurface::Direct(manager) | ManagerSurface::ProductBacked(manager) => {
+                manager.manager_class_name.as_str()
+            }
+            ManagerSurface::Semantic(record) => record.manager_class_name.as_str(),
+            ManagerSurface::ItemData(manager) => manager.manager_class_name.as_str(),
+        };
+        let accessor = rust_manager_accessor_name(&manager_name);
+        let factory = to_snake_ident(manager_type, "manager");
+        source.push_str(&format!(
+            r#"    pub fn {accessor}(&mut self) -> Result<{manager_type}> {{
+        surfaces::{factory}(&mut self.cache)
+    }}
+
+"#
+        ));
+    }
+
+    source.push_str("}\n\n");
+}
+
 fn push_rust_direct_manager_wrapper(
     source: &mut String,
     manager: &DirectManagerSurface,
@@ -562,9 +615,9 @@ pub struct {manager_name} {{
 }}
 
 impl {manager_name} {{
-    pub fn from_runtime(runtime: &mut ManagerRuntime) -> Result<Self> {{
+    pub(super) fn from_cache(cache: &mut ManagerCache) -> Result<Self> {{
         Ok(Self {{
-            instance: runtime.manager({manager_name:?})?,
+            instance: cache.manager({manager_name:?})?,
         }})
     }}
 
@@ -576,8 +629,8 @@ impl {manager_name} {{
 {product_methods}
 }}
 
-pub fn {factory}(runtime: &mut ManagerRuntime) -> Result<{manager_name}> {{
-    {manager_name}::from_runtime(runtime)
+pub(super) fn {factory}(cache: &mut ManagerCache) -> Result<{manager_name}> {{
+    {manager_name}::from_cache(cache)
 }}
 "#
     ));
@@ -596,17 +649,17 @@ pub struct {manager_name} {{
 }}
 
 impl {manager_name} {{
-    pub fn from_runtime(runtime: &mut ManagerRuntime) -> Result<Self> {{
+    pub(super) fn from_cache(cache: &mut ManagerCache) -> Result<Self> {{
         Ok(Self {{
-            instance: runtime.manager({manager_name:?})?,
+            instance: cache.manager({manager_name:?})?,
         }})
     }}
 
 {product_methods}
 }}
 
-pub fn {factory}(runtime: &mut ManagerRuntime) -> Result<{manager_name}> {{
-    {manager_name}::from_runtime(runtime)
+pub(super) fn {factory}(cache: &mut ManagerCache) -> Result<{manager_name}> {{
+    {manager_name}::from_cache(cache)
 }}
 "#
     ));
@@ -793,8 +846,8 @@ pub struct {manager_name} {{
 }}
 
 impl {manager_name} {{
-    pub fn from_runtime(runtime: &mut ManagerRuntime) -> Result<Self> {{
-        Self::from_instance(runtime.manager({manager_name_literal})?)
+    pub(super) fn from_cache(cache: &mut ManagerCache) -> Result<Self> {{
+        Self::from_instance(cache.manager({manager_name_literal})?)
     }}
 
     fn from_instance(instance: Arc<ManagerInstance>) -> Result<Self> {{
@@ -846,8 +899,8 @@ impl {manager_name} {{
     }}
 }}
 
-pub fn {factory}(runtime: &mut ManagerRuntime) -> Result<{manager_name}> {{
-    {manager_name}::from_runtime(runtime)
+pub(super) fn {factory}(cache: &mut ManagerCache) -> Result<{manager_name}> {{
+    {manager_name}::from_cache(cache)
 }}
 
 fn materialize_{factory}(instance: &ManagerInstance) -> Result<Vec<{data_type}>> {{
@@ -1273,8 +1326,8 @@ pub struct {manager_name} {{
 }}
 
 impl {manager_name} {{
-    pub fn from_runtime(runtime: &mut ManagerRuntime) -> Result<Self> {{
-        Self::from_instance(runtime.manager({manager_name:?})?)
+    pub(super) fn from_cache(cache: &mut ManagerCache) -> Result<Self> {{
+        Self::from_instance(cache.manager({manager_name:?})?)
     }}
 
     fn from_instance(instance: Arc<ManagerInstance>) -> Result<Self> {{
@@ -1294,8 +1347,8 @@ impl {manager_name} {{
 {lookup_methods}{source_row_method}{ids_method}{rows_method}{len_method}{is_empty_method}{special_methods}
 }}
 
-pub fn {factory}(runtime: &mut ManagerRuntime) -> Result<{manager_name}> {{
-    {manager_name}::from_runtime(runtime)
+pub(super) fn {factory}(cache: &mut ManagerCache) -> Result<{manager_name}> {{
+    {manager_name}::from_cache(cache)
 }}
 
 "#
@@ -3558,16 +3611,16 @@ struct ManagerInstance {
 }
 
 #[derive(Debug, Clone)]
-pub struct ManagerRuntime {
+struct ManagerCache {
     datasheets_by_path: HashMap<String, crate::assets::DatasheetAsset>,
     assets_by_path: HashMap<String, Vec<u8>>,
     table_cache: HashMap<String, Arc<DynamicTable>>,
     manager_cache: HashMap<&'static str, Arc<ManagerInstance>>,
 }
 
-impl ManagerRuntime {
+impl ManagerCache {
     #[must_use]
-    pub fn from_pak_source(source: PakDatasheetSource) -> Self {
+    fn from_source(source: PakDatasheetSource) -> Self {
         let datasheets_by_path = source
             .datasheets
             .into_iter()
@@ -3584,6 +3637,10 @@ impl ManagerRuntime {
             table_cache: HashMap::new(),
             manager_cache: HashMap::new(),
         }
+    }
+
+    fn from_asset_loader(loader: &crate::assets::AssetLoader) -> Result<Self> {
+        Ok(Self::from_source(loader.datasheet_source()?))
     }
 
     fn manager(&mut self, name: &str) -> Result<Arc<ManagerInstance>> {

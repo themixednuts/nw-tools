@@ -73,7 +73,7 @@ import {
   type ObjectStreamElement,
   type ObjectStreamVec3,
 } from "../game-assets/object-stream.js";
-import { type PakDatasheetSource } from "../game-assets/pak.js";
+import { type AssetLoader } from "../game-assets/pak.js";
 
 "#,
     );
@@ -150,6 +150,22 @@ interface DynamicTable {
   readonly duplicateKeys: ReadonlyMap<string, readonly DynamicTableRow[]>;
 }
 
+interface BinaryAsset {
+  readonly path: string;
+  readonly bytes: Uint8Array;
+}
+
+interface PakDatasheetSource {
+  readonly datasheets: readonly DatasheetAsset[];
+  readonly assets: readonly BinaryAsset[];
+}
+
+const ASSET_LOADER_SOURCE = Symbol.for("@nw-tools/asset-loader/source");
+
+type AssetLoaderSourceAccessor = {
+  [key: symbol]: () => Promise<PakDatasheetSource>;
+};
+
 "#,
     );
 
@@ -160,6 +176,7 @@ interface DynamicTable {
     push_manager_surface_classes(&mut source, unit, surfaces);
     source.push_str(PRODUCT_MANAGER_RUNTIME_TS);
     source.push_str(DYNAMIC_MANAGER_RUNTIME_TS);
+    push_managers_facade(&mut source, surfaces);
 
     Ok(format_typescript_source(&source)?)
 }
@@ -190,6 +207,10 @@ fn direct_schema_row_types(surfaces: &[ManagerSurface]) -> BTreeSet<String> {
         );
     }
     row_types
+}
+
+fn ts_manager_accessor_name(manager_name: &str) -> String {
+    ts_method_name(manager_name.strip_suffix("Manager").unwrap_or(manager_name))
 }
 
 #[derive(Debug, Clone)]
@@ -721,6 +742,51 @@ fn push_manager_surface_classes(
     source.push_str(SEMANTIC_MANAGER_RUNTIME_TS);
 }
 
+fn push_managers_facade(source: &mut String, surfaces: &[ManagerSurface]) {
+    let mut methods = String::new();
+    let mut seen = BTreeSet::new();
+    for surface in surfaces {
+        let manager_name = manager_surface_name(surface);
+        if !seen.insert(manager_name) {
+            continue;
+        }
+        let manager_class = match surface {
+            ManagerSurface::Direct(manager) | ManagerSurface::ProductBacked(manager) => {
+                manager.manager_class_name.as_str()
+            }
+            ManagerSurface::Semantic(record) => record.manager_class_name.as_str(),
+            ManagerSurface::ItemData(manager) => manager.manager_class_name.as_str(),
+        };
+        let accessor = ts_manager_accessor_name(&manager_name);
+        methods.push_str(&format!(
+            r#"  {accessor}(): {manager_class} {{
+    return {manager_class}.fromCache(this.cache);
+  }}
+
+"#
+        ));
+    }
+
+    source.push_str(&format!(
+        r#"
+export class Managers {{
+  private constructor(private readonly cache: ManagerCache) {{}}
+
+  static async open(loader: AssetLoader): Promise<Managers> {{
+    const source = await (loader as unknown as AssetLoaderSourceAccessor)[ASSET_LOADER_SOURCE]();
+    return new Managers(new ManagerCache(source));
+  }}
+
+{methods}}}
+
+export async function openManagers(loader: AssetLoader): Promise<Managers> {{
+  return Managers.open(loader);
+}}
+
+"#
+    ));
+}
+
 fn push_direct_manager_class(
     source: &mut String,
     unit: &GameDataCompileUnit,
@@ -729,6 +795,7 @@ fn push_direct_manager_class(
     let manager_class = &manager.manager_class_name;
     let manager_name = typescript_string_literal(&manager.manager_name);
     let runtime_factory = ts_method_name(&manager.manager_name);
+    let accessor = ts_manager_accessor_name(&manager.manager_name);
     let mut product_methods = direct_ts_product_methods(manager);
     product_methods.push_str(&special_ts_manager_extra_methods(manager_class));
     let row_methods = direct_ts_schema_methods(unit, manager);
@@ -742,16 +809,16 @@ fn push_direct_manager_class(
 export class {manager_class} {{
   {constructor}
 
-  static fromRuntime(runtime: ManagerRuntime): {manager_class} {{
-    return new {manager_class}(runtime[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
+  static fromCache(cache: ManagerCache): {manager_class} {{
+    return new {manager_class}(cache[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
   }}
 
 {row_methods}
 {product_methods}
 }}
 
-export function {runtime_factory}(runtime: ManagerRuntime): {manager_class} {{
-  return {manager_class}.fromRuntime(runtime);
+export function {runtime_factory}(managers: Managers): {manager_class} {{
+  return managers.{accessor}();
 }}
 
 "#
@@ -1075,6 +1142,7 @@ fn push_product_backed_manager_class(source: &mut String, manager: &DirectManage
     let manager_class = &manager.manager_class_name;
     let manager_name = typescript_string_literal(&manager.manager_name);
     let runtime_factory = ts_method_name(&manager.manager_name);
+    let accessor = ts_manager_accessor_name(&manager.manager_name);
     let mut product_methods = direct_ts_product_methods(manager);
     product_methods.push_str(&special_ts_manager_extra_methods(manager_class));
     let constructor = if product_methods.trim().is_empty() {
@@ -1087,15 +1155,15 @@ fn push_product_backed_manager_class(source: &mut String, manager: &DirectManage
 export class {manager_class} {{
   {constructor}
 
-  static fromRuntime(runtime: ManagerRuntime): {manager_class} {{
-    return new {manager_class}(runtime[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
+  static fromCache(cache: ManagerCache): {manager_class} {{
+    return new {manager_class}(cache[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
   }}
 
 {product_methods}
 }}
 
-export function {runtime_factory}(runtime: ManagerRuntime): {manager_class} {{
-  return {manager_class}.fromRuntime(runtime);
+export function {runtime_factory}(managers: Managers): {manager_class} {{
+  return managers.{accessor}();
 }}
 
 "#
@@ -1106,6 +1174,7 @@ fn push_item_data_manager_class(source: &mut String, manager: &ItemDataManagerSu
     let manager_class = &manager.manager_class_name;
     let manager_name = typescript_string_literal(&manager.manager_name);
     let runtime_factory = ts_method_name(&manager.manager_name);
+    let accessor = ts_manager_accessor_name(&manager.manager_name);
     let table_type = &manager.table_type_name;
     let handle_type = &manager.handle_type_name;
     let data_type = &manager.data_type_name;
@@ -1168,8 +1237,8 @@ export class {manager_class} {{
     }}
   }}
 
-  static fromRuntime(runtime: ManagerRuntime): {manager_class} {{
-    return new {manager_class}(runtime[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
+  static fromCache(cache: ManagerCache): {manager_class} {{
+    return new {manager_class}(cache[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
   }}
 
   get(itemId: string): {data_type} | undefined {{
@@ -1200,8 +1269,8 @@ export class {manager_class} {{
   }}
 }}
 
-export function {runtime_factory}(runtime: ManagerRuntime): {manager_class} {{
-  return {manager_class}.fromRuntime(runtime);
+export function {runtime_factory}(managers: Managers): {manager_class} {{
+  return managers.{accessor}();
 }}
 
 function materialize{manager_class}(instance: ManagerInstance): {data_type}[] {{
@@ -1266,6 +1335,7 @@ fn push_semantic_manager_class(source: &mut String, record: &SemanticManagerReco
     let by_key_field = "rowsByKey";
     let source_row_field = "rowsBySourceRow";
     let runtime_factory = ts_method_name(&record.manager_name);
+    let accessor = ts_manager_accessor_name(&record.manager_name);
     let key_map_type = ts_key_map_type(record);
     let has_lookup_index = !record.lookup_methods.is_empty();
     let source_row_index_field = record.source_row_method.as_ref().map(|_| {
@@ -1320,8 +1390,8 @@ export class {manager_class} {{
         r#"
   }}
 
-  static fromRuntime(runtime: ManagerRuntime): {manager_class} {{
-    return new {manager_class}(runtime[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
+  static fromCache(cache: ManagerCache): {manager_class} {{
+    return new {manager_class}(cache[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
   }}
 
 "#
@@ -1423,8 +1493,8 @@ export class {manager_class} {{
     source.push_str(&special_ts_manager_extra_methods(manager_class));
     source.push_str("}\n\n");
     source.push_str(&format!(
-        r#"export function {runtime_factory}(runtime: ManagerRuntime): {manager_class} {{
-  return {manager_class}.fromRuntime(runtime);
+        r#"export function {runtime_factory}(managers: Managers): {manager_class} {{
+  return managers.{accessor}();
 }}
 
 "#
@@ -3800,7 +3870,7 @@ class ManagerInstance {
   }
 }
 
-export class ManagerRuntime {
+class ManagerCache {
   private readonly datasheetsByPath: ReadonlyMap<string, DatasheetAsset>;
   private readonly assetsByPath: ReadonlyMap<string, Uint8Array>;
   private readonly tableCache = new Map<string, DynamicTable>();
@@ -3813,10 +3883,6 @@ export class ManagerRuntime {
     this.assetsByPath = new Map(
       source.assets.map((asset) => [normalizeDataPath(asset.path), asset.bytes]),
     );
-  }
-
-  static fromPakSource(source: PakDatasheetSource): ManagerRuntime {
-    return new ManagerRuntime(source);
   }
 
   [MANAGER_INSTANCE](name: string): unknown {

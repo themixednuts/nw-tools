@@ -39,15 +39,10 @@ type PakArchive struct {
 	byName  map[string]int
 }
 
-type PakDatasheetSource struct {
-	Catalog    AssetCatalog
-	Datasheets []DatasheetAsset
-	Assets     []BinaryAsset
-}
-
-type BinaryAsset struct {
-	Path  string
-	Bytes []byte
+type AssetLoader struct {
+	Catalog       AssetCatalog
+	mountedArchives []mountedPakArchive
+	entriesByPath   map[string]pakEntryRef
 }
 
 type UnsupportedPakCompressionError struct {
@@ -161,7 +156,7 @@ func (archive *PakArchive) ReadEntry(entry PakEntryInfo) ([]byte, error) {
 	return peelAzcs(bytes)
 }
 
-func LoadPakDatasheetSource(assetRoot string, pakPaths []string) (*PakDatasheetSource, error) {
+func OpenDir(assetRoot string, pakPaths ...string) (*AssetLoader, error) {
 	if len(pakPaths) == 0 {
 		collected, err := CollectPakPaths(assetRoot)
 		if err != nil {
@@ -177,9 +172,12 @@ func LoadPakDatasheetSource(assetRoot string, pakPaths []string) (*PakDatasheetS
 	}
 
 	var mountedArchives []mountedPakArchive
+	closeOnError := true
 	defer func() {
-		for _, mounted := range mountedArchives {
-			_ = mounted.archive.Close()
+		if closeOnError {
+			for _, mounted := range mountedArchives {
+				_ = mounted.archive.Close()
+			}
 		}
 	}()
 
@@ -216,39 +214,44 @@ func LoadPakDatasheetSource(assetRoot string, pakPaths []string) (*PakDatasheetS
 		return nil, err
 	}
 
-	var datasheets []DatasheetAsset
-	var assets []BinaryAsset
-	for _, entry := range catalog.Entries {
-		if !IsDatasheetPath(entry.RelativePath) && !IsManagerAssetPath(entry.RelativePath) {
-			continue
-		}
-		path := NormalizeVirtualPath(entry.RelativePath)
-		located, ok := entriesByPath[path]
-		if !ok {
-			return nil, fmt.Errorf("catalog asset %s was not present in selected paks", path)
-		}
-		bytes, err := located.archive.ReadEntry(located.entry)
-		if err != nil {
-			return nil, err
-		}
-		if IsDatasheetPath(entry.RelativePath) {
-			datasheets = append(datasheets, DatasheetAsset{
-				Path:  path,
-				Bytes: bytes,
-			})
-		} else {
-			assets = append(assets, BinaryAsset{
-				Path:  path,
-				Bytes: bytes,
-			})
+	closeOnError = false
+	return &AssetLoader{
+		Catalog:         catalog,
+		mountedArchives: mountedArchives,
+		entriesByPath:   entriesByPath,
+	}, nil
+}
+
+func (loader *AssetLoader) Close() error {
+	var closeErr error
+	for _, mounted := range loader.mountedArchives {
+		if err := mounted.archive.Close(); err != nil && closeErr == nil {
+			closeErr = err
 		}
 	}
+	return closeErr
+}
 
-	return &PakDatasheetSource{
-		Catalog:    catalog,
-		Datasheets: datasheets,
-		Assets:     assets,
-	}, nil
+func (loader *AssetLoader) Read(path string) ([]byte, error) {
+	located, ok := loader.entry(path)
+	if !ok {
+		return nil, fmt.Errorf("asset %s was not present in selected paks", path)
+	}
+	return located.archive.ReadEntry(located.entry)
+}
+
+func (loader *AssetLoader) entry(path string) (pakEntryRef, bool) {
+	normalized := NormalizeVirtualPath(path)
+	if located, ok := loader.entriesByPath[normalized]; ok {
+		return located, true
+	}
+	suffix := "/" + normalized
+	for candidate, located := range loader.entriesByPath {
+		if strings.HasSuffix(candidate, suffix) {
+			return located, true
+		}
+	}
+	return pakEntryRef{}, false
 }
 
 func IsManagerAssetPath(path string) bool {

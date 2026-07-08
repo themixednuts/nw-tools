@@ -158,6 +158,7 @@ fn standalone_lib_rs_source(
     }
     if target.supports_product(GameDataProduct::GameAssetAccess) {
         source.push_str("\npub mod assets;\n");
+        source.push_str("pub use assets::AssetLoader;\n");
     }
     if target.supports_product(GameDataProduct::Systems)
         && matches!(data_format, GameDataDataFormat::Datasheet)
@@ -166,6 +167,7 @@ fn standalone_lib_rs_source(
     }
     if target.supports_product(GameDataProduct::SemanticManagers) {
         source.push_str("\npub mod managers;\n");
+        source.push_str("pub use managers::Managers;\n");
     }
     format_rust_source(&source)
 }
@@ -284,88 +286,133 @@ pub use nw_objectstream::{ObjectStream, ObjectStreamEncoding, ObjectStreamError}
 pub use nw_pak::{EntryInfo, PakArchive, PakError, PakFile, PakFileMmap, PakMmapReader};
 
 #[derive(Debug, Clone)]
-pub struct DatasheetAsset {
-    pub path: String,
-    pub bytes: Vec<u8>,
+pub(crate) struct DatasheetAsset {
+    pub(crate) path: String,
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
-pub struct BinaryAsset {
-    pub path: String,
-    pub bytes: Vec<u8>,
+pub(crate) struct BinaryAsset {
+    pub(crate) path: String,
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
-pub struct PakDatasheetSource {
-    pub catalog: AssetCatalog,
-    pub datasheets: Vec<DatasheetAsset>,
-    pub assets: Vec<BinaryAsset>,
+pub(crate) struct PakDatasheetSource {
+    pub(crate) catalog: AssetCatalog,
+    pub(crate) datasheets: Vec<DatasheetAsset>,
+    pub(crate) assets: Vec<BinaryAsset>,
 }
 
+#[derive(Clone)]
+pub struct AssetLoader {
+    inner: Arc<AssetLoaderInner>,
+}
+
+struct AssetLoaderInner {
+    catalog: AssetCatalog,
+    entries_by_path: HashMap<String, PakEntryRef>,
+}
+
+#[derive(Clone)]
 struct PakEntryRef {
     reader: Arc<PakReader>,
     index: usize,
 }
 
-pub fn load_pak_datasheet_source(asset_root: impl AsRef<Path>) -> Result<PakDatasheetSource> {
-    let asset_root = asset_root.as_ref();
-    let pak_paths = collect_pak_paths(asset_root)?;
-    if pak_paths.is_empty() {
-        bail!("no .pak files found under {}", asset_root.display());
-    }
+impl AssetLoader {
+    pub fn from_dir(asset_root: impl AsRef<Path>) -> Result<Self> {
+        let asset_root = asset_root.as_ref();
+        let pak_paths = collect_pak_paths(asset_root)?;
+        if pak_paths.is_empty() {
+            bail!("no .pak files found under {}", asset_root.display());
+        }
 
-    let mut readers: Vec<(String, Arc<PakReader>)> = Vec::new();
-    let mut entries_by_path: HashMap<String, PakEntryRef> = HashMap::new();
-    let mut claimed_paths: HashSet<String> = HashSet::new();
+        let mut readers: Vec<(String, Arc<PakReader>)> = Vec::new();
+        let mut entries_by_path: HashMap<String, PakEntryRef> = HashMap::new();
+        let mut claimed_paths: HashSet<String> = HashSet::new();
 
-    for pak_path in pak_paths {
-        let reader = Arc::new(
-            PakReader::open(&pak_path)
-                .with_context(|| format!("open pak {}", pak_path.display()))?,
-        );
-        let mount_root = pak_mount_root(asset_root, &pak_path)?;
-        for entry in reader.entries() {
-            let path = normalize_data_path(&mounted_entry_path(&mount_root, entry.name()));
-            if claimed_paths.insert(path.clone()) {
-                entries_by_path.insert(
-                    path,
-                    PakEntryRef {
-                        reader: reader.clone(),
-                        index: entry.index(),
-                    },
-                );
+        for pak_path in pak_paths {
+            let reader = Arc::new(
+                PakReader::open(&pak_path)
+                    .with_context(|| format!("open pak {}", pak_path.display()))?,
+            );
+            let mount_root = pak_mount_root(asset_root, &pak_path)?;
+            for entry in reader.entries() {
+                let path = normalize_data_path(&mounted_entry_path(&mount_root, entry.name()));
+                if claimed_paths.insert(path.clone()) {
+                    entries_by_path.insert(
+                        path,
+                        PakEntryRef {
+                            reader: reader.clone(),
+                            index: entry.index(),
+                        },
+                    );
+                }
             }
+            readers.push((mount_root, reader));
         }
-        readers.push((mount_root, reader));
+
+        let catalog = load_catalog_from_paks(&readers)?;
+        Ok(Self {
+            inner: Arc::new(AssetLoaderInner {
+                catalog,
+                entries_by_path,
+            }),
+        })
     }
 
-    let catalog = load_catalog_from_paks(&readers)?;
-    let mut datasheets = Vec::new();
-    let mut assets = Vec::new();
-    for entry in catalog.entries() {
-        let path = normalize_data_path(entry.path());
-        if !is_datasheet_path(&path) && !is_manager_asset_path(&path) {
-            continue;
-        }
-        let located = entries_by_path
-            .get(&path)
-            .with_context(|| format!("catalog asset {path} was not present in selected paks"))?;
-        let bytes = located
+    pub fn catalog(&self) -> &AssetCatalog {
+        &self.inner.catalog
+    }
+
+    pub fn read(&self, path: impl AsRef<str>) -> Result<Vec<u8>> {
+        let path = path.as_ref();
+        let normalized = normalize_data_path(path);
+        let located = self
+            .inner
+            .entries_by_path
+            .get(&normalized)
+            .or_else(|| {
+                let suffix = format!("/{normalized}");
+                self.inner
+                    .entries_by_path
+                    .iter()
+                    .find_map(|(candidate, located)| candidate.ends_with(&suffix).then_some(located))
+            })
+            .with_context(|| format!("asset {path} was not present in selected paks"))?;
+        located
             .reader
             .read_by_index(located.index)
-            .with_context(|| format!("read pak asset {path}"))?;
-        if is_datasheet_path(&path) {
-            datasheets.push(DatasheetAsset { path, bytes });
-        } else {
-            assets.push(BinaryAsset { path, bytes });
-        }
+            .with_context(|| format!("read pak asset {path}"))
     }
 
-    Ok(PakDatasheetSource {
-        catalog,
-        datasheets,
-        assets,
-    })
+    pub(crate) fn datasheet_source(&self) -> Result<PakDatasheetSource> {
+        let mut datasheets = Vec::new();
+        let mut assets = Vec::new();
+        for entry in self.inner.catalog.entries() {
+            let path = normalize_data_path(entry.path());
+            if !is_datasheet_path(&path) && !is_manager_asset_path(&path) {
+                continue;
+            }
+            let bytes = self.read(&path)?;
+            if is_datasheet_path(&path) {
+                datasheets.push(DatasheetAsset { path, bytes });
+            } else {
+                assets.push(BinaryAsset { path, bytes });
+            }
+        }
+
+        Ok(PakDatasheetSource {
+            catalog: self.inner.catalog.clone(),
+            datasheets,
+            assets,
+        })
+    }
+}
+
+pub(crate) fn load_pak_datasheet_source(asset_root: impl AsRef<Path>) -> Result<PakDatasheetSource> {
+    AssetLoader::from_dir(asset_root)?.datasheet_source()
 }
 
 pub fn is_manager_asset_path(path: &str) -> bool {
@@ -618,6 +665,11 @@ mod tests {
         assert!(assets.contains("pub use nw_localization::"));
         assert!(assets.contains("pub use nw_objectstream::"));
         assert!(assets.contains("pub use nw_pak::"));
+        assert!(assets.contains("pub(crate) struct PakDatasheetSource"));
+        assert!(assets.contains("pub(crate) fn datasheet_source"));
+        assert!(assets.contains("pub(crate) fn load_pak_datasheet_source"));
+        assert!(!assets.contains("pub struct PakDatasheetSource"));
+        assert!(!assets.contains("pub fn datasheet_source"));
         assert!(
             project
                 .files()

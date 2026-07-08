@@ -136,6 +136,17 @@ type dynamicTable struct {{
 	DuplicateKeys map[string][]dynamicTableRow
 }}
 
+type assetSource struct {{
+	Catalog    gameassets.AssetCatalog
+	Datasheets []gameassets.DatasheetAsset
+	Assets     []binaryAsset
+}}
+
+type binaryAsset struct {{
+	Path  string
+	Bytes []byte
+}}
+
 "#,
         DEFAULT_GO_GAMEASSETS_IMPORT,
     );
@@ -146,6 +157,7 @@ type dynamicTable struct {{
     push_manager_surface_types(&mut source, unit, surfaces);
     source.push_str(PRODUCT_MANAGER_RUNTIME_GO);
     source.push_str(DYNAMIC_MANAGER_RUNTIME_GO);
+    push_go_managers_facade(&mut source, surfaces);
 
     format_go_source(&source).map_err(Into::into)
 }
@@ -160,6 +172,17 @@ fn semantic_records(surfaces: &[ManagerSurface]) -> Vec<SemanticManagerRecord> {
             | ManagerSurface::ProductBacked(_) => None,
         })
         .collect()
+}
+
+fn go_manager_accessor_name(manager_name: &str) -> String {
+    to_upper_camel_ident(
+        manager_name.strip_suffix("Manager").unwrap_or(manager_name),
+        "manager",
+    )
+}
+
+fn go_manager_constructor_name(manager_type: &str) -> String {
+    format!("new{manager_type}")
 }
 
 #[derive(Debug, Clone)]
@@ -761,6 +784,7 @@ fn push_direct_manager_type(
     manager: &DirectManagerSurface,
 ) {
     let manager_type = &manager.manager_class_name;
+    let constructor = go_manager_constructor_name(manager_type);
     let mut product_methods = direct_go_product_methods(manager);
     product_methods.push_str(&special_go_manager_extra_methods(manager_type));
     let row_methods = direct_go_schema_methods(unit, manager);
@@ -770,8 +794,8 @@ type {manager_type} struct {{
 	instance *managerInstance
 }}
 
-func New{manager_type}(runtime *ManagerRuntime) (*{manager_type}, error) {{
-	instance, err := runtime.manager({})
+func {constructor}(cache *managerCache) (*{manager_type}, error) {{
+	instance, err := cache.manager({})
 	if err != nil {{
 		return nil, err
 	}}
@@ -1180,6 +1204,7 @@ func (manager *{manager_type}) Ranks() ([]SocialRankData, error) {{
 
 fn push_product_backed_manager_type(source: &mut String, manager: &DirectManagerSurface) {
     let manager_type = &manager.manager_class_name;
+    let constructor = go_manager_constructor_name(manager_type);
     let mut product_methods = direct_go_product_methods(manager);
     product_methods.push_str(&special_go_manager_extra_methods(manager_type));
     source.push_str(&format!(
@@ -1188,8 +1213,8 @@ type {manager_type} struct {{
 	instance *managerInstance
 }}
 
-func New{manager_type}(runtime *ManagerRuntime) (*{manager_type}, error) {{
-	instance, err := runtime.manager({})
+func {constructor}(cache *managerCache) (*{manager_type}, error) {{
+	instance, err := cache.manager({})
 	if err != nil {{
 		return nil, err
 	}}
@@ -1204,7 +1229,7 @@ func New{manager_type}(runtime *ManagerRuntime) (*{manager_type}, error) {{
 
 fn push_item_data_manager_type(source: &mut String, manager: &ItemDataManagerSurface) {
     let manager_type = &manager.manager_class_name;
-    let factory = format!("New{manager_type}");
+    let factory = go_manager_constructor_name(manager_type);
     let table_type = &manager.table_type_name;
     let handle_type = &manager.handle_type_name;
     let data_type = &manager.data_type_name;
@@ -1266,8 +1291,8 @@ type {manager_type} struct {{
 	itemsByID map[uint32]int
 }}
 
-func {factory}(runtime *ManagerRuntime) (*{manager_type}, error) {{
-	instance, err := runtime.manager({})
+func {factory}(cache *managerCache) (*{manager_type}, error) {{
+	instance, err := cache.manager({})
 	if err != nil {{
 		return nil, err
 	}}
@@ -1444,6 +1469,7 @@ func cache{manager_type}Rows(items *[]{data_type}, seen map[uint32]struct{{}}, t
 fn push_semantic_manager_type(source: &mut String, record: &SemanticManagerRecord) {
     let manager_type = &record.manager_class_name;
     let record_type = &record.record_type_name;
+    let constructor = go_manager_constructor_name(manager_type);
     let by_key_field = "entriesByKey";
     let by_source_row_field = "entriesBySourceRow";
     let key_map_type = go_key_map_type(record);
@@ -1456,8 +1482,8 @@ type {manager_type} struct {{
 	{by_source_row_field} map[uint32]int
 }}
 
-func New{manager_type}(runtime *ManagerRuntime) (*{manager_type}, error) {{
-	instance, err := runtime.manager({})
+func {constructor}(cache *managerCache) (*{manager_type}, error) {{
+	instance, err := cache.manager({})
 	if err != nil {{
 		return nil, err
 	}}
@@ -1634,6 +1660,49 @@ fn special_go_manager_extra_methods(manager_type: &str) -> String {
 "#
         .to_owned(),
         _ => String::new(),
+    }
+}
+
+fn push_go_managers_facade(source: &mut String, surfaces: &[ManagerSurface]) {
+    source.push_str(
+        r#"
+type Managers struct {
+	cache *managerCache
+}
+
+func Open(loader *gameassets.AssetLoader) (*Managers, error) {
+	source, err := assetSourceFromLoader(loader)
+	if err != nil {
+		return nil, err
+	}
+	return &Managers{cache: newManagerCacheFromSource(source)}, nil
+}
+
+"#,
+    );
+
+    let mut seen = BTreeSet::new();
+    for surface in surfaces {
+        let manager_name = manager_surface_name(surface);
+        if !seen.insert(manager_name) {
+            continue;
+        }
+        let manager_type = match surface {
+            ManagerSurface::Direct(manager) | ManagerSurface::ProductBacked(manager) => {
+                manager.manager_class_name.as_str()
+            }
+            ManagerSurface::Semantic(record) => record.manager_class_name.as_str(),
+            ManagerSurface::ItemData(manager) => manager.manager_class_name.as_str(),
+        };
+        let accessor = go_manager_accessor_name(&manager_name);
+        let constructor = go_manager_constructor_name(manager_type);
+        source.push_str(&format!(
+            r#"func (managers *Managers) {accessor}() (*{manager_type}, error) {{
+	return {constructor}(managers.cache)
+}}
+
+"#
+        ));
     }
 }
 
@@ -4634,14 +4703,44 @@ func (instance *managerInstance) allTables() []*dynamicTable {
 	return tables
 }
 
-type ManagerRuntime struct {
+type managerCache struct {
 	datasheetsByPath map[string]gameassets.DatasheetAsset
 	assetsByPath     map[string][]byte
 	tableCache       map[string]*dynamicTable
 	managerCache     map[string]*managerInstance
 }
 
-func NewManagerRuntimeFromPakSource(source *gameassets.PakDatasheetSource) *ManagerRuntime {
+func assetSourceFromLoader(loader *gameassets.AssetLoader) (*assetSource, error) {
+	source := &assetSource{
+		Catalog:    loader.Catalog,
+		Datasheets: []gameassets.DatasheetAsset{},
+		Assets:     []binaryAsset{},
+	}
+	for _, entry := range loader.Catalog.Entries {
+		if !gameassets.IsDatasheetPath(entry.RelativePath) && !gameassets.IsManagerAssetPath(entry.RelativePath) {
+			continue
+		}
+		path := gameassets.NormalizeVirtualPath(entry.RelativePath)
+		bytes, err := loader.Read(path)
+		if err != nil {
+			return nil, err
+		}
+		if gameassets.IsDatasheetPath(path) {
+			source.Datasheets = append(source.Datasheets, gameassets.DatasheetAsset{
+				Path:  path,
+				Bytes: bytes,
+			})
+		} else {
+			source.Assets = append(source.Assets, binaryAsset{
+				Path:  path,
+				Bytes: bytes,
+			})
+		}
+	}
+	return source, nil
+}
+
+func newManagerCacheFromSource(source *assetSource) *managerCache {
 	datasheetsByPath := make(map[string]gameassets.DatasheetAsset, len(source.Datasheets))
 	for _, asset := range source.Datasheets {
 		datasheetsByPath[normalizeDataPath(asset.Path)] = asset
@@ -4650,7 +4749,7 @@ func NewManagerRuntimeFromPakSource(source *gameassets.PakDatasheetSource) *Mana
 	for _, asset := range source.Assets {
 		assetsByPath[normalizeDataPath(asset.Path)] = asset.Bytes
 	}
-	return &ManagerRuntime{
+	return &managerCache{
 		datasheetsByPath: datasheetsByPath,
 		assetsByPath:     assetsByPath,
 		tableCache:       map[string]*dynamicTable{},
@@ -4658,7 +4757,7 @@ func NewManagerRuntimeFromPakSource(source *gameassets.PakDatasheetSource) *Mana
 	}
 }
 
-func (runtime *ManagerRuntime) manager(name string) (*managerInstance, error) {
+func (runtime *managerCache) manager(name string) (*managerInstance, error) {
 	definition := managerByName(name)
 	if definition == nil {
 		return nil, fmt.Errorf("unknown manager %s", name)
@@ -4666,7 +4765,7 @@ func (runtime *ManagerRuntime) manager(name string) (*managerInstance, error) {
 	return runtime.buildManager(definition, map[string]struct{}{})
 }
 
-func (runtime *ManagerRuntime) buildManager(definition *managerDefinition, stack map[string]struct{}) (*managerInstance, error) {
+func (runtime *managerCache) buildManager(definition *managerDefinition, stack map[string]struct{}) (*managerInstance, error) {
 	if cached := runtime.managerCache[definition.Name]; cached != nil {
 		return cached, nil
 	}
@@ -4711,7 +4810,7 @@ func (runtime *ManagerRuntime) buildManager(definition *managerDefinition, stack
 	return instance, nil
 }
 
-func (runtime *ManagerRuntime) buildTable(schema *TableSchema) (*dynamicTable, error) {
+func (runtime *managerCache) buildTable(schema *TableSchema) (*dynamicTable, error) {
 	cacheKey := schema.Name + ":" + schema.RowType
 	if cached := runtime.tableCache[cacheKey]; cached != nil {
 		return cached, nil
@@ -4800,7 +4899,7 @@ func columnSlotsForSheet(schema *TableSchema, sheet *gameassets.Datasheet) map[u
 	return slots
 }
 
-func (runtime *ManagerRuntime) datasheetAsset(sourcePath string) (gameassets.DatasheetAsset, bool) {
+func (runtime *managerCache) datasheetAsset(sourcePath string) (gameassets.DatasheetAsset, bool) {
 	normalized := normalizeDataPath(sourcePath)
 	if asset, ok := runtime.datasheetsByPath[normalized]; ok {
 		return asset, true
@@ -4814,7 +4913,7 @@ func (runtime *ManagerRuntime) datasheetAsset(sourcePath string) (gameassets.Dat
 	return gameassets.DatasheetAsset{}, false
 }
 
-func (runtime *ManagerRuntime) assetBytes(path string) ([]byte, bool) {
+func (runtime *managerCache) assetBytes(path string) ([]byte, bool) {
 	normalized := normalizeDataPath(path)
 	if bytes, ok := runtime.assetsByPath[normalized]; ok {
 		return bytes, true

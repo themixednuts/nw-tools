@@ -186,7 +186,12 @@ mod tests {
         assert!(!managers.contains("export type ManagerDependency"));
         assert!(!managers.contains("export interface ManagerDefinition"));
         assert!(!managers.contains("export function managerByName"));
-        assert!(managers.contains("export class ManagerRuntime"));
+        assert!(managers.contains("export class Managers"));
+        assert!(managers.contains("static async open(loader: AssetLoader): Promise<Managers>"));
+        assert!(!managers.contains("PakDatasheetSource } from \"../game-assets/pak.js\""));
+        assert!(managers.contains("playerData(): PlayerDataManager"));
+        assert!(managers.contains("armorOffsetData(): ArmorOffsetDataManager"));
+        assert!(!managers.contains("export class ManagerRuntime"));
         assert!(managers.contains("export class ArmorOffsetDataManager"));
         assert!(managers.contains("ArmorOffsetDataManager"));
         assert!(managers.contains("PlayerDataManager"));
@@ -282,9 +287,12 @@ mod tests {
         assert!(managers.contains("export interface TableSchema"));
         assert!(managers.contains("export interface ColumnSchema"));
         assert!(managers.contains("export const TABLE_SCHEMAS: readonly TableSchema[]"));
-        assert!(managers.contains("export class ManagerRuntime"));
+        assert!(managers.contains("export class Managers"));
+        assert!(managers.contains("class ManagerCache"));
+        assert!(managers.contains("interface PakDatasheetSource"));
+        assert!(!managers.contains("export interface PakDatasheetSource"));
         assert!(managers.contains("const MANAGER_INSTANCE = Symbol(\"managerInstance\")"));
-        assert!(managers.contains("static fromPakSource"));
+        assert!(!managers.contains("static fromPakSource"));
         assert!(managers.contains("parseDatasheet"));
         assert!(managers.contains("readonly duplicateKeys"));
         assert!(managers.contains("readonly rowsByLookupKey"));
@@ -306,6 +314,18 @@ mod tests {
         assert!(!managers.contains("ProjectionTransform"));
         assert!(!managers.contains("native"));
         assert!(!managers.contains("runtimeResource"));
+
+        let pak = output
+            .files()
+            .iter()
+            .find(|file| file.path() == Path::new("src/game-assets/pak.ts"))
+            .expect("pak asset loader")
+            .contents();
+        assert!(pak.contains("export interface AssetLoaderOptions"));
+        assert!(pak.contains("Symbol.for(\"@nw-tools/asset-loader/source\")"));
+        assert!(!pak.contains("export interface PakDatasheetSource"));
+        assert!(!pak.contains("export interface BinaryAsset"));
+        assert!(!pak.contains("export async function loadPakDatasheetSource"));
     }
 
     fn manager_definition_names(source: &str) -> BTreeSet<String> {

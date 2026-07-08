@@ -271,12 +271,22 @@ mod tests {
         let public_managers = public_manager_type_names(managers);
         assert_eq!(manager_definitions, public_managers);
         assert!(managers.contains("var managers = []managerDefinition"));
+        assert!(managers.contains("type Managers struct"));
+        assert!(managers.contains("func Open(loader *gameassets.AssetLoader) (*Managers, error)"));
+        assert!(managers.contains("func assetSourceFromLoader(loader *gameassets.AssetLoader)"));
+        assert!(!managers.contains("loader.DatasheetSource()"));
+        assert!(
+            managers.contains("func (managers *Managers) PlayerData() (*PlayerDataManager, error)")
+        );
+        assert!(managers.contains(
+            "func (managers *Managers) ArmorOffsetData() (*ArmorOffsetDataManager, error)"
+        ));
         assert!(!managers.contains("var Managers"));
         assert!(!managers.contains("type ManagerDefinition"));
         assert!(!managers.contains("type ManagerDependency "));
         assert!(!managers.contains("type ManagerDependencyKind"));
         assert!(!managers.contains("func ManagerByName"));
-        assert!(managers.contains("type ManagerRuntime struct"));
+        assert!(!managers.contains("type ManagerRuntime struct"));
         assert!(managers.contains("type ArmorOffsetDataManager struct"));
         assert!(managers.contains("ArmorOffsetDataManager"));
         assert!(managers.contains("PlayerDataManager"));
@@ -382,8 +392,9 @@ mod tests {
         assert!(managers.contains("type TableSchema struct"));
         assert!(managers.contains("type ColumnSchema struct"));
         assert!(managers.contains("var TableSchemas = []TableSchema"));
-        assert!(managers.contains("type ManagerRuntime struct"));
-        assert!(managers.contains("NewManagerRuntimeFromPakSource"));
+        assert!(managers.contains("type managerCache struct"));
+        assert!(!managers.contains("NewManagerRuntimeFromPakSource"));
+        assert!(managers.contains("type assetSource struct"));
         assert!(managers.contains("gameassets.ParseDatasheet"));
         assert!(managers.contains("type dynamicTable struct"));
         assert!(managers.contains("DuplicateKeys"));
@@ -409,6 +420,16 @@ mod tests {
         assert!(!managers.contains("ProjectionTransform"));
         assert!(!managers.contains("Native"));
         assert!(!managers.contains("RuntimeResource"));
+
+        let pak = output
+            .files()
+            .iter()
+            .find(|file| file.path() == Path::new("gameassets/pak.go"))
+            .expect("pak asset loader")
+            .contents();
+        assert!(!pak.contains("type PakDatasheetSource struct"));
+        assert!(!pak.contains("func (loader *AssetLoader) DatasheetSource"));
+        assert!(!pak.contains("func LoadPakDatasheetSource"));
     }
 
     fn manager_definition_names(source: &str) -> BTreeSet<String> {
