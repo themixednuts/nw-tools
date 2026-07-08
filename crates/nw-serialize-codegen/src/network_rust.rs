@@ -13,8 +13,9 @@ use crate::network_schema::{
     NetworkConfidence, NetworkField, NetworkFragmentMetadata, NetworkNativeTypeInfoEvidence,
     NetworkReplicatedContainerShape, NetworkReplicatedContainerStorageKind,
     NetworkReplicatedContainerWireShape, NetworkSchema, NetworkSerializeFieldType,
-    NetworkSerializeKind, NetworkSerializeType, NetworkType, NetworkTypeCapability,
-    NetworkWireScalarShape as SchemaWireScalarShape, NetworkWireShape as SchemaWireShape,
+    NetworkSerializeKind, NetworkSerializeRole, NetworkSerializeType, NetworkType,
+    NetworkTypeCapability, NetworkWireScalarShape as SchemaWireScalarShape,
+    NetworkWireShape as SchemaWireShape,
 };
 use crate::types::{ResolvedType, ScalarType};
 
@@ -3301,6 +3302,7 @@ fn container_value_type(
             &container.value_wire_shapes,
             &container.embedded_value_type_shapes,
         )
+        && container_value_shape_members_are_emittable(shape, &container.embedded_value_type_shapes)
     {
         let rust_type = container_value_shape_rust_type(field, shape, serialize_types)?;
         let marshaler_type = container_value_shape_codec_name(field, shape)?;
@@ -3647,7 +3649,9 @@ fn unique_container_value_candidate<'a>(
         let Some(serialize) = serialize_types.get(&type_id).copied() else {
             continue;
         };
-        if wire_scalar_shapes_match(&container.value_wire_shapes, &serialize.wire_shapes) {
+        if serialize.role == NetworkSerializeRole::SupportType
+            && wire_scalar_shapes_match(&container.value_wire_shapes, &serialize.wire_shapes)
+        {
             matches.push(serialize);
         }
     }
@@ -3754,6 +3758,7 @@ fn container_value_matches_serialize(
     container
         .value_type_id
         .is_none_or(|type_id| type_id == serialize.type_id)
+        && serialize.role == NetworkSerializeRole::SupportType
         && wire_scalar_shapes_match(&container.value_wire_shapes, &serialize.wire_shapes)
 }
 
@@ -3767,9 +3772,47 @@ fn container_named_source_type(
         return Some(value);
     }
     let serialize = serialize_types.values().copied().find(|serialize| {
-        serialize.name == leaf_name && wire_scalar_shapes_match(wire_shapes, &serialize.wire_shapes)
+        serialize.role == NetworkSerializeRole::SupportType
+            && serialize.name == leaf_name
+            && wire_scalar_shapes_match(wire_shapes, &serialize.wire_shapes)
     })?;
     serialize_container_value_type(serialize.kind, &serialize.name, wire_shapes)
+}
+
+fn container_value_shape_members_are_emittable(
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+    embedded_shapes: &[crate::network_schema::NetworkNestedTypeShape],
+) -> bool {
+    shape.members.iter().all(|member| {
+        member.wire_shape.as_deref().is_some_and(|wire_shape| {
+            container_value_member_wire_shape_is_emittable(
+                wire_shape,
+                member.native_type.as_deref(),
+                embedded_shapes,
+            )
+        })
+    })
+}
+
+fn container_value_member_wire_shape_is_emittable(
+    wire_shape: &str,
+    native_type: Option<&str>,
+    embedded_shapes: &[crate::network_schema::NetworkNestedTypeShape],
+) -> bool {
+    if wire_scalar_shape_from_name(wire_shape).is_some() {
+        return true;
+    }
+    if let Some(shapes) = composite_member_wire_shapes(wire_shape) {
+        return composite_member_rust_type(native_type, &shapes).is_some();
+    }
+    if let Some(element) = vector_element_wire_shape(wire_shape) {
+        return wire_scalar_shape_from_name(element).is_some()
+            || nested_shape_by_wire_name(element, embedded_shapes).is_some_and(|shape| {
+                container_value_shape_members_are_emittable(shape, embedded_shapes)
+            });
+    }
+    nested_shape_by_wire_name(wire_shape, embedded_shapes)
+        .is_some_and(|shape| container_value_shape_members_are_emittable(shape, embedded_shapes))
 }
 
 fn runtime_semantic_container_type(
