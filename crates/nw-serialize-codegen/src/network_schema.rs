@@ -265,6 +265,8 @@ pub struct NetworkSerializeFieldType {
     pub field_count: usize,
     pub variant_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_dependency_type_ids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wire_shapes: Vec<NetworkWireScalarShape>,
     pub source: String,
     pub confidence: NetworkConfidence,
@@ -1976,6 +1978,11 @@ fn network_serialize_field_type(
     source: String,
     confidence: NetworkConfidence,
 ) -> NetworkSerializeFieldType {
+    let mut direct_dependency_type_ids = item
+        .direct_dependency_type_ids()
+        .into_iter()
+        .collect::<Vec<_>>();
+    direct_dependency_type_ids.sort_unstable();
     NetworkSerializeFieldType {
         type_id: item.source_type_id,
         kind: network_serialize_kind(item.kind),
@@ -1983,6 +1990,7 @@ fn network_serialize_field_type(
         role: network_serialize_role(item.role),
         field_count: item.fields.len(),
         variant_count: item.variants.len(),
+        direct_dependency_type_ids,
         wire_shapes: serialize_item_wire_shapes(item, index).unwrap_or_default(),
         source,
         confidence,

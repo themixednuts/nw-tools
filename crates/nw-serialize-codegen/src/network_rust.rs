@@ -19,7 +19,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v46";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v47";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -1476,35 +1476,44 @@ fn candidate_backed_container_shape_from_vtable(
             }
             let split = full_data.len() - serialize.wire_shapes.len();
             if wire_scalar_shapes_match(&full_data[split..], &serialize.wire_shapes) {
-                matches.push((serialize, full_data[..split].to_vec()));
+                let key_wire_shapes = full_data[..split].to_vec();
+                let key_type = unique_candidate_serialize_type_for_wire_shapes(
+                    &vtable.value_type_candidates,
+                    &key_wire_shapes,
+                    serialize_types,
+                    Some(serialize.type_id),
+                );
+                if key_type.is_none() && key_wire_shapes.len() > 1 {
+                    continue;
+                }
+                matches.push(CandidateBackedContainerMatch {
+                    value_type: serialize,
+                    key_wire_shapes,
+                    key_type,
+                });
             }
         }
     }
-    matches.sort_by_key(|(serialize, key_wire_shapes)| {
+    matches.sort_by_key(|matched| {
         (
-            serialize.type_id,
-            key_wire_shapes
+            matched.value_type.type_id,
+            matched
+                .key_wire_shapes
                 .iter()
                 .map(|shape| wire_scalar_shape_name(*shape))
                 .collect::<Vec<_>>(),
         )
     });
-    matches.dedup_by(|left, right| left.0.type_id == right.0.type_id && left.1 == right.1);
+    matches.dedup_by(|left, right| {
+        left.value_type.type_id == right.value_type.type_id
+            && left.key_wire_shapes == right.key_wire_shapes
+    });
 
-    let [(serialize, key_wire_shapes)] = matches.as_slice() else {
-        return None;
-    };
+    let matched = select_candidate_backed_container_match(matches)?;
+    let serialize = matched.value_type;
+    let key_wire_shapes = matched.key_wire_shapes;
     let key_wire_shape = *key_wire_shapes.first()?;
-    let key_type_name = unique_candidate_serialize_type_for_wire_shapes(
-        &vtable.value_type_candidates,
-        key_wire_shapes,
-        serialize_types,
-        Some(serialize.type_id),
-    )
-    .map(|serialize| serialize.name.clone());
-    if key_type_name.is_none() && key_wire_shapes.len() > 1 {
-        return None;
-    }
+    let key_type_name = matched.key_type.map(|serialize| serialize.name.clone());
 
     Some(NetworkReplicatedContainerShape {
         storage: NetworkReplicatedContainerStorageKind::Map,
@@ -1523,6 +1532,36 @@ fn candidate_backed_container_shape_from_vtable(
         embedded_value_type_shapes: Vec::new(),
         source: Some("replicated-container-map-candidate-value-suffix".to_owned()),
     })
+}
+
+#[derive(Clone)]
+struct CandidateBackedContainerMatch<'a> {
+    value_type: &'a NetworkSerializeType,
+    key_wire_shapes: Vec<SchemaWireScalarShape>,
+    key_type: Option<&'a NetworkSerializeType>,
+}
+
+fn select_candidate_backed_container_match(
+    matches: Vec<CandidateBackedContainerMatch<'_>>,
+) -> Option<CandidateBackedContainerMatch<'_>> {
+    if matches.len() == 1 {
+        return matches.into_iter().next();
+    }
+
+    let matches = matches
+        .into_iter()
+        .filter(|matched| {
+            !matched.key_type.is_some_and(|key_type| {
+                key_type
+                    .direct_dependency_type_ids
+                    .contains(&matched.value_type.type_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    let [matched] = matches.as_slice() else {
+        return None;
+    };
+    Some(matched.clone())
 }
 
 fn has_container_marshal_sequence(
