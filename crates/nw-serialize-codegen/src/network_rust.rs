@@ -18,7 +18,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v37";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v38";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -2356,6 +2356,10 @@ fn message_nested_shape_uses_source_type(
             .member_name_source
             .as_deref()
             .is_some_and(|source| source.contains("serialize") || source == "ghidra-datatype")
+        && !shape
+            .validation
+            .as_deref()
+            .is_some_and(|validation| validation.contains("native-rtti"))
 }
 
 fn message_nested_shape_support_type_name(
@@ -4003,6 +4007,9 @@ fn replicated_state_field_support_tokens(
 ) -> Vec<proc_macro2::TokenStream> {
     let mut items = Vec::new();
     for shape in &field.container_embedded_value_type_shapes {
+        if !container_embedded_shape_is_referenced(field, shape) {
+            continue;
+        }
         if let Some(tokens) = replicated_state_shape_support_tokens(field, shape, emitted_names) {
             items.push(tokens);
         }
@@ -4013,6 +4020,24 @@ fn replicated_state_field_support_tokens(
         items.push(tokens);
     }
     items
+}
+
+fn container_embedded_shape_is_referenced(
+    field: &NetworkStateFieldShapeReport,
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+) -> bool {
+    let Some(parent) = field.container_value_type_shape.as_ref() else {
+        return false;
+    };
+    parent.members.iter().any(|member| {
+        member
+            .wire_shape
+            .as_deref()
+            .and_then(|wire_shape| {
+                nested_shape_by_wire_name(wire_shape, core::slice::from_ref(shape))
+            })
+            .is_some()
+    })
 }
 
 fn replicated_state_shape_support_tokens(
@@ -4339,15 +4364,7 @@ fn container_member_source_rust_type(native_type: &str) -> Option<String> {
     if matches!(native_type, "Quaternion" | "AZ::Quaternion") {
         return Some("::glam::Quat".to_owned());
     }
-    let leaf = native_type.rsplit("::").next().unwrap_or(native_type);
-    let first = leaf.chars().next()?;
-    if !first.is_ascii_uppercase()
-        || native_type.starts_with("AZ::")
-        || matches!(leaf, "EntityRef" | "FragmentKey")
-    {
-        return None;
-    }
-    serialize_source_rust_type_name(leaf)
+    None
 }
 
 fn runtime_semantic_container_member_type(native_type: &str) -> Option<&'static str> {
@@ -4377,6 +4394,7 @@ fn runtime_semantic_container_member_type(native_type: &str) -> Option<&'static 
         "RemoteServerGDERef" | "RemoteServerGdeRef" => Some("::nw_network::RemoteServerGdeRef"),
         "RemoteServerContextRef" => Some("::nw_network::RemoteServerContextRef"),
         "RemoteTypelessServerFacetRef" => Some("::nw_network::RemoteTypelessServerFacetRef"),
+        "AssetId" | "AZ::Data::AssetId" => Some("::nw_network::AssetId"),
         _ => None,
     }
 }
