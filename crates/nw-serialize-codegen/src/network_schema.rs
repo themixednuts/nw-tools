@@ -3004,7 +3004,7 @@ fn replicated_container_shape_from_vtable(
         )
     } else if ((!full_data.is_empty() && full_values_match_data) || whole_value_is_structured)
         && (delta_key == Some(NetworkWireScalarShape::VlqU64)
-            || (delta_key.is_none() && full_data.len() == 1 && !whole_value_is_structured))
+            || (delta_key.is_none() && full_data.len() == 1))
         && delta_value_shapes.as_ref().is_none_or(|delta_values| {
             delta_key == Some(NetworkWireScalarShape::VlqU64)
                 || delta_values.is_empty()
@@ -3162,9 +3162,6 @@ fn selected_vector_value_type_shape(
     vtable: &NetworkFieldHandlerVtable,
     value_wire_shapes: &[NetworkWireScalarShape],
 ) -> Option<NetworkNestedTypeShape> {
-    if value_wire_shapes.len() <= 1 {
-        return None;
-    }
     if let Some(shape) = vtable.value_type_shape.as_ref()
         && nested_type_shape_matches_wire_shapes(
             shape,
@@ -3173,6 +3170,9 @@ fn selected_vector_value_type_shape(
         )
     {
         return Some(shape.clone());
+    }
+    if value_wire_shapes.len() <= 1 {
+        return None;
     }
     Some(synthetic_container_value_shape_from_wire_shapes(
         "replicated-container-vector-value-shape",
@@ -4437,6 +4437,79 @@ mod tests {
             container_shape.source.as_deref(),
             Some("replicated-container-vector-full-shape")
         );
+    }
+
+    #[test]
+    fn infers_structured_vector_container_from_single_full_value_shape() {
+        let report = json!({
+            "registryEntries": [],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x82f3038",
+                "fieldCount": 2,
+                "handlerKind": "replicated-container",
+                "wireShape": "replicated-container<bool,bool>",
+                "wireShapeSource": "replicated-container-marshal-calls",
+                "deltaMarshalShapes": ["bool", "vlq-u32"],
+                "fullMarshalShapes": ["sequence-number", "bool", "vlq-u32"],
+                "valueTypeShape": {
+                    "typeId": "B715B520-5FC0-4245-84E7-7D974B8410F8",
+                    "typeIdSource": "rtti-provider-vtable",
+                    "typeName": "StatMultiplierData",
+                    "typeNameFull": "StatMultiplierData",
+                    "typeNameSource": "rtti-helper-function-name",
+                    "azRttiAddress": "NewWorld+0x82f2710",
+                    "memberNameSource": "ghidra-datatype",
+                    "memberNamesProven": true,
+                    "validation": "container-value-datatype-layout",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x8",
+                        "name": "m_syncVitals",
+                        "nameSource": "ghidra-datatype",
+                        "nameProven": true,
+                        "nativeType": "bool",
+                        "wireShape": "bool",
+                        "byteWidth": 1,
+                        "evidenceSource": "container-value-datatype-member"
+                    }]
+                },
+                "slots": []
+            }]
+        });
+
+        let schema =
+            NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+        let container_shape = schema.field_handler_vtables[0]
+            .container_shape
+            .as_ref()
+            .expect("structured one-member full value is a vector container");
+
+        assert_eq!(
+            container_shape.storage,
+            NetworkReplicatedContainerStorageKind::Vec
+        );
+        assert_eq!(
+            container_shape.key_wire_shape,
+            NetworkWireScalarShape::VlqU64
+        );
+        assert_eq!(
+            container_shape.value_wire_shapes,
+            vec![NetworkWireScalarShape::Bool]
+        );
+        assert_eq!(
+            container_shape.value_type_name.as_deref(),
+            Some("StatMultiplierData")
+        );
+        assert_eq!(
+            container_shape.value_type_id,
+            Some(uuid!("b715b520-5fc0-4245-84e7-7d974b8410f8"))
+        );
+        assert_eq!(
+            container_shape.source.as_deref(),
+            Some("replicated-container-vector-full-shape")
+        );
+        assert_eq!(schema.field_handler_vtables[0].wire_shape, None);
     }
 
     #[test]

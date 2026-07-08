@@ -19,7 +19,7 @@ use crate::network_schema::{
 };
 use crate::types::{ResolvedType, ScalarType};
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v39";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v40";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -6385,6 +6385,88 @@ mod tests {
         assert!(compact_source.contains("DefaultMarshaler<bool"));
         assert!(compact_source.contains("value:field_value"));
         assert!(compact_source.contains("sync_vitals:field_sync_vitals"));
+    }
+
+    #[test]
+    fn single_member_source_container_value_keeps_projected_source_type() {
+        let value_type_id = uuid!("b715b520-5fc0-4245-84e7-7d974b8410f8");
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "C5021E27-01D8-4E31-87E8-51E00506E07B",
+                "typeIndex": 1525,
+                "typeName": "MB::StatMultiplierTableComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "name": "multiplierTable",
+                    "group": 1,
+                    "handlerVtable": "NewWorld+0x82f3038",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x82f3038",
+                "fieldCount": 2,
+                "handlerKind": "replicated-container",
+                "deltaMarshalShapes": ["bool", "vlq-u32"],
+                "fullMarshalShapes": ["sequence-number", "bool", "vlq-u32"],
+                "valueTypeInfoCandidates": [{
+                    "address": "NewWorld+0x82f2710",
+                    "name": "StatMultiplierData",
+                    "typeId": value_type_id.to_string(),
+                    "source": "rtti-provider-vtable",
+                    "nameSource": "rtti-helper-function-name"
+                }],
+                "valueTypeShape": {
+                    "typeId": value_type_id.to_string(),
+                    "typeIdSource": "rtti-provider-vtable",
+                    "typeName": "StatMultiplierData",
+                    "typeNameFull": "StatMultiplierData",
+                    "typeNameSource": "rtti-helper-function-name",
+                    "azRttiAddress": "NewWorld+0x82f2710",
+                    "memberNameSource": "ghidra-datatype",
+                    "memberNamesProven": true,
+                    "validation": "container-value-datatype-layout",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x8",
+                        "name": "m_syncVitals",
+                        "nameSource": "ghidra-datatype",
+                        "nameProven": true,
+                        "nativeType": "bool",
+                        "wireShape": "bool",
+                        "byteWidth": 1,
+                        "evidenceSource": "container-value-datatype-member"
+                    }]
+                },
+                "slots": []
+            }]
+        }))
+        .expect("schema");
+
+        let output =
+            NetworkRustEmitter::emit_replicated_states(&schema, [1525]).expect("state source");
+        let plan = &output.report.state_generation_plans[0];
+        let field = &plan.fields[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            field.rust_value_type.as_deref(),
+            Some("::std::vec::Vec<::nw_network::source::StatMultiplierData>")
+        );
+        assert!(
+            field
+                .rust_field_type
+                .as_deref()
+                .is_some_and(|ty| { ty.contains("MultiplierTableStatMultiplierDataMarshaler") })
+        );
+        let compact_source = output.source.split_whitespace().collect::<String>();
+        assert!(compact_source.contains("value.sync_vitals"));
+        assert!(compact_source.contains("sync_vitals:field_sync_vitals"));
+        assert!(compact_source.contains("::core::default::Default>::default()"));
+        assert!(
+            !compact_source.contains("DefaultMarshaler<::nw_network::source::StatMultiplierData>")
+        );
     }
 
     #[test]
