@@ -13,7 +13,7 @@ use thiserror::Error;
 pub use container::{
     DecodedFloatImage, DecodedImage, DecodedImage16, Error as Ktx2Error, Ktx2, Sidecar,
     decode_all_mips, decode_all_mips_until, decode_header_mip, decode_mip_max, decode_top_mip,
-    decode_top_mip_float, decode_top_mip_rgba16,
+    decode_top_mip_float, decode_top_mip_rgba16, decode_top_mip_with_attached_alpha,
 };
 
 pub const DDS_EXTENSION: &str = "dds";

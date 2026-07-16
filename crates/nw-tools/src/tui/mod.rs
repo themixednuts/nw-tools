@@ -13,15 +13,14 @@ use std::io;
 
 use std::sync::Arc;
 
+pub use crate::dds::{AlphaSurface, DdsFrame, DdsItem};
 use app::View;
 use datasheet::DatasheetView;
 pub use datasheet::{
     GridCell, GridColumn, GridType, IndexProgress, Loc, LocaleState, SheetData, SheetSource,
 };
 use dds::DdsBrowser;
-pub use dds::{
-    AlphaSurface, DdsCatalog, DdsFrame, DdsItem, PakIndex, SharedIndex, TextureStore, shared_index,
-};
+pub use dds::{DdsCatalog, PakIndex, SharedIndex, TextureStore, shared_index};
 use nw_jobs::JobRunner;
 use ratatui_image::picker::Picker;
 use sheets::SheetPicker;

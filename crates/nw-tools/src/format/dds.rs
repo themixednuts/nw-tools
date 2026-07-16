@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 use humansize::{DECIMAL, format_size};
 use nw_pak::PakMmapReader;
 
 use crate::jobs::{JobArgs, RunCtx};
-use crate::support::{PakSet, collect_matching, ensure_parent, guard_existing, write_guarded};
+use crate::support::{PakSet, collect_matching, write_guarded};
 use crate::ui::{Cell, Report, Table};
 
 use super::common::{finish_scan, path_label, strip_suffix_ignore_ascii_case};
@@ -39,6 +39,42 @@ pub struct Dds {
 
     #[command(flatten)]
     jobs: JobArgs,
+
+    #[command(subcommand)]
+    command: Option<DdsCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum DdsCommand {
+    /// Merge a numbered DDS sequence into one image export.
+    Sequence(DdsSequence),
+}
+
+#[derive(Debug, Args)]
+struct DdsSequence {
+    /// Sequence base or one frame to auto-discover; multiple paths select exact frames.
+    #[arg(required = true, num_args = 1.., value_name = "INPUT")]
+    inputs: Vec<PathBuf>,
+
+    /// Output image format.
+    #[arg(long, value_enum)]
+    to: crate::dds::ImageFormat,
+
+    /// Animated GIF playback rate.
+    #[arg(
+        long,
+        default_value_t = crate::dds::DEFAULT_FRAMES_PER_SECOND,
+        value_parser = clap::value_parser!(u32).range(1..=60)
+    )]
+    fps: u32,
+
+    /// Output image path.
+    #[arg(long, value_name = "PATH")]
+    out: PathBuf,
+
+    /// Replace an existing output.
+    #[arg(long)]
+    overwrite: bool,
 }
 
 /// Output format for `dds --to`.
@@ -46,6 +82,24 @@ pub struct Dds {
 enum DdsFormat {
     Ktx2,
     Png,
+    #[value(alias = "tif")]
+    Tiff,
+    Exr,
+    Gif,
+    Qoi,
+}
+
+impl DdsFormat {
+    const fn image(self) -> Option<crate::dds::ImageFormat> {
+        match self {
+            Self::Ktx2 => None,
+            Self::Png => Some(crate::dds::ImageFormat::Png),
+            Self::Tiff => Some(crate::dds::ImageFormat::Tiff),
+            Self::Exr => Some(crate::dds::ImageFormat::Exr),
+            Self::Gif => Some(crate::dds::ImageFormat::Gif),
+            Self::Qoi => Some(crate::dds::ImageFormat::Qoi),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +129,9 @@ struct DdsConvert {
 
 impl Dds {
     pub(super) fn run(self) -> Result<()> {
+        if let Some(DdsCommand::Sequence(sequence)) = &self.command {
+            return export_dds_sequence(sequence);
+        }
         let ctx = self.jobs.ctx()?;
         if let Some(format) = self.to {
             let path = self
@@ -82,9 +139,9 @@ impl Dds {
                 .as_deref()
                 .context("--to needs a DDS file or directory path")?;
             let out = self.out.as_deref().expect("--out is required with --to");
-            return match format {
-                DdsFormat::Ktx2 => convert_dds_to_ktx2(&ctx, path, out, self.overwrite),
-                DdsFormat::Png => write_dds_png(path, out, self.overwrite),
+            return match format.image() {
+                None => convert_dds_to_ktx2(&ctx, path, out, self.overwrite),
+                Some(format) => write_dds_image(path, out, format, self.overwrite),
             };
         }
         if self.view {
@@ -298,28 +355,12 @@ fn decode_dds(path: &Path) -> Result<(PathBuf, image::RgbaImage)> {
     if path.is_dir() {
         bail!("--view and --to expect a single DDS file, not a directory");
     }
-    let group = collect_dds_groups(path)?
-        .into_iter()
-        .next()
-        .context("no DDS texture found")?;
-    let header_bytes =
-        std::fs::read(&group.header).with_context(|| format!("read {}", group.header.display()))?;
-    let mut sidecar_bytes = Vec::with_capacity(group.sidecars.len());
-    for sidecar in &group.sidecars {
-        let part = split_part_for_path(sidecar)?;
-        let bytes =
-            std::fs::read(sidecar).with_context(|| format!("read {}", sidecar.display()))?;
-        sidecar_bytes.push((part, bytes));
-    }
-    let sidecars = sidecar_bytes
-        .iter()
-        .map(|(part, bytes)| nw_dds::Sidecar::new(*part, bytes.as_slice()))
-        .collect::<Vec<_>>();
-    let decoded = nw_dds::decode_top_mip(&header_bytes, &sidecars)
-        .with_context(|| format!("decode {}", group.header.display()))?;
-    let image = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)
-        .context("decoded texture had an unexpected size")?;
-    Ok((group.header, image))
+    let item = dds_item_for_path(path)?;
+    let frame = item.frames.first().context("no DDS texture found")?;
+    let image = crate::dds::decode_frame(frame, |key| {
+        std::fs::read(key).with_context(|| format!("read {key}"))
+    })?;
+    Ok((PathBuf::from(&frame.header), image))
 }
 
 /// Show a DDS texture inline via the kitty graphics protocol.
@@ -339,18 +380,29 @@ fn view_dds(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Decode a DDS texture and write it as a PNG.
-fn write_dds_png(path: &Path, out: &Path, overwrite: bool) -> Result<()> {
-    let (header, image) = decode_dds(path)?;
-    guard_existing(out, overwrite.into())?;
-    ensure_parent(out)?;
-    image
-        .save(out)
-        .with_context(|| format!("write {}", out.display()))?;
-    Report::new("dds png")
-        .stat("source", path_label(&header))
-        .stat("size", format!("{}x{}", image.width(), image.height()))
-        .stat("png", out.display())
+/// Decode a DDS texture and write it through the shared image exporter.
+fn write_dds_image(
+    path: &Path,
+    out: &Path,
+    format: crate::dds::ImageFormat,
+    overwrite: bool,
+) -> Result<()> {
+    if path.is_dir() {
+        bail!("image export expects a single DDS file, not a directory");
+    }
+    let item = dds_item_for_path(path)?;
+    let exported = crate::dds::export_item(
+        &item,
+        |key| std::fs::read(key).with_context(|| format!("read {key}")),
+        out,
+        format,
+        overwrite,
+        crate::dds::DEFAULT_FRAMES_PER_SECOND,
+    )?;
+    Report::new("dds image")
+        .stat("source", item.label)
+        .stat("size", format!("{}x{}", exported.width, exported.height))
+        .stat("image", exported.output.display())
         .print();
     Ok(())
 }
@@ -509,7 +561,7 @@ fn group_sprites(items: Vec<crate::tui::DdsItem>) -> Vec<crate::tui::DdsItem> {
     let mut sprites: BTreeMap<String, Vec<(u32, crate::tui::DdsItem)>> = BTreeMap::new();
     let mut passthrough = Vec::new();
     for item in items {
-        match sprite_base(&item.label) {
+        match crate::dds::sequence_base(&item.label) {
             Some((base, number)) => sprites.entry(base).or_default().push((number, item)),
             None => passthrough.push(item),
         }
@@ -534,43 +586,191 @@ fn group_sprites(items: Vec<crate::tui::DdsItem>) -> Vec<crate::tui::DdsItem> {
     out
 }
 
-/// Split a `.dds` label into its sprite base and frame number. The frame number is
-/// the trailing run of digits; an optional single `_` separator is absorbed into
-/// the base. The underscore form accepts any digit count (`fx/spark_0.dds` →
-/// (`fx/spark`, 0)); the bare form requires ≥2 digits (`ui/coin01.dds` →
-/// (`ui/coin`, 1)) so ordinary names like `wood1.dds` aren't mistaken for frames.
-fn sprite_base(label: &str) -> Option<(String, u32)> {
-    let stem = label.strip_suffix(".dds")?;
-    let digits = stem.len() - stem.bytes().rev().take_while(u8::is_ascii_digit).count();
-    let (head, digits) = stem.split_at(digits);
-    if digits.is_empty() {
-        return None;
-    }
-    let number = digits.parse().ok()?;
-    let (base, separated) = match head.strip_suffix('_') {
-        Some(base) => (base, true),
-        None => (head, false),
+fn export_dds_sequence(command: &DdsSequence) -> Result<()> {
+    let item = if command.inputs.len() == 1 {
+        discover_sequence(&command.inputs[0])?
+    } else {
+        selected_sequence(&command.inputs)?
     };
-    if base.is_empty() {
-        return None;
-    }
-    // Reject coordinate tiles like `map_l1_y000_x000` (worldtiles): digits that
-    // follow a single-letter axis label (`_x`, `_y`) are a spatial grid, not frames.
-    if let [.., b'_', axis] = base.as_bytes()
-        && axis.is_ascii_alphabetic()
+    let exported = crate::dds::export_item(
+        &item,
+        |key| std::fs::read(key).with_context(|| format!("read {key}")),
+        &command.out,
+        command.to,
+        command.overwrite,
+        command.fps,
+    )?;
+
+    Report::new("dds sequence")
+        .stat("source", item.label)
+        .stat("frames", exported.frames)
+        .stat("size", format!("{}x{}", exported.width, exported.height))
+        .stat("bytes", format_size(exported.bytes, DECIMAL))
+        .stat("image", exported.output.display())
+        .print();
+    Ok(())
+}
+
+/// Resolve one input as a sequence base. An existing frame discovers its numbered
+/// siblings; a non-existent path is treated as the base itself (`spark`,
+/// `spark_`, and `spark_*.dds` are equivalent).
+fn discover_sequence(input: &Path) -> Result<crate::tui::DdsItem> {
+    let existing_header = input
+        .is_file()
+        .then(|| dds_base_header_path(input))
+        .transpose()?;
+    let absolute_input = absolute_path(existing_header.as_deref().unwrap_or(input))?;
+    let input_label = slash_path(&absolute_input);
+    let target = crate::dds::sequence_base(&input_label)
+        .map(|(base, _)| base)
+        .unwrap_or_else(|| sequence_input_base(&input_label));
+    let parent = absolute_input
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut headers = Vec::new();
+    for entry in std::fs::read_dir(parent)
+        .with_context(|| format!("scan DDS sequence in {}", parent.display()))?
     {
-        return None;
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let candidate = entry.path();
+        let Ok(part) = split_part_for_path(&candidate) else {
+            continue;
+        };
+        if part != nw_dds::SplitPart::Header {
+            continue;
+        }
+        let label = slash_path(&candidate);
+        if let Some((base, number)) = crate::dds::sequence_base(&label)
+            && base.eq_ignore_ascii_case(&target)
+        {
+            headers.push((number, candidate));
+        }
     }
-    // A folder explicitly named for a sequence (`.../imagesequence/`, `sequence_*`)
-    // is authoritative: accept any frame numbering, including single-digit bare
-    // frames like `tension0`. Outside such a folder the bare `XNN` form is risky
-    // (e.g. LODs `tree_lod0`, variants `wood1`), so require ≥2 digits there.
-    let directory = label.rsplit_once('/').map_or("", |(dir, _)| dir);
-    let in_sequence_dir = directory.to_ascii_lowercase().contains("sequence");
-    if !separated && !in_sequence_dir && digits.len() < 2 {
-        return None;
+    headers.sort_by_key(|(number, _)| *number);
+
+    if headers.is_empty()
+        && let Some(header) = existing_header
+    {
+        headers.push((0, absolute_path(&header)?));
     }
-    Some((base.to_string(), number))
+    if headers.is_empty() {
+        bail!("no DDS sequence frames found for {}", input.display());
+    }
+
+    let frames = headers
+        .into_iter()
+        .map(|(_, header)| {
+            let item = dds_item_for_path(&header)?;
+            item.frames
+                .into_iter()
+                .next()
+                .context("DDS sequence frame was empty")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(crate::tui::DdsItem {
+        label: format!("{target}_*.dds"),
+        frames,
+    })
+}
+
+/// The multi-input escape hatch: every positional path contributes exactly one
+/// frame, in the order supplied, without sibling discovery.
+fn selected_sequence(inputs: &[PathBuf]) -> Result<crate::tui::DdsItem> {
+    let mut frames = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        if !input.is_file() {
+            bail!("selected DDS frame does not exist: {}", input.display());
+        }
+        let item = dds_item_for_path(input)?;
+        frames.push(
+            item.frames
+                .into_iter()
+                .next()
+                .context("selected DDS frame was empty")?,
+        );
+    }
+    Ok(crate::tui::DdsItem {
+        label: inputs
+            .first()
+            .map_or_else(|| "sequence".to_string(), |path| path.display().to_string()),
+        frames,
+    })
+}
+
+fn sequence_input_base(label: &str) -> String {
+    let without_extension = strip_suffix_ignore_ascii_case(label, ".dds").unwrap_or(label);
+    without_extension
+        .trim_end_matches('*')
+        .trim_end_matches('_')
+        .to_string()
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()
+        .context("resolve current directory")?
+        .join(path))
+}
+
+fn slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Build one logical DDS item from any of its filesystem parts, including the
+/// base split mips and attached-alpha header/mips.
+fn dds_item_for_path(path: &Path) -> Result<crate::tui::DdsItem> {
+    if !path.is_file() {
+        bail!("DDS input does not exist: {}", path.display());
+    }
+    let header = dds_base_header_path(path)?;
+    let parent = header
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut classified = Vec::new();
+    for entry in std::fs::read_dir(parent)
+        .with_context(|| format!("scan DDS parts for {}", header.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let candidate = entry.path();
+        let Ok(part) = split_part_for_path(&candidate) else {
+            continue;
+        };
+        if dds_base_header_path(&candidate)? == header {
+            classified.push((part, candidate.to_string_lossy().into_owned()));
+        }
+    }
+
+    let mut items = group_dds_items(classified, |_| path_label(&header))?;
+    match items.len() {
+        1 => Ok(items.pop().expect("one DDS item was checked")),
+        0 => bail!("no DDS texture found for {}", path.display()),
+        count => bail!("found {count} DDS textures for {}", path.display()),
+    }
+}
+
+fn dds_base_header_path(path: &Path) -> Result<PathBuf> {
+    let part = split_part_for_path(path)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("DDS path is not UTF-8: {}", path.display()))?;
+    let base = dds_base_key(name, part)?;
+    Ok(path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(base))
 }
 
 /// Resolve the base texture key (`foo.dds`) for any DDS part — base or attached
@@ -810,28 +1010,38 @@ fn scan_dds(path: &Path) -> Result<DdsScan> {
 
 #[cfg(test)]
 mod tests {
-    use super::sprite_base;
+    use std::fs;
+
+    use crate::dds::sequence_base;
+
+    use super::{discover_sequence, selected_sequence};
 
     #[test]
     fn sprite_base_matches_underscore_and_bare_forms() {
         // Underscore form: any digit count.
-        assert_eq!(sprite_base("fx/spark_0.dds"), Some(("fx/spark".into(), 0)));
-        assert_eq!(sprite_base("fx/spark_07.dds"), Some(("fx/spark".into(), 7)));
+        assert_eq!(
+            sequence_base("fx/spark_0.dds"),
+            Some(("fx/spark".into(), 0))
+        );
+        assert_eq!(
+            sequence_base("fx/spark_07.dds"),
+            Some(("fx/spark".into(), 7))
+        );
         // Bare form: requires ≥2 digits.
-        assert_eq!(sprite_base("ui/coin01.dds"), Some(("ui/coin".into(), 1)));
-        assert_eq!(sprite_base("ui/coin12.dds"), Some(("ui/coin".into(), 12)));
+        assert_eq!(sequence_base("ui/coin01.dds"), Some(("ui/coin".into(), 1)));
+        assert_eq!(sequence_base("ui/coin12.dds"), Some(("ui/coin".into(), 12)));
     }
 
     #[test]
     fn sprite_base_rejects_non_frames() {
         // A single trailing digit without a separator is part of the name.
-        assert_eq!(sprite_base("wood1.dds"), None);
+        assert_eq!(sequence_base("wood1.dds"), None);
         // No trailing digits at all.
-        assert_eq!(sprite_base("stone.dds"), None);
+        assert_eq!(sequence_base("stone.dds"), None);
         // All digits (no base) is not a frame.
-        assert_eq!(sprite_base("00.dds"), None);
+        assert_eq!(sequence_base("00.dds"), None);
         // Not a DDS.
-        assert_eq!(sprite_base("fx/spark_00.png"), None);
+        assert_eq!(sequence_base("fx/spark_00.png"), None);
     }
 
     #[test]
@@ -839,12 +1049,12 @@ mod tests {
         // World map tiles: trailing digits follow a single-letter axis (`_x`/`_y`),
         // so they must NOT be grouped as animation frames.
         assert_eq!(
-            sprite_base("lyshineui/worldtiles/newworld_vitaeeterna/map_l1_y000_x000.dds"),
+            sequence_base("lyshineui/worldtiles/newworld_vitaeeterna/map_l1_y000_x000.dds"),
             None
         );
-        assert_eq!(sprite_base("map_l1_y001_x017.dds"), None);
+        assert_eq!(sequence_base("map_l1_y001_x017.dds"), None);
         // But an underscore-separated frame after a single letter is still a frame.
-        assert_eq!(sprite_base("fx/a_07.dds"), Some(("fx/a".into(), 7)));
+        assert_eq!(sequence_base("fx/a_07.dds"), Some(("fx/a".into(), 7)));
     }
 
     #[test]
@@ -852,19 +1062,58 @@ mod tests {
         // Real single-digit bare frames in a `*sequence*` folder must be grouped.
         let dir = "lyshineui/images/hud/fishing/tensionimagesequence";
         assert_eq!(
-            sprite_base(&format!("{dir}/tension0.dds")),
+            sequence_base(&format!("{dir}/tension0.dds")),
             Some((format!("{dir}/tension"), 0))
         );
         assert_eq!(
-            sprite_base(&format!("{dir}/tension9.dds")),
+            sequence_base(&format!("{dir}/tension9.dds")),
             Some((format!("{dir}/tension"), 9))
         );
         assert_eq!(
-            sprite_base(&format!("{dir}/tension12.dds")),
+            sequence_base(&format!("{dir}/tension12.dds")),
             Some((format!("{dir}/tension"), 12))
         );
         // Single-digit bare suffix outside a sequence folder stays a plain texture
         // (LODs/variants, e.g. `tree_lod0`).
-        assert_eq!(sprite_base("objects/tree/tree_lod0.dds"), None);
+        assert_eq!(sequence_base("objects/tree/tree_lod0.dds"), None);
+    }
+
+    #[test]
+    fn one_input_discovers_and_numerically_orders_sibling_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("spark_sequence");
+        fs::create_dir(&directory).unwrap();
+        for name in [
+            "spark_10.dds",
+            "spark_2.dds",
+            "spark_2.dds.1",
+            "spark_2.dds.a",
+        ] {
+            fs::write(directory.join(name), []).unwrap();
+        }
+
+        let item = discover_sequence(&directory.join("spark")).unwrap();
+
+        assert_eq!(item.frames.len(), 2);
+        assert!(item.frames[0].header.ends_with("spark_2.dds"));
+        assert!(item.frames[1].header.ends_with("spark_10.dds"));
+        assert_eq!(item.frames[0].sidecars.len(), 1);
+        assert!(item.frames[0].alpha.is_some());
+    }
+
+    #[test]
+    fn multiple_inputs_preserve_only_the_selected_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let frames =
+            ["spark_0.dds", "spark_1.dds", "spark_2.dds"].map(|name| temp.path().join(name));
+        for path in &frames {
+            fs::write(path, []).unwrap();
+        }
+
+        let item = selected_sequence(&[frames[2].clone(), frames[0].clone()]).unwrap();
+
+        assert_eq!(item.frames.len(), 2);
+        assert!(item.frames[0].header.ends_with("spark_2.dds"));
+        assert!(item.frames[1].header.ends_with("spark_0.dds"));
     }
 }

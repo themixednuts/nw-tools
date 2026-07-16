@@ -100,6 +100,16 @@ pub enum Error {
     #[error("unexpected DDS split part {part}")]
     UnexpectedSidecar { part: SplitPart },
 
+    #[error(
+        "attached-alpha DDS dimensions {alpha_width}x{alpha_height} do not match color {color_width}x{color_height}"
+    )]
+    AttachedAlphaDimensions {
+        color_width: u32,
+        color_height: u32,
+        alpha_width: u32,
+        alpha_height: u32,
+    },
+
     #[error("{what} is too large for KTX2")]
     SizeOverflow { what: &'static str },
 }
@@ -307,6 +317,62 @@ pub fn decode_top_mip<'a>(
         height,
         rgba,
     })
+}
+
+/// Decode the largest color mip and merge Cry's optional attached-alpha DDS
+/// (`.dds.a` plus `.dds.Na`) into the returned RGBA alpha channel.
+///
+/// The signal-channel selection matches Lumberyard/New World's texture source
+/// transform: single/dual-channel and BC4/BC5 alpha surfaces use red; ordinary
+/// RGBA surfaces use alpha.
+pub fn decode_top_mip_with_attached_alpha<'a>(
+    bytes: &'a [u8],
+    sidecars: &[Sidecar<'a>],
+    attached_alpha: Option<(&'a [u8], &[Sidecar<'a>])>,
+) -> Result<DecodedImage, Error> {
+    let mut color = decode_top_mip(bytes, sidecars)?;
+    let Some((alpha_bytes, alpha_sidecars)) = attached_alpha else {
+        return Ok(color);
+    };
+    let (alpha_texture, alpha_blocks, alpha_width, alpha_height) =
+        top_mip_blocks(alpha_bytes, alpha_sidecars)?;
+    if color.width != alpha_width || color.height != alpha_height {
+        return Err(Error::AttachedAlphaDimensions {
+            color_width: color.width,
+            color_height: color.height,
+            alpha_width,
+            alpha_height,
+        });
+    }
+    let alpha = decode_rgba(
+        alpha_texture.format.vk,
+        alpha_blocks,
+        alpha_width as usize,
+        alpha_height as usize,
+    )?;
+    let signal = if matches!(
+        alpha_texture.format.vk,
+        VK_FORMAT_R8_UNORM
+            | VK_FORMAT_R8G8_UNORM
+            | VK_FORMAT_R16_UNORM
+            | VK_FORMAT_R16_SFLOAT
+            | VK_FORMAT_R16G16_UNORM
+            | VK_FORMAT_R16G16_SFLOAT
+            | VK_FORMAT_R32_SFLOAT
+            | VK_FORMAT_R32G32_SFLOAT
+            | VK_FORMAT_BC4_UNORM_BLOCK
+            | VK_FORMAT_BC4_SNORM_BLOCK
+            | VK_FORMAT_BC5_UNORM_BLOCK
+            | VK_FORMAT_BC5_SNORM_BLOCK
+    ) {
+        0
+    } else {
+        3
+    };
+    for (pixel, alpha_pixel) in color.rgba.chunks_exact_mut(4).zip(alpha.chunks_exact(4)) {
+        pixel[3] = alpha_pixel[signal];
+    }
+    Ok(color)
 }
 
 /// Decode the largest mip of a DDS to RGBA16 UNORM, assembling split sidecars
@@ -1753,6 +1819,25 @@ mod tests {
         assert_eq!(
             decoded.rgba,
             vec![0, 0, 0, 255, 64, 0, 0, 255, 128, 0, 0, 255, 255, 0, 0, 255,]
+        );
+    }
+
+    #[test]
+    fn merges_attached_alpha_red_plane_into_color() {
+        let mut color = dds_header(*b"DXT1", 2, 2, 1, 0);
+        // One BC1 block encoding opaque white.
+        color.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
+        let mut alpha = dds_alpha8_header(2, 2);
+        alpha.extend_from_slice(&[0, 64, 128, 255]);
+
+        let decoded = decode_top_mip_with_attached_alpha(&color, &[], Some((&alpha, &[]))).unwrap();
+        assert_eq!(
+            decoded
+                .rgba
+                .chunks_exact(4)
+                .map(|pixel| pixel[3])
+                .collect::<Vec<_>>(),
+            vec![0, 64, 128, 255]
         );
     }
 

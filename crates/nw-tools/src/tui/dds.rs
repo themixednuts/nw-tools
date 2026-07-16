@@ -26,6 +26,7 @@ use ratatui_image::{Image, Resize};
 use nw_jobs::{CancellationToken, JobRunner};
 
 use super::app::{Flow, View};
+use crate::dds::{DdsFrame, DdsItem};
 use crate::fuzzy;
 use crate::ui::theme::{self, Caps};
 
@@ -67,7 +68,7 @@ const THUMB_DISK_CAP: u64 = 10 * 1024 * 1024 * 1024;
 /// well below that, but allow it).
 const FPS_MIN: u32 = 1;
 const FPS_MAX: u32 = 60;
-const FPS_DEFAULT: u32 = 30;
+const FPS_DEFAULT: u32 = crate::dds::DEFAULT_FRAMES_PER_SECOND;
 
 /// Resolves a texture key (a pak virtual path) to the archive entry that holds
 /// it. Built during discovery from the readers it already opened, so reads are an
@@ -179,57 +180,6 @@ impl DdsCatalog {
     }
 }
 
-/// One frame of a texture: its DDS header path, split sidecars, and optional
-/// attached-alpha surface. A standalone texture is a single frame; a sprite
-/// sequence (`X_NN.dds`) has several.
-#[derive(Clone)]
-pub struct DdsFrame {
-    pub header: String,
-    pub sidecars: Vec<(nw_dds::SplitPart, String)>,
-    /// The attached-alpha surface (`.dds.a` header + `.dds.Na` mips), if present —
-    /// a second image of the same texture (gloss/opacity), viewable on its own.
-    pub alpha: Option<AlphaSurface>,
-}
-
-/// A browser entry: a single texture, or a sprite sequence shown as one
-/// animatable entry (its `X_NN.dds` frames grouped into `frames`).
-#[derive(Clone)]
-pub struct DdsItem {
-    /// Display label (relative path, forward slashes).
-    pub label: String,
-    /// One or more frames; more than one means an animated sprite.
-    pub frames: Vec<DdsFrame>,
-}
-
-impl DdsItem {
-    /// A single-frame entry.
-    #[must_use]
-    pub fn single(label: String, frame: DdsFrame) -> Self {
-        Self {
-            label,
-            frames: vec![frame],
-        }
-    }
-
-    /// The frame at `index`, wrapping — for animation.
-    #[must_use]
-    pub fn frame(&self, index: usize) -> &DdsFrame {
-        &self.frames[index % self.frames.len().max(1)]
-    }
-
-    #[must_use]
-    pub fn is_sprite(&self) -> bool {
-        self.frames.len() > 1
-    }
-}
-
-/// The attached-alpha companion surface of a [`DdsItem`].
-#[derive(Clone)]
-pub struct AlphaSurface {
-    pub header: String,
-    pub sidecars: Vec<(nw_dds::SplitPart, String)>,
-}
-
 /// One decoded mip level, sized for display. `width`/`height` are the mip's true
 /// dimensions (the `image` may be downscaled for transmission).
 struct Mip {
@@ -317,6 +267,11 @@ struct EncodeResult {
     key: FocusKey,
     generation: u64,
     protocol: Option<Arc<Protocol>>,
+}
+
+/// Completion of a browser-initiated image export.
+struct ExportResult {
+    result: Result<crate::dds::ExportedImage, String>,
 }
 
 /// One thumbnail decode job for the worker pool: decode `key` = `(item, frame)` at
@@ -457,6 +412,8 @@ pub struct DdsBrowser {
     catalog: Arc<DdsCatalog>,
     /// Where the textures came from — shown in the header (e.g. the install path).
     source: String,
+    /// Retained for browser exports; preview and thumbnail workers share it too.
+    store: Arc<TextureStore>,
     /// Lowercased label per item (parallel to `items`), for fuzzy filtering.
     haystacks: Vec<String>,
     /// All item indices sorted by label — the unfiltered display order.
@@ -537,6 +494,11 @@ pub struct DdsBrowser {
     /// The focus image-area size from the last render; a change invalidates the
     /// encoded protocols (they were sized for the old area).
     focus_size: Option<(u16, u16)>,
+    /// Editable output path while the export prompt is active.
+    export_path: Option<String>,
+    export_tx: CbSender<ExportResult>,
+    export_rx: CbReceiver<ExportResult>,
+    export_busy: bool,
     status: Option<String>,
     result: Option<String>,
 }
@@ -563,17 +525,19 @@ impl DdsBrowser {
         let (thumb_jobs, thumb_results) = spawn_thumb_pool(
             workers,
             catalog.clone(),
-            store,
+            store.clone(),
             thumb_cache,
             picker.clone(),
             thumb_generation.clone(),
         );
         let (encode_tx, encode_rx) = spawn_encoder(picker);
+        let (export_tx, export_rx) = unbounded();
         let mut browser = Self {
             caps,
             items: Vec::new(),
             catalog,
             source,
+            store,
             haystacks: Vec::new(),
             order: Vec::new(),
             visible: Vec::new(),
@@ -610,6 +574,10 @@ impl DdsBrowser {
             encode_generation: 0,
             preview_lru: VecDeque::new(),
             focus_size: None,
+            export_path: None,
+            export_tx,
+            export_rx,
+            export_busy: false,
             status: None,
             result: None,
         };
@@ -973,6 +941,7 @@ impl DdsBrowser {
             KeyCode::Char('G') | KeyCode::End => self.select(self.visible.len().saturating_sub(1)),
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('y') => self.copy_path(),
+            KeyCode::Char('e') => self.begin_export(),
             KeyCode::Enter => self.focus(),
             _ => {}
         }
@@ -1005,6 +974,7 @@ impl DdsBrowser {
                 self.refocus();
             }
             KeyCode::Char('y') => self.copy_path(),
+            KeyCode::Char('e') => self.begin_export(),
             KeyCode::Enter => {
                 if let Some(item) = self.current_item() {
                     self.result = Some(self.items[item].frame(0).header.clone());
@@ -1067,6 +1037,78 @@ impl DdsBrowser {
             });
         }
     }
+
+    fn begin_export(&mut self) {
+        if self.export_busy {
+            self.status = Some("an export is already running".to_string());
+            return;
+        }
+        if let Some(item) = self.current_item() {
+            self.export_path = Some(
+                crate::dds::default_export_path(
+                    &self.items[item].label,
+                    crate::dds::ImageFormat::Png,
+                )
+                .display()
+                .to_string(),
+            );
+            self.status = None;
+        }
+    }
+
+    fn submit_export(&mut self) {
+        let Some(path) = self.export_path.take() else {
+            return;
+        };
+        let output = PathBuf::from(path.trim());
+        if output.as_os_str().is_empty() {
+            self.status = Some("export cancelled: output path is empty".to_string());
+            return;
+        }
+        let format = match crate::dds::ImageFormat::from_path(&output) {
+            Ok(format) => format,
+            Err(error) => {
+                self.status = Some(error.to_string());
+                return;
+            }
+        };
+        let Some(item) = self.current_item().map(|item| self.items[item].clone()) else {
+            return;
+        };
+        let store = self.store.clone();
+        let sender = self.export_tx.clone();
+        let frames_per_second = self.fps;
+        self.export_busy = true;
+        self.status = Some(format!("exporting {}", output.display()));
+        std::thread::spawn(move || {
+            let result = crate::dds::export_item(
+                &item,
+                |key| store.read(key).map_err(anyhow::Error::msg),
+                &output,
+                format,
+                false,
+                frames_per_second,
+            )
+            .map_err(|error| error.to_string());
+            let _ = sender.send(ExportResult { result });
+        });
+    }
+
+    fn drain_exports(&mut self) {
+        while let Ok(done) = self.export_rx.try_recv() {
+            self.export_busy = false;
+            self.status = Some(match done.result {
+                Ok(exported) => format!(
+                    "exported {} frame(s), {}x{} to {}",
+                    exported.frames,
+                    exported.width,
+                    exported.height,
+                    exported.output.display()
+                ),
+                Err(error) => format!("export failed: {error}"),
+            });
+        }
+    }
 }
 
 impl View for DdsBrowser {
@@ -1078,6 +1120,9 @@ impl View for DdsBrowser {
         // Keep redrawing while discovery streams textures in, or while anything
         // on screen is still decoding (the focused preview, or grid thumbnails).
         if self.catalog.is_scanning() {
+            return true;
+        }
+        if self.export_busy {
             return true;
         }
         // A playing sprite always redraws at its frame rate (grid or focus).
@@ -1099,6 +1144,7 @@ impl View for DdsBrowser {
         self.ingest();
         self.drain_thumbs();
         self.drain_encodes();
+        self.drain_exports();
     }
 
     fn poll_interval(&self) -> Duration {
@@ -1120,6 +1166,24 @@ impl View for DdsBrowser {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Flow {
+        if self.export_path.is_some() {
+            match key.code {
+                KeyCode::Esc => self.export_path = None,
+                KeyCode::Enter => self.submit_export(),
+                KeyCode::Backspace => {
+                    if let Some(path) = &mut self.export_path {
+                        path.pop();
+                    }
+                }
+                KeyCode::Char(character) => {
+                    if let Some(path) = &mut self.export_path {
+                        path.push(character);
+                    }
+                }
+                _ => {}
+            }
+            return Flow::Continue;
+        }
         if self.filtering {
             match key.code {
                 KeyCode::Esc => {
@@ -1353,7 +1417,7 @@ impl DdsBrowser {
             let entry = &self.items[item];
             let name = entry.label.rsplit('/').next().unwrap_or(&entry.label);
             // Mark sprites (animated sequences) with a play glyph + frame count.
-            let name = if entry.is_sprite() {
+            let name = if entry.is_sequence() {
                 format!("▶{} {name}", entry.frames.len())
             } else {
                 name.to_string()
@@ -1681,7 +1745,14 @@ impl DdsBrowser {
     }
 
     fn render_bottom(&self, frame: &mut Frame, area: Rect) {
-        let line = if self.filtering {
+        let line = if let Some(path) = &self.export_path {
+            Line::from(vec![
+                Span::styled("export ", theme::accent()),
+                Span::raw(path.clone()),
+                Span::styled("▏", theme::dim()),
+                Span::styled("  (.png/.tiff/.exr/.gif/.qoi)", theme::dim()),
+            ])
+        } else if self.filtering {
             Line::from(vec![
                 Span::styled("/", theme::accent()),
                 Span::raw(self.filter.clone()),
@@ -1694,17 +1765,21 @@ impl DdsBrowser {
             // animated sequence.
             let sprite = self.focused && self.focused_frames() > 1;
             let hint = match (self.focused, sprite, self.caps.unicode) {
-                (false, _, true) => "↑↓←→ move   ⏎ open   / filter   y copy   q quit",
-                (false, _, false) => "arrows move   enter open   / filter   y copy   q quit",
+                (false, _, true) => "↑↓←→ move   ⏎ open   / filter   e export   y copy   q quit",
+                (false, _, false) => {
+                    "arrows move   enter open   / filter   e export   y copy   q quit"
+                }
                 (true, true, true) => {
-                    "[ ] mip   a alpha   space play   ± fps   , . frame   m join   esc back"
+                    "[ ] mip  a alpha  space play  ± fps  , . frame  m join  e export  esc back"
                 }
                 (true, true, false) => {
-                    "[ ] mip   a alpha   space play   +/- fps   , . frame   m join   esc back"
+                    "[ ] mip  a alpha  space play  +/- fps  , . frame  m join  e export  esc back"
                 }
-                (true, false, true) => "[ ] mip   a alpha   ↑↓ texture   ⏎ select   esc back",
+                (true, false, true) => {
+                    "[ ] mip   a alpha   ↑↓ texture   e export   ⏎ select   esc back"
+                }
                 (true, false, false) => {
-                    "[ ] mip   a alpha   up/dn texture   enter select   esc back"
+                    "[ ] mip   a alpha   up/dn texture   e export   enter select   esc back"
                 }
             };
             Line::from(Span::styled(hint.to_string(), theme::dim()))
@@ -1793,21 +1868,7 @@ fn montage_sheet(frames: &[Arc<Preview>]) -> Option<RgbaImage> {
                 .map(|m| &m.image)
         })
         .collect::<Option<Vec<_>>>()?;
-    if images.is_empty() {
-        return None;
-    }
-    let count = images.len();
-    let cols = (count as f64).sqrt().ceil() as usize;
-    let rows = count.div_ceil(cols);
-    let cell_w = images.iter().map(|image| image.width()).max().unwrap_or(1);
-    let cell_h = images.iter().map(|image| image.height()).max().unwrap_or(1);
-    let mut sheet = RgbaImage::new(cell_w * cols as u32, cell_h * rows as u32);
-    for (index, image) in images.iter().enumerate() {
-        let x = (index % cols) as u32 * cell_w + (cell_w - image.width()) / 2;
-        let y = (index / cols) as u32 * cell_h + (cell_h - image.height()) / 2;
-        image::imageops::overlay(&mut sheet, *image, i64::from(x), i64::from(y));
-    }
-    Some(sheet)
+    crate::dds::sequence_sheet(&images)
 }
 
 fn decode_loop(

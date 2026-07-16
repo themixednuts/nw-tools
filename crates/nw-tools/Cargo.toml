@@ -36,7 +36,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 frizbee = "0.9.0"
 arboard = { version = "3.6.1", default-features = false }
-image = { version = "0.25.10", default-features = false, features = ["png", "qoi"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "qoi", "tiff", "exr", "gif"] }
 base64 = "0.22.1"
 uuid.workspace = true
 drizzle = { version = "0.1.9", features = ["rusqlite"] }
@@ -45,3 +45,6 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 [build-dependencies]
 drizzle-migrations = "0.1.9"
 drizzle-types = "0.1.9"
+
+[dev-dependencies]
+tempfile.workspace = true

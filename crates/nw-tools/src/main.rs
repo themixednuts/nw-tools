@@ -1,5 +1,6 @@
 mod asset;
 mod cache;
+mod dds;
 mod extract;
 mod format;
 mod fuzzy;
