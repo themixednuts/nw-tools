@@ -8,6 +8,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use cry_xml::XmlElement;
+use nw_asset::{AssetDependencies, AssetDependency, AssetDependencyTarget};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AudioControlsSource {
@@ -85,6 +86,78 @@ impl AudioControlsSource {
             }
         }
         Ok(source)
+    }
+}
+
+impl AssetDependencies for AudioControlsSource {
+    fn asset_dependencies(&self) -> Vec<AssetDependency> {
+        let mut dependencies = Vec::new();
+        for file in self.preloads.iter().flat_map(|preload| {
+            preload
+                .files
+                .iter()
+                .chain(preload.config_groups.iter().flat_map(|group| &group.files))
+        }) {
+            let name = normalize_path(&file.wwise_name);
+            let path = if name.contains('/') {
+                name
+            } else {
+                format!("sounds/wwise/{name}")
+            };
+            let localized = file
+                .localized
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+            let target = if localized {
+                let basename = path.rsplit('/').next().unwrap_or(&path);
+                AssetDependencyTarget::pattern(format!("sounds/wwise/**/{basename}"))
+            } else {
+                AssetDependencyTarget::path(path)
+            };
+            dependencies.push(AssetDependency::required("audio.preload_bank", target));
+        }
+
+        for reference in self
+            .triggers
+            .iter()
+            .flat_map(|control| &control.requests)
+            .chain(self.rtpcs.iter().flat_map(|control| &control.requests))
+            .chain(
+                self.switches
+                    .iter()
+                    .chain(&self.states)
+                    .flat_map(|control| &control.states)
+                    .flat_map(|state| &state.requests),
+            )
+            .chain(
+                self.environments
+                    .iter()
+                    .flat_map(|control| &control.requests),
+            )
+        {
+            push_backend_symbols(reference, &mut dependencies);
+        }
+        dependencies
+    }
+}
+
+fn push_backend_symbols(
+    reference: &AudioBackendReference,
+    dependencies: &mut Vec<AssetDependency>,
+) {
+    if let Some(name) = reference
+        .wwise_name
+        .as_deref()
+        .or(reference.atl_name.as_deref())
+        && !name.trim().is_empty()
+    {
+        dependencies.push(AssetDependency::optional(
+            format!("audio.backend.{:?}", reference.kind).to_ascii_lowercase(),
+            AssetDependencyTarget::symbol(name),
+        ));
+    }
+    for child in &reference.children {
+        push_backend_symbols(child, dependencies);
     }
 }
 

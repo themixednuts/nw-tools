@@ -15,5 +15,6 @@ workspace = true
 crc32fast.workspace = true
 cry-chunk.workspace = true
 cry-xml.workspace = true
+nw-asset.workspace = true
 nw-reflected-types.workspace = true
 thiserror.workspace = true

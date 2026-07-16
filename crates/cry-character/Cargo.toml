@@ -10,6 +10,7 @@ description = "Lossless Cry/Lumberyard character-definition and attachment graph
 
 [dependencies]
 cry-xml.workspace = true
+nw-asset.workspace = true
 nw-reflected-types.workspace = true
 thiserror.workspace = true
 

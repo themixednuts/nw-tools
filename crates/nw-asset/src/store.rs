@@ -22,6 +22,8 @@ pub enum AssetStoreError {
     ParseCatalog { path: PathBuf, source: CatalogError },
     #[error("read asset {path:?}: {source}")]
     ReadFile { path: PathBuf, source: io::Error },
+    #[error("asset `{path}` was not found")]
+    NotFound { path: Box<str> },
     #[error("read directory {path:?}: {source}")]
     ReadDir { path: PathBuf, source: io::Error },
     #[error("read pak {path:?}: {source}")]
@@ -230,6 +232,27 @@ impl AssetStore {
         self.read(&self.info(path))
     }
 
+    pub fn read_required_path(&self, path: &str) -> Result<Vec<u8>, AssetStoreError> {
+        self.read_path(path)?
+            .ok_or_else(|| AssetStoreError::NotFound {
+                path: normalize_virtual_path(path).into_boxed_str(),
+            })
+    }
+
+    pub fn read_id(&self, asset_id: AssetId) -> Result<Option<Vec<u8>>, AssetStoreError> {
+        let Some(asset) = self.resolve_id(asset_id) else {
+            return Ok(None);
+        };
+        self.read(&asset)
+    }
+
+    pub fn read_required_id(&self, asset_id: AssetId) -> Result<Vec<u8>, AssetStoreError> {
+        self.read_id(asset_id)?
+            .ok_or_else(|| AssetStoreError::NotFound {
+                path: asset_id.to_string().into_boxed_str(),
+            })
+    }
+
     pub fn read(&self, asset: &AssetInfo) -> Result<Option<Vec<u8>>, AssetStoreError> {
         let loose = self.path(asset.path())?;
         if loose.is_file() {
@@ -296,27 +319,65 @@ impl AssetStore {
 
 pub fn load_catalog(root: &Path) -> Result<Option<AssetCatalog>, AssetStoreError> {
     let rasc_path = root.join(ASSET_CATALOG_PATH);
-    if !rasc_path.is_file() {
-        return Ok(None);
-    }
-
-    let rasc_bytes = fs::read(&rasc_path).map_err(|source| AssetStoreError::ReadCatalog {
-        path: rasc_path.clone(),
-        source,
-    })?;
-    let rasc = Rasc::parse(&rasc_bytes).map_err(|source| AssetStoreError::ParseCatalog {
-        path: rasc_path,
-        source,
-    })?;
     let raoc_path = root.join(ASSET_CATALOG_OPTIMIZED_PATH);
-    let raoc = if raoc_path.is_file() {
-        let bytes = fs::read(&raoc_path).map_err(|source| AssetStoreError::ReadCatalog {
-            path: raoc_path.clone(),
+    let (rasc_bytes, raoc_bytes, rasc_label, raoc_label) = if rasc_path.is_file() {
+        let rasc_bytes = fs::read(&rasc_path).map_err(|source| AssetStoreError::ReadCatalog {
+            path: rasc_path.clone(),
             source,
         })?;
+        let raoc_bytes = if raoc_path.is_file() {
+            Some(
+                fs::read(&raoc_path).map_err(|source| AssetStoreError::ReadCatalog {
+                    path: raoc_path.clone(),
+                    source,
+                })?,
+            )
+        } else {
+            None
+        };
+        (rasc_bytes, raoc_bytes, rasc_path, raoc_path)
+    } else {
+        let engine_path = root.join("Engine.pak");
+        if !engine_path.is_file() {
+            return Ok(None);
+        }
+        let reader = PakMmapReader::open(&engine_path).map_err(|source| AssetStoreError::Pak {
+            path: engine_path.clone(),
+            source,
+        })?;
+        let rasc_bytes =
+            reader
+                .read_wrapped(ASSET_CATALOG_PATH)
+                .map_err(|source| AssetStoreError::Pak {
+                    path: engine_path.clone(),
+                    source,
+                })?;
+        let raoc_bytes = reader
+            .entry(ASSET_CATALOG_OPTIMIZED_PATH)
+            .map(|entry| {
+                reader
+                    .read_wrapped_by_index(entry.index())
+                    .map_err(|source| AssetStoreError::Pak {
+                        path: engine_path.clone(),
+                        source,
+                    })
+            })
+            .transpose()?;
+        (
+            rasc_bytes,
+            raoc_bytes,
+            engine_path.join(ASSET_CATALOG_PATH),
+            engine_path.join(ASSET_CATALOG_OPTIMIZED_PATH),
+        )
+    };
+    let rasc = Rasc::parse(&rasc_bytes).map_err(|source| AssetStoreError::ParseCatalog {
+        path: rasc_label,
+        source,
+    })?;
+    let raoc = if let Some(bytes) = raoc_bytes {
         Some(
             Raoc::parse(&bytes).map_err(|source| AssetStoreError::ParseCatalog {
-                path: raoc_path,
+                path: raoc_label,
                 source,
             })?,
         )
@@ -399,7 +460,7 @@ mod tests {
     fn catalog_info_uses_catalog_identity() {
         let asset_id = AssetId::new(uuid::Uuid::from_u128(1), 2);
         let asset_type = AssetType::new(uuid::Uuid::from_u128(3));
-        let rasc = Rasc::from_entries(
+        let rasc = Rasc::new(
             1,
             vec![crate::RascEntry::new(asset_id, asset_type, "a/b.dds", 7)],
         );

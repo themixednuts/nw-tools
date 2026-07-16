@@ -19,9 +19,9 @@ const RASC_HEADER_LEN: usize = 40;
 const RASC_ENTRY_LEN: usize = 40;
 const RAOC_HEADER_LEN: usize = 20;
 const RAOC_ENTRY_LEN: usize = 48;
-const RAOC_AUX_LEN: usize = 32;
+const RAOC_GUID_INFO_LEN: usize = 32;
 const RAOC_PATH_LEN: usize = 48;
-const RAOC_DEP_LEN: usize = 32;
+const RAOC_LEGACY_MAPPING_LEN: usize = 32;
 const RAOC_TYPE_LEN: usize = 48;
 const GUID_LEN: usize = 16;
 
@@ -111,9 +111,22 @@ impl Catalog {
     /// Returns [`Error`] if the input is not a supported `RASC` or `RAOC`
     /// catalog, or if any table, string, GUID, or size field is malformed.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse_with_runner(bytes, &nw_jobs::JobRunner::automatic())
+    }
+
+    /// Parse a catalog using the caller's worker policy for fixed-record tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] under the same conditions as [`Self::parse`].
+    pub fn parse_with_runner(bytes: &[u8], runner: &nw_jobs::JobRunner) -> Result<Self, Error> {
         match detect(bytes)? {
-            Kind::Rasc => Rasc::parse(bytes).map(Box::new).map(Self::Rasc),
-            Kind::Raoc => Raoc::parse(bytes).map(Box::new).map(Self::Raoc),
+            Kind::Rasc => Rasc::parse_with_runner(bytes, runner)
+                .map(Box::new)
+                .map(Self::Rasc),
+            Kind::Raoc => Raoc::parse_with_runner(bytes, runner)
+                .map(Box::new)
+                .map(Self::Raoc),
         }
     }
 
@@ -219,6 +232,7 @@ pub struct Rasc {
     entries: Vec<RascEntry>,
     by_id: HashMap<AssetId, usize>,
     by_path: HashMap<String, usize>,
+    by_source: HashMap<Uuid, Vec<usize>>,
 }
 
 impl RascEntry {
@@ -271,21 +285,72 @@ impl Rasc {
     /// Returns [`Error`] if the input is not a valid `RASC` catalog or when
     /// any table offset, string, GUID, or size sentinel is malformed.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        parse_rasc(bytes)
+        Self::parse_with_runner(bytes, &nw_jobs::JobRunner::automatic())
     }
 
-    pub(crate) fn from_entries(version: u32, entries: Vec<RascEntry>) -> Self {
+    /// Parse a `RASC` catalog using the caller's worker policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] under the same conditions as [`Self::parse`].
+    pub fn parse_with_runner(bytes: &[u8], runner: &nw_jobs::JobRunner) -> Result<Self, Error> {
+        parse_rasc(bytes, runner)
+    }
+
+    #[must_use]
+    pub fn new(version: u32, entries: Vec<RascEntry>) -> Self {
+        Self::new_with_runner(version, entries, &nw_jobs::JobRunner::inline())
+    }
+
+    /// Build lookup indexes using the caller's worker policy.
+    #[must_use]
+    pub fn new_with_runner(
+        version: u32,
+        entries: Vec<RascEntry>,
+        runner: &nw_jobs::JobRunner,
+    ) -> Self {
+        let lane_count = runner.parallelism().saturating_mul(4).max(1);
+        let chunk_size = entries.len().div_ceil(lane_count).max(1);
+        let ranges = (0..entries.len())
+            .step_by(chunk_size)
+            .map(|start| start..entries.len().min(start + chunk_size))
+            .collect::<Vec<_>>();
+        let partial = runner.map(&ranges, |range| {
+            let mut by_id = HashMap::with_capacity(range.len());
+            let mut by_path = HashMap::with_capacity(range.len());
+            let mut by_source = HashMap::<Uuid, Vec<usize>>::new();
+            for index in range.clone() {
+                let entry = &entries[index];
+                by_id.entry(entry.asset_id()).or_insert(index);
+                by_path.entry(entry.path().to_string()).or_insert(index);
+                by_source
+                    .entry(entry.asset_id().guid)
+                    .or_default()
+                    .push(index);
+            }
+            (by_id, by_path, by_source)
+        });
+
         let mut by_id = HashMap::with_capacity(entries.len());
         let mut by_path = HashMap::with_capacity(entries.len());
-        for (index, entry) in entries.iter().enumerate() {
-            by_id.entry(entry.asset_id()).or_insert(index);
-            by_path.entry(entry.path().to_string()).or_insert(index);
+        let mut by_source = HashMap::<Uuid, Vec<usize>>::new();
+        for (partial_id, partial_path, partial_source) in partial {
+            for (asset_id, index) in partial_id {
+                by_id.entry(asset_id).or_insert(index);
+            }
+            for (path, index) in partial_path {
+                by_path.entry(path).or_insert(index);
+            }
+            for (guid, mut indices) in partial_source {
+                by_source.entry(guid).or_default().append(&mut indices);
+            }
         }
         Self {
             version,
             entries,
             by_id,
             by_path,
+            by_source,
         }
     }
 
@@ -332,6 +397,19 @@ impl Rasc {
     pub fn id_by_path(&self, path: &str) -> Option<AssetId> {
         self.entry_by_path(path).map(RascEntry::asset_id)
     }
+
+    /// Product entries emitted from the same source GUID as `asset_id`.
+    pub fn entries_by_source(
+        &self,
+        asset_id: AssetId,
+    ) -> impl ExactSizeIterator<Item = &RascEntry> {
+        self.by_source
+            .get(&asset_id.guid)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|index| &self.entries[*index])
+    }
 }
 
 impl<'a> IntoIterator for &'a Rasc {
@@ -346,15 +424,18 @@ impl<'a> IntoIterator for &'a Rasc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RaocEntry {
     asset_id: AssetId,
-    asset_type: AssetType,
+    asset_id_padding: [u8; 12],
+    metadata_raw: [u8; 8],
     size_bytes: u32,
-    flags: u32,
+    reserved: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AuxIndex {
-    key: [u8; 16],
-    raw: [u8; 16],
+pub struct GuidAssetInfo {
+    asset_id: AssetId,
+    metadata_raw: [u8; 8],
+    size_bytes: u32,
+    reserved: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -364,9 +445,9 @@ pub struct PathId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Dependency {
-    source: AssetId,
-    target: AssetId,
+pub struct LegacyAssetIdMapping {
+    legacy: AssetId,
+    real: AssetId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -381,29 +462,33 @@ pub struct Raoc {
     version: u32,
     file_size: u64,
     entries: Vec<RaocEntry>,
-    aux_index: Vec<AuxIndex>,
+    guid_asset_info: Vec<GuidAssetInfo>,
     path_ids: Vec<PathId>,
-    dependencies: Vec<Dependency>,
+    legacy_mappings: Vec<LegacyAssetIdMapping>,
     types: Vec<TypeInfo>,
     dir_blob: Vec<u8>,
     file_blob: Vec<u8>,
     by_id: HashMap<AssetId, usize>,
+    by_guid: HashMap<Uuid, usize>,
     by_path_hash: HashMap<[u8; 16], AssetId>,
+    by_legacy_id: HashMap<AssetId, AssetId>,
 }
 
 impl RaocEntry {
     #[must_use]
     pub const fn new(
         asset_id: AssetId,
-        asset_type: AssetType,
+        asset_id_padding: [u8; 12],
+        metadata_raw: [u8; 8],
         size_bytes: u32,
-        flags: u32,
+        reserved: u32,
     ) -> Self {
         Self {
             asset_id,
-            asset_type,
+            asset_id_padding,
+            metadata_raw,
             size_bytes,
-            flags,
+            reserved,
         }
     }
 
@@ -413,8 +498,13 @@ impl RaocEntry {
     }
 
     #[must_use]
-    pub const fn asset_type(self) -> AssetType {
-        self.asset_type
+    pub const fn asset_id_padding(self) -> [u8; 12] {
+        self.asset_id_padding
+    }
+
+    #[must_use]
+    pub const fn metadata_raw(self) -> [u8; 8] {
+        self.metadata_raw
     }
 
     #[must_use]
@@ -423,20 +513,30 @@ impl RaocEntry {
     }
 
     #[must_use]
-    pub const fn flags(self) -> u32 {
-        self.flags
+    pub const fn reserved(self) -> u32 {
+        self.reserved
     }
 }
 
-impl AuxIndex {
+impl GuidAssetInfo {
     #[must_use]
-    pub const fn key(self) -> [u8; 16] {
-        self.key
+    pub const fn asset_id(self) -> AssetId {
+        self.asset_id
     }
 
     #[must_use]
-    pub const fn raw(self) -> [u8; 16] {
-        self.raw
+    pub const fn metadata_raw(self) -> [u8; 8] {
+        self.metadata_raw
+    }
+
+    #[must_use]
+    pub const fn size_bytes(self) -> u32 {
+        self.size_bytes
+    }
+
+    #[must_use]
+    pub const fn reserved(self) -> u32 {
+        self.reserved
     }
 }
 
@@ -452,15 +552,20 @@ impl PathId {
     }
 }
 
-impl Dependency {
+impl LegacyAssetIdMapping {
     #[must_use]
-    pub const fn source(self) -> AssetId {
-        self.source
+    pub const fn new(legacy: AssetId, real: AssetId) -> Self {
+        Self { legacy, real }
     }
 
     #[must_use]
-    pub const fn target(self) -> AssetId {
-        self.target
+    pub const fn legacy(self) -> AssetId {
+        self.legacy
+    }
+
+    #[must_use]
+    pub const fn real(self) -> AssetId {
+        self.real
     }
 }
 
@@ -500,7 +605,16 @@ impl Raoc {
     /// its declared file size differs from the buffer length, or if any packed
     /// table is truncated.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        parse_raoc(bytes)
+        Self::parse_with_runner(bytes, &nw_jobs::JobRunner::automatic())
+    }
+
+    /// Parse a `RAOC` catalog using the caller's worker policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] under the same conditions as [`Self::parse`].
+    pub fn parse_with_runner(bytes: &[u8], runner: &nw_jobs::JobRunner) -> Result<Self, Error> {
+        parse_raoc(bytes, runner)
     }
 
     #[must_use]
@@ -519,8 +633,8 @@ impl Raoc {
     }
 
     #[must_use]
-    pub fn aux_index(&self) -> &[AuxIndex] {
-        &self.aux_index
+    pub fn guid_asset_info(&self) -> &[GuidAssetInfo] {
+        &self.guid_asset_info
     }
 
     #[must_use]
@@ -529,8 +643,8 @@ impl Raoc {
     }
 
     #[must_use]
-    pub fn dependencies(&self) -> &[Dependency] {
-        &self.dependencies
+    pub fn legacy_mappings(&self) -> &[LegacyAssetIdMapping] {
+        &self.legacy_mappings
     }
 
     #[must_use]
@@ -567,6 +681,18 @@ impl Raoc {
         self.by_id
             .get(&asset_id)
             .and_then(|index| self.entries.get(*index))
+    }
+
+    #[must_use]
+    pub fn guid_info(&self, guid: Uuid) -> Option<&GuidAssetInfo> {
+        self.by_guid
+            .get(&guid)
+            .and_then(|index| self.guid_asset_info.get(*index))
+    }
+
+    #[must_use]
+    pub fn resolve_legacy_id(&self, asset_id: AssetId) -> Option<AssetId> {
+        self.by_legacy_id.get(&asset_id).copied()
     }
 
     #[must_use]
@@ -660,7 +786,7 @@ pub fn detect(bytes: &[u8]) -> Result<Kind, Error> {
     }
 }
 
-fn parse_rasc(bytes: &[u8]) -> Result<Rasc, Error> {
+fn parse_rasc(bytes: &[u8], runner: &nw_jobs::JobRunner) -> Result<Rasc, Error> {
     if bytes.len() < RASC_HEADER_LEN {
         return Err(Error::InputTooSmall { len: bytes.len() });
     }
@@ -684,8 +810,7 @@ fn parse_rasc(bytes: &[u8]) -> Result<Rasc, Error> {
         });
     }
 
-    let mut entries = Vec::with_capacity(entry_count);
-    for index in 0..entry_count {
+    let entries = runner.try_map_indexed(entry_count, |index| {
         let offset = checked_add(RASC_HEADER_LEN, checked_mul(index, RASC_ENTRY_LEN)?)?;
         let record = slice_at(bytes, offset, RASC_ENTRY_LEN, "RASC entry")?;
         let guid_index = usize_from_u32(le_u32(record, 0))?;
@@ -711,99 +836,149 @@ fn parse_rasc(bytes: &[u8]) -> Result<Rasc, Error> {
             format!("{directory}/{file_name}")
         };
         let asset_id = AssetId::new(
-            uuid_le_at(
+            uuid_at(
                 bytes,
                 checked_add(guid_offset, checked_mul(guid_index, GUID_LEN)?)?,
                 "RASC asset id",
             )?,
             sub_id,
         );
-        let asset_type = AssetType::new(uuid_le_at(
+        let asset_type = AssetType::new(uuid_at(
             bytes,
             checked_add(asset_type_offset, checked_mul(asset_type_index, GUID_LEN)?)?,
             "RASC asset type",
         )?);
-        entries.push(RascEntry::new(asset_id, asset_type, path, size_bytes));
-    }
+        Ok(RascEntry::new(asset_id, asset_type, path, size_bytes))
+    })?;
 
-    Ok(Rasc::from_entries(version, entries))
+    Ok(Rasc::new_with_runner(version, entries, runner))
 }
 
-fn parse_raoc(bytes: &[u8]) -> Result<Raoc, Error> {
+fn parse_raoc(bytes: &[u8], runner: &nw_jobs::JobRunner) -> Result<Raoc, Error> {
     let header = RaocHeader::parse(bytes)?;
     let mut reader = RaocReader::new(bytes, checked_raoc_entries_end(header.entry_count)?);
-    let entries = parse_raoc_entries(bytes, header.entry_count)?;
-    let aux_index = reader.table(RAOC_AUX_LEN, "RAOC auxiliary index", |record| {
-        Ok(AuxIndex {
-            key: record_array(record, 0),
-            raw: record_array(record, 16),
-        })
-    })?;
-    let path_ids = reader.table(RAOC_PATH_LEN, "RAOC path table", |record| {
+    let entries = parse_raoc_entries(bytes, header.entry_count, runner)?;
+    let guid_asset_info = reader.table(
+        runner,
+        RAOC_GUID_INFO_LEN,
+        "RAOC GUID-only asset info",
+        |record| {
+            Ok(GuidAssetInfo {
+                asset_id: AssetId::from(uuid_at(record, 0, "RAOC GUID-only asset id")?),
+                metadata_raw: record_array(record, 16),
+                size_bytes: le_u32(record, 24),
+                reserved: le_u32(record, 28),
+            })
+        },
+    )?;
+    let path_ids = reader.table(runner, RAOC_PATH_LEN, "RAOC path table", |record| {
         Ok(PathId {
             path_hash: record_array(record, 0),
             asset_id: AssetId::new(
-                Uuid::from_bytes(record_array(record, 16)),
+                uuid_at(record, 16, "RAOC path asset id")?,
                 le_u32(record, 32),
             ),
         })
     })?;
-    let dependencies = reader.table(RAOC_DEP_LEN, "RAOC dependencies", |record| {
-        Ok(Dependency {
-            source: AssetId::new(Uuid::from_bytes(record_array(record, 0)), 0),
-            target: AssetId::new(Uuid::from_bytes(record_array(record, 16)), 0),
-        })
-    })?;
-    let types = reader.table(RAOC_TYPE_LEN, "RAOC asset type registry", |record| {
-        Ok(TypeInfo {
-            asset_type: AssetType::new(Uuid::from_bytes(record_array(record, 0))),
-            extension_raw: record_array(record, 16),
-            metadata_raw: record_array(record, 32),
-        })
-    })?;
+    let legacy_mappings = reader.table(
+        runner,
+        RAOC_LEGACY_MAPPING_LEN,
+        "RAOC legacy asset-id mappings",
+        |record| {
+            Ok(LegacyAssetIdMapping::new(
+                AssetId::from(uuid_at(record, 0, "RAOC legacy asset id")?),
+                AssetId::from(uuid_at(record, 16, "RAOC real asset id")?),
+            ))
+        },
+    )?;
+    let types = reader.table(
+        runner,
+        RAOC_TYPE_LEN,
+        "RAOC asset type registry",
+        |record| {
+            Ok(TypeInfo {
+                asset_type: AssetType::new(uuid_at(record, 0, "RAOC asset type")?),
+                extension_raw: record_array(record, 16),
+                metadata_raw: record_array(record, 32),
+            })
+        },
+    )?;
     let dir_blob = reader.blob("RAOC directory blob")?.to_vec();
     let file_blob = reader.blob("RAOC file blob")?.to_vec();
 
-    let mut by_id = HashMap::with_capacity(entries.len());
-    for (index, entry) in entries.iter().enumerate() {
-        by_id.insert(entry.asset_id(), index);
-    }
-    let mut by_path_hash = HashMap::with_capacity(path_ids.len());
-    for entry in &path_ids {
-        by_path_hash.insert(entry.path_hash(), entry.asset_id());
-    }
+    let ((by_id, by_guid), (by_path_hash, by_legacy_id)) = runner.join(
+        || {
+            runner.join(
+                || {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, entry)| (entry.asset_id(), index))
+                        .collect()
+                },
+                || {
+                    guid_asset_info
+                        .iter()
+                        .enumerate()
+                        .map(|(index, entry)| (entry.asset_id().guid, index))
+                        .collect()
+                },
+            )
+        },
+        || {
+            runner.join(
+                || {
+                    path_ids
+                        .iter()
+                        .map(|entry| (entry.path_hash(), entry.asset_id()))
+                        .collect()
+                },
+                || {
+                    legacy_mappings
+                        .iter()
+                        .map(|mapping| (mapping.legacy(), mapping.real()))
+                        .collect()
+                },
+            )
+        },
+    );
 
     Ok(Raoc {
         version: header.version,
         file_size: header.file_size,
         entries,
-        aux_index,
+        guid_asset_info,
         path_ids,
-        dependencies,
+        legacy_mappings,
         types,
         dir_blob,
         file_blob,
         by_id,
+        by_guid,
         by_path_hash,
+        by_legacy_id,
     })
 }
 
-fn parse_raoc_entries(bytes: &[u8], count: usize) -> Result<Vec<RaocEntry>, Error> {
-    let mut entries = Vec::with_capacity(count);
-    for index in 0..count {
+fn parse_raoc_entries(
+    bytes: &[u8],
+    count: usize,
+    runner: &nw_jobs::JobRunner,
+) -> Result<Vec<RaocEntry>, Error> {
+    runner.try_map_indexed(count, |index| {
         let offset = checked_add(RAOC_HEADER_LEN, checked_mul(index, RAOC_ENTRY_LEN)?)?;
         let record = slice_at(bytes, offset, RAOC_ENTRY_LEN, "RAOC entry")?;
-        entries.push(RaocEntry::new(
+        Ok(RaocEntry::new(
             AssetId::new(
-                Uuid::from_bytes(record_array(record, 0)),
+                uuid_at(record, 0, "RAOC entry asset id")?,
                 le_u32(record, 16),
             ),
-            AssetType::nil(),
+            record_array(record, 20),
+            record_array(record, 32),
             le_u32(record, 40),
             le_u32(record, 44),
-        ));
-    }
-    Ok(entries)
+        ))
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -856,21 +1031,21 @@ impl<'a> RaocReader<'a> {
         Self { bytes, cursor }
     }
 
-    fn table<T>(
+    fn table<T: Send>(
         &mut self,
+        runner: &nw_jobs::JobRunner,
         stride: usize,
         label: &'static str,
-        mut parse: impl FnMut(&[u8]) -> Result<T, Error>,
+        parse: impl Fn(&[u8]) -> Result<T, Error> + Send + Sync,
     ) -> Result<Vec<T>, Error> {
         let count = usize_from_u32(self.u32(label)?)?;
         let bytes_len = checked_mul(count, stride)?;
         let start = self.cursor;
         let table = self.slice(bytes_len, label)?;
-        let mut rows = Vec::with_capacity(count);
-        for index in 0..count {
+        let rows = runner.try_map_indexed(count, |index| {
             let offset = checked_mul(index, stride)?;
-            rows.push(parse(slice_at(table, offset, stride, label)?)?);
-        }
+            parse(slice_at(table, offset, stride, label)?)
+        })?;
         debug_assert_eq!(self.cursor, checked_add(start, bytes_len)?);
         Ok(rows)
     }
@@ -897,16 +1072,9 @@ fn checked_raoc_entries_end(count: usize) -> Result<usize, Error> {
     checked_add(RAOC_HEADER_LEN, checked_mul(count, RAOC_ENTRY_LEN)?)
 }
 
-fn uuid_le_at(bytes: &[u8], offset: usize, label: &'static str) -> Result<Uuid, Error> {
+fn uuid_at(bytes: &[u8], offset: usize, label: &'static str) -> Result<Uuid, Error> {
     let guid = array_at::<16>(bytes, offset, label)?;
-    Ok(Uuid::from_fields(
-        u32::from_le_bytes([guid[0], guid[1], guid[2], guid[3]]),
-        u16::from_le_bytes([guid[4], guid[5]]),
-        u16::from_le_bytes([guid[6], guid[7]]),
-        &[
-            guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15],
-        ],
-    ))
+    Ok(Uuid::from_bytes(guid))
 }
 
 fn u32_at(bytes: &[u8], offset: usize, label: &'static str) -> Result<u32, Error> {
@@ -1038,22 +1206,24 @@ mod tests {
         );
         let asset_type = AssetType::new(Uuid::from_u128(0xaabb_ccdd_eeff_0011_2233_4455_6677_8899));
         let path = "localization/en-us/main.loc.xml";
-        let rasc = Rasc::from_entries(1, vec![RascEntry::new(asset_id, asset_type, path, 42)]);
+        let rasc = Rasc::new(1, vec![RascEntry::new(asset_id, asset_type, path, 42)]);
         let raoc = Raoc {
             version: RAOC_VERSION,
             file_size: 0,
-            entries: vec![RaocEntry::new(asset_id, asset_type, 42, 0)],
-            aux_index: Vec::new(),
+            entries: vec![RaocEntry::new(asset_id, [0; 12], [0; 8], 42, 0)],
+            guid_asset_info: Vec::new(),
             path_ids: vec![PathId {
                 path_hash: asset_path_hash(path),
                 asset_id,
             }],
-            dependencies: Vec::new(),
+            legacy_mappings: Vec::new(),
             types: Vec::new(),
             dir_blob: Vec::new(),
             file_blob: Vec::new(),
             by_id: [(asset_id, 0)].into_iter().collect(),
+            by_guid: HashMap::new(),
             by_path_hash: [(asset_path_hash(path), asset_id)].into_iter().collect(),
+            by_legacy_id: HashMap::new(),
         };
         let catalog = AssetCatalog::new(rasc, Some(raoc));
 
@@ -1102,9 +1272,8 @@ mod tests {
 
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog.entries()[0].asset_id(), asset_id);
-        assert_eq!(catalog.entries()[0].asset_type(), AssetType::nil());
         assert_eq!(catalog.entries()[0].size_bytes(), 1668);
-        assert_eq!(catalog.entries()[0].flags(), 7);
+        assert_eq!(catalog.entries()[0].reserved(), 7);
         assert_eq!(catalog.id_by_path_hash(&path_hash), Some(asset_id));
         assert_eq!(catalog.entry(asset_id).unwrap().asset_id(), asset_id);
     }
@@ -1124,6 +1293,36 @@ mod tests {
                 expected: RAOC_VERSION
             }
         ));
+    }
+
+    #[test]
+    fn parses_raoc_legacy_guid_mapping_with_az_byte_order() {
+        let legacy = Uuid::parse_str("00002a52-40d6-57a0-a717-19088d1f44f2").unwrap();
+        let real = Uuid::parse_str("8c7f0c3a-a71b-5d3e-8afa-142be76f97e0").unwrap();
+        let mut bytes = raoc_header(0);
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(legacy.as_bytes());
+        bytes.extend_from_slice(real.as_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        patch_file_size(&mut bytes);
+
+        let catalog = Raoc::parse(&bytes).unwrap();
+
+        assert_eq!(
+            catalog.legacy_mappings(),
+            &[LegacyAssetIdMapping::new(
+                AssetId::from(legacy),
+                AssetId::from(real)
+            )]
+        );
+        assert_eq!(
+            catalog.resolve_legacy_id(AssetId::from(legacy)),
+            Some(AssetId::from(real))
+        );
     }
 
     #[test]

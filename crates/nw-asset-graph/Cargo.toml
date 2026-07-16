@@ -1,0 +1,27 @@
+[package]
+name = "nw-asset-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Typed authored-dependency discovery and closure resolution for New World assets"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+cry-animation.workspace = true
+cry-audio.workspace = true
+cry-character.workspace = true
+cry-chunk.workspace = true
+cry-mannequin.workspace = true
+nw-asset.workspace = true
+nw-jobs.workspace = true
+nw-model.workspace = true
+nw-objectstream.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

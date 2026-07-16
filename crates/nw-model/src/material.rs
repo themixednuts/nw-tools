@@ -9,6 +9,7 @@ use std::str::FromStr;
 
 use cry_xml::XmlElement;
 use glam::Vec4;
+use nw_asset::{AssetDependencies, AssetDependency};
 
 /// `EMaterialFlags` values from `CryCommon/IMaterial.h`.
 pub const MTL_FLAG_2SIDED: i64 = 0x0002;
@@ -208,6 +209,17 @@ impl MaterialSet {
         let offset = self.sub_materials.len();
         self.sub_materials.append(&mut other.sub_materials);
         offset
+    }
+}
+
+impl AssetDependencies for MaterialSet {
+    fn asset_dependencies(&self) -> Vec<AssetDependency> {
+        self.sub_materials
+            .iter()
+            .flat_map(|material| &material.textures)
+            .filter(|texture| texture.source_kind() == TextureSourceKind::Asset)
+            .map(|texture| AssetDependency::required_path("material.texture", &texture.file))
+            .collect()
     }
 }
 

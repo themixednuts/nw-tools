@@ -9,6 +9,7 @@ use std::{
     str,
 };
 
+use nw_asset::{AssetDependencies, AssetDependency, AssetDependencyTarget};
 use quick_xml::{
     Reader,
     events::{BytesStart, Event},
@@ -87,6 +88,27 @@ pub struct BlendSpaceSource {
     pub blend_space: BlendSpace,
 }
 
+impl AssetDependencies for BlendSpaceSource {
+    fn asset_dependencies(&self) -> Vec<AssetDependency> {
+        let mut dependencies = Vec::new();
+        for animation in self
+            .blend_space
+            .examples
+            .iter()
+            .map(|example| &example.animation)
+            .chain(
+                self.blend_space
+                    .motion_combinations
+                    .iter()
+                    .map(|combination| &combination.animation),
+            )
+        {
+            push_animation_dependency(animation, &mut dependencies);
+        }
+        dependencies
+    }
+}
+
 impl BlendSpaceSource {
     pub fn from_legacy(source_path: &str, bytes: &[u8]) -> Result<Self, BlendSpaceSourceError> {
         Self::from_legacy_with_motion_resolver(source_path, bytes, |_| None)
@@ -137,6 +159,87 @@ impl BlendSpaceSource {
 pub struct CombinedBlendSpaceSource {
     pub source_path: String,
     pub combined_blend_space: CombinedBlendSpace,
+}
+
+/// A legacy blend-space document classified by its serialized root rather than
+/// its filename extension. Shipped New World assets do not always keep `.comb`
+/// and `.bspace` aligned with `CombinedBlendSpace` and `ParaGroup` roots.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BlendSpaceDocumentSource {
+    BlendSpace(BlendSpaceSource),
+    CombinedBlendSpace(CombinedBlendSpaceSource),
+}
+
+impl BlendSpaceDocumentSource {
+    pub fn from_legacy(source_path: &str, bytes: &[u8]) -> Result<Self, BlendSpaceSourceError> {
+        let source_path = normalize_source_path(source_path);
+        match parse_blend_space_document(bytes)? {
+            BlendSpaceDocument::BlendSpace(blend_space) => Ok(Self::BlendSpace(BlendSpaceSource {
+                source_path,
+                blend_space,
+            })),
+            BlendSpaceDocument::CombinedBlendSpace(combined_blend_space) => {
+                Ok(Self::CombinedBlendSpace(CombinedBlendSpaceSource {
+                    source_path,
+                    combined_blend_space,
+                }))
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> BlendSpaceXmlKind {
+        match self {
+            Self::BlendSpace(_) => BlendSpaceXmlKind::BlendSpace,
+            Self::CombinedBlendSpace(_) => BlendSpaceXmlKind::CombinedBlendSpace,
+        }
+    }
+}
+
+impl AssetDependencies for BlendSpaceDocumentSource {
+    fn asset_dependencies(&self) -> Vec<AssetDependency> {
+        match self {
+            Self::BlendSpace(source) => source.asset_dependencies(),
+            Self::CombinedBlendSpace(source) => source.asset_dependencies(),
+        }
+    }
+}
+
+impl AssetDependencies for CombinedBlendSpaceSource {
+    fn asset_dependencies(&self) -> Vec<AssetDependency> {
+        let mut dependencies = self
+            .combined_blend_space
+            .blend_spaces
+            .iter()
+            .filter(|reference| !reference.path.trim().is_empty())
+            .map(|reference| {
+                AssetDependency::required_path("mannequin.blend_space", &reference.path)
+            })
+            .collect::<Vec<_>>();
+        for animation in self
+            .combined_blend_space
+            .motion_combinations
+            .iter()
+            .map(|combination| &combination.animation)
+        {
+            push_animation_dependency(animation, &mut dependencies);
+        }
+        dependencies
+    }
+}
+
+fn push_animation_dependency(
+    animation: &BlendSpaceAnimationRef,
+    dependencies: &mut Vec<AssetDependency>,
+) {
+    if let Some(path) = animation.motion_path.as_deref() {
+        dependencies.push(AssetDependency::required_path("mannequin.animation", path));
+    } else if !animation.name.trim().is_empty() {
+        dependencies.push(AssetDependency::required(
+            "mannequin.animation",
+            AssetDependencyTarget::symbol(&animation.name),
+        ));
+    }
 }
 
 impl CombinedBlendSpaceSource {
@@ -476,7 +579,7 @@ pub fn blend_space_source_path(source_path: &str) -> Option<String> {
 #[must_use]
 pub fn motion_parameter_id(name: &str) -> Option<u8> {
     match name.to_ascii_lowercase().as_str() {
-        "movespeed" => Some(0),
+        "movespeed" | "travelspeed" => Some(0),
         "turnspeed" => Some(1),
         "travelangle" => Some(2),
         "travelslope" => Some(3),
@@ -487,16 +590,16 @@ pub fn motion_parameter_id(name: &str) -> Option<u8> {
         "blendweight2" => Some(8),
         "blendweight3" => Some(9),
         "blendweight4" => Some(10),
-        "blendweight5" => Some(11),
-        "blendweight6" => Some(12),
-        "blendweight7" => Some(13),
+        "aimhorznavspeed" => Some(11),
+        "aimhorznavangle" => Some(12),
+        "desiredfacing" => Some(13),
         _ => None,
     }
 }
 
 fn additional_extraction_parameter_id(name: &str) -> Option<u8> {
     match name.to_ascii_lowercase().as_str() {
-        "movespeed" => Some(0),
+        "movespeed" | "travelspeed" => Some(0),
         "turnspeed" => Some(1),
         "travelangle" => Some(2),
         "travelslope" => Some(3),
@@ -1152,9 +1255,9 @@ impl BlendSpaceElement {
 }
 
 fn unresolved_parameter_reason(name: &str, parameter_id: Option<u8>) -> Option<String> {
-    parameter_id.is_none().then(|| {
-        format!("`{name}` is not present in the Lumberyard EMotionParamID blend-space mapping")
-    })
+    parameter_id
+        .is_none()
+        .then(|| format!("`{name}` is not present in the current motion-parameter registry"))
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -1712,7 +1815,10 @@ mod tests {
             source.combined_blend_space.dimensions[0].name,
             "DesiredFacing"
         );
-        assert_eq!(source.combined_blend_space.dimensions[0].parameter_id, None);
+        assert_eq!(
+            source.combined_blend_space.dimensions[0].parameter_id,
+            Some(13)
+        );
         assert_eq!(
             source.combined_blend_space.additional_extraction[0].parameter_id,
             Some(2)
@@ -1726,6 +1832,18 @@ mod tests {
                 "animations/gameplay/character/npc/natural/prey/buffalo/blendspaces/bison_turn_blend_right.bspace.ron"
             )
         );
+    }
+
+    #[test]
+    fn document_source_uses_serialized_root_when_extension_disagrees() {
+        let source = BlendSpaceDocumentSource::from_legacy(
+            "animations/shipped_mismatch.comb",
+            sample_bspace(),
+        )
+        .unwrap();
+
+        assert!(matches!(&source, BlendSpaceDocumentSource::BlendSpace(_)));
+        assert_eq!(source.kind(), BlendSpaceXmlKind::BlendSpace);
     }
 
     #[test]

@@ -1184,6 +1184,7 @@ dependencies = [
  "crc32fast",
  "cry-chunk",
  "cry-xml",
+ "nw-asset",
  "nw-reflected-types",
  "thiserror 2.0.18",
 ]
@@ -1193,6 +1194,7 @@ name = "cry-audio"
 version = "0.1.0"
 dependencies = [
  "cry-xml",
+ "nw-asset",
  "nw-reflected-types",
  "serde",
  "thiserror 2.0.18",
@@ -1203,6 +1205,7 @@ name = "cry-character"
 version = "0.1.0"
 dependencies = [
  "cry-xml",
+ "nw-asset",
  "nw-reflected-types",
  "thiserror 2.0.18",
 ]
@@ -1219,6 +1222,7 @@ dependencies = [
 name = "cry-mannequin"
 version = "0.1.0"
 dependencies = [
+ "nw-asset",
  "nw-reflected-types",
  "quick-xml",
  "ron",
@@ -2491,9 +2495,27 @@ name = "nw-asset"
 version = "0.1.0"
 dependencies = [
  "nw-filesystem",
+ "nw-jobs",
  "nw-pak",
  "sha1",
  "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "nw-asset-graph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cry-animation",
+ "cry-audio",
+ "cry-character",
+ "cry-chunk",
+ "cry-mannequin",
+ "nw-asset",
+ "nw-jobs",
+ "nw-model",
+ "nw-objectstream",
  "uuid",
 ]
 
@@ -2572,6 +2594,7 @@ dependencies = [
 name = "nw-jobs"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "rayon",
  "signal-hook 0.4.4",
  "thiserror 2.0.18",
@@ -2620,6 +2643,8 @@ dependencies = [
  "cry-chunk",
  "cry-xml",
  "glam 0.32.1",
+ "nw-asset",
+ "nw-jobs",
  "nw-reflected-types",
  "serde",
  "serde_json",
@@ -2736,6 +2761,7 @@ dependencies = [
  "image",
  "memchr",
  "nw-asset",
+ "nw-asset-graph",
  "nw-datasheet",
  "nw-dds",
  "nw-filesystem",

@@ -58,3 +58,8 @@ by runtime crates instead of maintaining hand-written mirrors:
 nw-serialize-codegen generate --language rust --rust-layout vendored `
   --selection explicit --selection-file selection.json --out crates/generated-types
 ```
+
+## GameData SDK generation
+
+See [docs/gamedata-codegen.md](docs/gamedata-codegen.md) for the self-contained
+Rust, TypeScript, and Go architecture and public API contract.

@@ -9,6 +9,13 @@ use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use thiserror::Error;
 
+mod pipeline;
+
+pub use pipeline::{
+    BlockingPipelineConfig, BlockingPipelineError, BlockingPipelineStage, BlockingPipelineSummary,
+    try_for_each_bounded_blocking,
+};
+
 #[derive(Debug, Clone, Default)]
 pub struct JobRunner {
     execution: Execution,
@@ -40,6 +47,22 @@ impl CancellationToken {
     }
 }
 
+/// Minimal cooperative cancellation contract used by generic job primitives.
+pub trait Cancellation: Clone + Send + Sync + 'static {
+    fn cancel(&self);
+    fn is_cancelled(&self) -> bool;
+}
+
+impl Cancellation for CancellationToken {
+    fn cancel(&self) {
+        CancellationToken::cancel(self);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        CancellationToken::is_cancelled(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobBatch<R> {
     completed: Vec<R>,
@@ -54,6 +77,11 @@ impl<R> JobBatch<R> {
             skipped,
             cancelled,
         }
+    }
+
+    #[must_use]
+    pub fn from_parts(completed: Vec<R>, skipped: usize, cancelled: bool) -> Self {
+        Self::new(completed, skipped, cancelled)
     }
 
     #[must_use]
@@ -104,14 +132,14 @@ enum Execution {
 
 impl JobRunner {
     #[must_use]
-    pub fn automatic() -> Self {
+    pub const fn automatic() -> Self {
         Self {
             execution: Execution::Global,
         }
     }
 
     #[must_use]
-    pub fn inline() -> Self {
+    pub const fn inline() -> Self {
         Self {
             execution: Execution::Inline,
         }
@@ -157,7 +185,7 @@ impl JobRunner {
     }
 
     #[must_use]
-    pub fn is_inline(&self) -> bool {
+    pub const fn is_inline(&self) -> bool {
         matches!(self.execution, Execution::Inline)
     }
 
@@ -167,6 +195,16 @@ impl JobRunner {
             Execution::Inline => JobRunnerPolicy::Inline,
             Execution::Global => JobRunnerPolicy::Automatic,
             Execution::Pool(pool) => JobRunnerPolicy::Workers(pool.current_num_threads()),
+        }
+    }
+
+    /// Number of worker lanes available to this runner.
+    #[must_use]
+    pub fn parallelism(&self) -> usize {
+        match &self.execution {
+            Execution::Inline => 1,
+            Execution::Global => rayon::current_num_threads().max(1),
+            Execution::Pool(pool) => pool.current_num_threads().max(1),
         }
     }
 
@@ -197,6 +235,33 @@ impl JobRunner {
         }
     }
 
+    /// Map the integer range `0..len` without allocating an index vector.
+    pub fn map_indexed<R, F>(&self, len: usize, f: F) -> Vec<R>
+    where
+        R: Send,
+        F: Fn(usize) -> R + Send + Sync,
+    {
+        match &self.execution {
+            Execution::Inline => (0..len).map(f).collect(),
+            Execution::Global => (0..len).into_par_iter().map(f).collect(),
+            Execution::Pool(pool) => pool.install(|| (0..len).into_par_iter().map(f).collect()),
+        }
+    }
+
+    /// Fallible variant of [`Self::map_indexed`].
+    pub fn try_map_indexed<R, E, F>(&self, len: usize, f: F) -> Result<Vec<R>, E>
+    where
+        R: Send,
+        E: Send,
+        F: Fn(usize) -> Result<R, E> + Send + Sync,
+    {
+        match &self.execution {
+            Execution::Inline => (0..len).map(f).collect(),
+            Execution::Global => (0..len).into_par_iter().map(f).collect(),
+            Execution::Pool(pool) => pool.install(|| (0..len).into_par_iter().map(f).collect()),
+        }
+    }
+
     pub fn install<R, F>(&self, f: F) -> R
     where
         R: Send,
@@ -222,16 +287,12 @@ impl JobRunner {
         }
     }
 
-    pub fn map_until_cancelled<T, R, F>(
-        &self,
-        items: &[T],
-        cancel: &CancellationToken,
-        f: F,
-    ) -> JobBatch<R>
+    pub fn map_until_cancelled<T, R, F, C>(&self, items: &[T], cancel: &C, f: F) -> JobBatch<R>
     where
         T: Sync,
         R: Send,
         F: Fn(&T) -> R + Send + Sync,
+        C: Cancellation,
     {
         let mapped: Vec<Option<R>> = match &self.execution {
             Execution::Inline => {
@@ -271,10 +332,10 @@ impl JobRunner {
         collect_job_batch(mapped, cancel.is_cancelled())
     }
 
-    pub fn try_map_until_cancelled<T, R, E, F>(
+    pub fn try_map_until_cancelled<T, R, E, F, C>(
         &self,
         items: &[T],
-        cancel: &CancellationToken,
+        cancel: &C,
         f: F,
     ) -> Result<JobBatch<R>, E>
     where
@@ -282,6 +343,7 @@ impl JobRunner {
         R: Send,
         E: Send,
         F: Fn(&T) -> Result<R, E> + Send + Sync,
+        C: Cancellation,
     {
         let mapped: Vec<Option<R>> = match &self.execution {
             Execution::Inline => {
@@ -358,10 +420,10 @@ impl JobRunner {
         }
     }
 
-    pub fn map_init_until_cancelled<T, S, R, Init, F>(
+    pub fn map_init_until_cancelled<T, S, R, Init, F, C>(
         &self,
         items: &[T],
-        cancel: &CancellationToken,
+        cancel: &C,
         init: Init,
         f: F,
     ) -> JobBatch<R>
@@ -371,6 +433,7 @@ impl JobRunner {
         R: Send,
         Init: Fn() -> S + Send + Sync,
         F: Fn(&mut S, &T) -> R + Send + Sync,
+        C: Cancellation,
     {
         let mapped: Vec<Option<R>> = match &self.execution {
             Execution::Inline => {
@@ -420,15 +483,11 @@ impl JobRunner {
     /// zero-sized `Vec<()>` whose length equals the number of items actually
     /// run, so `completed().len()` stays consistent with the other methods at
     /// no heap cost.
-    pub fn for_each_until_cancelled<T, F>(
-        &self,
-        items: &[T],
-        cancel: &CancellationToken,
-        f: F,
-    ) -> JobBatch<()>
+    pub fn for_each_until_cancelled<T, F, C>(&self, items: &[T], cancel: &C, f: F) -> JobBatch<()>
     where
         T: Sync,
         F: Fn(&T) + Send + Sync,
+        C: Cancellation,
     {
         use std::sync::atomic::AtomicUsize;
 
@@ -456,10 +515,10 @@ impl JobRunner {
         JobBatch::new(vec![(); completed], skipped, cancelled)
     }
 
-    pub fn try_map_init_until_cancelled<T, S, R, E, Init, F>(
+    pub fn try_map_init_until_cancelled<T, S, R, E, Init, F, C>(
         &self,
         items: &[T],
-        cancel: &CancellationToken,
+        cancel: &C,
         init: Init,
         f: F,
     ) -> Result<JobBatch<R>, E>
@@ -470,6 +529,7 @@ impl JobRunner {
         E: Send,
         Init: Fn() -> S + Send + Sync,
         F: Fn(&mut S, &T) -> Result<R, E> + Send + Sync,
+        C: Cancellation,
     {
         let mapped: Vec<Option<R>> = match &self.execution {
             Execution::Inline => {
@@ -540,13 +600,10 @@ fn collect_job_batch<R>(mapped: Vec<Option<R>>, cancelled: bool) -> JobBatch<R> 
     JobBatch::new(completed, skipped, cancelled || skipped > 0)
 }
 
-fn try_map_item_until_cancelled<T, R, E, F>(
-    item: &T,
-    cancel: &CancellationToken,
-    f: &F,
-) -> Result<Option<R>, E>
+fn try_map_item_until_cancelled<T, R, E, F, C>(item: &T, cancel: &C, f: &F) -> Result<Option<R>, E>
 where
     F: Fn(&T) -> Result<R, E>,
+    C: Cancellation,
 {
     if cancel.is_cancelled() {
         return Ok(None);
@@ -560,14 +617,15 @@ where
     }
 }
 
-fn try_map_init_item_until_cancelled<T, S, R, E, F>(
+fn try_map_init_item_until_cancelled<T, S, R, E, F, C>(
     state: &mut S,
     item: &T,
-    cancel: &CancellationToken,
+    cancel: &C,
     f: &F,
 ) -> Result<Option<R>, E>
 where
     F: Fn(&mut S, &T) -> Result<R, E>,
+    C: Cancellation,
 {
     if cancel.is_cancelled() {
         return Ok(None);
@@ -611,6 +669,17 @@ mod tests {
     fn inline_map_keeps_order() {
         let runner = JobRunner::inline();
         assert_eq!(runner.map(&[1, 2, 3], |value| value * 2), vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn indexed_maps_do_not_allocate_input_indices_and_keep_order() {
+        let runner = JobRunner::with_workers(2).unwrap();
+        assert_eq!(runner.map_indexed(4, |index| index * 3), vec![0, 3, 6, 9]);
+        assert_eq!(
+            runner.try_map_indexed(4, |index| Ok::<_, ()>(index * 2)),
+            Ok(vec![0, 2, 4, 6])
+        );
+        assert_eq!(runner.parallelism(), 2);
     }
 
     #[test]

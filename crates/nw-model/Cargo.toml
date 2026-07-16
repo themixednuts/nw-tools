@@ -17,6 +17,8 @@ cry-animation.workspace = true
 cry-chunk = { path = "../cry-chunk" }
 cry-xml.workspace = true
 glam = { workspace = true }
+nw-asset.workspace = true
+nw-jobs.workspace = true
 nw-reflected-types.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }

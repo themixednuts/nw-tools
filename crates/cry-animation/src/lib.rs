@@ -15,6 +15,7 @@ pub use cry_chunk::{
     DbaDecodeError, PositionKey, RotationKey, ScaleKey,
 };
 pub use cry_xml::XmlElement;
+use nw_asset::{AssetDependencies, AssetDependency, AssetDependencyTarget};
 
 #[derive(Debug, Clone)]
 pub struct AnimationClip {
@@ -147,6 +148,35 @@ impl AnimationEventDatabase {
             .iter()
             .filter(move |list| normalize_path(&list.animation_path) == wanted)
             .flat_map(|list| &list.events)
+    }
+}
+
+impl AssetDependencies for AnimationEventDatabase {
+    fn asset_dependencies(&self) -> Vec<AssetDependency> {
+        let mut dependencies = Vec::new();
+        for list in &self.animations {
+            if !list.animation_path.trim().is_empty() {
+                dependencies.push(AssetDependency::optional_path(
+                    "animation_event.clip",
+                    &list.animation_path,
+                ));
+            }
+            for event in &list.events {
+                if !event.model.trim().is_empty() {
+                    dependencies.push(AssetDependency::required_path(
+                        "animation_event.model",
+                        &event.model,
+                    ));
+                }
+                if !event.parameter.trim().is_empty() {
+                    dependencies.push(AssetDependency::optional(
+                        format!("animation_event.{}", event.name.to_ascii_lowercase()),
+                        AssetDependencyTarget::symbol(&event.parameter),
+                    ));
+                }
+            }
+        }
+        dependencies
     }
 }
 

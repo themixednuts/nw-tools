@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::num::TryFromIntError;
 use std::str::Utf8Error;
 
@@ -201,6 +202,59 @@ pub enum TypedAssetOrSimpleReferenceError {
 
     #[error("simple asset reference path error")]
     Path(#[from] ObjectStreamValueError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CollectAssetReferencesError {
+    #[error("invalid AZ::Data::Asset value")]
+    Asset(#[from] AssetValueError),
+    #[error("invalid SimpleAssetReference path")]
+    Simple(#[from] ObjectStreamValueError),
+}
+
+/// Collect every concrete `AZ::Data::Asset` and generated
+/// `SimpleAssetReference<T>` in an ObjectStream.
+///
+/// Generated wrappers have distinct type UUIDs, so shape detection follows the
+/// reflected `AssetPath` base field instead of maintaining a handwritten UUID
+/// allowlist. Malformed recognized references fail closed.
+pub fn collect_asset_references(
+    stream: &crate::ObjectStream,
+) -> Result<Vec<AssetReference>, CollectAssetReferencesError> {
+    let mut references = Vec::new();
+    let mut seen = HashSet::new();
+    for element in stream.iter_recursive() {
+        let reference = if element.id() == &types::ASSET && element.data().is_some() {
+            let value = read_asset_value(element)?;
+            Some(value.into_asset_reference())
+        } else if element.id() != &SIMPLE_ASSET_REFERENCE_BASE_TYPE_ID
+            && has_reflected_asset_path(element)
+        {
+            read_simple_asset_reference_path_any(element)?
+                .map(|path| AssetReference::from_hint(path.to_owned()))
+        } else {
+            None
+        };
+        if let Some(reference) = reference
+            && seen.insert(reference.clone())
+        {
+            references.push(reference);
+        }
+    }
+    Ok(references)
+}
+
+fn has_reflected_asset_path(element: &Element) -> bool {
+    element.children().iter().any(|child| {
+        child
+            .field()
+            .is_some_and(|field| field.as_str() == ASSET_PATH_FIELD)
+            || child.children().iter().any(|grandchild| {
+                grandchild
+                    .field()
+                    .is_some_and(|field| field.as_str() == ASSET_PATH_FIELD)
+            })
+    })
 }
 
 pub fn read_asset_value<E>(element: &E) -> Result<AssetValue<'_>, AssetValueError>

@@ -20,13 +20,14 @@ use thiserror::Error;
 
 pub use blend_space::{
     BLEND_SPACE_SOURCE_SCHEMA, BlendSpace, BlendSpaceAdditionalExtraction, BlendSpaceAnimationRef,
-    BlendSpaceAnnotation, BlendSpaceCoordinate, BlendSpaceDimension, BlendSpaceExample,
-    BlendSpaceJoint, BlendSpaceMotionCombination, BlendSpacePseudoExample, BlendSpaceReference,
-    BlendSpaceSource, BlendSpaceSourceArtifact, BlendSpaceSourceError, BlendSpaceSourceInput,
-    BlendSpaceSourceSchema, BlendSpaceSourceTransform, BlendSpaceSourceTransformError,
-    BlendSpaceVirtualExample, BlendSpaceXmlKind, COMBINED_BLEND_SPACE_SOURCE_SCHEMA,
-    CombinedBlendSpace, CombinedBlendSpaceDimension, CombinedBlendSpaceSource,
-    blend_space_source_path, is_legacy_blend_space_source, motion_parameter_id,
+    BlendSpaceAnnotation, BlendSpaceCoordinate, BlendSpaceDimension, BlendSpaceDocumentSource,
+    BlendSpaceExample, BlendSpaceJoint, BlendSpaceMotionCombination, BlendSpacePseudoExample,
+    BlendSpaceReference, BlendSpaceSource, BlendSpaceSourceArtifact, BlendSpaceSourceError,
+    BlendSpaceSourceInput, BlendSpaceSourceSchema, BlendSpaceSourceTransform,
+    BlendSpaceSourceTransformError, BlendSpaceVirtualExample, BlendSpaceXmlKind,
+    COMBINED_BLEND_SPACE_SOURCE_SCHEMA, CombinedBlendSpace, CombinedBlendSpaceDimension,
+    CombinedBlendSpaceSource, blend_space_source_path, is_legacy_blend_space_source,
+    motion_parameter_id,
 };
 pub use source_transform::{
     MANNEQUIN_ACTIONS_SOURCE_SCHEMA, MANNEQUIN_ANIMATION_DATABASE_SOURCE_SCHEMA,

@@ -12,6 +12,7 @@ use glam::{Mat4, Quat, Vec3};
 use crate::model::{AssetSource, MeshRef};
 
 pub(crate) struct ResolveOptions<'a> {
+    pub runner: &'a nw_jobs::JobRunner,
     pub no_materials: bool,
     pub skeleton: Option<&'a str>,
     pub animations: &'a [String],
@@ -25,6 +26,7 @@ pub(crate) struct ResolvedAsset {
     pub materials: Option<nw_model::MaterialSet>,
     pub animations: Vec<nw_model::ModelAnimation>,
     pub extras: nw_model::CryAssetExtras,
+    parsed_animation_assets: HashSet<(usize, String)>,
 }
 
 pub(crate) fn resolve(
@@ -36,27 +38,58 @@ pub(crate) fn resolve(
     material_override: Option<&str>,
     options: ResolveOptions<'_>,
 ) -> Result<ResolvedAsset> {
+    let runner = options.runner;
     let extension = source_extension(source_path);
+    let mut additional_roots = options.animations.to_vec();
+    additional_roots.extend(options.mannequin.iter().cloned());
+    additional_roots.extend(options.audio.iter().cloned());
+    additional_roots.extend(options.animation_events.map(str::to_owned));
+    additional_roots.extend(options.skeleton.map(str::to_owned));
+    let dependency_graph = nw_asset_graph::resolve_with_runner(
+        source,
+        source_path,
+        &nw_asset_graph::ResolveOptions { additional_roots },
+        runner,
+    )?;
+    if !dependency_graph.is_complete() {
+        let unresolved = dependency_graph
+            .unresolved()
+            .iter()
+            .filter(|dependency| dependency.is_required())
+            .map(|dependency| {
+                format!(
+                    "{} --{}--> {} ({:?})",
+                    dependency.source(),
+                    dependency.relation(),
+                    dependency.target(),
+                    dependency.reason()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("authored dependency closure is incomplete: {unresolved}");
+    }
     let mut resolved = match extension.as_str() {
-        "cdf" => resolve_cdf(source, source_path, bytes, options.no_materials)?,
+        "cdf" => resolve_cdf(runner, source, source_path, bytes, options.no_materials)?,
         "caf" | "i_caf" | "dba" => {
-            let skeleton_path = options
-                .skeleton
-                .context("CAF/DBA export requires --skeleton <character.chr|skin>")?;
-            let skeleton_bytes = read_required(source, skeleton_path)?;
-            let skeleton = nw_model::skeleton_from_bytes(&skeleton_bytes)
-                .with_context(|| format!("decode skeleton {skeleton_path}"))?;
             let clips = if extension == "dba" {
                 cry_animation::AnimationClip::parse_dba(bytes)?
             } else {
                 vec![cry_animation::AnimationClip::parse(source_path, bytes)?]
             };
+            let skeleton_path = options.skeleton.context(
+                "CAF/DBA export requires --skeleton <character.chr|skin>; optimized catalogs do not contain the runtime product-dependency map",
+            )?;
+            let skeleton_path = normalize_path(skeleton_path);
+            let skeleton_bytes = read_required(source, &skeleton_path)?;
+            let skeleton = nw_model::skeleton_from_bytes(&skeleton_bytes)
+                .with_context(|| format!("decode skeleton {skeleton_path}"))?;
             let mut extras = nw_model::CryAssetExtras {
                 source_path: normalize_path(source_path),
                 ..Default::default()
             };
             add_dependency(&mut extras, source_path);
-            add_dependency(&mut extras, skeleton_path);
+            add_dependency(&mut extras, &skeleton_path);
             let mut animations = Vec::new();
             for clip in clips {
                 if clip_targets_skeleton(&clip, &skeleton) {
@@ -77,6 +110,7 @@ pub(crate) fn resolve(
                 materials: None,
                 animations,
                 extras,
+                parsed_animation_assets: [(0, normalize_path(source_path))].into_iter().collect(),
             }
         }
         _ => {
@@ -98,19 +132,27 @@ pub(crate) fn resolve(
                     source_path: normalize_path(source_path),
                     ..Default::default()
                 },
+                parsed_animation_assets: HashSet::new(),
             }
         }
     };
 
-    if resolved.model.skeletons.is_empty()
-        && let Some(skeleton_path) = options.skeleton
-    {
-        let skeleton_bytes = read_required(source, skeleton_path)?;
-        resolved.model.set_primary_skeleton(
-            nw_model::skeleton_from_bytes(&skeleton_bytes)
-                .with_context(|| format!("decode skeleton {skeleton_path}"))?,
-        );
-        add_dependency(&mut resolved.extras, skeleton_path);
+    if resolved.model.skeletons.is_empty() {
+        let selected = if let Some(path) = options.skeleton {
+            let path = normalize_path(path);
+            let bytes = read_required(source, &path)?;
+            Some((
+                path.clone(),
+                nw_model::skeleton_from_bytes(&bytes)
+                    .with_context(|| format!("decode skeleton {path}"))?,
+            ))
+        } else {
+            None
+        };
+        if let Some((skeleton_path, skeleton)) = selected {
+            resolved.model.set_primary_skeleton(skeleton);
+            add_dependency(&mut resolved.extras, &skeleton_path);
+        }
     }
 
     let event_database = options
@@ -128,36 +170,132 @@ pub(crate) fn resolve(
                 .source,
         );
     }
-    for path in options.animations {
-        push_animation(
-            source,
-            path,
-            event_database.as_ref(),
-            0,
-            true,
-            &mut resolved,
-        )?;
-    }
+    push_animation_assets(
+        runner,
+        source,
+        options.animations,
+        event_database.as_ref(),
+        0,
+        true,
+        &mut resolved,
+    )?;
     for path in options.mannequin {
         add_mannequin_source(source, path, &mut resolved.extras)?;
     }
     for path in options.audio {
         add_audio_source(source, path, &mut resolved.extras)?;
     }
+    apply_resolved_dependencies(runner, source, dependency_graph.assets(), &mut resolved)?;
     Ok(resolved)
 }
 
+fn apply_resolved_dependencies(
+    runner: &nw_jobs::JobRunner,
+    source: &dyn AssetSource,
+    paths: &[String],
+    resolved: &mut ResolvedAsset,
+) -> Result<()> {
+    for path in paths {
+        add_dependency(&mut resolved.extras, path);
+    }
+
+    if !resolved.model.skeletons.is_empty() {
+        for path in paths
+            .iter()
+            .filter(|path| source_extension(path) == "chrparams")
+        {
+            if !has_source_asset(&resolved.extras, path) {
+                load_character_parameters(runner, source, path, false, 0, resolved)?;
+            }
+        }
+        let animation_paths = paths
+            .iter()
+            .filter(|path| matches!(source_extension(path).as_str(), "caf" | "i_caf" | "dba"))
+            .cloned()
+            .collect::<Vec<_>>();
+        push_animation_assets(runner, source, &animation_paths, None, 0, false, resolved)?;
+    }
+
+    for path in paths
+        .iter()
+        .filter(|path| source_extension(path) == "animevents")
+    {
+        if has_source_asset(&resolved.extras, path) {
+            continue;
+        }
+        let database = load_event_database(source, path)?;
+        add_xml_source(
+            &mut resolved.extras,
+            path,
+            nw_model::CrySourceAssetKind::AnimationEvents,
+            &database.source,
+        );
+        for animation in &mut resolved.animations {
+            animation
+                .clip
+                .events
+                .extend(database.events_for(&animation.clip.source_path).cloned());
+        }
+    }
+
+    for path in paths.iter().filter(|path| {
+        cry_mannequin::MannequinXmlKind::from_source_path(path).is_some()
+            || cry_mannequin::BlendSpaceXmlKind::from_source_path(path).is_some()
+    }) {
+        if !has_source_asset(&resolved.extras, path) {
+            add_mannequin_source(source, path, &mut resolved.extras)?;
+        }
+    }
+
+    for path in paths {
+        if !has_source_asset(&resolved.extras, path) && is_audio_source(source, path) {
+            add_audio_source(source, path, &mut resolved.extras)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_audio_source(source: &dyn AssetSource, path: &str) -> bool {
+    if path
+        .to_ascii_lowercase()
+        .ends_with(cry_audio::WWISE_TRIGGER_BANK_MAP_FILE)
+        || matches!(source_extension(path).as_str(), "bnk" | "wem")
+    {
+        return true;
+    }
+    if source_extension(path) != "xml" {
+        return false;
+    }
+    source
+        .read(path)
+        .and_then(|bytes| {
+            str::from_utf8(&bytes)
+                .ok()
+                .map(|xml| cry_audio::AudioControlsSource::from_xml(path, xml).is_ok())
+        })
+        .unwrap_or(false)
+}
+
 fn resolve_cdf(
+    runner: &nw_jobs::JobRunner,
     source: &dyn AssetSource,
     source_path: &str,
     bytes: &[u8],
     no_materials: bool,
 ) -> Result<ResolvedAsset> {
     let mut resolving = HashSet::new();
-    resolve_cdf_inner(source, source_path, bytes, no_materials, &mut resolving)
+    resolve_cdf_inner(
+        runner,
+        source,
+        source_path,
+        bytes,
+        no_materials,
+        &mut resolving,
+    )
 }
 
 fn resolve_cdf_inner(
+    runner: &nw_jobs::JobRunner,
     source: &dyn AssetSource,
     source_path: &str,
     bytes: &[u8],
@@ -219,6 +357,7 @@ fn resolve_cdf_inner(
     add_dependency(&mut extras, &skeleton_path);
 
     let mut animations = Vec::new();
+    let mut parsed_animation_assets = HashSet::new();
     for attachment in &definition.attachments {
         let Some(binding) = attachment.binding.as_deref() else {
             continue;
@@ -226,9 +365,15 @@ fn resolve_cdf_inner(
         let binding = normalize_path(binding);
         let binding_bytes = read_required(source, &binding)?;
         if source_extension(&binding) == "cdf" {
-            let mut child =
-                resolve_cdf_inner(source, &binding, &binding_bytes, no_materials, resolving)
-                    .with_context(|| format!("resolve nested CDF attachment {binding}"))?;
+            let mut child = resolve_cdf_inner(
+                runner,
+                source,
+                &binding,
+                &binding_bytes,
+                no_materials,
+                resolving,
+            )
+            .with_context(|| format!("resolve nested CDF attachment {binding}"))?;
             if let Some(set) = child.materials.take() {
                 append_material_table(&mut child.model, &mut materials, set)?;
             }
@@ -253,6 +398,9 @@ fn resolve_cdf_inner(
             for mut animation in child.animations {
                 animation.skeleton += skeleton_offset;
                 animations.push(animation);
+            }
+            for (skeleton, path) in child.parsed_animation_assets {
+                parsed_animation_assets.insert((skeleton + skeleton_offset, path));
             }
             for animation in &mut child.extras.unbound_animations {
                 animation.skeleton += skeleton_offset;
@@ -327,6 +475,7 @@ fn resolve_cdf_inner(
         materials,
         animations,
         extras,
+        parsed_animation_assets,
     };
     let parameters_path = definition
         .model
@@ -335,6 +484,7 @@ fn resolve_cdf_inner(
         .map(normalize_path)
         .unwrap_or_else(|| replace_extension(&skeleton_path, "chrparams"));
     load_character_parameters(
+        runner,
         source,
         &parameters_path,
         definition.model.params_override.is_some(),
@@ -346,6 +496,7 @@ fn resolve_cdf_inner(
 }
 
 fn load_character_parameters(
+    runner: &nw_jobs::JobRunner,
     source: &dyn AssetSource,
     path: &str,
     required: bool,
@@ -353,6 +504,9 @@ fn load_character_parameters(
     resolved: &mut ResolvedAsset,
 ) -> Result<()> {
     let path = normalize_path(path);
+    if has_source_asset(&resolved.extras, &path) {
+        return Ok(());
+    }
     let Some(bytes) = source.read(&path) else {
         if required {
             bail!("CDF ParamsOverride asset not found: {path}");
@@ -373,6 +527,7 @@ fn load_character_parameters(
     let mut event_database = None;
     let mut visited = HashSet::new();
     load_animation_list(
+        runner,
         source,
         &path,
         &parameters,
@@ -387,6 +542,7 @@ fn load_character_parameters(
 
 #[allow(clippy::too_many_arguments)]
 fn load_animation_list(
+    runner: &nw_jobs::JobRunner,
     source: &dyn AssetSource,
     source_path: &str,
     parameters: &CharacterParameters,
@@ -441,6 +597,7 @@ fn load_animation_list(
                     &included.source,
                 );
                 load_animation_list(
+                    runner,
                     source,
                     &value,
                     &included,
@@ -458,16 +615,15 @@ fn load_animation_list(
                 } else {
                     vec![value.clone()]
                 };
-                for path in paths {
-                    push_dba_animations(
-                        source,
-                        &path,
-                        event_database.as_ref(),
-                        skeleton,
-                        false,
-                        resolved,
-                    )?;
-                }
+                push_animation_assets(
+                    runner,
+                    source,
+                    &paths,
+                    event_database.as_ref(),
+                    skeleton,
+                    false,
+                    resolved,
+                )?;
             }
             CharacterAnimationEntryKind::FaceLibrary => {
                 add_dependency(&mut resolved.extras, &value);
@@ -475,17 +631,21 @@ fn load_animation_list(
             CharacterAnimationEntryKind::WildcardAsset => {
                 let pattern = animation_path(animation_directory, &value);
                 let paths = source.matching_paths(&pattern)?;
-                for path in paths {
-                    if matches!(source_extension(&path).as_str(), "caf" | "i_caf") {
-                        push_animation(
-                            source,
-                            &path,
-                            event_database.as_ref(),
-                            skeleton,
-                            false,
-                            resolved,
-                        )?;
-                    } else if matches!(source_extension(&path).as_str(), "bspace" | "comb") {
+                let (animations, mannequin): (Vec<_>, Vec<_>) =
+                    paths.into_iter().partition(|path| {
+                        matches!(source_extension(path).as_str(), "caf" | "i_caf" | "dba")
+                    });
+                push_animation_assets(
+                    runner,
+                    source,
+                    &animations,
+                    event_database.as_ref(),
+                    skeleton,
+                    false,
+                    resolved,
+                )?;
+                for path in mannequin {
+                    if matches!(source_extension(&path).as_str(), "bspace" | "comb") {
                         add_mannequin_source(source, &path, &mut resolved.extras)?;
                     }
                 }
@@ -493,10 +653,11 @@ fn load_animation_list(
             CharacterAnimationEntryKind::Asset => {
                 let path = animation_path(animation_directory, &value);
                 match source_extension(&path).as_str() {
-                    "caf" | "i_caf" => {
-                        push_animation(
+                    "caf" | "i_caf" | "dba" => {
+                        push_animation_assets(
+                            runner,
                             source,
-                            &path,
+                            std::slice::from_ref(&path),
                             event_database.as_ref(),
                             skeleton,
                             false,
@@ -520,89 +681,99 @@ fn load_animation_list(
     Ok(())
 }
 
-fn push_animation(
+struct ParsedAnimationAsset {
+    path: String,
+    is_dba: bool,
+    clips: Vec<cry_animation::AnimationClip>,
+}
+
+fn push_animation_assets(
+    runner: &nw_jobs::JobRunner,
     source: &dyn AssetSource,
-    path: &str,
+    paths: &[String],
     events: Option<&cry_animation::AnimationEventDatabase>,
     skeleton: usize,
     require_mapping: bool,
     resolved: &mut ResolvedAsset,
 ) -> Result<()> {
-    let path = normalize_path(path);
-    if resolved.animations.iter().any(|animation| {
-        animation.skeleton == skeleton && animation.clip.source_path.eq_ignore_ascii_case(&path)
-    }) {
-        return Ok(());
-    }
-    let bytes = read_required(source, &path)?;
-    let mut clip = cry_animation::AnimationClip::parse(path.clone(), &bytes)
-        .with_context(|| format!("decode animation {path}"))?;
-    if let Some(events) = events {
-        clip = clip.with_event_database(events);
-    }
+    let mut paths = paths
+        .iter()
+        .map(|path| normalize_path(path))
+        .filter(|path| {
+            !resolved
+                .parsed_animation_assets
+                .contains(&(skeleton, path.clone()))
+        })
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    let parsed = runner.try_map(&paths, |path| {
+        let bytes = read_required(source, path)?;
+        let is_dba = source_extension(path) == "dba";
+        let mut clips = if is_dba {
+            cry_animation::AnimationClip::parse_dba(&bytes)
+                .with_context(|| format!("decode tracks database {path}"))?
+        } else {
+            vec![
+                cry_animation::AnimationClip::parse(path.clone(), &bytes)
+                    .with_context(|| format!("decode animation {path}"))?,
+            ]
+        };
+        if let Some(events) = events {
+            for clip in &mut clips {
+                clip.events = events.events_for(&clip.source_path).cloned().collect();
+            }
+        }
+        Ok::<_, anyhow::Error>(ParsedAnimationAsset {
+            path: path.clone(),
+            is_dba,
+            clips,
+        })
+    })?;
     let target = resolved
         .model
         .skeletons
         .get(skeleton)
         .with_context(|| format!("animation targets missing skeleton {skeleton}"))?;
-    if !clip_targets_skeleton(&clip, target) {
-        record_unbound_animation(&mut resolved.extras, &path, skeleton);
-        add_dependency(&mut resolved.extras, &path);
-        if require_mapping {
-            bail!("CAF {path} has no controllers targeting model skeleton {skeleton}");
+    for asset in parsed {
+        let mut mapped = 0usize;
+        let mut duplicate = false;
+        for clip in asset.clips {
+            if resolved.animations.iter().any(|existing| {
+                existing.skeleton == skeleton
+                    && existing
+                        .clip
+                        .source_path
+                        .eq_ignore_ascii_case(&clip.source_path)
+            }) {
+                duplicate = true;
+                continue;
+            }
+            if !clip_targets_skeleton(&clip, target) {
+                record_unbound_animation(&mut resolved.extras, &clip.source_path, skeleton);
+                continue;
+            }
+            mapped += 1;
+            resolved
+                .animations
+                .push(nw_model::ModelAnimation { skeleton, clip });
         }
-        return Ok(());
-    }
-    resolved
-        .animations
-        .push(nw_model::ModelAnimation { skeleton, clip });
-    add_dependency(&mut resolved.extras, &path);
-    Ok(())
-}
-
-fn push_dba_animations(
-    source: &dyn AssetSource,
-    path: &str,
-    events: Option<&cry_animation::AnimationEventDatabase>,
-    skeleton: usize,
-    require_mapping: bool,
-    resolved: &mut ResolvedAsset,
-) -> Result<()> {
-    let path = normalize_path(path);
-    let bytes = read_required(source, &path)?;
-    let clips = cry_animation::AnimationClip::parse_dba(&bytes)
-        .with_context(|| format!("decode tracks database {path}"))?;
-    let target = resolved
-        .model
-        .skeletons
-        .get(skeleton)
-        .with_context(|| format!("tracks database targets missing skeleton {skeleton}"))?;
-    let mut mapped = 0usize;
-    for mut clip in clips {
-        if resolved.animations.iter().any(|existing| {
-            existing.skeleton == skeleton
-                && existing
-                    .clip
-                    .source_path
-                    .eq_ignore_ascii_case(&clip.source_path)
-        }) {
-            continue;
-        }
-        if let Some(events) = events {
-            clip = clip.with_event_database(events);
-        }
-        if !clip_targets_skeleton(&clip, target) {
-            record_unbound_animation(&mut resolved.extras, &clip.source_path, skeleton);
-            continue;
-        }
-        mapped += 1;
         resolved
-            .animations
-            .push(nw_model::ModelAnimation { skeleton, clip });
-    }
-    add_dependency(&mut resolved.extras, &path);
-    if require_mapping && mapped == 0 {
-        bail!("tracks database {path} has no controllers targeting model skeleton {skeleton}");
+            .parsed_animation_assets
+            .insert((skeleton, asset.path.clone()));
+        add_dependency(&mut resolved.extras, &asset.path);
+        if require_mapping && mapped == 0 && (asset.is_dba || !duplicate) {
+            if asset.is_dba {
+                bail!(
+                    "tracks database {} has no controllers targeting model skeleton {skeleton}",
+                    asset.path
+                );
+            }
+            bail!(
+                "CAF {} has no controllers targeting model skeleton {skeleton}",
+                asset.path
+            );
+        }
     }
     Ok(())
 }
@@ -642,6 +813,9 @@ fn add_mannequin_source(
     extras: &mut nw_model::CryAssetExtras,
 ) -> Result<()> {
     let path = normalize_path(path);
+    if has_source_asset(extras, &path) {
+        return Ok(());
+    }
     let bytes = read_required(source, &path)?;
     let (kind, document) = if let Some(kind) =
         cry_mannequin::MannequinXmlKind::from_source_path(&path)
@@ -666,17 +840,15 @@ fn add_mannequin_source(
                 )?,
             ),
         }
-    } else if let Some(kind) = cry_mannequin::BlendSpaceXmlKind::from_source_path(&path) {
-        match kind {
-            cry_mannequin::BlendSpaceXmlKind::BlendSpace => (
+    } else if cry_mannequin::BlendSpaceXmlKind::from_source_path(&path).is_some() {
+        match cry_mannequin::BlendSpaceDocumentSource::from_legacy(&path, &bytes)? {
+            cry_mannequin::BlendSpaceDocumentSource::BlendSpace(source) => (
                 nw_model::CrySourceAssetKind::BlendSpace,
-                serde_json::to_value(cry_mannequin::BlendSpaceSource::from_legacy(&path, &bytes)?)?,
+                serde_json::to_value(source)?,
             ),
-            cry_mannequin::BlendSpaceXmlKind::CombinedBlendSpace => (
+            cry_mannequin::BlendSpaceDocumentSource::CombinedBlendSpace(source) => (
                 nw_model::CrySourceAssetKind::CombinedBlendSpace,
-                serde_json::to_value(cry_mannequin::CombinedBlendSpaceSource::from_legacy(
-                    &path, &bytes,
-                )?)?,
+                serde_json::to_value(source)?,
             ),
         }
     } else {
@@ -966,12 +1138,23 @@ fn add_xml_source(
     kind: nw_model::CrySourceAssetKind,
     element: &cry_xml::XmlElement,
 ) {
+    if has_source_asset(extras, path) {
+        add_dependency(extras, path);
+        return;
+    }
     extras.source_assets.push(nw_model::CrySourceAsset {
         path: normalize_path(path),
         kind,
         document: xml_json(element),
     });
     add_dependency(extras, path);
+}
+
+fn has_source_asset(extras: &nw_model::CryAssetExtras, path: &str) -> bool {
+    extras
+        .source_assets
+        .iter()
+        .any(|asset| asset.path.eq_ignore_ascii_case(path))
 }
 
 fn xml_json(element: &cry_xml::XmlElement) -> serde_json::Value {

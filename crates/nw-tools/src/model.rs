@@ -96,12 +96,12 @@ impl Model {
         match self.path.clone() {
             None => self.export_install(&ctx),
             Some(path) if path.is_dir() => self.export_tree(&ctx, &path),
-            Some(path) => self.export_file(&path),
+            Some(path) => self.export_file(&ctx, &path),
         }
     }
 
     /// Convert a single mesh file on disk.
-    fn export_file(&self, path: &Path) -> Result<()> {
+    fn export_file(&self, ctx: &RunCtx, path: &Path) -> Result<()> {
         let source = Tree::around(path);
         let out = self
             .out
@@ -116,6 +116,7 @@ impl Model {
             .and_then(|p| std::fs::read_to_string(p).ok());
         let source_path = path.to_string_lossy();
         let stats = self.convert(
+            &ctx.runner,
             &source,
             ConvertRequest {
                 source_path: &source_path,
@@ -163,6 +164,7 @@ impl Model {
                     let heap = std::fs::read(heap_sibling(path)).unwrap_or_default();
                     let source_path = path.to_string_lossy();
                     self.convert(
+                        &ctx.runner,
                         &source,
                         ConvertRequest {
                             source_path: &source_path,
@@ -200,6 +202,7 @@ impl Model {
                 let cgf = source.read(key).with_context(|| format!("read {key}"))?;
                 let heap = source.read(&format!("{key}heap")).unwrap_or_default();
                 self.convert(
+                    &ctx.runner,
                     &source,
                     ConvertRequest {
                         source_path: key,
@@ -220,7 +223,12 @@ impl Model {
 
     /// The shared conversion: assemble the model, resolve materials/textures via the
     /// source, and write the chosen container.
-    fn convert(&self, source: &dyn AssetSource, request: ConvertRequest<'_>) -> Result<ModelStats> {
+    fn convert(
+        &self,
+        runner: &nw_jobs::JobRunner,
+        source: &dyn AssetSource,
+        request: ConvertRequest<'_>,
+    ) -> Result<ModelStats> {
         let ConvertRequest {
             source_path,
             cgf,
@@ -237,6 +245,7 @@ impl Model {
             &mesh,
             mtl_override.as_deref(),
             crate::model_asset::ResolveOptions {
+                runner,
                 no_materials: self.no_materials,
                 skeleton: self.skeleton.as_deref(),
                 animations: &self.animations,
@@ -253,23 +262,22 @@ impl Model {
         let texture_cache = materials
             .as_ref()
             .map(|set| {
-                let mut cache = HashMap::new();
-                for texture in set
+                let mut files = set
                     .sub_materials
                     .iter()
                     .flat_map(|material| &material.textures)
                     .filter(|texture| texture.source_kind() == nw_model::TextureSourceKind::Asset)
-                {
-                    if !cache.contains_key(&texture.file) {
-                        cache.insert(
-                            texture.file.clone(),
-                            decode_texture(source, &texture.file).with_context(|| {
-                                format!("decode material texture {}", texture.file)
-                            })?,
-                        );
-                    }
-                }
-                Ok::<_, anyhow::Error>(cache)
+                    .map(|texture| texture.file.clone())
+                    .collect::<Vec<_>>();
+                files.sort_unstable();
+                files.dedup();
+                runner
+                    .try_map(&files, |file| {
+                        decode_texture(source, file)
+                            .with_context(|| format!("decode material texture {file}"))
+                            .map(|texture| (file.clone(), texture))
+                    })
+                    .map(|textures| textures.into_iter().collect::<HashMap<_, _>>())
             })
             .transpose()?
             .unwrap_or_default();
@@ -281,16 +289,18 @@ impl Model {
                 .animations(&animations)?;
             match (&materials, self.format) {
                 (Some(set), Container::Glb) => {
-                    let glb = gltf.materials(set).to_glb(&mut load);
+                    let glb = gltf.materials(set).to_glb_with_runner(runner, &mut load);
                     write_glb(out, &glb)?
                 }
                 (Some(set), Container::Gltf) => {
-                    let (json, blob) = gltf.materials(set).to_gltf(&bin_uri(out), &mut load);
+                    let (json, blob) =
+                        gltf.materials(set)
+                            .to_gltf_with_runner(&bin_uri(out), runner, &mut load);
                     write_gltf(out, &json, &blob)?
                 }
-                (None, Container::Glb) => write_glb(out, &gltf.to_glb())?,
+                (None, Container::Glb) => write_glb(out, &gltf.to_glb_with_runner(runner))?,
                 (None, Container::Gltf) => {
-                    let (json, blob) = gltf.to_gltf(&bin_uri(out));
+                    let (json, blob) = gltf.to_gltf_with_runner(&bin_uri(out), runner);
                     write_gltf(out, &json, &blob)?
                 }
             }
@@ -324,16 +334,10 @@ struct ConvertRequest<'a> {
 
 /// Reads assets and resolves a mesh's material, abstracting over the filesystem and
 /// the install's paks.
-pub(crate) trait AssetSource: Sync {
-    /// Read an asset's bytes by virtual path (forward slashes, case-insensitive).
-    fn read(&self, path: &str) -> Option<Vec<u8>>;
-
+pub(crate) trait AssetSource: Sync + nw_asset_graph::AssetSource {
     /// Resolve the material set for a mesh, using whatever the source affords —
     /// the catalog (install) or a sibling-directory scan (filesystem).
     fn materials(&self, cgf: &[u8], mesh: &MeshRef) -> Option<nw_model::MaterialSet>;
-
-    /// Resolve a Cry recursive wildcard against this source's virtual paths.
-    fn matching_paths(&self, pattern: &str) -> Result<Vec<String>>;
 }
 
 /// Parse the first `.mtl` among `keys` that this source can read.
@@ -368,7 +372,7 @@ impl Tree {
     }
 }
 
-impl AssetSource for Tree {
+impl nw_asset_graph::AssetSource for Tree {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         self.roots
             .iter()
@@ -377,21 +381,8 @@ impl AssetSource for Tree {
             .and_then(|candidate| std::fs::read(candidate).ok())
     }
 
-    /// Pick the sibling `.mtl` whose sub-materials best match the mesh's MtlName
-    /// chunk (and the `foo_mesh` → `foo_mat` naming convention), then fall back to
-    /// convention-named candidates.
-    fn materials(&self, cgf: &[u8], mesh: &MeshRef) -> Option<nw_model::MaterialSet> {
-        let dir = self.roots.first()?;
-        let wanted = cgf_submaterial_names(cgf);
-        let best = std::fs::read_dir(dir)
-            .ok()?
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path_ext(path).as_deref() == Some("mtl"))
-            .max_by_key(|path| mtl_match_score(path, &mesh.stem, &wanted));
-        best.and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|xml| xml.parse::<nw_model::MaterialSet>().ok())
-            .or_else(|| first_material(self, mesh.mtl_candidates()))
+    fn contains(&self, path: &str) -> bool {
+        self.roots.iter().any(|root| root.join(path).is_file())
     }
 
     fn matching_paths(&self, pattern: &str) -> Result<Vec<String>> {
@@ -422,6 +413,25 @@ impl AssetSource for Tree {
             }
         }
         Ok(found.into_values().collect())
+    }
+}
+
+impl AssetSource for Tree {
+    /// Pick the sibling `.mtl` whose sub-materials best match the mesh's MtlName
+    /// chunk (and the `foo_mesh` → `foo_mat` naming convention), then fall back to
+    /// convention-named candidates.
+    fn materials(&self, cgf: &[u8], mesh: &MeshRef) -> Option<nw_model::MaterialSet> {
+        let dir = self.roots.first()?;
+        let wanted = cgf_submaterial_names(cgf);
+        let best = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path_ext(path).as_deref() == Some("mtl"))
+            .max_by_key(|path| mtl_match_score(path, &mesh.stem, &wanted));
+        best.and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|xml| xml.parse::<nw_model::MaterialSet>().ok())
+            .or_else(|| first_material(self, mesh.mtl_candidates()))
     }
 }
 
@@ -461,16 +471,13 @@ fn cgf_submaterial_names(cgf: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-impl AssetSource for Install {
+impl nw_asset_graph::AssetSource for Install {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         Install::read(self, path)
     }
 
-    /// Resolve the material by the mesh's MtlName GUID through the catalog, falling
-    /// back to convention-named siblings.
-    fn materials(&self, cgf: &[u8], mesh: &MeshRef) -> Option<nw_model::MaterialSet> {
-        let by_guid = mtlname_guid(cgf).and_then(|guid| self.material_path(&guid));
-        first_material(self, by_guid.into_iter().chain(mesh.mtl_candidates()))
+    fn contains(&self, path: &str) -> bool {
+        Install::contains(self, path)
     }
 
     fn matching_paths(&self, pattern: &str) -> Result<Vec<String>> {
@@ -490,6 +497,25 @@ impl AssetSource for Install {
             .filter(|path| matcher.is_match(path))
             .cloned()
             .collect())
+    }
+
+    fn path_by_id(&self, asset_id: nw_asset::AssetId) -> Option<String> {
+        self.catalog()
+            .entry_by_id(asset_id)
+            .map(|entry| entry.path().to_owned())
+    }
+
+    fn legacy_material_path(&self, name: &str) -> Option<String> {
+        self.material_path(name)
+    }
+}
+
+impl AssetSource for Install {
+    /// Resolve the material by the mesh's MtlName GUID through the catalog, falling
+    /// back to convention-named siblings.
+    fn materials(&self, cgf: &[u8], mesh: &MeshRef) -> Option<nw_model::MaterialSet> {
+        let by_guid = mtlname_guid(cgf).and_then(|guid| self.material_path(&guid));
+        first_material(self, by_guid.into_iter().chain(mesh.mtl_candidates()))
     }
 }
 

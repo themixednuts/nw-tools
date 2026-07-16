@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use humansize::{DECIMAL, format_size};
 use nw_jobs::{CancellationToken, JobRunner};
@@ -13,7 +13,7 @@ use nw_pak::{Compression, EntryInfo, PakMmapReader, azcs, crypak, shape};
 use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
 use crate::progress::Job;
-use crate::source::{self, CatalogIndex};
+use crate::source;
 use crate::support::{
     AssetRootArg, GlobSet, MatchMode, PakSet, PathSelector, ScanIssues,
     contains_ascii_case_insensitive, load_lookup,
@@ -32,6 +32,8 @@ pub enum Cmd {
     Extract(Extract),
     #[command(about = "Replace structured assets in a pak archive")]
     Update(Update),
+    #[command(about = "Inspect or extract an asset and its catalog dependency closure")]
+    Dependencies(Dependencies),
 }
 
 impl Cmd {
@@ -41,6 +43,7 @@ impl Cmd {
             Self::Search(cmd) => cmd.run(),
             Self::Extract(cmd) => cmd.run(),
             Self::Update(cmd) => cmd.run(),
+            Self::Dependencies(cmd) => cmd.run(),
         }
     }
 }
@@ -160,6 +163,32 @@ pub struct Extract {
 pub struct Update {
     #[command(subcommand)]
     command: UpdateCmd,
+}
+
+#[derive(Debug, Args)]
+pub struct Dependencies {
+    /// Virtual asset path or `{GUID}:subid` catalog identity.
+    asset: String,
+
+    /// Extract the root and all resolved dependencies under this directory.
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Only include immediate dependencies instead of the transitive closure.
+    #[arg(long)]
+    direct: bool,
+
+    #[arg(long)]
+    overwrite: bool,
+
+    #[arg(long, default_value_t = 100)]
+    show: usize,
+
+    #[command(flatten)]
+    root: AssetRootArg,
+
+    #[command(flatten)]
+    jobs: JobArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -561,7 +590,7 @@ impl SearchPath {
         paks: &PakSet,
         path: &Path,
         query: &TextQuery,
-        catalog: Option<&CatalogIndex>,
+        catalog: Option<&nw_asset::AssetCatalog>,
         cancel: &CancellationToken,
         progress: Option<&Job>,
     ) -> Result<Vec<PathHit>> {
@@ -582,7 +611,7 @@ impl SearchPath {
             if let Some(progress) = progress {
                 progress.inc(1);
             }
-            let info = catalog.and_then(|catalog| catalog.info(entry.name()));
+            let info = catalog.and_then(|catalog| catalog.entry_by_path(entry.name()));
             let score = match &mut search {
                 Some(search) => match search.score(entry.name()) {
                     Some(score) => score,
@@ -590,7 +619,8 @@ impl SearchPath {
                 },
                 None => {
                     // Literal mode also matches the catalog GUID, so an AssetId query resolves.
-                    let guid_match = info.is_some_and(|info| query.matches(&info.asset_id));
+                    let guid_match =
+                        info.is_some_and(|info| query.matches(&info.asset_id().to_string()));
                     if !query.matches(entry.name()) && !guid_match {
                         continue;
                     }
@@ -602,12 +632,159 @@ impl SearchPath {
                 method: entry.compression().to_string(),
                 size: format_size(entry.uncompressed_size(), DECIMAL),
                 name: entry.name().to_string(),
-                asset_id: info.map_or_else(|| "-".to_string(), |info| info.asset_id.clone()),
+                asset_id: info.map_or_else(|| "-".to_string(), |info| info.asset_id().to_string()),
                 score,
             });
         }
 
         Ok(rows)
+    }
+}
+
+impl Dependencies {
+    fn run(self) -> Result<()> {
+        let ctx = self.jobs.ctx()?;
+        let root = self.root.resolve()?;
+        let install = source::Install::open(&ctx, &root)?;
+        let root_asset = install
+            .asset(&self.asset)
+            .with_context(|| format!("asset is not cataloged: {}", self.asset))?;
+        let graph = nw_asset_graph::resolve_with_runner(
+            &install,
+            root_asset.path(),
+            &nw_asset_graph::ResolveOptions::default(),
+            &ctx.runner,
+        )?;
+        let mut paths = if self.direct {
+            std::iter::once(root_asset.path().to_owned())
+                .chain(
+                    graph
+                        .direct_dependencies(root_asset.path())
+                        .map(str::to_owned),
+                )
+                .collect::<Vec<_>>()
+        } else {
+            graph.assets().to_vec()
+        };
+        paths.sort_unstable();
+        paths.dedup();
+
+        let unresolved = graph
+            .unresolved()
+            .iter()
+            .filter(|dependency| {
+                !self.direct || dependency.source().eq_ignore_ascii_case(root_asset.path())
+            })
+            .collect::<Vec<_>>();
+        let required_unresolved = unresolved
+            .iter()
+            .copied()
+            .filter(|dependency| dependency.is_required())
+            .collect::<Vec<_>>();
+        if !required_unresolved.is_empty() && self.out.is_some() {
+            let unresolved = required_unresolved
+                .iter()
+                .map(|dependency| {
+                    format!(
+                        "{} --{}--> {} ({:?})",
+                        dependency.source(),
+                        dependency.relation(),
+                        dependency.target(),
+                        dependency.reason()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("authored dependency closure is incomplete: {unresolved}");
+        }
+
+        let missing = paths
+            .iter()
+            .filter(|path| !install.contains(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() && self.out.is_some() {
+            bail!(
+                "dependency products are absent from the mounted paks: {}",
+                missing.join(", ")
+            );
+        }
+
+        let mut report = Report::new("asset dependencies")
+            .stat("root", root_asset.path())
+            .stat("asset-id", root_asset.asset_id())
+            .stat("scope", if self.direct { "direct" } else { "transitive" })
+            .stat("products", paths.len().saturating_sub(1))
+            .stat("unresolved", unresolved.len())
+            .stat("required-unresolved", required_unresolved.len())
+            .stat("missing", missing.len());
+        let mut mappings = graph
+            .edges()
+            .iter()
+            .filter(|edge| !self.direct || edge.source().eq_ignore_ascii_case(root_asset.path()))
+            .map(|edge| {
+                (
+                    edge.source().to_owned(),
+                    edge.relation().to_owned(),
+                    edge.is_required(),
+                    edge.target().to_owned(),
+                    "resolved".to_owned(),
+                )
+            })
+            .chain(unresolved.iter().map(|dependency| {
+                (
+                    dependency.source().to_owned(),
+                    dependency.relation().to_owned(),
+                    dependency.is_required(),
+                    dependency.target().to_string(),
+                    format!("{:?}", dependency.reason()),
+                )
+            }))
+            .collect::<Vec<_>>();
+        mappings.sort_unstable();
+        let mut table = Table::new(["Required", "Relation", "Source", "Target", "Status"]);
+        for (source, relation, required, target, status) in mappings.iter().take(self.show) {
+            table.push([
+                Cell::text(if *required { "yes" } else { "no" }),
+                Cell::text(relation),
+                Cell::path(source),
+                Cell::path(target),
+                Cell::text(status),
+            ]);
+        }
+
+        if let Some(out) = self.out {
+            let claims = PathClaims::default();
+            let mut extracted = ExtractReport {
+                matched: paths.len() as u64,
+                ..ExtractReport::default()
+            };
+            for path in &paths {
+                let bytes = install
+                    .read(path)
+                    .with_context(|| format!("read dependency product {path}"))?;
+                let target = MountedPath::new(&out, "", path)?;
+                if extracted.write(&target, &bytes, self.overwrite, &claims)?
+                    == WriteOutcome::Written
+                {
+                    extracted.rows.push(ExtractRow {
+                        pak: "catalog".to_owned(),
+                        size: format_size(bytes.len(), DECIMAL),
+                        path: target.display(),
+                    });
+                }
+            }
+            report = report
+                .stat("written", extracted.written)
+                .stat("skipped", extracted.skipped_existing)
+                .stat("output", out.display());
+        }
+        report.table_or(table, "no authored dependency mappings");
+        if mappings.len() > self.show {
+            report.more(mappings.len() - self.show, "mapping(s)");
+        }
+        report.print();
+        Ok(())
     }
 }
 

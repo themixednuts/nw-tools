@@ -1,0 +1,103 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "id": "c57cda6d-74aa-4a64-8860-a136e92cb279",
+  "prevIds": [
+    "00000000-0000-0000-0000-000000000000"
+  ],
+  "ddl": [
+    {
+      "entityType": "tables",
+      "name": "catalog"
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "asset_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "path",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "asset_type",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "catalog",
+      "name": "size",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "catalog",
+      "name": "catalog_pkey",
+      "columns": [
+        "asset_id"
+      ],
+      "nameExplicit": false
+    },
+    {
+      "entityType": "tables",
+      "name": "meta"
+    },
+    {
+      "entityType": "columns",
+      "table": "meta",
+      "name": "key",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "columns",
+      "table": "meta",
+      "name": "value",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": null,
+      "default": null,
+      "generated": null,
+      "collate": null
+    },
+    {
+      "entityType": "pks",
+      "table": "meta",
+      "name": "meta_pkey",
+      "columns": [
+        "key"
+      ],
+      "nameExplicit": false
+    }
+  ],
+  "renames": []
+}

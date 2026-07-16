@@ -264,6 +264,7 @@ struct AnimationTarget {
 struct CryAnimationExtras {
     cry_source_path: String,
     cry_duration: f32,
+    cry_sample_rate: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     cry_root_motion: Option<CryRootMotion>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -459,6 +460,13 @@ struct EmittedSkeleton {
     roots: Vec<usize>,
 }
 
+struct BuiltAnimation {
+    bin: Vec<u8>,
+    accessors: Vec<Accessor>,
+    views: Vec<BufferView>,
+    animation: Animation,
+}
+
 impl Builder {
     fn new() -> Self {
         Self {
@@ -493,6 +501,29 @@ impl Builder {
             target,
         });
         self.views.len() - 1
+    }
+
+    fn append_animation(&mut self, mut built: BuiltAnimation) {
+        while !self.bin.len().is_multiple_of(4) {
+            self.bin.push(0);
+        }
+        let byte_offset = self.bin.len();
+        let view_offset = self.views.len();
+        let accessor_offset = self.accessors.len();
+        for view in &mut built.views {
+            view.byte_offset += byte_offset;
+        }
+        for accessor in &mut built.accessors {
+            accessor.buffer_view += view_offset;
+        }
+        for sampler in &mut built.animation.samplers {
+            sampler.input += accessor_offset;
+            sampler.output += accessor_offset;
+        }
+        self.bin.append(&mut built.bin);
+        self.views.append(&mut built.views);
+        self.accessors.append(&mut built.accessors);
+        self.animations.push(built.animation);
     }
 
     /// Get or create a glTF texture for a `.mtl` File path, embedding the image.
@@ -942,6 +973,7 @@ impl Builder {
             extras: CryAnimationExtras {
                 cry_source_path: clip.source_path.clone(),
                 cry_duration: clip.caf.header.total_duration,
+                cry_sample_rate: clip.caf.sample_rate,
                 cry_root_motion: clip.caf.root_motion.map(CryRootMotion::from),
                 cry_events: clip.events.iter().map(CryAnimationEvent::from).collect(),
             },
@@ -1081,6 +1113,7 @@ fn build(
     materials: Option<&MaterialSet>,
     extras: Option<&CryAssetExtras>,
     loader: &mut TextureLoader<'_>,
+    runner: &nw_jobs::JobRunner,
 ) -> (Document, Vec<u8>) {
     let mut builder = Builder::new();
 
@@ -1138,12 +1171,22 @@ fn build(
         builder.skins[emitted.skin].skeleton = Some(anchor);
     }
 
-    for animation in animations {
-        if let (Some(skeleton), Some(emitted)) = (
-            model.skeletons.get(animation.skeleton),
-            emitted_skeletons.get(animation.skeleton),
-        ) {
-            builder.add_animation(&animation.clip, skeleton, &emitted.joints);
+    let batch_size = runner.parallelism().saturating_mul(2).max(1);
+    for batch in animations.chunks(batch_size) {
+        let built = runner.map(batch, |animation| {
+            let skeleton = model.skeletons.get(animation.skeleton)?;
+            let emitted = emitted_skeletons.get(animation.skeleton)?;
+            let mut local = Builder::new();
+            local.add_animation(&animation.clip, skeleton, &emitted.joints);
+            Some(BuiltAnimation {
+                bin: local.bin,
+                accessors: local.accessors,
+                views: local.views,
+                animation: local.animations.pop().expect("one animation was emitted"),
+            })
+        });
+        for animation in built.into_iter().flatten() {
+            builder.append_animation(animation);
         }
     }
 
@@ -1393,22 +1436,44 @@ impl<'a> Gltf<'a, NoMaterials> {
     /// Serialize to a self-contained `.glb` (geometry only).
     #[must_use]
     pub fn to_glb(&self) -> Vec<u8> {
+        self.to_glb_with_runner(&nw_jobs::JobRunner::automatic())
+    }
+
+    /// Serialize to GLB using the caller's worker policy for animation channels.
+    #[must_use]
+    pub fn to_glb_with_runner(&self, runner: &nw_jobs::JobRunner) -> Vec<u8> {
         glb_bytes(build(
             self.model,
             self.animations,
             None,
             self.extras,
             &mut |_| None,
+            runner,
         ))
     }
 
     /// Serialize to a `.gltf` JSON string + external `.bin` (geometry only).
     #[must_use]
     pub fn to_gltf(&self, bin_uri: &str) -> (String, Vec<u8>) {
+        self.to_gltf_with_runner(bin_uri, &nw_jobs::JobRunner::automatic())
+    }
+
+    /// Serialize to glTF using the caller's worker policy for animation channels.
+    #[must_use]
+    pub fn to_gltf_with_runner(
+        &self,
+        bin_uri: &str,
+        runner: &nw_jobs::JobRunner,
+    ) -> (String, Vec<u8>) {
         gltf_pair(
-            build(self.model, self.animations, None, self.extras, &mut |_| {
-                None
-            }),
+            build(
+                self.model,
+                self.animations,
+                None,
+                self.extras,
+                &mut |_| None,
+                runner,
+            ),
             bin_uri,
         )
     }
@@ -1418,12 +1483,23 @@ impl<'a> Gltf<'a, WithMaterials<'a>> {
     /// Serialize to `.glb`, resolving each material's textures through `loader`.
     #[must_use]
     pub fn to_glb(&self, mut loader: impl FnMut(&str) -> Option<TextureData>) -> Vec<u8> {
+        self.to_glb_with_runner(&nw_jobs::JobRunner::automatic(), &mut loader)
+    }
+
+    /// Serialize to GLB using the caller's worker policy for animation channels.
+    #[must_use]
+    pub fn to_glb_with_runner(
+        &self,
+        runner: &nw_jobs::JobRunner,
+        mut loader: impl FnMut(&str) -> Option<TextureData>,
+    ) -> Vec<u8> {
         glb_bytes(build(
             self.model,
             self.animations,
             Some(self.state.0),
             self.extras,
             &mut loader,
+            runner,
         ))
     }
 
@@ -1434,6 +1510,17 @@ impl<'a> Gltf<'a, WithMaterials<'a>> {
         bin_uri: &str,
         mut loader: impl FnMut(&str) -> Option<TextureData>,
     ) -> (String, Vec<u8>) {
+        self.to_gltf_with_runner(bin_uri, &nw_jobs::JobRunner::automatic(), &mut loader)
+    }
+
+    /// Serialize to glTF using the caller's worker policy for animation channels.
+    #[must_use]
+    pub fn to_gltf_with_runner(
+        &self,
+        bin_uri: &str,
+        runner: &nw_jobs::JobRunner,
+        mut loader: impl FnMut(&str) -> Option<TextureData>,
+    ) -> (String, Vec<u8>) {
         gltf_pair(
             build(
                 self.model,
@@ -1441,6 +1528,7 @@ impl<'a> Gltf<'a, WithMaterials<'a>> {
                 Some(self.state.0),
                 self.extras,
                 &mut loader,
+                runner,
             ),
             bin_uri,
         )

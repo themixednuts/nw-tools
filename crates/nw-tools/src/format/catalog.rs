@@ -438,11 +438,10 @@ fn scan_catalog(
             let mut matched = 0usize;
             for entry in catalog.entries() {
                 let asset_id = entry.asset_id().to_string();
-                let asset_type = entry.asset_type().to_string();
-                let flags = format!("0x{:08x}", entry.flags());
+                let reserved = format!("0x{:08x}", entry.reserved());
                 let score = match &mut search {
                     Some(search) => {
-                        match search.score_any([asset_id.as_str(), asset_type.as_str(), &flags]) {
+                        match search.score_any([asset_id.as_str(), reserved.as_str()]) {
                             Some(score) => score,
                             None => continue,
                         }
@@ -461,8 +460,8 @@ fn scan_catalog(
                         kind: "RAOC".to_string(),
                         size: format_size(u64::from(entry.size_bytes()), DECIMAL),
                         asset_id,
-                        asset_type,
-                        flags,
+                        asset_type: String::new(),
+                        flags: reserved,
                         path: String::new(),
                         score,
                     });
@@ -475,9 +474,10 @@ fn scan_catalog(
                 entries: catalog.len(),
                 matched,
                 details: format!(
-                    "path hashes {}  dependencies {}  types {}",
+                    "GUID-only info {}  path hashes {}  legacy mappings {}  types {}",
+                    catalog.guid_asset_info().len(),
                     catalog.path_ids().len(),
-                    catalog.dependencies().len(),
+                    catalog.legacy_mappings().len(),
                     catalog.types().len()
                 ),
                 rows,
@@ -523,13 +523,8 @@ fn get_catalog(source: &str, bytes: &[u8], queries: &[String]) -> Result<Vec<Cat
         nw_asset::Catalog::Raoc(catalog) => {
             for entry in catalog.entries() {
                 let asset_id = entry.asset_id().to_string();
-                let asset_type = entry.asset_type().to_string();
-                let flags = format!("0x{:08x}", entry.flags());
-                let haystack = [
-                    asset_id.to_ascii_lowercase(),
-                    asset_type.to_ascii_lowercase(),
-                    flags.to_ascii_lowercase(),
-                ];
+                let reserved = format!("0x{:08x}", entry.reserved());
+                let haystack = [asset_id.to_ascii_lowercase(), reserved.to_ascii_lowercase()];
                 if !queries
                     .iter()
                     .any(|query| haystack.iter().any(|value| value == query))
@@ -541,8 +536,8 @@ fn get_catalog(source: &str, bytes: &[u8], queries: &[String]) -> Result<Vec<Cat
                     kind: "RAOC".to_string(),
                     size: format_size(u64::from(entry.size_bytes()), DECIMAL),
                     asset_id,
-                    asset_type,
-                    flags,
+                    asset_type: String::new(),
+                    flags: reserved,
                     path: String::new(),
                     score: 0,
                 });
@@ -578,9 +573,9 @@ fn export_catalog(source: &str, bytes: &[u8]) -> Result<Vec<CatalogExportRow>> {
                 source: source.clone(),
                 kind: "RAOC".to_string(),
                 asset_id: entry.asset_id().to_string(),
-                asset_type: entry.asset_type().to_string(),
+                asset_type: String::new(),
                 size_bytes: entry.size_bytes(),
-                flags: format!("0x{:08x}", entry.flags()),
+                flags: format!("0x{:08x}", entry.reserved()),
                 path: String::new(),
             })
             .collect(),
@@ -613,8 +608,7 @@ fn write_catalog_csv(path: &Path, rows: &[CatalogExportRow]) -> Result<()> {
 fn raoc_text_matches(entry: &nw_asset::RaocEntry, needles: &[String]) -> bool {
     let fields = [
         entry.asset_id().to_string().to_ascii_lowercase(),
-        entry.asset_type().to_string().to_ascii_lowercase(),
-        format!("0x{:08x}", entry.flags()),
+        format!("0x{:08x}", entry.reserved()),
     ];
     needles
         .iter()

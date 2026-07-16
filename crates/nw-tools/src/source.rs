@@ -1,22 +1,21 @@
 //! The located New World install as an asset source: its paks indexed by virtual
-//! path, plus the asset catalog's material map.
+//! path, plus the complete product and dependency catalog.
 //!
 //! Several commands need the same plumbing — locate the install, open every pak,
 //! build a path → (reader, entry) table of contents, and resolve `MtlName` GUIDs
-//! through the catalog. [`Install`] is that shared backbone; the catalog material
-//! map is cached on disk and only rebuilt when `Engine.pak` changes (see
-//! [`crate::cache`]).
+//! through the catalog. [`Install`] is that shared backbone; the parsed catalog is
+//! cached on disk and only rebuilt when `Engine.pak` changes (see [`crate::cache`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use nw_asset::{AssetId, Rasc};
+use nw_asset::{AssetCatalog, AssetId, Raoc, Rasc, RascEntry};
 use nw_pak::PakMmapReader;
 use uuid::Uuid;
 
-use crate::cache::{Cache, CatalogRecord};
+use crate::cache::Cache;
 use crate::jobs::RunCtx;
 use crate::support::PakSet;
 
@@ -133,20 +132,20 @@ impl Toc {
     }
 }
 
-/// The install's paks indexed by virtual path, plus the catalog material map.
+/// The install's paks indexed by virtual path, plus the resolved asset catalog.
 ///
 /// `read` resolves a virtual path through the pak table-of-contents; `material_path`
-/// resolves a `MtlName` GUID to its `.mtl` path through the cached catalog map.
+/// and dependency queries resolve through the same cached catalog abstraction.
 pub struct Install {
     toc: Toc,
-    materials: HashMap<String, String>,
+    catalog: AssetCatalog,
     /// Hot path index for recursive animation/material/audio glob resolution.
     indexed_paths: HashMap<String, Vec<String>>,
 }
 
 impl Install {
     /// Open every pak under `assets`, building the table of contents and loading
-    /// the catalog material map (from cache when `Engine.pak` is unchanged).
+    /// the complete catalog (from cache when `Engine.pak` is unchanged).
     ///
     /// # Errors
     ///
@@ -157,7 +156,7 @@ impl Install {
             bail!("no pak archives found in {}", assets.display());
         }
         let toc = Toc::build(ctx, paks.paths(), |_| true);
-        let materials = ensure_catalog_cache(assets)?.material_map();
+        let catalog = load_install_catalog(assets, &ctx.runner)?;
         let indexed_extensions = ["caf", "i_caf", "bspace", "comb", "dba", "mtl", "bnk", "wem"];
         let mut indexed_paths = HashMap::<String, Vec<String>>::new();
         for path in toc.names() {
@@ -176,7 +175,7 @@ impl Install {
         }
         Ok(Self {
             toc,
-            materials,
+            catalog,
             indexed_paths,
         })
     }
@@ -187,11 +186,34 @@ impl Install {
         self.toc.read(path)
     }
 
+    #[must_use]
+    pub fn contains(&self, path: &str) -> bool {
+        self.toc.entries.contains_key(&path.to_ascii_lowercase())
+    }
+
     /// Resolve a `MtlName`-chunk GUID to its `.mtl` path via the cached catalog map.
     #[must_use]
     pub fn material_path(&self, guid: &str) -> Option<String> {
         let id = guid_to_asset_id(guid)?;
-        self.materials.get(&id.to_string()).cloned()
+        self.catalog
+            .entry_by_id(id)
+            .filter(|entry| entry.path().ends_with(".mtl"))
+            .map(|entry| entry.path().to_owned())
+    }
+
+    #[must_use]
+    pub const fn catalog(&self) -> &AssetCatalog {
+        &self.catalog
+    }
+
+    /// Resolve a virtual path or textual `AssetId` to its product entry.
+    #[must_use]
+    pub fn asset(&self, query: &str) -> Option<&RascEntry> {
+        query
+            .parse::<AssetId>()
+            .ok()
+            .and_then(|asset_id| self.catalog.entry_by_id(asset_id))
+            .or_else(|| self.catalog.entry_by_path(query))
     }
 
     /// Sorted virtual paths whose extension is one of `extensions`, optionally
@@ -208,121 +230,83 @@ impl Install {
     }
 }
 
-/// What the catalog knows about one asset, for enriching a pak entry.
-#[derive(Debug, Clone)]
-pub struct AssetInfo {
-    pub asset_id: String,
-}
-
-/// The RASC catalog indexed by virtual path, for enriching pak entries with their
-/// catalog identity.
-pub struct CatalogIndex {
-    by_path: HashMap<String, AssetInfo>,
-}
-
-impl CatalogIndex {
-    fn from_records(records: Vec<CatalogRecord>) -> Self {
-        let by_path = records
-            .into_iter()
-            .map(|record| {
-                (
-                    record.path.to_ascii_lowercase(),
-                    AssetInfo {
-                        asset_id: record.asset_id,
-                    },
-                )
-            })
-            .collect();
-        Self { by_path }
-    }
-
-    /// The catalog identity of a virtual path, if any.
-    #[must_use]
-    pub fn info(&self, path: &str) -> Option<&AssetInfo> {
-        self.by_path.get(&path.to_ascii_lowercase())
-    }
-}
-
-/// Load the install's RASC catalog index (path → `AssetId`/type), from cache when
+/// Load the install's product catalog from cache when
 /// `Engine.pak` is unchanged.
 ///
 /// # Errors
 ///
 /// Returns an error if `Engine.pak` cannot be read or the catalog cannot be parsed.
-pub fn catalog_index(assets: &Path) -> Result<CatalogIndex> {
-    Ok(CatalogIndex::from_records(
-        ensure_catalog_cache(assets)?.catalog_records(),
-    ))
+pub fn catalog_index(assets: &Path) -> Result<AssetCatalog> {
+    load_install_catalog(assets, &nw_jobs::JobRunner::automatic())
 }
 
-/// Ensure the RASC catalog cache is current for `assets`, rebuilding it from
-/// `Engine.pak` when the fingerprint changed, and return the opened cache.
+/// Ensure the catalog cache is current for `assets`, rebuilding it from
+/// `Engine.pak` when the fingerprint changed.
 ///
 /// The cache is replaced wholesale on a rebuild (a fresh file), so re-storing can
 /// never collide with stale rows; the fingerprint row is written last in the same
 /// transaction, so its presence means the rebuild committed.
-fn ensure_catalog_cache(assets: &Path) -> Result<Cache> {
+fn load_install_catalog(assets: &Path, runner: &nw_jobs::JobRunner) -> Result<AssetCatalog> {
     // The leading version forces a rebuild when the cached projection's shape
     // changes, even if Engine.pak itself is unchanged.
     let fingerprint =
-        crate::cache::file_fingerprint(&assets.join("Engine.pak")).map(|fp| format!("v2:{fp}"));
+        crate::cache::file_fingerprint(&assets.join("Engine.pak")).map(|fp| format!("v5:{fp}"));
     let db_path = crate::cache::default_path();
 
     // Fast path: reuse the cache while Engine.pak is unchanged.
     if let Some(fp) = &fingerprint
         && let Ok(cache) = Cache::open(&db_path)
         && cache.fingerprint().as_ref() == Some(fp)
+        && let Ok(catalog) = cache.catalog()
     {
-        return Ok(cache);
+        return Ok(catalog);
     }
 
-    // Rebuild from Engine.pak's RASC catalog.
-    let (rasc_bytes, _raoc) = install_catalog_bytes(assets)?;
-    let records = build_catalog_records(&rasc_bytes)?;
-    tracing::debug!("catalog index: {} entries (rebuilt)", records.len());
+    // Rebuild from Engine.pak's RASC and RAOC catalogs.
+    let (rasc_bytes, raoc_bytes) = install_catalog_bytes(assets)?;
+    let (rasc, raoc) = runner.join(
+        || Rasc::parse_with_runner(&rasc_bytes, runner),
+        || {
+            raoc_bytes
+                .as_deref()
+                .map(|bytes| Raoc::parse_with_runner(bytes, runner))
+                .transpose()
+        },
+    );
+    let rasc = rasc.context("parse asset catalog (rasc) from Engine.pak")?;
+    let raoc = raoc.context("parse optimized asset catalog (raoc) from Engine.pak")?;
+    let catalog = AssetCatalog::new(rasc, raoc);
+    tracing::debug!("catalog index: {} products (rebuilt)", catalog.len());
 
-    match &fingerprint {
-        Some(fp) => {
-            let _ = std::fs::remove_file(&db_path);
-            let mut cache = Cache::open(&db_path)?;
-            cache.store(fp, &records)?;
-            Ok(cache)
-        }
-        // Can't fingerprint Engine.pak (rare) — serve this run from a transient cache.
-        None => {
-            let mut cache = Cache::open_in_memory()?;
-            cache.store("transient", &records)?;
-            Ok(cache)
-        }
+    if let Some(fp) = &fingerprint {
+        let mut cache = Cache::open(&db_path)?;
+        cache.store(fp, &catalog)?;
     }
-}
-
-/// Parse the RASC catalog and project every entry to a [`CatalogRecord`].
-fn build_catalog_records(rasc_bytes: &[u8]) -> Result<Vec<CatalogRecord>> {
-    let rasc = Rasc::parse(rasc_bytes).context("parse asset catalog (rasc) from Engine.pak")?;
-    Ok(rasc
-        .entries()
-        .iter()
-        .map(|entry| CatalogRecord {
-            asset_id: entry.asset_id().to_string(),
-            path: entry.path().to_string(),
-            asset_type: entry.asset_type().to_string(),
-            size: i64::from(entry.size_bytes()),
-        })
-        .collect())
+    Ok(catalog)
 }
 
 /// Map a Cry `MtlName` GUID to a Lumberyard catalog [`AssetId`].
 ///
-/// AzCore stores UUIDs as straight big-endian bytes (`Uuid::CreateName` →
-/// `from_be_bytes`), but the `MtlName` chunk records the GUID in Microsoft display
-/// form, where Data1/Data2/Data3 are little-endian. Reinterpreting those three
-/// fields (`swap_bytes`) yields the AZ-canonical UUID. A `.mtl` is a single-product
-/// source asset, so its product sub-id is 0.
+/// New World's `MtlName` chunks and asset catalog use the same canonical textual
+/// UUID representation. A `.mtl` is a single-product source asset, so its product
+/// sub-id is 0.
 #[must_use]
 pub fn guid_to_asset_id(guid: &str) -> Option<AssetId> {
-    let uuid = Uuid::parse_str(guid.trim()).ok()?;
-    let (d1, d2, d3, d4) = uuid.as_fields();
-    let canonical = Uuid::from_fields(d1.swap_bytes(), d2.swap_bytes(), d3.swap_bytes(), d4);
-    Some(AssetId::new(canonical, 0))
+    Some(AssetId::new(Uuid::parse_str(guid.trim()).ok()?, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cry_material_guid_uses_catalog_uuid_byte_order() {
+        let id = guid_to_asset_id("{bca85a99-c440-5e6f-bf24-930333ac3367}").unwrap();
+
+        assert_eq!(
+            id.guid,
+            Uuid::parse_str("bca85a99-c440-5e6f-bf24-930333ac3367").unwrap()
+        );
+        assert_eq!(id.sub_id, 0);
+    }
 }

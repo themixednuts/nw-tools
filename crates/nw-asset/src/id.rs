@@ -160,7 +160,7 @@ impl FromStr for AssetType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct AssetReference {
     pub asset_id: AssetId,
     pub asset_type: AssetType,

@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 pub mod reflected;
 
 pub use cry_xml::XmlElement;
+use nw_asset::{AssetDependencies, AssetDependency, AssetDependencyTarget};
 use nw_reflected_types::types::{
     SimpleAssetReferenceBase, SimpleAssetReferenceCharacterDefinitionAsset,
     SimpleAssetReferenceMeshAsset, SimpleAssetReferenceSkinAsset,
@@ -173,6 +174,48 @@ impl CharacterDefinition {
             physics: self.model.physics.clone(),
             rig: self.model.rig.clone(),
         }
+    }
+}
+
+impl AssetDependencies for CharacterDefinition {
+    fn asset_dependencies(&self) -> Vec<AssetDependency> {
+        let mut dependencies = Vec::new();
+        push_required_path(
+            &mut dependencies,
+            "character.skeleton",
+            &self.model.skeleton,
+        );
+        if let Some(path) = &self.model.params_override {
+            push_required_path(&mut dependencies, "character.parameters", path);
+        }
+        if let Some(path) = &self.model.material {
+            push_required_material(&mut dependencies, "character.material", path);
+        }
+        if let Some(path) = &self.model.physics {
+            push_required_path(&mut dependencies, "character.physics", path);
+        }
+        if let Some(path) = &self.model.rig {
+            push_required_path(&mut dependencies, "character.rig", path);
+        }
+        for attachment in &self.attachments {
+            if let Some(path) = &attachment.binding {
+                push_required_path(&mut dependencies, "character.attachment", path);
+            }
+            if let Some(path) = &attachment.simulation_binding {
+                push_required_path(&mut dependencies, "character.simulation_binding", path);
+            }
+            if let Some(path) = &attachment.material {
+                push_required_material(&mut dependencies, "character.attachment_material", path);
+            }
+            for path in attachment.material_lods.values() {
+                push_required_material(
+                    &mut dependencies,
+                    "character.attachment_material_lod",
+                    path,
+                );
+            }
+        }
+        dependencies
     }
 }
 
@@ -363,6 +406,101 @@ impl CharacterParameters {
             .collect();
         Ok(Self { source, animations })
     }
+}
+
+impl AssetDependencies for CharacterParameters {
+    fn asset_dependencies(&self) -> Vec<AssetDependency> {
+        let mut dependencies = Vec::new();
+        let mut animation_directory = String::new();
+        for entry in &self.animations {
+            let path = normalize_authored_path(&entry.path);
+            match entry.kind {
+                CharacterAnimationEntryKind::FilePath => {
+                    animation_directory = path.trim_end_matches('/').to_owned();
+                }
+                CharacterAnimationEntryKind::ParseSubfolders => {}
+                CharacterAnimationEntryKind::TracksDatabase => {
+                    dependencies.push(path_dependency("animation.tracks_database", path, true))
+                }
+                CharacterAnimationEntryKind::Include => {
+                    push_required_path(&mut dependencies, "animation.parameters_include", &path);
+                }
+                CharacterAnimationEntryKind::AnimationEventDatabase => {
+                    push_required_path(&mut dependencies, "animation.events", &path);
+                }
+                CharacterAnimationEntryKind::FaceLibrary => {
+                    push_required_path(&mut dependencies, "animation.face_library", &path);
+                }
+                CharacterAnimationEntryKind::WildcardAsset => {
+                    dependencies.push(path_dependency(
+                        "animation.clip_pattern",
+                        animation_path(&animation_directory, &path),
+                        false,
+                    ));
+                }
+                CharacterAnimationEntryKind::Asset => {
+                    push_required_path(
+                        &mut dependencies,
+                        "animation.asset",
+                        &animation_path(&animation_directory, &path),
+                    );
+                }
+                CharacterAnimationEntryKind::UnknownDirective => {
+                    dependencies.push(AssetDependency::required(
+                        "animation.unknown_directive",
+                        AssetDependencyTarget::symbol(format!("{}={}", entry.name, entry.path)),
+                    ));
+                }
+            }
+        }
+        dependencies
+    }
+}
+
+fn path_dependency(relation: &str, path: String, required: bool) -> AssetDependency {
+    let target = if path.contains(['*', '?', '[']) {
+        AssetDependencyTarget::pattern(path)
+    } else {
+        AssetDependencyTarget::path(path)
+    };
+    if required {
+        AssetDependency::required(relation, target)
+    } else {
+        AssetDependency::optional(relation, target)
+    }
+}
+
+fn push_required_path(dependencies: &mut Vec<AssetDependency>, relation: &str, path: &str) {
+    if !path.trim().is_empty() {
+        dependencies.push(AssetDependency::required_path(relation, path));
+    }
+}
+
+fn push_required_material(dependencies: &mut Vec<AssetDependency>, relation: &str, path: &str) {
+    if path.trim().is_empty() {
+        return;
+    }
+    let path = if path
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("mtl"))
+    {
+        path.to_owned()
+    } else {
+        format!("{path}.mtl")
+    };
+    dependencies.push(AssetDependency::required_path(relation, path));
+}
+
+fn animation_path(directory: &str, path: &str) -> String {
+    if directory.is_empty() || path.contains('/') {
+        path.to_owned()
+    } else {
+        format!("{directory}/{path}")
+    }
+}
+
+fn normalize_authored_path(path: &str) -> String {
+    path.trim_start_matches(['/', '\\']).replace('\\', "/")
 }
 
 fn animation_entry_kind(name: &str, path: &str) -> CharacterAnimationEntryKind {

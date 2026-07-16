@@ -2,6 +2,7 @@
 
 use std::{num::ParseIntError, str};
 
+use nw_asset::{AssetDependencies, AssetDependency, AssetDependencyTarget};
 use quick_xml::{
     Reader,
     events::{BytesStart, Event},
@@ -150,6 +151,98 @@ impl MannequinAnimationDatabaseSource {
         F: FnMut(&str) -> Option<String>,
     {
         self.database.resolve_animation_references(&mut resolver);
+    }
+}
+
+impl AssetDependencies for MannequinAnimationDatabaseSource {
+    fn asset_dependencies(&self) -> Vec<AssetDependency> {
+        let mut dependencies = Vec::new();
+        for (relation, path) in [
+            (
+                "mannequin.controller_definition",
+                self.database.definition.as_deref(),
+            ),
+            (
+                "mannequin.fragment_definition",
+                self.database.fragment_definition.as_deref(),
+            ),
+            (
+                "mannequin.tag_definition",
+                self.database.tag_definition.as_deref(),
+            ),
+        ] {
+            if let Some(path) = path.filter(|path| !path.trim().is_empty()) {
+                dependencies.push(AssetDependency::required_path(relation, path));
+            }
+        }
+        dependencies.extend(
+            self.database
+                .sub_databases
+                .iter()
+                .filter(|database| !database.file.trim().is_empty())
+                .map(|database| {
+                    AssetDependency::required_path("mannequin.sub_database", &database.file)
+                }),
+        );
+        for group in &self.database.fragment_groups {
+            for fragment in &group.fragments {
+                push_fragment_dependencies(fragment, &mut dependencies);
+            }
+        }
+        for blend in &self.database.fragment_blends {
+            for variant in &blend.variants {
+                for fragment in &variant.fragments {
+                    push_fragment_dependencies(fragment, &mut dependencies);
+                }
+            }
+        }
+        dependencies
+    }
+}
+
+fn push_fragment_dependencies(
+    fragment: &MannequinFragment,
+    dependencies: &mut Vec<AssetDependency>,
+) {
+    for animation in fragment
+        .animation_layers
+        .iter()
+        .flat_map(|layer| &layer.animations)
+    {
+        if let Some(path) = animation.motion_path.as_deref() {
+            dependencies.push(AssetDependency::required_path("mannequin.animation", path));
+        } else if !animation.name.trim().is_empty() {
+            dependencies.push(AssetDependency::required(
+                "mannequin.animation",
+                AssetDependencyTarget::symbol(&animation.name),
+            ));
+        }
+    }
+    for procedural in fragment
+        .procedural_layers
+        .iter()
+        .flat_map(|layer| &layer.procedurals)
+    {
+        push_procedural_parameters(&procedural.parameters, dependencies);
+    }
+}
+
+fn push_procedural_parameters(
+    parameters: &[MannequinProceduralParameter],
+    dependencies: &mut Vec<AssetDependency>,
+) {
+    for parameter in parameters {
+        if let Some(value) = parameter
+            .value
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            dependencies.push(AssetDependency::optional(
+                format!("mannequin.procedural_parameter.{}", parameter.name),
+                AssetDependencyTarget::symbol(value),
+            ));
+        }
+        push_procedural_parameters(&parameter.children, dependencies);
     }
 }
 
@@ -332,6 +425,43 @@ impl MannequinTagDefinitionSource {
     }
 }
 
+impl AssetDependencies for MannequinTagDefinitionSource {
+    fn asset_dependencies(&self) -> Vec<AssetDependency> {
+        let mut dependencies = self
+            .imports
+            .iter()
+            .filter(|path| !path.trim().is_empty())
+            .map(|path| AssetDependency::required_path("mannequin.tag_import", path))
+            .collect::<Vec<_>>();
+        for entry in &self.entries {
+            match entry {
+                MannequinTagDefinitionEntry::Tag(tag) => {
+                    push_sub_tag_definition(tag, &mut dependencies);
+                }
+                MannequinTagDefinitionEntry::Group(group) => {
+                    for tag in &group.tags {
+                        push_sub_tag_definition(tag, &mut dependencies);
+                    }
+                }
+            }
+        }
+        dependencies
+    }
+}
+
+fn push_sub_tag_definition(tag: &MannequinTagEntry, dependencies: &mut Vec<AssetDependency>) {
+    if let Some(path) = tag
+        .sub_tag_definition
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    {
+        dependencies.push(AssetDependency::required_path(
+            "mannequin.sub_tag_definition",
+            path,
+        ));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MannequinTagDefinitionEntry {
     Tag(MannequinTagEntry),
@@ -375,6 +505,22 @@ impl MannequinControllerDefinitionSource {
 
     pub fn from_ron_bytes(bytes: &[u8]) -> Result<Self, ron::error::SpannedError> {
         ron::de::from_bytes(bytes)
+    }
+}
+
+impl AssetDependencies for MannequinControllerDefinitionSource {
+    fn asset_dependencies(&self) -> Vec<AssetDependency> {
+        [
+            ("mannequin.controller_tags", self.tags.filename.as_str()),
+            (
+                "mannequin.controller_fragments",
+                self.fragments.filename.as_str(),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, path)| !path.trim().is_empty())
+        .map(|(relation, path)| AssetDependency::required_path(relation, path))
+        .collect()
     }
 }
 
