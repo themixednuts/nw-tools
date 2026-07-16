@@ -17,8 +17,8 @@ pub use geometry::{
 };
 pub use gltf::{
     CryAssetExtras, CryNonRenderNode, CryNonRenderNodeRole, CrySourceAsset, CrySourceAssetKind,
-    CryUnboundAnimation, Gltf, GltfAnimationError, ModelAnimation, NoMaterials, TextureData,
-    WithMaterials,
+    CryUnboundAnimation, Gltf, GltfAnimationError, GltfPackage, GltfPackageError, GltfResource,
+    ModelAnimation, NoMaterials, TextureData, WithMaterials,
 };
 pub use material::{MapSlot, MaterialSet, SubMaterial, TextureRef, TextureSourceKind};
 
@@ -102,6 +102,54 @@ mod tests {
         assert_eq!(&glb[16..20], b"JSON");
     }
 
+    #[test]
+    fn structured_gltf_keeps_reusable_mesh_buffers_separate() {
+        use glam::Vec3;
+
+        let primitive = || Primitive {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: None,
+            uvs: None,
+            indices: vec![0, 1, 2],
+            joints: None,
+            weights: None,
+            material_id: 0,
+        };
+        let mesh = |name: &str| Mesh {
+            name: name.to_string(),
+            skin: None,
+            lod: None,
+            shadow_proxy: false,
+            attachment: None,
+            primitives: vec![primitive()],
+        };
+        let model = Model {
+            skeletons: Vec::new(),
+            auxiliary_nodes: Vec::new(),
+            meshes: vec![mesh("left"), mesh("right")],
+        };
+        let package = Gltf::new(&model).to_gltf_package();
+
+        assert_eq!(package.resources().len(), 2);
+        assert_eq!(package.resources()[0].extension(), "bin");
+        assert_eq!(
+            package.resources()[0].bytes(),
+            package.resources()[1].bytes()
+        );
+        let shared_uri = "../_shared/sha256/same.bin".to_string();
+        let json: serde_json::Value = serde_json::from_str(
+            &package
+                .into_json(&[shared_uri.clone(), shared_uri.clone()])
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["buffers"].as_array().unwrap().len(), 2);
+        assert_eq!(json["buffers"][0]["uri"], shared_uri);
+        assert_eq!(json["buffers"][1]["uri"], shared_uri);
+        assert_eq!(json["bufferViews"][0]["buffer"], 0);
+        assert_eq!(json["bufferViews"][2]["buffer"], 1);
+    }
+
     /// Extract and parse the JSON chunk of a GLB.
     fn glb_json(glb: &[u8]) -> serde_json::Value {
         let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
@@ -157,6 +205,8 @@ mod tests {
         assert_eq!(json["materials"].as_array().unwrap().len(), 1);
         assert_eq!(json["textures"].as_array().unwrap().len(), 1);
         assert_eq!(json["images"].as_array().unwrap().len(), 1);
+        assert!(json["images"][0]["bufferView"].is_number());
+        assert!(json["images"][0].get("uri").is_none());
         // Only the non-Nodraw primitive survives.
         assert_eq!(json["meshes"][0]["primitives"].as_array().unwrap().len(), 1);
         let prim = &json["meshes"][0]["primitives"][0];
@@ -165,6 +215,26 @@ mod tests {
             json["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["index"],
             0
         );
+
+        let package = Gltf::new(&model).materials(&mtl).to_gltf_package(|_| {
+            Some(TextureData {
+                bytes: vec![0x89, b'P', b'N', b'G'],
+                mime: "image/png".to_string(),
+            })
+        });
+        assert_eq!(package.resources().len(), 2);
+        assert_eq!(package.resources()[1].extension(), "png");
+        let structured: serde_json::Value = serde_json::from_str(
+            &package
+                .into_json(&[
+                    "shared/mesh.bin".to_string(),
+                    "shared/image.png".to_string(),
+                ])
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(structured["images"][0]["uri"], "shared/image.png");
+        assert!(structured["images"][0].get("bufferView").is_none());
     }
 
     #[test]

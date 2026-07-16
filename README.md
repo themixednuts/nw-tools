@@ -38,6 +38,22 @@ Non-render physics proxies and runtime-defined material textures such as
 `nearest_cubemap` remain typed in Cry extras instead of being fabricated as glTF
 geometry or file textures. Missing explicit dependencies fail the conversion.
 
+Choose `--format glb` for one self-contained binary file. Choose `--format gltf`
+for automatic structured output: manifests keep mesh, skeleton, animation, and
+texture payloads in `_shared/sha256`, and every export under the same output root
+reuses byte-identical resources. No manual asset linking is required.
+
+```text
+models/
+  _shared/sha256/<content-hash>.bin
+  _shared/sha256/<content-hash>.png
+  objects/characters/example.gltf
+  objects/characters/another.gltf
+```
+
+See [docs/structured-exports.md](docs/structured-exports.md) for the container
+tradeoffs, package guarantees, and reusable exporter API.
+
 ## ATL and Wwise inspection
 
 `format audio` validates ATL XML, Wwise BNK/WEM containers, and New World's

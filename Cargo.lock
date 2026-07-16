@@ -2491,6 +2491,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nw-artifact"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "nw-asset"
 version = "0.1.0"
 dependencies = [
@@ -2760,6 +2769,7 @@ dependencies = [
  "humansize",
  "image",
  "memchr",
+ "nw-artifact",
  "nw-asset",
  "nw-asset-graph",
  "nw-datasheet",

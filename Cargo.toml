@@ -81,6 +81,7 @@ cry-mannequin = { version = "0.1.0", path = "crates/cry-mannequin" }
 cry-xml = { version = "0.1.0", path = "crates/cry-xml" }
 nw-asset = { version = "0.1.0", path = "crates/nw-asset", default-features = false }
 nw-asset-graph = { version = "0.1.0", path = "crates/nw-asset-graph" }
+nw-artifact = { version = "0.1.0", path = "crates/nw-artifact" }
 nw-datasheet = { version = "0.1.0", path = "crates/nw-datasheet" }
 nw-dds = { version = "0.1.0", path = "crates/nw-dds" }
 nw-filesystem = { version = "0.1.0", path = "crates/nw-filesystem" }

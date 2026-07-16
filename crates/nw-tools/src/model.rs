@@ -7,12 +7,14 @@
 //! material by its MtlName GUID rather than guessing by file name.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use humansize::{DECIMAL, format_size};
 use image::ImageEncoder;
+use nw_artifact::PackageWriter;
 
 use crate::jobs::{JobArgs, RunCtx};
 use crate::source::{self, Install};
@@ -107,6 +109,17 @@ impl Model {
             .out
             .clone()
             .unwrap_or_else(|| path.with_extension(self.format.extension()));
+        let package = if self.format == Container::Gltf {
+            Some(PackageWriter::new(
+                out.parent().unwrap_or_else(|| Path::new(".")),
+            )?)
+        } else {
+            None
+        };
+        let artifact = out
+            .file_name()
+            .map(PathBuf::from)
+            .context("model output has no file name")?;
         guard_existing(&out, self.overwrite.into())?;
         let cgf = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         let heap = std::fs::read(heap_sibling(path)).unwrap_or_default();
@@ -125,6 +138,8 @@ impl Model {
                 mesh: MeshRef::for_file(path),
                 mtl_override,
                 out: &out,
+                package: package.as_ref(),
+                artifact: &artifact,
             },
         )?;
 
@@ -146,6 +161,11 @@ impl Model {
     /// Batch-convert every mesh under a directory, in parallel.
     fn export_tree(&self, ctx: &RunCtx, dir: &Path) -> Result<()> {
         let out_dir = self.out.clone().unwrap_or_else(|| dir.to_path_buf());
+        let package = if self.format == Container::Gltf {
+            Some(PackageWriter::new(&out_dir)?)
+        } else {
+            None
+        };
         let meshes = collect_matching(dir, is_mesh_file)?;
         let batch = ctx.map_results_compact(
             "model",
@@ -155,9 +175,8 @@ impl Model {
                 progress.step(|| {
                     let source = Tree::around(path);
                     let relative = path.strip_prefix(dir).unwrap_or(path);
-                    let out = out_dir
-                        .join(relative)
-                        .with_extension(self.format.extension());
+                    let artifact = relative.with_extension(self.format.extension());
+                    let out = out_dir.join(&artifact);
                     guard_existing(&out, self.overwrite.into())?;
                     ensure_parent(&out)?;
                     let cgf = std::fs::read(path)?;
@@ -173,6 +192,8 @@ impl Model {
                             mesh: MeshRef::for_file(path),
                             mtl_override: None,
                             out: &out,
+                            package: package.as_ref(),
+                            artifact: &artifact,
                         },
                     )
                 })
@@ -193,10 +214,16 @@ impl Model {
             bail!("no matching meshes found in the install paks");
         }
         let out_dir = self.out.clone().unwrap_or_else(|| PathBuf::from("models"));
+        let package = if self.format == Container::Gltf {
+            Some(PackageWriter::new(&out_dir)?)
+        } else {
+            None
+        };
 
         let batch = ctx.map_results_compact("model", &meshes, Clone::clone, |key, progress| {
             progress.step(|| {
-                let out = out_dir.join(key).with_extension(self.format.extension());
+                let artifact = Path::new(key).with_extension(self.format.extension());
+                let out = out_dir.join(&artifact);
                 guard_existing(&out, self.overwrite.into())?;
                 ensure_parent(&out)?;
                 let cgf = source.read(key).with_context(|| format!("read {key}"))?;
@@ -211,6 +238,8 @@ impl Model {
                         mesh: MeshRef::for_key(key),
                         mtl_override: None,
                         out: &out,
+                        package: package.as_ref(),
+                        artifact: &artifact,
                     },
                 )
             })
@@ -236,6 +265,8 @@ impl Model {
             mesh,
             mtl_override,
             out,
+            package,
+            artifact,
         } = request;
         let resolved = crate::model_asset::resolve(
             source,
@@ -293,15 +324,17 @@ impl Model {
                     write_glb(out, &glb)?
                 }
                 (Some(set), Container::Gltf) => {
-                    let (json, blob) =
-                        gltf.materials(set)
-                            .to_gltf_with_runner(&bin_uri(out), runner, &mut load);
-                    write_gltf(out, &json, &blob)?
+                    let package = package.context("structured glTF package writer missing")?;
+                    let gltf = gltf
+                        .materials(set)
+                        .to_gltf_package_with_runner(runner, &mut load);
+                    write_gltf_package(runner, package, artifact, gltf)?
                 }
                 (None, Container::Glb) => write_glb(out, &gltf.to_glb_with_runner(runner))?,
                 (None, Container::Gltf) => {
-                    let (json, blob) = gltf.to_gltf_with_runner(&bin_uri(out), runner);
-                    write_gltf(out, &json, &blob)?
+                    let package = package.context("structured glTF package writer missing")?;
+                    let gltf = gltf.to_gltf_package_with_runner(runner);
+                    write_gltf_package(runner, package, artifact, gltf)?
                 }
             }
         };
@@ -330,6 +363,8 @@ struct ConvertRequest<'a> {
     mesh: MeshRef,
     mtl_override: Option<String>,
     out: &'a Path,
+    package: Option<&'a PackageWriter>,
+    artifact: &'a Path,
 }
 
 /// Reads assets and resolves a mesh's material, abstracting over the filesystem and
@@ -646,25 +681,39 @@ fn decode_texture(source: &dyn AssetSource, file: &str) -> Result<nw_model::Text
     })
 }
 
-/// The `.bin` sidecar URI for a `.gltf` output (its file name).
-fn bin_uri(out: &Path) -> String {
-    out.with_extension("bin")
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("model.bin")
-        .to_string()
-}
-
 fn write_glb(out: &Path, glb: &[u8]) -> Result<usize> {
     std::fs::write(out, glb).with_context(|| format!("write {}", out.display()))?;
     Ok(glb.len())
 }
 
-fn write_gltf(out: &Path, json: &str, blob: &[u8]) -> Result<usize> {
-    let bin = out.with_extension("bin");
-    std::fs::write(out, json.as_bytes()).with_context(|| format!("write {}", out.display()))?;
-    std::fs::write(&bin, blob).with_context(|| format!("write {}", bin.display()))?;
-    Ok(json.len() + blob.len())
+fn write_gltf_package(
+    runner: &nw_jobs::JobRunner,
+    package: &PackageWriter,
+    artifact: &Path,
+    gltf: nw_model::GltfPackage,
+) -> Result<usize> {
+    let stored = runner.try_map(gltf.resources(), |resource| {
+        package
+            .store(resource.bytes(), resource.extension())
+            .map_err(anyhow::Error::from)
+    })?;
+    let uris = stored
+        .iter()
+        .map(|blob| {
+            package
+                .uri_from(artifact, blob)
+                .map_err(anyhow::Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let resource_bytes = gltf
+        .resources()
+        .iter()
+        .map(|resource| resource.bytes().len())
+        .sum::<usize>();
+    let manifest_bytes = package.write_stream(artifact, |writer| {
+        gltf.write_json(&uris, writer).map_err(io::Error::other)
+    })?;
+    Ok(manifest_bytes + resource_bytes)
 }
 
 #[derive(Debug, Default, Clone, Copy)]

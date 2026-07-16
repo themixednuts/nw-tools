@@ -1,8 +1,10 @@
-//! A minimal glTF 2.0 writer: turns a [`crate::Model`] into a self-contained
-//! binary `.glb` (and a `.gltf` + `.bin` pair). Covers the geometry subset now;
-//! materials, skins, and animations slot into the same document model later.
+//! A glTF 2.0 writer for complete [`crate::Model`] graphs. It can produce a
+//! self-contained binary `.glb`, a traditional `.gltf` + `.bin` pair, or a
+//! structured package whose mesh, skeleton, animation, and image resources stay
+//! independent for content-addressed sharing.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 
 use bevy_math::Isometry3d;
 use bevy_math::bounding::Aabb3d;
@@ -188,12 +190,16 @@ struct CryMaterialExtras {
     cry_source: serde_json::Value,
 }
 
-/// glTF image (embedded via a buffer view in the GLB binary chunk).
+/// glTF image. It is embedded through a buffer view for GLB/paired glTF and
+/// receives a URI for structured glTF packages.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Image {
     mime_type: String,
-    buffer_view: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    buffer_view: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -435,7 +441,8 @@ pub type TextureLoader<'a> = dyn FnMut(&str) -> Option<TextureData> + 'a;
 /// Accumulates the binary blob, buffer views, accessors, and material/texture
 /// tables as primitives are added.
 struct Builder {
-    bin: Vec<u8>,
+    buffers: Vec<Vec<u8>>,
+    active_buffer: usize,
     accessors: Vec<Accessor>,
     views: Vec<BufferView>,
     meshes: Vec<Mesh>,
@@ -445,6 +452,7 @@ struct Builder {
     materials: Vec<Material>,
     textures: Vec<Texture>,
     images: Vec<Image>,
+    image_data: Vec<TextureData>,
     samplers: Vec<Sampler>,
     /// sub-material index → glTF material index.
     material_cache: HashMap<usize, Option<usize>>,
@@ -461,16 +469,23 @@ struct EmittedSkeleton {
 }
 
 struct BuiltAnimation {
-    bin: Vec<u8>,
+    buffer: Vec<u8>,
     accessors: Vec<Accessor>,
     views: Vec<BufferView>,
     animation: Animation,
 }
 
+struct Built {
+    document: Document,
+    buffers: Vec<Vec<u8>>,
+    images: Vec<TextureData>,
+}
+
 impl Builder {
     fn new() -> Self {
         Self {
-            bin: Vec::new(),
+            buffers: vec![Vec::new()],
+            active_buffer: 0,
             accessors: Vec::new(),
             views: Vec::new(),
             meshes: Vec::new(),
@@ -480,6 +495,7 @@ impl Builder {
             materials: Vec::new(),
             textures: Vec::new(),
             images: Vec::new(),
+            image_data: Vec::new(),
             samplers: Vec::new(),
             material_cache: HashMap::new(),
             texture_cache: HashMap::new(),
@@ -488,14 +504,29 @@ impl Builder {
         }
     }
 
-    fn push_view(&mut self, bytes: &[u8], target: Option<u32>) -> usize {
-        while !self.bin.len().is_multiple_of(4) {
-            self.bin.push(0);
+    /// Start one independently reusable binary resource. Views emitted until
+    /// the next call share this glTF buffer.
+    fn begin_buffer(&mut self) {
+        if !self.buffers[self.active_buffer].is_empty()
+            || self
+                .views
+                .iter()
+                .any(|view| view.buffer == self.active_buffer)
+        {
+            self.buffers.push(Vec::new());
+            self.active_buffer = self.buffers.len() - 1;
         }
-        let byte_offset = self.bin.len();
-        self.bin.extend_from_slice(bytes);
+    }
+
+    fn push_view(&mut self, bytes: &[u8], target: Option<u32>) -> usize {
+        let buffer = &mut self.buffers[self.active_buffer];
+        while !buffer.len().is_multiple_of(4) {
+            buffer.push(0);
+        }
+        let byte_offset = buffer.len();
+        buffer.extend_from_slice(bytes);
         self.views.push(BufferView {
-            buffer: 0,
+            buffer: self.active_buffer,
             byte_offset,
             byte_length: bytes.len(),
             target,
@@ -504,14 +535,12 @@ impl Builder {
     }
 
     fn append_animation(&mut self, mut built: BuiltAnimation) {
-        while !self.bin.len().is_multiple_of(4) {
-            self.bin.push(0);
-        }
-        let byte_offset = self.bin.len();
+        self.begin_buffer();
+        let buffer_index = self.active_buffer;
         let view_offset = self.views.len();
         let accessor_offset = self.accessors.len();
         for view in &mut built.views {
-            view.byte_offset += byte_offset;
+            view.buffer = buffer_index;
         }
         for accessor in &mut built.accessors {
             accessor.buffer_view += view_offset;
@@ -520,24 +549,26 @@ impl Builder {
             sampler.input += accessor_offset;
             sampler.output += accessor_offset;
         }
-        self.bin.append(&mut built.bin);
+        self.buffers[buffer_index] = built.buffer;
         self.views.append(&mut built.views);
         self.accessors.append(&mut built.accessors);
         self.animations.push(built.animation);
     }
 
-    /// Get or create a glTF texture for a `.mtl` File path, embedding the image.
+    /// Get or create a glTF texture for a `.mtl` File path. Image bytes remain a
+    /// distinct resource until the selected container is packed.
     fn texture(&mut self, file: &str, loader: &mut TextureLoader<'_>) -> Option<usize> {
         if let Some(cached) = self.texture_cache.get(file) {
             return *cached;
         }
         let resolved = loader(file).map(|data| {
-            let view = self.push_view(&data.bytes, None);
             let image = self.images.len();
             self.images.push(Image {
-                mime_type: data.mime,
-                buffer_view: view,
+                mime_type: data.mime.clone(),
+                buffer_view: None,
+                uri: None,
             });
+            self.image_data.push(data);
             if self.samplers.is_empty() {
                 // 9729 = LINEAR, 9987 = LINEAR_MIPMAP_LINEAR, 10497 = REPEAT.
                 self.samplers.push(Sampler {
@@ -836,6 +867,7 @@ impl Builder {
 
     /// Emit one independent skeleton graph and its glTF skin.
     fn add_skeleton(&mut self, skeleton: &Skeleton) -> EmittedSkeleton {
+        self.begin_buffer();
         let count = skeleton.bones.len();
         let node_offset = self.nodes.len();
         for bone in &skeleton.bones {
@@ -1114,7 +1146,7 @@ fn build(
     extras: Option<&CryAssetExtras>,
     loader: &mut TextureLoader<'_>,
     runner: &nw_jobs::JobRunner,
-) -> (Document, Vec<u8>) {
+) -> Built {
     let mut builder = Builder::new();
 
     let mut root_nodes = Vec::new();
@@ -1179,7 +1211,7 @@ fn build(
             let mut local = Builder::new();
             local.add_animation(&animation.clip, skeleton, &emitted.joints);
             Some(BuiltAnimation {
-                bin: local.bin,
+                buffer: local.buffers.pop().unwrap_or_default(),
                 accessors: local.accessors,
                 views: local.views,
                 animation: local.animations.pop().expect("one animation was emitted"),
@@ -1193,6 +1225,7 @@ fn build(
     let mut lod_groups = BTreeMap::<String, Vec<(u32, usize)>>::new();
     let mut attachment_parents = HashMap::<usize, usize>::new();
     for mesh in &model.meshes {
+        builder.begin_buffer();
         let mut primitives = Vec::new();
         for primitive in &mesh.primitives {
             if primitive.positions.is_empty() || primitive.indices.is_empty() {
@@ -1348,6 +1381,23 @@ fn build(
     } else {
         None
     };
+    while builder.buffers.len() > 1
+        && builder.buffers.last().is_some_and(Vec::is_empty)
+        && !builder
+            .views
+            .iter()
+            .any(|view| view.buffer == builder.buffers.len() - 1)
+    {
+        builder.buffers.pop();
+    }
+    let buffers = builder
+        .buffers
+        .iter()
+        .map(|buffer| Buffer {
+            byte_length: buffer.len(),
+            uri: None,
+        })
+        .collect();
     let document = Document {
         asset: Asset {
             version: "2.0",
@@ -1362,10 +1412,7 @@ fn build(
         animations: builder.animations,
         accessors: builder.accessors,
         buffer_views: builder.views,
-        buffers: vec![Buffer {
-            byte_length: builder.bin.len(),
-            uri: None,
-        }],
+        buffers,
         skins: builder.skins,
         materials: builder.materials,
         textures: builder.textures,
@@ -1374,7 +1421,11 @@ fn build(
         extensions_used,
         extras: document_extras,
     };
-    (document, builder.bin)
+    Built {
+        document,
+        buffers: builder.buffers,
+        images: builder.image_data,
+    }
 }
 
 fn lod_group_name(name: &str) -> String {
@@ -1477,6 +1528,26 @@ impl<'a> Gltf<'a, NoMaterials> {
             bin_uri,
         )
     }
+
+    /// Build structured `.gltf` resources. Every binary buffer and image stays
+    /// separate so a package writer can content-address and share it.
+    #[must_use]
+    pub fn to_gltf_package(&self) -> GltfPackage {
+        self.to_gltf_package_with_runner(&nw_jobs::JobRunner::automatic())
+    }
+
+    /// Build structured glTF resources with the caller's worker policy.
+    #[must_use]
+    pub fn to_gltf_package_with_runner(&self, runner: &nw_jobs::JobRunner) -> GltfPackage {
+        GltfPackage::from_built(build(
+            self.model,
+            self.animations,
+            None,
+            self.extras,
+            &mut |_| None,
+            runner,
+        ))
+    }
 }
 
 impl<'a> Gltf<'a, WithMaterials<'a>> {
@@ -1532,6 +1603,32 @@ impl<'a> Gltf<'a, WithMaterials<'a>> {
             ),
             bin_uri,
         )
+    }
+
+    /// Build structured `.gltf` resources, resolving textures through `loader`.
+    #[must_use]
+    pub fn to_gltf_package(
+        &self,
+        mut loader: impl FnMut(&str) -> Option<TextureData>,
+    ) -> GltfPackage {
+        self.to_gltf_package_with_runner(&nw_jobs::JobRunner::automatic(), &mut loader)
+    }
+
+    /// Build structured glTF resources with the caller's worker policy.
+    #[must_use]
+    pub fn to_gltf_package_with_runner(
+        &self,
+        runner: &nw_jobs::JobRunner,
+        mut loader: impl FnMut(&str) -> Option<TextureData>,
+    ) -> GltfPackage {
+        GltfPackage::from_built(build(
+            self.model,
+            self.animations,
+            Some(self.state.0),
+            self.extras,
+            &mut loader,
+            runner,
+        ))
     }
 }
 
@@ -1592,8 +1689,152 @@ pub enum GltfAnimationError {
     },
 }
 
+/// One external resource referenced by a structured `.gltf` manifest.
+#[derive(Debug, Clone)]
+pub struct GltfResource {
+    bytes: Vec<u8>,
+    extension: &'static str,
+    mime_type: Option<String>,
+}
+
+impl GltfResource {
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub const fn extension(&self) -> &'static str {
+        self.extension
+    }
+
+    #[must_use]
+    pub fn mime_type(&self) -> Option<&str> {
+        self.mime_type.as_deref()
+    }
+}
+
+/// A glTF manifest plus independent buffers/images ready for a shared store.
+pub struct GltfPackage {
+    document: Document,
+    resources: Vec<GltfResource>,
+    buffer_count: usize,
+}
+
+impl GltfPackage {
+    fn from_built(built: Built) -> Self {
+        let buffer_count = built.buffers.len();
+        let mut resources = built
+            .buffers
+            .into_iter()
+            .map(|bytes| GltfResource {
+                bytes,
+                extension: "bin",
+                mime_type: Some("application/octet-stream".to_string()),
+            })
+            .collect::<Vec<_>>();
+        resources.extend(built.images.into_iter().map(|image| GltfResource {
+            extension: image_extension(&image.mime),
+            mime_type: Some(image.mime),
+            bytes: image.bytes,
+        }));
+        Self {
+            document: built.document,
+            resources,
+            buffer_count,
+        }
+    }
+
+    #[must_use]
+    pub fn resources(&self) -> &[GltfResource] {
+        &self.resources
+    }
+
+    /// Assign a URI to every external resource and serialize the manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless exactly one URI is supplied per resource.
+    pub fn into_json(mut self, uris: &[String]) -> Result<String, GltfPackageError> {
+        self.assign_uris(uris)?;
+        self.resources.clear();
+        serde_json::to_string_pretty(&self.document).map_err(GltfPackageError::Serialize)
+    }
+
+    /// Assign every external resource URI and stream a compact manifest.
+    ///
+    /// Resource payloads are released before serialization begins, avoiding a
+    /// second full-manifest allocation and reducing peak memory for animation-
+    /// heavy character exports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless exactly one URI is supplied per resource or the
+    /// manifest cannot be serialized to `writer`.
+    pub fn write_json(
+        mut self,
+        uris: &[String],
+        writer: impl Write,
+    ) -> Result<(), GltfPackageError> {
+        self.assign_uris(uris)?;
+        self.resources.clear();
+        serde_json::to_writer(writer, &self.document).map_err(GltfPackageError::Serialize)
+    }
+
+    fn assign_uris(&mut self, uris: &[String]) -> Result<(), GltfPackageError> {
+        if uris.len() != self.resources.len() {
+            return Err(GltfPackageError::UriCount {
+                expected: self.resources.len(),
+                actual: uris.len(),
+            });
+        }
+        for (buffer, uri) in self
+            .document
+            .buffers
+            .iter_mut()
+            .zip(&uris[..self.buffer_count])
+        {
+            buffer.uri = Some(uri.clone());
+        }
+        for ((image, resource), uri) in self
+            .document
+            .images
+            .iter_mut()
+            .zip(&self.resources[self.buffer_count..])
+            .zip(&uris[self.buffer_count..])
+        {
+            image.buffer_view = None;
+            image.uri = Some(uri.clone());
+            if let Some(mime_type) = &resource.mime_type {
+                image.mime_type.clone_from(mime_type);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GltfPackageError {
+    #[error("structured glTF needs {expected} resource URIs, received {actual}")]
+    UriCount { expected: usize, actual: usize },
+    #[error("serialize structured glTF manifest")]
+    Serialize(#[source] serde_json::Error),
+}
+
+fn image_extension(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/ktx2" => "ktx2",
+        _ => "bin",
+    }
+}
+
 /// Pack a built document + blob into a binary `.glb`.
-fn glb_bytes((mut document, mut bin): (Document, Vec<u8>)) -> Vec<u8> {
+fn glb_bytes(built: Built) -> Vec<u8> {
+    let (mut document, mut bin) = merge_resources(built);
     // The single GLB buffer is the embedded BIN chunk (no uri).
     document.buffers[0].uri = None;
     let mut json = serde_json::to_vec(&document).unwrap_or_default();
@@ -1619,8 +1860,48 @@ fn glb_bytes((mut document, mut bin): (Document, Vec<u8>)) -> Vec<u8> {
 }
 
 /// Pack a built document + blob into a `.gltf` JSON string + external `.bin`.
-fn gltf_pair((mut document, bin): (Document, Vec<u8>), bin_uri: &str) -> (String, Vec<u8>) {
+fn gltf_pair(built: Built, bin_uri: &str) -> (String, Vec<u8>) {
+    let (mut document, bin) = merge_resources(built);
     document.buffers[0].uri = Some(bin_uri.to_string());
     let json = serde_json::to_string_pretty(&document).unwrap_or_default();
     (json, bin)
+}
+
+fn merge_resources(mut built: Built) -> (Document, Vec<u8>) {
+    let mut bin = Vec::new();
+    for (buffer_index, buffer) in built.buffers.into_iter().enumerate() {
+        while !bin.len().is_multiple_of(4) {
+            bin.push(0);
+        }
+        let base = bin.len();
+        for view in &mut built.document.buffer_views {
+            if view.buffer == buffer_index {
+                view.buffer = 0;
+                view.byte_offset += base;
+            }
+        }
+        bin.extend_from_slice(&buffer);
+    }
+    for (image, data) in built.document.images.iter_mut().zip(built.images) {
+        while !bin.len().is_multiple_of(4) {
+            bin.push(0);
+        }
+        let byte_offset = bin.len();
+        bin.extend_from_slice(&data.bytes);
+        let view = built.document.buffer_views.len();
+        built.document.buffer_views.push(BufferView {
+            buffer: 0,
+            byte_offset,
+            byte_length: data.bytes.len(),
+            target: None,
+        });
+        image.mime_type = data.mime;
+        image.buffer_view = Some(view);
+        image.uri = None;
+    }
+    built.document.buffers = vec![Buffer {
+        byte_length: bin.len(),
+        uri: None,
+    }];
+    (built.document, bin)
 }

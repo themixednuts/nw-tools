@@ -707,6 +707,9 @@ fn push_animation_assets(
         .collect::<Vec<_>>();
     paths.sort_unstable();
     paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    if paths.is_empty() {
+        return Ok(());
+    }
     let parsed = runner.try_map(&paths, |path| {
         let bytes = read_required(source, path)?;
         let is_dba = source_extension(path) == "dba";
@@ -1229,4 +1232,53 @@ fn replace_extension(path: &str, extension: &str) -> String {
 
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EmptySource;
+
+    impl nw_asset_graph::AssetSource for EmptySource {
+        fn read(&self, _path: &str) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn matching_paths(&self, _pattern: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl AssetSource for EmptySource {
+        fn materials(&self, _cgf: &[u8], _mesh: &MeshRef) -> Option<nw_model::MaterialSet> {
+            None
+        }
+    }
+
+    #[test]
+    fn empty_animation_work_does_not_require_a_skeleton() {
+        let mut resolved = ResolvedAsset {
+            model: nw_model::Model {
+                meshes: Vec::new(),
+                skeletons: Vec::new(),
+                auxiliary_nodes: Vec::new(),
+            },
+            materials: None,
+            animations: Vec::new(),
+            extras: nw_model::CryAssetExtras::default(),
+            parsed_animation_assets: HashSet::new(),
+        };
+
+        push_animation_assets(
+            &nw_jobs::JobRunner::inline(),
+            &EmptySource,
+            &[],
+            None,
+            0,
+            false,
+            &mut resolved,
+        )
+        .unwrap();
+    }
 }

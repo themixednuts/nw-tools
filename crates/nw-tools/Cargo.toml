@@ -26,6 +26,7 @@ glam.workspace = true
 memchr.workspace = true
 nw-asset = { workspace = true, features = ["oodle"] }
 nw-asset-graph.workspace = true
+nw-artifact.workspace = true
 nw-datasheet.workspace = true
 nw-dds.workspace = true
 nw-filesystem.workspace = true
