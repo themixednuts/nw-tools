@@ -8,6 +8,12 @@
   images. `nw-tools` automatically stores those resources in a shared,
   content-addressed directory.
 
+The glTF specification technically allows a GLB JSON chunk to reference external
+resources too. `nw-tools` deliberately reserves `--format glb` for the useful
+self-contained behavior and uses `.gltf` manifests for shared packages. A hybrid
+GLB would lose the single-file advantage while providing no additional sharing
+or compatibility benefit over the inspectable `.gltf` layout.
+
 The output root has this shape:
 
 ```text
