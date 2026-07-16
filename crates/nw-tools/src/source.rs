@@ -140,6 +140,8 @@ impl Toc {
 pub struct Install {
     toc: Toc,
     materials: HashMap<String, String>,
+    /// Hot path index for recursive animation/material/audio glob resolution.
+    indexed_paths: HashMap<String, Vec<String>>,
 }
 
 impl Install {
@@ -156,7 +158,27 @@ impl Install {
         }
         let toc = Toc::build(ctx, paks.paths(), |_| true);
         let materials = ensure_catalog_cache(assets)?.material_map();
-        Ok(Self { toc, materials })
+        let indexed_extensions = ["caf", "i_caf", "bspace", "comb", "dba", "mtl", "bnk", "wem"];
+        let mut indexed_paths = HashMap::<String, Vec<String>>::new();
+        for path in toc.names() {
+            let Some((_, extension)) = path.rsplit_once('.') else {
+                continue;
+            };
+            if indexed_extensions.contains(&extension) {
+                indexed_paths
+                    .entry(extension.to_owned())
+                    .or_default()
+                    .push(path.to_owned());
+            }
+        }
+        for paths in indexed_paths.values_mut() {
+            paths.sort_unstable();
+        }
+        Ok(Self {
+            toc,
+            materials,
+            indexed_paths,
+        })
     }
 
     /// Read an asset's bytes by virtual path (forward slashes, case-insensitive).
@@ -177,6 +199,12 @@ impl Install {
     #[must_use]
     pub fn paths_with_extensions(&self, extensions: &[&str], filter: Option<&str>) -> Vec<String> {
         self.toc.paths_with_extensions(extensions, filter)
+    }
+
+    /// Pre-indexed paths for recursive model dependency globs.
+    #[must_use]
+    pub fn indexed_paths(&self, extension: &str) -> Option<&[String]> {
+        self.indexed_paths.get(extension).map(Vec::as_slice)
     }
 }
 

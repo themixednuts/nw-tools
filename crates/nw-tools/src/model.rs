@@ -1,4 +1,4 @@
-//! `format model` — convert Cry meshes (`.cgf`/`.skin`) into glTF source assets.
+//! `format model` — convert complete Cry model/character graphs into glTF.
 //!
 //! Both the filesystem and the install's paks present the same [`AssetSource`]
 //! interface (read an asset by path; resolve a material GUID), so one converter
@@ -6,6 +6,7 @@
 //! source loads New World's asset catalog from `Engine.pak` to resolve each mesh's
 //! material by its MtlName GUID rather than guessing by file name.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -36,7 +37,7 @@ impl Container {
 
 #[derive(Debug, Args)]
 pub struct Model {
-    /// A `.cgf`/`.skin` file, or a directory to batch-convert. Omit to convert
+    /// A `.cgf`/`.skin`/`.chr`/`.cdf`/`.caf`/`.dba` file, or a directory to batch-convert. Omit to convert
     /// from the located install's paks (narrow with `--filter`).
     path: Option<PathBuf>,
 
@@ -52,6 +53,26 @@ pub struct Model {
     /// Material file override (single-file mode); otherwise resolved automatically.
     #[arg(long)]
     mtl: Option<PathBuf>,
+
+    /// Skeleton asset for standalone CAF or skinned-geometry export.
+    #[arg(long)]
+    skeleton: Option<String>,
+
+    /// Additional CAF/i_caf assets to embed as glTF animations.
+    #[arg(long = "animation")]
+    animations: Vec<String>,
+
+    /// Cry `.animevents` database to attach to exported CAF clips.
+    #[arg(long)]
+    animation_events: Option<String>,
+
+    /// Mannequin ADB/tag/controller/blend-space source to retain in glTF extras.
+    #[arg(long = "mannequin")]
+    mannequin: Vec<String>,
+
+    /// ATL controls, Wwise BNK/WEM, or trigger-bank maps to validate and retain in glTF extras.
+    #[arg(long = "audio")]
+    audio: Vec<String>,
 
     /// Case-insensitive path substring filter (install mode).
     #[arg(long)]
@@ -93,13 +114,17 @@ impl Model {
             .mtl
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok());
+        let source_path = path.to_string_lossy();
         let stats = self.convert(
             &source,
-            &cgf,
-            &heap,
-            &MeshRef::for_file(path),
-            mtl_override,
-            &out,
+            ConvertRequest {
+                source_path: &source_path,
+                cgf: &cgf,
+                heap: &heap,
+                mesh: MeshRef::for_file(path),
+                mtl_override,
+                out: &out,
+            },
         )?;
 
         Report::new("model")
@@ -110,6 +135,7 @@ impl Model {
             .stat("joints", stats.joints)
             .stat("materials", stats.materials)
             .stat("textures", stats.textures)
+            .stat("animations", stats.animations)
             .stat("output", out.display())
             .stat("bytes", format_size(stats.bytes, DECIMAL))
             .print();
@@ -135,7 +161,18 @@ impl Model {
                     ensure_parent(&out)?;
                     let cgf = std::fs::read(path)?;
                     let heap = std::fs::read(heap_sibling(path)).unwrap_or_default();
-                    self.convert(&source, &cgf, &heap, &MeshRef::for_file(path), None, &out)
+                    let source_path = path.to_string_lossy();
+                    self.convert(
+                        &source,
+                        ConvertRequest {
+                            source_path: &source_path,
+                            cgf: &cgf,
+                            heap: &heap,
+                            mesh: MeshRef::for_file(path),
+                            mtl_override: None,
+                            out: &out,
+                        },
+                    )
                 })
             },
         );
@@ -146,7 +183,10 @@ impl Model {
     fn export_install(&self, ctx: &RunCtx) -> Result<()> {
         let install = source::locate()?;
         let source = Install::open(ctx, &install.assets())?;
-        let meshes = source.paths_with_extensions(&["cgf", "skin"], self.filter.as_deref());
+        let meshes = source.paths_with_extensions(
+            &["cgf", "skin", "chr", "cga", "cdf", "caf", "i_caf", "dba"],
+            self.filter.as_deref(),
+        );
         if meshes.is_empty() {
             bail!("no matching meshes found in the install paks");
         }
@@ -159,7 +199,17 @@ impl Model {
                 ensure_parent(&out)?;
                 let cgf = source.read(key).with_context(|| format!("read {key}"))?;
                 let heap = source.read(&format!("{key}heap")).unwrap_or_default();
-                self.convert(&source, &cgf, &heap, &MeshRef::for_key(key), None, &out)
+                self.convert(
+                    &source,
+                    ConvertRequest {
+                        source_path: key,
+                        cgf: &cgf,
+                        heap: &heap,
+                        mesh: MeshRef::for_key(key),
+                        mtl_override: None,
+                        out: &out,
+                    },
+                )
             })
         });
         report_batch(
@@ -170,47 +220,77 @@ impl Model {
 
     /// The shared conversion: assemble the model, resolve materials/textures via the
     /// source, and write the chosen container.
-    fn convert(
-        &self,
-        source: &dyn AssetSource,
-        cgf: &[u8],
-        heap: &[u8],
-        mesh: &MeshRef,
-        mtl_override: Option<String>,
-        out: &Path,
-    ) -> Result<ModelStats> {
-        let model = nw_model::model_from_bytes(cgf, heap)
-            .with_context(|| format!("assemble {}", mesh.stem))?;
+    fn convert(&self, source: &dyn AssetSource, request: ConvertRequest<'_>) -> Result<ModelStats> {
+        let ConvertRequest {
+            source_path,
+            cgf,
+            heap,
+            mesh,
+            mtl_override,
+            out,
+        } = request;
+        let resolved = crate::model_asset::resolve(
+            source,
+            source_path,
+            cgf,
+            heap,
+            &mesh,
+            mtl_override.as_deref(),
+            crate::model_asset::ResolveOptions {
+                no_materials: self.no_materials,
+                skeleton: self.skeleton.as_deref(),
+                animations: &self.animations,
+                animation_events: self.animation_events.as_deref(),
+                mannequin: &self.mannequin,
+                audio: &self.audio,
+            },
+        )?;
+        let model = resolved.model;
+        let materials = resolved.materials;
+        let animations = resolved.animations;
+        let extras = resolved.extras;
 
-        let materials = if self.no_materials {
-            None
-        } else {
-            mtl_override
-                .and_then(|xml| xml.parse::<nw_model::MaterialSet>().ok())
-                .or_else(|| source.materials(cgf, mesh))
-        };
-
-        let mut textures = 0usize;
+        let texture_cache = materials
+            .as_ref()
+            .map(|set| {
+                let mut cache = HashMap::new();
+                for texture in set
+                    .sub_materials
+                    .iter()
+                    .flat_map(|material| &material.textures)
+                    .filter(|texture| texture.source_kind() == nw_model::TextureSourceKind::Asset)
+                {
+                    if !cache.contains_key(&texture.file) {
+                        cache.insert(
+                            texture.file.clone(),
+                            decode_texture(source, &texture.file).with_context(|| {
+                                format!("decode material texture {}", texture.file)
+                            })?,
+                        );
+                    }
+                }
+                Ok::<_, anyhow::Error>(cache)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let textures = texture_cache.len();
         let bytes = {
-            let mut load = |file: &str| {
-                let data = decode_texture(source, file);
-                textures += usize::from(data.is_some());
-                data
-            };
+            let mut load = |file: &str| texture_cache.get(file).cloned();
+            let gltf = nw_model::Gltf::new(&model)
+                .extras(&extras)
+                .animations(&animations)?;
             match (&materials, self.format) {
                 (Some(set), Container::Glb) => {
-                    let glb = nw_model::Gltf::new(&model).materials(set).to_glb(&mut load);
+                    let glb = gltf.materials(set).to_glb(&mut load);
                     write_glb(out, &glb)?
                 }
                 (Some(set), Container::Gltf) => {
-                    let (json, blob) = nw_model::Gltf::new(&model)
-                        .materials(set)
-                        .to_gltf(&bin_uri(out), &mut load);
+                    let (json, blob) = gltf.materials(set).to_gltf(&bin_uri(out), &mut load);
                     write_gltf(out, &json, &blob)?
                 }
-                (None, Container::Glb) => write_glb(out, &nw_model::Gltf::new(&model).to_glb())?,
+                (None, Container::Glb) => write_glb(out, &gltf.to_glb())?,
                 (None, Container::Gltf) => {
-                    let (json, blob) = nw_model::Gltf::new(&model).to_gltf(&bin_uri(out));
+                    let (json, blob) = gltf.to_gltf(&bin_uri(out));
                     write_gltf(out, &json, &blob)?
                 }
             }
@@ -220,23 +300,40 @@ impl Model {
             meshes: model.meshes.len(),
             vertices: model.vertex_count(),
             triangles: model.triangle_count(),
-            joints: model.skeleton.as_ref().map_or(0, |s| s.bones.len()),
+            joints: model
+                .skeletons
+                .iter()
+                .map(|skeleton| skeleton.bones.len())
+                .sum(),
             materials: materials.as_ref().map_or(0, |m| m.sub_materials.len()),
             textures,
+            animations: animations.len(),
             bytes,
         })
     }
 }
 
+struct ConvertRequest<'a> {
+    source_path: &'a str,
+    cgf: &'a [u8],
+    heap: &'a [u8],
+    mesh: MeshRef,
+    mtl_override: Option<String>,
+    out: &'a Path,
+}
+
 /// Reads assets and resolves a mesh's material, abstracting over the filesystem and
 /// the install's paks.
-trait AssetSource: Sync {
+pub(crate) trait AssetSource: Sync {
     /// Read an asset's bytes by virtual path (forward slashes, case-insensitive).
     fn read(&self, path: &str) -> Option<Vec<u8>>;
 
     /// Resolve the material set for a mesh, using whatever the source affords —
     /// the catalog (install) or a sibling-directory scan (filesystem).
     fn materials(&self, cgf: &[u8], mesh: &MeshRef) -> Option<nw_model::MaterialSet>;
+
+    /// Resolve a Cry recursive wildcard against this source's virtual paths.
+    fn matching_paths(&self, pattern: &str) -> Result<Vec<String>>;
 }
 
 /// Parse the first `.mtl` among `keys` that this source can read.
@@ -296,6 +393,36 @@ impl AssetSource for Tree {
             .and_then(|xml| xml.parse::<nw_model::MaterialSet>().ok())
             .or_else(|| first_material(self, mesh.mtl_candidates()))
     }
+
+    fn matching_paths(&self, pattern: &str) -> Result<Vec<String>> {
+        let pattern = pattern.replace('\\', "/");
+        let matcher = globset::Glob::new(&pattern)
+            .with_context(|| format!("invalid Cry asset wildcard {pattern}"))?
+            .compile_matcher();
+        let wildcard = pattern.find(['*', '?']).unwrap_or(pattern.len());
+        let directory = pattern[..wildcard]
+            .rsplit_once('/')
+            .map_or("", |(directory, _)| directory);
+        let mut found = std::collections::BTreeMap::new();
+        for root in &self.roots {
+            let scan_root = root.join(directory);
+            if !scan_root.is_dir() {
+                continue;
+            }
+            for path in collect_matching(&scan_root, |_| true)? {
+                let Ok(relative) = path.strip_prefix(root) else {
+                    continue;
+                };
+                let virtual_path = relative.to_string_lossy().replace('\\', "/");
+                if matcher.is_match(&virtual_path) {
+                    found
+                        .entry(virtual_path.to_ascii_lowercase())
+                        .or_insert(virtual_path);
+                }
+            }
+        }
+        Ok(found.into_values().collect())
+    }
 }
 
 /// Score how well a candidate `.mtl` matches a mesh: naming-convention hits weigh
@@ -345,18 +472,37 @@ impl AssetSource for Install {
         let by_guid = mtlname_guid(cgf).and_then(|guid| self.material_path(&guid));
         first_material(self, by_guid.into_iter().chain(mesh.mtl_candidates()))
     }
+
+    fn matching_paths(&self, pattern: &str) -> Result<Vec<String>> {
+        let pattern = pattern.replace('\\', "/").to_ascii_lowercase();
+        let matcher = globset::Glob::new(&pattern)
+            .with_context(|| format!("invalid Cry asset wildcard {pattern}"))?
+            .compile_matcher();
+        let extension = pattern
+            .rsplit_once('.')
+            .map(|(_, extension)| extension)
+            .filter(|extension| !extension.contains(['*', '?', '[']));
+        let candidates = extension
+            .and_then(|extension| self.indexed_paths(extension))
+            .unwrap_or_default();
+        Ok(candidates
+            .iter()
+            .filter(|path| matcher.is_match(path))
+            .cloned()
+            .collect())
+    }
 }
 
 /// Identifies a mesh for material resolution: its sub-material GUID hint plus the
 /// virtual directory and base name used for naming-convention fallback.
-struct MeshRef {
+pub(crate) struct MeshRef {
     dir: String,
     stem: String,
 }
 
 impl MeshRef {
     /// For a pak virtual path like `a/b/foo_mesh.cgf`.
-    fn for_key(key: &str) -> Self {
+    pub(crate) fn for_key(key: &str) -> Self {
         let (dir, file) = key.rsplit_once('/').unwrap_or(("", key));
         Self {
             dir: dir.to_string(),
@@ -366,7 +512,7 @@ impl MeshRef {
 
     /// For a filesystem path: the `.mtl` is a sibling, so the directory is empty
     /// (the [`Tree`] source resolves siblings via its roots).
-    fn for_file(path: &Path) -> Self {
+    pub(crate) fn for_file(path: &Path) -> Self {
         let file = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -407,9 +553,12 @@ fn mtlname_guid(cgf: &[u8]) -> Option<String> {
 }
 
 /// Decode a referenced texture (`.tif` → `.dds`, split mips assembled) to PNG bytes.
-fn decode_texture(source: &dyn AssetSource, file: &str) -> Option<nw_model::TextureData> {
+fn decode_texture(source: &dyn AssetSource, file: &str) -> Result<nw_model::TextureData> {
     let dds = tif_to_dds(file);
-    let header = source.read(&dds)?;
+    let header = source
+        .read(&dds)
+        .with_context(|| format!("texture asset not found: {dds}"))?;
+    let dds_header = nw_dds::Dds::parse(&header)?;
     let mut sidecars = Vec::new();
     let mut mip = 1u32;
     while let Some(bytes) = source.read(&format!("{dds}.{mip}")) {
@@ -426,19 +575,46 @@ fn decode_texture(source: &dyn AssetSource, file: &str) -> Option<nw_model::Text
         .iter()
         .map(|(part, bytes)| nw_dds::Sidecar::new(*part, bytes.as_slice()))
         .collect::<Vec<_>>();
-    let decoded = nw_dds::decode_top_mip(&header, &parts).ok()?;
-    let image = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)?;
+    let alpha_header = if dds_header.has_attached_alpha() {
+        Some(source.read(&format!("{dds}.a")).with_context(|| {
+            format!("texture {dds} declares attached alpha but {dds}.a is missing")
+        })?)
+    } else {
+        None
+    };
+    let mut alpha_sidecars = Vec::new();
+    if alpha_header.is_some() {
+        let mut mip = 1u32;
+        while let Some(bytes) = source.read(&format!("{dds}.{mip}a")) {
+            alpha_sidecars.push((
+                nw_dds::SplitPart::Mip {
+                    index: mip,
+                    alpha: true,
+                },
+                bytes,
+            ));
+            mip += 1;
+        }
+    }
+    let alpha_parts = alpha_sidecars
+        .iter()
+        .map(|(part, bytes)| nw_dds::Sidecar::new(*part, bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let attached_alpha = alpha_header
+        .as_deref()
+        .map(|alpha| (alpha, alpha_parts.as_slice()));
+    let decoded = nw_dds::decode_top_mip_with_attached_alpha(&header, &parts, attached_alpha)?;
+    let image = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)
+        .context("decoded texture RGBA dimensions do not match payload")?;
 
     let mut bytes = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut bytes)
-        .write_image(
-            image.as_raw(),
-            image.width(),
-            image.height(),
-            image::ExtendedColorType::Rgba8,
-        )
-        .ok()?;
-    Some(nw_model::TextureData {
+    image::codecs::png::PngEncoder::new(&mut bytes).write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::Rgba8,
+    )?;
+    Ok(nw_model::TextureData {
         bytes,
         mime: "image/png".to_string(),
     })
@@ -473,6 +649,7 @@ struct ModelStats {
     joints: usize,
     materials: usize,
     textures: usize,
+    animations: usize,
     bytes: usize,
 }
 
@@ -505,7 +682,10 @@ fn heap_sibling(path: &Path) -> PathBuf {
 }
 
 fn is_mesh_file(path: &Path) -> bool {
-    matches!(path_ext(path).as_deref(), Some("cgf" | "skin"))
+    matches!(
+        path_ext(path).as_deref(),
+        Some("cgf" | "skin" | "chr" | "cga" | "cdf" | "caf" | "i_caf" | "dba")
+    )
 }
 
 /// A mesh base name with the `_mesh`/`_lod0` suffix stripped, for `.mtl` matching.

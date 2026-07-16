@@ -9,17 +9,27 @@ mod geometry;
 mod gltf;
 mod material;
 pub mod math;
+pub mod reflected;
 
-pub use geometry::{Bone, Mesh, Model, Primitive, Skeleton};
-pub use gltf::{Gltf, NoMaterials, TextureData, WithMaterials};
-pub use material::{MapSlot, MaterialSet, SubMaterial, TextureRef};
+pub use geometry::{
+    AuxiliaryNode, AuxiliaryNodeRole, Bone, Mesh, MeshAttachment, Model, ModelBuildError,
+    Primitive, Skeleton, SkeletonPlacement,
+};
+pub use gltf::{
+    CryAssetExtras, CryNonRenderNode, CryNonRenderNodeRole, CrySourceAsset, CrySourceAssetKind,
+    CryUnboundAnimation, Gltf, GltfAnimationError, ModelAnimation, NoMaterials, TextureData,
+    WithMaterials,
+};
+pub use material::{MapSlot, MaterialSet, SubMaterial, TextureRef, TextureSourceKind};
 
 /// Errors from building a model.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
     Chunk(#[from] cry_chunk::CgfParseError),
-    #[error("no drawable geometry found in chunk file")]
+    #[error(transparent)]
+    Model(#[from] ModelBuildError),
+    #[error("no drawable geometry, skeleton, or auxiliary nodes found in chunk file")]
     NoGeometry,
     #[error("no compiled skeleton found in chunk file")]
     NoSkeleton,
@@ -29,11 +39,11 @@ pub enum Error {
 ///
 /// # Errors
 ///
-/// Returns [`Error`] if the chunk file fails to parse or has no geometry.
+/// Returns [`Error`] if the chunk file fails to parse or has no model graph.
 pub fn model_from_bytes(cgf: &[u8], heap: &[u8]) -> Result<Model, Error> {
     let file = cry_chunk::CgfFile::parse(cgf)?;
-    let model = Model::from((&file, heap));
-    if model.is_empty() {
+    let model = Model::try_from_cgf(&file, heap)?;
+    if model.is_empty() && model.skeletons.is_empty() && model.auxiliary_nodes.is_empty() {
         return Err(Error::NoGeometry);
     }
     Ok(model)
@@ -64,10 +74,14 @@ mod tests {
         use glam::Vec3;
         // A model with one triangle.
         let model = Model {
-            skeleton: None,
+            skeletons: Vec::new(),
+            auxiliary_nodes: Vec::new(),
             meshes: vec![Mesh {
                 name: "tri".to_string(),
-                skinned: false,
+                skin: None,
+                lod: None,
+                shadow_proxy: false,
+                attachment: None,
                 primitives: vec![Primitive {
                     positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
                     normals: None,
@@ -117,10 +131,14 @@ mod tests {
             material_id,
         };
         let model = Model {
-            skeleton: None,
+            skeletons: Vec::new(),
+            auxiliary_nodes: Vec::new(),
             meshes: vec![Mesh {
                 name: "m".to_string(),
-                skinned: false,
+                skin: None,
+                lod: None,
+                shadow_proxy: false,
+                attachment: None,
                 primitives: vec![tri(0), tri(1)], // second uses the Nodraw sub-material
             }],
         };
@@ -147,5 +165,111 @@ mod tests {
             json["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["index"],
             0
         );
+    }
+
+    #[test]
+    fn glb_preserves_lods_with_msft_lod() {
+        use glam::Vec3;
+
+        let primitive = || Primitive {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: None,
+            uvs: None,
+            indices: vec![0, 1, 2],
+            joints: None,
+            weights: None,
+            material_id: 0,
+        };
+        let model = Model {
+            skeletons: Vec::new(),
+            auxiliary_nodes: Vec::new(),
+            meshes: vec![
+                Mesh {
+                    name: "body".to_owned(),
+                    primitives: vec![primitive()],
+                    skin: None,
+                    lod: None,
+                    shadow_proxy: false,
+                    attachment: None,
+                },
+                Mesh {
+                    name: "body$lod1".to_owned(),
+                    primitives: vec![primitive()],
+                    skin: None,
+                    lod: Some(1),
+                    shadow_proxy: false,
+                    attachment: None,
+                },
+            ],
+        };
+
+        let json = glb_json(&Gltf::new(&model).to_glb());
+        assert_eq!(json["extensionsUsed"], serde_json::json!(["MSFT_lod"]));
+        assert_eq!(json["scenes"][0]["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(json["nodes"][0]["extensions"]["MSFT_lod"]["ids"][0], 1);
+        assert_eq!(json["nodes"][1]["extras"]["cryLod"], 1);
+    }
+
+    #[test]
+    fn glb_emits_independent_parented_skeletons() {
+        use glam::{Mat4, Vec3};
+
+        let skeleton = |name: &str, controller_id, placement| Skeleton {
+            bones: vec![Bone {
+                name: name.to_owned(),
+                controller_id,
+                parent: None,
+                local: Mat4::IDENTITY,
+                inverse_bind: Mat4::IDENTITY,
+            }],
+            placement,
+        };
+        let primitive = || Primitive {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: None,
+            uvs: None,
+            indices: vec![0, 1, 2],
+            joints: Some(vec![[0, 0, 0, 0]; 3]),
+            weights: Some(vec![[1.0, 0.0, 0.0, 0.0]; 3]),
+            material_id: 0,
+        };
+        let mesh = |name: &str, skin| Mesh {
+            name: name.to_owned(),
+            primitives: vec![primitive()],
+            skin: Some(skin),
+            lod: None,
+            shadow_proxy: false,
+            attachment: None,
+        };
+        let model = Model {
+            skeletons: vec![
+                skeleton("body_root", 1, None),
+                skeleton(
+                    "weapon_root",
+                    2,
+                    Some(SkeletonPlacement {
+                        parent_skeleton: Some(0),
+                        bone_name: Some("body_root".to_owned()),
+                        local: Mat4::IDENTITY,
+                    }),
+                ),
+            ],
+            meshes: vec![mesh("body", 0), mesh("weapon", 1)],
+            auxiliary_nodes: Vec::new(),
+        };
+
+        let json = glb_json(&Gltf::new(&model).to_glb());
+        assert_eq!(json["skins"].as_array().unwrap().len(), 2);
+        assert_eq!(json["skins"][0]["joints"], serde_json::json!([0]));
+        assert_eq!(json["skins"][1]["joints"], serde_json::json!([1]));
+        assert_eq!(json["nodes"][3]["skin"], 0);
+        assert_eq!(json["nodes"][4]["skin"], 1);
+        assert!(
+            json["nodes"][0]["children"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(2))
+        );
+        assert_eq!(json["nodes"][2]["children"], serde_json::json!([1]));
     }
 }

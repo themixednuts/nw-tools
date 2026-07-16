@@ -38,4 +38,16 @@ fn main() {
             stream.stream_type, stream.element_count, stream.element_size
         );
     }
+    for material in model.materials().values() {
+        println!(
+            "  material name={} sub-materials={:?} physicalize={:?}",
+            material.name, material.sub_material_names, material.physicalize_types
+        );
+    }
+    for node in model.nodes().values() {
+        println!(
+            "  node name={} material={} properties={:?}",
+            node.name, node.material_chunk_id, node.properties
+        );
+    }
 }

@@ -1,0 +1,26 @@
+[package]
+name = "nw-reflected-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Vendored behavior-free New World SerializeContext asset types"
+
+[dependencies]
+bevy_app = "0.18"
+bevy_ecs = { version = "0.18", features = ["serialize"] }
+bevy_color = { version = "0.18", features = ["serialize"] }
+bevy_math = { version = "0.18", features = ["serialize"] }
+bevy_platform = "0.18"
+bevy_reflect = { version = "0.18", features = ["uuid"] }
+bevy_transform = { version = "0.18", features = ["serialize"] }
+sha1.workspace = true
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json.workspace = true
+arrayvec = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["serde", "v4", "v7"] }
+
+[lints]
+workspace = true

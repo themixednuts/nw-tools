@@ -74,6 +74,11 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 treesitter-types-go = "0.2"
 treesitter-types-cpp = "0.2"
 cry-chunk = { version = "0.1.0", path = "crates/cry-chunk" }
+cry-animation = { version = "0.1.0", path = "crates/cry-animation" }
+cry-audio = { version = "0.1.0", path = "crates/cry-audio" }
+cry-character = { version = "0.1.0", path = "crates/cry-character" }
+cry-mannequin = { version = "0.1.0", path = "crates/cry-mannequin" }
+cry-xml = { version = "0.1.0", path = "crates/cry-xml" }
 nw-asset = { version = "0.1.0", path = "crates/nw-asset", default-features = false }
 nw-datasheet = { version = "0.1.0", path = "crates/nw-datasheet" }
 nw-dds = { version = "0.1.0", path = "crates/nw-dds" }
@@ -86,4 +91,5 @@ nw-localization = { version = "0.1.0", path = "crates/nw-localization" }
 nw-objectstream = { version = "0.1.0", path = "crates/nw-objectstream", default-features = false }
 nw-pak = { version = "0.1.0", path = "crates/nw-pak", default-features = false }
 nw-resources = { version = "0.1.0", path = "crates/nw-resources" }
+nw-reflected-types = { version = "0.1.0", path = "crates/nw-reflected-types" }
 nw-serialize-codegen = { version = "0.1.0", path = "crates/nw-serialize-codegen" }

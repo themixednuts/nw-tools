@@ -1,0 +1,19 @@
+[package]
+name = "cry-animation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "CryAnimation CAF clips, animation events, and asset dependencies"
+
+[lints]
+workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+cry-chunk.workspace = true
+cry-xml.workspace = true
+nw-reflected-types.workspace = true
+thiserror.workspace = true

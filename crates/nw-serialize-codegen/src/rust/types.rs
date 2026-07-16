@@ -188,7 +188,7 @@ impl RustTypeRenderer {
             (SequenceKind::Array, Some(capacity)) => format!("[{element}; {capacity}]"),
             (SequenceKind::BitSet, _) => rust_bitset_storage_type(capacity),
             (SequenceKind::FixedVector, Some(capacity)) => {
-                format!("smallvec::SmallVec<[{element}; {capacity}]>")
+                format!("arrayvec::ArrayVec<{element}, {capacity}>")
             }
             (SequenceKind::Set, _) => format!("std::collections::BTreeSet<{element}>"),
             (SequenceKind::UnorderedSet, _) => format!("std::collections::HashSet<{element}>"),

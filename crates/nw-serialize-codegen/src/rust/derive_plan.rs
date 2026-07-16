@@ -875,6 +875,7 @@ fn resolved_type_supports_reflect(
         ResolvedType::Sequence { kind, element, .. } => {
             resolved_type_supports_reflect(element, items_by_type_id, cache, visiting, mode)
                 && match kind {
+                    SequenceKind::FixedVector => false,
                     SequenceKind::Set => {
                         matches!(mode, RustCodegenMode::Standalone)
                             || rust_type_supports_native_ordering(element, items_by_type_id)

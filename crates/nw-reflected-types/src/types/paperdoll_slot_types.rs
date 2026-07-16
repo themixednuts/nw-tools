@@ -1,0 +1,341 @@
+use crate::az::rtti::AzRtti;
+use crate::az::uuid::Uuid as AzUuid;
+use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
+
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    bevy_reflect::Reflect,
+)]
+#[repr(i32)]
+#[serde(try_from = "i32", into = "i32")]
+#[reflect(Serialize, Deserialize)]
+pub enum PaperdollSlotTypes {
+    Head = 0,
+    Chest = 1,
+    Hands = 2,
+    Legs = 3,
+    Feet = 4,
+    Amulet = 5,
+    Token = 6,
+    Ring = 7,
+    Paint = 8,
+    MainHand = 9,
+    OffHand = 10,
+    TwoHand = 11,
+    ArrowAmmo = 12,
+    CartridgeAmmo = 13,
+    Quickslot1 = 14,
+    Quickslot2 = 15,
+    Quickslot3 = 16,
+    Quickslot4 = 17,
+    Quickslot5 = 18,
+    Quickslot6 = 19,
+    Backpack = 20,
+    Mouth = 21,
+    Saddle = 22,
+    Bridle = 23,
+    MainHandOption1 = 24,
+    MainHandOption2 = 25,
+    MainHandOption3 = 26,
+    OffHandOption1 = 27,
+    OffHandOption2 = 28,
+    OffHandOption3 = 29,
+    BagSlot1 = 30,
+    BagSlot2 = 31,
+    BagSlot3 = 32,
+    ChoppingSlot = 33,
+    CuttingSlot = 34,
+    DressingSlot = 35,
+    MiningSlot = 36,
+    FishingSlot = 37,
+    AzothstaffSlot = 38,
+    InstrumentFluteSlot = 39,
+    InstrumentGuitarSlot = 40,
+    InstrumentMandolinSlot = 41,
+    InstrumentUprightbassSlot = 42,
+    InstrumentDrumsSlot = 43,
+    ThrowableObjectSlot = 44,
+    HeartGemSlot = 45,
+    MountBuffSlot1 = 46,
+    MountBuffSlot2 = 47,
+    MountAttachmentSlot1 = 48,
+    MountAttachmentSlot2 = 49,
+    MaxSlots = 50,
+    #[default]
+    Invalid = 51,
+}
+
+impl From<PaperdollSlotTypes> for i32 {
+    fn from(value: PaperdollSlotTypes) -> Self {
+        match value {
+            PaperdollSlotTypes::Head => 0,
+            PaperdollSlotTypes::Chest => 1,
+            PaperdollSlotTypes::Hands => 2,
+            PaperdollSlotTypes::Legs => 3,
+            PaperdollSlotTypes::Feet => 4,
+            PaperdollSlotTypes::Amulet => 5,
+            PaperdollSlotTypes::Token => 6,
+            PaperdollSlotTypes::Ring => 7,
+            PaperdollSlotTypes::Paint => 8,
+            PaperdollSlotTypes::MainHand => 9,
+            PaperdollSlotTypes::OffHand => 10,
+            PaperdollSlotTypes::TwoHand => 11,
+            PaperdollSlotTypes::ArrowAmmo => 12,
+            PaperdollSlotTypes::CartridgeAmmo => 13,
+            PaperdollSlotTypes::Quickslot1 => 14,
+            PaperdollSlotTypes::Quickslot2 => 15,
+            PaperdollSlotTypes::Quickslot3 => 16,
+            PaperdollSlotTypes::Quickslot4 => 17,
+            PaperdollSlotTypes::Quickslot5 => 18,
+            PaperdollSlotTypes::Quickslot6 => 19,
+            PaperdollSlotTypes::Backpack => 20,
+            PaperdollSlotTypes::Mouth => 21,
+            PaperdollSlotTypes::Saddle => 22,
+            PaperdollSlotTypes::Bridle => 23,
+            PaperdollSlotTypes::MainHandOption1 => 24,
+            PaperdollSlotTypes::MainHandOption2 => 25,
+            PaperdollSlotTypes::MainHandOption3 => 26,
+            PaperdollSlotTypes::OffHandOption1 => 27,
+            PaperdollSlotTypes::OffHandOption2 => 28,
+            PaperdollSlotTypes::OffHandOption3 => 29,
+            PaperdollSlotTypes::BagSlot1 => 30,
+            PaperdollSlotTypes::BagSlot2 => 31,
+            PaperdollSlotTypes::BagSlot3 => 32,
+            PaperdollSlotTypes::ChoppingSlot => 33,
+            PaperdollSlotTypes::CuttingSlot => 34,
+            PaperdollSlotTypes::DressingSlot => 35,
+            PaperdollSlotTypes::MiningSlot => 36,
+            PaperdollSlotTypes::FishingSlot => 37,
+            PaperdollSlotTypes::AzothstaffSlot => 38,
+            PaperdollSlotTypes::InstrumentFluteSlot => 39,
+            PaperdollSlotTypes::InstrumentGuitarSlot => 40,
+            PaperdollSlotTypes::InstrumentMandolinSlot => 41,
+            PaperdollSlotTypes::InstrumentUprightbassSlot => 42,
+            PaperdollSlotTypes::InstrumentDrumsSlot => 43,
+            PaperdollSlotTypes::ThrowableObjectSlot => 44,
+            PaperdollSlotTypes::HeartGemSlot => 45,
+            PaperdollSlotTypes::MountBuffSlot1 => 46,
+            PaperdollSlotTypes::MountBuffSlot2 => 47,
+            PaperdollSlotTypes::MountAttachmentSlot1 => 48,
+            PaperdollSlotTypes::MountAttachmentSlot2 => 49,
+            PaperdollSlotTypes::MaxSlots => 50,
+            PaperdollSlotTypes::Invalid => 51,
+        }
+    }
+}
+
+impl ::core::convert::TryFrom<i32> for PaperdollSlotTypes {
+    type Error = i32;
+    fn try_from(value: i32) -> Result<Self, i32> {
+        match value {
+            0 => Ok(Self::Head),
+            1 => Ok(Self::Chest),
+            2 => Ok(Self::Hands),
+            3 => Ok(Self::Legs),
+            4 => Ok(Self::Feet),
+            5 => Ok(Self::Amulet),
+            6 => Ok(Self::Token),
+            7 => Ok(Self::Ring),
+            8 => Ok(Self::Paint),
+            9 => Ok(Self::MainHand),
+            10 => Ok(Self::OffHand),
+            11 => Ok(Self::TwoHand),
+            12 => Ok(Self::ArrowAmmo),
+            13 => Ok(Self::CartridgeAmmo),
+            14 => Ok(Self::Quickslot1),
+            15 => Ok(Self::Quickslot2),
+            16 => Ok(Self::Quickslot3),
+            17 => Ok(Self::Quickslot4),
+            18 => Ok(Self::Quickslot5),
+            19 => Ok(Self::Quickslot6),
+            20 => Ok(Self::Backpack),
+            21 => Ok(Self::Mouth),
+            22 => Ok(Self::Saddle),
+            23 => Ok(Self::Bridle),
+            24 => Ok(Self::MainHandOption1),
+            25 => Ok(Self::MainHandOption2),
+            26 => Ok(Self::MainHandOption3),
+            27 => Ok(Self::OffHandOption1),
+            28 => Ok(Self::OffHandOption2),
+            29 => Ok(Self::OffHandOption3),
+            30 => Ok(Self::BagSlot1),
+            31 => Ok(Self::BagSlot2),
+            32 => Ok(Self::BagSlot3),
+            33 => Ok(Self::ChoppingSlot),
+            34 => Ok(Self::CuttingSlot),
+            35 => Ok(Self::DressingSlot),
+            36 => Ok(Self::MiningSlot),
+            37 => Ok(Self::FishingSlot),
+            38 => Ok(Self::AzothstaffSlot),
+            39 => Ok(Self::InstrumentFluteSlot),
+            40 => Ok(Self::InstrumentGuitarSlot),
+            41 => Ok(Self::InstrumentMandolinSlot),
+            42 => Ok(Self::InstrumentUprightbassSlot),
+            43 => Ok(Self::InstrumentDrumsSlot),
+            44 => Ok(Self::ThrowableObjectSlot),
+            45 => Ok(Self::HeartGemSlot),
+            46 => Ok(Self::MountBuffSlot1),
+            47 => Ok(Self::MountBuffSlot2),
+            48 => Ok(Self::MountAttachmentSlot1),
+            49 => Ok(Self::MountAttachmentSlot2),
+            50 => Ok(Self::MaxSlots),
+            51 => Ok(Self::Invalid),
+            _ => Err(value),
+        }
+    }
+}
+
+impl PaperdollSlotTypes {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Head => "head",
+            Self::Chest => "chest",
+            Self::Hands => "hands",
+            Self::Legs => "legs",
+            Self::Feet => "feet",
+            Self::Amulet => "amulet",
+            Self::Token => "token",
+            Self::Ring => "ring",
+            Self::Paint => "paint",
+            Self::MainHand => "main-hand",
+            Self::OffHand => "off-hand",
+            Self::TwoHand => "two-hand",
+            Self::ArrowAmmo => "arrow-ammo",
+            Self::CartridgeAmmo => "cartridge-ammo",
+            Self::Quickslot1 => "quickslot-1",
+            Self::Quickslot2 => "quickslot-2",
+            Self::Quickslot3 => "quickslot-3",
+            Self::Quickslot4 => "quickslot-4",
+            Self::Quickslot5 => "quickslot-5",
+            Self::Quickslot6 => "quickslot-6",
+            Self::Backpack => "backpack",
+            Self::Mouth => "Mouth",
+            Self::Saddle => "Saddle",
+            Self::Bridle => "Bridle",
+            Self::MainHandOption1 => "main-hand-option-1",
+            Self::MainHandOption2 => "main-hand-option-2",
+            Self::MainHandOption3 => "main-hand-option-3",
+            Self::OffHandOption1 => "off-hand-option-1",
+            Self::OffHandOption2 => "off-hand-option-2",
+            Self::OffHandOption3 => "off-hand-option-3",
+            Self::BagSlot1 => "bag-slot-1",
+            Self::BagSlot2 => "bag-slot-2",
+            Self::BagSlot3 => "bag-slot-3",
+            Self::ChoppingSlot => "chopping-slot",
+            Self::CuttingSlot => "cutting-slot",
+            Self::DressingSlot => "dressing-slot",
+            Self::MiningSlot => "mining-slot",
+            Self::FishingSlot => "fishing-slot",
+            Self::AzothstaffSlot => "azothstaff-slot",
+            Self::InstrumentFluteSlot => "instrument-flute-slot",
+            Self::InstrumentGuitarSlot => "instrument-guitar-slot",
+            Self::InstrumentMandolinSlot => "instrument-mandolin-slot",
+            Self::InstrumentUprightbassSlot => "instrument-uprightbass-slot",
+            Self::InstrumentDrumsSlot => "instrument-drums-slot",
+            Self::ThrowableObjectSlot => "throwable-object-slot",
+            Self::HeartGemSlot => "heart-gem-slot",
+            Self::MountBuffSlot1 => "mount-buff-slot-1",
+            Self::MountBuffSlot2 => "mount-buff-slot-2",
+            Self::MountAttachmentSlot1 => "mount-attachment-slot-1",
+            Self::MountAttachmentSlot2 => "mount-attachment-slot-2",
+            Self::MaxSlots => "MaxSlots",
+            Self::Invalid => "Invalid",
+        }
+    }
+}
+
+impl AsRef<str> for PaperdollSlotTypes {
+    fn as_ref(&self) -> &str {
+        (*self).as_str()
+    }
+}
+
+impl<'a> ::core::convert::TryFrom<&'a str> for PaperdollSlotTypes {
+    type Error = &'a str;
+    fn try_from(value: &'a str) -> Result<Self, &'a str> {
+        match value {
+            "head" => Ok(Self::Head),
+            "chest" => Ok(Self::Chest),
+            "hands" => Ok(Self::Hands),
+            "legs" => Ok(Self::Legs),
+            "feet" => Ok(Self::Feet),
+            "amulet" => Ok(Self::Amulet),
+            "token" => Ok(Self::Token),
+            "ring" => Ok(Self::Ring),
+            "paint" => Ok(Self::Paint),
+            "main-hand" => Ok(Self::MainHand),
+            "off-hand" => Ok(Self::OffHand),
+            "two-hand" => Ok(Self::TwoHand),
+            "arrow-ammo" => Ok(Self::ArrowAmmo),
+            "cartridge-ammo" => Ok(Self::CartridgeAmmo),
+            "quickslot-1" => Ok(Self::Quickslot1),
+            "quickslot-2" => Ok(Self::Quickslot2),
+            "quickslot-3" => Ok(Self::Quickslot3),
+            "quickslot-4" => Ok(Self::Quickslot4),
+            "quickslot-5" => Ok(Self::Quickslot5),
+            "quickslot-6" => Ok(Self::Quickslot6),
+            "backpack" => Ok(Self::Backpack),
+            "Mouth" => Ok(Self::Mouth),
+            "Saddle" => Ok(Self::Saddle),
+            "Bridle" => Ok(Self::Bridle),
+            "main-hand-option-1" => Ok(Self::MainHandOption1),
+            "main-hand-option-2" => Ok(Self::MainHandOption2),
+            "main-hand-option-3" => Ok(Self::MainHandOption3),
+            "off-hand-option-1" => Ok(Self::OffHandOption1),
+            "off-hand-option-2" => Ok(Self::OffHandOption2),
+            "off-hand-option-3" => Ok(Self::OffHandOption3),
+            "bag-slot-1" => Ok(Self::BagSlot1),
+            "bag-slot-2" => Ok(Self::BagSlot2),
+            "bag-slot-3" => Ok(Self::BagSlot3),
+            "chopping-slot" => Ok(Self::ChoppingSlot),
+            "cutting-slot" => Ok(Self::CuttingSlot),
+            "dressing-slot" => Ok(Self::DressingSlot),
+            "mining-slot" => Ok(Self::MiningSlot),
+            "fishing-slot" => Ok(Self::FishingSlot),
+            "azothstaff-slot" => Ok(Self::AzothstaffSlot),
+            "instrument-flute-slot" => Ok(Self::InstrumentFluteSlot),
+            "instrument-guitar-slot" => Ok(Self::InstrumentGuitarSlot),
+            "instrument-mandolin-slot" => Ok(Self::InstrumentMandolinSlot),
+            "instrument-uprightbass-slot" => Ok(Self::InstrumentUprightbassSlot),
+            "instrument-drums-slot" => Ok(Self::InstrumentDrumsSlot),
+            "throwable-object-slot" => Ok(Self::ThrowableObjectSlot),
+            "heart-gem-slot" => Ok(Self::HeartGemSlot),
+            "mount-buff-slot-1" => Ok(Self::MountBuffSlot1),
+            "mount-buff-slot-2" => Ok(Self::MountBuffSlot2),
+            "mount-attachment-slot-1" => Ok(Self::MountAttachmentSlot1),
+            "mount-attachment-slot-2" => Ok(Self::MountAttachmentSlot2),
+            "MaxSlots" => Ok(Self::MaxSlots),
+            "Invalid" => Ok(Self::Invalid),
+            _ => Err(value),
+        }
+    }
+}
+
+impl ::core::str::FromStr for PaperdollSlotTypes {
+    type Err = ::std::string::String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value).map_err(str::to_owned)
+    }
+}
+
+impl ::core::fmt::Display for PaperdollSlotTypes {
+    fn fmt(&self, formatter: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        formatter.write_str((*self).as_str())
+    }
+}
+
+impl AzRtti for PaperdollSlotTypes {
+    const NAME: &'static str = "PaperdollSlotTypes";
+    const TYPE_ID: AzUuid = AzUuid::from_u128(0x5D42C439_A859_4133_9032_88DE31048F2C);
+}

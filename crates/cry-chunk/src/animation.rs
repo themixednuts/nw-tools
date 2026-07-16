@@ -7,8 +7,8 @@ use thiserror::Error;
 
 use crate::{
     ChunkFile, ChunkFileError, ChunkPayload, ChunkPayloadError, ChunkType, ControllerChunk,
-    ControllerCompressedChunk, ControllerTrack, GlobalAnimationHeaderCafChunk,
-    MotionParametersChunk, TimingChunk,
+    ControllerCompressedChunk, ControllerDbChunk, ControllerTrack, GlobalAnimationHeaderCafChunk,
+    MotionParametersChunk, QuatT, TimingChunk,
 };
 
 /// Decoded CAF animation with per-controller TRS tracks in CAF key seconds.
@@ -17,6 +17,19 @@ pub struct CafAnimation {
     pub header: CafAnimationHeader,
     pub sample_rate: f32,
     pub controllers: Vec<CafController>,
+    pub root_motion: Option<CafRootMotion>,
+}
+
+/// One CAF payload stored inside a Cry 0x0905 tracks database (`.dba`).
+#[derive(Debug, Clone)]
+pub struct DbaAnimation {
+    pub file_path: String,
+    pub animation: CafAnimation,
+}
+
+#[derive(Debug, Clone)]
+pub struct DbaArchive {
+    pub animations: Vec<DbaAnimation>,
 }
 
 /// Timing/header values used by Lumberyard to sample a CAF.
@@ -28,6 +41,19 @@ pub struct CafAnimationHeader {
     pub total_duration: f32,
     pub controller_count: u32,
     pub source: CafAnimationHeaderSource,
+    pub file_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CafRootMotion {
+    pub start: QuatT,
+    pub end: QuatT,
+    pub velocity: [f32; 3],
+    pub distance: f32,
+    pub speed: f32,
+    pub turn_speed: f32,
+    pub turn_angle: f32,
+    pub slope: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +188,7 @@ pub struct CafController {
     pub flags: u32,
     pub rotations: Vec<RotationKey>,
     pub positions: Vec<PositionKey>,
+    pub scales: Vec<ScaleKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -175,6 +202,12 @@ pub struct RotationKey {
 pub struct PositionKey {
     pub time: f32,
     /// Position in Cry component order `[x, y, z]`.
+    pub value: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScaleKey {
+    pub time: f32,
     pub value: [f32; 3],
 }
 
@@ -233,20 +266,60 @@ pub enum CafDecodeError {
     InvalidQuaternion { controller_id: u32 },
 }
 
+#[derive(Debug, Error)]
+pub enum DbaDecodeError {
+    #[error(transparent)]
+    ChunkFile(#[from] ChunkFileError),
+    #[error(transparent)]
+    ChunkPayload(#[from] ChunkPayloadError),
+    #[error(transparent)]
+    Caf(#[from] CafDecodeError),
+    #[error("DBA has no ControllerDb 0x0905 chunk")]
+    MissingControllerDatabase,
+    #[error("DBA 0x0905 layout is invalid: {0}")]
+    InvalidLayout(&'static str),
+    #[error("DBA animation path is not UTF-8")]
+    InvalidPath,
+    #[error("DBA track index {index} is outside {kind} table length {count}")]
+    TrackIndexOutOfRange {
+        kind: &'static str,
+        index: u32,
+        count: usize,
+    },
+    #[error("DBA track {index} has no known {kind} compression format")]
+    UnknownTrackFormat { kind: &'static str, index: usize },
+}
+
+impl DbaArchive {
+    /// Decode a CryAnimation `.dba` using the exact ControllerDb 0x0905 layout
+    /// consumed by Lumberyard `LoaderDBA.cpp::ReadController905`.
+    pub fn parse(bytes: &[u8]) -> Result<Self, DbaDecodeError> {
+        let file = ChunkFile::parse(bytes)?;
+        for chunk in file.decoded_chunks() {
+            if let ChunkPayload::Controller(ControllerChunk::ControllerDb(database)) =
+                chunk?.payload
+            {
+                return decode_dba_0905(&database);
+            }
+        }
+        Err(DbaDecodeError::MissingControllerDatabase)
+    }
+}
+
 impl CafAnimation {
-    /// Parse a CAF chunk file and decode all compressed PQ controllers.
+    /// Parse a CAF chunk file and decode compressed PQ and legacy PQLog controllers.
     ///
     /// The formulas mirror Lumberyard CryAnimation:
     /// `GlobalAnimationHeaderCAF::ReadMotionParameters` for sample rate,
     /// `ControllerPQ` key-time tracks, and `QuatQuantization` for quaternion
-    /// unpacking. Old PQLog/TCB forms remain explicit unsupported errors.
+    /// unpacking. TCB/ControllerDb chunks fail the whole conversion rather than
+    /// being silently discarded.
     pub fn parse(bytes: &[u8]) -> Result<Self, CafDecodeError> {
         let file = ChunkFile::parse(bytes)?;
         let mut global_header = None;
         let mut motion_parameters = None;
         let mut timing = None;
-        let mut compressed = Vec::new();
-        let mut unsupported = Vec::new();
+        let mut controller_chunks = Vec::new();
 
         for chunk in file.decoded_chunks() {
             let chunk = chunk?;
@@ -255,27 +328,24 @@ impl CafAnimation {
                 ChunkPayload::MotionParameters(chunk) => motion_parameters = Some(chunk),
                 ChunkPayload::Timing(chunk) => timing = Some(chunk),
                 ChunkPayload::Controller(ControllerChunk::Compressed(controller)) => {
-                    compressed.push(controller);
+                    controller_chunks.push(ControllerChunk::Compressed(controller));
                 }
-                ChunkPayload::Controller(ControllerChunk::Tcb(controller)) => {
-                    unsupported.push((controller.controller_id, "TCB"));
-                }
-                ChunkPayload::Controller(ControllerChunk::Uncompressed(controller)) => {
-                    unsupported.push((controller.controller_id, "PQLog"));
-                }
-                ChunkPayload::Controller(ControllerChunk::ControllerDb(_)) => {
-                    unsupported.push((0, "ControllerDb"));
+                ChunkPayload::Controller(controller @ ControllerChunk::Tcb(_))
+                | ChunkPayload::Controller(controller @ ControllerChunk::Uncompressed(_))
+                | ChunkPayload::Controller(controller @ ControllerChunk::ControllerDb(_)) => {
+                    controller_chunks.push(controller);
                 }
                 ChunkPayload::Controller(ControllerChunk::Empty0828) => {}
                 _ => {}
             }
         }
 
+        let root_motion = build_root_motion(global_header.as_ref(), motion_parameters.as_ref());
         let (header, sample_rate) = build_header(
             global_header,
             motion_parameters,
             timing,
-            compressed.len() as u32,
+            controller_chunks.len() as u32,
         )?;
         if !sample_rate.is_finite() || sample_rate <= 0.0 {
             return Err(CafDecodeError::InvalidSampleRate { sample_rate });
@@ -286,30 +356,510 @@ impl CafAnimation {
             });
         }
 
-        if compressed.is_empty()
-            && let Some((controller_id, form)) = unsupported.into_iter().next()
-        {
-            return Err(CafDecodeError::UnsupportedControllerForm {
-                controller_id,
-                form,
-            });
-        }
-
-        let mut controllers = Vec::with_capacity(compressed.len());
-        for controller in compressed {
-            controllers.push(decode_compressed_controller(
-                &controller,
-                &header,
-                sample_rate,
-            )?);
+        let mut controllers = Vec::with_capacity(controller_chunks.len());
+        for controller in controller_chunks {
+            match controller {
+                ControllerChunk::Compressed(controller) => controllers.push(
+                    decode_compressed_controller(&controller, &header, sample_rate)?,
+                ),
+                ControllerChunk::Uncompressed(controller) => controllers.push(
+                    decode_uncompressed_controller(&controller, &header, sample_rate)?,
+                ),
+                ControllerChunk::Tcb(controller) => {
+                    match controller.controller_type {
+                        0 => controllers.push(CafController {
+                            controller_id: controller.controller_id,
+                            flags: controller.flags,
+                            rotations: Vec::new(),
+                            positions: Vec::new(),
+                            scales: Vec::new(),
+                        }),
+                        // Lumberyard's CTRL_CRYBONE is the same 28-byte
+                        // CryKeyPQLog layout as 0x0827/0x0830 controllers.
+                        1 => controllers.push(decode_pq_log_controller(
+                            controller.controller_id,
+                            controller.flags,
+                            controller.key_data,
+                            controller.key_count,
+                            &header,
+                            sample_rate,
+                        )?),
+                        _ => {
+                            return Err(CafDecodeError::UnsupportedControllerForm {
+                                controller_id: controller.controller_id,
+                                form: "non-skeletal TCB curve",
+                            });
+                        }
+                    }
+                }
+                ControllerChunk::ControllerDb(_) => {
+                    return Err(CafDecodeError::UnsupportedControllerForm {
+                        controller_id: 0,
+                        form: "ControllerDb",
+                    });
+                }
+                ControllerChunk::Empty0828 => {}
+            }
         }
 
         Ok(Self {
             header,
             sample_rate,
             controllers,
+            root_motion,
         })
     }
+}
+
+#[derive(Debug, Clone)]
+struct DbaMotionParameters {
+    asset_flags: u32,
+    ticks_per_frame: i32,
+    seconds_per_tick: f32,
+    start: i32,
+    end: i32,
+    move_speed: f32,
+    turn_speed: f32,
+    asset_turn: f32,
+    distance: f32,
+    slope: f32,
+    start_location: QuatT,
+    end_location: QuatT,
+}
+
+#[derive(Debug, Clone)]
+struct DbaAnimationRecord {
+    file_path: String,
+    motion: DbaMotionParameters,
+    controllers: Vec<DbaControllerInfo>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DbaControllerInfo {
+    controller_id: u32,
+    position_time: u32,
+    position: u32,
+    rotation_time: u32,
+    rotation: u32,
+}
+
+fn decode_dba_0905(database: &ControllerDbChunk<'_>) -> Result<DbaArchive, DbaDecodeError> {
+    const TIME_FORMATS: usize = 7;
+    const VALUE_FORMATS: usize = 9;
+    const MOTION_PARAMS_SIZE: usize = 132;
+    const CONTROLLER_INFO_SIZE: usize = 20;
+
+    let data = database.data;
+    let mut cursor = 0usize;
+    let time_sizes = dba_u16_array(data, &mut cursor, database.time_key_count)?;
+    let time_formats = dba_u32_array(data, &mut cursor, TIME_FORMATS)?;
+    let position_sizes = dba_u16_array(data, &mut cursor, database.position_key_count)?;
+    let position_formats = dba_u32_array(data, &mut cursor, VALUE_FORMATS)?;
+    let rotation_sizes = dba_u16_array(data, &mut cursor, database.rotation_key_count)?;
+    let rotation_formats = dba_u32_array(data, &mut cursor, VALUE_FORMATS)?;
+    let time_offsets = dba_i32_array(data, &mut cursor, database.time_key_count)?;
+    let position_offsets = dba_i32_array(data, &mut cursor, database.position_key_count)?;
+    let rotation_offsets = dba_i32_array(
+        data,
+        &mut cursor,
+        database
+            .rotation_key_count
+            .checked_add(1)
+            .ok_or(DbaDecodeError::InvalidLayout("rotation count overflow"))?,
+    )?;
+    let storage_length_marker = *rotation_offsets
+        .last()
+        .ok_or(DbaDecodeError::InvalidLayout(
+            "missing rotation storage sentinel",
+        ))?;
+    let in_place = storage_length_marker < 0;
+    let padding = if in_place {
+        dba_u32(data, &mut cursor)? as usize
+    } else {
+        0
+    };
+    cursor = align_usize(cursor, 4)?;
+    let track_length = usize::try_from(storage_length_marker.unsigned_abs())
+        .map_err(|_| DbaDecodeError::InvalidLayout("track storage length overflow"))?;
+    let track_length = align_usize(track_length, 4)?;
+    let storage_start = if in_place { None } else { Some(cursor) };
+    if !in_place {
+        cursor = cursor
+            .checked_add(track_length)
+            .filter(|end| *end <= data.len())
+            .ok_or(DbaDecodeError::InvalidLayout("track storage is truncated"))?;
+    }
+    cursor = cursor
+        .checked_add(padding)
+        .filter(|end| *end <= data.len())
+        .ok_or(DbaDecodeError::InvalidLayout(
+            "in-place padding is truncated",
+        ))?;
+    let animation_block_start = cursor;
+
+    let mut records = Vec::with_capacity(database.animation_count);
+    for _ in 0..database.animation_count {
+        let path_length = dba_u16(data, &mut cursor)? as usize;
+        let path_bytes = dba_bytes(data, &mut cursor, path_length)?;
+        let file_path = str::from_utf8(path_bytes)
+            .map_err(|_| DbaDecodeError::InvalidPath)?
+            .to_owned();
+        let motion_bytes = dba_bytes(data, &mut cursor, MOTION_PARAMS_SIZE)?;
+        let motion = parse_dba_motion_parameters(motion_bytes)?;
+        let foot_plant_count = dba_u16(data, &mut cursor)? as usize;
+        let _foot_plants = dba_bytes(data, &mut cursor, foot_plant_count)?;
+        let controller_count = dba_u16(data, &mut cursor)? as usize;
+        let controller_offset = if in_place {
+            let offset = dba_i32(data, &mut cursor)?;
+            usize::try_from(offset)
+                .ok()
+                .and_then(|offset| animation_block_start.checked_add(offset))
+                .ok_or(DbaDecodeError::InvalidLayout(
+                    "negative in-place controller-info offset",
+                ))?
+        } else {
+            cursor
+        };
+        let controller_bytes = controller_count.checked_mul(CONTROLLER_INFO_SIZE).ok_or(
+            DbaDecodeError::InvalidLayout("controller-info size overflow"),
+        )?;
+        let mut info_cursor = controller_offset;
+        let mut controllers = Vec::with_capacity(controller_count);
+        for _ in 0..controller_count {
+            controllers.push(DbaControllerInfo {
+                controller_id: dba_u32(data, &mut info_cursor)?,
+                position_time: dba_u32(data, &mut info_cursor)?,
+                position: dba_u32(data, &mut info_cursor)?,
+                rotation_time: dba_u32(data, &mut info_cursor)?,
+                rotation: dba_u32(data, &mut info_cursor)?,
+            });
+        }
+        if !in_place {
+            cursor = cursor
+                .checked_add(controller_bytes)
+                .ok_or(DbaDecodeError::InvalidLayout(
+                    "controller-info cursor overflow",
+                ))?;
+        }
+        records.push(DbaAnimationRecord {
+            file_path,
+            motion,
+            controllers,
+        });
+    }
+
+    let mut starts = Vec::new();
+    for offset in time_offsets
+        .iter()
+        .chain(position_offsets.iter())
+        .chain(rotation_offsets[..database.rotation_key_count].iter())
+    {
+        starts.push(resolve_dba_track_offset(
+            *offset,
+            in_place,
+            storage_start,
+            data.len(),
+        )?);
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    let storage_end = if in_place {
+        data.len()
+    } else {
+        storage_start
+            .and_then(|start| start.checked_add(track_length))
+            .ok_or(DbaDecodeError::InvalidLayout("track storage end overflow"))?
+    };
+    starts.push(storage_end);
+
+    let track = |kind: &'static str,
+                 index: u32,
+                 sizes: &[u16],
+                 formats: &[u32],
+                 offsets: &[i32]|
+     -> Result<Option<ControllerTrack<'_>>, DbaDecodeError> {
+        if index == u32::MAX {
+            return Ok(None);
+        }
+        let index = usize::try_from(index).map_err(|_| DbaDecodeError::TrackIndexOutOfRange {
+            kind,
+            index,
+            count: sizes.len(),
+        })?;
+        let key_count = usize::from(*sizes.get(index).ok_or(
+            DbaDecodeError::TrackIndexOutOfRange {
+                kind,
+                index: index as u32,
+                count: sizes.len(),
+            },
+        )?);
+        let format = dba_format_for_index(index, formats)
+            .ok_or(DbaDecodeError::UnknownTrackFormat { kind, index })?;
+        let start = resolve_dba_track_offset(offsets[index], in_place, storage_start, data.len())?;
+        let end = starts
+            .iter()
+            .copied()
+            .find(|candidate| *candidate > start)
+            .ok_or(DbaDecodeError::InvalidLayout("track has no end boundary"))?;
+        let bytes = data
+            .get(start..end)
+            .ok_or(DbaDecodeError::InvalidLayout("track points outside DBA"))?;
+        Ok(Some(ControllerTrack {
+            format: u8::try_from(format)
+                .map_err(|_| DbaDecodeError::InvalidLayout("track format exceeds u8"))?,
+            key_count,
+            data: bytes,
+        }))
+    };
+
+    let mut animations = Vec::with_capacity(records.len());
+    for record in records {
+        let sample_rate = compute_sample_rate(
+            record.motion.seconds_per_tick,
+            record.motion.ticks_per_frame,
+        );
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return Err(CafDecodeError::InvalidSampleRate { sample_rate }.into());
+        }
+        let mut start_key = record.motion.start;
+        if record.motion.asset_flags & 0x001 != 0 {
+            start_key += 1;
+        }
+        let start_sec = start_key as f32 / sample_rate;
+        let end_sec = record.motion.end as f32 / sample_rate;
+        let total_duration = (end_sec - start_sec).max(0.0);
+        let header = CafAnimationHeader {
+            flags: record.motion.asset_flags,
+            start_sec,
+            end_sec,
+            total_duration,
+            controller_count: record.controllers.len() as u32,
+            source: CafAnimationHeaderSource::MotionParameters,
+            file_path: Some(record.file_path.clone()),
+        };
+        let root_motion = Some(CafRootMotion {
+            start: record.motion.start_location,
+            end: record.motion.end_location,
+            velocity: [0.0; 3],
+            distance: record.motion.distance,
+            speed: record.motion.move_speed,
+            turn_speed: record.motion.turn_speed,
+            turn_angle: record.motion.asset_turn,
+            slope: record.motion.slope,
+        });
+        let mut controllers = Vec::with_capacity(record.controllers.len());
+        for info in record.controllers {
+            let rotation = track(
+                "rotation",
+                info.rotation,
+                &rotation_sizes,
+                &rotation_formats,
+                &rotation_offsets,
+            )?;
+            let rotation_times = track(
+                "time",
+                info.rotation_time,
+                &time_sizes,
+                &time_formats,
+                &time_offsets,
+            )?;
+            let position = track(
+                "position",
+                info.position,
+                &position_sizes,
+                &position_formats,
+                &position_offsets,
+            )?;
+            let position_times = track(
+                "time",
+                info.position_time,
+                &time_sizes,
+                &time_formats,
+                &time_offsets,
+            )?;
+            controllers.push(decode_compressed_controller(
+                &ControllerCompressedChunk {
+                    controller_id: info.controller_id,
+                    flags: 0,
+                    rotation,
+                    rotation_times,
+                    position,
+                    position_times,
+                    position_keys_info: 1,
+                    tracks_aligned: true,
+                },
+                &header,
+                sample_rate,
+            )?);
+        }
+        animations.push(DbaAnimation {
+            file_path: record.file_path,
+            animation: CafAnimation {
+                header,
+                sample_rate,
+                controllers,
+                root_motion,
+            },
+        });
+    }
+    Ok(DbaArchive { animations })
+}
+
+fn parse_dba_motion_parameters(bytes: &[u8]) -> Result<DbaMotionParameters, DbaDecodeError> {
+    let mut cursor = 0usize;
+    let asset_flags = dba_u32(bytes, &mut cursor)?;
+    let _compression = dba_u32(bytes, &mut cursor)?;
+    let ticks_per_frame = dba_i32(bytes, &mut cursor)?;
+    let seconds_per_tick = dba_f32(bytes, &mut cursor)?;
+    let start = dba_i32(bytes, &mut cursor)?;
+    let end = dba_i32(bytes, &mut cursor)?;
+    let move_speed = dba_f32(bytes, &mut cursor)?;
+    let turn_speed = dba_f32(bytes, &mut cursor)?;
+    let asset_turn = dba_f32(bytes, &mut cursor)?;
+    let distance = dba_f32(bytes, &mut cursor)?;
+    let slope = dba_f32(bytes, &mut cursor)?;
+    let start_location = dba_quat_t(bytes, &mut cursor)?;
+    let end_location = dba_quat_t(bytes, &mut cursor)?;
+    for _ in 0..8 {
+        let _ = dba_f32(bytes, &mut cursor)?;
+    }
+    Ok(DbaMotionParameters {
+        asset_flags,
+        ticks_per_frame,
+        seconds_per_tick,
+        start,
+        end,
+        move_speed,
+        turn_speed,
+        asset_turn,
+        distance,
+        slope,
+        start_location,
+        end_location,
+    })
+}
+
+fn dba_quat_t(bytes: &[u8], cursor: &mut usize) -> Result<QuatT, DbaDecodeError> {
+    Ok(QuatT {
+        rotation: [
+            dba_f32(bytes, cursor)?,
+            dba_f32(bytes, cursor)?,
+            dba_f32(bytes, cursor)?,
+            dba_f32(bytes, cursor)?,
+        ],
+        translation: [
+            dba_f32(bytes, cursor)?,
+            dba_f32(bytes, cursor)?,
+            dba_f32(bytes, cursor)?,
+        ],
+    })
+}
+
+fn dba_format_for_index(index: usize, format_counts: &[u32]) -> Option<usize> {
+    let mut end = 0usize;
+    for (format, count) in format_counts.iter().copied().enumerate() {
+        end = end.checked_add(count as usize)?;
+        if index < end {
+            return Some(format);
+        }
+    }
+    None
+}
+
+fn resolve_dba_track_offset(
+    offset: i32,
+    in_place: bool,
+    storage_start: Option<usize>,
+    data_len: usize,
+) -> Result<usize, DbaDecodeError> {
+    let resolved = if in_place {
+        data_len.checked_add_signed(offset as isize)
+    } else {
+        usize::try_from(offset)
+            .ok()
+            .and_then(|offset| storage_start?.checked_add(offset))
+    };
+    resolved
+        .filter(|offset| *offset <= data_len)
+        .ok_or(DbaDecodeError::InvalidLayout("track offset is outside DBA"))
+}
+
+fn align_usize(value: usize, alignment: usize) -> Result<usize, DbaDecodeError> {
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value / alignment * alignment)
+        .ok_or(DbaDecodeError::InvalidLayout("alignment overflow"))
+}
+
+fn dba_bytes<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Result<&'a [u8], DbaDecodeError> {
+    let end = cursor
+        .checked_add(count)
+        .ok_or(DbaDecodeError::InvalidLayout("cursor overflow"))?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or(DbaDecodeError::InvalidLayout("truncated field"))?;
+    *cursor = end;
+    Ok(value)
+}
+
+fn dba_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, DbaDecodeError> {
+    Ok(u16::from_le_bytes(
+        dba_bytes(bytes, cursor, 2)?
+            .try_into()
+            .expect("two-byte field"),
+    ))
+}
+
+fn dba_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, DbaDecodeError> {
+    Ok(u32::from_le_bytes(
+        dba_bytes(bytes, cursor, 4)?
+            .try_into()
+            .expect("four-byte field"),
+    ))
+}
+
+fn dba_i32(bytes: &[u8], cursor: &mut usize) -> Result<i32, DbaDecodeError> {
+    Ok(i32::from_le_bytes(
+        dba_bytes(bytes, cursor, 4)?
+            .try_into()
+            .expect("four-byte field"),
+    ))
+}
+
+fn dba_f32(bytes: &[u8], cursor: &mut usize) -> Result<f32, DbaDecodeError> {
+    Ok(f32_from_le_bytes(
+        dba_bytes(bytes, cursor, 4)?
+            .try_into()
+            .expect("four-byte field"),
+    ))
+}
+
+fn dba_u16_array(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Result<Vec<u16>, DbaDecodeError> {
+    (0..count).map(|_| dba_u16(bytes, cursor)).collect()
+}
+
+fn dba_u32_array(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Result<Vec<u32>, DbaDecodeError> {
+    (0..count).map(|_| dba_u32(bytes, cursor)).collect()
+}
+
+fn dba_i32_array(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Result<Vec<i32>, DbaDecodeError> {
+    (0..count).map(|_| dba_i32(bytes, cursor)).collect()
 }
 
 impl CafControllerScan {
@@ -470,6 +1020,7 @@ fn build_header(
                 total_duration: global.total_duration,
                 controller_count: global.controller_count,
                 source: CafAnimationHeaderSource::GlobalAnimationHeaderCaf,
+                file_path: Some(global.file_path.to_string()),
             },
             None => CafAnimationHeader {
                 flags: motion.asset_flags,
@@ -478,6 +1029,7 @@ fn build_header(
                 total_duration,
                 controller_count,
                 source: CafAnimationHeaderSource::MotionParameters,
+                file_path: None,
             },
         };
         return Ok((header, sample_rate));
@@ -496,6 +1048,7 @@ fn build_header(
                 total_duration: global.total_duration,
                 controller_count: global.controller_count,
                 source: CafAnimationHeaderSource::GlobalAnimationHeaderCaf,
+                file_path: Some(global.file_path.to_string()),
             },
             None => CafAnimationHeader {
                 flags: 0,
@@ -504,12 +1057,41 @@ fn build_header(
                 total_duration: end_sec - start_sec,
                 controller_count,
                 source: CafAnimationHeaderSource::Timing,
+                file_path: None,
             },
         };
         return Ok((header, sample_rate));
     }
 
     Err(CafDecodeError::MissingHeader)
+}
+
+fn build_root_motion(
+    global: Option<&GlobalAnimationHeaderCafChunk>,
+    motion: Option<&MotionParametersChunk>,
+) -> Option<CafRootMotion> {
+    if let Some(global) = global {
+        return Some(CafRootMotion {
+            start: global.start_location,
+            end: global.last_locator_key,
+            velocity: global.velocity,
+            distance: global.distance,
+            speed: global.speed,
+            turn_speed: motion.map_or(0.0, |value| value.turn_speed),
+            turn_angle: motion.map_or(0.0, |value| value.asset_turn),
+            slope: motion.map_or(0.0, |value| value.slope),
+        });
+    }
+    motion.map(|motion| CafRootMotion {
+        start: motion.start_location,
+        end: motion.end_location,
+        velocity: [0.0; 3],
+        distance: motion.distance,
+        speed: motion.move_speed,
+        turn_speed: motion.turn_speed,
+        turn_angle: motion.asset_turn,
+        slope: motion.slope,
+    })
 }
 
 fn compute_sample_rate(seconds_per_tick: f32, ticks_per_frame: i32) -> f32 {
@@ -565,7 +1147,92 @@ fn decode_compressed_controller(
         flags: controller.flags,
         rotations,
         positions,
+        scales: Vec::new(),
     })
+}
+
+fn decode_uncompressed_controller(
+    controller: &crate::ControllerUncompressedChunk<'_>,
+    header: &CafAnimationHeader,
+    sample_rate: f32,
+) -> Result<CafController, CafDecodeError> {
+    decode_pq_log_controller(
+        controller.controller_id,
+        controller.flags,
+        controller.keys,
+        controller.key_count,
+        header,
+        sample_rate,
+    )
+}
+
+fn decode_pq_log_controller(
+    controller_id: u32,
+    flags: u32,
+    keys: &[u8],
+    key_count: usize,
+    header: &CafAnimationHeader,
+    sample_rate: f32,
+) -> Result<CafController, CafDecodeError> {
+    let mut rotations = Vec::with_capacity(key_count);
+    let mut positions = Vec::with_capacity(key_count);
+    for key in keys.chunks_exact(28) {
+        let tick = i32::from_le_bytes(key[0..4].try_into().expect("PQLog key time"));
+        let time = tick as f32 / sample_rate - header.start_sec;
+        let position = [
+            f32_from_le_bytes(key[4..8].try_into().expect("PQLog position x")),
+            f32_from_le_bytes(key[8..12].try_into().expect("PQLog position y")),
+            f32_from_le_bytes(key[12..16].try_into().expect("PQLog position z")),
+        ];
+        let log = [
+            f32_from_le_bytes(key[16..20].try_into().expect("PQLog rotation x")),
+            f32_from_le_bytes(key[20..24].try_into().expect("PQLog rotation y")),
+            f32_from_le_bytes(key[24..28].try_into().expect("PQLog rotation z")),
+        ];
+        let rotation =
+            inverse_quat_exp(log).ok_or(CafDecodeError::InvalidQuaternion { controller_id })?;
+        positions.push(PositionKey {
+            time,
+            value: position,
+        });
+        rotations.push(RotationKey {
+            time,
+            value: rotation,
+        });
+    }
+    validate_key_times("PQLog position", positions.iter().map(|key| key.time))?;
+    validate_key_times("PQLog rotation", rotations.iter().map(|key| key.time))?;
+    Ok(CafController {
+        controller_id,
+        flags,
+        rotations,
+        positions,
+        scales: Vec::new(),
+    })
+}
+
+fn inverse_quat_exp(log: [f32; 3]) -> Option<[f32; 4]> {
+    let length_sq = log.iter().map(|value| value * value).sum::<f32>();
+    if !length_sq.is_finite() {
+        return None;
+    }
+    if length_sq <= f32::EPSILON {
+        return Some([0.0, 0.0, 0.0, 1.0]);
+    }
+    let length = length_sq.sqrt();
+    let scale = -length.sin() / length;
+    normalize_quat([log[0] * scale, log[1] * scale, log[2] * scale, length.cos()])
+}
+
+fn validate_key_times(
+    track: &'static str,
+    times: impl IntoIterator<Item = f32>,
+) -> Result<(), CafDecodeError> {
+    let times = times.into_iter().collect::<Vec<_>>();
+    if !times.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(CafDecodeError::NonIncreasingTimes { track });
+    }
+    Ok(())
 }
 
 fn keys_with_times<T>(
@@ -911,6 +1578,151 @@ mod tests {
         let times = decode_times(track, 1.0, 0.0).unwrap();
 
         assert_eq!(times, [10.0, 13.0, 26.0]);
+    }
+
+    #[test]
+    fn decodes_crybone_tcb_payload_as_pq_log() {
+        let mut keys = Vec::new();
+        for (tick, position) in [(30_i32, [1.0_f32, 2.0, 3.0]), (31, [4.0, 5.0, 6.0])] {
+            keys.extend_from_slice(&tick.to_le_bytes());
+            for component in position {
+                keys.extend_from_slice(&component.to_le_bytes());
+            }
+            for component in [0.0_f32; 3] {
+                keys.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        let header = CafAnimationHeader {
+            flags: 0,
+            start_sec: 1.0,
+            end_sec: 2.0,
+            total_duration: 1.0,
+            controller_count: 1,
+            source: CafAnimationHeaderSource::Timing,
+            file_path: None,
+        };
+
+        let controller = decode_pq_log_controller(7, 3, &keys, 2, &header, 30.0).unwrap();
+
+        assert_eq!(controller.controller_id, 7);
+        assert_eq!(controller.flags, 3);
+        assert_eq!(controller.positions[0].value, [1.0, 2.0, 3.0]);
+        assert!((controller.positions[0].time - 0.0).abs() < 0.000_001);
+        assert_quat_close(
+            controller.rotations[0].value,
+            [0.0, 0.0, 0.0, 1.0],
+            0.000_001,
+        );
+    }
+
+    #[test]
+    fn decodes_controller_db_0905_shared_tracks() {
+        let mut data = Vec::new();
+
+        push_u16(&mut data, 2); // one two-key time track
+        push_format_counts(&mut data, 7, 0);
+        push_u16(&mut data, 2); // one two-key position track
+        push_format_counts(&mut data, 9, 0);
+        push_u16(&mut data, 2); // one two-key rotation track
+        push_format_counts(&mut data, 9, 0);
+
+        push_i32(&mut data, 0); // time storage offset
+        push_i32(&mut data, 8); // position storage offset
+        push_i32(&mut data, 32); // rotation storage offset
+        push_i32(&mut data, 64); // aligned storage length sentinel
+        while !data.len().is_multiple_of(4) {
+            data.push(0);
+        }
+
+        for time in [0.0_f32, 1.0] {
+            push_f32(&mut data, time);
+        }
+        for position in [[1.0_f32, 2.0, 3.0], [4.0, 5.0, 6.0]] {
+            for component in position {
+                push_f32(&mut data, component);
+            }
+        }
+        for rotation in [[0.0_f32, 0.0, 0.0, 1.0]; 2] {
+            for component in rotation {
+                push_f32(&mut data, component);
+            }
+        }
+
+        let path = b"animations/test.caf";
+        push_u16(&mut data, path.len() as u16);
+        data.extend_from_slice(path);
+        push_u32(&mut data, 0); // asset flags
+        push_u32(&mut data, u32::MAX); // compression setting
+        push_i32(&mut data, 1); // ticks per frame
+        push_f32(&mut data, 1.0 / 30.0); // seconds per tick
+        push_i32(&mut data, 0); // start key
+        push_i32(&mut data, 1); // end key
+        for value in [1.0_f32, 2.0, 3.0, 4.0, 5.0] {
+            push_f32(&mut data, value);
+        }
+        for _ in 0..2 {
+            for component in [0.0_f32, 0.0, 0.0, 1.0] {
+                push_f32(&mut data, component);
+            }
+            for component in [0.0_f32; 3] {
+                push_f32(&mut data, component);
+            }
+        }
+        for _ in 0..8 {
+            push_f32(&mut data, -1.0);
+        }
+        push_u16(&mut data, 0); // foot-plant bytes
+        push_u16(&mut data, 1); // controller count
+        push_u32(&mut data, 0x1234_5678);
+        push_u32(&mut data, 0); // position time track
+        push_u32(&mut data, 0); // position track
+        push_u32(&mut data, 0); // rotation time track
+        push_u32(&mut data, 0); // rotation track
+
+        let archive = decode_dba_0905(&ControllerDbChunk {
+            position_key_count: 1,
+            rotation_key_count: 1,
+            time_key_count: 1,
+            animation_count: 1,
+            data: &data,
+        })
+        .unwrap();
+
+        let clip = &archive.animations[0];
+        assert_eq!(clip.file_path, "animations/test.caf");
+        assert_eq!(clip.animation.controllers.len(), 1);
+        assert_eq!(clip.animation.controllers[0].controller_id, 0x1234_5678);
+        assert_eq!(
+            clip.animation.controllers[0].positions[1].value,
+            [4.0, 5.0, 6.0]
+        );
+        assert_quat_close(
+            clip.animation.controllers[0].rotations[1].value,
+            [0.0, 0.0, 0.0, 1.0],
+            0.000_001,
+        );
+    }
+
+    fn push_format_counts(bytes: &mut Vec<u8>, count: usize, populated_format: usize) {
+        for format in 0..count {
+            push_u32(bytes, u32::from(format == populated_format));
+        }
+    }
+
+    fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_i32(bytes: &mut Vec<u8>, value: i32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_f32(bytes: &mut Vec<u8>, value: f32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     fn assert_quat_close(actual: [f32; 4], expected: [f32; 4], epsilon: f32) {

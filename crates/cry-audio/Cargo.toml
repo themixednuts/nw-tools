@@ -1,0 +1,18 @@
+[package]
+name = "cry-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Pure legacy CryAudio ATL, Wwise soundbank, and Wwise media formats"
+
+[lints]
+workspace = true
+
+[dependencies]
+cry-xml.workspace = true
+nw-reflected-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true

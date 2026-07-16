@@ -557,7 +557,7 @@ pub struct AimPose {
     pub positions: Vec<[f32; 3]>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuatT {
     pub rotation: [f32; 4],
     pub translation: [f32; 3],

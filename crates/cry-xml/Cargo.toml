@@ -1,0 +1,16 @@
+[package]
+name = "cry-xml"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Loss-preserving CryEngine XML element tree"
+
+[lints]
+workspace = true
+
+[dependencies]
+quick-xml.workspace = true
+thiserror.workspace = true

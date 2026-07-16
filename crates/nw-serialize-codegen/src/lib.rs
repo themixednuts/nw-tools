@@ -34,6 +34,7 @@ pub mod role;
 pub mod rust;
 pub mod schema;
 pub mod selection;
+pub mod selection_manifest;
 pub mod status;
 pub mod support_usage;
 pub mod symbol_surface;
@@ -181,6 +182,10 @@ pub use rust::types::{RustTypeOptions, RustTypeRenderer};
 pub use selection::{
     SerializeCodegenRootMode, SerializeCodegenRootResolveError, SerializeCodegenRootSelection,
     resolve_codegen_root_type_id, resolve_codegen_root_type_ids,
+};
+pub use selection_manifest::{
+    SelectionManifestError, SerializeCodegenEngineOwnedTypeEntry, SerializeCodegenRootEntry,
+    SerializeCodegenSelectionManifest,
 };
 pub use status::{
     CodegenStatus, CodegenStatusEvent, CodegenStatusKind, CodegenStatusPhase, CodegenStatusSink,

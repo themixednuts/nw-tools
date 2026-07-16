@@ -12,6 +12,7 @@ description = "Streaming parsers for CryAction Mannequin metadata assets"
 workspace = true
 
 [dependencies]
+nw-reflected-types.workspace = true
 quick-xml = { workspace = true }
 ron = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

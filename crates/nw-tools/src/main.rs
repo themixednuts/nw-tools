@@ -6,6 +6,7 @@ mod format;
 mod fuzzy;
 mod jobs;
 mod model;
+mod model_asset;
 mod pak;
 mod progress;
 mod source;

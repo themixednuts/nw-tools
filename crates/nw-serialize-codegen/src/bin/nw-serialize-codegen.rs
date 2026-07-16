@@ -15,13 +15,13 @@ use nw_serialize_codegen::{
     NetworkRustEmitter, NetworkSchema, NetworkType, NetworkTypeCapability, NetworkWireShape,
     ReflectedTypeCatalogSummary, RustCodegenPlanner, RustSourceEmitter, RustSourceField,
     RustSourceInventory, RustSourceInventoryItem, RustStandaloneProjectFile,
-    SerializeCodegenRootMode, SerializeCodegenRootSelection, SerializeCodegenUnit,
-    SerializeContextCompileInputs, SerializeContextCompiler, SerializeContextDocument, Severity,
-    TypeScriptSourceEmitter, TypeScriptStandaloneProjectFile, TypeScriptStandaloneProjectOptions,
-    class_registration_trace_root_from_jsonl_str, complete_known_missing_reflected_bodies,
-    is_module_descriptor_json_name, module_descriptor_capture, module_descriptors_root,
-    module_descriptors_root_from_capture, module_name_from_path, module_name_from_resource_name,
-    resolve_codegen_root_type_ids,
+    SerializeCodegenRootMode, SerializeCodegenRootSelection, SerializeCodegenSelectionManifest,
+    SerializeCodegenUnit, SerializeContextCompileInputs, SerializeContextCompiler,
+    SerializeContextDocument, Severity, TypeScriptSourceEmitter, TypeScriptStandaloneProjectFile,
+    TypeScriptStandaloneProjectOptions, class_registration_trace_root_from_jsonl_str,
+    complete_known_missing_reflected_bodies, is_module_descriptor_json_name,
+    module_descriptor_capture, module_descriptors_root, module_descriptors_root_from_capture,
+    module_name_from_path, module_name_from_resource_name, resolve_codegen_root_type_ids,
 };
 use rust_embed::RustEmbed;
 use serde::Serialize;
@@ -88,6 +88,9 @@ struct GenerateArgs {
     /// Explicit root type to emit with its dependency closure. With `--selection explicit`, these are the only roots; otherwise they are added to the selected mode. Accepts a UUID, exact source name, or unique unqualified name.
     #[arg(long = "root", value_name = "NAME_OR_UUID")]
     roots: Vec<String>,
+    /// Checked-in selection manifest. Its `roots` and `data_roots` are merged with `--root`.
+    #[arg(long, value_name = "PATH")]
+    selection_file: Option<PathBuf>,
     /// Rust package name for generated Cargo.toml.
     #[arg(long, default_value = "aztypes-rust")]
     rust_package: String,
@@ -194,6 +197,8 @@ enum StatusMode {
 enum RustLayout {
     /// Emit a complete standalone Rust crate.
     Standalone,
+    /// Emit a complete crate intended to live under the current Cargo workspace.
+    Vendored,
     /// Emit a single module file that integrates with an existing crate.
     #[value(name = "module")]
     Module,
@@ -1003,9 +1008,7 @@ fn generate_language(
 ) -> Result<()> {
     let files = match language {
         Language::All => unreachable!("all is expanded before generation"),
-        Language::Rust => {
-            rust_output_files(completed, args.rust_layout, &args.rust_package, context)?
-        }
+        Language::Rust => rust_output_files(completed, args, context)?,
         Language::Go => go_output_files(completed, &args.go_module, &args.go_package, context)?,
         Language::TypeScript => typescript_output_files(
             completed,
@@ -1049,7 +1052,26 @@ fn codegen_root_selection(
     unit: &SerializeCodegenUnit,
     args: &GenerateArgs,
 ) -> Result<SerializeCodegenRootSelection> {
-    let root_type_ids = resolve_codegen_root_type_ids(unit, args.roots.iter().map(String::as_str))?;
+    let selection_manifest = args
+        .selection_file
+        .as_deref()
+        .map(SerializeCodegenSelectionManifest::from_path)
+        .transpose()?;
+    if let Some(manifest) = selection_manifest.as_ref()
+        && !manifest.engine_owned_types.is_empty()
+    {
+        bail!(
+            "--selection-file contains engine_owned_types; standalone CLI generation cannot resolve handwritten source ownership"
+        );
+    }
+    let manifest_roots = selection_manifest
+        .as_ref()
+        .into_iter()
+        .flat_map(SerializeCodegenSelectionManifest::root_specs);
+    let root_type_ids = resolve_codegen_root_type_ids(
+        unit,
+        args.roots.iter().map(String::as_str).chain(manifest_roots),
+    )?;
     if args.selection.requires_explicit_roots() && root_type_ids.is_empty() {
         bail!("--selection explicit requires at least one --root");
     }
@@ -1201,17 +1223,15 @@ fn load_json_root(path: &Path, label: &str) -> Result<Value> {
 
 fn rust_output_files(
     completed: &CompletedCodegenUnits,
-    layout: RustLayout,
-    package_name: &str,
+    args: &GenerateArgs,
     context: &CodegenContext,
 ) -> Result<Vec<OutputFile>> {
-    match layout {
-        RustLayout::Standalone => {
-            let rust_unit = RustCodegenPlanner::standalone().plan_serialize_codegen_units(
-                &completed.emitted,
-                &completed.context,
-                context,
-            );
+    let native_default_type_ids = selection_manifest_native_default_type_ids(completed, args)?;
+    match args.rust_layout {
+        RustLayout::Standalone | RustLayout::Vendored => {
+            let rust_unit = RustCodegenPlanner::standalone()
+                .without_default_derive_for(native_default_type_ids.iter().copied())
+                .plan_serialize_codegen_units(&completed.emitted, &completed.context, context);
             let mut files = RustSourceEmitter::emit_standalone_project(&rust_unit, context)
                 .context("emit standalone Rust project")?
                 .files
@@ -1220,16 +1240,18 @@ fn rust_output_files(
                 .collect::<Vec<_>>();
             files.push(OutputFile {
                 path: "Cargo.toml".to_owned(),
-                source: rust_cargo_toml(package_name),
+                source: match args.rust_layout {
+                    RustLayout::Standalone => rust_cargo_toml(&args.rust_package),
+                    RustLayout::Vendored => rust_vendored_cargo_toml(&args.rust_package),
+                    RustLayout::Module | RustLayout::Modules => unreachable!(),
+                },
             });
             Ok(files)
         }
         RustLayout::Module => {
-            let rust_unit = RustCodegenPlanner::default().plan_serialize_codegen_units(
-                &completed.emitted,
-                &completed.context,
-                context,
-            );
+            let rust_unit = RustCodegenPlanner::default()
+                .without_default_derive_for(native_default_type_ids.iter().copied())
+                .plan_serialize_codegen_units(&completed.emitted, &completed.context, context);
             let source = RustSourceEmitter::emit_unit(&rust_unit, context)
                 .context("emit integrated Rust module")?;
             Ok(vec![OutputFile {
@@ -1238,11 +1260,9 @@ fn rust_output_files(
             }])
         }
         RustLayout::Modules => {
-            let rust_unit = RustCodegenPlanner::default().plan_serialize_codegen_units(
-                &completed.emitted,
-                &completed.context,
-                context,
-            );
+            let rust_unit = RustCodegenPlanner::default()
+                .without_default_derive_for(native_default_type_ids.iter().copied())
+                .plan_serialize_codegen_units(&completed.emitted, &completed.context, context);
             RustSourceEmitter::emit_integrated_project(&rust_unit, context)
                 .context("emit integrated Rust module tree")
                 .map(|project| {
@@ -1254,6 +1274,18 @@ fn rust_output_files(
                 })
         }
     }
+}
+
+fn selection_manifest_native_default_type_ids(
+    completed: &CompletedCodegenUnits,
+    args: &GenerateArgs,
+) -> Result<Vec<uuid::Uuid>> {
+    let Some(path) = args.selection_file.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let manifest = SerializeCodegenSelectionManifest::from_path(path)?;
+    resolve_codegen_root_type_ids(&completed.context, manifest.native_default_specs())
+        .map_err(Into::into)
 }
 
 fn generated_rust_module_source(source: &str) -> String {
@@ -1354,15 +1386,47 @@ bevy_ecs = {{ version = "0.18", features = ["serialize"] }}
 bevy_color = {{ version = "0.18", features = ["serialize"] }}
 bevy_math = {{ version = "0.18", features = ["serialize"] }}
 bevy_platform = "0.18"
-bevy_reflect = {{ version = "0.18", features = ["smallvec", "uuid"] }}
+bevy_reflect = {{ version = "0.18", features = ["uuid"] }}
 bevy_transform = {{ version = "0.18", features = ["serialize"] }}
 sha1 = "0.11"
 serde = {{ version = "1", features = ["derive", "rc"] }}
 serde_json = "1"
-smallvec = {{ version = "1", features = ["serde"] }}
+arrayvec = {{ version = "0.7", features = ["serde"] }}
 uuid = {{ version = "1.23", features = ["serde", "v4", "v7"] }}
 
 [workspace]
+"#
+    )
+}
+
+fn rust_vendored_cargo_toml(package_name: &str) -> String {
+    format!(
+        r#"[package]
+name = "{package_name}"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Vendored behavior-free New World SerializeContext asset types"
+
+[dependencies]
+bevy_app = "0.18"
+bevy_ecs = {{ version = "0.18", features = ["serialize"] }}
+bevy_color = {{ version = "0.18", features = ["serialize"] }}
+bevy_math = {{ version = "0.18", features = ["serialize"] }}
+bevy_platform = "0.18"
+bevy_reflect = {{ version = "0.18", features = ["uuid"] }}
+bevy_transform = {{ version = "0.18", features = ["serialize"] }}
+sha1.workspace = true
+serde = {{ workspace = true, features = ["derive", "rc"] }}
+serde_json.workspace = true
+arrayvec = {{ workspace = true, features = ["serde"] }}
+uuid = {{ workspace = true, features = ["serde", "v4", "v7"] }}
+
+[lints]
+workspace = true
 "#
     )
 }

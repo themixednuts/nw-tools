@@ -558,7 +558,7 @@ impl RustFieldPlanner {
             (SequenceKind::Array, Some(capacity)) => format!("[{element_type}; {capacity}]"),
             (SequenceKind::BitSet, _) => rust_bitset_storage_type(capacity),
             (SequenceKind::FixedVector, Some(capacity)) => {
-                format!("smallvec::SmallVec<[{element_type}; {capacity}]>")
+                format!("arrayvec::ArrayVec<{element_type}, {capacity}>")
             }
             (SequenceKind::Set, _) => format!("std::collections::BTreeSet<{element_type}>"),
             (SequenceKind::UnorderedSet, _) => {
@@ -618,7 +618,7 @@ impl RustFieldPlanner {
             (SequenceKind::Array, Some(capacity)) => format!("[{element_type}; {capacity}]"),
             (SequenceKind::BitSet, _) => rust_bitset_storage_type(capacity),
             (SequenceKind::FixedVector, Some(capacity)) => {
-                format!("smallvec::SmallVec<[{element_type}; {capacity}]>")
+                format!("arrayvec::ArrayVec<{element_type}, {capacity}>")
             }
             (SequenceKind::Set, _)
                 if rust_type_supports_native_ordering(element, items_by_type_id) =>

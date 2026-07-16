@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 bcdec_rs = "0.2.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+nw-reflected-types.workspace = true
 texture2ddecoder = "0.1.2"
 thiserror.workspace = true
 vk2dfd.workspace = true

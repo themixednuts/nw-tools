@@ -2,6 +2,7 @@
 //! classification.
 
 mod container;
+pub mod reflected;
 
 use std::fmt;
 use std::io::Cursor;

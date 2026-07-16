@@ -425,11 +425,12 @@ impl BlendSpaceSourceTransform {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        let _source_kind = BlendSpaceXmlKind::from_source_path(input.source_path).ok_or_else(|| {
-            BlendSpaceSourceTransformError::UnsupportedPath {
-                path: normalize_source_path(input.source_path),
-            }
-        })?;
+        let _source_kind =
+            BlendSpaceXmlKind::from_source_path(input.source_path).ok_or_else(|| {
+                BlendSpaceSourceTransformError::UnsupportedPath {
+                    path: normalize_source_path(input.source_path),
+                }
+            })?;
         let source_path = normalize_source_path(input.source_path);
 
         let (kind, bytes) = match parse_blend_space_document(input.bytes)? {

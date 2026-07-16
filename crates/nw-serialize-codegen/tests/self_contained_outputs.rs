@@ -214,12 +214,12 @@ rust-version = "1.96"
 bevy_ecs = { version = "0.18", features = ["serialize"] }
 bevy_color = { version = "0.18", features = ["serialize"] }
 bevy_math = { version = "0.18", features = ["serialize"] }
-bevy_reflect = { version = "0.18", features = ["smallvec", "uuid"] }
+bevy_reflect = { version = "0.18", features = ["uuid"] }
 bevy_transform = { version = "0.18", features = ["serialize"] }
 sha1 = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-smallvec = { version = "1", features = ["serde"] }
+arrayvec = { version = "0.7", features = ["serde"] }
 uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
 
 [workspace]

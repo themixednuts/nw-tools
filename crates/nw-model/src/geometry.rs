@@ -5,7 +5,7 @@
 //! pointing into the heap (New World's common interleaved layout). Both are
 //! resolved here, following nw-buddy's `convertPrimitive`.
 
-use cry_chunk::{CgfFile, MeshChunk, MeshSubset};
+use cry_chunk::{CgfFile, MeshChunk, MeshSubset, MeshSubsetBoneIds};
 use glam::{Mat3, Mat4, Quat, Vec2, Vec3};
 
 use crate::math;
@@ -39,8 +39,50 @@ pub struct Primitive {
 pub struct Mesh {
     pub name: String,
     pub primitives: Vec<Primitive>,
-    /// Whether the mesh's primitives carry skin weights (bound to the skeleton).
-    pub skinned: bool,
+    /// Skeleton index used by this mesh's JOINTS/WEIGHTS streams.
+    pub skin: Option<usize>,
+    /// Cry node LOD suffix (`$lodN`), when present.
+    pub lod: Option<u32>,
+    /// Whether this node is authored as a shadow-proxy mesh.
+    pub shadow_proxy: bool,
+    /// Optional CDF socket placement for rigid bone/face attachments.
+    pub attachment: Option<MeshAttachment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MeshAttachment {
+    /// Skeleton containing `bone_name`. `None` is character/root space.
+    pub skeleton: Option<usize>,
+    /// Bone parent for CA_BONE attachments. `None` is character/root space.
+    pub bone_name: Option<String>,
+    pub local: Mat4,
+}
+
+/// Authored non-render node retained from the Cry chunk graph.
+#[derive(Debug, Clone)]
+pub struct AuxiliaryNode {
+    pub name: String,
+    pub role: AuxiliaryNodeRole,
+    pub object_chunk_id: i32,
+    pub parent_chunk_id: i32,
+    pub material_chunk_id: i32,
+    pub transform: [f32; 16],
+    pub properties: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuxiliaryNodeRole {
+    PhysicsProxy,
+}
+
+/// Placement of a complete skeleton graph, used by nested CDF attachments.
+#[derive(Debug, Clone)]
+pub struct SkeletonPlacement {
+    /// Parent skeleton for a bone attachment. `None` places the graph in scene space.
+    pub parent_skeleton: Option<usize>,
+    /// Parent bone within `parent_skeleton`. `None` places the graph in scene space.
+    pub bone_name: Option<String>,
+    pub local: Mat4,
 }
 
 /// One joint of a [`Skeleton`].
@@ -62,34 +104,112 @@ pub struct Bone {
 #[derive(Debug, Clone)]
 pub struct Skeleton {
     pub bones: Vec<Bone>,
+    /// Optional placement of this skeleton as a nested character attachment.
+    pub placement: Option<SkeletonPlacement>,
+}
+
+impl Skeleton {
+    #[must_use]
+    pub fn bone_index(&self, name: &str) -> Option<usize> {
+        self.bones
+            .iter()
+            .position(|bone| bone.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Character-space transform for a bone, composed from its local hierarchy.
+    #[must_use]
+    pub fn bone_world(&self, index: usize) -> Option<Mat4> {
+        let mut current = index;
+        let mut world = self.bones.get(current)?.local;
+        for _ in 0..self.bones.len() {
+            let Some(parent) = self.bones.get(current)?.parent else {
+                return Some(world);
+            };
+            world = self.bones.get(parent)?.local * world;
+            current = parent;
+        }
+        None
+    }
 }
 
 /// A fully-resolved model ready to serialize to glTF.
 #[derive(Debug, Clone, Default)]
 pub struct Model {
     pub meshes: Vec<Mesh>,
-    /// The skeleton, if this is a skinned model.
-    pub skeleton: Option<Skeleton>,
+    /// Every independent skeleton graph used by this model. Mesh `skin` indices
+    /// and nested placements index this table.
+    pub skeletons: Vec<Skeleton>,
+    /// Collision/proxy nodes that are part of the source graph but are not
+    /// renderable glTF meshes.
+    pub auxiliary_nodes: Vec<AuxiliaryNode>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ModelBuildError {
+    #[error("mesh node `{mesh}` references missing MeshSubsets chunk {chunk_id}")]
+    MissingSubsets { mesh: String, chunk_id: i32 },
+    #[error("mesh node `{mesh}` subset {subset} has no readable position stream")]
+    MissingPositions { mesh: String, subset: usize },
+    #[error("mesh node `{mesh}` subset {subset} has no readable index stream")]
+    MissingIndices { mesh: String, subset: usize },
+    #[error("skinned mesh node `{mesh}` subset {subset} has no valid bone mapping")]
+    MissingBoneMapping { mesh: String, subset: usize },
+    #[error(
+        "skinned mesh node `{mesh}` subset {subset} joint {joint} is outside skeleton size {skeleton_len}"
+    )]
+    JointOutOfRange {
+        mesh: String,
+        subset: usize,
+        joint: u16,
+        skeleton_len: usize,
+    },
+    #[error("CDF attachment targets missing skeleton bone `{bone_name}`")]
+    MissingAttachmentBone { bone_name: String },
+    #[error("model references missing skeleton index {index}")]
+    MissingSkeleton { index: usize },
+    #[error("attached skin bone `{bone}` does not exist in target skeleton {target}")]
+    MissingSkinBone { bone: String, target: usize },
+    #[error("material index {material_id} plus table offset {offset} exceeds Cry's i32 range")]
+    MaterialIndexOverflow { material_id: i32, offset: usize },
 }
 
 /// Build a model from a parsed chunk file and its heap (`&[]` if none).
 ///
-/// World transforms are baked into vertices (glTF nodes stay at the origin), which
-/// is correct and avoids matrix-convention pitfalls; `$lod` and `shadowproxy`
-/// nodes are skipped.
-impl From<(&CgfFile<'_>, &[u8])> for Model {
-    fn from((cgf, heap): (&CgfFile<'_>, &[u8])) -> Self {
-        let skeleton = cgf.compiled_bones().first().map(build_skeleton);
-        let skinned = skeleton.is_some();
+/// World transforms are baked into vertices (glTF nodes stay at the origin).
+impl Model {
+    /// Assemble every drawable mesh node from a parsed chunk graph.
+    ///
+    /// # Errors
+    ///
+    /// Fails when required geometry or skin streams cannot be resolved. Optional
+    /// attributes (normal/UV/tangent) remain optional glTF attributes.
+    pub fn try_from_cgf(cgf: &CgfFile<'_>, heap: &[u8]) -> Result<Self, ModelBuildError> {
+        let skeletons = cgf
+            .compiled_bones()
+            .first()
+            .map(build_skeleton)
+            .into_iter()
+            .collect::<Vec<_>>();
         let mut meshes = Vec::new();
+        let mut auxiliary_nodes = Vec::new();
         for node in cgf.nodes().values() {
             let name = node.name.as_str();
-            if name.contains("$lod") || name.to_ascii_lowercase().contains("shadowproxy") {
-                continue;
-            }
             let Some(mesh) = cgf.meshes().get(&node.object_id) else {
                 continue;
             };
+            if name.to_ascii_lowercase().starts_with("$physics_proxy") {
+                auxiliary_nodes.push(AuxiliaryNode {
+                    name: name.to_owned(),
+                    role: AuxiliaryNodeRole::PhysicsProxy,
+                    object_chunk_id: node.object_id,
+                    parent_chunk_id: node.parent_id,
+                    material_chunk_id: node.material_chunk_id,
+                    transform: node.transform,
+                    properties: node.properties.clone(),
+                });
+                continue;
+            }
+            let skinned = stream_id(mesh, KIND_BONE_MAPPING).is_some();
             // Skinned vertices live in bind/model space — the skin handles placement,
             // so we don't bake the node's world transform into them.
             let world = if skinned {
@@ -97,11 +217,23 @@ impl From<(&CgfFile<'_>, &[u8])> for Model {
             } else {
                 node_world_matrix(cgf, node.parent_id, math::node_matrix(node.transform))
             };
-            if let Some(out) = build_mesh(cgf, mesh, heap, &world, name, skinned) {
+            if let Some(out) = build_mesh(
+                cgf,
+                mesh,
+                heap,
+                &world,
+                name,
+                skinned,
+                skeletons.first().map_or(0, |value| value.bones.len()),
+            )? {
                 meshes.push(out);
             }
         }
-        Self { meshes, skeleton }
+        Ok(Self {
+            meshes,
+            skeletons,
+            auxiliary_nodes,
+        })
     }
 }
 
@@ -143,7 +275,10 @@ pub(crate) fn build_skeleton(chunk: &cry_chunk::CompiledBonesChunk) -> Skeleton 
             }
         })
         .collect();
-    Skeleton { bones }
+    Skeleton {
+        bones,
+        placement: None,
+    }
 }
 
 impl Model {
@@ -168,6 +303,266 @@ impl Model {
             .flat_map(|mesh| &mesh.primitives)
             .map(|primitive| primitive.indices.len() / 3)
             .sum()
+    }
+
+    #[must_use]
+    pub fn primary_skeleton(&self) -> Option<&Skeleton> {
+        self.skeletons.first()
+    }
+
+    pub fn set_primary_skeleton(&mut self, skeleton: Skeleton) {
+        if self.skeletons.is_empty() {
+            self.skeletons.push(skeleton);
+        } else {
+            self.skeletons[0] = skeleton;
+        }
+    }
+
+    /// Merge a `.skin`/cloth binding onto an existing character skeleton. The
+    /// attachment's CompiledBones graph may use a different joint order; bindings
+    /// are remapped by controller ID/name to the receiving skeleton.
+    pub fn append_skinned_geometry(
+        &mut self,
+        mut other: Self,
+        target: usize,
+    ) -> Result<(), ModelBuildError> {
+        let target_skeleton = self
+            .skeletons
+            .get(target)
+            .ok_or(ModelBuildError::MissingSkeleton { index: target })?;
+        let joint_remap = other.skeletons.first().map(|source_skeleton| {
+            source_skeleton
+                .bones
+                .iter()
+                .map(|source_bone| {
+                    target_skeleton
+                        .bones
+                        .iter()
+                        .position(|target_bone| {
+                            (source_bone.controller_id != 0
+                                && target_bone.controller_id == source_bone.controller_id)
+                                || target_bone.name.eq_ignore_ascii_case(&source_bone.name)
+                        })
+                        .and_then(|index| u16::try_from(index).ok())
+                })
+                .collect::<Vec<_>>()
+        });
+        for mesh in &mut other.meshes {
+            if mesh.skin.is_some() {
+                mesh.skin = Some(target);
+            }
+            for primitive in &mut mesh.primitives {
+                let (Some(joints), Some(weights)) =
+                    (&mut primitive.joints, primitive.weights.as_ref())
+                else {
+                    continue;
+                };
+                for (vertex_joints, vertex_weights) in joints.iter_mut().zip(weights) {
+                    for influence in 0..4 {
+                        if vertex_weights[influence] <= 0.0 {
+                            vertex_joints[influence] = 0;
+                            continue;
+                        }
+                        let source_index = usize::from(vertex_joints[influence]);
+                        let mapped = if let Some(remap) = &joint_remap {
+                            remap.get(source_index).copied().flatten().ok_or_else(|| {
+                                ModelBuildError::MissingSkinBone {
+                                    bone: other
+                                        .skeletons
+                                        .first()
+                                        .and_then(|skeleton| skeleton.bones.get(source_index))
+                                        .map_or_else(
+                                            || format!("#{source_index}"),
+                                            |bone| bone.name.clone(),
+                                        ),
+                                    target,
+                                }
+                            })?
+                        } else {
+                            if source_index >= target_skeleton.bones.len() {
+                                return Err(ModelBuildError::JointOutOfRange {
+                                    mesh: mesh.name.clone(),
+                                    subset: 0,
+                                    joint: vertex_joints[influence],
+                                    skeleton_len: target_skeleton.bones.len(),
+                                });
+                            }
+                            vertex_joints[influence]
+                        };
+                        vertex_joints[influence] = mapped;
+                    }
+                }
+            }
+        }
+        self.meshes.append(&mut other.meshes);
+        self.auxiliary_nodes.append(&mut other.auxiliary_nodes);
+        Ok(())
+    }
+
+    /// Rebase every non-negative Cry subset material ID before merging asset-local
+    /// material tables into one glTF material table.
+    pub fn rebase_material_ids(&mut self, offset: usize) -> Result<(), ModelBuildError> {
+        for primitive in self.meshes.iter_mut().flat_map(|mesh| &mut mesh.primitives) {
+            if primitive.material_id < 0 {
+                continue;
+            }
+            let material_id = primitive.material_id;
+            primitive.material_id = usize::try_from(material_id)
+                .ok()
+                .and_then(|index| index.checked_add(offset))
+                .and_then(|index| i32::try_from(index).ok())
+                .ok_or(ModelBuildError::MaterialIndexOverflow {
+                    material_id,
+                    offset,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Merge rigid attachment geometry and parent every emitted mesh node to a
+    /// validated character bone.
+    pub fn append_attached_geometry(
+        &mut self,
+        mut other: Self,
+        skeleton: usize,
+        bone_name: impl Into<String>,
+        local: Mat4,
+    ) -> Result<(), ModelBuildError> {
+        let bone_name = bone_name.into();
+        if self
+            .skeletons
+            .get(skeleton)
+            .is_none_or(|skeleton| skeleton.bone_index(&bone_name).is_none())
+        {
+            return Err(ModelBuildError::MissingAttachmentBone { bone_name });
+        }
+        for mesh in &mut other.meshes {
+            mesh.attachment = Some(MeshAttachment {
+                skeleton: Some(skeleton),
+                bone_name: Some(bone_name.clone()),
+                local,
+            });
+        }
+        self.meshes.append(&mut other.meshes);
+        self.auxiliary_nodes.append(&mut other.auxiliary_nodes);
+        Ok(())
+    }
+
+    /// Merge rigid geometry in character/root space (for example a statically
+    /// representable CA_FACE attachment).
+    pub fn append_root_geometry(&mut self, mut other: Self, local: Mat4) {
+        for mesh in &mut other.meshes {
+            mesh.attachment = Some(MeshAttachment {
+                skeleton: None,
+                bone_name: None,
+                local,
+            });
+        }
+        self.meshes.append(&mut other.meshes);
+        self.auxiliary_nodes.append(&mut other.auxiliary_nodes);
+    }
+
+    pub fn attach_meshes_to_bone(
+        &mut self,
+        skeleton: usize,
+        bone_name: impl Into<String>,
+        local: Mat4,
+    ) -> Result<(), ModelBuildError> {
+        let bone_name = bone_name.into();
+        if self
+            .skeletons
+            .get(skeleton)
+            .is_none_or(|skeleton| skeleton.bone_index(&bone_name).is_none())
+        {
+            return Err(ModelBuildError::MissingAttachmentBone { bone_name });
+        }
+        for mesh in &mut self.meshes {
+            mesh.attachment = Some(MeshAttachment {
+                skeleton: Some(skeleton),
+                bone_name: Some(bone_name.clone()),
+                local,
+            });
+        }
+        Ok(())
+    }
+
+    /// Merge a complete model graph and parent its primary skeleton to a bone in
+    /// this model. Returns the skeleton-table offset assigned to the child.
+    pub fn append_character_attachment(
+        &mut self,
+        mut other: Self,
+        parent_skeleton: usize,
+        bone_name: impl Into<String>,
+        local: Mat4,
+    ) -> Result<usize, ModelBuildError> {
+        let bone_name = bone_name.into();
+        if self
+            .skeletons
+            .get(parent_skeleton)
+            .is_none_or(|skeleton| skeleton.bone_index(&bone_name).is_none())
+        {
+            return Err(ModelBuildError::MissingAttachmentBone { bone_name });
+        }
+        if other.skeletons.is_empty() {
+            return Err(ModelBuildError::MissingSkeleton { index: 0 });
+        }
+        let offset = self.skeletons.len();
+        remap_skeleton_indices(&mut other, offset);
+        other.skeletons[0].placement = Some(SkeletonPlacement {
+            parent_skeleton: Some(parent_skeleton),
+            bone_name: Some(bone_name),
+            local,
+        });
+        self.meshes.append(&mut other.meshes);
+        self.skeletons.append(&mut other.skeletons);
+        self.auxiliary_nodes.append(&mut other.auxiliary_nodes);
+        Ok(offset)
+    }
+
+    /// Merge a complete model graph in scene/root space. Returns its skeleton offset.
+    pub fn append_character_root(
+        &mut self,
+        mut other: Self,
+        local: Mat4,
+    ) -> Result<usize, ModelBuildError> {
+        if other.skeletons.is_empty() {
+            return Err(ModelBuildError::MissingSkeleton { index: 0 });
+        }
+        let offset = self.skeletons.len();
+        remap_skeleton_indices(&mut other, offset);
+        other.skeletons[0].placement = Some(SkeletonPlacement {
+            parent_skeleton: None,
+            bone_name: None,
+            local,
+        });
+        self.meshes.append(&mut other.meshes);
+        self.skeletons.append(&mut other.skeletons);
+        self.auxiliary_nodes.append(&mut other.auxiliary_nodes);
+        Ok(offset)
+    }
+}
+
+fn remap_skeleton_indices(model: &mut Model, offset: usize) {
+    for mesh in &mut model.meshes {
+        if let Some(skin) = &mut mesh.skin {
+            *skin += offset;
+        }
+        if let Some(skeleton) = mesh
+            .attachment
+            .as_mut()
+            .and_then(|attachment| attachment.skeleton.as_mut())
+        {
+            *skeleton += offset;
+        }
+    }
+    for skeleton in &mut model.skeletons {
+        if let Some(parent) = skeleton
+            .placement
+            .as_mut()
+            .and_then(|placement| placement.parent_skeleton.as_mut())
+        {
+            *parent += offset;
+        }
     }
 }
 
@@ -194,45 +589,122 @@ fn build_mesh(
     world: &Mat4,
     name: &str,
     skinned: bool,
-) -> Option<Mesh> {
-    let subsets = cgf.mesh_subsets().get(&mesh.subsets_chunk_id)?;
+    skeleton_len: usize,
+) -> Result<Option<Mesh>, ModelBuildError> {
+    let subsets = cgf
+        .mesh_subsets()
+        .get(&mesh.subsets_chunk_id)
+        .ok_or_else(|| ModelBuildError::MissingSubsets {
+            mesh: name.to_owned(),
+            chunk_id: mesh.subsets_chunk_id,
+        })?;
     let mut primitives = Vec::new();
-    for subset in &subsets.subsets {
-        if let Some(primitive) = build_primitive(cgf, mesh, subset, heap, world, skinned) {
-            primitives.push(primitive);
-        }
+    let options = PrimitiveBuildOptions {
+        world,
+        mesh_name: name,
+        skinned,
+        skeleton_len,
+    };
+    for (subset_index, subset) in subsets.subsets.iter().enumerate() {
+        primitives.push(build_primitive(
+            cgf,
+            mesh,
+            subset,
+            subsets.bone_ids.get(subset_index),
+            heap,
+            subset_index,
+            &options,
+        )?);
     }
     if primitives.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(Mesh {
+    Ok(Some(Mesh {
         name: name.to_string(),
         primitives,
-        skinned,
-    })
+        skin: skinned.then_some(0),
+        lod: node_lod(name),
+        shadow_proxy: name.to_ascii_lowercase().contains("shadowproxy"),
+        attachment: None,
+    }))
+}
+
+struct PrimitiveBuildOptions<'a> {
+    world: &'a Mat4,
+    mesh_name: &'a str,
+    skinned: bool,
+    skeleton_len: usize,
 }
 
 fn build_primitive(
     cgf: &CgfFile,
     mesh: &MeshChunk,
     subset: &MeshSubset,
+    bone_palette: Option<&MeshSubsetBoneIds>,
     heap: &[u8],
-    world: &Mat4,
-    skinned: bool,
-) -> Option<Primitive> {
-    let positions = read_vec3_stream(cgf, mesh, KIND_POSITIONS, subset, heap, Some(world))?;
-    let indices = read_indices(cgf, mesh, subset, heap)?;
+    subset_index: usize,
+    options: &PrimitiveBuildOptions<'_>,
+) -> Result<Primitive, ModelBuildError> {
+    let positions = read_vec3_stream(
+        cgf,
+        mesh,
+        KIND_POSITIONS,
+        subset,
+        heap,
+        Vec3Transform::Point(options.world),
+    )
+    .ok_or_else(|| ModelBuildError::MissingPositions {
+        mesh: options.mesh_name.to_owned(),
+        subset: subset_index,
+    })?;
+    let indices =
+        read_indices(cgf, mesh, subset, heap).ok_or_else(|| ModelBuildError::MissingIndices {
+            mesh: options.mesh_name.to_owned(),
+            subset: subset_index,
+        })?;
     let uvs = read_uv_stream(cgf, mesh, KIND_TEXCOORDS, subset, heap);
-    let normals = read_vec3_stream(cgf, mesh, KIND_NORMALS, subset, heap, None)
-        .or_else(|| derive_normals_from_tangents(cgf, mesh, subset, heap))
-        .or_else(|| derive_normals_from_qtangents(cgf, mesh, subset, heap));
-    let (joints, weights) = if skinned {
-        read_bone_mapping(cgf, mesh, subset, heap).unzip()
+    let normal_transform = Mat3::from_mat4(*options.world).inverse().transpose();
+    let normals = read_vec3_stream(
+        cgf,
+        mesh,
+        KIND_NORMALS,
+        subset,
+        heap,
+        Vec3Transform::Direction(normal_transform),
+    )
+    .or_else(|| {
+        derive_normals_from_tangents(cgf, mesh, subset, heap)
+            .map(|normals| transform_gltf_normals(normals, normal_transform))
+    })
+    .or_else(|| {
+        derive_normals_from_qtangents(cgf, mesh, subset, heap)
+            .map(|normals| transform_gltf_normals(normals, normal_transform))
+    });
+    let (joints, weights) = if options.skinned {
+        let (joints, weights) = read_bone_mapping(cgf, mesh, subset, bone_palette, heap)
+            .ok_or_else(|| ModelBuildError::MissingBoneMapping {
+                mesh: options.mesh_name.to_owned(),
+                subset: subset_index,
+            })?;
+        if let Some(joint) = joints
+            .iter()
+            .flatten()
+            .copied()
+            .find(|joint| usize::from(*joint) >= options.skeleton_len)
+        {
+            return Err(ModelBuildError::JointOutOfRange {
+                mesh: options.mesh_name.to_owned(),
+                subset: subset_index,
+                joint,
+                skeleton_len: options.skeleton_len,
+            });
+        }
+        (Some(joints), Some(weights))
     } else {
         (None, None)
     };
 
-    Some(Primitive {
+    Ok(Primitive {
         positions,
         normals,
         uvs,
@@ -301,6 +773,7 @@ fn read_bone_mapping(
     cgf: &CgfFile,
     mesh: &MeshChunk,
     subset: &MeshSubset,
+    bone_palette: Option<&MeshSubsetBoneIds>,
     heap: &[u8],
 ) -> Option<BoneMapping> {
     let id = stream_id(mesh, KIND_BONE_MAPPING)?;
@@ -326,12 +799,15 @@ fn read_bone_mapping(
         let o = base + i * stride;
         let (joint, raw_weights) = match stride {
             8 => (
-                [
-                    u16::from(u8_at(data, o)?),
-                    u16::from(u8_at(data, o + 1)?),
-                    u16::from(u8_at(data, o + 2)?),
-                    u16::from(u8_at(data, o + 3)?),
-                ],
+                map_subset_bone_ids(
+                    [
+                        u8_at(data, o)?,
+                        u8_at(data, o + 1)?,
+                        u8_at(data, o + 2)?,
+                        u8_at(data, o + 3)?,
+                    ],
+                    bone_palette?,
+                )?,
                 [
                     u8_at(data, o + 4)?,
                     u8_at(data, o + 5)?,
@@ -361,6 +837,28 @@ fn read_bone_mapping(
     Some((joints, weights))
 }
 
+/// Maps the compact per-subset u8 indices used by New World's stride-8 stream
+/// through the parallel MeshSubsets bone-remapping table.
+fn map_subset_bone_ids(local: [u8; 4], palette: &MeshSubsetBoneIds) -> Option<[u16; 4]> {
+    let ids = palette.ids.get(..palette.count)?;
+    Some([
+        *ids.get(usize::from(local[0]))?,
+        *ids.get(usize::from(local[1]))?,
+        *ids.get(usize::from(local[2]))?,
+        *ids.get(usize::from(local[3]))?,
+    ])
+}
+
+fn node_lod(name: &str) -> Option<u32> {
+    let lowercase = name.to_ascii_lowercase();
+    let suffix = lowercase.split("$lod").nth(1)?;
+    let digits = suffix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
 /// Normalize Cry u8 bone weights (summing to ~255) to floats summing to 1.
 fn normalize_weights(raw: [u8; 4]) -> [f32; 4] {
     let sum = f32::from(raw[0]) + f32::from(raw[1]) + f32::from(raw[2]) + f32::from(raw[3]);
@@ -383,13 +881,19 @@ fn stream_id(mesh: &MeshChunk, kind: usize) -> Option<i32> {
 /// Read a per-vertex `[f32;3]` attribute (positions or normals). If `world` is
 /// set, points are transformed to world space; all values are converted to glTF
 /// axes.
+#[derive(Clone, Copy)]
+enum Vec3Transform<'a> {
+    Point(&'a Mat4),
+    Direction(Mat3),
+}
+
 fn read_vec3_stream(
     cgf: &CgfFile,
     mesh: &MeshChunk,
     kind: usize,
     subset: &MeshSubset,
     heap: &[u8],
-    world: Option<&Mat4>,
+    transform: Vec3Transform<'_>,
 ) -> Option<Vec<Vec3>> {
     let id = stream_id(mesh, kind)?;
     let count = subset.num_vertices;
@@ -399,9 +903,9 @@ fn read_vec3_stream(
         let v = Vec3::from_array(raw);
         // A point (position) is placed by the world matrix; a direction (normal)
         // is only rotated. Distinguish by whether a matrix was supplied.
-        let v = match world {
-            Some(matrix) => matrix.transform_point3(v),
-            None => v,
+        let v = match transform {
+            Vec3Transform::Point(matrix) => matrix.transform_point3(v),
+            Vec3Transform::Direction(matrix) => (matrix * v).normalize_or_zero(),
         };
         out.push(math::cry_to_gltf(v));
     };
@@ -446,6 +950,18 @@ fn read_vec3_stream(
         return None;
     }
     Some(out)
+}
+
+fn transform_gltf_normals(normals: Vec<Vec3>, cry_normal_matrix: Mat3) -> Vec<Vec3> {
+    // Tangent-derived normals have already had the Cry→glTF axis conversion.
+    // Convert back, apply the Cry-space inverse transpose, and convert once more.
+    normals
+        .into_iter()
+        .map(|normal| {
+            let cry = math::cry_to_gltf(normal);
+            math::cry_to_gltf((cry_normal_matrix * cry).normalize_or_zero())
+        })
+        .collect()
 }
 
 /// Read UVs (the texcoord channel sits after position[+color] in interleaved refs).
@@ -591,4 +1107,29 @@ fn f32_at(data: &[u8], offset: usize) -> Option<f32> {
 
 fn half_at(data: &[u8], offset: usize) -> Option<f32> {
     Some(math::half_to_f32(u16_at(data, offset)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stride_eight_joint_indices_use_subset_palette() {
+        let mut ids = [0_u16; 128];
+        ids[..4].copy_from_slice(&[21, 7, 42, 3]);
+        let palette = MeshSubsetBoneIds { count: 4, ids };
+
+        assert_eq!(
+            map_subset_bone_ids([2, 0, 3, 1], &palette),
+            Some([42, 21, 3, 7])
+        );
+        assert_eq!(map_subset_bone_ids([4, 0, 0, 0], &palette), None);
+    }
+
+    #[test]
+    fn extracts_cry_lod_suffix() {
+        assert_eq!(node_lod("body$lod2"), Some(2));
+        assert_eq!(node_lod("body$LOD12_extra"), Some(12));
+        assert_eq!(node_lod("body"), None);
+    }
 }

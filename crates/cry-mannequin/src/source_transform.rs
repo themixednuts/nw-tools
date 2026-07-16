@@ -356,6 +356,8 @@ pub struct MannequinControllerDefinitionSource {
     pub source_path: String,
     pub tags: MannequinFileReference,
     pub fragments: MannequinFileReference,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sub_contexts: Vec<MannequinSubContext>,
     pub fragment_definitions: Vec<MannequinFragmentDefinition>,
     pub scope_contexts: Vec<MannequinScopeContext>,
     pub scopes: Vec<MannequinScopeDefinition>,
@@ -392,12 +394,25 @@ pub struct MannequinFragmentDefinition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MannequinFragmentOverride {
     pub tags: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_tags: Option<String>,
     pub scopes: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MannequinSubContext {
+    pub name: String,
+    pub scopes: String,
+    pub tags: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MannequinScopeContext {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_tags: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_tags: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,6 +421,8 @@ pub struct MannequinScopeDefinition {
     pub layer: i32,
     pub num_layers: i32,
     pub context: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     /// Legacy Mannequin spells this scope filter attribute as `Tags`.
     pub tags: Option<String>,
 }
@@ -1238,6 +1255,7 @@ struct ControllerDefinitionParseState {
     source_path: String,
     tags: Option<MannequinFileReference>,
     fragments: Option<MannequinFileReference>,
+    sub_contexts: Vec<MannequinSubContext>,
     fragment_definitions: Vec<MannequinFragmentDefinition>,
     scope_contexts: Vec<MannequinScopeContext>,
     scopes: Vec<MannequinScopeDefinition>,
@@ -1251,6 +1269,7 @@ impl ControllerDefinitionParseState {
             source_path,
             tags: None,
             fragments: None,
+            sub_contexts: Vec::new(),
             fragment_definitions: Vec::new(),
             scope_contexts: Vec::new(),
             scopes: Vec::new(),
@@ -1278,6 +1297,7 @@ impl ControllerDefinitionParseState {
             .unwrap_or(ControllerDefinitionElement::Unknown);
         match parent {
             ControllerDefinitionElement::Root => self.visit_root_child(reader, event),
+            ControllerDefinitionElement::SubContexts => self.visit_sub_context(reader, event),
             ControllerDefinitionElement::FragmentDefs => self.visit_fragment_def(reader, event),
             ControllerDefinitionElement::Fragment(index) => {
                 self.visit_fragment_child(reader, event, index)
@@ -1288,6 +1308,7 @@ impl ControllerDefinitionParseState {
             ControllerDefinitionElement::ScopeDefs => self.visit_scope(reader, event),
             ControllerDefinitionElement::TagsRef
             | ControllerDefinitionElement::FragmentsRef
+            | ControllerDefinitionElement::SubContext
             | ControllerDefinitionElement::FragmentOverride
             | ControllerDefinitionElement::ScopeContext
             | ControllerDefinitionElement::Scope => {
@@ -1320,6 +1341,10 @@ impl ControllerDefinitionParseState {
                 });
                 Ok(ControllerDefinitionElement::FragmentsRef)
             }
+            "SubContexts" => {
+                ensure_no_attributes(reader, event, "SubContexts")?;
+                Ok(ControllerDefinitionElement::SubContexts)
+            }
             "FragmentDefs" => {
                 ensure_no_attributes(reader, event, "FragmentDefs")?;
                 Ok(ControllerDefinitionElement::FragmentDefs)
@@ -1337,6 +1362,20 @@ impl ControllerDefinitionParseState {
                 child: child.to_string(),
             }),
         }
+    }
+
+    fn visit_sub_context(
+        &mut self,
+        reader: &Reader<&[u8]>,
+        event: &BytesStart<'_>,
+    ) -> Result<ControllerDefinitionElement, MannequinXmlParseError> {
+        ensure_attributes(reader, event, "SubContext", &[b"scopes", b"tags"])?;
+        self.sub_contexts.push(MannequinSubContext {
+            name: local_name_string(reader, event)?,
+            scopes: attr_string(reader, event, b"scopes")?.unwrap_or_default(),
+            tags: attr_string(reader, event, b"tags")?.unwrap_or_default(),
+        });
+        Ok(ControllerDefinitionElement::SubContext)
     }
 
     fn visit_fragment_def(
@@ -1364,11 +1403,17 @@ impl ControllerDefinitionParseState {
         index: usize,
     ) -> Result<ControllerDefinitionElement, MannequinXmlParseError> {
         ensure_element(reader, "fragment", "Override", event)?;
-        ensure_attributes(reader, event, "Override", &[b"tags", b"scopes"])?;
+        ensure_attributes(
+            reader,
+            event,
+            "Override",
+            &[b"tags", b"fragTags", b"scopes"],
+        )?;
         self.fragment_definitions[index]
             .overrides
             .push(MannequinFragmentOverride {
                 tags: attr_required_string(reader, event, b"tags", "tags")?,
+                fragment_tags: attr_string(reader, event, b"fragTags")?,
                 scopes: attr_required_string(reader, event, b"scopes", "scopes")?,
             });
         Ok(ControllerDefinitionElement::FragmentOverride)
@@ -1379,9 +1424,11 @@ impl ControllerDefinitionParseState {
         reader: &Reader<&[u8]>,
         event: &BytesStart<'_>,
     ) -> Result<ControllerDefinitionElement, MannequinXmlParseError> {
-        ensure_no_attributes(reader, event, "ScopeContext")?;
+        ensure_attributes(reader, event, "ScopeContext", &[b"tags", b"sharedTags"])?;
         self.scope_contexts.push(MannequinScopeContext {
             name: local_name_string(reader, event)?,
+            additional_tags: attr_string(reader, event, b"tags")?,
+            shared_tags: attr_string(reader, event, b"sharedTags")?,
         });
         Ok(ControllerDefinitionElement::ScopeContext)
     }
@@ -1395,13 +1442,14 @@ impl ControllerDefinitionParseState {
             reader,
             event,
             "Scope",
-            &[b"layer", b"numLayers", b"context", b"Tags"],
+            &[b"layer", b"numLayers", b"context", b"scopeAlias", b"Tags"],
         )?;
         self.scopes.push(MannequinScopeDefinition {
             name: local_name_string(reader, event)?,
             layer: attr_required_i32(reader, event, b"layer", "layer")?,
             num_layers: attr_required_i32(reader, event, b"numLayers", "numLayers")?,
             context: attr_required_string(reader, event, b"context", "context")?,
+            alias: attr_string(reader, event, b"scopeAlias")?,
             tags: attr_string(reader, event, b"Tags")?,
         });
         Ok(ControllerDefinitionElement::Scope)
@@ -1421,6 +1469,7 @@ impl ControllerDefinitionParseState {
             fragments: self
                 .fragments
                 .ok_or(MannequinXmlParseError::MissingElement("Fragments"))?,
+            sub_contexts: self.sub_contexts,
             fragment_definitions: self.fragment_definitions,
             scope_contexts: self.scope_contexts,
             scopes: self.scopes,
@@ -1433,6 +1482,8 @@ enum ControllerDefinitionElement {
     Root,
     TagsRef,
     FragmentsRef,
+    SubContexts,
+    SubContext,
     FragmentDefs,
     Fragment(usize),
     FragmentOverride,
@@ -1449,6 +1500,8 @@ impl ControllerDefinitionElement {
             Self::Root => "ControllerDef",
             Self::TagsRef => "Tags",
             Self::FragmentsRef => "Fragments",
+            Self::SubContexts => "SubContexts",
+            Self::SubContext => "SubContext",
             Self::FragmentDefs => "FragmentDefs",
             Self::Fragment(_) => "FragmentDef",
             Self::FragmentOverride => "Override",
@@ -1866,6 +1919,7 @@ mod tests {
             source.fragment_definitions[0].overrides[0],
             MannequinFragmentOverride {
                 tags: "InCombat".to_string(),
+                fragment_tags: None,
                 scopes: "UpperBody".to_string(),
             }
         );

@@ -47,6 +47,13 @@ pub fn cry_to_gltf(v: Vec3) -> Vec3 {
     Vec3::new(-v.x, v.z, v.y)
 }
 
+/// Reorder scale axes for the Cry → glTF basis change. Unlike a direction or
+/// translation, a scale does not inherit the reflected X-axis sign.
+#[must_use]
+pub fn cry_to_gltf_scale(v: Vec3) -> Vec3 {
+    Vec3::new(v.x, v.z, v.y)
+}
+
 /// Express a Cry-space quaternion in glTF space using the same basis
 /// conjugation as matrices.
 #[must_use]

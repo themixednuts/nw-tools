@@ -7,9 +7,13 @@ use crate::{
     DataStreamChunk, DecodedChunk, MaterialNameChunk, MeshChunk, MeshSubsetsChunk, NodeChunk,
 };
 
-/// Parsed representation of the chunk payloads required by Cry static model workflows.
+/// Parsed Cry model/character chunk graph with convenience indexes for the
+/// geometry hot path. `chunks` retains every decoded payload in file order, so
+/// morph targets, physical data, animation headers, and New World extensions
+/// remain available even when they do not have a dedicated index yet.
 #[derive(Debug, Default)]
 pub struct CgfFile<'a> {
+    chunks: Vec<DecodedChunk<'a>>,
     meshes: BTreeMap<i32, MeshChunk>,
     mesh_subsets: BTreeMap<i32, MeshSubsetsChunk>,
     data_streams: BTreeMap<i32, DataStreamChunk<'a>>,
@@ -29,20 +33,25 @@ pub enum CgfParseError {
 }
 
 impl<'a> CgfFile<'a> {
-    /// Parse a full CGF payload graph and keep only the chunks required by the model
-    /// transform pipeline.
+    /// Parse and retain the full decoded CGF/CHR/SKIN chunk graph.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, CgfParseError> {
         let chunk_file = ChunkFile::parse(bytes)?;
         let mut file = Self::default();
 
         for chunk in chunk_file.decoded_chunks() {
             let chunk = chunk?;
+            file.chunks.push(chunk.clone());
             if let Some(chunk) = ModelChunk::from_decoded(chunk) {
                 chunk.insert_into(&mut file);
             }
         }
 
         Ok(file)
+    }
+
+    /// Every decoded chunk in original file order.
+    pub fn chunks(&self) -> &[DecodedChunk<'a>] {
+        &self.chunks
     }
 
     pub fn meshes(&self) -> &BTreeMap<i32, MeshChunk> {

@@ -3,6 +3,7 @@
 //! Follows `dev/Gems/CryLegacy/Code/Source/CryAction/Mannequin/AnimationDatabaseManager.cpp`.
 
 pub mod blend_space;
+pub mod reflected;
 pub mod source_transform;
 
 use std::{

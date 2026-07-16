@@ -15,7 +15,8 @@ mod scan;
 pub use animation::{
     CafAnimation, CafAnimationHeader, CafAnimationHeaderSource, CafCompressedControllerScan,
     CafController, CafControllerChunkScan, CafControllerForm, CafControllerScan,
-    CafControllerScanError, CafDecodeError, PositionKey, RotationKey,
+    CafControllerScanError, CafDecodeError, CafRootMotion, DbaAnimation, DbaArchive,
+    DbaDecodeError, PositionKey, RotationKey, ScaleKey,
 };
 pub use model::{CgfFile, CgfParseError};
 pub use payload::{
@@ -30,8 +31,8 @@ pub use payload::{
     FoliageVertexBoneMapping, GlobalAnimationHeaderAimChunk, GlobalAnimationHeaderCafChunk,
     HelperChunk, MaterialNameChunk, MeshChunk, MeshMorphTargetChunk, MeshPhysicsDataChunk,
     MeshStreamKind, MeshSubset, MeshSubsetBoneIds, MeshSubsetsChunk, MotionParametersChunk,
-    NewWorldChunk, NodeChunk, STREAM_INDEX_COUNT, STREAM_TYPE_COUNT, SourceInfoChunk, TimingChunk,
-    VertAnimChunk,
+    NewWorldChunk, NodeChunk, QuatT, STREAM_INDEX_COUNT, STREAM_TYPE_COUNT, SourceInfoChunk,
+    TimingChunk, VertAnimChunk,
 };
 pub use scan::{
     CHUNK_FILE_EXTENSIONS, ChunkFileSummary, ChunkFileTotals, is_chunk_file_extension,

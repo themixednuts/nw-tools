@@ -1,0 +1,17 @@
+[package]
+name = "cry-character"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Lossless Cry/Lumberyard character-definition and attachment graph parser"
+
+[dependencies]
+cry-xml.workspace = true
+nw-reflected-types.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,3 +1,4 @@
+mod audio;
 mod catalog;
 mod common;
 mod datasheet;
@@ -9,6 +10,7 @@ mod objectstream;
 use anyhow::Result;
 use clap::Subcommand;
 
+use audio::Audio;
 use catalog::Catalog;
 use datasheet::Datasheet;
 use dds::Dds;
@@ -17,6 +19,11 @@ use objectstream::ObjectStream;
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
+    #[command(
+        name = "audio",
+        about = "Inspect ATL, Wwise BNK/WEM, and trigger-bank maps"
+    )]
+    Audio(Audio),
     #[command(about = "Inspect asset catalog files")]
     Catalog(Catalog),
     #[command(about = "Inspect datasheet files")]
@@ -34,6 +41,7 @@ pub enum Cmd {
 impl Cmd {
     pub fn run(self) -> Result<()> {
         match self {
+            Self::Audio(cmd) => cmd.run(),
             Self::Catalog(cmd) => cmd.run(),
             Self::Datasheet(cmd) => cmd.run(),
             Self::Dds(cmd) => cmd.run(),
