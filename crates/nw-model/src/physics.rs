@@ -538,6 +538,9 @@ pub enum QueryShape {
 #[serde(rename_all = "camelCase")]
 pub struct PhysicsComponentContext {
     pub source_path: String,
+    /// Equivalent alternate scene-slice contexts omitted from this component.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alternate_source_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1284,7 +1287,10 @@ mod tests {
             .map(|p| p.x)
             .fold(f32::NEG_INFINITY, f32::max);
         // Endpoints at ±height/2 plus spherical caps of radius → total 0.8+0.8=1.6.
-        assert!((max_x - min_x - 1.6).abs() < 1e-3, "extent along axis {max_x}-{min_x}");
+        assert!(
+            (max_x - min_x - 1.6).abs() < 1e-3,
+            "extent along axis {max_x}-{min_x}"
+        );
     }
 
     #[test]
@@ -1300,7 +1306,9 @@ mod tests {
             converted,
             QueryShape::Capsule { axis, .. } if axis.abs_diff_eq(Vec3::Y, 1e-5)
         ));
-        assert!(crate::math::cry_to_gltf(Vec3::new(0.0, 0.0, 0.05))
-            .abs_diff_eq(Vec3::new(0.0, 0.05, 0.0), 1e-5));
+        assert!(
+            crate::math::cry_to_gltf(Vec3::new(0.0, 0.0, 0.05))
+                .abs_diff_eq(Vec3::new(0.0, 0.05, 0.0), 1e-5)
+        );
     }
 }
