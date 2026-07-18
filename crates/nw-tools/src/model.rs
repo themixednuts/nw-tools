@@ -75,7 +75,7 @@ pub struct Model {
 
     /// Output container.
     #[arg(long, value_enum, default_value_t = Container::Glb)]
-    format: Container,
+    container: Container,
 
     /// Material file override (single-file mode); otherwise resolved automatically.
     #[arg(long)]
@@ -105,7 +105,7 @@ pub struct Model {
     #[arg(long = "no-decode-audio")]
     no_decode_audio: bool,
 
-    /// Skip writing a playable Blender `.blend` next to the package (default for glTF is to write one).
+    /// Skip writing a playable Blender `.blend` next to each manifest (default for glTF is to write one).
     #[arg(long = "no-blend")]
     no_blend: bool,
 
@@ -117,13 +117,15 @@ pub struct Model {
     #[arg(long = "blender", value_name = "PATH")]
     blender: Option<PathBuf>,
 
-    /// Case-insensitive path substring filter (install mode).
-    #[arg(long)]
-    filter: Option<String>,
+    /// Case-insensitive path substring filter (install mode). Repeat `--filter`
+    /// to batch several characters in one run (union match, one dependency-index
+    /// build). Omit to convert the whole install.
+    #[arg(long = "filter")]
+    filters: Vec<String>,
 
     /// Geometry only — skip materials and textures.
-    #[arg(long)]
-    no_materials: bool,
+    #[arg(long = "geometry-only")]
+    geometry_only: bool,
 
     /// Replace existing output files.
     #[arg(long)]
@@ -135,19 +137,19 @@ pub struct Model {
 
 impl Model {
     fn decode_audio_enabled(&self) -> bool {
-        self.format == Container::Gltf && !self.no_decode_audio
+        self.container == Container::Gltf && !self.no_decode_audio
     }
 
     fn blend_enabled(&self) -> bool {
-        self.format == Container::Gltf && !self.no_blend
+        self.container == Container::Gltf && !self.no_blend
     }
 
-    /// Write a playable `.blend` for a structured glTF package when enabled.
-    ///
-    /// `preferred_gltf` is used for single-file exports; otherwise the first
-    /// `.gltf` under the package root is chosen.
-    fn maybe_write_blend(&self, package_root: &Path, preferred_gltf: Option<&Path>) -> Result<()> {
-        if !self.blend_enabled() {
+    /// Write one playable `.blend` per exported manifest, placed next to that
+    /// manifest (`<manifest dir>/<stem>.blend`). Each manifest's directory is
+    /// unique, so the blend names never collide. `package_root` is the shared
+    /// package writer root (audio WAVs resolve relative to it).
+    fn write_blends(&self, package_root: &Path, manifests: &[PathBuf]) -> Result<()> {
+        if !self.blend_enabled() || manifests.is_empty() {
             return Ok(());
         }
         let blender = match self
@@ -163,30 +165,19 @@ impl Model {
                 return Ok(());
             }
         };
-        let gltf = if let Some(path) = preferred_gltf.filter(|path| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("gltf"))
-        }) {
-            path.to_path_buf()
-        } else {
-            find_first_gltf(package_root).with_context(|| {
-                format!(
-                    "no .gltf under {} to bind into a .blend",
-                    package_root.display()
-                )
-            })?
-        };
-        let blend_path = package_root.join(
-            gltf.file_stem()
+        let mut written = 0usize;
+        for manifest in manifests {
+            let stem = manifest
+                .file_stem()
                 .and_then(|stem| stem.to_str())
-                .unwrap_or("model")
-                .to_owned()
-                + ".blend",
-        );
-        crate::audio_export::write_playable_blend(&blender, &gltf, package_root, &blend_path)
-            .with_context(|| format!("write playable blend {}", blend_path.display()))?;
-        eprintln!("blend {}", blend_path.display());
+                .unwrap_or("model");
+            let blend_path = manifest.with_file_name(format!("{stem}.blend"));
+            crate::audio_export::write_playable_blend(&blender, manifest, package_root, &blend_path)
+                .with_context(|| format!("write playable blend {}", blend_path.display()))?;
+            eprintln!("blend {}", blend_path.display());
+            written += 1;
+        }
+        eprintln!("{written} blend(s) written");
         Ok(())
     }
 
@@ -207,8 +198,8 @@ impl Model {
         let out = self
             .out
             .clone()
-            .unwrap_or_else(|| path.with_extension(self.format.extension()));
-        let package = if self.format == Container::Gltf {
+            .unwrap_or_else(|| path.with_extension(self.container.extension()));
+        let package = if self.container == Container::Gltf {
             Some(PackageWriter::new(
                 out.parent().unwrap_or_else(|| Path::new(".")),
             )?)
@@ -258,18 +249,17 @@ impl Model {
             .stat("output", out.display())
             .stat("bytes", format_size(stats.bytes, DECIMAL))
             .print();
-        let package_root = package
-            .as_ref()
-            .map(|_| out.parent().unwrap_or_else(|| Path::new(".")).to_path_buf())
-            .unwrap_or_else(|| out.parent().unwrap_or_else(|| Path::new(".")).to_path_buf());
-        self.maybe_write_blend(&package_root, Some(&out))?;
+        if package.is_some() {
+            let package_root = out.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+            self.write_blends(&package_root, std::slice::from_ref(&out))?;
+        }
         Ok(())
     }
 
     /// Batch-convert every mesh under a directory, in parallel.
     fn export_tree(&self, ctx: &RunCtx, dir: &Path) -> Result<()> {
         let out_dir = self.out.clone().unwrap_or_else(|| dir.to_path_buf());
-        let package = if self.format == Container::Gltf {
+        let package = if self.container == Container::Gltf {
             Some(PackageWriter::new(&out_dir)?)
         } else {
             None
@@ -285,14 +275,14 @@ impl Model {
                 progress.step(|| {
                     let source = Tree::around(path);
                     let relative = path.strip_prefix(dir).unwrap_or(path);
-                    let artifact = relative.with_extension(self.format.extension());
+                    let artifact = relative.with_extension(self.container.extension());
                     let out = out_dir.join(&artifact);
                     guard_existing(&out, self.overwrite.into())?;
                     ensure_parent(&out)?;
                     let cgf = std::fs::read(path)?;
                     let heap = std::fs::read(heap_sibling(path)).unwrap_or_default();
                     let source_path = relative.to_string_lossy().replace('\\', "/");
-                    self.convert(
+                    let stats = self.convert(
                         &ctx.runner,
                         &source,
                         ConvertRequest {
@@ -306,15 +296,15 @@ impl Model {
                             artifact: &artifact,
                             dependency_index: dependency_index.as_ref(),
                         },
-                    )
+                    )?;
+                    let manifest = package.is_some().then(|| out.clone());
+                    Ok(Exported { stats, manifest })
                 })
             },
         );
         let results = batch.into_completed();
         report_batch(&results, dir.display().to_string())?;
-        if results.iter().any(|result| result.is_ok()) {
-            self.maybe_write_blend(&out_dir, None)?;
-        }
+        self.write_blends(&out_dir, &exported_manifests(&results))?;
         Ok(())
     }
 
@@ -324,13 +314,13 @@ impl Model {
         let source = Install::open(ctx, &install.assets())?;
         let meshes = source.paths_with_extensions(
             &["cgf", "skin", "chr", "cga", "cdf", "caf", "i_caf", "dba"],
-            self.filter.as_deref(),
+            &self.filters,
         );
         if meshes.is_empty() {
             bail!("no matching meshes found in the install paks");
         }
         let out_dir = self.out.clone().unwrap_or_else(|| PathBuf::from("models"));
-        let package = if self.format == Container::Gltf {
+        let package = if self.container == Container::Gltf {
             Some(PackageWriter::new(&out_dir)?)
         } else {
             None
@@ -339,13 +329,13 @@ impl Model {
 
         let batch = ctx.map_results_compact("model", &meshes, Clone::clone, |key, progress| {
             progress.step(|| {
-                let artifact = Path::new(key).with_extension(self.format.extension());
+                let artifact = Path::new(key).with_extension(self.container.extension());
                 let out = out_dir.join(&artifact);
                 guard_existing(&out, self.overwrite.into())?;
                 ensure_parent(&out)?;
                 let cgf = source.read(key).with_context(|| format!("read {key}"))?;
                 let heap = source.read(&format!("{key}heap")).unwrap_or_default();
-                self.convert(
+                let stats = self.convert(
                     &ctx.runner,
                     &source,
                     ConvertRequest {
@@ -359,14 +349,14 @@ impl Model {
                         artifact: &artifact,
                         dependency_index: dependency_index.as_ref(),
                     },
-                )
+                )?;
+                let manifest = package.is_some().then(|| out.clone());
+                Ok(Exported { stats, manifest })
             })
         });
         let results = batch.into_completed();
         report_batch(&results, install.assets().display().to_string())?;
-        if results.iter().any(|result| result.is_ok()) {
-            self.maybe_write_blend(&out_dir, None)?;
-        }
+        self.write_blends(&out_dir, &exported_manifests(&results))?;
         Ok(())
     }
 
@@ -398,7 +388,7 @@ impl Model {
             mtl_override.as_deref(),
             crate::model_asset::ResolveOptions {
                 runner,
-                no_materials: self.no_materials,
+                no_materials: self.geometry_only,
                 skeleton: self.skeleton.as_deref(),
                 animations: &self.animations,
                 animation_events: self.animation_events.as_deref(),
@@ -453,7 +443,7 @@ impl Model {
                 .extras(&extras)
                 .physics(&physics)?
                 .animations(&animations)?;
-            match (&materials, self.format) {
+            match (&materials, self.container) {
                 (Some(set), Container::Glb) => {
                     let glb = gltf.materials(set).to_glb_with_runner(runner, &mut load);
                     write_glb(out, &glb)?
@@ -496,7 +486,7 @@ impl Model {
         ctx: &RunCtx,
         source: &dyn nw_asset_graph::AssetSource,
     ) -> Result<Option<nw_asset_graph::AssetDependencyIndex>> {
-        if self.format != Container::Gltf {
+        if self.container != Container::Gltf {
             return Ok(None);
         }
         let paths = source.paths_with_extensions(MODEL_CONSUMER_EXTENSIONS)?;
@@ -514,7 +504,7 @@ impl Model {
         source: &Install,
         assets: &Path,
     ) -> Result<Option<nw_asset_graph::AssetDependencyIndex>> {
-        if self.format != Container::Gltf {
+        if self.container != Container::Gltf {
             return Ok(None);
         }
         let paths = nw_asset_graph::AssetSource::paths_with_extensions(
@@ -712,7 +702,7 @@ impl nw_asset_graph::AssetSource for Install {
     }
 
     fn paths_with_extensions(&self, extensions: &[&str]) -> Result<Vec<String>> {
-        Ok(Install::paths_with_extensions(self, extensions, None))
+        Ok(Install::paths_with_extensions(self, extensions, &[]))
     }
 
     fn path_by_id(&self, asset_id: nw_asset::AssetId) -> Option<String> {
@@ -1026,15 +1016,31 @@ struct ModelStats {
     bytes: usize,
 }
 
-fn report_batch(results: &[Result<ModelStats>], source: String) -> Result<()> {
+/// One successful batch conversion: its stats plus, for structured glTF runs, the
+/// on-disk manifest path a `.blend` is written next to.
+struct Exported {
+    stats: ModelStats,
+    manifest: Option<PathBuf>,
+}
+
+/// The manifests written by a batch run, in order, for blend generation.
+fn exported_manifests(results: &[Result<Exported>]) -> Vec<PathBuf> {
+    results
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .filter_map(|exported| exported.manifest.clone())
+        .collect()
+}
+
+fn report_batch(results: &[Result<Exported>], source: String) -> Result<()> {
     let mut converted = 0usize;
     let mut vertices = 0usize;
     let mut errors = Vec::new();
     for result in results {
         match result {
-            Ok(stats) => {
+            Ok(exported) => {
                 converted += 1;
-                vertices += stats.vertices;
+                vertices += exported.stats.vertices;
             }
             Err(error) => errors.push(anyhow::anyhow!("{error:#}")),
         }
@@ -1048,32 +1054,6 @@ fn report_batch(results: &[Result<ModelStats>], source: String) -> Result<()> {
 }
 
 /// The geometry-heap sidecar (`foo.cgf` → `foo.cgfheap`, `foo.skin` → `foo.skinheap`).
-fn find_first_gltf(root: &Path) -> Result<PathBuf> {
-    fn walk(dir: &Path, out: &mut Option<PathBuf>) -> std::io::Result<()> {
-        if out.is_some() {
-            return Ok(());
-        }
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out)?;
-            } else if path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("gltf"))
-            {
-                *out = Some(path);
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
-    let mut found = None;
-    walk(root, &mut found).with_context(|| format!("walk {}", root.display()))?;
-    found.with_context(|| format!("no .gltf under {}", root.display()))
-}
-
 fn heap_sibling(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push("heap");

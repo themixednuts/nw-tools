@@ -38,7 +38,7 @@ Non-render physics proxies and runtime-defined material textures such as
 `nearest_cubemap` remain typed in Cry extras instead of being fabricated as glTF
 geometry or file textures. Missing explicit dependencies fail the conversion.
 
-Choose `--format glb` for one self-contained binary file. Choose `--format gltf`
+Choose `--container glb` for one self-contained binary file. Choose `--container gltf`
 for automatic structured output: manifests keep mesh, skeleton, animation, and
 texture payloads in `_shared/sha256`, and every export under the same output root
 reuses byte-identical resources. No manual asset linking is required.

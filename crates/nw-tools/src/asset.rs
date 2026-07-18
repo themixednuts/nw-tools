@@ -25,7 +25,7 @@ const DEFAULT_MAX_ENTRY_SIZE: u64 = 128 * 1024 * 1024;
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
     #[command(about = "Summarize archive entries by observed extension key")]
-    Inventory(Inventory),
+    Summary(Summary),
     #[command(about = "Search assets across one or more pak archives")]
     Search(Search),
     #[command(about = "Extract selected assets from pak archives")]
@@ -39,7 +39,7 @@ pub enum Cmd {
 impl Cmd {
     pub fn run(self) -> Result<()> {
         match self {
-            Self::Inventory(cmd) => cmd.run(),
+            Self::Summary(cmd) => cmd.run(),
             Self::Search(cmd) => cmd.run(),
             Self::Extract(cmd) => cmd.run(),
             Self::Update(cmd) => cmd.run(),
@@ -49,18 +49,18 @@ impl Cmd {
 }
 
 #[derive(Debug, Args)]
-pub struct Inventory {
+pub struct Summary {
     #[command(flatten)]
     root: AssetRootArg,
 
     #[arg(long = "pak")]
     paks: Vec<String>,
 
-    #[arg(long, value_enum, default_value_t = InventorySort::Count)]
-    sort: InventorySort,
+    #[arg(long, value_enum, default_value_t = SummarySort::Count)]
+    sort: SummarySort,
 
-    #[arg(long, value_enum, default_value_t = InventoryGroup::Ext)]
-    group: InventoryGroup,
+    #[arg(long, value_enum, default_value_t = SummaryGroup::Ext)]
+    group: SummaryGroup,
 
     #[arg(long, default_value_t = DEFAULT_MAX_ENTRY_SIZE)]
     max_entry_size: u64,
@@ -286,7 +286,7 @@ pub struct ExtractObjectStream {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum InventorySort {
+enum SummarySort {
     Count,
     Size,
     Packed,
@@ -294,7 +294,7 @@ enum InventorySort {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum InventoryGroup {
+enum SummaryGroup {
     Ext,
     Kind,
 }
@@ -307,14 +307,14 @@ enum EncodingArg {
 }
 
 #[derive(Debug, Clone, Default)]
-struct InventoryReport {
+struct SummaryReport {
     paks: usize,
     entries: u64,
-    stats: BTreeMap<String, InventoryStat>,
+    stats: BTreeMap<String, SummaryStat>,
 }
 
 #[derive(Debug, Clone)]
-struct InventoryStat {
+struct SummaryStat {
     key: String,
     entries: u64,
     unpacked_bytes: u64,
@@ -324,7 +324,7 @@ struct InventoryStat {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct InventoryRow {
+struct SummaryRow {
     key: String,
     entries: u64,
     unpacked_bytes: u64,
@@ -426,18 +426,18 @@ struct ExtExtractOptions<'a> {
     cancel: &'a CancellationToken,
 }
 
-impl Inventory {
+impl Summary {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
         let cancel = ctx.cancel.clone();
         let batch = ctx.map_results(
-            "asset inventory",
+            "asset summary",
             paks.paths(),
             |path| paks.relative(path),
             |path, progress| {
-                InventoryReport::from_pak(
+                SummaryReport::from_pak(
                     &paks,
                     path,
                     self.group,
@@ -449,7 +449,7 @@ impl Inventory {
         );
         let skipped = batch.skipped();
         let cancelled = batch.was_cancelled();
-        let mut report = InventoryReport::default();
+        let mut report = SummaryReport::default();
         let mut errors = Vec::new();
 
         for result in batch.into_completed() {
@@ -460,7 +460,7 @@ impl Inventory {
         }
 
         report.print(self.sort, self.show);
-        ScanIssues::new("asset inventory", skipped, cancelled, errors).finish()
+        ScanIssues::new("asset summary", skipped, cancelled, errors).finish()
     }
 }
 
@@ -1267,11 +1267,11 @@ impl ExtractObjectStream {
     }
 }
 
-impl InventoryReport {
+impl SummaryReport {
     fn from_pak(
         paks: &PakSet,
         path: &Path,
-        group: InventoryGroup,
+        group: SummaryGroup,
         max_entry_size: u64,
         cancel: &CancellationToken,
         progress: &Job,
@@ -1289,7 +1289,7 @@ impl InventoryReport {
                 break;
             }
             progress.inc(1);
-            let key = inventory_key(&pak, entry, group, max_entry_size)
+            let key = summary_key(&pak, entry, group, max_entry_size)
                 .with_context(|| format!("classify {} in {}", entry.name(), path.display()))?;
             report.add(&pak_name, entry, key);
         }
@@ -1302,7 +1302,7 @@ impl InventoryReport {
         let stat = self
             .stats
             .entry(key.clone())
-            .or_insert_with(|| InventoryStat::new(key, entry.name()));
+            .or_insert_with(|| SummaryStat::new(key, entry.name()));
         stat.add(pak, entry);
     }
 
@@ -1317,37 +1317,37 @@ impl InventoryReport {
         }
     }
 
-    fn rows(&self, sort: InventorySort) -> Vec<InventoryRow> {
+    fn rows(&self, sort: SummarySort) -> Vec<SummaryRow> {
         let mut rows = self
             .stats
             .values()
-            .map(InventoryRow::from)
+            .map(SummaryRow::from)
             .collect::<Vec<_>>();
         match sort {
-            InventorySort::Count => rows.sort_by(|left, right| {
+            SummarySort::Count => rows.sort_by(|left, right| {
                 right
                     .entries
                     .cmp(&left.entries)
                     .then(left.key.cmp(&right.key))
             }),
-            InventorySort::Size => rows.sort_by(|left, right| {
+            SummarySort::Size => rows.sort_by(|left, right| {
                 right
                     .unpacked_bytes
                     .cmp(&left.unpacked_bytes)
                     .then(left.key.cmp(&right.key))
             }),
-            InventorySort::Packed => rows.sort_by(|left, right| {
+            SummarySort::Packed => rows.sort_by(|left, right| {
                 right
                     .packed_bytes
                     .cmp(&left.packed_bytes)
                     .then(left.key.cmp(&right.key))
             }),
-            InventorySort::Key => rows.sort_by(|left, right| left.key.cmp(&right.key)),
+            SummarySort::Key => rows.sort_by(|left, right| left.key.cmp(&right.key)),
         }
         rows
     }
 
-    fn print(&self, sort: InventorySort, limit: usize) {
+    fn print(&self, sort: SummarySort, limit: usize) {
         let rows = self.rows(sort);
         let stats = vec![
             ("archives".to_string(), self.paks.to_string()),
@@ -1356,15 +1356,15 @@ impl InventoryReport {
         ];
         if theme::caps().interactive
             && !rows.is_empty()
-            && crate::tui::browse("asset inventory", stats.clone(), inventory_table(&rows), 0)
+            && crate::tui::browse("asset summary", stats.clone(), summary_table(&rows), 0)
                 .is_ok()
         {
             return;
         }
 
-        let mut report = Report::with_stats("asset inventory", stats);
+        let mut report = Report::with_stats("asset summary", stats);
         let shown = &rows[..rows.len().min(limit)];
-        report.table_or(inventory_table(shown), "no entries");
+        report.table_or(summary_table(shown), "no entries");
         if self.stats.len() > limit {
             report.more(self.stats.len() - limit, "group(s)");
         }
@@ -1372,7 +1372,7 @@ impl InventoryReport {
     }
 }
 
-fn inventory_table(rows: &[InventoryRow]) -> Table {
+fn summary_table(rows: &[SummaryRow]) -> Table {
     let mut table =
         Table::new(["Key", "Entries", "Unpacked", "Packed", "Paks", "Sample"]).right([1, 2, 3, 4]);
     for row in rows {
@@ -1388,16 +1388,16 @@ fn inventory_table(rows: &[InventoryRow]) -> Table {
     table
 }
 
-fn inventory_key(
+fn summary_key(
     pak: &PakMmapReader,
     entry: EntryInfo<'_>,
-    group: InventoryGroup,
+    group: SummaryGroup,
     max_entry_size: u64,
 ) -> Result<String> {
     match group {
-        InventoryGroup::Ext => Ok(nw_filesystem::archive_extension_key(entry.name())
+        SummaryGroup::Ext => Ok(nw_filesystem::archive_extension_key(entry.name())
             .unwrap_or_else(|| "<none>".to_string())),
-        InventoryGroup::Kind => classify_entry(pak, entry, max_entry_size),
+        SummaryGroup::Kind => classify_entry(pak, entry, max_entry_size),
     }
 }
 
@@ -1447,7 +1447,7 @@ fn classify_entry(
     Ok(shape::path_family(entry.name()).to_string())
 }
 
-impl InventoryStat {
+impl SummaryStat {
     fn new(key: String, sample: &str) -> Self {
         Self {
             key,
@@ -1480,8 +1480,8 @@ impl InventoryStat {
     }
 }
 
-impl From<&InventoryStat> for InventoryRow {
-    fn from(value: &InventoryStat) -> Self {
+impl From<&SummaryStat> for SummaryRow {
+    fn from(value: &SummaryStat) -> Self {
         Self {
             key: value.key.clone(),
             entries: value.entries,

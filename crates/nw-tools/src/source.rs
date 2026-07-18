@@ -110,10 +110,15 @@ impl Toc {
     }
 
     /// Sorted virtual paths whose extension is one of `extensions` (lowercase, no
-    /// dot), optionally narrowed to those containing `filter` (case-insensitive).
+    /// dot), optionally narrowed to those containing ANY of `filters`
+    /// (case-insensitive substring union). An empty `filters` slice matches every
+    /// path.
     #[must_use]
-    pub fn paths_with_extensions(&self, extensions: &[&str], filter: Option<&str>) -> Vec<String> {
-        let filter = filter.map(str::to_ascii_lowercase);
+    pub fn paths_with_extensions(&self, extensions: &[&str], filters: &[String]) -> Vec<String> {
+        let needles = filters
+            .iter()
+            .map(|needle| needle.to_ascii_lowercase())
+            .collect::<Vec<_>>();
         let mut paths = self
             .names()
             .filter(|key| {
@@ -121,9 +126,7 @@ impl Toc {
                     .is_some_and(|(_, ext)| extensions.contains(&ext))
             })
             .filter(|key| {
-                filter
-                    .as_ref()
-                    .is_none_or(|needle| key.contains(needle.as_str()))
+                needles.is_empty() || needles.iter().any(|needle| key.contains(needle.as_str()))
             })
             .map(str::to_string)
             .collect::<Vec<_>>();
@@ -217,10 +220,10 @@ impl Install {
     }
 
     /// Sorted virtual paths whose extension is one of `extensions`, optionally
-    /// narrowed to those containing `filter`.
+    /// narrowed to those containing ANY of `filters` (case-insensitive union).
     #[must_use]
-    pub fn paths_with_extensions(&self, extensions: &[&str], filter: Option<&str>) -> Vec<String> {
-        self.toc.paths_with_extensions(extensions, filter)
+    pub fn paths_with_extensions(&self, extensions: &[&str], filters: &[String]) -> Vec<String> {
+        self.toc.paths_with_extensions(extensions, filters)
     }
 
     /// Pre-indexed paths for recursive model dependency globs.

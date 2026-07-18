@@ -1,17 +1,40 @@
 # Structured exports
 
-`nw-tools format model` supports the two standard glTF container forms:
+`nw-tools format model` supports the two standard glTF container forms, selected
+with `--container`:
 
-- `--format glb` writes one self-contained binary. It is convenient to move, but
+- `--container glb` writes one self-contained binary. It is convenient to move, but
   every GLB owns another copy of all of its buffers and images.
-- `--format gltf` writes a JSON manifest with external standard glTF buffers and
+- `--container gltf` writes a JSON manifest with external standard glTF buffers and
   images, laid out to mirror the game's own asset-catalog directory tree.
 
 The glTF specification technically allows a GLB JSON chunk to reference external
-resources too. `nw-tools` deliberately reserves `--format glb` for the useful
+resources too. `nw-tools` deliberately reserves `--container glb` for the useful
 self-contained behavior and uses `.gltf` manifests for shared packages. A hybrid
 GLB would lose the single-file advantage while providing no additional sharing
 or compatibility benefit over the inspectable `.gltf` layout.
+
+Pass `--geometry-only` to skip material and texture resolution entirely and export
+just the meshes and skeletons.
+
+## Batch exports from the install
+
+With no path argument, `format model` converts straight out of the install paks.
+Narrow the run with `--filter <substring>` (case-insensitive path match). The flag
+is repeatable: each `--filter` adds to a union, so
+
+```text
+nw-tools format model --container gltf --filter alligator.cdf --filter barghestwolf.cdf --out ./out
+```
+
+exports every mesh whose path contains *either* substring in a single run. Batching
+several characters this way builds the shared authored-asset dependency index once
+for the whole run rather than once per character. Omit `--filter` entirely to
+convert the whole install.
+
+All exports share one output root, so identical resources (skeletons, animations,
+textures, geometry) are written once and deduplicated across models *and* across
+successive runs into the same root — see the path-normalization rules below.
 
 The output root mirrors the asset catalog:
 
@@ -65,7 +88,10 @@ Placement rules:
   to no catalog entry are dropped with a single summary note rather than shipped
   half-filled. For structured glTF, the reachable media is decoded to PCM WAV at
   `sounds/wwise/decoded/<mediaId>.wav` (via `vgmstream-cli`) and one playable
-  Blender `.blend` is written next to the manifest: one scene per clip (the scene
+  Blender `.blend` is written next to *each* exported manifest
+  (`<manifest dir>/<stem>.blend`) — single-file, tree, and install/batch runs
+  alike, so a batch of N characters yields N blends beside their manifests and a
+  closing `N blend(s) written` summary. Each blend has one scene per clip (the scene
   dropdown is the clip browser), each with that clip active on the shared
   armature and its audio events as VSE sound strips at the keyframed frames, WAVs
   packed so the file survives moves. Footstep strips follow the engine's

@@ -59,7 +59,7 @@ enum Command {
     Locate,
     #[command(about = "Normalize an archive path")]
     Paths { path: String },
-    #[command(about = "Cross-pak asset inventory, search, and extraction")]
+    #[command(about = "Cross-pak asset summary, search, and extraction")]
     Asset {
         #[command(subcommand)]
         command: asset::Cmd,
