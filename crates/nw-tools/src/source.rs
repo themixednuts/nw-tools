@@ -343,10 +343,10 @@ pub fn load_or_build_dependency_index(
     }
     let index = nw_asset_graph::AssetDependencyIndex::build_with_runner(source, paths, runner)
         .context("build shared authored-asset dependency index")?;
-    if let Some(fingerprint) = &fingerprint {
-        if let Err(error) = crate::cache::store_dependency_index(fingerprint, index.edges()) {
-            tracing::debug!("dependency index cache store failed: {error:#}");
-        }
+    if let Some(fingerprint) = &fingerprint
+        && let Err(error) = crate::cache::store_dependency_index(fingerprint, index.edges())
+    {
+        tracing::debug!("dependency index cache store failed: {error:#}");
     }
     Ok(index)
 }

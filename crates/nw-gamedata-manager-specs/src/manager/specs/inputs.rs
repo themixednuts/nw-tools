@@ -33,12 +33,10 @@ pub(super) fn runtime_manifest_manager_specs() -> Vec<NativeManagerSpec> {
 }
 
 fn manager_table_inputs(rust_type_path: &'static str) -> Vec<NativeManagerInput> {
-    let inputs = table_inputs::manager_table_input_specs()
+    table_inputs::manager_table_input_specs()
         .filter(|input| input.rust_type == rust_type_path)
         .map(|input| table_input(input.table_name, input.row_type_name))
-        .collect::<Vec<_>>();
-
-    inputs
+        .collect()
 }
 
 pub(super) fn manager_table_family_specs(

@@ -91,11 +91,11 @@ impl SeasonReward {{
         self.rewards_by_type.get(&normalize_lookup_key(reward_type.as_ref())).into_iter().flatten().filter_map(|slot| self.rewards.get(*slot))
     }}
     pub fn rewards(&self) -> std::slice::Iter<'_, SeasonReward> {{ self.rewards.iter() }}
-    pub fn reward_source(&self, reward: &SeasonReward) -> Option<&{row_type}> {{ {row_field}.get(&reward.source) }}
+    pub fn reward_source(&self, reward: &SeasonReward) -> Option<&{row_type}> {{ self.{row_field}.get(&reward.source) }}
 
 "#,
         row_type = parts.row_type,
-        row_field = format!("self.{}", parts.row_field),
+        row_field = parts.row_field,
     );
     Ok(RustNativeManagerAugmentation {
         declarations: format!("{}{}", numeric_helpers(), declarations),

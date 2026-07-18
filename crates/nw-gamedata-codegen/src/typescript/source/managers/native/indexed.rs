@@ -710,7 +710,7 @@ function lootBucketOdds(value: string | null): number {{ const odds = Number.par
       }}
     }}
 "#),
-        methods: format!("  byId(id: Crc32): LootBucketData | undefined {{ return this.lootBucketsById.get(id); }}\n  byKey(key: string): LootBucketData | undefined {{ return this.byId(Crc32.fromStringLower(key.trim())); }}\n  bucketForSlot(slot: LootBucketSlot): LootBucketData | undefined {{ return this.lootBucketsBySlot.get(tableNumberLookupKey(slot.table, normalizeUint16(slot.slot))); }}\n  buckets(): IterableIterator<LootBucketData> {{ return this.lootBuckets.values(); }}\n\n"),
+        methods: "  byId(id: Crc32): LootBucketData | undefined {{ return this.lootBucketsById.get(id); }}\n  byKey(key: string): LootBucketData | undefined {{ return this.byId(Crc32.fromStringLower(key.trim())); }}\n  bucketForSlot(slot: LootBucketSlot): LootBucketData | undefined {{ return this.lootBucketsBySlot.get(tableNumberLookupKey(slot.table, normalizeUint16(slot.slot))); }}\n  buckets(): IterableIterator<LootBucketData> {{ return this.lootBuckets.values(); }}\n\n".to_owned(),
         rows_interface: Some(" implements Rows<LootBucketData>".to_owned()),
         row_methods: Some("  rows(): IterableIterator<LootBucketData> { return this.lootBuckets.values(); }\n  [Symbol.iterator](): Iterator<LootBucketData> { return this.rows(); }\n\n".to_owned()),
     }
@@ -786,7 +786,7 @@ function rewardTrackTags(value: string): readonly RewardTrackTagConstraint[] {{ 
 "#),
         fields: "  private readonly rewardTrackEntries: RewardTrackData[] = [];\n  private readonly rewardTracksById = new Map<Crc32, RewardTrackData>();\n  private readonly rewardTracksBySlot = new Map<string, RewardTrackData>();\n".to_owned(),
         initializers: format!("    for (const source of this.{field}) {{\n{init}    }}\n"),
-        methods: format!("  rewardTrackDataFromId(id: Crc32): RewardTrackData | undefined {{ return this.rewardTracksById.get(id); }}\n  rewardTrackData(key: string): RewardTrackData | undefined {{ return this.rewardTrackDataFromId(Crc32.fromStringLower(key.trim())); }}\n  rewardTrackDataByKey(key: string): RewardTrackData | undefined {{ return this.rewardTrackData(key); }}\n  rewardTrackForSlot(slot: RewardTrackSlot): RewardTrackData | undefined {{ return this.rewardTracksBySlot.get(tableNumberLookupKey(slot.table, normalizeUint16(slot.slot))); }}\n  rewardTracks(): IterableIterator<RewardTrackData> {{ return this.rewardTrackEntries.values(); }}\n\n"),
+        methods: "  rewardTrackDataFromId(id: Crc32): RewardTrackData | undefined {{ return this.rewardTracksById.get(id); }}\n  rewardTrackData(key: string): RewardTrackData | undefined {{ return this.rewardTrackDataFromId(Crc32.fromStringLower(key.trim())); }}\n  rewardTrackDataByKey(key: string): RewardTrackData | undefined {{ return this.rewardTrackData(key); }}\n  rewardTrackForSlot(slot: RewardTrackSlot): RewardTrackData | undefined {{ return this.rewardTracksBySlot.get(tableNumberLookupKey(slot.table, normalizeUint16(slot.slot))); }}\n  rewardTracks(): IterableIterator<RewardTrackData> {{ return this.rewardTrackEntries.values(); }}\n\n".to_owned(),
         rows_interface: Some(" implements Rows<RewardTrackData>".to_owned()),
         row_methods: Some("  rows(): IterableIterator<RewardTrackData> { return this.rewardTrackEntries.values(); }\n  [Symbol.iterator](): Iterator<RewardTrackData> { return this.rows(); }\n\n".to_owned()),
     }

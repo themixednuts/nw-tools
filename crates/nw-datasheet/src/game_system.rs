@@ -1277,7 +1277,7 @@ impl GameSystemTable {
             !asset_path.is_absolute(),
             "asset catalog paths must be relative"
         );
-        let sheet = Datasheet::parse(&bytes).map_err(|source| GameSystemDataError::Parse {
+        let sheet = Datasheet::parse(bytes).map_err(|source| GameSystemDataError::Parse {
             path: asset_path.to_path_buf(),
             source,
         })?;
@@ -1415,7 +1415,6 @@ impl GameSystemTable {
         self.source_asset().and_then(GameSystemAsset::asset_id)
     }
 
-    #[must_use]
     #[inline]
     pub fn source_asset_ids(&self) -> impl Iterator<Item = AssetId> + '_ {
         self.sources.iter().filter_map(GameSystemAsset::asset_id)
@@ -1534,7 +1533,6 @@ impl GameSystemTable {
         })
     }
 
-    #[must_use]
     pub fn row_refs(&self) -> impl Iterator<Item = GameSystemRowRef<'_>> {
         (0..self.rows.len()).map(|row_index| GameSystemRowRef {
             table: self,
@@ -2125,7 +2123,7 @@ impl<'a> CharacterCreationTemplateResolver<'a> {
             .unwrap_or_default();
         let achievement_unlock_override = backstory.achievement_unlock_override()?.to_owned();
         let objective_unlock_override = backstory.objective_unlock_override()?.to_owned();
-        let items = if let Some(diagnostics) = diagnostics.as_deref_mut() {
+        let items = if let Some(diagnostics) = diagnostics.as_mut() {
             self.game_system.resolve_items_for_transform(
                 &inventory_items,
                 &consumable_items,
@@ -2139,7 +2137,7 @@ impl<'a> CharacterCreationTemplateResolver<'a> {
                 .resolve_items(&inventory_items, &consumable_items)?
         };
         let cooldowns = self.game_system.cooldowns.rows()?.collect();
-        let achievement_unlocks = if let Some(diagnostics) = diagnostics.as_deref_mut() {
+        let achievement_unlocks = if let Some(diagnostics) = diagnostics.as_mut() {
             self.game_system.achievement_unlocks_for_transform(
                 &achievement_unlock_override,
                 self.backstories.table().name(),

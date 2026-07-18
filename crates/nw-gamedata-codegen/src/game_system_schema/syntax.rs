@@ -311,12 +311,12 @@ pub(super) fn reference_token_variants(value: &str) -> Vec<String> {
     }
 
     let mut out = vec![token.to_owned()];
-    if let Some((head, tail)) = token.split_once(':') {
-        if is_numeric_tail(tail) {
-            let head = normalize_reference_token(head);
-            if !head.is_empty() {
-                out.push(head.to_owned());
-            }
+    if let Some((head, tail)) = token.split_once(':')
+        && is_numeric_tail(tail)
+    {
+        let head = normalize_reference_token(head);
+        if !head.is_empty() {
+            out.push(head.to_owned());
         }
     }
     out.sort();
@@ -334,10 +334,10 @@ pub(super) fn reference_key_candidates(token: &str) -> Vec<String> {
     if let Some(base_item_id) = base_item_id_from_modifier_instance_id(token) {
         out.push(canonical_key(base_item_id));
     }
-    if let Some((head, tail)) = token.split_once(':') {
-        if is_numeric_tail(tail) {
-            out.push(canonical_key(head));
-        }
+    if let Some((head, tail)) = token.split_once(':')
+        && is_numeric_tail(tail)
+    {
+        out.push(canonical_key(head));
     }
 
     out.sort();

@@ -228,10 +228,10 @@ impl HircGraph {
                         .insert(object.object_id.0, object.event_action_ids.clone());
                 }
                 WwiseHierarchyObjectKind::ACTION => {
-                    if let Some(action) = WwiseAction::parse(body) {
-                        if action.is_play() {
-                            graph.play_targets.insert(object.object_id.0, action.target);
-                        }
+                    if let Some(action) = WwiseAction::parse(body)
+                        && action.is_play()
+                    {
+                        graph.play_targets.insert(object.object_id.0, action.target);
                     }
                 }
                 WwiseHierarchyObjectKind::SOUND => {

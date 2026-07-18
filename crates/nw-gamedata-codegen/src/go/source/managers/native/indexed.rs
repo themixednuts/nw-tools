@@ -636,8 +636,9 @@ pub(super) fn numeric_contract(
     let row_field = go_direct_row_field_name(row_type);
     let row_name = row.type_name.clone();
     let manager_type = go_method_name(&manager.manager_class_name);
-    let map_field = go_local_name(&format!("{row_type} by number"));
-    let (key_guard, key_expression) = numeric_key_parts(&key, key_type);
+    let map_name = format!("{row_type} by number");
+    let map_field = go_local_name(&map_name);
+    let (key_guard, key_expression) = numeric_key_parts(key, key_type);
     let mut method_source = String::new();
     for method in methods {
         let method = go_method_name(method);
@@ -1051,9 +1052,7 @@ func lootBucketTags(value *string) []LootBucketTag {{
             table_type = table_type,
         )
         .replace("LootBucketDataTable", &table_type),
-        fields: format!(
-            "\tlootBuckets []LootBucketData\n\tlootBucketsByID map[gametypes.CRC32]int\n\tlootBucketsBySlot map[LootBucketSlot]int\n"
-        ),
+        fields: "\tlootBuckets []LootBucketData\n\tlootBucketsByID map[gametypes.CRC32]int\n\tlootBucketsBySlot map[LootBucketSlot]int\n".to_owned(),
         field_values: "\t\tlootBucketsByID: make(map[gametypes.CRC32]int),\n\t\tlootBucketsBySlot: make(map[LootBucketSlot]int),\n".to_owned(),
         initializers: format!(
             r#"	for sourceIndex := range manager.{row_field}.entries {{

@@ -162,7 +162,7 @@ struct Material {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum MaterialExtras {
-    Cry(CryMaterialExtras),
+    Cry(Box<CryMaterialExtras>),
     PhysicsDebug(PhysicsDebugExtras),
 }
 
@@ -1153,7 +1153,7 @@ impl Builder {
                     .then_some(KhrMaterialsEmissiveStrength { emissive_strength }),
                 unlit: None,
             }),
-            extras: MaterialExtras::Cry(CryMaterialExtras::from(sub)),
+            extras: MaterialExtras::Cry(Box::new(CryMaterialExtras::from(sub))),
         };
         let material_index = self.materials.len();
         self.materials.push(material);

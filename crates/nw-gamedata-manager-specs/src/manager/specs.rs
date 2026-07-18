@@ -648,6 +648,8 @@ fn projection_field(
     NativeProjectionField::new(ident(field), column(column_name), ident(getter), transform)
 }
 
+// This builder mirrors the complete foreign-key evidence record.
+#[allow(clippy::too_many_arguments)]
 fn foreign_key_target_field(
     field: &'static str,
     column_name: &'static str,

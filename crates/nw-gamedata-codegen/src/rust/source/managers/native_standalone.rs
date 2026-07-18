@@ -421,9 +421,11 @@ impl AugmentationContext<'_> {
         let parts = self.row_parts(row);
         let index = format!("{}_by_crc", rust_fragment_ident(tag));
         let key_value = string_value_expression(key, "source.row")?;
-        let zero_guard = reject_zero_crc
-            .then_some("            if key == Crc32::ZERO { continue; }\n")
-            .unwrap_or_default();
+        let zero_guard = if reject_zero_crc {
+            "            if key == Crc32::ZERO { continue; }\n"
+        } else {
+            ""
+        };
         let insert = duplicate_insert(
             duplicate_policy,
             &index,
@@ -551,9 +553,11 @@ impl AugmentationContext<'_> {
         } else {
             value
         };
-        let empty_guard = skip_empty
-            .then_some("            if key_text.is_empty() { continue; }\n")
-            .unwrap_or_default();
+        let empty_guard = if skip_empty {
+            "            if key_text.is_empty() { continue; }\n"
+        } else {
+            ""
+        };
         let invalid_guard = if invalid_key_variants.is_empty() {
             String::new()
         } else {
@@ -614,9 +618,11 @@ impl AugmentationContext<'_> {
         let parts = self.row_parts(row);
         let index = format!("{}_by_string", rust_fragment_ident(tag));
         let value = string_value_expression(key, "source.row")?;
-        let empty_guard = skip_empty
-            .then_some("            if key.is_empty() { continue; }\n")
-            .unwrap_or_default();
+        let empty_guard = if skip_empty {
+            "            if key.is_empty() { continue; }\n"
+        } else {
+            ""
+        };
         let insert = duplicate_insert(
             duplicate_policy,
             &index,

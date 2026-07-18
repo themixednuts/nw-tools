@@ -298,7 +298,7 @@ fn validate_indexed_mesh(vertices: &[Vec3], indices: &[u16]) -> Result<(), Physi
     if vertices.iter().any(|vertex| !vertex.is_finite()) {
         return Err(PhysicsSceneError::InvalidDimension);
     }
-    if indices.len() % 3 != 0 {
+    if !indices.len().is_multiple_of(3) {
         return Err(PhysicsSceneError::InvalidMeshIndexCount(indices.len()));
     }
     if let Some(&index) = indices

@@ -358,14 +358,16 @@ pub(super) fn add_dependency_resources(
         .iter()
         .filter_map(|path| dependency_resource_kind(path).map(|kind| (normalize_path(path), kind)))
         .filter(|(path, kind)| {
-            !resolved.extras.resource_payloads.iter().any(|resource| {
+            let already_embedded = resolved.extras.resource_payloads.iter().any(|resource| {
                 resource.kind == *kind && resource.source_path.eq_ignore_ascii_case(path)
-            }) && !(*kind == nw_model::CryEmbeddedResourceKind::RockNRollShape
+            });
+            let already_loaded_shape = *kind == nw_model::CryEmbeddedResourceKind::RockNRollShape
                 && resolved
                     .physics
                     .shape_assets
                     .iter()
-                    .any(|asset| asset.source_path.eq_ignore_ascii_case(path)))
+                    .any(|asset| asset.source_path.eq_ignore_ascii_case(path));
+            !already_embedded && !already_loaded_shape
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {

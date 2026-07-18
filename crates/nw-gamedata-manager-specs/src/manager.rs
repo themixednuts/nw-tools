@@ -1559,13 +1559,15 @@ pub enum NativeCrcIndexLookupParameterKind {
     IntoCrc32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum NativeCrcHashPolicy {
+    #[default]
     Lowercase,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum NativeCrcKeyStorageTransform {
+    #[default]
     Raw,
     RemoveSpaceAndTab,
 }
@@ -1823,20 +1825,7 @@ pub enum NativeManagerShapeError {
     MissingArguments { module: RustIdentifier },
 }
 
-impl Default for NativeCrcHashPolicy {
-    fn default() -> Self {
-        Self::Lowercase
-    }
-}
-
-impl Default for NativeCrcKeyStorageTransform {
-    fn default() -> Self {
-        Self::Raw
-    }
-}
-
 impl NativeManagerSpec {
-    #[must_use]
     pub fn new(
         ghidra_class: GhidraClassPath,
         rust_type: RustTypePath,
@@ -1857,7 +1846,6 @@ impl NativeManagerSpec {
         })
     }
 
-    #[must_use]
     pub fn class_evidence(
         ghidra_class: GhidraClassPath,
         rust_type: RustTypePath,
@@ -1878,7 +1866,6 @@ impl NativeManagerSpec {
         })
     }
 
-    #[must_use]
     pub fn runtime_manifest(
         ghidra_class: GhidraClassPath,
         rust_type: RustTypePath,
@@ -2542,153 +2529,6 @@ impl NativeManagerShape {
     #[must_use]
     pub const fn composed_resource(manager: NativeComposedResourceManager) -> Self {
         Self::ComposedResource(manager)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use super::{
-        GENERATED_MANAGERS_OUTSIDE_DATAMANAGER_RTTI, NON_STANDALONE_MANAGER_EVIDENCE,
-        NativeManagerInput, NativeManagerProductKind, NativeManagerShape,
-        validated_native_manager_specs,
-    };
-
-    #[test]
-    fn every_validated_manager_has_one_concrete_surface_shape() {
-        let managers = validated_native_manager_specs();
-        let missing = managers
-            .iter()
-            .filter(|manager| manager.shape().is_none())
-            .map(|manager| manager.rust_type().as_str())
-            .collect::<Vec<_>>();
-
-        assert!(
-            missing.is_empty(),
-            "validated managers without a generated surface shape: {}",
-            missing.join(", ")
-        );
-    }
-
-    #[test]
-    fn validated_manager_identities_are_unique() {
-        let managers = validated_native_manager_specs();
-        let mut ghidra_classes = BTreeSet::new();
-        let mut rust_types = BTreeSet::new();
-
-        for manager in &managers {
-            assert!(
-                ghidra_classes.insert(manager.ghidra_class().as_str()),
-                "duplicate native manager class: {}",
-                manager.ghidra_class().as_str()
-            );
-            assert!(
-                rust_types.insert(manager.rust_type().as_str()),
-                "duplicate generated manager type: {}",
-                manager.rust_type().as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn shared_semantic_and_product_types_are_standalone_identities() {
-        let managers = validated_native_manager_specs();
-        for manager in &managers {
-            for input in manager.inputs() {
-                if let NativeManagerInput::Product(product) = input {
-                    let identity = product.rust_type().as_str();
-                    assert!(
-                        NativeManagerProductKind::from_canonical_type_path(identity).is_some(),
-                        "manager {} uses non-canonical product identity {identity}",
-                        manager.rust_type()
-                    );
-                }
-            }
-
-            let Some(shape) = manager.shape() else {
-                continue;
-            };
-            let rendered = format!("{shape:?}");
-            assert!(
-                !rendered.contains("newworld_plugin"),
-                "manager {} shared shape leaks newworld_plugin: {rendered}",
-                manager.rust_type()
-            );
-
-            if let NativeManagerShape::ProductAssetResource(products) = shape {
-                for product in products.products() {
-                    assert_eq!(
-                        product.product_type(),
-                        product.value_type(),
-                        "shared product identity must not encode an asset wrapper"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn live_rtti_inventory_has_a_complete_standalone_disposition() {
-        let inventory = include_str!("../resources/newworld-3-26-datamanager-rtti.txt")
-            .lines()
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| {
-                line.split_once('|')
-                    .expect("RTTI inventory rows use class|offset")
-                    .0
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(inventory.len(), 205, "live manager RTTI inventory drifted");
-
-        let generated = validated_native_manager_specs()
-            .into_iter()
-            .map(|manager| manager.ghidra_class().as_str().to_owned())
-            .collect::<BTreeSet<_>>();
-        let non_standalone = NON_STANDALONE_MANAGER_EVIDENCE
-            .iter()
-            .map(|entry| entry.ghidra_class)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            non_standalone.len(),
-            NON_STANDALONE_MANAGER_EVIDENCE.len(),
-            "duplicate non-standalone manager evidence"
-        );
-        assert!(
-            generated.is_disjoint(
-                &non_standalone
-                    .iter()
-                    .map(|name| (*name).to_owned())
-                    .collect()
-            ),
-            "a manager cannot be generated and classified as non-standalone"
-        );
-
-        let covered = generated
-            .iter()
-            .map(String::as_str)
-            .chain(non_standalone.iter().copied())
-            .collect::<BTreeSet<_>>();
-        let missing = inventory.difference(&covered).copied().collect::<Vec<_>>();
-        assert!(
-            missing.is_empty(),
-            "live RTTI managers without standalone semantics or evidence disposition: {}",
-            missing.join(", ")
-        );
-
-        let extra_generated = generated
-            .iter()
-            .map(String::as_str)
-            .filter(|manager| !inventory.contains(manager))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            extra_generated,
-            GENERATED_MANAGERS_OUTSIDE_DATAMANAGER_RTTI
-                .iter()
-                .copied()
-                .collect(),
-            "generated managers outside the DataManager RTTI inventory require explicit evidence"
-        );
     }
 }
 
@@ -7491,4 +7331,151 @@ fn ensure_tables(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{
+        GENERATED_MANAGERS_OUTSIDE_DATAMANAGER_RTTI, NON_STANDALONE_MANAGER_EVIDENCE,
+        NativeManagerInput, NativeManagerProductKind, NativeManagerShape,
+        validated_native_manager_specs,
+    };
+
+    #[test]
+    fn every_validated_manager_has_one_concrete_surface_shape() {
+        let managers = validated_native_manager_specs();
+        let missing = managers
+            .iter()
+            .filter(|manager| manager.shape().is_none())
+            .map(|manager| manager.rust_type().as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "validated managers without a generated surface shape: {}",
+            missing.join(", ")
+        );
+    }
+
+    #[test]
+    fn validated_manager_identities_are_unique() {
+        let managers = validated_native_manager_specs();
+        let mut ghidra_classes = BTreeSet::new();
+        let mut rust_types = BTreeSet::new();
+
+        for manager in &managers {
+            assert!(
+                ghidra_classes.insert(manager.ghidra_class().as_str()),
+                "duplicate native manager class: {}",
+                manager.ghidra_class().as_str()
+            );
+            assert!(
+                rust_types.insert(manager.rust_type().as_str()),
+                "duplicate generated manager type: {}",
+                manager.rust_type().as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_semantic_and_product_types_are_standalone_identities() {
+        let managers = validated_native_manager_specs();
+        for manager in &managers {
+            for input in manager.inputs() {
+                if let NativeManagerInput::Product(product) = input {
+                    let identity = product.rust_type().as_str();
+                    assert!(
+                        NativeManagerProductKind::from_canonical_type_path(identity).is_some(),
+                        "manager {} uses non-canonical product identity {identity}",
+                        manager.rust_type()
+                    );
+                }
+            }
+
+            let Some(shape) = manager.shape() else {
+                continue;
+            };
+            let rendered = format!("{shape:?}");
+            assert!(
+                !rendered.contains("newworld_plugin"),
+                "manager {} shared shape leaks newworld_plugin: {rendered}",
+                manager.rust_type()
+            );
+
+            if let NativeManagerShape::ProductAssetResource(products) = shape {
+                for product in products.products() {
+                    assert_eq!(
+                        product.product_type(),
+                        product.value_type(),
+                        "shared product identity must not encode an asset wrapper"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_rtti_inventory_has_a_complete_standalone_disposition() {
+        let inventory = include_str!("../resources/newworld-3-26-datamanager-rtti.txt")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                line.split_once('|')
+                    .expect("RTTI inventory rows use class|offset")
+                    .0
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(inventory.len(), 205, "live manager RTTI inventory drifted");
+
+        let generated = validated_native_manager_specs()
+            .into_iter()
+            .map(|manager| manager.ghidra_class().as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let non_standalone = NON_STANDALONE_MANAGER_EVIDENCE
+            .iter()
+            .map(|entry| entry.ghidra_class)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            non_standalone.len(),
+            NON_STANDALONE_MANAGER_EVIDENCE.len(),
+            "duplicate non-standalone manager evidence"
+        );
+        assert!(
+            generated.is_disjoint(
+                &non_standalone
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect()
+            ),
+            "a manager cannot be generated and classified as non-standalone"
+        );
+
+        let covered = generated
+            .iter()
+            .map(String::as_str)
+            .chain(non_standalone.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let missing = inventory.difference(&covered).copied().collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "live RTTI managers without standalone semantics or evidence disposition: {}",
+            missing.join(", ")
+        );
+
+        let extra_generated = generated
+            .iter()
+            .map(String::as_str)
+            .filter(|manager| !inventory.contains(manager))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            extra_generated,
+            GENERATED_MANAGERS_OUTSIDE_DATAMANAGER_RTTI
+                .iter()
+                .copied()
+                .collect(),
+            "generated managers outside the DataManager RTTI inventory require explicit evidence"
+        );
+    }
 }

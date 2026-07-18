@@ -97,6 +97,8 @@ fn is_reference_target_column(row_key: bool, unique: bool, key_score: u8) -> boo
     row_key && key_score > 0 || unique && key_score >= 4
 }
 
+// Foreign-key inference consumes the complete source and index context.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn infer_foreign_keys(
     data_tables: &GameSystemDataTables,
     table_index: usize,
@@ -162,11 +164,7 @@ pub(super) fn infer_foreign_keys(
             }
 
             let index = &key_indexes[*index_id];
-            if index
-                .sources
-                .iter()
-                .any(|source| *source == (table_index, column_index))
-            {
+            if index.sources.contains(&(table_index, column_index)) {
                 continue;
             }
             if !columns_semantically_compatible(column.name(), &index.column_name) {
@@ -744,6 +742,8 @@ pub(super) fn emit_missing_foreign_key_diagnostics_for_target(
     }
 }
 
+// Repair diagnostics retain every source, target, and confidence detail.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn record_foreign_key_affinity_repairs(
     data_tables: &GameSystemDataTables,
     type_affinities: &mut [GameSystemColumnTypeAffinity],

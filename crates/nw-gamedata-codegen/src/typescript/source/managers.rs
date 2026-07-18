@@ -1831,12 +1831,12 @@ mod tests {
                 SemanticLookupMethod {
                     name: "backstory".to_owned(),
                     parameter: "backstory_id".to_owned(),
-                    kind: SemanticLookupKind::IntoCrcKey,
+                    kind: SemanticLookupKind::IntoCrc,
                 },
                 SemanticLookupMethod {
                     name: "backstory_by_key".to_owned(),
                     parameter: "backstory_key".to_owned(),
-                    kind: SemanticLookupKind::CrcStringKey,
+                    kind: SemanticLookupKind::CrcString,
                 },
             ],
             ids_method: None,
@@ -2131,7 +2131,7 @@ fn push_managers_facade(source: &mut String, surfaces: &[ManagerSurface]) {
             ManagerSurface::ItemData(manager) => manager.manager_class_name.as_str(),
             ManagerSurface::Composition(manager) => manager.manager_class_name.as_str(),
         };
-        let accessor = ts_manager_accessor_name(&manager_name);
+        let accessor = ts_manager_accessor_name(manager_name);
         let field = format!("{accessor}Value");
         fields.push_str(&format!("  private {field}?: Promise<{manager_class}>;\n"));
         let build = match surface {
@@ -3953,35 +3953,35 @@ export class {manager_class} implements Rows<{record_type}> {{
         let method_name = ts_method_name(&method.name);
         let parameter_name = ts_field_name(&method.parameter);
         match method.kind {
-            SemanticLookupKind::CrcStringKey => source.push_str(&format!(
+            SemanticLookupKind::CrcString => source.push_str(&format!(
                 r#"  {method_name}({parameter_name}: string): {record_type} | undefined {{
     return this.{by_key_field}.get(Crc32.fromStringLower({parameter_name}));
   }}
 
 "#
             )),
-            SemanticLookupKind::CrcKey => source.push_str(&format!(
+            SemanticLookupKind::Crc => source.push_str(&format!(
                 r#"  {method_name}({parameter_name}: Crc32): {record_type} | undefined {{
     return this.{by_key_field}.get({parameter_name});
   }}
 
 "#
             )),
-            SemanticLookupKind::IntoCrcKey => source.push_str(&format!(
+            SemanticLookupKind::IntoCrc => source.push_str(&format!(
                 r#"  {method_name}({parameter_name}: string | Crc32): {record_type} | undefined {{
     return this.{by_key_field}.get(crc32LookupKey({parameter_name}));
   }}
 
 "#
             )),
-            SemanticLookupKind::NumericKey(_) => source.push_str(&format!(
+            SemanticLookupKind::Numeric(_) => source.push_str(&format!(
                 r#"  {method_name}({parameter_name}: number): {record_type} | undefined {{
     return this.{by_key_field}.get(normalizeNumericKey({parameter_name}));
   }}
 
 "#
             )),
-            SemanticLookupKind::StringKey => source.push_str(&format!(
+            SemanticLookupKind::String => source.push_str(&format!(
                 r#"  {method_name}({parameter_name}: string): {record_type} | undefined {{
     return this.{by_key_field}.get(normalizeStringKey({parameter_name}));
   }}

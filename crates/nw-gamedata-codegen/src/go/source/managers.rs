@@ -2025,12 +2025,12 @@ func example() Example {
                 SemanticLookupMethod {
                     name: "backstory".to_owned(),
                     parameter: "backstory_id".to_owned(),
-                    kind: SemanticLookupKind::IntoCrcKey,
+                    kind: SemanticLookupKind::IntoCrc,
                 },
                 SemanticLookupMethod {
                     name: "backstory_by_key".to_owned(),
                     parameter: "backstory_key".to_owned(),
-                    kind: SemanticLookupKind::CrcStringKey,
+                    kind: SemanticLookupKind::CrcString,
                 },
             ],
             ids_method: None,
@@ -3294,18 +3294,18 @@ fn push_go_projection_methods(
         let method_name = go_method_name(&method.name);
         let parameter = go_local_name(&method.parameter);
         let (parameter_type, key) = match method.kind {
-            SemanticLookupKind::CrcStringKey => (
+            SemanticLookupKind::CrcString => (
                 "string".to_owned(),
                 format!("CRC32(crc32Lowercase({parameter}))"),
             ),
-            SemanticLookupKind::CrcKey | SemanticLookupKind::IntoCrcKey => {
+            SemanticLookupKind::Crc | SemanticLookupKind::IntoCrc => {
                 ("CRC32".to_owned(), parameter.clone())
             }
-            SemanticLookupKind::NumericKey(key_type) => (
+            SemanticLookupKind::Numeric(key_type) => (
                 go_numeric_key_type(key_type).to_owned(),
                 go_numeric_key_as_u32(&parameter, key_type),
             ),
-            SemanticLookupKind::StringKey => (
+            SemanticLookupKind::String => (
                 "string".to_owned(),
                 format!("normalizeStringKey({parameter})"),
             ),
@@ -4586,23 +4586,29 @@ fn push_semantic_manager_type(source: &mut String, record: &SemanticManagerRecor
         !has_source_row_index || record.source_row_field.is_some(),
         "{manager_type} exposes a source-row lookup without a source-row field"
     );
-    let key_index_field = has_key_index
-        .then(|| format!("\t{by_key_field} map[{}]int\n", go_key_map_type(record)))
-        .unwrap_or_default();
-    let source_row_index_field = has_source_row_index
-        .then_some("\tentriesBySourceRow map[uint32]int\n")
-        .unwrap_or_default();
-    let key_index_initializer = has_key_index
-        .then(|| {
-            format!(
-                "\t\t{by_key_field}: map[{}]int{{}},\n",
-                go_key_map_type(record)
-            )
-        })
-        .unwrap_or_default();
-    let source_row_index_initializer = has_source_row_index
-        .then_some("\t\tentriesBySourceRow: map[uint32]int{},\n")
-        .unwrap_or_default();
+    let key_index_field = if has_key_index {
+        format!("\t{by_key_field} map[{}]int\n", go_key_map_type(record))
+    } else {
+        String::new()
+    };
+    let source_row_index_field = if has_source_row_index {
+        "\tentriesBySourceRow map[uint32]int\n"
+    } else {
+        ""
+    };
+    let key_index_initializer = if has_key_index {
+        format!(
+            "\t\t{by_key_field}: map[{}]int{{}},\n",
+            go_key_map_type(record)
+        )
+    } else {
+        String::new()
+    };
+    let source_row_index_initializer = if has_source_row_index {
+        "\t\tentriesBySourceRow: map[uint32]int{},\n"
+    } else {
+        ""
+    };
     let mut index_build = String::new();
     if has_key_index || has_source_row_index {
         index_build.push_str("\tfor index := range rows {\n");
@@ -4659,7 +4665,7 @@ func {constructor}(cache *managerCache) (*{manager_type}, error) {{
         let method_name = go_method_name(&method.name);
         let parameter_name = go_local_name(&method.parameter);
         match method.kind {
-            SemanticLookupKind::CrcStringKey => source.push_str(&format!(
+            SemanticLookupKind::CrcString => source.push_str(&format!(
                 r#"func (manager *{manager_type}) {method_name}({parameter_name} string) *{record_type} {{
 	index, ok := manager.{by_key_field}[CRC32(crc32Lowercase({parameter_name}))]
 	if !ok {{
@@ -4670,7 +4676,7 @@ func {constructor}(cache *managerCache) (*{manager_type}, error) {{
 
 "#
             )),
-            SemanticLookupKind::CrcKey => source.push_str(&format!(
+            SemanticLookupKind::Crc => source.push_str(&format!(
                 r#"func (manager *{manager_type}) {method_name}({parameter_name} CRC32) *{record_type} {{
 	index, ok := manager.{by_key_field}[{parameter_name}]
 	if !ok {{
@@ -4681,7 +4687,7 @@ func {constructor}(cache *managerCache) (*{manager_type}, error) {{
 
 "#
             )),
-            SemanticLookupKind::IntoCrcKey => source.push_str(&format!(
+            SemanticLookupKind::IntoCrc => source.push_str(&format!(
                 r#"func (manager *{manager_type}) {method_name}({parameter_name} CRC32) *{record_type} {{
 	index, ok := manager.{by_key_field}[{parameter_name}]
 	if !ok {{
@@ -4692,7 +4698,7 @@ func {constructor}(cache *managerCache) (*{manager_type}, error) {{
 
 "#
             )),
-            SemanticLookupKind::NumericKey(key_type) => {
+            SemanticLookupKind::Numeric(key_type) => {
                 let parameter_type = go_numeric_key_type(key_type);
                 let key_value = go_numeric_key_as_u32(&parameter_name, key_type);
                 source.push_str(&format!(
@@ -4707,7 +4713,7 @@ func {constructor}(cache *managerCache) (*{manager_type}, error) {{
 "#
                 ));
             }
-            SemanticLookupKind::StringKey => source.push_str(&format!(
+            SemanticLookupKind::String => source.push_str(&format!(
                 r#"func (manager *{manager_type}) {method_name}({parameter_name} string) *{record_type} {{
 	index, ok := manager.{by_key_field}[normalizeStringKey({parameter_name})]
 	if !ok {{
@@ -4835,7 +4841,7 @@ fn push_go_managers_facade(source: &mut String, surfaces: &[ManagerSurface]) {
             ManagerSurface::ItemData(manager) => manager.manager_class_name.as_str(),
             ManagerSurface::Composition(manager) => manager.manager_class_name.as_str(),
         });
-        let accessor = go_manager_accessor_name(&manager_name);
+        let accessor = go_manager_accessor_name(manager_name);
         let constructor = go_manager_constructor_name(&manager_type);
         let field = go_local_name(&accessor);
         fields.push_str(&format!(

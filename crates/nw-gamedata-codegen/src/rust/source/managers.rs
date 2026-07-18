@@ -1175,6 +1175,8 @@ fn rust_standalone_schema_row_type_name(row_type: &str) -> String {
     format!("{}SchemaRow", to_upper_camel_ident(row_type, "Schema"))
 }
 
+// Tests exercise source renderers before the remaining production helpers below.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use nw_datasheet::game_system::Crc32;
@@ -1601,12 +1603,12 @@ mod tests {
                 SemanticLookupMethod {
                     name: "backstory".to_owned(),
                     parameter: "backstory_id".to_owned(),
-                    kind: SemanticLookupKind::IntoCrcKey,
+                    kind: SemanticLookupKind::IntoCrc,
                 },
                 SemanticLookupMethod {
                     name: "backstory_by_key".to_owned(),
                     parameter: "backstory_key".to_owned(),
-                    kind: SemanticLookupKind::CrcStringKey,
+                    kind: SemanticLookupKind::CrcString,
                 },
             ],
             ids_method: None,
@@ -1802,7 +1804,7 @@ fn push_rust_managers_facade(
             ManagerSurface::ItemData(manager) => manager.manager_class_name.as_str(),
             ManagerSurface::Composition(manager) => manager.manager_class_name.as_str(),
         };
-        let accessor = rust_manager_accessor_name(&manager_name);
+        let accessor = rust_manager_accessor_name(manager_name);
         fields.push_str(&format!(
             "    {accessor}: once_cell::sync::OnceCell<{manager_type}>,\n"
         ));
@@ -3046,17 +3048,17 @@ fn rust_direct_primary_row_family_methods(
     let source_row_type = &row_spec.source_row_type;
     let row_type = &row_spec.type_name;
     let field = rust_direct_row_field_name(source_row_type);
-    let rows = include_rows
-        .then(|| {
-            format!(
-                r#"    pub fn rows(&self) -> std::slice::Iter<'_, RowEntry<{table_type}, {row_type}>> {{
+    let rows = if include_rows {
+        format!(
+            r#"    pub fn rows(&self) -> std::slice::Iter<'_, RowEntry<{table_type}, {row_type}>> {{
         self.{field}.rows()
     }}
 
 "#,
-            )
-        })
-        .unwrap_or_default();
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"{rows}    pub fn table(&self, table: {table_type}) -> TableRows<'_, {table_type}, {row_type}> {{
         self.{field}.table(table)
@@ -3632,12 +3634,16 @@ fn push_rust_semantic_manager_wrapper(source: &mut String, record: &SemanticMana
         }
         index_build.push_str("        }\n");
     }
-    let key_index_initializer = has_key_index
-        .then_some("            entries_by_key: Arc::new(entries_by_key),\n")
-        .unwrap_or_default();
-    let source_row_index_initializer = has_source_row_index
-        .then_some("            entries_by_source_row: Arc::new(entries_by_source_row),\n")
-        .unwrap_or_default();
+    let key_index_initializer = if has_key_index {
+        "            entries_by_key: Arc::new(entries_by_key),\n"
+    } else {
+        ""
+    };
+    let source_row_index_initializer = if has_source_row_index {
+        "            entries_by_source_row: Arc::new(entries_by_source_row),\n"
+    } else {
+        ""
+    };
 
     source.push_str(&format!(
         r#"
@@ -3765,7 +3771,7 @@ fn rust_semantic_lookup_methods(record: &SemanticManagerRecord) -> String {
         let method_name = to_snake_ident(&method.name, "method");
         let parameter_name = to_snake_ident(&method.parameter, "key");
         match method.kind {
-            SemanticLookupKind::CrcStringKey => source.push_str(&format!(
+            SemanticLookupKind::CrcString => source.push_str(&format!(
                 r#"    pub fn {method_name}(&self, {parameter_name}: impl AsRef<str>) -> Option<&{record_type}> {{
         let key = Crc32::from_str_lower({parameter_name}.as_ref());
         self.entries_by_key.get(&key).map(|index| &self.entries[*index])
@@ -3773,14 +3779,14 @@ fn rust_semantic_lookup_methods(record: &SemanticManagerRecord) -> String {
 
 "#
             )),
-            SemanticLookupKind::CrcKey => source.push_str(&format!(
+            SemanticLookupKind::Crc => source.push_str(&format!(
                 r#"    pub fn {method_name}(&self, {parameter_name}: Crc32) -> Option<&{record_type}> {{
         self.entries_by_key.get(&{parameter_name}).map(|index| &self.entries[*index])
     }}
 
 "#
             )),
-            SemanticLookupKind::IntoCrcKey => source.push_str(&format!(
+            SemanticLookupKind::IntoCrc => source.push_str(&format!(
                 r#"    pub fn {method_name}(&self, {parameter_name}: impl IntoCrc32Key) -> Option<&{record_type}> {{
         let key = {parameter_name}.into_crc32_key();
         self.entries_by_key.get(&key).map(|index| &self.entries[*index])
@@ -3788,7 +3794,7 @@ fn rust_semantic_lookup_methods(record: &SemanticManagerRecord) -> String {
 
 "#
             )),
-            SemanticLookupKind::NumericKey(key_type) => {
+            SemanticLookupKind::Numeric(key_type) => {
                 let parameter_type = rust_numeric_key_type(key_type);
                 let key_value = rust_numeric_key_as_u32(&parameter_name, key_type);
                 source.push_str(&format!(
@@ -3800,7 +3806,7 @@ fn rust_semantic_lookup_methods(record: &SemanticManagerRecord) -> String {
 "#
                 ));
             }
-            SemanticLookupKind::StringKey => source.push_str(&format!(
+            SemanticLookupKind::String => source.push_str(&format!(
                 r#"    pub fn {method_name}(&self, {parameter_name}: impl AsRef<str>) -> Option<&{record_type}> {{
         let key = normalize_lookup_key({parameter_name}.as_ref());
         self.entries_by_key.get(&key).map(|index| &self.entries[*index])

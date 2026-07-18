@@ -7,6 +7,8 @@ use super::super::{
 };
 use super::{shape::ShapeEvidence, value_match::string_list_value_matches_shape};
 
+// List evidence requires all column and separator semantics together.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::game_system_schema) fn column_semantic_list_shape(
     data_tables: &GameSystemDataTables,
     table_index: usize,

@@ -108,6 +108,8 @@ pub(in crate::game_system_schema) fn adjacent_shift_expected_shapes(
     shapes
 }
 
+// Repair evidence requires the complete neighboring-cell context.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::game_system_schema) fn adjacent_column_shift_repair(
     data_tables: &GameSystemDataTables,
     source_state: &TypeAffinityState,

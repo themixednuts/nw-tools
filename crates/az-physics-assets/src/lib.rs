@@ -429,11 +429,12 @@ impl MaterialSetAsset {
                         return Err(MaterialSetParseError::UnexpectedText);
                     }
                 }
-                Event::GeneralRef(event) => {
-                    if !xml_general_reference_content(&event)?.trim().is_empty() {
-                        return Err(MaterialSetParseError::UnexpectedText);
-                    }
+                Event::GeneralRef(event)
+                    if !xml_general_reference_content(&event)?.trim().is_empty() =>
+                {
+                    return Err(MaterialSetParseError::UnexpectedText);
                 }
+                Event::GeneralRef(_) => {}
                 _ => {}
             }
         }

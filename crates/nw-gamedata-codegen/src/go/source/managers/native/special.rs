@@ -39,13 +39,12 @@ fn elemental_mutations(
         .filter(|field| field.source_name.eq_ignore_ascii_case("Dungeon"))
         .collect::<Vec<_>>();
     for column in ["Dungeon2", "Dungeon3"] {
-        if let Some(field) = optional_field(&row, column) {
-            if !bucket_fields
+        if let Some(field) = optional_field(&row, column)
+            && !bucket_fields
                 .iter()
                 .any(|candidate| candidate.field_name == field.field_name)
-            {
-                bucket_fields.push(field);
-            }
+        {
+            bucket_fields.push(field);
         }
     }
     let mut bucket_specs = ["Dungeon-", "Dungeon", "Dungeon+"]

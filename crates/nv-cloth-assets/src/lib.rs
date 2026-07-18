@@ -1005,7 +1005,7 @@ fn ensure_zero_padding(
 }
 
 fn validate_triangles(indices: &[u32], vertices: usize) -> Result<(), ClothValidationError> {
-    if indices.len() % 3 != 0 {
+    if !indices.len().is_multiple_of(3) {
         return Err(ClothValidationError::TriangleIndexCount {
             indices: indices.len(),
         });

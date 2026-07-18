@@ -229,9 +229,9 @@ pub(super) fn number_matches_shape(value: f32, number_shape: GameSystemNumberSha
         GameSystemNumberShape::Integer => value.fract() == 0.0,
         GameSystemNumberShape::NonNegativeInteger => value.fract() == 0.0 && value >= 0.0,
         GameSystemNumberShape::PositiveInteger => value.fract() == 0.0 && value > 0.0,
-        GameSystemNumberShape::U8 => value.fract() == 0.0 && value >= 0.0 && value <= 255.0,
+        GameSystemNumberShape::U8 => value.fract() == 0.0 && (0.0..=255.0).contains(&value),
         GameSystemNumberShape::NonZeroU8 => value.fract() == 0.0 && value > 0.0 && value <= 255.0,
-        GameSystemNumberShape::U16 => value.fract() == 0.0 && value >= 0.0 && value <= 65_535.0,
+        GameSystemNumberShape::U16 => value.fract() == 0.0 && (0.0..=65_535.0).contains(&value),
         GameSystemNumberShape::NonZeroU16 => {
             value.fract() == 0.0 && value > 0.0 && value <= 65_535.0
         }

@@ -17,6 +17,8 @@ use super::*;
 /// Contributes the cooked simulation mesh to `model`, resolves the fabric's
 /// render `.skin` as character-skinned geometry, and records the fabric plus its
 /// `.clothmaterial` as embedded resources / dependencies.
+// Resolving one attachment requires the complete mutable export context.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_cloth_attachment(
     source: &dyn AssetSource,
     binding: &str,

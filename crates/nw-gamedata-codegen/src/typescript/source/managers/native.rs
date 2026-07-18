@@ -255,6 +255,8 @@ pub(super) fn crc_schema_contract(
     )
 }
 
+// This renderer needs the complete key and table method contract.
+#[allow(clippy::too_many_arguments)]
 fn crc_schema_contract_with_policy(
     unit: &GameDataCompileUnit,
     manager: &DirectManagerSurface,

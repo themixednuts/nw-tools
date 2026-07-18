@@ -33,6 +33,8 @@ use crate::manager::{
     NativeTableFamilyPartitionedCrcKeyProjectionManager, NativeTableFamilyTable,
 };
 
+// The native surface carries all derived schema metadata without an extra allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ManagerSurface {
     Direct(DirectManagerSurface),
@@ -318,11 +320,11 @@ pub(crate) struct SemanticLookupMethod {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SemanticLookupKind {
-    CrcStringKey,
-    CrcKey,
-    IntoCrcKey,
-    NumericKey(SemanticNumericKeyType),
-    StringKey,
+    CrcString,
+    Crc,
+    IntoCrc,
+    Numeric(SemanticNumericKeyType),
+    String,
 }
 
 pub(crate) fn manager_surfaces(unit: &GameDataCompileUnit) -> Result<Vec<ManagerSurface>> {
@@ -1622,7 +1624,7 @@ fn one_table_enum_record(
             .map(|method| SemanticLookupMethod {
                 name: method.name().as_str().to_owned(),
                 parameter: method.parameter().as_str().to_owned(),
-                kind: SemanticLookupKind::StringKey,
+                kind: SemanticLookupKind::String,
             })
             .collect(),
         ids_method: shape.ids_method().map(|method| method.as_str().to_owned()),
@@ -2044,9 +2046,9 @@ fn crc_lookup_methods(methods: &[NativeCrcIndexLookupMethod]) -> Vec<SemanticLoo
             let parameter = method.parameter();
             let kind = match parameter.kind() {
                 NativeCrcIndexLookupParameterKind::StrRef
-                | NativeCrcIndexLookupParameterKind::AsRefStr => SemanticLookupKind::CrcStringKey,
-                NativeCrcIndexLookupParameterKind::Crc32 => SemanticLookupKind::CrcKey,
-                NativeCrcIndexLookupParameterKind::IntoCrc32 => SemanticLookupKind::IntoCrcKey,
+                | NativeCrcIndexLookupParameterKind::AsRefStr => SemanticLookupKind::CrcString,
+                NativeCrcIndexLookupParameterKind::Crc32 => SemanticLookupKind::Crc,
+                NativeCrcIndexLookupParameterKind::IntoCrc32 => SemanticLookupKind::IntoCrc,
             };
             SemanticLookupMethod {
                 name: method.name().as_str().to_owned(),
@@ -2063,13 +2065,13 @@ fn numeric_lookup_methods(methods: &[NativeNumericLookupMethod]) -> Vec<Semantic
         .map(|method| {
             let kind = match method.parameter_kind() {
                 NativeNumericLookupParameterKind::NonZeroU8 => {
-                    SemanticLookupKind::NumericKey(SemanticNumericKeyType::U8)
+                    SemanticLookupKind::Numeric(SemanticNumericKeyType::U8)
                 }
                 NativeNumericLookupParameterKind::U16 => {
-                    SemanticLookupKind::NumericKey(SemanticNumericKeyType::U16)
+                    SemanticLookupKind::Numeric(SemanticNumericKeyType::U16)
                 }
                 NativeNumericLookupParameterKind::NonZeroU32 => {
-                    SemanticLookupKind::NumericKey(SemanticNumericKeyType::U32)
+                    SemanticLookupKind::Numeric(SemanticNumericKeyType::U32)
                 }
             };
             SemanticLookupMethod {
@@ -2087,7 +2089,7 @@ fn string_lookup_methods(methods: &[NativeStringLookupMethod]) -> Vec<SemanticLo
         .map(|method| SemanticLookupMethod {
             name: method.name().as_str().to_owned(),
             parameter: method.parameter().as_str().to_owned(),
-            kind: SemanticLookupKind::StringKey,
+            kind: SemanticLookupKind::String,
         })
         .collect()
 }
@@ -2736,16 +2738,13 @@ mod tests {
             .iter()
             .find(|method| method.name == "backstory")
             .expect("backstory lookup");
-        assert_eq!(backstory_lookup.kind, SemanticLookupKind::IntoCrcKey);
+        assert_eq!(backstory_lookup.kind, SemanticLookupKind::IntoCrc);
         let backstory_by_key_lookup = backstory
             .lookup_methods
             .iter()
             .find(|method| method.name == "backstory_by_key")
             .expect("backstory_by_key lookup");
-        assert_eq!(
-            backstory_by_key_lookup.kind,
-            SemanticLookupKind::CrcStringKey
-        );
+        assert_eq!(backstory_by_key_lookup.kind, SemanticLookupKind::CrcString);
 
         let mutation_perks = surfaces
             .iter()
