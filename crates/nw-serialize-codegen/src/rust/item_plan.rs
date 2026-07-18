@@ -51,6 +51,7 @@ pub struct RustFieldPlan {
     pub rust_name: String,
     pub source_type_id: Uuid,
     pub rust_type: String,
+    pub reflect_ignore: bool,
     pub unresolved_type: Option<RustUnresolvedTypePlan>,
     pub integer_range: Option<RustIntegerRangePlan>,
     pub data_size: Option<u32>,

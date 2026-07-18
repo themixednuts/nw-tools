@@ -8,7 +8,7 @@ use crate::field_projection::{
 use crate::ir::{SerializeCodegenField, SerializeCodegenItem};
 use crate::naming::{rust_field_ident, rust_type_ident};
 use crate::rust::derive_plan::{
-    rust_type_supports_native_hash_key, rust_type_supports_native_ordering,
+    field_supports_reflect, rust_type_supports_native_hash_key, rust_type_supports_native_ordering,
 };
 use crate::rust::enum_plan::is_rust_integer_type;
 use crate::rust::integrate::source_index::RustSourceTypeIndex;
@@ -164,6 +164,13 @@ impl RustFieldPlanner {
             },
             source_type_id: field.source_type_id,
             rust_type,
+            reflect_ignore: !field_supports_reflect(
+                field,
+                context.items_by_type_id,
+                &mut BTreeMap::new(),
+                &mut BTreeSet::new(),
+                self.mode,
+            ),
             unresolved_type: self.unresolved_type_for_field(field, context.source_types),
             integer_range: self.plan_integer_range(&field.resolved_type),
             data_size: field.data_size,

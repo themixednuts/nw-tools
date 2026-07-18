@@ -1153,8 +1153,11 @@ fn render_field(
         }
     })?;
     replace_self_type_references(&mut ty, &item.rust_name);
+    let reflect_attr = (field.reflect_ignore
+        && item.derives.iter().any(|derive| derive == "Reflect"))
+    .then(|| quote!(#[reflect(ignore, clone)]));
     let serde_attr = render_field_serde_attr(item, field);
-    Ok(quote!(#serde_attr pub #ident: #ty,))
+    Ok(quote!(#reflect_attr #serde_attr pub #ident: #ty,))
 }
 
 fn render_field_serde_attr(item: &RustItemPlan, field: &RustFieldPlan) -> TokenStream {
@@ -1622,6 +1625,7 @@ mod tests {
                     rust_name: "is_skin".to_owned(),
                     source_type_id: type_ids::BOOL,
                     rust_type: "bool".to_owned(),
+                    reflect_ignore: false,
                     unresolved_type: None,
                     integer_range: None,
                     data_size: None,
@@ -1867,6 +1871,7 @@ mod tests {
                     rust_name: "value".to_owned(),
                     source_type_id: type_ids::U8,
                     rust_type: "u8".to_owned(),
+                    reflect_ignore: false,
                     unresolved_type: None,
                     integer_range: None,
                     data_size: None,
@@ -3273,6 +3278,120 @@ mod tests {
     }
 
     #[test]
+    fn integrated_component_ignores_non_reflect_fields_and_registers_publicly() {
+        let component_id = uuid!("11111111-1111-1111-1111-111111111111");
+        let unit = IrUnit {
+            items: vec![fixture_item(
+                component_id,
+                "NWTagComponentServerFacet",
+                ReflectedTypeRole::ServerFacet,
+                false,
+                vec![IrField {
+                    source_name: "Tags".to_owned(),
+                    source_type_id: uuid!("22222222-2222-2222-2222-222222222222"),
+                    resolved_type: ResolvedType::Sequence {
+                        kind: SequenceKind::FixedVector,
+                        element: Box::new(ResolvedType::Scalar(ScalarType::String)),
+                        capacity: Some(10),
+                    },
+                    data_size: None,
+                    offset: None,
+                    flags: None,
+                    is_base_class: false,
+                    is_pointer: false,
+                    is_dynamic_field: false,
+                }],
+            )],
+        };
+        let rust_unit = RustCodegenPlanner::default()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
+        let component = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == component_id)
+            .expect("server facet plan");
+
+        assert!(component.derives.iter().any(|derive| derive == "Reflect"));
+        assert!(component.fields[0].reflect_ignore);
+
+        let project = RustSourceEmitter::emit_integrated_project(
+            &rust_unit,
+            &crate::CodegenContext::inline(),
+        )
+        .expect("integrated project");
+        let source = project
+            .files
+            .iter()
+            .find(|file| file.source.contains("pub struct NWTagComponentServerFacet"))
+            .expect("server facet module")
+            .source
+            .as_str();
+
+        assert!(source.contains("::bevy::prelude::Reflect"));
+        assert!(source.contains("#[reflect(ignore, clone)]"));
+        assert!(source.contains("pub tags: arrayvec::ArrayVec<String, 10>"));
+        assert!(source.contains("pub fn register(app: &mut App)"));
+        assert!(source.contains("app.register_type::<NWTagComponentServerFacet>();"));
+    }
+
+    #[test]
+    fn integrated_support_type_ignores_non_reflect_fields_and_registers_publicly() {
+        let item_id = uuid!("11111111-1111-1111-1111-111111111111");
+        let unit = IrUnit {
+            items: vec![fixture_item(
+                item_id,
+                "PersistentAbilitiesData",
+                ReflectedTypeRole::SupportType,
+                false,
+                vec![IrField {
+                    source_name: "Entries".to_owned(),
+                    source_type_id: uuid!("22222222-2222-2222-2222-222222222222"),
+                    resolved_type: ResolvedType::Sequence {
+                        kind: SequenceKind::FixedVector,
+                        element: Box::new(ResolvedType::Scalar(ScalarType::String)),
+                        capacity: Some(10),
+                    },
+                    data_size: None,
+                    offset: None,
+                    flags: None,
+                    is_base_class: false,
+                    is_pointer: false,
+                    is_dynamic_field: false,
+                }],
+            )],
+        };
+        let rust_unit = RustCodegenPlanner::default()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
+        let item = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == item_id)
+            .expect("support type plan");
+
+        assert!(!item.is_bevy_component);
+        assert!(item.derives.iter().any(|derive| derive == "Reflect"));
+        assert!(item.fields[0].reflect_ignore);
+
+        let project = RustSourceEmitter::emit_integrated_project(
+            &rust_unit,
+            &crate::CodegenContext::inline(),
+        )
+        .expect("integrated project");
+        let source = project
+            .files
+            .iter()
+            .find(|file| file.source.contains("pub struct PersistentAbilitiesData"))
+            .expect("support type module")
+            .source
+            .as_str();
+
+        assert!(source.contains("::bevy::prelude::Reflect"));
+        assert!(source.contains("#[reflect(ignore, clone)]"));
+        assert!(source.contains("pub fn register(app: &mut App)"));
+        assert!(source.contains("app.register_type::<PersistentAbilitiesData>();"));
+    }
+
+    #[test]
     fn integrated_family_registration_includes_reflected_children() {
         let unit = namespace_and_base_family_fixture();
         let rust_unit = RustCodegenPlanner::default()
@@ -3728,6 +3847,7 @@ mod tests {
                     rust_name: "values".to_owned(),
                     source_type_id: uuid!("22222222-2222-2222-2222-222222222222"),
                     rust_type: "Type33333333".to_owned(),
+                    reflect_ignore: false,
                     unresolved_type: Some(RustUnresolvedTypePlan {
                         type_id: uuid!("33333333-3333-3333-3333-333333333333"),
                         reason: "missing fixture type".to_owned(),

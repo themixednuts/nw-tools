@@ -131,13 +131,6 @@ impl RustDerivePlanner {
             &mut BTreeSet::new(),
             self.mode,
         );
-        let supports_reflect = item_supports_reflect(
-            item,
-            items_by_type_id,
-            &mut BTreeMap::new(),
-            &mut BTreeSet::new(),
-            self.mode,
-        );
         let supports_marshaler = matches!(self.mode, RustCodegenMode::Integrated)
             && item_supports_marshaler(
                 item,
@@ -188,9 +181,7 @@ impl RustDerivePlanner {
                     derives.push("Serialize".to_owned());
                     derives.push("Deserialize".to_owned());
                 }
-                if supports_reflect {
-                    derives.push("Reflect".to_owned());
-                }
+                derives.push("Reflect".to_owned());
                 derives
             }
             RustCodegenMode::Standalone => {
@@ -222,9 +213,7 @@ impl RustDerivePlanner {
                     derives.push("Serialize".to_owned());
                     derives.push("Deserialize".to_owned());
                 }
-                if supports_reflect {
-                    derives.push("Reflect".to_owned());
-                }
+                derives.push("Reflect".to_owned());
                 derives
             }
         }
@@ -482,15 +471,7 @@ fn item_supports_reflect(
             .fields
             .iter()
             .filter(|field| should_materialize_rust_field(field, items_by_type_id))
-            .all(|field| {
-                resolved_type_supports_reflect(
-                    &field.resolved_type,
-                    items_by_type_id,
-                    cache,
-                    visiting,
-                    mode,
-                )
-            }),
+            .all(|field| field_supports_reflect(field, items_by_type_id, cache, visiting, mode)),
     };
     visiting.remove(&item.source_type_id);
     cache.insert(item.source_type_id, supports_reflect);
@@ -599,6 +580,21 @@ fn field_supports_default(
         CodegenFieldTypeProjection::FixedOpaqueBytes { byte_len } => byte_len <= 32,
         CodegenFieldTypeProjection::Reflected(resolved_type) => {
             resolved_type_supports_default(resolved_type, items_by_type_id, cache, visiting, mode)
+        }
+    }
+}
+
+pub(super) fn field_supports_reflect(
+    field: &SerializeCodegenField,
+    items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+    cache: &mut BTreeMap<Uuid, bool>,
+    visiting: &mut BTreeSet<Uuid>,
+    mode: RustCodegenMode,
+) -> bool {
+    match classify_codegen_field_type(field) {
+        CodegenFieldTypeProjection::FixedOpaqueBytes { .. } => true,
+        CodegenFieldTypeProjection::Reflected(resolved_type) => {
+            resolved_type_supports_reflect(resolved_type, items_by_type_id, cache, visiting, mode)
         }
     }
 }

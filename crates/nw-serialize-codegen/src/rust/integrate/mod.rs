@@ -658,6 +658,7 @@ pub struct ManaComponent;
                 rust_name: "value".to_owned(),
                 source_type_id: uuid!("43DA906B-7DEF-4CA8-9790-854106D3F983"),
                 rust_type: "u32".to_owned(),
+                reflect_ignore: false,
                 unresolved_type: None,
                 integer_range: None,
                 data_size: None,
