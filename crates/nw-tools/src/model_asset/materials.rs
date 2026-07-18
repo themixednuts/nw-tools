@@ -23,7 +23,7 @@ pub(super) fn resolve_primary_materials(
         return Ok(Some(materials));
     }
     resolve_material_name(source, cgf)?.map(Some).context(
-        "mesh material could not be resolved; use --no-materials for an explicit geometry-only export",
+        "mesh material could not be resolved; use --geometry-only for an explicit geometry-only export",
     )
 }
 

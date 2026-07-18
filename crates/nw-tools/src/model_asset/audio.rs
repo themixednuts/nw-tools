@@ -65,11 +65,18 @@ pub(super) fn resolve_animation_audio_triggers(
         }
     });
 
+    // Parse each Wwise bank at most once for the whole resolution and read raw
+    // bank bytes only on demand: hundreds of candidate banks per event otherwise
+    // re-decompress + re-parse on every trigger, and holding a whole preload
+    // group's media DATA resident at once exhausts memory on large characters.
+    let mut banks = BankStore::new(source);
+
     let mut resolutions = Vec::with_capacity(triggers.len());
     let mut dropped = Vec::new();
     for candidate in triggers {
         let Some(resolution) = resolve_one_audio_trigger(
             source,
+            &mut banks,
             &catalogs,
             &candidate.parameter,
             candidate.is_footstep,
@@ -283,6 +290,7 @@ fn ensure_atl_control_sources(
 
 fn resolve_one_audio_trigger(
     source: &dyn AssetSource,
+    banks: &mut BankStore,
     catalogs: &AudioCatalogs,
     parameter: &str,
     is_footstep: bool,
@@ -352,48 +360,49 @@ fn resolve_one_audio_trigger(
         // Step 2: event → candidate banks (trigger-bank map, else preload group).
         let mut candidates = catalogs.map_banks(name);
         if candidates.is_empty() {
-            candidates = catalogs.preload_banks_defining_event(source, event_id);
+            candidates = catalogs.preload_banks_defining_event(banks, event_id);
         }
         if candidates.is_empty() {
             continue;
         }
 
+        // The readable, parseable candidate banks, deduped by path in first-seen
+        // order (matching the former eager loader). Only the light bank index is
+        // held here — the raw media DATA is never resident for the whole group.
+        let mut seen = HashSet::new();
+        let loaded: Vec<(String, Arc<cry_audio::WwiseSoundBank>)> = candidates
+            .iter()
+            .filter(|path| seen.insert(path.to_ascii_lowercase()))
+            .filter_map(|path| banks.parsed(path).map(|bank| (path.clone(), bank)))
+            .collect();
+
         // Step 3: typed HIRC walk in the defining bank(s); locate each media's
-        // owning bank among the shipped candidates.
-        let loaded = load_audio_banks(source, &candidates);
+        // owning bank among the shipped candidates. Raw bytes are read on demand
+        // for the (few) defining banks and dropped immediately after the walk.
         let event = cry_audio::WwiseObjectId(event_id);
         let mut source_ids = std::collections::BTreeSet::new();
-        for entry in &loaded {
-            if entry.bank.defines_event(event) {
-                push_unique_path(&mut ship_banks, &entry.path);
-                source_ids.extend(
-                    entry
-                        .bank
-                        .event_media(&entry.bytes, event)
-                        .iter()
-                        .map(|id| id.0),
-                );
-                let event_default: Vec<u32> = entry
-                    .bank
-                    .event_default_media(&entry.bytes, event)
-                    .iter()
-                    .map(|id| id.0)
-                    .collect();
-                default_media.extend(&event_default);
-                accumulate_surface_branches(
-                    &entry.bank,
-                    &entry.bytes,
-                    event,
-                    &event_default,
-                    &mut surface_branches,
-                );
+        for (path, bank) in &loaded {
+            if !bank.defines_event(event) {
+                continue;
             }
+            let Some(bytes) = banks.bytes(path) else {
+                continue;
+            };
+            push_unique_path(&mut ship_banks, path);
+            source_ids.extend(bank.event_media(&bytes, event).iter().map(|id| id.0));
+            let event_default: Vec<u32> = bank
+                .event_default_media(&bytes, event)
+                .iter()
+                .map(|id| id.0)
+                .collect();
+            default_media.extend(&event_default);
+            accumulate_surface_branches(bank, &bytes, event, &event_default, &mut surface_branches);
         }
         for media_id in source_ids {
             let owner = loaded
                 .iter()
-                .find(|entry| entry.bank.media.iter().any(|media| media.id.0 == media_id))
-                .map(|entry| entry.path.clone());
+                .find(|(_, bank)| bank.media.iter().any(|media| media.id.0 == media_id))
+                .map(|(path, _)| path.clone());
             if let Some(bank) = &owner {
                 push_unique_path(&mut ship_banks, bank);
             }
@@ -652,34 +661,52 @@ fn ship_material_effects_fxlib(
     Ok(())
 }
 
-/// A bank parsed once, retained with its bytes for the HIRC walk and DIDX
-/// owner lookup.
-struct LoadedAudioBank {
-    path: String,
-    bank: cry_audio::WwiseSoundBank,
-    bytes: Vec<u8>,
+/// A resolution-scoped cache of parsed Wwise banks.
+///
+/// Bank resolution otherwise re-reads and re-parses the same banks hundreds of
+/// times (every trigger's fallback scan walks every preload group) and, worse,
+/// holds a whole preload group's raw media DATA resident at once — enough to
+/// exhaust memory on a player-grade character with many audio events. The store
+/// parses each bank at most once and keeps only the light index (sections, media
+/// table, HIRC), which is all that `defines_event` and the DIDX owner lookup
+/// need; the raw bytes required for the typed HIRC walk are read on demand for
+/// the (few) defining banks and dropped immediately after.
+struct BankStore<'a> {
+    source: &'a dyn AssetSource,
+    /// Lowercased path → parsed bank (`None` when unreadable or unparseable),
+    /// so a repeated miss is not re-read every time either.
+    parsed: std::collections::HashMap<String, Option<Arc<cry_audio::WwiseSoundBank>>>,
 }
 
-fn load_audio_banks(source: &dyn AssetSource, paths: &[String]) -> Vec<LoadedAudioBank> {
-    let mut loaded = Vec::new();
-    let mut seen = HashSet::new();
-    for path in paths {
-        if !seen.insert(path.to_ascii_lowercase()) {
-            continue;
+impl<'a> BankStore<'a> {
+    fn new(source: &'a dyn AssetSource) -> Self {
+        Self {
+            source,
+            parsed: std::collections::HashMap::new(),
         }
-        let Some(bytes) = source.read(path) else {
-            continue;
-        };
-        let Ok(bank) = cry_audio::WwiseSoundBank::parse(&bytes) else {
-            continue;
-        };
-        loaded.push(LoadedAudioBank {
-            path: path.clone(),
-            bank,
-            bytes,
-        });
     }
-    loaded
+
+    /// The parsed bank at `path`, cached by lowercased path. `None` when the bank
+    /// is unreadable or does not parse. Never retains the raw bank bytes.
+    fn parsed(&mut self, path: &str) -> Option<Arc<cry_audio::WwiseSoundBank>> {
+        if let Some(cached) = self.parsed.get(&path.to_ascii_lowercase()) {
+            return cached.clone();
+        }
+        let parsed = self
+            .source
+            .read(path)
+            .and_then(|bytes| cry_audio::WwiseSoundBank::parse(&bytes).ok())
+            .map(Arc::new);
+        self.parsed.insert(path.to_ascii_lowercase(), parsed.clone());
+        parsed
+    }
+
+    /// The raw bank bytes at `path`, read fresh (never cached). Deterministic for
+    /// a given path, so the absolute HIRC offsets in the cached parse still line
+    /// up with this buffer.
+    fn bytes(&self, path: &str) -> Option<Vec<u8>> {
+        self.source.read(path)
+    }
 }
 
 fn parse_audio_controls_document(
@@ -988,15 +1015,16 @@ impl AudioCatalogs {
 
     /// Fallback for events the trigger-bank map does not cover: the preload
     /// group whose banks include one whose HIRC defines the event id.
-    fn preload_banks_defining_event(&self, source: &dyn AssetSource, event_id: u32) -> Vec<String> {
+    ///
+    /// Bank parses are served from `banks`, so each candidate bank is read and
+    /// parsed at most once across the whole resolution — the scan touches only
+    /// the light HIRC index, never a bank's raw media DATA.
+    fn preload_banks_defining_event(&self, banks: &mut BankStore, event_id: u32) -> Vec<String> {
         let event = cry_audio::WwiseObjectId(event_id);
         for group in &self.preload_groups {
-            let defines = group.iter().any(|path| {
-                source
-                    .read(path)
-                    .and_then(|bytes| cry_audio::WwiseSoundBank::parse(&bytes).ok())
-                    .is_some_and(|bank| bank.defines_event(event))
-            });
+            let defines = group
+                .iter()
+                .any(|path| banks.parsed(path).is_some_and(|bank| bank.defines_event(event)));
             if defines {
                 return group.clone();
             }
@@ -1071,26 +1099,41 @@ mod tests {
             event_ids,
         };
 
+        let mut banks = BankStore::new(&EmptySource);
+
         // A parameter that matches no ATL trigger and no event-id table entry is
         // dropped — even though its name shape looks exactly like a footstep
         // blend trigger, there is no prefix acceptance.
         assert!(
-            resolve_one_audio_trigger(&EmptySource, &catalogs, "blend_ftsp_unlisted", false)
-                .unwrap()
-                .is_none()
+            resolve_one_audio_trigger(
+                &EmptySource,
+                &mut banks,
+                &catalogs,
+                "blend_ftsp_unlisted",
+                false
+            )
+            .unwrap()
+            .is_none()
         );
 
         // Resolves via the ATL trigger → Wwise event.
-        let atl = resolve_one_audio_trigger(&EmptySource, &catalogs, "blend_ftsp_alligator", false)
-            .unwrap()
-            .expect("ATL trigger resolves");
+        let atl = resolve_one_audio_trigger(
+            &EmptySource,
+            &mut banks,
+            &catalogs,
+            "blend_ftsp_alligator",
+            false,
+        )
+        .unwrap()
+        .expect("ATL trigger resolves");
         assert_eq!(atl.wwise_events.len(), 1);
         assert_eq!(atl.wwise_events[0].name, "blend_ftsp_alligator");
 
         // Resolves as a bare Wwise event name present in the event-id table.
-        let bare = resolve_one_audio_trigger(&EmptySource, &catalogs, "Play_BareEvent", false)
-            .unwrap()
-            .expect("bare event name resolves");
+        let bare =
+            resolve_one_audio_trigger(&EmptySource, &mut banks, &catalogs, "Play_BareEvent", false)
+                .unwrap()
+                .expect("bare event name resolves");
         assert_eq!(bare.wwise_events[0].id, Some(4242));
     }
 
