@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIsEmotePreviewEnabled;
+pub struct ActionConditionIsEmotePreviewEnabled {}
 
 impl AzRtti for ActionConditionIsEmotePreviewEnabled {
     const NAME: &'static str = "ActionConditionIsEmotePreviewEnabled";

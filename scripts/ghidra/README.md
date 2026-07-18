@@ -56,24 +56,27 @@ removes copied helper `.java` files from that output directory. Keeping helper
 standalone scripts, which can prevent `NetworkSchemaExtractor` from loading.
 The sync script also rejects network-schema source modules over 1000 lines.
 
+Compile the bundled script without running binary analysis:
+
+```powershell
+scripts/ghidra/Test-NetworkSchemaExtractor.ps1 -GhidraHome D:\.ghidra
+```
+
 - `NetworkSchemaAddressFormatter.java` — address formatter callback shared by models.
 - `NetworkSchemaModels.java` — leaf model/data holders.
 - `NetworkSchemaPcode.java` — p-code evidence model holders.
 - `NetworkSchemaStack.java` — stack-state and constructor evidence models.
 - `NetworkSchemaText.java` — deterministic text/literal helpers.
-- `NetworkSchemaTextParser.java` — decompiled-text parser plus parse caches.
 - `NetworkSchemaTypeModels.java` — nested type and container-shape model holders.
 - `NetworkSchemaX86.java` — x86 operand, register, memory, and offset helpers.
 - `NetworkSchemaJson.java` — JSON helpers.
 - `network_schema_extractor/NetworkSchemaExtractor.*.javafrag` — ordered
   fragments for the generated Ghidra script entrypoint.
 
-Useful environment variables:
-
-```text
-NW_NETWORK_SCHEMA_TYPEREGISTRY_JSON=E:\Projects\nw-tools\resources\typeregistry.json
-NW_NETWORK_SCHEMA_OUT=E:\Projects\new-world\resources\network-schema.static.json
-```
+Interactive runs present an analysis-mode dialog. `Full schema` remains the default.
+Focused type, handler-vtable, and function-trace runs ask for their addresses or type
+indices directly and write distinct report files, so they cannot replace the complete
+schema report.
 
 The script emits every `typeregistry.json` row, recovers
 `MB::ReplicatedState::RegisterField` callers from Ghidra where available, and
@@ -82,7 +85,7 @@ decoded AZ RTTI provider evidence to rows that can be statically mapped. Native
 type names are recovered from actual AZ/Hub registration helper tables or AZ RTTI
 providers; TypeRegistry names remain the raw TypeRegistry/debug-name field.
 
-For message-only types with no replicated-state field registration, the extractor
-also follows `UnmarshalFields<...>` helper calls and records source-signature
-evidence when MSVC RTTI strings expose the source constructor/callback path. This
-keeps wire-shape evidence separate from semantic field-name evidence.
+For types with no replicated-state field registration, the extractor follows their
+unmarshal call graph and records only field, storage, codec, and nested-type evidence
+proven by P-code data flow. Delegation to a polymorphic fragment codec remains an
+explicit schema operation instead of being flattened into synthetic fields.

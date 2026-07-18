@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use nw_gamedata_codegen::{
-    GameDataCodegenOutput, GameDataCompileMode, GameDataCompiler, GameDataCompilerOptions,
-    GameDataEmitter, GameDataTargetLanguage, GameDataTargetPlan, GoSourceEmitter,
-    RustSourceEmitter, TypeScriptSourceEmitter, load_catalog_from_asset_root,
+    GameDataCodegenOutput, GameDataCompileMode, GameDataCompiler, GameDataEmitter,
+    GameDataTargetLanguage, GoSourceEmitter, RustSourceEmitter, TypeScriptSourceEmitter,
+    load_catalog_from_asset_root,
 };
 
 #[derive(Debug, Parser)]
@@ -78,18 +78,12 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let mode = GameDataCompileMode::from(cli.mode);
     let languages = target_languages(&cli);
-    let targets = languages
-        .iter()
-        .copied()
-        .map(GameDataTargetPlan::standalone);
-    let options = GameDataCompilerOptions::with_targets(mode, targets)?;
-    let compiler = GameDataCompiler::with_options(options);
+    let compiler = GameDataCompiler::new(mode);
     let catalog = load_catalog_from_asset_root(&cli.assets)?;
     let unit = compiler.compile_unit(&catalog);
 
     for language in languages {
-        let target = GameDataTargetPlan::standalone(language);
-        let output = emit_target(&unit, target)?;
+        let output = emit_language(&unit, language)?;
         let root = cli.output.join(language_output_dir(language));
         let files = write_codegen_output(&output, &root)?;
         println!(
@@ -116,14 +110,14 @@ fn target_languages(cli: &Cli) -> Vec<GameDataTargetLanguage> {
         .collect()
 }
 
-fn emit_target(
+fn emit_language(
     unit: &nw_gamedata_codegen::GameDataCompileUnit,
-    target: GameDataTargetPlan,
+    language: GameDataTargetLanguage,
 ) -> Result<GameDataCodegenOutput> {
-    match target.language() {
-        GameDataTargetLanguage::Rust => RustSourceEmitter::new(target)?.emit(unit),
-        GameDataTargetLanguage::TypeScript => TypeScriptSourceEmitter::new(target)?.emit(unit),
-        GameDataTargetLanguage::Go => GoSourceEmitter::new(target)?.emit(unit),
+    match language {
+        GameDataTargetLanguage::Rust => RustSourceEmitter.emit(unit),
+        GameDataTargetLanguage::TypeScript => TypeScriptSourceEmitter.emit(unit),
+        GameDataTargetLanguage::Go => GoSourceEmitter.emit(unit),
     }
 }
 

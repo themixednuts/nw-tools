@@ -1,0 +1,132 @@
+import java.util.Collection;
+import java.util.Comparator;
+
+    private static final int REPLICATED_STATE_ABI_FIRST_SLOT = 17;
+    private static final int REPLICATED_STATE_ABI_SLOT_COUNT = 6;
+    private static final int REPLICATED_STATE_ABI_MIN_COHORT = 3;
+
+    private JsonObject replicatedStateAbiDiagnostics = new JsonObject();
+
+    private void classifyReplicatedStateAbis(
+        Collection<RegistrationFunction> registrations) {
+
+        LinkedHashMap<String, ReplicatedStateAbiSignature> signatures =
+            new LinkedHashMap<>();
+        LinkedHashMap<String, Integer> counts = new LinkedHashMap<>();
+        LinkedHashMap<RegistrationFunction, String> keysByRegistration =
+            new LinkedHashMap<>();
+        int candidateCount = 0;
+        for (RegistrationFunction registration : registrations) {
+            ReplicatedStateAbiSignature signature = replicatedStateAbiSignature(registration);
+            if (signature == null) {
+                continue;
+            }
+            candidateCount++;
+            String key = signature.key();
+            signatures.putIfAbsent(key, signature);
+            counts.merge(key, 1, Integer::sum);
+            keysByRegistration.put(registration, key);
+        }
+
+        ArrayList<Map.Entry<String, Integer>> ranked = new ArrayList<>(counts.entrySet());
+        ranked.sort(Comparator
+            .<Map.Entry<String, Integer>>comparingInt(Map.Entry::getValue)
+            .reversed()
+            .thenComparing(Map.Entry::getKey));
+        Map.Entry<String, Integer> winner = ranked.isEmpty() ? null : ranked.get(0);
+        boolean tied = winner != null && ranked.size() > 1 &&
+            Objects.equals(winner.getValue(), ranked.get(1).getValue());
+        boolean proven = winner != null && !tied &&
+            winner.getValue() >= REPLICATED_STATE_ABI_MIN_COHORT;
+        int matchCount = 0;
+        for (Map.Entry<RegistrationFunction, String> entry :
+                keysByRegistration.entrySet()) {
+            String key = entry.getValue();
+            ReplicatedStateAbiSignature signature = signatures.get(key);
+            int cohortCount = counts.get(key);
+            boolean dominant = proven && winner.getKey().equals(key);
+            entry.getKey().replicatedStateAbi = new ReplicatedStateAbiEvidence(
+                REPLICATED_STATE_ABI_FIRST_SLOT,
+                signature.targets(),
+                cohortCount,
+                dominant ? "shared" : "specialized",
+                dominant
+                    ? "register-field-receiver+dominant-fragment-vtable-signature"
+                    : "register-field-receiver+specialized-fragment-vtable-signature");
+            matchCount++;
+        }
+
+        JsonObject diagnostics = new JsonObject();
+        diagnostics.addProperty("candidateCount", candidateCount);
+        diagnostics.addProperty("signatureCount", counts.size());
+        diagnostics.addProperty("minimumCohort", REPLICATED_STATE_ABI_MIN_COHORT);
+        diagnostics.addProperty("ambiguousTopCohort", tied);
+        diagnostics.addProperty("proven", proven);
+        diagnostics.addProperty("matchedRegistrationCount", matchCount);
+        if (winner != null) {
+            diagnostics.addProperty("dominantCohortCount", winner.getValue());
+            JsonArray slots = new JsonArray();
+            ReplicatedStateAbiSignature signature = signatures.get(winner.getKey());
+            for (int index = 0; index < signature.targets().size(); index++) {
+                JsonObject slot = new JsonObject();
+                slot.addProperty("slot", REPLICATED_STATE_ABI_FIRST_SLOT + index);
+                NetworkSchemaJson.addAddress(
+                    slot,
+                    "function",
+                    signature.targets().get(index),
+                    addressFormatter);
+                slots.add(slot);
+            }
+            diagnostics.add("dominantSlots", slots);
+        }
+        replicatedStateAbiDiagnostics = diagnostics;
+    }
+
+    private ReplicatedStateAbiSignature replicatedStateAbiSignature(
+        RegistrationFunction registration) {
+
+        Address vtable = registration == null ? null : registration.instanceVtable;
+        if (vtable == null || registration.fields.isEmpty() ||
+            fragmentMetadataEvidence(vtable) == null ||
+            countExecutableVtableSlots(
+                vtable,
+                REPLICATED_STATE_ABI_FIRST_SLOT + REPLICATED_STATE_ABI_SLOT_COUNT) <
+                REPLICATED_STATE_ABI_FIRST_SLOT + REPLICATED_STATE_ABI_SLOT_COUNT) {
+            return null;
+        }
+        ArrayList<Address> targets = new ArrayList<>(REPLICATED_STATE_ABI_SLOT_COUNT);
+        for (int index = 0; index < REPLICATED_STATE_ABI_SLOT_COUNT; index++) {
+            int slot = REPLICATED_STATE_ABI_FIRST_SLOT + index;
+            Address target = resolvedCodeTarget(readPointer(vtable.add(slot * 8L)));
+            if (!isExecutableAddress(target)) {
+                return null;
+            }
+            targets.add(target);
+        }
+        return new ReplicatedStateAbiSignature(List.copyOf(targets));
+    }
+
+    private ReplicatedStateAbiEvidence replicatedStateAbiEvidence(
+        List<RegistrationFunction> matches) {
+
+        ReplicatedStateAbiEvidence selected = null;
+        for (RegistrationFunction match : matches) {
+            ReplicatedStateAbiEvidence candidate = match.replicatedStateAbi;
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.signatureKey().equals(candidate.signatureKey())) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private record ReplicatedStateAbiSignature(List<Address> targets) {
+        String key() {
+            return targets.stream()
+                .map(Address::toString)
+                .collect(java.util.stream.Collectors.joining(":"));
+        }
+    }

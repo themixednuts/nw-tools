@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn progression_pool_category_uses_reflected_enum() {
+    let data_tables = test_data_tables(
+        "ProgressionPools",
+        "ProgressionPoolData",
+        vec![
+            ("ProgressionPoolId", ColumnType::String),
+            ("Category", ColumnType::String),
+        ],
+        vec![
+            vec![
+                OwnedCellValue::String("sword".to_owned()),
+                OwnedCellValue::String("Player".to_owned()),
+            ],
+            vec![
+                OwnedCellValue::String("territory".to_owned()),
+                OwnedCellValue::String("Territory".to_owned()),
+            ],
+        ],
+    );
+
+    let report = infer_data_tables_schema(&data_tables);
+    let column = report_column(&report, "Category");
+    let GameSystemColumnValueShape::Enum { enum_shape } = &column.value_shape else {
+        panic!("expected enum column")
+    };
+    assert_eq!(enum_shape.name, "PoolCategory");
+    assert_eq!(
+        enum_shape
+            .variants
+            .iter()
+            .map(|variant| (variant.name.as_str(), variant.discriminant))
+            .collect::<Vec<_>>(),
+        [("Invalid", 0), ("Player", 1), ("Territory", 2)]
+    );
+}
+
+#[test]
 fn semantic_enum_affinity_repairs_reward_milestone_type() {
     let data_tables = test_data_tables(
         "RewardMilestones",

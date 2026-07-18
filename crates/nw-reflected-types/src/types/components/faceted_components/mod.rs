@@ -5,11 +5,27 @@ use bevy_ecs::reflect::ReflectComponent;
 use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 
 pub mod audio_set_trigger_override_component;
+pub mod game_rigid_body_component;
+pub mod game_transform_component;
+pub mod hit_volume_component;
 pub mod material_override_component;
 
 pub use self::audio_set_trigger_override_component::{
     AudioSetTriggerOverrideComponent, AudioSetTriggerOverrideComponentClientFacet,
     AudioSetTriggerOverrideComponentServerFacet, TriggerOverridePair,
+};
+
+pub use self::game_rigid_body_component::{
+    GameRigidBodyComponent, GameRigidBodyComponentClientFacet, GameRigidBodyComponentServerFacet,
+    GameRigidBodyServerFacetConfig,
+};
+
+pub use self::game_transform_component::{
+    GameTransformComponent, GameTransformComponentClientFacet, GameTransformComponentServerFacet,
+};
+
+pub use self::hit_volume_component::{
+    HitVolumeComponent, HitVolumeComponentClientFacet, HitVolumeComponentServerFacet,
 };
 
 pub use self::material_override_component::MaterialOverrideInfo;
@@ -29,7 +45,7 @@ pub use self::material_override_component::MaterialOverrideInfo;
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct Facet;
+pub struct Facet {}
 
 impl AzRtti for Facet {
     const NAME: &'static str = "Facet";

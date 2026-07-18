@@ -1,0 +1,89 @@
+    private final class DelegatedCodecEvidence {
+        final String kind;
+        final Address callsite;
+        final Address function;
+        final PcodeStorage valueStorage;
+        final PcodeStorage outcomeStorage;
+        final PcodeStorage readBufferStorage;
+        final String evidenceSource;
+
+        DelegatedCodecEvidence(
+            String kind,
+            Address callsite,
+            Address function,
+            PcodeStorage valueStorage,
+            PcodeStorage outcomeStorage,
+            PcodeStorage readBufferStorage,
+            String evidenceSource) {
+
+            this.kind = kind;
+            this.callsite = callsite;
+            this.function = function;
+            this.valueStorage = valueStorage;
+            this.outcomeStorage = outcomeStorage;
+            this.readBufferStorage = readBufferStorage;
+            this.evidenceSource = evidenceSource;
+        }
+
+        JsonObject toJson() {
+            JsonObject object = new JsonObject();
+            object.addProperty("kind", kind);
+            object.addProperty("callsite", formatAddress(callsite));
+            object.addProperty("function", formatAddress(function));
+            NetworkSchemaJson.add(
+                object,
+                "valueStorage",
+                valueStorage == null ? null : valueStorage.expression());
+            NetworkSchemaJson.add(
+                object,
+                "outcomeStorage",
+                outcomeStorage == null ? null : outcomeStorage.expression());
+            object.addProperty("readBufferStorage", readBufferStorage.expression());
+            object.addProperty("evidenceSource", evidenceSource);
+            return object;
+        }
+    }
+
+    private DelegatedCodecEvidence delegatedFragmentCodec(Function wrapper) {
+        HighFunction high = highFunction(wrapper);
+        if (high == null) {
+            return null;
+        }
+
+        Address expectedTarget = currentProgram.getImageBase().add(
+            I_FRAGMENT_FULL_UNMARSHAL_RVA);
+        DelegatedCodecEvidence selected = null;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL || operation.getNumInputs() != 4) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (target == null || !target.getEntryPoint().equals(expectedTarget)) {
+                continue;
+            }
+
+            PcodeStorage readBuffer = pcodeStorageExpression(operation.getInput(3));
+            if (readBuffer == null || readBuffer.offset != 0L ||
+                formalParameterSlot(readBuffer) == null) {
+                runMetrics.increment("delegatedFragmentCodecArgumentRejects");
+                continue;
+            }
+            DelegatedCodecEvidence evidence = new DelegatedCodecEvidence(
+                "fragment-full-unmarshal",
+                operation.getSeqnum().getTarget(),
+                target.getEntryPoint(),
+                pcodeStorageExpression(operation.getInput(1)),
+                pcodeStorageExpression(operation.getInput(2)),
+                readBuffer,
+                "direct-call-target-and-ssa-arguments");
+            if (selected != null) {
+                runMetrics.increment("delegatedFragmentCodecAmbiguities");
+                return null;
+            }
+            selected = evidence;
+        }
+        if (selected != null) {
+            runMetrics.increment("delegatedFragmentCodecs");
+        }
+        return selected;
+    }

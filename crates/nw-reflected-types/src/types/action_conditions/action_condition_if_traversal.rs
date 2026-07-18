@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfTraversal;
+pub struct ActionConditionIfTraversal {}
 
 impl AzRtti for ActionConditionIfTraversal {
     const NAME: &'static str = "ActionConditionIfTraversal";

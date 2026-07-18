@@ -1,4 +1,4 @@
-pub(crate) fn is_hex_color_text(value: &str) -> bool {
+pub fn is_hex_color_text(value: &str) -> bool {
     let value = value.trim();
     let Some(hex) = value.strip_prefix('#') else {
         return false;

@@ -92,7 +92,6 @@
             return "provider";
         }
     }
-
     private final class TypeNameEvidence {
         String source;
         Address function;
@@ -108,7 +107,6 @@
             return object;
         }
     }
-
     private final class HookTypeEvidence {
         Address hookFunction;
         Address helperTable;
@@ -117,16 +115,16 @@
         Address uuidSource;
         Address typeDescriptor;
         Address slotTypeNameFunction;
-        Address handlerVtable;
-        Address createInstance;
-        Address marshal;
-        Address unmarshal;
         String typeId;
         String typeName;
+        String typeNameEvidenceSource;
         String slotTypeName;
         String source;
 
         String typeNameSource() {
+            if (typeNameEvidenceSource != null) {
+                return typeNameEvidenceSource;
+            }
             return source == null ? "registrationHook" : source;
         }
 
@@ -143,26 +141,7 @@
             NetworkSchemaJson.add(object, "uuidSource", formatAddress(uuidSource));
             NetworkSchemaJson.add(object, "typeDescriptor", formatAddress(typeDescriptor));
             NetworkSchemaJson.add(object, "slotTypeNameFunction", formatAddress(slotTypeNameFunction));
-            if (handlerVtable != null) {
-                JsonObject handler = new JsonObject();
-                NetworkSchemaJson.add(handler, "handlerVtable", formatAddress(handlerVtable));
-                NetworkSchemaJson.add(handler, "CreateInstance", formatAddress(createInstance));
-                NetworkSchemaJson.add(handler, "Marshal", formatAddress(marshal));
-                NetworkSchemaJson.add(handler, "Unmarshal", formatAddress(unmarshal));
-                JsonArray slots = new JsonArray();
-                for (int slot = 0; slot < MESSAGE_HANDLER_VTABLE_SLOTS; slot++) {
-                    Address target = readPointer(handlerVtable.add(slot * 8L));
-                    if (target == null || !isExecutableAddress(target)) {
-                        break;
-                    }
-                    slots.add(virtualFunctionSlot(
-                        slot,
-                        messageHandlerSlotName(slot),
-                        target));
-                }
-                handler.add("slots", slots);
-                object.add("messageHandler", handler);
-            }
+            NetworkSchemaJson.add(object, "typeNameSource", typeNameSource());
             return object;
         }
 
@@ -221,5 +200,3 @@
             return object;
         }
     }
-
-}

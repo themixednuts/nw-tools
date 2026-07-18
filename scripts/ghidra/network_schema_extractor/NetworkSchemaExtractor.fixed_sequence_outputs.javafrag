@@ -1,0 +1,198 @@
+    private record FixedSequenceRecovery(
+        FixedSequenceStorage storage,
+        FixedSequenceShape shape) {
+    }
+
+    private record CollectionStorageSpan(PcodeStorage root, long length) {
+    }
+
+    private FixedSequenceRecovery fixedSequenceRecovery(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        String bufferParameter,
+        NetworkSchemaCodecClassifier.CodecDirection direction) {
+
+        FixedSequenceStorage storage = fixedSequenceStorage(high, loop, operations);
+        if (storage == null) {
+            return null;
+        }
+        WireShape element = fixedSequenceElementWireEvidence(
+            high,
+            loop,
+            operations,
+            storage,
+            bufferParameter,
+            direction);
+        if (element == null || element.layout == null) {
+            return null;
+        }
+        PcodeOpAST countCall = fixedSequenceCountCall(
+            high,
+            loop,
+            operations,
+            direction);
+        Integer capacity = countCall == null ? null : provenFixedSequenceCapacity(
+            high,
+            loop,
+            operations,
+            storage,
+            countCall,
+            direction);
+        if (capacity == null) {
+            return null;
+        }
+        if (direction == NetworkSchemaCodecClassifier.CodecDirection.DECODE &&
+            !countControlsFixedSequenceExtent(
+                high,
+                loop,
+                operations,
+                storage,
+                countCall)) {
+            return null;
+        }
+        NativeTypeInfoEvidence elementType = direction ==
+            NetworkSchemaCodecClassifier.CodecDirection.DECODE
+                ? fixedSequenceElementTypeInfo(
+                    high,
+                    loop,
+                    operations,
+                    storage,
+                    countCall)
+                : null;
+        FixedSequenceShape shape = new FixedSequenceShape(
+            capacity,
+            storage.stride(),
+            storage.data().offset,
+            storage.end().offset,
+            element,
+            elementType,
+            countCall.getSeqnum().getTarget(),
+            loop.header().getStart(),
+            "cfg-fixed-capacity-sequence");
+        return new FixedSequenceRecovery(storage, shape);
+    }
+
+    private Map<Address, CollectionOutputShape> containerCollectionOutputs(
+        Function function) {
+
+        LinkedHashMap<Address, CollectionOutputShape> result = new LinkedHashMap<>(
+            collectionOutputShapesByCountCallsite(function));
+        String readBufferParameter = uniqueReadBufferParameter(function);
+        HighFunction high = readBufferParameter == null ? null : highFunction(function);
+        if (high == null) {
+            return Map.copyOf(result);
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            FixedSequenceRecovery recovery = fixedSequenceRecovery(
+                high,
+                loop,
+                operations,
+                readBufferParameter,
+                NetworkSchemaCodecClassifier.CodecDirection.DECODE);
+            if (recovery == null || recovery.shape().wireEvidence == null) {
+                continue;
+            }
+            long interiorSpan;
+            try {
+                interiorSpan = Math.subtractExact(
+                    recovery.storage().end().offset,
+                    recovery.storage().data().offset);
+            }
+            catch (ArithmeticException ignored) {
+                continue;
+            }
+            if (interiorSpan <= 0L) {
+                continue;
+            }
+            CollectionIteration iteration = collectionIteration(
+                function,
+                high,
+                loop,
+                operations,
+                new PcodeStorage(readBufferParameter, 0L),
+                recovery.storage());
+            if (iteration == null || iteration.wireEvidence().layout == null ||
+                !iteration.wireEvidence().layout.equals(
+                    recovery.shape().wireEvidence.layout)) {
+                recordNestedTypeShapeReject("fixed-sequence-codec-callsites-unproven");
+                continue;
+            }
+            CollectionOutputShape output = new CollectionOutputShape(
+                recovery.storage().data(),
+                recovery.shape().wireEvidence,
+                recovery.shape().countCallsite,
+                loop.header().getStart(),
+                iteration.codecCallsites(),
+                interiorSpan);
+            CollectionOutputShape previous = result.putIfAbsent(
+                output.countCallsite,
+                output);
+            if (previous != null &&
+                (!previous.storage.sameLocation(output.storage) ||
+                 !sameWireEvidence(previous.wireEvidence, output.wireEvidence))) {
+                recordNestedTypeShapeReject("ambiguous-collection-output-callsite");
+                return Collections.emptyMap();
+            }
+        }
+        return Map.copyOf(result);
+    }
+
+    private void collapseCollectionInteriorMembers(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        List<CollectionStorageSpan> spans) {
+
+        for (CollectionStorageSpan span : spans) {
+            removeCollectionStorageMembers(byBase, span, false);
+        }
+    }
+
+    private void removeCollectionStorageMembers(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        CollectionStorageSpan span,
+        boolean includeRoot) {
+
+        if (byBase == null || span == null || span.root() == null) {
+            return;
+        }
+        LinkedHashMap<Long, NestedTypeMember> members = byBase.get(span.root().base);
+        Long end = collectionStorageEnd(span);
+        if (members == null || end == null) {
+            return;
+        }
+        members.entrySet().removeIf(entry ->
+            (includeRoot
+                ? entry.getKey() >= span.root().offset
+                : entry.getKey() > span.root().offset) &&
+            entry.getKey() < end);
+    }
+
+    private boolean collectionStorageContains(
+        List<CollectionStorageSpan> spans,
+        PcodeStorage storage) {
+
+        if (spans == null || storage == null) {
+            return false;
+        }
+        for (CollectionStorageSpan span : spans) {
+            Long end = collectionStorageEnd(span);
+            if (end != null && storage.base.equals(span.root().base) &&
+                storage.offset >= span.root().offset && storage.offset < end) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Long collectionStorageEnd(CollectionStorageSpan span) {
+        if (span == null || span.root() == null || span.length() <= 0L) {
+            return null;
+        }
+        try {
+            return Math.addExact(span.root().offset, span.length());
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }

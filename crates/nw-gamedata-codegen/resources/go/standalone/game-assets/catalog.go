@@ -5,22 +5,16 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	gametypes "example.com/newworld/gamedata/types"
+	"github.com/google/uuid"
 )
 
 const AssetCatalogPath = "assetcatalog.catalog"
 
-type AssetID struct {
-	GUID  string
-	SubID uint32
-}
-
-type AssetType struct {
-	GUID string
-}
-
 type AssetCatalogEntry struct {
-	AssetID      AssetID
-	AssetType    AssetType
+	AssetID      gametypes.AssetID
+	AssetType    gametypes.UUID
 	RelativePath string
 	SizeBytes    uint32
 }
@@ -71,14 +65,20 @@ func ParseRascCatalog(bytes []byte) (AssetCatalog, error) {
 		if dir != "" {
 			relativePath = dir + "/" + fileName
 		}
+		guid, err := uuidAt(bytes, guidOffset+guidIndex*16)
+		if err != nil {
+			return AssetCatalog{}, fmt.Errorf("RASC entry %d asset id: %w", index, err)
+		}
+		assetType, err := uuidAt(bytes, assetTypeOffset+assetTypeIndex*16)
+		if err != nil {
+			return AssetCatalog{}, fmt.Errorf("RASC entry %d asset type: %w", index, err)
+		}
 		entries = append(entries, AssetCatalogEntry{
-			AssetID: AssetID{
-				GUID:  formatUUID(bytes, guidOffset+guidIndex*16),
+			AssetID: gametypes.AssetID{
+				GUID:  guid,
 				SubID: subID,
 			},
-			AssetType: AssetType{
-				GUID: formatUUID(bytes, assetTypeOffset+assetTypeIndex*16),
-			},
+			AssetType:    assetType,
 			RelativePath: NormalizeVirtualPath(relativePath),
 			SizeBytes:    sizeBytes,
 		})
@@ -98,17 +98,11 @@ func readNullTerminated(bytes []byte, offset int) string {
 	return string(bytes[offset:end])
 }
 
-func formatUUID(bytes []byte, offset int) string {
+func uuidAt(bytes []byte, offset int) (uuid.UUID, error) {
 	if offset < 0 || offset+16 > len(bytes) {
-		return "00000000-0000-0000-0000-000000000000"
+		return uuid.Nil, fmt.Errorf("range %d..%d is outside %d catalog bytes", offset, offset+16, len(bytes))
 	}
-	return fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-		bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3],
-		bytes[offset+4], bytes[offset+5],
-		bytes[offset+6], bytes[offset+7],
-		bytes[offset+8], bytes[offset+9],
-		bytes[offset+10], bytes[offset+11], bytes[offset+12], bytes[offset+13], bytes[offset+14], bytes[offset+15],
-	)
+	return uuid.FromBytes(bytes[offset : offset+16])
 }
 
 func NormalizeVirtualPath(path string) string {

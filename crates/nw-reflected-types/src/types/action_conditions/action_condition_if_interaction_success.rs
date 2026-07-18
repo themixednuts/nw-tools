@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfInteractionSuccess;
+pub struct ActionConditionIfInteractionSuccess {}
 
 impl AzRtti for ActionConditionIfInteractionSuccess {
     const NAME: &'static str = "ActionConditionIfInteractionSuccess";

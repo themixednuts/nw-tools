@@ -1,19 +1,4 @@
-export const objectStreamExtensions = [
-  "slice",
-  "dynamicslice",
-  "spawnable",
-  "uicanvas",
-  "aoffdb",
-  "equipdb",
-  "gds",
-  "uidb",
-  "pbadb",
-  "sprd",
-  "gdb",
-  "gactdb",
-  "rankdb",
-  "craftstationdb",
-] as const;
+import { type Vector3 } from "../values.js";
 
 const STREAM_TAG_BINARY = 0;
 const ELEMENT_HEADER = 1 << 3;
@@ -24,11 +9,6 @@ const HAS_VERSION = 1 << 7;
 const VALUE_SIZE_MASK = 0x07;
 
 const TEXT_DECODER = new TextDecoder();
-
-export interface ObjectStreamAsset {
-  readonly path: string;
-  readonly bytes: Uint8Array;
-}
 
 export interface ObjectStream {
   readonly version: number;
@@ -42,11 +22,6 @@ export interface ObjectStreamElement {
   readonly typeId: string;
   readonly data: Uint8Array;
   readonly children: readonly ObjectStreamElement[];
-}
-
-export function isObjectStreamPath(path: string): boolean {
-  const extension = path.split(".").pop()?.toLowerCase();
-  return extension !== undefined && objectStreamExtensions.includes(extension as never);
 }
 
 export function parseObjectStream(bytes: Uint8Array): ObjectStream {
@@ -135,13 +110,7 @@ export function objectStreamF32(element: ObjectStreamElement): number {
   return dataView(element).getFloat32(0, false);
 }
 
-export interface ObjectStreamVec3 {
-  readonly x: number;
-  readonly y: number;
-  readonly z: number;
-}
-
-export function objectStreamVec3(element: ObjectStreamElement): ObjectStreamVec3 {
+export function objectStreamVec3(element: ObjectStreamElement): Vector3 {
   requireLength(element, 12);
   const view = dataView(element);
   return {

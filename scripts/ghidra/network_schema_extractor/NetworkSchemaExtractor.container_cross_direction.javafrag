@@ -1,0 +1,258 @@
+    private enum ContainerCodecAgreement {
+        NONE,
+        PHYSICAL,
+        SEMANTIC
+    }
+
+    private ContainerCodecAgreement reconcileLogicalContainerCodecSequence(
+        List<ContainerCodecCall> encodedKeyLeaves,
+        List<ContainerCodecCall> encodedValueLeaves,
+        List<ContainerCodecCall> decoded) {
+
+        List<ContainerCodecCall> decodedLeaves = physicalContainerCodecLeaves(decoded);
+        if (decodedLeaves == null) {
+            return ContainerCodecAgreement.NONE;
+        }
+        ArrayList<ContainerCodecCall> encodedLeaves = new ArrayList<>(
+            encodedKeyLeaves.size() + encodedValueLeaves.size());
+        encodedLeaves.addAll(encodedKeyLeaves);
+        encodedLeaves.addAll(encodedValueLeaves);
+        if (encodedLeaves.isEmpty() ||
+            !samePhysicalContainerCodecSequence(encodedLeaves, decodedLeaves)) {
+            return ContainerCodecAgreement.NONE;
+        }
+
+        if (encodedLeaves.size() != decodedLeaves.size()) {
+            return ContainerCodecAgreement.PHYSICAL;
+        }
+
+        boolean completeSemantics = true;
+        for (int index = 0; index < encodedLeaves.size(); index++) {
+            completeSemantics &= applyUnmarshalCodecSemantics(
+                encodedLeaves.get(index),
+                decodedLeaves.get(index));
+        }
+        return completeSemantics
+            ? ContainerCodecAgreement.SEMANTIC
+            : ContainerCodecAgreement.PHYSICAL;
+    }
+
+    private boolean samePhysicalContainerCodecSequence(
+        List<ContainerCodecCall> encoded,
+        List<ContainerCodecCall> decoded) {
+
+        ArrayList<String> encodedLayouts = new ArrayList<>();
+        ArrayList<String> decodedLayouts = new ArrayList<>();
+        if (appendContainerPhysicalLayouts(encodedLayouts, encoded) < 0 ||
+            appendContainerPhysicalLayouts(decodedLayouts, decoded) < 0 ||
+            encodedLayouts.size() != decodedLayouts.size()) {
+            return false;
+        }
+        for (int index = 0; index < encodedLayouts.size(); index++) {
+            if (!containerPhysicalLayoutsMatch(
+                    encodedLayouts.get(index),
+                    decodedLayouts.get(index))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private ContainerCodecAgreement reconcileConditionalContainerCodecSequence(
+        List<ContainerCodecCall> encoded,
+        List<ContainerCodecCall> decoded) {
+
+        if (encoded == null || decoded == null || encoded.isEmpty() ||
+            encoded.size() != decoded.size()) {
+            return ContainerCodecAgreement.NONE;
+        }
+        ContainerCodecAgreement agreement = ContainerCodecAgreement.SEMANTIC;
+        for (int index = 0; index < encoded.size(); index++) {
+            ContainerCodecAgreement memberAgreement =
+                reconcileConditionalContainerCodec(
+                    encoded.get(index),
+                    decoded.get(index));
+            if (memberAgreement == ContainerCodecAgreement.NONE) {
+                return ContainerCodecAgreement.NONE;
+            }
+            if (memberAgreement == ContainerCodecAgreement.PHYSICAL) {
+                agreement = ContainerCodecAgreement.PHYSICAL;
+            }
+        }
+        return agreement;
+    }
+
+    private ContainerCodecAgreement reconcileConditionalContainerCodec(
+        ContainerCodecCall encoded,
+        ContainerCodecCall decoded) {
+
+        boolean encodedOptional = encoded != null &&
+            "optional-suffix".equals(encoded.memberSemantics);
+        boolean decodedOptional = decoded != null &&
+            "optional-suffix".equals(decoded.memberSemantics);
+        if (encodedOptional != decodedOptional) {
+            return ContainerCodecAgreement.NONE;
+        }
+        if (!encodedOptional) {
+            return reconcileLogicalContainerCodecSequence(
+                List.of(encoded),
+                List.of(),
+                List.of(decoded));
+        }
+
+        ContainerCodecAgreement required = reconcileConditionalContainerCodecSequence(
+            encoded.members,
+            decoded.members);
+        ContainerCodecAgreement optional = reconcileConditionalContainerCodecSequence(
+            encoded.optionalMembers,
+            decoded.optionalMembers);
+        if (required == ContainerCodecAgreement.NONE ||
+            optional == ContainerCodecAgreement.NONE) {
+            return ContainerCodecAgreement.NONE;
+        }
+        return required == ContainerCodecAgreement.SEMANTIC &&
+            optional == ContainerCodecAgreement.SEMANTIC
+                ? ContainerCodecAgreement.SEMANTIC
+                : ContainerCodecAgreement.PHYSICAL;
+    }
+
+    private boolean samePhysicalContainerCodec(
+        ContainerCodecCall encoded,
+        ContainerCodecCall unmarshal) {
+
+        if (encoded == null || unmarshal == null ||
+            encoded.wireEvidence == null || unmarshal.wireEvidence == null) {
+            return false;
+        }
+        List<String> encodedLayouts = containerPhysicalLayouts(encoded);
+        List<String> unmarshalLayouts = containerPhysicalLayouts(unmarshal);
+        if (encodedLayouts == null || unmarshalLayouts == null ||
+            encodedLayouts.size() != unmarshalLayouts.size()) {
+            return false;
+        }
+        for (int index = 0; index < encodedLayouts.size(); index++) {
+            if (!containerPhysicalLayoutsMatch(
+                    encodedLayouts.get(index),
+                    unmarshalLayouts.get(index))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean applyUnmarshalCodecSemantics(
+        ContainerCodecCall encoded,
+        ContainerCodecCall unmarshal) {
+
+        if (unmarshal.wireEvidence == null ||
+            !unmarshal.wireEvidence.hasProvenSemantics()) {
+            return encoded.wireEvidence != null &&
+                encoded.wireEvidence.hasProvenSemantics();
+        }
+        String layout = encoded.wireEvidence == null
+            ? unmarshal.wireEvidence.layout
+            : encoded.wireEvidence.layout;
+        encoded.wireEvidence = WireShape.semantic(
+            unmarshal.wireEvidence.shape,
+            layout,
+            "marshal-full+unmarshal-logical-sequence-agreement");
+        encoded.evidenceSource = "marshal-full+unmarshal-logical-sequence-agreement";
+        if (encoded.nativeType == null) {
+            encoded.nativeType = unmarshal.nativeType;
+        }
+        if (encoded.typeId == null) {
+            encoded.typeId = unmarshal.typeId;
+            encoded.typeIdSource = unmarshal.typeIdSource;
+        }
+        mergeProvenContainerCodecIdentity(encoded, unmarshal);
+        return true;
+    }
+
+    private void mergeProvenContainerCodecIdentity(
+        ContainerCodecCall target,
+        ContainerCodecCall source) {
+
+        if (target == null || source == null || !source.typeIdentityProven ||
+            source.typeId == null) {
+            return;
+        }
+        if (target.typeId == null) {
+            target.typeId = source.typeId;
+            target.typeIdSource = source.typeIdSource;
+        }
+        String targetTypeId = canonicalUuidFromString(target.typeId);
+        String sourceTypeId = canonicalUuidFromString(source.typeId);
+        if (targetTypeId == null || !targetTypeId.equals(sourceTypeId)) {
+            return;
+        }
+        if (target.nativeType == null) {
+            target.nativeType = source.nativeType;
+        }
+        target.typeIdentityProven = true;
+        if (target.typeIdSource == null) {
+            target.typeIdSource = source.typeIdSource;
+        }
+    }
+
+    private int appendContainerPhysicalLayouts(
+        List<String> output,
+        List<ContainerCodecCall> codecs) {
+
+        int start = output.size();
+        for (ContainerCodecCall codec : codecs) {
+            List<String> layouts = containerPhysicalLayouts(codec);
+            if (layouts == null || layouts.isEmpty()) {
+                return -1;
+            }
+            output.addAll(layouts);
+        }
+        return output.size() - start;
+    }
+
+    private List<String> containerPhysicalLayouts(ContainerCodecCall codec) {
+        if (codec == null) {
+            return null;
+        }
+        if (!codec.members.isEmpty()) {
+            if (!"linear-sequence".equals(codec.memberSemantics) &&
+                !"counted-sequence".equals(codec.memberSemantics) &&
+                !"fixed-sequence".equals(codec.memberSemantics) &&
+                !"structured-value".equals(codec.memberSemantics)) {
+                return null;
+            }
+            ArrayList<String> nested = new ArrayList<>();
+            return appendContainerPhysicalLayouts(nested, codec.members) < 0
+                ? null
+                : List.copyOf(nested);
+        }
+        if (codec.wireEvidence == null || codec.wireEvidence.layout == null) {
+            return null;
+        }
+        String shape = codec.wireEvidence.shape;
+        if (shape == null) {
+            return List.of(codec.wireEvidence.layout);
+        }
+        return switch (shape) {
+            case "vec2" -> fixedFloatPhysicalLayouts(codec.wireEvidence, 2);
+            case "vec3" -> fixedFloatPhysicalLayouts(codec.wireEvidence, 3);
+            case "quat" -> fixedFloatPhysicalLayouts(codec.wireEvidence, 4);
+            default -> List.of(codec.wireEvidence.layout);
+        };
+    }
+
+    private List<String> fixedFloatPhysicalLayouts(WireShape evidence, int count) {
+        Integer width = wireShapeByteWidth(evidence.layout);
+        if (width == null || width != count * Float.BYTES) {
+            return null;
+        }
+        return Collections.nCopies(count, "f32");
+    }
+
+    private boolean containerPhysicalLayoutsMatch(String encoded, String decoded) {
+        if (Objects.equals(encoded, decoded)) {
+            return true;
+        }
+        Integer encodedWidth = wireShapeByteWidth(encoded);
+        Integer decodedWidth = wireShapeByteWidth(decoded);
+        return encodedWidth != null && encodedWidth.equals(decodedWidth);
+    }

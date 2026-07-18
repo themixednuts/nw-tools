@@ -1,0 +1,995 @@
+    private Map<Address, CollectionOutputShape> collectionOutputShapesByCountCallsite(
+        Function target) {
+
+        LinkedHashMap<Address, CollectionOutputShape> result = new LinkedHashMap<>();
+        for (CollectionOutputShape shape :
+                collectionOutputShapesByParameterFromPcode(target).values()) {
+            if (shape.countCallsite == null || result.putIfAbsent(
+                    shape.countCallsite,
+                    shape) != null) {
+                recordNestedTypeShapeReject("ambiguous-counted-collection-callsite");
+                return Collections.emptyMap();
+            }
+        }
+        return result;
+    }
+
+    private JsonObject countedCollectionFunctionTrace(Function function) {
+        JsonObject trace = new JsonObject();
+        trace.addProperty("schema", "newworld.network_schema.counted_collection_trace.v1");
+        trace.addProperty("extractorVersion", EXTRACTOR_VERSION);
+        NetworkSchemaJson.addAddress(
+            trace,
+            "function",
+            function == null ? null : function.getEntryPoint(),
+            addressFormatter);
+        NetworkSchemaJson.add(
+            trace,
+            "functionName",
+            function == null ? null : fullFunctionName(function));
+        HighFunction high = highFunction(function);
+        JsonArray loopsJson = new JsonArray();
+        if (high == null) {
+            trace.add("loops", loopsJson);
+            return trace;
+        }
+        trace.add("directType", directTypeFunctionTrace(function, high));
+        NetworkSchemaCodecClassifier.VariableIntegerCodec variable =
+            NetworkSchemaCodecClassifier.variableIntegerCodec(high);
+        NetworkSchemaJson.add(
+            trace,
+            "variableIntegerShape",
+            variable == null ? null : variable.shape());
+        NetworkSchemaJson.add(
+            trace,
+            "variableIntegerDirection",
+            variable == null ? null : variable.direction().name());
+        JsonArray readBufferParameters = new JsonArray();
+        JsonArray codecTraces = new JsonArray();
+        int parameterCount = win64RegisterParameterCandidateCount(high);
+        for (int slot = 1; slot <= parameterCount; slot++) {
+            String parameter = "param_" + slot;
+            if (hasReadBufferFlow(function, parameter, new LinkedHashSet<>())) {
+                readBufferParameters.add(parameter);
+                JsonObject codecTrace = new JsonObject();
+                codecTrace.addProperty("readBufferParameter", parameter);
+                CodecWireTrace wireTrace = traceUnmarshalCodec(
+                    function,
+                    parameter,
+                    new LinkedHashSet<>(),
+                    new HashMap<>());
+                JsonArray events = new JsonArray();
+                if (wireTrace != null) {
+                    for (CodecWireEvent event : wireTrace.events) {
+                        JsonObject eventJson = new JsonObject();
+                        NetworkSchemaJson.add(eventJson, "nativeType", event.nativeType());
+                        NetworkSchemaJson.add(
+                            eventJson,
+                            "wireShape",
+                            event.wireEvidence().shape);
+                        NetworkSchemaJson.add(
+                            eventJson,
+                            "wireLayout",
+                            event.wireEvidence().layout);
+                        NetworkSchemaJson.addAddress(
+                            eventJson,
+                            "callsite",
+                            event.callsite(),
+                            addressFormatter);
+                        NetworkSchemaJson.add(
+                            eventJson,
+                            "targetName",
+                            event.targetName());
+                        events.add(eventJson);
+                    }
+                }
+                codecTrace.add("events", events);
+                codecTraces.add(codecTrace);
+            }
+        }
+        trace.add("readBufferParameters", readBufferParameters);
+        trace.add("codecTraces", codecTraces);
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        trace.add("valuePcodeOps", containerValuePcodeOpsDiagnostic(function));
+        trace.add("cursorReadCandidates", cursorReadCandidates(high, operations));
+        List<NetworkSchemaNaturalLoop> loops = NetworkSchemaControlFlow.naturalLoops(high);
+        trace.addProperty("naturalLoopCount", loops.size());
+        for (NetworkSchemaNaturalLoop loop : loops) {
+            JsonObject loopJson = new JsonObject();
+            NetworkSchemaJson.addAddress(
+                loopJson,
+                "header",
+                loop.header().getStart(),
+                addressFormatter);
+            loopJson.addProperty("blockCount", loop.blockCount());
+            DynamicSequenceExtent dynamicExtent = dynamicSequenceExtent(loop, operations);
+            if (dynamicExtent != null) {
+                JsonObject extentJson = new JsonObject();
+                extentJson.addProperty("data", dynamicExtent.data().expression());
+                extentJson.addProperty("end", dynamicExtent.end().expression());
+                extentJson.addProperty("stride", dynamicExtent.stride());
+                loopJson.add("dynamicSequenceExtent", extentJson);
+            }
+            JsonArray encodeSequences = new JsonArray();
+            for (int slot = 1; slot <= parameterCount; slot++) {
+                String parameter = "param_" + slot;
+                ContainerSequenceAnalysis analysis = analyzeContainerSequence(
+                    function,
+                    high,
+                    loop,
+                    operations,
+                    parameter,
+                    new LinkedHashSet<>(),
+                    new ArrayList<>());
+                JsonObject candidate = new JsonObject();
+                candidate.addProperty("writeBufferParameter", parameter);
+                NetworkSchemaJson.add(candidate, "rejectReason", analysis.rejectReason());
+                ContainerSequenceSummary summary = analysis.summary();
+                if (summary != null) {
+                    NetworkSchemaJson.add(
+                        candidate,
+                        "wireShape",
+                        summary.codec().wireEvidence.shape);
+                    NetworkSchemaJson.add(
+                        candidate,
+                        "wireLayout",
+                        summary.codec().wireEvidence.layout);
+                }
+                encodeSequences.add(candidate);
+            }
+            loopJson.add("encodeSequenceCandidates", encodeSequences);
+
+            JsonArray callsJson = new JsonArray();
+            for (PcodeOpAST operation : operations) {
+                if (operation.getOpcode() != PcodeOp.CALL) {
+                    continue;
+                }
+                WireShape evidence = directCallWireEvidence(operation);
+                String parameter = uniqueLikelyOutputParameter(function, operation);
+                if (!loop.contains(operation) && evidence == null ||
+                    loop.contains(operation) && evidence == null && parameter == null) {
+                    continue;
+                }
+                JsonObject call = new JsonObject();
+                NetworkSchemaJson.addAddress(
+                    call,
+                    "callsite",
+                    operation.getSeqnum().getTarget(),
+                    addressFormatter);
+                call.addProperty("insideLoop", loop.contains(operation));
+                Function target = pcodeCallTarget(operation);
+                NetworkSchemaJson.add(
+                    call,
+                    "targetName",
+                    target == null ? null : fullFunctionName(target));
+                NetworkSchemaJson.add(
+                    call,
+                    "wireShape",
+                    evidence == null ? null : evidence.shape);
+                NetworkSchemaJson.add(
+                    call,
+                    "wireLayout",
+                    evidence == null ? null : evidence.layout);
+                NetworkSchemaJson.add(call, "outputParameter", parameter);
+                if (!loop.contains(operation) && evidence != null &&
+                    "vlq-u32".equals(evidence.shape)) {
+                    call.addProperty(
+                        "controlsLoop",
+                        countCallControlsLoop(function, high, operation, loop, operations));
+                    if (dynamicExtent != null) {
+                        call.add(
+                            "resizeEvidence",
+                            partitionedFixedSequenceResizeEvidence(
+                                high,
+                                loop,
+                                operations,
+                                dynamicExtent,
+                                operation,
+                                scalarCallOutputStorages(operation)).toJson(addressFormatter));
+                    }
+                }
+                callsJson.add(call);
+            }
+            loopJson.add("calls", callsJson);
+            CollectionOutputShape recovered = countedCollectionOutputFromLoop(
+                function,
+                high,
+                loop,
+                operations);
+            if (recovered != null) {
+                loopJson.addProperty("outputStorage", recovered.storage.expression());
+                NetworkSchemaJson.addAddress(
+                    loopJson,
+                    "countCallsite",
+                    recovered.countCallsite,
+                    addressFormatter);
+                NetworkSchemaJson.add(
+                    loopJson,
+                    "wireShape",
+                    recovered.wireEvidence.shape);
+            }
+            FixedSequenceStorage fixedStorage = fixedSequenceStorage(
+                high,
+                loop,
+                operations);
+            if (fixedStorage != null) {
+                JsonObject fixed = new JsonObject();
+                fixed.addProperty("data", fixedStorage.data().expression());
+                fixed.addProperty("end", fixedStorage.end().expression());
+                fixed.addProperty("stride", fixedStorage.stride());
+                fixed.addProperty("capacity", fixedStorage.capacity());
+                for (NetworkSchemaCodecClassifier.CodecDirection direction :
+                        NetworkSchemaCodecClassifier.CodecDirection.values()) {
+                    String key = direction == NetworkSchemaCodecClassifier.CodecDirection.DECODE
+                        ? "decode"
+                        : "encode";
+                    String buffer = direction == NetworkSchemaCodecClassifier.CodecDirection.DECODE
+                        ? readBufferParameters.size() == 1
+                            ? readBufferParameters.get(0).getAsString()
+                            : null
+                        : uniqueVirtualRawWriteBufferRoot(operations);
+                    WireShape element = fixedSequenceElementWireEvidence(
+                        high,
+                        loop,
+                        operations,
+                        fixedStorage,
+                        buffer,
+                        direction);
+                    PcodeOpAST count = fixedSequenceCountCall(
+                        high,
+                        loop,
+                        operations,
+                        direction);
+                    JsonObject directional = new JsonObject();
+                    NetworkSchemaJson.add(
+                        directional,
+                        "elementLayout",
+                        element == null ? null : element.layout);
+                    NetworkSchemaJson.addAddress(
+                        directional,
+                        "countCall",
+                        count == null ? null : count.getSeqnum().getTarget(),
+                        addressFormatter);
+                    Integer provenCapacity = count == null ? null :
+                        provenFixedSequenceCapacity(
+                            high,
+                            loop,
+                            operations,
+                            fixedStorage,
+                            count,
+                            direction);
+                    directional.addProperty("capacityGuard", provenCapacity != null);
+                    if (provenCapacity != null) {
+                        directional.addProperty("provenCapacity", provenCapacity);
+                    }
+                    if (direction == NetworkSchemaCodecClassifier.CodecDirection.DECODE) {
+                        FixedSequenceResizeEvidence resize = count == null
+                            ? null
+                            : partitionedFixedSequenceResizeEvidence(
+                                high,
+                                loop,
+                                operations,
+                                fixedStorage,
+                                count,
+                                scalarCallOutputStorages(count));
+                        directional.addProperty(
+                            "countControlsExtent",
+                            count != null && countControlsFixedSequenceExtent(
+                                high,
+                                loop,
+                                operations,
+                                fixedStorage,
+                                count));
+                        if (resize != null) {
+                            directional.add("resizeProof", resize.toJson(addressFormatter));
+                        }
+                        NativeTypeInfoEvidence elementType = count == null
+                            ? null
+                            : fixedSequenceElementTypeInfo(
+                                high,
+                                loop,
+                                operations,
+                                fixedStorage,
+                                count);
+                        if (elementType != null) {
+                            directional.add(
+                                "elementTypeInfo",
+                                elementType.toJson(addressFormatter));
+                        }
+                    }
+                    fixed.add(key, directional);
+                }
+                loopJson.add("fixedSequence", fixed);
+            }
+            else {
+                loopJson.add(
+                    "fixedSequenceStorageCandidates",
+                    fixedSequenceStorageCandidatesJson(high, loop, operations));
+            }
+            loopsJson.add(loopJson);
+        }
+        trace.add("loops", loopsJson);
+        return trace;
+    }
+
+    private JsonObject countedCollectionFunctionTraces(String addresses) {
+        JsonObject report = new JsonObject();
+        report.addProperty("schema", "newworld.network_schema.function_traces.v1");
+        report.addProperty("extractorVersion", EXTRACTOR_VERSION);
+        JsonArray traces = new JsonArray();
+        LinkedHashSet<Address> selected = new LinkedHashSet<>();
+        for (String value : addresses.split(",")) {
+            String trimmed = value.trim();
+            if (!trimmed.isEmpty()) {
+                selected.add(moduleRelativeAddress(trimmed));
+            }
+        }
+        for (Address address : selected) {
+            traces.add(countedCollectionFunctionTrace(functionAtOrContaining(address)));
+        }
+        report.add("traces", traces);
+        return report;
+    }
+
+    private JsonArray cursorReadCandidates(
+        HighFunction high,
+        List<PcodeOpAST> operations) {
+        JsonArray candidates = new JsonArray();
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.STORE || operation.getNumInputs() < 3) {
+                continue;
+            }
+            PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+            if (destination == null || !destination.base.matches("param_\\d+")) {
+                continue;
+            }
+            JsonObject candidate = new JsonObject();
+            NetworkSchemaJson.addAddress(
+                candidate,
+                "store",
+                operation.getSeqnum().getTarget(),
+                addressFormatter);
+            candidate.addProperty("destination", destination.expression());
+            CursorAdvanceEvidence advance = cursorAdvance(
+                operation.getInput(2),
+                destination,
+                new LinkedHashSet<>());
+            if (advance != null) {
+                candidate.addProperty("byteCount", advance.byteCount());
+                candidate.addProperty(
+                    "sourcePointer",
+                    pcodeSsaNodeKey(advance.sourcePointer()));
+                PcodeOpAST load = advance.byteCount() > 0L && advance.byteCount() <= 0x1000L
+                    ? uniqueCursorDataLoadBefore(
+                        high,
+                        operations,
+                        operation,
+                        advance.sourcePointer(),
+                        Math.toIntExact(advance.byteCount()))
+                    : null;
+                NetworkSchemaJson.addAddress(
+                    candidate,
+                    "dataLoad",
+                    load == null ? null : load.getSeqnum().getTarget(),
+                    addressFormatter);
+                candidate.add(
+                    "aggregateLoadCandidates",
+                    aggregateCursorLoadCandidatesJson(
+                        high,
+                        operations,
+                        operation,
+                        advance.sourcePointer(),
+                        Math.toIntExact(advance.byteCount())));
+            }
+            candidates.add(candidate);
+        }
+        return candidates;
+    }
+
+    private JsonArray aggregateCursorLoadCandidatesJson(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST cursorStore,
+        Varnode sourcePointer,
+        int byteWidth) {
+
+        JsonArray result = new JsonArray();
+        PcodeMemoryPath sourcePath = pcodeMemoryPath(sourcePointer, 1);
+        for (PcodeOpAST candidate : operations) {
+            if (candidate.getOpcode() != PcodeOp.LOAD ||
+                candidate.getNumInputs() < 2 || candidate.getOutput() == null ||
+                candidate.getOutput().getSize() <= 0 ||
+                candidate.getOutput().getSize() > byteWidth ||
+                candidate.getParent() != cursorStore.getParent() ||
+                !NetworkSchemaControlFlow.precedes(high, candidate, cursorStore)) {
+                continue;
+            }
+            PcodeMemoryPath candidatePath = pcodeMemoryPath(candidate.getInput(1), 1);
+            Long relativeOffset = relativeMemoryOffset(candidatePath, sourcePath);
+            if (relativeOffset == null || relativeOffset < 0L ||
+                relativeOffset + candidate.getOutput().getSize() > byteWidth) {
+                continue;
+            }
+            JsonObject row = new JsonObject();
+            NetworkSchemaJson.addAddress(
+                row,
+                "load",
+                candidate.getSeqnum().getTarget(),
+                addressFormatter);
+            row.addProperty("width", candidate.getOutput().getSize());
+            row.addProperty("relativeOffset", relativeOffset);
+            row.addProperty("sourcePath", sourcePath.toString());
+            row.addProperty("candidatePath", candidatePath.toString());
+            row.addProperty(
+                "feedsStoreBeforeAdvance",
+                loadedValueFeedsStoreBefore(
+                    high,
+                    operations,
+                    candidate,
+                    cursorStore));
+            result.add(row);
+        }
+        return result;
+    }
+
+    private Map<String, CollectionOutputShape> collectionOutputShapesByParameterFromPcode(
+        Function target) {
+
+        if (target == null || target.getEntryPoint() == null) {
+            return Collections.emptyMap();
+        }
+        String context = functionCacheKey("collection-output-shape", target);
+        Map<String, CollectionOutputShape> cached = collectionOutputShapeCache.get(context);
+        if (cached != null) {
+            return cached;
+        }
+        HighFunction high = highFunction(target);
+        if (high == null) {
+            return Collections.emptyMap();
+        }
+
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        LinkedHashMap<String, CollectionOutputShape> result = new LinkedHashMap<>();
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            CollectionOutputShape shape = countedCollectionOutputFromLoop(
+                target,
+                high,
+                loop,
+                operations);
+            if (shape == null) {
+                continue;
+            }
+            CollectionOutputShape previous = result.putIfAbsent(
+                storageKey(shape.storage),
+                shape);
+            if (previous != null &&
+                (!Objects.equals(previous.countCallsite, shape.countCallsite) ||
+                 !sameWireEvidence(previous.wireEvidence, shape.wireEvidence))) {
+                recordNestedTypeShapeReject("ambiguous-counted-collection-output");
+                result.clear();
+                break;
+            }
+        }
+        Map<String, CollectionOutputShape> immutable = Map.copyOf(result);
+        collectionOutputShapeCache.put(context, immutable);
+        return immutable;
+    }
+
+    private CollectionOutputShape countedCollectionOutputFromLoop(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        PcodeOpAST countCall = nearestCountCallForLoop(owner, high, loop, operations);
+        if (countCall == null) {
+            if (hasDominatingVlqCountCandidate(high, loop, operations)) {
+                recordCountedCollectionReject(owner, loop, "count-not-linked-to-loop");
+            }
+            return null;
+        }
+
+        DynamicSequenceExtent extent = dynamicSequenceExtent(loop, operations);
+        PcodeStorage outputStorage;
+        WireShape sequence;
+        Set<Address> codecCallsites;
+        if (extent != null) {
+            String bufferParameter = uniqueReadBufferParameter(owner);
+            CollectionIteration iteration = bufferParameter == null
+                ? null
+                : collectionIteration(
+                    owner,
+                    high,
+                    loop,
+                    operations,
+                    new PcodeStorage(bufferParameter, 0L),
+                    extent);
+            if (iteration == null) {
+                recordCountedCollectionReject(owner, loop, "missing-element-codecs");
+                return null;
+            }
+            outputStorage = directFormalParameterStorage(extent.data());
+            sequence = iteration.wireEvidence();
+            codecCallsites = iteration.codecCallsites();
+        }
+        else {
+            CollectionElementSequence elementSequence = loopElementCodecs(
+                owner,
+                high,
+                loop,
+                operations);
+            if (elementSequence == null || elementSequence.codecs().isEmpty()) {
+                recordCountedCollectionReject(owner, loop, "missing-element-codecs");
+                return null;
+            }
+            List<PcodeCodecCall> elementCodecs = elementSequence.codecs();
+            if (!strictlyOrderedCodecCalls(high, elementCodecs)) {
+                recordCountedCollectionReject(owner, loop, "unordered-element-codecs");
+                return null;
+            }
+            String outputParameter = countedCollectionInsertionOutput(
+                owner,
+                high,
+                loop,
+                operations,
+                elementCodecs);
+            outputStorage = outputParameter == null
+                ? null
+                : new PcodeStorage(outputParameter, 0L);
+            sequence = countedSequenceWireEvidence(elementCodecs);
+            codecCallsites = elementSequence.consumedCallsites();
+        }
+        if (outputStorage == null) {
+            recordCountedCollectionReject(owner, loop, extent == null
+                ? "missing-output-insertion"
+                : "dynamic-output-owner-unproven");
+            return null;
+        }
+        if (sequence == null) {
+            recordCountedCollectionReject(owner, loop, "missing-sequence-wire-evidence");
+        }
+        if (sequence == null) {
+            return null;
+        }
+        countedCollectionsRecovered++;
+        recordCountedCollectionRecovery(
+            owner,
+            loop,
+            outputStorage.expression(),
+            countCall.getSeqnum().getTarget(),
+            sequence);
+        return new CollectionOutputShape(
+                outputStorage,
+                sequence,
+                countCall.getSeqnum().getTarget(),
+                loop.header().getStart(),
+                codecCallsites,
+                null);
+    }
+
+    private PcodeStorage directFormalParameterStorage(PcodeStorage storage) {
+        if (storage == null || storage.offset < 0L) {
+            return null;
+        }
+        if (storage.base != null && storage.base.matches("param_\\d+")) {
+            return storage;
+        }
+        if (!"stack".equals(storage.base)) {
+            return null;
+        }
+        Integer index = stackArgumentParameterIndex(storage.offset);
+        return index == null ? null : new PcodeStorage("param_" + index, 0L);
+    }
+
+    private void recordCountedCollectionRecovery(
+        Function owner,
+        NetworkSchemaNaturalLoop loop,
+        String outputParameter,
+        Address countCallsite,
+        WireShape evidence) {
+
+        if (countedCollectionRecoveredSamples.size() >= 64) {
+            return;
+        }
+        JsonObject sample = new JsonObject();
+        NetworkSchemaJson.addAddress(
+            sample,
+            "function",
+            owner == null ? null : owner.getEntryPoint(),
+            addressFormatter);
+        NetworkSchemaJson.addAddress(
+            sample,
+            "loopHeader",
+            loop == null || loop.header() == null ? null : loop.header().getStart(),
+            addressFormatter);
+        NetworkSchemaJson.add(sample, "outputParameter", outputParameter);
+        NetworkSchemaJson.addAddress(sample, "countCallsite", countCallsite, addressFormatter);
+        NetworkSchemaJson.add(sample, "wireShape", evidence.shape);
+        NetworkSchemaJson.add(sample, "wireLayout", evidence.layout);
+        countedCollectionRecoveredSamples.add(sample);
+    }
+
+    private boolean hasDominatingVlqCountCandidate(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        PcodeOpAST headerOperation = firstLoopHeaderOperation(loop);
+        if (headerOperation == null) {
+            return false;
+        }
+        for (PcodeOpAST operation : operations) {
+            if (loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            WireShape evidence = directCallWireEvidence(operation);
+            if (evidence != null && "vlq-u32".equals(evidence.shape) &&
+                NetworkSchemaControlFlow.precedes(high, operation, headerOperation)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private PcodeOpAST firstLoopHeaderOperation(NetworkSchemaNaturalLoop loop) {
+        var operations = loop.header().getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (operation instanceof PcodeOpAST ast) {
+                return ast;
+            }
+        }
+        return null;
+    }
+
+    private void recordCountedCollectionReject(
+        Function owner,
+        NetworkSchemaNaturalLoop loop,
+        String reason) {
+
+        countedCollectionRejectCounts.merge(reason, 1, Integer::sum);
+        if (countedCollectionRejectSamples.size() >= 64) {
+            return;
+        }
+        JsonObject sample = new JsonObject();
+        NetworkSchemaJson.addAddress(
+            sample,
+            "function",
+            owner == null ? null : owner.getEntryPoint(),
+            addressFormatter);
+        NetworkSchemaJson.add(
+            sample,
+            "functionName",
+            owner == null ? null : fullFunctionName(owner));
+        NetworkSchemaJson.addAddress(
+            sample,
+            "loopHeader",
+            loop == null || loop.header() == null ? null : loop.header().getStart(),
+            addressFormatter);
+        sample.addProperty("reason", reason);
+        countedCollectionRejectSamples.add(sample);
+    }
+
+    private WireShape directCallWireEvidence(PcodeOpAST operation) {
+        Function target = pcodeCallTarget(operation);
+        WireShape rawEvidence = pcodeReadRawWireEvidence(operation, target);
+        if (rawEvidence != null) {
+            return rawEvidence;
+        }
+        String nativeType = unmarshalNativeTypeFromTarget(target);
+        return wireShapeEvidenceFromUnmarshalTarget(target, nativeType);
+    }
+
+    private boolean strictlyOrderedCodecCalls(
+        HighFunction high,
+        List<PcodeCodecCall> codecs) {
+
+        for (int index = 1; index < codecs.size(); index++) {
+            if (!NetworkSchemaControlFlow.precedes(
+                    high,
+                    codecs.get(index - 1).operation(),
+                    codecs.get(index).operation())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private PcodeOpAST countedCollectionInsertionCall(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        List<PcodeCodecCall> codecs) {
+
+        String selectedParameter = null;
+        PcodeOpAST selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL ||
+                directCallWireEvidence(operation) != null ||
+                codecs.stream().anyMatch(codec -> !NetworkSchemaControlFlow.precedes(
+                    high,
+                    codec.operation(),
+                    operation))) {
+                continue;
+            }
+            String parameter = uniqueLikelyOutputParameter(owner, operation);
+            if (parameter == null) {
+                continue;
+            }
+            if (selectedParameter != null && !selectedParameter.equals(parameter)) {
+                return null;
+            }
+            selectedParameter = parameter;
+            if (selected == null || NetworkSchemaControlFlow.precedes(high, operation, selected)) {
+                selected = operation;
+            }
+        }
+        return selected;
+    }
+
+    private String countedCollectionInsertionOutput(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        List<PcodeCodecCall> codecs) {
+
+        PcodeOpAST insertion = countedCollectionInsertionCall(
+            owner,
+            high,
+            loop,
+            operations,
+            codecs);
+        return insertion == null ? null : uniqueLikelyOutputParameter(owner, insertion);
+    }
+
+    private String uniqueLikelyOutputParameter(Function owner, PcodeOp operation) {
+        LinkedHashSet<String> parameters = new LinkedHashSet<>();
+        Function target = pcodeCallTarget(operation);
+        int argumentCount = provenCallArgumentCount(operation, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            PcodeStorage storage = provenCallArgumentStorage(
+                owner,
+                operation,
+                target,
+                slot);
+            String parameter = formalParameterBaseFromStorage(owner, storage);
+            if (isLikelyOutputParameterBase(parameter)) {
+                parameters.add(parameter);
+            }
+        }
+        return parameters.size() == 1 ? parameters.iterator().next() : null;
+    }
+
+    private PcodeOpAST nearestCountCallForLoop(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        PcodeOpAST selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            WireShape evidence = directCallWireEvidence(operation);
+            if (evidence == null || !"vlq-u32".equals(evidence.shape) ||
+                !countCallControlsLoop(owner, high, operation, loop, operations)) {
+                continue;
+            }
+            if (selected == null || NetworkSchemaControlFlow.precedes(
+                    high,
+                    selected,
+                    operation)) {
+                selected = operation;
+                continue;
+            }
+            if (!NetworkSchemaControlFlow.precedes(high, operation, selected)) {
+                return null;
+            }
+        }
+        return selected;
+    }
+
+    private boolean countCallControlsLoop(
+        Function owner,
+        HighFunction high,
+        PcodeOpAST countCall,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        PcodeOpAST headerOperation = firstLoopHeaderOperation(loop);
+        if (headerOperation == null ||
+            !NetworkSchemaControlFlow.precedes(high, countCall, headerOperation)) {
+            return false;
+        }
+        Set<PcodeStorage> candidateStorages = scalarCallOutputStorages(countCall);
+        if (candidateStorages.isEmpty()) {
+            return false;
+        }
+
+        DynamicSequenceExtent extent = dynamicSequenceExtent(loop, operations);
+        if (extent != null && countControlsSequenceExtent(
+                high,
+                loop,
+                operations,
+                extent,
+                countCall)) {
+            return true;
+        }
+
+        ArrayList<PcodeOpAST> inductions = new ArrayList<>();
+        var headerOperations = loop.header().getIterator();
+        while (headerOperations.hasNext()) {
+            PcodeOp operation = headerOperations.next();
+            if (!(operation instanceof PcodeOpAST phi) ||
+                phi.getOpcode() != PcodeOp.MULTIEQUAL || phi.getOutput() == null) {
+                continue;
+            }
+            Long step = affinePointerInductionStride(phi);
+            if (step != null && step > 0L) {
+                inductions.add(phi);
+            }
+        }
+        if (inductions.isEmpty()) {
+            return false;
+        }
+
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CBRANCH ||
+                operation.getNumInputs() < 2) {
+                continue;
+            }
+            Varnode condition = operation.getInput(operation.getNumInputs() - 1);
+            boolean usesInduction = inductions.stream().anyMatch(phi -> pcodeNodeDependsOn(
+                condition,
+                phi.getOutput(),
+                new LinkedHashSet<>(),
+                0));
+            if (!usesInduction) {
+                continue;
+            }
+            long storageMatches = candidateStorages.stream()
+                .filter(storage -> pcodeNodeReferencesStorage(
+                    condition,
+                    storage,
+                    new LinkedHashSet<>(),
+                    0))
+                .count();
+            if (storageMatches == 1L) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private DynamicSequenceExtent dynamicSequenceExtent(
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        DynamicSequenceExtent selected = null;
+        int pointerSize = currentProgram.getDefaultPointerSize();
+        for (PcodeOpAST induction : affineSequenceInductions(loop)) {
+            Long stride = affinePointerInductionStride(induction);
+            PcodeStorage data = fixedSequenceInitialStorage(induction);
+            if (stride == null || stride <= 0L || data == null ||
+                !loopConditionReferencesStorage(loop, operations, data.plus(pointerSize))) {
+                continue;
+            }
+            DynamicSequenceExtent candidate = new DynamicSequenceExtent(
+                data,
+                data.plus(pointerSize),
+                stride);
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private boolean loopConditionReferencesStorage(
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeStorage storage) {
+
+        return operations.stream().anyMatch(operation ->
+            loop.contains(operation) && operation.getOpcode() == PcodeOp.CBRANCH &&
+                operation.getNumInputs() >= 2 && referencesStorage(
+                    operation.getInput(operation.getNumInputs() - 1),
+                    storage));
+    }
+
+    private boolean pcodeNodeReferencesStorage(
+        Varnode node,
+        PcodeStorage expected,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || expected == null || depth > 48 ||
+            !seen.add(pcodeNodeKey(node))) {
+            return false;
+        }
+        PcodeStorage storage = pcodeLoadedStorageExpression(node);
+        if (expected.sameLocation(storage)) {
+            return true;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null || definition.getOpcode() == PcodeOp.CALL ||
+            definition.getOpcode() == PcodeOp.CALLIND) {
+            return false;
+        }
+        int inputs = definition.getOpcode() == PcodeOp.INDIRECT
+            ? Math.min(1, definition.getNumInputs())
+            : definition.getNumInputs();
+        for (int slot = 0; slot < inputs; slot++) {
+            Varnode input = definition.getInput(slot);
+            if (input != null && !input.isConstant() && pcodeNodeReferencesStorage(
+                    input,
+                    expected,
+                    new LinkedHashSet<>(seen),
+                    depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private WireShape countedSequenceWireEvidence(List<PcodeCodecCall> codecs) {
+        ArrayList<String> shapes = new ArrayList<>(codecs.size());
+        ArrayList<String> layouts = new ArrayList<>(codecs.size());
+        boolean semantic = true;
+        for (PcodeCodecCall codec : codecs) {
+            WireShape evidence = codec.evidence();
+            layouts.add(evidence.layout);
+            if (evidence.hasProvenSemantics()) {
+                shapes.add(evidence.shape);
+            }
+            else {
+                semantic = false;
+            }
+        }
+        String elementLayout = compositeWireShape(layouts);
+        if (elementLayout == null) {
+            return null;
+        }
+        String layout = "vec<" + elementLayout + ">";
+        String source = "cfg-counted-loop+ordered-element-codecs";
+        if (!semantic) {
+            return WireShape.layout(layout, source);
+        }
+        String elementShape = compositeWireShape(shapes);
+        return WireShape.semantic("vec<" + elementShape + ">", layout, source);
+    }
+
+    private boolean sameWireEvidence(WireShape left, WireShape right) {
+        return left != null && right != null &&
+            Objects.equals(left.shape, right.shape) &&
+            Objects.equals(left.layout, right.layout);
+    }
+
+    private void markNestedTypeMemberWireOrder(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        PcodeStorage storage,
+        String source) {
+
+        if (byBase == null || storage == null) {
+            return;
+        }
+        Map<Long, NestedTypeMember> members = byBase.get(storage.base);
+        NestedTypeMember member = members == null ? null : members.get(storage.offset);
+        if (member == null || member.wireLayout == null || member.wireOrdinal != null) {
+            return;
+        }
+        member.wireOrdinal = members.values().stream()
+            .map(existing -> existing.wireOrdinal)
+            .filter(Objects::nonNull)
+            .max(Integer::compareTo)
+            .map(ordinal -> ordinal + 1)
+            .orElse(0);
+        member.wireOrderSource = source;
+    }
+
+    private record PcodeCodecCall(PcodeOpAST operation, WireShape evidence) {
+    }

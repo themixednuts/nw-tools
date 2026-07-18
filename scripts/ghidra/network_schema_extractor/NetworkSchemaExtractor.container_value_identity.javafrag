@@ -1,0 +1,555 @@
+    private void collectContainerElementTypeInfo(
+        Address unmarshalFull,
+        String bufferParameter,
+        Long expectedElementStride,
+        Map<String, NativeTypeInfoEvidence> candidates) {
+
+        if (expectedElementStride == null || expectedElementStride <= 0L) {
+            return;
+        }
+        collectContainerElementTypeInfo(
+            functionAtOrContaining(resolvedCodeTarget(unmarshalFull)),
+            bufferParameter,
+            expectedElementStride,
+            new LinkedHashSet<>(),
+            candidates,
+            0);
+    }
+
+    private void collectContainerElementTypeInfo(
+        Function function,
+        String bufferParameter,
+        long expectedElementStride,
+        Set<String> active,
+        Map<String, NativeTypeInfoEvidence> candidates,
+        int depth) {
+
+        if (function == null || bufferParameter == null || depth > 8) {
+            return;
+        }
+        String context = function.getEntryPoint() + "|" + bufferParameter;
+        if (!active.add(context)) {
+            return;
+        }
+        try {
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                return;
+            }
+            NativeTypeInfoEvidence elementType = containerElementTypeInfo(
+                function,
+                high,
+                expectedElementStride);
+            putNativeTypeInfoCandidate(candidates, elementType);
+
+            PcodeStorage readBuffer = new PcodeStorage(bufferParameter, 0L);
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (operation.getOpcode() != PcodeOp.CALL) {
+                    continue;
+                }
+                Function target = pcodeCallTarget(operation);
+                Integer bufferSlot = provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    readBuffer);
+                if (bufferSlot == null) {
+                    continue;
+                }
+                if (target == null || validatedUnmarshalLeaf(
+                        target,
+                        "param_" + bufferSlot) != null) {
+                    continue;
+                }
+                collectContainerElementTypeInfo(
+                    target,
+                    "param_" + bufferSlot,
+                    expectedElementStride,
+                    active,
+                    candidates,
+                    depth + 1);
+            }
+        }
+        finally {
+            active.remove(context);
+        }
+    }
+
+    private NativeTypeInfoEvidence containerElementTypeInfo(
+        Function function,
+        HighFunction high,
+        long expectedElementStride) {
+
+        LinkedHashMap<String, NativeTypeInfoEvidence> byIdentity = new LinkedHashMap<>();
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            for (PcodeOpAST induction : affinePointerInductions(loop, expectedElementStride)) {
+                ElementVptrStore selected = mostDerivedElementVptrStore(high, loop, induction);
+                if (selected == null) {
+                    continue;
+                }
+                NativeTypeInfoEvidence evidence = elementTypeInfoFromVtable(
+                    selected.vtable(),
+                    expectedElementStride);
+                String identity = nativeTypeInfoIdentityKey(evidence);
+                if (identity != null) {
+                    byIdentity.putIfAbsent(identity, evidence);
+                }
+            }
+        }
+        if (byIdentity.size() > 1) {
+            recordNestedTypeShapeReject("ambiguous-container-element-vptr-identity");
+            return null;
+        }
+        return byIdentity.isEmpty() ? null : byIdentity.values().iterator().next();
+    }
+
+    private List<PcodeOpAST> affinePointerInductions(
+        NetworkSchemaNaturalLoop loop,
+        long expectedElementStride) {
+
+        ArrayList<PcodeOpAST> result = new ArrayList<>();
+        var operations = loop.header().getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (!(operation instanceof PcodeOpAST phi) ||
+                phi.getOpcode() != PcodeOp.MULTIEQUAL ||
+                phi.getOutput() == null ||
+                phi.getOutput().getSize() != currentProgram.getDefaultPointerSize()) {
+                continue;
+            }
+            Long stride = affinePointerInductionStride(phi);
+            if (stride != null && stride == expectedElementStride) {
+                result.add(phi);
+            }
+        }
+        return result;
+    }
+
+    private Long affinePointerInductionStride(PcodeOpAST phi) {
+        Long selected = null;
+        for (int slot = 0; slot < phi.getNumInputs(); slot++) {
+            Long stride = affineStepFromPhi(
+                phi.getInput(slot),
+                phi.getOutput(),
+                new LinkedHashSet<>(),
+                0);
+            if (stride == null || stride <= 0L || stride > 0x100000L) {
+                continue;
+            }
+            if (selected != null && !selected.equals(stride)) {
+                return null;
+            }
+            selected = stride;
+        }
+        return selected;
+    }
+
+    private ElementVptrStore mostDerivedElementVptrStore(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        PcodeOpAST induction) {
+
+        ArrayList<ElementVptrStore> stores = new ArrayList<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (!loop.contains(operation)) {
+                continue;
+            }
+            if (operation.getOpcode() == PcodeOp.STORE &&
+                operation.getNumInputs() >= 3) {
+                Long offset = pcodeConstantOffsetFromRoot(
+                    operation.getInput(1),
+                    induction.getOutput(),
+                    new LinkedHashSet<>(),
+                    0);
+                Address vtable = offset != null && offset == 0L
+                    ? uniquePcodeVtableAddress(operation.getInput(2))
+                    : null;
+                if (vtable != null) {
+                    stores.add(new ElementVptrStore(operation, vtable));
+                }
+                continue;
+            }
+            if (operation.getOpcode() == PcodeOp.CALL) {
+                Address vtable = constructorElementVtable(operation, induction);
+                if (vtable != null) {
+                    stores.add(new ElementVptrStore(operation, vtable));
+                }
+            }
+        }
+        if (stores.isEmpty()) {
+            return null;
+        }
+        ElementVptrStore selected = stores.get(stores.size() - 1);
+        for (int index = 0; index + 1 < stores.size(); index++) {
+            if (!NetworkSchemaControlFlow.precedes(
+                high,
+                stores.get(index).operation(),
+                selected.operation())) {
+                recordNestedTypeShapeReject("ambiguous-container-element-vptr-order");
+                return null;
+            }
+        }
+        return selected;
+    }
+
+    private Address constructorElementVtable(
+        PcodeOpAST call,
+        PcodeOpAST induction) {
+
+        if (call == null || induction == null || call.getNumInputs() < 2) {
+            return null;
+        }
+        Long receiverOffset = pcodeConstantOffsetFromRoot(
+            call.getInput(1),
+            induction.getOutput(),
+            new LinkedHashSet<>(),
+            0);
+        Function target = receiverOffset != null && receiverOffset == 0L
+            ? pcodeCallTarget(call)
+            : null;
+        if (target == null) {
+            return null;
+        }
+        VtableWrite selected = null;
+        for (VtableWrite write : constructorVtableWrites(target.getEntryPoint())) {
+            if (write.thisOffset == null || write.thisOffset != 0) {
+                continue;
+            }
+            if (selected != null && write.order <= selected.order) {
+                return null;
+            }
+            selected = write;
+        }
+        return selected == null ? null : selected.vtable;
+    }
+
+    private NativeTypeInfoEvidence elementTypeInfoFromVtable(
+        Address vtable,
+        long expectedElementStride) {
+
+        AzRttiEvidence rtti = decodeAzRttiFromVtable(vtable);
+        String name = rtti == null ? null : rtti.selectedProviderTypeName();
+        if (rtti != null && !isPlausibleTypeName(name) &&
+            isPlausibleTypeName(rtti.typeName)) {
+            name = rtti.typeName;
+        }
+        if (rtti == null || rtti.typeId == null && !isPlausibleTypeName(name)) {
+            recordContainerElementTypeReject(
+                "container-element-vptr-rtti-unresolved",
+                vtable,
+                expectedElementStride,
+                rtti);
+            return null;
+        }
+        NativeSizeEvidence size = exactNativeTypeSizeEvidence(
+            rtti.typeId,
+            name,
+            expectedElementStride);
+        if (size != null) {
+            return new NativeTypeInfoEvidence(
+                vtable,
+                name,
+                normalizeUuid(rtti.typeId),
+                "unmarshal-full-element-vptr+native-size",
+                isPlausibleTypeName(name) ? "az-rtti-vtable-provider" : null,
+                size.size(),
+                size.source());
+        }
+
+        NativeTypeInfoEvidence enclosing = enclosingSerializeElementType(
+            vtable,
+            rtti,
+            expectedElementStride);
+        if (enclosing != null) {
+            return enclosing;
+        }
+
+        if (!hasConflictingElementTypeSizeEvidence(
+                rtti.typeId,
+                name,
+                expectedElementStride)) {
+            return new NativeTypeInfoEvidence(
+                vtable,
+                name,
+                normalizeUuid(rtti.typeId),
+                "unmarshal-full-element-vptr+affine-element-stride",
+                isPlausibleTypeName(name) ? "az-rtti-vtable-provider" : null,
+                expectedElementStride,
+                "container-affine-element-stride");
+        }
+
+        recordContainerElementTypeReject(
+            "container-element-vptr-size-unproven",
+            vtable,
+            expectedElementStride,
+            rtti);
+        return null;
+    }
+
+    private boolean hasConflictingElementTypeSizeEvidence(
+        String typeId,
+        String typeName,
+        long expectedElementStride) {
+
+        String normalized = normalizeUuid(typeId);
+        LinkedHashSet<Long> declaredSizes = serializeDeclaredSizesByTypeId.get(normalized);
+        if (declaredSizes != null && !declaredSizes.isEmpty() &&
+            !declaredSizes.contains(expectedElementStride)) {
+            return true;
+        }
+
+        SerializeTypeInfo reflected = reflectedTypeForIdentity(typeId, typeName);
+        Long reflectedSpan = serializeTypeByteWidth(reflected);
+        // A reflected span may omit native tail padding, but it cannot exceed
+        // the exact affine stride of adjacent constructed elements.
+        return reflectedSpan != null && reflectedSpan > expectedElementStride;
+    }
+
+    private NativeTypeInfoEvidence enclosingSerializeElementType(
+        Address memberVtable,
+        AzRttiEvidence memberRtti,
+        long expectedElementStride) {
+
+        String memberTypeId = normalizeUuid(memberRtti.typeId);
+        if (memberTypeId == null) {
+            return null;
+        }
+        ArrayList<SerializeTypeInfo> matches = new ArrayList<>();
+        for (SerializeTypeInfo candidate :
+                serializeTypesWithExactNativeSize(expectedElementStride)) {
+            boolean firstMemberMatches = candidate.layoutFields.stream().anyMatch(field ->
+                field != null && Long.valueOf(0L).equals(field.offset) &&
+                    uuidEquals(memberTypeId, field.typeId));
+            if (firstMemberMatches) {
+                matches.add(candidate);
+            }
+        }
+        if (matches.size() != 1) {
+            if (matches.size() > 1) {
+                recordNestedTypeShapeReject(
+                    "ambiguous-container-element-first-member-vptr");
+            }
+            return null;
+        }
+        SerializeTypeInfo enclosing = matches.get(0);
+        return new NativeTypeInfoEvidence(
+            memberVtable,
+            enclosing.name,
+            normalizeUuid(enclosing.typeId),
+            "unmarshal-full-element-vptr+first-member+serialize-native-size",
+            "serialize-first-member-type-match",
+            expectedElementStride,
+            "serialize-field-data-size+container-affine-element-stride");
+    }
+
+    private SerializeTypeInfo reflectedTypeForIdentity(String typeId, String typeName) {
+        SerializeTypeInfo reflected = serializeTypesById.get(normalizeUuid(typeId));
+        return reflected != null ? reflected : serializeTypeForTypeName(typeName);
+    }
+
+    private void recordContainerElementTypeReject(
+        String reason,
+        Address vtable,
+        long expectedElementStride,
+        AzRttiEvidence rtti) {
+
+        if (containerValueShapeRejectSamples.size() >=
+            CONTAINER_VALUE_SHAPE_REJECT_SAMPLE_LIMIT) {
+            return;
+        }
+        JsonObject sample = new JsonObject();
+        sample.addProperty("reason", reason);
+        NetworkSchemaJson.add(sample, "elementVtable", formatAddress(vtable));
+        sample.addProperty("expectedElementStride", expectedElementStride);
+        if (rtti != null) {
+            sample.add("azRtti", rtti.toJson());
+        }
+        containerValueShapeRejectSamples.add(sample);
+    }
+
+    private NativeSizeEvidence exactNativeTypeSizeEvidence(
+        String typeId,
+        String typeName,
+        long expectedSize) {
+
+        String normalized = normalizeUuid(typeId);
+        LinkedHashMap<Long, LinkedHashSet<String>> evidence = new LinkedHashMap<>();
+        LinkedHashSet<Long> declaredSizes = serializeDeclaredSizesByTypeId.get(normalized);
+        if (declaredSizes != null) {
+            for (Long size : declaredSizes) {
+                addNativeSizeEvidence(evidence, size, "serialize-field-data-size");
+            }
+        }
+
+        SerializeTypeInfo reflected = serializeTypesById.get(normalized);
+        Long reflectedSpan = serializeTypeByteWidth(reflected);
+        if (reflectedSpan != null && reflectedSpan == expectedSize) {
+            addNativeSizeEvidence(evidence, reflectedSpan, "serialize-exact-field-span");
+        }
+
+        if (isPlausibleTypeName(typeName)) {
+            NestedTypeShape query = new NestedTypeShape();
+            query.typeName = NetworkSchemaText.sourceTypeLeaf(typeName);
+            query.typeNameFull = typeName;
+            for (Structure structure : nestedTypeStructures(query)) {
+                // Ghidra structures may end at the last known member and omit
+                // native tail padding. Their length is exact evidence only
+                // when it agrees with the independently recovered stride.
+                if (structure != null && structure.getLength() == expectedSize) {
+                    addNativeSizeEvidence(
+                        evidence,
+                        (long)structure.getLength(),
+                        "ghidra-structure-size");
+                }
+            }
+        }
+
+        if (evidence.size() != 1 || !evidence.containsKey(expectedSize)) {
+            return null;
+        }
+        return new NativeSizeEvidence(
+            expectedSize,
+            String.join("+", evidence.get(expectedSize)));
+    }
+
+    private void addNativeSizeEvidence(
+        Map<Long, LinkedHashSet<String>> evidence,
+        Long size,
+        String source) {
+
+        if (size != null && size > 0L && size <= 0x1000000L) {
+            evidence.computeIfAbsent(size, ignored -> new LinkedHashSet<>()).add(source);
+        }
+    }
+
+    private Long pcodeConstantOffsetFromRoot(
+        Varnode node,
+        Varnode root,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || root == null || depth > 48) {
+            return null;
+        }
+        if (sameVarnodeIdentity(node, root)) {
+            return 0L;
+        }
+        if (!seen.add(pcodeNodeKey(node))) {
+            return null;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return null;
+        }
+        if (transparentPcodeDefinition(definition)) {
+            return pcodeConstantOffsetFromRoot(
+                definition.getInput(0),
+                root,
+                seen,
+                depth + 1);
+        }
+        return switch (definition.getOpcode()) {
+            case PcodeOp.INT_ADD -> pcodeAddOffsetFromRoot(
+                definition, root, seen, depth + 1);
+            case PcodeOp.INT_SUB -> pcodeSubtractOffsetFromRoot(
+                definition, root, seen, depth + 1);
+            case PcodeOp.PTRADD -> pcodePtrAddOffsetFromRoot(
+                definition, root, seen, depth + 1);
+            case PcodeOp.PTRSUB -> pcodePtrSubOffsetFromRoot(
+                definition, root, seen, depth + 1);
+            default -> null;
+        };
+    }
+
+    private Long pcodeAddOffsetFromRoot(
+        PcodeOp operation,
+        Varnode root,
+        Set<String> seen,
+        int depth) {
+
+        if (operation.getNumInputs() != 2) {
+            return null;
+        }
+        for (int rootSlot = 0; rootSlot < 2; rootSlot++) {
+            Long base = pcodeConstantOffsetFromRoot(
+                operation.getInput(rootSlot),
+                root,
+                new LinkedHashSet<>(seen),
+                depth);
+            Long constant = NetworkSchemaIntegerEvaluator.evaluate(
+                operation.getInput(1 - rootSlot));
+            if (base != null && constant != null) {
+                return addExactOrNull(base, constant);
+            }
+        }
+        return null;
+    }
+
+    private Long pcodeSubtractOffsetFromRoot(
+        PcodeOp operation,
+        Varnode root,
+        Set<String> seen,
+        int depth) {
+
+        if (operation.getNumInputs() != 2) {
+            return null;
+        }
+        Long base = pcodeConstantOffsetFromRoot(
+            operation.getInput(0),
+            root,
+            new LinkedHashSet<>(seen),
+            depth);
+        Long constant = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(1));
+        return base == null || constant == null ? null : subtractExactOrNull(base, constant);
+    }
+
+    private Long pcodePtrAddOffsetFromRoot(
+        PcodeOp operation,
+        Varnode root,
+        Set<String> seen,
+        int depth) {
+
+        if (operation.getNumInputs() != 3) {
+            return null;
+        }
+        Long base = pcodeConstantOffsetFromRoot(
+            operation.getInput(0),
+            root,
+            new LinkedHashSet<>(seen),
+            depth);
+        Long index = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(1));
+        Long scale = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(2));
+        if (base == null || index == null || scale == null) {
+            return null;
+        }
+        try {
+            return Math.addExact(base, Math.multiplyExact(index, scale));
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private Long pcodePtrSubOffsetFromRoot(
+        PcodeOp operation,
+        Varnode root,
+        Set<String> seen,
+        int depth) {
+
+        if (operation.getNumInputs() != 2) {
+            return null;
+        }
+        Long base = pcodeConstantOffsetFromRoot(
+            operation.getInput(0),
+            root,
+            new LinkedHashSet<>(seen),
+            depth);
+        Long offset = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(1));
+        return base == null || offset == null ? null : addExactOrNull(base, offset);
+    }
+
+    private record ElementVptrStore(PcodeOpAST operation, Address vtable) {
+    }
+
+    private record NativeSizeEvidence(long size, String source) {
+    }

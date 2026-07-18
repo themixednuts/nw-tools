@@ -68,6 +68,12 @@ impl<'a> AssetValue<'a> {
 
     #[inline]
     #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.guid.is_nil() && self.sub_id == 0 && self.hint.trim().is_empty()
+    }
+
+    #[inline]
+    #[must_use]
     pub fn into_asset_reference(self) -> AssetReference {
         let hint = (!self.hint.trim().is_empty()).then(|| self.hint.to_string());
         AssetReference::new(
@@ -88,9 +94,6 @@ pub enum AssetValueError {
 
     #[error("AZ::Data::Asset has {actual} bytes, expected at least {expected}")]
     TooShort { expected: usize, actual: usize },
-
-    #[error("AZ::Data::Asset sub id overflows u32")]
-    SubIdOverflow(#[from] TryFromIntError),
 
     #[error("AZ::Data::Asset hint is not valid UTF-8")]
     Utf8(#[from] Utf8Error),
@@ -226,7 +229,7 @@ pub fn collect_asset_references(
     for element in stream.iter_recursive() {
         let reference = if element.id() == &types::ASSET && element.data().is_some() {
             let value = read_asset_value(element)?;
-            Some(value.into_asset_reference())
+            (!value.is_empty()).then(|| value.into_asset_reference())
         } else if element.id() != &SIMPLE_ASSET_REFERENCE_BASE_TYPE_ID
             && has_reflected_asset_path(element)
         {
@@ -581,48 +584,28 @@ impl SimpleAssetReferenceLayout {
 
 #[derive(Debug, Clone)]
 struct AssetValueLayout {
-    sub_id: SubIdLayout,
     asset_type_offset: usize,
     hint_len_offset: usize,
     hint_offset: usize,
-    reserved: Option<std::ops::Range<usize>>,
 }
 
 impl AssetValueLayout {
-    const PADDED: Self = Self {
-        sub_id: SubIdLayout::U32,
+    const ASSET_ID_32: Self = Self {
         asset_type_offset: 32,
         hint_len_offset: 48,
         hint_offset: 56,
-        reserved: Some(20..32),
     };
-    const U32_RESERVED: Self = Self {
-        sub_id: SubIdLayout::U32,
+    const ASSET_ID_24: Self = Self {
         asset_type_offset: 24,
         hint_len_offset: 40,
         hint_offset: 48,
-        reserved: Some(20..24),
     };
-    const U64_SUB_ID: Self = Self {
-        sub_id: SubIdLayout::U64,
-        asset_type_offset: 24,
-        hint_len_offset: 40,
-        hint_offset: 48,
-        reserved: None,
-    };
-    const COMPACT: Self = Self {
-        sub_id: SubIdLayout::U32,
+    const ASSET_ID_20: Self = Self {
         asset_type_offset: 20,
         hint_len_offset: 36,
         hint_offset: 44,
-        reserved: None,
     };
-    const CANDIDATES: &'static [Self] = &[
-        Self::PADDED,
-        Self::U32_RESERVED,
-        Self::U64_SUB_ID,
-        Self::COMPACT,
-    ];
+    const CANDIDATES: &'static [Self] = &[Self::ASSET_ID_32, Self::ASSET_ID_24, Self::ASSET_ID_20];
 
     fn read(data: &[u8]) -> Result<AssetValue<'_>, AssetValueError> {
         let minimum_len = Self::CANDIDATES
@@ -650,12 +633,6 @@ impl AssetValueLayout {
         if data.len() < self.hint_offset {
             return Ok(None);
         }
-        if let Some(reserved) = &self.reserved
-            && data[reserved.clone()].iter().any(|byte| *byte != 0)
-        {
-            return Ok(None);
-        }
-
         let Ok(hint_len) = usize::try_from(u64::from_be_bytes(
             data[self.hint_len_offset..self.hint_len_offset + 8]
                 .try_into()
@@ -669,7 +646,8 @@ impl AssetValueLayout {
         }
 
         let guid = Uuid::from_bytes(data[0..16].try_into().expect("guid slice is sixteen bytes"));
-        let sub_id = self.sub_id.read(data)?;
+        let sub_id =
+            u32::from_be_bytes(data[16..20].try_into().expect("sub id slice is four bytes"));
         let asset_type = Uuid::from_bytes(
             data[self.asset_type_offset..self.asset_type_offset + 16]
                 .try_into()
@@ -678,28 +656,6 @@ impl AssetValueLayout {
         let hint = std::str::from_utf8(&data[self.hint_offset..])?;
 
         Ok(Some(AssetValue::new(guid, sub_id, asset_type, hint)))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SubIdLayout {
-    U32,
-    U64,
-}
-
-impl SubIdLayout {
-    fn read(self, data: &[u8]) -> Result<u32, AssetValueError> {
-        match self {
-            Self::U32 => Ok(u32::from_be_bytes(
-                data[16..20].try_into().expect("sub id slice is four bytes"),
-            )),
-            Self::U64 => Ok(u64::from_be_bytes(
-                data[16..24]
-                    .try_into()
-                    .expect("sub id slice is eight bytes"),
-            )
-            .try_into()?),
-        }
     }
 }
 
@@ -724,13 +680,13 @@ mod tests {
     }
 
     #[test]
-    fn reads_source_uuid_sub_id_from_first_uuid_word() {
+    fn ignores_nonzero_asset_id_abi_padding() {
         let guid = uuid!("699fa9e5-4f8a-5b01-87b2-d5f718c927b8");
-        let source_sub_id = uuid!("d087f9c9-0000-0000-0000-000000000000");
         let asset_type = uuid!("c2869e3b-dda0-4e01-8fe3-6770d788866b");
-        let element = Element::new(types::ASSET).with_data(source_uuid_sub_id_asset_bytes(
+        let element = Element::new(types::ASSET).with_data(asset_bytes_with_padding(
             guid,
-            source_sub_id,
+            0xd087_f9c9,
+            [0xa5; 12],
             asset_type,
             "slices/dungeon/firstlight/ancientgrate_circular__28236438930.cgf",
         ));
@@ -740,6 +696,25 @@ mod tests {
         assert_eq!(asset.guid(), guid);
         assert_eq!(asset.sub_id(), 0xd087_f9c9);
         assert_eq!(asset.asset_type(), asset_type);
+    }
+
+    #[test]
+    fn skips_empty_asset_with_nonzero_abi_padding() {
+        let element = Element::new(types::ASSET).with_data(asset_bytes_with_padding(
+            Uuid::nil(),
+            0,
+            [0xa5; 12],
+            Uuid::nil(),
+            "",
+        ));
+        let stream = crate::ObjectStream {
+            elements: vec![element],
+            ..crate::ObjectStream::new(3)
+        };
+
+        let references = collect_asset_references(&stream).unwrap();
+
+        assert!(references.is_empty());
     }
 
     #[test]
@@ -988,15 +963,17 @@ mod tests {
         bytes
     }
 
-    fn source_uuid_sub_id_asset_bytes(
+    fn asset_bytes_with_padding(
         guid: Uuid,
-        sub_id: Uuid,
+        sub_id: u32,
+        padding: [u8; 12],
         asset_type: Uuid,
         hint: &str,
     ) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(56 + hint.len());
         bytes.extend_from_slice(guid.as_bytes());
-        bytes.extend_from_slice(sub_id.as_bytes());
+        bytes.extend_from_slice(&sub_id.to_be_bytes());
+        bytes.extend_from_slice(&padding);
         bytes.extend_from_slice(asset_type.as_bytes());
         bytes.extend_from_slice(&(hint.len() as u64).to_be_bytes());
         bytes.extend_from_slice(hint.as_bytes());

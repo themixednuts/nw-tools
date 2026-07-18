@@ -277,63 +277,6 @@
             normalized.contains("_alloca_probe");
     }
 
-    private TrackedValue formattedFieldNameCallValue(
-        Instruction instruction,
-        ForwardArgState state) {
-
-        if (!instruction.getFlowType().isCall()) {
-            return null;
-        }
-
-        TrackedValue destination = state.registers.get("RCX");
-        TrackedValue formatValue = state.registers.get("RDX");
-        TrackedValue indexValue = state.registers.get("R8");
-        if (destination == null || destination.stackOffset == null ||
-            formatValue == null || formatValue.address == null ||
-            indexValue == null || indexValue.immediate == null) {
-            return null;
-        }
-
-        String format = readPrintableString(formatValue.address);
-        String fieldName = renderFormattedFieldName(format, indexValue.immediate);
-        return fieldName == null ? null : TrackedValue.fieldName(formatValue.address, fieldName);
-    }
-
-    private String renderFormattedFieldName(String format, long index) {
-        if (!isLikelyFieldNameFormat(format) || index < 0 || index > 4096) {
-            return null;
-        }
-
-        Matcher matcher = Pattern.compile("%(?:0?\\d+)?[du]").matcher(format);
-        if (!matcher.find() || matcher.find()) {
-            return null;
-        }
-
-        String rendered = format.replaceFirst(
-            "%(?:0?\\d+)?[du]",
-            Long.toUnsignedString(index));
-        return isLikelyFieldName(rendered) ? rendered : null;
-    }
-
-    private boolean isLikelyFieldNameFormat(String value) {
-        if (value == null || value.isBlank() || value.length() > 96) {
-            return false;
-        }
-        if (!value.contains("%")) {
-            return false;
-        }
-        if (value.indexOf(' ') >= 0 || value.indexOf('\\') >= 0 || value.indexOf('/') >= 0) {
-            return false;
-        }
-        String withoutPlaceholder = value.replaceAll("%(?:0?\\d+)?[du]", "0");
-        return isLikelyFieldName(withoutPlaceholder);
-    }
-
-    private boolean isLikelyFieldName(String value) {
-        return value != null &&
-            value.matches("[A-Za-z_][A-Za-z0-9_]*");
-    }
-
     private boolean isAllocatorCall(Instruction instruction, ForwardArgState state) {
         Function target = functionAtOrContaining(callTarget(instruction));
         String targetName = fullFunctionName(target);
@@ -391,50 +334,36 @@
             return cached;
         }
 
-        boolean result = false;
-        int count = 0;
-        boolean sawAllocatorDispatch = false;
-        LinkedHashSet<String> allocatorDispatchRegisters = new LinkedHashSet<>();
-        for (Instruction instruction : functionInstructions(function)) {
-            if (count++ >= VTABLE_SCAN_LIMIT) {
-                break;
-            }
-            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-            if (mnemonic == null) {
-                continue;
-            }
-            if (instruction.getFlowType().isCall()) {
-                String callRegister = NetworkSchemaX86.registerOperand(instruction, 0);
-                if (isAllocatorVtableDispatch(instruction)) {
-                    sawAllocatorDispatch = true;
+        HighFunction high = highFunction(function);
+        PcodeOpAST selectedOrigin = null;
+        boolean sawValueReturn = false;
+        boolean result = high != null;
+        if (high != null) {
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (operation.getOpcode() != PcodeOp.RETURN ||
+                    operation.getNumInputs() < 2) {
+                    continue;
                 }
-                else if (callRegister != null &&
-                    allocatorDispatchRegisters.contains(callRegister)) {
-                    sawAllocatorDispatch = true;
+                Varnode value = operation.getInput(operation.getNumInputs() - 1);
+                if (value == null || value.isConstant()) {
+                    continue;
                 }
-                else if (isNamedAllocatorFunction(
-                    fullFunctionName(functionAtOrContaining(callTarget(instruction))))) {
-                    sawAllocatorDispatch = true;
+                sawValueReturn = true;
+                PcodeOpAST origin = uniquePcodeCallOrigin(value);
+                if (!isPcodeAllocatorCall(origin)) {
+                    result = false;
+                    break;
                 }
-                continue;
-            }
-            if (sawAllocatorDispatch && mnemonic.startsWith("RET")) {
-                result = true;
-                break;
-            }
-            if (sawAllocatorDispatch && writesReturnRegister(instruction)) {
-                break;
-            }
-            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
-            if (destination != null) {
-                if ("MOV".equals(mnemonic) && isAllocatorVtableSlotLoad(instruction)) {
-                    allocatorDispatchRegisters.add(destination);
+                if (selectedOrigin == null) {
+                    selectedOrigin = origin;
                 }
-                else {
-                    allocatorDispatchRegisters.remove(destination);
+                else if (selectedOrigin != origin) {
+                    result = false;
+                    break;
                 }
             }
         }
+        result = result && sawValueReturn && selectedOrigin != null;
 
         allocatorReturnFunctionCache.put(key, result);
         return result;
@@ -478,14 +407,6 @@
         return address != null &&
             address.displacement == 8 &&
             !address.terms.isEmpty();
-    }
-
-    private boolean writesReturnRegister(Instruction instruction) {
-        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-        if (mnemonic == null || !writesRegister(mnemonic)) {
-            return false;
-        }
-        return isReturnRegister(NetworkSchemaX86.registerOperand(instruction, 0));
     }
 
     private String allocationBaseKey(Address callsite) {
@@ -681,7 +602,7 @@
         Instruction instruction,
         String pattern) {
 
-        String key = baseOffsetKey(baseKey, baseOffset);
+        ObjectOffset key = baseOffsetKey(baseKey, baseOffset);
         state.vtablesByBaseOffset.put(key, vtable);
         state.handlerConstructionsByBaseOffset.put(
             key,
@@ -715,8 +636,8 @@
         return "this-slot:0x" + Integer.toHexString(offset);
     }
 
-    private String baseOffsetKey(String baseKey, int offset) {
-        return baseKey + "@0x" + Integer.toHexString(offset);
+    private ObjectOffset baseOffsetKey(String baseKey, int offset) {
+        return new ObjectOffset(baseKey, offset);
     }
 
     private void adjustTrackedRegister(ForwardArgState state, String register, int delta) {
@@ -758,9 +679,11 @@
             return null;
         }
 
-        if (left == null || right == null ||
-            left.immediate == null || right.immediate == null) {
+        if (left == null || right == null) {
             return null;
+        }
+        if (left.immediate == null || right.immediate == null) {
+            return mergedTrackedDependencies(left, right);
         }
         try {
             return TrackedValue.immediate(Math.multiplyExact(left.immediate, right.immediate));
@@ -788,12 +711,15 @@
         if (left.immediate != null) {
             return addTrackedOffset(right, left.immediate);
         }
-        return null;
+        return mergedTrackedDependencies(left, right);
     }
 
     private TrackedValue subtractTrackedValues(TrackedValue left, TrackedValue right) {
-        if (left == null || right == null || right.immediate == null) {
+        if (left == null || right == null) {
             return null;
+        }
+        if (right.immediate == null) {
+            return mergedTrackedDependencies(left, right);
         }
         try {
             return addTrackedOffset(left, Math.negateExact(right.immediate));
@@ -804,8 +730,11 @@
     }
 
     private TrackedValue trackedUnaryIntegerValue(String mnemonic, TrackedValue value) {
-        if (value == null || value.immediate == null) {
+        if (value == null) {
             return null;
+        }
+        if (value.immediate == null) {
+            return TrackedValue.storageDependencies(value.storageDependencies);
         }
         try {
             return switch (mnemonic) {
@@ -825,16 +754,22 @@
         TrackedValue left,
         TrackedValue right) {
 
-        if (left == null || right == null || right.immediate == null) {
+        if (left == null || right == null) {
             return null;
+        }
+        if (right.immediate == null) {
+            return mergedTrackedDependencies(left, right);
         }
 
         if (left.immediate == null) {
-            return switch (mnemonic) {
+            TrackedValue identity = switch (mnemonic) {
                 case "AND" -> right.immediate == -1L ? left.copy() : null;
                 case "OR", "XOR" -> right.immediate == 0L ? left.copy() : null;
                 default -> null;
             };
+            return identity == null
+                ? TrackedValue.storageDependencies(left.storageDependencies)
+                : identity;
         }
 
         long leftValue = left.immediate;
@@ -887,6 +822,16 @@
             return null;
         }
         return value.addOffset((int)delta);
+    }
+
+    private TrackedValue mergedTrackedDependencies(TrackedValue left, TrackedValue right) {
+        if (left == null || right == null) {
+            return null;
+        }
+        LinkedHashSet<PcodeStorage> dependencies = new LinkedHashSet<>(
+            left.storageDependencies);
+        dependencies.addAll(right.storageDependencies);
+        return TrackedValue.storageDependencies(dependencies);
     }
 
     private int operandCount(Instruction instruction) {

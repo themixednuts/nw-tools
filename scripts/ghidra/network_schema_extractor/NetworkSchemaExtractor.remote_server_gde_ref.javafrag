@@ -1,0 +1,363 @@
+    private WireShape remoteServerGdeRefHandlerShape(
+        Address handlerVtable,
+        WireShape physicalShape,
+        HandlerWireShapeEvidence wireEvidence,
+        HandlerValueTypeRecovery valueType,
+        Address marshalAddress,
+        Address unmarshalAddress) {
+
+        if (handlerVtable == null || physicalShape == null ||
+            !"fixed-bytes-16".equals(physicalShape.layout) ||
+            wireEvidence == null || wireEvidence.unmarshalEvents.size() != 1 ||
+            valueType == null || valueType.typeShape() == null ||
+            !Boolean.TRUE.equals(valueType.typeShape().identityProven) ||
+            valueType.typeShape().typeId == null) {
+            return null;
+        }
+
+        NestedTypeShape valueShape = valueType.typeShape();
+        SerializeTypeInfo reflected = serializeTypesById.get(
+            normalizeUuid(valueShape.typeId));
+        Long nativeSize = reflected == null ? null : serializeTypeByteWidth(reflected);
+        if (reflected == null || nativeSize == null || nativeSize != 40L ||
+            !uuidEquals(reflected.typeId, REMOTE_SERVER_GDE_REF_TYPE_ID)) {
+            return null;
+        }
+
+        List<SerializeWireSlot> slots = serializeTypeNativeWireLayout(reflected.typeId);
+        if (slots.size() != 2) {
+            return null;
+        }
+        SerializeWireSlot actorId = slots.get(0);
+        SerializeWireSlot targetId = slots.get(1);
+        if (actorId.offset != 16L ||
+            !"fixed-bytes-16".equals(actorId.wireShape) ||
+            targetId.offset != 32L || !"u64".equals(targetId.wireShape)) {
+            return null;
+        }
+
+        List<HandlerValueWindow> windows = handlerValueStorageWindows(handlerVtable);
+        if (windows.size() != 1 || windows.get(0).nativeSize() != nativeSize) {
+            return null;
+        }
+        long valueRoot = windows.get(0).rootOffset();
+        Long actorStorageOffset = addExactOrNull(valueRoot, actorId.offset);
+        Long targetStorageOffset = addExactOrNull(valueRoot, targetId.offset);
+        if (actorStorageOffset == null || targetStorageOffset == null) {
+            return null;
+        }
+
+        Function marshal = functionAtOrContaining(resolvedCodeTarget(marshalAddress));
+        Function unmarshal = functionAtOrContaining(resolvedCodeTarget(unmarshalAddress));
+        if (!marshalWritesRemoteServerGdeActorId(marshal, actorStorageOffset) ||
+            !unmarshalBuildsRemoteServerGdeRef(
+                unmarshal,
+                wireEvidence.unmarshalEvents.get(0),
+                actorStorageOffset,
+                targetStorageOffset)) {
+            return null;
+        }
+
+        return WireShape.semantic(
+            "remote-server-gde-ref",
+            "fixed-bytes-16",
+            "reflected-value-layout+marshal-pcode+unmarshal-pcode-low-u64-projection");
+    }
+
+    private boolean marshalWritesRemoteServerGdeActorId(
+        Function function,
+        long actorStorageOffset) {
+
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return false;
+        }
+        int matches = 0;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if ((operation.getOpcode() != PcodeOp.CALL &&
+                    operation.getOpcode() != PcodeOp.CALLIND) ||
+                operation.getNumInputs() < 4 ||
+                !pcodeStorageIs(operation.getInput(1), "param_2", 0L) ||
+                !pcodeStorageIs(
+                    operation.getInput(2),
+                    "param_1",
+                    actorStorageOffset) ||
+                !constantPcodeValueIs(operation.getInput(3), 16L)) {
+                continue;
+            }
+            matches++;
+        }
+        return matches == 1;
+    }
+
+    private boolean unmarshalBuildsRemoteServerGdeRef(
+        Function function,
+        CodecWireEvent rawRead,
+        long actorStorageOffset,
+        long targetStorageOffset) {
+
+        HighFunction high = highFunction(function);
+        if (high == null || rawRead == null || rawRead.callsite() == null) {
+            return false;
+        }
+        PcodeOpAST read = pcodeCallAt(high, rawRead.callsite());
+        if (read == null || read.getNumInputs() < 4 ||
+            !pcodeStorageIs(read.getInput(1), "param_2", 0L) ||
+            !constantPcodeValueIs(read.getInput(3), 16L)) {
+            return false;
+        }
+        PcodeStorage rawStorage = pcodeStorageExpression(read.getInput(2));
+        if (!isPcodeLocalTempStorage(rawStorage) ||
+            !storesContiguousBytes(
+                high,
+                new PcodeStorage("param_1", actorStorageOffset),
+                rawStorage,
+                16)) {
+            return false;
+        }
+
+        int projections = 0;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL ||
+                operation.getNumInputs() < 3 ||
+                operation.getSeqnum().getTarget().equals(rawRead.callsite())) {
+                continue;
+            }
+            PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+            PcodeStorage source = pcodeStorageExpression(operation.getInput(2));
+            Function target = pcodeCallTarget(operation);
+            if (!isPcodeLocalTempStorage(destination) ||
+                source == null || !source.sameLocation(rawStorage) ||
+                !functionCopiesParameterBytes(target, 8)) {
+                continue;
+            }
+            if (!storesContiguousBytes(
+                    high,
+                    new PcodeStorage("param_1", targetStorageOffset),
+                    destination,
+                    8)) {
+                continue;
+            }
+            projections++;
+        }
+        return projections == 1;
+    }
+
+    private PcodeOpAST pcodeCallAt(HighFunction high, Address callsite) {
+        PcodeOpAST selected = null;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if ((operation.getOpcode() != PcodeOp.CALL &&
+                    operation.getOpcode() != PcodeOp.CALLIND) ||
+                operation.getSeqnum() == null ||
+                !callsite.equals(operation.getSeqnum().getTarget())) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = operation;
+        }
+        return selected;
+    }
+
+    private boolean functionCopiesParameterBytes(Function function, int byteLength) {
+        HighFunction high = highFunction(function);
+        if (high == null || byteLength <= 0) {
+            return false;
+        }
+        int matches = 0;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3 ||
+                !pcodeStorageIs(operation.getInput(1), "param_1", 0L)) {
+                continue;
+            }
+            PcodeByteSpan source = pcodeByteSpan(
+                operation.getInput(2),
+                new LinkedHashSet<>(),
+                0);
+            if (source == null || source.byteLength() != byteLength ||
+                !source.storage().sameLocation(new PcodeStorage("param_2", 0L))) {
+                return false;
+            }
+            matches++;
+        }
+        return matches == 1;
+    }
+
+    private boolean storesContiguousBytes(
+        HighFunction high,
+        PcodeStorage destination,
+        PcodeStorage source,
+        int byteLength) {
+
+        if (high == null || destination == null || source == null || byteLength <= 0) {
+            return false;
+        }
+        boolean[] covered = new boolean[byteLength];
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.STORE || operation.getNumInputs() < 3) {
+                continue;
+            }
+            PcodeStorage storedAt = pcodeStorageExpression(operation.getInput(1));
+            PcodeByteSpan storedValue = pcodeByteSpan(
+                operation.getInput(2),
+                new LinkedHashSet<>(),
+                0);
+            if (storedAt == null || storedValue == null ||
+                !storedAt.base.equals(destination.base) ||
+                !storedValue.storage().base.equals(source.base)) {
+                continue;
+            }
+            long destinationDelta = storedAt.offset - destination.offset;
+            long sourceDelta = storedValue.storage().offset - source.offset;
+            if (destinationDelta != sourceDelta || destinationDelta < 0L ||
+                destinationDelta > byteLength ||
+                storedValue.byteLength() > byteLength - destinationDelta) {
+                continue;
+            }
+            for (int index = 0; index < storedValue.byteLength(); index++) {
+                int byteIndex = Math.toIntExact(destinationDelta) + index;
+                if (covered[byteIndex]) {
+                    return false;
+                }
+                covered[byteIndex] = true;
+            }
+        }
+        for (boolean value : covered) {
+            if (!value) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private PcodeByteSpan pcodeByteSpan(
+        Varnode value,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || value.getSize() <= 0 || depth > 48 ||
+            !active.add(pcodeSsaNodeKey(value))) {
+            return null;
+        }
+        try {
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                PcodeStorage storage = pcodeStorageExpression(value);
+                return storage == null ? null : new PcodeByteSpan(storage, value.getSize());
+            }
+            return switch (definition.getOpcode()) {
+                case PcodeOp.LOAD -> {
+                    PcodeStorage storage = definition.getNumInputs() < 2
+                        ? null
+                        : pcodeStorageExpression(definition.getInput(1));
+                    yield storage == null
+                        ? null
+                        : new PcodeByteSpan(storage, value.getSize());
+                }
+                case PcodeOp.COPY, PcodeOp.CAST -> pcodeByteSpan(
+                    definition.getInput(0), active, depth + 1);
+                case PcodeOp.INDIRECT -> {
+                    PcodeStorage storage = pcodeStorageExpression(value);
+                    yield storage == null
+                        ? null
+                        : new PcodeByteSpan(storage, value.getSize());
+                }
+                case PcodeOp.SUBPIECE -> subpieceByteSpan(definition, active, depth + 1);
+                case PcodeOp.PIECE -> pieceByteSpan(definition, active, depth + 1);
+                case PcodeOp.MULTIEQUAL -> phiByteSpan(definition, active, depth + 1);
+                default -> null;
+            };
+        }
+        finally {
+            active.remove(pcodeSsaNodeKey(value));
+        }
+    }
+
+    private PcodeByteSpan subpieceByteSpan(
+        PcodeOp definition,
+        Set<String> active,
+        int depth) {
+
+        if (definition.getNumInputs() < 2 || !definition.getInput(1).isConstant()) {
+            return null;
+        }
+        PcodeByteSpan source = pcodeByteSpan(
+            definition.getInput(0),
+            new LinkedHashSet<>(active),
+            depth);
+        long dropped = definition.getInput(1).getOffset();
+        int outputSize = definition.getOutput() == null
+            ? 0
+            : definition.getOutput().getSize();
+        if (source == null || dropped > source.byteLength() || outputSize <= 0 ||
+            outputSize > source.byteLength() - dropped) {
+            return null;
+        }
+        return new PcodeByteSpan(source.storage().plus(dropped), outputSize);
+    }
+
+    private PcodeByteSpan pieceByteSpan(
+        PcodeOp definition,
+        Set<String> active,
+        int depth) {
+
+        if (definition.getNumInputs() != 2) {
+            return null;
+        }
+        PcodeByteSpan high = pcodeByteSpan(
+            definition.getInput(0),
+            new LinkedHashSet<>(active),
+            depth);
+        PcodeByteSpan low = pcodeByteSpan(
+            definition.getInput(1),
+            new LinkedHashSet<>(active),
+            depth);
+        if (high == null || low == null ||
+            !high.storage().base.equals(low.storage().base) ||
+            high.storage().offset != low.storage().offset + low.byteLength()) {
+            return null;
+        }
+        return new PcodeByteSpan(
+            low.storage(),
+            Math.addExact(low.byteLength(), high.byteLength()));
+    }
+
+    private PcodeByteSpan phiByteSpan(
+        PcodeOp definition,
+        Set<String> active,
+        int depth) {
+
+        PcodeByteSpan selected = null;
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            PcodeByteSpan candidate = pcodeByteSpan(
+                definition.getInput(slot),
+                new LinkedHashSet<>(active),
+                depth);
+            if (candidate == null || selected != null && !selected.same(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private boolean pcodeStorageIs(Varnode value, String base, long offset) {
+        PcodeStorage storage = pcodeStorageExpression(value);
+        return storage != null && storage.base.equals(base) && storage.offset == offset;
+    }
+
+    private boolean constantPcodeValueIs(Varnode value, long expected) {
+        Long actual = NetworkSchemaIntegerEvaluator.evaluate(value);
+        return actual != null && actual == expected;
+    }
+
+    private record PcodeByteSpan(PcodeStorage storage, int byteLength) {
+        boolean same(PcodeByteSpan other) {
+            return other != null && byteLength == other.byteLength &&
+                storage.sameLocation(other.storage);
+        }
+    }
+    private static final String REMOTE_SERVER_GDE_REF_TYPE_ID =
+        "17207DAC-730B-4793-B975-23591A950260";

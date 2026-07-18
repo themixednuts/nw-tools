@@ -1,63 +1,405 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
+use base64::Engine;
 use nw_datasheet::ColumnType;
+use oxc_ast::ast::{
+    IdentifierReference, ImportDeclarationSpecifier, ImportOrExportKind, Statement,
+};
+use oxc_ast_visit::Visit;
+use oxc_span::GetSpan;
 
 use crate::compiler::GameDataCompileUnit;
 use crate::emit::GameDataCodegenFile;
-use crate::game_system_schema::GameSystemTableSchema;
+use crate::manager::{NativeManagerProductKind, NativeManagerShape};
 use crate::manager_records::{
-    DirectManagerSurface, ItemDataManagerSurface, ManagerSurface, ManagerSurfaceDependency,
-    SemanticLookupKind, SemanticManagerKey, SemanticManagerRecord, SemanticNumericKeyType,
-    SemanticProjectionTransform, SemanticRowFilterPredicate, default_direct_manager_row_type,
-    manager_surface_dependencies, manager_surface_name, manager_surfaces,
+    CompositionManagerKind, CompositionManagerSurface, DirectManagerSurface, DirectManagerTable,
+    ItemDataManagerSurface, ManagerSurface, SemanticLookupKind, SemanticManagerKey,
+    SemanticManagerRecord, SemanticNumericKeyType, SemanticProjectionTransform,
+    SemanticRowFilterPredicate, default_direct_manager_row_type, manager_accessor_domain,
+    manager_surface_name, manager_surfaces, semantic_enum_default_variant, semantic_enum_type_name,
     semantic_manager_record_unit, ts_field_name, ts_method_name,
 };
-use crate::naming::{to_snake_ident, to_upper_camel_ident};
+use crate::naming::to_upper_camel_ident;
 use crate::typescript::source::{format_typescript_source, typescript_string_literal};
 use nw_serialize_codegen::{
     TypeScriptSourceEmitter as SerializeTypeScriptSourceEmitter,
     TypeScriptSourceOptions as SerializeTypeScriptSourceOptions,
 };
 
-pub(super) fn emit_manager_files(unit: &GameDataCompileUnit) -> Result<Vec<GameDataCodegenFile>> {
-    let surfaces = manager_surfaces(unit)?;
-    Ok(vec![GameDataCodegenFile::new(
-        "src/managers/index.ts",
-        manager_index_source(unit, false, &surfaces)?,
-    )])
-}
+mod native;
 
 pub(super) fn emit_dynamic_manager_files(
     unit: &GameDataCompileUnit,
 ) -> Result<Vec<GameDataCodegenFile>> {
     let surfaces = manager_surfaces(unit)?;
     let records = semantic_records(&surfaces);
-    let mut files = vec![GameDataCodegenFile::new(
+    let manager_source = manager_index_source(unit, &surfaces)?;
+    let mut files = split_typescript_declaration_source(
+        &manager_source,
+        "",
         "src/managers/index.ts",
-        manager_index_source(unit, true, &surfaces)?,
-    )];
+        (!records.is_empty()).then_some("./types.js"),
+    )?;
+    files.extend(datasheet_catalog_files(unit)?);
     if !records.is_empty() {
-        files.push(GameDataCodegenFile::new(
+        files.extend(split_typescript_declaration_source(
+            &manager_record_types_source(&records)?,
+            "type-",
             "src/managers/types.ts",
-            manager_record_types_source(&records)?,
-        ));
+            None,
+        )?);
     }
     Ok(files)
 }
 
-fn manager_index_source(
-    unit: &GameDataCompileUnit,
-    dynamic_assets: bool,
-    surfaces: &[ManagerSurface],
-) -> Result<String> {
-    if !dynamic_assets {
-        return manager_manifest_source(unit, surfaces);
+#[derive(Debug, Clone)]
+struct TypeScriptManagerStatement {
+    source: String,
+    name: String,
+    public: bool,
+    type_only: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TypeScriptExternalImport {
+    module: String,
+    imported: String,
+    type_only: bool,
+}
+
+#[derive(Debug, Default)]
+struct TypeScriptImportGroup {
+    values: BTreeSet<String>,
+    types: BTreeSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct TypeScriptReferenceCollector {
+    names: BTreeSet<String>,
+}
+
+impl<'a> Visit<'a> for TypeScriptReferenceCollector {
+    fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
+        self.names.insert(identifier.name.to_string());
+    }
+}
+
+fn split_typescript_declaration_source(
+    source: &str,
+    chunk_prefix: &str,
+    index_path: &str,
+    extra_export: Option<&str>,
+) -> Result<Vec<GameDataCodegenFile>> {
+    const TARGET_LINES: usize = 700;
+
+    let allocator = oxc_allocator::Allocator::default();
+    let parsed = oxc_parser::Parser::new(&allocator, source, oxc_span::SourceType::ts()).parse();
+    if !parsed.errors.is_empty() {
+        anyhow::bail!(
+            "parse formatted TypeScript manager source: {}",
+            parsed
+                .errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
     }
 
+    let mut external_imports = BTreeMap::new();
+    let mut statements = Vec::new();
+    for statement in &parsed.program.body {
+        match statement {
+            Statement::ImportDeclaration(import) => {
+                let module = import.source.value.to_string();
+                let declaration_type_only = import.import_kind == ImportOrExportKind::Type;
+                for specifier in import.specifiers.iter().flatten() {
+                    let ImportDeclarationSpecifier::ImportSpecifier(specifier) = specifier else {
+                        anyhow::bail!(
+                            "standalone manager splitting requires named TypeScript imports"
+                        );
+                    };
+                    let local = specifier.local.name.to_string();
+                    external_imports.insert(
+                        local,
+                        TypeScriptExternalImport {
+                            module: module.clone(),
+                            imported: specifier.imported.name().to_string(),
+                            type_only: declaration_type_only
+                                || specifier.import_kind == ImportOrExportKind::Type,
+                        },
+                    );
+                }
+            }
+            _ => {
+                let span = statement.span();
+                let statement_source = &source[span.start as usize..span.end as usize];
+                let Some((name, public, type_only)) =
+                    typescript_declaration_header(statement_source)
+                else {
+                    anyhow::bail!(
+                        "unsupported top-level TypeScript manager statement: {}",
+                        statement_source.lines().next().unwrap_or_default()
+                    );
+                };
+                statements.push(TypeScriptManagerStatement {
+                    source: statement_source.to_owned(),
+                    name,
+                    public,
+                    type_only,
+                });
+            }
+        }
+    }
+
+    let mut chunks = Vec::<Vec<usize>>::new();
+    for (index, statement) in statements.iter().enumerate() {
+        if statement.name == "CREATE_MANAGER" {
+            chunks.push(vec![index]);
+        }
+    }
+    let mut current = Vec::<usize>::new();
+    let mut current_lines = 0usize;
+    for (index, statement) in statements.iter().enumerate() {
+        if statement.name == "CREATE_MANAGER" {
+            continue;
+        }
+        let lines = statement.source.lines().count() + 2;
+        let same_declaration = current
+            .last()
+            .is_some_and(|previous| statements[*previous].name == statement.name);
+        if !current.is_empty() && current_lines + lines > TARGET_LINES && !same_declaration {
+            chunks.push(std::mem::take(&mut current));
+            current_lines = 0;
+        }
+        current.push(index);
+        current_lines += lines;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    let mut statement_chunks = vec![0usize; statements.len()];
+    let mut chunk_names = Vec::with_capacity(chunks.len());
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        for statement in chunk {
+            statement_chunks[*statement] = chunk_index;
+        }
+        let anchor = chunk
+            .iter()
+            .find_map(|index| {
+                statements[*index]
+                    .public
+                    .then_some(&statements[*index].name)
+            })
+            .unwrap_or(&statements[chunk[0]].name);
+        chunk_names.push(format!(
+            "{chunk_prefix}{chunk_index:03}-{}.ts",
+            crate::naming::to_snake_ident(anchor, "part").replace('_', "-")
+        ));
+    }
+
+    let mut declaration_kinds = BTreeMap::<String, bool>::new();
+    for statement in &statements {
+        declaration_kinds
+            .entry(statement.name.clone())
+            .and_modify(|type_only| *type_only &= statement.type_only)
+            .or_insert(statement.type_only);
+    }
+
+    let declaration_chunks = statements
+        .iter()
+        .enumerate()
+        .map(|(index, statement)| (statement.name.clone(), statement_chunks[index]))
+        .collect::<BTreeMap<_, _>>();
+    let mut imports = (0..chunks.len())
+        .map(|_| BTreeMap::<String, TypeScriptImportGroup>::new())
+        .collect::<Vec<_>>();
+
+    for (statement_index, statement) in parsed
+        .program
+        .body
+        .iter()
+        .filter(|statement| !matches!(statement, Statement::ImportDeclaration(_)))
+        .enumerate()
+    {
+        let reference_chunk = statement_chunks[statement_index];
+        let mut references = TypeScriptReferenceCollector::default();
+        references.visit_statement(statement);
+        for symbol_name in references.names {
+            let external = external_imports.get(&symbol_name);
+            let owner_chunk = declaration_chunks.get(&symbol_name).copied();
+            if (external.is_none() && owner_chunk.is_none()) || owner_chunk == Some(reference_chunk)
+            {
+                continue;
+            }
+            let (module, imported, type_only) = if let Some(external) = external {
+                (
+                    external.module.clone(),
+                    external.imported.clone(),
+                    external.type_only,
+                )
+            } else {
+                let owner_chunk = owner_chunk.expect("internal symbol has an owner chunk");
+                (
+                    format!("./{}", chunk_names[owner_chunk].replace(".ts", ".js")),
+                    symbol_name.clone(),
+                    *declaration_kinds.get(&symbol_name).unwrap_or(&false),
+                )
+            };
+            let group = imports[reference_chunk].entry(module).or_default();
+            if type_only {
+                group.types.insert(imported);
+            } else {
+                group.values.insert(imported.clone());
+                group.types.remove(&imported);
+            }
+        }
+    }
+
+    let mut files = Vec::with_capacity(chunks.len() + 1);
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        let mut chunk_source = typescript_imports_source(&imports[chunk_index]);
+        for statement_index in chunk {
+            let statement = &statements[*statement_index];
+            if statement.source.trim_start().starts_with("export ") {
+                chunk_source.push_str(&statement.source);
+            } else {
+                chunk_source.push_str("export ");
+                chunk_source.push_str(&statement.source);
+            }
+            chunk_source.push_str("\n\n");
+        }
+        files.push(GameDataCodegenFile::new(
+            format!("src/managers/{}", chunk_names[chunk_index]),
+            format_typescript_source(&chunk_source)?,
+        ));
+    }
+
+    let mut exports = BTreeMap::<String, TypeScriptImportGroup>::new();
+    for (statement_index, statement) in statements.iter().enumerate() {
+        if !statement.public {
+            continue;
+        }
+        let module = format!(
+            "./{}",
+            chunk_names[statement_chunks[statement_index]].replace(".ts", ".js")
+        );
+        let group = exports.entry(module).or_default();
+        if statement.type_only {
+            if !group.values.contains(&statement.name) {
+                group.types.insert(statement.name.clone());
+            }
+        } else {
+            group.values.insert(statement.name.clone());
+            group.types.remove(&statement.name);
+        }
+    }
+    let mut index_source = typescript_exports_source(&exports);
+    if let Some(module) = extra_export {
+        index_source.push_str(&format!(
+            "export * from {};\n",
+            typescript_string_literal(module)
+        ));
+    }
+    files.push(GameDataCodegenFile::new(
+        index_path,
+        format_typescript_source(&index_source)?,
+    ));
+    Ok(files)
+}
+
+fn typescript_declaration_header(source: &str) -> Option<(String, bool, bool)> {
+    let mut source = source.trim_start();
+    let public = if let Some(rest) = source.strip_prefix("export ") {
+        source = rest.trim_start();
+        true
+    } else {
+        false
+    };
+    if let Some(rest) = source.strip_prefix("declare ") {
+        source = rest.trim_start();
+    }
+    let (rest, type_only) = [
+        ("interface ", true),
+        ("type ", true),
+        ("enum ", false),
+        ("class ", false),
+        ("function ", false),
+        ("function* ", false),
+        ("async function ", false),
+        ("const ", false),
+        ("let ", false),
+        ("var ", false),
+    ]
+    .into_iter()
+    .find_map(|(prefix, type_only)| source.strip_prefix(prefix).map(|rest| (rest, type_only)))?;
+    let name = rest
+        .trim_start()
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '$'))
+        .collect::<String>();
+    (!name.is_empty()).then_some((name, public, type_only))
+}
+
+fn typescript_imports_source(imports: &BTreeMap<String, TypeScriptImportGroup>) -> String {
+    let mut source = String::new();
+    for (module, group) in imports {
+        if !group.values.is_empty() {
+            source.push_str(&format!(
+                "import {{ {} }} from {};\n",
+                group.values.iter().cloned().collect::<Vec<_>>().join(", "),
+                typescript_string_literal(module)
+            ));
+        }
+        let types = group
+            .types
+            .difference(&group.values)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !types.is_empty() {
+            source.push_str(&format!(
+                "import type {{ {} }} from {};\n",
+                types.join(", "),
+                typescript_string_literal(module)
+            ));
+        }
+    }
+    source.push('\n');
+    source
+}
+
+fn typescript_exports_source(exports: &BTreeMap<String, TypeScriptImportGroup>) -> String {
+    let mut source = String::new();
+    for (module, group) in exports {
+        if !group.values.is_empty() {
+            source.push_str(&format!(
+                "export {{ {} }} from {};\n",
+                group.values.iter().cloned().collect::<Vec<_>>().join(", "),
+                typescript_string_literal(module)
+            ));
+        }
+        let types = group
+            .types
+            .difference(&group.values)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !types.is_empty() {
+            source.push_str(&format!(
+                "export type {{ {} }} from {};\n",
+                types.join(", "),
+                typescript_string_literal(module)
+            ));
+        }
+    }
+    source
+}
+
+fn manager_index_source(unit: &GameDataCompileUnit, surfaces: &[ManagerSurface]) -> Result<String> {
     let mut source = String::from(
         r#"
-import { parseDatasheet, type Datasheet, type DatasheetAsset, type DatasheetCellValue, type DatasheetRow } from "../game-assets/datasheet.js";
+import { parseDatasheet, type Datasheet, type DatasheetCellValue, type DatasheetRow } from "../game-assets/datasheet.js";
 import {
   objectStreamBool,
   objectStreamF32,
@@ -71,81 +413,200 @@ import {
   requireObjectStreamType,
   singleObjectStreamRoot,
   type ObjectStreamElement,
-  type ObjectStreamVec3,
 } from "../game-assets/object-stream.js";
-import { type AssetLoader } from "../game-assets/pak.js";
+import { type AssetLoader } from "../game-assets/loader.js";
+import { AssetId, Crc32, Uuid, Vector3, type AssetReference } from "../values.js";
+import { loadTableSchemas, type TableSchema } from "./datasheet-catalog.js";
 
 "#,
     );
     let records = semantic_records(surfaces);
     if !records.is_empty() {
-        source.push_str(&format!(
-            "import {{ {} }} from \"./types.js\";\n\n",
+        let mut imports = semantic_enum_shapes(surfaces)
+            .into_iter()
+            .map(|shape| shape.name)
+            .collect::<Vec<_>>();
+        imports.extend(
             records
                 .iter()
-                .map(|record| format!("type {}", record.record_type_name))
-                .collect::<Vec<_>>()
-                .join(", ")
+                .map(|record| format!("type {}", record.record_type_name)),
+        );
+        source.push_str(&format!(
+            "import {{ {} }} from \"./types.js\";\n\n",
+            imports.join(", ")
         ));
     }
     source.push_str(
         r#"
-export type DatasheetCellKind = "string" | "number" | "boolean";
-
-export interface ColumnSchema {
-  readonly name: string;
-  readonly fieldName: string;
-  readonly crc: number;
-  readonly kind: DatasheetCellKind;
-  readonly rowKey: boolean;
-  readonly required: boolean;
-}
-
-export interface TableSchema {
-  readonly name: string;
-  readonly nameCrc: number;
-  readonly rowType: string;
-  readonly rowTypeCrc: number;
-  readonly rowCount: number;
-  readonly sources: readonly string[];
-  readonly columns: readonly ColumnSchema[];
-}
-
-interface TableDependency {
-  readonly kind: "table";
-  readonly name: string;
-  readonly row: string;
-}
-
-interface AssetDependency {
-  readonly kind: "asset";
-  readonly path: string;
-}
-
-interface ManagerDependencyRef {
-  readonly kind: "manager";
-  readonly name: string;
-}
-
-type ManagerDependency =
-  | TableDependency
-  | AssetDependency
-  | ManagerDependencyRef;
-
-interface ManagerDefinition {
-  readonly name: string;
-  readonly dependencies: readonly ManagerDependency[];
-}
-
 export interface Rows<Row> extends Iterable<Row> {
-  readonly rows: readonly Row[];
+  rows(): IterableIterator<Row>;
 }
 
 export interface RowLookup<Key, Row> extends Rows<Row> {
-  readonly get: (key: Key) => Row | undefined;
+  get(key: Key): Row | undefined;
 }
 
-const MANAGER_INSTANCE = Symbol("managerInstance");
+declare const ROW_TYPE: unique symbol;
+
+export interface RowRef<Table extends string, Row> {
+  readonly table: Table;
+  readonly key: string;
+  readonly [ROW_TYPE]?: Row;
+}
+
+export interface RowSlot<Table extends string, Row> {
+  readonly table: Table;
+  readonly rowIndex: number;
+  readonly [ROW_TYPE]?: Row;
+}
+
+export interface TableReference {
+  readonly path: string;
+  readonly key: string;
+}
+
+export interface RowEntry<Table extends string, Row> {
+  readonly ref: RowRef<Table, Row>;
+  readonly slot: RowSlot<Table, Row>;
+  readonly row: Row;
+}
+
+interface ResolvedRowEntry<Row> {
+  readonly sourcePath: string;
+  readonly key: string;
+  readonly rowIndex: number;
+  readonly row: Row;
+}
+
+export interface RowCollection<Row, Table extends string> extends Rows<RowEntry<Table, Row>> {
+  readonly length: number;
+  readonly empty: boolean;
+  table(table: Table): TableRows<Row, Table>;
+  get(ref: RowRef<Table, Row>): Row | undefined;
+  rowByIndex(slot: RowSlot<Table, Row>): Row | undefined;
+  rowKeyByIndex(slot: RowSlot<Table, Row>): string | undefined;
+}
+
+interface RowTableIndex<Table extends string, Row> {
+  readonly entries: RowEntry<Table, Row>[];
+  readonly byKey: Map<string, RowEntry<Table, Row>>;
+  readonly byRowIndex: Map<number, RowEntry<Table, Row>>;
+}
+
+class RowCollectionImpl<Row, Table extends string> implements RowCollection<Row, Table> {
+  private readonly entriesByTable = new Map<string, RowTableIndex<Table, Row>>();
+  private readonly entries: RowEntry<Table, Row>[] = [];
+
+  constructor(
+    resolvedEntries: readonly ResolvedRowEntry<Row>[],
+    tableSources: ReadonlyMap<Table, readonly string[]>,
+  ) {
+    for (const [table, sources] of tableSources) {
+      const alias = normalizeDataPath(table);
+      const index = { entries: [], byKey: new Map(), byRowIndex: new Map() } as RowTableIndex<Table, Row>;
+      for (const resolved of resolvedEntries) {
+        if (!sources.some((source) => tablePathMatches(resolved.sourcePath, source))) continue;
+        const entry: RowEntry<Table, Row> = {
+          ref: { table, key: resolved.key },
+          slot: { table, rowIndex: resolved.rowIndex },
+          row: resolved.row,
+        };
+        this.entries.push(entry);
+        index.entries.push(entry);
+        const key = normalizeLookupKey(resolved.key);
+        if (!index.byKey.has(key)) index.byKey.set(key, entry);
+        if (!index.byRowIndex.has(resolved.rowIndex)) index.byRowIndex.set(resolved.rowIndex, entry);
+      }
+      this.entriesByTable.set(alias, index);
+    }
+  }
+
+  get length(): number {
+    return this.entries.length;
+  }
+
+  get empty(): boolean {
+    return this.entries.length === 0;
+  }
+
+  rows(): IterableIterator<RowEntry<Table, Row>> {
+    return this.entries.values();
+  }
+
+  table(table: Table): TableRows<Row, Table> {
+    return new TableRowsImpl(this, table);
+  }
+
+  get(ref: RowRef<Table, Row>): Row | undefined {
+    return this.tableIndex(ref.table)?.byKey.get(normalizeLookupKey(ref.key))?.row;
+  }
+
+  rowByIndex(slot: RowSlot<Table, Row>): Row | undefined {
+    return this.tableIndex(slot.table)?.byRowIndex.get(slot.rowIndex)?.row;
+  }
+
+  rowKeyByIndex(slot: RowSlot<Table, Row>): string | undefined {
+    return this.tableIndex(slot.table)?.byRowIndex.get(slot.rowIndex)?.ref.key;
+  }
+
+  entriesForTable(table: Table): readonly RowEntry<Table, Row>[] {
+    return this.tableIndex(table)?.entries ?? [];
+  }
+
+  [Symbol.iterator](): Iterator<RowEntry<Table, Row>> {
+    return this.rows();
+  }
+
+  private tableIndex(table: Table): RowTableIndex<Table, Row> | undefined {
+    const normalized = normalizeDataPath(table);
+    const exact = this.entriesByTable.get(normalized);
+    if (exact !== undefined) {
+      return exact;
+    }
+    for (const [candidate, index] of this.entriesByTable) {
+      if (tablePathMatches(candidate, normalized)) {
+        return index;
+      }
+    }
+    return undefined;
+  }
+}
+
+export interface TableRows<Row, Table extends string> extends Rows<RowEntry<Table, Row>> {
+  readonly table: Table;
+  get(key: string): Row | undefined;
+  rowByIndex(rowIndex: number): Row | undefined;
+  rowKeyByIndex(rowIndex: number): string | undefined;
+}
+
+class TableRowsImpl<Row, Table extends string> implements TableRows<Row, Table> {
+  constructor(
+    private readonly collection: RowCollectionImpl<Row, Table>,
+    readonly table: Table,
+  ) {}
+
+  *rows(): IterableIterator<RowEntry<Table, Row>> {
+    yield* this.collection.entriesForTable(this.table);
+  }
+
+  get(key: string): Row | undefined {
+    return this.collection.get({ table: this.table, key });
+  }
+
+  rowByIndex(rowIndex: number): Row | undefined {
+    return this.collection.rowByIndex({ table: this.table, rowIndex });
+  }
+
+  rowKeyByIndex(rowIndex: number): string | undefined {
+    return this.collection.rowKeyByIndex({ table: this.table, rowIndex });
+  }
+
+  [Symbol.iterator](): Iterator<RowEntry<Table, Row>> {
+    return this.rows();
+  }
+}
+
+const CREATE_MANAGER = Symbol("createManager");
 
 interface DynamicTableRow {
   readonly sourcePath: string;
@@ -157,36 +618,16 @@ interface DynamicTableRow {
 
 interface DynamicTable {
   readonly schema: TableSchema;
-  readonly sheets: readonly Datasheet[];
   readonly rows: readonly DynamicTableRow[];
-  readonly rowsByKey: ReadonlyMap<string, DynamicTableRow>;
-  readonly rowsByLookupKey: ReadonlyMap<string, DynamicTableRow>;
-  readonly duplicateKeys: ReadonlyMap<string, readonly DynamicTableRow[]>;
+  readonly columnCrcs: ReadonlyMap<string, number>;
 }
-
-interface BinaryAsset {
-  readonly path: string;
-  readonly bytes: Uint8Array;
-}
-
-interface PakDatasheetSource {
-  readonly datasheets: readonly DatasheetAsset[];
-  readonly assets: readonly BinaryAsset[];
-}
-
-const ASSET_LOADER_SOURCE = Symbol.for("@nw-tools/asset-loader/source");
-
-type AssetLoaderSourceAccessor = {
-  [key: symbol]: () => Promise<PakDatasheetSource>;
-};
 
 "#,
     );
 
     let readable_row_types = direct_schema_row_types(surfaces);
     push_schema_row_types(&mut source, unit, &readable_row_types);
-    push_table_schemas(&mut source, unit);
-    push_managers(&mut source, unit, surfaces);
+    push_ts_enum_parsers(&mut source, surfaces);
     push_direct_row_family_types(&mut source, unit, surfaces);
     push_manager_surface_classes(&mut source, unit, surfaces);
     source.push_str(PRODUCT_MANAGER_RUNTIME_TS);
@@ -202,17 +643,133 @@ fn semantic_records(surfaces: &[ManagerSurface]) -> Vec<SemanticManagerRecord> {
         .filter_map(|surface| match surface {
             ManagerSurface::Semantic(record) => Some(record.clone()),
             ManagerSurface::Direct(_)
+            | ManagerSurface::Native { .. }
             | ManagerSurface::ItemData(_)
+            | ManagerSurface::Composition(_)
             | ManagerSurface::ProductBacked(_) => None,
         })
         .collect()
 }
 
+fn semantic_enum_shapes(
+    surfaces: &[ManagerSurface],
+) -> Vec<crate::game_system_schema::GameSystemEnumShape> {
+    let mut shapes = BTreeMap::new();
+    for shape in surfaces
+        .iter()
+        .filter_map(|surface| match surface {
+            ManagerSurface::Semantic(record) => Some(record),
+            ManagerSurface::Direct(_)
+            | ManagerSurface::Native { .. }
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::Composition(_)
+            | ManagerSurface::ProductBacked(_) => None,
+        })
+        .flat_map(|record| record.fields.iter())
+        .filter_map(|field| field.enum_shape.as_ref())
+    {
+        shapes
+            .entry(shape.name.clone())
+            .or_insert_with(|| shape.clone());
+    }
+    shapes.into_values().collect()
+}
+
+fn semantic_pair_first_enum_shapes(
+    surfaces: &[ManagerSurface],
+) -> Vec<crate::game_system_schema::GameSystemEnumShape> {
+    let mut shapes = BTreeMap::new();
+    for shape in surfaces
+        .iter()
+        .filter_map(|surface| match surface {
+            ManagerSurface::Semantic(record) => Some(record),
+            ManagerSurface::Direct(_)
+            | ManagerSurface::Native { .. }
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::Composition(_)
+            | ManagerSurface::ProductBacked(_) => None,
+        })
+        .flat_map(|record| record.fields.iter())
+        .filter_map(|field| field.pair_first_enum_shape.as_ref())
+    {
+        shapes
+            .entry(shape.name.clone())
+            .or_insert_with(|| shape.clone());
+    }
+    shapes.into_values().collect()
+}
+
+fn push_ts_enum_parsers(source: &mut String, surfaces: &[ManagerSurface]) {
+    for shape in semantic_enum_shapes(surfaces) {
+        let parser = format!("parse{}", shape.name);
+        source.push_str(&format!(
+            "function {parser}(source: string): {} {{\n  switch (source.trim()) {{\n",
+            shape.name
+        ));
+        let mut tokens = BTreeMap::<String, String>::new();
+        for variant in &shape.variants {
+            let variant_name = to_upper_camel_ident(&variant.name, "Variant");
+            tokens
+                .entry(variant.name.clone())
+                .or_insert_with(|| variant_name.clone());
+            for token in &variant.source_tokens {
+                tokens
+                    .entry(token.clone())
+                    .or_insert_with(|| variant_name.clone());
+            }
+        }
+        for (token, variant) in tokens {
+            source.push_str(&format!(
+                "    case {}:\n      return {}.{variant};\n",
+                typescript_string_literal(&token),
+                shape.name
+            ));
+        }
+        source.push_str(&format!(
+            "    default:\n      throw new Error(`unknown {} value ${{source}}`);\n  }}\n}}\n\n",
+            shape.name
+        ));
+    }
+    for shape in semantic_pair_first_enum_shapes(surfaces) {
+        let parser = ts_pair_enum_parser_name(&shape.name);
+        source.push_str(&format!(
+            "function {parser}(source: string): number {{\n  switch (source.trim()) {{\n"
+        ));
+        let mut tokens = BTreeMap::<String, i64>::new();
+        for variant in &shape.variants {
+            tokens
+                .entry(variant.name.clone())
+                .or_insert(variant.discriminant);
+            for token in &variant.source_tokens {
+                tokens.entry(token.clone()).or_insert(variant.discriminant);
+            }
+        }
+        for (token, discriminant) in tokens {
+            source.push_str(&format!(
+                "    case {}:\n      return {discriminant};\n",
+                typescript_string_literal(&token)
+            ));
+        }
+        source.push_str(&format!(
+            "    default: {{\n      const value = Number(source);\n      if (Number.isInteger(value) && value >= 0 && value <= 0xff) return value;\n      throw new Error(`unknown {} value ${{source}}`);\n    }}\n  }}\n}}\n\n",
+            shape.name
+        ));
+    }
+}
+
+fn ts_pair_enum_parser_name(enum_name: &str) -> String {
+    format!("parse{enum_name}Discriminant")
+}
+
 fn direct_schema_row_types(surfaces: &[ManagerSurface]) -> BTreeSet<String> {
     let mut row_types = BTreeSet::new();
     for surface in surfaces {
-        let ManagerSurface::Direct(manager) = surface else {
-            continue;
+        let manager = match surface {
+            ManagerSurface::Direct(manager) | ManagerSurface::Native { manager, .. } => manager,
+            ManagerSurface::Semantic(_)
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::Composition(_)
+            | ManagerSurface::ProductBacked(_) => continue,
         };
         row_types.extend(
             manager
@@ -225,6 +782,10 @@ fn direct_schema_row_types(surfaces: &[ManagerSurface]) -> BTreeSet<String> {
 }
 
 fn ts_manager_accessor_name(manager_name: &str) -> String {
+    ts_method_name(manager_accessor_domain(manager_name))
+}
+
+fn ts_manager_dependency_name(manager_name: &str) -> String {
     ts_method_name(manager_name.strip_suffix("Manager").unwrap_or(manager_name))
 }
 
@@ -293,11 +854,11 @@ fn push_loot_bucket_schema_row_type(source: &mut String, readable: bool) {
         r#"
 export interface LootBucketDataSchemaRow {
   readonly rowPlaceholders: string;
-  readonly entries: readonly LootBucketDataEntry[];
+  readonly entries: readonly LootBucketDataSlotEntry[];
   readonly lootBiasingDisabled: readonly LootBucketBiasingDisabled[];
 }
 
-export interface LootBucketDataEntry {
+export interface LootBucketDataSlotEntry {
   readonly slot: number;
   readonly lootBucket: string | null;
   readonly tags: string | null;
@@ -325,7 +886,7 @@ function readLootBucketDataSchemaRow(
   table: DynamicTable,
   row: DynamicTableRow,
 ): LootBucketDataSchemaRow {
-  const entries: LootBucketDataEntry[] = [];
+  const entries: LootBucketDataSlotEntry[] = [];
   for (const slot of numberedColumnSlots(table, [
     "LootBucket",
     "Tags",
@@ -536,9 +1097,31 @@ mod tests {
     use crate::manager_records::{DirectManagerTable, ItemDataManagerTable, SemanticLookupMethod};
     use crate::plan::GameDataCodegenPlan;
     use crate::schema::GameDataCompileMode;
-    use crate::target::{GameDataTargetLanguage, GameDataTargetPlan};
 
     use super::*;
+
+    #[test]
+    fn semantic_resources_use_exact_table_schema_identity() {
+        let expression = ts_manager_instance_expression(
+            "ExampleManager",
+            [("SharedTable", "ExampleRow")],
+            std::iter::empty(),
+        );
+
+        assert!(expression.contains("cache.resourcesForTables("));
+        assert!(expression.contains("{ name: \"SharedTable\", rowType: \"ExampleRow\" }"));
+        assert!(!expression.contains("cache.resources("));
+    }
+
+    #[test]
+    fn skip_empty_semantic_keys_accept_missing_cells() {
+        let mut source = String::new();
+        push_ts_key_materializer(&mut source, &semantic_lookup_record());
+
+        assert!(source.contains("optionalStringCell"));
+        assert!(source.contains("keyText === null"));
+        assert!(!source.contains("requiredStringCell"));
+    }
 
     #[test]
     fn merged_schema_column_type_is_lossless_for_mixed_source_columns() {
@@ -557,24 +1140,62 @@ mod tests {
     }
 
     #[test]
+    fn ability_coordinates_are_filtering_parsers() {
+        let helper = SEMANTIC_MANAGER_RUNTIME_TS
+            .split("function abilityCoordinate")
+            .nth(1)
+            .expect("ability coordinate helper")
+            .split("function tableNumberLookupKey")
+            .next()
+            .expect("ability coordinate body");
+
+        assert!(helper.contains("optionalSchemaNumber(value)"));
+        assert!(helper.contains("return null"));
+        assert!(!helper.contains("requiredSchemaNumber"));
+        assert!(!helper.contains("throw new RangeError"));
+    }
+
+    #[test]
     fn direct_schema_manager_uses_rows_contract_for_primary_row_type() {
         let unit = damage_compile_unit();
         let manager = damage_manager_surface();
         let rows_interface = direct_ts_rows_interface(&unit, &manager);
         let methods = direct_ts_schema_methods(&unit, &manager);
+        let resources = ts_direct_manager_instance_expression(&manager);
 
-        assert_eq!(rows_interface, " implements DamageDataRows");
-        assert!(methods.contains("get rows(): readonly DamageDataEntry[]"));
-        assert!(methods.contains("table(table: string): DamageDataTableRows"));
-        assert!(methods.contains("get(ref: DamageDataRef): DamageDataSchemaRow | undefined"));
-        assert!(
-            methods.contains("rowByIndex(slot: DamageDataSlot): DamageDataSchemaRow | undefined")
+        assert!(resources.contains("cache.resourcesForRows"));
+        assert!(resources.contains("\"AfflictionData\""));
+        assert!(resources.contains("\"DamageTypeData\""));
+        assert_eq!(
+            rows_interface,
+            " implements Rows<RowEntry<DamageDataTable, DamageDataSchemaRow>>"
         );
-        assert!(methods.contains("[Symbol.iterator](): Iterator<DamageDataEntry>"));
-        assert!(methods.contains("afflictionData(): AfflictionDataRows"));
-        assert!(methods.contains("damageTypeData(): DamageTypeDataRows"));
-        assert!(!methods.contains("afflictionDataRows(): readonly AfflictionDataSchemaRow[]"));
-        assert!(!methods.contains("damageTypeDataRows(): readonly DamageTypeDataSchemaRow[]"));
+        assert!(
+            methods.contains(
+                "rows(): IterableIterator<RowEntry<DamageDataTable, DamageDataSchemaRow>>"
+            )
+        );
+        assert!(methods.contains(
+            "table(table: DamageDataTable): TableRows<DamageDataSchemaRow, DamageDataTable>"
+        ));
+        assert!(!methods.contains("table(table: string)"));
+        assert!(methods.contains(
+            "row(ref: RowRef<DamageDataTable, DamageDataSchemaRow>): DamageDataSchemaRow | undefined"
+        ));
+        assert!(methods.contains(
+            "rowByIndex(slot: RowSlot<DamageDataTable, DamageDataSchemaRow>): DamageDataSchemaRow | undefined"
+        ));
+        assert!(methods.contains(
+            "[Symbol.iterator](): Iterator<RowEntry<DamageDataTable, DamageDataSchemaRow>>"
+        ));
+        assert!(methods.contains(
+            "afflictionDataRows(): RowCollection<AfflictionDataSchemaRow, DamageDataAfflictionDataTable>"
+        ));
+        assert!(methods.contains(
+            "damageTypeDataRows(): RowCollection<DamageTypeDataSchemaRow, DamageDataDamageTypeDataTable>"
+        ));
+        assert!(!methods.contains("afflictionData(): RowCollection"));
+        assert!(!methods.contains("damageTypeData(): RowCollection"));
         assert!(
             !methods.contains("afflictionData(key: AfflictionDataSchemaRow[\"afflictionId\"])")
         );
@@ -587,6 +1208,86 @@ mod tests {
     }
 
     #[test]
+    fn generic_direct_manager_emits_typed_table_selector() {
+        let unit = damage_compile_unit();
+        let manager = DirectManagerSurface {
+            manager_name: "AfflictionDataManager".to_owned(),
+            manager_class_name: "AfflictionDataManager".to_owned(),
+            tables: vec![DirectManagerTable {
+                table_name: "AfflictionData".to_owned(),
+                row_type_name: "AfflictionData".to_owned(),
+            }],
+            products: Vec::new(),
+        };
+        let mut source = String::new();
+
+        push_direct_manager_class(&mut source, &unit, &manager);
+
+        assert!(source.contains("export type AfflictionDataTable = \"AfflictionData\";"));
+        assert!(source.contains(
+            "table(table: AfflictionDataTable): TableRows<AfflictionDataSchemaRow, AfflictionDataTable>"
+        ));
+        assert!(!source.contains("table(table: string)"));
+        assert!(source.contains("row(ref: RowRef<AfflictionDataTable, AfflictionDataSchemaRow>)"));
+        assert!(!source.contains("RowRef<AfflictionDataSchemaRow>"));
+    }
+
+    #[test]
+    fn resolved_asset_paths_do_not_escape_through_public_row_refs() {
+        assert!(DYNAMIC_MANAGER_RUNTIME_TS.contains("sourcePath: row.sourcePath"));
+        assert!(!DYNAMIC_MANAGER_RUNTIME_TS.contains("ref: { table: row.sourcePath"));
+        let source = manager_index_source(
+            &damage_compile_unit(),
+            &[ManagerSurface::Direct(damage_manager_surface())],
+        )
+        .expect("manager source");
+        assert!(source.contains("export interface RowRef<"));
+        assert!(source.contains("Table extends string"));
+    }
+
+    #[test]
+    fn replication_manager_builds_reverse_index_once() {
+        assert!(REPLICATION_DATA_MANAGER_TS.contains("private readonly indexesById"));
+        assert!(REPLICATION_DATA_MANAGER_TS.contains("this.indexesById.set(id, index)"));
+        assert!(REPLICATION_DATA_MANAGER_TS.contains("return this.indexesById.get(key) ?? 0"));
+        assert!(!REPLICATION_DATA_MANAGER_TS.contains("this.idsCache.indexOf"));
+    }
+
+    #[test]
+    fn static_tradeskill_mapping_is_materialized_from_dependencies() {
+        assert!(
+            STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_TS
+                .contains("private readonly playerLevelsByDisplayName")
+        );
+        assert!(
+            STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_TS
+                .contains("private readonly tradeskillRanksByDisplayName")
+        );
+        assert!(
+            STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_TS.contains("playerLevelForDisplayName")
+        );
+        assert!(
+            STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_TS.contains("tradeskillRankForDisplayName")
+        );
+        assert!(!STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_TS.contains("_experience"));
+    }
+
+    #[test]
+    fn experience_native_manager_materializes_lookup_indexes() {
+        let augmentation = experience_manager_augmentation();
+
+        assert!(augmentation.fields.contains("experienceByLevel"));
+        assert!(
+            augmentation
+                .initializers
+                .contains("gearScoreThresholds.sort")
+        );
+        assert!(augmentation.methods.contains("experienceDataFromId"));
+        assert!(augmentation.methods.contains("levelForXp"));
+        assert!(augmentation.methods.contains("maxLevel"));
+    }
+
+    #[test]
     fn item_data_manager_uses_rows_contract() {
         let mut source = String::new();
         push_item_data_manager_class(&mut source, &item_data_manager_surface());
@@ -594,7 +1295,7 @@ mod tests {
         assert!(
             source.contains("export class ItemDataManager implements RowLookup<string, ItemData>")
         );
-        assert!(source.contains("get rows(): readonly ItemData[]"));
+        assert!(source.contains("rows(): IterableIterator<ItemData>"));
         assert!(source.contains("[Symbol.iterator](): Iterator<ItemData>"));
         assert!(!source.contains("items(): readonly ItemData[]"));
     }
@@ -606,7 +1307,7 @@ mod tests {
 
         assert!(
             source.contains(
-                "backstory(backstoryId: string | number): StaticBackstoryData | undefined"
+                "backstory(backstoryId: string | Crc32): StaticBackstoryData | undefined"
             )
         );
         assert!(source.contains("this.rowsByKey.get(crc32LookupKey(backstoryId))"));
@@ -616,14 +1317,456 @@ mod tests {
         );
     }
 
+    #[test]
+    fn semantic_managers_emit_only_consumed_indexes() {
+        let mut record = semantic_lookup_record();
+        record.lookup_methods.clear();
+        let mut source = String::new();
+
+        push_semantic_manager_class(&mut source, &record);
+
+        assert!(!source.contains("rowsByKey"));
+        assert!(!source.contains("rowsBySourceRow"));
+    }
+
+    #[test]
+    fn skip_invalid_enum_projection_continues_without_fabricating_a_variant() {
+        let mut record = semantic_lookup_record();
+        record.fields.push(skip_invalid_enum_field());
+        let mut source = String::new();
+
+        push_semantic_materializer(&mut source, &record);
+
+        assert!(source.contains("let missionGoalTypeValue: MissionGoalType;"));
+        assert!(source.contains("missionGoalTypeValue = parseMissionGoalType"));
+        assert!(source.contains("catch {\n        continue;"));
+        assert!(!source.contains("MissionGoalType.Invalid"));
+    }
+
+    #[test]
+    fn every_native_manager_has_an_explicit_typescript_contract() {
+        let managers = crate::manager::validated_native_manager_specs();
+        let surfaces = crate::manager_records::manager_surfaces_from_managers(&managers)
+            .expect("manager surfaces");
+        let mut seen = BTreeSet::new();
+        let tables = surfaces
+            .iter()
+            .flat_map(|surface| match surface {
+                ManagerSurface::Native { manager, shape, .. } => {
+                    ts_effective_native_manager_surface(manager, shape).tables
+                }
+                _ => Vec::new(),
+            })
+            .filter(|table| seen.insert((table.table_name.clone(), table.row_type_name.clone())))
+            .map(|table| {
+                schema_table(
+                    &table.table_name,
+                    &table.row_type_name,
+                    native_contract_columns(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let schema_report = GameSystemDataTablesSchemaReport {
+            tables,
+            diagnostics: Vec::new(),
+            type_affinities: Vec::new(),
+        };
+        let plan = GameDataCodegenPlan::from_schema_report(
+            GameDataCompileMode::SourceFormat,
+            &schema_report,
+        );
+        let unit = GameDataCompileUnit::new(schema_report.clone(), schema_report, plan);
+
+        let mut covered = 0usize;
+        for surface in &surfaces {
+            let ManagerSurface::Native { manager, shape, .. } = surface else {
+                continue;
+            };
+            let effective = ts_effective_native_manager_surface(manager, shape);
+            let augmentation = ts_native_manager_augmentation(&unit, &effective, shape);
+            assert!(
+                !augmentation.fields.is_empty() || !augmentation.methods.is_empty(),
+                "{} emitted an empty native contract",
+                manager.manager_name
+            );
+            assert!(
+                !augmentation.initializers.is_empty() || effective.tables.is_empty(),
+                "{} did not build indexes during construction",
+                manager.manager_name
+            );
+            let contract = format!(
+                "{}{}{}",
+                augmentation.declarations, augmentation.fields, augmentation.methods
+            );
+            let marker = native_contract_marker(shape);
+            assert!(
+                contract.contains(marker),
+                "{} omitted native contract marker {marker}",
+                manager.manager_name
+            );
+            assert!(
+                !contract.contains("table: string"),
+                "{} leaked an untyped table",
+                manager.manager_name
+            );
+            assert!(
+                !contract.contains("table(table: string)"),
+                "{} leaked stringly table selection",
+                manager.manager_name
+            );
+            assert!(
+                !augmentation.initializers.contains("source.ref.key"),
+                "{} used the generic row key",
+                manager.manager_name
+            );
+            let emitted_contract = format!(
+                "{}{}{}{}",
+                augmentation.declarations,
+                augmentation.fields,
+                augmentation.initializers,
+                augmentation.methods
+            );
+            let emitted_contract_lower = emitted_contract.to_ascii_lowercase();
+            for banned in ["native", "runtime", "context", "loadpak"] {
+                assert!(
+                    !emitted_contract_lower.contains(banned),
+                    "{} leaked banned generated vocabulary `{banned}`",
+                    manager.manager_name
+                );
+            }
+            if semantic_rows_shape(shape) {
+                assert!(
+                    augmentation.rows_interface.is_some() && augmentation.row_methods.is_some(),
+                    "{} did not expose its semantic DTO through Rows and iteration",
+                    manager.manager_name
+                );
+            }
+            covered += 1;
+        }
+        assert!(
+            covered >= 50,
+            "expected the complete native manager inventory"
+        );
+    }
+
+    fn native_contract_columns() -> Vec<GameSystemColumnSchema> {
+        const STRING_COLUMNS: &[&str] = &[
+            "AbilityID",
+            "TreeID",
+            "TreeRowPosition",
+            "AffixID",
+            "AfflictionID",
+            "Attribute",
+            "Buff1",
+            "Buff2",
+            "Buff3",
+            "Buff4",
+            "Buff5",
+            "Buff6",
+            "BuffBucketID",
+            "BuffType1",
+            "BuffType2",
+            "BuffType3",
+            "BuffType4",
+            "BuffType5",
+            "BuffType6",
+            "Bucket1",
+            "BucketID",
+            "CampSkinID",
+            "CardAndRowID",
+            "Category",
+            "BalanceTarget",
+            "BalanceCategory",
+            "AbilityBaseDamageAdjustment",
+            "AffixStatAdjustment",
+            "IncomingHealAdjustment",
+            "ConsumableHealAdjustment",
+            "Chapter",
+            "ChapterID",
+            "ChapterRewardID",
+            "ChapterType",
+            "ContainerTypeID",
+            "ContributionID",
+            "ConversionID",
+            "CostumeChangeID",
+            "CostumeChangeMesh",
+            "DamageID",
+            "DarknessID",
+            "DungeonTileID",
+            "Dungeon",
+            "Dungeon2",
+            "Dungeon3",
+            "DungeonMiniBoss",
+            "DungeonBoss",
+            "DynamicDifficultyID",
+            "Effect Name",
+            "ElementalMutationID",
+            "EquipmentSetID",
+            "FootprintID",
+            "FromItemID",
+            "GameEventIDRankAmazing",
+            "GameEventIDRankBad",
+            "GameEventIDRankGreat",
+            "GameEventIDRankOkay",
+            "GameModeIds",
+            "GatherableID",
+            "GatheringAction",
+            "GatheringType",
+            "Ingredient1",
+            "Ingredient2",
+            "Ingredient3",
+            "Ingredient4",
+            "Ingredient5",
+            "Ingredient6",
+            "Ingredient7",
+            "Instrument",
+            "ItemID",
+            "ItemIds",
+            "JourneyTaskID",
+            "MountID",
+            "TimedRaceNodeTypeId",
+            "ObjectiveID",
+            "Pages",
+            "PrefabPath",
+            "ProfileName",
+            "ProfileType",
+            "ProgressionPointID",
+            "Promotion1",
+            "Promotion2",
+            "Promotion3",
+            "PromotionMutationID",
+            "QuickCourseID",
+            "PathReferenceQuickCourseID",
+            "RecipeID",
+            "RewardID",
+            "RewardID1",
+            "Reward(s)",
+            "RewardType",
+            "RotationalQueueID",
+            "RuleID",
+            "Hub",
+            "Zone",
+            "Tags",
+            "SheetID",
+            "Slot01",
+            "Slot02",
+            "Slot03",
+            "Slot04",
+            "Slot05",
+            "SongID",
+            "StatusEffect_1",
+            "StatusEffect_2",
+            "StatusEffect_3",
+            "StatusEffect_4",
+            "StatusEffect_5",
+            "StatusID",
+            "StoreCategory",
+            "StructurePieceID",
+            "TaskID",
+            "TerritoryName",
+            "TrackedStatID",
+            "TradeSkillType",
+            "UniqueTagID",
+            "VitalsID",
+            "WeaponName",
+            "WhisperID",
+            "WhisperVfxID",
+            "WorldEncounterID",
+            "ActivitiesTaskID",
+            "ReusableScoreboardTabId",
+            "TableType",
+            "CraftingCategory",
+            "ToItemID",
+            "FeatureID",
+            "Tag1",
+            "MatchOne1",
+            "Type1",
+            "ExcludeTypeStage1",
+            "ExcludeTypeShop1",
+            "Mesh",
+            "HEAD_SLOT_Left",
+            "HEAD_SLOT_Right",
+            "CHEST_SLOT_Left",
+            "CHEST_SLOT_Right",
+            "HANDS_SLOT_Left",
+            "HANDS_SLOT_Right",
+            "LEGS_SLOT_Left",
+            "LEGS_SLOT_Right",
+            "FEET_SLOT_Left",
+            "FEET_SLOT_Right",
+        ];
+        const NUMBER_COLUMNS: &[&str] = &[
+            "Index",
+            "EntitlementIndex",
+            "BuffPotency1",
+            "BuffPotency2",
+            "BuffPotency3",
+            "BuffPotency4",
+            "BuffPotency5",
+            "BuffPotency6",
+            "ChapterIndex",
+            "DifficultyTier",
+            "Level",
+            "LevelDisparity",
+            "MaximumInfluence",
+            "RewardIndex",
+            "SortOrder",
+            "MaxRoll",
+            "OutputQty",
+            "Qty1",
+            "Qty2",
+            "Qty3",
+            "Qty4",
+            "Qty5",
+            "Qty6",
+            "Qty7",
+            "TerritoryID",
+            "UIPriority",
+            "MaxEvents",
+            "MinDistance",
+            "StartingTimerSeconds",
+            "NodeTimeOverrideMultiplier",
+            "DetectionRadius",
+            "AddTimeSeconds",
+            "WeaponBaseDamageAdjustment",
+            "SelfHealAdjustment",
+            "CooldownAdjustment",
+            "PotencyAdjustment",
+            "DurationAdjustment",
+            "RandomWeights1",
+            "BudgetContribution1",
+            "MeshRenderZPosOffset",
+            "Quantity",
+            "BuyCategoricalProgressionCost",
+        ];
+        const BOOLEAN_COLUMNS: &[&str] = &[
+            "KeepPerks",
+            "MatchesPlayerSkeleton",
+            "Disabled",
+            "IsTimed",
+            "AccumulateTime",
+            "UseTimeOverride",
+            "IsEntitlement",
+            "RollOnPresent",
+            "UseLevelGS",
+        ];
+        STRING_COLUMNS
+            .iter()
+            .map(|name| schema_column(name, ColumnType::String, true))
+            .chain(
+                NUMBER_COLUMNS
+                    .iter()
+                    .map(|name| schema_column(name, ColumnType::Number, true)),
+            )
+            .chain(
+                BOOLEAN_COLUMNS
+                    .iter()
+                    .map(|name| schema_column(name, ColumnType::Boolean, true)),
+            )
+            .collect()
+    }
+
+    fn semantic_rows_shape(shape: &NativeManagerShape) -> bool {
+        matches!(
+            shape,
+            NativeManagerShape::AbilityData(_)
+                | NativeManagerShape::DamageData(_)
+                | NativeManagerShape::VitalsData(_)
+                | NativeManagerShape::TradeskillRankData(_)
+                | NativeManagerShape::OneTableWorldEventRule(_)
+                | NativeManagerShape::QuickCourseData(_)
+                | NativeManagerShape::DynamicDifficultyData(_)
+                | NativeManagerShape::OneTablePvpBalance(_)
+                | NativeManagerShape::OneTableDyeColor(_)
+                | NativeManagerShape::RewardTrackData(_)
+                | NativeManagerShape::OneTableCostumeChange(_)
+                | NativeManagerShape::LootBucketData(_)
+                | NativeManagerShape::BuffBucketData(_)
+                | NativeManagerShape::ElementalMutationStaticData(_)
+                | NativeManagerShape::PromotionMutationStaticData(_)
+                | NativeManagerShape::ItemTransformData(_)
+                | NativeManagerShape::GatherableData(_)
+                | NativeManagerShape::RecipeData(_)
+        )
+    }
+
+    fn native_contract_marker(shape: &NativeManagerShape) -> &'static str {
+        match shape {
+            NativeManagerShape::OneTableExperience(_) => "experienceDataFromId",
+            NativeManagerShape::AbilityData(_) => "abilityDataFromId",
+            NativeManagerShape::DamageData(_) => "damageById",
+            NativeManagerShape::VitalsData(_) => "creatureTypeIds",
+            NativeManagerShape::StatusEffectData(_) => "statusEffectDataFromId",
+            NativeManagerShape::ItemConversionData(_) => "byId",
+            NativeManagerShape::MultiTableCrcKeyProjection(_) => "affixDataFromId",
+            NativeManagerShape::TradeskillRankData(_) => "tradeskillRank",
+            NativeManagerShape::ObjectivesData(_) => "objectiveTaskDataFromId",
+            NativeManagerShape::ContributionData(_) => "contributionDataByKey",
+            NativeManagerShape::BuffBucketData(_) => "visitAllBuffsFromId",
+            NativeManagerShape::StructureData(_) => "structurePieceDataFromId",
+            NativeManagerShape::ReusableScoreboardData(_) => "reusableScoreboardDataFromId",
+            NativeManagerShape::MountHitVolumeData(_) => "mountHitVolumeFromMountTypeId",
+            NativeManagerShape::OneTableCampSkin(_) => "campSkinDataFromId",
+            NativeManagerShape::OneTableEmote(_) => "emoteDataFromId",
+            NativeManagerShape::OneTableStoreCategory(_) => "storeCategoryPropertiesFromId",
+            NativeManagerShape::OneTableStoreProduct(_) => "storeProductDataFromId",
+            NativeManagerShape::OneTableRewardTrackItem(_) => "rewardTrackItemFromId",
+            NativeManagerShape::OneTableWorldEventRule(_) => "worldEventRuleByCrc32",
+            NativeManagerShape::QuickCourseData(_) => "nodeTypeByCrc32",
+            NativeManagerShape::RotationalQueueData(_) => "rotationalQueueFromId",
+            NativeManagerShape::DynamicDifficultyData(_) => "DynamicDifficultyStatusEffectPotency",
+            NativeManagerShape::ProgressionPointData(_) => "progressionPointFromId",
+            NativeManagerShape::EntitlementData(_) => "entitlementsForReward",
+            NativeManagerShape::EquipmentSetData(_) => "setsForPerk",
+            NativeManagerShape::OneTablePvpBalance(_) => "balances",
+            NativeManagerShape::OneTableDyeColor(_) => "dyeColorDataFromIndex",
+            NativeManagerShape::RewardTrackData(_) => "RewardTrackSlot",
+            NativeManagerShape::PostSkillCapProgression(_) => "postSkillCapProgressionDataFromId",
+            NativeManagerShape::WhisperData(_) => "whisperVfxFromId",
+            NativeManagerShape::OneTableCostumeChange(_) => "costumeChangeDataFromId",
+            NativeManagerShape::OneTableCrestPart(_) => "crestPartDataFromIndex",
+            NativeManagerShape::OneTableDungeonTile(_) => "dungeonTileStaticDataByKey",
+            NativeManagerShape::OneTableLevelDisparity(_) => {
+                "clampedLevelDisparityDataForLevelsWithPlayerLevelCap"
+            }
+            NativeManagerShape::OneTableEncumbrance(_) => "encumbranceDataFromId",
+            NativeManagerShape::OneTableDifficultyScaling(_) => "difficultyScalingDataFromId",
+            NativeManagerShape::OneTableDarkness(_) => "darknessDataByCrc32",
+            NativeManagerShape::OneTableParticleData(_) => "particleDataFromId",
+            NativeManagerShape::CharacterAttributeData(_) => "clampedAttributeData",
+            NativeManagerShape::GovernanceData(_) => "governanceRows",
+            NativeManagerShape::LootBucketData(_) => "LootBucketSlot",
+            NativeManagerShape::TerritoryDefinitionsData(_) => "territoryForAchievement",
+            NativeManagerShape::StatModifierData(_) => "FromId",
+            NativeManagerShape::SeasonsRewardsData(_) => "rewardsByType",
+            NativeManagerShape::SeasonsTrackedStatData(_) => "trackedStatFromId",
+            NativeManagerShape::SeasonsRewardsActivitiesTasksData(_) => "activityTaskByKey",
+            NativeManagerShape::SeasonsRewardsBattlePassData(_) => "rankBySeasonKey",
+            NativeManagerShape::SeasonsRewardsCardTemplateData(_) => "cardTemplateByKey",
+            NativeManagerShape::SeasonsRewardsChapterData(_) => "chapterByKindIndex",
+            NativeManagerShape::SeasonsRewardsJourneyData(_) => "journeysForChapter",
+            NativeManagerShape::SongBookSheetData(_) => "sheetIdsForPage",
+            NativeManagerShape::SongBookData(_) => "sheetIdsForInstrument",
+            NativeManagerShape::ElementalMutationStaticData(_) => "possibleElementalStatusEffects",
+            NativeManagerShape::PromotionMutationStaticData(_) => {
+                "possiblePromotionalStatusEffectsForElement"
+            }
+            NativeManagerShape::MusicalRewardsData(_) => "rewardForGameEvent",
+            NativeManagerShape::CombatProfilesData(_) => "activeAbilityProfileByKey",
+            NativeManagerShape::ItemTransformData(_) => "transformByKey",
+            NativeManagerShape::GatherableData(_) => "gatheringActionByKey",
+            NativeManagerShape::SocialData(_) => "rankBySecurityLevel",
+            NativeManagerShape::PlayerData(_) => "hasPlayerBaseAttributes",
+            NativeManagerShape::RecipeData(_) => "craftingRecipeDataByResult",
+            _ => panic!("pre-lowered shape reached TypeScript native contract test: {shape:?}"),
+        }
+    }
+
     fn damage_compile_unit() -> GameDataCompileUnit {
         let schema_report = damage_schema_report();
         let codegen_plan = GameDataCodegenPlan::from_schema_report(
             GameDataCompileMode::SourceFormat,
             &schema_report,
-            vec![GameDataTargetPlan::standalone(
-                GameDataTargetLanguage::TypeScript,
-            )],
         );
         GameDataCompileUnit::new(schema_report.clone(), schema_report, codegen_plan)
     }
@@ -660,6 +1803,7 @@ mod tests {
             tables: vec![ItemDataManagerTable {
                 variant_name: "Master".to_owned(),
                 table_name: "MasterItemDefinitions".to_owned(),
+                row_type_name: "MasterItemDefinitions".to_owned(),
             }],
         }
     }
@@ -670,7 +1814,15 @@ mod tests {
             manager_class_name: "StaticBackstoryDataManager".to_owned(),
             record_type_name: "StaticBackstoryData".to_owned(),
             tables: Vec::new(),
-            key: None,
+            key: Some(SemanticManagerKey::Crc {
+                key_field: "backstory_id".to_owned(),
+                crc_field: "backstory_crc".to_owned(),
+                key_column: "BackstoryID".to_owned(),
+                skip_empty_key: true,
+                trim_key: true,
+                reject_zero_crc: true,
+                duplicate_key_policy: crate::manager::NativeDuplicateKeyPolicy::FirstWins,
+            }),
             source_row_field: None,
             source_row_method: None,
             row_filters: Vec::new(),
@@ -691,6 +1843,24 @@ mod tests {
             rows_method: None,
             len_method: None,
             is_empty_method: None,
+        }
+    }
+
+    fn skip_invalid_enum_field() -> crate::manager_records::SemanticRecordField {
+        crate::manager_records::SemanticRecordField {
+            name: "mission_goal_type".to_owned(),
+            column: "MissionGoalType".to_owned(),
+            transform: SemanticProjectionTransform::EnumStringSkipInvalid,
+            value_type: Some("MissionGoalType".to_owned()),
+            default_value: None,
+            reference_field: None,
+            u16_max_exclusive: None,
+            enum_shape: Some(crate::game_system_schema::GameSystemEnumShape {
+                name: "MissionGoalType".to_owned(),
+                representation: crate::game_system_schema::GameSystemEnumRepresentation::U8,
+                variants: Vec::new(),
+            }),
+            pair_first_enum_shape: None,
         }
     }
 
@@ -769,187 +1939,117 @@ mod tests {
     }
 }
 
-fn manager_manifest_source(
-    unit: &GameDataCompileUnit,
-    surfaces: &[ManagerSurface],
-) -> Result<String> {
-    let mut source = String::from(
-        r#"
-interface TableDependency {
-  readonly kind: "table";
+fn datasheet_catalog_files(unit: &GameDataCompileUnit) -> Result<Vec<GameDataCodegenFile>> {
+    let compressed = crate::rust::source::tables::compressed_datasheet_catalog_json(unit)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(compressed);
+    Ok(vec![
+        GameDataCodegenFile::new(
+            "src/managers/datasheet-catalog.ts",
+            format_typescript_source(DATASHEET_CATALOG_TS)?,
+        ),
+        GameDataCodegenFile::new(
+            "src/managers/datasheet-catalog-data.ts",
+            format!(
+                "export const DATASHEET_CATALOG_BASE64 = {};\n",
+                typescript_string_literal(&encoded)
+            ),
+        ),
+    ])
+}
+
+const DATASHEET_CATALOG_TS: &str = r#"
+import { DATASHEET_CATALOG_BASE64 } from "./datasheet-catalog-data.js";
+
+export interface ColumnSchema {
   readonly name: string;
-  readonly row: string;
+  readonly crc: number;
+  readonly rowKey: boolean;
 }
 
-interface AssetDependency {
-  readonly kind: "asset";
-  readonly path: string;
-}
-
-type ManagerDependency =
-  | TableDependency
-  | AssetDependency;
-
-interface ManagerDefinition {
+export interface TableSchema {
   readonly name: string;
-  readonly dependencies: readonly ManagerDependency[];
+  readonly rowType: string;
+  readonly sources: readonly string[];
+  readonly columns: readonly ColumnSchema[];
 }
 
-"#,
-    );
-
-    push_managers(&mut source, unit, surfaces);
-    source.push_str(
-        r#"
-function managerByName(
-  name: string,
-): ManagerDefinition | undefined {
-  return MANAGERS.find((entry) => entry.name === name);
-}
-"#,
-    );
-
-    Ok(format_typescript_source(&source)?)
+export async function loadTableSchemas(): Promise<readonly TableSchema[]> {
+  const compressed = Uint8Array.from(atob(DATASHEET_CATALOG_BASE64), (value) => value.charCodeAt(0));
+  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("gzip"));
+  const decoded: unknown = JSON.parse(await new Response(stream).text());
+  if (!Array.isArray(decoded)) {
+    throw new TypeError("generated datasheet catalog must contain an array");
+  }
+  return decoded.map(parseTableSchema);
 }
 
-fn push_table_schemas(source: &mut String, unit: &GameDataCompileUnit) {
-    source.push_str("export const TABLE_SCHEMAS: readonly TableSchema[] = [\n");
-    for table in &unit.schema_report().tables {
-        push_table_schema(source, table);
+function parseTableSchema(value: unknown, index: number): TableSchema {
+  const table = record(value, `table ${index}`);
+  return {
+    name: stringField(table, "name"),
+    rowType: stringField(table, "row_type"),
+    sources: stringArrayField(table, "sources"),
+    columns: arrayField(table, "columns").map(parseColumnSchema),
+  };
+}
+
+function parseColumnSchema(value: unknown, index: number): ColumnSchema {
+  const column = record(value, `column ${index}`);
+  return {
+    name: stringField(column, "name"),
+    crc: u32Field(column, "crc"),
+    rowKey: booleanField(column, "row_key"),
+  };
+}
+
+function record(value: unknown, label: string): Readonly<Record<string, unknown>> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  return value as Readonly<Record<string, unknown>>;
+}
+
+function stringField(value: Readonly<Record<string, unknown>>, field: string): string {
+  const fieldValue = value[field];
+  if (typeof fieldValue !== "string") {
+    throw new TypeError(`${field} must be a string`);
+  }
+  return fieldValue;
+}
+
+function u32Field(value: Readonly<Record<string, unknown>>, field: string): number {
+  const fieldValue = value[field];
+  if (!Number.isInteger(fieldValue) || (fieldValue as number) < 0 || (fieldValue as number) > 0xffff_ffff) {
+    throw new TypeError(`${field} must be an unsigned 32-bit integer`);
+  }
+  return fieldValue as number;
+}
+
+function booleanField(value: Readonly<Record<string, unknown>>, field: string): boolean {
+  const fieldValue = value[field];
+  if (typeof fieldValue !== "boolean") {
+    throw new TypeError(`${field} must be a boolean`);
+  }
+  return fieldValue;
+}
+
+function arrayField(value: Readonly<Record<string, unknown>>, field: string): readonly unknown[] {
+  const fieldValue = value[field];
+  if (!Array.isArray(fieldValue)) {
+    throw new TypeError(`${field} must be an array`);
+  }
+  return fieldValue;
+}
+
+function stringArrayField(value: Readonly<Record<string, unknown>>, field: string): readonly string[] {
+  return arrayField(value, field).map((entry, index) => {
+    if (typeof entry !== "string") {
+      throw new TypeError(`${field}[${index}] must be a string`);
     }
-    source.push_str(
-        r#"] as const satisfies readonly TableSchema[];
-
-export function tableSchemaByName(name: string): TableSchema | undefined {
-  return TABLE_SCHEMAS.find((table) => table.name === name);
+    return entry;
+  });
 }
-
-export function tableSchemaByNameAndRow(
-  name: string,
-  rowType: string,
-): TableSchema | undefined {
-  return TABLE_SCHEMAS.find((table) => table.name === name && table.rowType === rowType);
-}
-
-export function tableSchemaBySourcePath(sourcePath: string): TableSchema | undefined {
-  const normalized = normalizeDataPath(sourcePath);
-  return TABLE_SCHEMAS.find((table) =>
-    table.sources.some((candidate) => normalizeDataPath(candidate) === normalized),
-  );
-}
-
-"#,
-    );
-}
-
-fn push_table_schema(source: &mut String, table: &GameSystemTableSchema) {
-    source.push_str("  {\n");
-    source.push_str(&format!(
-        "    name: {},\n",
-        typescript_string_literal(&table.table_name)
-    ));
-    source.push_str(&format!("    nameCrc: {},\n", table.table_name_crc));
-    source.push_str(&format!(
-        "    rowType: {},\n",
-        typescript_string_literal(&table.row_type_name)
-    ));
-    source.push_str(&format!("    rowTypeCrc: {},\n", table.row_type_crc));
-    source.push_str(&format!("    rowCount: {},\n", table.row_count));
-    source.push_str("    sources: [");
-    for (index, source_path) in table.sources.iter().enumerate() {
-        if index > 0 {
-            source.push_str(", ");
-        }
-        source.push_str(&typescript_string_literal(source_path));
-    }
-    source.push_str("],\n");
-    source.push_str("    columns: [\n");
-    for column in &table.columns {
-        source.push_str("      {\n");
-        source.push_str(&format!(
-            "        name: {},\n",
-            typescript_string_literal(&column.name)
-        ));
-        source.push_str(&format!(
-            "        fieldName: {},\n",
-            typescript_string_literal(&to_snake_ident(&column.name, "column"))
-        ));
-        source.push_str(&format!("        crc: {},\n", column.crc));
-        source.push_str(&format!(
-            "        kind: {},\n",
-            typescript_string_literal(cell_kind(column.declared_type))
-        ));
-        source.push_str(&format!("        rowKey: {},\n", column.row_key));
-        source.push_str(&format!("        required: {},\n", column.required));
-        source.push_str("      },\n");
-    }
-    source.push_str("    ],\n");
-    source.push_str("  },\n");
-}
-
-fn push_managers(source: &mut String, unit: &GameDataCompileUnit, surfaces: &[ManagerSurface]) {
-    source.push_str("const MANAGERS: readonly ManagerDefinition[] = [\n");
-    let contracts = unit.codegen_plan_ref().managers().contracts();
-    for surface in surfaces {
-        let manager_name = manager_surface_name(surface);
-        let Some(contract) = contracts
-            .iter()
-            .find(|contract| semantic_type_name(contract.manager().as_str()) == manager_name)
-        else {
-            continue;
-        };
-        let dependencies = manager_surface_dependencies(surface, contract.inputs());
-        source.push_str("  {\n");
-        source.push_str(&format!(
-            "    name: {},\n",
-            typescript_string_literal(manager_name)
-        ));
-        source.push_str(&format!(
-            "    dependencies: [{}],\n",
-            manager_dependencies(&dependencies)
-        ));
-        source.push_str("  },\n");
-    }
-    source.push_str("];\n\n");
-}
-
-fn manager_dependencies(dependencies: &[ManagerSurfaceDependency]) -> String {
-    dependencies
-        .iter()
-        .map(manager_dependency)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn manager_dependency(input: &ManagerSurfaceDependency) -> String {
-    match input {
-        ManagerSurfaceDependency::Table { name, row } => format!(
-            "{{ kind: \"table\", name: {}, row: {} }}",
-            typescript_string_literal(name),
-            typescript_string_literal(row),
-        ),
-        ManagerSurfaceDependency::Asset { path } => format!(
-            "{{ kind: \"asset\", path: {} }}",
-            typescript_string_literal(path),
-        ),
-        ManagerSurfaceDependency::Manager { name } => format!(
-            "{{ kind: \"manager\", name: {} }}",
-            typescript_string_literal(name),
-        ),
-    }
-}
-
-fn semantic_type_name(path: &str) -> &str {
-    path.rsplit("::").next().unwrap_or(path)
-}
-
-fn cell_kind(column_type: ColumnType) -> &'static str {
-    match column_type {
-        ColumnType::String => "string",
-        ColumnType::Number => "number",
-        ColumnType::Boolean => "boolean",
-    }
-}
+"#;
 
 fn manager_record_types_source(records: &[SemanticManagerRecord]) -> Result<String> {
     let unit = semantic_manager_record_unit(records);
@@ -958,8 +2058,11 @@ fn manager_record_types_source(records: &[SemanticManagerRecord]) -> Result<Stri
             &unit,
             &SerializeTypeScriptSourceOptions {
                 include_support_aliases: false,
+                use_support_aliases: true,
+                immutable: true,
             },
         )
+        .map(|source| format!("import {{ Crc32 }} from \"../values.js\";\n\n{source}"))
         .map_err(|err| anyhow::anyhow!("emit TypeScript manager record types: {err}"))
 }
 
@@ -974,17 +2077,44 @@ fn push_manager_surface_classes(
     for surface in surfaces {
         match surface {
             ManagerSurface::Direct(manager) => push_direct_manager_class(source, unit, manager),
+            ManagerSurface::Native {
+                manager,
+                shape,
+                dependencies,
+                ..
+            } => push_native_manager_class(source, unit, manager, shape, dependencies),
             ManagerSurface::Semantic(record) => push_semantic_manager_class(source, record),
             ManagerSurface::ItemData(manager) => push_item_data_manager_class(source, manager),
+            ManagerSurface::Composition(manager) => push_composition_manager_class(source, manager),
             ManagerSurface::ProductBacked(manager) => {
                 push_product_backed_manager_class(source, manager)
             }
         }
     }
     source.push_str(SEMANTIC_MANAGER_RUNTIME_TS);
+    if surfaces.iter().any(|surface| {
+        matches!(surface, ManagerSurface::Semantic(record) if record.fields.iter().any(
+            |field| matches!(
+                field.transform,
+                SemanticProjectionTransform::OptionalU32
+                    | SemanticProjectionTransform::U32DefaultZero
+                    | SemanticProjectionTransform::OptionalNonZeroU32
+            )
+        ))
+    }) {
+        source.push_str(OPTIONAL_UINT32_CELL_TS);
+    }
+    if surfaces.iter().any(|surface| {
+        matches!(surface, ManagerSurface::Semantic(record) if record.fields.iter().any(
+            |field| field.transform == SemanticProjectionTransform::OptionalNonZeroU32
+        ))
+    }) {
+        source.push_str(OPTIONAL_NON_ZERO_UINT32_CELL_TS);
+    }
 }
 
 fn push_managers_facade(source: &mut String, surfaces: &[ManagerSurface]) {
+    let mut fields = String::new();
     let mut methods = String::new();
     let mut seen = BTreeSet::new();
     for surface in surfaces {
@@ -996,13 +2126,65 @@ fn push_managers_facade(source: &mut String, surfaces: &[ManagerSurface]) {
             ManagerSurface::Direct(manager) | ManagerSurface::ProductBacked(manager) => {
                 manager.manager_class_name.as_str()
             }
+            ManagerSurface::Native { manager, .. } => manager.manager_class_name.as_str(),
             ManagerSurface::Semantic(record) => record.manager_class_name.as_str(),
             ManagerSurface::ItemData(manager) => manager.manager_class_name.as_str(),
+            ManagerSurface::Composition(manager) => manager.manager_class_name.as_str(),
         };
         let accessor = ts_manager_accessor_name(&manager_name);
+        let field = format!("{accessor}Value");
+        fields.push_str(&format!("  private {field}?: Promise<{manager_class}>;\n"));
+        let build = match surface {
+            ManagerSurface::Composition(manager) => {
+                let dependencies = manager
+                    .dependencies
+                    .iter()
+                    .map(|dependency| {
+                        format!("await this.{}()", ts_manager_accessor_name(dependency))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("return {manager_class}[CREATE_MANAGER]({dependencies});")
+            }
+            ManagerSurface::Native { dependencies, .. } => {
+                let dependencies = dependencies
+                    .iter()
+                    .map(|dependency| {
+                        format!("await this.{}()", ts_manager_accessor_name(dependency))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let arguments = if dependencies.is_empty() {
+                    "this.cache".to_owned()
+                } else {
+                    format!("this.cache, {dependencies}")
+                };
+                format!("return {manager_class}[CREATE_MANAGER]({arguments});")
+            }
+            ManagerSurface::Direct(_)
+            | ManagerSurface::Semantic(_)
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::ProductBacked(_) => {
+                format!("return {manager_class}[CREATE_MANAGER](this.cache);")
+            }
+        };
+        let prepare = if matches!(surface, ManagerSurface::Composition(_)) {
+            String::new()
+        } else {
+            let (selectors, assets) = typescript_manager_resource_inputs(surface);
+            format!(
+                "await this.cache.prepare({manager_name:?}, {selectors}, {assets});\n          "
+            )
+        };
         methods.push_str(&format!(
-            r#"  {accessor}(): {manager_class} {{
-    return {manager_class}.fromCache(this.cache);
+            r#"  {accessor}(): Promise<{manager_class}> {{
+    return this.{field} ??= (async () => {{
+      try {{
+        {prepare}{build}
+      }} catch (cause) {{
+        throw new ManagerLoadError({manager_name:?}, cause);
+      }}
+    }})();
   }}
 
 "#
@@ -1011,71 +2193,1062 @@ fn push_managers_facade(source: &mut String, surfaces: &[ManagerSurface]) {
 
     source.push_str(&format!(
         r#"
+export class ManagerLoadError extends Error {{
+  readonly manager: string;
+
+  constructor(manager: string, cause: unknown) {{
+    super(`load ${{manager}}`, {{ cause }});
+    this.name = "ManagerLoadError";
+    this.manager = manager;
+  }}
+}}
+
 export class Managers {{
+{fields}
   private constructor(private readonly cache: ManagerCache) {{}}
 
   static async open(loader: AssetLoader): Promise<Managers> {{
-    const source = await (loader as unknown as AssetLoaderSourceAccessor)[ASSET_LOADER_SOURCE]();
-    return new Managers(new ManagerCache(source));
+    const tableSchemas = await loadTableSchemas();
+    return new Managers(new ManagerCache(loader, tableSchemas));
   }}
 
 {methods}}}
 
-export async function openManagers(loader: AssetLoader): Promise<Managers> {{
-  return Managers.open(loader);
-}}
-
 "#
     ));
 }
+
+fn typescript_manager_resource_inputs(surface: &ManagerSurface) -> (String, String) {
+    let (tables, products): (Vec<(String, String)>, Vec<&str>) = match surface {
+        ManagerSurface::Direct(manager)
+        | ManagerSurface::ProductBacked(manager)
+        | ManagerSurface::Native { manager, .. } => (
+            manager
+                .tables
+                .iter()
+                .map(|table| (table.table_name.clone(), table.row_type_name.clone()))
+                .collect(),
+            manager
+                .products
+                .iter()
+                .map(|product| product.path.as_str())
+                .collect(),
+        ),
+        ManagerSurface::Semantic(manager) => (
+            manager
+                .tables
+                .iter()
+                .map(|table| (table.table_name.clone(), table.row_type_name.clone()))
+                .collect(),
+            Vec::new(),
+        ),
+        ManagerSurface::ItemData(manager) => (
+            manager
+                .tables
+                .iter()
+                .map(|table| (table.table_name.clone(), table.row_type_name.clone()))
+                .collect(),
+            Vec::new(),
+        ),
+        ManagerSurface::Composition(_) => (Vec::new(), Vec::new()),
+    };
+    let selectors = tables
+        .into_iter()
+        .map(|(table_name, row_type_name)| {
+            format!(
+                "{{ name: {}, rowType: {} }}",
+                typescript_string_literal(&table_name),
+                typescript_string_literal(&row_type_name),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let products = products
+        .into_iter()
+        .map(typescript_string_literal)
+        .collect::<Vec<_>>()
+        .join(", ");
+    (format!("[{selectors}]"), format!("[{products}]"))
+}
+
+fn push_composition_manager_class(source: &mut String, manager: &CompositionManagerSurface) {
+    source.push_str(match manager.kind {
+        CompositionManagerKind::CurrencyExchangeMapping => CURRENCY_EXCHANGE_MAPPING_MANAGER_TS,
+        CompositionManagerKind::ReplicationData => REPLICATION_DATA_MANAGER_TS,
+        CompositionManagerKind::StaticTradeskillRankDataMapping => {
+            STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_TS
+        }
+        CompositionManagerKind::VitalsModifierMapping => VITALS_MODIFIER_MAPPING_MANAGER_TS,
+    });
+}
+
+const CURRENCY_EXCHANGE_MAPPING_MANAGER_TS: &str = r#"
+export type CurrencyExchangeEndpoint =
+  | { readonly kind: "currency" }
+  | { readonly kind: "categoricalProgression"; readonly id: Crc32 };
+
+export interface CurrencyExchangeMapping {
+  readonly source: CurrencyExchangeEndpoint;
+  readonly target: CurrencyExchangeEndpoint;
+  readonly exchange: CurrencyExchangeData;
+}
+
+export class CurrencyExchangeMappingManager {
+  private readonly mappingsCache: readonly CurrencyExchangeMapping[];
+  private readonly mappingsByEndpoint = new Map<string, CurrencyExchangeMapping>();
+
+  private constructor(
+    currencyExchangeData: CurrencyExchangeDataManager,
+    categoricalProgressionData: CategoricalProgressionDataManager,
+  ) {
+    const mappings: CurrencyExchangeMapping[] = [];
+    for (const exchange of currencyExchangeData) {
+      const source = currencyExchangeEndpoint(
+        exchange.fromCurrencyCrc,
+        exchange.fromCurrencyIsCategoricalProgression,
+        categoricalProgressionData,
+      );
+      const target = currencyExchangeEndpoint(
+        exchange.toCurrencyCrc,
+        exchange.toCurrencyIsCategoricalProgression,
+        categoricalProgressionData,
+      );
+      if (source === undefined || target === undefined) continue;
+      if (
+        source.kind === "categoricalProgression" &&
+        target.kind === "categoricalProgression" &&
+        source.id === target.id
+      ) continue;
+      const key = currencyExchangeEndpointPairKey(source, target);
+      if (this.mappingsByEndpoint.has(key)) continue;
+      const mapping = Object.freeze({ source, target, exchange });
+      this.mappingsByEndpoint.set(key, mapping);
+      mappings.push(mapping);
+    }
+    this.mappingsCache = Object.freeze(mappings);
+  }
+
+  static [CREATE_MANAGER](
+    currencyExchangeData: CurrencyExchangeDataManager,
+    categoricalProgressionData: CategoricalProgressionDataManager,
+  ): CurrencyExchangeMappingManager {
+    return new CurrencyExchangeMappingManager(currencyExchangeData, categoricalProgressionData);
+  }
+
+  mapping(source: CurrencyExchangeEndpoint, target: CurrencyExchangeEndpoint): CurrencyExchangeMapping | undefined {
+    return this.mappingsByEndpoint.get(currencyExchangeEndpointPairKey(source, target));
+  }
+
+  currencyExchange(source: CurrencyExchangeEndpoint, target: CurrencyExchangeEndpoint): CurrencyExchangeData | undefined {
+    return this.mapping(source, target)?.exchange;
+  }
+
+  conversionId(source: CurrencyExchangeEndpoint, target: CurrencyExchangeEndpoint): Crc32 | undefined {
+    return this.currencyExchange(source, target)?.conversionCrc;
+  }
+
+  mappings(): IterableIterator<CurrencyExchangeMapping> { return this.mappingsCache.values(); }
+  [Symbol.iterator](): Iterator<CurrencyExchangeMapping> { return this.mappings(); }
+  len(): number { return this.mappingsCache.length; }
+  isEmpty(): boolean { return this.mappingsCache.length === 0; }
+}
+
+function currencyExchangeEndpoint(
+  id: Crc32,
+  categorical: boolean,
+  progressions: CategoricalProgressionDataManager,
+): CurrencyExchangeEndpoint | undefined {
+  if (!categorical) return Object.freeze({ kind: "currency" });
+  const progression = progressions.categoricalProgressionDataFromId(id);
+  return progression === undefined
+    ? undefined
+    : Object.freeze({ kind: "categoricalProgression", id: progression.categoricalProgressionIdCrc });
+}
+
+function currencyExchangeEndpointPairKey(source: CurrencyExchangeEndpoint, target: CurrencyExchangeEndpoint): string {
+  return `${currencyExchangeEndpointKey(source)}>${currencyExchangeEndpointKey(target)}`;
+}
+
+function currencyExchangeEndpointKey(endpoint: CurrencyExchangeEndpoint): string {
+  return endpoint.kind === "currency" ? "currency" : `progression:${endpoint.id}`;
+}
+"#;
+
+const REPLICATION_DATA_MANAGER_TS: &str = r#"
+export class ReplicationDataManager {
+  private readonly indexesById = new Map<Crc32, number>();
+
+  private constructor(private readonly idsCache: readonly Crc32[]) {
+    for (let index = 1; index < idsCache.length && index <= 0xffff; index += 1) {
+      const id = idsCache[index];
+      if (id !== Crc32.ZERO && !this.indexesById.has(id)) this.indexesById.set(id, index);
+    }
+  }
+
+  static [CREATE_MANAGER](perkData: PerkDataManager): ReplicationDataManager {
+    return new ReplicationDataManager(Object.freeze([Crc32.ZERO, ...perkData.perkIds()]));
+  }
+
+  idAt(index: number): Crc32 {
+    return Number.isInteger(index) && index >= 0 ? (this.idsCache[index] ?? Crc32.ZERO) : Crc32.ZERO;
+  }
+
+  indexOf(id: string | Crc32): number {
+    const key = crc32LookupKey(id);
+    if (key === Crc32.ZERO) return 0;
+    return this.indexesById.get(key) ?? 0;
+  }
+
+  ids(): readonly Crc32[] { return this.idsCache; }
+  len(): number { return this.idsCache.length; }
+  isEmpty(): boolean { return this.idsCache.length === 0; }
+}
+"#;
+
+const VITALS_MODIFIER_MAPPING_MANAGER_TS: &str = r#"
+export interface VitalsModifierMapping {
+  readonly key: string;
+  readonly id: Crc32;
+}
+
+export class VitalsModifierMappingManager {
+  private readonly entriesCache: VitalsModifierMapping[] = [];
+  private readonly entriesById = new Map<Crc32, VitalsModifierMapping>();
+
+  private constructor(vitals: VitalsDataManager, damage: DamageDataManager, items: ItemDataManager) {
+    for (const entry of vitals) this.insertLowercase(entry.key);
+    for (const entry of damage.damageTypes()) this.insertLowercase(entry.key);
+    for (const entry of damage) {
+      this.insertLowercase(normalizeWeaponCategory(entry.weaponCategory));
+    }
+    this.insertLowercase("Physical");
+    this.insertLowercase("Elemental");
+    for (const item of items) this.insertItemAliases(item.itemId, item.itemIdCrc);
+  }
+
+  static [CREATE_MANAGER](
+    vitals: VitalsDataManager,
+    damage: DamageDataManager,
+    items: ItemDataManager,
+  ): VitalsModifierMappingManager {
+    return new VitalsModifierMappingManager(vitals, damage, items);
+  }
+
+  get(id: string | Crc32): VitalsModifierMapping | undefined { return this.entriesById.get(crc32LookupKey(id)); }
+  byKey(key: string): VitalsModifierMapping | undefined { return this.entriesById.get(Crc32.fromStringLower(key)); }
+  rows(): IterableIterator<VitalsModifierMapping> { return this.entriesCache.values(); }
+  [Symbol.iterator](): Iterator<VitalsModifierMapping> { return this.rows(); }
+  len(): number { return this.entriesCache.length; }
+  isEmpty(): boolean { return this.entriesCache.length === 0; }
+
+  private insertLowercase(raw: string): void {
+    const key = raw.trim();
+    if (key.length !== 0) this.insertWithId(key, Crc32.fromStringLower(key));
+  }
+
+  private insertItemAliases(raw: string, id: Crc32): void {
+    const key = raw.trim();
+    if (key.length === 0 || id === Crc32.ZERO) return;
+    const entry = this.insertWithId(key, id);
+    const lowercaseId = Crc32.fromStringLower(key);
+    if (lowercaseId !== Crc32.ZERO && !this.entriesById.has(lowercaseId)) this.entriesById.set(lowercaseId, entry);
+  }
+
+  private insertWithId(key: string, id: Crc32): VitalsModifierMapping {
+    const existing = this.entriesById.get(id);
+    if (existing !== undefined) return existing;
+    const entry = Object.freeze({ key, id });
+    this.entriesById.set(id, entry);
+    this.entriesCache.push(entry);
+    return entry;
+  }
+}
+
+function normalizeWeaponCategory(value: string): string {
+  const normalized = value.trim();
+  return normalized.length === 0 || normalized.toLowerCase() === "none" ? "Default" : normalized;
+}
+"#;
+
+const STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_TS: &str = r#"
+export interface StaticTradeskillRankDataMapping {
+  readonly categoricalProgressionId: Crc32;
+  readonly table: TradeskillRankDataTable;
+  readonly rank: number;
+}
+
+export interface PlayerLevelRankMapping {
+  readonly displayNameId: Crc32;
+  readonly rank: number;
+}
+
+const TRADESKILL_TYPES: readonly TradeskillType[] = Object.freeze([
+  "Weaponsmithing", "Armoring", "Jewelcrafting", "Arcana", "Cooking", "Furnishing",
+  "Engineering", "Smelting", "Woodworking", "Leatherworking", "Weaving", "Stonecutting",
+  "Skinning", "Mining", "Logging", "Harvesting", "Fishing", "AzothStaff", "Musician", "Riding",
+]);
+
+const TRADESKILL_RANK_TABLES: ReadonlySet<string> = new Set(TRADESKILL_TYPES);
+
+function isTradeskillRankTable(
+  value: string,
+): value is TradeskillRankDataTable {
+  return TRADESKILL_RANK_TABLES.has(value);
+}
+
+export class StaticTradeskillRankDataMappingManager {
+  private readonly playerLevelsByDisplayName = new Map<Crc32, number>();
+  private readonly tradeskillRanksByDisplayName = new Map<Crc32, StaticTradeskillRankDataMapping>();
+
+  private constructor(
+    experience: ExperienceDataManager,
+    player: PlayerDataManager,
+    progressions: CategoricalProgressionDataManager,
+    ranks: TradeskillRankDataManager,
+  ) {
+    const maxPlayerLevel = experience.maxLevel();
+    if (maxPlayerLevel !== undefined) {
+      for (const row of ranks.playerLevels()) {
+        if (row.rank > maxPlayerLevel || row.displayNameId === Crc32.ZERO) continue;
+        if (!this.playerLevelsByDisplayName.has(row.displayNameId)) {
+          this.playerLevelsByDisplayName.set(row.displayNameId, row.rank);
+        }
+      }
+    }
+
+    for (const tradeskill of TRADESKILL_TYPES) {
+      const categoricalProgressionId = player.categoricalProgressionId(tradeskill);
+      if (categoricalProgressionId === undefined) continue;
+      const progression = progressions.categoricalProgressionDataFromId(categoricalProgressionId);
+      if (
+        progression === undefined
+        || progression.rankTableId === null
+        || !isTradeskillRankTable(progression.rankTableId)
+      ) continue;
+      for (let rank = 0; rank <= progression.maxLevel; rank += 1) {
+        if (rank > 0xffff) {
+          throw new RangeError(
+            `categorical progression ${progression.categoricalProgressionId} max rank ${rank} exceeds u16 range`,
+          );
+        }
+        const row = ranks.tradeskillRank(progression.rankTableId, rank);
+        if (row === undefined || row.displayNameId === Crc32.ZERO) continue;
+        if (!this.tradeskillRanksByDisplayName.has(row.displayNameId)) {
+          this.tradeskillRanksByDisplayName.set(
+            row.displayNameId,
+            Object.freeze({ categoricalProgressionId, table: row.table, rank }),
+          );
+        }
+      }
+    }
+  }
+
+  static [CREATE_MANAGER](
+    experience: ExperienceDataManager,
+    player: PlayerDataManager,
+    progressions: CategoricalProgressionDataManager,
+    ranks: TradeskillRankDataManager,
+  ): StaticTradeskillRankDataMappingManager {
+    return new StaticTradeskillRankDataMappingManager(experience, player, progressions, ranks);
+  }
+
+  playerLevelForDisplayName(displayName: string | Crc32): number | undefined {
+    return this.playerLevelsByDisplayName.get(crc32LookupKey(displayName));
+  }
+
+  tradeskillRankForDisplayName(
+    displayName: string | Crc32,
+  ): StaticTradeskillRankDataMapping | undefined {
+    return this.tradeskillRanksByDisplayName.get(crc32LookupKey(displayName));
+  }
+
+  *playerLevels(): IterableIterator<PlayerLevelRankMapping> {
+    for (const [displayNameId, rank] of this.playerLevelsByDisplayName) {
+      yield Object.freeze({ displayNameId, rank });
+    }
+  }
+
+  tradeskillRanks(): IterableIterator<StaticTradeskillRankDataMapping> {
+    return this.tradeskillRanksByDisplayName.values();
+  }
+
+  len(): number {
+    return this.playerLevelsByDisplayName.size + this.tradeskillRanksByDisplayName.size;
+  }
+
+  isEmpty(): boolean {
+    return this.playerLevelsByDisplayName.size === 0 && this.tradeskillRanksByDisplayName.size === 0;
+  }
+}
+"#;
 
 fn push_direct_manager_class(
     source: &mut String,
     unit: &GameDataCompileUnit,
     manager: &DirectManagerSurface,
 ) {
+    push_direct_manager_class_with_dependencies(
+        source,
+        unit,
+        manager,
+        &[],
+        &TsNativeManagerAugmentation::default(),
+    );
+}
+
+#[derive(Debug, Default)]
+struct TsNativeManagerAugmentation {
+    declarations: String,
+    fields: String,
+    initializers: String,
+    methods: String,
+    rows_interface: Option<String>,
+    row_methods: Option<String>,
+}
+
+fn push_direct_manager_class_with_dependencies(
+    source: &mut String,
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+    dependencies: &[String],
+    augmentation: &TsNativeManagerAugmentation,
+) {
     let manager_class = &manager.manager_class_name;
-    let manager_name = typescript_string_literal(&manager.manager_name);
-    let runtime_factory = ts_method_name(&manager.manager_name);
-    let accessor = ts_manager_accessor_name(&manager.manager_name);
+    let manager_instance = ts_direct_manager_instance_expression(manager);
     let mut product_methods = direct_ts_product_methods(manager);
     product_methods.push_str(&special_ts_manager_extra_methods(manager_class));
-    let row_methods = direct_ts_schema_methods(unit, manager);
-    let rows_interface = direct_ts_rows_interface(unit, manager);
-    let constructor = if row_methods.trim().is_empty() && product_methods.trim().is_empty() {
-        "constructor(instance: ManagerInstance) { void instance; }"
+    let row_methods = augmentation.row_methods.as_ref().map_or_else(
+        || direct_ts_schema_methods(unit, manager),
+        |semantic_methods| {
+            format!(
+                "{semantic_methods}{}",
+                direct_ts_named_row_family_methods(unit, manager)
+            )
+        },
+    );
+    let rows_interface = augmentation
+        .rows_interface
+        .clone()
+        .unwrap_or_else(|| direct_ts_rows_interface(unit, manager));
+    let row_specs = ts_direct_row_specs(unit, manager);
+    let row_fields = row_specs
+        .iter()
+        .map(|row| {
+            let table_type = ts_direct_table_type_name(manager, &row.source_row_type);
+            format!(
+                "  private readonly {}: RowCollection<{}, {}>;\n",
+                ts_direct_row_field_name(&row.source_row_type),
+                row.type_name,
+                table_type,
+            )
+        })
+        .collect::<String>();
+    let row_initializers = row_specs
+        .iter()
+        .map(|row| {
+            let table_sources = ts_direct_table_sources_expression(unit, manager, row);
+            format!(
+                "    this.{} = new RowCollectionImpl(resources.schemaFamilyEntries({:?}, {}), {table_sources});\n",
+                ts_direct_row_field_name(&row.source_row_type),
+                row.source_row_type,
+                ts_schema_reader_name(&row.source_row_type)
+            )
+        })
+        .collect::<String>();
+    let table_types = ts_direct_table_type_declarations(unit, manager, &row_specs);
+    let (product_fields, product_initializers) = ts_product_storage(manager);
+    let dependency_parameters = dependencies
+        .iter()
+        .map(|dependency| {
+            format!(
+                ", _{}: {}",
+                ts_manager_dependency_name(dependency),
+                dependency
+            )
+        })
+        .collect::<String>();
+    let dependency_arguments = dependencies
+        .iter()
+        .map(|dependency| format!(", _{}", ts_manager_dependency_name(dependency)))
+        .collect::<String>();
+    let native_fields = &augmentation.fields;
+    let native_initializers = &augmentation.initializers;
+    let native_methods = &augmentation.methods;
+    source.push_str(&augmentation.declarations);
+    let constructor = if row_specs.is_empty()
+        && product_fields.is_empty()
+        && native_initializers.is_empty()
+    {
+        format!("private constructor(_resources: ManagerResources{dependency_parameters}) {{}}")
     } else {
-        "constructor(private readonly instance: ManagerInstance) {}"
+        format!(
+            "private constructor(resources: ManagerResources{dependency_parameters}) {{\n{row_initializers}{product_initializers}{native_initializers}  }}"
+        )
     };
     source.push_str(&format!(
         r#"
+{table_types}
 export class {manager_class}{rows_interface} {{
+{row_fields}
+{product_fields}
+{native_fields}
   {constructor}
 
-  static fromCache(cache: ManagerCache): {manager_class} {{
-    return new {manager_class}(cache[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
+  static [CREATE_MANAGER](cache: ManagerCache{dependency_parameters}): {manager_class} {{
+    return new {manager_class}({manager_instance}{dependency_arguments});
   }}
 
 {row_methods}
 {product_methods}
-}}
-
-export function {runtime_factory}(managers: Managers): {manager_class} {{
-  return managers.{accessor}();
+{native_methods}
 }}
 
 "#
     ));
 }
 
+fn push_native_manager_class(
+    source: &mut String,
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+    shape: &NativeManagerShape,
+    dependencies: &[String],
+) {
+    let effective = ts_effective_native_manager_surface(manager, shape);
+    let augmentation = ts_native_manager_augmentation(unit, &effective, shape);
+    push_direct_manager_class_with_dependencies(
+        source,
+        unit,
+        &effective,
+        dependencies,
+        &augmentation,
+    );
+}
+
+fn ts_effective_native_manager_surface(
+    manager: &DirectManagerSurface,
+    shape: &NativeManagerShape,
+) -> DirectManagerSurface {
+    let mut effective = manager.clone();
+    if let NativeManagerShape::RecipeData(recipe) = shape {
+        for table in recipe.tables() {
+            let candidate = DirectManagerTable {
+                table_name: table.table_name().as_str().to_owned(),
+                row_type_name: table.row_type_name().as_str().to_owned(),
+            };
+            if !effective.tables.contains(&candidate) {
+                effective.tables.push(candidate);
+            }
+        }
+    }
+    effective
+}
+
+fn ts_native_manager_augmentation(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+    shape: &NativeManagerShape,
+) -> TsNativeManagerAugmentation {
+    native::augmentation(unit, manager, shape)
+}
+
+fn experience_manager_augmentation() -> TsNativeManagerAugmentation {
+    TsNativeManagerAugmentation {
+        fields: r#"  private readonly experienceByLevel = new Map<number, ExperienceDataSchemaRow>();
+  private readonly gearScoreThresholds: Array<readonly [number, number]> = [];
+  private readonly xpThresholds: Array<readonly [number, number]> = [];
+  private maxLevelValue: number | undefined;
+"#
+        .to_owned(),
+        initializers: r#"    for (const { row } of this.experienceDataCollection) {
+      const level = normalizeUnsignedInteger(row.levelNumber);
+      this.experienceByLevel.set(level, row);
+      this.maxLevelValue = this.maxLevelValue === undefined ? level : Math.max(this.maxLevelValue, level);
+      const gearScore = normalizeOptionalPositiveInteger(row.maxEquippableGearScore);
+      if (gearScore !== undefined) this.gearScoreThresholds.push([gearScore, level]);
+      this.xpThresholds.push([normalizeOptionalUnsignedInteger(row.xpToLevel), level]);
+    }
+    this.gearScoreThresholds.sort(compareNumberPairs);
+    this.xpThresholds.sort(compareNumberPairs);
+"#
+        .to_owned(),
+        methods: r#"  experienceDataFromId(level: number): ExperienceDataSchemaRow | undefined {
+    return this.experienceByLevel.get(normalizeUnsignedInteger(level));
+  }
+
+  experienceData(level: number): ExperienceDataSchemaRow | undefined {
+    return this.experienceDataFromId(level);
+  }
+
+  experienceDataForMaxEquippableGearScore(gearScore: number): ExperienceDataSchemaRow | undefined {
+    const normalized = normalizeUnsignedInteger(gearScore);
+    const match = this.gearScoreThresholds.find(([threshold]) => normalized <= threshold);
+    return match === undefined ? undefined : this.experienceByLevel.get(match[1]);
+  }
+
+  levelForXp(xp: number | bigint): number {
+    const normalized = typeof xp === "bigint" ? xp : BigInt(normalizeUnsignedInteger(xp));
+    let level = 0;
+    for (const [threshold, candidate] of this.xpThresholds) {
+      if (BigInt(threshold) <= normalized) level = Math.max(level, candidate);
+    }
+    return level;
+  }
+
+  maxLevel(): number | undefined {
+    return this.maxLevelValue;
+  }
+
+  len(): number { return this.experienceByLevel.size; }
+  isEmpty(): boolean { return this.experienceByLevel.size === 0; }
+"#
+        .to_owned(),
+        ..TsNativeManagerAugmentation::default()
+    }
+}
+
+fn damage_manager_augmentation(
+    _unit: &GameDataCompileUnit,
+    _manager: &DirectManagerSurface,
+) -> TsNativeManagerAugmentation {
+    TsNativeManagerAugmentation {
+        declarations: r#"export interface DamageDataReference {
+  readonly table: DamageDataTable;
+  readonly id: Crc32;
+}
+
+export interface DamageDataSlot {
+  readonly table: DamageDataTable;
+  readonly rowIndex: number;
+}
+
+export interface DamageData {
+  readonly reference: DamageDataReference;
+  readonly slot: DamageDataSlot;
+  readonly key: string;
+  readonly id: Crc32;
+  readonly weaponCategory: string;
+  readonly weaponCategoryId: Crc32;
+  readonly source: RowRef<DamageDataTable, DamageDataSchemaRow>;
+}
+
+export interface DamageTypeData {
+  readonly key: string;
+  readonly id: Crc32;
+  readonly numericId: number;
+  readonly source: RowRef<DamageDataDamageTypeDataTable, DamageTypeDataSchemaRow>;
+}
+
+export interface AfflictionData {
+  readonly key: string;
+  readonly id: Crc32;
+  readonly numericId: number;
+  readonly source: RowRef<DamageDataAfflictionDataTable, AfflictionDataSchemaRow>;
+}
+
+"#
+        .to_owned(),
+        fields: r#"  private readonly damageEntries: DamageData[] = [];
+  private readonly damageByReference = new Map<string, DamageData>();
+  private readonly damageBySlotIndex = new Map<string, DamageData>();
+  private readonly damageTypeEntries: DamageTypeData[] = [];
+  private readonly damageTypesById = new Map<Crc32, DamageTypeData>();
+  private readonly afflictionEntries: AfflictionData[] = [];
+  private readonly afflictionsById = new Map<Crc32, AfflictionData>();
+  private readonly weaponCategoryEntries: string[] = [];
+  private readonly weaponCategoryIds = new Set<Crc32>();
+"#
+        .to_owned(),
+        initializers: r#"    for (const source of this.damageDataCollection) {
+      const table = source.ref.table;
+      const key = source.row.damageId.trim();
+      if (key.length === 0) continue;
+      const id = Crc32.fromStringLower(key);
+      if (id === Crc32.ZERO || source.slot.rowIndex >= 0xffff) continue;
+      const reference = Object.freeze({ table, id });
+      const slot = Object.freeze({ table, rowIndex: source.slot.rowIndex });
+      const referenceKey = damageReferenceLookupKey(reference);
+      const slotKey = damageSlotLookupKey(slot);
+      if (this.damageByReference.has(referenceKey) || this.damageBySlotIndex.has(slotKey)) continue;
+      const weaponCategory = normalizeWeaponCategory(source.row.weaponCategory ?? "");
+      const weaponCategoryId = Crc32.fromStringLower(weaponCategory);
+      const data = Object.freeze({ reference, slot, key, id, weaponCategory, weaponCategoryId, source: source.ref });
+      this.damageEntries.push(data);
+      this.damageByReference.set(referenceKey, data);
+      this.damageBySlotIndex.set(slotKey, data);
+      if (weaponCategoryId !== Crc32.ZERO && !this.weaponCategoryIds.has(weaponCategoryId)) {
+        this.weaponCategoryIds.add(weaponCategoryId);
+        this.weaponCategoryEntries.push(weaponCategory);
+      }
+    }
+    for (const source of this.damageTypeDataCollection) {
+      const key = source.row.typeId.trim();
+      const id = Crc32.fromStringLower(key);
+      const numericId = normalizeOptionalUnsignedInteger(source.row.intId);
+      if (key.length === 0 || id === Crc32.ZERO || numericId === 0 || numericId > 0xff || this.damageTypesById.has(id)) continue;
+      const data = Object.freeze({ key, id, numericId, source: source.ref });
+      this.damageTypeEntries.push(data);
+      this.damageTypesById.set(id, data);
+    }
+    for (const source of this.afflictionDataCollection) {
+      const key = source.row.afflictionId.trim();
+      const id = Crc32.fromStringLower(key);
+      const numericId = normalizeOptionalUnsignedInteger(source.row.intId);
+      if (key.length === 0 || id === Crc32.ZERO || numericId === 0 || numericId >= 0xff || this.afflictionsById.has(id)) continue;
+      const data = Object.freeze({ key, id, numericId, source: source.ref });
+      this.afflictionEntries.push(data);
+      this.afflictionsById.set(id, data);
+    }
+"#
+        .to_owned(),
+        methods: r#"  damage(reference: DamageDataReference): DamageData | undefined {
+    return this.damageByReference.get(damageReferenceLookupKey(reference));
+  }
+
+  damageBySlot(slot: DamageDataSlot): DamageData | undefined {
+    return this.damageBySlotIndex.get(damageSlotLookupKey(slot));
+  }
+
+  damageById(table: DamageDataTable, id: string | Crc32): DamageData | undefined {
+    return this.damage({ table, id: crc32LookupKey(id) });
+  }
+
+  damageByKey(table: DamageDataTable, key: string): DamageData | undefined {
+    return this.damageById(table, key);
+  }
+
+  resolve(reference: TableReference): DamageData | undefined {
+    const table = parseDamageDataTable(reference.path);
+    return table === undefined ? undefined : this.damageByKey(table, reference.key);
+  }
+
+  damageRefBySlot(slot: DamageDataSlot): DamageDataReference | undefined {
+    return this.damageBySlot(slot)?.reference;
+  }
+
+  damageKeyBySlot(slot: DamageDataSlot): string | undefined {
+    return this.damageBySlot(slot)?.key;
+  }
+
+  damageType(id: string | Crc32): DamageTypeData | undefined {
+    return this.damageTypesById.get(crc32LookupKey(id));
+  }
+
+  damageTypeByKey(key: string): DamageTypeData | undefined { return this.damageType(key); }
+  affliction(id: string | Crc32): AfflictionData | undefined { return this.afflictionsById.get(crc32LookupKey(id)); }
+  afflictionByKey(key: string): AfflictionData | undefined { return this.affliction(key); }
+  damageRows(): IterableIterator<DamageData> { return this.damageEntries.values(); }
+  damageTypes(): IterableIterator<DamageTypeData> { return this.damageTypeEntries.values(); }
+  *damageTypeIds(): IterableIterator<Crc32> { for (const row of this.damageTypeEntries) yield row.id; }
+  afflictions(): IterableIterator<AfflictionData> { return this.afflictionEntries.values(); }
+  weaponCategories(): IterableIterator<string> { return this.weaponCategoryEntries.values(); }
+  len(): number { return this.damageEntries.length; }
+  isEmpty(): boolean { return this.damageEntries.length === 0; }
+"#
+        .to_owned(),
+        rows_interface: Some(" implements Rows<DamageData>".to_owned()),
+        row_methods: Some("  rows(): IterableIterator<DamageData> { return this.damageEntries.values(); }\n  [Symbol.iterator](): Iterator<DamageData> { return this.rows(); }\n\n".to_owned()),
+    }
+}
+
+fn vitals_manager_augmentation() -> TsNativeManagerAugmentation {
+    TsNativeManagerAugmentation {
+        declarations: r#"export interface VitalsLevelVariantData {
+  readonly key: string;
+  readonly id: Crc32;
+  readonly baseVitalsKey: string;
+  readonly baseVitalsId: Crc32;
+  readonly source: RowRef<VitalsDataTable, VitalsLevelVariantDataSchemaRow>;
+}
+
+"#
+        .to_owned(),
+        fields: r#"  private readonly vitalsEntries: VitalsLevelVariantData[] = [];
+  private readonly vitalsById = new Map<Crc32, VitalsLevelVariantData>();
+  private readonly creatureTypeIdEntries: Crc32[] = [];
+  private readonly creatureTypeIdSet = new Set<Crc32>();
+"#
+        .to_owned(),
+        initializers: r#"    for (const source of this.vitalsLevelVariantDataCollection) {
+      const key = source.row.vitalsId.trim();
+      const id = Crc32.fromStringLower(key);
+      if (key.length === 0 || id === Crc32.ZERO || this.vitalsById.has(id)) continue;
+      const baseVitalsKey = source.row.baseVitalsId?.trim() ?? "";
+      const baseVitalsId = Crc32.fromStringLower(baseVitalsKey);
+      const data = Object.freeze({ key, id, baseVitalsKey, baseVitalsId, source: source.ref });
+      this.vitalsEntries.push(data);
+      this.vitalsById.set(id, data);
+      const creatureTypeId = _vitalsBaseData.vitalsBaseDataFromId(baseVitalsId)?.creatureTypeCrc;
+      if (creatureTypeId !== undefined && creatureTypeId !== Crc32.ZERO && !this.creatureTypeIdSet.has(creatureTypeId)) {
+        this.creatureTypeIdSet.add(creatureTypeId);
+        this.creatureTypeIdEntries.push(creatureTypeId);
+      }
+    }
+"#
+        .to_owned(),
+        methods: r#"  getById(id: string | Crc32): VitalsLevelVariantData | undefined {
+    return this.vitalsById.get(crc32LookupKey(id));
+  }
+
+  byKey(key: string): VitalsLevelVariantData | undefined { return this.getById(key); }
+  vitals(): IterableIterator<VitalsLevelVariantData> { return this.vitalsEntries.values(); }
+  creatureTypeIds(): IterableIterator<Crc32> { return this.creatureTypeIdEntries.values(); }
+  len(): number { return this.vitalsEntries.length; }
+  isEmpty(): boolean { return this.vitalsEntries.length === 0; }
+"#
+        .to_owned(),
+        rows_interface: Some(" implements Rows<VitalsLevelVariantData>".to_owned()),
+        row_methods: Some("  rows(): IterableIterator<VitalsLevelVariantData> { return this.vitalsEntries.values(); }\n  [Symbol.iterator](): Iterator<VitalsLevelVariantData> { return this.rows(); }\n\n".to_owned()),
+    }
+}
+
+fn tradeskill_rank_manager_augmentation(
+    _unit: &GameDataCompileUnit,
+    _manager: &DirectManagerSurface,
+) -> TsNativeManagerAugmentation {
+    TsNativeManagerAugmentation {
+        declarations: r#"export interface PlayerLevelRankData {
+  readonly rank: number;
+  readonly displayNameId: Crc32;
+  readonly source: RowRef<TradeskillRankDataExperienceDataTable, ExperienceDataSchemaRow>;
+}
+
+export interface StaticTradeskillRankData {
+  readonly table: TradeskillRankDataTable;
+  readonly rank: number;
+  readonly displayName: string | null;
+  readonly displayNameId: Crc32;
+  readonly source: RowRef<TradeskillRankDataTable, TradeskillRankDataSchemaRow>;
+}
+
+export type TradeskillRankData = PlayerLevelRankData | StaticTradeskillRankData;
+
+"#
+        .to_owned(),
+        fields: r#"  private readonly playerLevelsByRank = new Map<number, PlayerLevelRankData>();
+  private readonly tradeskillRanksByTableAndRank = new Map<string, StaticTradeskillRankData>();
+"#
+        .to_owned(),
+        initializers: r#"    for (const source of this.experienceDataCollection) {
+      const rank = normalizeUnsignedInteger(source.row.levelNumber);
+      if (!this.playerLevelsByRank.has(rank)) {
+        this.playerLevelsByRank.set(rank, Object.freeze({ rank, displayNameId: Crc32.ZERO, source: source.ref }));
+      }
+    }
+    for (const source of this.tradeskillRankDataCollection) {
+      const table = source.ref.table;
+      const rank = normalizeUnsignedInteger(source.row.level);
+      const key = tradeskillRankLookupKey(table, rank);
+      if (this.tradeskillRanksByTableAndRank.has(key)) continue;
+      const displayName = source.row.displayName?.trim() || null;
+      this.tradeskillRanksByTableAndRank.set(key, Object.freeze({
+        table,
+        rank,
+        displayName,
+        displayNameId: displayName === null ? Crc32.ZERO : Crc32.fromStringLower(displayName),
+        source: source.ref,
+      }));
+    }
+"#
+        .to_owned(),
+        methods: r#"  playerLevelRow(rank: number): PlayerLevelRankData | undefined {
+    return this.playerLevelsByRank.get(normalizeUnsignedInteger(rank));
+  }
+
+  tradeskillRank(table: TradeskillRankDataTable, rank: number): StaticTradeskillRankData | undefined {
+    return this.tradeskillRanksByTableAndRank.get(tradeskillRankLookupKey(table, rank));
+  }
+
+  playerLevels(): IterableIterator<PlayerLevelRankData> {
+    return this.playerLevelsByRank.values();
+  }
+
+  tradeskillRanks(): IterableIterator<StaticTradeskillRankData> {
+    return this.tradeskillRanksByTableAndRank.values();
+  }
+
+  len(): number { return this.playerLevelsByRank.size + this.tradeskillRanksByTableAndRank.size; }
+  isEmpty(): boolean { return this.playerLevelsByRank.size === 0 && this.tradeskillRanksByTableAndRank.size === 0; }
+"#
+        .to_owned(),
+        rows_interface: Some(" implements Rows<TradeskillRankData>".to_owned()),
+        row_methods: Some("  *rows(): IterableIterator<TradeskillRankData> { yield* this.playerLevelsByRank.values(); yield* this.tradeskillRanksByTableAndRank.values(); }\n  [Symbol.iterator](): Iterator<TradeskillRankData> { return this.rows(); }\n\n".to_owned()),
+    }
+}
+
+fn ts_manager_instance_expression<'a>(
+    manager_name: &str,
+    tables: impl IntoIterator<Item = (&'a str, &'a str)>,
+    asset_paths: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let tables = tables
+        .into_iter()
+        .map(|(name, row_type)| {
+            format!(
+                "{{ name: {}, rowType: {} }}",
+                typescript_string_literal(name),
+                typescript_string_literal(row_type)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let assets = asset_paths
+        .into_iter()
+        .map(typescript_string_literal)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "cache.resourcesForTables({}, [{tables}], [{assets}])",
+        typescript_string_literal(manager_name)
+    )
+}
+
+fn ts_direct_manager_instance_expression(manager: &DirectManagerSurface) -> String {
+    let row_types = manager
+        .tables
+        .iter()
+        .map(|table| table.row_type_name.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(typescript_string_literal)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let assets = manager
+        .products
+        .iter()
+        .map(|product| typescript_string_literal(&product.path))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "cache.resourcesForRows({}, [{row_types}], [{assets}])",
+        typescript_string_literal(&manager.manager_name)
+    )
+}
+
 fn direct_ts_rows_interface(unit: &GameDataCompileUnit, manager: &DirectManagerSurface) -> String {
     let Some(row_spec) = ts_direct_default_row_spec(unit, manager) else {
         return String::new();
     };
+    let table_type = ts_direct_table_type_name(manager, &row_spec.source_row_type);
     format!(
-        " implements {}",
-        ts_direct_row_family_type(&row_spec.source_row_type)
+        " implements Rows<RowEntry<{table_type}, {}>>",
+        row_spec.type_name
     )
+}
+
+fn ts_direct_table_type_name(manager: &DirectManagerSurface, source_row_type: &str) -> String {
+    let manager_stem = manager
+        .manager_class_name
+        .strip_suffix("Manager")
+        .unwrap_or(&manager.manager_class_name);
+    let row_types = manager
+        .tables
+        .iter()
+        .map(|table| table.row_type_name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if default_direct_manager_row_type(&manager.manager_class_name, &row_types)
+        == Some(source_row_type)
+    {
+        format!("{manager_stem}Table")
+    } else {
+        format!(
+            "{manager_stem}{}Table",
+            to_upper_camel_ident(source_row_type, "Rows")
+        )
+    }
+}
+
+fn ts_direct_table_type_declarations(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+    rows: &[TsSchemaRow],
+) -> String {
+    rows.iter()
+        .map(|row| {
+            let table_type = ts_direct_table_type_name(manager, &row.source_row_type);
+            let family_tables = manager
+                .tables
+                .iter()
+                .filter(|table| table.row_type_name == row.source_row_type)
+                .collect::<Vec<_>>();
+            let tables = family_tables
+                .iter()
+                .map(|table| typescript_string_literal(&table.table_name))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let checks = family_tables
+                .iter()
+                .map(|table| {
+                    let mut paths = vec![table.table_name.as_str()];
+                    if let Some(schema) = unit.schema_report().tables.iter().find(|schema| {
+                        schema.table_name == table.table_name
+                            && schema.row_type_name == table.row_type_name
+                    }) {
+                        paths.extend(schema.sources.iter().map(String::as_str));
+                    }
+                    let matches = paths
+                        .into_iter()
+                        .map(|path| {
+                            format!(
+                                "tablePathMatches(path, {})",
+                                typescript_string_literal(path)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" || ");
+                    format!(
+                        "  if ({matches}) return {};\n",
+                        typescript_string_literal(&table.table_name)
+                    )
+                })
+                .collect::<String>();
+            format!(
+                "export type {table_type} = {tables};\n\nexport function parse{table_type}(path: string): {table_type} | undefined {{\n{checks}  return undefined;\n}}\n"
+            )
+        })
+        .collect()
+}
+
+fn ts_direct_table_sources_expression(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+    row: &TsSchemaRow,
+) -> String {
+    let table_type = ts_direct_table_type_name(manager, &row.source_row_type);
+    let entries = manager
+        .tables
+        .iter()
+        .filter(|input| input.row_type_name == row.source_row_type)
+        .map(|input| {
+            let sources = unit
+                .schema_report()
+                .tables
+                .iter()
+                .find(|table| {
+                    table.table_name == input.table_name
+                        && table.row_type_name == input.row_type_name
+                })
+                .map(|table| table.sources.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(|source| typescript_string_literal(source))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "[{}, [{}]]",
+                typescript_string_literal(&input.table_name),
+                sources
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("new Map<{table_type}, readonly string[]>([{entries}])")
 }
 
 fn direct_ts_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerSurface) -> String {
@@ -1085,13 +3258,15 @@ fn direct_ts_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerS
         let row_type = &row_spec.source_row_type;
         let is_default_row_type = default_row_type.as_deref() == Some(row_type.as_str());
         if is_default_row_type {
-            source.push_str(&ts_direct_primary_row_family_methods(&row_spec));
+            source.push_str(&ts_direct_primary_row_family_methods(manager, &row_spec));
         } else {
-            let accessor = ts_method_name(row_type);
-            let family_type = ts_direct_row_family_type(row_type);
+            let accessor = format!("{}Rows", ts_method_name(row_type));
+            let field = ts_direct_row_field_name(row_type);
+            let schema_row_type = &row_spec.type_name;
+            let table_type = ts_direct_table_type_name(manager, row_type);
             source.push_str(&format!(
-                r#"  {accessor}(): {family_type} {{
-    return new {family_type}View(this.instance);
+                r#"  {accessor}(): RowCollection<{schema_row_type}, {table_type}> {{
+    return this.{field};
   }}
 
 "#
@@ -1099,6 +3274,24 @@ fn direct_ts_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerS
         }
     }
     source
+}
+
+fn direct_ts_named_row_family_methods(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+) -> String {
+    ts_direct_row_specs(unit, manager)
+        .into_iter()
+        .map(|row_spec| {
+            let accessor = format!("{}Rows", ts_method_name(&row_spec.source_row_type));
+            let field = ts_direct_row_field_name(&row_spec.source_row_type);
+            let table_type = ts_direct_table_type_name(manager, &row_spec.source_row_type);
+            let schema_row_type = row_spec.type_name;
+            format!(
+                "  {accessor}(): RowCollection<{schema_row_type}, {table_type}> {{\n    return this.{field};\n  }}\n\n"
+            )
+        })
+        .collect()
 }
 
 fn ts_direct_row_specs(
@@ -1139,218 +3332,143 @@ fn ts_direct_default_row_spec(
 }
 
 fn push_direct_row_family_types(
-    source: &mut String,
-    unit: &GameDataCompileUnit,
-    surfaces: &[ManagerSurface],
+    _source: &mut String,
+    _unit: &GameDataCompileUnit,
+    _surfaces: &[ManagerSurface],
 ) {
-    let mut emitted = BTreeSet::new();
-    for surface in surfaces {
-        let ManagerSurface::Direct(manager) = surface else {
-            continue;
-        };
-        for row_spec in ts_direct_row_specs(unit, manager) {
-            if emitted.insert(row_spec.source_row_type.clone()) {
-                push_direct_row_family_type(source, &row_spec);
-            }
-        }
-    }
 }
 
-fn push_direct_row_family_type(source: &mut String, row_spec: &TsSchemaRow) {
+fn ts_direct_primary_row_family_methods(
+    manager: &DirectManagerSurface,
+    row_spec: &TsSchemaRow,
+) -> String {
     let row_type = &row_spec.type_name;
     let source_row_type = &row_spec.source_row_type;
-    let ref_type = ts_direct_row_ref_type(source_row_type);
-    let slot_type = ts_direct_row_slot_type(source_row_type);
-    let entry_type = ts_direct_entry_type(source_row_type);
-    let family_type = ts_direct_row_family_type(source_row_type);
-    let table_rows_type = ts_direct_table_rows_type(source_row_type);
-    let reader = ts_schema_reader_name(source_row_type);
-    let entry_fn = ts_direct_entry_fn(source_row_type);
-    source.push_str(&format!(
-        r#"
-export interface {ref_type} {{
-  readonly table: string;
-  readonly row: string;
-}}
-
-export interface {slot_type} {{
-  readonly table: string;
-  readonly rowIndex: number;
-}}
-
-export interface {entry_type} {{
-  readonly ref: {ref_type};
-  readonly rowIndex: number;
-  readonly row: {row_type};
-}}
-
-export interface {family_type} extends Rows<{entry_type}> {{
-  table(table: string): {table_rows_type};
-  get(ref: {ref_type}): {row_type} | undefined;
-  rowByIndex(slot: {slot_type}): {row_type} | undefined;
-  rowKeyByIndex(slot: {slot_type}): string | undefined;
-}}
-
-class {family_type}View implements {family_type} {{
-  constructor(private readonly instance: ManagerInstance) {{}}
-
-  get rows(): readonly {entry_type}[] {{
-    return this.instance.schemaFamilyEntries({source_row_type:?}, {reader}, {entry_fn});
-  }}
-
-  table(table: string): {table_rows_type} {{
-    return new {table_rows_type}View(this.instance, table);
-  }}
-
-  get(ref: {ref_type}): {row_type} | undefined {{
-    return this.table(ref.table).get(ref.row);
-  }}
-
-  rowByIndex(slot: {slot_type}): {row_type} | undefined {{
-    return this.table(slot.table).rowByIndex(slot.rowIndex);
-  }}
-
-  rowKeyByIndex(slot: {slot_type}): string | undefined {{
-    return this.table(slot.table).rowKeyByIndex(slot.rowIndex);
-  }}
-
-  [Symbol.iterator](): Iterator<{entry_type}> {{
-    return this.rows[Symbol.iterator]();
-  }}
-}}
-
-export interface {table_rows_type} extends Rows<{entry_type}> {{
-  readonly table: string;
-  get(key: string): {row_type} | undefined;
-  rowByIndex(rowIndex: number): {row_type} | undefined;
-  rowKeyByIndex(rowIndex: number): string | undefined;
-}}
-
-class {table_rows_type}View implements {table_rows_type} {{
-  constructor(
-    private readonly instance: ManagerInstance,
-    readonly table: string,
-  ) {{}}
-
-  get rows(): readonly {entry_type}[] {{
-    return this.instance.schemaTableEntries(
-      this.table,
-      {source_row_type:?},
-      {reader},
-      {entry_fn},
-    );
-  }}
-
-  get(key: string): {row_type} | undefined {{
-    return this.instance.schemaTableRow(this.table, {source_row_type:?}, key, {reader});
-  }}
-
-  rowByIndex(rowIndex: number): {row_type} | undefined {{
-    return this.instance.schemaTableRowByIndex(this.table, {source_row_type:?}, rowIndex, {reader});
-  }}
-
-  rowKeyByIndex(rowIndex: number): string | undefined {{
-    return this.instance.schemaTableRowKeyByIndex(this.table, {source_row_type:?}, rowIndex);
-  }}
-
-  [Symbol.iterator](): Iterator<{entry_type}> {{
-    return this.rows[Symbol.iterator]();
-  }}
-}}
-
-function {entry_fn}(
-  table: DynamicTable,
-  row: DynamicTableRow,
-  data: {row_type},
-): {entry_type} {{
-  return {{
-    ref: {{
-      table: table.schema.name,
-      row: row.key,
-    }},
-    rowIndex: row.rowIndex,
-    row: data,
-  }};
-}}
-
-"#
-    ));
-}
-
-fn ts_direct_primary_row_family_methods(row_spec: &TsSchemaRow) -> String {
-    let row_type = &row_spec.type_name;
-    let source_row_type = &row_spec.source_row_type;
-    let ref_type = ts_direct_row_ref_type(source_row_type);
-    let slot_type = ts_direct_row_slot_type(source_row_type);
-    let entry_type = ts_direct_entry_type(source_row_type);
-    let family_type = ts_direct_row_family_type(source_row_type);
-    let table_rows_type = ts_direct_table_rows_type(source_row_type);
+    let field = ts_direct_row_field_name(source_row_type);
+    let table_type = ts_direct_table_type_name(manager, source_row_type);
     format!(
-        r#"  get rows(): readonly {entry_type}[] {{
-    return new {family_type}View(this.instance).rows;
+        r#"  rows(): IterableIterator<RowEntry<{table_type}, {row_type}>> {{
+    return this.{field}.rows();
   }}
 
-  table(table: string): {table_rows_type} {{
-    return new {family_type}View(this.instance).table(table);
+  table(table: {table_type}): TableRows<{row_type}, {table_type}> {{
+    return this.{field}.table(table);
   }}
 
-  get(ref: {ref_type}): {row_type} | undefined {{
-    return new {family_type}View(this.instance).get(ref);
+  resolveRow(reference: TableReference): {row_type} | undefined {{
+    const table = parse{table_type}(reference.path);
+    return table === undefined ? undefined : this.{field}.table(table).get(reference.key);
   }}
 
-  rowByIndex(slot: {slot_type}): {row_type} | undefined {{
-    return new {family_type}View(this.instance).rowByIndex(slot);
+  row(ref: RowRef<{table_type}, {row_type}>): {row_type} | undefined {{
+    return this.{field}.get(ref);
   }}
 
-  rowKeyByIndex(slot: {slot_type}): string | undefined {{
-    return new {family_type}View(this.instance).rowKeyByIndex(slot);
+  rowByIndex(slot: RowSlot<{table_type}, {row_type}>): {row_type} | undefined {{
+    return this.{field}.rowByIndex(slot);
   }}
 
-  [Symbol.iterator](): Iterator<{entry_type}> {{
-    return this.rows[Symbol.iterator]();
+  rowKeyByIndex(slot: RowSlot<{table_type}, {row_type}>): string | undefined {{
+    return this.{field}.rowKeyByIndex(slot);
+  }}
+
+  [Symbol.iterator](): Iterator<RowEntry<{table_type}, {row_type}>> {{
+    return this.rows();
   }}
 
 "#
     )
 }
 
-fn ts_direct_row_ref_type(source_row_type: &str) -> String {
-    format!("{}Ref", to_upper_camel_ident(source_row_type, "Row"))
+fn ts_direct_row_field_name(source_row_type: &str) -> String {
+    format!("{}Collection", ts_method_name(source_row_type))
 }
 
-fn ts_direct_row_slot_type(source_row_type: &str) -> String {
-    format!("{}Slot", to_upper_camel_ident(source_row_type, "Row"))
+fn ts_product_info(
+    value_type: &str,
+) -> Option<(NativeManagerProductKind, &'static str, &'static str)> {
+    let kind = NativeManagerProductKind::from_canonical_type_path(value_type)?;
+    let info = match kind {
+        NativeManagerProductKind::ArmorOffsetDatabase => {
+            ("ArmorOffsetDatabase", "parseArmorOffsetDatabase")
+        }
+        NativeManagerProductKind::EquipTypesDatabase => {
+            ("EquipTypesDatabase", "parseEquipTypesDatabase")
+        }
+        NativeManagerProductKind::GameDebugSettings => {
+            ("GameDebugSettings", "parseGameDebugSettings")
+        }
+        NativeManagerProductKind::PlayerBaseAttributes => {
+            ("PlayerBaseAttributes", "parsePlayerBaseAttributes")
+        }
+        NativeManagerProductKind::SettlementProgressionData => (
+            "SettlementProgressionData",
+            "parseSettlementProgressionData",
+        ),
+        NativeManagerProductKind::UiDatabase => ("UiDatabase", "parseUiDatabase"),
+        NativeManagerProductKind::GameCameraSettings => {
+            ("GameCameraSettings", "parseGameCameraSettings")
+        }
+        NativeManagerProductKind::GatheringDatabase => {
+            ("GatheringDatabase", "parseGatheringDatabase")
+        }
+        NativeManagerProductKind::GatheringActionDatabase => {
+            ("GatheringActionDatabase", "parseGatheringActionDatabase")
+        }
+        NativeManagerProductKind::CraftingStationDatabase => {
+            ("CraftingStationDatabase", "parseCraftingStationDatabase")
+        }
+        NativeManagerProductKind::SocialRankDatabase => {
+            ("SocialRankDatabase", "parseSocialRankDatabase")
+        }
+    };
+    Some((kind, info.0, info.1))
 }
 
-fn ts_direct_entry_type(source_row_type: &str) -> String {
-    format!("{}Entry", to_upper_camel_ident(source_row_type, "Row"))
+fn ts_product_storage(manager: &DirectManagerSurface) -> (String, String) {
+    let mut fields = String::new();
+    let mut initializers = String::new();
+    let mut seen = BTreeSet::new();
+    for product in &manager.products {
+        let (_, type_name, parser) = ts_product_info(&product.value_type).unwrap_or_else(|| {
+            panic!(
+                "TypeScript manager {} has no typed product parser for {} ({})",
+                manager.manager_name, product.value_type, product.path
+            )
+        });
+        let field = ts_product_field_name(type_name);
+        if !seen.insert(field.clone()) {
+            continue;
+        }
+        fields.push_str(&format!("  private readonly {field}: {type_name};\n"));
+        initializers.push_str(&format!(
+            "    this.{field} = {parser}(resources.requiredAssetBytes({}));\n",
+            typescript_string_literal(&product.path)
+        ));
+    }
+    (fields, initializers)
 }
 
-fn ts_direct_row_family_type(source_row_type: &str) -> String {
-    format!("{}Rows", to_upper_camel_ident(source_row_type, "Rows"))
-}
-
-fn ts_direct_table_rows_type(source_row_type: &str) -> String {
-    format!("{}TableRows", to_upper_camel_ident(source_row_type, "Rows"))
-}
-
-fn ts_direct_entry_fn(source_row_type: &str) -> String {
-    ts_method_name(&format!("{source_row_type}Entry"))
+fn ts_product_field_name(type_name: &str) -> String {
+    format!("{}Value", ts_method_name(type_name))
 }
 
 fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
     let mut source = String::new();
     for product in &manager.products {
-        let path = typescript_string_literal(&product.path);
         let getter = ts_method_name(&product.manager_getter);
-        match product.value_type.as_str() {
-            "newworld_plugin::assets::armor_offset_database::ArmorOffsetDatabase" => {
+        let (kind, type_name, _) = ts_product_info(&product.value_type).unwrap_or_else(|| {
+            panic!(
+                "TypeScript manager {} has no typed product API for {} ({})",
+                manager.manager_name, product.value_type, product.path
+            )
+        });
+        let field = ts_product_field_name(type_name);
+        match kind {
+            NativeManagerProductKind::ArmorOffsetDatabase => {
                 source.push_str(&format!(
-                    r#"  private parsedArmorOffsetDatabase?: ArmorOffsetDatabase;
-
-  {getter}(): ArmorOffsetDatabase {{
-    this.parsedArmorOffsetDatabase ??= parseArmorOffsetDatabase(this.instance.requiredAssetBytes({path}));
-    return this.parsedArmorOffsetDatabase;
+                    r#"  {getter}(): ArmorOffsetDatabase {{
+    return this.{field};
   }}
 
   armorOffset(name: string): ArmorOffsetData | undefined {{
@@ -1360,7 +3478,7 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
   furthestAttachmentOffset(
     armorOffsetNames: readonly string[],
     attachmentName: string,
-    currentPosition: Vec3 = ZERO_VEC3,
+    currentPosition: Vector3 = Vector3.ZERO,
   ): AttachmentOffsetData | undefined {{
     return furthestArmorAttachmentOffset(
       this.{getter}(),
@@ -1370,38 +3488,26 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
     );
   }}
 
-"#
-                    ,
-                    getter = getter,
-                    path = path,
+"#,
                 ));
             }
-            "newworld_plugin::assets::equip_types_database::EquipTypesDatabase" => {
+            NativeManagerProductKind::EquipTypesDatabase => {
                 source.push_str(&format!(
-                    r#"  private parsedEquipTypesDatabase?: EquipTypesDatabase;
-
-  {getter}(): EquipTypesDatabase {{
-    this.parsedEquipTypesDatabase ??= parseEquipTypesDatabase(this.instance.requiredAssetBytes({path}));
-    return this.parsedEquipTypesDatabase;
+                    r#"  {getter}(): EquipTypesDatabase {{
+    return this.{field};
   }}
 
   equipTypes(): readonly EquipTypeData[] {{
     return this.{getter}().equipTypes;
   }}
 
-"#
-                    ,
-                    getter = getter,
-                    path = path,
+"#,
                 ));
             }
-            "newworld_plugin::assets::game_debug_settings::GameDebugSettings" => {
+            NativeManagerProductKind::GameDebugSettings => {
                 source.push_str(&format!(
-                    r#"  private parsedGameDebugSettings?: GameDebugSettings;
-
-  {getter}(): GameDebugSettings {{
-    this.parsedGameDebugSettings ??= parseGameDebugSettings(this.instance.requiredAssetBytes({path}));
-    return this.parsedGameDebugSettings;
+                    r#"  {getter}(): GameDebugSettings {{
+    return this.{field};
   }}
 
   combat(): CombatDebugSettings {{
@@ -1412,19 +3518,13 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
     return disabledCombatToggleCount(this.combat());
   }}
 
-"#
-                    ,
-                    getter = getter,
-                    path = path,
+"#,
                 ));
             }
-            "newworld_plugin::assets::player_base_attributes::PlayerBaseAttributes" => {
+            NativeManagerProductKind::PlayerBaseAttributes => {
                 source.push_str(&format!(
-                    r#"  private parsedPlayerBaseAttributes?: PlayerBaseAttributes;
-
-  {getter}(): PlayerBaseAttributes {{
-    this.parsedPlayerBaseAttributes ??= parsePlayerBaseAttributes(this.instance.requiredAssetBytes({path}));
-    return this.parsedPlayerBaseAttributes;
+                    r#"  {getter}(): PlayerBaseAttributes {{
+    return this.{field};
   }}
 
   playerAttributeData(): PlayerAttributeData {{
@@ -1436,17 +3536,12 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
   }}
 
 "#,
-                    getter = getter,
-                    path = path,
                 ));
             }
-            "newworld_plugin::assets::settlement_progression_data::SettlementProgressionData" => {
+            NativeManagerProductKind::SettlementProgressionData => {
                 source.push_str(&format!(
-                    r#"  private parsedSettlementProgressionData?: SettlementProgressionData;
-
-  {getter}(): SettlementProgressionData {{
-    this.parsedSettlementProgressionData ??= parseSettlementProgressionData(this.instance.requiredAssetBytes({path}));
-    return this.parsedSettlementProgressionData;
+                    r#"  {getter}(): SettlementProgressionData {{
+    return this.{field};
   }}
 
   settlementProgressionCategories(): readonly ProgressionCategoryEntry[] {{
@@ -1454,50 +3549,44 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
   }}
 
 "#,
-                    getter = getter,
-                    path = path,
                 ));
             }
-            "newworld_plugin::assets::ui_database::UiDatabase" => {
+            NativeManagerProductKind::UiDatabase => {
                 source.push_str(&format!(
-                    r#"  private parsedUiDatabase?: UiDatabase;
-  private interactOptionsByNameCrc?: ReadonlyMap<number, InteractOptionData>;
+                    r#"  private interactOptionsByNameCrc?: ReadonlyMap<Crc32, InteractOptionData>;
 
   {getter}(): UiDatabase {{
-    this.parsedUiDatabase ??= parseUiDatabase(this.instance.requiredAssetBytes({path}));
-    return this.parsedUiDatabase;
+    return this.{field};
   }}
 
   interactOptions(): readonly InteractOptionData[] {{
     return this.{getter}().unifiedInteractData.interactOptions;
   }}
 
-  interactOption(id: string | number): InteractOptionData | undefined {{
-    const key = typeof id === "number" ? normalizeCrcKey(id) : crc32Lowercase(id);
+  interactOption(id: string | Crc32): InteractOptionData | undefined {{
+    const key = typeof id === "number" ? id : crc32Lowercase(id);
     this.interactOptionsByNameCrc ??= indexInteractOptionsByNameCrc(this.interactOptions());
     return this.interactOptionsByNameCrc.get(key);
   }}
 
-  interactOptionsByCategory(category: number): readonly InteractOptionData[] {{
-    return this.interactOptions().filter(
-      (option) =>
+  *interactOptionsByCategory(category: number): IterableIterator<InteractOptionData> {{
+    for (const option of this.interactOptions()) {{
+      if (
         option.interactOptionCategory === category ||
-        option.interactOptionCategory === ALL_INTERACT_OPTIONS_CATEGORY,
-    );
+        option.interactOptionCategory === ALL_INTERACT_OPTIONS_CATEGORY
+      ) {{
+        yield option;
+      }}
+    }}
   }}
 
 "#,
-                    getter = getter,
-                    path = path,
                 ));
             }
-            "newworld_plugin::assets::camera_settings::GameCameraSettings" => {
+            NativeManagerProductKind::GameCameraSettings => {
                 source.push_str(&format!(
-                    r#"  private parsedCameraSettings?: GameCameraSettings;
-
-  {getter}(): GameCameraSettings {{
-    this.parsedCameraSettings ??= parseGameCameraSettings(this.instance.requiredAssetBytes({path}));
-    return this.parsedCameraSettings;
+                    r#"  {getter}(): GameCameraSettings {{
+    return this.{field};
   }}
 
   cameraStates(): readonly CameraStateSettings[] {{
@@ -1505,17 +3594,12 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
   }}
 
 "#,
-                    getter = getter,
-                    path = path,
                 ));
             }
-            "newworld_plugin::assets::gathering_database::GatheringDatabase" => {
+            NativeManagerProductKind::GatheringDatabase => {
                 source.push_str(&format!(
-                    r#"  private parsedGatheringDatabase?: GatheringDatabase;
-
-  {getter}(): GatheringDatabase {{
-    this.parsedGatheringDatabase ??= parseGatheringDatabase(this.instance.requiredAssetBytes({path}));
-    return this.parsedGatheringDatabase;
+                    r#"  {getter}(): GatheringDatabase {{
+    return this.{field};
   }}
 
   gatheringData(): GatheringData {{
@@ -1531,17 +3615,12 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
   }}
 
 "#,
-                    getter = getter,
-                    path = path,
                 ));
             }
-            "newworld_plugin::assets::gathering_database::GatheringActionDatabase" => {
+            NativeManagerProductKind::GatheringActionDatabase => {
                 source.push_str(&format!(
-                    r#"  private parsedGatheringActionDatabase?: GatheringActionDatabase;
-
-  {getter}(): GatheringActionDatabase {{
-    this.parsedGatheringActionDatabase ??= parseGatheringActionDatabase(this.instance.requiredAssetBytes({path}));
-    return this.parsedGatheringActionDatabase;
+                    r#"  {getter}(): GatheringActionDatabase {{
+    return this.{field};
   }}
 
   gatheringActionData(): readonly GatheringActionData[] {{
@@ -1549,17 +3628,12 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
   }}
 
 "#,
-                    getter = getter,
-                    path = path,
                 ));
             }
-            "newworld_plugin::assets::crafting_station_database::CraftingStationDatabase" => {
+            NativeManagerProductKind::CraftingStationDatabase => {
                 source.push_str(&format!(
-                    r#"  private parsedCraftingStationDatabase?: CraftingStationDatabase;
-
-  {getter}(): CraftingStationDatabase {{
-    this.parsedCraftingStationDatabase ??= parseCraftingStationDatabase(this.instance.requiredAssetBytes({path}));
-    return this.parsedCraftingStationDatabase;
+                    r#"  {getter}(): CraftingStationDatabase {{
+    return this.{field};
   }}
 
   craftingStations(): readonly CraftingStationData[] {{
@@ -1567,17 +3641,12 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
   }}
 
 "#,
-                    getter = getter,
-                    path = path,
                 ));
             }
-            "newworld_plugin::assets::rank_database::SocialRankDatabase" => {
+            NativeManagerProductKind::SocialRankDatabase => {
                 source.push_str(&format!(
-                    r#"  private parsedSocialRankDatabase?: SocialRankDatabase;
-
-  {getter}(): SocialRankDatabase {{
-    this.parsedSocialRankDatabase ??= parseSocialRankDatabase(this.instance.requiredAssetBytes({path}));
-    return this.parsedSocialRankDatabase;
+                    r#"  {getter}(): SocialRankDatabase {{
+    return this.{field};
   }}
 
   ranks(): readonly SocialRankData[] {{
@@ -1585,11 +3654,8 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
   }}
 
 "#,
-                    getter = getter,
-                    path = path,
                 ));
             }
-            _ => {}
         }
     }
     source
@@ -1597,30 +3663,33 @@ fn direct_ts_product_methods(manager: &DirectManagerSurface) -> String {
 
 fn push_product_backed_manager_class(source: &mut String, manager: &DirectManagerSurface) {
     let manager_class = &manager.manager_class_name;
-    let manager_name = typescript_string_literal(&manager.manager_name);
-    let runtime_factory = ts_method_name(&manager.manager_name);
-    let accessor = ts_manager_accessor_name(&manager.manager_name);
+    let manager_instance = ts_manager_instance_expression(
+        &manager.manager_name,
+        manager
+            .tables
+            .iter()
+            .map(|table| (table.table_name.as_str(), table.row_type_name.as_str())),
+        manager.products.iter().map(|product| product.path.as_str()),
+    );
     let mut product_methods = direct_ts_product_methods(manager);
     product_methods.push_str(&special_ts_manager_extra_methods(manager_class));
-    let constructor = if product_methods.trim().is_empty() {
-        "constructor(instance: ManagerInstance) { void instance; }"
+    let (product_fields, product_initializers) = ts_product_storage(manager);
+    let constructor = if product_fields.is_empty() {
+        "private constructor(_resources: ManagerResources) {}".to_owned()
     } else {
-        "constructor(private readonly instance: ManagerInstance) {}"
+        format!("private constructor(resources: ManagerResources) {{\n{product_initializers}  }}")
     };
     source.push_str(&format!(
         r#"
 export class {manager_class} {{
+{product_fields}
   {constructor}
 
-  static fromCache(cache: ManagerCache): {manager_class} {{
-    return new {manager_class}(cache[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
+  static [CREATE_MANAGER](cache: ManagerCache): {manager_class} {{
+    return new {manager_class}({manager_instance});
   }}
 
 {product_methods}
-}}
-
-export function {runtime_factory}(managers: Managers): {manager_class} {{
-  return managers.{accessor}();
 }}
 
 "#
@@ -1629,9 +3698,14 @@ export function {runtime_factory}(managers: Managers): {manager_class} {{
 
 fn push_item_data_manager_class(source: &mut String, manager: &ItemDataManagerSurface) {
     let manager_class = &manager.manager_class_name;
-    let manager_name = typescript_string_literal(&manager.manager_name);
-    let runtime_factory = ts_method_name(&manager.manager_name);
-    let accessor = ts_manager_accessor_name(&manager.manager_name);
+    let manager_instance = ts_manager_instance_expression(
+        &manager.manager_name,
+        manager
+            .tables
+            .iter()
+            .map(|table| (table.table_name.as_str(), table.row_type_name.as_str())),
+        std::iter::empty(),
+    );
     let table_type = &manager.table_type_name;
     let handle_type = &manager.handle_type_name;
     let data_type = &manager.data_type_name;
@@ -1649,7 +3723,14 @@ fn push_item_data_manager_class(source: &mut String, manager: &ItemDataManagerSu
     let table_list = manager
         .tables
         .iter()
-        .map(|table| format!("  {table_type}.{},\n", table.variant_name))
+        .map(|table| {
+            format!(
+                "  {{ table: {table_type}.{}, selector: {{ name: {}, rowType: {} }} }},\n",
+                table.variant_name,
+                typescript_string_literal(&table.table_name),
+                typescript_string_literal(&table.row_type_name)
+            )
+        })
         .collect::<String>();
 
     source.push_str(&format!(
@@ -1666,8 +3747,9 @@ export interface {handle_type} {{
 
 export interface {data_type} {{
   readonly sourceHandle: {handle_type};
+  readonly definition: MasterItemDefinitionsSchemaRow;
   readonly itemId: string;
-  readonly itemIdCrc: number;
+  readonly itemIdCrc: Crc32;
   readonly name: string | null;
   readonly description: string | null;
   readonly itemType: string | null;
@@ -1680,30 +3762,33 @@ export interface {data_type} {{
   readonly deathDropPercentage: number;
 }}
 
-const ITEM_DATA_MANAGER_TABLES: readonly {table_type}[] = [
+const ITEM_DATA_MANAGER_TABLES: readonly {{
+  readonly table: {table_type};
+  readonly selector: TableSelector;
+}}[] = [
 {table_list}];
 
 export class {manager_class} implements RowLookup<string, {data_type}> {{
   private readonly rowsCache: readonly {data_type}[];
-  private readonly rowsById = new Map<number, {data_type}>();
+  private readonly rowsById = new Map<Crc32, {data_type}>();
 
-  constructor(instance: ManagerInstance) {{
-    this.rowsCache = materialize{manager_class}(instance);
+  private constructor(resources: ManagerResources) {{
+    this.rowsCache = materialize{manager_class}(resources);
     for (const row of this.rowsCache) {{
       this.rowsById.set(row.itemIdCrc, row);
     }}
   }}
 
-  static fromCache(cache: ManagerCache): {manager_class} {{
-    return new {manager_class}(cache[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
+  static [CREATE_MANAGER](cache: ManagerCache): {manager_class} {{
+    return new {manager_class}({manager_instance});
   }}
 
   get(itemId: string): {data_type} | undefined {{
-    return this.getFromId(crc32Lowercase(itemId));
+    return this.getFromId(Crc32.fromStringLower(itemId));
   }}
 
-  getFromId(itemId: number): {data_type} | undefined {{
-    return this.rowsById.get(normalizeCrcKey(itemId));
+  getFromId(itemId: Crc32): {data_type} | undefined {{
+    return this.rowsById.get(itemId);
   }}
 
   byIndex(index: number): {data_type} | undefined {{
@@ -1713,12 +3798,12 @@ export class {manager_class} implements RowLookup<string, {data_type}> {{
     return this.rowsCache[index - 1];
   }}
 
-  get rows(): readonly {data_type}[] {{
-    return this.rowsCache;
+  rows(): IterableIterator<{data_type}> {{
+    return this.rowsCache.values();
   }}
 
   [Symbol.iterator](): Iterator<{data_type}> {{
-    return this.rows[Symbol.iterator]();
+    return this.rows();
   }}
 
   len(): number {{
@@ -1730,15 +3815,11 @@ export class {manager_class} implements RowLookup<string, {data_type}> {{
   }}
 }}
 
-export function {runtime_factory}(managers: Managers): {manager_class} {{
-  return managers.{accessor}();
-}}
-
-function materialize{manager_class}(instance: ManagerInstance): {data_type}[] {{
+function materialize{manager_class}(resources: ManagerResources): {data_type}[] {{
   const items: {data_type}[] = [];
-  const seen = new Set<number>();
-  for (const tableName of ITEM_DATA_MANAGER_TABLES) {{
-    const table = instance.table(tableName);
+  const seen = new Set<Crc32>();
+  for (const {{ table: tableName, selector }} of ITEM_DATA_MANAGER_TABLES) {{
+    const table = resources.table(selector);
     if (table === undefined) {{
       throw new Error(`manager {manager_class} table ${{tableName}} was not loaded`);
     }}
@@ -1749,16 +3830,17 @@ function materialize{manager_class}(instance: ManagerInstance): {data_type}[] {{
 
 function cache{manager_class}Rows(
   items: {data_type}[],
-  seen: Set<number>,
+  seen: Set<Crc32>,
   tableName: {table_type},
   table: DynamicTable,
 ): void {{
   for (const sourceRow of table.rows) {{
-    const itemId = requiredStringCell(table, sourceRow, "ItemID").trim();
+    const definition = readMasterItemDefinitionsSchemaRow(table, sourceRow);
+    const itemId = definition.itemId.trim();
     if (itemId.length === 0) {{
       continue;
     }}
-    const itemIdCrc = crc32Lowercase(itemId);
+    const itemIdCrc = Crc32.fromStringLower(itemId);
     if (itemIdCrc === 0 || seen.has(itemIdCrc)) {{
       continue;
     }}
@@ -1768,6 +3850,7 @@ function cache{manager_class}Rows(
         table: tableName,
         row: sourceRow.rowIndex + 1,
       }},
+      definition,
       itemId,
       itemIdCrc,
       name: optionalStringCell(table, sourceRow, "Name"),
@@ -1791,14 +3874,23 @@ function cache{manager_class}Rows(
 fn push_semantic_manager_class(source: &mut String, record: &SemanticManagerRecord) {
     let record_type = &record.record_type_name;
     let manager_class = &record.manager_class_name;
-    let manager_name = typescript_string_literal(&record.manager_name);
+    let manager_instance = ts_manager_instance_expression(
+        &record.manager_name,
+        record
+            .tables
+            .iter()
+            .map(|table| (table.table_name.as_str(), table.row_type_name.as_str())),
+        std::iter::empty(),
+    );
     let entries_field = "rowsCache";
     let by_key_field = "rowsByKey";
     let source_row_field = "rowsBySourceRow";
-    let runtime_factory = ts_method_name(&record.manager_name);
-    let accessor = ts_manager_accessor_name(&record.manager_name);
     let key_map_type = ts_key_map_type(record);
     let has_lookup_index = !record.lookup_methods.is_empty();
+    assert!(
+        !has_lookup_index || record.key.is_some(),
+        "{manager_class} exposes key lookups without a semantic key"
+    );
     let source_row_index_field = record.source_row_method.as_ref().map(|_| {
         record
             .source_row_field
@@ -1824,19 +3916,19 @@ export class {manager_class} implements Rows<{record_type}> {{
     source.push_str(&format!(
         r#"
 
-  constructor(instance: ManagerInstance) {{
-    this.{entries_field} = materialize{manager_class}(instance);
+  private constructor(resources: ManagerResources) {{
+    this.{entries_field} = materialize{manager_class}(resources);
 "#
     ));
     if has_lookup_index || source_row_index_field.is_some() {
         source.push_str(&format!("    for (const row of this.{entries_field}) {{\n"));
     }
     if has_lookup_index {
-        if let Some(index_expression) = ts_row_index_expression(record) {
-            source.push_str(&format!(
-                "      this.{by_key_field}.set({index_expression}, row);\n"
-            ));
-        }
+        let index_expression = ts_row_index_expression(record)
+            .expect("semantic manager key index requires a semantic key");
+        source.push_str(&format!(
+            "      this.{by_key_field}.set({index_expression}, row);\n"
+        ));
     }
     if let Some(field) = source_row_index_field {
         source.push_str(&format!(
@@ -1851,8 +3943,8 @@ export class {manager_class} implements Rows<{record_type}> {{
         r#"
   }}
 
-  static fromCache(cache: ManagerCache): {manager_class} {{
-    return new {manager_class}(cache[MANAGER_INSTANCE]({manager_name}) as ManagerInstance);
+  static [CREATE_MANAGER](cache: ManagerCache): {manager_class} {{
+    return new {manager_class}({manager_instance});
   }}
 
 "#
@@ -1863,20 +3955,20 @@ export class {manager_class} implements Rows<{record_type}> {{
         match method.kind {
             SemanticLookupKind::CrcStringKey => source.push_str(&format!(
                 r#"  {method_name}({parameter_name}: string): {record_type} | undefined {{
-    return this.{by_key_field}.get(crc32Lowercase({parameter_name}));
+    return this.{by_key_field}.get(Crc32.fromStringLower({parameter_name}));
   }}
 
 "#
             )),
             SemanticLookupKind::CrcKey => source.push_str(&format!(
-                r#"  {method_name}({parameter_name}: number): {record_type} | undefined {{
-    return this.{by_key_field}.get(normalizeCrcKey({parameter_name}));
+                r#"  {method_name}({parameter_name}: Crc32): {record_type} | undefined {{
+    return this.{by_key_field}.get({parameter_name});
   }}
 
 "#
             )),
             SemanticLookupKind::IntoCrcKey => source.push_str(&format!(
-                r#"  {method_name}({parameter_name}: string | number): {record_type} | undefined {{
+                r#"  {method_name}({parameter_name}: string | Crc32): {record_type} | undefined {{
     return this.{by_key_field}.get(crc32LookupKey({parameter_name}));
   }}
 
@@ -1913,16 +4005,18 @@ export class {manager_class} implements Rows<{record_type}> {{
         let id_type = ts_ids_type(record);
         let id_expression = ts_ids_expression(record);
         source.push_str(&format!(
-            r#"  {method_name}(): readonly {id_type}[] {{
-    return this.{entries_field}.map((row) => {id_expression});
+            r#"  *{method_name}(): IterableIterator<{id_type}> {{
+    for (const row of this.{entries_field}) {{
+      yield {id_expression};
+    }}
   }}
 
 "#
         ));
     }
     source.push_str(&format!(
-        r#"  get rows(): readonly {record_type}[] {{
-    return this.{entries_field};
+        r#"  rows(): IterableIterator<{record_type}> {{
+    return this.{entries_field}.values();
   }}
 
 "#
@@ -1931,8 +4025,8 @@ export class {manager_class} implements Rows<{record_type}> {{
         let method_name = ts_method_name(method);
         if method_name != "rows" {
             source.push_str(&format!(
-                r#"  {method_name}(): readonly {record_type}[] {{
-    return this.rows;
+                r#"  {method_name}(): IterableIterator<{record_type}> {{
+    return this.rows();
   }}
 
 "#
@@ -1941,7 +4035,7 @@ export class {manager_class} implements Rows<{record_type}> {{
     }
     source.push_str(&format!(
         r#"  [Symbol.iterator](): Iterator<{record_type}> {{
-    return this.rows[Symbol.iterator]();
+    return this.rows();
   }}
 
 "#
@@ -1968,25 +4062,17 @@ export class {manager_class} implements Rows<{record_type}> {{
     }
     source.push_str(&special_ts_manager_extra_methods(manager_class));
     source.push_str("}\n\n");
-    source.push_str(&format!(
-        r#"export function {runtime_factory}(managers: Managers): {manager_class} {{
-  return managers.{accessor}();
-}}
-
-"#
-    ));
     push_semantic_materializer(source, record);
 }
 
 fn special_ts_manager_extra_methods(manager_class_name: &str) -> String {
     match manager_class_name {
         "PlayerDataManager" => {
-            r#"  categoricalProgressionId(tradeskill: string | number): number | undefined {
-    const normalized = normalizeTradeskillType(tradeskill);
-    if (normalized === "None" || normalized === "WildernessSurvival") {
+            r#"  categoricalProgressionId(tradeskill: TradeskillType): Crc32 | undefined {
+    if (tradeskill === "None" || tradeskill === "WildernessSurvival") {
       return undefined;
     }
-    return crc32Lowercase(normalized);
+    return Crc32.fromStringLower(tradeskill);
   }
 
 "#
@@ -1999,7 +4085,8 @@ fn special_ts_manager_extra_methods(manager_class_name: &str) -> String {
 fn ts_key_map_type(record: &SemanticManagerRecord) -> &'static str {
     match record.key {
         Some(SemanticManagerKey::String { .. } | SemanticManagerKey::EnumString { .. }) => "string",
-        Some(_) => "number",
+        Some(SemanticManagerKey::Crc { .. } | SemanticManagerKey::FallbackCrc { .. }) => "Crc32",
+        Some(SemanticManagerKey::Numeric { .. }) => "number",
         None => "number",
     }
 }
@@ -2023,6 +4110,7 @@ fn ts_row_index_expression(record: &SemanticManagerRecord) -> Option<String> {
 fn ts_ids_type(record: &SemanticManagerRecord) -> &'static str {
     match record.key {
         Some(SemanticManagerKey::String { .. } | SemanticManagerKey::EnumString { .. }) => "string",
+        Some(SemanticManagerKey::Crc { .. } | SemanticManagerKey::FallbackCrc { .. }) => "Crc32",
         _ => "number",
     }
 }
@@ -2046,29 +4134,18 @@ fn push_semantic_materializer(source: &mut String, record: &SemanticManagerRecor
     let record_type = &record.record_type_name;
     let manager_class = &record.manager_class_name;
     source.push_str(&format!(
-        r#"function materialize{manager_class}(instance: ManagerInstance): readonly {record_type}[] {{
+        r#"function materialize{manager_class}(resources: ManagerResources): readonly {record_type}[] {{
   const rows: {record_type}[] = [];
 "#
     ));
     if record.key.is_some() {
         source.push_str("  const seen = new Set<string | number>();\n");
     }
-    source.push_str(&format!(
-        r#"  for (const tableName of [{}]) {{
-    const table = instance.table(tableName);
-    if (table === undefined) {{
-      throw new Error(`manager {} missing table ${{tableName}}`);
-    }}
-    for (const sourceRow of table.rows) {{
+    source.push_str(
+        r#"  for (const table of resources) {
+    for (const sourceRow of table.rows) {
 "#,
-        record
-            .tables
-            .iter()
-            .map(|table| typescript_string_literal(&table.table_name))
-            .collect::<Vec<_>>()
-            .join(", "),
-        record.manager_name
-    ));
+    );
     push_ts_key_materializer(source, record);
     for filter in &record.row_filters {
         let column = typescript_string_literal(&filter.column);
@@ -2143,6 +4220,45 @@ fn push_semantic_materializer(source: &mut String, record: &SemanticManagerRecor
             }
         }
     }
+    for field in &record.fields {
+        let local = ts_projection_local_name(&field.name);
+        if matches!(
+            field.transform,
+            SemanticProjectionTransform::EnumStringSkipInvalid
+                | SemanticProjectionTransform::EnumStringRejectDefault
+        ) {
+            let enum_type = semantic_enum_type_name(field);
+            source.push_str(&format!(
+                "      let {local}: {enum_type};\n      try {{\n        {local} = {};\n      }} catch {{\n        continue;\n      }}\n",
+                ts_projection_value(field)
+            ));
+        } else {
+            source.push_str(&format!(
+                "      const {local} = {};\n",
+                ts_projection_value(field)
+            ));
+        }
+    }
+    for field in &record.fields {
+        let local = ts_projection_local_name(&field.name);
+        match field.transform {
+            SemanticProjectionTransform::NonEmptyString => source.push_str(&format!(
+                "      if ({local}.length === 0) {{\n        continue;\n      }}\n"
+            )),
+            SemanticProjectionTransform::NonEmptyStringList => source.push_str(&format!(
+                "      if ({local}.length === 0) {{\n        continue;\n      }}\n"
+            )),
+            SemanticProjectionTransform::EnumStringRejectDefault => {
+                let enum_type = semantic_enum_type_name(field);
+                let default = semantic_enum_default_variant(field);
+                source.push_str(&format!(
+                    "      if ({local} === {enum_type}.{}) {{\n        continue;\n      }}\n",
+                    to_upper_camel_ident(default, "Variant")
+                ));
+            }
+            _ => {}
+        }
+    }
     push_ts_duplicate_key_policy(source, record);
     source.push_str(&format!(
         r#"      const row: {record_type} = {{
@@ -2159,7 +4275,7 @@ fn push_semantic_materializer(source: &mut String, record: &SemanticManagerRecor
         source.push_str(&format!(
             "        {}: {},\n",
             ts_field_name(&field.name),
-            ts_projection_value(field)
+            ts_projection_local_name(&field.name)
         ));
     }
     source.push_str(
@@ -2180,6 +4296,10 @@ fn push_semantic_materializer(source: &mut String, record: &SemanticManagerRecor
     );
 }
 
+fn ts_projection_local_name(field_name: &str) -> String {
+    format!("{}Value", ts_field_name(field_name))
+}
+
 fn push_ts_key_materializer(source: &mut String, record: &SemanticManagerRecord) {
     let Some(key) = &record.key else {
         return;
@@ -2192,10 +4312,16 @@ fn push_ts_key_materializer(source: &mut String, record: &SemanticManagerRecord)
             reject_zero_crc,
             ..
         } => {
-            source.push_str(&format!(
-                "      const keyText = requiredStringCell(table, sourceRow, {});\n",
-                typescript_string_literal(key_column)
-            ));
+            let column = typescript_string_literal(key_column);
+            if *skip_empty_key {
+                source.push_str(&format!(
+                    "      const keyText = optionalStringCell(table, sourceRow, {column});\n      if (keyText === null) {{\n        continue;\n      }}\n"
+                ));
+            } else {
+                source.push_str(&format!(
+                    "      const keyText = requiredStringCell(table, sourceRow, {column});\n"
+                ));
+            }
             if *trim_key {
                 source.push_str("      const keyValue = keyText.trim();\n");
             } else {
@@ -2209,7 +4335,7 @@ fn push_ts_key_materializer(source: &mut String, record: &SemanticManagerRecord)
 "#,
                 );
             }
-            source.push_str("      const keyCrc = crc32Lowercase(keyValue);\n");
+            source.push_str("      const keyCrc = Crc32.fromStringLower(keyValue);\n");
             if *reject_zero_crc {
                 source.push_str(
                     r#"      if (keyCrc === 0) {
@@ -2252,7 +4378,7 @@ fn push_ts_key_materializer(source: &mut String, record: &SemanticManagerRecord)
                 );
             }
             source.push_str(
-                r#"      const keyCrc = crc32Lowercase(keyValue);
+                r#"      const keyCrc = Crc32.fromStringLower(keyValue);
       const seenKey = keyCrc;
 "#,
             );
@@ -2273,10 +4399,16 @@ fn push_ts_key_materializer(source: &mut String, record: &SemanticManagerRecord)
             trim_key,
             ..
         } => {
-            source.push_str(&format!(
-                "      const keyText = requiredStringCell(table, sourceRow, {});\n",
-                typescript_string_literal(key_column)
-            ));
+            let column = typescript_string_literal(key_column);
+            if *skip_empty_key {
+                source.push_str(&format!(
+                    "      const keyText = optionalStringCell(table, sourceRow, {column});\n      if (keyText === null) {{\n        continue;\n      }}\n"
+                ));
+            } else {
+                source.push_str(&format!(
+                    "      const keyText = requiredStringCell(table, sourceRow, {column});\n"
+                ));
+            }
             if *trim_key {
                 source.push_str("      const keyValue = keyText.trim();\n");
             } else {
@@ -2297,10 +4429,16 @@ fn push_ts_key_materializer(source: &mut String, record: &SemanticManagerRecord)
             skip_empty_key,
             ..
         } => {
-            source.push_str(&format!(
-                "      const keyValue = requiredStringCell(table, sourceRow, {});\n",
-                typescript_string_literal(key_column)
-            ));
+            let column = typescript_string_literal(key_column);
+            if *skip_empty_key {
+                source.push_str(&format!(
+                    "      const keyValue = optionalStringCell(table, sourceRow, {column});\n      if (keyValue === null) {{\n        continue;\n      }}\n"
+                ));
+            } else {
+                source.push_str(&format!(
+                    "      const keyValue = requiredStringCell(table, sourceRow, {column});\n"
+                ));
+            }
             if *skip_empty_key {
                 source.push_str(
                     r#"      if (keyValue.length === 0) {
@@ -2416,8 +4554,23 @@ fn ts_numeric_key_value(
 fn ts_projection_value(field: &crate::manager_records::SemanticRecordField) -> String {
     let column = typescript_string_literal(&field.column);
     match field.transform {
-        SemanticProjectionTransform::String => {
+        SemanticProjectionTransform::String | SemanticProjectionTransform::NonEmptyString => {
             format!("requiredStringCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::EnumString
+        | SemanticProjectionTransform::EnumStringSkipInvalid
+        | SemanticProjectionTransform::EnumStringRejectDefault => {
+            format!(
+                "parse{}(requiredStringCell(table, sourceRow, {column}))",
+                semantic_enum_type_name(field)
+            )
+        }
+        SemanticProjectionTransform::EnumDefault => {
+            let enum_type = semantic_enum_type_name(field);
+            let default = to_upper_camel_ident(semantic_enum_default_variant(field), "Variant");
+            format!(
+                "enumCellOr(table, sourceRow, {column}, {enum_type}.{default}, parse{enum_type})"
+            )
         }
         SemanticProjectionTransform::StringDefaultEmpty => {
             format!("optionalStringCell(table, sourceRow, {column}) ?? \"\"")
@@ -2427,6 +4580,9 @@ fn ts_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         }
         SemanticProjectionTransform::OptionalString => {
             format!("optionalStringCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::OptionalFirstString => {
+            format!("optionalStringListCell(table, sourceRow, {column})?.[0] ?? null")
         }
         SemanticProjectionTransform::StringList => {
             format!("stringListCell(table, sourceRow, {column})")
@@ -2445,17 +4601,56 @@ fn ts_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         SemanticProjectionTransform::OptionalBool => {
             format!("optionalBoolCell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::BoolDefaultFalse => {
+            format!("optionalBoolCell(table, sourceRow, {column}) ?? false")
+        }
+        SemanticProjectionTransform::Crc32NonZeroBool => {
+            let reference = field
+                .reference_field
+                .as_deref()
+                .expect("CRC presence projections have reference fields");
+            format!("{} !== Crc32.ZERO", ts_projection_local_name(reference))
+        }
         SemanticProjectionTransform::U8 => {
             format!("requiredUint8Cell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::NonZeroU8 => {
+            format!("requiredNonZeroUint8Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::U8DefaultZero => {
+            format!("normalizeUint8(optionalNumberCell(table, sourceRow, {column}) ?? 0)")
+        }
+        SemanticProjectionTransform::U8DefaultMax => {
+            format!("normalizeUint8(optionalNumberCell(table, sourceRow, {column}) ?? 0xff)")
+        }
         SemanticProjectionTransform::U16 => {
             format!("requiredUint16Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::NonZeroU16 => {
+            format!("requiredNonZeroUint16Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::U16BelowMax => {
+            let max = field
+                .u16_max_exclusive
+                .expect("capped u16 projections have a maximum");
+            format!(
+                "(() => {{ const value = requiredUint16Cell(table, sourceRow, {column}); if (value >= {max}) throw new Error(`row ${{sourceRow.sourcePath}}:${{sourceRow.rowIndex + 1}} {column} exceeds supported cap {max}`); return value; }})()"
+            )
         }
         SemanticProjectionTransform::U32 => {
             format!("requiredUint32Cell(table, sourceRow, {column})")
         }
         SemanticProjectionTransform::OptionalU32 => {
             format!("optionalUint32Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::U32DefaultZero => {
+            format!("optionalUint32Cell(table, sourceRow, {column}) ?? 0")
+        }
+        SemanticProjectionTransform::NonZeroU32 => {
+            format!("requiredNonZeroUint32Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::OptionalNonZeroU32 => {
+            format!("optionalNonZeroUint32Cell(table, sourceRow, {column})")
         }
         SemanticProjectionTransform::I32 => {
             format!("requiredInt32Cell(table, sourceRow, {column})")
@@ -2465,6 +4660,22 @@ fn ts_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         }
         SemanticProjectionTransform::OptionalF32 => {
             format!("optionalNumberCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::F32MinutesToSeconds => {
+            format!("requiredNumberCell(table, sourceRow, {column}) * 60")
+        }
+        SemanticProjectionTransform::F32UpperBound10000ZeroIsDefault => {
+            format!("upperBoundCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::F32LowerBound10000CappedToField => {
+            let reference = field
+                .reference_field
+                .as_deref()
+                .expect("lower-bound projections have reference fields");
+            format!(
+                "lowerBoundCell(table, sourceRow, {column}, {})",
+                ts_projection_local_name(reference)
+            )
         }
         SemanticProjectionTransform::F32List => {
             format!("numberListCell(table, sourceRow, {column})")
@@ -2477,27 +4688,50 @@ fn ts_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         SemanticProjectionTransform::Crc32 => {
             format!("requiredCrc32Cell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::LowercaseCrcString => {
+            format!("Crc32.fromStringLower(requiredStringCell(table, sourceRow, {column}))")
+        }
+        SemanticProjectionTransform::LowercaseCrcStringDefaultZero => {
+            format!("Crc32.fromStringLower(optionalStringCell(table, sourceRow, {column}) ?? \"\")")
+        }
+        SemanticProjectionTransform::FirstLowercaseCrcStringDefaultZero => {
+            format!(
+                "Crc32.fromStringLower(optionalStringListCell(table, sourceRow, {column})?.[0] ?? \"\")"
+            )
+        }
+        SemanticProjectionTransform::TrimmedLowercaseCrcStringDefaultZero => {
+            format!(
+                "Crc32.fromStringLower((optionalStringCell(table, sourceRow, {column}) ?? \"\").trim())"
+            )
+        }
+        SemanticProjectionTransform::OptionalCrc32 => {
+            format!("optionalCrc32Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::OptionalCrc32ZeroAsNone => {
+            format!("optionalCrc32Cell(table, sourceRow, {column}, true)")
+        }
         SemanticProjectionTransform::Crc32List => {
             format!("crc32ListCell(table, sourceRow, {column})")
         }
         SemanticProjectionTransform::OptionalLowercaseCrcString => {
             format!("optionalLowercaseCrcStringCell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::OptionalTrimmedLowercaseCrcString => {
+            format!("optionalTrimmedLowercaseCrcStringCell(table, sourceRow, {column})")
+        }
         SemanticProjectionTransform::LowercaseCrcStringList => {
             format!(
-                "stringListCell(table, sourceRow, {column}).filter((value) => value.length > 0).map((value) => crc32Lowercase(value))"
+                "stringListCell(table, sourceRow, {column}).filter((value) => value.length > 0).map((value) => Crc32.fromStringLower(value))"
             )
         }
-        SemanticProjectionTransform::RowIndex => {
-            format!("requiredUint32Cell(table, sourceRow, {column})")
+        SemanticProjectionTransform::ForeignKey => {
+            format!("requiredStringCell(table, sourceRow, {column})")
         }
-        SemanticProjectionTransform::OptionalRowIndex => {
-            format!("optionalUint32Cell(table, sourceRow, {column})")
+        SemanticProjectionTransform::OptionalForeignKey => {
+            format!("optionalStringCell(table, sourceRow, {column})")
         }
-        SemanticProjectionTransform::RowIndexList => {
-            format!(
-                "numberListCell(table, sourceRow, {column}).map((value) => normalizeUint32(value))"
-            )
+        SemanticProjectionTransform::ForeignKeyList => {
+            format!("stringListCell(table, sourceRow, {column})")
         }
         SemanticProjectionTransform::F32RangeInclusive => {
             format!("numberRangeCell(table, sourceRow, {column})")
@@ -2505,22 +4739,42 @@ fn ts_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         SemanticProjectionTransform::U32RangeInclusive => {
             format!("uint32RangeCell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::OptionalCrc32F32PairList => {
+            format!("optionalCrc32Float32PairListCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::OptionalU8F32PairList => {
+            let enum_shape = field
+                .pair_first_enum_shape
+                .as_ref()
+                .expect("u8 pair-list projections have a reconciled enum schema");
+            let parser = ts_pair_enum_parser_name(&enum_shape.name);
+            format!("optionalUint8Float32PairListCell(table, sourceRow, {column}, {parser})")
+        }
     }
 }
 
 const SEMANTIC_MANAGER_RUNTIME_TS: &str = r#"
+function enumCellOr<T>(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+  fallback: T,
+  parse: (source: string) => T,
+): T {
+  const value = optionalStringCell(table, row, columnName);
+  return value === null ? fallback : parse(value);
+}
+
 function rowCell(
   table: DynamicTable,
   row: DynamicTableRow,
   columnName: string,
 ): DatasheetCellValue | undefined {
-  const column = table.schema.columns.find((candidate) =>
-    columnMatches(candidate, columnName),
-  );
-  if (column === undefined) {
+  const columnCrc = table.columnCrcs.get(columnName);
+  if (columnCrc === undefined) {
     return undefined;
   }
-  const slot = row.columnSlots.get(column.crc);
+  const slot = row.columnSlots.get(columnCrc);
   return slot === undefined ? undefined : row.row.cells[slot]?.value;
 }
 
@@ -2672,7 +4926,9 @@ function numberCellValue(
   if (Number.isFinite(parsed)) {
     return parsed;
   }
-  throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} has non-number ${columnName}`);
+  throw new Error(
+    `row ${row.sourcePath}:${row.rowIndex + 1} has non-number ${columnName}=${JSON.stringify(value.value)}`,
+  );
 }
 
 function requiredUint8Cell(
@@ -2680,11 +4936,7 @@ function requiredUint8Cell(
   row: DynamicTableRow,
   columnName: string,
 ): number {
-  const value = requiredUint32Cell(table, row, columnName);
-  if (value > 0xff) {
-    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} ${columnName} exceeds u8`);
-  }
-  return value;
+  return normalizeUint8(requiredUint32Cell(table, row, columnName));
 }
 
 function requiredUint16Cell(
@@ -2692,11 +4944,23 @@ function requiredUint16Cell(
   row: DynamicTableRow,
   columnName: string,
 ): number {
-  const value = requiredUint32Cell(table, row, columnName);
-  if (value > 0xffff) {
-    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} ${columnName} exceeds u16`);
-  }
-  return value;
+  return normalizeUint16(requiredUint32Cell(table, row, columnName));
+}
+
+function requiredNonZeroUint8Cell(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+): number {
+  return requireNonZero(requiredUint8Cell(table, row, columnName), row, columnName);
+}
+
+function requiredNonZeroUint16Cell(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+): number {
+  return requireNonZero(requiredUint16Cell(table, row, columnName), row, columnName);
 }
 
 function requiredUint32Cell(
@@ -2707,13 +4971,12 @@ function requiredUint32Cell(
   return normalizeUint32(requiredNumberCell(table, row, columnName));
 }
 
-function optionalUint32Cell(
+function requiredNonZeroUint32Cell(
   table: DynamicTable,
   row: DynamicTableRow,
   columnName: string,
-): number | null {
-  const value = optionalNumberCell(table, row, columnName);
-  return value === null ? null : normalizeUint32(value);
+): number {
+  return requireNonZero(requiredUint32Cell(table, row, columnName), row, columnName);
 }
 
 function requiredInt32Cell(
@@ -2728,24 +4991,69 @@ function requiredCrc32Cell(
   table: DynamicTable,
   row: DynamicTableRow,
   columnName: string,
-): number {
+): Crc32 {
   const value = rowCell(table, row, columnName);
   if (value?.kind === "number") {
-    return normalizeCrcKey(value.value);
+    return Crc32.from(value.value);
   }
   if (value?.kind === "string") {
-    return crc32Lowercase(value.value);
+    return Crc32.fromStringLower(value.value);
   }
   throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} missing crc ${columnName}`);
+}
+
+function optionalCrc32Cell(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+  zeroAsNone = false,
+): Crc32 | null {
+  const value = rowCell(table, row, columnName);
+  if (value === undefined || value.kind === "boolean") {
+    return null;
+  }
+  if (value.kind === "string" && value.value.length === 0) {
+    return null;
+  }
+  const crc = value.kind === "number" ? Crc32.from(value.value) : Crc32.fromStringLower(value.value);
+  return zeroAsNone && crc === Crc32.ZERO ? null : crc;
 }
 
 function optionalLowercaseCrcStringCell(
   table: DynamicTable,
   row: DynamicTableRow,
   columnName: string,
-): number | null {
+): Crc32 | null {
   const value = optionalStringCell(table, row, columnName);
-  return value === null ? null : crc32Lowercase(value);
+  return value === null ? null : Crc32.fromStringLower(value);
+}
+
+function optionalTrimmedLowercaseCrcStringCell(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+): Crc32 | null {
+  const value = optionalStringCell(table, row, columnName)?.trim();
+  return value === undefined || value.length === 0 ? null : Crc32.fromStringLower(value);
+}
+
+function upperBoundCell(table: DynamicTable, row: DynamicTableRow, columnName: string): number {
+  const value = requiredNumberCell(table, row, columnName);
+  if (Number.isNaN(value) || Math.abs(value) <= 1.1920928955078125e-7) {
+    return 10_000;
+  }
+  return Math.min(Math.max(value, 0), 10_000);
+}
+
+function lowerBoundCell(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+  upperBound: number,
+): number {
+  const value = requiredNumberCell(table, row, columnName);
+  const bounded = Number.isNaN(value) ? 0 : Math.min(Math.max(value, 0), 10_000);
+  return Math.min(bounded, upperBound);
 }
 
 function stringListCell(
@@ -2804,21 +5112,73 @@ function crc32ListCell(
   table: DynamicTable,
   row: DynamicTableRow,
   columnName: string,
-): number[] {
+): Crc32[] {
   const value = rowCell(table, row, columnName);
   if (value === undefined) {
     return [];
   }
   if (value.kind === "number") {
-    return [normalizeCrcKey(value.value)];
+    return [Crc32.from(value.value)];
   }
   if (value.kind !== "string") {
     throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} has non-crc-list ${columnName}`);
   }
   return splitDesignerList(value.value).map((part) => {
     const number = Number(part);
-    return Number.isFinite(number) ? normalizeCrcKey(number) : crc32Lowercase(part);
+    return Number.isFinite(number) ? Crc32.from(number) : Crc32.fromStringLower(part);
   });
+}
+
+function optionalCrc32Float32PairListCell(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+): ReadonlyArray<readonly [Crc32, number]> | null {
+  return optionalPairListCell(table, row, columnName, (source) => {
+    const numeric = Number(source);
+    return Number.isInteger(numeric) && numeric >= 0 && numeric <= 0xffffffff
+      ? Crc32.from(numeric)
+      : Crc32.fromStringLower(source);
+  });
+}
+
+function optionalUint8Float32PairListCell(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+  parseFirst: (source: string) => number,
+): ReadonlyArray<readonly [number, number]> | null {
+  return optionalPairListCell(table, row, columnName, parseFirst);
+}
+
+function optionalPairListCell<T>(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+  parseFirst: (source: string) => T,
+): ReadonlyArray<readonly [T, number]> | null {
+  const value = rowCell(table, row, columnName);
+  if (
+    value === undefined ||
+    (value.kind === "number" && value.value === 0) ||
+    (value.kind === "boolean" && !value.value) ||
+    (value.kind === "string" && value.value.trim().length === 0)
+  ) {
+    return null;
+  }
+  if (value.kind !== "string") {
+    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} has non-pair-list ${columnName}`);
+  }
+  const pairs = splitDesignerList(value.value).map((entry): readonly [T, number] => {
+    const separator = entry.indexOf("=");
+    if (separator < 0) {
+      throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} has invalid pair in ${columnName}`);
+    }
+    const first = entry.slice(0, separator).trim();
+    const second = entry.slice(separator + 1).trim();
+    return [parseFirst(first), parseDesignerNumber(second, row, columnName)];
+  });
+  return pairs.length === 0 ? null : pairs;
 }
 
 function numberRangeCell(
@@ -2830,14 +5190,13 @@ function numberRangeCell(
   if (value === undefined) {
     throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} missing range ${columnName}`);
   }
-  const values =
-    value.kind === "string"
-      ? splitDesignerRange(value.value).map((part) => parseDesignerNumber(part, row, columnName))
-      : numberListCell(table, row, columnName);
-  if (values.length < 2) {
-    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} missing range ${columnName}`);
+  if (value.kind === "number") {
+    return [value.value, value.value];
   }
-  return [values[0], values[1]];
+  if (value.kind === "boolean") {
+    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} has non-number range ${columnName}`);
+  }
+  return floatRangeFromText(value.value);
 }
 
 function uint32RangeCell(
@@ -2845,8 +5204,39 @@ function uint32RangeCell(
   row: DynamicTableRow,
   columnName: string,
 ): [number, number] {
-  const [min, max] = numberRangeCell(table, row, columnName);
-  return [normalizeUint32(min), normalizeUint32(max)];
+  const value = rowCell(table, row, columnName);
+  if (value === undefined || value.kind === "boolean") {
+    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} missing unsigned range ${columnName}`);
+  }
+  if (value.kind === "number") {
+    const endpoint = normalizeUint32(value.value);
+    return [endpoint, endpoint];
+  }
+  const parts = value.value.trim().split("-").map((part) => part.trim());
+  if (parts.length === 1 && parts[0].length > 0) {
+    const endpoint = normalizeUint32(Number(parts[0]));
+    return [endpoint, endpoint];
+  }
+  if (parts.length === 2 && parts.every((part) => part.length > 0)) {
+    return [normalizeUint32(Number(parts[0])), normalizeUint32(Number(parts[1]))];
+  }
+  throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} has invalid unsigned range ${columnName}`);
+}
+
+function floatRangeFromText(value: string): [number, number] {
+  const parts = value.trim().split("-").map((part) => part.trim());
+  if (parts.length === 1) {
+    const endpoint = Number(parts[0]);
+    return Number.isFinite(endpoint) ? [endpoint, endpoint] : [0, 0];
+  }
+  if (parts.length === 2) {
+    const first = Number(parts[0]);
+    const second = Number(parts[1]);
+    if (Number.isFinite(first) && Number.isFinite(second)) {
+      return first <= second ? [first, second] : [second, first];
+    }
+  }
+  return [0, 0];
 }
 
 function splitDesignerList(value: string): string[] {
@@ -2856,24 +5246,81 @@ function splitDesignerList(value: string): string[] {
     .filter((part) => part.length > 0);
 }
 
-function splitDesignerRange(value: string): string[] {
-  const listed = splitDesignerList(value);
-  if (listed.length >= 2) {
-    return [listed[0], listed[1]];
-  }
-  const text = value.trim();
-  for (let index = 1; index < text.length; index += 1) {
-    if (text[index] !== "-") {
-      continue;
-    }
-    const left = text.slice(0, index).trim();
-    const right = text.slice(index + 1).trim();
-    if (left.length > 0 && right.length > 0) {
-      return [left, right];
-    }
-  }
-  return listed;
+function normalizeLookupText(value: string): string {
+  return value.trim().toLowerCase();
 }
+
+
+function tableCrcLookupKey(table: string, id: Crc32): string {
+  return `${table}\u0000${id}`;
+}
+
+function abilityPositionLookupKey(table: string, position: number): string {
+  return `${table}\u0000${normalizeUint16(position)}`;
+}
+
+function abilityCoordinate(
+  value: number | string | null,
+): number | null {
+  const coordinate = optionalSchemaNumber(value);
+  if (coordinate === null) return null;
+  if (!Number.isInteger(coordinate) || coordinate < 0 || coordinate > 0xff) {
+    return null;
+  }
+  return coordinate;
+}
+
+function tableNumberLookupKey(table: string, value: number): string {
+  return `${table}\u0000${value}`;
+}
+
+function tableCrcTextLookupKey(table: string, id: Crc32, text: string): string {
+  return `${table}\u0000${id}\u0000${text}`;
+}
+
+function crcNumberLookupKey(id: Crc32, value: number): string {
+  return `${id}\u0000${value}`;
+}
+
+function crcPairLookupKey(left: Crc32, right: Crc32): string {
+  return `${left}\u0000${right}`;
+}
+
+function crcTextNumberLookupKey(id: Crc32, text: string, value: number): string {
+  return `${id}\u0000${text}\u0000${value}`;
+}
+
+function seasonIdFromTable(table: string): Crc32 {
+  const separator = table.lastIndexOf("_");
+  return separator < 0 || separator + 1 === table.length
+    ? Crc32.ZERO
+    : Crc32.fromStringLower(table.slice(separator + 1));
+}
+
+function appendMapValue<Key, Value>(map: Map<Key, Value[]>, key: Key, value: Value): void {
+  const values = map.get(key);
+  if (values === undefined) map.set(key, [value]);
+  else values.push(value);
+}
+
+function appendUniqueMapValue<Key, Value>(map: Map<Key, Value[]>, key: Key, value: Value): void {
+  const values = map.get(key);
+  if (values === undefined) map.set(key, [value]);
+  else if (!values.includes(value)) values.push(value);
+}
+
+function floorInSorted(values: readonly number[], target: number): number | undefined {
+  if (values.length === 0) return undefined;
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (values[middle] <= target) low = middle + 1;
+    else high = middle;
+  }
+  return values[Math.max(0, low - 1)];
+}
+
 
 function parseDesignerNumber(part: string, row: DynamicTableRow, columnName: string): number {
   const number = Number(part);
@@ -2890,6 +5337,29 @@ function normalizeUint32(value: number): number {
   return value >>> 0;
 }
 
+function normalizeUint8(value: number): number {
+  const normalized = normalizeUint32(value);
+  if (normalized > 0xff) {
+    throw new RangeError(`expected u8, got ${value}`);
+  }
+  return normalized;
+}
+
+function normalizeUint16(value: number): number {
+  const normalized = normalizeUint32(value);
+  if (normalized > 0xffff) {
+    throw new RangeError(`expected u16, got ${value}`);
+  }
+  return normalized;
+}
+
+function requireNonZero(value: number, row: DynamicTableRow, columnName: string): number {
+  if (value === 0) {
+    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} ${columnName} must be non-zero`);
+  }
+  return value;
+}
+
 function normalizeInt32(value: number): number {
   if (!Number.isInteger(value) || value < -0x80000000 || value > 0x7fffffff) {
     throw new Error(`expected i32, got ${value}`);
@@ -2897,47 +5367,123 @@ function normalizeInt32(value: number): number {
   return value | 0;
 }
 
-function normalizeCrcKey(value: number): number {
-  return value >>> 0;
-}
-
-function crc32LookupKey(value: string | number): number {
-  return typeof value === "number" ? normalizeCrcKey(value) : crc32Lowercase(value);
+function crc32LookupKey(value: string | Crc32): Crc32 {
+  return typeof value === "number" ? value : Crc32.fromStringLower(value);
 }
 
 function normalizeNumericKey(value: number): number {
   return normalizeUint32(value);
 }
 
+function normalizeUnsignedInteger(value: number): number {
+  return normalizeUint32(value);
+}
+
+function normalizeOptionalUnsignedInteger(value: number | null): number {
+  return value === null ? 0 : normalizeUnsignedInteger(value);
+}
+
+function normalizeOptionalPositiveInteger(value: number | null): number | undefined {
+  const normalized = normalizeOptionalUnsignedInteger(value);
+  return normalized === 0 ? undefined : normalized;
+}
+
+function compareNumberPairs(
+  left: readonly [number, number],
+  right: readonly [number, number],
+): number {
+  return left[0] - right[0] || left[1] - right[1];
+}
+
+function tradeskillRankLookupKey(table: string, rank: number): string {
+  return `${normalizeStringKey(table)}:${normalizeUnsignedInteger(rank)}`;
+}
+
+function damageReferenceLookupKey(reference: DamageDataReference): string {
+  return `${normalizeStringKey(reference.table)}:${reference.id}`;
+}
+
+function damageSlotLookupKey(slot: DamageDataSlot): string {
+  return `${normalizeStringKey(slot.table)}:${normalizeUnsignedInteger(slot.rowIndex)}`;
+}
+
+function nonEmptyString(value: string | null): string | null {
+  const normalized = value?.trim() ?? "";
+  return normalized.length === 0 ? null : normalized;
+}
+
+function optionalSchemaNumber(value: number | string | null): number | null {
+  if (value === null) return null;
+  if (typeof value === "string" && value.trim().length === 0) return null;
+  const number = typeof value === "number" ? value : Number(value.trim());
+  return Number.isFinite(number) ? number : null;
+}
+
+function schemaBoolean(value: boolean | number | string | null, fallback: boolean): boolean {
+  if (value === null) return fallback;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  switch (value.trim().toLowerCase()) {
+    case "true":
+    case "1":
+    case "yes":
+      return true;
+    case "false":
+    case "0":
+    case "no":
+    case "":
+      return false;
+    default:
+      return fallback;
+  }
+}
+
+function requiredSchemaNumber(
+  value: number | string | null,
+  field: string,
+  ref: { readonly table: string; readonly key: string },
+): number {
+  const number = optionalSchemaNumber(value);
+  if (number === null) throw new Error(`table ${ref.table} row ${ref.key} requires numeric ${field}`);
+  return number;
+}
+
 function normalizeStringKey(value: string): string {
   return value.trim().toLowerCase();
 }
 
-const CRC32_TABLE = new Uint32Array(256);
-for (let index = 0; index < 256; index += 1) {
-  let crc = index;
-  for (let bit = 0; bit < 8; bit += 1) {
-    crc = (crc & 1) !== 0 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
-  }
-  CRC32_TABLE[index] = crc >>> 0;
-}
-
-function crc32Lowercase(value: string): number {
-  const bytes = new TextEncoder().encode(value);
-  let crc = 0xffffffff;
-  for (const byte of bytes) {
-    const lower = byte >= 65 && byte <= 90 ? byte + 32 : byte;
-    crc = CRC32_TABLE[(crc ^ lower) & 0xff] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
+function crc32Lowercase(value: string): Crc32 {
+  return Crc32.fromStringLower(value);
 }
 
 "#;
 
-const PRODUCT_MANAGER_RUNTIME_TS: &str = r#"
-export type Vec3 = ObjectStreamVec3;
+const OPTIONAL_UINT32_CELL_TS: &str = r#"
+function optionalUint32Cell(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+): number | null {
+  const value = optionalNumberCell(table, row, columnName);
+  return value === null ? null : normalizeUint32(value);
+}
+"#;
 
-export const ZERO_VEC3: Vec3 = { x: 0, y: 0, z: 0 };
+const OPTIONAL_NON_ZERO_UINT32_CELL_TS: &str = r#"
+function optionalNonZeroUint32Cell(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+): number | null {
+  const value = optionalUint32Cell(table, row, columnName);
+  if (value === 0) {
+    throw new Error(`row ${row.sourcePath}:${row.rowIndex + 1} ${columnName} must be non-zero`);
+  }
+  return value;
+}
+"#;
+
+const PRODUCT_MANAGER_RUNTIME_TS: &str = r#"
 export const ALL_INTERACT_OPTIONS_CATEGORY = 0x15;
 
 export interface ArmorOffsetDatabase {
@@ -2951,8 +5497,8 @@ export interface ArmorOffsetData {
 
 export interface AttachmentOffsetData {
   readonly attachment: string;
-  readonly position: Vec3;
-  readonly rotationDegrees: Vec3;
+  readonly position: Vector3;
+  readonly rotationDegrees: Vector3;
 }
 
 export interface EquipTypesDatabase {
@@ -2962,17 +5508,17 @@ export interface EquipTypesDatabase {
 export interface EquipTypeData {
   readonly name: string;
   readonly attachment: string;
-  readonly attachmentOffsetPosition: Vec3;
-  readonly attachmentOffsetRotationDegrees: Vec3;
+  readonly attachmentOffsetPosition: Vector3;
+  readonly attachmentOffsetRotationDegrees: Vector3;
   readonly sheathData: string;
-  readonly sheathOffsetPosition: Vec3;
-  readonly sheathOffsetRotationDegrees: Vec3;
+  readonly sheathOffsetPosition: Vector3;
+  readonly sheathOffsetRotationDegrees: Vector3;
   readonly offHandAttachment: string;
-  readonly offHandAttachmentOffsetPosition: Vec3;
-  readonly offHandAttachmentOffsetRotationDegrees: Vec3;
+  readonly offHandAttachmentOffsetPosition: Vector3;
+  readonly offHandAttachmentOffsetRotationDegrees: Vector3;
   readonly offHandSheathData: string;
-  readonly offHandSheathOffsetPosition: Vec3;
-  readonly offHandSheathOffsetRotationDegrees: Vec3;
+  readonly offHandSheathOffsetPosition: Vector3;
+  readonly offHandSheathOffsetRotationDegrees: Vector3;
 }
 
 export interface GameDebugSettings {
@@ -3095,7 +5641,7 @@ export type TradeskillType =
 
 export interface EditCrc {
   readonly valueStr: string;
-  readonly valueCrc: number;
+  readonly valueCrc: Crc32;
 }
 
 export interface ColorRgba {
@@ -3108,13 +5654,6 @@ export interface ColorRgba {
 export interface IntRange {
   readonly min: number;
   readonly max: number;
-}
-
-export interface AssetReference {
-  readonly guid: string;
-  readonly subId: number;
-  readonly assetType: string;
-  readonly hint: string;
 }
 
 export interface SimpleAssetReferenceTextureAsset {
@@ -3149,7 +5688,7 @@ export interface ItemRarityData {
 
 export interface PerkGenerationData {
   readonly perkDataPerTier: readonly PerkTierData[];
-  readonly craftingResultLootBucketId: number;
+  readonly craftingResultLootBucketId: Crc32;
   readonly craftingResultLootBucket: string;
   readonly rollPerkOnUpgradeGs: number;
   readonly rollPerkOnUpgradeTier: number;
@@ -3163,14 +5702,14 @@ export interface PerkTierData {
   readonly generalGearScorePerkCount: ReadonlyMap<number, readonly IntRange[]>;
   readonly craftingGearScorePerkCount: ReadonlyMap<number, readonly IntRange[]>;
   readonly attributePerkBucket: string;
-  readonly attributePerkBucketId: number;
+  readonly attributePerkBucketId: Crc32;
 }
 
 export interface GuildSiegeWindowRegionData {
   readonly startHour: number;
   readonly endHour: number;
   readonly utcOffset: number;
-  readonly dstRuleId: number;
+  readonly dstRuleId: Crc32;
   readonly dstRule: string;
   readonly observesDst: boolean;
 }
@@ -3204,14 +5743,14 @@ export interface ValidGroupData {
 }
 
 export interface WarData {
-  readonly deployableLimits: ReadonlyMap<number, WarDeployableLimitData>;
+  readonly deployableLimits: ReadonlyMap<Crc32, WarDeployableLimitData>;
 }
 
 export interface WarDeployableLimitData {
-  readonly id: number;
+  readonly id: Crc32;
   readonly displayName: string;
   readonly buildableNames: readonly string[];
-  readonly buildableIds: readonly number[];
+  readonly buildableIds: readonly Crc32[];
   readonly attackerLimits: readonly [number, number, number];
   readonly defenderLimit: number;
 }
@@ -3411,49 +5950,7 @@ const SOCIAL_GUILD_RANK_SECURITY_LEVEL_FIELD_CRC = 265698600;
 const SOCIAL_GUILD_RANK_ALL_PRIVILEGES_FIELD_CRC = 928054442;
 const SOCIAL_GUILD_RANK_PRIVILEGE_IDS_FIELD_CRC = 2614315740;
 
-const TRADESKILL_TYPES: readonly TradeskillType[] = [
-  "Weaponsmithing",
-  "Armoring",
-  "Jewelcrafting",
-  "Arcana",
-  "Cooking",
-  "Furnishing",
-  "Engineering",
-  "Smelting",
-  "Woodworking",
-  "Leatherworking",
-  "Weaving",
-  "Stonecutting",
-  "Skinning",
-  "Mining",
-  "Logging",
-  "Harvesting",
-  "WildernessSurvival",
-  "Fishing",
-  "AzothStaff",
-  "Musician",
-  "Riding",
-];
-
 const PRODUCT_TEXT_DECODER = new TextDecoder();
-
-function normalizeTradeskillType(value: string | number): TradeskillType {
-  if (typeof value === "number") {
-    if (value === 255) {
-      return "None";
-    }
-    const tradeskill = TRADESKILL_TYPES[value];
-    if (tradeskill === undefined) {
-      throw new Error(`unknown TradeskillType value ${value}`);
-    }
-    return tradeskill;
-  }
-  const normalized = String(value).trim();
-  if (normalized === "None" || TRADESKILL_TYPES.includes(normalized as TradeskillType)) {
-    return normalized as TradeskillType;
-  }
-  throw new Error(`unknown TradeskillType ${value}`);
-}
 
 function parsePlayerBaseAttributes(bytes: Uint8Array): PlayerBaseAttributes {
   const root = strictObjectStreamRoot(bytes, PLAYER_BASE_ATTRIBUTES_TYPE_ID);
@@ -3601,7 +6098,7 @@ function parseValidGroupData(element: ObjectStreamElement): ValidGroupData {
 }
 
 function parseWarData(element: ObjectStreamElement): WarData {
-  const deployableLimits = new Map<number, WarDeployableLimitData>();
+  const deployableLimits = new Map<Crc32, WarDeployableLimitData>();
   for (const pair of requiredFieldByName(element, "Deployable Limits").children) {
     deployableLimits.set(
       requiredCrc32FieldByName(pair, "value1"),
@@ -3798,7 +6295,7 @@ function furthestArmorAttachmentOffset(
   database: ArmorOffsetDatabase,
   armorOffsetNames: readonly string[],
   attachmentName: string,
-  currentPosition: Vec3,
+  currentPosition: Vector3,
 ): AttachmentOffsetData | undefined {
   let best: AttachmentOffsetData | undefined;
   let bestLength = vec3Length(currentPosition);
@@ -3942,8 +6439,8 @@ function parseEffects(element: ObjectStreamElement): readonly EffectData[] {
 
 function indexInteractOptionsByNameCrc(
   options: readonly InteractOptionData[],
-): ReadonlyMap<number, InteractOptionData> {
-  const out = new Map<number, InteractOptionData>();
+): ReadonlyMap<Crc32, InteractOptionData> {
+  const out = new Map<Crc32, InteractOptionData>();
   for (const option of options) {
     const key = crc32Lowercase(option.name);
     if (!out.has(key)) {
@@ -4006,7 +6503,7 @@ function requiredStringField(element: ObjectStreamElement, nameCrc: number): str
   return objectStreamString(child);
 }
 
-function requiredVec3Field(element: ObjectStreamElement, nameCrc: number): Vec3 {
+function requiredVec3Field(element: ObjectStreamElement, nameCrc: number): Vector3 {
   const child = requiredTypedChild(element, nameCrc, VECTOR3_TYPE_ID);
   return objectStreamVec3(child);
 }
@@ -4063,7 +6560,7 @@ function requiredBoolFieldByName(element: ObjectStreamElement, fieldName: string
   return requiredBoolField(element, crc32Lowercase(fieldName));
 }
 
-function requiredCrc32FieldByName(element: ObjectStreamElement, fieldName: string): number {
+function requiredCrc32FieldByName(element: ObjectStreamElement, fieldName: string): Crc32 {
   return readCrc32(requiredFieldByName(element, fieldName));
 }
 
@@ -4077,7 +6574,7 @@ function requiredStringSequenceByName(
 function requiredCrc32SequenceByName(
   element: ObjectStreamElement,
   fieldName: string,
-): readonly number[] {
+): readonly Crc32[] {
   return requiredFieldByName(element, fieldName).children.map(readCrc32);
 }
 
@@ -4088,13 +6585,13 @@ function readStringVector(element: ObjectStreamElement): readonly string[] {
   });
 }
 
-function readCrc32(element: ObjectStreamElement): number {
+function readCrc32(element: ObjectStreamElement): Crc32 {
   requireObjectStreamType(element, CRC32_TYPE_ID);
   if (element.data.length === 4) {
-    return objectStreamU32(element);
+    return Crc32.from(objectStreamU32(element));
   }
   const value = requiredChildByNameCrc(element, crc32Lowercase("Value"));
-  return objectStreamU32(value);
+  return Crc32.from(objectStreamU32(value));
 }
 
 function parseEditCrc(element: ObjectStreamElement): EditCrc {
@@ -4165,9 +6662,8 @@ function readAssetReference(element: ObjectStreamElement): AssetReference {
       ? Number(view.getBigUint64(16, false))
       : view.getUint32(16, false);
     return {
-      guid: uuidFromBytes(data.slice(0, 16)),
-      subId,
-      assetType: uuidFromBytes(data.slice(candidate.assetTypeOffset, candidate.assetTypeOffset + 16)),
+      id: new AssetId(Uuid.fromBytes(data.slice(0, 16)), subId),
+      assetType: Uuid.fromBytes(data.slice(candidate.assetTypeOffset, candidate.assetTypeOffset + 16)),
       hint: PRODUCT_TEXT_DECODER.decode(data.slice(candidate.hintOffset)),
     };
   }
@@ -4188,14 +6684,6 @@ function objectStreamDataView(element: ObjectStreamElement): DataView {
     element.data.byteOffset,
     element.data.byteLength,
   );
-}
-
-function uuidFromBytes(bytes: Uint8Array): string {
-  if (bytes.length !== 16) {
-    throw new Error(`uuid has ${bytes.length} bytes, expected 16`);
-  }
-  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
-  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
 }
 
 function requiredChild(
@@ -4238,7 +6726,7 @@ function firstStringDescendant(element: ObjectStreamElement): string | undefined
   return undefined;
 }
 
-function vec3Length(value: Vec3): number {
+function vec3Length(value: Vector3): number {
   return Math.hypot(value.x, value.y, value.z);
 }
 
@@ -4281,34 +6769,38 @@ function parseOptionalFloat(value: string | undefined): number | undefined {
 "#;
 
 const DYNAMIC_MANAGER_RUNTIME_TS: &str = r#"
-class ManagerInstance {
+interface TableSelector {
+  readonly name: string;
+  readonly rowType: string;
+}
+
+class ManagerResources {
   constructor(
-    private readonly definition: ManagerDefinition,
-    private readonly tables: ReadonlyMap<string, DynamicTable>,
-    private readonly assets: readonly string[],
-    private readonly assetBytesByPath: ReadonlyMap<string, Uint8Array>,
-    private readonly managers: ReadonlyMap<string, ManagerInstance>,
+    private readonly managerName: string,
+    private readonly tablesByName: ReadonlyMap<string, ReadonlyMap<string, DynamicTable>>,
+    private readonly tableOrder: readonly DynamicTable[],
+    private readonly assets: ReadonlyMap<string, Uint8Array>,
   ) {}
 
-  table(name: string): DynamicTable | undefined {
-    return this.tables.get(name);
+  table(selector: TableSelector): DynamicTable | undefined {
+    return this.tablesByName.get(selector.name)?.get(selector.rowType);
   }
 
-  manager(name: string): ManagerInstance | undefined {
-    return this.managers.get(name);
+  *[Symbol.iterator](): IterableIterator<DynamicTable> {
+    yield* this.tableOrder;
   }
 
   private assetBytes(path?: string): Uint8Array | undefined {
-    const requested = path ?? (this.assets.length === 1 ? this.assets[0] : undefined);
+    const requested = path ?? (this.assets.size === 1 ? this.assets.keys().next().value : undefined);
     if (requested === undefined) {
       return undefined;
     }
     const normalized = normalizeDataPath(requested);
-    const exact = this.assetBytesByPath.get(normalized);
+    const exact = this.assets.get(normalized);
     if (exact !== undefined) {
       return exact;
     }
-    for (const [candidate, bytes] of this.assetBytesByPath) {
+    for (const [candidate, bytes] of this.assets) {
       if (candidate.endsWith(`/${normalized}`)) {
         return bytes;
       }
@@ -4319,215 +6811,138 @@ class ManagerInstance {
   requiredAssetBytes(path?: string): Uint8Array {
     const bytes = this.assetBytes(path);
     if (bytes === undefined) {
-      throw new Error(`manager ${this.definition.name} asset ${path ?? "<single>"} was not loaded`);
+      throw new Error(`manager ${this.managerName} asset ${path ?? "<single>"} was not loaded`);
     }
     return bytes;
   }
 
-  schemaRows<T>(
+  schemaFamilyEntries<T>(
     rowType: string,
     read: (table: DynamicTable, row: DynamicTableRow) => T,
-  ): readonly T[] {
-    const out: T[] = [];
-    for (const table of this.allTables()) {
+  ): readonly ResolvedRowEntry<T>[] {
+    const out: ResolvedRowEntry<T>[] = [];
+    for (const table of this.tableOrder) {
       if (table.schema.rowType !== rowType) {
         continue;
       }
       for (const row of table.rows) {
-        out.push(read(table, row));
+        out.push({
+          sourcePath: row.sourcePath,
+          key: row.key,
+          rowIndex: row.rowIndex,
+          row: read(table, row),
+        });
       }
     }
     return out;
   }
 
-  schemaFamilyEntries<T, Entry>(
-    rowType: string,
-    read: (table: DynamicTable, row: DynamicTableRow) => T,
-    entry: (table: DynamicTable, row: DynamicTableRow, data: T) => Entry,
-  ): readonly Entry[] {
-    const out: Entry[] = [];
-    for (const table of this.allTables()) {
-      if (table.schema.rowType !== rowType) {
-        continue;
-      }
-      for (const row of table.rows) {
-        out.push(entry(table, row, read(table, row)));
-      }
-    }
-    return out;
-  }
-
-  schemaTableEntries<T, Entry>(
-    tableName: string,
-    rowType: string,
-    read: (table: DynamicTable, row: DynamicTableRow) => T,
-    entry: (table: DynamicTable, row: DynamicTableRow, data: T) => Entry,
-  ): readonly Entry[] {
-    const table = this.tableByNameAndRow(tableName, rowType);
-    if (table === undefined) {
-      return [];
-    }
-    return table.rows.map((row) => entry(table, row, read(table, row)));
-  }
-
-  schemaRow<T>(
-    rowType: string,
-    key: string | number | boolean | null,
-    read: (table: DynamicTable, row: DynamicTableRow) => T,
-    keyOf: (row: T) => string | number | boolean | null,
-  ): T | undefined {
-    const lookupKey = normalizeLookupKey(key);
-    return this.schemaRows(rowType, read).find((row) => normalizeLookupKey(keyOf(row)) === lookupKey);
-  }
-
-  schemaTableRow<T>(
-    tableName: string,
-    rowType: string,
-    key: string | number | boolean | null,
-    read: (table: DynamicTable, row: DynamicTableRow) => T,
-  ): T | undefined {
-    const row = this.schemaTableDynamicRow(tableName, rowType, key);
-    if (row === undefined) {
-      return undefined;
-    }
-    return read(row.table, row.row);
-  }
-
-  schemaTableRowByIndex<T>(
-    tableName: string,
-    rowType: string,
-    rowIndex: number,
-    read: (table: DynamicTable, row: DynamicTableRow) => T,
-  ): T | undefined {
-    const table = this.tableByNameAndRow(tableName, rowType);
-    if (table === undefined || rowIndex < 0 || rowIndex >= table.rows.length) {
-      return undefined;
-    }
-    const row = table.rows[rowIndex];
-    return read(table, row);
-  }
-
-  schemaTableRowKeyByIndex(
-    tableName: string,
-    rowType: string,
-    rowIndex: number,
-  ): string | undefined {
-    const table = this.tableByNameAndRow(tableName, rowType);
-    if (table === undefined || rowIndex < 0 || rowIndex >= table.rows.length) {
-      return undefined;
-    }
-    return table.rows[rowIndex].key;
-  }
-
-  private schemaTableDynamicRow(
-    tableName: string,
-    rowType: string,
-    key: string | number | boolean | null,
-  ): { table: DynamicTable; row: DynamicTableRow } | undefined {
-    const table = this.tableByNameAndRow(tableName, rowType);
-    const row = table?.rowsByLookupKey.get(normalizeLookupKey(key));
-    if (table === undefined || row === undefined) {
-      return undefined;
-    }
-    return { table, row };
-  }
-
-  private tableByNameAndRow(tableName: string, rowType: string): DynamicTable | undefined {
-    const table = this.table(tableName);
-    if (table === undefined || table.schema.rowType !== rowType) {
-      return undefined;
-    }
-    return table;
-  }
-
-  private allTables(): readonly DynamicTable[] {
-    return Array.from(new Set(this.tables.values()));
-  }
 }
 
 class ManagerCache {
-  private readonly datasheetsByPath: ReadonlyMap<string, DatasheetAsset>;
-  private readonly assetsByPath: ReadonlyMap<string, Uint8Array>;
   private readonly tableCache = new Map<string, DynamicTable>();
-  private readonly managerCache = new Map<string, ManagerInstance>();
+  private readonly assetsByPath = new Map<string, Uint8Array>();
+  private readonly assetLoads = new Map<string, Promise<Uint8Array>>();
 
-  constructor(source: PakDatasheetSource) {
-    this.datasheetsByPath = new Map(
-      source.datasheets.map((asset) => [normalizeDataPath(asset.path), asset]),
-    );
-    this.assetsByPath = new Map(
-      source.assets.map((asset) => [normalizeDataPath(asset.path), asset.bytes]),
-    );
-  }
+  constructor(
+    private readonly loader: AssetLoader,
+    private readonly tableSchemas: readonly TableSchema[],
+  ) {}
 
-  [MANAGER_INSTANCE](name: string): unknown {
-    const definition = managerByName(name);
-    if (definition === undefined) {
-      throw new Error(`unknown manager ${name}`);
-    }
-    return this.buildManager(definition, new Set());
-  }
-
-  private buildManager(
-    definition: ManagerDefinition,
-    stack: Set<string>,
-  ): ManagerInstance {
-    const cached = this.managerCache.get(definition.name);
-    if (cached !== undefined) {
-      return cached;
-    }
-    if (stack.has(definition.name)) {
-      throw new Error(`manager dependency cycle at ${definition.name}`);
-    }
-    stack.add(definition.name);
-
-    const tables = new Map<string, DynamicTable>();
-    const assets: string[] = [];
-    const assetBytesByPath = new Map<string, Uint8Array>();
-    const managers = new Map<string, ManagerInstance>();
-
-    for (const dependency of definition.dependencies) {
-      switch (dependency.kind) {
-        case "table": {
-          const schema = tableSchemaByNameAndRow(dependency.name, dependency.row);
-          if (schema === undefined) {
-            throw new Error(
-              `manager ${definition.name} depends on unknown table ${dependency.name}/${dependency.row}`,
-            );
-          }
-          const table = this.buildTable(schema);
-          tables.set(dependency.name, table);
-          tables.set(schema.name, table);
-          tables.set(`${schema.name}:${schema.rowType}`, table);
-          break;
-        }
-        case "asset":
-          assets.push(dependency.path);
-          assetBytesByPath.set(
-            normalizeDataPath(dependency.path),
-            this.requiredAssetBytes(dependency.path),
-          );
-          break;
-        case "manager": {
-          const dependencyDefinition = managerByName(dependency.name);
-          if (dependencyDefinition === undefined) {
-            throw new Error(
-              `manager ${definition.name} depends on unknown manager ${dependency.name}`,
-            );
-          }
-          managers.set(
-            dependency.name,
-            this.buildManager(dependencyDefinition, stack),
-          );
-          break;
-        }
+  async prepare(
+    managerName: string,
+    selectors: readonly TableSelector[],
+    assetPaths: readonly string[],
+  ): Promise<void> {
+    const paths = new Set<string>();
+    for (const selector of selectors) {
+      const matches = this.tableSchemas.filter(
+        (table) => table.name === selector.name && table.rowType === selector.rowType,
+      );
+      if (matches.length !== 1) {
+        throw new Error(
+          matches.length === 0
+            ? `manager ${managerName} uses unknown table ${selector.name}:${selector.rowType}`
+            : `manager ${managerName} has duplicate table schema ${selector.name}:${selector.rowType}`,
+        );
+      }
+      for (const source of matches[0].sources) {
+        paths.add(source);
       }
     }
+    for (const path of assetPaths) {
+      paths.add(path);
+    }
+    await Promise.all(
+      Array.from(paths)
+        .sort()
+        .map((path) => this.loadAsset(path)),
+    );
+  }
 
-    stack.delete(definition.name);
-    const instance = new ManagerInstance(definition, tables, assets, assetBytesByPath, managers);
-    this.managerCache.set(definition.name, instance);
-    return instance;
+  resourcesForTables(
+    managerName: string,
+    selectors: readonly TableSelector[],
+    assetPaths: readonly string[],
+  ): ManagerResources {
+    const schemas: TableSchema[] = [];
+    for (const selector of selectors) {
+      const matches = this.tableSchemas.filter(
+        (table) => table.name === selector.name && table.rowType === selector.rowType,
+      );
+      if (matches.length === 0) {
+        throw new Error(
+          `manager ${managerName} uses unknown table ${selector.name}:${selector.rowType}`,
+        );
+      }
+      if (matches.length !== 1) {
+        throw new Error(
+          `manager ${managerName} has duplicate table schema ${selector.name}:${selector.rowType}`,
+        );
+      }
+      schemas.push(matches[0]);
+    }
+    return this.resourcesFromSchemas(managerName, schemas, assetPaths);
+  }
+
+  resourcesForRows(
+    managerName: string,
+    rowTypes: readonly string[],
+    assetPaths: readonly string[],
+  ): ManagerResources {
+    for (const rowType of rowTypes) {
+      if (!this.tableSchemas.some((table) => table.rowType === rowType)) {
+        throw new Error(`manager ${managerName} uses unknown row type ${rowType}`);
+      }
+    }
+    const requested = new Set(rowTypes);
+    const schemas = this.tableSchemas.filter((table) => requested.has(table.rowType));
+    return this.resourcesFromSchemas(managerName, schemas, assetPaths);
+  }
+
+  private resourcesFromSchemas(
+    managerName: string,
+    schemas: readonly TableSchema[],
+    assetPaths: readonly string[],
+  ): ManagerResources {
+    const tablesByName = new Map<string, Map<string, DynamicTable>>();
+    const tableOrder: DynamicTable[] = [];
+    for (const schema of schemas) {
+      const table = this.buildTable(schema);
+      let rowsByType = tablesByName.get(schema.name);
+      if (rowsByType === undefined) {
+        rowsByType = new Map<string, DynamicTable>();
+        tablesByName.set(schema.name, rowsByType);
+      }
+      rowsByType.set(schema.rowType, table);
+      tableOrder.push(table);
+    }
+
+    const assets = new Map<string, Uint8Array>();
+    for (const path of assetPaths) {
+      assets.set(normalizeDataPath(path), this.requiredAssetBytes(path));
+    }
+    return new ManagerResources(managerName, tablesByName, tableOrder, assets);
   }
 
   private buildTable(schema: TableSchema): DynamicTable {
@@ -4538,28 +6953,21 @@ class ManagerCache {
     }
 
     const rowKeyColumn = schema.columns.find((column) => column.rowKey);
-    if (rowKeyColumn === undefined) {
-      throw new Error(`table ${schema.name} has no row-key column`);
-    }
-
-    const sheets: Datasheet[] = [];
     const rows: DynamicTableRow[] = [];
-    const rowsByKey = new Map<string, DynamicTableRow>();
-    const rowsByLookupKey = new Map<string, DynamicTableRow>();
-    const duplicateKeys = new Map<string, DynamicTableRow[]>();
 
     for (const sourcePath of schema.sources) {
-      const asset = this.datasheetAsset(sourcePath);
-      if (asset === undefined) {
-        throw new Error(`datasheet source ${sourcePath} was not loaded`);
+      const sheet = parseDatasheet(this.requiredAssetBytes(sourcePath));
+      if (rowKeyColumn === undefined) {
+        if (sheet.rows.length !== 0) {
+          throw new Error(`non-empty datasheet source ${sourcePath} has no row-key column`);
+        }
+        continue;
       }
-      const sheet = parseDatasheet(asset.bytes);
       const columnSlots = columnSlotsForSheet(schema, sheet);
       const rowKeySlot = columnSlots.get(rowKeyColumn.crc);
       if (rowKeySlot === undefined) {
         throw new Error(`datasheet source ${sourcePath} missing row-key column ${rowKeyColumn.name}`);
       }
-      sheets.push(sheet);
       for (const [rowIndex, row] of sheet.rows.entries()) {
         const keyCell = row.cells[rowKeySlot];
         const key = keyCell === undefined ? undefined : rowKeyValue(keyCell.value);
@@ -4567,53 +6975,23 @@ class ManagerCache {
           continue;
         }
         const dynamicRow: DynamicTableRow = {
-          sourcePath: asset.path,
+          sourcePath: normalizeDataPath(sourcePath),
           rowIndex,
           key,
           row,
           columnSlots,
         };
         rows.push(dynamicRow);
-        const existing = rowsByKey.get(key);
-        if (existing === undefined) {
-          rowsByKey.set(key, dynamicRow);
-        }
-        const lookupKey = normalizeLookupKey(key);
-        const existingLookup = rowsByLookupKey.get(lookupKey);
-        if (existingLookup === undefined) {
-          rowsByLookupKey.set(lookupKey, dynamicRow);
-        } else {
-          const duplicates = duplicateKeys.get(lookupKey) ?? [existingLookup];
-          duplicates.push(dynamicRow);
-          duplicateKeys.set(lookupKey, duplicates);
-        }
       }
     }
 
     const table: DynamicTable = {
       schema,
-      sheets,
       rows,
-      rowsByKey,
-      rowsByLookupKey,
-      duplicateKeys,
+      columnCrcs: new Map(schema.columns.map((column) => [column.name, column.crc])),
     };
     this.tableCache.set(cacheKey, table);
     return table;
-  }
-
-  private datasheetAsset(sourcePath: string): DatasheetAsset | undefined {
-    const normalized = normalizeDataPath(sourcePath);
-    const exact = this.datasheetsByPath.get(normalized);
-    if (exact !== undefined) {
-      return exact;
-    }
-    for (const [path, asset] of this.datasheetsByPath) {
-      if (path.endsWith(`/${normalized}`)) {
-        return asset;
-      }
-    }
-    return undefined;
   }
 
   private assetBytes(path: string): Uint8Array | undefined {
@@ -4637,12 +7015,28 @@ class ManagerCache {
     }
     return bytes;
   }
-}
 
-function managerByName(
-  name: string,
-): ManagerDefinition | undefined {
-  return MANAGERS.find((entry) => entry.name === name);
+  private loadAsset(path: string): Promise<Uint8Array> {
+    const normalized = normalizeDataPath(path);
+    const loaded = this.assetsByPath.get(normalized);
+    if (loaded !== undefined) {
+      return Promise.resolve(loaded);
+    }
+    const pending = this.assetLoads.get(normalized);
+    if (pending !== undefined) {
+      return pending;
+    }
+    const load = this.loader.read(path).then((bytes) => {
+      this.assetsByPath.set(normalized, bytes);
+      this.assetLoads.delete(normalized);
+      return bytes;
+    }, (error: unknown) => {
+      this.assetLoads.delete(normalized);
+      throw error;
+    });
+    this.assetLoads.set(normalized, load);
+    return load;
+  }
 }
 
 function columnSlotsForSheet(
@@ -4678,11 +7072,17 @@ function normalizeLookupKey(key: string | number | boolean | null): string {
   return key === null ? "" : String(key).trim().toLowerCase();
 }
 
-function columnMatches(column: ColumnSchema, name: string): boolean {
-  return column.name === name || column.fieldName === name;
-}
-
 function normalizeDataPath(path: string): string {
   return path.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
+}
+
+function tablePathMatches(left: string, right: string): boolean {
+  const normalizedLeft = normalizeDataPath(left);
+  const normalizedRight = normalizeDataPath(right);
+  return (
+    normalizedLeft === normalizedRight ||
+    normalizedLeft.endsWith(`/${normalizedRight}`) ||
+    normalizedRight.endsWith(`/${normalizedLeft}`)
+  );
 }
 "#;

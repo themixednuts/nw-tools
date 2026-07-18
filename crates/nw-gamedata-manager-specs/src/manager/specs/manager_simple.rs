@@ -49,7 +49,7 @@ pub(super) fn emote_data_manager_spec() -> NativeManagerSpec {
     let shape = NativeOneTableEmoteManager::new(
         ident("emote_data"),
         game_table("EmoteDefinitions"),
-        game_row_type("EmoteDefinitions"),
+        game_row_type("EmoteData"),
         ident("table"),
         ident("EmoteDefinitionsRow"),
         ident("EmoteData"),
@@ -70,7 +70,7 @@ pub(super) fn emote_data_manager_spec() -> NativeManagerSpec {
         "Javelin::EmoteDataManager",
         "crate::EmoteDataManager",
         "EmoteDefinitions",
-        "EmoteDefinitions",
+        "EmoteData",
         vec![
             "Javelin::EmoteDataManager::EmoteDataManager",
             "Javelin::EmoteDataManager::CacheAllEmoteDataTables",
@@ -86,7 +86,7 @@ pub(super) fn experience_data_manager_spec() -> NativeManagerSpec {
     let shape = NativeOneTableExperienceManager::new(
         ident("experience_data"),
         game_table("XPLevels"),
-        game_row_type("XPLevels"),
+        game_row_type("ExperienceData"),
         ident("table"),
         ident("XpLevelsRow"),
         ident("ExperienceData"),
@@ -107,7 +107,7 @@ pub(super) fn experience_data_manager_spec() -> NativeManagerSpec {
         "Javelin::ExperienceDataManager",
         "crate::ExperienceDataManager",
         "XPLevels",
-        "XPLevels",
+        "ExperienceData",
         vec![
             "Javelin::ExperienceDataManager::ExperienceDataManager",
             "Javelin::ExperienceDataManager::CacheAllExperienceDataTables",

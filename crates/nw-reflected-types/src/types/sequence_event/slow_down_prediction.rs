@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct SlowDownPrediction;
+pub struct SlowDownPrediction {}
 
 impl AzRtti for SlowDownPrediction {
     const NAME: &'static str = "SlowDownPrediction";

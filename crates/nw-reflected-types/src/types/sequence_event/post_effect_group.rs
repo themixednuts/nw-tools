@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct PostEffectGroup;
+pub struct PostEffectGroup {}
 
 impl AzRtti for PostEffectGroup {
     const NAME: &'static str = "PostEffectGroup";

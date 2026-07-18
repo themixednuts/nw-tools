@@ -1,44 +1,8 @@
-                    write.function,
-                    write.instruction,
-                    write.vtable,
-                    result.size(),
-                    projected,
-                    prefixPattern("vector-constructor", write.pattern)));
-            }
-        }
-    }
-
     private String prefixPattern(String prefix, String pattern) {
         return pattern == null ? prefix : prefix + ":" + pattern;
     }
 
-    private boolean isVectorConstructorIteratorCall(Address target) {
-        Address resolved = resolvedCodeTarget(target);
-        if (!isExecutableAddress(resolved)) {
-            return false;
-        }
-        String name = fullFunctionName(functionAtOrContaining(resolved));
-        return name != null &&
-            name.toLowerCase(Locale.ROOT).contains("eh_vector_constructor_iterator");
-    }
-
-    private boolean isMemoryOperand(Instruction instruction, int operandIndex) {
-        String text = NetworkSchemaX86.operandText(instruction, operandIndex);
-        return text != null && text.contains("[") && text.contains("]");
-    }
-
-    private void clearVolatileAddressRegisters(Map<String, Address> registers) {
-        registers.remove("RAX");
-        registers.remove("RCX");
-        registers.remove("RDX");
-        registers.remove("R8");
-        registers.remove("R9");
-        registers.remove("R10");
-        registers.remove("R11");
-    }
-
     private TypeNameEvidence resolvedTypeName(
-        RegistryEntry entry,
         AzRttiEvidence resolvedRtti,
         HookTypeEvidence hookType,
         List<RegistrationFunction> matches) {
@@ -60,85 +24,7 @@
             return evidence;
         }
 
-        return typeNameFromCreateInstanceAllocation(entry);
-    }
-
-    private TypeNameEvidence typeNameFromCreateInstanceAllocation(RegistryEntry entry) {
-        Address createInstance = parseCapturedAddress(entry.createInstance);
-        if (!isExecutableAddress(createInstance)) {
-            return null;
-        }
-
-        String bestName = null;
-        String bestSource = null;
-        int bestScore = Integer.MIN_VALUE;
-        Address bestAddress = null;
-        for (Instruction instruction :
-            linearInstructions(createInstance, REGISTRY_HANDLER_RTTI_SCAN_LIMIT)) {
-
-            for (Address target : referencedAddresses(instruction)) {
-                String name = readPrintableString(target);
-                TypeNameCandidate candidate =
-                    typeNameCandidate(name, "createInstanceAllocationLabel", target);
-                if (candidate == null || candidate.score < bestScore) {
-                    continue;
-                }
-                bestName = candidate.typeName;
-                bestSource = candidate.source;
-                bestAddress = candidate.address;
-                bestScore = candidate.score;
-            }
-        }
-
-        TypeNameCandidate decompiledCandidate =
-            typeNameFromCreateInstanceDecompile(createInstance);
-        if (decompiledCandidate != null && decompiledCandidate.score >= bestScore) {
-            bestName = decompiledCandidate.typeName;
-            bestSource = decompiledCandidate.source;
-            bestAddress = decompiledCandidate.address;
-            bestScore = decompiledCandidate.score;
-        }
-
-        if (bestName == null) {
-            return null;
-        }
-
-        TypeNameEvidence evidence = new TypeNameEvidence();
-        evidence.source = bestSource == null ? "createInstanceAllocationLabel" : bestSource;
-        evidence.function = createInstance;
-        evidence.typeName = bestName;
-        evidence.typeNameAddress = bestAddress;
-        return evidence;
-    }
-
-    private TypeNameCandidate typeNameFromCreateInstanceDecompile(Address createInstance) {
-        Function function = functionAtOrContaining(createInstance);
-        String text = decompileC(function);
-        if (text == null) {
-            return null;
-        }
-
-        TypeNameCandidate best = null;
-        Matcher matcher = Pattern
-            .compile("\"(?<value>[A-Za-z_][A-Za-z0-9_:<>.$-]{0,255})\"")
-            .matcher(text);
-        while (matcher.find()) {
-            TypeNameCandidate candidate =
-                typeNameCandidate(matcher.group("value"), "createInstanceAllocationLiteral", null);
-            if (candidate == null || (best != null && candidate.score < best.score)) {
-                continue;
-            }
-            best = candidate;
-        }
-        return best;
-    }
-
-    private TypeNameCandidate typeNameCandidate(String name, String source, Address address) {
-        if (!isLikelyRuntimeTypeName(name)) {
-            return null;
-        }
-
-        return new TypeNameCandidate(name, source, address, runtimeTypeNameScore(name));
+        return null;
     }
 
     private boolean isLikelyRuntimeTypeName(String name) {
@@ -255,38 +141,6 @@
             }
         }
         return false;
-    }
-
-    private String typeNameFromRttiHelperFunctionName(Address function) {
-        Function providerFunction = functionAtOrContaining(function);
-        if (providerFunction == null) {
-            return null;
-        }
-
-        Matcher matcher = RTTI_HELPER_NAME_RE.matcher(fullFunctionName(providerFunction));
-        if (!matcher.find()) {
-            return null;
-        }
-
-        String typeName = matcher.group("type");
-        return isLikelyRuntimeTypeName(typeName) ? typeName : null;
-    }
-
-    private TypeNameDecode typeNameDecodeFromFunctionName(Address function, Address provider) {
-        String typeName = typeNameFromRttiHelperFunctionName(provider);
-        if (typeName == null) {
-            typeName = typeNameFromRttiHelperFunctionName(function);
-        }
-        if (typeName == null) {
-            return null;
-        }
-
-        TypeNameDecode decode = new TypeNameDecode();
-        decode.function = function;
-        decode.provider = provider;
-        decode.typeName = typeName;
-        decode.typeNameSource = "rttiHelperFunctionName";
-        return decode;
     }
 
     private List<Address> registryHandlerFunctionAddresses(RegistryEntry entry) {
@@ -828,6 +682,9 @@
 
         SymbolIterator symbols = currentProgram.getSymbolTable().getAllSymbols(true);
         while (symbols.hasNext()) {
+            if (monitor.isCancelled()) {
+                break;
+            }
             Symbol symbol = symbols.next();
             String typeName = registrationHookTypeName(symbol);
             if (!isPlausibleTypeName(typeName)) {
@@ -861,6 +718,7 @@
             ", queued no type-id=" + queuedRegistrationNoTypeIdCount +
             ", direct refs=" + directRegisterTypeReferenceCount +
             ", direct decoded=" + directRegisterTypeDecodedCount +
+            ", direct covered=" + directRegisterTypeCoveredCount +
             ", direct no function=" + directRegisterTypeNoFunctionCount +
             ", direct no type-id=" + directRegisterTypeNoTypeIdCount);
         return result;

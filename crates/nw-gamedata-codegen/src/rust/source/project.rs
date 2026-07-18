@@ -1,6 +1,5 @@
 use crate::emit::GameDataCodegenFile;
 use crate::project::{RUST_EDITION, RUST_VERSION};
-use crate::target::{GameDataDataFormat, GameDataProduct, GameDataTargetPlan};
 
 use super::{RustSourceEmitError, format_rust_source};
 
@@ -12,7 +11,6 @@ pub struct RustStandaloneProject {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustStandaloneProjectOptions {
     package_name: String,
-    include_product_placeholders: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,7 +23,6 @@ impl Default for RustStandaloneProjectOptions {
     fn default() -> Self {
         Self {
             package_name: "newworld-gamedata".to_owned(),
-            include_product_placeholders: true,
         }
     }
 }
@@ -39,44 +36,22 @@ impl super::RustSourceEmitter {
         &self,
         options: &RustStandaloneProjectOptions,
     ) -> Result<RustStandaloneProject, RustSourceEmitError> {
-        let data_format = self.target.data_format();
         let mut files = vec![
             RustStandaloneProjectFile::new(
                 "Cargo.toml",
-                cargo_manifest_source(options.package_name(), data_format),
+                cargo_manifest_source(options.package_name()),
             ),
             RustStandaloneProjectFile::new(
                 ".cargo/config.toml",
                 rust_standalone_cargo_config_source()?,
             ),
             RustStandaloneProjectFile::new("build.rs", rust_standalone_build_rs_source()?),
-            RustStandaloneProjectFile::new(
-                "src/lib.rs",
-                standalone_lib_rs_source(&self.target, data_format)?,
-            ),
+            RustStandaloneProjectFile::new("src/lib.rs", standalone_lib_rs_source()?),
         ];
-        if options.include_product_placeholders {
-            if self.target.supports_product(GameDataProduct::TableManifest) {
-                files.push(RustStandaloneProjectFile::new("src/table_manifest.rs", ""));
-            }
-        }
-        if self
-            .target
-            .supports_product(GameDataProduct::GameAssetAccess)
-        {
-            files.push(RustStandaloneProjectFile::new(
-                "src/assets.rs",
-                asset_facade_source()?,
-            ));
-        }
-        if options.include_product_placeholders
-            && self.target.supports_product(GameDataProduct::Systems)
-        {
-            files.push(RustStandaloneProjectFile::new(
-                "src/system.rs",
-                standalone_system_source()?,
-            ));
-        }
+        files.push(RustStandaloneProjectFile::new(
+            "src/assets.rs",
+            asset_facade_source()?,
+        ));
         Ok(RustStandaloneProject { files })
     }
 }
@@ -106,19 +81,12 @@ impl RustStandaloneProjectOptions {
     pub fn new(package_name: impl Into<String>) -> Self {
         Self {
             package_name: package_name.into(),
-            include_product_placeholders: true,
         }
     }
 
     #[must_use]
     pub fn package_name(&self) -> &str {
         &self.package_name
-    }
-
-    #[must_use]
-    pub const fn with_product_placeholders(mut self, include: bool) -> Self {
-        self.include_product_placeholders = include;
-        self
     }
 }
 
@@ -147,60 +115,43 @@ impl RustStandaloneProjectFile {
     }
 }
 
-fn standalone_lib_rs_source(
-    target: &GameDataTargetPlan,
-    data_format: GameDataDataFormat,
-) -> Result<String, RustSourceEmitError> {
-    let mut source =
-        String::from("#![allow(clippy::struct_excessive_bools, dead_code, unused_mut)]\n\n");
-    if target.supports_product(GameDataProduct::TableManifest) {
-        source.push_str("mod table_manifest;\n");
-    }
-    if target.supports_product(GameDataProduct::GameAssetAccess) {
-        source.push_str("\npub mod assets;\n");
-        source.push_str("pub use assets::AssetLoader;\n");
-    }
-    if target.supports_product(GameDataProduct::Systems)
-        && matches!(data_format, GameDataDataFormat::Datasheet)
-    {
-        source.push_str("\npub mod system;\n");
-    }
-    if target.supports_product(GameDataProduct::SemanticManagers) {
-        source.push_str("\npub mod managers;\n");
-        source.push_str("pub use managers::Managers;\n");
-    }
-    format_rust_source(&source)
+fn standalone_lib_rs_source() -> Result<String, RustSourceEmitError> {
+    format_rust_source(
+        "mod datasheet_catalog;\n\nmod assets;\n\
+         pub use assets::{AssetCatalog, AssetId, AssetLoader, AssetReference, AssetType};\n\n\
+         pub mod managers;\n\
+         pub use managers::Managers;\n\n\
+         pub use nw_datasheet::game_system::Crc32;\n\
+         pub use glam::Vec3;\n\
+         pub use uuid::Uuid;\n",
+    )
 }
 
-fn cargo_manifest_source(package_name: &str, data_format: GameDataDataFormat) -> String {
+fn cargo_manifest_source(package_name: &str) -> String {
     RUST_STANDALONE_CARGO_TOML
         .replace("{{PACKAGE_NAME}}", package_name)
         .replace("{{RUST_EDITION}}", RUST_EDITION)
         .replace("{{RUST_VERSION}}", RUST_VERSION)
         .replace(
             "{{RUST_STANDALONE_DEPENDENCIES}}",
-            &rust_standalone_dependencies(data_format),
+            &rust_standalone_dependencies(),
         )
 }
 
-fn rust_standalone_dependencies(data_format: GameDataDataFormat) -> String {
-    let mut dependencies = vec![
+fn rust_standalone_dependencies() -> String {
+    let dependencies = vec![
         "anyhow = \"1\"",
         "flate2 = \"1.1.9\"",
+        "glam = \"0.32\"",
         "nw-asset = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-asset\", features = [\"oodle\"] }",
         "nw-datasheet = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-datasheet\" }",
-        "nw-filesystem = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-filesystem\" }",
-        "nw-jobs = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-jobs\" }",
-        "nw-localization = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-localization\" }",
         "nw-objectstream = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-objectstream\" }",
         "nw-pak = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-pak\", features = [\"oodle\"] }",
+        "once_cell = \"1\"",
         "serde = { version = \"1\", features = [\"derive\"] }",
         "serde_json = \"1\"",
-        "thiserror = \"2\"",
+        "uuid = \"1.23.3\"",
     ];
-    if matches!(data_format, GameDataDataFormat::Ron) {
-        dependencies.insert(5, "ron = \"0.12.1\"");
-    }
     dependencies.join("\n")
 }
 
@@ -237,7 +188,7 @@ fn copy_runtime_dlls(bin_dir: &Path) {
     let Some(profile_dir) = profile_dir() else {
         return;
     };
-    for name in ["oo2core_win64.dll", "oo2core_9_win64.dll", "oo2core_8_win64.dll"] {
+    for name in ["oo2core_win64.dll"] {
         let source = bin_dir.join(name);
         if !source.is_file() {
             continue;
@@ -279,43 +230,8 @@ use anyhow::{Context, Result, bail};
 use nw_asset::{ASSET_CATALOG_PATH, Rasc};
 use nw_pak::PakMmapReader as PakReader;
 
-pub mod asset {
-    pub use nw_asset::AssetId;
-}
-
-pub use nw_asset::{
-    AssetCatalog, AssetId, AssetInfo, AssetStore, AssetStoreError, AssetType,
-    normalize_virtual_path,
-};
-pub use nw_datasheet::{Cell, CellValue, Column, ColumnType, Datasheet, Row};
-pub use nw_filesystem::{
-    SafeJoinError, archive_extension_key, display_relative, normalize_archive_path, safe_join,
-};
-pub use nw_jobs::{
-    CancellationToken, JobBatch, JobRunner, JobRunnerBuildError, JobRunnerPolicy,
-};
-pub use nw_localization::{LanguageCode, LocalizationError, LocalizedTextResolver};
-pub use nw_objectstream::{ObjectStream, ObjectStreamEncoding, ObjectStreamError};
-pub use nw_pak::{EntryInfo, PakArchive, PakError, PakFile, PakFileMmap, PakMmapReader};
-
-#[derive(Debug, Clone)]
-pub(crate) struct DatasheetAsset {
-    pub(crate) path: String,
-    pub(crate) bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BinaryAsset {
-    pub(crate) path: String,
-    pub(crate) bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PakDatasheetSource {
-    pub(crate) catalog: AssetCatalog,
-    pub(crate) datasheets: Vec<DatasheetAsset>,
-    pub(crate) assets: Vec<BinaryAsset>,
-}
+pub use nw_asset::{AssetCatalog, AssetId, AssetReference, AssetType};
+use nw_asset::normalize_virtual_path;
 
 #[derive(Clone)]
 pub struct AssetLoader {
@@ -334,7 +250,8 @@ struct PakEntryRef {
 }
 
 impl AssetLoader {
-    pub fn from_dir(asset_root: impl AsRef<Path>) -> Result<Self> {
+    /// Opens a New World asset directory and indexes every cataloged asset.
+    pub fn open(asset_root: impl AsRef<Path>) -> Result<Self> {
         let asset_root = canonical_path(asset_root.as_ref())
             .with_context(|| format!("resolve asset root {}", asset_root.as_ref().display()))?;
         let pak_paths = collect_pak_paths(&asset_root)?;
@@ -401,46 +318,6 @@ impl AssetLoader {
             .with_context(|| format!("read pak asset {path}"))
     }
 
-    pub(crate) fn datasheet_source(&self) -> Result<PakDatasheetSource> {
-        let mut datasheets = Vec::new();
-        let mut assets = Vec::new();
-        for entry in self.inner.catalog.entries() {
-            let path = normalize_data_path(entry.path());
-            if !is_datasheet_path(&path) && !is_manager_asset_path(&path) {
-                continue;
-            }
-            let bytes = self.read(&path)?;
-            if is_datasheet_path(&path) {
-                datasheets.push(DatasheetAsset { path, bytes });
-            } else {
-                assets.push(BinaryAsset { path, bytes });
-            }
-        }
-
-        Ok(PakDatasheetSource {
-            catalog: self.inner.catalog.clone(),
-            datasheets,
-            assets,
-        })
-    }
-}
-
-pub(crate) fn load_pak_datasheet_source(asset_root: impl AsRef<Path>) -> Result<PakDatasheetSource> {
-    AssetLoader::from_dir(asset_root)?.datasheet_source()
-}
-
-pub fn is_manager_asset_path(path: &str) -> bool {
-    let normalized = normalize_data_path(path);
-    if normalized == "libs/camera/gamecamera.xml" {
-        return true;
-    }
-    matches!(
-        path_extension(&normalized).as_deref(),
-        Some(
-            "aoffdb" | "equipdb" | "gds" | "uidb" | "pbadb" | "sprd" | "gdb" | "gactdb"
-            | "rankdb" | "craftstationdb",
-        )
-    )
 }
 
 fn load_catalog_from_paks(readers: &[(String, Arc<PakReader>)]) -> Result<AssetCatalog> {
@@ -516,30 +393,9 @@ fn mounted_entry_path(mount_root: &str, entry_name: &str) -> String {
     }
 }
 
-fn is_datasheet_path(path: &str) -> bool {
-    path_extension(path).is_some_and(|extension| extension == "datasheet")
-}
-
-fn path_extension(path: &str) -> Option<String> {
-    path.rsplit_once('.')
-        .map(|(_, extension)| extension.to_ascii_lowercase())
-}
-
 fn normalize_data_path(path: &str) -> String {
     normalize_virtual_path(path)
 }
-"#,
-    )
-}
-
-pub(super) fn standalone_system_source() -> Result<String, RustSourceEmitError> {
-    super::format_rust_source(
-        r#"
-//! Runtime system integration for the standalone datasheet GameData package.
-//!
-//! The standalone package loads shipping datasheets and manager resources from
-//! game assets. System-specific code is emitted here only after the
-//! system behavior is mapped.
 "#,
     )
 }
@@ -552,7 +408,7 @@ mod tests {
 
     #[test]
     fn standalone_project_uses_current_rust_toolchain() {
-        let emitter = crate::rust::source::RustSourceEmitter::standalone();
+        let emitter = crate::rust::source::RustSourceEmitter;
         let project = emitter
             .emit_standalone_project_with_options(&RustStandaloneProjectOptions::new(
                 "newworld-gamedata-check",
@@ -570,22 +426,17 @@ mod tests {
         assert!(cargo.contains("rust-version = \"1.96\""));
         assert!(!cargo.contains("[features]"));
         assert!(cargo.contains("anyhow = \"1\""));
-        assert!(cargo.contains("thiserror = \"2\""));
+        assert!(!cargo.contains("thiserror"));
+        assert!(cargo.contains("uuid = \"1.23.3\""));
         assert!(cargo.contains(
             "nw-asset = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-asset\", features = [\"oodle\"] }"
         ));
         assert!(cargo.contains(
             "nw-datasheet = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-datasheet\" }"
         ));
-        assert!(cargo.contains(
-            "nw-filesystem = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-filesystem\" }"
-        ));
-        assert!(cargo.contains(
-            "nw-jobs = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-jobs\" }"
-        ));
-        assert!(cargo.contains(
-            "nw-localization = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-localization\" }"
-        ));
+        assert!(!cargo.contains("nw-filesystem"));
+        assert!(!cargo.contains("nw-jobs"));
+        assert!(!cargo.contains("nw-localization"));
         assert!(cargo.contains(
             "nw-objectstream = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-objectstream\" }"
         ));
@@ -620,7 +471,7 @@ mod tests {
             project
                 .files()
                 .iter()
-                .any(|file| file.path() == "src/table_manifest.rs")
+                .all(|file| file.path() != "src/datasheet_catalog.rs")
         );
         assert!(
             project
@@ -632,7 +483,7 @@ mod tests {
             project
                 .files()
                 .iter()
-                .any(|file| file.path() == "src/system.rs")
+                .all(|file| file.path() != "src/system.rs")
         );
         assert!(
             project
@@ -650,7 +501,7 @@ mod tests {
 
     #[test]
     fn standalone_project_uses_typed_datasheet_mode() {
-        let emitter = crate::rust::source::RustSourceEmitter::standalone();
+        let emitter = crate::rust::source::RustSourceEmitter;
         let project = emitter
             .emit_standalone_project_with_options(&RustStandaloneProjectOptions::new(
                 "newworld-gamedata-check",
@@ -667,15 +518,9 @@ mod tests {
         assert!(cargo.contains(
             "nw-datasheet = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-datasheet\" }"
         ));
-        assert!(cargo.contains(
-            "nw-filesystem = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-filesystem\" }"
-        ));
-        assert!(cargo.contains(
-            "nw-jobs = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-jobs\" }"
-        ));
-        assert!(cargo.contains(
-            "nw-localization = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-localization\" }"
-        ));
+        assert!(!cargo.contains("nw-filesystem"));
+        assert!(!cargo.contains("nw-jobs"));
+        assert!(!cargo.contains("nw-localization"));
         assert!(cargo.contains(
             "nw-objectstream = { git = \"https://github.com/themixednuts/nw-tools\", package = \"nw-objectstream\" }"
         ));
@@ -691,19 +536,19 @@ mod tests {
             .expect("assets facade")
             .source();
         assert!(assets.contains("pub use nw_asset::"));
-        assert!(assets.contains("pub use nw_datasheet::"));
-        assert!(assets.contains("pub use nw_jobs::"));
-        assert!(assets.contains("pub use nw_localization::"));
-        assert!(assets.contains("pub use nw_objectstream::"));
-        assert!(assets.contains("pub use nw_pak::"));
-        assert!(assets.contains("pub(crate) struct PakDatasheetSource"));
-        assert!(assets.contains("pub(crate) fn datasheet_source"));
-        assert!(assets.contains("pub(crate) fn load_pak_datasheet_source"));
+        assert!(!assets.contains("pub use nw_datasheet::"));
+        assert!(!assets.contains("pub use nw_jobs::"));
+        assert!(!assets.contains("pub use nw_localization::"));
+        assert!(!assets.contains("pub use nw_objectstream::"));
+        assert!(!assets.contains("pub use nw_pak::"));
+        assert!(assets.contains("pub fn open(asset_root: impl AsRef<Path>)"));
+        assert!(!assets.contains("pub fn from_dir"));
+        assert!(!assets.contains("PakDatasheetSource"));
+        assert!(!assets.contains("datasheet_source"));
+        assert!(!assets.contains("load_pak_datasheet_source"));
         assert!(assets.contains("std::fs::canonicalize(path)"));
         assert!(assets.contains("std::fs::symlink_metadata(path)"));
         assert!(assets.contains("pak {} is not under asset root {}"));
-        assert!(!assets.contains("pub struct PakDatasheetSource"));
-        assert!(!assets.contains("pub fn datasheet_source"));
         assert!(
             project
                 .files()

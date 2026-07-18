@@ -214,12 +214,10 @@ fn read_spawner(element: &Element) -> Result<SliceMetaDataSpawnerEntry<'_>, Slic
 }
 
 fn read_asset_id_vector(element: &Element) -> Result<Vec<AssetId>, SliceMetaDataError> {
-    element
-        .children()
-        .iter()
-        .filter(|child| child.id() == &types::ASSET)
-        .map(read_asset_id)
-        .collect()
+    crate::asset_id::read_asset_id_vector(element).map_err(|source| SliceMetaDataError::Field {
+        field: "assetId",
+        source,
+    })
 }
 
 fn read_transform_vector(element: &Element) -> Result<Vec<[f32; 12]>, SliceMetaDataError> {
@@ -237,11 +235,10 @@ fn read_transform_vector(element: &Element) -> Result<Vec<[f32; 12]>, SliceMetaD
 }
 
 fn read_asset_id(element: &Element) -> Result<AssetId, SliceMetaDataError> {
-    expect_type(element, types::ASSET, "AZ::Data::AssetId")?;
-    let mut fields = FieldCursor::from_element(element);
-    let guid = read_required(&mut fields, "AZ::Data::AssetId", "guid")?;
-    let sub_id = read_required(&mut fields, "AZ::Data::AssetId", "subId")?;
-    Ok(AssetId::new(guid, sub_id))
+    crate::asset_id::read_asset_id(element).map_err(|source| SliceMetaDataError::Field {
+        field: "assetId",
+        source,
+    })
 }
 
 fn read_required_asset_id(
@@ -450,7 +447,7 @@ mod tests {
     }
 
     fn asset_id(field: &str, guid: Uuid, sub_id: u32) -> Element {
-        let element = Element::new(types::ASSET).with_children([
+        let element = Element::new(types::ASSET_ID).with_children([
             leaf("guid", types::AZ_UUID, guid.as_bytes()),
             leaf("subId", types::UNSIGNED_INT, sub_id.to_be_bytes()),
         ]);

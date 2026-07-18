@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionSpellChannelingState;
+pub struct ActionConditionSpellChannelingState {}
 
 impl AzRtti for ActionConditionSpellChannelingState {
     const NAME: &'static str = "ActionConditionSpellChannelingState";

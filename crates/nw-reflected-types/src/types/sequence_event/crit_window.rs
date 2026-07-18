@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct CritWindow;
+pub struct CritWindow {}
 
 impl AzRtti for CritWindow {
     const NAME: &'static str = "CritWindow";

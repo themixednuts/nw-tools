@@ -1,171 +1,3 @@
-            if (nativeType == null) {
-                recordPcodeMessageReject(
-                    plan,
-                    "pcode-call",
-                    "target-not-unmarshal-named",
-                    op,
-                    targetInfo,
-                    null,
-                    null);
-                continue;
-            }
-            observePcodeTempUnmarshal(
-                tempNativeTypes,
-                tempWireShapes,
-                op,
-                nativeType,
-                targetWireShape);
-
-            NestedDirectTypeCallShape directCallShape =
-                recoverNestedDirectTypeCallShape(wrapper, op, target, nativeType);
-            PcodeArgStorageSelection storageSelection =
-                pcodeStorageArgumentEvidence(op, messageBases);
-            PcodeStorage storage = directCallShape == null
-                ? (storageSelection == null ? null : storageSelection.storage)
-                : directCallShape.storage;
-            if (storage == null) {
-                recordPcodeMessageReject(
-                    plan,
-                    "pcode-call",
-                    "no-storage-arg-matched",
-                    op,
-                    targetInfo,
-                    null,
-                    storageSelection == null ? null : storageSelection.argStorageEvidence);
-                continue;
-            }
-            String storageExpression = storage.expression();
-            if (!isLikelyMessageStorage(storageExpression)) {
-                JsonArray argEvidence = storageSelection == null
-                    ? null
-                    : storageSelection.argStorageEvidence;
-                recordPcodeMessageReject(
-                    plan,
-                    "pcode-call",
-                    "storage-not-message-shaped",
-                    op,
-                    targetInfo,
-                    storage,
-                    argEvidence);
-                continue;
-            }
-
-            pcodeMessageFieldCandidateCount++;
-            int before = plan.fields.size();
-            FieldCall field = addPcodeMessageField(
-                plan,
-                op.getSeqnum().getTarget(),
-                storage,
-                nativeType,
-                "message-unmarshal-pcode-call",
-                recoveryOrder++);
-            applyPcodeUnmarshalEvidence(
-                field,
-                pcodeUnmarshalEvidence(
-                    op,
-                    targetInfo,
-                    "direct-unmarshal",
-                    storage,
-                    storageSelection == null ? null : storageSelection.storageArgSlot,
-                    "message-unmarshal-pcode-call",
-                    storageSelection == null ? null : storageSelection.argStorageEvidence),
-                plan.fields.size() > before);
-            applyMessageFieldWireShape(
-                field,
-                targetWireShape,
-                "message-unmarshal-pcode-call-target-wire-shape");
-            if (field != null && directCallShape != null) {
-                applyNestedTypeShapeToField(
-                    field,
-                    directCallShape.shape,
-                    "message-unmarshal-pcode-direct-type-shape");
-            }
-            else {
-                attachNestedDirectTypeShape(field, target, nativeType);
-            }
-            if (field != null && plan.fields.size() > before) {
-                pcodeMessageFieldAcceptedCount++;
-            }
-        }
-    }
-
-    private void recoverPcodeMessageStore(
-        MessageUnmarshalPlan plan,
-        PcodeOp op,
-        Set<String> messageBases,
-        Map<String, String> tempNativeTypes,
-        Map<String, String> tempWireShapes,
-        int recoveryOrder) {
-
-        if (op == null || op.getOpcode() != PcodeOp.STORE || op.getNumInputs() < 3) {
-            recordPcodeMessageReject(
-                plan,
-                "pcode-store",
-                "store-malformed",
-                op,
-                null,
-                null,
-                null);
-            return;
-        }
-        PcodeStorage storage = pcodeStorageExpression(op.getInput(1));
-        if (!isPcodeMessageStorage(storage, messageBases)) {
-            recordPcodeMessageReject(
-                plan,
-                "pcode-store",
-                "store-dest-not-message-base",
-                op,
-                null,
-                storage,
-                null);
-            return;
-        }
-        String nativeType = pcodeValueNativeType(op.getInput(2), tempNativeTypes);
-        String wireShape = pcodeValueWireShape(op.getInput(2), tempWireShapes, tempNativeTypes);
-        if (nativeType == null && wireShape != null) {
-            nativeType = nativeTypeFromWireShape(wireShape);
-        }
-        if (nativeType == null) {
-            recordPcodeMessageReject(
-                plan,
-                "pcode-store",
-                "store-value-type-unknown",
-                op,
-                pcodeValueCallTargetInfo(op.getInput(2)),
-                storage,
-                null);
-            return;
-        }
-
-        pcodeMessageFieldCandidateCount++;
-        int before = plan.fields.size();
-        FieldCall field = addPcodeMessageField(
-            plan,
-            op.getSeqnum().getTarget(),
-            storage,
-                nativeType,
-                "message-unmarshal-pcode-store",
-                recoveryOrder);
-        applyPcodeUnmarshalEvidence(
-            field,
-            pcodeUnmarshalEvidence(
-                op,
-                pcodeValueCallTargetInfo(op.getInput(2)),
-                "store-value-call",
-                storage,
-                null,
-                "message-unmarshal-pcode-store",
-                null),
-            plan.fields.size() > before);
-        applyMessageFieldWireShape(
-            field,
-            wireShape,
-            "message-unmarshal-pcode-store-value-wire-shape");
-        if (field != null && plan.fields.size() > before) {
-            pcodeMessageFieldAcceptedCount++;
-        }
-    }
-
     private void observePcodeTempUnmarshal(
         Map<String, String> tempNativeTypes,
         PcodeOp op,
@@ -181,13 +13,15 @@
         String nativeType,
         String wireShape) {
 
-        if (tempNativeTypes == null || nativeType == null || nativeType.isEmpty() ||
-            op == null || op.getOpcode() != PcodeOp.CALL || op.getNumInputs() < 3) {
+        boolean hasNativeType = nativeType != null && !nativeType.isEmpty();
+        boolean hasWireShape = wireShape != null && !wireShape.isEmpty();
+        if (tempNativeTypes == null || (!hasNativeType && !hasWireShape) ||
+            op == null || op.getOpcode() != PcodeOp.CALL) {
             return;
         }
-        if (wireShapeFromNativeType(nativeType) != null) {
-            PcodeStorage scalarOutput = pcodeScalarUnmarshalOutputStorage(op);
-            putPcodeTempUnmarshal(
+        if (hasNativeType && wireShapeFromNativeType(nativeType) != null) {
+            PcodeStorage scalarOutput = pcodeScalarUnmarshalOutputStorage(op, nativeType);
+            putPcodeTempUnmarshalRange(
                 tempNativeTypes,
                 tempWireShapes,
                 scalarOutput,
@@ -195,7 +29,7 @@
                 wireShape);
             return;
         }
-        PcodeStorage storage = pcodePreferredUnmarshalOutputStorage(op);
+        PcodeStorage storage = provenUnmarshalOutputStorage(op);
         putPcodeTempUnmarshal(
             tempNativeTypes,
             tempWireShapes,
@@ -215,30 +49,57 @@
             return;
         }
         String key = storageKey(storage);
-        tempNativeTypes.put(key, nativeType);
+        if (nativeType != null && !nativeType.isEmpty()) {
+            tempNativeTypes.put(key, nativeType);
+        }
         if (tempWireShapes != null && wireShape != null && !wireShape.isEmpty()) {
             tempWireShapes.put(key, wireShape);
         }
     }
 
-    private PcodeStorage pcodePreferredUnmarshalOutputStorage(PcodeOp op) {
-        if (op == null || op.getNumInputs() < 3) {
-            return null;
+    private void putPcodeTempUnmarshalRange(
+        Map<String, String> tempNativeTypes,
+        Map<String, String> tempWireShapes,
+        PcodeStorage storage,
+        String nativeType,
+        String wireShape) {
+
+        if (!isPcodeLocalTempStorage(storage)) {
+            return;
         }
-        return pcodeStorageExpression(op.getInput(op.getNumInputs() - 2));
+        Integer width = nativeTypeByteWidth(nativeType);
+        if (width == null) {
+            width = wireShapeByteWidth(wireShape);
+        }
+        if (width == null || width <= 0 || width > 64) {
+            putPcodeTempUnmarshal(
+                tempNativeTypes,
+                tempWireShapes,
+                storage,
+                nativeType,
+                wireShape);
+            return;
+        }
+        for (int byteOffset = 0; byteOffset < width; byteOffset++) {
+            putPcodeTempUnmarshal(
+                tempNativeTypes,
+                tempWireShapes,
+                storage.plus(byteOffset),
+                nativeType,
+                wireShape);
+        }
     }
 
-    private PcodeStorage pcodeScalarUnmarshalOutputStorage(PcodeOp op) {
-        if (op == null || op.getNumInputs() < 3) {
+    private PcodeStorage provenUnmarshalOutputStorage(PcodeOp op) {
+        if (op == null || op.getOpcode() != PcodeOp.CALL || op.getSeqnum() == null) {
             return null;
         }
-        for (int i = op.getNumInputs() - 1; i >= 1; i--) {
-            PcodeStorage storage = pcodeStorageExpression(op.getInput(i));
-            if (isPcodeLocalTempStorage(storage)) {
-                return storage;
-            }
-        }
-        return null;
+        Function target = pcodeCallTarget(op);
+        Integer outputSlot = unmarshalOutputParameterSlot(target);
+        Function owner = functionContaining(op.getSeqnum().getTarget());
+        return outputSlot == null
+            ? null
+            : provenCallArgumentStorage(owner, op, target, outputSlot);
     }
 
     private PcodeStorage nestedDirectTypeCallOutputStorage(
@@ -248,7 +109,7 @@
         Map<String, PcodeStorage> callerParamStorage) {
 
         if (op == null || shape == null || shape.memberBase == null) {
-            return pcodePreferredUnmarshalOutputStorage(op);
+            return provenUnmarshalOutputStorage(op);
         }
 
         Map<String, PcodeStorage> arguments =
@@ -262,16 +123,21 @@
         }
 
         Integer parameterIndex = pcodeParameterIndex(shape.memberBase);
-        if (parameterIndex != null && parameterIndex > 0 &&
-            parameterIndex < op.getNumInputs()) {
-            storage = pcodeStorageExpression(op.getInput(parameterIndex));
+        if (parameterIndex != null && parameterIndex > 0) {
+            storage = provenCallArgumentStorage(
+                owner,
+                op,
+                pcodeCallTarget(op),
+                parameterIndex);
             storage = translatedAbsoluteHelperStorage(storage, callerParamStorage);
             if (storage != null) {
                 return storage;
             }
         }
 
-        return pcodePreferredUnmarshalOutputStorage(op);
+        return translatedAbsoluteHelperStorage(
+            provenUnmarshalOutputStorage(op),
+            callerParamStorage);
     }
 
     private NestedDirectTypeCallShape recoverNestedDirectTypeCallShape(
@@ -280,18 +146,29 @@
         Function target,
         String nativeType) {
 
+        return recoverNestedDirectTypeCallShape(
+            owner,
+            op,
+            target,
+            nativeType,
+            Collections.emptyMap());
+    }
+
+    private NestedDirectTypeCallShape recoverNestedDirectTypeCallShape(
+        Function owner,
+        PcodeOp op,
+        Function target,
+        String nativeType,
+        Map<String, PcodeStorage> callerParamStorage) {
+
         if (owner == null || op == null || target == null || nativeType == null) {
             return null;
         }
 
         String targetName = fullFunctionName(target);
-        String typeName = directUnmarshalOwnerFullName(targetName);
-        if (typeName == null) {
-            typeName = directUnmarshalOwnerFullNameFromPrototype(target);
-        }
-        if (typeName == null) {
-            typeName = nativeType;
-        }
+        String typeName = firstNonEmpty(
+            directUnmarshalValueTypeName(target),
+            nativeType);
         if (typeName == null || wireShapeFromNativeType(typeName) != null) {
             return null;
         }
@@ -308,7 +185,7 @@
         }
 
         Map<String, PcodeStorage> arguments =
-            callArgumentStorageMap(owner, op, Collections.emptyMap());
+            callArgumentStorageMap(owner, op, callerParamStorage);
         return translatedNestedDirectTypeCallShape(
             typeName,
             target,
@@ -328,9 +205,7 @@
 
         HashMap<String, String> tempNativeTypes = new HashMap<>();
         HashMap<String, String> tempWireShapes = new HashMap<>();
-        Iterator<PcodeOpAST> ops = high.getPcodeOps();
-        while (ops.hasNext()) {
-            PcodeOpAST op = ops.next();
+        for (PcodeOpAST op : orderedPcodeOps(high)) {
             if (op.getOpcode() == PcodeOp.CALL) {
                 Function callTarget = pcodeCallTarget(op);
                 RawPcodeWrite rawWrite = pcodeReadRawWrite(op, callTarget);
@@ -339,17 +214,21 @@
                         byBase,
                         rawWrite.storage,
                         rawWrite.nativeType,
-                        rawWrite.wireShape,
+                        rawWrite.wireEvidence,
                         op,
                         callTarget,
                         "pcode-multi-output-readraw-fixed-bytes");
+                    markNestedTypeMemberWireOrder(
+                        byBase,
+                        rawWrite.storage,
+                        "cfg-call-order");
                     continue;
                 }
 
                 NestedTypeShape nestedMemberShape =
                     recoverNestedDirectMemberShape(target, callTarget);
                 PcodeStorage storage = nestedMemberShape == null
-                    ? pcodePreferredUnmarshalOutputStorage(op)
+                    ? provenUnmarshalOutputStorage(op)
                     : nestedDirectTypeCallOutputStorage(
                         target,
                         op,
@@ -363,34 +242,34 @@
                         op,
                         callTarget,
                         "pcode-multi-output-nested-direct-type-call")) {
+                    markNestedTypeMemberWireOrder(
+                        byBase,
+                        storage,
+                        "cfg-call-order");
                     continue;
                 }
 
                 String memberType = unmarshalNativeTypeFromTarget(callTarget);
-                String memberWireShape = wireShapeFromNativeType(memberType);
-                String evidenceSource = "pcode-multi-output-call";
-                if (memberWireShape == null) {
-                    String scalarType = scalarOutputStoreNativeType(callTarget);
-                    if (memberType == null) {
-                        memberType = scalarType;
-                    }
-                    memberWireShape = wireShapeFromNativeType(scalarType);
-                    evidenceSource = "pcode-multi-output-call-scalar-output-store";
+                WireShape memberWireEvidence =
+                    wireShapeEvidenceFromUnmarshalTarget(callTarget, memberType);
+                if (memberType == null) {
+                    memberType = scalarOutputStoreNativeType(callTarget);
                 }
                 observePcodeTempUnmarshal(
                     tempNativeTypes,
                     tempWireShapes,
                     op,
                     memberType,
-                    memberWireShape);
+                    memberWireEvidence == null ? null : memberWireEvidence.shape);
                 addNestedTypeMemberCandidate(
                     byBase,
                     storage,
                     memberType,
-                    memberWireShape,
+                    memberWireEvidence,
                     op,
                     callTarget,
-                    evidenceSource);
+                    "pcode-multi-output-call");
+                markNestedTypeMemberWireOrder(byBase, storage, "cfg-call-order");
                 continue;
             }
             if (op.getOpcode() != PcodeOp.STORE || op.getNumInputs() < 3) {
@@ -398,18 +277,22 @@
             }
             PcodeStorage storage = pcodeStorageExpression(op.getInput(1));
             String memberType = pcodeValueNativeType(op.getInput(2), tempNativeTypes);
-            String memberWireShape =
-                pcodeValueWireShape(op.getInput(2), tempWireShapes, tempNativeTypes);
+            PcodeCallTargetInfo valueTarget = pcodeValueCallTargetInfo(op.getInput(2));
+            WireShape memberWireEvidence = pcodeStoredValueWireEvidence(
+                op.getInput(2),
+                tempWireShapes,
+                tempNativeTypes,
+                valueTarget,
+                memberType);
             addNestedTypeMemberCandidate(
                 byBase,
                 storage,
                 memberType,
-                memberWireShape,
+                memberWireEvidence,
                 op,
-                pcodeValueCallTargetInfo(op.getInput(2)) == null
-                    ? null
-                    : pcodeValueCallTargetInfo(op.getInput(2)).target,
+                valueTarget == null ? null : valueTarget.target,
                 "pcode-multi-output-store");
+            markNestedTypeMemberWireOrder(byBase, storage, "cfg-store-order");
         }
         return byBase;
     }
@@ -474,7 +357,6 @@
             shape.typeNameSource = "ghidra-symbol";
             shape.function = target.getEntryPoint();
             shape.functionName = targetName;
-            applySerializeIdentity(shape, typeName);
             shape.memberBase = entry.getKey();
             shape.memberNameSource = "synthetic-offset";
             shape.memberNamesProven = false;
@@ -501,8 +383,7 @@
             if (member == null ||
                 Boolean.TRUE.equals(member.typeConflict) ||
                 member.offset < 0 ||
-                member.nativeType == null ||
-                member.wireShape == null) {
+                member.wireLayout == null) {
                 return false;
             }
             if (i + 1 >= members.size()) {
@@ -529,9 +410,17 @@
         copy.nameProven = source.nameProven;
         copy.nameEvidence = source.nameEvidence;
         copy.nativeType = source.nativeType;
+        copy.typeId = source.typeId;
+        copy.typeIdSource = source.typeIdSource;
+        copy.typeIdentityProven = source.typeIdentityProven;
+        copy.typeIdentitySource = source.typeIdentitySource;
         copy.wireShape = source.wireShape;
+        copy.wireShapeSource = source.wireShapeSource;
+        copy.wireLayout = source.wireLayout;
+        copy.wireLayoutSource = source.wireLayoutSource;
         copy.byteWidth = source.byteWidth;
-        copy.evidenceSource = source.evidenceSource;
+        copy.wireOrdinal = source.wireOrdinal;
+        copy.wireOrderSource = source.wireOrderSource;
         copy.callsite = source.callsite;
         copy.target = source.target;
         copy.targetName = source.targetName;
@@ -549,108 +438,6 @@
         catch (NumberFormatException ignored) {
             return null;
         }
-    }
-
-    private RawPcodeWrite pcodeReadRawWrite(PcodeOp op, Function callTarget) {
-        if (op == null || !isReadRawFunction(callTarget)) {
-            return null;
-        }
-        for (int i = 2; i < op.getNumInputs(); i++) {
-            Long byteLength =
-                pcodeConstantValue(op.getInput(i), new LinkedHashSet<>(), 0);
-            if (byteLength == null || byteLength <= 0 || byteLength > Integer.MAX_VALUE) {
-                continue;
-            }
-            String wireShape = wireShapeFromRawByteLength(byteLength.intValue());
-            if (wireShape == null) {
-                continue;
-            }
-            PcodeStorage storage = pcodeStorageExpression(op.getInput(i - 1));
-            if (storage == null) {
-                continue;
-            }
-            return new RawPcodeWrite(
-                storage,
-                "fixed-bytes-" + byteLength.intValue(),
-                wireShape);
-        }
-        return null;
-    }
-
-    private boolean isReadRawFunction(Function function) {
-        String name = fullFunctionName(function);
-        return name != null && name.endsWith("ReadBuffer::ReadRaw");
-    }
-
-    private PcodeArgStorageSelection pcodeStorageArgumentEvidence(
-        PcodeOp op,
-        Set<String> messageBases) {
-
-        if (op == null || op.getNumInputs() < 2) {
-            return null;
-        }
-
-        PcodeArgStorageSelection selection = new PcodeArgStorageSelection();
-        int preferred = op.getNumInputs() >= 3 ? op.getNumInputs() - 2 : -1;
-        for (int i = 1; i < op.getNumInputs(); i++) {
-            PcodeStorage storage = pcodeStorageExpression(op.getInput(i));
-            JsonObject evidence = new JsonObject();
-            evidence.addProperty("slot", i);
-            if (storage != null) {
-                NetworkSchemaJson.add(evidence, "base", storage.base);
-                evidence.addProperty("offset", "0x" + Long.toHexString(storage.offset));
-                NetworkSchemaJson.add(evidence, "expression", storage.expression());
-            }
-            boolean isMessageStorage = isPcodeMessageStorage(storage, messageBases);
-            evidence.addProperty("isMessageStorage", isMessageStorage);
-            evidence.addProperty("preferredOutputSlot", i == preferred);
-            selection.argStorageEvidence.add(evidence);
-            if (isMessageStorage && i == preferred) {
-                selection.storage = storage;
-                selection.storageArgSlot = i;
-                selection.selectionRule = "preferred-output-slot";
-            }
-            else if (isMessageStorage && selection.fallbackStorage == null) {
-                selection.fallbackStorage = storage;
-                selection.fallbackStorageArgSlot = i;
-            }
-        }
-        if (selection.storage == null && selection.fallbackStorage != null) {
-            selection.storage = selection.fallbackStorage;
-            selection.storageArgSlot = selection.fallbackStorageArgSlot;
-            selection.selectionRule = "first-message-storage-fallback";
-        }
-        if (selection.selectionRule != null) {
-            JsonObject selected = new JsonObject();
-            selected.addProperty("selectionRule", selection.selectionRule);
-            selected.addProperty("slot", selection.storageArgSlot);
-            selection.argStorageEvidence.add(selected);
-        }
-        return selection;
-    }
-
-    private PcodeStorage pcodeStorageArgument(
-        PcodeOp op,
-        Function target,
-        Set<String> messageBases) {
-
-        if (op == null || target == null || op.getNumInputs() < 3) {
-            return null;
-        }
-
-        int preferred = op.getNumInputs() - 2;
-        PcodeStorage storage = pcodeStorageExpression(op.getInput(preferred));
-        if (isPcodeMessageStorage(storage, messageBases)) {
-            return storage;
-        }
-
-        for (int i = 1; i < op.getNumInputs(); i++) {
-            storage = pcodeStorageExpression(op.getInput(i));
-            if (isPcodeMessageStorage(storage, messageBases)) {
-                return storage;
-            }
-        }
-        return null;
     }
 
     private void attachNestedDirectTypeShape(
@@ -678,6 +465,7 @@
         if (field == null || shape == null) {
             return;
         }
+        enrichKnownSerializeIdentity(shape);
         if (field.nestedTypeShape == null) {
             field.nestedTypeShape = shape;
         }
@@ -743,48 +531,43 @@
         if (nestedTypeShapeCache.containsKey(key)) {
             return nestedTypeShapeCache.get(key);
         }
+        if (!nestedTypeShapeActive.add(key)) {
+            recordNestedTypeShapeReject("cycle");
+            return null;
+        }
 
-        NestedTypeShape shape = recoverNestedDirectTypeShapeUncached(
-            target,
-            nativeType,
-            new LinkedHashSet<>(),
-            0,
-            allowAnonymousHelper);
-        nestedTypeShapeCache.put(key, shape);
-        if (shape == null) {
-            nestedTypeShapeFailures++;
+        try {
+            NestedTypeShape shape = recoverNestedDirectTypeShapeUncached(
+                target,
+                nativeType,
+                allowAnonymousHelper);
+            nestedTypeShapeCache.put(key, shape);
+            if (shape == null) {
+                nestedTypeShapeFailures++;
+            }
+            else {
+                nestedTypeShapesRecovered++;
+            }
+            return shape;
         }
-        else {
-            nestedTypeShapesRecovered++;
+        finally {
+            nestedTypeShapeActive.remove(key);
         }
-        return shape;
     }
 
     private NestedTypeShape recoverNestedDirectTypeShapeUncached(
         Function target,
         String nativeType,
-        Set<String> seen,
-        int depth,
         boolean allowAnonymousHelper) {
 
-        if (target == null || depth > NESTED_DIRECT_TYPE_DEPTH_LIMIT) {
-            recordNestedTypeShapeReject("depth-limit");
-            return null;
-        }
-        String seenKey = target.getEntryPoint() + "|" + nativeType;
-        if (!seen.add(seenKey)) {
-            recordNestedTypeShapeReject("cycle");
+        if (target == null) {
             return null;
         }
 
         String targetName = fullFunctionName(target);
-        String owner = directUnmarshalOwnerFullName(targetName);
-        if (owner == null) {
-            owner = directUnmarshalOwnerFullNameFromPrototype(target);
-        }
-        if (owner == null) {
-            owner = nativeType;
-        }
+        String owner = firstNonEmpty(
+            directUnmarshalValueTypeName(target),
+            nativeType);
         if (owner == null && !allowAnonymousHelper) {
             recordNestedTypeShapeReject("target-not-direct-unmarshal");
             return null;
@@ -810,7 +593,7 @@
                         byBase,
                         rawWrite.storage,
                         rawWrite.nativeType,
-                        rawWrite.wireShape,
+                        rawWrite.wireEvidence,
                         op,
                         callTarget,
                         "pcode-readraw-fixed-bytes");
@@ -820,7 +603,7 @@
                     target,
                     callTarget);
                 PcodeStorage storage = nestedMemberShape == null
-                    ? pcodePreferredUnmarshalOutputStorage(op)
+                    ? provenUnmarshalOutputStorage(op)
                     : nestedDirectTypeCallOutputStorage(
                         target,
                         op,
@@ -834,33 +617,32 @@
                         op,
                         callTarget,
                         "pcode-nested-direct-type-call")) {
+                    markNestedTypeMemberWireOrder(
+                        byBase,
+                        storage,
+                        "cfg-call-order");
                     continue;
                 }
                 String memberType = unmarshalNativeTypeFromTarget(callTarget);
-                String memberWireShape = wireShapeFromNativeType(memberType);
-                String evidenceSource = "pcode-call";
-                if (memberWireShape == null) {
-                    String scalarType = scalarOutputStoreNativeType(callTarget);
-                    if (memberType == null) {
-                        memberType = scalarType;
-                    }
-                    memberWireShape = wireShapeFromNativeType(scalarType);
-                    evidenceSource = "pcode-call-scalar-output-store";
+                WireShape memberWireEvidence =
+                    wireShapeEvidenceFromUnmarshalTarget(callTarget, memberType);
+                if (memberType == null) {
+                    memberType = scalarOutputStoreNativeType(callTarget);
                 }
                 observePcodeTempUnmarshal(
                     tempNativeTypes,
                     tempWireShapes,
                     op,
                     memberType,
-                    memberWireShape);
+                    memberWireEvidence == null ? null : memberWireEvidence.shape);
                 addNestedTypeMemberCandidate(
                     byBase,
                     storage,
                     memberType,
-                    memberWireShape,
+                    memberWireEvidence,
                     op,
                     callTarget,
-                    evidenceSource);
+                    "pcode-call");
                 continue;
             }
             if (op.getOpcode() != PcodeOp.STORE || op.getNumInputs() < 3) {
@@ -868,30 +650,50 @@
             }
             PcodeStorage storage = pcodeStorageExpression(op.getInput(1));
             String memberType = pcodeValueNativeType(op.getInput(2), tempNativeTypes);
-            String memberWireShape =
-                pcodeValueWireShape(op.getInput(2), tempWireShapes, tempNativeTypes);
+            PcodeCallTargetInfo valueTarget = pcodeValueCallTargetInfo(op.getInput(2));
+            WireShape memberWireEvidence = pcodeStoredValueWireEvidence(
+                op.getInput(2),
+                tempWireShapes,
+                tempNativeTypes,
+                valueTarget,
+                memberType);
             addNestedTypeMemberCandidate(
                 byBase,
                 storage,
                 memberType,
-                memberWireShape,
+                memberWireEvidence,
                 op,
-                pcodeValueCallTargetInfo(op.getInput(2)) == null
-                    ? null
-                    : pcodeValueCallTargetInfo(op.getInput(2)).target,
+                valueTarget == null ? null : valueTarget.target,
                 "pcode-store");
         }
 
-        String leaf = NetworkSchemaText.sourceTypeLeaf(owner);
-        if ("ActorRequestId".equals(leaf)) {
-            return actorRequestIdShapeFromCandidates(owner, target, targetName, byBase);
-        }
-        return directTypeShapeFromCandidates(
+        NestedTypeShape storageShape = directTypeShapeFromCandidates(
             owner,
             target,
             targetName,
             byBase,
             allowAnonymousHelper && owner == null);
+        NestedTypeShape wireSequenceShape = directWireSequenceShape(
+            target,
+            owner,
+            targetName);
+        if (wireSequenceShape == null) {
+            proveDirectTypeIdentity(storageShape, target);
+            return storageShape;
+        }
+        if (storageShape == null) {
+            proveDirectTypeIdentity(wireSequenceShape, target);
+            return wireSequenceShape;
+        }
+        if (sameNestedWireSequence(storageShape, wireSequenceShape)) {
+            proveDirectTypeIdentity(storageShape, target);
+            return storageShape;
+        }
+        wireSequenceShape.validation = appendValidation(
+            wireSequenceShape.validation,
+            "typed-codec-native-storage-transform");
+        proveDirectTypeIdentity(wireSequenceShape, target);
+        return wireSequenceShape;
     }
 
     private NestedTypeShape recoverNestedDirectMemberShape(

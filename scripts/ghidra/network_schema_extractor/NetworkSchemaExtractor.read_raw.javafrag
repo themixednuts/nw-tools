@@ -1,0 +1,94 @@
+    private WireShape pcodeReadRawWireEvidence(PcodeOp operation, Function target) {
+        Integer width = pcodeReadRawWidth(operation, target);
+        return width == null
+            ? null
+            : WireShape.layout(
+                fixedByteLayout(width),
+                "unmarshal-pcode-read-raw-layout");
+    }
+
+    private Integer pcodeReadRawWidth(PcodeOp operation, Function target) {
+        if (operation == null || !isReadRawFunction(target)) {
+            return null;
+        }
+        Function owner = operation.getSeqnum() == null
+            ? null
+            : functionContaining(operation.getSeqnum().getTarget());
+        Long width = provenCallArgumentImmediate(owner, operation, target, 3);
+        return width == null || width <= 0L || width > 0x1000L
+            ? null
+            : width.intValue();
+    }
+
+    private RawPcodeWrite pcodeReadRawWrite(PcodeOp operation, Function target) {
+        WireShape evidence = pcodeReadRawWireEvidence(operation, target);
+        if (evidence == null) {
+            return null;
+        }
+        Function owner = operation.getSeqnum() == null
+            ? null
+            : functionContaining(operation.getSeqnum().getTarget());
+        PcodeStorage destination = provenCallArgumentStorage(
+            owner,
+            operation,
+            target,
+            2);
+        return destination == null
+            ? null
+            : new RawPcodeWrite(destination, null, evidence);
+    }
+
+    private boolean isReadRawFunction(Function function) {
+        if (function == null || function.getEntryPoint() == null) {
+            return false;
+        }
+        String key = functionCacheKey("read-raw-shape", function);
+        Boolean cached = readRawFunctionCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        HighFunction high = highFunction(function);
+        if (high == null || high.getLocalSymbolMap().getNumParams() < 4) {
+            readRawFunctionCache.put(key, false);
+            return false;
+        }
+        boolean loadedEnd = false;
+        boolean loadedCursor = false;
+        boolean storedCursor = false;
+        boolean storedStatus = false;
+        boolean copiedWithDestinationAndLength = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() == PcodeOp.LOAD && operation.getOutput() != null) {
+                PcodeStorage source = pcodeLoadedStorageExpression(operation.getOutput());
+                loadedEnd = loadedEnd || sameStorage(source, "param_1", 0x8L);
+                loadedCursor = loadedCursor || sameStorage(source, "param_1", 0x10L);
+                continue;
+            }
+            if (operation.getOpcode() == PcodeOp.STORE && operation.getNumInputs() >= 3) {
+                PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+                storedCursor = storedCursor || sameStorage(destination, "param_1", 0x10L);
+                storedStatus = storedStatus || sameStorage(destination, "param_4", 0L);
+                continue;
+            }
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            boolean destination = false;
+            boolean length = false;
+            for (int slot = 1; slot < operation.getNumInputs(); slot++) {
+                PcodeStorage argument = pcodeStorageExpression(operation.getInput(slot));
+                destination = destination || sameStorage(argument, "param_2", 0L);
+                length = length || sameStorage(argument, "param_3", 0L);
+            }
+            copiedWithDestinationAndLength |= destination && length;
+        }
+        boolean result = loadedEnd && loadedCursor && storedCursor && storedStatus &&
+            copiedWithDestinationAndLength;
+        readRawFunctionCache.put(key, result);
+        return result;
+    }
+
+    private boolean sameStorage(PcodeStorage storage, String base, long offset) {
+        return storage != null && base.equals(storage.base) && storage.offset == offset;
+    }

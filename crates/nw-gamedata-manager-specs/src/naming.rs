@@ -28,6 +28,7 @@ pub fn to_snake_ident(value: &str, fallback: &str) -> String {
 }
 
 pub fn to_upper_camel_ident(value: &str, fallback: &str) -> String {
+    let value = value.replace("(s)", "s").replace("(S)", "S");
     rust_ident_from_cased(
         &value.to_upper_camel_case(),
         fallback,
@@ -36,6 +37,7 @@ pub fn to_upper_camel_ident(value: &str, fallback: &str) -> String {
 }
 
 fn snake_ident(value: &str, fallback: &str) -> String {
+    let value = value.replace("(s)", "s").replace("(S)", "S");
     rust_ident_from_cased(&value.to_snake_case(), fallback, IdentCase::Snake)
 }
 
@@ -126,4 +128,15 @@ fn is_rust_keyword(value: &str) -> bool {
             | "await"
             | "dyn"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parenthetical_plural_is_a_natural_identifier() {
+        assert_eq!(to_snake_ident("Reward(s)", "field"), "rewards");
+        assert_eq!(to_upper_camel_ident("Reward(s)", "Field"), "Rewards");
+    }
 }

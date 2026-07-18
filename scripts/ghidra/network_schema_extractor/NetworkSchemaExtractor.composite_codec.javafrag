@@ -1,0 +1,131 @@
+    private NetworkSchemaFlowSequence.Result<WireShape> collapseValidatedMarshalSequence(
+        Function function,
+        NetworkSchemaFlowSequence.Result<WireShape> body) {
+
+        if (!body.complete() || body.events().isEmpty()) {
+            return body;
+        }
+        DeclaredCodecShape declared = declaredCodecShape(function);
+        Integer width = declared == null
+            ? null
+            : wireShapeByteWidth(declared.shape());
+        if (width == null || !codecSemanticBodyMatches(declared.shape(), body.events())) {
+            return body;
+        }
+        long observedWidth = 0L;
+        for (WireShape event : body.events()) {
+            Integer eventWidth = wireShapeByteWidth(event.layout);
+            if (eventWidth == null) {
+                return body;
+            }
+            observedWidth += eventWidth;
+        }
+        if (observedWidth != width) {
+            return body;
+        }
+        WireShape semantic = WireShape.semantic(
+            declared.shape(),
+            fixedByteLayout(width),
+            "marshal-codec-specialization+cfg-semantic-decomposition");
+        return new NetworkSchemaFlowSequence.Result<>(
+            NetworkSchemaFlowSequence.Status.COMPLETE,
+            List.of(semantic));
+    }
+
+    private boolean codecSemanticBodyMatches(
+        String semantic,
+        List<WireShape> events) {
+
+        List<String> expected = flattenedSemanticMembers(semantic);
+        if (expected == null || expected.size() <= 1) {
+            return true;
+        }
+        int expectedIndex = 0;
+        for (WireShape event : events) {
+            if (event == null) {
+                return false;
+            }
+            if (event.hasProvenSemantics()) {
+                ArrayList<String> observed = new ArrayList<>();
+                if (!appendFlattenedSemanticMembers(
+                        event.shape,
+                        observed,
+                        new HashSet<>()) ||
+                    expectedIndex + observed.size() > expected.size() ||
+                    !expected.subList(
+                        expectedIndex,
+                        expectedIndex + observed.size()).equals(observed)) {
+                    return false;
+                }
+                expectedIndex += observed.size();
+                continue;
+            }
+            List<String> physical = flattenedLayoutMembers(event.layout);
+            if (physical == null || expectedIndex + physical.size() > expected.size()) {
+                return false;
+            }
+            for (String layout : physical) {
+                Integer expectedWidth = wireShapeByteWidth(expected.get(expectedIndex++));
+                Integer observedWidth = wireShapeByteWidth(layout);
+                if (expectedWidth == null || !expectedWidth.equals(observedWidth)) {
+                    return false;
+                }
+            }
+        }
+        return expectedIndex == expected.size();
+    }
+
+    private List<String> flattenedLayoutMembers(String layout) {
+        if (layout == null) {
+            return null;
+        }
+        List<String> composite = compositeWireShapeMembers(layout);
+        if (composite == null) {
+            return List.of(layout);
+        }
+        ArrayList<String> result = new ArrayList<>();
+        for (String member : composite) {
+            List<String> nested = flattenedLayoutMembers(member);
+            if (nested == null) {
+                return null;
+            }
+            result.addAll(nested);
+        }
+        return List.copyOf(result);
+    }
+
+    private List<String> flattenedSemanticMembers(String semantic) {
+        ArrayList<String> members = new ArrayList<>();
+        return appendFlattenedSemanticMembers(semantic, members, new HashSet<>())
+            ? members
+            : null;
+    }
+
+    private boolean appendFlattenedSemanticMembers(
+        String semantic,
+        List<String> result,
+        Set<String> active) {
+
+        if (semantic == null || !active.add(semantic)) {
+            return false;
+        }
+        try {
+            List<String> composite = compositeWireShapeMembers(semantic);
+            List<String> members = composite == null
+                ? semanticMembers(semantic)
+                : composite;
+            if (members == null) {
+                result.add(semantic);
+                return true;
+            }
+            for (String member : members) {
+                if (!appendFlattenedSemanticMembers(member, result, active)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        finally {
+            active.remove(semantic);
+        }
+    }

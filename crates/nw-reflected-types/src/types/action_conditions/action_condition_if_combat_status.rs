@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfCombatStatus;
+pub struct ActionConditionIfCombatStatus {}
 
 impl AzRtti for ActionConditionIfCombatStatus {
     const NAME: &'static str = "ActionConditionIfCombatStatus";

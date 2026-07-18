@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfPreviousInstrument;
+pub struct ActionConditionIfPreviousInstrument {}
 
 impl AzRtti for ActionConditionIfPreviousInstrument {
     const NAME: &'static str = "ActionConditionIfPreviousInstrument";

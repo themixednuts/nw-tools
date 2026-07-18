@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct SetMannequinTagData;
+pub struct SetMannequinTagData {}
 
 impl AzRtti for SetMannequinTagData {
     const NAME: &'static str = "SetMannequinTagData";

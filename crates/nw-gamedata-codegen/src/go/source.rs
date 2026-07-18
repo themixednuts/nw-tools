@@ -1,10 +1,6 @@
 use crate::compiler::GameDataCompileUnit;
-use crate::emit::{
-    GameDataCodegenFile, GameDataCodegenOutput, GameDataEmitter, GameDataEmitterConfigError,
-};
-use crate::target::{
-    GameDataProduct, GameDataRuntimeProfile, GameDataTargetLanguage, GameDataTargetPlan,
-};
+use crate::emit::{GameDataCodegenOutput, GameDataEmitter};
+use crate::target::GameDataTargetLanguage;
 use thiserror::Error;
 use treesitter_types_go::FromNode;
 
@@ -15,9 +11,6 @@ pub use project::{GoStandaloneProject, GoStandaloneProjectFile, GoStandaloneProj
 
 #[derive(Debug, Error)]
 pub enum GoSourceEmitError {
-    #[error("invalid Go package name `{package_name}`")]
-    PackageName { package_name: String },
-
     #[error("format Go source: {0}")]
     Format(String),
 
@@ -28,109 +21,60 @@ pub enum GoSourceEmitError {
     Utf8(#[from] std::string::FromUtf8Error),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GoSourceEmitter {
-    target: GameDataTargetPlan,
-}
-
-impl GoSourceEmitter {
-    pub fn new(target: GameDataTargetPlan) -> Result<Self, GameDataEmitterConfigError> {
-        if Self::target_is_supported(&target) {
-            Ok(Self { target })
-        } else {
-            Err(GameDataEmitterConfigError::unsupported(
-                GameDataTargetLanguage::Go,
-                &target,
-            ))
-        }
-    }
-
-    #[must_use]
-    pub fn standalone() -> Self {
-        Self {
-            target: Self::standalone_target(),
-        }
-    }
-
-    #[must_use]
-    pub fn standalone_target() -> GameDataTargetPlan {
-        GameDataTargetPlan::standalone(GameDataTargetLanguage::Go)
-    }
-
-    #[must_use]
-    pub fn target_is_supported(target: &GameDataTargetPlan) -> bool {
-        target.supports_language(GameDataTargetLanguage::Go)
-    }
-}
-
-impl Default for GoSourceEmitter {
-    fn default() -> Self {
-        Self::standalone()
-    }
-}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GoSourceEmitter;
 
 impl GameDataEmitter for GoSourceEmitter {
-    fn target(&self) -> GameDataTargetPlan {
-        self.target.clone()
+    fn target_language(&self) -> GameDataTargetLanguage {
+        GameDataTargetLanguage::Go
     }
 
     fn emit(&self, unit: &GameDataCompileUnit) -> anyhow::Result<GameDataCodegenOutput> {
-        let mut files = if matches!(self.target.runtime(), GameDataRuntimeProfile::Standalone) {
-            self.emit_standalone_project_with_options(
-                &project::GoStandaloneProjectOptions::default().with_product_placeholders(false),
-            )?
-            .into_codegen_files()
-        } else {
-            Vec::new()
-        };
-        if matches!(self.target.runtime(), GameDataRuntimeProfile::Standalone)
-            && self
-                .target
-                .supports_product(GameDataProduct::SemanticManagers)
-        {
-            if self
-                .target
-                .supports_product(GameDataProduct::GameAssetAccess)
-            {
-                files.extend(managers::emit_dynamic_manager_files(unit)?);
-            } else {
-                files.extend(managers::emit_manager_files(unit)?);
-            }
-        }
-        if matches!(self.target.runtime(), GameDataRuntimeProfile::Standalone)
-            && self
-                .target
-                .supports_product(GameDataProduct::GameAssetAccess)
-        {
-            files.extend(crate::oodle_bundle::oodle_runtime_files()?);
-        }
-        if matches!(self.target.runtime(), GameDataRuntimeProfile::Standalone)
-            && self.target.supports_product(GameDataProduct::Systems)
-        {
-            files.push(GameDataCodegenFile::new(
-                "systems/systems.go",
-                format_go_source("package systems\n")?,
-            ));
-        }
-        Ok(GameDataCodegenOutput::new(self.target(), files))
+        let mut files = self
+            .emit_standalone_project_with_options(&project::GoStandaloneProjectOptions::default())?
+            .into_codegen_files();
+        files.extend(managers::emit_dynamic_manager_files(unit)?);
+        files.extend(crate::oodle_bundle::oodle_dynamic_runtime_files()?);
+        Ok(GameDataCodegenOutput::new(self.target_language(), files))
     }
 }
 
 pub(crate) fn format_go_source(source: &str) -> Result<String, GoSourceEmitError> {
-    const GOFMT_SOURCE_LIMIT: usize = 128 * 1024;
-
-    if source.len() > GOFMT_SOURCE_LIMIT {
-        validate_go_source(source)?;
-        return Ok(source.to_owned());
+    validate_go_source(source)?;
+    let mut child = std::process::Command::new("gofmt")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| GoSourceEmitError::Format(format!("start gofmt: {error}")))?;
+    {
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .expect("gofmt stdin is piped")
+            .write_all(source.as_bytes())
+            .map_err(|error| GoSourceEmitError::Format(format!("write gofmt input: {error}")))?;
     }
-
-    let formatted = match std::panic::catch_unwind(|| gofmt::formatter::format(source)) {
-        Ok(Ok(bytes)) => String::from_utf8(bytes)?,
-        Ok(Err(error)) => return Err(GoSourceEmitError::Format(error.to_string())),
-        Err(_) => source.to_owned(),
-    };
+    let output = child
+        .wait_with_output()
+        .map_err(|error| GoSourceEmitError::Format(format!("wait for gofmt: {error}")))?;
+    if !output.status.success() {
+        return Err(GoSourceEmitError::Format(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    let formatted = String::from_utf8(output.stdout)?;
     validate_go_source(&formatted)?;
-    Ok(formatted)
+    Ok(ensure_trailing_newline(&formatted))
+}
+
+fn ensure_trailing_newline(source: &str) -> String {
+    if source.ends_with('\n') {
+        source.to_owned()
+    } else {
+        format!("{source}\n")
+    }
 }
 
 fn validate_go_source(source: &str) -> Result<(), GoSourceEmitError> {
@@ -200,89 +144,62 @@ fn source_line_context(source: &str, row: usize) -> String {
     context
 }
 
-pub(crate) fn is_go_identifier(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        && !is_go_keyword(value)
-}
-
-fn is_go_keyword(value: &str) -> bool {
-    matches!(
-        value,
-        "break"
-            | "default"
-            | "func"
-            | "interface"
-            | "select"
-            | "case"
-            | "defer"
-            | "go"
-            | "map"
-            | "struct"
-            | "chan"
-            | "else"
-            | "goto"
-            | "package"
-            | "switch"
-            | "const"
-            | "fallthrough"
-            | "if"
-            | "range"
-            | "type"
-            | "continue"
-            | "for"
-            | "import"
-            | "return"
-            | "var"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeSet, path::Path};
 
     use nw_datasheet::game_system::GameSystemDataTables;
 
+    use super::*;
     use crate::compiler::GameDataCompiler;
     use crate::emit::GameDataEmitter;
-    use crate::target::GameDataDataFormat;
-
-    use super::*;
 
     #[test]
-    fn standalone_manager_output_emits_all_manager_contracts() {
+    fn standalone_manager_output_emits_available_manager_contracts() {
         let catalog = GameSystemDataTables::default();
         let unit = GameDataCompiler::source_format().compile_unit(&catalog);
-        let output = GoSourceEmitter::standalone()
-            .emit(&unit)
-            .expect("go output");
-        let managers = output
+        let output = GoSourceEmitter.emit(&unit).expect("go output");
+        let managers = manager_sources(&output);
+        let values = output
             .files()
             .iter()
-            .find(|file| file.path() == Path::new("managers/managers.go"))
-            .expect("manager manifest")
+            .find(|file| file.path() == Path::new("types/types.go"))
+            .expect("shared values")
             .contents();
 
-        let manager_definitions = manager_definition_names(managers);
-        let public_managers = public_manager_type_names(managers);
-        assert_eq!(manager_definitions, public_managers);
-        assert!(managers.contains("var managers = []managerDefinition"));
+        let public_managers = public_manager_type_names(&managers);
+        assert_eq!(constructed_manager_type_names(&managers), public_managers);
+        assert!(!managers.contains("managerDefinitions"));
         assert!(managers.contains("type Managers struct"));
         assert!(managers.contains("type Rows[T any] interface"));
-        assert!(managers.contains("Rows() ([]T, error)"));
-        assert!(managers.contains("func Open(loader *gameassets.AssetLoader) (*Managers, error)"));
-        assert!(managers.contains("func assetSourceFromLoader(loader *gameassets.AssetLoader)"));
+        assert!(managers.contains("Rows() iter.Seq[T]"));
+        assert!(managers.contains("type RowRef[TTable ~string, TRow any] struct"));
+        assert!(managers.contains("type RowSlot[TTable ~string, TRow any] struct"));
+        assert!(managers.contains("type RowSet[TTable ~string, TRow any] struct"));
+        assert!(managers.contains("tableIndexes map[string]*rowTableIndex"));
+        assert!(managers.contains("type rowTableIndex struct"));
+        assert!(managers.contains("byKey"));
+        assert!(managers.contains("type ManagerLoadError struct"));
+        assert!(!managers.contains("Source *RowEntry["));
+        assert!(!managers.contains("Row *RowEntry["));
+        assert!(managers.contains("func New(loader *assets.AssetLoader) (*Managers, error)"));
+        assert!(
+            managers.contains("func (managers *Managers) Player() (*PlayerDataManager, error)")
+        );
+        assert!(managers.contains("playerOnce"));
+        assert!(managers.contains("sync.Once"));
+        assert!(!managers.contains("func Load(loader *assets.AssetLoader)"));
+        assert!(managers.contains("func newManagerCache(loader *assets.AssetLoader"));
+        assert!(!managers.contains("assetSourceFromLoader"));
         assert!(!managers.contains("loader.DatasheetSource()"));
         assert!(
-            managers.contains("func (managers *Managers) PlayerData() (*PlayerDataManager, error)")
+            managers.contains("func (managers *Managers) Player() (*PlayerDataManager, error)")
         );
-        assert!(managers.contains(
-            "func (managers *Managers) ArmorOffsetData() (*ArmorOffsetDataManager, error)"
-        ));
+        assert!(
+            managers.contains(
+                "func (managers *Managers) ArmorOffset() (*ArmorOffsetDataManager, error)"
+            )
+        );
         assert!(!managers.contains("var Managers"));
         assert!(!managers.contains("type ManagerDefinition"));
         assert!(!managers.contains("type ManagerDependency "));
@@ -297,21 +214,23 @@ mod tests {
             "ArmorOffsetDataManager",
             "EquipTypesDataManager",
             "GameDebugSettingsManager",
-            "UiDataManager",
+            "UIDataManager",
             "PlayerDataManager",
-            "SocialDataManager",
         ] {
             assert!(
                 managers.contains(&format!("type {manager} struct")),
                 "{manager} should be emitted as a standalone product-backed manager"
             );
         }
-        assert!(managers.contains("Kind: managerDependencyAsset"));
-        assert!(managers.contains("managerDependencyTable"));
+        assert!(managers.contains("cache.resourcesForTables("));
+        assert!(!managers.contains("cache.resources("));
+        assert!(!managers.contains("managerDependency"));
+        assert!(!managers.contains("buildManager"));
         assert!(!managers.contains("ProductPath"));
         assert!(!managers.contains(".aztbl"));
         assert!(managers.contains("sharedassets/genericassets/items/armoroffsets.aoffdb"));
-        assert!(managers.contains("ParseArmorOffsetDatabase"));
+        assert!(managers.contains("parseArmorOffsetDatabase"));
+        assert!(!managers.contains("func ParseArmorOffsetDatabase"));
         assert!(managers.contains("func (manager *ArmorOffsetDataManager) Database"));
         assert!(managers.contains("func (manager *ArmorOffsetDataManager) ArmorOffset"));
         assert!(
@@ -325,13 +244,11 @@ mod tests {
         assert!(
             managers.contains("func (manager *GameDebugSettingsManager) DisabledCombatToggleCount")
         );
-        assert!(managers.contains("func (manager *UiDataManager) Database"));
-        assert!(managers.contains("func (manager *UiDataManager) InteractOptions"));
+        assert!(managers.contains("func (manager *UIDataManager) Database"));
+        assert!(managers.contains("func (manager *UIDataManager) InteractOptions"));
         assert!(managers.contains("func (manager *PlayerDataManager) PlayerBaseAttributes"));
         assert!(managers.contains("func (manager *PlayerDataManager) MaxPerks"));
         assert!(managers.contains("func (manager *PlayerDataManager) CategoricalProgressionID"));
-        assert!(managers.contains("func (manager *SocialDataManager) RankDatabase"));
-        assert!(managers.contains("func (manager *SocialDataManager) Ranks"));
         assert!(!managers.contains("type ObjectiveTasksDataManager struct"));
         assert!(
             output
@@ -339,12 +256,19 @@ mod tests {
                 .iter()
                 .all(|file| file.path() != Path::new("products/products.go"))
         );
-        assert!(!managers.contains("AssetID"));
+        assert!(!managers.contains("type AssetID ="));
+        assert!(managers.contains("gametypes.AssetID"));
         assert!(!managers.contains("ProductAssetID"));
         assert!(!managers.contains("ArmorOffsetDatabaseAsset"));
         assert!(!managers.contains("ManagerImplementation"));
         assert!(!managers.contains("Implementation:"));
         assert!(!managers.contains("RuntimeResource"));
+        assert!(!managers.contains("func (runtime *managerCache)"));
+        assert!(!managers.contains("managerInstance"));
+        assert!(managers.contains("type managerResources struct"));
+        assert!(values.contains("func CRC32FromBytesLowercase(bytes []byte) CRC32"));
+        assert!(!values.contains("func NewCRC32"));
+        assert!(!values.contains("func CRC32FromBytes(bytes []byte, lowercaseASCII bool)"));
         assert!(!managers.contains("Generated"));
         assert!(!managers.contains("ManagerInputProduct"));
         assert!(!managers.contains("ManagerInputDatasheet"));
@@ -365,18 +289,8 @@ mod tests {
     fn source_format_managers_own_dynamic_schema_runtime() {
         let catalog = GameSystemDataTables::default();
         let unit = GameDataCompiler::source_format().compile_unit(&catalog);
-        let target =
-            GoSourceEmitter::standalone_target().with_data_format(GameDataDataFormat::Datasheet);
-        let output = GoSourceEmitter::new(target)
-            .expect("go datasheet emitter")
-            .emit(&unit)
-            .expect("go output");
-        let managers = output
-            .files()
-            .iter()
-            .find(|file| file.path() == Path::new("managers/managers.go"))
-            .expect("manager runtime")
-            .contents();
+        let output = GoSourceEmitter.emit(&unit).expect("go output");
+        let managers = manager_sources(&output);
 
         assert!(
             output
@@ -390,24 +304,37 @@ mod tests {
                 .iter()
                 .any(|file| file.path() == Path::new("bin/oo2core_9_win64.dll"))
         );
-        assert!(managers.contains("type DatasheetCellKind string"));
-        assert!(managers.contains("type TableSchema struct"));
-        assert!(managers.contains("type ColumnSchema struct"));
+        assert!(output.files().iter().all(|file| {
+            file.path() != Path::new("bin/oo2core_win64.lib")
+                && file.path() != Path::new("bin/oo2core_win64.dll")
+        }));
+        assert!(!managers.contains("type DatasheetCellKind string"));
+        assert!(managers.contains("type tableSchema struct"));
+        assert!(managers.contains("type columnSchema struct"));
+        assert!(!managers.contains("type TableSchema struct"));
+        assert!(!managers.contains("type ColumnSchema struct"));
         assert!(managers.contains("type Rows[T any] interface"));
-        assert!(managers.contains("Rows() ([]T, error)"));
-        assert!(managers.contains("var TableSchemas = []TableSchema"));
+        assert!(managers.contains("Rows() iter.Seq[T]"));
+        assert!(!managers.contains("var tableSchemas = []tableSchema"));
         assert!(managers.contains("type managerCache struct"));
         assert!(!managers.contains("NewManagerRuntimeFromPakSource"));
-        assert!(managers.contains("type assetSource struct"));
+        assert!(!managers.contains("type assetSource struct"));
+        assert!(managers.contains("loader.Read(path)"));
         assert!(managers.contains("gameassets.ParseDatasheet"));
         assert!(managers.contains("type dynamicTable struct"));
-        assert!(managers.contains("DuplicateKeys"));
-        assert!(managers.contains("map[string][]dynamicTableRow"));
-        assert!(managers.contains("RowsByLookupKey map[string]dynamicTableRow"));
+        assert!(!managers.contains("DuplicateKeys"));
+        assert!(!managers.contains("map[string][]dynamicTableRow"));
+        assert!(!managers.contains("RowsByLookupKey map[string]dynamicTableRow"));
         assert!(!managers.contains("type DynamicTable struct"));
         assert!(!managers.contains("type DynamicTableRow struct"));
         assert!(!managers.contains("type ManagerInstance struct"));
         assert!(!managers.contains("func (instance *managerInstance) Manager"));
+        assert!(!managers.contains("func (instance *managerInstance) manager"));
+        assert!(!managers.contains("managers map[string]*managerInstance"));
+        assert!(managers.contains("cache.resourcesForTables("));
+        assert!(!managers.contains("cache.resources("));
+        assert!(!managers.contains("buildManager"));
+        assert!(!managers.contains("managerByName"));
         assert!(!managers.contains("func (instance *managerInstance) AssetPaths"));
         assert!(!managers.contains("func (manager *ArmorOffsetDataManager) Definition"));
         assert!(!managers.contains("func ManagerByName"));
@@ -418,64 +345,63 @@ mod tests {
         assert!(!managers.contains("func (instance *managerInstance) Rows"));
         assert!(!managers.contains("func (instance *managerInstance) RowByKey"));
         assert!(!managers.contains("func (instance *managerInstance) CellByKey"));
-        assert!(managers.contains("Kind      DatasheetCellKind"));
+        assert!(!managers.contains("DatasheetCellKind"));
+        assert!(!managers.contains("FieldName string"));
+        assert!(!managers.contains("column.FieldName"));
+        assert!(!managers.contains("RowCount"));
         assert!(!managers.contains("DeclaredType"));
         assert!(!managers.contains("OptionalBool"));
         assert!(!managers.contains("ProjectionTransform"));
         assert!(!managers.contains("Native"));
         assert!(!managers.contains("RuntimeResource"));
+        assert!(managers.contains("values := make([]gametypes.CRC32, 0, len(child.Children))"));
+        assert!(managers.contains("return gametypes.CRC32(raw), err"));
 
         let pak = output
             .files()
             .iter()
-            .find(|file| file.path() == Path::new("gameassets/pak.go"))
+            .find(|file| file.path() == Path::new("internal/gameassets/pak.go"))
             .expect("pak asset loader")
             .contents();
         assert!(pak.contains("filepath.EvalSymlinks"));
-        assert!(pak.contains("canonicalPakPaths"));
         assert!(pak.contains("pak path %s is outside asset root %s"));
         assert!(pak.contains("errors.Join(err, closeErr)"));
         assert!(!pak.contains("type PakDatasheetSource struct"));
         assert!(!pak.contains("func (loader *AssetLoader) DatasheetSource"));
         assert!(!pak.contains("func LoadPakDatasheetSource"));
 
-        let filesystem = output
-            .files()
-            .iter()
-            .find(|file| file.path() == Path::new("gameassets/filesystem.go"))
-            .expect("filesystem asset loader")
-            .contents();
-        assert!(filesystem.contains("resolve datasheet root %s"));
-        assert!(filesystem.contains("relativePathEscapesRoot(relative)"));
+        assert!(pak.contains("func Open(assetRoot string)"));
+        assert!(!pak.contains("func OpenAssetLoader"));
     }
 
-    fn manager_definition_names(source: &str) -> BTreeSet<String> {
-        const MANAGERS_PREFIX: &str = "var managers = []managerDefinition{";
-        let Some((_, managers)) = source.split_once(MANAGERS_PREFIX) else {
-            return BTreeSet::new();
-        };
-        let managers = managers
-            .split_once("\n}\n")
-            .map_or(managers, |(block, _)| block);
-        let mut depth = 0usize;
-        let mut names = BTreeSet::new();
-        const NAME_PREFIX: &str = "Name: \"";
-        for line in managers.lines() {
-            let trimmed = line.trim();
-            depth = depth.saturating_add(trimmed.matches('{').count());
-            if depth == 1 {
-                if let Some(rest) = trimmed.strip_prefix(NAME_PREFIX) {
-                    if let Some(end) = rest.find('"') {
-                        let name = &rest[..end];
-                        if name.ends_with("Manager") {
-                            names.insert(name.to_owned());
-                        }
-                    }
-                }
-            }
-            depth = depth.saturating_sub(trimmed.matches('}').count());
-        }
-        names
+    fn constructed_manager_type_names(source: &str) -> BTreeSet<String> {
+        const PREFIX: &str = "func new";
+        source
+            .match_indices(PREFIX)
+            .filter_map(|(index, _)| {
+                let rest = &source[index + PREFIX.len()..];
+                let name = rest
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                    .next()?;
+                name.ends_with("Manager").then(|| name.to_owned())
+            })
+            .collect()
+    }
+
+    fn manager_sources(output: &GameDataCodegenOutput) -> String {
+        output
+            .files()
+            .iter()
+            .filter(|file| {
+                file.path().parent() == Some(Path::new("managers"))
+                    && file
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "go")
+            })
+            .map(|file| file.contents())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn public_manager_type_names(source: &str) -> BTreeSet<String> {

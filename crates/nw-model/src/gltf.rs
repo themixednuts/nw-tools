@@ -3,8 +3,9 @@
 //! structured package whose mesh, skeleton, animation, and image resources stay
 //! independent for content-addressed sharing.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
+use std::sync::Arc;
 
 use bevy_math::Isometry3d;
 use bevy_math::bounding::Aabb3d;
@@ -12,8 +13,9 @@ use cry_animation::{AnimationClip, AnimationEvent, CafRootMotion};
 use glam::{Quat, Vec2, Vec3, Vec3A, Vec4};
 use serde::Serialize;
 
-use crate::geometry::{AuxiliaryNode, AuxiliaryNodeRole, Model, Skeleton};
+use crate::geometry::{AuxiliaryNode, AuxiliaryNodeRole, MeshRole, Model, Skeleton};
 use crate::material::{MapSlot, MaterialSet, SubMaterial};
+use crate::physics::{PhysicsScene, PhysicsSceneError, PhysicsVisualRole};
 
 const COMPONENT_FLOAT: u32 = 5126;
 const COMPONENT_UNSIGNED_INT: u32 = 5125;
@@ -72,6 +74,10 @@ struct CryNodeExtras {
     #[serde(skip_serializing_if = "Option::is_none")]
     cry_lod: Option<u32>,
     shadow_proxy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<MeshRole>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    physics: Option<PhysicsVisualRole>,
 }
 
 #[derive(Serialize)]
@@ -86,6 +92,10 @@ struct Attributes {
     joints_0: Option<usize>,
     #[serde(rename = "WEIGHTS_0", skip_serializing_if = "Option::is_none")]
     weights_0: Option<usize>,
+    #[serde(rename = "JOINTS_1", skip_serializing_if = "Option::is_none")]
+    joints_1: Option<usize>,
+    #[serde(rename = "WEIGHTS_1", skip_serializing_if = "Option::is_none")]
+    weights_1: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -119,6 +129,8 @@ struct PbrMetallicRoughness {
     base_color_texture: Option<TextureInfo>,
     metallic_factor: f32,
     roughness_factor: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metallic_roughness_texture: Option<TextureInfo>,
 }
 
 #[derive(Serialize)]
@@ -140,7 +152,17 @@ struct Material {
     double_sided: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     extensions: Option<MaterialExtensions>,
-    extras: CryMaterialExtras,
+    extras: MaterialExtras,
+}
+
+/// A material's `extras` payload. Rendered sub-materials carry the lossless Cry
+/// projection; the shared physics-debug material records the engine's exact
+/// two-pass debug-draw values instead.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum MaterialExtras {
+    Cry(CryMaterialExtras),
+    PhysicsDebug(PhysicsDebugExtras),
 }
 
 #[derive(Serialize)]
@@ -155,7 +177,14 @@ struct MaterialExtensions {
         skip_serializing_if = "Option::is_none"
     )]
     emissive_strength: Option<KhrMaterialsEmissiveStrength>,
+    #[serde(rename = "KHR_materials_unlit", skip_serializing_if = "Option::is_none")]
+    unlit: Option<KhrMaterialsUnlit>,
 }
+
+/// `KHR_materials_unlit` carries no parameters; its presence on a material means
+/// the base color is used directly with no lighting. Serializes to `{}`.
+#[derive(Serialize)]
+struct KhrMaterialsUnlit {}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -188,6 +217,28 @@ struct CryMaterialExtras {
     cry_shader_generation_mask: Option<String>,
     /// Lossless `.mtl` subtree, including every texture slot/TexMod/public param.
     cry_source: serde_json::Value,
+}
+
+/// `extras` for the shared `physics_debug` material. glTF has no two-pass
+/// fill+outline material, so the emitted `baseColorFactor` uses the dominant
+/// wire alpha; this records the engine's exact values so consumers can
+/// reproduce the debug draw faithfully.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PhysicsDebugExtras {
+    cry_debug_draw: CryDebugDraw,
+}
+
+/// The `Javelin::QueryShapeBase` debug-draw constants (NewWorld 3-26): a solid
+/// fill pass at `fill_alpha` plus a wire/edge pass at `wire_alpha`, both using
+/// `rgb`. Draw cluster: capsule `FUN_7ff6016a8ff0`, sphere `FUN_7ff6016a92d0`,
+/// cylinder `FUN_7ff6016a9150`, box `FUN_7ff6016a8ef0`, point `FUN_7ff6016a9280`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CryDebugDraw {
+    rgb: [f32; 3],
+    fill_alpha: f32,
+    wire_alpha: f32,
 }
 
 /// glTF image. It is embedded through a buffer view for GLB/paired glTF and
@@ -275,6 +326,48 @@ struct CryAnimationExtras {
     cry_root_motion: Option<CryRootMotion>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     cry_events: Vec<CryAnimationEvent>,
+    /// Mannequin `ProcLayer` `type="Audio"` clips this clip's fragment fires
+    /// (bite/vocal/action sounds), attached here when the clip name matches the
+    /// fragment's AnimLayer animation. Their triggers resolve through the same
+    /// `audioTriggers` table as animevents.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cry_mannequin_audio: Vec<CryMannequinAudioClip>,
+}
+
+/// One Mannequin fragment audio clip attached to a glTF animation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryMannequinAudioClip {
+    /// The audio key that resolves through `extras.audioTriggers`: an ATL
+    /// `StartTrigger` for a `type="Audio"` clip, or the resolved Wwise event
+    /// name for a `type="CharacterEvent"` clip (e.g. `Play_SFX_Alligator_Bite`).
+    pub trigger: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_trigger: Option<String>,
+    /// For a `type="CharacterEvent"` clip, the short `CharacterEventName` the
+    /// character audio handler expanded (e.g. `Bite`); `None` for a direct
+    /// `type="Audio"` ATL clip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub character_event: Option<String>,
+    /// Skeleton joint the sound rides (e.g. `bind_mouth_web`).
+    pub joint: String,
+    /// Seconds from the clip start: an `Audio` clip's `<Blend StartTime>` or a
+    /// `CharacterEvent` clip's `<Blend ExitTime>`.
+    pub start_time: f32,
+    /// Owning Mannequin fragment name (e.g. `Attack_Bite`).
+    pub fragment: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tags: String,
+}
+
+/// Mannequin fragment audio grouped by the glTF animation it attaches to. Carried
+/// on [`CryAssetExtras`] (not serialized there) so the exporter can distribute each
+/// animation's clips into its per-animation `cryMannequinAudio` extras.
+#[derive(Debug, Clone)]
+pub struct CryMannequinAnimationAudio {
+    /// Animation name that matches a fragment's AnimLayer `<Animation name>`.
+    pub animation: String,
+    pub clips: Vec<CryMannequinAudioClip>,
 }
 
 #[derive(Serialize)]
@@ -369,6 +462,290 @@ pub struct CryAssetExtras {
     pub non_render_nodes: Vec<CryNonRenderNode>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unbound_animations: Vec<CryUnboundAnimation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physics: Option<PhysicsScene>,
+    /// Resolved ATL → Wwise event → bank/media chain for animation audio
+    /// triggers (`cryEvents[].parameter`). Keyed by trigger name so each
+    /// keyframed event resolves in one hop without repeating the fan-out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audio_triggers: Vec<AudioTriggerResolution>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub embedded_resources: Vec<CryEmbeddedResource>,
+    /// Payloads are emitted as independent package resources and referenced by
+    /// `embedded_resources`; they never duplicate their bytes in JSON.
+    #[serde(skip)]
+    pub resource_payloads: Vec<CryResourcePayload>,
+    /// Mannequin fragment audio keyed by animation name. Not serialized here — the
+    /// exporter distributes each entry into its animation's `cryMannequinAudio`
+    /// extras during build.
+    #[serde(skip)]
+    pub mannequin_audio: Vec<CryMannequinAnimationAudio>,
+}
+
+/// One ATL audio trigger resolved end-to-end for consumers of animation events.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTriggerResolution {
+    pub trigger: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub wwise_events: Vec<AudioTriggerWwiseEvent>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub banks: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<AudioTriggerMediaRef>,
+    /// For footstep triggers, the surfaces the MaterialEffects FX library maps
+    /// to this trigger's Wwise `SurfaceType` switch (authored catalog data;
+    /// empty for direct `sound`/`audio` events).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub surfaces: Vec<String>,
+    /// Per-surface breakdown of every switch-container branch this trigger's
+    /// event exposes: the `ulSwitchID`, the media that branch plays, and — for
+    /// the engine default branch — the deterministic weighted selection order the
+    /// blend preview consumes. Empty for events with no switch container.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub surface_media: Vec<AudioTriggerSurfaceMedia>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playback: Option<AudioTriggerPlayback>,
+}
+
+/// One switch-container branch of a footstep trigger, tagged with its surface
+/// name when the FX-library → Wwise switch-id mapping validates against the
+/// authored branch ids (else `surface` is `None` — no guessed mapping is shipped).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTriggerSurfaceMedia {
+    /// Resolved surface name, present only when the FX-library state's Wwise
+    /// switch id matched this branch's authored `switchId`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
+    /// The Wwise `ulSwitchID` this branch fires on (0 for a synthetic single
+    /// branch on an event with no switch container).
+    pub switch_id: u32,
+    /// True for the engine's authored `ulDefaultSwitch` branch — the surface the
+    /// blend preview plays.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+    /// Distinct media this branch reaches (its variation pool).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<u32>,
+    /// Deterministic, engine-faithful weighted selection order of media ids
+    /// (may repeat). Present on the default branch so the blend preview assigns
+    /// consecutive footsteps without re-parsing banks.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sequence: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTriggerWwiseEvent {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTriggerMediaRef {
+    pub media_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bank: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// True when the default switch branch (the surface the engine plays by
+    /// default) reaches this media. `media` still lists every reachable variation;
+    /// this flags the subset a default-surface footstep actually plays, so a
+    /// preview can rotate through those instead of combing one sample.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default_branch: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTriggerPlayback {
+    pub max_radius: f64,
+    pub max_duration: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CryResourcePayload {
+    pub source_path: String,
+    pub kind: CryEmbeddedResourceKind,
+    pub bytes: Arc<[u8]>,
+}
+
+impl CryResourcePayload {
+    #[must_use]
+    pub fn new(
+        source_path: impl Into<String>,
+        kind: CryEmbeddedResourceKind,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Self {
+        Self {
+            source_path: source_path.into(),
+            kind,
+            bytes: bytes.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryEmbeddedResource {
+    pub source_path: String,
+    pub kind: CryEmbeddedResourceKind,
+    pub buffer_view: usize,
+    pub mime_type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CryEmbeddedResourceKind {
+    CharacterDefinition,
+    CharacterParameters,
+    AnimationEvents,
+    MannequinAnimationDatabase,
+    MannequinTagDefinition,
+    MannequinControllerDefinition,
+    BlendSpace,
+    CombinedBlendSpace,
+    AudioControls,
+    AudioMapping,
+    /// MaterialEffects `<FXLib>` a footstep parameter names, mapping surfaces to
+    /// ATL triggers.
+    MaterialEffectsFxLibrary,
+    WwiseSoundBank,
+    WwiseMedia,
+    /// Decoded PCM WAV sibling of a Wwise media payload (glTF/Blender-playable).
+    WwiseDecodedWave,
+    WwiseTriggerBankMap,
+    RockNRollShape,
+    NvClothFabric,
+    NvClothMaterial,
+    VertexShape,
+    CollisionFilters,
+    PhysicsMaterialSet,
+    CharacterRig,
+    CharacterPhysics,
+    FaceLibrary,
+    CryAnimation,
+    CryIntermediateAnimation,
+    CryTracksDatabase,
+    LegacyObjectStreamScene,
+    TerrainHeightmap,
+    TerrainSurfaceMap,
+    TerrainMapSettings,
+    TerrainWaterQuadtree,
+    TerrainTractMap,
+    TerrainRegionMaterial,
+    TerrainWorldMaterial,
+    TerrainSettings,
+    TerrainTracts,
+    VegetationDistribution,
+    VegetationRegion,
+    VegetationImage,
+    SliceMetadata,
+    RegionSliceData,
+    RegionMetadata,
+    RegionChunks,
+}
+
+impl CryEmbeddedResourceKind {
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::CharacterDefinition => "cdf",
+            Self::CharacterParameters => "chrparams",
+            Self::AnimationEvents => "animevents",
+            Self::MannequinAnimationDatabase => "adb",
+            Self::MannequinTagDefinition
+            | Self::MannequinControllerDefinition
+            | Self::AudioControls
+            | Self::MaterialEffectsFxLibrary => "xml",
+            Self::AudioMapping => "csv",
+            Self::BlendSpace => "bspace",
+            Self::CombinedBlendSpace => "comb",
+            Self::WwiseSoundBank => "bnk",
+            Self::WwiseMedia => "wem",
+            Self::WwiseDecodedWave => "wav",
+            Self::WwiseTriggerBankMap => "bin",
+            Self::RockNRollShape => "rnr",
+            Self::NvClothFabric => "cloth",
+            Self::NvClothMaterial => "clothmaterial",
+            Self::VertexShape => "vshapec",
+            Self::CollisionFilters => "collisionfilters",
+            Self::PhysicsMaterialSet => "physicsmaterialset",
+            Self::CharacterRig => "rig",
+            Self::CharacterPhysics => "phys",
+            Self::FaceLibrary => "fxl",
+            Self::CryAnimation => "caf",
+            Self::CryIntermediateAnimation => "i_caf",
+            Self::CryTracksDatabase => "dba",
+            Self::LegacyObjectStreamScene => "objectstream",
+            Self::TerrainHeightmap => "heightmap",
+            Self::TerrainSurfaceMap => "surfacemap",
+            Self::TerrainMapSettings => "mapsettings.json",
+            Self::TerrainWaterQuadtree => "waterqt",
+            Self::TerrainTractMap => "tractmap.tif",
+            Self::TerrainRegionMaterial => "regionmat",
+            Self::TerrainWorldMaterial => "worldmat",
+            Self::TerrainSettings => "terrain.json",
+            Self::TerrainTracts => "tracts.json",
+            Self::VegetationDistribution => "distribution",
+            Self::VegetationRegion => "vegetation",
+            Self::VegetationImage => "vegimage",
+            Self::SliceMetadata => "slice.meta",
+            Self::RegionSliceData => "slicedata",
+            Self::RegionMetadata => "metadata",
+            Self::RegionChunks => "chunks",
+        }
+    }
+
+    const fn mime_type(self) -> &'static str {
+        match self {
+            Self::CharacterDefinition
+            | Self::CharacterParameters
+            | Self::AnimationEvents
+            | Self::MannequinAnimationDatabase
+            | Self::MannequinTagDefinition
+            | Self::MannequinControllerDefinition
+            | Self::BlendSpace
+            | Self::CombinedBlendSpace
+            | Self::AudioControls
+            | Self::MaterialEffectsFxLibrary
+            | Self::PhysicsMaterialSet => "application/xml",
+            Self::AudioMapping => "text/csv",
+            Self::WwiseSoundBank => "application/x-wwise-soundbank",
+            Self::WwiseMedia => "audio/x-wwise-media",
+            Self::WwiseDecodedWave => "audio/wav",
+            Self::WwiseTriggerBankMap => "application/x-new-world-wwise-trigger-bank-map",
+            Self::RockNRollShape => "application/x-new-world-rock-n-roll",
+            Self::NvClothFabric => "application/x-lumberyard-nvcloth-fabric",
+            Self::NvClothMaterial => "application/x-lumberyard-nvcloth-material",
+            Self::VertexShape => "application/x-lumberyard-vertex-shape",
+            Self::CollisionFilters => "application/x-lumberyard-collision-filters",
+            Self::CharacterRig => "application/x-cry-character-rig",
+            Self::CharacterPhysics => "application/x-cry-character-physics",
+            Self::FaceLibrary => "application/x-cry-face-library",
+            Self::CryAnimation | Self::CryIntermediateAnimation | Self::CryTracksDatabase => {
+                "application/x-cry-animation"
+            }
+            Self::LegacyObjectStreamScene => "application/x-lumberyard-objectstream",
+            Self::TerrainHeightmap => "image/tiff",
+            Self::TerrainSurfaceMap => "application/x-new-world-terrain-surface-map",
+            Self::TerrainMapSettings => "application/json",
+            Self::TerrainWaterQuadtree
+            | Self::TerrainRegionMaterial
+            | Self::TerrainWorldMaterial => "application/x-lumberyard-objectstream",
+            Self::TerrainTractMap => "image/tiff",
+            Self::TerrainSettings | Self::TerrainTracts => "application/json",
+            Self::VegetationDistribution => "application/x-new-world-vegetation-distribution",
+            Self::VegetationRegion => "application/x-new-world-vegetation-region",
+            Self::VegetationImage => "application/x-new-world-vegetation-image",
+            Self::SliceMetadata
+            | Self::RegionSliceData
+            | Self::RegionMetadata
+            | Self::RegionChunks => "application/x-lumberyard-objectstream",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -423,9 +800,33 @@ pub enum CrySourceAssetKind {
     BlendSpace,
     CombinedBlendSpace,
     AudioControls,
+    AudioMapping,
+    MaterialEffectsFxLibrary,
     WwiseSoundBank,
     WwiseMedia,
+    WwiseDecodedWave,
     WwiseTriggerBankMap,
+    NvClothFabric,
+    NvClothMaterial,
+    VertexShape,
+    CollisionFilters,
+    PhysicsMaterialSet,
+    TerrainHeightmap,
+    TerrainSurfaceMap,
+    TerrainMapSettings,
+    TerrainWaterQuadtree,
+    TerrainTractMap,
+    TerrainRegionMaterial,
+    TerrainWorldMaterial,
+    TerrainSettings,
+    TerrainTracts,
+    VegetationDistribution,
+    VegetationRegion,
+    VegetationImage,
+    SliceMetadata,
+    RegionSliceData,
+    RegionMetadata,
+    RegionChunks,
 }
 
 /// Loaded texture image bytes (already encoded, e.g. PNG) for embedding.
@@ -433,6 +834,15 @@ pub enum CrySourceAssetKind {
 pub struct TextureData {
     pub bytes: Vec<u8>,
     pub mime: String,
+    /// Desired package-relative path for the decoded image (the shipped `.dds`
+    /// catalog path with a `.png` extension). `None` embeds it in a GLB or lets
+    /// the structured exporter name it from the manifest.
+    pub path: Option<String>,
+    /// For a two-channel CryEngine ddna normal map, the metallic-roughness image
+    /// split from its gloss alpha. It is wired as
+    /// `pbrMetallicRoughness.metallicRoughnessTexture` alongside the normal; a
+    /// plain normal or any other slot leaves this `None`.
+    pub derived_roughness: Option<Box<TextureData>>,
 }
 
 /// A texture loader: maps a `.mtl` texture File path to encoded image bytes.
@@ -441,7 +851,7 @@ pub type TextureLoader<'a> = dyn FnMut(&str) -> Option<TextureData> + 'a;
 /// Accumulates the binary blob, buffer views, accessors, and material/texture
 /// tables as primitives are added.
 struct Builder {
-    buffers: Vec<Vec<u8>>,
+    buffers: Vec<BufferData>,
     active_buffer: usize,
     accessors: Vec<Accessor>,
     views: Vec<BufferView>,
@@ -458,8 +868,36 @@ struct Builder {
     material_cache: HashMap<usize, Option<usize>>,
     /// texture File path → glTF texture index.
     texture_cache: HashMap<String, Option<usize>>,
+    /// normal File path → (normal texture index, derived roughness texture index).
+    normal_cache: HashMap<String, (Option<usize>, Option<usize>)>,
     uses_khr_materials_specular: bool,
     uses_khr_materials_emissive_strength: bool,
+    uses_khr_materials_unlit: bool,
+    /// glTF index of the one shared `physics_debug` material, created lazily the
+    /// first time a query-shape visual needs it.
+    physics_debug_material: Option<usize>,
+}
+
+struct BufferData {
+    bytes: Vec<u8>,
+    extension: &'static str,
+    mime_type: &'static str,
+    /// Desired package-relative path for this buffer, when it mirrors a catalog
+    /// asset (a raw dependency payload, or an animation's glTF channel buffer,
+    /// which takes the source CAF's exact catalog path). `None` for anonymous
+    /// geometry buffers, which the exporter names from the manifest instead.
+    path: Option<String>,
+}
+
+impl BufferData {
+    fn binary() -> Self {
+        Self {
+            bytes: Vec::new(),
+            extension: "bin",
+            mime_type: "application/octet-stream",
+            path: None,
+        }
+    }
 }
 
 struct EmittedSkeleton {
@@ -477,14 +915,14 @@ struct BuiltAnimation {
 
 struct Built {
     document: Document,
-    buffers: Vec<Vec<u8>>,
+    buffers: Vec<BufferData>,
     images: Vec<TextureData>,
 }
 
 impl Builder {
     fn new() -> Self {
         Self {
-            buffers: vec![Vec::new()],
+            buffers: vec![BufferData::binary()],
             active_buffer: 0,
             accessors: Vec::new(),
             views: Vec::new(),
@@ -499,27 +937,30 @@ impl Builder {
             samplers: Vec::new(),
             material_cache: HashMap::new(),
             texture_cache: HashMap::new(),
+            normal_cache: HashMap::new(),
             uses_khr_materials_specular: false,
             uses_khr_materials_emissive_strength: false,
+            uses_khr_materials_unlit: false,
+            physics_debug_material: None,
         }
     }
 
     /// Start one independently reusable binary resource. Views emitted until
     /// the next call share this glTF buffer.
     fn begin_buffer(&mut self) {
-        if !self.buffers[self.active_buffer].is_empty()
+        if !self.buffers[self.active_buffer].bytes.is_empty()
             || self
                 .views
                 .iter()
                 .any(|view| view.buffer == self.active_buffer)
         {
-            self.buffers.push(Vec::new());
+            self.buffers.push(BufferData::binary());
             self.active_buffer = self.buffers.len() - 1;
         }
     }
 
     fn push_view(&mut self, bytes: &[u8], target: Option<u32>) -> usize {
-        let buffer = &mut self.buffers[self.active_buffer];
+        let buffer = &mut self.buffers[self.active_buffer].bytes;
         while !buffer.len().is_multiple_of(4) {
             buffer.push(0);
         }
@@ -549,43 +990,96 @@ impl Builder {
             sampler.input += accessor_offset;
             sampler.output += accessor_offset;
         }
-        self.buffers[buffer_index] = built.buffer;
+        self.buffers[buffer_index].bytes = built.buffer;
+        // The channel buffer IS the animation's catalog asset: its glTF-format
+        // bytes take the source CAF's exact pak path (e.g. `.../idle.caf`). No
+        // raw CAF copy ships alongside, so there is no collision. A clip without
+        // a source path stays anonymous and is named by the exporter from the
+        // manifest instead.
+        self.buffers[buffer_index].path = (!built.animation.extras.cry_source_path.is_empty())
+            .then(|| built.animation.extras.cry_source_path.clone());
         self.views.append(&mut built.views);
         self.accessors.append(&mut built.accessors);
         self.animations.push(built.animation);
     }
 
-    /// Get or create a glTF texture for a `.mtl` File path. Image bytes remain a
-    /// distinct resource until the selected container is packed.
+    fn add_source_resource(
+        &mut self,
+        bytes: &[u8],
+        source_path: &str,
+        extension: &'static str,
+        mime_type: &'static str,
+    ) -> usize {
+        self.begin_buffer();
+        self.buffers[self.active_buffer].extension = extension;
+        self.buffers[self.active_buffer].mime_type = mime_type;
+        self.buffers[self.active_buffer].path = Some(resource_path(source_path, extension));
+        self.push_view(bytes, None)
+    }
+
+    /// Register loaded image bytes as a glTF image + texture, returning the
+    /// texture index. Image bytes remain a distinct resource until the selected
+    /// container is packed.
+    fn push_image_texture(&mut self, data: TextureData) -> usize {
+        let image = self.images.len();
+        self.images.push(Image {
+            mime_type: data.mime.clone(),
+            buffer_view: None,
+            uri: None,
+        });
+        self.image_data.push(data);
+        if self.samplers.is_empty() {
+            // 9729 = LINEAR, 9987 = LINEAR_MIPMAP_LINEAR, 10497 = REPEAT.
+            self.samplers.push(Sampler {
+                mag_filter: 9729,
+                min_filter: 9987,
+                wrap_s: 10497,
+                wrap_t: 10497,
+            });
+        }
+        let texture = self.textures.len();
+        self.textures.push(Texture {
+            source: image,
+            sampler: 0,
+        });
+        texture
+    }
+
+    /// Get or create a glTF texture for a `.mtl` File path.
     fn texture(&mut self, file: &str, loader: &mut TextureLoader<'_>) -> Option<usize> {
         if let Some(cached) = self.texture_cache.get(file) {
             return *cached;
         }
-        let resolved = loader(file).map(|data| {
-            let image = self.images.len();
-            self.images.push(Image {
-                mime_type: data.mime.clone(),
-                buffer_view: None,
-                uri: None,
-            });
-            self.image_data.push(data);
-            if self.samplers.is_empty() {
-                // 9729 = LINEAR, 9987 = LINEAR_MIPMAP_LINEAR, 10497 = REPEAT.
-                self.samplers.push(Sampler {
-                    mag_filter: 9729,
-                    min_filter: 9987,
-                    wrap_s: 10497,
-                    wrap_t: 10497,
-                });
-            }
-            let texture = self.textures.len();
-            self.textures.push(Texture {
-                source: image,
-                sampler: 0,
-            });
-            texture
-        });
+        let resolved = loader(file).map(|data| self.push_image_texture(data));
         self.texture_cache.insert(file.to_string(), resolved);
+        resolved
+    }
+
+    /// Get or create the glTF texture(s) for a material's normal map. A
+    /// two-channel ddna map arrives with its gloss already split into a derived
+    /// metallic-roughness sibling, so this yields the Z-reconstructed normal
+    /// texture plus that roughness texture; a plain normal map yields only the
+    /// normal.
+    fn normal_map(
+        &mut self,
+        file: &str,
+        loader: &mut TextureLoader<'_>,
+    ) -> (Option<usize>, Option<usize>) {
+        if let Some(cached) = self.normal_cache.get(file) {
+            return *cached;
+        }
+        let resolved = match loader(file) {
+            None => (None, None),
+            Some(mut data) => {
+                let roughness = data
+                    .derived_roughness
+                    .take()
+                    .map(|rough| self.push_image_texture(*rough));
+                let normal = self.push_image_texture(data);
+                (Some(normal), roughness)
+            }
+        };
+        self.normal_cache.insert(file.to_string(), resolved);
         resolved
     }
 
@@ -619,10 +1113,15 @@ impl Builder {
             .texture(MapSlot::Diffuse)
             .and_then(|t| self.texture(&t.file, loader))
             .map(|index| TextureInfo { index });
-        let normal_texture = sub
+        // A CryEngine ddna normal splits into an RGB normal (Z reconstructed) and
+        // a metallic-roughness image (gloss alpha → roughness); a plain normal
+        // map yields only the normal texture.
+        let (normal_index, metallic_roughness_index) = sub
             .texture(MapSlot::Normals)
-            .and_then(|t| self.texture(&t.file, loader))
-            .map(|index| TextureInfo { index });
+            .map_or((None, None), |t| self.normal_map(&t.file, loader));
+        let normal_texture = normal_index.map(|index| TextureInfo { index });
+        let metallic_roughness_texture =
+            metallic_roughness_index.map(|index| TextureInfo { index });
         let emissive_texture = sub
             .texture(MapSlot::Emittance)
             .and_then(|t| self.texture(&t.file, loader))
@@ -659,7 +1158,15 @@ impl Builder {
                 // Cry's legacy shader flow is non-metallic. `Shininess` stores
                 // smoothness in the 0..255 engine range.
                 metallic_factor: 0.0,
-                roughness_factor,
+                // A ddna gloss split provides per-pixel roughness, so the factor
+                // just passes the texture through; otherwise use the constant
+                // smoothness-derived roughness.
+                roughness_factor: if metallic_roughness_texture.is_some() {
+                    1.0
+                } else {
+                    roughness_factor
+                },
+                metallic_roughness_texture,
             },
             normal_texture,
             emissive_texture,
@@ -676,12 +1183,57 @@ impl Builder {
                 }),
                 emissive_strength: uses_emissive_strength
                     .then_some(KhrMaterialsEmissiveStrength { emissive_strength }),
+                unlit: None,
             }),
-            extras: CryMaterialExtras::from(sub),
+            extras: MaterialExtras::Cry(CryMaterialExtras::from(sub)),
         };
         let material_index = self.materials.len();
         self.materials.push(material);
         Some(material_index)
+    }
+
+    /// Get or create the one shared `physics_debug` material for query-shape
+    /// visuals (hit volumes and rigid bodies). It reproduces the engine's
+    /// `Javelin::QueryShapeBase` debug draw as closely as core glTF allows: an
+    /// unlit BLEND surface at the wire-pass RGBA, doubly sided, with the exact
+    /// two-pass values recorded in `extras`.
+    fn physics_debug_material(&mut self) -> usize {
+        if let Some(index) = self.physics_debug_material {
+            return index;
+        }
+        self.uses_khr_materials_unlit = true;
+        let index = self.materials.len();
+        self.materials.push(Material {
+            name: Some("physics_debug".to_owned()),
+            pbr_metallic_roughness: PbrMetallicRoughness {
+                base_color_factor: Vec4::new(0.22, 1.0, 0.38, 0.4),
+                base_color_texture: None,
+                metallic_factor: 0.0,
+                roughness_factor: 1.0,
+                metallic_roughness_texture: None,
+            },
+            normal_texture: None,
+            emissive_texture: None,
+            occlusion_texture: None,
+            emissive_factor: Vec3::ZERO,
+            alpha_mode: "BLEND",
+            alpha_cutoff: None,
+            double_sided: true,
+            extensions: Some(MaterialExtensions {
+                specular: None,
+                emissive_strength: None,
+                unlit: Some(KhrMaterialsUnlit {}),
+            }),
+            extras: MaterialExtras::PhysicsDebug(PhysicsDebugExtras {
+                cry_debug_draw: CryDebugDraw {
+                    rgb: [0.22, 1.0, 0.38],
+                    fill_alpha: 0.05,
+                    wire_alpha: 0.4,
+                },
+            }),
+        });
+        self.physics_debug_material = Some(index);
+        index
     }
 
     fn accessor_positions(&mut self, data: &[Vec3]) -> usize {
@@ -1008,6 +1560,7 @@ impl Builder {
                 cry_sample_rate: clip.caf.sample_rate,
                 cry_root_motion: clip.caf.root_motion.map(CryRootMotion::from),
                 cry_events: clip.events.iter().map(CryAnimationEvent::from).collect(),
+                cry_mannequin_audio: Vec::new(),
             },
         });
     }
@@ -1144,6 +1697,7 @@ fn build(
     animations: &[ModelAnimation],
     materials: Option<&MaterialSet>,
     extras: Option<&CryAssetExtras>,
+    physics: Option<&PhysicsScene>,
     loader: &mut TextureLoader<'_>,
     runner: &nw_jobs::JobRunner,
 ) -> Built {
@@ -1211,7 +1765,10 @@ fn build(
             let mut local = Builder::new();
             local.add_animation(&animation.clip, skeleton, &emitted.joints);
             Some(BuiltAnimation {
-                buffer: local.buffers.pop().unwrap_or_default(),
+                buffer: local
+                    .buffers
+                    .pop()
+                    .map_or_else(Vec::new, |buffer| buffer.bytes),
                 accessors: local.accessors,
                 views: local.views,
                 animation: local.animations.pop().expect("one animation was emitted"),
@@ -1219,6 +1776,22 @@ fn build(
         });
         for animation in built.into_iter().flatten() {
             builder.append_animation(animation);
+        }
+    }
+    order_animations(&mut builder.animations);
+
+    // Attach Mannequin fragment audio to each animation whose name matches a
+    // fragment's AnimLayer animation (case-insensitive).
+    if let Some(extras) = extras {
+        for animation in &mut builder.animations {
+            for entry in &extras.mannequin_audio {
+                if entry.animation.eq_ignore_ascii_case(&animation.name) {
+                    animation
+                        .extras
+                        .cry_mannequin_audio
+                        .extend(entry.clips.iter().cloned());
+                }
+            }
         }
     }
 
@@ -1233,8 +1806,9 @@ fn build(
             }
             // Resolve the material first: a skippable sub-material (Nodraw / shadow
             // proxy) drops the whole primitive.
-            let material = match materials {
-                Some(set) => {
+            let material = match (mesh.role, materials) {
+                (MeshRole::PhysicsProxy | MeshRole::ClothSimulation, _) => None,
+                (MeshRole::Render, Some(set)) => {
                     let index = usize::try_from(primitive.material_id).unwrap_or(usize::MAX);
                     if set
                         .sub_materials
@@ -1245,7 +1819,7 @@ fn build(
                     }
                     builder.material(set, index, loader)
                 }
-                None => None,
+                (MeshRole::Render, None) => None,
             };
 
             let count = primitive.positions.len();
@@ -1268,6 +1842,14 @@ fn build(
                 ),
                 _ => (None, None),
             };
+            // Influences 5-8 (from a 2× bone-mapping stream) as JOINTS_1/WEIGHTS_1.
+            let (joints_1, weights_1) = match (&primitive.joints2, &primitive.weights2) {
+                (Some(j), Some(w)) if j.len() == count && w.len() == count => (
+                    Some(builder.accessor_joints(j)),
+                    Some(builder.accessor_weights(w)),
+                ),
+                _ => (None, None),
+            };
             let indices = builder.accessor_indices(&primitive.indices);
             primitives.push(Primitive {
                 attributes: Attributes {
@@ -1276,6 +1858,8 @@ fn build(
                     texcoord_0,
                     joints_0,
                     weights_0,
+                    joints_1,
+                    weights_1,
                 },
                 indices,
                 mode: MODE_TRIANGLES,
@@ -1314,10 +1898,13 @@ fn build(
             translation,
             rotation,
             scale,
-            extras: (mesh.lod.is_some() || mesh.shadow_proxy).then_some(CryNodeExtras {
-                cry_lod: mesh.lod,
-                shadow_proxy: mesh.shadow_proxy,
-            }),
+            extras: (mesh.lod.is_some() || mesh.shadow_proxy || mesh.role != MeshRole::Render)
+                .then_some(CryNodeExtras {
+                    cry_lod: mesh.lod,
+                    shadow_proxy: mesh.shadow_proxy,
+                    role: (mesh.role != MeshRole::Render).then_some(mesh.role),
+                    physics: None,
+                }),
             ..Node::default()
         };
         let node_index = builder.nodes.len();
@@ -1361,6 +1948,87 @@ fn build(
         }
     }
 
+    if let Some(physics) = physics {
+        for visual in physics
+            .visuals_with_runner(runner)
+            .expect("PhysicsScene was validated by Gltf::physics")
+        {
+            // Query-shape visuals (hit volumes and rigid bodies) share the one
+            // physics_debug material matching the engine's debug draw; RockNRoll
+            // `.rnr` visuals keep no material.
+            let is_query_shape = visual.role.is_query_shape();
+            let mesh = visual.geometry.and_then(|geometry| {
+                if geometry.positions.is_empty() || geometry.indices.is_empty() {
+                    return None;
+                }
+                let material = is_query_shape.then(|| builder.physics_debug_material());
+                builder.begin_buffer();
+                let position = builder.accessor_positions(&geometry.positions);
+                let indices = builder.accessor_indices(&geometry.indices);
+                let mesh = builder.meshes.len();
+                builder.meshes.push(Mesh {
+                    name: Some(visual.name.clone()),
+                    primitives: vec![Primitive {
+                        attributes: Attributes {
+                            position,
+                            normal: None,
+                            texcoord_0: None,
+                            joints_0: None,
+                            weights_0: None,
+                            joints_1: None,
+                            weights_1: None,
+                        },
+                        indices,
+                        mode: MODE_TRIANGLES,
+                        material,
+                    }],
+                });
+                Some(mesh)
+            });
+            // A hit volume that targets a skeleton joint rides that bone: its
+            // node parents under the joint with the bone-local transform, so it
+            // follows the skeleton in rest pose and during animation. The
+            // entity's context/world placement is provided by the bone chain and
+            // is deliberately not baked into the local transform.
+            let bone_parent = visual.target_bone.as_ref().and_then(|target| {
+                model
+                    .primary_skeleton()
+                    .and_then(|skeleton| skeleton.bone_index(&target.name))
+                    .and_then(|bone| {
+                        emitted_skeletons
+                            .first()
+                            .and_then(|emitted| emitted.joints.get(bone))
+                            .copied()
+                    })
+                    .map(|parent_node| (parent_node, target.local))
+            });
+            let local = bone_parent.map_or(visual.transform, |(_, local)| local);
+            let (scale, rotation, translation) = local.to_scale_rotation_translation();
+            let node = builder.nodes.len();
+            builder.nodes.push(Node {
+                name: Some(visual.name),
+                mesh,
+                translation: (!translation.abs_diff_eq(Vec3::ZERO, 0.000_001))
+                    .then_some(translation.to_array()),
+                rotation: (!rotation.abs_diff_eq(Quat::IDENTITY, 0.000_001))
+                    .then_some(rotation.normalize().to_array()),
+                scale: (!scale.abs_diff_eq(Vec3::ONE, 0.000_001)).then_some(scale.to_array()),
+                extras: Some(CryNodeExtras {
+                    cry_lod: None,
+                    shadow_proxy: false,
+                    role: None,
+                    physics: Some(visual.role),
+                }),
+                ..Node::default()
+            });
+            if let Some((parent_node, _)) = bone_parent {
+                builder.nodes[parent_node].children.push(node);
+            } else {
+                root_nodes.push(node);
+            }
+        }
+    }
+
     let node_indices = root_nodes;
     let mut extensions_used = Vec::new();
     if uses_msft_lod {
@@ -1372,17 +2040,73 @@ fn build(
     if builder.uses_khr_materials_emissive_strength {
         extensions_used.push("KHR_materials_emissive_strength");
     }
-    let document_extras = if extras.is_some() || !model.auxiliary_nodes.is_empty() {
+    if builder.uses_khr_materials_unlit {
+        extensions_used.push("KHR_materials_unlit");
+    }
+    let document_extras = if extras.is_some()
+        || !model.auxiliary_nodes.is_empty()
+        || physics.is_some_and(|physics| !physics.is_empty())
+    {
         let mut value = extras.cloned().unwrap_or_default();
         value
             .non_render_nodes
             .extend(model.auxiliary_nodes.iter().map(CryNonRenderNode::from));
+        let mut emitted_resources = value
+            .embedded_resources
+            .iter()
+            .map(|resource| (resource.source_path.to_ascii_lowercase(), resource.kind))
+            .collect::<HashSet<_>>();
+        if let Some(extras) = extras {
+            for resource in &extras.resource_payloads {
+                if !emitted_resources
+                    .insert((resource.source_path.to_ascii_lowercase(), resource.kind))
+                {
+                    continue;
+                }
+                let buffer_view = builder.add_source_resource(
+                    &resource.bytes,
+                    &resource.source_path,
+                    resource.kind.extension(),
+                    resource.kind.mime_type(),
+                );
+                value.embedded_resources.push(CryEmbeddedResource {
+                    source_path: resource.source_path.clone(),
+                    kind: resource.kind,
+                    buffer_view,
+                    mime_type: resource.kind.mime_type().to_owned(),
+                });
+            }
+        }
+        if let Some(physics) = physics {
+            value.physics = Some(physics.clone());
+            for asset in &physics.shape_assets {
+                let kind = CryEmbeddedResourceKind::RockNRollShape;
+                if !emitted_resources.insert((asset.source_path.to_ascii_lowercase(), kind)) {
+                    continue;
+                }
+                let buffer_view = builder.add_source_resource(
+                    &asset.source_bytes,
+                    &asset.source_path,
+                    kind.extension(),
+                    kind.mime_type(),
+                );
+                value.embedded_resources.push(CryEmbeddedResource {
+                    source_path: asset.source_path.clone(),
+                    kind,
+                    buffer_view,
+                    mime_type: kind.mime_type().to_owned(),
+                });
+            }
+        }
         Some(value)
     } else {
         None
     };
     while builder.buffers.len() > 1
-        && builder.buffers.last().is_some_and(Vec::is_empty)
+        && builder
+            .buffers
+            .last()
+            .is_some_and(|buffer| buffer.bytes.is_empty())
         && !builder
             .views
             .iter()
@@ -1394,7 +2118,7 @@ fn build(
         .buffers
         .iter()
         .map(|buffer| Buffer {
-            byte_length: buffer.len(),
+            byte_length: buffer.bytes.len(),
             uri: None,
         })
         .collect();
@@ -1425,6 +2149,25 @@ fn build(
         document,
         buffers: builder.buffers,
         images: builder.image_data,
+    }
+}
+
+/// Order emitted clips deterministically with any idle clip first. Blender's
+/// glTF importer activates `animations[0]` on import, so a character should
+/// default to its idle pose rather than whatever the CDF/chrparams enumeration
+/// happened to place first. Sort by name (case-insensitive) for reproducible
+/// exports, then move the first clip whose name contains `idle` to the front.
+fn order_animations(animations: &mut [Animation]) {
+    animations.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+    });
+    if let Some(idle) = animations
+        .iter()
+        .position(|animation| animation.name.to_ascii_lowercase().contains("idle"))
+    {
+        animations[..=idle].rotate_right(1);
     }
 }
 
@@ -1459,6 +2202,7 @@ pub struct Gltf<'a, State> {
     model: &'a Model,
     animations: &'a [ModelAnimation],
     extras: Option<&'a CryAssetExtras>,
+    physics: Option<&'a PhysicsScene>,
     state: State,
 }
 
@@ -1469,6 +2213,7 @@ impl<'a> Gltf<'a, NoMaterials> {
             model,
             animations: &[],
             extras: None,
+            physics: None,
             state: NoMaterials,
         }
     }
@@ -1480,6 +2225,7 @@ impl<'a> Gltf<'a, NoMaterials> {
             model: self.model,
             animations: self.animations,
             extras: self.extras,
+            physics: self.physics,
             state: WithMaterials(materials),
         }
     }
@@ -1498,6 +2244,7 @@ impl<'a> Gltf<'a, NoMaterials> {
             self.animations,
             None,
             self.extras,
+            self.physics,
             &mut |_| None,
             runner,
         ))
@@ -1522,6 +2269,7 @@ impl<'a> Gltf<'a, NoMaterials> {
                 self.animations,
                 None,
                 self.extras,
+                self.physics,
                 &mut |_| None,
                 runner,
             ),
@@ -1544,6 +2292,7 @@ impl<'a> Gltf<'a, NoMaterials> {
             self.animations,
             None,
             self.extras,
+            self.physics,
             &mut |_| None,
             runner,
         ))
@@ -1569,6 +2318,7 @@ impl<'a> Gltf<'a, WithMaterials<'a>> {
             self.animations,
             Some(self.state.0),
             self.extras,
+            self.physics,
             &mut loader,
             runner,
         ))
@@ -1598,6 +2348,7 @@ impl<'a> Gltf<'a, WithMaterials<'a>> {
                 self.animations,
                 Some(self.state.0),
                 self.extras,
+                self.physics,
                 &mut loader,
                 runner,
             ),
@@ -1626,6 +2377,7 @@ impl<'a> Gltf<'a, WithMaterials<'a>> {
             self.animations,
             Some(self.state.0),
             self.extras,
+            self.physics,
             &mut loader,
             runner,
         ))
@@ -1638,6 +2390,18 @@ impl<'a, State> Gltf<'a, State> {
     pub fn extras(mut self, extras: &'a CryAssetExtras) -> Self {
         self.extras = Some(extras);
         self
+    }
+
+    /// Attach validated collision, rigid-body, and hit-volume data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a shape cannot be represented without silently
+    /// dropping or corrupting its geometry.
+    pub fn physics(mut self, physics: &'a PhysicsScene) -> Result<Self, PhysicsSceneError> {
+        physics.validate()?;
+        self.physics = Some(physics);
+        Ok(self)
     }
 
     /// Attach CAF clips after validating each explicit skeleton binding.
@@ -1695,6 +2459,7 @@ pub struct GltfResource {
     bytes: Vec<u8>,
     extension: &'static str,
     mime_type: Option<String>,
+    path: Option<String>,
 }
 
 impl GltfResource {
@@ -1712,6 +2477,15 @@ impl GltfResource {
     pub fn mime_type(&self) -> Option<&str> {
         self.mime_type.as_deref()
     }
+
+    /// Desired package-relative path mirroring the game's asset catalog, when
+    /// this resource corresponds to a catalog asset or a derived sibling.
+    /// `None` for anonymous geometry buffers and images the exporter must name
+    /// from the manifest.
+    #[must_use]
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
 }
 
 /// A glTF manifest plus independent buffers/images ready for a shared store.
@@ -1727,15 +2501,17 @@ impl GltfPackage {
         let mut resources = built
             .buffers
             .into_iter()
-            .map(|bytes| GltfResource {
-                bytes,
-                extension: "bin",
-                mime_type: Some("application/octet-stream".to_string()),
+            .map(|buffer| GltfResource {
+                bytes: buffer.bytes,
+                extension: buffer.extension,
+                mime_type: Some(buffer.mime_type.to_owned()),
+                path: buffer.path,
             })
             .collect::<Vec<_>>();
         resources.extend(built.images.into_iter().map(|image| GltfResource {
             extension: image_extension(&image.mime),
             mime_type: Some(image.mime),
+            path: image.path,
             bytes: image.bytes,
         }));
         Self {
@@ -1821,6 +2597,21 @@ pub enum GltfPackageError {
     Serialize(#[source] serde_json::Error),
 }
 
+/// Package-relative path for a raw source resource. Producers pass full pak
+/// paths with real extensions, so the path is used as-is when it already ends
+/// with `.{extension}` (ASCII case-insensitive); otherwise the extension is
+/// appended.
+fn resource_path(source_path: &str, extension: &str) -> String {
+    let suffix = format!(".{extension}");
+    if source_path.len() >= suffix.len()
+        && source_path[source_path.len() - suffix.len()..].eq_ignore_ascii_case(&suffix)
+    {
+        source_path.to_string()
+    } else {
+        format!("{source_path}{suffix}")
+    }
+}
+
 fn image_extension(mime_type: &str) -> &'static str {
     match mime_type {
         "image/png" => "png",
@@ -1880,7 +2671,7 @@ fn merge_resources(mut built: Built) -> (Document, Vec<u8>) {
                 view.byte_offset += base;
             }
         }
-        bin.extend_from_slice(&buffer);
+        bin.extend_from_slice(&buffer.bytes);
     }
     for (image, data) in built.document.images.iter_mut().zip(built.images) {
         while !bin.len().is_multiple_of(4) {

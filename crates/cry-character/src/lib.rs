@@ -128,7 +128,7 @@ impl CharacterDefinition {
             .flat_map(|list| list.children.iter())
             .filter(|child| child.name == "Attachment")
             .map(CharacterAttachment::from_element)
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
         Ok(Self {
             source,
             model,
@@ -220,7 +220,7 @@ impl AssetDependencies for CharacterDefinition {
 }
 
 impl CharacterAttachment {
-    fn from_element(element: &XmlElement) -> Result<Self, CharacterDefinitionError> {
+    fn from_element(element: &XmlElement) -> Self {
         let material_lods = (0_u8..=5)
             .filter_map(|lod| {
                 element
@@ -228,7 +228,7 @@ impl CharacterAttachment {
                     .map(|value| (lod, value.to_owned()))
             })
             .collect();
-        Ok(Self {
+        Self {
             kind: AttachmentKind::from_cry_name(element.attribute("Type").unwrap_or_default()),
             name: owned_attribute(element, "AName"),
             bone_name: owned_attribute(element, "BoneName"),
@@ -236,66 +236,41 @@ impl CharacterAttachment {
             simulation_binding: owned_attribute(element, "SimBinding"),
             material: owned_attribute(element, "Material"),
             material_lods,
-            flags: parse_optional(element, "Flags")?,
-            character_rotation: parse_array::<4>(element, "Rotation")?,
-            character_position: parse_array::<3>(element, "Position")?,
-            relative_rotation: parse_array::<4>(element, "RelRotation")?,
-            relative_position: parse_array::<3>(element, "RelPosition")?,
+            flags: parse_optional(element, "Flags"),
+            character_rotation: parse_array::<4>(element, "Rotation"),
+            character_position: parse_array::<3>(element, "Position"),
+            relative_rotation: parse_array::<4>(element, "RelRotation"),
+            relative_position: parse_array::<3>(element, "RelPosition"),
             attributes: element.attributes.clone(),
             children: element.children.clone(),
-        })
+        }
     }
 }
 
-fn parse_optional<T>(
-    element: &XmlElement,
-    attribute: &'static str,
-) -> Result<Option<T>, CharacterDefinitionError>
+fn parse_optional<T>(element: &XmlElement, attribute: &'static str) -> Option<T>
 where
     T: std::str::FromStr,
 {
-    let Some(value) = element.attribute(attribute) else {
-        return Ok(None);
-    };
-    value
-        .parse()
-        .map(Some)
-        .map_err(|_| CharacterDefinitionError::InvalidAttribute {
-            attribute,
-            value: value.to_owned(),
-        })
+    // Cry XML `getAttr` leaves the destination at its default when conversion fails.
+    element.attribute(attribute)?.parse().ok()
 }
 
-fn parse_array<const N: usize>(
-    element: &XmlElement,
-    attribute: &'static str,
-) -> Result<Option<[f32; N]>, CharacterDefinitionError> {
-    let Some(value) = element.attribute(attribute) else {
-        return Ok(None);
-    };
-    let values = value
+fn parse_array<const N: usize>(element: &XmlElement, attribute: &'static str) -> Option<[f32; N]> {
+    let value = element.attribute(attribute)?;
+    // Cry's Vec/Quat overloads use sscanf: they require the requested prefix but
+    // ignore extra components, and report failure rather than rejecting the CDF.
+    let mut components = value
         .split(|character: char| character == ',' || character.is_ascii_whitespace())
-        .filter(|component| !component.is_empty())
-        .map(str::parse::<f32>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| CharacterDefinitionError::InvalidAttribute {
-            attribute,
-            value: value.to_owned(),
-        })?;
-    let values: [f32; N] =
-        values
-            .try_into()
-            .map_err(|_| CharacterDefinitionError::InvalidAttribute {
-                attribute,
-                value: value.to_owned(),
-            })?;
-    if !values.iter().all(|component| component.is_finite()) {
-        return Err(CharacterDefinitionError::InvalidAttribute {
-            attribute,
-            value: value.to_owned(),
-        });
+        .filter(|component| !component.is_empty());
+    let mut values = [0.0; N];
+    for output in &mut values {
+        let value = components.next()?.parse::<f32>().ok()?;
+        if !value.is_finite() {
+            return None;
+        }
+        *output = value;
     }
-    Ok(Some(values))
+    Some(values)
 }
 
 fn owned_attribute(element: &XmlElement, name: &str) -> Option<String> {
@@ -347,11 +322,6 @@ pub enum CharacterDefinitionError {
     UnexpectedRoot(String),
     #[error("CharacterDefinition has no Model element")]
     MissingModel,
-    #[error("CharacterDefinition attribute `{attribute}` has invalid value `{value}`")]
-    InvalidAttribute {
-        attribute: &'static str,
-        value: String,
-    },
 }
 
 /// One exact `<Animation>` directive from a `.chrparams` AnimationList.
@@ -362,6 +332,38 @@ pub struct CharacterAnimationEntry {
     pub flags: Option<String>,
     pub kind: CharacterAnimationEntryKind,
     pub source: XmlElement,
+}
+
+/// Sequential path state for a `.chrparams` `<AnimationList>`.
+///
+/// CryAnimation treats `#Filepath` as the directory for every following
+/// concrete or wildcard animation entry, including entries whose relative
+/// path contains directory separators. Other directives keep their authored
+/// paths and are only normalized to forward slashes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CharacterAnimationPathResolver {
+    directory: String,
+}
+
+impl CharacterAnimationPathResolver {
+    /// Advance the list's `#Filepath` state and return the engine path for an
+    /// animation entry.
+    #[must_use]
+    pub fn resolve_entry(&mut self, entry: &CharacterAnimationEntry) -> String {
+        let path = normalize_authored_path(&entry.path);
+        match entry.kind {
+            CharacterAnimationEntryKind::FilePath => {
+                self.directory = path.trim_end_matches('/').to_owned();
+                self.directory.clone()
+            }
+            CharacterAnimationEntryKind::WildcardAsset | CharacterAnimationEntryKind::Asset
+                if !self.directory.is_empty() =>
+            {
+                format!("{}/{path}", self.directory)
+            }
+            _ => path,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,13 +413,11 @@ impl CharacterParameters {
 impl AssetDependencies for CharacterParameters {
     fn asset_dependencies(&self) -> Vec<AssetDependency> {
         let mut dependencies = Vec::new();
-        let mut animation_directory = String::new();
+        let mut paths = CharacterAnimationPathResolver::default();
         for entry in &self.animations {
-            let path = normalize_authored_path(&entry.path);
+            let path = paths.resolve_entry(entry);
             match entry.kind {
-                CharacterAnimationEntryKind::FilePath => {
-                    animation_directory = path.trim_end_matches('/').to_owned();
-                }
+                CharacterAnimationEntryKind::FilePath => {}
                 CharacterAnimationEntryKind::ParseSubfolders => {}
                 CharacterAnimationEntryKind::TracksDatabase => {
                     dependencies.push(path_dependency("animation.tracks_database", path, true))
@@ -432,18 +432,10 @@ impl AssetDependencies for CharacterParameters {
                     push_required_path(&mut dependencies, "animation.face_library", &path);
                 }
                 CharacterAnimationEntryKind::WildcardAsset => {
-                    dependencies.push(path_dependency(
-                        "animation.clip_pattern",
-                        animation_path(&animation_directory, &path),
-                        false,
-                    ));
+                    dependencies.push(path_dependency("animation.clip_pattern", path, false));
                 }
                 CharacterAnimationEntryKind::Asset => {
-                    push_required_path(
-                        &mut dependencies,
-                        "animation.asset",
-                        &animation_path(&animation_directory, &path),
-                    );
+                    push_required_path(&mut dependencies, "animation.asset", &path);
                 }
                 CharacterAnimationEntryKind::UnknownDirective => {
                     dependencies.push(AssetDependency::required(
@@ -489,14 +481,6 @@ fn push_required_material(dependencies: &mut Vec<AssetDependency>, relation: &st
         format!("{path}.mtl")
     };
     dependencies.push(AssetDependency::required_path(relation, path));
-}
-
-fn animation_path(directory: &str, path: &str) -> String {
-    if directory.is_empty() || path.contains('/') {
-        path.to_owned()
-    } else {
-        format!("{directory}/{path}")
-    }
 }
 
 fn normalize_authored_path(path: &str) -> String {
@@ -560,6 +544,30 @@ mod tests {
     }
 
     #[test]
+    fn mirrors_cry_get_attr_for_malformed_attachment_transforms() {
+        let definition = CharacterDefinition::from_xml(
+            r#"<CharacterDefinition><Model File="objects/weapon.chr"/><AttachmentList>
+                <Attachment Type="CA_BONE" Flags="invalid"
+                    RelPosition="-8.7422777e-08,0,0,0.99999994"
+                    RelRotation="-8.5965385e-10,0.054916643,0.088664211"/>
+            </AttachmentList></CharacterDefinition>"#,
+        )
+        .unwrap();
+
+        let attachment = &definition.attachments[0];
+        assert_eq!(attachment.flags, None);
+        assert_eq!(
+            attachment.relative_position,
+            Some([-8.742_278e-8, 0.0, 0.0])
+        );
+        assert_eq!(attachment.relative_rotation, None);
+        assert_eq!(
+            attachment.attributes["RelRotation"],
+            "-8.5965385e-10,0.054916643,0.088664211"
+        );
+    }
+
+    #[test]
     fn parses_chrparams_animation_directives_without_dropping_other_categories() {
         let parameters = CharacterParameters::from_xml(
             r##"<Params><IK_Definition custom="keep"/><AnimationList>
@@ -589,5 +597,40 @@ mod tests {
             CharacterAnimationEntryKind::WildcardAsset
         );
         assert_eq!(parameters.source.children[0].name, "IK_Definition");
+    }
+
+    #[test]
+    fn filepath_rebases_nested_animation_paths_and_wildcards() {
+        let parameters = CharacterParameters::from_xml(
+            r##"<Params><AnimationList>
+                <Animation name="#filepath" path="animations\Gameplay\Alligator\"/>
+                <Animation name="walk" path="navigation\walk.caf"/>
+                <Animation name="*" path="*\*.caf"/>
+                <Animation name="$AnimEventDatabase" path="animations/alligator.animevents"/>
+            </AnimationList></Params>"##,
+        )
+        .unwrap();
+
+        let dependencies = parameters.asset_dependencies();
+
+        assert!(dependencies.iter().any(|dependency| {
+            matches!(
+                dependency.target(),
+                AssetDependencyTarget::Asset(reference)
+                    if reference.hint()
+                        == Some("animations/Gameplay/Alligator/navigation/walk.caf")
+            )
+        }));
+        assert!(dependencies.iter().any(|dependency| {
+            dependency.target()
+                == &AssetDependencyTarget::pattern("animations/Gameplay/Alligator/*/*.caf")
+        }));
+        assert!(dependencies.iter().any(|dependency| {
+            matches!(
+                dependency.target(),
+                AssetDependencyTarget::Asset(reference)
+                    if reference.hint() == Some("animations/alligator.animevents")
+            )
+        }));
     }
 }

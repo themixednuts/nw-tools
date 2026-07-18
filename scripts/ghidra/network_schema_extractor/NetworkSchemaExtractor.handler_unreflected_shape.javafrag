@@ -1,0 +1,236 @@
+    private NestedTypeShape unreflectedHandlerValueShape(
+        FieldCall field,
+        Function unmarshal,
+        LinkedHashMap<Long, NestedTypeMember> observed,
+        HandlerValueVptr value,
+        AzRttiEvidence rtti,
+        String typeId) {
+
+        Long nativeSize = handlerValueWindowSize(
+            field.handlerVtable,
+            value.rootOffset());
+        String typeName = rtti.selectedProviderTypeName();
+        LinkedHashMap<Long, NestedTypeMember> payload = handlerPayloadMembersInWindow(
+            observed,
+            value.rootOffset(),
+            nativeSize == null ? 0L : nativeSize);
+        if (nativeSize == null || nativeSize <= 0L ||
+            !isPlausibleTypeName(typeName) ||
+            payload.isEmpty()) {
+            return null;
+        }
+
+        Address ownerConstructor = handlerOwnerConstructor(field);
+        if (ownerConstructor == null) {
+            return null;
+        }
+        List<VtableWrite> writes = constructorVtableWrites(ownerConstructor);
+        Long handlerBase = handlerBaseOffsetInConstructor(field, writes);
+        if (handlerBase == null) {
+            return null;
+        }
+        List<HandlerValueMemberProvider> providers = handlerValueMemberProviders(
+            ownerConstructor,
+            handlerBase,
+            value.rootOffset(),
+            nativeSize,
+            payload);
+        List<HandlerValueLayoutMember> members = completeHandlerValueLayout(
+            providers,
+            payload,
+            value.rootOffset(),
+            nativeSize);
+        if (members == null || members.isEmpty()) {
+            return null;
+        }
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeId = typeId;
+        shape.typeIdSource = "handler-constructor-value-vptr";
+        shape.identityProven = true;
+        shape.identitySource =
+            "handler-value-vptr+is-default-window+constructor-member-providers";
+        shape.typeNameFull = typeName;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(typeName);
+        shape.typeNameSource = "az-rtti-vtable-provider";
+        shape.function = unmarshal.getEntryPoint();
+        shape.functionName = fullFunctionName(unmarshal);
+        shape.constructor = ownerConstructor;
+        shape.vtable = value.write().vtable;
+        shape.memberBase = "param_1";
+        shape.memberNameSource = "synthetic-provider-type";
+        shape.memberNamesProven = false;
+        shape.layoutProven = true;
+        shape.memberCoverageProven = true;
+        shape.wireOrderProven = true;
+        shape.wireOrderSource =
+            "cfg-unmarshal-order+constructor-provider-layout-cover";
+        shape.validation =
+            "handler-value-vptr+is-default-storage-pair+maximal-provider-layout-cover";
+        shape.nativeSize = nativeSize;
+        shape.nativeSizeSource = "field-handler-is-default-storage-pair";
+
+        populateHandlerValueLayoutMembers(shape, members, value.rootOffset());
+        return shape;
+    }
+
+    private Long handlerValueWindowSize(Address handlerVtable, long rootOffset) {
+        LinkedHashSet<Long> sizes = new LinkedHashSet<>();
+        for (HandlerValueWindow window : handlerValueStorageWindows(handlerVtable)) {
+            if (window.rootOffset() == rootOffset) {
+                sizes.add(window.nativeSize());
+            }
+        }
+        return sizes.size() == 1 ? sizes.iterator().next() : null;
+    }
+
+    private List<HandlerValueMemberProvider> handlerValueMemberProviders(
+        Address constructorAddress,
+        long handlerBase,
+        long rootOffset,
+        long nativeSize,
+        Map<Long, NestedTypeMember> observed) {
+
+        Function constructor = functionAtOrContaining(
+            resolvedCodeTarget(constructorAddress));
+        HighFunction high = highFunction(constructor);
+        Long windowEnd = addExactOrNull(rootOffset, nativeSize);
+        if (high == null || windowEnd == null) {
+            return List.of();
+        }
+
+        ArrayList<HandlerValueMemberProvider> result = new ArrayList<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3) {
+                continue;
+            }
+            PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+            if (destination == null || !"param_1".equals(destination.base)) {
+                continue;
+            }
+            Long relative = subtractExactOrNull(destination.offset, handlerBase);
+            if (relative == null || relative < rootOffset || relative >= windowEnd) {
+                continue;
+            }
+            HandlerValueMemberProvider provider = handlerValueMemberProvider(
+                operation,
+                relative,
+                windowEnd,
+                observed);
+            if (provider != null) {
+                result.add(provider);
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private HandlerValueMemberProvider handlerValueMemberProvider(
+        PcodeOpAST store,
+        long offset,
+        long windowEnd,
+        Map<Long, NestedTypeMember> observed) {
+
+        LinkedHashSet<Address> origins = new LinkedHashSet<>();
+        collectPcodeAddressOrigins(
+            store.getInput(2),
+            origins,
+            new LinkedHashSet<>());
+        LinkedHashMap<String, Address> providersByTypeId = new LinkedHashMap<>();
+        for (Address origin : origins) {
+            TypeIdDecode decoded = decodeDirectTypeIdProvider(origin);
+            if (decoded != null && decoded.typeId != null) {
+                providersByTypeId.putIfAbsent(normalizeUuid(decoded.typeId), origin);
+            }
+        }
+        if (providersByTypeId.size() != 1) {
+            return null;
+        }
+
+        Map.Entry<String, Address> identity = providersByTypeId.entrySet().iterator().next();
+        SerializeTypeInfo type = serializeTypesById.get(identity.getKey());
+        Long nativeSize = serializeTypeByteWidth(type);
+        List<SerializeWireSlot> expected = serializeTypeNativeWireLayout(identity.getKey());
+        Long end = nativeSize == null ? null : addExactOrNull(offset, nativeSize);
+        if (type == null || nativeSize == null || nativeSize <= 0L ||
+            expected.isEmpty() || end == null || end > windowEnd) {
+            return null;
+        }
+
+        LinkedHashSet<Long> coverage = new LinkedHashSet<>();
+        ArrayList<String> shapes = new ArrayList<>(expected.size());
+        ArrayList<String> layouts = new ArrayList<>(expected.size());
+        ArrayList<NestedTypeMember> ordered = new ArrayList<>(expected.size());
+        for (SerializeWireSlot slot : expected) {
+            Long observedOffset = addExactOrNull(offset, slot.offset);
+            NestedTypeMember member = observedOffset == null
+                ? null
+                : observed.get(observedOffset);
+            String layout = member == null
+                ? null
+                : member.wireLayout == null ? member.wireShape : member.wireLayout;
+            if (slot.wireShape == null || member == null || member.wireOrdinal == null ||
+                !canonicalLayoutWireShape(slot.wireShape).equals(
+                    canonicalLayoutWireShape(layout))) {
+                return null;
+            }
+            coverage.add(observedOffset);
+            shapes.add(slot.wireShape);
+            layouts.add(layout);
+            ordered.add(member);
+        }
+        for (Map.Entry<Long, NestedTypeMember> entry : observed.entrySet()) {
+            long observedOffset = entry.getKey();
+            if (observedOffset >= offset && observedOffset < end &&
+                !coverage.contains(observedOffset)) {
+                return null;
+            }
+        }
+        ordered.sort(Comparator.comparingInt(member -> member.wireOrdinal));
+        for (int index = 1; index < ordered.size(); index++) {
+            if (ordered.get(index).wireOrdinal != ordered.get(index - 1).wireOrdinal + 1) {
+                return null;
+            }
+        }
+        return new HandlerValueMemberProvider(
+            offset,
+            nativeSize,
+            type,
+            identity.getValue(),
+            store.getSeqnum().getTarget(),
+            Set.copyOf(coverage),
+            ordered.get(0).wireOrdinal,
+            ordered.get(ordered.size() - 1).wireOrdinal,
+            compositeWireShape(shapes),
+            compositeWireShape(layouts));
+    }
+
+    private String syntheticHandlerMemberName(String typeName) {
+        String leaf = NetworkSchemaText.sourceTypeLeaf(typeName);
+        if (leaf == null || leaf.isBlank()) {
+            return "field";
+        }
+        return leaf
+            .replaceAll("([A-Z]+)([A-Z][a-z])", "$1_$2")
+            .replaceAll("([a-z0-9])([A-Z])", "$1_$2")
+            .replaceAll("[^A-Za-z0-9]+", "_")
+            .replaceAll("^_+|_+$", "")
+            .toLowerCase(Locale.ROOT);
+    }
+
+    private record HandlerValueMemberProvider(
+        long offset,
+        long nativeSize,
+        SerializeTypeInfo type,
+        Address provider,
+        Address store,
+        Set<Long> coverage,
+        int firstWireOrdinal,
+        int lastWireOrdinal,
+        String wireShape,
+        String wireLayout) {
+
+        long end() {
+            return Math.addExact(offset, nativeSize);
+        }
+    }

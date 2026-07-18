@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct AudioTriggerCC4062C6;
+pub struct AudioTriggerCC4062C6 {}
 
 impl AzRtti for AudioTriggerCC4062C6 {
     const NAME: &'static str = "AudioTrigger";

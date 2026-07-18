@@ -312,6 +312,32 @@ pub trait GameSystemAssetSource {
     fn read_datasheet(&self, asset: &GameSystemAsset) -> Result<Vec<u8>, Self::Error>;
 }
 
+impl GameSystemAssetSource for nw_asset::AssetStore {
+    type Error = nw_asset::AssetStoreError;
+
+    fn datasheet_assets(&self) -> Result<Vec<GameSystemAsset>, Self::Error> {
+        Ok(self
+            .catalog()
+            .into_iter()
+            .flat_map(nw_asset::AssetCatalog::entries)
+            .filter(|entry| is_datasheet_path(entry.relative_path()))
+            .map(|entry| {
+                GameSystemAsset::with_asset_id(
+                    entry.relative_path().to_path_buf(),
+                    entry.asset_id(),
+                )
+            })
+            .collect())
+    }
+
+    fn read_datasheet(&self, asset: &GameSystemAsset) -> Result<Vec<u8>, Self::Error> {
+        match asset.asset_id() {
+            Some(asset_id) => self.read_required_id(asset_id),
+            None => self.read_required_path(&asset.path().to_string_lossy()),
+        }
+    }
+}
+
 /// Headless asset-catalog source for transform-time game-system datasheets.
 ///
 /// This is the `nw-extract` adapter for New World's shipped

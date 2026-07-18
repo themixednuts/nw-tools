@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfItemSheathed;
+pub struct ActionConditionIfItemSheathed {}
 
 impl AzRtti for ActionConditionIfItemSheathed {
     const NAME: &'static str = "ActionConditionIfItemSheathed";

@@ -1,0 +1,74 @@
+    private PcodeStorage pcodeScalarUnmarshalOutputStorage(
+        PcodeOp call,
+        String nativeType) {
+
+        return pcodeScalarUnmarshalOutputStorage(call, nativeTypeByteWidth(nativeType));
+    }
+
+    private PcodeStorage pcodeScalarUnmarshalOutputStorage(
+        PcodeOp call,
+        Integer nativeWidth) {
+
+        Function target = pcodeCallTarget(call);
+        Integer slot = scalarOutputParameterSlot(target, nativeWidth);
+        Function owner = call == null || call.getSeqnum() == null
+            ? null
+            : functionContaining(call.getSeqnum().getTarget());
+        if (slot == null) {
+            return null;
+        }
+        PcodeStorage storage = provenCallArgumentStorage(
+            owner,
+            call,
+            target,
+            slot);
+        return storage;
+    }
+
+    private Integer scalarOutputParameterSlot(Function target, Integer nativeWidth) {
+        if (target == null || target.getEntryPoint() == null || nativeWidth == null ||
+            nativeWidth <= 0) {
+            return null;
+        }
+        String key = functionCacheKey("scalar-output-slot-" + nativeWidth, target);
+        Integer cached = scalarOutputParameterSlotCache.get(key);
+        if (cached != null) {
+            return cached > 0 ? cached : null;
+        }
+
+        Integer returnedSlot = returnedParameterSlot(target);
+        LinkedHashSet<Integer> candidates = new LinkedHashSet<>();
+        HighFunction high = highFunction(target);
+        if (high != null) {
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (operation.getOpcode() != PcodeOp.STORE ||
+                    operation.getNumInputs() < 3 ||
+                    operation.getInput(2).getSize() != nativeWidth) {
+                    continue;
+                }
+                PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+                Integer slot = formalParameterSlot(destination);
+                if (slot != null && destination.offset == 0L &&
+                    !slot.equals(returnedSlot)) {
+                    candidates.add(slot);
+                }
+            }
+        }
+        Integer selected = candidates.size() == 1 ? candidates.iterator().next() : null;
+        scalarOutputParameterSlotCache.put(key, selected == null ? -1 : selected);
+        return selected;
+    }
+
+    private Set<PcodeStorage> scalarCallOutputStorages(PcodeOp call) {
+        Function target = pcodeCallTarget(call);
+        String nativeType = firstNonEmpty(
+            unmarshalNativeTypeFromTarget(target),
+            scalarOutputStoreNativeType(target));
+        Integer nativeWidth = nativeTypeByteWidth(nativeType);
+        if (nativeWidth == null) {
+            WireShape evidence = directCallWireEvidence((PcodeOpAST)call);
+            nativeWidth = evidence == null ? null : wireShapeByteWidth(evidence.shape);
+        }
+        PcodeStorage storage = pcodeScalarUnmarshalOutputStorage(call, nativeWidth);
+        return storage == null ? Collections.emptySet() : Set.of(storage);
+    }

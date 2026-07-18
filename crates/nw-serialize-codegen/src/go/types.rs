@@ -1,15 +1,17 @@
-use crate::naming::rust_type_name;
+use crate::naming::{rust_field_ident, rust_type_name};
 use crate::types::{ResolvedType, ScalarType, SequenceKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GoTypeOptions {
     pub use_support_aliases: bool,
+    pub idiomatic_initialisms: bool,
 }
 
 impl Default for GoTypeOptions {
     fn default() -> Self {
         Self {
             use_support_aliases: true,
+            idiomatic_initialisms: false,
         }
     }
 }
@@ -29,7 +31,14 @@ impl GoTypeRenderer {
     pub fn render(&self, resolved: &ResolvedType) -> String {
         match resolved {
             ResolvedType::Scalar(scalar) => self.render_scalar(*scalar).to_owned(),
-            ResolvedType::Named { source_name, .. } => rust_type_name(source_name),
+            ResolvedType::Named { source_name, .. } => {
+                let name = rust_type_name(source_name);
+                if self.options.idiomatic_initialisms {
+                    go_exported_identifier(&name)
+                } else {
+                    name
+                }
+            }
             ResolvedType::Sequence {
                 kind,
                 element,
@@ -45,7 +54,7 @@ impl GoTypeRenderer {
             }
             ResolvedType::Uid { .. } => {
                 if self.options.use_support_aliases {
-                    "Uuid".to_owned()
+                    self.uuid_type().to_owned()
                 } else {
                     "uuid.UUID".to_owned()
                 }
@@ -84,12 +93,12 @@ impl GoTypeRenderer {
             ScalarType::F32 => "float32",
             ScalarType::F64 => "float64",
             ScalarType::Bool => "bool",
-            ScalarType::Uuid if self.options.use_support_aliases => "Uuid",
+            ScalarType::Uuid if self.options.use_support_aliases => self.uuid_type(),
             ScalarType::Uuid => "uuid.UUID",
-            ScalarType::Crc32 if self.options.use_support_aliases => "Crc32",
+            ScalarType::Crc32 if self.options.use_support_aliases => self.crc32_type(),
             ScalarType::Crc32 => "az.Crc32",
             ScalarType::EntityId => "uint64",
-            ScalarType::AssetId if self.options.use_support_aliases => "AssetId",
+            ScalarType::AssetId if self.options.use_support_aliases => self.asset_id_type(),
             ScalarType::AssetId => "az.AssetId",
             ScalarType::Vector2 if self.options.use_support_aliases => "Vector2",
             ScalarType::Vector2 => "azmath.Vector2",
@@ -108,6 +117,30 @@ impl GoTypeRenderer {
             ScalarType::ColorB if self.options.use_support_aliases => "ColorB",
             ScalarType::ColorB => "azmath.ColorB",
             ScalarType::String => "string",
+        }
+    }
+
+    fn uuid_type(&self) -> &'static str {
+        if self.options.idiomatic_initialisms {
+            "UUID"
+        } else {
+            "Uuid"
+        }
+    }
+
+    fn crc32_type(&self) -> &'static str {
+        if self.options.idiomatic_initialisms {
+            "CRC32"
+        } else {
+            "Crc32"
+        }
+    }
+
+    fn asset_id_type(&self) -> &'static str {
+        if self.options.idiomatic_initialisms {
+            "AssetID"
+        } else {
+            "AssetId"
         }
     }
 
@@ -161,6 +194,73 @@ impl GoTypeRenderer {
     }
 }
 
+#[must_use]
+pub fn go_exported_identifier(source_name: &str) -> String {
+    rust_field_ident(source_name)
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            go_initialism(part)
+                .map(str::to_owned)
+                .unwrap_or_else(|| title_case(part))
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn go_initialism(value: &str) -> Option<&'static str> {
+    Some(match value.to_ascii_lowercase().as_str() {
+        "acl" => "ACL",
+        "ai" => "AI",
+        "api" => "API",
+        "ascii" => "ASCII",
+        "cpu" => "CPU",
+        "crc" => "CRC",
+        "css" => "CSS",
+        "db" => "DB",
+        "dns" => "DNS",
+        "dto" => "DTO",
+        "eof" => "EOF",
+        "guid" => "GUID",
+        "html" => "HTML",
+        "http" => "HTTP",
+        "https" => "HTTPS",
+        "id" => "ID",
+        "ip" => "IP",
+        "json" => "JSON",
+        "npc" => "NPC",
+        "pve" => "PVE",
+        "pvp" => "PVP",
+        "ram" => "RAM",
+        "rpc" => "RPC",
+        "rtti" => "RTTI",
+        "sql" => "SQL",
+        "ssh" => "SSH",
+        "tcp" => "TCP",
+        "tls" => "TLS",
+        "ttl" => "TTL",
+        "udp" => "UDP",
+        "ui" => "UI",
+        "uid" => "UID",
+        "uri" => "URI",
+        "url" => "URL",
+        "utf8" => "UTF8",
+        "uuid" => "UUID",
+        "vm" => "VM",
+        "xml" => "XML",
+        "xp" => "XP",
+        _ => return None,
+    })
+}
+
+fn title_case(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_ascii_uppercase().to_string() + chars.as_str()
+}
+
 fn go_resolved_type_is_comparable(resolved: &ResolvedType) -> bool {
     match resolved {
         ResolvedType::Scalar(_) | ResolvedType::Named { .. } | ResolvedType::Asset { .. } => true,
@@ -194,6 +294,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exports_parenthetical_plural_as_a_natural_identifier() {
+        assert_eq!(go_exported_identifier("Reward(s)"), "Rewards");
+    }
+
+    #[test]
     fn renders_semantic_aliases_when_support_types_are_enabled() {
         let renderer = GoTypeRenderer::default();
 
@@ -211,6 +316,7 @@ mod tests {
     fn renders_engine_selectors_when_support_aliases_are_disabled() {
         let renderer = GoTypeRenderer::new(GoTypeOptions {
             use_support_aliases: false,
+            idiomatic_initialisms: false,
         });
 
         assert_eq!(
@@ -227,6 +333,7 @@ mod tests {
     fn renders_az_math_semantics_through_support_package() {
         let renderer = GoTypeRenderer::new(GoTypeOptions {
             use_support_aliases: false,
+            idiomatic_initialisms: false,
         });
 
         assert_eq!(
@@ -305,6 +412,7 @@ mod tests {
     fn renders_inline_entry_containers_without_support_aliases() {
         let renderer = GoTypeRenderer::new(GoTypeOptions {
             use_support_aliases: false,
+            idiomatic_initialisms: false,
         });
 
         assert_eq!(

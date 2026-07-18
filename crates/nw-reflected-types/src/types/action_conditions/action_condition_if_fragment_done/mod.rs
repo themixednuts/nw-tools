@@ -21,7 +21,7 @@ pub use self::action_condition_if_fragment_playing::ActionConditionIfFragmentPla
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfFragmentDone;
+pub struct ActionConditionIfFragmentDone {}
 
 impl AzRtti for ActionConditionIfFragmentDone {
     const NAME: &'static str = "ActionConditionIfFragmentDone";

@@ -30,6 +30,62 @@
         return merged;
     }
 
+    private String pcodeNativeTypeAtValueWidth(String nativeType, int valueWidth) {
+        if (nativeType == null || valueWidth <= 0) {
+            return nativeType;
+        }
+        Integer nativeWidth = nativeTypeByteWidth(nativeType);
+        if (nativeWidth == null || nativeWidth == valueWidth) {
+            return nativeType;
+        }
+        return scalarNativeTypeFromByteWidth(valueWidth);
+    }
+
+    private WireShape pcodeStoredValueWireEvidence(
+        Varnode value,
+        Map<String, String> tempWireShapes,
+        Map<String, String> tempNativeTypes,
+        PcodeCallTargetInfo valueTarget,
+        String nativeType) {
+
+        WireShape evidence = valueTarget == null
+            ? null
+            : wireShapeEvidenceFromUnmarshalTarget(valueTarget.target, nativeType);
+        if (evidence != null) {
+            return evidence;
+        }
+        String shape = pcodeValueWireShape(value, tempWireShapes, tempNativeTypes);
+        return shape == null
+            ? null
+            : WireShape.semantic(shape, shape, "pcode-stored-value-lineage");
+    }
+
+    private String pcodePieceValueNativeType(
+        PcodeOp def,
+        Map<String, String> tempNativeTypes,
+        Set<String> seen,
+        int depth) {
+
+        if (def.getNumInputs() != 2 || def.getOutput() == null) {
+            return null;
+        }
+        String high = pcodeValueNativeType(
+            def.getInput(0),
+            tempNativeTypes,
+            new LinkedHashSet<>(seen),
+            depth);
+        String low = pcodeValueNativeType(
+            def.getInput(1),
+            tempNativeTypes,
+            new LinkedHashSet<>(seen),
+            depth);
+        Integer width = high == null ? null : nativeTypeByteWidth(high);
+        return high != null && high.equals(low) && width != null &&
+            width == def.getOutput().getSize()
+                ? high
+                : null;
+    }
+
     private String pcodeTempNativeType(
         Varnode node,
         Map<String, String> tempNativeTypes) {
@@ -64,47 +120,6 @@
         return tempWireShapes.get(storageKey(storage));
     }
 
-    private Long pcodeConstantValue(Varnode node, Set<String> seen, int depth) {
-        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
-            return null;
-        }
-        if (node.isConstant()) {
-            return node.getOffset();
-        }
-        String key = "constant:" + pcodeNodeKey(node);
-        if (!seen.add(key)) {
-            return null;
-        }
-        PcodeOp def = node.getDef();
-        if (def == null || def.getNumInputs() == 0) {
-            return null;
-        }
-        switch (def.getOpcode()) {
-            case PcodeOp.COPY:
-            case PcodeOp.CAST:
-            case PcodeOp.INT_ZEXT:
-            case PcodeOp.INT_SEXT:
-            case PcodeOp.SUBPIECE:
-                return pcodeConstantValue(def.getInput(0), seen, depth + 1);
-            case PcodeOp.INT_ADD: {
-                Long left =
-                    pcodeConstantValue(def.getInput(0), new LinkedHashSet<>(seen), depth + 1);
-                Long right =
-                    pcodeConstantValue(def.getInput(1), new LinkedHashSet<>(seen), depth + 1);
-                return left == null || right == null ? null : left + right;
-            }
-            case PcodeOp.INT_SUB: {
-                Long left =
-                    pcodeConstantValue(def.getInput(0), new LinkedHashSet<>(seen), depth + 1);
-                Long right =
-                    pcodeConstantValue(def.getInput(1), new LinkedHashSet<>(seen), depth + 1);
-                return left == null || right == null ? null : left - right;
-            }
-            default:
-                return null;
-        }
-    }
-
     private String pcodeHighName(Varnode node) {
         if (!(node instanceof VarnodeAST ast) || ast.getHigh() == null) {
             return null;
@@ -133,95 +148,15 @@
         if (node == null) {
             return "<null>";
         }
-        return node.getAddress() + ":" + node.getOffset() + ":" + node.getSize() +
-            ":" + node.isConstant();
+        if (node instanceof VarnodeAST ast) {
+            return "ssa:" + ast.getUniqueId();
+        }
+        return "storage:" + node.getAddress() + ":" + node.getOffset() + ":" +
+            node.getSize() + ":" + node.isConstant();
     }
 
-    private MessageHelperCall findMessageHelperCall(Function wrapper) {
-        for (Instruction instruction : functionInstructions(wrapper)) {
-            if (!instruction.getFlowType().isCall()) {
-                continue;
-            }
-            Address target = callTarget(instruction);
-            Function function = functionAtOrContaining(target);
-            if (function == null) {
-                continue;
-            }
-            String name = fullFunctionName(function);
-            if (name.contains("UnmarshalFields<")) {
-                MessageHelperCall call = new MessageHelperCall();
-                call.callsite = instruction.getMinAddress();
-                call.target = function.getEntryPoint();
-                call.targetName = name;
-                return call;
-            }
-        }
-        return null;
-    }
-
-    private String nativeTypeFromCast(String castType) {
-        if (castType == null) {
-            return null;
-        }
-        String normalized = castType
-            .replace("AZStd::", "")
-            .replace("_string", "string")
-            .replace(" *", "*")
-            .trim();
-        if (normalized.contains("unordered_map") &&
-            normalized.contains("u32") &&
-            normalized.contains("string")) {
-            return "unordered_map<u32,string>";
-        }
-        if (normalized.contains("string")) {
-            return "AZStd::string";
-        }
-        if (normalized.startsWith("bool")) {
-            return "bool";
-        }
-        if (normalized.startsWith("byte") || normalized.startsWith("undefined1")) {
-            return "u8";
-        }
-        if (normalized.startsWith("undefined2")) {
-            return "u16";
-        }
-        if (normalized.startsWith("undefined4")) {
-            return "u32";
-        }
-        if (normalized.startsWith("undefined8")) {
-            return "u64";
-        }
-        return normalized.replace("*", "").trim();
-    }
-
-    private boolean shouldUseTemplateType(String nativeType, String templateType) {
-        if (templateType == null || templateType.isEmpty()) {
-            return false;
-        }
-        if (nativeType == null) {
-            return true;
-        }
-        if ("u32".equals(nativeType)) {
-            return templateType.endsWith("Token") ||
-                templateType.endsWith("Values") ||
-                templateType.endsWith("Info") ||
-                templateType.endsWith("Data");
-        }
-        return false;
-    }
-
-    private boolean templateMatchesCast(String templateType, String nativeType) {
-        if (templateType == null || nativeType == null) {
-            return false;
-        }
-        if ("ClientVersionTokenMap".equals(templateType) &&
-            nativeType.contains("unordered_map<u32,string>")) {
-            return true;
-        }
-        if ("AZStd::string".equals(nativeType) && templateType.endsWith("String")) {
-            return true;
-        }
-        return false;
+    private String pcodeSsaNodeKey(Varnode node) {
+        return pcodeNodeKey(node);
     }
 
     private String wireShapeFromNativeType(String nativeType) {
@@ -307,7 +242,9 @@
         }
         if ("AZ::Uuid".equals(normalized) ||
             "AZ::TypeId".equals(normalized) ||
-            "Uuid".equals(normalized)) {
+            "Uuid".equals(normalized) ||
+            "Amazon::Pervasives::UID".equals(normalized) ||
+            normalized.startsWith("Amazon::Pervasives::UID<")) {
             return "fixed-bytes-16";
         }
         if (normalized.matches("fixed-bytes-[1-9][0-9]*")) {
@@ -378,9 +315,6 @@
 
     private FieldCall recoverFieldCall(Function owner, Address callsite, int index) {
         ArgState state = recoverForwardArgState(owner, callsite);
-        ArgState fallback = recoverBackwardArgState(owner, callsite);
-        state.fillMissingFrom(fallback);
-
         return fieldCallFromArgState(owner, callsite, index, state);
     }
 
@@ -399,16 +333,54 @@
         field.handlerOffset = state.handlerOffset;
         field.handlerExpression = state.handlerExpression;
         field.handlerVtable = state.handlerVtable;
-        field.handlerConstruction = state.handlerConstruction;
+        field.handlerConstruction = handlerConstructionOwnedBy(
+            owner,
+            state.handlerConstruction);
         field.constructorWrites = state.handlerConstructorWrites;
         field.registrationKind = "field";
-        applyFieldHandlerShape(field, fieldHandlerShape(field.handlerVtable));
-        field.handlerTypeName = fieldHandlerTypeName(field.handlerConstruction, field.handlerVtable);
-        enrichFieldFromHandlerType(field);
         field.confidence = field.name == null
             ? "register-field-call-unresolved-name"
             : "register-field-call";
         return field;
+    }
+
+    private HandlerConstruction handlerConstructionOwnedBy(
+        Function owner,
+        HandlerConstruction construction) {
+
+        if (construction == null || construction.constructor != null || owner == null ||
+            construction.callsite == null) {
+            return construction;
+        }
+        Function writeOwner = functionAtOrContaining(construction.callsite);
+        if (writeOwner == null ||
+            !writeOwner.getEntryPoint().equals(owner.getEntryPoint())) {
+            return construction;
+        }
+        return new HandlerConstruction(
+            construction.pattern,
+            construction.callsite,
+            owner.getEntryPoint(),
+            fullFunctionName(owner),
+            construction.vtable);
+    }
+
+    private void enrichRegistrationFieldHandlers(
+        Map<String, RegistrationFunction> registrationFunctions) {
+
+        if (registrationFunctions == null) {
+            return;
+        }
+        for (RegistrationFunction function : registrationFunctions.values()) {
+            for (FieldCall field : function.fields) {
+                field.handlerConstruction = handlerConstructionOwnedBy(
+                    function.function,
+                    field.handlerConstruction);
+                applyFieldHandlerShape(field, fieldHandlerShape(field.handlerVtable));
+                field.handlerTypeName =
+                    fieldHandlerTypeName(field.handlerConstruction, field.handlerVtable);
+            }
+        }
     }
 
     private void applyFieldHandlerShape(FieldCall field, FieldHandlerShape shape) {
@@ -417,15 +389,32 @@
         }
 
         field.handlerKind = shape.kind;
+        field.handlerKindSource = shape.kindSource;
         field.handlerVtableSlots = shape.vtableSlots;
         field.physicalFieldCount = shape.physicalFieldCount;
-        if (shape.wireShape != null) {
-            field.wireShape = shape.wireShape.shape;
-            field.wireShapeSource = shape.wireShape.source;
+        applyWireEvidence(field, shape.wireShape);
+        if (shape.handlerWireEvidence != null) {
+            field.fixedSequenceShape = shape.handlerWireEvidence.selectedSequence;
         }
 
         ContainerWireShape container = shape.containerWireShape;
         if (container == null) {
+            if (field.nestedTypeShape == null) {
+                field.nestedTypeShape = recoverHandlerValueTypeShape(field);
+            }
+            if (field.nestedTypeShape != null && field.sourceTypeName == null) {
+                field.sourceTypeName = field.nestedTypeShape.typeNameFull;
+            }
+            if (field.wireShape == null && field.nestedTypeShape != null) {
+                String nestedWireShape = wireShapeFromNestedTypeShape(field.nestedTypeShape);
+                if (nestedWireShape != null) {
+                    applyWireEvidence(
+                        field,
+                        WireShape.semantic(
+                            nestedWireShape,
+                            "handler-value-complete-nested-shape"));
+                }
+            }
             return;
         }
         if (field.nestedTypeShape == null && container.valueTypeShape != null) {
@@ -433,119 +422,22 @@
         }
         if (field.wireShape == null) {
             WireShape derivedShape = scalarContainerWireShape(container);
-            if (derivedShape != null) {
-                field.wireShape = derivedShape.shape;
-                field.wireShapeSource = derivedShape.source;
-            }
+            applyWireEvidence(field, derivedShape);
         }
     }
 
-    private void enrichFieldFromHandlerType(FieldCall field) {
-        if (field == null || field.handlerTypeName == null) {
+    private void applyWireEvidence(FieldCall field, WireShape evidence) {
+        if (field == null || evidence == null) {
             return;
         }
-
-        if (field.nativeType == null) {
-            field.nativeType = field.handlerTypeName;
+        if (evidence.shape != null && field.wireShape == null) {
+            field.wireShape = evidence.shape;
+            field.wireShapeSource = evidence.source;
         }
-        if (field.sourceTypeName == null) {
-            field.sourceTypeName = field.handlerTypeName;
+        if (evidence.layout != null && field.wireLayout == null) {
+            field.wireLayout = evidence.layout;
+            field.wireLayoutSource = evidence.layoutSource;
         }
-        if (field.wireShape == null) {
-            WireShape wireShape = wireShapeFromHandlerTypeName(field.handlerTypeName);
-            if (wireShape != null) {
-                field.wireShape = wireShape.shape;
-                field.wireShapeSource = wireShape.source;
-            }
-        }
-    }
-
-    private WireShape wireShapeFromHandlerTypeName(String handlerTypeName) {
-        NetworkTemplateType type = parseNetworkTemplateType(handlerTypeName);
-        if (type == null) {
-            return null;
-        }
-
-        if (type.simpleName.equals("ReplicatedFieldHandler") && !type.args.isEmpty()) {
-            String shape = wireShapeFromReplicatedFieldHandlerArgs(type.args);
-            return shape == null ? null : new WireShape(shape, "handler-template-type");
-        }
-
-        if (type.simpleName.equals("ReplicatedMapFieldHandler") ||
-            type.simpleName.equals("ReplicatedContainer")) {
-            String shape = wireShapeFromKeyValueHandlerArgs(type.args);
-            return shape == null ? null : new WireShape(shape, "handler-template-type");
-        }
-
-        if (type.simpleName.equals("ReplicatedVectorFieldHandler") && !type.args.isEmpty()) {
-            String valueShape = wireShapeFromNativeTypeOrMarshaller(type.args.get(0), null);
-            return valueShape == null
-                ? null
-                : new WireShape(containerShape("u32", valueShape), "handler-template-type");
-        }
-
-        if (type.simpleName.equals("ReplicatedSetFieldHandler") && !type.args.isEmpty()) {
-            String keyShape = wireShapeFromNativeTypeOrMarshaller(type.args.get(0), null);
-            return keyShape == null
-                ? null
-                : new WireShape(containerShape(keyShape, keyShape), "handler-template-type");
-        }
-
-        if ((type.simpleName.equals("DeltaCompressedReplicatedFieldHandler") ||
-            type.simpleName.equals("DeltaCompressedReplicatedFieldHandlerBase") ||
-            type.simpleName.equals("DeltaCompressedCounterHandler") ||
-            type.simpleName.equals("DynamicDeltaReplicatedFieldHandler")) &&
-            !type.args.isEmpty()) {
-            String shape = wireShapeFromNativeTypeOrMarshaller(type.args.get(0), null);
-            return shape == null ? null : new WireShape(shape, "handler-template-type");
-        }
-
-        if (type.simpleName.equals("FloatTimerDeltaReplicatedField")) {
-            return new WireShape("u8", "handler-template-type-physical-lane");
-        }
-        return null;
-    }
-
-    private String wireShapeFromSourceTypeName(String sourceTypeName) {
-        if (sourceTypeName == null) {
-            return null;
-        }
-        for (String part : sourceTypeName.split(",")) {
-            String trimmed = part.trim();
-            if (!trimmed.isEmpty() && !"composite".equals(trimmed)) {
-                String shape = wireShapeFromNativeType(trimmed);
-                if (shape != null) {
-                    return shape;
-                }
-            }
-        }
-        return null;
-    }
-
-    private String wireShapeFromReplicatedFieldHandlerArgs(List<String> args) {
-        String nativeType = args.isEmpty() ? null : args.get(0);
-        String marshallerType = args.size() > 1 ? args.get(1) : null;
-        return wireShapeFromNativeTypeOrMarshaller(nativeType, marshallerType);
-    }
-
-    private String wireShapeFromKeyValueHandlerArgs(List<String> args) {
-        if (args.size() < 2) {
-            return null;
-        }
-
-        String keyMarshaller = args.size() >= 4 ? args.get(args.size() - 2) : null;
-        String valueMarshaller = args.size() >= 4 ? args.get(args.size() - 1) : null;
-        String keyShape = wireShapeFromNativeTypeOrMarshaller(args.get(0), keyMarshaller);
-        String valueShape = wireShapeFromNativeTypeOrMarshaller(args.get(1), valueMarshaller);
-        return containerShape(keyShape, valueShape);
-    }
-
-    private String wireShapeFromNativeTypeOrMarshaller(String nativeType, String marshallerType) {
-        String fromMarshaller = wireShapeFromMarshallerType(marshallerType);
-        if (fromMarshaller != null) {
-            return fromMarshaller;
-        }
-        return wireShapeFromNativeType(nativeType);
     }
 
     private String wireShapeFromMarshallerType(String marshallerType) {
@@ -556,18 +448,17 @@
         if (normalized.contains("HalfMarshaler")) {
             return "half-f32";
         }
-        if (normalized.contains("PositionAnchorMarshaler")) {
-            return "position-anchor";
-        }
         if (normalized.contains("NonUniformScaleCompMarshaler")) {
             return "non-uniform-scale-comp";
         }
         if (normalized.contains("Vec2CompMarshaler")) {
             return "vec2-comp";
         }
-        if (normalized.contains("Vec3CompNormMarshaler") ||
-            normalized.contains("PackedNormalizedVec3Marshaller")) {
+        if (normalized.contains("Vec3CompNormMarshaler")) {
             return "vec3-comp-norm";
+        }
+        if (normalized.contains("PackedNormalizedVec3Marshaller")) {
+            return "vec3-smallest-three";
         }
         if (normalized.contains("Vec3CompMarshaler")) {
             return "vec3-comp";
@@ -586,16 +477,15 @@
         if (normalized.contains("VlqU64Marshaler")) {
             return "vlq-u64";
         }
-        if (normalized.contains("QuatSmallestThreeQuantizedMarshaler")) {
+        if (normalized.contains("QuatSmallestThreeQuantizedMarshaler") ||
+            normalized.contains("PackedQuaternionMarshaller") ||
+            normalized.contains("QuatCompressSmallestThree")) {
             return "quat-smallest-three";
         }
-        if (normalized.contains("PackedQuaternionMarshaller") ||
-            normalized.contains("QuatCompNormMarshaler") ||
-            normalized.contains("QuatCompressSmallestThree")) {
+        if (normalized.contains("QuatCompNormMarshaler")) {
             return "quat-comp-norm";
         }
-        if (normalized.contains("QuatCompMarshaler") ||
-            normalized.contains("PackedQuaternionMarshaller")) {
+        if (normalized.contains("QuatCompMarshaler")) {
             return "quat-comp";
         }
         if (normalized.contains("TransformCompressor")) {
@@ -608,37 +498,8 @@
     }
 
     private String unmarshalWireShapeFromTarget(Function target) {
-        String name = fullFunctionName(target);
-        if (name == null) {
-            return null;
-        }
-        String custom = wireShapeFromMarshallerType(name);
-        if (custom != null) {
-            return custom;
-        }
-        if (name.contains("SequenceNumber>::Unmarshal")) {
-            return "sequence-number";
-        }
-        return null;
-    }
-
-    private ArgState recoverBackwardArgState(Function owner, Address callsite) {
-        ArgState state = new ArgState();
-        Instruction cursor = currentProgram.getListing().getInstructionBefore(callsite);
-        for (int i = 0; i < BACKWARD_ARGUMENT_SCAN_LIMIT && cursor != null; i++) {
-            if (!owner.getBody().contains(cursor.getMinAddress())) {
-                break;
-            }
-            observeArgumentAssignment(cursor, state);
-            if (state.nameAddress != null && state.groupKnown && state.handlerKnown) {
-                break;
-            }
-            if (cursor.getFlowType().isCall()) {
-                break;
-            }
-            cursor = cursor.getPrevious();
-        }
-        return state;
+        WireShape evidence = validatedUnmarshalLeaf(target);
+        return evidence == null ? null : evidence.shape;
     }
 
     private ArgState recoverForwardArgState(Function owner, Address callsite) {
@@ -681,7 +542,7 @@
                     state.constructorWritesByHandlerOffset.get(handler.thisOffset);
             }
             else if (handler.baseKey != null && handler.baseOffset != null) {
-                String key = baseOffsetKey(handler.baseKey, handler.baseOffset);
+                ObjectOffset key = baseOffsetKey(handler.baseKey, handler.baseOffset);
                 result.handlerExpression = handler.expression;
                 result.handlerVtable = state.vtablesByBaseOffset.get(key);
                 result.handlerConstruction = state.handlerConstructionsByBaseOffset.get(key);
@@ -724,10 +585,6 @@
             ForwardArgState cached = inheritedForwardStateCache.get(key);
             return cached == null ? null : cached.copy();
         }
-        if (activeFunctions.size() >= INHERITED_FORWARD_STATE_RECURSION_LIMIT) {
-            return null;
-        }
-
         String activeKey = owner.getEntryPoint().toString();
         if (!activeFunctions.add(activeKey)) {
             return null;
@@ -864,6 +721,12 @@
                 return;
             }
 
+            if (!observeConstructors) {
+                clearVolatileRegisters(state.registers);
+                clearVolatileAllocatorDispatchRegisters(state);
+                return;
+            }
+
             TrackedValue formattedFieldName = formattedFieldNameCallValue(instruction, state);
 
             if (isAllocatorCall(instruction, state)) {
@@ -879,11 +742,9 @@
 
             boolean addFilterGroupCall = isAddFilterGroupCall(instruction, state);
             promoteReplicatedStateConstructorReceiver(instruction, state);
-            if (observeConstructors) {
-                observeHandlerConstructorMemsetCall(instruction, state);
-                observeVectorFieldHandlerConstructorCall(instruction, state);
-                observeFieldHandlerConstructorCall(instruction, state);
-            }
+            observeHandlerConstructorMemsetCall(instruction, state);
+            observeVectorFieldHandlerConstructorCall(instruction, state);
+            observeFieldHandlerConstructorCall(instruction, state);
             clearVolatileRegisters(state.registers);
             clearVolatileAllocatorDispatchRegisters(state);
             if (formattedFieldName != null) {

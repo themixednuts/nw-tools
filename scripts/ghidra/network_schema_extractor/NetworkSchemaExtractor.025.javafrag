@@ -385,99 +385,6 @@
         return cachedInstructions;
     }
 
-    private List<Instruction> linearInstructions(Address address, int limit) {
-        if (!isExecutableAddress(address) || limit <= 0) {
-            return List.of();
-        }
-
-        ArrayList<Instruction> instructions = new ArrayList<>();
-        Address cursor = address;
-        for (int i = 0; i < limit; i++) {
-            Instruction instruction = currentProgram.getListing().getInstructionAt(cursor);
-            if (instruction == null) {
-                break;
-            }
-            instructions.add(instruction);
-
-            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-            if (mnemonic != null &&
-                (mnemonic.startsWith("RET") ||
-                    mnemonic.startsWith("INT") ||
-                    "CCH".equals(mnemonic))) {
-                break;
-            }
-
-            Address fallThrough = instruction.getFallThrough();
-            if (fallThrough == null || !isProgramAddress(fallThrough)) {
-                break;
-            }
-            cursor = fallThrough;
-        }
-        return instructions;
-    }
-
-    private List<Instruction> reachableInstructions(Address address, int limit) {
-        if (!isExecutableAddress(address) || limit <= 0) {
-            return List.of();
-        }
-
-        ArrayList<Instruction> instructions = new ArrayList<>();
-        Deque<Address> pending = new ArrayDeque<>();
-        LinkedHashSet<String> seen = new LinkedHashSet<>();
-        pending.add(address);
-
-        while (!pending.isEmpty() && instructions.size() < limit) {
-            Address cursor = pending.removeFirst();
-            while (instructions.size() < limit) {
-                if (!isExecutableAddress(cursor) || !seen.add(cursor.toString())) {
-                    break;
-                }
-
-                Instruction instruction = currentProgram.getListing().getInstructionAt(cursor);
-                if (instruction == null) {
-                    break;
-                }
-                instructions.add(instruction);
-
-                String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-                if (mnemonic != null &&
-                    (mnemonic.startsWith("RET") ||
-                        mnemonic.startsWith("INT") ||
-                        "CCH".equals(mnemonic))) {
-                    break;
-                }
-
-                Address fallThrough = instruction.getFallThrough();
-                boolean branch = false;
-                boolean unconditionalJump = false;
-                if (!instruction.getFlowType().isCall()) {
-                    Address[] flows = instruction.getFlows();
-                    if (flows != null) {
-                        for (Address flow : flows) {
-                            if (!isExecutableAddress(flow) || flow.equals(fallThrough)) {
-                                continue;
-                            }
-                            branch = true;
-                            if (!seen.contains(flow.toString())) {
-                                pending.addFirst(flow);
-                            }
-                        }
-                    }
-                    unconditionalJump = mnemonic != null && mnemonic.startsWith("JMP");
-                }
-
-                if (fallThrough == null ||
-                    !isProgramAddress(fallThrough) ||
-                    unconditionalJump ||
-                    (branch && fallThrough.equals(cursor))) {
-                    break;
-                }
-                cursor = fallThrough;
-            }
-        }
-        return instructions;
-    }
-
     private Address parseCapturedAddress(String value) {
         if (value == null || value.isEmpty()) {
             return null;
@@ -660,13 +567,79 @@
             return null;
         }
 
+        String loaded = canonicalUuidFromNativeUuidBytes(
+            readProgramBytes(address, 39));
+        if (loaded != null) {
+            return loaded;
+        }
+        String original = canonicalUuidFromNativeUuidBytes(
+            readOriginalFileBytes(address, 39));
+        if (original != null) {
+            runMetrics.increment("nativeUuidOriginalFileByteRecoveries");
+        }
+        return original;
+    }
+
+    private byte[] readProgramBytes(Address address, int length) {
+        byte[] bytes = new byte[length];
+        try {
+            return currentProgram.getMemory().getBytes(address, bytes) == length
+                ? bytes
+                : null;
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private byte[] readOriginalFileBytes(Address address, int length) {
+        MemoryBlock block = currentProgram.getMemory().getBlock(address);
+        if (block == null) {
+            return null;
+        }
+        for (MemoryBlockSourceInfo source : block.getSourceInfos()) {
+            if (!source.contains(address)) {
+                continue;
+            }
+            Optional<FileBytes> fileBytes = source.getFileBytes();
+            long fileOffset = source.getFileBytesOffset(address);
+            if (fileBytes.isEmpty() || fileOffset < 0) {
+                continue;
+            }
+            long available = source.getMaxAddress().subtract(address) + 1;
+            int readLength = Math.toIntExact(Math.min(available, length));
+            if (readLength < 37) {
+                continue;
+            }
+            byte[] bytes = new byte[readLength];
+            try {
+                return fileBytes.get().getOriginalBytes(fileOffset, bytes) == readLength
+                    ? bytes
+                    : null;
+            }
+            catch (Exception ignored) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private String canonicalUuidFromNativeUuidBytes(byte[] literal) {
+        if (literal == null || literal.length < 37) {
+            return null;
+        }
+
         byte[] uuid = new byte[16];
         try {
-            boolean braced = (getByte(address) & 0xff) == '{';
+            boolean braced = (literal[0] & 0xff) == '{';
+            int requiredLength = braced ? 39 : 37;
+            if (literal.length < requiredLength) {
+                return null;
+            }
             int start = braced ? 1 : 0;
             int nibble = 0;
             for (int i = 0; i < 36; i++) {
-                int value = getByte(address.add(start + (long)i)) & 0xff;
+                int value = literal[start + i] & 0xff;
                 if (isUuidDashOffset(i)) {
                     if (value != '-') {
                         return null;
@@ -690,16 +663,16 @@
                 return null;
             }
             if (braced) {
-                if ((getByte(address.add(37L)) & 0xff) != '}') {
+                if ((literal[37] & 0xff) != '}') {
                     return null;
                 }
-                int terminator = getByte(address.add(38L)) & 0xff;
+                int terminator = literal[38] & 0xff;
                 if (terminator != 0) {
                     return null;
                 }
             }
             else {
-                int terminator = getByte(address.add(36L)) & 0xff;
+                int terminator = literal[36] & 0xff;
                 if (terminator != 0) {
                     return null;
                 }
@@ -881,8 +854,13 @@
         }
     }
 
-    private String firstNonEmpty(String left, String right) {
-        return left != null && !left.isEmpty() ? left : right;
+    private String firstNonEmpty(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isEmpty()) {
+                return value;
+            }
+        }
+        return null;
     }
 
     private Integer firstNonNull(Integer left, Integer right) {

@@ -28,6 +28,34 @@ use crate::visit::{
 };
 use crate::{Element, ObjectStream, StreamTag, types};
 
+/// Find a direct child by serialized field name without assuming that a
+/// binary ObjectStream was decoded with a complete name table.
+///
+/// XML/JSON streams preserve the field spelling, while binary streams may
+/// only retain the AZ name CRC. Callers that know the schema's CRC can use
+/// this one helper for both encodings.
+#[must_use]
+pub fn child_by_field_ignore_case_or_crc<'a>(
+    element: &'a Element,
+    field: &str,
+    name_crc: u32,
+) -> Option<&'a Element> {
+    element
+        .children()
+        .iter()
+        .find(|child| {
+            child
+                .field()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(field))
+        })
+        .or_else(|| {
+            element
+                .children()
+                .iter()
+                .find(|child| child.name_crc() == Some(name_crc))
+        })
+}
+
 /// Owned snapshot of an element header — the data the streaming
 /// visitor sees borrowed.
 #[derive(Debug, Clone, PartialEq, Eq)]

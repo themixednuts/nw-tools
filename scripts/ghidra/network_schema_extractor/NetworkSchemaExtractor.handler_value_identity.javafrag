@@ -1,0 +1,384 @@
+    private NestedTypeShape recoverHandlerValueTypeShape(FieldCall field) {
+        if (field == null || field.handlerVtable == null || field.handlerOffset == null ||
+            handlerOwnerConstructor(field) == null) {
+            return null;
+        }
+
+        String cacheKey = addressCacheKey("handler-value-shape", field.handlerVtable);
+        if (nestedTypeShapeCache.containsKey(cacheKey)) {
+            return nestedTypeShapeCache.get(cacheKey);
+        }
+
+        NestedTypeShape shape = recoverHandlerValueTypeShapeUncached(field);
+        if (shape != null) {
+            nestedTypeShapeCache.put(cacheKey, shape);
+        }
+        return shape;
+    }
+
+    private NestedTypeShape recoverHandlerValueTypeShapeUncached(FieldCall field) {
+        Address unmarshal = readPointer(
+            field.handlerVtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        Function function = functionAtOrContaining(resolvedCodeTarget(unmarshal));
+        LinkedHashMap<Long, NestedTypeMember> observed = rootedHandlerPayloadMembers(function);
+        if (function == null || observed.isEmpty()) {
+            return null;
+        }
+
+        NestedTypeShape layout = anonymousHandlerValueShape(field, function, observed);
+        NestedTypeShape selected = null;
+        for (HandlerValueVptr candidate : handlerValueVptrCandidates(field)) {
+            NestedTypeShape shape = handlerValueShapeForCandidate(
+                field,
+                function,
+                observed,
+                candidate,
+                layout);
+            if (shape == null) {
+                continue;
+            }
+            if (selected != null && !uuidEquals(selected.typeId, shape.typeId)) {
+                recordNestedTypeShapeReject("ambiguous-handler-value-type");
+                return null;
+            }
+            selected = shape;
+        }
+        if (selected == null) {
+            selected = registeredHandlerValueShape(function, layout);
+            if (selected == null) {
+                selected = uniqueSerializeHandlerValueShape(field, function, layout);
+                if (selected == null) {
+                    selected = layout;
+                }
+            }
+        }
+        if (selected == null) {
+            recordNestedTypeShapeReject("handler-value-constructor-layout-mismatch");
+        }
+        else {
+            enrichKnownSerializeIdentity(selected);
+            nestedTypeShapesRecovered++;
+        }
+        return selected;
+    }
+
+    private Address handlerOwnerConstructor(FieldCall field) {
+        if (field == null || field.handlerConstruction == null) {
+            return null;
+        }
+        if (field.handlerConstruction.constructor != null) {
+            Function constructor = functionAtOrContaining(
+                resolvedCodeTarget(field.handlerConstruction.constructor));
+            return constructor == null ? null : constructor.getEntryPoint();
+        }
+        if (!"inline-vtable-write".equals(field.handlerConstruction.pattern) ||
+            field.handlerConstruction.callsite == null ||
+            field.handlerOffset == null || field.handlerVtable == null) {
+            return null;
+        }
+
+        Function owner = functionAtOrContaining(field.handlerConstruction.callsite);
+        if (owner == null) {
+            return null;
+        }
+        int matches = 0;
+        for (VtableWrite write : constructorVtableWrites(owner.getEntryPoint())) {
+            if (write.thisOffset != null &&
+                write.thisOffset.longValue() == field.handlerOffset.longValue() &&
+                field.handlerVtable.equals(write.vtable)) {
+                matches++;
+            }
+        }
+        return matches == 1 ? owner.getEntryPoint() : null;
+    }
+
+    private NestedTypeShape handlerValueShapeForCandidate(
+        FieldCall field,
+        Function function,
+        LinkedHashMap<Long, NestedTypeMember> observed,
+        HandlerValueVptr candidate,
+        NestedTypeShape layout) {
+
+        AzRttiEvidence rtti = decodeAzRttiFromVtable(candidate.write().vtable);
+        if (rtti == null || rtti.typeId == null) {
+            return null;
+        }
+        String typeId = normalizeUuid(rtti.typeId);
+        SerializeTypeInfo reflected = serializeTypesById.get(typeId);
+        if (reflected == null) {
+            return unreflectedHandlerValueShape(
+                field,
+                function,
+                observed,
+                candidate,
+                rtti,
+                typeId);
+        }
+        Long nativeSize = serializeTypeByteWidth(reflected);
+        if (nativeSize == null || nativeSize.longValue() != candidate.nativeSize()) {
+            return null;
+        }
+        List<SerializeWireSlot> expected = serializeTypeNativeWireLayout(typeId);
+        LinkedHashMap<Long, NestedTypeMember> payload = handlerPayloadMembersInWindow(
+            observed,
+            candidate.rootOffset(),
+            nativeSize == null ? 0L : nativeSize);
+        if (reflected == null || nativeSize == null || nativeSize <= 0L || expected.isEmpty() ||
+            payload.isEmpty()) {
+            return null;
+        }
+
+        NestedTypeShape shape = exactContainerValueShapeForBase(
+            reflected,
+            function,
+            candidate.write().vtable,
+            "param_1",
+            payload,
+            expected,
+            nativeSize,
+            candidate.rootOffset());
+        if (shape == null) {
+            shape = customCodecHandlerValueShape(layout, reflected, rtti, candidate);
+            if (shape == null) {
+                return null;
+            }
+            return shape;
+        }
+
+        String typeName = rtti.selectedProviderTypeName();
+        if (!isPlausibleTypeName(typeName)) {
+            typeName = reflected.name;
+        }
+        shape.typeId = typeId;
+        shape.typeIdSource = "handler-constructor-value-vptr";
+        shape.identityProven = true;
+        shape.identitySource =
+            "handler-payload-flow+constructor-vptr+exact-serialize-layout";
+        shape.typeNameFull = isPlausibleTypeName(typeName) ? typeName : reflected.name;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(shape.typeNameFull);
+        shape.typeNameSource = isPlausibleTypeName(typeName)
+            ? "az-rtti-vtable-provider"
+            : "serialize-type-id";
+        shape.constructor = handlerOwnerConstructor(field);
+        shape.vtable = candidate.write().vtable;
+        shape.validation =
+            "handler-payload-flow+most-derived-constructor-vptr+exact-native-wire-layout";
+        shape.nativeSize = nativeSize;
+        shape.nativeSizeSource = "serialize-exact-field-span";
+        for (NestedTypeMember member : shape.members) {
+            member.typeIdentitySource = shape.identitySource;
+        }
+        return shape;
+    }
+
+    private NestedTypeShape customCodecHandlerValueShape(
+        NestedTypeShape shape,
+        SerializeTypeInfo reflected,
+        AzRttiEvidence rtti,
+        HandlerValueVptr candidate) {
+
+        if (shape == null || reflected == null || candidate == null ||
+            shape.nativeSize == null ||
+            shape.nativeSize.longValue() != candidate.nativeSize()) {
+            return null;
+        }
+        String typeName = rtti.selectedProviderTypeName();
+        if (!isPlausibleTypeName(typeName)) {
+            typeName = reflected.name;
+        }
+        shape.typeId = normalizeUuid(reflected.typeId);
+        shape.typeIdSource = "handler-constructor-top-level-value-vptr";
+        shape.identityProven = true;
+        shape.identitySource =
+            "handler-top-level-storage-window+constructor-vptr+az-rtti";
+        shape.typeNameFull = isPlausibleTypeName(typeName) ? typeName : reflected.name;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(shape.typeNameFull);
+        shape.typeNameSource = isPlausibleTypeName(typeName)
+            ? "az-rtti-vtable-provider"
+            : "serialize-type-id";
+        shape.vtable = candidate.write().vtable;
+        shape.validation = appendValidation(
+            shape.validation,
+            "custom-codec-over-proven-top-level-native-value");
+        for (NestedTypeMember member : shape.members) {
+            member.typeIdentitySource = shape.identitySource;
+        }
+        return shape;
+    }
+
+    private List<HandlerValueVptr> handlerValueVptrCandidates(FieldCall field) {
+        List<HandlerValueWindow> windows = handlerValueStorageWindows(field.handlerVtable);
+        if (windows.size() != 1) {
+            return Collections.emptyList();
+        }
+        HandlerValueWindow window = windows.get(0);
+        Address ownerConstructor = handlerOwnerConstructor(field);
+        if (ownerConstructor == null) {
+            return Collections.emptyList();
+        }
+        List<VtableWrite> writes = constructorVtableWrites(ownerConstructor);
+        Long handlerBase = handlerBaseOffsetInConstructor(field, writes);
+        if (handlerBase == null) {
+            return Collections.emptyList();
+        }
+
+        LinkedHashMap<Long, VtableWrite> byRoot = new LinkedHashMap<>();
+        for (VtableWrite write : writes) {
+            if (write.thisOffset == null) {
+                continue;
+            }
+            long relativeOffset;
+            try {
+                relativeOffset = Math.subtractExact(write.thisOffset.longValue(), handlerBase);
+            }
+            catch (ArithmeticException ignored) {
+                continue;
+            }
+            if (relativeOffset != window.rootOffset()) {
+                continue;
+            }
+            VtableWrite previous = byRoot.get(relativeOffset);
+            if (previous == null || write.order > previous.order) {
+                byRoot.put(relativeOffset, write);
+            }
+        }
+        ArrayList<HandlerValueVptr> result = new ArrayList<>();
+        for (Map.Entry<Long, VtableWrite> entry : byRoot.entrySet()) {
+            result.add(new HandlerValueVptr(
+                entry.getKey(),
+                window.nativeSize(),
+                entry.getValue()));
+        }
+        return result;
+    }
+
+    private Long handlerBaseOffsetInConstructor(
+        FieldCall field,
+        List<VtableWrite> writes) {
+
+        LinkedHashSet<Long> offsets = new LinkedHashSet<>();
+        for (VtableWrite write : writes) {
+            if (write.thisOffset != null && field.handlerVtable.equals(write.vtable)) {
+                offsets.add(write.thisOffset.longValue());
+            }
+        }
+        if (offsets.isEmpty()) {
+            return null;
+        }
+        if (offsets.size() == 1) {
+            return offsets.iterator().next();
+        }
+        long fieldOffset = field.handlerOffset.longValue();
+        if (offsets.contains(fieldOffset)) {
+            return fieldOffset;
+        }
+        recordNestedTypeShapeReject("ambiguous-handler-base-in-constructor");
+        return null;
+    }
+
+    private LinkedHashMap<Long, NestedTypeMember> rootedHandlerPayloadMembers(
+        Function unmarshal) {
+
+        LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> byBase =
+            new LinkedHashMap<>();
+        LinkedHashMap<String, PcodeStorage> roots = new LinkedHashMap<>();
+        roots.put("param_1", new PcodeStorage("param_1", 0L));
+        roots.put("param_2", new PcodeStorage("read-buffer", 0L));
+        collectContainerValuePcodeMemberCandidates(byBase, unmarshal, roots);
+
+        LinkedHashMap<Long, NestedTypeMember> all = byBase.get("param_1");
+        LinkedHashMap<Long, NestedTypeMember> result = new LinkedHashMap<>();
+        if (all == null) {
+            return result;
+        }
+        for (Map.Entry<Long, NestedTypeMember> entry : all.entrySet()) {
+            NestedTypeMember member = entry.getValue();
+            if (member.wireLayout != null || member.wireShape != null) {
+                result.put(entry.getKey(), member);
+            }
+        }
+        return result;
+    }
+
+    private LinkedHashMap<Long, NestedTypeMember> handlerPayloadMembersInWindow(
+        Map<Long, NestedTypeMember> payload,
+        long rootOffset,
+        long nativeSize) {
+
+        Long end = addExactOrNull(rootOffset, nativeSize);
+        LinkedHashMap<Long, NestedTypeMember> result = new LinkedHashMap<>();
+        if (payload == null || payload.isEmpty() || end == null || nativeSize <= 0L) {
+            return result;
+        }
+        for (Map.Entry<Long, NestedTypeMember> entry : payload.entrySet()) {
+            Long offset = entry.getKey();
+            if (offset != null && offset >= rootOffset && offset < end) {
+                result.put(offset, entry.getValue());
+            }
+        }
+        return result;
+    }
+
+    private HandlerValueTypeRecovery consensusHandlerValueType(List<FieldCall> fields) {
+        NestedTypeShape selected = null;
+        for (FieldCall field : fields) {
+            NestedTypeShape candidate = field == null ? null : field.nestedTypeShape;
+            if (candidate == null ||
+                !Boolean.TRUE.equals(candidate.identityProven) &&
+                    !Boolean.TRUE.equals(candidate.layoutProven)) {
+                continue;
+            }
+            if (selected != null && !sameHandlerValueShape(selected, candidate)) {
+                recordNestedTypeShapeReject("handler-vtable-value-type-conflict");
+                return null;
+            }
+            selected = candidate;
+        }
+        if (selected == null) {
+            return null;
+        }
+
+        NativeTypeInfoEvidence typeInfo = selected.typeId == null
+            ? null
+            : new NativeTypeInfoEvidence(
+                selected.vtable,
+                selected.typeNameFull,
+                normalizeUuid(selected.typeId),
+                selected.identitySource,
+                selected.typeNameSource,
+                selected.nativeSize,
+                selected.nativeSizeSource);
+        return new HandlerValueTypeRecovery(typeInfo, selected);
+    }
+
+    private boolean sameHandlerValueShape(NestedTypeShape left, NestedTypeShape right) {
+        if (left == null || right == null ||
+            !Objects.equals(left.typeId, right.typeId) ||
+            !Objects.equals(left.typeName, right.typeName) ||
+            !Objects.equals(left.nativeSize, right.nativeSize) ||
+            left.members.size() != right.members.size()) {
+            return false;
+        }
+        for (int index = 0; index < left.members.size(); index++) {
+            NestedTypeMember leftMember = left.members.get(index);
+            NestedTypeMember rightMember = right.members.get(index);
+            if (leftMember.offset != rightMember.offset ||
+                !Objects.equals(leftMember.typeId, rightMember.typeId) ||
+                !Objects.equals(leftMember.wireShape, rightMember.wireShape) ||
+                !Objects.equals(leftMember.wireLayout, rightMember.wireLayout)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private record HandlerValueTypeRecovery(
+        NativeTypeInfoEvidence typeInfo,
+        NestedTypeShape typeShape) {
+    }
+
+    private record HandlerValueVptr(
+        long rootOffset,
+        long nativeSize,
+        VtableWrite write) {
+    }

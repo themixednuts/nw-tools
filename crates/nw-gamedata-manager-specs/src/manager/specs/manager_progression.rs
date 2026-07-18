@@ -324,11 +324,12 @@ pub(super) fn player_tutorials_condition_data_manager_spec() -> NativeManagerSpe
         source_row_method: Some("source_row"),
         row_filters: Vec::new(),
         fields: vec![
-            projection_field(
+            optional_u8_enum_default_projection_field(
                 "operation",
                 "Operation",
                 "operation",
-                NativeProjectionTransform::OptionalString,
+                "TutorialConditionOperation",
+                "TutorialConditionOperation::Equals",
             ),
             projection_field(
                 "player_level",
@@ -508,7 +509,13 @@ pub(super) fn player_tutorials_data_manager_spec() -> NativeManagerSpec {
         source_row_method: Some("source_row"),
         row_filters: Vec::new(),
         fields: vec![
-            projection_field("type_", "Type", "type_", NativeProjectionTransform::String),
+            typed_projection_field(
+                "type_",
+                "Type",
+                "type_",
+                NativeProjectionTransform::U8Enum,
+                "TutorialType",
+            ),
             projection_field(
                 "prompt_content_ids",
                 "PromptContentIds",
@@ -527,11 +534,12 @@ pub(super) fn player_tutorials_data_manager_spec() -> NativeManagerSpec {
                 "condition_ids_and",
                 NativeProjectionTransform::OptionalForeignKeyRow,
             ),
-            projection_field(
+            optional_u8_enum_default_projection_field(
                 "condition_ids_relation",
                 "ConditionIdsRelation",
                 "condition_ids_relation",
-                NativeProjectionTransform::OptionalString,
+                "TutorialConditionIdsRelation",
+                "TutorialConditionIdsRelation::OR",
             ),
             projection_field(
                 "condition_ids_or",
@@ -539,17 +547,19 @@ pub(super) fn player_tutorials_data_manager_spec() -> NativeManagerSpec {
                 "condition_ids_or",
                 NativeProjectionTransform::OptionalForeignKeyRow,
             ),
-            projection_field(
+            typed_projection_field(
                 "classification",
                 "Classification",
                 "classification",
-                NativeProjectionTransform::String,
+                NativeProjectionTransform::U8Enum,
+                "TutorialClassification",
             ),
-            projection_field(
+            optional_u8_enum_default_projection_field(
                 "prompt_style",
                 "PromptStyle",
                 "prompt_style",
-                NativeProjectionTransform::OptionalString,
+                "TutorialPromptStyle",
+                "TutorialPromptStyle::None",
             ),
             projection_field(
                 "title_text",
@@ -575,11 +585,12 @@ pub(super) fn player_tutorials_data_manager_spec() -> NativeManagerSpec {
                 "exit_action_and_description",
                 NativeProjectionTransform::OptionalString,
             ),
-            projection_field(
+            optional_u8_enum_default_projection_field(
                 "exit_duration",
                 "ExitDuration",
                 "exit_duration",
-                NativeProjectionTransform::OptionalF32,
+                "TutorialPromptExitDuration",
+                "TutorialPromptExitDuration::None",
             ),
             projection_field(
                 "hidden_trigger_condition_id",
@@ -656,8 +667,8 @@ pub(super) fn title_data_manager_spec() -> NativeManagerSpec {
                 "title_type",
                 "TitleType",
                 "title_type",
-                NativeProjectionTransform::EnumStringRejectDefault,
-                "newworld_plugin::game_data::TitleType",
+                NativeProjectionTransform::U8Enum,
+                "gamedata::semantic::TitleType",
             ),
             projection_field(
                 "ui_display_category",
@@ -791,7 +802,7 @@ pub(super) fn story_progress_data_manager_spec() -> NativeManagerSpec {
 
 pub(super) fn reward_milestone_data_manager_spec() -> NativeManagerSpec {
     const REWARD_MILESTONE_TYPE: &str = "RewardMilestoneType";
-    const REWARD_MILESTONE_EXPANSION_ID: &str = "newworld_plugin::game_data::ExpansionId";
+    const REWARD_MILESTONE_EXPANSION_ID: &str = "gamedata::semantic::ExpansionId";
 
     crc_projection(CrcProjectionSpec {
         module: "reward_milestone_data",
@@ -855,7 +866,7 @@ pub(super) fn reward_milestone_data_manager_spec() -> NativeManagerSpec {
                 "ExpansionIdUnlock",
                 "expansion_id_unlock",
                 REWARD_MILESTONE_EXPANSION_ID,
-                "newworld_plugin::game_data::ExpansionId::None",
+                "gamedata::semantic::ExpansionId::None",
             ),
             projection_field(
                 "notes",

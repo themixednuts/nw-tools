@@ -116,6 +116,7 @@
         final ArrayList<FieldCall> fields = new ArrayList<>();
         Address instanceVtable;
         AzRttiEvidence azRtti;
+        ReplicatedStateAbiEvidence replicatedStateAbi;
 
         RegistrationFunction(Function function) {
             this.function = function;
@@ -142,6 +143,11 @@
             }
             if (azRtti != null) {
                 object.add("azRtti", azRtti.toJson());
+            }
+            if (replicatedStateAbi != null) {
+                object.add(
+                    "replicatedStateAbi",
+                    replicatedStateAbi.toJson(addressFormatter));
             }
             JsonArray array = new JsonArray();
             for (FieldCall field : fields) {
@@ -204,6 +210,7 @@
         HandlerConstruction handlerConstruction;
         List<HandlerConstructorWrite> handlerConstructorWrites;
         String handlerKind;
+        String handlerKindSource;
         Integer handlerVtableSlots;
         Integer physicalFieldCount;
         String handlerTypeName;
@@ -212,6 +219,9 @@
         Integer groupCursorOffset;
         String nativeType;
         String sourceTypeName;
+        String sourceTypeId;
+        String sourceTypeIdSource;
+        Boolean sourceTypeIdentityProven;
         String storageExpression;
         String storageIdentity;
         Long storageOffset;
@@ -220,6 +230,9 @@
         Integer rawByteLength;
         String wireShape;
         String wireShapeSource;
+        String wireLayout;
+        String wireLayoutSource;
+        FixedSequenceShape fixedSequenceShape;
         List<HandlerConstructorWrite> constructorWrites;
         String confidence;
         Address unmarshalCallsite;
@@ -236,6 +249,7 @@
         JsonArray argStorageEvidence;
         JsonArray typeEvidence;
         NestedTypeShape nestedTypeShape;
+        Boolean callFrameBoundaryProven;
         JsonArray mergedCallsites;
         Boolean multipleCallEvidence;
         Boolean typeConflict;
@@ -257,6 +271,7 @@
             NetworkSchemaJson.add(object, "handlerExpression", handlerExpression);
             NetworkSchemaJson.add(object, "handlerVtable", formatAddress(handlerVtable));
             NetworkSchemaJson.add(object, "handlerKind", handlerKind);
+            NetworkSchemaJson.add(object, "handlerKindSource", handlerKindSource);
             NetworkSchemaJson.add(object, "handlerVtableSlots", handlerVtableSlots);
             NetworkSchemaJson.add(object, "physicalFieldCount", physicalFieldCount);
             NetworkSchemaJson.add(object, "handlerTypeName", handlerTypeName);
@@ -278,11 +293,25 @@
             NetworkSchemaJson.add(object, "nativeType", nativeType);
             NetworkSchemaJson.add(object, "sourceTypeName", sourceTypeName);
             NetworkSchemaJson.add(object, "sourceTypeId", fieldSourceTypeId());
+            NetworkSchemaJson.add(
+                object,
+                "sourceTypeIdSource",
+                fieldSourceTypeIdSource());
+            if (fieldSourceTypeId() != null) {
+                object.addProperty(
+                    "sourceTypeIdentityProven",
+                    Boolean.TRUE.equals(sourceTypeIdentityProven) ||
+                        nestedTypeShape != null &&
+                        Boolean.TRUE.equals(nestedTypeShape.identityProven));
+            }
             if (typeEvidence != null && typeEvidence.size() != 0) {
                 object.add("typeEvidence", typeEvidence);
             }
             if (nestedTypeShape != null) {
                 object.add("nestedTypeShape", nestedTypeShape.toJson(addressFormatter));
+            }
+            if (callFrameBoundaryProven != null) {
+                object.addProperty("callFrameBoundaryProven", callFrameBoundaryProven);
             }
             JsonObject sourceTypeFoldEvidence =
                 foldEvidenceForCandidates(null, "computed", sourceTypeName, nativeType);
@@ -305,6 +334,11 @@
             }
             NetworkSchemaJson.add(object, "wireShape", resolvedWireShape);
             NetworkSchemaJson.add(object, "wireShapeSource", resolvedWireShapeSource);
+            NetworkSchemaJson.add(object, "wireLayout", wireLayout);
+            NetworkSchemaJson.add(object, "wireLayoutSource", wireLayoutSource);
+            if (fixedSequenceShape != null) {
+                object.add("fixedSequenceShape", fixedSequenceShape.toJson(addressFormatter));
+            }
             if (constructorWrites != null && !constructorWrites.isEmpty()) {
                 JsonArray writes = new JsonArray();
                 for (HandlerConstructorWrite write : constructorWrites) {
@@ -313,6 +347,7 @@
                 object.add("constructorWrites", writes);
             }
             NetworkSchemaJson.add(object, "confidence", confidence);
+            NetworkSchemaJson.add(object, "evidenceSource", evidenceSource);
             JsonObject unmarshalEvidence = unmarshalEvidenceJson();
             if (unmarshalEvidence.size() != 0) {
                 object.add("unmarshalEvidence", unmarshalEvidence);
@@ -321,14 +356,7 @@
         }
 
         private String resolvedWireShape() {
-            if (wireShape != null) {
-                return wireShape;
-            }
-            String nativeShape = wireShapeFromNativeType(nativeType);
-            if (nativeShape != null) {
-                return nativeShape;
-            }
-            return wireShapeFromSourceTypeName(sourceTypeName);
+            return wireShape;
         }
 
         private String resolvedWireShapeSource(String resolvedWireShape) {
@@ -338,35 +366,25 @@
             if (wireShape != null) {
                 return wireShapeSource;
             }
-            if (wireShapeFromNativeType(nativeType) != null) {
-                return "native-type";
-            }
-            if (wireShapeFromSourceTypeName(sourceTypeName) != null) {
-                return "source-type-name";
-            }
             return wireShapeSource;
         }
 
         private String fieldSourceTypeId() {
-            if (nestedTypeShape != null && nestedTypeShape.typeId != null) {
+            if (sourceTypeId != null && Boolean.TRUE.equals(sourceTypeIdentityProven)) {
+                return sourceTypeId;
+            }
+            if (nestedTypeShape != null && nestedTypeShape.typeId != null &&
+                Boolean.TRUE.equals(nestedTypeShape.identityProven)) {
                 return nestedTypeShape.typeId;
             }
-            String typeId = sourceTypeIdFromName(sourceTypeName);
-            if (typeId != null) {
-                return typeId;
-            }
-            return sourceTypeIdFromName(nativeType);
+            return null;
         }
 
-        private String sourceTypeIdFromName(String typeName) {
-            if (isWireNativeSourceTypeName(typeName)) {
-                return null;
+        private String fieldSourceTypeIdSource() {
+            if (sourceTypeId != null && Boolean.TRUE.equals(sourceTypeIdentityProven)) {
+                return sourceTypeIdSource;
             }
-            String typeId = typeIdForTypeName(typeName);
-            if (typeId == null || isBuiltinTypeId(typeId)) {
-                return null;
-            }
-            return typeId;
+            return nestedTypeShape == null ? null : nestedTypeShape.identitySource;
         }
 
         boolean typeConflict() {
@@ -452,10 +470,6 @@
             field.handlerVtable = state.vtablesByThisOffset.get(handlerOffset);
             field.handlerConstruction = state.handlerConstructionsByThisOffset.get(handlerOffset);
             field.constructorWrites = state.constructorWritesByHandlerOffset.get(handlerOffset);
-            applyFieldHandlerShape(field, fieldHandlerShape(field.handlerVtable));
-            field.handlerTypeName =
-                fieldHandlerTypeName(field.handlerConstruction, field.handlerVtable);
-            enrichFieldFromHandlerType(field);
             String confidencePrefix = "attribute".equals(field.registrationKind)
                 ? "fixed-attribute-table-append"
                 : "fixed-field-table-append";
@@ -475,22 +489,28 @@
 
     private final class FieldHandlerShape {
         final String kind;
+        final String kindSource;
         final int vtableSlots;
         final WireShape wireShape;
         final ContainerWireShape containerWireShape;
+        final HandlerWireShapeEvidence handlerWireEvidence;
         final int physicalFieldCount;
 
         FieldHandlerShape(
             String kind,
+            String kindSource,
             int vtableSlots,
             WireShape wireShape,
             ContainerWireShape containerWireShape,
+            HandlerWireShapeEvidence handlerWireEvidence,
             int physicalFieldCount) {
 
             this.kind = kind;
+            this.kindSource = kindSource;
             this.vtableSlots = vtableSlots;
             this.wireShape = wireShape;
             this.containerWireShape = containerWireShape;
+            this.handlerWireEvidence = handlerWireEvidence;
             this.physicalFieldCount = physicalFieldCount;
         }
     }
@@ -507,10 +527,14 @@
         Address instanceConstructorCallsite;
         Address instanceConstructor;
         String instanceConstructorName;
-        final ArrayList<String> templateTypes = new ArrayList<>();
+        String rootStorageBase;
+        String readBufferParameter;
+        String rootEvidenceSource;
+        DelegatedCodecEvidence delegatedCodec;
         final ArrayList<FieldCall> fields = new ArrayList<>();
-        final ArrayList<MessageSourceSignature> sourceSignatures = new ArrayList<>();
         final JsonArray rejectedPcodeFields = new JsonArray();
+        final HashMap<String, Integer> pcodeOrderByCallsite = new HashMap<>();
+        int collapsedAggregateLeafCount;
 
         JsonObject toJson() {
             JsonObject object = new JsonObject();
@@ -527,12 +551,12 @@
             NetworkSchemaJson.add(object, "instanceConstructorCallsite", formatAddress(instanceConstructorCallsite));
             NetworkSchemaJson.add(object, "instanceConstructor", formatAddress(instanceConstructor));
             NetworkSchemaJson.add(object, "instanceConstructorName", instanceConstructorName);
-
-            JsonArray templateJson = new JsonArray();
-            for (String templateType : templateTypes) {
-                templateJson.add(templateType);
+            NetworkSchemaJson.add(object, "rootStorageBase", rootStorageBase);
+            NetworkSchemaJson.add(object, "readBufferParameter", readBufferParameter);
+            NetworkSchemaJson.add(object, "rootEvidenceSource", rootEvidenceSource);
+            if (delegatedCodec != null) {
+                object.add("delegatedCodec", delegatedCodec.toJson());
             }
-            object.add("templateTypes", templateJson);
 
             JsonArray fieldJson = new JsonArray();
             for (FieldCall field : fields) {
@@ -540,86 +564,20 @@
             }
             object.add("fields", fieldJson);
 
-            if (!sourceSignatures.isEmpty()) {
-                JsonArray sourceJson = new JsonArray();
-                for (MessageSourceSignature signature : sourceSignatures) {
-                    sourceJson.add(signature.toJson());
-                }
-                object.add("sourceSignatures", sourceJson);
-            }
-            if (rejectedPcodeFields.size() != 0) {
+            if (rejectedPcodeFields.size() != 0 || collapsedAggregateLeafCount != 0) {
                 JsonObject diagnostics = new JsonObject();
-                diagnostics.add("rejectedPcodeFields", rejectedPcodeFields);
+                if (rejectedPcodeFields.size() != 0) {
+                    diagnostics.add("rejectedPcodeFields", rejectedPcodeFields);
+                }
+                if (collapsedAggregateLeafCount != 0) {
+                    diagnostics.addProperty(
+                        "collapsedAggregateLeafCount",
+                        collapsedAggregateLeafCount);
+                }
                 object.add("recoveryDiagnostics", diagnostics);
             }
             return object;
         }
-    }
-
-    private final class MessageSourceSignature {
-        Address stringAddress;
-        Address typeDescriptor;
-        String mangledName;
-        final LinkedHashMap<String, String> providers = new LinkedHashMap<>();
-        final LinkedHashSet<String> tableReferences = new LinkedHashSet<>();
-        final LinkedHashMap<String, String> sourceFunctions = new LinkedHashMap<>();
-        final JsonArray callGraph = new JsonArray();
-
-        void addProvider(Function function, NetworkSchemaExtractor extractor) {
-            providers.putIfAbsent(
-                extractor.formatAddress(function.getEntryPoint()),
-                extractor.fullFunctionName(function));
-        }
-
-        boolean addSourceFunction(Function function, NetworkSchemaExtractor extractor) {
-            return sourceFunctions.putIfAbsent(
-                extractor.formatAddress(function.getEntryPoint()),
-                extractor.fullFunctionName(function)) == null;
-        }
-
-        void addCallTarget(
-            Function caller,
-            Address callsite,
-            Function target,
-            NetworkSchemaExtractor extractor) {
-
-            JsonObject edge = new JsonObject();
-            edge.addProperty("callsite", extractor.formatAddress(callsite));
-            edge.addProperty("caller", extractor.formatAddress(caller.getEntryPoint()));
-            edge.addProperty("callerName", extractor.fullFunctionName(caller));
-            edge.addProperty("target", extractor.formatAddress(target.getEntryPoint()));
-            edge.addProperty("targetName", extractor.fullFunctionName(target));
-            callGraph.add(edge);
-        }
-
-        JsonObject toJson() {
-            JsonObject object = new JsonObject();
-            object.addProperty("source", "msvc-rtti-type-descriptor");
-            NetworkSchemaJson.add(object, "stringAddress", formatAddress(stringAddress));
-            NetworkSchemaJson.add(object, "typeDescriptor", formatAddress(typeDescriptor));
-            NetworkSchemaJson.add(object, "mangledName", mangledName);
-            object.add("providers", functionMapJson(providers));
-            JsonArray tableJson = new JsonArray();
-            for (String tableReference : tableReferences) {
-                tableJson.add(tableReference);
-            }
-            object.add("tableReferences", tableJson);
-            object.add("sourceFunctions", functionMapJson(sourceFunctions));
-            object.add("callGraph", callGraph);
-            return object;
-        }
-
-        private static JsonArray functionMapJson(LinkedHashMap<String, String> functions) {
-            JsonArray array = new JsonArray();
-            for (Map.Entry<String, String> entry : functions.entrySet()) {
-                JsonObject object = new JsonObject();
-                object.addProperty("address", entry.getKey());
-                object.addProperty("name", entry.getValue());
-                array.add(object);
-            }
-            return array;
-        }
-
     }
 
     private final class AzRttiScanResult {

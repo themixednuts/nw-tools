@@ -236,7 +236,7 @@ fn emit_project_struct_for_package(
                 | CodegenFieldProjection::InterfaceBase
                 | CodegenFieldProjection::SkippedBase => continue,
             }
-            let field_name = unique_go_field_name(field, &mut used_field_names);
+            let field_name = unique_go_field_name(field, &mut used_field_names, false);
             let json_field_name =
                 unique_go_json_field_name_for_field(field, &field_name, &mut used_json_field_names);
             out.push('\t');
@@ -255,7 +255,7 @@ fn emit_project_struct_for_package(
             out.push_str("\"`\n");
             continue;
         }
-        let field_name = unique_go_field_name(field, &mut used_field_names);
+        let field_name = unique_go_field_name(field, &mut used_field_names, false);
         let json_field_name =
             unique_go_json_field_name_for_field(field, &field_name, &mut used_json_field_names);
         out.push('\t');
@@ -287,7 +287,7 @@ fn emit_project_enum_for_package(
     out: &mut String,
 ) {
     let type_name = go_type_name(item, names_by_type_id);
-    let variant_names = go_enum_variant_names(item, &type_name);
+    let variant_names = go_enum_variant_names(item, &type_name, false);
     let raw_type = item
         .enum_underlying_type
         .as_ref()

@@ -22,12 +22,16 @@ pub use project::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeScriptSourceOptions {
     pub include_support_aliases: bool,
+    pub use_support_aliases: bool,
+    pub immutable: bool,
 }
 
 impl Default for TypeScriptSourceOptions {
     fn default() -> Self {
         Self {
             include_support_aliases: true,
+            use_support_aliases: true,
+            immutable: false,
         }
     }
 }
@@ -71,7 +75,8 @@ impl TypeScriptSourceEmitter {
         }
 
         let type_renderer = TypeScriptTypeRenderer::new(TypeScriptTypeOptions {
-            use_support_aliases: options.include_support_aliases,
+            use_support_aliases: options.use_support_aliases,
+            immutable: options.immutable,
         });
 
         for item in dependency_ordered_codegen_items(unit)
@@ -84,6 +89,7 @@ impl TypeScriptSourceEmitter {
                         item,
                         &type_renderer,
                         options.include_support_aliases,
+                        options.immutable,
                         &mut out,
                     );
                 }
@@ -116,6 +122,7 @@ impl TypeScriptSourceEmitter {
         item: &SerializeCodegenItem,
         type_renderer: &TypeScriptTypeRenderer,
         include_support_aliases: bool,
+        immutable: bool,
         out: &mut String,
     ) {
         let type_name = rust_type_ident(&item.source_name);
@@ -142,6 +149,9 @@ impl TypeScriptSourceEmitter {
             out.push('\t');
             if include_support_aliases {
                 out.push_str("declare ");
+            }
+            if immutable {
+                out.push_str("readonly ");
             }
             out.push_str(&unique_typescript_field_name(field, &mut used_field_names));
             out.push_str(": ");
@@ -632,7 +642,7 @@ fn classify_typescript_top_level_line(line: &str) -> TypeScriptTopLevelLine {
     TypeScriptTopLevelLine::Other
 }
 
-fn typescript_field_name(source_name: &str) -> String {
+pub fn typescript_field_name(source_name: &str) -> String {
     let rust_name = rust_field_ident(source_name);
     let mut parts = rust_name.split('_');
     let Some(first) = parts.next() else {
@@ -994,6 +1004,8 @@ mod tests {
                 &unit,
                 &TypeScriptSourceOptions {
                     include_support_aliases: false,
+                    use_support_aliases: false,
+                    immutable: false,
                 },
             )
             .expect("TypeScript source");
@@ -1040,6 +1052,8 @@ mod tests {
                 &unit,
                 &TypeScriptSourceOptions {
                     include_support_aliases: false,
+                    use_support_aliases: false,
+                    immutable: false,
                 },
             )
             .expect("TypeScript source");

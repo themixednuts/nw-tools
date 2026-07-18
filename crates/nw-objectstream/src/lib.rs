@@ -29,6 +29,7 @@ pub mod lookup;
 pub mod object;
 pub mod query;
 pub mod region_slice_data;
+pub mod schema;
 pub mod serialize;
 pub mod slice_meta;
 pub mod stats;

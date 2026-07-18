@@ -723,12 +723,16 @@ pub struct ExternalPayload;
         let typescript = unit
             .emit_typescript_source_with_options(&TypeScriptSourceOptions {
                 include_support_aliases: false,
+                use_support_aliases: false,
+                immutable: false,
             })
             .expect("TypeScript source");
         let go = unit
             .emit_go_source_with_options(&GoSourceOptions {
                 package_name: "nwtypes".to_owned(),
                 include_support_aliases: false,
+                use_support_aliases: false,
+                idiomatic_initialisms: false,
             })
             .expect("Go source");
         let rust_project = unit

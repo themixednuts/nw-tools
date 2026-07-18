@@ -1,0 +1,52 @@
+    private JsonObject directTypeFunctionTrace(Function function, HighFunction high) {
+        JsonObject trace = new JsonObject();
+        if (function == null || high == null) {
+            return trace;
+        }
+
+        String functionName = fullFunctionName(function);
+        String owner = directUnmarshalValueTypeName(function);
+        NetworkSchemaJson.add(trace, "ownerType", owner);
+
+        LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> byBase =
+            nestedDirectTypeMemberCandidates(function, high);
+        JsonArray bases = new JsonArray();
+        for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry :
+                byBase.entrySet()) {
+            JsonObject base = new JsonObject();
+            base.addProperty("storageBase", entry.getKey());
+            JsonArray members = new JsonArray();
+            entry.getValue().values().stream()
+                .sorted(Comparator.comparingLong(member -> member.offset))
+                .map(member -> member.toJson(addressFormatter))
+                .forEach(members::add);
+            base.add("members", members);
+            bases.add(base);
+        }
+        trace.add("candidateBases", bases);
+
+        NestedTypeShape storageShape = directTypeShapeFromCandidates(
+            owner,
+            function,
+            functionName,
+            byBase,
+            owner == null);
+        if (storageShape != null) {
+            trace.add("storageShape", storageShape.toJson(addressFormatter));
+        }
+        NestedTypeShape wireShape = directWireSequenceShape(
+            function,
+            owner,
+            functionName);
+        if (wireShape != null) {
+            trace.add("wireShape", wireShape.toJson(addressFormatter));
+        }
+        NestedTypeShape selected = recoverNestedDirectTypeShape(
+            function,
+            owner,
+            owner == null);
+        if (selected != null) {
+            trace.add("selectedShape", selected.toJson(addressFormatter));
+        }
+        return trace;
+    }

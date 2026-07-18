@@ -21,7 +21,7 @@ pub use self::action_condition_if_behavior_tree_task::ActionConditionIfBehaviorT
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfHTNCAGEAction;
+pub struct ActionConditionIfHTNCAGEAction {}
 
 impl AzRtti for ActionConditionIfHTNCAGEAction {
     const NAME: &'static str = "ActionConditionIfHTNCAGEAction";

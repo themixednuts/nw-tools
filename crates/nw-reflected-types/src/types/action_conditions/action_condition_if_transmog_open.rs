@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfTransmogOpen;
+pub struct ActionConditionIfTransmogOpen {}
 
 impl AzRtti for ActionConditionIfTransmogOpen {
     const NAME: &'static str = "ActionConditionIfTransmogOpen";

@@ -1,0 +1,18 @@
+[package]
+name = "lmbr-central-vshape"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Borrowed parser for Lumberyard LmbrCentral vertex-shape assets"
+
+[lints]
+workspace = true
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

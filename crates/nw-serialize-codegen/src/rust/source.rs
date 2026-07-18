@@ -391,7 +391,11 @@ fn render_item(
                 .map(|field| render_field(item, field, options))
                 .collect::<Result<Vec<_>, _>>()?;
             let body = if fields.is_empty() {
-                quote!(;)
+                // SerializeContext classes are record-shaped even when the
+                // reflected version has no fields.  Emit an empty record
+                // struct so serde accepts the `{}` produced by ObjectStream
+                // instead of requiring the unit value expected by `struct T;`.
+                quote!({})
             } else {
                 quote!({ #(#fields)* })
             };
@@ -3428,6 +3432,14 @@ mod tests {
                     == "components/faceted_components/inventory_component/local_component_ref_base/mod.rs"
             })
             .expect("local component ref base module");
+
+        assert!(
+            component
+                .source
+                .contains("pub struct InventoryComponent {}"),
+            "{}",
+            component.source
+        );
 
         assert!(
             component

@@ -1,0 +1,163 @@
+    private UnmarshalTerminalFlow scalarReturnUnmarshalTerminalFlow(HighFunction high) {
+        if (high == null) {
+            return UnmarshalTerminalFlow.unresolved("missing-high-function");
+        }
+
+        LinkedHashSet<PcodeBlockBasic> successful = new LinkedHashSet<>();
+        boolean sawReturn = false;
+        ArrayList<PcodeBlockBasic> blocks = new ArrayList<>(high.getBasicBlocks());
+        blocks.sort(Comparator
+            .comparing(PcodeBlockBasic::getStart)
+            .thenComparingInt(PcodeBlock::getIndex));
+        for (PcodeBlockBasic block : blocks) {
+            UnmarshalStatusByte selected = null;
+            var operations = block.getIterator();
+            while (operations.hasNext()) {
+                PcodeOp operation = operations.next();
+                if (operation.getOpcode() != PcodeOp.RETURN ||
+                    operation.getNumInputs() < 2) {
+                    continue;
+                }
+                sawReturn = true;
+                UnmarshalStatusByte candidate = scalarReturnStatus(
+                    operation.getInput(operation.getNumInputs() - 1),
+                    new LinkedHashSet<>(),
+                    0);
+                if (candidate == UnmarshalStatusByte.UNKNOWN ||
+                    candidate == UnmarshalStatusByte.UNSET ||
+                    selected != null && selected != candidate) {
+                    return UnmarshalTerminalFlow.unresolved(
+                        "scalar-return-unproven:" + formatAddress(block.getStart()));
+                }
+                selected = candidate;
+            }
+            if (selected == UnmarshalStatusByte.SUCCESS) {
+                successful.add(block);
+            }
+        }
+        if (!sawReturn || successful.isEmpty()) {
+            return UnmarshalTerminalFlow.unresolved(
+                sawReturn ? "no-scalar-success-terminal" : "no-return-operation");
+        }
+        return new UnmarshalTerminalFlow(
+            Set.copyOf(successful),
+            Map.of(),
+            "scalar-return-complete");
+    }
+
+    private UnmarshalStatusByte scalarReturnStatus(
+        Varnode value,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || depth > 48 || !active.add(pcodeSsaNodeKey(value))) {
+            return UnmarshalStatusByte.UNKNOWN;
+        }
+        try {
+            Long constant = NetworkSchemaIntegerEvaluator.evaluate(value);
+            if (constant != null) {
+                return statusFromLowByte(constant);
+            }
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                return UnmarshalStatusByte.UNKNOWN;
+            }
+            return switch (definition.getOpcode()) {
+                case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT,
+                    PcodeOp.INT_SEXT, PcodeOp.INDIRECT ->
+                    scalarReturnStatus(
+                        definition.getInput(0),
+                        active,
+                        depth + 1);
+                case PcodeOp.SUBPIECE -> {
+                    Long offset = definition.getNumInputs() < 2
+                        ? null
+                        : NetworkSchemaIntegerEvaluator.evaluate(definition.getInput(1));
+                    yield Long.valueOf(0L).equals(offset)
+                        ? scalarReturnStatus(
+                            definition.getInput(0),
+                            active,
+                            depth + 1)
+                        : UnmarshalStatusByte.UNKNOWN;
+                }
+                case PcodeOp.PIECE -> definition.getNumInputs() == 2
+                    ? scalarReturnStatus(
+                        definition.getInput(1),
+                        active,
+                        depth + 1)
+                    : UnmarshalStatusByte.UNKNOWN;
+                case PcodeOp.INT_AND -> scalarAndReturnStatus(
+                    definition,
+                    active,
+                    depth + 1);
+                case PcodeOp.MULTIEQUAL -> equalScalarReturnStatuses(
+                    definition,
+                    active,
+                    depth + 1);
+                default -> UnmarshalStatusByte.UNKNOWN;
+            };
+        }
+        finally {
+            active.remove(pcodeSsaNodeKey(value));
+        }
+    }
+
+    private UnmarshalStatusByte scalarAndReturnStatus(
+        PcodeOp definition,
+        Set<String> active,
+        int depth) {
+
+        if (definition == null || definition.getNumInputs() != 2) {
+            return UnmarshalStatusByte.UNKNOWN;
+        }
+        for (int slot = 0; slot < 2; slot++) {
+            Long mask = NetworkSchemaIntegerEvaluator.evaluate(definition.getInput(slot));
+            if (mask != null && (mask & 0xffL) == 0L) {
+                return UnmarshalStatusByte.FAILURE;
+            }
+        }
+        UnmarshalStatusByte left = scalarReturnStatus(
+            definition.getInput(0),
+            new LinkedHashSet<>(active),
+            depth);
+        UnmarshalStatusByte right = scalarReturnStatus(
+            definition.getInput(1),
+            new LinkedHashSet<>(active),
+            depth);
+        if (left == UnmarshalStatusByte.FAILURE || right == UnmarshalStatusByte.FAILURE) {
+            return UnmarshalStatusByte.FAILURE;
+        }
+        return left == UnmarshalStatusByte.SUCCESS && right == UnmarshalStatusByte.SUCCESS
+            ? UnmarshalStatusByte.SUCCESS
+            : UnmarshalStatusByte.UNKNOWN;
+    }
+
+    private UnmarshalStatusByte equalScalarReturnStatuses(
+        PcodeOp definition,
+        Set<String> active,
+        int depth) {
+
+        UnmarshalStatusByte selected = null;
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            UnmarshalStatusByte candidate = scalarReturnStatus(
+                definition.getInput(slot),
+                new LinkedHashSet<>(active),
+                depth);
+            if (candidate == UnmarshalStatusByte.UNKNOWN ||
+                candidate == UnmarshalStatusByte.UNSET ||
+                selected != null && selected != candidate) {
+                return UnmarshalStatusByte.UNKNOWN;
+            }
+            selected = candidate;
+        }
+        return selected == null ? UnmarshalStatusByte.UNKNOWN : selected;
+    }
+
+    private UnmarshalStatusByte statusFromLowByte(long value) {
+        int lowByte = (int)(value & 0xffL);
+        return lowByte == 0
+            ? UnmarshalStatusByte.FAILURE
+            : lowByte == 1
+                ? UnmarshalStatusByte.SUCCESS
+                : UnmarshalStatusByte.UNKNOWN;
+    }

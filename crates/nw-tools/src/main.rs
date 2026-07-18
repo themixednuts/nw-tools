@@ -1,4 +1,5 @@
 mod asset;
+mod audio_export;
 mod cache;
 mod dds;
 mod extract;
@@ -9,12 +10,14 @@ mod model;
 mod model_asset;
 mod pak;
 mod progress;
+mod rnr_asset;
 mod source;
 mod support;
 mod tui;
 mod ui;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use nw_tools::native_port;
 
 use ui::{Report, theme};
 
@@ -71,6 +74,11 @@ enum Command {
         #[command(subcommand)]
         command: format::Cmd,
     },
+    #[command(about = "Extract-time legacy asset port (ADR 0027 + ADR 0028)")]
+    Port {
+        #[command(subcommand)]
+        command: native_port::Cmd,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -97,6 +105,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Asset { command }) => command.run()?,
         Some(Command::Pak { command }) => command.run()?,
         Some(Command::Format { command }) => command.run()?,
+        Some(Command::Port { command }) => command.run()?,
         None => {
             Cli::command().print_help()?;
             println!();

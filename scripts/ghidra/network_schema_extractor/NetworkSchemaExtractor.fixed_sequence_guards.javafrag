@@ -1,0 +1,119 @@
+    private boolean hasFixedSequenceCapacityGuard(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        FixedSequenceStorage storage,
+        PcodeOpAST countCall,
+        NetworkSchemaCodecClassifier.CodecDirection direction) {
+
+        return provenFixedSequenceCapacity(
+            high,
+            loop,
+            operations,
+            storage,
+            countCall,
+            direction) != null;
+    }
+
+    private Integer provenFixedSequenceCapacity(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        FixedSequenceStorage storage,
+        PcodeOpAST countCall,
+        NetworkSchemaCodecClassifier.CodecDirection direction) {
+
+        PcodeOpAST header = firstLoopHeaderOperation(loop);
+        Set<PcodeStorage> countOutputs = scalarCallOutputStorages(countCall);
+        Integer selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (!isOrderedIntegerComparison(operation) || operation.getNumInputs() != 2 ||
+                operation.getOutput() == null || header == null ||
+                !NetworkSchemaControlFlow.precedes(high, operation, header) ||
+                !comparisonFeedsBranch(operations, operation)) {
+                continue;
+            }
+            int constantSlot = operation.getInput(0).isConstant() ? 0 :
+                operation.getInput(1).isConstant() ? 1 : -1;
+            if (constantSlot < 0) {
+                continue;
+            }
+            Long threshold = NetworkSchemaIntegerEvaluator.evaluate(
+                operation.getInput(constantSlot));
+            Integer capacity = fixedSequenceCapacityFromComparison(
+                operation.getOpcode(),
+                constantSlot,
+                threshold);
+            if (capacity == null || capacity <= 0 || capacity > storage.capacity()) {
+                continue;
+            }
+
+            Varnode value = operation.getInput(1 - constantSlot);
+            boolean controlsCapacity;
+            if (direction == NetworkSchemaCodecClassifier.CodecDirection.ENCODE) {
+                LinkedHashMap<String, PcodeStorage> referenced = new LinkedHashMap<>();
+                collectPcodeStorages(value, referenced, new LinkedHashSet<>(), 0);
+                controlsCapacity = referenced.values().stream()
+                    .anyMatch(storage.data()::sameLocation) &&
+                    referenced.values().stream().anyMatch(storage.end()::sameLocation);
+            }
+            else {
+                controlsCapacity = !countOutputs.isEmpty() &&
+                    referencesAnyStorage(value, countOutputs);
+            }
+            if (!controlsCapacity) {
+                continue;
+            }
+            if (selected != null && !selected.equals(capacity)) {
+                return null;
+            }
+            selected = capacity;
+        }
+        return selected;
+    }
+
+    private Integer fixedSequenceCapacityFromComparison(
+        int opcode,
+        int constantSlot,
+        Long threshold) {
+
+        if (threshold == null || threshold <= 0L || threshold > Integer.MAX_VALUE) {
+            return null;
+        }
+        long capacity = switch (opcode) {
+            case PcodeOp.INT_LESS, PcodeOp.INT_SLESS ->
+                constantSlot == 0 ? threshold : threshold - 1L;
+            case PcodeOp.INT_LESSEQUAL, PcodeOp.INT_SLESSEQUAL ->
+                constantSlot == 0 ? threshold - 1L : threshold;
+            default -> -1L;
+        };
+        return capacity <= 0L || capacity > Integer.MAX_VALUE
+            ? null
+            : Math.toIntExact(capacity);
+    }
+
+    private boolean isOrderedIntegerComparison(PcodeOp operation) {
+        return operation != null && switch (operation.getOpcode()) {
+            case PcodeOp.INT_LESS, PcodeOp.INT_LESSEQUAL,
+                PcodeOp.INT_SLESS, PcodeOp.INT_SLESSEQUAL -> true;
+            default -> false;
+        };
+    }
+
+    private boolean comparisonFeedsBranch(
+        List<PcodeOpAST> operations,
+        PcodeOpAST comparison) {
+
+        for (PcodeOpAST operation : operations) {
+            if (operation.getParent() == comparison.getParent() &&
+                operation.getOpcode() == PcodeOp.CBRANCH &&
+                operation.getNumInputs() >= 2 && pcodeNodeDependsOn(
+                    operation.getInput(operation.getNumInputs() - 1),
+                    comparison.getOutput(),
+                    new LinkedHashSet<>(),
+                    0)) {
+                return true;
+            }
+        }
+        return false;
+    }

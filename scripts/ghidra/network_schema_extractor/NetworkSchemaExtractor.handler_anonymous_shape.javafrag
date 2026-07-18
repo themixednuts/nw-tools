@@ -1,0 +1,341 @@
+    private NestedTypeShape anonymousHandlerValueShape(
+        FieldCall field,
+        Function unmarshal,
+        LinkedHashMap<Long, NestedTypeMember> observed) {
+
+        LinkedHashMap<String, HandlerValueWindow> windows = new LinkedHashMap<>();
+        for (HandlerValueWindow window : handlerValueStorageWindows(field.handlerVtable)) {
+            if (handlerPayloadMembersInWindow(
+                    observed,
+                    window.rootOffset(),
+                    window.nativeSize()).isEmpty()) {
+                continue;
+            }
+            windows.putIfAbsent(window.key(), window);
+        }
+        if (windows.size() != 1) {
+            return null;
+        }
+
+        HandlerValueWindow window = windows.values().iterator().next();
+        LinkedHashMap<Long, NestedTypeMember> payload = handlerPayloadMembersInWindow(
+            observed,
+            window.rootOffset(),
+            window.nativeSize());
+        Address ownerConstructor = handlerOwnerConstructor(field);
+        if (ownerConstructor == null) {
+            return null;
+        }
+        List<VtableWrite> writes = constructorVtableWrites(ownerConstructor);
+        Long handlerBase = handlerBaseOffsetInConstructor(field, writes);
+        if (handlerBase == null) {
+            return null;
+        }
+        List<HandlerValueMemberProvider> providers = handlerValueMemberProviders(
+            ownerConstructor,
+            handlerBase,
+            window.rootOffset(),
+            window.nativeSize(),
+            payload);
+        List<HandlerValueLayoutMember> members = completeHandlerValueLayout(
+            providers,
+            payload,
+            window.rootOffset(),
+            window.nativeSize());
+        if (members == null || members.isEmpty()) {
+            return null;
+        }
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.identityProven = false;
+        shape.typeName = "Value";
+        shape.typeNameSource = "synthetic-anonymous-composite";
+        shape.function = unmarshal.getEntryPoint();
+        shape.functionName = fullFunctionName(unmarshal);
+        shape.constructor = ownerConstructor;
+        shape.memberBase = "param_1";
+        shape.memberNameSource = "synthetic-layout-member";
+        shape.memberNamesProven = false;
+        shape.layoutProven = true;
+        shape.memberCoverageProven = true;
+        shape.wireOrderProven = true;
+        shape.wireOrderSource =
+            "cfg-unmarshal-order+constructor-subobject-layout+scalar-storage";
+        shape.validation =
+            "is-default-storage-pair+complete-nonoverlapping-layout+contiguous-wire-order";
+        shape.nativeSize = window.nativeSize();
+        shape.nativeSizeSource = "field-handler-is-default-storage-pair";
+        populateHandlerValueLayoutMembers(shape, members, window.rootOffset());
+        proveDirectTypeIdentity(shape, unmarshal);
+        return shape;
+    }
+
+    private List<HandlerValueWindow> handlerValueStorageWindows(Address handlerVtable) {
+        Address isDefaultAddress = readPointer(
+            handlerVtable.add(FIELD_HANDLER_IS_DEFAULT_VALUE_SLOT * 8L));
+        Function isDefault = functionAtOrContaining(
+            resolvedCodeTarget(isDefaultAddress));
+        HighFunction high = highFunction(isDefault);
+        if (high == null) {
+            return List.of();
+        }
+
+        LinkedHashMap<String, HandlerValueWindow> windows = new LinkedHashMap<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALLIND) {
+                continue;
+            }
+            LinkedHashSet<Long> offsets = new LinkedHashSet<>();
+            int argumentCount = provenCallArgumentCount(operation, null);
+            for (int slot = 1; slot <= argumentCount; slot++) {
+                PcodeStorage storage = provenCallArgumentStorage(
+                    high.getFunction(),
+                    operation,
+                    null,
+                    slot);
+                if (storage != null && "param_1".equals(storage.base) && storage.offset > 0L) {
+                    offsets.add(storage.offset);
+                }
+            }
+            if (offsets.size() != 2) {
+                continue;
+            }
+            ArrayList<Long> ordered = new ArrayList<>(offsets);
+            Collections.sort(ordered);
+            long rootOffset = ordered.get(0);
+            Long nativeSize = subtractExactOrNull(ordered.get(1), rootOffset);
+            if (nativeSize == null || nativeSize <= 0L) {
+                continue;
+            }
+            HandlerValueWindow window = new HandlerValueWindow(rootOffset, nativeSize);
+            windows.putIfAbsent(window.key(), window);
+        }
+        return List.copyOf(windows.values());
+    }
+
+    private List<HandlerValueLayoutMember> completeHandlerValueLayout(
+        List<HandlerValueMemberProvider> providers,
+        Map<Long, NestedTypeMember> observed,
+        long rootOffset,
+        long nativeSize) {
+
+        Long windowEnd = addExactOrNull(rootOffset, nativeSize);
+        if (providers == null || observed == null || observed.isEmpty() || windowEnd == null) {
+            return null;
+        }
+
+        ArrayList<HandlerValueMemberProvider> maximalProviders = new ArrayList<>();
+        for (HandlerValueMemberProvider candidate : providers) {
+            boolean nested = providers.stream().anyMatch(parent ->
+                parent != candidate &&
+                parent.offset() <= candidate.offset() &&
+                parent.end() >= candidate.end() &&
+                (parent.offset() < candidate.offset() || parent.end() > candidate.end()) &&
+                parent.coverage().containsAll(candidate.coverage()));
+            if (!nested) {
+                maximalProviders.add(candidate);
+            }
+        }
+
+        LinkedHashSet<Long> expectedCoverage = observed.keySet().stream()
+            .filter(offset -> offset >= rootOffset && offset < windowEnd)
+            .collect(Collectors.toCollection(LinkedHashSet::new));
+        LinkedHashSet<Long> actualCoverage = new LinkedHashSet<>();
+        ArrayList<HandlerValueLayoutMember> members = new ArrayList<>();
+        for (HandlerValueMemberProvider provider : maximalProviders) {
+            if (!Collections.disjoint(actualCoverage, provider.coverage())) {
+                return null;
+            }
+            actualCoverage.addAll(provider.coverage());
+            members.add(HandlerValueLayoutMember.provider(provider));
+        }
+
+        for (Long offset : expectedCoverage) {
+            if (actualCoverage.contains(offset)) {
+                continue;
+            }
+            NestedTypeMember scalar = observed.get(offset);
+            Integer byteWidth = scalarNativeStorageWidth(
+                offset,
+                scalar,
+                expectedCoverage,
+                maximalProviders);
+            Long end = byteWidth == null || byteWidth <= 0
+                ? null
+                : addExactOrNull(offset, byteWidth.longValue());
+            if (scalar == null || scalar.wireOrdinal == null || end == null ||
+                offset < rootOffset || end > windowEnd) {
+                return null;
+            }
+            actualCoverage.add(offset);
+            members.add(HandlerValueLayoutMember.scalar(offset, byteWidth, scalar));
+        }
+        if (!actualCoverage.equals(expectedCoverage)) {
+            return null;
+        }
+
+        members.sort(Comparator
+            .comparingInt(HandlerValueLayoutMember::firstWireOrdinal)
+            .thenComparingLong(HandlerValueLayoutMember::offset));
+        int expectedOrdinal = members.isEmpty()
+            ? 0
+            : members.get(0).firstWireOrdinal();
+        for (int index = 0; index < members.size(); index++) {
+            HandlerValueLayoutMember current = members.get(index);
+            if (current.firstWireOrdinal() != expectedOrdinal ||
+                current.lastWireOrdinal() < current.firstWireOrdinal()) {
+                return null;
+            }
+            expectedOrdinal = current.lastWireOrdinal() + 1;
+            for (int otherIndex = 0; otherIndex < index; otherIndex++) {
+                HandlerValueLayoutMember other = members.get(otherIndex);
+                if (current.offset() < other.end() && other.offset() < current.end()) {
+                    return null;
+                }
+            }
+        }
+        return List.copyOf(members);
+    }
+
+    private Integer scalarNativeStorageWidth(
+        long offset,
+        NestedTypeMember scalar,
+        Set<Long> observedOffsets,
+        List<HandlerValueMemberProvider> providers) {
+
+        if (scalar == null) {
+            return null;
+        }
+        if (scalar.byteWidth != null && scalar.byteWidth > 0) {
+            return scalar.byteWidth;
+        }
+        String layout = scalar.wireLayout == null
+            ? scalar.wireShape
+            : scalar.wireLayout;
+        Integer fixedWidth = wireShapeByteWidth(layout);
+        if (fixedWidth != null && fixedWidth > 0) {
+            return fixedWidth;
+        }
+
+        Long nextBoundary = observedOffsets.stream()
+            .filter(candidate -> candidate > offset)
+            .min(Long::compareTo)
+            .orElse(null);
+        for (HandlerValueMemberProvider provider : providers) {
+            if (provider.offset() > offset &&
+                (nextBoundary == null || provider.offset() < nextBoundary)) {
+                nextBoundary = provider.offset();
+            }
+        }
+        Long span = nextBoundary == null
+            ? null
+            : subtractExactOrNull(nextBoundary, offset);
+        return span == null || span <= 0L || span > Integer.MAX_VALUE
+            ? null
+            : span.intValue();
+    }
+
+    private void populateHandlerValueLayoutMembers(
+        NestedTypeShape shape,
+        List<HandlerValueLayoutMember> layout,
+        long rootOffset) {
+
+        LinkedHashMap<String, Integer> nameCounts = new LinkedHashMap<>();
+        for (int index = 0; index < layout.size(); index++) {
+            HandlerValueLayoutMember source = layout.get(index);
+            HandlerValueMemberProvider provider = source.provider();
+            NestedTypeMember scalar = source.scalar();
+            NestedTypeMember member = new NestedTypeMember();
+            member.index = index;
+            member.offset = source.offset() - rootOffset;
+            member.nativeOffset = member.offset;
+            if (provider != null) {
+                String baseName = syntheticHandlerMemberName(provider.type().name);
+                int occurrence = nameCounts.merge(baseName, 1, Integer::sum);
+                member.name = occurrence == 1 ? baseName : baseName + "_" + occurrence;
+                member.nameSource = "synthetic-provider-type";
+                member.nativeType = provider.type().name;
+                member.typeId = normalizeUuid(provider.type().typeId);
+                member.typeIdSource = "constructor-stored-az-rtti-provider";
+                member.typeIdentityProven = true;
+                member.typeIdentitySource =
+                    "constructor-provider+exact-serialize-native-layout";
+                member.wireShape = provider.wireShape();
+                member.wireShapeSource =
+                    "constructor-provider+serialize-native-wire-layout";
+                member.wireLayout = provider.wireLayout();
+                member.wireLayoutSource =
+                    "cfg-unmarshal-storage+serialize-native-wire-layout";
+                member.callsite = provider.store();
+                member.target = provider.provider();
+                member.targetName = fullFunctionName(
+                    functionAtOrContaining(resolvedCodeTarget(provider.provider())));
+            }
+            else {
+                member.name = "field_" + source.firstWireOrdinal();
+                member.nameSource = "synthetic-wire-ordinal";
+                member.nativeType = scalar.nativeType;
+                member.typeId = scalar.typeId;
+                member.typeIdSource = scalar.typeIdSource;
+                member.typeIdentityProven = Boolean.TRUE.equals(scalar.typeIdentityProven);
+                member.typeIdentitySource = scalar.typeIdentitySource;
+                member.wireShape = scalar.wireShape;
+                member.wireShapeSource = scalar.wireShapeSource;
+                member.wireLayout = scalar.wireLayout;
+                member.wireLayoutSource = scalar.wireLayoutSource;
+                member.callsite = scalar.callsite;
+                member.target = scalar.target;
+                member.targetName = scalar.targetName;
+            }
+            member.nameProven = false;
+            member.byteWidth = source.nativeSize() <= Integer.MAX_VALUE
+                ? (int)source.nativeSize()
+                : null;
+            member.wireOrdinal = index;
+            member.wireOrderSource = shape.wireOrderSource;
+            shape.members.add(member);
+        }
+    }
+
+    private record HandlerValueWindow(long rootOffset, long nativeSize) {
+        String key() {
+            return rootOffset + ":" + nativeSize;
+        }
+    }
+
+    private record HandlerValueLayoutMember(
+        long offset,
+        long nativeSize,
+        int firstWireOrdinal,
+        int lastWireOrdinal,
+        HandlerValueMemberProvider provider,
+        NestedTypeMember scalar) {
+
+        static HandlerValueLayoutMember provider(HandlerValueMemberProvider provider) {
+            return new HandlerValueLayoutMember(
+                provider.offset(),
+                provider.nativeSize(),
+                provider.firstWireOrdinal(),
+                provider.lastWireOrdinal(),
+                provider,
+                null);
+        }
+
+        static HandlerValueLayoutMember scalar(
+            long offset,
+            int nativeSize,
+            NestedTypeMember scalar) {
+
+            return new HandlerValueLayoutMember(
+                offset,
+                nativeSize,
+                scalar.wireOrdinal,
+                scalar.wireOrdinal,
+                null,
+                scalar);
+        }
+
+        long end() {
+            return Math.addExact(offset, nativeSize);
+        }
+    }

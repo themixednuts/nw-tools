@@ -18,22 +18,22 @@ use super::{
     NativeEnumProjectionCrcIndex, NativeEquipmentSetDataManager, NativeGatherableDataManager,
     NativeGovernanceDataManager, NativeItemConversionDataManager, NativeItemDataManager,
     NativeItemTransformDataManager, NativeLootBucketDataManager, NativeManagerInput,
-    NativeManagerProductFormat, NativeManagerProductInput, NativeManagerShape, NativeManagerSpec,
-    NativeMountHitVolumeDataManager, NativeMultiTableCrcKeyProjectionManager,
-    NativeMusicalRewardsDataManager, NativeNumericKeyType, NativeNumericLookupMethod,
-    NativeNumericLookupParameterKind, NativeObjectivesDataManager, NativeOneTableCampSkinManager,
-    NativeOneTableCostumeChangeManager, NativeOneTableCrcIndexManager,
-    NativeOneTableCrcKeyProjectionManager, NativeOneTableCrestPartManager,
-    NativeOneTableDarknessManager, NativeOneTableDifficultyScalingManager,
-    NativeOneTableDungeonTileManager, NativeOneTableDyeColorManager, NativeOneTableEmoteManager,
-    NativeOneTableEncumbranceManager, NativeOneTableEnumKeyProjectionManager,
-    NativeOneTableExperienceManager, NativeOneTableLevelDisparityManager,
-    NativeOneTableNumericKeyProjectionManager, NativeOneTableOwnedStringCrcIndexManager,
-    NativeOneTableParticleDataManager, NativeOneTablePvpBalanceManager,
-    NativeOneTableRewardTrackItemManager, NativeOneTableRowProjectionManager,
-    NativeOneTableStoreCategoryManager, NativeOneTableStoreProductManager,
-    NativeOneTableStringKeyProjectionManager, NativeOneTableWorldEventRuleManager,
-    NativePartitionedCrcGlobalIndex, NativePlayerDataManager,
+    NativeManagerProductFormat, NativeManagerProductInput, NativeManagerProductKind,
+    NativeManagerShape, NativeManagerSpec, NativeMountHitVolumeDataManager,
+    NativeMultiTableCrcKeyProjectionManager, NativeMusicalRewardsDataManager, NativeNumericKeyType,
+    NativeNumericLookupMethod, NativeNumericLookupParameterKind, NativeObjectivesDataManager,
+    NativeOneTableCampSkinManager, NativeOneTableCostumeChangeManager,
+    NativeOneTableCrcIndexManager, NativeOneTableCrcKeyProjectionManager,
+    NativeOneTableCrestPartManager, NativeOneTableDarknessManager,
+    NativeOneTableDifficultyScalingManager, NativeOneTableDungeonTileManager,
+    NativeOneTableDyeColorManager, NativeOneTableEmoteManager, NativeOneTableEncumbranceManager,
+    NativeOneTableEnumKeyProjectionManager, NativeOneTableExperienceManager,
+    NativeOneTableLevelDisparityManager, NativeOneTableNumericKeyProjectionManager,
+    NativeOneTableOwnedStringCrcIndexManager, NativeOneTableParticleDataManager,
+    NativeOneTablePvpBalanceManager, NativeOneTableRewardTrackItemManager,
+    NativeOneTableRowProjectionManager, NativeOneTableStoreCategoryManager,
+    NativeOneTableStoreProductManager, NativeOneTableStringKeyProjectionManager,
+    NativeOneTableWorldEventRuleManager, NativePartitionedCrcGlobalIndex, NativePlayerDataManager,
     NativePostSkillCapProgressionDataManager, NativeProductAssetResource,
     NativeProductAssetResourceManager, NativeProgressionPointDataManager, NativeProjectionField,
     NativeProjectionForeignKeyTarget, NativeProjectionTransform,
@@ -295,9 +295,6 @@ struct TableFamilyCrcProjectionSpec {
     trim_key: bool,
     reject_zero_crc: bool,
     duplicate_key_policy: NativeDuplicateKeyPolicy,
-    source_row_field: Option<&'static str>,
-    source_row_method: Option<&'static str>,
-    source_row_by_crc_method: Option<&'static str>,
     source_handle_field: Option<&'static str>,
     source_handle_method: Option<(&'static str, &'static str)>,
     row_filters: Vec<NativeCrcProjectionRowFilter>,
@@ -510,7 +507,6 @@ struct AssetProductSpec {
 #[derive(Debug, Clone, Copy)]
 struct ProductAssetResourceSpec {
     product: AssetProductSpec,
-    value_type: &'static str,
     handle_getter: &'static str,
     asset_getter: &'static str,
     manager_getter: &'static str,
@@ -813,8 +809,8 @@ fn progression_pool_data_manager_spec() -> NativeManagerSpec {
                 "category",
                 "Category",
                 "category",
-                NativeProjectionTransform::EnumStringRejectDefault,
-                "newworld_plugin::game_data::PoolCategory",
+                NativeProjectionTransform::U8Enum,
+                "gamedata::semantic::PoolCategory",
             ),
             projection_field(
                 "point_cap",
@@ -1630,15 +1626,6 @@ fn table_family_crc_projection(spec: TableFamilyCrcProjectionSpec) -> NativeMana
     if !spec.store_key_text {
         shape = shape.without_key_text();
     }
-    if let Some(field) = spec.source_row_field {
-        shape = shape.with_source_row_field(ident(field));
-    }
-    if let Some(method) = spec.source_row_method {
-        shape = shape.with_source_row_method(ident(method));
-    }
-    if let Some(method) = spec.source_row_by_crc_method {
-        shape = shape.with_source_row_by_crc_method(ident(method));
-    }
     if let Some(field) = spec.source_handle_field {
         shape = shape.with_source_handle_field(ident(field));
     }
@@ -2063,7 +2050,7 @@ fn product_asset_resource_manager_spec_with_format(
                 .map(|product| {
                     NativeProductAssetResource::new(
                         rust_type(product.product.rust_type),
-                        rust_type(product.value_type),
+                        rust_type(product.product.rust_type),
                         ident(product.handle_getter),
                         ident(product.asset_getter),
                         ident(product.manager_getter),
@@ -2148,24 +2135,22 @@ fn manager_spec_with_exact_inputs(
     .expect("validated native manager spec")
 }
 
-fn asset_product(asset_path: &'static str, rust_type: &'static str) -> AssetProductSpec {
+fn asset_product(asset_path: &'static str, kind: NativeManagerProductKind) -> AssetProductSpec {
     AssetProductSpec {
         asset_path,
-        rust_type,
+        rust_type: kind.canonical_type_path(),
     }
 }
 
 fn product_asset_resource(
     asset_path: &'static str,
-    rust_type: &'static str,
-    value_type: &'static str,
+    kind: NativeManagerProductKind,
     handle_getter: &'static str,
     asset_getter: &'static str,
     manager_getter: &'static str,
 ) -> ProductAssetResourceSpec {
     ProductAssetResourceSpec {
-        product: asset_product(asset_path, rust_type),
-        value_type,
+        product: asset_product(asset_path, kind),
         handle_getter,
         asset_getter,
         manager_getter,
@@ -2175,7 +2160,7 @@ fn product_asset_resource(
 fn native_product_asset_resource(product: ProductAssetResourceSpec) -> NativeProductAssetResource {
     NativeProductAssetResource::new(
         rust_type(product.product.rust_type),
-        rust_type(product.value_type),
+        rust_type(product.product.rust_type),
         ident(product.handle_getter),
         ident(product.asset_getter),
         ident(product.manager_getter),

@@ -1,0 +1,308 @@
+    private NestedTypeShape uniqueSerializeContainerHelperShape(
+        Function function,
+        ContainerCodecMembers codecs) {
+
+        if (function == null || codecs == null || !codecs.linear() ||
+            !codecs.optionalMembers().isEmpty()) {
+            return null;
+        }
+        List<ContainerCodecCall> leaves = physicalContainerCodecLeaves(codecs.members());
+        if (leaves == null || leaves.size() < 2 || leaves.stream().anyMatch(codec ->
+                codec == null || codec.elementBase == null || codec.elementOffset == null ||
+                codec.wireEvidence == null || codec.wireEvidence.layout == null)) {
+            return null;
+        }
+        String elementBase = leaves.get(0).elementBase;
+        if (leaves.stream().anyMatch(codec -> !elementBase.equals(codec.elementBase))) {
+            return null;
+        }
+
+        LinkedHashMap<Long, NestedTypeMember> observed = new LinkedHashMap<>();
+        for (int ordinal = 0; ordinal < leaves.size(); ordinal++) {
+            ContainerCodecCall codec = leaves.get(ordinal);
+            if (observed.containsKey(codec.elementOffset)) {
+                recordNestedTypeShapeReject("container-helper-member-offset-conflict");
+                return null;
+            }
+            NestedTypeMember member = new NestedTypeMember();
+            member.index = ordinal;
+            member.offset = codec.elementOffset;
+            member.nativeOffset = codec.elementOffset;
+            member.name = "field_" + ordinal;
+            member.nameSource = "synthetic-wire-ordinal";
+            member.nameProven = false;
+            member.nativeType = codec.nativeType;
+            member.typeId = normalizeUuid(codec.typeId);
+            member.typeIdSource = codec.typeIdSource;
+            member.typeIdentityProven = codec.typeIdentityProven;
+            member.typeIdentitySource = codec.typeIdSource;
+            member.wireShape = codec.wireEvidence.shape;
+            member.wireShapeSource = codec.wireEvidence.source;
+            member.wireLayout = codec.wireEvidence.layout;
+            member.wireLayoutSource = codec.wireEvidence.layoutSource;
+            member.byteWidth = wireShapeByteWidth(codec.wireEvidence.layout);
+            member.wireOrdinal = ordinal;
+            member.wireOrderSource = "cfg-marshal-helper-call-order";
+            member.callsite = codec.callsite;
+            member.target = codec.target;
+            member.targetName = codec.targetName;
+            observed.put(codec.elementOffset, member);
+        }
+
+        String observedLayout = absoluteObservedNativeWireLayoutKey(observed.values());
+        if (observedLayout == null) {
+            return null;
+        }
+        LinkedHashMap<String, SerializeTypeInfo> matches = new LinkedHashMap<>();
+        for (SerializeTypeInfo candidate : serializeTypesById.values()) {
+            Long nativeSize = exactSerializeNativeSize(candidate);
+            List<SerializeWireSlot> expected = serializeTypeNativeWireLayout(candidate.typeId);
+            if (nativeSize == null || expected.size() != observed.size() ||
+                !observedLayout.equals(absoluteSerializeNativeWireLayoutKey(expected))) {
+                continue;
+            }
+            matches.putIfAbsent(normalizeUuid(candidate.typeId), candidate);
+        }
+        if (matches.isEmpty()) {
+            return uniqueSerializeContainerHelperTailShape(
+                function,
+                observed);
+        }
+        if (matches.size() != 1) {
+            recordNestedTypeShapeReject("ambiguous-container-helper-native-layout");
+            return null;
+        }
+
+        SerializeTypeInfo reflected = matches.values().iterator().next();
+        long nativeSize = exactSerializeNativeSize(reflected);
+        NestedTypeShape shape = exactContainerValueShapeForBase(
+            reflected,
+            function,
+            null,
+            "marshal-value-parameter",
+            observed,
+            serializeTypeNativeWireLayout(reflected.typeId),
+            nativeSize,
+            0L);
+        if (shape == null) {
+            return null;
+        }
+        String source =
+            "marshal-helper-source-offsets+unique-serialize-native-layout";
+        shape.typeId = normalizeUuid(reflected.typeId);
+        shape.typeIdSource = source;
+        shape.identityProven = true;
+        shape.identitySource = source;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(reflected.name);
+        shape.typeNameFull = reflected.name;
+        shape.typeNameSource = source;
+        shape.nativeSize = nativeSize;
+        shape.nativeSizeSource = "serialize-exact-native-size";
+        shape.validation = appendValidation(shape.validation, source);
+        return shape;
+    }
+
+    private NestedTypeShape uniqueSerializeContainerHelperTailShape(
+        Function function,
+        LinkedHashMap<Long, NestedTypeMember> observed) {
+
+        LinkedHashMap<String, SerializeTypeInfo> matches = new LinkedHashMap<>();
+        for (SerializeTypeInfo candidate : serializeTypesById.values()) {
+            Long reflectedSpan = exactSerializeNativeSize(candidate);
+            List<SerializeWireSlot> expected = serializeTypeNativeWireLayout(candidate.typeId);
+            if (reflectedSpan == null || expected.size() < 2 ||
+                expected.size() >= observed.size() ||
+                !completeSerializePrefixWithObservedTail(
+                    expected,
+                    reflectedSpan,
+                    observed)) {
+                continue;
+            }
+            matches.putIfAbsent(normalizeUuid(candidate.typeId), candidate);
+        }
+        if (matches.size() != 1) {
+            if (matches.size() > 1) {
+                recordNestedTypeShapeReject(
+                    "ambiguous-container-helper-reflected-prefix");
+            }
+            return null;
+        }
+
+        SerializeTypeInfo reflected = matches.values().iterator().next();
+        List<SerializeWireSlot> expected = serializeTypeNativeWireLayout(reflected.typeId);
+        LinkedHashMap<Long, SerializeWireSlot> expectedByOffset = new LinkedHashMap<>();
+        for (SerializeWireSlot slot : expected) {
+            if (expectedByOffset.put(slot.offset, slot) != null) {
+                return null;
+            }
+        }
+
+        String source =
+            "marshal-helper-source-offsets+unique-serialize-reflected-prefix+observed-native-tail";
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeId = normalizeUuid(reflected.typeId);
+        shape.typeIdSource = source;
+        shape.identityProven = true;
+        shape.identitySource = source;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(reflected.name);
+        shape.typeNameFull = reflected.name;
+        shape.typeNameSource = source;
+        shape.factory = reflected.factory;
+        shape.azRttiAddress = reflected.azRttiAddress;
+        shape.function = function.getEntryPoint();
+        shape.functionName = fullFunctionName(function);
+        shape.memberBase = "marshal-value-parameter";
+        shape.memberNameSource = "serialize-fields-with-observed-native-tail";
+        shape.memberNamesProven = false;
+        shape.memberCoverageProven = true;
+        shape.wireOrderProven = true;
+        shape.wireOrderSource = "cfg-marshal-helper-call-order";
+        shape.validation = source;
+        shape.nativeSize = observedNativeMemberSpan(observed.values());
+        shape.nativeSizeSource = "ghidra-marshal-helper-observed-member-span";
+
+        int index = 0;
+        for (NestedTypeMember sourceMember : observed.values()) {
+            NestedTypeMember member = copyNestedTypeMember(sourceMember);
+            member.index = index++;
+            member.nativeOffset = sourceMember.offset;
+            SerializeWireSlot slot = expectedByOffset.get(sourceMember.offset);
+            if (slot != null) {
+                member.offset = slot.offset;
+                member.name = slot.path;
+                member.nameSource = "serialize-field-for-proven-type";
+                member.nameProven = true;
+                member.nameEvidence = slot.path;
+                if (isPlausibleTypeName(slot.nativeType)) {
+                    member.nativeType = slot.nativeType;
+                }
+                member.typeId = normalizeUuid(slot.typeId);
+                member.typeIdSource = "serialize-field-for-proven-type";
+                member.typeIdentityProven = true;
+                member.typeIdentitySource = source;
+            }
+            shape.members.add(member);
+        }
+        return shape.nativeSize == null ? null : shape;
+    }
+
+    private boolean completeSerializePrefixWithObservedTail(
+        List<SerializeWireSlot> expected,
+        long reflectedSpan,
+        Map<Long, NestedTypeMember> observed) {
+
+        LinkedHashSet<Long> matched = new LinkedHashSet<>();
+        for (SerializeWireSlot slot : expected) {
+            NestedTypeMember member = observed.get(slot.offset);
+            String observedLayout = member == null
+                ? null
+                : member.wireLayout == null ? member.wireShape : member.wireLayout;
+            if (member == null || Boolean.TRUE.equals(member.typeConflict) ||
+                !canonicalLayoutWireShape(slot.wireShape).equals(
+                    canonicalLayoutWireShape(observedLayout))) {
+                return false;
+            }
+            matched.add(slot.offset);
+        }
+        boolean sawTail = false;
+        for (Long offset : observed.keySet()) {
+            if (matched.contains(offset)) {
+                continue;
+            }
+            if (offset < reflectedSpan) {
+                return false;
+            }
+            sawTail = true;
+        }
+        return sawTail;
+    }
+
+    private Long observedNativeMemberSpan(Collection<NestedTypeMember> members) {
+        long span = 0L;
+        for (NestedTypeMember member : members) {
+            Integer width = nativeTypeByteWidth(member.nativeType);
+            if (width == null) {
+                width = member.byteWidth;
+            }
+            Long end = width == null || width <= 0
+                ? null
+                : addExactOrNull(member.offset, width.longValue());
+            if (end == null) {
+                return null;
+            }
+            span = Math.max(span, end);
+        }
+        return span == 0L ? null : span;
+    }
+
+    private String absoluteObservedNativeWireLayoutKey(
+        Collection<NestedTypeMember> members) {
+
+        ArrayList<NestedTypeMember> ordered = new ArrayList<>(members);
+        ordered.sort(Comparator.comparingLong(member -> member.offset));
+        StringBuilder key = new StringBuilder().append(ordered.size());
+        for (NestedTypeMember member : ordered) {
+            String layout = member.wireLayout == null
+                ? member.wireShape
+                : member.wireLayout;
+            if (member.offset < 0L || layout == null ||
+                Boolean.TRUE.equals(member.typeConflict)) {
+                return null;
+            }
+            key.append('|').append(member.offset).append(':')
+                .append(canonicalLayoutWireShape(layout));
+        }
+        return key.toString();
+    }
+
+    private String absoluteSerializeNativeWireLayoutKey(List<SerializeWireSlot> slots) {
+        if (slots == null || slots.isEmpty()) {
+            return null;
+        }
+        StringBuilder key = new StringBuilder().append(slots.size());
+        for (SerializeWireSlot slot : slots) {
+            if (slot.offset < 0L || slot.wireShape == null) {
+                return null;
+            }
+            key.append('|').append(slot.offset).append(':')
+                .append(canonicalLayoutWireShape(slot.wireShape));
+        }
+        return key.toString();
+    }
+    private NativeTypeInfoEvidence withDirectContainerElementSize(
+        NativeTypeInfoEvidence candidate,
+        FullContainerPlan plan) {
+
+        if (candidate == null || candidate.nativeSize != null || plan == null ||
+            plan.storageKind != ContainerStorageKind.VECTOR || plan.elementStride == null ||
+            plan.elementStride <= 0L || candidate.address == null) {
+            return candidate;
+        }
+
+        ContainerCodecCall direct = null;
+        for (ContainerCodecCall codec : plan.valueCodecs) {
+            if (codec == null || codec.target == null || codec.operation == null ||
+                !"element".equals(codec.elementBase) ||
+                !Long.valueOf(0L).equals(codec.elementOffset) ||
+                !Objects.equals(resolvedCodeTarget(codec.target),
+                    resolvedCodeTarget(candidate.address))) {
+                continue;
+            }
+            if (direct != null) {
+                return candidate;
+            }
+            direct = codec;
+        }
+        if (direct == null) {
+            return candidate;
+        }
+
+        return new NativeTypeInfoEvidence(
+            candidate.address,
+            candidate.name,
+            candidate.typeId,
+            candidate.source,
+            candidate.nameSource,
+            plan.elementStride,
+            "cfg-vector-affine-stride+direct-typed-element-helper");
+    }

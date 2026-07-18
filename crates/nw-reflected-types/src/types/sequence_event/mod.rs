@@ -113,7 +113,7 @@ pub use self::weapon_effects::WeaponEffects;
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct SequenceEvent;
+pub struct SequenceEvent {}
 
 impl AzRtti for SequenceEvent {
     const NAME: &'static str = "SequenceEvent";

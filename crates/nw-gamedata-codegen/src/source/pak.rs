@@ -7,9 +7,11 @@ use anyhow::{Context, Result, bail};
 use nw_asset::{ASSET_CATALOG_PATH, Error as AssetCatalogError, Rasc};
 use nw_datasheet::game_system::{
     GameSystemAsset, GameSystemAssetSource, GameSystemDataTables as GameSystemCatalog,
+    GameSystemTable,
 };
 use nw_datasheet::is_datasheet_path;
 use nw_pak::{PakError, PakMmapReader};
+use rayon::prelude::*;
 use thiserror::Error;
 
 use super::GameDataSourceProvider;
@@ -65,7 +67,7 @@ impl GameDataSourceProvider for PakDatasheetGameDataSource {
     fn load_catalog(&self) -> Result<GameSystemCatalog> {
         let source = PakDatasheetSource::open(&self.asset_root, &self.pak_paths)
             .context("open pak-backed game-system datasheet source")?;
-        GameSystemCatalog::load_from_source(&source).context("load game-system datasheets")
+        source.load_catalog_parallel()
     }
 }
 
@@ -210,6 +212,34 @@ impl PakDatasheetSource {
             entries_by_path,
             assets,
         })
+    }
+
+    fn load_catalog_parallel(&self) -> Result<GameSystemCatalog> {
+        let mut assets = self.assets.clone();
+        assets.sort_by(|left, right| {
+            left.path()
+                .cmp(right.path())
+                .then(left.asset_id().cmp(&right.asset_id()))
+        });
+        let mut catalog = GameSystemCatalog::default();
+        let batch_size = rayon::current_num_threads().max(1) * 2;
+        for batch in assets.chunks(batch_size) {
+            let tables = batch
+                .par_iter()
+                .cloned()
+                .map(|asset| {
+                    let bytes = self
+                        .read_datasheet(&asset)
+                        .with_context(|| format!("read datasheet {}", asset.path().display()))?;
+                    GameSystemTable::parse_asset(asset, &bytes)
+                        .context("parse game-system datasheet")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for table in tables {
+                catalog.insert(table)?;
+            }
+        }
+        Ok(catalog)
     }
 }
 

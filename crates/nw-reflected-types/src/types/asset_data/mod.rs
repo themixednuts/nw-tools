@@ -15,6 +15,7 @@ pub mod game_debug_settings;
 pub mod game_event_database;
 pub mod gathering_action_database;
 pub mod gathering_database;
+pub mod grid_generic_assets;
 pub mod input_event_bindings_asset;
 pub mod input_map_asset;
 pub mod player_base_attributes;
@@ -58,6 +59,7 @@ pub use self::gathering_database::{
     GatheringAction, GatheringData, GatheringDatabase, GatheringTypeData,
 };
 
+pub use self::grid_generic_assets::{CellIndex, ChunkEntry, GridGenericAssetAssetData};
 pub use self::input_event_bindings_asset::{
     InputEventBindings, InputEventBindingsAsset, InputEventGroup, InputSubComponent,
 };
@@ -115,7 +117,7 @@ pub use self::world_material_data_asset::{TileMaterialData, WorldMaterialDataAss
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct AssetData;
+pub struct AssetData {}
 
 impl AzRtti for AssetData {
     const NAME: &'static str = "AssetData";

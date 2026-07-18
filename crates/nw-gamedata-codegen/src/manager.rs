@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use crate::game_system_schema::GameSystemDataTablesSchemaReport;
 use crate::native::{NativeCodegenFile, NativeCodegenOutput, NativeCodegenPlan};
 use crate::schema::GameDataCompileMode;
-use crate::target::{GameDataTargetLanguage, GameDataTargetPlan};
+use crate::target::GameDataTargetLanguage;
 
 pub use nw_gamedata_manager_specs::manager::*;
 
@@ -27,7 +27,6 @@ pub struct ManagerCodegenPlan {
 #[derive(Debug, Clone, Copy)]
 pub struct ManagerEmissionContext<'a> {
     mode: GameDataCompileMode,
-    target: &'a GameDataTargetPlan,
     plan: &'a ManagerCodegenPlan,
 }
 
@@ -43,10 +42,28 @@ pub fn validated_native_manager_plan_for_schema(
         .iter()
         .map(|table| (table.table_name.as_str(), table.row_type_name.as_str()))
         .collect::<BTreeSet<_>>();
-    let managers = validated_native_manager_specs()
+    let mut managers = validated_native_manager_specs()
         .into_iter()
         .filter(|manager| manager_table_inputs_available(manager, &available_tables))
-        .collect();
+        .collect::<Vec<_>>();
+    loop {
+        let available_managers = managers
+            .iter()
+            .map(|manager| manager.rust_type().as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let previous_len = managers.len();
+        managers.retain(|manager| {
+            manager.inputs().iter().all(|input| match input {
+                NativeManagerInput::Manager(dependency) => {
+                    available_managers.contains(dependency.as_str())
+                }
+                NativeManagerInput::Table(_) | NativeManagerInput::Product(_) => true,
+            })
+        });
+        if managers.len() == previous_len {
+            break;
+        }
+    }
     ManagerCodegenPlan::from_native_managers(managers)
 }
 
@@ -114,22 +131,13 @@ impl ManagerCodegenPlan {
 
 impl<'a> ManagerEmissionContext<'a> {
     #[must_use]
-    pub const fn new(
-        mode: GameDataCompileMode,
-        target: &'a GameDataTargetPlan,
-        plan: &'a ManagerCodegenPlan,
-    ) -> Self {
-        Self { mode, target, plan }
+    pub const fn new(mode: GameDataCompileMode, plan: &'a ManagerCodegenPlan) -> Self {
+        Self { mode, plan }
     }
 
     #[must_use]
     pub const fn mode(&self) -> GameDataCompileMode {
         self.mode
-    }
-
-    #[must_use]
-    pub const fn target(&self) -> &'a GameDataTargetPlan {
-        self.target
     }
 
     #[must_use]
@@ -145,4 +153,21 @@ pub trait ManagerEmitter {
         &self,
         context: ManagerEmissionContext<'_>,
     ) -> anyhow::Result<ManagerCodegenOutput>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_filtered_plan_removes_consumers_with_missing_manager_dependencies() {
+        let schema = GameSystemDataTablesSchemaReport {
+            tables: Vec::new(),
+            diagnostics: Vec::new(),
+            type_affinities: Vec::new(),
+        };
+        let plan = validated_native_manager_plan_for_schema(&schema);
+        crate::manager_records::manager_surfaces_from_managers(plan.managers())
+            .expect("schema-filtered plan must be dependency complete");
+    }
 }

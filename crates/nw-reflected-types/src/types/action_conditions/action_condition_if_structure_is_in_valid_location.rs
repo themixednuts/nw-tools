@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfStructureIsInValidLocation;
+pub struct ActionConditionIfStructureIsInValidLocation {}
 
 impl AzRtti for ActionConditionIfStructureIsInValidLocation {
     const NAME: &'static str = "ActionConditionIfStructureIsInValidLocation";

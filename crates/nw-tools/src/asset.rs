@@ -646,22 +646,30 @@ impl Dependencies {
         let ctx = self.jobs.ctx()?;
         let root = self.root.resolve()?;
         let install = source::Install::open(&ctx, &root)?;
-        let root_asset = install
-            .asset(&self.asset)
-            .with_context(|| format!("asset is not cataloged: {}", self.asset))?;
-        let graph = nw_asset_graph::resolve_with_runner(
-            &install,
-            root_asset.path(),
-            &nw_asset_graph::ResolveOptions::default(),
-            &ctx.runner,
-        )?;
+        let (root_path, root_asset_id) = if let Some(asset) = install.asset(&self.asset) {
+            (asset.path().to_owned(), Some(asset.asset_id().to_string()))
+        } else if self.asset.parse::<nw_asset::AssetId>().is_ok() {
+            bail!("asset id is not present in the catalog: {}", self.asset);
+        } else {
+            let path = nw_asset::normalize_virtual_path(&self.asset);
+            if !install.contains(&path) {
+                bail!("asset path is not present in the mounted paks: {path}");
+            }
+            (path, None)
+        };
+        let graph = if self.direct {
+            nw_asset_graph::inspect_direct(&install, &root_path)?
+        } else {
+            nw_asset_graph::resolve_with_runner(
+                &install,
+                &root_path,
+                &nw_asset_graph::ResolveOptions::default(),
+                &ctx.runner,
+            )?
+        };
         let mut paths = if self.direct {
-            std::iter::once(root_asset.path().to_owned())
-                .chain(
-                    graph
-                        .direct_dependencies(root_asset.path())
-                        .map(str::to_owned),
-                )
+            std::iter::once(root_path.clone())
+                .chain(graph.direct_dependencies(&root_path).map(str::to_owned))
                 .collect::<Vec<_>>()
         } else {
             graph.assets().to_vec()
@@ -673,7 +681,7 @@ impl Dependencies {
             .unresolved()
             .iter()
             .filter(|dependency| {
-                !self.direct || dependency.source().eq_ignore_ascii_case(root_asset.path())
+                !self.direct || dependency.source().eq_ignore_ascii_case(&root_path)
             })
             .collect::<Vec<_>>();
         let required_unresolved = unresolved
@@ -711,8 +719,11 @@ impl Dependencies {
         }
 
         let mut report = Report::new("asset dependencies")
-            .stat("root", root_asset.path())
-            .stat("asset-id", root_asset.asset_id())
+            .stat("root", &root_path)
+            .stat(
+                "asset-id",
+                root_asset_id.as_deref().unwrap_or("uncataloged"),
+            )
             .stat("scope", if self.direct { "direct" } else { "transitive" })
             .stat("products", paths.len().saturating_sub(1))
             .stat("unresolved", unresolved.len())
@@ -721,7 +732,7 @@ impl Dependencies {
         let mut mappings = graph
             .edges()
             .iter()
-            .filter(|edge| !self.direct || edge.source().eq_ignore_ascii_case(root_asset.path()))
+            .filter(|edge| !self.direct || edge.source().eq_ignore_ascii_case(&root_path))
             .map(|edge| {
                 (
                     edge.source().to_owned(),

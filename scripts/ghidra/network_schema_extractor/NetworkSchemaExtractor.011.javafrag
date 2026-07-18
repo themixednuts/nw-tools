@@ -1,181 +1,3 @@
-    private List<String> callArgumentsForTarget(String text, Function target) {
-        return callArgumentsForTarget(text, target, 0);
-    }
-
-    private List<String> callArgumentsForTarget(
-        String text,
-        Function target,
-        int occurrence) {
-
-        if (text == null || target == null) {
-            return List.of();
-        }
-        for (String name : functionCallNameCandidates(target)) {
-            List<String> args = callArgumentsForName(text, name, occurrence);
-            if (!args.isEmpty()) {
-                return args;
-            }
-        }
-        return List.of();
-    }
-
-    private int callTextIndexForTarget(String text, Function target) {
-        return callTextIndexForTarget(text, target, 0);
-    }
-
-    private int callTextIndexForTarget(String text, Function target, int occurrence) {
-        if (text == null || target == null) {
-            return Integer.MAX_VALUE;
-        }
-        for (String name : functionCallNameCandidates(target)) {
-            int index = callTextIndexForName(text, name, occurrence);
-            if (index >= 0) {
-                return index;
-            }
-        }
-        return Integer.MAX_VALUE;
-    }
-
-    private int callTextIndexForName(String text, String name) {
-        return callTextIndexForName(text, name, 0);
-    }
-
-    private int callTextIndexForName(String text, String name, int occurrence) {
-        if (text == null || name == null || name.isEmpty()) {
-            return -1;
-        }
-        int matched = 0;
-        int search = 0;
-        while (search < text.length()) {
-            int nameIndex = text.indexOf(name, search);
-            if (nameIndex < 0) {
-                return -1;
-            }
-            int argsStart = text.indexOf('(', nameIndex + name.length());
-            if (argsStart < 0) {
-                return -1;
-            }
-            String between = text.substring(nameIndex + name.length(), argsStart).trim();
-            if (!between.isEmpty()) {
-                search = nameIndex + name.length();
-                continue;
-            }
-            if (matched++ == occurrence) {
-                return nameIndex;
-            }
-            int argsEnd = NetworkSchemaText.matchingIndex(text, argsStart, '(', ')');
-            search = argsEnd < 0 ? nameIndex + name.length() : argsEnd + 1;
-        }
-        return -1;
-    }
-
-    private List<String> functionCallNameCandidates(Function function) {
-        ArrayList<String> result = new ArrayList<>();
-        String fullName = fullFunctionName(function);
-        addDistinct(result, fullName);
-        String plainName = function.getName();
-        if (!isGenericCallName(plainName)) {
-            addDistinct(result, plainName);
-        }
-        String leaf = NetworkSchemaText.sourceTypeLeaf(fullName);
-        if (!isGenericCallName(leaf)) {
-            addDistinct(result, leaf);
-        }
-        return result;
-    }
-
-    private boolean isGenericCallName(String value) {
-        return value == null ||
-            value.isEmpty() ||
-            "Unmarshal".equals(value) ||
-            "Marshal".equals(value) ||
-            "CopyValue".equals(value) ||
-            "CreateInstance".equals(value) ||
-            "GetEmptyValue".equals(value) ||
-            "Destructor".equals(value);
-    }
-
-    private void addDistinct(List<String> values, String value) {
-        if (value == null || value.isEmpty() || values.contains(value)) {
-            return;
-        }
-        values.add(value);
-    }
-
-    private List<String> callArgumentsForName(String text, String name) {
-        return callArgumentsForName(text, name, 0);
-    }
-
-    private List<String> callArgumentsForName(String text, String name, int occurrence) {
-        if (text == null || name == null || name.isEmpty()) {
-            return List.of();
-        }
-        int matched = 0;
-        int search = 0;
-        while (search < text.length()) {
-            int nameIndex = text.indexOf(name, search);
-            if (nameIndex < 0) {
-                return List.of();
-            }
-            int argsStart = text.indexOf('(', nameIndex + name.length());
-            if (argsStart < 0) {
-                return List.of();
-            }
-            String between = text.substring(nameIndex + name.length(), argsStart).trim();
-            if (!between.isEmpty()) {
-                search = nameIndex + name.length();
-                continue;
-            }
-            int argsEnd = NetworkSchemaText.matchingIndex(text, argsStart, '(', ')');
-            if (argsEnd < 0) {
-                return List.of();
-            }
-            if (matched++ == occurrence) {
-                return NetworkSchemaText.splitTopLevel(text.substring(argsStart + 1, argsEnd));
-            }
-            search = argsEnd + 1;
-        }
-        return List.of();
-    }
-
-    private int callOccurrenceIndex(
-        Function owner,
-        Instruction currentInstruction,
-        Function target) {
-
-        if (owner == null || currentInstruction == null || target == null) {
-            return 0;
-        }
-        int occurrence = 0;
-        Address currentAddress = currentInstruction.getMinAddress();
-        Address targetAddress = target.getEntryPoint();
-        for (Instruction instruction : functionInstructions(owner)) {
-            if (!instruction.getFlowType().isCall()) {
-                continue;
-            }
-            Function candidate = functionAtOrContaining(callTarget(instruction));
-            if (candidate == null ||
-                !candidate.getEntryPoint().equals(targetAddress)) {
-                continue;
-            }
-            if (instruction.getMinAddress().equals(currentAddress)) {
-                return occurrence;
-            }
-            occurrence++;
-        }
-        return 0;
-    }
-
-    private boolean isLeafUnmarshalTarget(Function target) {
-        String name = fullFunctionName(target);
-        if (name == null) {
-            return false;
-        }
-        return name.contains("::Unmarshal") ||
-            name.contains("Marshaler<") ||
-            name.contains("Marshaller<");
-    }
-
     private String unmarshalTemplateType(String functionName) {
         if (functionName == null) {
             return null;
@@ -192,68 +14,55 @@
         return functionName.substring(start + 1, end).trim();
     }
 
-    private String bareArgumentName(String argument) {
-        if (argument == null) {
-            return null;
-        }
-        ParsedArgument parsed = textParser.parseArgument(argument);
-        String value = parsed.expression == null ? argument : parsed.expression;
-        value = value.trim();
-        while (value.startsWith("&")) {
-            value = value.substring(1).trim();
-        }
-        if (!value.matches("[A-Za-z_][A-Za-z0-9_]*")) {
-            return null;
-        }
-        return value;
-    }
-
-    private String decompileC(Function function) {
-        if (function == null || decompiler == null) {
-            return null;
-        }
-        String key = functionCacheKey("decompile", function);
-        if (decompileCache.containsKey(key)) {
-            return decompileCache.get(key);
-        }
-        try {
-            DecompileResults results = decompiler.decompileFunction(function, 30, monitor);
-            if (!results.decompileCompleted() || results.getDecompiledFunction() == null) {
-                decompileCache.put(key, null);
-                return null;
-            }
-            String text = results.getDecompiledFunction().getC();
-            decompileCache.put(key, text);
-            return text;
-        }
-        catch (Exception ignored) {
-            decompileCache.put(key, null);
-            return null;
-        }
-    }
-
     private HighFunction highFunction(Function function) {
         if (function == null || decompiler == null) {
             return null;
         }
+        runMetrics.increment("highFunctionRequests");
         String key = functionCacheKey("high-function", function);
-        if (highFunctionCache.containsKey(key)) {
-            return highFunctionCache.get(key);
+        Map<String, HighFunction> cache = highFunctionCacheFor(function);
+        if (cache.containsKey(key)) {
+            runMetrics.increment("highFunctionHits");
+            return cache.get(key);
+        }
+        if (failedHighFunctions.contains(key)) {
+            runMetrics.increment("highFunctionHits");
+            return null;
+        }
+        runMetrics.increment("highFunctionMisses");
+        if (!highFunctionSeen.add(key)) {
+            runMetrics.increment("highFunctionRecompilations");
+            highFunctionRecompileCounts.merge(
+                formatAddress(function.getEntryPoint()),
+                1,
+                Integer::sum);
         }
         try {
             DecompileResults results = decompiler.decompileFunction(function, 30, monitor);
             if (!results.decompileCompleted() || results.getHighFunction() == null) {
-                highFunctionCache.put(key, null);
+                runMetrics.increment("highFunctionFailures");
+                failedHighFunctions.add(key);
                 return null;
             }
+            runMetrics.increment("highFunctionCompleted");
             HighFunction high = results.getHighFunction();
-            highFunctionCache.put(key, high);
+            cache.put(key, high);
             return high;
         }
         catch (Exception ignored) {
-            highFunctionCache.put(key, null);
+            runMetrics.increment("highFunctionFailures");
+            failedHighFunctions.add(key);
             return null;
         }
+    }
+
+    private Map<String, HighFunction> highFunctionCacheFor(Function function) {
+        long bodyBytes = function.getBody() == null
+            ? Long.MAX_VALUE
+            : function.getBody().getNumAddresses();
+        return bodyBytes <= SMALL_HIGH_FUNCTION_BYTE_LIMIT
+            ? smallHighFunctionCache
+            : highFunctionCache;
     }
 
     private Function pcodeCallTarget(PcodeOp op) {
@@ -267,13 +76,16 @@
         }
         Address rawAddress = pcodeAddress(op.getInput(0));
         Address resolvedAddress = resolvedCodeTarget(rawAddress);
-        Function exact = functionExactlyAt(resolvedAddress);
-        Function containing = exact == null ? functionContaining(resolvedAddress) : null;
+        Function direct = functionExactlyAt(rawAddress);
+        Function resolved = direct == null ? functionExactlyAt(resolvedAddress) : null;
+        Function target = direct == null ? resolved : direct;
+        Address selectedAddress = direct == null ? resolvedAddress : rawAddress;
+        Function containing = target == null ? functionContaining(selectedAddress) : null;
         PcodeCallTargetInfo info = new PcodeCallTargetInfo();
         info.rawTarget = rawAddress;
         info.resolvedTarget = resolvedAddress;
-        info.target = exact;
-        info.targetExactStart = exact != null;
+        info.target = target;
+        info.targetExactStart = target != null;
         info.containing = containing;
         return info;
     }
@@ -287,7 +99,7 @@
         Set<String> seen,
         int depth) {
 
-        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+        if (node == null) {
             return null;
         }
         String key = pcodeNodeKey(node);
@@ -348,113 +160,74 @@
         return null;
     }
 
-    private Integer returnedCallInputSlot(Function target) {
-        if (target == null) {
+    private Integer returnedParameterSlot(Function function) {
+        if (function == null || function.getEntryPoint() == null) {
             return null;
         }
-        String key = functionCacheKey("returned-call-input-slot", target);
-        if (returnedCallInputSlotCache.containsKey(key)) {
-            return returnedCallInputSlotCache.get(key);
+        String key = functionCacheKey("returned-parameter-slot", function);
+        Integer cached = returnedParameterSlotCache.get(key);
+        if (cached != null) {
+            return cached > 0 ? cached : null;
         }
-
-        HighFunction high = highFunction(target);
-        if (high == null) {
-            returnedCallInputSlotCache.put(key, null);
+        if (!returnedParameterSlotActive.add(key)) {
             return null;
         }
 
-        Integer merged = null;
-        Iterator<PcodeOpAST> ops = high.getPcodeOps();
-        while (ops.hasNext()) {
-            PcodeOpAST op = ops.next();
-            if (op.getOpcode() != PcodeOp.RETURN || op.getNumInputs() < 2) {
-                continue;
-            }
-            Integer slot =
-                returnedCallInputSlotFromValue(op.getInput(1), new LinkedHashSet<>(), 0);
-            if (slot == null) {
-                returnedCallInputSlotCache.put(key, null);
+        Integer selected = null;
+        boolean sawReturnValue = false;
+        boolean valid = true;
+        try {
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                valid = false;
                 return null;
             }
-            if (merged == null) {
-                merged = slot;
-            }
-            else if (!merged.equals(slot)) {
-                returnedCallInputSlotCache.put(key, null);
-                return null;
-            }
-        }
-        returnedCallInputSlotCache.put(key, merged);
-        return merged;
-    }
-
-    private Integer returnedCallInputSlotFromValue(
-        Varnode node,
-        Set<String> seen,
-        int depth) {
-
-        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
-            return null;
-        }
-        String key = "return-slot:" + pcodeNodeKey(node);
-        if (!seen.add(key)) {
-            return null;
-        }
-
-        Integer direct = callInputSlotForRegister(node);
-        if (direct != null) {
-            return direct;
-        }
-
-        PcodeOp def = node.getDef();
-        if (def == null) {
-            return null;
-        }
-        switch (def.getOpcode()) {
-            case PcodeOp.COPY:
-            case PcodeOp.CAST:
-            case PcodeOp.INT_ZEXT:
-            case PcodeOp.INT_SEXT:
-            case PcodeOp.SUBPIECE:
-            case PcodeOp.INDIRECT:
-                return def.getNumInputs() == 0
-                    ? null
-                    : returnedCallInputSlotFromValue(def.getInput(0), seen, depth + 1);
-            case PcodeOp.MULTIEQUAL:
-                Integer merged = null;
-                for (int i = 0; i < def.getNumInputs(); i++) {
-                    Integer slot = returnedCallInputSlotFromValue(
-                        def.getInput(i),
-                        new LinkedHashSet<>(seen),
-                        depth + 1);
-                    if (slot == null) {
-                        return null;
-                    }
-                    if (merged == null) {
-                        merged = slot;
-                    }
-                    else if (!merged.equals(slot)) {
-                        return null;
-                    }
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (operation.getOpcode() != PcodeOp.RETURN ||
+                    operation.getNumInputs() < 2) {
+                    continue;
                 }
-                return merged;
-            default:
-                return null;
+                Varnode value = operation.getInput(operation.getNumInputs() - 1);
+                if (value == null || value.isConstant()) {
+                    continue;
+                }
+                PcodeStorage storage = pcodeStorageExpression(value);
+                Integer slot = formalParameterSlot(storage);
+                if (slot == null || storage.offset != 0L) {
+                    valid = false;
+                    return null;
+                }
+                sawReturnValue = true;
+                if (selected == null) {
+                    selected = slot;
+                }
+                else if (!selected.equals(slot)) {
+                    valid = false;
+                    return null;
+                }
+            }
+            return valid && sawReturnValue ? selected : null;
+        }
+        finally {
+            returnedParameterSlotActive.remove(key);
+            returnedParameterSlotCache.put(
+                key,
+                valid && sawReturnValue && selected != null ? selected : -1);
         }
     }
 
-    private Integer callInputSlotForRegister(Varnode node) {
-        String register = pcodeBaseRegisterName(node);
-        if (register == null) {
+    private Integer formalParameterSlot(PcodeStorage storage) {
+        if (storage == null || storage.base == null ||
+            !storage.base.startsWith("param_")) {
             return null;
         }
-        return switch (register) {
-            case "RCX" -> 1;
-            case "RDX" -> 2;
-            case "R8" -> 3;
-            case "R9" -> 4;
-            default -> null;
-        };
+        try {
+            int slot = Integer.parseInt(storage.base.substring("param_".length()));
+            return slot > 0 ? slot : null;
+        }
+        catch (NumberFormatException ignored) {
+            return null;
+        }
     }
 
     private String pcodeBaseRegisterName(Varnode node) {
@@ -507,221 +280,460 @@
     }
 
     private PcodeStorage pcodeStorageExpression(Varnode node) {
-        return pcodeStorageExpression(node, new LinkedHashSet<>(), 0);
+        PcodeMemoryPath path = pcodeMemoryPath(node, 0);
+        return path == null ? null : path.directStorage();
     }
 
     private PcodeStorage pcodeLoadedStorageExpression(Varnode node) {
-        return pcodeLoadedStorageExpression(node, new LinkedHashSet<>(), 0);
+        PcodeMemoryPath path = pcodeMemoryPath(node, 1);
+        if (path == null) {
+            return null;
+        }
+        PcodeStorage loaded = path.loadedStorage();
+        return loaded == null ? path.directStorage() : loaded;
     }
 
-    private PcodeStorage pcodeLoadedStorageExpression(
+    private PcodeVirtualDispatch pcodeVirtualDispatch(Varnode node) {
+        PcodeMemoryPath path = pcodeMemoryPath(node, 2);
+        return path == null ? null : path.virtualDispatch();
+    }
+
+    private PcodeMemoryPath pcodeMemoryPath(Varnode node, int remainingDereferences) {
+        if (node == null) {
+            return null;
+        }
+        String key = pcodeMemoryPathCacheKey(node, remainingDereferences);
+        Optional<PcodeMemoryPath> cached = pcodeMemoryPathCache.get(key);
+        if (cached != null) {
+            runMetrics.increment("pcodeMemoryPathHits");
+            return cached.orElse(null);
+        }
+        runMetrics.increment("pcodeMemoryPathMisses");
+        PcodeMemoryPath path = pcodeMemoryPath(
+            node,
+            remainingDereferences,
+            new HashSet<>(),
+            new HashMap<>());
+        pcodeMemoryPathCache.put(key, Optional.ofNullable(path));
+        return path;
+    }
+
+    private String pcodeMemoryPathCacheKey(Varnode node, int remainingDereferences) {
+        String owner = "<unknown>";
+        if (node.getHigh() != null && node.getHigh().getHighFunction() != null &&
+            node.getHigh().getHighFunction().getFunction() != null) {
+            owner = node.getHigh().getHighFunction().getFunction().getEntryPoint().toString();
+        }
+        else if (node.getDef() != null && node.getDef().getSeqnum() != null) {
+            owner = node.getDef().getSeqnum().getTarget().toString();
+        }
+        return owner + ':' + remainingDereferences + ':' + pcodeSsaNodeKey(node);
+    }
+
+    private PcodeMemoryPath pcodeMemoryPath(
         Varnode node,
-        Set<String> seen,
-        int depth) {
+        int remainingDereferences,
+        Set<String> active,
+        Map<String, Optional<PcodeMemoryPath>> memo) {
 
-        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+        if (node == null) {
             return null;
         }
-        String key = "loaded:" + pcodeNodeKey(node);
-        if (!seen.add(key)) {
+        String key = "memory-path:" + remainingDereferences + ":" + pcodeSsaNodeKey(node);
+        Optional<PcodeMemoryPath> cached = memo.get(key);
+        if (cached != null) {
+            return cached.orElse(null);
+        }
+        if (!active.add(key)) {
             return null;
         }
 
-        PcodeOp def = node.getDef();
-        if (def != null) {
-            switch (def.getOpcode()) {
-                case PcodeOp.LOAD:
-                    return def.getNumInputs() < 2
-                        ? null
-                        : pcodeStorageExpression(def.getInput(1), new LinkedHashSet<>(), 0);
-                case PcodeOp.COPY:
-                case PcodeOp.CAST:
-                case PcodeOp.INT_ZEXT:
-                case PcodeOp.INT_SEXT:
-                case PcodeOp.SUBPIECE:
-                case PcodeOp.INDIRECT:
-                    return def.getNumInputs() == 0
-                        ? null
-                        : pcodeLoadedStorageExpression(def.getInput(0), seen, depth + 1);
-                case PcodeOp.MULTIEQUAL:
-                    return pcodeMergedLoadedStorageExpression(def, seen, depth + 1);
-                default:
-                    break;
+        PcodeMemoryPath result;
+        try {
+            PcodeOp def = node.getDef();
+            result = def == null
+                ? null
+                : pcodeMemoryPathFromDef(
+                    def,
+                    remainingDereferences,
+                    active,
+                    memo);
+            if (result == null) {
+                result = pcodeStaticMemoryPath(node);
+            }
+            if (result == null) {
+                Integer parameterSlot = formalParameterSlot(node);
+                if (parameterSlot != null) {
+                    result = PcodeMemoryPath.storageRoot("param_" + parameterSlot, 0L);
+                }
+            }
+            if (result == null && node.getAddress() != null &&
+                node.getAddress().isStackAddress()) {
+                result = PcodeMemoryPath.storageRoot("stack", node.getOffset());
+            }
+            if (result == null && isStackPointerVarnode(node)) {
+                result = PcodeMemoryPath.storageRoot("stack", 0L);
+            }
+            if (result == null) {
+                String liveIn = pcodeLiveInRoot(node);
+                if (liveIn != null) {
+                    result = PcodeMemoryPath.storageRoot(liveIn, 0L);
+                }
             }
         }
-        return pcodeStorageExpression(node);
+        finally {
+            active.remove(key);
+        }
+        memo.put(key, Optional.ofNullable(result));
+        return result;
     }
 
-    private PcodeStorage pcodeMergedLoadedStorageExpression(
+    private String pcodeLiveInRoot(Varnode node) {
+        if (node == null || node.getDef() != null || !node.isRegister() ||
+            isStackPointerVarnode(node)) {
+            return null;
+        }
+        Varnode representative = node;
+        if (node.getHigh() != null && node.getHigh().getRepresentative() != null) {
+            representative = node.getHigh().getRepresentative();
+        }
+        Integer parameterSlot = formalParameterSlot(representative);
+        if (parameterSlot != null) {
+            return "param_" + parameterSlot;
+        }
+        return "input:" + pcodeSsaNodeKey(representative);
+    }
+
+    private PcodeMemoryPath pcodeMemoryPathFromDef(
         PcodeOp def,
-        Set<String> seen,
-        int depth) {
-
-        PcodeStorage merged = null;
-        for (int i = 0; i < def.getNumInputs(); i++) {
-            PcodeStorage storage = pcodeLoadedStorageExpression(
-                def.getInput(i),
-                new LinkedHashSet<>(seen),
-                depth);
-            if (storage == null) {
-                return null;
-            }
-            if (merged == null) {
-                merged = storage;
-            }
-            else if (!merged.sameLocation(storage)) {
-                return null;
-            }
-        }
-        return merged;
-    }
-
-    private PcodeStorage pcodeStorageExpression(
-        Varnode node,
-        Set<String> seen,
-        int depth) {
-
-        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
-            return null;
-        }
-        String key = pcodeNodeKey(node);
-        if (!seen.add(key)) {
-            return null;
-        }
-
-        PcodeOp def = node.getDef();
-        if (def != null) {
-            PcodeStorage storage = pcodeStorageFromDef(def, seen, depth + 1);
-            if (storage != null) {
-                return storage;
-            }
-        }
-
-        if (node.getAddress() != null && node.getAddress().isStackAddress()) {
-            return new PcodeStorage("stack", node.getOffset());
-        }
-        if (isStackPointerVarnode(node)) {
-            return new PcodeStorage("stack", 0L);
-        }
-
-        String name = pcodeHighName(node);
-        if (isPcodeStorageBase(name)) {
-            return new PcodeStorage(name, 0L);
-        }
-        return null;
-    }
-
-    private PcodeStorage pcodeStorageFromDef(
-        PcodeOp def,
-        Set<String> seen,
-        int depth) {
+        int remainingDereferences,
+        Set<String> active,
+        Map<String, Optional<PcodeMemoryPath>> memo) {
 
         switch (def.getOpcode()) {
             case PcodeOp.COPY:
             case PcodeOp.CAST:
+            case PcodeOp.INT_ZEXT:
+            case PcodeOp.INT_SEXT:
             case PcodeOp.SUBPIECE:
             case PcodeOp.INDIRECT:
                 return def.getNumInputs() == 0
                     ? null
-                    : pcodeStorageExpression(def.getInput(0), seen, depth);
+                    : pcodeMemoryPath(
+                        def.getInput(0),
+                        remainingDereferences,
+                        active,
+                        memo);
+            case PcodeOp.LOAD:
+                if (remainingDereferences == 0 || def.getNumInputs() < 2) {
+                    return null;
+                }
+                PcodeMemoryPath address = pcodeMemoryPath(
+                    def.getInput(1),
+                    remainingDereferences - 1,
+                    active,
+                    memo);
+                return address == null ? null : address.dereference();
             case PcodeOp.PTRADD:
-                return pcodePointerAddExpression(def, seen, depth);
+                return pcodePointerAddPath(
+                    def,
+                    remainingDereferences,
+                    active,
+                    memo);
             case PcodeOp.PTRSUB:
-                return pcodePointerSubExpression(def, seen, depth);
+                return pcodePointerSubPath(
+                    def,
+                    remainingDereferences,
+                    active,
+                    memo);
             case PcodeOp.INT_ADD:
-                return pcodeAddExpression(def, seen, depth, true);
+                return pcodeAddPath(
+                    def,
+                    remainingDereferences,
+                    active,
+                    memo,
+                    true);
             case PcodeOp.INT_SUB:
-                return pcodeAddExpression(def, seen, depth, false);
+                return pcodeAddPath(
+                    def,
+                    remainingDereferences,
+                    active,
+                    memo,
+                    false);
             case PcodeOp.MULTIEQUAL:
-                return pcodeMergedStorageExpression(def, seen, depth);
+                return pcodeMergedMemoryPath(
+                    def,
+                    remainingDereferences,
+                    active,
+                    memo);
+            case PcodeOp.PIECE:
+                return pcodePieceMemoryPath(
+                    def,
+                    remainingDereferences,
+                    active,
+                    memo);
+            case PcodeOp.CALL:
+                Function target = pcodeCallTarget(def);
+                Integer returnedSlot = returnedParameterSlot(target);
+                return returnedSlot == null || returnedSlot >= def.getNumInputs()
+                    ? null
+                    : pcodeMemoryPath(
+                        def.getInput(returnedSlot),
+                        remainingDereferences,
+                        active,
+                        memo);
             default:
                 return null;
         }
     }
 
-    private PcodeStorage pcodePointerAddExpression(
+    private PcodeMemoryPath pcodePointerAddPath(
         PcodeOp def,
-        Set<String> seen,
-        int depth) {
+        int remainingDereferences,
+        Set<String> active,
+        Map<String, Optional<PcodeMemoryPath>> memo) {
 
         if (def.getNumInputs() < 3) {
             return null;
         }
-        PcodeStorage base =
-            pcodeStorageExpression(def.getInput(0), new LinkedHashSet<>(seen), depth);
-        Long index = pcodeConstantValue(def.getInput(1), new LinkedHashSet<>(seen), depth);
-        Long elementSize =
-            pcodeConstantValue(def.getInput(2), new LinkedHashSet<>(seen), depth);
+        PcodeMemoryPath base =
+            pcodeMemoryPath(
+                def.getInput(0),
+                remainingDereferences,
+                active,
+                memo);
+        Long index = NetworkSchemaIntegerEvaluator.evaluate(def.getInput(1));
+        Long elementSize = NetworkSchemaIntegerEvaluator.evaluate(def.getInput(2));
         if (base == null || index == null || elementSize == null) {
             return null;
         }
-        return base.plus(index * elementSize);
+        try {
+            return base.plus(Math.multiplyExact(index, elementSize));
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
     }
 
-    private PcodeStorage pcodePointerSubExpression(
+    private PcodeMemoryPath pcodePointerSubPath(
         PcodeOp def,
-        Set<String> seen,
-        int depth) {
+        int remainingDereferences,
+        Set<String> active,
+        Map<String, Optional<PcodeMemoryPath>> memo) {
 
         if (def.getNumInputs() < 2) {
             return null;
         }
-        PcodeStorage base =
-            pcodeStorageExpression(def.getInput(0), new LinkedHashSet<>(seen), depth);
-        Long offset = pcodeConstantValue(def.getInput(1), new LinkedHashSet<>(seen), depth);
+        PcodeMemoryPath base =
+            pcodeMemoryPath(
+                def.getInput(0),
+                remainingDereferences,
+                active,
+                memo);
+        Long offset = NetworkSchemaIntegerEvaluator.evaluate(def.getInput(1));
         if (base == null || offset == null) {
             return null;
         }
         return base.plus(offset);
     }
 
-    private PcodeStorage pcodeAddExpression(
+    private PcodeMemoryPath pcodeAddPath(
         PcodeOp def,
-        Set<String> seen,
-        int depth,
+        int remainingDereferences,
+        Set<String> active,
+        Map<String, Optional<PcodeMemoryPath>> memo,
         boolean add) {
-
         if (def.getNumInputs() < 2) {
             return null;
         }
-        PcodeStorage left =
-            pcodeStorageExpression(def.getInput(0), new LinkedHashSet<>(seen), depth);
-        Long right = pcodeConstantValue(def.getInput(1), new LinkedHashSet<>(seen), depth);
+        PcodeMemoryPath left =
+            pcodeMemoryPath(
+                def.getInput(0),
+                remainingDereferences,
+                active,
+                memo);
+        Long right = NetworkSchemaIntegerEvaluator.evaluate(def.getInput(1));
         if (left != null && right != null) {
             return left.plus(add ? right : -right);
         }
         if (add) {
-            PcodeStorage rightStorage =
-                pcodeStorageExpression(def.getInput(1), new LinkedHashSet<>(seen), depth);
-            Long leftConstant =
-                pcodeConstantValue(def.getInput(0), new LinkedHashSet<>(seen), depth);
-            if (rightStorage != null && leftConstant != null) {
-                return rightStorage.plus(leftConstant);
+            PcodeMemoryPath rightPath =
+                pcodeMemoryPath(
+                    def.getInput(1),
+                    remainingDereferences,
+                    active,
+                    memo);
+            Long leftConstant = NetworkSchemaIntegerEvaluator.evaluate(def.getInput(0));
+            if (rightPath != null && leftConstant != null) {
+                return rightPath.plus(leftConstant);
             }
         }
         return null;
     }
 
-    private PcodeStorage pcodeMergedStorageExpression(
+    private PcodeMemoryPath pcodeMergedMemoryPath(
         PcodeOp def,
-        Set<String> seen,
-        int depth) {
+        int remainingDereferences,
+        Set<String> active,
+        Map<String, Optional<PcodeMemoryPath>> memo) {
 
-        PcodeStorage merged = null;
+        PcodeMemoryPath merged = null;
         for (int i = 0; i < def.getNumInputs(); i++) {
-            PcodeStorage storage =
-                pcodeStorageExpression(def.getInput(i), new LinkedHashSet<>(seen), depth);
-            if (storage == null) {
+            PcodeMemoryPath path =
+                pcodeMemoryPath(
+                    def.getInput(i),
+                    remainingDereferences,
+                    active,
+                    memo);
+            if (path == null) {
                 return null;
             }
             if (merged == null) {
-                merged = storage;
+                merged = path;
             }
-            else if (!merged.sameLocation(storage)) {
+            else if (!merged.equals(path)) {
                 return null;
             }
         }
         return merged;
+    }
+
+    private PcodeMemoryPath pcodePieceMemoryPath(
+        PcodeOp def,
+        int remainingDereferences,
+        Set<String> active,
+        Map<String, Optional<PcodeMemoryPath>> memo) {
+
+        if (def.getNumInputs() < 2) {
+            return null;
+        }
+        PcodeMemoryPath selected = null;
+        for (int slot = 0; slot < def.getNumInputs(); slot++) {
+            PcodeMemoryPath candidate = pcodeMemoryPath(
+                def.getInput(slot),
+                remainingDereferences,
+                active,
+                memo);
+            if (candidate == null) {
+                return null;
+            }
+            if (selected == null) {
+                selected = candidate;
+            }
+            else if (!selected.equals(candidate)) {
+                return null;
+            }
+        }
+        return selected;
+    }
+
+    private Integer formalParameterSlot(Varnode node) {
+        if (node == null) {
+            return null;
+        }
+        if (node.getHigh() instanceof HighParam parameter) {
+            return parameter.getSlot() + 1;
+        }
+
+        var highFunction = node.getHigh() == null
+            ? null
+            : node.getHigh().getHighFunction();
+        if (highFunction != null && highFunction.getLocalSymbolMap() != null) {
+            var symbols = highFunction.getLocalSymbolMap();
+            for (int index = 0; index < symbols.getNumParams(); index++) {
+                HighParam parameter = symbols.getParam(index);
+                if (parameter == null) {
+                    continue;
+                }
+                for (Varnode instance : parameter.getInstances()) {
+                    if (sameVarnodeIdentity(node, instance)) {
+                        return parameter.getSlot() + 1;
+                    }
+                }
+            }
+            Integer abiSlot = abiParameterSlot(node, highFunction.getFunction());
+            if (abiSlot != null) {
+                return abiSlot;
+            }
+        }
+        return win64LiveInParameterSlot(node);
+    }
+
+    private Integer win64LiveInParameterSlot(Varnode node) {
+        if (node == null || node.getDef() != null) {
+            return null;
+        }
+        String register = pcodeBaseRegisterName(node);
+        if (register == null) {
+            return null;
+        }
+        for (int slot = 1; slot <= 4; slot++) {
+            if (register.equals(win64ArgumentRegister(slot))) {
+                return slot;
+            }
+        }
+        return null;
+    }
+
+    private Integer abiParameterSlot(Varnode node, Function function) {
+        if (node == null || node.getAddress() == null || function == null) {
+            return null;
+        }
+        PrototypeModel convention = function.getCallingConvention();
+        if (convention == null) {
+            convention = currentProgram.getCompilerSpec().getDefaultCallingConvention();
+        }
+        if (convention == null) {
+            return null;
+        }
+
+        Parameter[] declared = function.getParameters();
+        int candidateCount = Math.max(16, declared.length + 8);
+        Integer selected = null;
+        for (int index = 0; index < candidateCount; index++) {
+            VariableStorage storage = convention.getArgLocation(
+                index,
+                declared,
+                DataType.DEFAULT,
+                currentProgram);
+            if (storage == null || storage.isUnassignedStorage() ||
+                !storageContains(storage, node)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = index + 1;
+        }
+        return selected;
+    }
+
+    private boolean storageContains(VariableStorage storage, Varnode node) {
+        for (Varnode piece : storage.getVarnodes()) {
+            if (piece == null || piece.getAddress() == null ||
+                !piece.getAddress().getAddressSpace().equals(
+                    node.getAddress().getAddressSpace())) {
+                continue;
+            }
+            long pieceStart = piece.getOffset();
+            long pieceEnd = pieceStart + piece.getSize();
+            long nodeStart = node.getOffset();
+            long nodeEnd = nodeStart + node.getSize();
+            if (nodeStart >= pieceStart && nodeEnd <= pieceEnd) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean sameVarnodeIdentity(Varnode left, Varnode right) {
+        if (left == null || right == null) {
+            return false;
+        }
+        if (left instanceof VarnodeAST leftAst && right instanceof VarnodeAST rightAst) {
+            return leftAst.getUniqueId() == rightAst.getUniqueId();
+        }
+        return left == right;
     }
 
     private String pcodeValueNativeType(
@@ -749,16 +761,12 @@
         Set<String> seen,
         int depth) {
 
-        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+        if (node == null) {
             return null;
         }
         String tempShape = pcodeTempWireShape(node, tempWireShapes);
         if (tempShape != null) {
             return tempShape;
-        }
-        String nativeShape = wireShapeFromNativeType(pcodeTempNativeType(node, tempNativeTypes));
-        if (nativeShape != null) {
-            return nativeShape;
         }
         String key = "shape:" + pcodeNodeKey(node);
         if (!seen.add(key)) {
@@ -767,14 +775,17 @@
 
         PcodeOp def = node.getDef();
         if (def == null) {
-            return wireShapeFromNativeType(pcodeValueNativeType(node, tempNativeTypes));
+            return wireShapeFromNativeType(
+                firstNonEmpty(
+                    pcodeTempNativeType(node, tempNativeTypes),
+                    pcodeValueNativeType(node, tempNativeTypes)));
         }
 
         switch (def.getOpcode()) {
             case PcodeOp.CALL: {
                 Function target = pcodeCallTarget(def);
                 String nativeType = unmarshalNativeTypeFromTarget(target);
-                String shape = wireShapeFromNativeType(nativeType);
+                String shape = wireShapeFromUnmarshalTarget(target, nativeType);
                 if (shape != null) {
                     return shape;
                 }
@@ -805,6 +816,13 @@
                 return node.getSize() == 1 ? "bool" : null;
             case PcodeOp.MULTIEQUAL:
                 return pcodeMergedValueWireShape(
+                    def,
+                    tempWireShapes,
+                    tempNativeTypes,
+                    seen,
+                    depth + 1);
+            case PcodeOp.PIECE:
+                return pcodePieceValueWireShape(
                     def,
                     tempWireShapes,
                     tempNativeTypes,
@@ -844,18 +862,47 @@
         return merged;
     }
 
+    private String pcodePieceValueWireShape(
+        PcodeOp def,
+        Map<String, String> tempWireShapes,
+        Map<String, String> tempNativeTypes,
+        Set<String> seen,
+        int depth) {
+
+        if (def.getNumInputs() != 2 || def.getOutput() == null) {
+            return null;
+        }
+        String high = pcodeValueWireShape(
+            def.getInput(0),
+            tempWireShapes,
+            tempNativeTypes,
+            new LinkedHashSet<>(seen),
+            depth);
+        String low = pcodeValueWireShape(
+            def.getInput(1),
+            tempWireShapes,
+            tempNativeTypes,
+            new LinkedHashSet<>(seen),
+            depth);
+        Integer width = high == null ? null : wireShapeByteWidth(high);
+        return high != null && high.equals(low) && width != null &&
+            width == def.getOutput().getSize()
+                ? high
+                : null;
+    }
+
     private String pcodeValueNativeType(
         Varnode node,
         Map<String, String> tempNativeTypes,
         Set<String> seen,
         int depth) {
 
-        if (node == null || depth > PCODE_VALUE_DEPTH_LIMIT) {
+        if (node == null) {
             return null;
         }
         String tempType = pcodeTempNativeType(node, tempNativeTypes);
         if (tempType != null) {
-            return tempType;
+            return pcodeNativeTypeAtValueWidth(tempType, node.getSize());
         }
         String key = "type:" + pcodeNodeKey(node);
         if (!seen.add(key)) {
@@ -873,14 +920,16 @@
             case PcodeOp.COPY:
             case PcodeOp.CAST:
             case PcodeOp.SUBPIECE:
-            case PcodeOp.INDIRECT:
-                return def.getNumInputs() == 0
+            case PcodeOp.INDIRECT: {
+                String sourceType = def.getNumInputs() == 0
                     ? null
                     : pcodeValueNativeType(
                         def.getInput(0),
                         tempNativeTypes,
                         seen,
                         depth + 1);
+                return pcodeNativeTypeAtValueWidth(sourceType, node.getSize());
+            }
             case PcodeOp.INT_EQUAL:
             case PcodeOp.INT_NOTEQUAL:
             case PcodeOp.INT_LESS:
@@ -898,3 +947,10 @@
                     tempNativeTypes,
                     seen,
                     depth + 1);
+            case PcodeOp.PIECE:
+                return pcodePieceValueNativeType(
+                    def,
+                    tempNativeTypes,
+                    seen,
+                    depth + 1);
+import ghidra.program.model.pcode.HighParam;

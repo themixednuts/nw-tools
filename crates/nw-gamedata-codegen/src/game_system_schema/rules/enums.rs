@@ -17,6 +17,15 @@ pub(in crate::game_system_schema) fn scalar_enum_column_affinity(
     .map(|factory| factory())
 }
 
+pub(in crate::game_system_schema) fn scalar_enum_shape_by_name(
+    name: &str,
+) -> Option<GameSystemEnumShape> {
+    SCALAR_ENUM_COLUMN_RULES
+        .iter()
+        .map(|rule| (rule.value())())
+        .find(|shape| shape.name == name)
+}
+
 const SCALAR_ENUM_COLUMN_RULES: &[ColumnRule<EnumShapeFactory>] = &[
     enum_rule(
         "ParticleContextualPriorityOverrideData",
@@ -106,6 +115,44 @@ const SCALAR_ENUM_COLUMN_RULES: &[ColumnRule<EnumShapeFactory>] = &[
         "RewardType",
         seasons_rewards_reward_type_enum_shape,
     ),
+    enum_rule(
+        "MissionData",
+        "MissionGoalType",
+        mission_goal_type_enum_shape,
+    ),
+    enum_rule(
+        "MissionWeightsData",
+        "MissionGoalType",
+        mission_goal_type_enum_shape,
+    ),
+    enum_rule("PlayerTitleData", "TitleType", title_type_enum_shape),
+    enum_rule("TutorialData", "Type", tutorial_type_enum_shape),
+    enum_rule(
+        "TutorialData",
+        "ConditionIdsRelation",
+        tutorial_condition_ids_relation_enum_shape,
+    ),
+    enum_rule(
+        "TutorialData",
+        "Classification",
+        tutorial_classification_enum_shape,
+    ),
+    enum_rule(
+        "TutorialData",
+        "PromptStyle",
+        tutorial_prompt_style_enum_shape,
+    ),
+    enum_rule(
+        "TutorialData",
+        "ExitDuration",
+        tutorial_prompt_exit_duration_enum_shape,
+    ),
+    enum_rule(
+        "TutorialConditionData",
+        "Operation",
+        tutorial_condition_operation_enum_shape,
+    ),
+    enum_rule("ProgressionPoolData", "Category", pool_category_enum_shape),
 ];
 
 const fn enum_rule(
@@ -711,4 +758,110 @@ pub(in crate::game_system_schema) fn expansion_id_enum_shape() -> GameSystemEnum
             },
         ],
     }
+}
+
+pub(in crate::game_system_schema) fn mission_goal_type_enum_shape() -> GameSystemEnumShape {
+    reflected_u8_enum_shape(
+        "MissionGoalType",
+        [
+            ("Gather", 1),
+            ("Courier", 2),
+            ("Creative", 3),
+            ("Kill", 4),
+            ("Explore", 5),
+            ("Raid", 6),
+            ("Loot", 7),
+            ("Hunt", 8),
+            ("Fish", 9),
+            ("Mine", 10),
+            ("Harvest", 11),
+            ("Log", 12),
+            ("Craft", 13),
+            ("Espionage", 14),
+            ("Intercept", 15),
+            ("Control", 16),
+            ("Poach", 17),
+            ("Expedition_Raid", 18),
+            ("Expedition_Loot", 19),
+            ("Expedition_Special", 20),
+        ],
+    )
+}
+
+pub(in crate::game_system_schema) fn title_type_enum_shape() -> GameSystemEnumShape {
+    reflected_u8_enum_shape(
+        "TitleType",
+        [("Invalid", 0), ("Character", 1), ("Account", 2)],
+    )
+}
+
+pub(in crate::game_system_schema) fn tutorial_type_enum_shape() -> GameSystemEnumShape {
+    reflected_u8_enum_shape(
+        "TutorialType",
+        [("Invalid", 0), ("Prompt", 1), ("Dialogue", 2), ("Both", 3)],
+    )
+}
+
+pub(in crate::game_system_schema) fn tutorial_condition_ids_relation_enum_shape()
+-> GameSystemEnumShape {
+    reflected_u8_enum_shape("TutorialConditionIdsRelation", [("OR", 0), ("AND", 1)])
+}
+
+pub(in crate::game_system_schema) fn tutorial_classification_enum_shape() -> GameSystemEnumShape {
+    reflected_u8_enum_shape(
+        "TutorialClassification",
+        [("All", 0), ("Core", 1), ("Mandatory", 2)],
+    )
+}
+
+pub(in crate::game_system_schema) fn tutorial_prompt_style_enum_shape() -> GameSystemEnumShape {
+    reflected_u8_enum_shape(
+        "TutorialPromptStyle",
+        [
+            ("None", 0),
+            ("MandatoryActionCenter", 1),
+            ("MandatoryActionSide", 2),
+            ("VoluntaryAction", 3),
+            ("InformationalHint", 4),
+            ("ContextualReminder", 5),
+            ("NewFeature", 6),
+        ],
+    )
+}
+
+pub(in crate::game_system_schema) fn tutorial_prompt_exit_duration_enum_shape()
+-> GameSystemEnumShape {
+    reflected_u8_enum_shape(
+        "TutorialPromptExitDuration",
+        [("None", 0), ("Short", 1), ("Medium", 2), ("Long", 3)],
+    )
+}
+
+pub(in crate::game_system_schema) fn tutorial_condition_operation_enum_shape() -> GameSystemEnumShape
+{
+    reflected_u8_enum_shape(
+        "TutorialConditionOperation",
+        [
+            ("Equals", 0),
+            ("GreaterThan", 1),
+            ("LessThan", 2),
+            ("HasUnlocked", 3),
+            ("HasNotUnlocked", 4),
+            ("EquipItemInAnySlot", 5),
+            ("EquipItemClassAny", 6),
+            ("EquipItemClassAll", 7),
+            ("EquipItemClassNone", 8),
+            ("ReceiveItemClassAny", 9),
+            ("ReceiveItemClassAll", 10),
+            ("ReceiveItemClassNone", 11),
+            ("ReceiveItemAnyId", 12),
+        ],
+    )
+}
+
+pub(in crate::game_system_schema) fn pool_category_enum_shape() -> GameSystemEnumShape {
+    reflected_u8_enum_shape(
+        "PoolCategory",
+        [("Invalid", 0), ("Player", 1), ("Territory", 2)],
+    )
 }

@@ -1,0 +1,914 @@
+    private WireShape validatedMarshalLeaf(
+        Function function,
+        String writeBufferParameter) {
+
+        if (function == null || writeBufferParameter == null) {
+            return null;
+        }
+        String key = functionCacheKey(
+            "marshal-leaf:" + writeBufferParameter,
+            function);
+        Optional<WireShape> cached = marshalLeafCache.get(key);
+        if (cached != null) {
+            runMetrics.increment("marshalLeafHits");
+            return cached.orElse(null);
+        }
+        runMetrics.increment("marshalLeafMisses");
+        WireShape result = validatedMarshalLeafUncached(function, writeBufferParameter);
+        marshalLeafCache.put(key, Optional.ofNullable(result));
+        return result;
+    }
+
+    private WireShape validatedMarshalLeafUncached(
+        Function function,
+        String writeBufferParameter) {
+
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return null;
+        }
+        NetworkSchemaCodecClassifier.VariableIntegerCodec structural =
+            NetworkSchemaCodecClassifier.variableIntegerCodec(high);
+        if (structural != null &&
+            structural.direction() == NetworkSchemaCodecClassifier.CodecDirection.ENCODE &&
+            hasVariableRawWriteCoverage(
+                function,
+                writeBufferParameter,
+                "vlq-u64".equals(structural.shape()) ? 9 : 5)) {
+            return WireShape.semantic(
+                structural.shape(),
+                "marshal-pcode-codec-structure");
+        }
+
+        WireShape smallestThree = structuralSmallestThreeMarshalLeaf(
+            function,
+            writeBufferParameter);
+        if (smallestThree != null) {
+            return smallestThree;
+        }
+
+        DeclaredCodecShape declared = declaredCodecShape(function);
+        if (declared == null) {
+            return null;
+        }
+        if ("string".equals(declared.shape()) &&
+            hasStructuralCodecCall(
+                function,
+                "vlq-u32",
+                NetworkSchemaCodecClassifier.CodecDirection.ENCODE) &&
+            hasVirtualBufferCall(function, writeBufferParameter, 0x40L)) {
+            return WireShape.semantic(
+                "string",
+                "marshal-codec-specialization+length-prefix-flow");
+        }
+        if ("sequence-number".equals(declared.shape()) &&
+            hasStructuralCodecCall(
+                function,
+                "vlq-u64",
+                NetworkSchemaCodecClassifier.CodecDirection.ENCODE) &&
+            hasFixedRawWrite(function, writeBufferParameter, 1)) {
+            return WireShape.semantic(
+                "optional<vlq-u64>",
+                "marshal-codec-specialization+optional-vlq-structure");
+        }
+        if ("entity-ref".equals(declared.shape()) &&
+            isEntityRefCodec(
+                function,
+                writeBufferParameter,
+                NetworkSchemaCodecClassifier.CodecDirection.ENCODE)) {
+            return WireShape.semantic(
+                "entity-ref",
+                "marshal-pcode-conditional-entity-reference");
+        }
+
+        Integer expectedWidth = wireShapeByteWidth(declared.shape());
+        if (expectedWidth != null &&
+            hasOnlyFixedRawWrite(function, writeBufferParameter, expectedWidth)) {
+            return WireShape.semantic(
+                declared.shape(),
+                fixedByteLayout(expectedWidth),
+                "marshal-codec-specialization+fixed-width-pcode");
+        }
+        return null;
+    }
+
+    private WireShape validatedUnmarshalLeaf(Function function) {
+        if (function == null) {
+            return null;
+        }
+        List<String> candidates = readBufferParameters(function);
+        if (candidates.size() != 1) {
+            return null;
+        }
+        return validatedUnmarshalLeaf(function, candidates.get(0));
+    }
+
+    private WireShape validatedUnmarshalLeaf(
+        Function function,
+        String readBufferParameter) {
+
+        if (function == null || readBufferParameter == null) {
+            return null;
+        }
+        String key = functionCacheKey(
+            "unmarshal-leaf:" + readBufferParameter,
+            function);
+        Optional<WireShape> cached = unmarshalLeafCache.get(key);
+        if (cached != null) {
+            runMetrics.increment("unmarshalLeafHits");
+            return cached.orElse(null);
+        }
+        runMetrics.increment("unmarshalLeafMisses");
+        WireShape result = validatedUnmarshalLeafUncached(
+            function,
+            readBufferParameter);
+        unmarshalLeafCache.put(key, Optional.ofNullable(result));
+        return result;
+    }
+
+    private WireShape validatedUnmarshalLeafUncached(
+        Function function,
+        String readBufferParameter) {
+
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return null;
+        }
+        NetworkSchemaCodecClassifier.VariableIntegerCodec structural =
+            NetworkSchemaCodecClassifier.variableIntegerCodec(high);
+        if (structural != null &&
+            structural.direction() == NetworkSchemaCodecClassifier.CodecDirection.DECODE &&
+            hasReadBufferFlow(function, readBufferParameter, new LinkedHashSet<>())) {
+            return WireShape.semantic(
+                structural.shape(),
+                "unmarshal-pcode-codec-structure");
+        }
+
+        if (NetworkSchemaCodecClassifier.isBinary16Decode(high) &&
+            hasExactlyOneFixedRawRead(function, readBufferParameter, Short.BYTES)) {
+            return WireShape.semantic(
+                "half-f32",
+                fixedByteLayout(Short.BYTES),
+                "unmarshal-pcode-binary16-expansion");
+        }
+
+        WireShape smallestThree = structuralSmallestThreeUnmarshalLeaf(
+            function,
+            readBufferParameter);
+        if (smallestThree != null) {
+            return smallestThree;
+        }
+
+        if (hasNormalizedBooleanRead(function, readBufferParameter) &&
+            hasNoAdditionalReadBufferCodecCalls(function, readBufferParameter)) {
+            return WireShape.semantic(
+                "bool",
+                fixedByteLayout(Byte.BYTES),
+                "unmarshal-pcode-bounded-boolean-store");
+        }
+
+        DeclaredCodecShape declared = declaredCodecShape(function);
+        if (declared != null && "string".equals(declared.shape()) &&
+            hasStructuralCodecCall(
+                function,
+                "vlq-u32",
+                NetworkSchemaCodecClassifier.CodecDirection.DECODE) &&
+            hasReadBufferFlow(function, readBufferParameter, new LinkedHashSet<>())) {
+            return WireShape.semantic(
+                "string",
+                "unmarshal-codec-specialization+length-prefix-flow");
+        }
+        if (hasStructuralCodecCall(
+                function,
+                "vlq-u32",
+                NetworkSchemaCodecClassifier.CodecDirection.DECODE) &&
+            NetworkSchemaCodecClassifier.hasLengthPrefixedByteCopyLoop(high)) {
+            return WireShape.layout(
+                "length-prefixed-bytes",
+                "unmarshal-pcode-length-prefixed-byte-copy");
+        }
+
+        if (declared == null) {
+            return null;
+        }
+        if ("sequence-number".equals(declared.shape()) &&
+            hasStructuralCodecCall(
+                function,
+                "vlq-u64",
+                NetworkSchemaCodecClassifier.CodecDirection.DECODE) &&
+            hasFixedRawRead(function, readBufferParameter, 1)) {
+            return WireShape.semantic(
+                "optional<vlq-u64>",
+                "unmarshal-codec-specialization+optional-vlq-structure");
+        }
+        if ("entity-ref".equals(declared.shape()) &&
+            isEntityRefCodec(
+                function,
+                readBufferParameter,
+                NetworkSchemaCodecClassifier.CodecDirection.DECODE)) {
+            return WireShape.semantic(
+                "entity-ref",
+                "unmarshal-pcode-conditional-entity-reference");
+        }
+        Integer expectedWidth = wireShapeByteWidth(declared.shape());
+        return expectedWidth != null &&
+            hasExactlyOneFixedRawRead(function, readBufferParameter, expectedWidth)
+            ? WireShape.semantic(
+                declared.shape(),
+                fixedByteLayout(expectedWidth),
+                "unmarshal-codec-specialization+fixed-width-pcode")
+            : null;
+    }
+
+    private WireShape structuralSmallestThreeMarshalLeaf(
+        Function function,
+        String writeBufferParameter) {
+
+        HighFunction high = highFunction(function);
+        if (high == null ||
+            !hasSmallestThreeCoreCall(
+                function,
+                NetworkSchemaCodecClassifier.CodecDirection.ENCODE) ||
+            !hasVirtualBufferCall(function, writeBufferParameter, 0x40L)) {
+            return null;
+        }
+        if (NetworkSchemaCodecClassifier.isProjectedVec3SmallestThreeEncodeWrapper(high)) {
+            return WireShape.semantic(
+                "vec3-smallest-three",
+                "marshal-pcode-projected-smallest-three");
+        }
+        if (NetworkSchemaCodecClassifier.isQuaternionSmallestThreeEncodeWrapper(high)) {
+            return WireShape.semantic(
+                "quat-smallest-three",
+                "marshal-pcode-quaternion-smallest-three");
+        }
+        return null;
+    }
+
+    private WireShape structuralSmallestThreeUnmarshalLeaf(
+        Function function,
+        String readBufferParameter) {
+
+        HighFunction high = highFunction(function);
+        if (high == null ||
+            !hasSmallestThreeCoreCall(
+                function,
+                NetworkSchemaCodecClassifier.CodecDirection.DECODE) ||
+            !hasReadBufferFlow(function, readBufferParameter, new LinkedHashSet<>())) {
+            return null;
+        }
+        if (NetworkSchemaCodecClassifier.isProjectedVec3SmallestThreeDecodeWrapper(high)) {
+            return WireShape.semantic(
+                "vec3-smallest-three",
+                "unmarshal-pcode-projected-smallest-three");
+        }
+        if (NetworkSchemaCodecClassifier.isQuaternionSmallestThreeDecodeWrapper(high)) {
+            return WireShape.semantic(
+                "quat-smallest-three",
+                "unmarshal-pcode-quaternion-smallest-three");
+        }
+        return null;
+    }
+
+    private boolean hasSmallestThreeCoreCall(
+        Function function,
+        NetworkSchemaCodecClassifier.CodecDirection direction) {
+
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return false;
+        }
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (NetworkSchemaCodecClassifier.smallestThreeCoreDirection(highFunction(target)) ==
+                direction) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isEntityRefCodec(
+        Function function,
+        String bufferParameter,
+        NetworkSchemaCodecClassifier.CodecDirection direction) {
+
+        return entityRefCodecEvidence(function, bufferParameter, direction).isComplete();
+    }
+
+    private EntityRefCodecEvidence entityRefCodecEvidence(
+        Function function,
+        String bufferParameter,
+        NetworkSchemaCodecClassifier.CodecDirection direction) {
+
+        HighFunction high = highFunction(function);
+        boolean conditionalFlag = high != null &&
+            NetworkSchemaCodecClassifier.hasConditionalBitMask(high, 1L);
+        boolean nestedString = high != null &&
+            hasValidatedCodecCall(function, bufferParameter, "string", direction);
+        boolean flagsByte = direction == NetworkSchemaCodecClassifier.CodecDirection.ENCODE
+            ? hasFixedRawWrite(function, bufferParameter, 1)
+            : hasFixedRawRead(function, bufferParameter, 1);
+        boolean uuidBytes = direction == NetworkSchemaCodecClassifier.CodecDirection.ENCODE
+            ? hasFixedRawWrite(function, bufferParameter, 16)
+            : hasFixedRawRead(function, bufferParameter, 16);
+        return new EntityRefCodecEvidence(
+            function == null ? null : function.getEntryPoint(),
+            bufferParameter,
+            direction.name().toLowerCase(Locale.ROOT),
+            conditionalFlag,
+            nestedString,
+            flagsByte,
+            uuidBytes);
+    }
+
+    private EntityRefCodecEvidence findEntityRefCodecEvidence(
+        Function function,
+        String bufferParameter,
+        NetworkSchemaCodecClassifier.CodecDirection direction) {
+
+        return findEntityRefCodecEvidence(
+            function,
+            bufferParameter,
+            direction,
+            new LinkedHashSet<>());
+    }
+
+    private EntityRefCodecEvidence findEntityRefCodecEvidence(
+        Function function,
+        String bufferParameter,
+        NetworkSchemaCodecClassifier.CodecDirection direction,
+        Set<String> activeContexts) {
+
+        if (function == null || bufferParameter == null) {
+            return null;
+        }
+        String context = function.getEntryPoint() + "|" + bufferParameter + "|" + direction;
+        if (!activeContexts.add(context)) {
+            return null;
+        }
+        try {
+            DeclaredCodecShape declared = declaredCodecShape(function);
+            if (declared != null && "entity-ref".equals(declared.shape())) {
+                return entityRefCodecEvidence(function, bufferParameter, direction);
+            }
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                return null;
+            }
+            PcodeStorage buffer = new PcodeStorage(bufferParameter, 0L);
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (operation.getOpcode() != PcodeOp.CALL) {
+                    continue;
+                }
+                Function target = pcodeCallTarget(operation);
+                Integer bufferSlot = provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    buffer);
+                if (bufferSlot == null || target == null) {
+                    continue;
+                }
+                EntityRefCodecEvidence evidence = findEntityRefCodecEvidence(
+                    target,
+                    "param_" + bufferSlot,
+                    direction,
+                    activeContexts);
+                if (evidence != null) {
+                    return evidence;
+                }
+            }
+            return null;
+        } finally {
+            activeContexts.remove(context);
+        }
+    }
+
+    private boolean hasValidatedCodecCall(
+        Function function,
+        String bufferParameter,
+        String shape,
+        NetworkSchemaCodecClassifier.CodecDirection direction) {
+
+        return hasValidatedCodecCall(
+            function,
+            bufferParameter,
+            shape,
+            direction,
+            new LinkedHashSet<>());
+    }
+
+    private boolean hasValidatedCodecCall(
+        Function function,
+        String bufferParameter,
+        String shape,
+        NetworkSchemaCodecClassifier.CodecDirection direction,
+        Set<String> activeContexts) {
+
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return false;
+        }
+        String context = function.getEntryPoint() + "|" + bufferParameter + "|" + direction;
+        if (!activeContexts.add(context)) {
+            return false;
+        }
+        PcodeStorage buffer = new PcodeStorage(bufferParameter, 0L);
+        try {
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (operation.getOpcode() != PcodeOp.CALL) {
+                    continue;
+                }
+                Function target = pcodeCallTarget(operation);
+                Integer bufferSlot = provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    buffer);
+                if (bufferSlot == null || target == null) {
+                    continue;
+                }
+                String targetBuffer = "param_" + bufferSlot;
+                WireShape evidence =
+                    direction == NetworkSchemaCodecClassifier.CodecDirection.ENCODE
+                        ? validatedMarshalLeaf(target, targetBuffer)
+                        : validatedUnmarshalLeaf(target, targetBuffer);
+                if (evidence != null && shape.equals(evidence.shape)) {
+                    return true;
+                }
+                if (hasValidatedCodecCall(
+                    target,
+                    targetBuffer,
+                    shape,
+                    direction,
+                    activeContexts)) {
+                    return true;
+                }
+            }
+            return false;
+        } finally {
+            activeContexts.remove(context);
+        }
+    }
+
+    private DeclaredCodecShape declaredCodecShape(Function function) {
+        if (function == null) {
+            return null;
+        }
+        String name = fullFunctionName(function);
+        String custom = wireShapeFromMarshallerType(name);
+        if (custom != null) {
+            return new DeclaredCodecShape(custom);
+        }
+        if (name != null && name.contains("SequenceNumber") &&
+            (name.contains("::Marshal") || name.contains("::Unmarshal"))) {
+            return new DeclaredCodecShape("sequence-number");
+        }
+        String nativeType = marshalFunctionTemplateType(name);
+        String shape = wireShapeFromNativeType(nativeType);
+        return shape == null ? null : new DeclaredCodecShape(shape);
+    }
+
+    private boolean hasStructuralCodecCall(
+        Function function,
+        String expectedShape,
+        NetworkSchemaCodecClassifier.CodecDirection expectedDirection) {
+
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return false;
+        }
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            HighFunction targetHigh = highFunction(target);
+            NetworkSchemaCodecClassifier.VariableIntegerCodec codec =
+                NetworkSchemaCodecClassifier.variableIntegerCodec(targetHigh);
+            if (codec != null && expectedShape.equals(codec.shape()) &&
+                expectedDirection == codec.direction()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasFixedRawWrite(
+        Function function,
+        String writeBufferParameter,
+        int expectedWidth) {
+
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return false;
+        }
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            Integer width = provenVirtualRawWriteLength(
+                function,
+                operation,
+                writeBufferParameter);
+            if (width != null && width == expectedWidth) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasVariableRawWriteCoverage(
+        Function function,
+        String writeBufferParameter,
+        int maximumWidth) {
+
+        for (int width = 1; width <= maximumWidth; width++) {
+            if (!hasFixedRawWrite(function, writeBufferParameter, width)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean hasOnlyFixedRawWrite(
+        Function function,
+        String writeBufferParameter,
+        int expectedWidth) {
+
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return false;
+        }
+        boolean found = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            Integer width = provenVirtualRawWriteLength(
+                function,
+                operation,
+                writeBufferParameter);
+            if (width == null) {
+                continue;
+            }
+            if (width != expectedWidth) {
+                return false;
+            }
+            found = true;
+        }
+        return found;
+    }
+
+    private boolean hasVirtualBufferCall(
+        Function function,
+        String bufferParameter,
+        long slotOffset) {
+
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return false;
+        }
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALLIND || operation.getNumInputs() == 0) {
+                continue;
+            }
+            PcodeVirtualDispatch target = pcodeVirtualDispatch(operation.getInput(0));
+            if (target == null || target.objectOffset() != 0L ||
+                target.slotOffset() != slotOffset) {
+                continue;
+            }
+            boolean pcodeReceiver = target.root().isStorage(bufferParameter);
+            Integer abiSlot = instructionAbiCallArgumentSlot(
+                function,
+                operation,
+                null,
+                new PcodeStorage(bufferParameter, 0L));
+            boolean abiReceiver = Integer.valueOf(1).equals(abiSlot);
+            if ((pcodeReceiver || abiReceiver) &&
+                (!pcodeReceiver || abiSlot == null || abiReceiver)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasFixedRawRead(
+        Function function,
+        String readBufferParameter,
+        int expectedWidth) {
+
+        HighFunction high = highFunction(function);
+        if (high == null || readBufferParameter == null) {
+            return false;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        Set<Integer> directWidths = directCursorReadWidths(
+            high,
+            operations).get(readBufferParameter);
+        if (directWidths != null && directWidths.contains(expectedWidth)) {
+            return true;
+        }
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    new PcodeStorage(readBufferParameter, 0L)) == null) {
+                continue;
+            }
+            WireShape read = pcodeReadRawWireEvidence(
+                operation,
+                target);
+            if (read != null && wireShapeByteWidth(read.layout) != null &&
+                wireShapeByteWidth(read.layout) == expectedWidth) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String uniqueReadBufferParameter(Function function) {
+        List<String> candidates = readBufferParameters(function);
+        return candidates.size() == 1 ? candidates.get(0) : null;
+    }
+
+    private List<String> readBufferParameters(Function function) {
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return List.of();
+        }
+        ArrayList<String> candidates = new ArrayList<>();
+        int parameterCount = win64RegisterParameterCandidateCount(high);
+        for (int slot = 1; slot <= parameterCount; slot++) {
+            String parameter = "param_" + slot;
+            if (!hasReadBufferFlow(function, parameter, new LinkedHashSet<>())) {
+                continue;
+            }
+            candidates.add(parameter);
+        }
+        return List.copyOf(candidates);
+    }
+
+    private boolean hasExactlyOneFixedRawRead(
+        Function function,
+        String readBufferParameter,
+        int expectedWidth) {
+
+        HighFunction high = highFunction(function);
+        if (high == null || readBufferParameter == null) {
+            return false;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        int readCount = 0;
+        for (PcodeOpAST operation : operations) {
+            CodecWireEvent direct = directCursorReadEvent(
+                high,
+                operation,
+                operations,
+                readBufferParameter);
+            if (direct == null) {
+                continue;
+            }
+            Integer width = wireShapeByteWidth(direct.wireEvidence().layout);
+            if (width == null || width != expectedWidth) {
+                return false;
+            }
+            readCount++;
+        }
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Integer slot = provenCallArgumentSlot(
+                function,
+                operation,
+                target,
+                new PcodeStorage(readBufferParameter, 0L));
+            if (slot == null) {
+                continue;
+            }
+            WireShape read = pcodeReadRawWireEvidence(
+                operation,
+                target);
+            if (read == null) {
+                if (target != null && slot != null && hasReadBufferFlow(
+                        target,
+                        "param_" + slot,
+                        new LinkedHashSet<>())) {
+                    return false;
+                }
+                continue;
+            }
+            Integer width = wireShapeByteWidth(read.layout);
+            if (width == null || width != expectedWidth) {
+                return false;
+            }
+            readCount++;
+        }
+        return readCount == 1;
+    }
+
+    private boolean hasNormalizedBooleanRead(
+        Function function,
+        String readBufferParameter) {
+
+        HighFunction high = highFunction(function);
+        if (high == null || readBufferParameter == null) {
+            return false;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        PcodeStorage readBuffer = new PcodeStorage(readBufferParameter, 0L);
+        for (PcodeOpAST readCall : operations) {
+            if (readCall.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(readCall);
+            if (provenCallArgumentSlot(
+                    function,
+                    readCall,
+                    target,
+                    readBuffer) == null) {
+                continue;
+            }
+            RawPcodeWrite rawRead = pcodeReadRawWrite(
+                readCall,
+                target);
+            if (boundedNormalizedBooleanReadEvidence(
+                    high,
+                    operations,
+                    readCall,
+                    rawRead) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasNoAdditionalReadBufferCodecCalls(
+        Function function,
+        String readBufferParameter) {
+
+        HighFunction high = highFunction(function);
+        if (high == null || readBufferParameter == null) {
+            return false;
+        }
+        PcodeStorage readBuffer = new PcodeStorage(readBufferParameter, 0L);
+        int rawReadCount = 0;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Integer bufferSlot = provenCallArgumentSlot(
+                function,
+                operation,
+                target,
+                readBuffer);
+            if (bufferSlot == null) {
+                continue;
+            }
+            WireShape rawRead = pcodeReadRawWireEvidence(operation, target);
+            if (rawRead != null) {
+                rawReadCount++;
+                continue;
+            }
+            if (hasReadBufferFlow(
+                    target,
+                    "param_" + bufferSlot,
+                    new LinkedHashSet<>())) {
+                return false;
+            }
+        }
+        return rawReadCount == 1;
+    }
+
+    private WireShape boundedNormalizedBooleanReadEvidence(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST readCall,
+        RawPcodeWrite rawRead) {
+
+        PcodeOpAST normalization = boundedNormalizedBooleanOperation(
+            high,
+            operations,
+            readCall,
+            rawRead);
+        return normalization == null
+            ? null
+            : WireShape.semantic(
+                "bool",
+                rawRead.wireEvidence.layout,
+                "unmarshal-pcode-bounded-boolean-normalization");
+    }
+
+    private boolean booleanGuardSelectsNormalization(
+        PcodeOpAST guard,
+        PcodeOpAST normalization,
+        List<PcodeOpAST> operations) {
+
+        PcodeOpAST branch = uniqueConditionalBranch(guard.getOutput(), operations);
+        if (branch == null ||
+            !(branch.getParent() instanceof PcodeBlockBasic branchBlock) ||
+            !(normalization.getParent() instanceof PcodeBlockBasic normalizationBlock) ||
+            branchBlock.getOutSize() != 2) {
+            return false;
+        }
+        int reachingEdges = 0;
+        for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(branchBlock)) {
+            if (successor == normalizationBlock ||
+                NetworkSchemaControlFlow.reaches(successor, normalizationBlock)) {
+                reachingEdges++;
+            }
+        }
+        return reachingEdges == 1;
+    }
+
+    private boolean isNormalizedBooleanValue(
+        Varnode value,
+        PcodeStorage rawStorage) {
+
+        if (value == null) {
+            return false;
+        }
+        PcodeOp definition = value.getDef();
+        if (definition == null || definition.getOpcode() != PcodeOp.INT_NOTEQUAL ||
+            definition.getNumInputs() != 2) {
+            return false;
+        }
+        int zeroSlot = definition.getInput(0).isConstant() &&
+            definition.getInput(0).getOffset() == 0L ? 0 :
+            definition.getInput(1).isConstant() &&
+                definition.getInput(1).getOffset() == 0L ? 1 : -1;
+        return zeroSlot >= 0 &&
+            isValueFromStorage(definition.getInput(1 - zeroSlot), rawStorage);
+    }
+
+    private boolean isValueFromStorage(Varnode value, PcodeStorage expected) {
+        PcodeStorage direct = pcodeStorageExpression(value);
+        if (expected.sameLocation(direct)) {
+            return true;
+        }
+        PcodeStorage loaded = pcodeLoadedStorageExpression(value);
+        return expected.sameLocation(loaded);
+    }
+
+    private boolean pcodeValueFeedsConditionalBranch(Varnode value) {
+        ArrayDeque<Varnode> pending = new ArrayDeque<>();
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        pending.add(value);
+        while (!pending.isEmpty() && seen.size() < PCODE_ALIAS_DESCENDANT_LIMIT) {
+            Varnode current = pending.removeFirst();
+            if (!seen.add(pcodeSsaNodeKey(current))) {
+                continue;
+            }
+            Iterator<PcodeOp> descendants = current.getDescendants();
+            while (descendants.hasNext()) {
+                PcodeOp descendant = descendants.next();
+                if (descendant.getOpcode() == PcodeOp.CBRANCH) {
+                    return true;
+                }
+                if (descendant.getOutput() != null &&
+                    switch (descendant.getOpcode()) {
+                        case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.BOOL_NEGATE,
+                            PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL -> true;
+                        default -> false;
+                    }) {
+                    pending.addLast(descendant.getOutput());
+                }
+            }
+        }
+        return false;
+    }
+
+    private Map<String, Set<Integer>> directCursorReadWidths(
+        HighFunction high,
+        List<PcodeOpAST> operations) {
+
+        LinkedHashMap<String, Set<Integer>> result = new LinkedHashMap<>();
+        int parameterCount = win64RegisterParameterCandidateCount(high);
+        for (int slot = 1; slot <= parameterCount; slot++) {
+            String parameter = "param_" + slot;
+            LinkedHashSet<Integer> widths = new LinkedHashSet<>();
+            for (PcodeOpAST operation : operations) {
+                CodecWireEvent event = directCursorReadEvent(
+                    high,
+                    operation,
+                    operations,
+                    parameter);
+                Integer width = event == null
+                    ? null
+                    : wireShapeByteWidth(event.wireEvidence().layout);
+                if (width != null) {
+                    widths.add(width);
+                }
+            }
+            if (!widths.isEmpty()) {
+                result.put(parameter, Set.copyOf(widths));
+            }
+        }
+        return Map.copyOf(result);
+    }

@@ -1,7 +1,10 @@
         return serializeObjectsByRef.getOrDefault(ref, object);
     }
 
-    private List<SerializeFieldInfo> parseSerializeFields(JsonObject type) {
+    private List<SerializeFieldInfo> parseSerializeFields(
+        JsonObject type,
+        boolean includeBaseClasses) {
+
         JsonArray elements = array(type, "elements");
         if (elements == null || elements.isEmpty()) {
             return Collections.emptyList();
@@ -13,14 +16,22 @@
                 continue;
             }
             JsonObject value = element.getAsJsonObject();
-            if (Boolean.TRUE.equals(bool(value, "is_base_class"))) {
+            boolean baseClass = Boolean.TRUE.equals(bool(value, "is_base_class"));
+            if (baseClass && !includeBaseClasses) {
                 continue;
             }
             String name = string(value, "name");
             String typeId = canonicalUuidFromString(string(value, "typeId"));
             Long offset = longValue(value, "offset");
-            if (name == null || name.trim().isEmpty() || typeId == null || offset == null) {
+            if (typeId == null || offset == null) {
                 continue;
+            }
+            String typeName = serializeFieldTypeName(value, typeId);
+            if (name == null || name.trim().isEmpty()) {
+                if (!baseClass || !isPlausibleTypeName(typeName)) {
+                    continue;
+                }
+                name = NetworkSchemaText.sourceTypeLeaf(typeName);
             }
 
             SerializeFieldInfo field = new SerializeFieldInfo();
@@ -28,8 +39,9 @@
             field.typeId = typeId;
             field.offset = offset;
             field.dataSize = longValue(value, "dataSize");
-            field.typeName = serializeFieldTypeName(value, typeId);
+            field.typeName = typeName;
             field.wireShape = wireShapeFromSerializeField(value, typeId, field.typeName);
+            field.baseClass = baseClass;
             fields.add(field);
         }
         return fields;
@@ -160,10 +172,6 @@
     }
 
     private File serializeJsonFile(File typeregistryInput) {
-        String explicit = envValue("NW_NETWORK_SCHEMA_SERIALIZE_JSON");
-        if (explicit != null) {
-            return new File(explicit);
-        }
         File dir = typeregistryInput == null ? null : typeregistryInput.getParentFile();
         for (int i = 0; i < 4 && dir != null; i++) {
             File candidate = new File(dir, "serialize.json");
@@ -256,7 +264,7 @@
     }
 
     private Map<String, RegistrationFunction> collectRegistrationFunctions(Address registerField) {
-        LinkedHashMap<String, RegistrationFunction> result = new LinkedHashMap<>();
+        LinkedHashMap<String, Function> owners = new LinkedHashMap<>();
         ReferenceIterator references =
             currentProgram.getReferenceManager().getReferencesTo(registerField);
         while (references.hasNext()) {
@@ -269,25 +277,27 @@
             if (owner == null) {
                 continue;
             }
-            String key = owner.getEntryPoint().toString();
-            RegistrationFunction function = result.get(key);
-            if (function == null) {
-                function = new RegistrationFunction(owner);
-                function.instanceVtable = findInstanceVtable(owner);
-                function.azRtti = decodeAzRttiFromVtable(function.instanceVtable);
-                result.put(key, function);
-            }
-            FieldCall field = recoverFieldCall(owner, callsite, function.fields.size());
-            function.fields.add(field);
+            owners.putIfAbsent(owner.getEntryPoint().toString(), owner);
         }
-        for (RegistrationFunction function : result.values()) {
-            List<FieldCall> executedFields = recoverExecutedRegisterFieldCalls(function.function);
+
+        LinkedHashMap<String, RegistrationFunction> result = new LinkedHashMap<>();
+        for (Map.Entry<String, Function> owner : owners.entrySet()) {
+            RegistrationFunction function = new RegistrationFunction(owner.getValue());
+            function.instanceVtable = findInstanceVtable(function.function);
+            function.azRtti = decodeAzRttiFromVtable(function.instanceVtable);
+            List<FieldCall> pcodeFields = recoverRegisterFieldCallsFromPcode(function.function);
+            function.fields.addAll(pcodeFields);
+
+            List<FieldCall> executedFields = hasBackwardPcodeBranch(function.function)
+                ? recoverExecutedRegisterFieldCalls(function.function)
+                : Collections.emptyList();
             if (executedFields.size() > function.fields.size()) {
                 registerFieldLoopRecoveredFunctionCount++;
                 registerFieldLoopRecoveredCallCount += executedFields.size() - function.fields.size();
                 function.fields.clear();
                 function.fields.addAll(executedFields);
             }
+            result.put(owner.getKey(), function);
         }
         return result;
     }
@@ -305,20 +315,25 @@
 
         ForwardArgState state = initialForwardArgState(owner, new LinkedHashSet<>());
         ArrayList<FieldCall> fields = new ArrayList<>();
-        HashMap<String, Integer> visitCounts = new HashMap<>();
+        LoopExecutionProof proof = proveRegisterFieldLoopExecution(owner, instructions.size());
+        if (proof == null) {
+            if (hasBackwardPcodeBranch(owner)) {
+                registerFieldLoopRejectCounts.merge("unproven-backedge", 1, Integer::sum);
+            }
+            return Collections.emptyList();
+        }
         int index = 0;
-        int maxSteps = Math.max(256, instructions.size() * 64);
-        for (int steps = 0; index >= 0 && index < instructions.size() && steps < maxSteps; steps++) {
-            Instruction instruction = instructions.get(index);
-            String visitKey = instruction.getMinAddress().toString();
-            int visits = visitCounts.merge(visitKey, 1, Integer::sum);
-            if (visits > 64) {
+        for (long steps = 0;
+            index >= 0 && index < instructions.size() && steps < proof.maxSteps();
+            steps++) {
+
+            if (monitor.isCancelled()) {
                 return Collections.emptyList();
             }
+            Instruction instruction = instructions.get(index);
 
             if (isRegisterFieldCall(instruction)) {
                 ArgState args = argStateFromForwardState(state);
-                args.fillMissingFrom(recoverBackwardArgState(owner, instruction.getMinAddress()));
                 fields.add(fieldCallFromArgState(
                     owner,
                     instruction.getMinAddress(),
@@ -333,14 +348,19 @@
                 index,
                 state);
             if (next == null) {
+                registerFieldLoopRejectCounts.merge(
+                    "control-flow-not-concrete",
+                    1,
+                    Integer::sum);
                 return Collections.emptyList();
             }
             if (next < 0) {
-                break;
+                return fields;
             }
             index = next;
         }
-        return fields;
+        registerFieldLoopRejectCounts.merge("proof-bound-exhausted", 1, Integer::sum);
+        return Collections.emptyList();
     }
 
     private boolean isRegisterFieldCall(Instruction instruction) {
@@ -498,74 +518,112 @@
 
     private void collectDirectFieldTableRegistrationFunctions(
         List<RegistryEntry> registry,
-        Map<String, HookTypeEvidence> hookTypeNamesById,
         Map<String, RegistrationFunction> registrationFunctions) {
 
-        LinkedHashSet<Address> candidates = new LinkedHashSet<>();
+        LinkedHashSet<String> visitedFunctions = new LinkedHashSet<>();
+        int seedCount = 0;
+        int matchedFunctionCount = 0;
         for (RegistryEntry entry : registry) {
-            HookTypeEvidence hook = registrationHookForEntry(entry, hookTypeNamesById);
-            collectConstructorCandidates(candidates, parseCapturedAddress(entry.createInstance));
-            collectConstructorCandidates(candidates, parseCapturedAddress(entry.unmarshal));
-            if (hook != null) {
-                collectConstructorCandidates(candidates, hook.createInstance);
-                collectConstructorCandidates(candidates, hook.unmarshal);
+            if (monitor.isCancelled()) {
+                break;
             }
+            matchedFunctionCount += collectDirectFieldTableRegistrationSeed(
+                parseCapturedAddress(entry.createInstance),
+                visitedFunctions,
+                registrationFunctions);
+            seedCount++;
+            matchedFunctionCount += collectDirectFieldTableRegistrationSeed(
+                parseCapturedAddress(entry.unmarshal),
+                visitedFunctions,
+                registrationFunctions);
+            seedCount++;
         }
 
-        for (Address candidate : candidates) {
-            Function function = functionAtOrContaining(candidate);
-            if (function == null) {
-                continue;
-            }
-            String key = function.getEntryPoint().toString();
-            if (registrationFunctions.containsKey(key)) {
-                continue;
-            }
-
-            List<FieldCall> fields = recoverDirectFieldTableAppends(function);
-            if (fields.isEmpty()) {
-                continue;
-            }
-
-            RegistrationFunction registration = new RegistrationFunction(function);
-            registration.instanceVtable = findInstanceVtable(function);
-            registration.azRtti = decodeAzRttiFromVtable(registration.instanceVtable);
-            registration.fields.addAll(fields);
-            registrationFunctions.put(key, registration);
-        }
+        println(
+            "Direct field registration scan: seeds=" + seedCount +
+            ", functions=" + visitedFunctions.size() +
+            ", matches=" + matchedFunctionCount);
     }
 
-    private void collectConstructorCandidates(Set<Address> candidates, Address seed) {
+    private int collectDirectFieldTableRegistrationSeed(
+        Address seed,
+        Set<String> visitedFunctions,
+        Map<String, RegistrationFunction> registrationFunctions) {
+
         Address target = resolvedCodeTarget(seed);
         if (!isExecutableAddress(target)) {
-            return;
+            return 0;
         }
 
         Function function = functionAtOrContaining(target);
         if (function == null) {
-            return;
+            return 0;
         }
-        candidates.add(function.getEntryPoint());
 
-        int count = 0;
+        int matches = collectDirectFieldTableRegistrationCandidate(
+            function,
+            visitedFunctions,
+            registrationFunctions);
         for (Instruction instruction : functionInstructions(function)) {
-            if (instruction.getMinAddress().compareTo(target) < 0) {
-                continue;
-            }
-            if (count++ >= VTABLE_SCAN_LIMIT) {
+            if (monitor.isCancelled()) {
                 break;
             }
             if (!instruction.getFlowType().isCall()) {
                 continue;
             }
             Address call = resolvedCodeTarget(callTarget(instruction));
-            if (isExecutableAddress(call)) {
-                candidates.add(call);
+            if (!isExecutableAddress(call)) {
+                continue;
+            }
+            Function callee = functionAtOrContaining(call);
+            if (callee != null) {
+                matches += collectDirectFieldTableRegistrationCandidate(
+                    callee,
+                    visitedFunctions,
+                    registrationFunctions);
             }
         }
+        return matches;
     }
 
-    private List<FieldCall> recoverDirectFieldTableAppends(Function owner) {
+    private int collectDirectFieldTableRegistrationCandidate(
+        Function function,
+        Set<String> visitedFunctions,
+        Map<String, RegistrationFunction> registrationFunctions) {
+
+        String key = function.getEntryPoint().toString();
+        if (!visitedFunctions.add(key) || registrationFunctions.containsKey(key)) {
+            return 0;
+        }
+        if (visitedFunctions.size() % 512 == 0) {
+            println(
+                "Direct field registration progress: functions=" +
+                visitedFunctions.size() +
+                ", registrations=" + registrationFunctions.size());
+        }
+
+        List<FieldCall> fields = recoverDirectFieldTableAppends(function, false);
+        if (fields.isEmpty()) {
+            return 0;
+        }
+
+        List<FieldCall> enrichedFields = recoverDirectFieldTableAppends(function, true);
+        if (!enrichedFields.isEmpty()) {
+            fields = enrichedFields;
+        }
+
+        RegistrationFunction registration = new RegistrationFunction(function);
+        registration.instanceVtable = findInstanceVtable(function);
+        registration.azRtti = decodeAzRttiFromVtable(registration.instanceVtable);
+        registration.fields.addAll(fields);
+        registrationFunctions.put(key, registration);
+        return 1;
+    }
+
+    private List<FieldCall> recoverDirectFieldTableAppends(
+        Function owner,
+        boolean observeConstructors) {
+
         ForwardArgState state = newForwardArgState();
 
         HashMap<String, Integer> cursorOffsetByRegister = new HashMap<>();
@@ -573,9 +631,8 @@
         HashMap<String, FixedNamedFieldValue> fixedNamedFieldsBySimdRegister = new HashMap<>();
         ArrayList<FieldCall> fields = new ArrayList<>();
 
-        int count = 0;
         for (Instruction instruction : functionInstructions(owner)) {
-            if (count++ >= DIRECT_FIELD_TABLE_SCAN_LIMIT) {
+            if (monitor.isCancelled()) {
                 break;
             }
 
@@ -586,7 +643,7 @@
                 pendingByCursorOffset,
                 fixedNamedFieldsBySimdRegister,
                 fields);
-            observeForwardInstruction(instruction, state);
+            observeForwardInstruction(instruction, state, observeConstructors);
         }
 
         if (fields.isEmpty()) {

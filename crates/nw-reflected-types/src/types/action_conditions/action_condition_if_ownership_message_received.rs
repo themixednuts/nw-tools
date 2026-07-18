@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfOwnershipMessageReceived;
+pub struct ActionConditionIfOwnershipMessageReceived {}
 
 impl AzRtti for ActionConditionIfOwnershipMessageReceived {
     const NAME: &'static str = "ActionConditionIfOwnershipMessageReceived";

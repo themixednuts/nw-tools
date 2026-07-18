@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct CharacterActionGridAliasRef;
+pub struct CharacterActionGridAliasRef {}
 
 impl AzRtti for CharacterActionGridAliasRef {
     const NAME: &'static str = "CharacterActionGridAliasRef";

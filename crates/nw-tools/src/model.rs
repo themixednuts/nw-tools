@@ -21,6 +21,31 @@ use crate::source::{self, Install};
 use crate::support::{ScanIssues, collect_matching, ensure_parent, guard_existing, path_ext};
 use crate::ui::Report;
 
+/// Formats which can own or indirectly select a render model. Structured glTF
+/// exports index these once, then reuse the reverse graph for every model in a
+/// batch. Opaque leaf formats remain handled by the normal forward closure.
+const MODEL_CONSUMER_EXTENSIONS: &[&str] = &[
+    "cdf",
+    "cloth",
+    "slice",
+    "dynamicslice",
+    "entity",
+    "entities",
+    "entities_xml",
+    "prefab",
+    "slicedata",
+    "meta",
+    "metadata",
+    "chunks",
+    "distribution",
+    "vegetation",
+    "terrain.json",
+    "tracts.json",
+    "terrain",
+    "worldmat",
+    "regionmat",
+];
+
 /// Output container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Container {
@@ -76,6 +101,22 @@ pub struct Model {
     #[arg(long = "audio")]
     audio: Vec<String>,
 
+    /// Skip Wwise → WAV decoding (default for glTF is to decode).
+    #[arg(long = "no-decode-audio")]
+    no_decode_audio: bool,
+
+    /// Skip writing a playable Blender `.blend` next to the package (default for glTF is to write one).
+    #[arg(long = "no-blend")]
+    no_blend: bool,
+
+    /// Explicit path to `vgmstream-cli` (otherwise PATH / WinGet install).
+    #[arg(long = "vgmstream", value_name = "PATH")]
+    vgmstream: Option<PathBuf>,
+
+    /// Explicit path to `blender` (otherwise PATH / Program Files).
+    #[arg(long = "blender", value_name = "PATH")]
+    blender: Option<PathBuf>,
+
     /// Case-insensitive path substring filter (install mode).
     #[arg(long)]
     filter: Option<String>,
@@ -93,6 +134,62 @@ pub struct Model {
 }
 
 impl Model {
+    fn decode_audio_enabled(&self) -> bool {
+        self.format == Container::Gltf && !self.no_decode_audio
+    }
+
+    fn blend_enabled(&self) -> bool {
+        self.format == Container::Gltf && !self.no_blend
+    }
+
+    /// Write a playable `.blend` for a structured glTF package when enabled.
+    ///
+    /// `preferred_gltf` is used for single-file exports; otherwise the first
+    /// `.gltf` under the package root is chosen.
+    fn maybe_write_blend(&self, package_root: &Path, preferred_gltf: Option<&Path>) -> Result<()> {
+        if !self.blend_enabled() {
+            return Ok(());
+        }
+        let blender = match self
+            .blender
+            .clone()
+            .or_else(crate::audio_export::find_blender)
+        {
+            Some(path) => path,
+            None => {
+                eprintln!(
+                    "note: skipping .blend write - blender not found (install Blender or pass --blender; use --no-blend to silence)"
+                );
+                return Ok(());
+            }
+        };
+        let gltf = if let Some(path) = preferred_gltf.filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gltf"))
+        }) {
+            path.to_path_buf()
+        } else {
+            find_first_gltf(package_root).with_context(|| {
+                format!(
+                    "no .gltf under {} to bind into a .blend",
+                    package_root.display()
+                )
+            })?
+        };
+        let blend_path = package_root.join(
+            gltf.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("model")
+                .to_owned()
+                + ".blend",
+        );
+        crate::audio_export::write_playable_blend(&blender, &gltf, package_root, &blend_path)
+            .with_context(|| format!("write playable blend {}", blend_path.display()))?;
+        eprintln!("blend {}", blend_path.display());
+        Ok(())
+    }
+
     pub fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
         match self.path.clone() {
@@ -105,6 +202,8 @@ impl Model {
     /// Convert a single mesh file on disk.
     fn export_file(&self, ctx: &RunCtx, path: &Path) -> Result<()> {
         let source = Tree::around(path);
+        let index_source = Tree::rooted(path.parent().unwrap_or_else(|| Path::new(".")));
+        let dependency_index = self.build_model_dependency_index(ctx, &index_source)?;
         let out = self
             .out
             .clone()
@@ -127,7 +226,10 @@ impl Model {
             .mtl
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok());
-        let source_path = path.to_string_lossy();
+        let source_path = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .context("model input has no file name")?;
         let stats = self.convert(
             &ctx.runner,
             &source,
@@ -140,6 +242,7 @@ impl Model {
                 out: &out,
                 package: package.as_ref(),
                 artifact: &artifact,
+                dependency_index: dependency_index.as_ref(),
             },
         )?;
 
@@ -155,6 +258,11 @@ impl Model {
             .stat("output", out.display())
             .stat("bytes", format_size(stats.bytes, DECIMAL))
             .print();
+        let package_root = package
+            .as_ref()
+            .map(|_| out.parent().unwrap_or_else(|| Path::new(".")).to_path_buf())
+            .unwrap_or_else(|| out.parent().unwrap_or_else(|| Path::new(".")).to_path_buf());
+        self.maybe_write_blend(&package_root, Some(&out))?;
         Ok(())
     }
 
@@ -167,6 +275,8 @@ impl Model {
             None
         };
         let meshes = collect_matching(dir, is_mesh_file)?;
+        let index_source = Tree::rooted(dir);
+        let dependency_index = self.build_model_dependency_index(ctx, &index_source)?;
         let batch = ctx.map_results_compact(
             "model",
             &meshes,
@@ -181,7 +291,7 @@ impl Model {
                     ensure_parent(&out)?;
                     let cgf = std::fs::read(path)?;
                     let heap = std::fs::read(heap_sibling(path)).unwrap_or_default();
-                    let source_path = path.to_string_lossy();
+                    let source_path = relative.to_string_lossy().replace('\\', "/");
                     self.convert(
                         &ctx.runner,
                         &source,
@@ -194,12 +304,18 @@ impl Model {
                             out: &out,
                             package: package.as_ref(),
                             artifact: &artifact,
+                            dependency_index: dependency_index.as_ref(),
                         },
                     )
                 })
             },
         );
-        report_batch(&batch.into_completed(), dir.display().to_string())
+        let results = batch.into_completed();
+        report_batch(&results, dir.display().to_string())?;
+        if results.iter().any(|result| result.is_ok()) {
+            self.maybe_write_blend(&out_dir, None)?;
+        }
+        Ok(())
     }
 
     /// Convert meshes straight out of the install's paks (+ asset catalog), parallel.
@@ -219,6 +335,7 @@ impl Model {
         } else {
             None
         };
+        let dependency_index = self.build_model_dependency_index(ctx, &source)?;
 
         let batch = ctx.map_results_compact("model", &meshes, Clone::clone, |key, progress| {
             progress.step(|| {
@@ -240,14 +357,17 @@ impl Model {
                         out: &out,
                         package: package.as_ref(),
                         artifact: &artifact,
+                        dependency_index: dependency_index.as_ref(),
                     },
                 )
             })
         });
-        report_batch(
-            &batch.into_completed(),
-            install.assets().display().to_string(),
-        )
+        let results = batch.into_completed();
+        report_batch(&results, install.assets().display().to_string())?;
+        if results.iter().any(|result| result.is_ok()) {
+            self.maybe_write_blend(&out_dir, None)?;
+        }
+        Ok(())
     }
 
     /// The shared conversion: assemble the model, resolve materials/textures via the
@@ -267,6 +387,7 @@ impl Model {
             out,
             package,
             artifact,
+            dependency_index,
         } = request;
         let resolved = crate::model_asset::resolve(
             source,
@@ -283,12 +404,16 @@ impl Model {
                 animation_events: self.animation_events.as_deref(),
                 mannequin: &self.mannequin,
                 audio: &self.audio,
+                decode_audio: self.decode_audio_enabled(),
+                vgmstream: self.vgmstream.as_deref(),
+                dependency_index,
             },
         )?;
         let model = resolved.model;
         let materials = resolved.materials;
         let animations = resolved.animations;
         let extras = resolved.extras;
+        let physics = resolved.physics;
 
         let texture_cache = materials
             .as_ref()
@@ -302,9 +427,18 @@ impl Model {
                     .collect::<Vec<_>>();
                 files.sort_unstable();
                 files.dedup();
+                // Files fed to a normal-map slot get ddna processing (Z rebuild +
+                // gloss→roughness split); every other slot decodes verbatim.
+                let normal_files = set
+                    .sub_materials
+                    .iter()
+                    .flat_map(|material| &material.textures)
+                    .filter(|texture| texture.slot == nw_model::MapSlot::Normals)
+                    .map(|texture| texture.file.clone())
+                    .collect::<std::collections::HashSet<_>>();
                 runner
                     .try_map(&files, |file| {
-                        decode_texture(source, file)
+                        decode_texture(source, file, normal_files.contains(file))
                             .with_context(|| format!("decode material texture {file}"))
                             .map(|texture| (file.clone(), texture))
                     })
@@ -317,6 +451,7 @@ impl Model {
             let mut load = |file: &str| texture_cache.get(file).cloned();
             let gltf = nw_model::Gltf::new(&model)
                 .extras(&extras)
+                .physics(&physics)?
                 .animations(&animations)?;
             match (&materials, self.format) {
                 (Some(set), Container::Glb) => {
@@ -354,6 +489,20 @@ impl Model {
             bytes,
         })
     }
+
+    fn build_model_dependency_index(
+        &self,
+        ctx: &RunCtx,
+        source: &dyn nw_asset_graph::AssetSource,
+    ) -> Result<Option<nw_asset_graph::AssetDependencyIndex>> {
+        if self.format != Container::Gltf {
+            return Ok(None);
+        }
+        let paths = source.paths_with_extensions(MODEL_CONSUMER_EXTENSIONS)?;
+        nw_asset_graph::AssetDependencyIndex::build_with_runner(source, &paths, &ctx.runner)
+            .map(Some)
+            .context("build shared authored-asset dependency index")
+    }
 }
 
 struct ConvertRequest<'a> {
@@ -365,6 +514,7 @@ struct ConvertRequest<'a> {
     out: &'a Path,
     package: Option<&'a PackageWriter>,
     artifact: &'a Path,
+    dependency_index: Option<&'a nw_asset_graph::AssetDependencyIndex>,
 }
 
 /// Reads assets and resolves a mesh's material, abstracting over the filesystem and
@@ -404,6 +554,12 @@ impl Tree {
             dir = current.parent();
         }
         Self { roots }
+    }
+
+    fn rooted(root: &Path) -> Self {
+        Self {
+            roots: vec![root.to_path_buf()],
+        }
     }
 }
 
@@ -534,6 +690,10 @@ impl nw_asset_graph::AssetSource for Install {
             .collect())
     }
 
+    fn paths_with_extensions(&self, extensions: &[&str]) -> Result<Vec<String>> {
+        Ok(Install::paths_with_extensions(self, extensions, None))
+    }
+
     fn path_by_id(&self, asset_id: nw_asset::AssetId) -> Option<String> {
         self.catalog()
             .entry_by_id(asset_id)
@@ -613,8 +773,16 @@ fn mtlname_guid(cgf: &[u8]) -> Option<String> {
         .map(|mtl| mtl.name.to_string())
 }
 
-/// Decode a referenced texture (`.tif` → `.dds`, split mips assembled) to PNG bytes.
-fn decode_texture(source: &dyn AssetSource, file: &str) -> Result<nw_model::TextureData> {
+/// Decode a referenced texture (`.tif` → `.dds`, split mips assembled) to PNG
+/// bytes. When `is_normal` is set, a two-channel CryEngine ddna map is split
+/// into an RGB normal (Z reconstructed) plus a derived metallic-roughness image
+/// (gloss alpha → roughness); a plain RGB normal passes through with its alpha
+/// stripped.
+fn decode_texture(
+    source: &dyn AssetSource,
+    file: &str,
+    is_normal: bool,
+) -> Result<nw_model::TextureData> {
     let dds = tif_to_dds(file);
     let header = source
         .read(&dds)
@@ -665,20 +833,111 @@ fn decode_texture(source: &dyn AssetSource, file: &str) -> Result<nw_model::Text
         .as_deref()
         .map(|alpha| (alpha, alpha_parts.as_slice()));
     let decoded = nw_dds::decode_top_mip_with_attached_alpha(&header, &parts, attached_alpha)?;
-    let image = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)
-        .context("decoded texture RGBA dimensions do not match payload")?;
+    let width = decoded.width;
+    let height = decoded.height;
+    let expected = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if decoded.rgba.len() != expected {
+        bail!("decoded texture RGBA dimensions do not match payload");
+    }
 
-    let mut bytes = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut bytes).write_image(
-        image.as_raw(),
-        image.width(),
-        image.height(),
-        image::ExtendedColorType::Rgba8,
-    )?;
+    // Place the decoded image at the shipped `.dds` catalog path, swapping the
+    // extension for `png`.
+    let path = png_from_dds(&dds);
+    let two_channel_normal = is_normal && blue_channel_is_empty(&decoded.rgba);
+    let (rgba, derived_roughness) = if two_channel_normal {
+        // The gloss (smoothness) rides the alpha; split it into a glTF
+        // metallic-roughness sibling before rebuilding the normal's blue (Z).
+        let roughness_bytes =
+            encode_rgba_png(&ddna_gloss_to_roughness(&decoded.rgba), width, height)?;
+        let stem = dds.rsplit_once('.').map_or(dds.as_str(), |(stem, _)| stem);
+        let derived = nw_model::TextureData {
+            bytes: roughness_bytes,
+            mime: "image/png".to_string(),
+            path: Some(format!("{stem}.rough.png")),
+            derived_roughness: None,
+        };
+        (
+            ddna_reconstruct_normal(&decoded.rgba),
+            Some(Box::new(derived)),
+        )
+    } else if is_normal {
+        // A true RGB normal keeps its Z in blue; drop the unused alpha.
+        (strip_alpha(&decoded.rgba), None)
+    } else {
+        (decoded.rgba, None)
+    };
     Ok(nw_model::TextureData {
-        bytes,
+        bytes: encode_rgba_png(&rgba, width, height)?,
         mime: "image/png".to_string(),
+        path: Some(path),
+        derived_roughness,
     })
+}
+
+/// Encode an RGBA8 buffer to PNG bytes.
+fn encode_rgba_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut bytes)
+        .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
+        .context("encode texture PNG")?;
+    Ok(bytes)
+}
+
+/// The CryEngine ddna signature: the blue channel is unused (normal X in red, Y
+/// in green, gloss in alpha). A true RGB normal keeps a meaningful Z in blue and
+/// fails this test.
+fn blue_channel_is_empty(rgba: &[u8]) -> bool {
+    const BLUE_EMPTY_MAX: u8 = 4;
+    !rgba.is_empty() && rgba.chunks_exact(4).all(|pixel| pixel[2] <= BLUE_EMPTY_MAX)
+}
+
+/// Rebuild a full RGB normal from a two-channel ddna map: X/Y stay in red/green,
+/// Z is reconstructed per pixel into blue, alpha is cleared to opaque.
+fn ddna_reconstruct_normal(rgba: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for (dst, src) in out.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+        let x = f32::from(src[0]) / 255.0 * 2.0 - 1.0;
+        let y = f32::from(src[1]) / 255.0 * 2.0 - 1.0;
+        let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = ((z * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+        dst[3] = 255;
+    }
+    out
+}
+
+/// Split a ddna map's gloss (smoothness in alpha) into a glTF metallic-roughness
+/// image: roughness = 1 - smoothness in green, metallic 0 in blue, red unused,
+/// alpha opaque.
+fn ddna_gloss_to_roughness(rgba: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for (dst, src) in out.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+        dst[0] = 255;
+        dst[1] = 255 - src[3];
+        dst[2] = 0;
+        dst[3] = 255;
+    }
+    out
+}
+
+/// Drop a true RGB normal map's alpha, leaving an opaque RGB image.
+fn strip_alpha(rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    for pixel in out.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+    out
+}
+
+/// Replace a texture's `.dds` extension with `png`, keeping the catalog path.
+fn png_from_dds(dds: &str) -> String {
+    match dds.rsplit_once('.') {
+        Some((stem, _)) => format!("{stem}.png"),
+        None => format!("{dds}.png"),
+    }
 }
 
 fn write_glb(out: &Path, glb: &[u8]) -> Result<usize> {
@@ -692,9 +951,27 @@ fn write_gltf_package(
     artifact: &Path,
     gltf: nw_model::GltfPackage,
 ) -> Result<usize> {
-    let stored = runner.try_map(gltf.resources(), |resource| {
+    // Resources that mirror a catalog asset carry their own path; anonymous
+    // derived payloads (the geometry buffer, pathless images) are named after
+    // the manifest they belong to.
+    let manifest = artifact.to_string_lossy().replace('\\', "/");
+    let manifest_stem = manifest
+        .rsplit_once('.')
+        .map_or(manifest.as_str(), |(stem, _)| stem);
+    let targets = gltf
+        .resources()
+        .iter()
+        .enumerate()
+        .map(|(index, resource)| match (resource.path(), index) {
+            (Some(path), _) => path.to_owned(),
+            (None, 0) => format!("{manifest_stem}.bin"),
+            (None, index) => format!("{manifest_stem}.{index}.{}", resource.extension()),
+        })
+        .collect::<Vec<_>>();
+    let jobs = targets.iter().zip(gltf.resources()).collect::<Vec<_>>();
+    let stored = runner.try_map(&jobs, |(target, resource)| {
         package
-            .store(resource.bytes(), resource.extension())
+            .store_at(target, resource.bytes())
             .map_err(anyhow::Error::from)
     })?;
     let uris = stored
@@ -750,6 +1027,32 @@ fn report_batch(results: &[Result<ModelStats>], source: String) -> Result<()> {
 }
 
 /// The geometry-heap sidecar (`foo.cgf` → `foo.cgfheap`, `foo.skin` → `foo.skinheap`).
+fn find_first_gltf(root: &Path) -> Result<PathBuf> {
+    fn walk(dir: &Path, out: &mut Option<PathBuf>) -> std::io::Result<()> {
+        if out.is_some() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out)?;
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gltf"))
+            {
+                *out = Some(path);
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+    let mut found = None;
+    walk(root, &mut found).with_context(|| format!("walk {}", root.display()))?;
+    found.with_context(|| format!("no .gltf under {}", root.display()))
+}
+
 fn heap_sibling(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push("heap");
@@ -785,4 +1088,49 @@ fn tif_to_dds(file: &str) -> String {
 
 fn display_path(path: &Path) -> String {
     path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_two_channel_ddna_by_empty_blue() {
+        // ddna: X in red, Y in green, blue unused, gloss in alpha.
+        let ddna = [130, 120, 0, 220, 128, 128, 0, 200];
+        assert!(blue_channel_is_empty(&ddna));
+        // A true RGB normal keeps Z in blue.
+        let rgb_normal = [130, 120, 200, 255, 128, 128, 255, 255];
+        assert!(!blue_channel_is_empty(&rgb_normal));
+        assert!(!blue_channel_is_empty(&[]));
+    }
+
+    #[test]
+    fn reconstructs_ddna_normal_z_into_blue() {
+        // A flat normal (x=y=0 → R=G=128) reconstructs Z≈1 → blue≈255; alpha opaque.
+        let ddna = [128, 128, 0, 210];
+        let normal = ddna_reconstruct_normal(&ddna);
+        assert_eq!(normal[0], 128);
+        assert_eq!(normal[1], 128);
+        assert!(
+            normal[2] >= 254,
+            "flat normal Z should encode near 255, got {}",
+            normal[2]
+        );
+        assert_eq!(normal[3], 255);
+    }
+
+    #[test]
+    fn ddna_gloss_becomes_inverted_roughness() {
+        // Smoothness 210/255 → roughness 45/255 in green; metallic 0; red unused.
+        let ddna = [128, 128, 0, 210];
+        let roughness = ddna_gloss_to_roughness(&ddna);
+        assert_eq!(roughness, [255, 45, 0, 255]);
+    }
+
+    #[test]
+    fn strips_true_rgb_normal_alpha() {
+        let normal = [130, 120, 200, 17];
+        assert_eq!(strip_alpha(&normal), [130, 120, 200, 255]);
+    }
 }

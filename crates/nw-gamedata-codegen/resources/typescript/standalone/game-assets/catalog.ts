@@ -1,14 +1,7 @@
+import { AssetId, type AssetType, Uuid } from "../values.js";
+
 export const ASSET_CATALOG_PATH = "assetcatalog.catalog" as const;
 export const RASC_SIGNATURE = "RASC" as const;
-
-export interface AssetId {
-  readonly guid: string;
-  readonly subId: number;
-}
-
-export interface AssetType {
-  readonly guid: string;
-}
 
 export interface AssetCatalogEntry {
   readonly assetId: AssetId;
@@ -58,13 +51,8 @@ export function parseRascCatalog(bytes: Uint8Array): AssetCatalog {
     const directory = readNullTerminatedUtf8(bytes, dirOffset + dirStringOffset);
     const fileName = readNullTerminatedUtf8(bytes, fileNameOffset + fileStringOffset);
     entries.push({
-      assetId: {
-        guid: formatUuid(bytes, guidOffset + guidIndex * 16),
-        subId
-      },
-      assetType: {
-        guid: formatUuid(bytes, assetTypeOffset + assetTypeIndex * 16)
-      },
+      assetId: new AssetId(formatUuid(bytes, guidOffset + guidIndex * 16), subId),
+      assetType: formatUuid(bytes, assetTypeOffset + assetTypeIndex * 16),
       relativePath: normalizeVirtualPath(directory.length === 0 ? fileName : `${directory}/${fileName}`),
       sizeBytes
     });
@@ -80,9 +68,12 @@ function readNullTerminatedUtf8(bytes: Uint8Array, offset: number): string {
   return new TextDecoder().decode(bytes.subarray(offset, end));
 }
 
-function formatUuid(bytes: Uint8Array, offset: number): string {
-  const hex = Array.from(bytes.subarray(offset, offset + 16), (byte) => byte.toString(16).padStart(2, "0"));
-  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
+function formatUuid(bytes: Uint8Array, offset: number): Uuid {
+  const end = offset + 16;
+  if (!Number.isSafeInteger(offset) || offset < 0 || end > bytes.byteLength) {
+    throw new RangeError(`UUID range ${offset}..${end} is outside ${bytes.byteLength} catalog bytes`);
+  }
+  return Uuid.fromBytes(bytes.subarray(offset, end));
 }
 
 export function normalizeVirtualPath(path: string): string {

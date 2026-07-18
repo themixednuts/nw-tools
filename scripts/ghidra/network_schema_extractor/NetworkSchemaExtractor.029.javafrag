@@ -1,0 +1,271 @@
+    private LoopExecutionProof proveRegisterFieldLoopExecution(
+        Function owner,
+        int instructionCount) {
+
+        HighFunction high = highFunction(owner);
+        if (high == null || instructionCount <= 0) {
+            return null;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        ArrayList<ProvenLoopRange> loops = new ArrayList<>();
+        for (PcodeOpAST op : operations) {
+            if (op.getOpcode() != PcodeOp.CBRANCH || op.getNumInputs() < 2) {
+                continue;
+            }
+            Address branch = op.getSeqnum().getTarget();
+            Address target = pcodeAddress(op.getInput(0));
+            if (branch == null || target == null || target.compareTo(branch) >= 0) {
+                continue;
+            }
+            Long iterations = proveLoopIterations(op, target, operations);
+            if (iterations == null || iterations <= 0L) {
+                return null;
+            }
+            loops.add(new ProvenLoopRange(target, branch, iterations));
+        }
+        if (loops.isEmpty()) {
+            return null;
+        }
+        try {
+            long executionMultiplier = 1L;
+            for (ProvenLoopRange loop : loops) {
+                if (hasContainingLoop(loop, loops)) {
+                    continue;
+                }
+                executionMultiplier = Math.addExact(
+                    executionMultiplier,
+                    provenLoopExecutionCost(loop, loops));
+            }
+            long maxSteps = Math.multiplyExact(
+                executionMultiplier,
+                instructionCount);
+            return new LoopExecutionProof(maxSteps, loops.size());
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private boolean hasBackwardPcodeBranch(Function owner) {
+        HighFunction high = highFunction(owner);
+        if (high == null) {
+            return false;
+        }
+        for (PcodeOpAST op : orderedPcodeOps(high)) {
+            if ((op.getOpcode() != PcodeOp.BRANCH &&
+                op.getOpcode() != PcodeOp.CBRANCH) || op.getNumInputs() == 0) {
+                continue;
+            }
+            Address target = pcodeAddress(op.getInput(0));
+            Address branch = op.getSeqnum().getTarget();
+            if (target != null && branch != null && target.compareTo(branch) < 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasContainingLoop(
+        ProvenLoopRange loop,
+        List<ProvenLoopRange> loops) {
+
+        for (ProvenLoopRange candidate : loops) {
+            if (candidate.contains(loop)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private long provenLoopExecutionCost(
+        ProvenLoopRange loop,
+        List<ProvenLoopRange> loops) {
+
+        long bodyMultiplier = 1L;
+        for (ProvenLoopRange child : loops) {
+            if (!loop.contains(child) || hasIntermediateContainingLoop(loop, child, loops)) {
+                continue;
+            }
+            bodyMultiplier = Math.addExact(
+                bodyMultiplier,
+                provenLoopExecutionCost(child, loops));
+        }
+        return Math.multiplyExact(loop.iterations(), bodyMultiplier);
+    }
+
+    private boolean hasIntermediateContainingLoop(
+        ProvenLoopRange parent,
+        ProvenLoopRange child,
+        List<ProvenLoopRange> loops) {
+
+        for (ProvenLoopRange candidate : loops) {
+            if (candidate != parent && candidate != child && parent.contains(candidate) &&
+                candidate.contains(child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Long proveLoopIterations(
+        PcodeOp branch,
+        Address loopTarget,
+        List<PcodeOpAST> operations) {
+
+        PcodeOp condition = branch.getInput(1).getDef();
+        if (condition == null || condition.getNumInputs() != 2) {
+            return null;
+        }
+        Varnode counter = nonConstantComparisonInput(condition);
+        Varnode terminal = constantComparisonInput(condition);
+        if (counter == null || terminal == null) {
+            return null;
+        }
+        PcodeOp update = counter.getDef();
+        if (update == null || update.getOpcode() != PcodeOp.INT_ADD ||
+            update.getNumInputs() != 2) {
+            return null;
+        }
+        Varnode previous = null;
+        Long step = null;
+        for (int slot = 0; slot < update.getNumInputs(); slot++) {
+            Varnode input = update.getInput(slot);
+            if (input.isConstant()) {
+                step = signedConstant(input);
+            }
+            else {
+                previous = input;
+            }
+        }
+        if (previous == null || step == null ||
+            !samePcodeStorageLocation(counter, previous)) {
+            return null;
+        }
+
+        Long initial = latestConstantAssignmentBefore(
+            previous,
+            loopTarget,
+            operations);
+        if (initial == null) {
+            return null;
+        }
+        Long terminalValue = signedConstant(terminal);
+        if (terminalValue == null) {
+            return null;
+        }
+        switch (condition.getOpcode()) {
+            case PcodeOp.INT_NOTEQUAL: {
+                if (terminalValue != 0L || step >= 0L || initial <= 0L) {
+                    return null;
+                }
+                long decrement;
+                try {
+                    decrement = Math.negateExact(step);
+                }
+                catch (ArithmeticException ignored) {
+                    return null;
+                }
+                return decrement == 0L || initial % decrement != 0L
+                    ? null
+                    : initial / decrement;
+            }
+            case PcodeOp.INT_LESS:
+            case PcodeOp.INT_SLESS:
+                if (!samePcodeValue(condition.getInput(0), counter)) {
+                    return null;
+                }
+                return affineUpperBoundIterations(initial, step, terminalValue, false);
+            case PcodeOp.INT_LESSEQUAL:
+            case PcodeOp.INT_SLESSEQUAL:
+                if (!samePcodeValue(condition.getInput(0), counter)) {
+                    return null;
+                }
+                return affineUpperBoundIterations(initial, step, terminalValue, true);
+            default:
+                return null;
+        }
+    }
+
+    private Long affineUpperBoundIterations(
+        long initial,
+        long step,
+        long terminal,
+        boolean inclusive) {
+
+        if (initial < 0L || step <= 0L || terminal < initial) {
+            return null;
+        }
+        long distance;
+        try {
+            distance = Math.subtractExact(terminal, initial);
+            if (inclusive) {
+                distance = Math.addExact(distance, 1L);
+            }
+            return Math.floorDiv(Math.addExact(distance, step - 1L), step);
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private Varnode nonConstantComparisonInput(PcodeOp comparison) {
+        for (int slot = 0; slot < comparison.getNumInputs(); slot++) {
+            Varnode input = comparison.getInput(slot);
+            if (input != null && !input.isConstant()) {
+                return input;
+            }
+        }
+        return null;
+    }
+
+    private Varnode constantComparisonInput(PcodeOp comparison) {
+        for (int slot = 0; slot < comparison.getNumInputs(); slot++) {
+            Varnode input = comparison.getInput(slot);
+            if (input != null && input.isConstant()) {
+                return input;
+            }
+        }
+        return null;
+    }
+
+    private Long signedConstant(Varnode node) {
+        if (node == null || !node.isConstant() || node.getSize() <= 0 ||
+            node.getSize() > Long.BYTES) {
+            return null;
+        }
+        long value = node.getOffset();
+        int bits = node.getSize() * Byte.SIZE;
+        if (bits == Long.SIZE) {
+            return value;
+        }
+        int shift = Long.SIZE - bits;
+        return value << shift >> shift;
+    }
+
+    private Long latestConstantAssignmentBefore(
+        Varnode storage,
+        Address before,
+        List<PcodeOpAST> operations) {
+
+        Long selected = null;
+        Address selectedAddress = null;
+        for (PcodeOpAST op : operations) {
+            Address address = op.getSeqnum().getTarget();
+            if (address == null || address.compareTo(before) >= 0 ||
+                op.getOpcode() != PcodeOp.COPY || op.getNumInputs() != 1 ||
+                op.getOutput() == null || !op.getInput(0).isConstant() ||
+                !samePcodeStorageLocation(storage, op.getOutput())) {
+                continue;
+            }
+            if (selectedAddress == null || address.compareTo(selectedAddress) > 0) {
+                selected = signedConstant(op.getInput(0));
+                selectedAddress = address;
+            }
+        }
+        return selected;
+    }
+
+    private boolean samePcodeStorageLocation(Varnode left, Varnode right) {
+        return left != null && right != null && left.getAddress() != null &&
+            left.getAddress().equals(right.getAddress()) && left.getSize() == right.getSize();
+    }

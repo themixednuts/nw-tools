@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfNumUsedFreeCooldowns;
+pub struct ActionConditionIfNumUsedFreeCooldowns {}
 
 impl AzRtti for ActionConditionIfNumUsedFreeCooldowns {
     const NAME: &'static str = "ActionConditionIfNumUsedFreeCooldowns";

@@ -1,0 +1,309 @@
+    private FixedSequenceShape fixedSequenceShape(
+        Function function,
+        String bufferParameter,
+        NetworkSchemaCodecClassifier.CodecDirection direction) {
+
+        return fixedSequenceShape(
+            function,
+            bufferParameter,
+            direction,
+            new LinkedHashSet<>());
+    }
+
+
+    private FixedSequenceResizeActions fixedSequenceResizeActions(
+        Function owner,
+        List<PcodeOpAST> operations,
+        SequenceExtent storage,
+        Set<PcodeStorage> countOutputs,
+        List<Varnode> currentSizeValues) {
+
+        PcodeOpAST growAction = null;
+        PcodeOpAST shrinkAction = null;
+        PcodeOpAST ownerCall = null;
+        PcodeOpAST deltaCall = null;
+        PcodeOpAST scaledOwnerCall = null;
+        PcodeOpAST endStore = null;
+        PcodeOpAST scaledEndStore = null;
+        boolean ambiguous = false;
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() == PcodeOp.CALL) {
+                boolean usesOwner = callUsesFixedSequenceOwner(operation, storage);
+                boolean usesDelta = callUsesCountAndCurrentSize(
+                    operation,
+                    countOutputs,
+                    currentSizeValues);
+                boolean usesScaledEnd = usesOwner && callUsesScaledSequenceEnd(
+                    owner,
+                    operation,
+                    storage,
+                    countOutputs);
+                if (usesOwner) {
+                    ownerCall = uniqueResizeCandidate(ownerCall, operation);
+                }
+                if (usesDelta) {
+                    deltaCall = uniqueResizeCandidate(deltaCall, operation);
+                }
+                if (usesScaledEnd) {
+                    if (scaledOwnerCall != null && scaledOwnerCall != operation) {
+                        ambiguous = true;
+                    }
+                    else {
+                        scaledOwnerCall = operation;
+                    }
+                }
+                if (usesOwner && usesDelta) {
+                    if (growAction != null) {
+                        ambiguous = true;
+                    }
+                    growAction = operation;
+                }
+                continue;
+            }
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3) {
+                continue;
+            }
+            boolean storesEnd = storage.end().sameLocation(
+                pcodeStorageExpression(operation.getInput(1)));
+            boolean writesScaledExtent = referencesAnyStorage(
+                    operation.getInput(2),
+                    countOutputs) &&
+                referencesFixedSequenceData(
+                    owner,
+                    operation.getInput(2),
+                    storage.data()) &&
+                hasFixedSequenceScale(
+                    operation.getInput(2),
+                    storage.stride(),
+                    new LinkedHashSet<>(),
+                    0);
+            if (storesEnd) {
+                endStore = uniqueResizeCandidate(endStore, operation);
+            }
+            if (writesScaledExtent) {
+                scaledEndStore = uniqueResizeCandidate(scaledEndStore, operation);
+            }
+            if (storesEnd && writesScaledExtent) {
+                if (shrinkAction != null) {
+                    ambiguous = true;
+                }
+                shrinkAction = operation;
+            }
+        }
+        return new FixedSequenceResizeActions(
+            growAction,
+            shrinkAction,
+            ownerCall,
+            deltaCall,
+            scaledOwnerCall,
+            endStore,
+            scaledEndStore,
+            ambiguous);
+    }
+
+    private boolean referencesFixedSequenceData(
+        Function owner,
+        Varnode value,
+        PcodeStorage data) {
+
+        if (referencesStorage(value, data)) {
+            return true;
+        }
+        LinkedHashMap<String, PcodeStorage> referenced = new LinkedHashMap<>();
+        collectPcodeStorages(value, referenced, new LinkedHashSet<>(), 0);
+        for (PcodeStorage storage : referenced.values()) {
+            String parameter = formalParameterBaseFromStorage(owner, storage);
+            if (parameter != null && parameter.equals(data.base) && data.offset == 0L) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean callUsesScaledSequenceEnd(
+        Function owner,
+        PcodeOp operation,
+        SequenceExtent storage,
+        Set<PcodeStorage> countOutputs) {
+
+        for (int slot = 1; slot < operation.getNumInputs(); slot++) {
+            Varnode argument = operation.getInput(slot);
+            if (referencesAnyStorage(argument, countOutputs) &&
+                referencesFixedSequenceData(owner, argument, storage.data()) &&
+                hasFixedSequenceScale(
+                    argument,
+                    storage.stride(),
+                    new LinkedHashSet<>(),
+                    0)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private PcodeOpAST uniqueResizeCandidate(
+        PcodeOpAST existing,
+        PcodeOpAST candidate) {
+
+        return existing == null ? candidate : existing;
+    }
+
+    private String uniqueVirtualRawWriteBufferRoot(List<PcodeOpAST> operations) {
+        LinkedHashSet<String> roots = new LinkedHashSet<>();
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALLIND ||
+                operation.getNumInputs() == 0) {
+                continue;
+            }
+            PcodeVirtualDispatch dispatch = pcodeVirtualDispatch(operation.getInput(0));
+            String storageBase = dispatch == null
+                ? null
+                : dispatch.root().storageBase();
+            if (dispatch != null && dispatch.objectOffset() == 0L &&
+                dispatch.slotOffset() == 0x40L &&
+                storageBase != null && storageBase.matches("param_\\d+")) {
+                roots.add(storageBase);
+            }
+        }
+        return roots.size() == 1 ? roots.iterator().next() : null;
+    }
+
+    private JsonArray fixedSequenceStorageCandidatesJson(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        JsonArray candidates = new JsonArray();
+        for (PcodeOpAST phi : affineSequenceInductions(loop)) {
+            JsonObject candidate = new JsonObject();
+            NetworkSchemaJson.addAddress(
+                candidate,
+                "phi",
+                phi.getSeqnum().getTarget(),
+                addressFormatter);
+            Long stride = affinePointerInductionStride(phi);
+            PcodeStorage initial = fixedSequenceInitialStorage(phi);
+            PcodeStorage end = initial == null
+                ? null
+                : fixedSequenceEndStorage(loop, operations, phi, initial);
+            if (stride != null) {
+                candidate.addProperty("stride", stride);
+            }
+            NetworkSchemaJson.add(
+                candidate,
+                "initial",
+                initial == null ? null : initial.expression());
+            candidate.addProperty(
+                "conditionDependsOnPhi",
+                loopConditionDependsOn(high, loop, phi.getOutput()));
+            NetworkSchemaJson.add(
+                candidate,
+                "end",
+                end == null ? null : end.expression());
+            JsonArray inputs = new JsonArray();
+            for (int slot = 0; slot < phi.getNumInputs(); slot++) {
+                Varnode input = phi.getInput(slot);
+                JsonObject inputJson = new JsonObject();
+                inputJson.addProperty("slot", slot);
+                NetworkSchemaJson.add(inputJson, "ssa", pcodeNodeKey(input));
+                PcodeStorage direct = pcodeStorageExpression(input);
+                PcodeStorage loaded = pcodeLoadedStorageExpression(input);
+                PcodeMemoryPath path = pcodeMemoryPath(input, 2);
+                NetworkSchemaJson.add(
+                    inputJson,
+                    "direct",
+                    direct == null ? null : direct.expression());
+                NetworkSchemaJson.add(
+                    inputJson,
+                    "loaded",
+                    loaded == null ? null : loaded.expression());
+                NetworkSchemaJson.add(
+                    inputJson,
+                    "path",
+                    path == null ? null : path.toString());
+                inputs.add(inputJson);
+            }
+            candidate.add("inputs", inputs);
+            JsonArray conditionStorages = new JsonArray();
+            for (PcodeStorage referenced : fixedSequenceConditionStorages(
+                    loop,
+                    operations,
+                    phi)) {
+                conditionStorages.add(referenced.expression());
+            }
+            candidate.add("conditionStorages", conditionStorages);
+            candidates.add(candidate);
+        }
+        return candidates;
+    }
+
+    private List<PcodeStorage> fixedSequenceConditionStorages(
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeOpAST induction) {
+
+        LinkedHashMap<String, PcodeStorage> storages = new LinkedHashMap<>();
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CBRANCH ||
+                operation.getNumInputs() < 2) {
+                continue;
+            }
+            Varnode condition = operation.getInput(operation.getNumInputs() - 1);
+            if (pcodeNodeDependsOn(
+                    condition,
+                    induction.getOutput(),
+                    new LinkedHashSet<>(),
+                    0)) {
+                collectPcodeStorages(condition, storages, new LinkedHashSet<>(), 0);
+            }
+        }
+        return List.copyOf(storages.values());
+    }
+
+    private void collectPcodeLoadedStorages(
+        Varnode node,
+        Map<String, PcodeStorage> result,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || depth > 48 || !seen.add(pcodeNodeKey(node))) {
+            return;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null || definition.getOpcode() == PcodeOp.CALL ||
+            definition.getOpcode() == PcodeOp.CALLIND) {
+            return;
+        }
+        if (definition.getOpcode() == PcodeOp.LOAD && definition.getNumInputs() >= 2) {
+            PcodeStorage storage = pcodeStorageExpression(definition.getInput(1));
+            if (storage != null) {
+                result.putIfAbsent(storageKey(storage), storage);
+            }
+            return;
+        }
+        int inputCount = definition.getOpcode() == PcodeOp.INDIRECT
+            ? Math.min(1, definition.getNumInputs())
+            : definition.getNumInputs();
+        for (int slot = 0; slot < inputCount; slot++) {
+            Varnode input = definition.getInput(slot);
+            if (input != null && !input.isConstant()) {
+                collectPcodeLoadedStorages(
+                    input,
+                    result,
+                    new LinkedHashSet<>(seen),
+                    depth + 1);
+            }
+        }
+    }
+
+    private record FixedSequenceResizeActions(
+        PcodeOpAST growAction,
+        PcodeOpAST shrinkAction,
+        PcodeOpAST ownerCall,
+        PcodeOpAST deltaCall,
+        PcodeOpAST scaledOwnerCall,
+        PcodeOpAST endStore,
+        PcodeOpAST scaledEndStore,
+        boolean ambiguous) {
+    }

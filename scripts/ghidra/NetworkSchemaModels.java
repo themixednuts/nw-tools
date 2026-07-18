@@ -7,8 +7,10 @@ import ghidra.program.model.listing.Function;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 final class SerializeFieldInfo {
     String name;
@@ -17,6 +19,24 @@ final class SerializeFieldInfo {
     String wireShape;
     Long offset;
     Long dataSize;
+    boolean baseClass;
+}
+
+final class SerializeWireSlot {
+    final long offset;
+    final String wireShape;
+    final String path;
+    final String typeId;
+    final String nativeType;
+
+    SerializeWireSlot(
+            long offset, String wireShape, String path, String typeId, String nativeType) {
+        this.offset = offset;
+        this.wireShape = wireShape;
+        this.path = path;
+        this.typeId = typeId;
+        this.nativeType = nativeType;
+    }
 }
 
 final class FixedNamedFieldValue {
@@ -149,14 +169,26 @@ final class PcodeStorage {
 }
 
 final class CollectionOutputShape {
-    final String parameterBase;
-    final String nativeType;
-    final String wireShape;
+    final PcodeStorage storage;
+    final WireShape wireEvidence;
+    final Address countCallsite;
+    final Address loopHeader;
+    final Set<Address> codecCallsites;
+    final Long interiorSpan;
 
-    CollectionOutputShape(String parameterBase, String nativeType, String wireShape) {
-        this.parameterBase = parameterBase;
-        this.nativeType = nativeType;
-        this.wireShape = wireShape;
+    CollectionOutputShape(
+            PcodeStorage storage,
+            WireShape wireEvidence,
+            Address countCallsite,
+            Address loopHeader,
+            Set<Address> codecCallsites,
+            Long interiorSpan) {
+        this.storage = storage;
+        this.wireEvidence = wireEvidence;
+        this.countCallsite = countCallsite;
+        this.loopHeader = loopHeader;
+        this.codecCallsites = Set.copyOf(codecCallsites);
+        this.interiorSpan = interiorSpan;
     }
 }
 
@@ -169,12 +201,52 @@ final class MessageHelperCall {
 final class RawPcodeWrite {
     final PcodeStorage storage;
     final String nativeType;
-    final String wireShape;
+    final WireShape wireEvidence;
 
-    RawPcodeWrite(PcodeStorage storage, String nativeType, String wireShape) {
+    RawPcodeWrite(PcodeStorage storage, String nativeType, WireShape wireEvidence) {
         this.storage = storage;
         this.nativeType = nativeType;
-        this.wireShape = wireShape;
+        this.wireEvidence = wireEvidence;
+    }
+}
+
+final class ConstructorFieldTypeIdentity {
+    final String typeId;
+    final String typeName;
+    final Address initializer;
+    final Address ownerConstructor;
+    final Address ownerVtable;
+    final String ownerTypeId;
+    final String ownerTypeName;
+    final String fieldName;
+    final long fieldOffset;
+    final long byteWidth;
+
+    ConstructorFieldTypeIdentity(
+            String typeId,
+            String typeName,
+            Address initializer,
+            Address ownerConstructor,
+            Address ownerVtable,
+            String ownerTypeId,
+            String ownerTypeName,
+            String fieldName,
+            long fieldOffset,
+            long byteWidth) {
+        this.typeId = typeId;
+        this.typeName = typeName;
+        this.initializer = initializer;
+        this.ownerConstructor = ownerConstructor;
+        this.ownerVtable = ownerVtable;
+        this.ownerTypeId = ownerTypeId;
+        this.ownerTypeName = ownerTypeName;
+        this.fieldName = fieldName;
+        this.fieldOffset = fieldOffset;
+        this.byteWidth = byteWidth;
+    }
+
+    String identityKey() {
+        return typeId.toLowerCase(java.util.Locale.ROOT);
     }
 }
 
@@ -182,43 +254,6 @@ final class MessageConstructorCall {
     Address callsite;
     Address target;
     String targetName;
-}
-
-final class ParsedUnmarshalFieldsCall {
-    final ArrayList<String> templateTypes = new ArrayList<>();
-    final ArrayList<ParsedArgument> fieldArgs = new ArrayList<>();
-}
-
-final class ParsedUnmarshalCall {
-    final String templateType;
-    final String functionName;
-    final int textIndex;
-    final List<String> args;
-
-    ParsedUnmarshalCall(
-            String templateType, String functionName, int textIndex, List<String> args) {
-        this.templateType = templateType;
-        this.functionName = functionName;
-        this.textIndex = textIndex;
-        this.args = Collections.unmodifiableList(new ArrayList<>(args));
-    }
-}
-
-final class ParsedArgument {
-    String castType;
-    String expression;
-}
-
-final class ParsedReadRawCall {
-    final String storageExpression;
-    final int byteLength;
-    final int textIndex;
-
-    ParsedReadRawCall(String storageExpression, int byteLength, int textIndex) {
-        this.storageExpression = storageExpression;
-        this.byteLength = byteLength;
-        this.textIndex = textIndex;
-    }
 }
 
 final class IndexedWireShape {
@@ -231,57 +266,67 @@ final class IndexedWireShape {
     }
 }
 
-final class WholeMessageStore {
-    String storageExpression;
-    String nativeType;
-    int textIndex;
-}
-
-final class WholeMessageHelperFrame {
-    final Address callsite;
-    final Function helper;
-    final String helperText;
-    final Map<String, String> baseExpressions;
-    final int recoveryOrder;
-
-    WholeMessageHelperFrame(Address callsite, Function helper, String helperText,
-            Map<String, String> baseExpressions, int recoveryOrder) {
-        this.callsite = callsite;
-        this.helper = helper;
-        this.helperText = helperText;
-        this.baseExpressions = Collections.unmodifiableMap(new LinkedHashMap<>(baseExpressions));
-        this.recoveryOrder = recoveryOrder;
-    }
-}
-
-final class MarshalPathFrame {
-    final Address address;
-    final String sourcePrefix;
-
-    MarshalPathFrame(Address address, String sourcePrefix) {
-        this.address = address;
-        this.sourcePrefix = sourcePrefix == null ? "" : sourcePrefix;
-    }
-
-    MarshalPathFrame nested(Address address) {
-        return new MarshalPathFrame(address, sourcePrefix + "marshal-call:");
-    }
-
-    WireShape wrap(WireShape shape) {
-        if (shape == null || sourcePrefix.isEmpty()) {
-            return shape;
-        }
-        return new WireShape(shape.shape, sourcePrefix + shape.source);
-    }
-}
-
 final class WireShape {
     final String shape;
     final String source;
+    final String layout;
+    final String layoutSource;
 
-    WireShape(String shape, String source) {
+    private WireShape(
+            String shape,
+            String source,
+            String layout,
+            String layoutSource) {
         this.shape = shape;
         this.source = source;
+        this.layout = layout;
+        this.layoutSource = layoutSource;
+    }
+
+    static WireShape semantic(String shape, String source) {
+        return new WireShape(shape, source, shape, source);
+    }
+
+    static WireShape semantic(String shape, String layout, String source) {
+        return new WireShape(shape, source, layout, source);
+    }
+
+    static WireShape layout(String layout, String source) {
+        return new WireShape(null, null, layout, source);
+    }
+
+    boolean hasProvenSemantics() {
+        return shape != null && source != null;
+    }
+}
+
+final class HandlerWireShapeEvidence {
+    WireShape selected;
+    WireShape marshal;
+    WireShape unmarshal;
+    FixedSequenceShape selectedSequence;
+    FixedSequenceShape marshalSequence;
+    FixedSequenceShape unmarshalSequence;
+    String resolution;
+    String conflict;
+    String unmarshalReadBufferParameter;
+    Integer unmarshalEventCount;
+    String unmarshalDiagnostic;
+    String quantizedVec3Diagnostic;
+    final List<CodecWireEvent> unmarshalEvents = new ArrayList<>();
+}
+
+record EntityRefCodecEvidence(
+        Address function,
+        String bufferParameter,
+        String direction,
+        boolean conditionalFlag,
+        boolean nestedString,
+        boolean flagsByte,
+        boolean uuidBytes) {
+
+    boolean isComplete() {
+        return conditionalFlag && nestedString && flagsByte && uuidBytes;
     }
 }
 
@@ -306,20 +351,6 @@ final class HandlerScanFrame {
     HandlerScanFrame(Address address, int depth) {
         this.address = address;
         this.depth = depth;
-    }
-}
-
-final class TypeNameCandidate {
-    final String typeName;
-    final String source;
-    final Address address;
-    final int score;
-
-    TypeNameCandidate(String typeName, String source, Address address, int score) {
-        this.typeName = typeName;
-        this.source = source;
-        this.address = address;
-        this.score = score;
     }
 }
 
@@ -365,10 +396,11 @@ final class TrackedValue {
     final Address fieldNameAddress;
     final String fieldName;
     final String expression;
+    final Set<PcodeStorage> storageDependencies;
 
     private TrackedValue(Address address, Integer thisOffset, Integer stackOffset, String baseKey,
             Integer baseOffset, Long immediate, Address fieldNameAddress, String fieldName,
-            String expression) {
+            String expression, Set<PcodeStorage> storageDependencies) {
         this.address = address;
         this.thisOffset = thisOffset;
         this.stackOffset = stackOffset;
@@ -378,35 +410,51 @@ final class TrackedValue {
         this.fieldNameAddress = fieldNameAddress;
         this.fieldName = fieldName;
         this.expression = expression;
+        this.storageDependencies = Set.copyOf(storageDependencies);
     }
 
     static TrackedValue address(Address address) {
-        return new TrackedValue(address, null, null, null, null, null, null, null, null);
+        return new TrackedValue(
+                address, null, null, null, null, null, null, null, null, Set.of());
     }
 
     static TrackedValue thisOffset(int offset) {
         return new TrackedValue(
-                null, offset, null, null, null, null, null, null, thisExpression(offset));
+                null, offset, null, null, null, null, null, null, thisExpression(offset), Set.of());
     }
 
     static TrackedValue stackOffset(int offset) {
         return new TrackedValue(
-                null, null, offset, null, null, null, null, null, stackExpression(offset));
+                null, null, offset, null, null, null, null, null, stackExpression(offset), Set.of());
     }
 
     static TrackedValue baseOffset(String baseKey, int offset) {
         return new TrackedValue(null, null, null, baseKey, offset, null, null, null,
-                baseExpression(baseKey, offset));
+                baseExpression(baseKey, offset), Set.of());
     }
 
     static TrackedValue immediate(long value) {
         return new TrackedValue(
-                null, null, null, null, null, value, null, null, Long.toUnsignedString(value));
+                null, null, null, null, null, value, null, null, Long.toUnsignedString(value),
+                Set.of());
     }
 
     static TrackedValue fieldName(Address formatAddress, String fieldName) {
         return new TrackedValue(
-                null, null, null, null, null, null, formatAddress, fieldName, fieldName);
+                null, null, null, null, null, null, formatAddress, fieldName, fieldName, Set.of());
+    }
+
+    static TrackedValue storageDependency(PcodeStorage storage) {
+        return storage == null ? null : storageDependencies(Set.of(storage));
+    }
+
+    static TrackedValue storageDependencies(Iterable<PcodeStorage> dependencies) {
+        LinkedHashSet<PcodeStorage> unique = new LinkedHashSet<>();
+        dependencies.forEach(unique::add);
+        return unique.isEmpty()
+                ? null
+                : new TrackedValue(
+                    null, null, null, null, null, null, null, null, null, unique);
     }
 
     TrackedValue addOffset(int delta) {
@@ -426,12 +474,12 @@ final class TrackedValue {
         } catch (ArithmeticException ignored) {
             return null;
         }
-        return this;
+        return storageDependencies.isEmpty() ? this : storageDependencies(storageDependencies);
     }
 
     TrackedValue copy() {
         return new TrackedValue(address, thisOffset, stackOffset, baseKey, baseOffset, immediate,
-                fieldNameAddress, fieldName, expression);
+                fieldNameAddress, fieldName, expression, storageDependencies);
     }
 
     boolean sameValue(TrackedValue other) {
@@ -443,7 +491,8 @@ final class TrackedValue {
                 && sameObject(baseOffset, other.baseOffset)
                 && sameObject(immediate, other.immediate)
                 && sameAddress(fieldNameAddress, other.fieldNameAddress)
-                && sameObject(fieldName, other.fieldName);
+                && sameObject(fieldName, other.fieldName)
+                && storageDependencies.equals(other.storageDependencies);
     }
 
     private static boolean sameAddress(Address left, Address right) {

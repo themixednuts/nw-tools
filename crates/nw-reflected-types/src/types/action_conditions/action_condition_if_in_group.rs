@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfInGroup;
+pub struct ActionConditionIfInGroup {}
 
 impl AzRtti for ActionConditionIfInGroup {
     const NAME: &'static str = "ActionConditionIfInGroup";

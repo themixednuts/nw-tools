@@ -1,0 +1,989 @@
+    private ContainerCodecMembers collectContainerUnmarshalCodecMembers(
+        Function function,
+        String readBufferParameter,
+        Set<String> active,
+        int depth) {
+        return readBufferParameter == null
+            ? ContainerCodecMembers.unresolved("invalid-unmarshal-helper-context")
+            : collectContainerUnmarshalCodecMembers(
+                function,
+                new PcodeStorage(readBufferParameter, 0L),
+                active,
+                depth);
+    }
+
+    private ContainerCodecMembers collectContainerUnmarshalCodecMembers(
+        Function function,
+        PcodeStorage readBuffer,
+        Set<String> active,
+        int depth) {
+
+        if (function == null || readBuffer == null || depth > 8) {
+            return ContainerCodecMembers.unresolved("invalid-unmarshal-helper-context");
+        }
+        String context = "unmarshal-codec-members|" + function.getEntryPoint() + "|" +
+            readBuffer.expression();
+        if (!active.add(context)) {
+            return ContainerCodecMembers.unresolved("recursive-unmarshal-helper-context");
+        }
+        try {
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                return ContainerCodecMembers.unresolved("unmarshal-decompile-failed");
+            }
+
+            ArrayList<ContainerCodecCall> discovered = new ArrayList<>();
+            Map<PcodeBlockBasic, List<ContainerCodecCall>> membersByBlock = new HashMap<>();
+            LinkedHashSet<PcodeBlockBasic> collapsedEventBlocks = new LinkedHashSet<>();
+            boolean nestedExact = true;
+            boolean allMembersMapped = true;
+            String nestedStatus = null;
+            List<PcodeOpAST> operations = orderedPcodeOps(high);
+            String directParameter = readBuffer.offset == 0L ? readBuffer.base : null;
+            Map<PcodeOpAST, UnmarshalSequenceAction> sequenceActions =
+                directParameter == null
+                ? Collections.emptyMap()
+                : unmarshalSequenceActions(
+                    function,
+                    high,
+                    directParameter,
+                    new LinkedHashSet<>(),
+                    new HashMap<>());
+            Map<PcodeOpAST, UnmarshalCollectionAction> collectionActions =
+                directParameter == null
+                ? Collections.emptyMap()
+                : unmarshalCollectionActions(
+                    function,
+                    high,
+                    directParameter,
+                    operations);
+            if (collectionActions == null) {
+                return ContainerCodecMembers.unresolved(
+                    "ambiguous-unmarshal-collection-actions");
+            }
+            UnmarshalTerminalFlow terminalFlow = successfulUnmarshalTerminalFlow(high);
+            Set<PcodeBlockBasic> successfulTerminals = terminalFlow.terminals();
+            if (successfulTerminals.isEmpty()) {
+                return ContainerCodecMembers.unresolved(
+                    "unmarshal-success-terminals-" + terminalFlow.status());
+            }
+
+            for (PcodeOpAST operation : operations) {
+                UnmarshalCollectionAction collection = collectionActions.get(operation);
+                if (collection != null) {
+                    if (collection.emit()) {
+                        ContainerCodecCall boundary = collection.codec();
+                        discovered.add(boundary);
+                        allMembersMapped &= addContainerCodecMembersForOperation(
+                            membersByBlock,
+                            operation,
+                            List.of(boundary));
+                        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+                        if (block != null) {
+                            collapsedEventBlocks.add(block);
+                        }
+                    }
+                    continue;
+                }
+                UnmarshalSequenceAction sequence = sequenceActions.get(operation);
+                if (sequence != null) {
+                    if (sequence.emit()) {
+                        ContainerCodecCall boundary = unmarshalSequenceBoundary(
+                            operation,
+                            sequence.events());
+                        discovered.add(boundary);
+                        allMembersMapped &= addContainerCodecMembersForOperation(
+                            membersByBlock,
+                            operation,
+                            List.of(boundary));
+                        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+                        if (block != null) {
+                            collapsedEventBlocks.add(block);
+                        }
+                    }
+                    continue;
+                }
+
+                if (operation.getOpcode() == PcodeOp.CALL) {
+                    Function target = pcodeCallTarget(operation);
+                    PcodeStorage targetReadBuffer = callTargetReadBufferStorage(
+                        high,
+                        operations,
+                        operation,
+                        target,
+                        readBuffer,
+                        active);
+                    if (target == null || targetReadBuffer == null) {
+                        continue;
+                    }
+                    String targetDirectParameter = targetReadBuffer.offset == 0L
+                        ? targetReadBuffer.base
+                        : null;
+
+                    WireShape rawEvidence = pcodeReadRawWireEvidence(operation, target);
+                    if (rawEvidence != null) {
+                        RawPcodeWrite raw = pcodeReadRawWrite(operation, target);
+                        WireShape booleanEvidence = raw == null
+                            ? null
+                            : boundedNormalizedBooleanReadEvidence(
+                                high,
+                                operations,
+                                operation,
+                                raw);
+                        ContainerCodecCall codec = unmarshalContainerCodec(
+                            operation,
+                            target,
+                            raw == null ? null : raw.nativeType,
+                            booleanEvidence == null ? rawEvidence : booleanEvidence);
+                        codec.evidenceSource = "container-helper-unmarshal-read-raw";
+                        applyConstructorFieldTypeIdentity(
+                            codec,
+                            rawConstructorFieldIdentity(
+                                function,
+                                high,
+                                operation,
+                                raw));
+                        discovered.add(codec);
+                        allMembersMapped &= addContainerCodecMembersForOperation(
+                            membersByBlock,
+                            operation,
+                            List.of(codec));
+                        continue;
+                    }
+
+                    WireShape leaf = targetDirectParameter == null
+                        ? null
+                        : validatedUnmarshalLeaf(target, targetDirectParameter);
+                    if (leaf != null) {
+                        ContainerCodecCall codec = unmarshalContainerCodec(
+                            operation,
+                            target,
+                            unmarshalNativeTypeFromTarget(target),
+                            leaf);
+                        codec.evidenceSource = "container-helper-unmarshal-leaf";
+                        discovered.add(codec);
+                        allMembersMapped &= addContainerCodecMembersForOperation(
+                            membersByBlock,
+                            operation,
+                            List.of(codec));
+                        continue;
+                    }
+
+                    ContainerCodecMembers nested = collectContainerUnmarshalCodecMembers(
+                        target,
+                        targetReadBuffer,
+                        active,
+                        depth + 1);
+                    nestedExact &= nested.exact();
+                    if (!nested.exact()) {
+                        nestedStatus = mergeContainerCodecAnalysisStatus(
+                            nestedStatus,
+                            nested.analysisStatus());
+                        allMembersMapped = false;
+                        continue;
+                    }
+                    if (nested.members().isEmpty() && nested.optionalMembers().isEmpty()) {
+                        continue;
+                    }
+                    ContainerCodecCall boundary = new ContainerCodecCall();
+                    boundary.operation = operation;
+                    boundary.callsite = operation.getSeqnum().getTarget();
+                    boundary.target = target.getEntryPoint();
+                    boundary.targetName = fullFunctionName(target);
+                    boundary.evidenceSource = "container-helper-unmarshal-boundary";
+                    boundary.memberSemantics = !nested.optionalMembers().isEmpty()
+                        ? "optional-suffix"
+                        : "linear-sequence";
+                    boundary.analysisStatus = nested.analysisStatus();
+                    boundary.members.addAll(nested.members());
+                    boundary.optionalMembers.addAll(nested.optionalMembers());
+                    discovered.add(boundary);
+                    allMembersMapped &= addContainerCodecMembersForOperation(
+                        membersByBlock,
+                        operation,
+                        List.of(boundary));
+                    continue;
+                }
+
+                CodecWireEvent directRead = directParameter == null
+                    ? null
+                    : directCursorReadEvent(
+                    high,
+                    operation,
+                    operations,
+                    directParameter);
+                if (directRead == null) {
+                    continue;
+                }
+                ContainerCodecCall codec = containerCodecFromWireEvent(
+                    directRead,
+                    "container-helper-unmarshal-cursor-read");
+                discovered.add(codec);
+                allMembersMapped &= addContainerCodecMembersForOperation(
+                    membersByBlock,
+                    operation,
+                    List.of(codec));
+            }
+
+            Map<PcodeBlockBasic, Set<PcodeBlockBasic>> unsuccessfulCodecEdges =
+                mergeExcludedEdges(
+                    unsuccessfulCodecEdges(membersByBlock, successfulTerminals),
+                    terminalFlow.excludedEdges());
+            NetworkSchemaFlowSequence.Result<ContainerCodecCall> flow =
+                NetworkSchemaFlowSequence.analyze(
+                    high,
+                    membersByBlock,
+                    collapsedEventBlocks,
+                    successfulTerminals,
+                    Set.of(),
+                    unsuccessfulCodecEdges,
+                    (left, right) -> left == right);
+            NetworkSchemaFlowSequence.OptionalSuffixResult<ContainerCodecCall> optional =
+                !flow.complete() && nestedExact && allMembersMapped &&
+                    flow.status() == NetworkSchemaFlowSequence.Status.DIVERGENT_PATHS
+                    ? NetworkSchemaFlowSequence.analyzeOptionalSuffix(
+                        high,
+                        membersByBlock,
+                        collapsedEventBlocks,
+                        successfulTerminals,
+                        Set.of(),
+                        unsuccessfulCodecEdges,
+                        (left, right) -> left == right)
+                    : null;
+            boolean linear = nestedExact && allMembersMapped && flow.complete();
+            boolean optionalExact = optional != null && optional.hasOptionalSuffix();
+            boolean exact = linear || optionalExact;
+            String analysisStatus = linear
+                ? "complete"
+                : optionalExact
+                    ? "optional-suffix"
+                    : optional != null
+                        ? "optional-analysis:" + flowSequenceStatus(optional.status()) +
+                            ":paths=" + optional.distinctSequenceCount() +
+                            ":lengths=" + codecSequenceLengths(optional.observedSequences()) +
+                            ":sequences=" + codecSequenceSignatures(
+                                optional.observedSequences()) +
+                            ":successful-terminals=" +
+                                pcodeBlockOffsets(successfulTerminals)
+                    : nestedStatus != null
+                        ? "nested:" + nestedStatus
+                        : !allMembersMapped
+                            ? "unmapped-unmarshal-codec-event"
+                            : flowSequenceStatus(flow.status());
+            if (!exact && !unsuccessfulCodecEdges.isEmpty()) {
+                analysisStatus += ":failure-edges=" +
+                    pcodeEdgeOffsets(unsuccessfulCodecEdges);
+            }
+            applyContainerCodecGuards(high, discovered);
+            return new ContainerCodecMembers(
+                linear
+                    ? flow.events()
+                    : optionalExact
+                        ? optional.requiredEvents()
+                        : discovered,
+                optionalExact ? optional.optionalEvents() : List.of(),
+                linear,
+                exact,
+                analysisStatus);
+        }
+        finally {
+            active.remove(context);
+        }
+    }
+
+    private ContainerCodecCall unmarshalSequenceBoundary(
+        PcodeOpAST operation,
+        List<CodecWireEvent> events) {
+
+        ContainerCodecCall boundary = new ContainerCodecCall();
+        boundary.operation = operation;
+        boundary.callsite = operation.getSeqnum().getTarget();
+        boundary.evidenceSource = "container-helper-unmarshal-sequence";
+        boundary.memberSemantics = "linear-sequence";
+        boundary.analysisStatus = "complete";
+        for (CodecWireEvent event : events) {
+            boundary.members.add(containerCodecFromWireEvent(
+                event,
+                "container-helper-unmarshal-sequence-member"));
+        }
+        return boundary;
+    }
+
+    private ContainerCodecCall containerCodecFromWireEvent(
+        CodecWireEvent event,
+        String evidenceSource) {
+
+        ContainerCodecCall codec = new ContainerCodecCall();
+        codec.callsite = event.callsite();
+        codec.target = event.target();
+        codec.targetName = event.targetName();
+        codec.nativeType = event.nativeType();
+        codec.wireEvidence = event.wireEvidence();
+        codec.evidenceSource = evidenceSource;
+        if (codec.nativeType != null) {
+            applyContainerCodecTypeIdentity(codec, codec.nativeType);
+        }
+        return codec;
+    }
+
+    private String flowSequenceStatus(NetworkSchemaFlowSequence.Status status) {
+        return switch (status) {
+            case COMPLETE -> "complete";
+            case DIVERGENT_PATHS -> "divergent-paths";
+            case CYCLIC_EVENTS -> "cyclic-events";
+            case NO_TERMINATING_PATH -> "no-terminating-path";
+        };
+    }
+
+    private Map<PcodeBlockBasic, Set<PcodeBlockBasic>> unsuccessfulCodecEdges(
+        Map<PcodeBlockBasic, List<ContainerCodecCall>> membersByBlock,
+        Set<PcodeBlockBasic> successfulTerminals) {
+
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> failedSuccessors = new HashMap<>();
+        for (Map.Entry<PcodeBlockBasic, List<ContainerCodecCall>> entry :
+                membersByBlock.entrySet()) {
+            ContainerCodecCall lastCodec = entry.getValue().isEmpty()
+                ? null
+                : entry.getValue().get(entry.getValue().size() - 1);
+            PcodeBlockBasic failed = failedCodecSuccessor(
+                entry.getKey(),
+                lastCodec,
+                membersByBlock,
+                successfulTerminals);
+            if (failed != null) {
+                failedSuccessors.put(entry.getKey(), Set.of(failed));
+            }
+        }
+        return Map.copyOf(failedSuccessors);
+    }
+
+    private PcodeBlockBasic failedCodecSuccessor(
+        PcodeBlockBasic block,
+        ContainerCodecCall codec,
+        Map<PcodeBlockBasic, List<ContainerCodecCall>> membersByBlock,
+        Set<PcodeBlockBasic> successfulTerminals) {
+
+        PcodeOpAST codecCall = codec == null ? null : codec.operation;
+        if (block == null || codecCall == null ||
+            codecCall.getOpcode() != PcodeOp.CALL) {
+            return null;
+        }
+        PcodeOpAST branch = null;
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (operation instanceof PcodeOpAST ast &&
+                ast.getOpcode() == PcodeOp.CBRANCH &&
+                ast.getSeqnum().getTarget().compareTo(
+                    codecCall.getSeqnum().getTarget()) > 0) {
+                branch = ast;
+            }
+        }
+        if (branch == null || branch.getNumInputs() < 2) {
+            return null;
+        }
+        PcodeOp condition = branch.getInput(1).getDef();
+        if (condition == null ||
+            condition.getOpcode() != PcodeOp.INT_EQUAL &&
+                condition.getOpcode() != PcodeOp.INT_NOTEQUAL ||
+            condition.getNumInputs() != 2) {
+            return null;
+        }
+        int zeroSlot = NetworkSchemaIntegerEvaluator.equals(condition.getInput(0), 0L)
+            ? 0
+            : NetworkSchemaIntegerEvaluator.equals(condition.getInput(1), 0L)
+                ? 1
+                : -1;
+        if (zeroSlot < 0) {
+            return null;
+        }
+        Varnode statusValue = condition.getInput(1 - zeroSlot);
+        if (statusValue.getSize() != Byte.BYTES) {
+            return null;
+        }
+        List<PcodeBlockBasic> successors = NetworkSchemaControlFlow.successors(block);
+        if (successors.size() != 2) {
+            return null;
+        }
+        Address trueDestination = pcodeAddress(branch.getInput(0));
+        PcodeBlockBasic trueSuccessor = successors.stream()
+            .filter(successor -> Objects.equals(successor.getStart(), trueDestination))
+            .findFirst()
+            .orElse(null);
+        if (trueSuccessor == null) {
+            return null;
+        }
+        PcodeBlockBasic falseSuccessor = successors.get(0) == trueSuccessor
+            ? successors.get(1)
+            : successors.get(0);
+        PcodeBlockBasic structuralSuccessor = structuralCodecSuccessor(
+            trueSuccessor,
+            falseSuccessor,
+            membersByBlock,
+            successfulTerminals);
+        if (structuralSuccessor != null &&
+            "container-helper-unmarshal-read-raw".equals(codec.evidenceSource)) {
+            return structuralSuccessor == trueSuccessor
+                ? falseSuccessor
+                : trueSuccessor;
+        }
+
+        PcodeStorage status = pcodeStorageExpression(statusValue);
+        boolean argumentResult = status != null &&
+            callCarriesResultStorage(codecCall, status);
+        boolean returnedResult = statusLoadedFromCallResult(statusValue, codecCall);
+        boolean callDefinedResult = statusProducedByCall(
+            statusValue,
+            status,
+            codecCall,
+            block);
+        if (!argumentResult && !returnedResult && !callDefinedResult) {
+            return null;
+        }
+        if (structuralSuccessor != null) {
+            return structuralSuccessor == trueSuccessor
+                ? falseSuccessor
+                : trueSuccessor;
+        }
+        boolean trueMeansSuccess = condition.getOpcode() == PcodeOp.INT_NOTEQUAL;
+        return trueMeansSuccess ? falseSuccessor : trueSuccessor;
+    }
+
+    private PcodeBlockBasic structuralCodecSuccessor(
+        PcodeBlockBasic first,
+        PcodeBlockBasic second,
+        Map<PcodeBlockBasic, List<ContainerCodecCall>> membersByBlock,
+        Set<PcodeBlockBasic> successfulTerminals) {
+
+        boolean firstHasCodec = !membersByBlock.getOrDefault(first, List.of()).isEmpty();
+        boolean secondHasCodec = !membersByBlock.getOrDefault(second, List.of()).isEmpty();
+        if (firstHasCodec != secondHasCodec) {
+            return firstHasCodec ? first : second;
+        }
+        boolean firstSuccess = successfulTerminals.contains(first);
+        boolean secondSuccess = successfulTerminals.contains(second);
+        if (firstSuccess != secondSuccess) {
+            return firstSuccess ? first : second;
+        }
+        boolean firstRejectedTerminal = isTerminatingPcodeBlock(first) && !firstSuccess;
+        boolean secondRejectedTerminal = isTerminatingPcodeBlock(second) && !secondSuccess;
+        if (firstRejectedTerminal != secondRejectedTerminal) {
+            return firstRejectedTerminal ? second : first;
+        }
+        return null;
+    }
+
+    private boolean callCarriesResultStorage(PcodeOpAST call, PcodeStorage status) {
+        Function owner = call == null || call.getSeqnum() == null
+            ? null
+            : functionContaining(call.getSeqnum().getTarget());
+        Function target = pcodeCallTarget(call);
+        int argumentCount = provenCallArgumentCount(call, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            PcodeStorage argument = provenCallArgumentStorage(
+                owner,
+                call,
+                target,
+                slot);
+            if (argument == null || !Objects.equals(argument.base, status.base)) {
+                continue;
+            }
+            long relative = status.offset - argument.offset;
+            if (relative == 0L || relative == 1L) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean statusLoadedFromCallResult(
+        Varnode statusValue,
+        PcodeOpAST call) {
+
+        if (statusValue == null || call == null || call.getOutput() == null) {
+            return false;
+        }
+        PcodeOp definition = statusValue.getDef();
+        if (definition == null || definition.getOpcode() != PcodeOp.LOAD ||
+            definition.getNumInputs() < 2) {
+            return false;
+        }
+        Long offset = ssaAffineOffset(
+            definition.getInput(1),
+            call.getOutput(),
+            new LinkedHashSet<>(),
+            0);
+        return offset != null && offset == 1L;
+    }
+
+    private boolean statusProducedByCall(
+        Varnode statusValue,
+        PcodeStorage status,
+        PcodeOpAST call,
+        PcodeBlockBasic block) {
+
+        PcodeOp definition = statusValue == null ? null : statusValue.getDef();
+        if (definition != null && definition.getOpcode() == PcodeOp.INDIRECT &&
+            definition.getSeqnum().getTarget().equals(call.getSeqnum().getTarget())) {
+            return true;
+        }
+        if (status == null || block == null) {
+            return false;
+        }
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (operation.getOpcode() != PcodeOp.INDIRECT ||
+                !operation.getSeqnum().getTarget().equals(call.getSeqnum().getTarget())) {
+                continue;
+            }
+            PcodeStorage output = pcodeStorageExpression(operation.getOutput());
+            if (output != null && output.sameLocation(status)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Long ssaAffineOffset(
+        Varnode value,
+        Varnode base,
+        Set<Varnode> active,
+        int depth) {
+
+        if (value == null || base == null || depth > 32) {
+            return null;
+        }
+        if (value.equals(base)) {
+            return 0L;
+        }
+        if (!active.add(value)) {
+            return null;
+        }
+        try {
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                return null;
+            }
+            if ((definition.getOpcode() == PcodeOp.COPY ||
+                definition.getOpcode() == PcodeOp.CAST) &&
+                definition.getNumInputs() >= 1) {
+                return ssaAffineOffset(
+                    definition.getInput(0),
+                    base,
+                    active,
+                    depth + 1);
+            }
+            if ((definition.getOpcode() == PcodeOp.INT_ADD ||
+                definition.getOpcode() == PcodeOp.PTRSUB) &&
+                definition.getNumInputs() == 2) {
+                for (int baseSlot = 0; baseSlot < 2; baseSlot++) {
+                    Long relative = ssaAffineOffset(
+                        definition.getInput(baseSlot),
+                        base,
+                        active,
+                        depth + 1);
+                    Long constant = NetworkSchemaIntegerEvaluator.evaluate(
+                        definition.getInput(1 - baseSlot));
+                    if (relative != null && constant != null) {
+                        try {
+                            return Math.addExact(relative, constant);
+                        }
+                        catch (ArithmeticException ignored) {
+                            return null;
+                        }
+                    }
+                }
+            }
+            if (definition.getOpcode() == PcodeOp.PTRADD &&
+                definition.getNumInputs() == 3) {
+                Long relative = ssaAffineOffset(
+                    definition.getInput(0),
+                    base,
+                    active,
+                    depth + 1);
+                Long index = NetworkSchemaIntegerEvaluator.evaluate(definition.getInput(1));
+                Long scale = NetworkSchemaIntegerEvaluator.evaluate(definition.getInput(2));
+                if (relative != null && index != null && scale != null) {
+                    try {
+                        return Math.addExact(relative, Math.multiplyExact(index, scale));
+                    }
+                    catch (ArithmeticException ignored) {
+                        return null;
+                    }
+                }
+            }
+            return null;
+        }
+        finally {
+            active.remove(value);
+        }
+    }
+
+    private String codecSequenceLengths(List<? extends List<?>> sequences) {
+        ArrayList<String> lengths = new ArrayList<>(sequences.size());
+        for (List<?> sequence : sequences) {
+            lengths.add(Integer.toString(sequence.size()));
+        }
+        return String.join(",", lengths);
+    }
+
+    private String pcodeBlockOffsets(Set<PcodeBlockBasic> blocks) {
+        ArrayList<PcodeBlockBasic> ordered = new ArrayList<>(blocks);
+        ordered.sort(Comparator.comparing(PcodeBlockBasic::getStart));
+        ArrayList<String> offsets = new ArrayList<>(ordered.size());
+        for (PcodeBlockBasic block : ordered) {
+            offsets.add(formatAddress(block.getStart()));
+        }
+        return String.join(",", offsets);
+    }
+
+    private String pcodeEdgeOffsets(
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> edges) {
+
+        ArrayList<PcodeBlockBasic> sources = new ArrayList<>(edges.keySet());
+        sources.sort(Comparator.comparing(PcodeBlockBasic::getStart));
+        ArrayList<String> result = new ArrayList<>();
+        for (PcodeBlockBasic source : sources) {
+            ArrayList<PcodeBlockBasic> targets = new ArrayList<>(edges.get(source));
+            targets.sort(Comparator.comparing(PcodeBlockBasic::getStart));
+            for (PcodeBlockBasic target : targets) {
+                result.add(formatAddress(source.getStart()) + "->" +
+                    formatAddress(target.getStart()));
+            }
+        }
+        return String.join(",", result);
+    }
+
+    private String codecSequenceSignatures(
+        List<? extends List<ContainerCodecCall>> sequences) {
+
+        ArrayList<String> signatures = new ArrayList<>(sequences.size());
+        for (List<ContainerCodecCall> sequence : sequences) {
+            ArrayList<String> callsites = new ArrayList<>(sequence.size());
+            for (ContainerCodecCall codec : sequence) {
+                callsites.add(codec.callsite == null
+                    ? "?"
+                    : formatAddress(codec.callsite));
+            }
+            signatures.add("[" + String.join(",", callsites) + "]");
+        }
+        return String.join("|", signatures);
+    }
+
+    private UnmarshalTerminalFlow successfulUnmarshalTerminalFlow(HighFunction high) {
+        return successfulUnmarshalTerminalFlow(
+            high,
+            null,
+            new LinkedHashSet<>(),
+            0);
+    }
+
+    private UnmarshalTerminalFlow successfulUnmarshalTerminalFlow(
+        HighFunction high,
+        String expectedResultBase,
+        Set<String> active,
+        int depth) {
+
+        if (high == null) {
+            return UnmarshalTerminalFlow.unresolved("missing-high-function");
+        }
+        if (depth > 8) {
+            return UnmarshalTerminalFlow.unresolved("result-delegation-depth");
+        }
+        String context = high.getFunction().getEntryPoint() + "|" +
+            Objects.toString(expectedResultBase, "?");
+        if (!active.add(context)) {
+            return UnmarshalTerminalFlow.unresolved("recursive-result-delegation");
+        }
+        try {
+        LinkedHashSet<String> resultBases = new LinkedHashSet<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            StatusByteWrite write = unmarshalStatusByteWrite(operation);
+            if (write != null) {
+                resultBases.add(write.base());
+            }
+        }
+        String resultBase;
+        if (expectedResultBase != null) {
+            resultBase = expectedResultBase;
+        }
+        else {
+            resultBase = resultBases.size() == 1
+                ? resultBases.iterator().next()
+                : returnedUnmarshalResultBase(high, resultBases);
+            if (resultBase == null) {
+                if (resultBases.isEmpty()) {
+                    return scalarReturnUnmarshalTerminalFlow(high);
+                }
+                return UnmarshalTerminalFlow.unresolved(
+                    "result-base-count:" + resultBases.size());
+            }
+        }
+        Set<PcodeOpAST> delegatedSuccess = delegatedUnmarshalSuccessCalls(
+            high,
+            resultBase,
+            active,
+            depth);
+        ArrayList<PcodeBlockBasic> blocks = high.getBasicBlocks();
+        blocks.sort(Comparator
+            .comparing(PcodeBlockBasic::getStart)
+            .thenComparingInt(PcodeBlock::getIndex));
+        Map<PcodeBlockBasic, Set<UnmarshalStatusByte>> output = new HashMap<>();
+        for (PcodeBlockBasic block : blocks) {
+            output.put(block, Set.of());
+        }
+
+        boolean changed;
+        int iterations = 0;
+        do {
+            changed = false;
+            for (PcodeBlockBasic block : blocks) {
+                LinkedHashSet<UnmarshalStatusByte> state = new LinkedHashSet<>();
+                List<PcodeBlockBasic> predecessors =
+                    NetworkSchemaControlFlow.predecessors(block);
+                if (predecessors.isEmpty()) {
+                    state.add(UnmarshalStatusByte.UNSET);
+                }
+                else {
+                    for (PcodeBlockBasic predecessor : predecessors) {
+                        state.addAll(output.getOrDefault(predecessor, Set.of()));
+                    }
+                }
+                var operations = block.getIterator();
+                while (operations.hasNext()) {
+                    PcodeOp operation = operations.next();
+                    if (!(operation instanceof PcodeOpAST ast)) {
+                        continue;
+                    }
+                    StatusByteWrite write = unmarshalStatusByteWrite(ast);
+                    if (write != null && resultBase.equals(write.base())) {
+                        state.clear();
+                        state.add(effectiveUnmarshalStatusByte(high, ast, write, active, depth));
+                    }
+                    else if (delegatedSuccess.contains(ast)) {
+                        state.clear();
+                        state.add(UnmarshalStatusByte.SUCCESS);
+                    }
+                }
+                Set<UnmarshalStatusByte> next = Set.copyOf(state);
+                if (!next.equals(output.put(block, next))) {
+                    changed = true;
+                }
+            }
+        } while (changed && ++iterations <= blocks.size() * 4);
+        if (changed) {
+            return UnmarshalTerminalFlow.unresolved("status-dataflow-did-not-converge");
+        }
+
+        LinkedHashSet<PcodeBlockBasic> successful = new LinkedHashSet<>();
+        HashMap<PcodeBlockBasic, LinkedHashSet<PcodeBlockBasic>> excluded =
+            new HashMap<>();
+        for (PcodeBlockBasic block : blocks) {
+            if (!isTerminatingPcodeBlock(block)) {
+                continue;
+            }
+            Map<PcodeBlockBasic, UnmarshalStatusByte> incomingStatus =
+                terminalIncomingStatus(high, block, resultBase);
+            if (incomingStatus != null) {
+                boolean hasSuccess = false;
+                for (Map.Entry<PcodeBlockBasic, UnmarshalStatusByte> entry :
+                        incomingStatus.entrySet()) {
+                    if (entry.getValue() == UnmarshalStatusByte.SUCCESS) {
+                        hasSuccess = true;
+                    }
+                    else if (entry.getValue() == UnmarshalStatusByte.FAILURE) {
+                        excluded.computeIfAbsent(
+                            entry.getKey(),
+                            ignored -> new LinkedHashSet<>()).add(block);
+                    }
+                    else {
+                        return UnmarshalTerminalFlow.unresolved(
+                            "terminal-phi-status-unproven:" +
+                                formatAddress(block.getStart()));
+                    }
+                }
+                if (hasSuccess) {
+                    successful.add(block);
+                }
+                continue;
+            }
+            Set<UnmarshalStatusByte> internalStatus =
+                terminalInternalInstructionStatus(high, block, resultBase);
+            if (internalStatus != null) {
+                if (internalStatus.contains(UnmarshalStatusByte.SUCCESS)) {
+                    successful.add(block);
+                }
+                continue;
+            }
+            Set<UnmarshalStatusByte> terminalState = output.getOrDefault(block, Set.of());
+            if (terminalState.equals(Set.of(UnmarshalStatusByte.SUCCESS))) {
+                successful.add(block);
+                continue;
+            }
+            if (terminalState.equals(Set.of(UnmarshalStatusByte.FAILURE))) {
+                continue;
+            }
+            List<PcodeBlockBasic> predecessors =
+                NetworkSchemaControlFlow.predecessors(block);
+            if (predecessors.isEmpty()) {
+                continue;
+            }
+            boolean hasSuccess = false;
+            boolean classified = true;
+            for (PcodeBlockBasic predecessor : predecessors) {
+                Set<UnmarshalStatusByte> state = output.getOrDefault(
+                    predecessor,
+                    Set.of());
+                if (state.equals(Set.of(UnmarshalStatusByte.SUCCESS))) {
+                    hasSuccess = true;
+                }
+                else if (state.equals(Set.of(UnmarshalStatusByte.FAILURE))) {
+                    excluded.computeIfAbsent(
+                        predecessor,
+                        ignored -> new LinkedHashSet<>()).add(block);
+                }
+                else {
+                    classified = false;
+                    break;
+                }
+            }
+            if (!classified) {
+                return UnmarshalTerminalFlow.unresolved(
+                    "mixed-terminal-edge:" + formatAddress(block.getStart()));
+            }
+            if (hasSuccess) {
+                successful.add(block);
+            }
+        }
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> immutableExcluded = new HashMap<>();
+        for (Map.Entry<PcodeBlockBasic, LinkedHashSet<PcodeBlockBasic>> entry :
+                excluded.entrySet()) {
+            immutableExcluded.put(entry.getKey(), Set.copyOf(entry.getValue()));
+        }
+        return new UnmarshalTerminalFlow(
+            Set.copyOf(successful),
+            Map.copyOf(immutableExcluded),
+            successful.isEmpty() ? "no-success-terminal" : "complete");
+        }
+        finally {
+            active.remove(context);
+        }
+    }
+
+    private Set<PcodeOpAST> delegatedUnmarshalSuccessCalls(
+        HighFunction high,
+        String resultBase,
+        Set<String> active,
+        int depth) {
+
+        LinkedHashSet<PcodeOpAST> result = new LinkedHashSet<>();
+        Function owner = high.getFunction();
+        PcodeStorage resultStorage = new PcodeStorage(resultBase, 0L);
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL ||
+                !isTailResultDelegation(operation, resultBase)) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Integer resultSlot = provenCallArgumentSlot(
+                owner,
+                operation,
+                target,
+                resultStorage);
+            if (target == null || resultSlot == null) {
+                continue;
+            }
+            UnmarshalTerminalFlow nested = successfulUnmarshalTerminalFlow(
+                highFunction(target),
+                "param_" + resultSlot,
+                active,
+                depth + 1);
+            if (!nested.terminals().isEmpty()) {
+                result.add(operation);
+            }
+        }
+        return Set.copyOf(result);
+    }
+
+    private boolean isTailResultDelegation(
+        PcodeOpAST call,
+        String resultBase) {
+
+        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(call);
+        if (block == null || !isTerminatingPcodeBlock(block)) {
+            return false;
+        }
+        boolean afterCall = false;
+        boolean returned = false;
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (operation == call) {
+                afterCall = true;
+                continue;
+            }
+            if (!afterCall) {
+                continue;
+            }
+            if (operation.getOpcode() == PcodeOp.CALL ||
+                operation.getOpcode() == PcodeOp.CALLIND ||
+                operation.getOpcode() == PcodeOp.CBRANCH ||
+                operation.getOpcode() == PcodeOp.BRANCH ||
+                operation.getOpcode() == PcodeOp.BRANCHIND) {
+                return false;
+            }
+            if (operation instanceof PcodeOpAST ast) {
+                StatusByteWrite write = unmarshalStatusByteWrite(ast);
+                if (write != null && resultBase.equals(write.base())) {
+                    return false;
+                }
+            }
+            returned |= operation.getOpcode() == PcodeOp.RETURN;
+        }
+        return returned;
+    }
+
+    private StatusByteWrite unmarshalStatusByteWrite(PcodeOpAST operation) {
+        if (operation == null || operation.getOpcode() != PcodeOp.STORE ||
+            operation.getNumInputs() < 3) {
+            return null;
+        }
+        PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+        if (destination == null || destination.base == null ||
+            !destination.base.matches("param_[0-9]+")) {
+            return null;
+        }
+        int width = operation.getInput(2).getSize();
+        long byteOffset = 1L - destination.offset;
+        if (byteOffset < 0L || byteOffset >= width) {
+            return null;
+        }
+        Long value = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(2));
+        UnmarshalStatusByte status;
+        if (value == null) {
+            status = UnmarshalStatusByte.UNKNOWN;
+        }
+        else {
+            int storedByte = (int)((value >>> (byteOffset * Byte.SIZE)) & 0xffL);
+            status = storedByte == 0
+                ? UnmarshalStatusByte.FAILURE
+                : storedByte == 1
+                    ? UnmarshalStatusByte.SUCCESS
+                    : UnmarshalStatusByte.UNKNOWN;
+        }
+        return new StatusByteWrite(destination.base, status);
+    }
+
+    private boolean isTerminatingPcodeBlock(PcodeBlockBasic block) {
+        if (block.getOutSize() == 0) {
+            return true;
+        }
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            if (operations.next().getOpcode() == PcodeOp.RETURN) {
+                return true;
+            }
+        }
+        return false;
+    }

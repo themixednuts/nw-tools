@@ -3,20 +3,29 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use sha1::{Digest, Sha1};
 use thiserror::Error as ThisError;
 use uuid::Uuid;
 
+use crate::uuid::AzUuidExt;
 use crate::{AssetId, AssetType};
 
 pub const ASSET_CATALOG_PATH: &str = "assetcatalog.catalog";
 pub const ASSET_CATALOG_OPTIMIZED_PATH: &str = "assetcatalog_optimized.catalog";
 pub const RASC_SIGNATURE: &[u8; 4] = b"RASC";
 pub const RAOC_SIGNATURE: &[u8; 4] = b"RAOC";
+pub const RASC_VERSION: u32 = 1;
 pub const RAOC_VERSION: u32 = 2;
 
 const RASC_HEADER_LEN: usize = 40;
 const RASC_ENTRY_LEN: usize = 40;
+/// `source-guid -> product` grouping record: `{guidIdx, subId, count, base}`.
+const RASC_SOURCE_GROUP_LEN: usize = 16;
+/// `path-hash -> AssetId` record: `{pathHashGuidIdx, assetGuidIdx, subId}`.
+const RASC_PATH_ID_LEN: usize = 12;
+/// `legacy -> real` redirect record: `{legacyGuidIdx, legacySubId, realGuidIdx, realSubId}`.
+const RASC_LEGACY_MAPPING_LEN: usize = 16;
+/// Product-array record referenced by the source-group table: `{guidIdx, subId, u64}`.
+const RASC_PRODUCT_REF_LEN: usize = 16;
 const RAOC_HEADER_LEN: usize = 20;
 const RAOC_ENTRY_LEN: usize = 48;
 const RAOC_GUID_INFO_LEN: usize = 32;
@@ -41,8 +50,8 @@ pub enum Error {
         expected: u32,
     },
 
-    #[error("RASC size sentinel mismatch: file_size={file_size} end_sentinel={end_sentinel}")]
-    SizeSentinelMismatch { file_size: u64, end_sentinel: u32 },
+    #[error("RASC declared file size {declared} exceeds input length {len}")]
+    RascSizeExceedsInput { declared: u64, len: usize },
 
     #[error("RAOC file size mismatch: declared={declared} actual={actual}")]
     FileSizeMismatch { declared: u64, actual: u64 },
@@ -226,13 +235,65 @@ pub struct RascEntry {
     size_bytes: u32,
 }
 
+/// One `(product AssetId, payload)` referenced by a [`RascSourceGroup`].
+///
+/// `extra` is the raw 8-byte tail the binary stores after the product
+/// `(guid, sub_id)` in the `@32` product array. Its meaning is unconfirmed
+/// because the shipping New World catalog carries an empty product array
+/// (`@32` == file size, so every group is empty); it is preserved verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RascProductRef {
+    asset_id: AssetId,
+    extra: u64,
+}
+
+impl RascProductRef {
+    #[must_use]
+    pub const fn asset_id(self) -> AssetId {
+        self.asset_id
+    }
+
+    #[must_use]
+    pub const fn extra(self) -> u64 {
+        self.extra
+    }
+}
+
+/// A source GUID and the product [`AssetId`]s grouped under it (RASC table a).
+///
+/// This is the catalog's explicit `source-guid -> products` grouping, distinct
+/// from the [`Rasc::entries_by_source`] view derived from the product entries.
+/// The New World catalog ships this table empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RascSourceGroup {
+    source: AssetId,
+    products: Vec<RascProductRef>,
+}
+
+impl RascSourceGroup {
+    #[must_use]
+    pub const fn source(&self) -> AssetId {
+        self.source
+    }
+
+    #[must_use]
+    pub fn products(&self) -> &[RascProductRef] {
+        &self.products
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rasc {
     version: u32,
     entries: Vec<RascEntry>,
+    source_groups: Vec<RascSourceGroup>,
+    path_ids: Vec<PathId>,
+    legacy_mappings: Vec<LegacyAssetIdMapping>,
     by_id: HashMap<AssetId, usize>,
     by_path: HashMap<String, usize>,
     by_source: HashMap<Uuid, Vec<usize>>,
+    by_path_hash: HashMap<[u8; 16], AssetId>,
+    by_legacy_id: HashMap<AssetId, AssetId>,
 }
 
 impl RascEntry {
@@ -348,9 +409,14 @@ impl Rasc {
         Self {
             version,
             entries,
+            source_groups: Vec::new(),
+            path_ids: Vec::new(),
+            legacy_mappings: Vec::new(),
             by_id,
             by_path,
             by_source,
+            by_path_hash: HashMap::new(),
+            by_legacy_id: HashMap::new(),
         }
     }
 
@@ -395,7 +461,43 @@ impl Rasc {
 
     #[must_use]
     pub fn id_by_path(&self, path: &str) -> Option<AssetId> {
+        // The catalog's own `path-hash -> AssetId` table keys on
+        // `AZ::Uuid::CreateName(normalize(path))`; consult it first, then fall
+        // back to the string index built from product entry paths.
+        if let Some(asset_id) = self.id_by_path_hash(&asset_path_hash(path)) {
+            return Some(asset_id);
+        }
         self.entry_by_path(path).map(RascEntry::asset_id)
+    }
+
+    /// The parsed `source-guid -> products` grouping table (RASC table a).
+    #[must_use]
+    pub fn source_groups(&self) -> &[RascSourceGroup] {
+        &self.source_groups
+    }
+
+    /// The parsed `path-hash -> AssetId` table (RASC table b).
+    #[must_use]
+    pub fn path_ids(&self) -> &[PathId] {
+        &self.path_ids
+    }
+
+    /// The parsed `legacy-AssetId -> real-AssetId` redirect table (RASC table c).
+    #[must_use]
+    pub fn legacy_mappings(&self) -> &[LegacyAssetIdMapping] {
+        &self.legacy_mappings
+    }
+
+    /// Resolve a legacy [`AssetId`] to its real replacement via table c.
+    #[must_use]
+    pub fn resolve_legacy_id(&self, asset_id: AssetId) -> Option<AssetId> {
+        self.by_legacy_id.get(&asset_id).copied()
+    }
+
+    /// Look up an [`AssetId`] by a raw path hash (`AZ::Uuid::CreateName` bytes).
+    #[must_use]
+    pub fn id_by_path_hash(&self, path_hash: &[u8; 16]) -> Option<AssetId> {
+        self.by_path_hash.get(path_hash).copied()
     }
 
     /// Product entries emitted from the same source GUID as `asset_id`.
@@ -758,14 +860,8 @@ pub fn normalize_virtual_path(path: impl AsRef<str>) -> String {
 #[must_use]
 pub fn asset_path_hash(path: &str) -> [u8; 16] {
     let normalized = normalize_virtual_path(path);
-    let digest = Sha1::digest(normalized.as_bytes());
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest[..16]);
-    out[8] &= 0xbf;
-    out[8] |= 0x80;
-    out[6] &= 0x5f;
-    out[6] |= 0x50;
-    out
+    // The catalog's path-hash table keys on `AZ::Uuid::CreateName(normalize(path))`.
+    Uuid::create_name(normalized.as_bytes()).into_bytes()
 }
 
 /// Return the catalog kind from the leading signature bytes.
@@ -786,6 +882,32 @@ pub fn detect(bytes: &[u8]) -> Result<Kind, Error> {
     }
 }
 
+/// Parse the `RASC` catalog.
+///
+/// # Binary layout (verified against `NewWorld 3-26`, `AZ::Uuid::CreateName`
+/// asset-catalog parser at RVA `+0x6367ca0`)
+///
+/// ```text
+/// header (40 bytes):
+///   @0  magic "RASC"
+///   @4  version (== 1)
+///   @8  file_size (u64; validated <= input length, NOT an end sentinel)
+///   @16 guid-table base       (16-byte GUIDs, indexed by every table below)
+///   @20 asset-type-table base (16-byte type GUIDs)
+///   @24 directory-string base (NUL-terminated strings)
+///   @28 file-string base      (NUL-terminated strings)
+///   @32 product-array base    (16-byte {guidIdx, subId, u64} rows; empty in NW)
+///   @36 entry_count
+/// entry table:            entry_count * 40-byte records @40
+/// [a] source-group table: u32 count + count * 16-byte records
+/// [b] path-hash table:    u32 count + count * 12-byte records
+/// [c] legacy redirect:    u32 count + count * 16-byte records
+/// ```
+///
+/// The header field at `@32` is the base of the product array (5th table
+/// pointer, `table = base + hdr[8]`), not an end sentinel; the binary never
+/// compares it to `file_size`. In the shipping catalog it happens to equal the
+/// file size only because that array is empty.
 fn parse_rasc(bytes: &[u8], runner: &nw_jobs::JobRunner) -> Result<Rasc, Error> {
     if bytes.len() < RASC_HEADER_LEN {
         return Err(Error::InputTooSmall { len: bytes.len() });
@@ -796,38 +918,53 @@ fn parse_rasc(bytes: &[u8], runner: &nw_jobs::JobRunner) -> Result<Rasc, Error> 
     }
 
     let version = u32_at(bytes, 4, "RASC version")?;
-    let file_size = u64_at(bytes, 8, "RASC file size")?;
-    let guid_offset = usize_from_u32(u32_at(bytes, 16, "RASC GUID table offset")?)?;
-    let asset_type_offset = usize_from_u32(u32_at(bytes, 20, "RASC asset type table offset")?)?;
-    let dir_offset = usize_from_u32(u32_at(bytes, 24, "RASC directory string table offset")?)?;
-    let file_name_offset = usize_from_u32(u32_at(bytes, 28, "RASC file string table offset")?)?;
-    let end_sentinel = u32_at(bytes, 32, "RASC end sentinel")?;
-    let entry_count = usize_from_u32(u32_at(bytes, 36, "RASC entry count")?)?;
-    if file_size != u64::from(end_sentinel) {
-        return Err(Error::SizeSentinelMismatch {
-            file_size,
-            end_sentinel,
+    if version != RASC_VERSION {
+        return Err(Error::UnsupportedVersion {
+            kind: Kind::Rasc,
+            actual: version,
+            expected: RASC_VERSION,
         });
     }
+    let file_size = u64_at(bytes, 8, "RASC file size")?;
+    if file_size > usize_to_u64(bytes.len())? {
+        return Err(Error::RascSizeExceedsInput {
+            declared: file_size,
+            len: bytes.len(),
+        });
+    }
+
+    let guid_base = usize_from_u32(u32_at(bytes, 16, "RASC GUID table offset")?)?;
+    let asset_type_base = usize_from_u32(u32_at(bytes, 20, "RASC asset type table offset")?)?;
+    let dir_base = usize_from_u32(u32_at(bytes, 24, "RASC directory string table offset")?)?;
+    let file_base = usize_from_u32(u32_at(bytes, 28, "RASC file string table offset")?)?;
+    let product_base = usize_from_u32(u32_at(bytes, 32, "RASC product array offset")?)?;
+    let entry_count = usize_from_u32(u32_at(bytes, 36, "RASC entry count")?)?;
 
     let entries = runner.try_map_indexed(entry_count, |index| {
         let offset = checked_add(RASC_HEADER_LEN, checked_mul(index, RASC_ENTRY_LEN)?)?;
         let record = slice_at(bytes, offset, RASC_ENTRY_LEN, "RASC entry")?;
+        // rec[0] guid index, rec[1] sub id -> the entry AssetId (map key).
         let guid_index = usize_from_u32(le_u32(record, 0))?;
         let sub_id = le_u32(record, 4);
-        let asset_type_index = usize_from_u32(le_u32(record, 16))?;
-        let size_bytes = le_u32(record, 24);
-        let dir_string_offset = usize_from_u32(le_u32(record, 32))?;
-        let file_string_offset = usize_from_u32(le_u32(record, 36))?;
+        // rec[2] (@8) and rec[3] (@12) are the O3DE registry value-record's own
+        // copy of the entry AssetId (guid index + sub id, stored at the record's
+        // +0x20/+0x30). They are byte-identical to the primary AssetId across the
+        // entire 1.6M-entry New World catalog (verified), carry no independent
+        // information, and no consumer needs them, so they are intentionally not
+        // re-materialized here.
+        let asset_type_index = usize_from_u32(le_u32(record, 16))?; // rec[4]
+        let size_bytes = le_u32(record, 24); // rec[6] (low u32 of the u64 size @24)
+        let dir_string_offset = usize_from_u32(le_u32(record, 32))?; // rec[8]
+        let file_string_offset = usize_from_u32(le_u32(record, 36))?; // rec[9]
 
         let directory = string_at(
             bytes,
-            checked_add(dir_offset, dir_string_offset)?,
+            checked_add(dir_base, dir_string_offset)?,
             "RASC directory",
         )?;
         let file_name = string_at(
             bytes,
-            checked_add(file_name_offset, file_string_offset)?,
+            checked_add(file_base, file_string_offset)?,
             "RASC file name",
         )?;
         let path = if directory.is_empty() {
@@ -836,22 +973,197 @@ fn parse_rasc(bytes: &[u8], runner: &nw_jobs::JobRunner) -> Result<Rasc, Error> 
             format!("{directory}/{file_name}")
         };
         let asset_id = AssetId::new(
-            uuid_at(
-                bytes,
-                checked_add(guid_offset, checked_mul(guid_index, GUID_LEN)?)?,
-                "RASC asset id",
-            )?,
+            guid_by_index(bytes, guid_base, guid_index, "RASC asset id")?,
             sub_id,
         );
-        let asset_type = AssetType::new(uuid_at(
+        let asset_type = AssetType::new(guid_by_index(
             bytes,
-            checked_add(asset_type_offset, checked_mul(asset_type_index, GUID_LEN)?)?,
+            asset_type_base,
+            asset_type_index,
             "RASC asset type",
         )?);
         Ok(RascEntry::new(asset_id, asset_type, path, size_bytes))
     })?;
 
-    Ok(Rasc::new_with_runner(version, entries, runner))
+    // The three side tables are packed contiguously right after the entry table.
+    let mut cursor = checked_add(RASC_HEADER_LEN, checked_mul(entry_count, RASC_ENTRY_LEN)?)?;
+
+    // [a] source-guid -> product grouping.
+    let source_group_count = usize_from_u32(u32_at(bytes, cursor, "RASC source group count")?)?;
+    cursor = checked_add(cursor, 4)?;
+    let source_group_start = cursor;
+    let source_groups = runner.try_map_indexed(source_group_count, |index| {
+        let record = slice_at(
+            bytes,
+            checked_add(
+                source_group_start,
+                checked_mul(index, RASC_SOURCE_GROUP_LEN)?,
+            )?,
+            RASC_SOURCE_GROUP_LEN,
+            "RASC source group",
+        )?;
+        let source = asset_id_by_index(
+            bytes,
+            guid_base,
+            usize_from_u32(le_u32(record, 0))?,
+            le_u32(record, 4),
+            "RASC source group guid",
+        )?;
+        let group_count = usize_from_u32(le_u32(record, 8))?;
+        let group_base = usize_from_u32(le_u32(record, 12))?;
+        let mut products = Vec::with_capacity(group_count);
+        for offset in 0..group_count {
+            let product_index = checked_add(group_base, offset)?;
+            let product = slice_at(
+                bytes,
+                checked_add(
+                    product_base,
+                    checked_mul(product_index, RASC_PRODUCT_REF_LEN)?,
+                )?,
+                RASC_PRODUCT_REF_LEN,
+                "RASC product ref",
+            )?;
+            products.push(RascProductRef {
+                asset_id: asset_id_by_index(
+                    bytes,
+                    guid_base,
+                    usize_from_u32(le_u32(product, 0))?,
+                    le_u32(product, 4),
+                    "RASC product guid",
+                )?,
+                extra: u64_at(product, 8, "RASC product extra")?,
+            });
+        }
+        Ok(RascSourceGroup { source, products })
+    })?;
+    cursor = checked_add(
+        cursor,
+        checked_mul(source_group_count, RASC_SOURCE_GROUP_LEN)?,
+    )?;
+
+    // [b] path-hash -> AssetId. The hash is `AZ::Uuid::CreateName(normalize(path))`
+    // stored as a GUID in the shared guid table.
+    let path_id_count = usize_from_u32(u32_at(bytes, cursor, "RASC path id count")?)?;
+    cursor = checked_add(cursor, 4)?;
+    let path_id_start = cursor;
+    let path_ids = runner.try_map_indexed(path_id_count, |index| {
+        let record = slice_at(
+            bytes,
+            checked_add(path_id_start, checked_mul(index, RASC_PATH_ID_LEN)?)?,
+            RASC_PATH_ID_LEN,
+            "RASC path id",
+        )?;
+        Ok(PathId {
+            path_hash: guid_bytes_by_index(
+                bytes,
+                guid_base,
+                usize_from_u32(le_u32(record, 0))?,
+                "RASC path hash guid",
+            )?,
+            asset_id: asset_id_by_index(
+                bytes,
+                guid_base,
+                usize_from_u32(le_u32(record, 4))?,
+                le_u32(record, 8),
+                "RASC path asset guid",
+            )?,
+        })
+    })?;
+    cursor = checked_add(cursor, checked_mul(path_id_count, RASC_PATH_ID_LEN)?)?;
+
+    // [c] legacy-AssetId -> real-AssetId redirect.
+    let legacy_count = usize_from_u32(u32_at(bytes, cursor, "RASC legacy mapping count")?)?;
+    cursor = checked_add(cursor, 4)?;
+    let legacy_start = cursor;
+    let legacy_mappings = runner.try_map_indexed(legacy_count, |index| {
+        let record = slice_at(
+            bytes,
+            checked_add(legacy_start, checked_mul(index, RASC_LEGACY_MAPPING_LEN)?)?,
+            RASC_LEGACY_MAPPING_LEN,
+            "RASC legacy mapping",
+        )?;
+        Ok(LegacyAssetIdMapping::new(
+            asset_id_by_index(
+                bytes,
+                guid_base,
+                usize_from_u32(le_u32(record, 0))?,
+                le_u32(record, 4),
+                "RASC legacy guid",
+            )?,
+            asset_id_by_index(
+                bytes,
+                guid_base,
+                usize_from_u32(le_u32(record, 8))?,
+                le_u32(record, 12),
+                "RASC real guid",
+            )?,
+        ))
+    })?;
+
+    let (by_path_hash, by_legacy_id) = runner.join(
+        || {
+            path_ids
+                .iter()
+                .map(|entry| (entry.path_hash(), entry.asset_id()))
+                .collect()
+        },
+        || {
+            legacy_mappings
+                .iter()
+                .map(|mapping| (mapping.legacy(), mapping.real()))
+                .collect()
+        },
+    );
+
+    let mut rasc = Rasc::new_with_runner(version, entries, runner);
+    rasc.source_groups = source_groups;
+    rasc.path_ids = path_ids;
+    rasc.legacy_mappings = legacy_mappings;
+    rasc.by_path_hash = by_path_hash;
+    rasc.by_legacy_id = by_legacy_id;
+    Ok(rasc)
+}
+
+/// Read a 16-byte GUID from the shared guid table by index.
+fn guid_by_index(
+    bytes: &[u8],
+    base: usize,
+    index: usize,
+    label: &'static str,
+) -> Result<Uuid, Error> {
+    uuid_at(
+        bytes,
+        checked_add(base, checked_mul(index, GUID_LEN)?)?,
+        label,
+    )
+}
+
+/// Read the raw 16 bytes of a GUID-table entry by index.
+fn guid_bytes_by_index(
+    bytes: &[u8],
+    base: usize,
+    index: usize,
+    label: &'static str,
+) -> Result<[u8; 16], Error> {
+    array_at::<16>(
+        bytes,
+        checked_add(base, checked_mul(index, GUID_LEN)?)?,
+        label,
+    )
+}
+
+/// Build an [`AssetId`] from a guid-table index plus a sub id.
+fn asset_id_by_index(
+    bytes: &[u8],
+    base: usize,
+    index: usize,
+    sub_id: u32,
+    label: &'static str,
+) -> Result<AssetId, Error> {
+    Ok(AssetId::new(
+        guid_by_index(bytes, base, index, label)?,
+        sub_id,
+    ))
 }
 
 fn parse_raoc(bytes: &[u8], runner: &nw_jobs::JobRunner) -> Result<Raoc, Error> {
@@ -1336,6 +1648,262 @@ mod tests {
         };
 
         assert_eq!(entry.extension(), "dds");
+    }
+
+    fn le(value: u32) -> [u8; 4] {
+        value.to_le_bytes()
+    }
+
+    fn rasc_entry(
+        guid: u32,
+        sub: u32,
+        type_index: u32,
+        size: u32,
+        dir_off: u32,
+        file_off: u32,
+    ) -> [u8; 40] {
+        let mut record = [0u8; 40];
+        record[0..4].copy_from_slice(&le(guid)); // rec[0] guid index
+        record[4..8].copy_from_slice(&le(sub)); // rec[1] sub id
+        // rec[2]/rec[3] are the value-record's echo of the AssetId; in the real
+        // catalog they equal the primary (guid, sub id), so mirror that here.
+        record[8..12].copy_from_slice(&le(guid));
+        record[12..16].copy_from_slice(&le(sub));
+        record[16..20].copy_from_slice(&le(type_index)); // rec[4]
+        record[24..28].copy_from_slice(&le(size)); // rec[6]
+        record[32..36].copy_from_slice(&le(dir_off)); // rec[8]
+        record[36..40].copy_from_slice(&le(file_off)); // rec[9]
+        record
+    }
+
+    /// Build a self-contained `RASC` exercising entries plus all three side
+    /// tables (source-group, path-hash, and legacy redirect). The product
+    /// array is placed last so its base (`@32`) is strictly below the file
+    /// size, which the old (removed) sentinel check would have rejected.
+    fn build_rasc_fixture() -> (Vec<u8>, RascFixture) {
+        let path_a = "objects/weapons/sword.dds";
+        let path_b = "root.txt";
+        let sub_a = 0x0002_0000u32;
+        let sub_b = 3u32;
+        let prod_sub = 9u32;
+
+        let guid_a = [0xA0u8; 16];
+        let guid_b = [0xB0u8; 16];
+        let guid_legacy = [0x4Cu8; 16];
+        let guid_product = [0x5Du8; 16];
+        let type0 = [0x71u8; 16];
+        let type1 = [0x72u8; 16];
+        let hash_a = asset_path_hash(path_a);
+        let hash_b = asset_path_hash(path_b);
+        // guid table indices: 0=A 1=B 2=hashA 3=hashB 4=legacy 5=product
+        let guid_table = [guid_a, guid_b, hash_a, hash_b, guid_legacy, guid_product];
+        let type_table = [type0, type1];
+
+        let mut dir_blob = vec![0u8]; // offset 0 -> "" (entry B)
+        let dir_a_off = dir_blob.len() as u32;
+        dir_blob.extend_from_slice(b"objects/weapons\0");
+
+        let mut file_blob = Vec::new();
+        let file_a_off = file_blob.len() as u32;
+        file_blob.extend_from_slice(b"sword.dds\0");
+        let file_b_off = file_blob.len() as u32;
+        file_blob.extend_from_slice(b"root.txt\0");
+
+        let mut body = Vec::new();
+        // entry table
+        body.extend_from_slice(&rasc_entry(0, sub_a, 0, 1234, dir_a_off, file_a_off));
+        body.extend_from_slice(&rasc_entry(1, sub_b, 1, 7, 0, file_b_off));
+        // [a] source-group table: one group with one product.
+        body.extend_from_slice(&le(1));
+        body.extend_from_slice(&le(0)); // source guid index
+        body.extend_from_slice(&le(sub_a)); // source sub id
+        body.extend_from_slice(&le(1)); // group count
+        body.extend_from_slice(&le(0)); // group base index into product array
+        // [b] path-hash table: two rows.
+        body.extend_from_slice(&le(2));
+        body.extend_from_slice(&le(2)); // path hash guid index
+        body.extend_from_slice(&le(0)); // asset guid index
+        body.extend_from_slice(&le(sub_a));
+        body.extend_from_slice(&le(3));
+        body.extend_from_slice(&le(1));
+        body.extend_from_slice(&le(sub_b));
+        // [c] legacy redirect table: one row.
+        body.extend_from_slice(&le(1));
+        body.extend_from_slice(&le(4)); // legacy guid index
+        body.extend_from_slice(&le(0)); // legacy sub id
+        body.extend_from_slice(&le(0)); // real guid index
+        body.extend_from_slice(&le(sub_a)); // real sub id
+        // guid table
+        let guid_base = 40 + body.len();
+        for guid in &guid_table {
+            body.extend_from_slice(guid);
+        }
+        // type table
+        let type_base = 40 + body.len();
+        for kind in &type_table {
+            body.extend_from_slice(kind);
+        }
+        // directory string blob
+        let dir_base = 40 + body.len();
+        body.extend_from_slice(&dir_blob);
+        // file string blob
+        let file_base = 40 + body.len();
+        body.extend_from_slice(&file_blob);
+        // product array (last -> base < file size)
+        let product_base = 40 + body.len();
+        body.extend_from_slice(&le(5)); // product guid index
+        body.extend_from_slice(&le(prod_sub));
+        body.extend_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
+
+        let total = 40 + body.len();
+        let mut bytes = Vec::with_capacity(total);
+        bytes.extend_from_slice(RASC_SIGNATURE);
+        bytes.extend_from_slice(&le(RASC_VERSION));
+        bytes.extend_from_slice(&(total as u64).to_le_bytes());
+        bytes.extend_from_slice(&le(guid_base as u32));
+        bytes.extend_from_slice(&le(type_base as u32));
+        bytes.extend_from_slice(&le(dir_base as u32));
+        bytes.extend_from_slice(&le(file_base as u32));
+        bytes.extend_from_slice(&le(product_base as u32));
+        bytes.extend_from_slice(&le(2)); // entry count
+        bytes.extend_from_slice(&body);
+
+        let fixture = RascFixture {
+            asset_a: AssetId::new(Uuid::from_bytes(guid_a), sub_a),
+            asset_b: AssetId::new(Uuid::from_bytes(guid_b), sub_b),
+            type_a: AssetType::new(Uuid::from_bytes(type0)),
+            legacy: AssetId::new(Uuid::from_bytes(guid_legacy), 0),
+            product: AssetId::new(Uuid::from_bytes(guid_product), prod_sub),
+            hash_a,
+            product_base_below_file_size: (product_base as u64) < (total as u64),
+        };
+        (bytes, fixture)
+    }
+
+    struct RascFixture {
+        asset_a: AssetId,
+        asset_b: AssetId,
+        type_a: AssetType,
+        legacy: AssetId,
+        product: AssetId,
+        hash_a: [u8; 16],
+        product_base_below_file_size: bool,
+    }
+
+    #[test]
+    fn parses_rasc_with_all_three_side_tables() {
+        let (bytes, fixture) = build_rasc_fixture();
+        // The @32 product base is strictly below file size: the old sentinel
+        // check (file_size == @32) would have wrongly rejected this catalog.
+        assert!(fixture.product_base_below_file_size);
+
+        let rasc = Rasc::parse(&bytes).unwrap();
+
+        // Entries.
+        assert_eq!(rasc.len(), 2);
+        assert_eq!(
+            rasc.entry_by_path("objects/weapons/sword.dds")
+                .unwrap()
+                .asset_id(),
+            fixture.asset_a
+        );
+        assert_eq!(
+            rasc.entry_by_path("objects/weapons/sword.dds")
+                .unwrap()
+                .asset_type(),
+            fixture.type_a
+        );
+        assert_eq!(rasc.entry(fixture.asset_a).unwrap().size_bytes(), 1234);
+        assert_eq!(
+            rasc.entry_by_path("root.txt").unwrap().asset_id(),
+            fixture.asset_b
+        );
+
+        // [b] path-hash lookups (case/separator insensitive through id_by_path).
+        assert_eq!(rasc.path_ids().len(), 2);
+        assert_eq!(rasc.id_by_path_hash(&fixture.hash_a), Some(fixture.asset_a));
+        assert_eq!(
+            rasc.id_by_path(r"Objects\Weapons\Sword.DDS"),
+            Some(fixture.asset_a)
+        );
+
+        // [c] legacy redirect table is parsed and non-empty.
+        assert_eq!(rasc.legacy_mappings().len(), 1);
+        assert_eq!(
+            rasc.resolve_legacy_id(fixture.legacy),
+            Some(fixture.asset_a)
+        );
+
+        // [a] source-group table with its product from the @32 array.
+        assert_eq!(rasc.source_groups().len(), 1);
+        let group = &rasc.source_groups()[0];
+        assert_eq!(group.source(), fixture.asset_a);
+        assert_eq!(group.products().len(), 1);
+        assert_eq!(group.products()[0].asset_id(), fixture.product);
+        assert_eq!(group.products()[0].extra(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn rejects_wrong_rasc_version() {
+        let (mut bytes, _) = build_rasc_fixture();
+        bytes[4..8].copy_from_slice(&le(2));
+        let error = Rasc::parse(&bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::UnsupportedVersion {
+                kind: Kind::Rasc,
+                actual: 2,
+                expected: RASC_VERSION
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_rasc_declared_size_larger_than_input() {
+        let (mut bytes, _) = build_rasc_fixture();
+        let oversized = (bytes.len() as u64) + 1;
+        bytes[8..16].copy_from_slice(&oversized.to_le_bytes());
+        assert!(matches!(
+            Rasc::parse(&bytes).unwrap_err(),
+            Error::RascSizeExceedsInput { .. }
+        ));
+    }
+
+    #[test]
+    fn real_rasc_and_raoc_catalogs_parse_when_present() {
+        let rasc_path = Path::new(r"E:\Projects\new-world\resources\assetcatalog.catalog");
+        if !rasc_path.exists() {
+            eprintln!(
+                "skipping: real RASC catalog not present at {}",
+                rasc_path.display()
+            );
+            return;
+        }
+        let bytes = std::fs::read(rasc_path).unwrap();
+        let rasc = Rasc::parse(&bytes).unwrap();
+        assert_eq!(rasc.version(), RASC_VERSION);
+        assert!(!rasc.is_empty(), "real catalog should have product entries");
+        // The standalone RASC carries a large legacy-redirect table that the old
+        // parser silently dropped; assert it is now recovered and non-empty.
+        assert!(
+            !rasc.legacy_mappings().is_empty(),
+            "real RASC legacy redirect table must be non-empty"
+        );
+        assert!(!rasc.path_ids().is_empty());
+        // The recovered redirect resolves.
+        let mapping = rasc.legacy_mappings()[0];
+        assert_eq!(
+            rasc.resolve_legacy_id(mapping.legacy()),
+            Some(mapping.real())
+        );
+
+        let raoc_path =
+            Path::new(r"E:\Projects\new-world\resources\assetcatalog_optimized.catalog");
+        if raoc_path.exists() {
+            let raoc_bytes = std::fs::read(raoc_path).unwrap();
+            let raoc = Raoc::parse(&raoc_bytes).unwrap();
+            assert!(!raoc.is_empty());
+        }
     }
 
     fn raoc_header(entry_count: u32) -> Vec<u8> {

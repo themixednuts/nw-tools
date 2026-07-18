@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfDamagedByPowerLevel;
+pub struct ActionConditionIfDamagedByPowerLevel {}
 
 impl AzRtti for ActionConditionIfDamagedByPowerLevel {
     const NAME: &'static str = "ActionConditionIfDamagedByPowerLevel";

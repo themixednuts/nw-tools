@@ -1,0 +1,101 @@
+    private NestedTypeShape uniqueSerializeHandlerValueShape(
+        FieldCall field,
+        Function function,
+        NestedTypeShape layout) {
+
+        if (field == null || function == null || layout == null ||
+            layout.nativeSize == null || layout.nativeSize <= 0L ||
+            !Boolean.TRUE.equals(layout.layoutProven) || layout.members.isEmpty()) {
+            return null;
+        }
+
+        LinkedHashMap<Long, NestedTypeMember> observed = new LinkedHashMap<>();
+        for (NestedTypeMember member : layout.members) {
+            long offset = member.nativeOffset == null ? member.offset : member.nativeOffset;
+            if (offset < 0L || observed.putIfAbsent(offset, member) != null) {
+                recordNestedTypeShapeReject("handler-value-native-offset-conflict");
+                return null;
+            }
+        }
+        String observedLayout = containerNativeLayoutKey(layout.nativeSize, observed);
+        if (observedLayout == null) {
+            return null;
+        }
+
+        LinkedHashMap<String, SerializeTypeInfo> matches = new LinkedHashMap<>();
+        for (SerializeTypeInfo candidate :
+                serializeTypesWithExactNativeSize(layout.nativeSize)) {
+            List<SerializeWireSlot> expected =
+                serializeTypeNativeWireLayout(candidate.typeId);
+            if (expected.size() != observed.size() ||
+                !observedLayout.equals(nativeWireLayoutKey(layout.nativeSize, expected)) ||
+                !provenHandlerMemberTypesMatch(observed, expected)) {
+                continue;
+            }
+            matches.putIfAbsent(normalizeUuid(candidate.typeId), candidate);
+        }
+        if (matches.size() != 1) {
+            if (matches.size() > 1) {
+                recordNestedTypeShapeReject("ambiguous-handler-serialize-native-layout");
+            }
+            return null;
+        }
+
+        SerializeTypeInfo reflected = matches.values().iterator().next();
+        NestedTypeShape shape = exactContainerValueShapeForBase(
+            reflected,
+            function,
+            field.handlerVtable,
+            "param_1",
+            observed,
+            serializeTypeNativeWireLayout(reflected.typeId),
+            layout.nativeSize,
+            0L);
+        if (shape == null) {
+            recordNestedTypeShapeReject("unique-handler-serialize-layout-rejected");
+            return null;
+        }
+
+        String source =
+            "handler-storage-window+constructor-member-types+unique-serialize-native-layout";
+        shape.typeId = normalizeUuid(reflected.typeId);
+        shape.typeIdSource = source;
+        shape.identityProven = true;
+        shape.identitySource = source;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(reflected.name);
+        shape.typeNameFull = reflected.name;
+        shape.typeNameSource = source;
+        shape.constructor = handlerOwnerConstructor(field);
+        shape.nativeSize = layout.nativeSize;
+        shape.nativeSizeSource = "field-handler-is-default-storage-pair";
+        shape.validation = appendValidation(shape.validation, source);
+        for (NestedTypeMember member : shape.members) {
+            member.typeIdentitySource = source;
+        }
+        return shape;
+    }
+
+    private boolean provenHandlerMemberTypesMatch(
+        Map<Long, NestedTypeMember> observed,
+        List<SerializeWireSlot> expected) {
+
+        LinkedHashMap<Long, SerializeWireSlot> expectedByOffset = new LinkedHashMap<>();
+        for (SerializeWireSlot slot : expected) {
+            if (expectedByOffset.putIfAbsent(slot.offset, slot) != null) {
+                return false;
+            }
+        }
+        for (Map.Entry<Long, NestedTypeMember> entry : observed.entrySet()) {
+            NestedTypeMember member = entry.getValue();
+            if (member == null || !Boolean.TRUE.equals(member.typeIdentityProven) ||
+                member.typeId == null) {
+                continue;
+            }
+            SerializeWireSlot slot = expectedByOffset.get(entry.getKey());
+            if (slot == null || slot.typeId == null ||
+                !uuidEquals(member.typeId, slot.typeId)) {
+                return false;
+            }
+        }
+        return true;
+    }

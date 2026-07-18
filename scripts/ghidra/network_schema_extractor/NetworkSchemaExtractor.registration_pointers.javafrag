@@ -1,0 +1,27 @@
+    private Address registrationCodePointer(Address slotAddress) {
+        Address raw = readPointer(slotAddress);
+        Address resolved = resolvedCodeTarget(raw);
+        if (isExecutableAddress(resolved) || raw == null) {
+            return resolved;
+        }
+
+        long rawOffset = raw.getOffset();
+        long poison = rawOffset & 0x0000ffffc0000000L;
+        if (poison != 0x0000ffeac0000000L) {
+            return resolved;
+        }
+
+        long relativeOffset = rawOffset & 0x3fffffffL;
+        Address candidate;
+        try {
+            candidate = currentProgram.getImageBase().add(relativeOffset);
+        }
+        catch (AddressOutOfBoundsException ignored) {
+            return resolved;
+        }
+        if (!isExecutableAddress(candidate)) {
+            return resolved;
+        }
+        runMetrics.increment("registrationCodePointerRepairs");
+        return resolvedCodeTarget(candidate);
+    }

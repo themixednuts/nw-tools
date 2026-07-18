@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use nw_objectstream::type_uuid::type_ids;
@@ -9,7 +10,8 @@ use crate::native::native_reflected_type_name;
 
 const MAX_TYPE_DEPTH: usize = 32;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", rename_all_fields = "camelCase")]
 pub enum ResolvedType {
     Scalar(ScalarType),
     Named {
@@ -95,7 +97,8 @@ impl ResolvedType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ScalarType {
     Char,
     SignedChar,
@@ -161,7 +164,8 @@ impl ScalarType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SequenceKind {
     Vector,
     FixedVector,
@@ -173,14 +177,16 @@ pub enum SequenceKind {
     BitSet,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum MapKind {
     Map,
     UnorderedMap,
     UnorderedFlatMap,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum PointerKind {
     Unique,
     Shared,

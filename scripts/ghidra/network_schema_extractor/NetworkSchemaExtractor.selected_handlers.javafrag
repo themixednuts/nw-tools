@@ -1,0 +1,162 @@
+    private JsonObject selectedHandlerVtableReport(String requestedAddresses) throws Exception {
+        LinkedHashMap<String, Address> selected = new LinkedHashMap<>();
+        for (String value : requestedAddresses.split(",")) {
+            if (value.isBlank()) {
+                continue;
+            }
+            Address address = moduleRelativeAddress(value.strip());
+            if (!isProgramAddress(address)) {
+                throw new IllegalArgumentException(
+                    "Handler vtable is outside the program: " + value);
+            }
+            selected.putIfAbsent(address.toString(), address);
+        }
+        if (selected.isEmpty()) {
+            throw new IllegalArgumentException("No handler vtable addresses were provided");
+        }
+
+        JsonArray handlers = new JsonArray();
+        for (Address address : selected.values()) {
+            List<FieldCall> fields = selectedHandlerFields(address);
+            String handlerTypeName = fields.stream()
+                .map(field -> fieldHandlerTypeName(field.handlerConstruction, address))
+                .filter(Objects::nonNull)
+                .distinct()
+                .collect(Collectors.collectingAndThen(
+                    Collectors.toList(),
+                    names -> names.size() == 1 ? names.get(0) : null));
+            JsonObject handler = fieldHandlerVtableJson(
+                address,
+                0,
+                handlerTypeName,
+                handlerTypeName == null ? null : "handler-constructor-template",
+                fields);
+            addSelectedHandlerEntityRefEvidence(handler, address);
+            handlers.add(handler);
+        }
+
+        JsonObject report = new JsonObject();
+        report.addProperty("schema", "newworld.network_schema.handler_probe.v1");
+        report.addProperty("extractorVersion", EXTRACTOR_VERSION);
+        report.addProperty("program", currentProgram.getName());
+        report.addProperty("imageBase", formatAddress(currentProgram.getImageBase()));
+        report.add("fieldHandlerVtables", handlers);
+        report.add(
+            "nestedTypeShapeRejectSummary",
+            countMapJson(nestedTypeShapeRejectCounts));
+        report.add(
+            "containerValueShapeDiagnostics",
+            containerValueShapeDiagnosticsJson());
+        report.add(
+            "helperStoreRelationDiagnostics",
+            helperStoreRelationDiagnosticsJson());
+        return report;
+    }
+
+    private List<FieldCall> selectedHandlerFields(Address vtable) throws Exception {
+        LinkedHashMap<String, Function> owners = new LinkedHashMap<>();
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(vtable);
+        while (references.hasNext()) {
+            monitor.checkCancelled();
+            Function owner = functionAtOrContaining(references.next().getFromAddress());
+            if (owner != null) {
+                owners.putIfAbsent(owner.getEntryPoint().toString(), owner);
+            }
+        }
+
+        LinkedHashMap<String, FieldCall> fields = new LinkedHashMap<>();
+        for (Function owner : owners.values()) {
+            for (VtableWrite write : constructorVtableWrites(owner.getEntryPoint())) {
+                if (!vtable.equals(write.vtable) || write.thisOffset == null) {
+                    continue;
+                }
+                String key = write.function + ":" + write.thisOffset;
+                if (fields.containsKey(key)) {
+                    continue;
+                }
+                Function constructor = functionAtOrContaining(write.function);
+                FieldCall field = new FieldCall();
+                field.index = fields.size();
+                field.handlerOffset = write.thisOffset;
+                field.handlerVtable = vtable;
+                field.handlerConstruction = new HandlerConstruction(
+                    write.pattern,
+                    write.instruction,
+                    write.function,
+                    fullFunctionName(constructor),
+                    vtable);
+                field.nestedTypeShape = recoverHandlerValueTypeShape(field);
+                fields.put(key, field);
+            }
+        }
+        return List.copyOf(fields.values());
+    }
+
+    private JsonObject containerValueShapeDiagnosticsJson() {
+        JsonObject diagnostics = new JsonObject();
+        diagnostics.add("rejectSamples", containerValueShapeRejectSamples.deepCopy());
+        diagnostics.add(
+            "countedCollectionRejectSummary",
+            countMapJson(countedCollectionRejectCounts));
+        diagnostics.add(
+            "countedCollectionRejectSamples",
+            countedCollectionRejectSamples.deepCopy());
+        diagnostics.addProperty("countedCollectionsRecovered", countedCollectionsRecovered);
+        diagnostics.addProperty("countedCollectionsApplied", countedCollectionsApplied);
+        diagnostics.add(
+            "countedCollectionRecoveredSamples",
+            countedCollectionRecoveredSamples.deepCopy());
+        return diagnostics;
+    }
+
+    private void addSelectedHandlerEntityRefEvidence(
+        JsonObject handler,
+        Address vtable) {
+
+        Address marshalAddress = readPointer(
+            vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
+        Function marshal = functionAtOrContaining(resolvedCodeTarget(marshalAddress));
+        EntityRefCodecEvidence marshalEvidence = findEntityRefCodecEvidence(
+            marshal,
+            "param_2",
+            NetworkSchemaCodecClassifier.CodecDirection.ENCODE);
+
+        Address unmarshalAddress = readPointer(
+            vtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        Function unmarshal = functionAtOrContaining(resolvedCodeTarget(unmarshalAddress));
+        List<String> readBuffers = readBufferParameters(unmarshal);
+        EntityRefCodecEvidence unmarshalEvidence = readBuffers.size() == 1
+            ? findEntityRefCodecEvidence(
+                unmarshal,
+                readBuffers.get(0),
+                NetworkSchemaCodecClassifier.CodecDirection.DECODE)
+            : null;
+
+        if (marshalEvidence == null && unmarshalEvidence == null) {
+            return;
+        }
+        JsonObject evidence = new JsonObject();
+        if (marshalEvidence != null) {
+            evidence.add("marshal", entityRefCodecEvidenceJson(marshalEvidence));
+        }
+        if (unmarshalEvidence != null) {
+            evidence.add("unmarshal", entityRefCodecEvidenceJson(unmarshalEvidence));
+        }
+        handler.add("entityRefCodecEvidence", evidence);
+    }
+
+    private JsonObject entityRefCodecEvidenceJson(EntityRefCodecEvidence evidence) {
+        JsonObject object = new JsonObject();
+        NetworkSchemaJson.add(object, "function", formatAddress(evidence.function()));
+        Function function = functionAtOrContaining(evidence.function());
+        NetworkSchemaJson.add(object, "functionName", fullFunctionName(function));
+        NetworkSchemaJson.add(object, "bufferParameter", evidence.bufferParameter());
+        NetworkSchemaJson.add(object, "direction", evidence.direction());
+        object.addProperty("conditionalFlag", evidence.conditionalFlag());
+        object.addProperty("nestedString", evidence.nestedString());
+        object.addProperty("flagsByte", evidence.flagsByte());
+        object.addProperty("uuidBytes", evidence.uuidBytes());
+        object.addProperty("complete", evidence.isComplete());
+        return object;
+    }

@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfPlayerIsLoggedOff;
+pub struct ActionConditionIfPlayerIsLoggedOff {}
 
 impl AzRtti for ActionConditionIfPlayerIsLoggedOff {
     const NAME: &'static str = "ActionConditionIfPlayerIsLoggedOff";

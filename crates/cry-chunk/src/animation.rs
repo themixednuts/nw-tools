@@ -1392,6 +1392,15 @@ fn decode_rotations(
     track: ControllerTrack<'_>,
     controller_id: u32,
 ) -> Result<Vec<[f32; 4]>, CafDecodeError> {
+    // The runtime sampler (@ 0x7ff606ed5860) only handles formats 1/5/6/8 and
+    // routes format 0 to "Unknown Rotation Compression format %i". A track
+    // with no keys never reaches the sampler, so it stays accepted here.
+    if track.format == 0 && track.key_count > 0 {
+        return Err(CafDecodeError::UnsupportedTrackFormat {
+            track: "rotation",
+            format: track.format,
+        });
+    }
     let stride = match track.format {
         0 | 1 => 16,
         5 => 6,
@@ -1413,6 +1422,13 @@ fn decode_rotations(
 
     let mut rotations = Vec::with_capacity(track.key_count);
     for bytes in track.data[..expected].chunks_exact(stride) {
+        // The sampler (@ 0x7ff606ed5860) short-circuits format 6 to a zero
+        // quaternion; no non-extended SmallTree64 decoder exists in the
+        // binary, so the raw bits are never inspected.
+        if track.format == 6 {
+            rotations.push([0.0, 0.0, 0.0, 0.0]);
+            continue;
+        }
         let q = match track.format {
             0 | 1 => [
                 f32_from_le_bytes(bytes[0..4].try_into().expect("x")),
@@ -1421,8 +1437,7 @@ fn decode_rotations(
                 f32_from_le_bytes(bytes[12..16].try_into().expect("w")),
             ],
             5 => decode_small_tree_48(bytes.try_into().expect("48-bit quat")),
-            6 => decode_small_tree_64(bytes.try_into().expect("64-bit quat"), false),
-            8 => decode_small_tree_64(bytes.try_into().expect("64-bit ext quat"), true),
+            8 => decode_small_tree_64(bytes.try_into().expect("64-bit ext quat")),
             _ => unreachable!("format checked above"),
         };
         rotations
@@ -1444,33 +1459,23 @@ fn decode_small_tree_48(bytes: [u8; 6]) -> [f32; 4] {
     expand_missing_component(index, packed, [23_170.0; 3], [0.707_106_77; 3])
 }
 
-fn decode_small_tree_64(bytes: [u8; 8], extended: bool) -> [f32; 4] {
+/// Decodes the 64-bit SmallTree64 "extended" quaternion format (format 8).
+/// Format 6 uses the same on-disk layout but the engine never decodes it
+/// (see `decode_rotations`), so no non-extended variant exists here.
+fn decode_small_tree_64(bytes: [u8; 8]) -> [f32; 4] {
     let m1 = u32::from_le_bytes(bytes[0..4].try_into().expect("m1"));
     let m2 = u32::from_le_bytes(bytes[4..8].try_into().expect("m2"));
     let index = ((m2 >> 30) & 3) as usize;
-    if extended {
-        expand_missing_component(
-            index,
-            [
-                m1 & 0x1f_ffff,
-                ((m1 >> 21) + (m2 << 11)) & 0x1f_ffff,
-                (m2 >> 10) & 0x0f_ffff,
-            ],
-            [1_482_909.0, 1_482_909.0, 741_454.0],
-            [0.707_106_77, 0.707_106_77, 0.707_106_77],
-        )
-    } else {
-        expand_missing_component(
-            index,
-            [
-                m1 & 0x0f_ffff,
-                ((m1 >> 20) + (m2 << 12)) & 0x0f_ffff,
-                (m2 >> 8) & 0x0f_ffff,
-            ],
-            [741_454.0; 3],
-            [0.707_106_77; 3],
-        )
-    }
+    expand_missing_component(
+        index,
+        [
+            m1 & 0x1f_ffff,
+            ((m1 >> 21) + (m2 << 11)) & 0x1f_ffff,
+            (m2 >> 10) & 0x0f_ffff,
+        ],
+        [1_482_909.0, 1_482_909.0, 741_454.0],
+        [0.707_106_77, 0.707_106_77, 0.707_106_77],
+    )
 }
 
 fn expand_missing_component(
@@ -1527,20 +1532,70 @@ mod tests {
 
     #[test]
     fn decodes_small_tree_64_identity_quaternion() {
-        let bytes = pack_small_tree_64([0.0, 0.0, 0.0, 1.0], false);
+        let bytes = pack_small_tree_64([0.0, 0.0, 0.0, 1.0]);
 
-        let q = normalize_quat(decode_small_tree_64(bytes, false)).unwrap();
+        let q = normalize_quat(decode_small_tree_64(bytes)).unwrap();
 
         assert_quat_close(q, [0.0, 0.0, 0.0, 1.0], 0.000001);
     }
 
     #[test]
-    fn decodes_small_tree_64_ext_identity_quaternion() {
-        let bytes = pack_small_tree_64([0.0, 0.0, 0.0, 1.0], true);
+    fn rotation_format_6_decodes_as_zero_quaternion() {
+        // Engine sampler (@ 0x7ff606ed5860) short-circuits format 6 to
+        // (0,0,0,0) regardless of the on-disk bits; no non-extended
+        // SmallTree64 decoder exists in the binary.
+        let bytes = pack_small_tree_64([0.0, 0.0, 0.0, 1.0]);
+        let track = ControllerTrack {
+            format: 6,
+            key_count: 1,
+            data: &bytes,
+        };
 
-        let q = normalize_quat(decode_small_tree_64(bytes, true)).unwrap();
+        let rotations = decode_rotations(track, 0).unwrap();
 
-        assert_quat_close(q, [0.0, 0.0, 0.0, 1.0], 0.000001);
+        assert_eq!(rotations, [[0.0, 0.0, 0.0, 0.0]]);
+    }
+
+    #[test]
+    fn rotation_format_0_with_zero_keys_is_accepted() {
+        // Loader sizes format 0 at 16 bytes/key, but a zero-key track never
+        // reaches the sampler, so it must keep decoding to an empty track.
+        let track = ControllerTrack {
+            format: 0,
+            key_count: 0,
+            data: &[],
+        };
+
+        let rotations = decode_rotations(track, 0).unwrap();
+
+        assert!(rotations.is_empty());
+    }
+
+    #[test]
+    fn rotation_format_0_with_keys_is_rejected() {
+        // Sampler (@ 0x7ff606ed5860) has no case for format 0 and logs
+        // "Unknown Rotation Compression format %i"; a track with actual
+        // keys must fail to decode rather than being read as raw float4.
+        let mut data = Vec::new();
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        data.extend_from_slice(&1.0f32.to_le_bytes());
+        let track = ControllerTrack {
+            format: 0,
+            key_count: 1,
+            data: &data,
+        };
+
+        let err = decode_rotations(track, 0).unwrap_err();
+
+        assert!(matches!(
+            err,
+            CafDecodeError::UnsupportedTrackFormat {
+                track: "rotation",
+                format: 0
+            }
+        ));
     }
 
     #[test]
@@ -1624,7 +1679,8 @@ mod tests {
         push_u16(&mut data, 2); // one two-key position track
         push_format_counts(&mut data, 9, 0);
         push_u16(&mut data, 2); // one two-key rotation track
-        push_format_counts(&mut data, 9, 0);
+        // Rotation format 1 (raw float4); format 0 is rejected by the sampler.
+        push_format_counts(&mut data, 9, 1);
 
         push_i32(&mut data, 0); // time storage offset
         push_i32(&mut data, 8); // position storage offset
@@ -1754,12 +1810,12 @@ mod tests {
         ]
     }
 
-    fn pack_small_tree_64(q: [f32; 4], extended: bool) -> [u8; 8] {
+    fn pack_small_tree_64(q: [f32; 4]) -> [u8; 8] {
         let index = largest_abs_index(q);
         let mut value = 0u64;
         let mut shift = 0;
         for (slot, component) in components_except(index).into_iter().enumerate() {
-            let (range, max, bits) = if extended && slot < 2 {
+            let (range, max, bits) = if slot < 2 {
                 (0.707_106_77, 1_482_909.0, 21)
             } else {
                 (0.707_106_77, 741_454.0, 20)

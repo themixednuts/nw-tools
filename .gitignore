@@ -8,3 +8,6 @@ bun.lockb
 
 # ignore build dirs at any depth (nested crate targets)
 target/
+
+# scratch/probe/audit outputs
+/tmp/

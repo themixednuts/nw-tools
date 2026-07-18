@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct SpawnParticleEffect;
+pub struct SpawnParticleEffect {}
 
 impl AzRtti for SpawnParticleEffect {
     const NAME: &'static str = "SpawnParticleEffect";

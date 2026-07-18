@@ -1,0 +1,221 @@
+    private record MessageGraphRoots(
+        String rootParameter,
+        String readBufferParameter,
+        String evidenceSource) {}
+
+    private static final class MessageRootScore {
+        int callUses;
+        int nonZeroOffsets;
+        int preReadReturnAliases;
+
+        int score() {
+            return preReadReturnAliases * 1_000 + nonZeroOffsets * 10 + callUses;
+        }
+    }
+
+    private MessageGraphRoots discoverMessageGraphRoots(Function wrapper) {
+        if (wrapper == null) {
+            return null;
+        }
+        String cacheKey = functionCacheKey("message-graph-roots", wrapper);
+        Optional<MessageGraphRoots> cached = messageGraphRootsCache.get(cacheKey);
+        if (cached != null) {
+            runMetrics.increment("messageGraphRootsCacheHits");
+            return cached.orElse(null);
+        }
+        runMetrics.increment("messageGraphRootsCacheMisses");
+        HighFunction high = highFunction(wrapper);
+        if (high == null) {
+            messageGraphRootsCache.put(cacheKey, Optional.empty());
+            return null;
+        }
+        ArrayList<String> readBufferCandidates = new ArrayList<>();
+        int parameterCount = win64RegisterParameterCandidateCount(high);
+        for (int slot = 1; slot <= parameterCount; slot++) {
+            String parameter = "param_" + slot;
+            if (hasReadBufferFlow(wrapper, parameter, new LinkedHashSet<>())) {
+                readBufferCandidates.add(parameter);
+            }
+        }
+        if (readBufferCandidates.size() != 1) {
+            messageGraphRootsCache.put(cacheKey, Optional.empty());
+            return null;
+        }
+
+        String readBuffer = readBufferCandidates.get(0);
+        String root = discoverMessageRootParameter(wrapper, readBuffer);
+        MessageGraphRoots result = root == null
+            ? null
+            : new MessageGraphRoots(root, readBuffer, "pcode-buffer-and-return-flow");
+        messageGraphRootsCache.put(cacheKey, Optional.ofNullable(result));
+        return result;
+    }
+
+    private boolean hasReadBufferFlow(
+        Function function,
+        String parameter,
+        Set<String> activeContexts) {
+
+        return parameter != null && hasReadBufferFlow(
+            function,
+            new PcodeStorage(parameter, 0L),
+            activeContexts);
+    }
+
+    private boolean hasReadBufferFlow(
+        Function function,
+        PcodeStorage storage,
+        Set<String> activeContexts) {
+
+        if (function == null || storage == null) {
+            return false;
+        }
+        String context = functionCacheKey(
+            "read-buffer-flow:" + storage.expression(),
+            function);
+        Boolean cached = readBufferFlowCache.get(context);
+        if (cached != null) {
+            return cached;
+        }
+        if (!activeContexts.add(context)) {
+            return false;
+        }
+
+        boolean result = false;
+        try {
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                return false;
+            }
+            List<PcodeOpAST> operations = orderedPcodeOps(high);
+            for (PcodeOpAST operation : operations) {
+                if (storage.offset == 0L && directCursorReadEvent(
+                        high,
+                        operation,
+                        operations,
+                        storage.base) != null) {
+                    result = true;
+                    return true;
+                }
+                if (operation.getOpcode() != PcodeOp.CALL) {
+                    continue;
+                }
+                Function target = pcodeCallTarget(operation);
+                Integer slot = provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    storage);
+                if (target != null && slot != null) {
+                    if (pcodeReadRawWireEvidence(operation, target) != null ||
+                        hasReadBufferFlow(
+                            target,
+                            "param_" + slot,
+                            activeContexts)) {
+                        result = true;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        finally {
+            activeContexts.remove(context);
+            readBufferFlowCache.put(context, result);
+        }
+    }
+
+    private String discoverMessageRootParameter(
+        Function wrapper,
+        String readBufferParameter) {
+
+        HighFunction high = highFunction(wrapper);
+        if (high == null) {
+            return null;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        LinkedHashMap<String, MessageRootScore> scores = new LinkedHashMap<>();
+        int firstReadCall = operations.size();
+
+        for (int index = 0; index < operations.size(); index++) {
+            PcodeOpAST operation = operations.get(index);
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Integer readSlot = provenCallArgumentSlot(
+                wrapper,
+                operation,
+                target,
+                new PcodeStorage(readBufferParameter, 0L));
+            if (readSlot == null) {
+                continue;
+            }
+            firstReadCall = Math.min(firstReadCall, index);
+            int argumentCount = provenCallArgumentCount(operation, target);
+            for (int slot = 1; slot <= argumentCount; slot++) {
+                if (slot == readSlot) {
+                    continue;
+                }
+                PcodeStorage storage = provenCallArgumentStorage(
+                    wrapper,
+                    operation,
+                    target,
+                    slot);
+                if (!isMessageRootCandidate(storage, readBufferParameter)) {
+                    continue;
+                }
+                MessageRootScore score = scores.computeIfAbsent(
+                    storage.base,
+                    ignored -> new MessageRootScore());
+                score.callUses++;
+                if (storage.offset != 0L) {
+                    score.nonZeroOffsets++;
+                }
+            }
+        }
+
+        for (int index = 0; index < firstReadCall; index++) {
+            PcodeOpAST operation = operations.get(index);
+            if (operation.getOpcode() != PcodeOp.CALL || operation.getOutput() == null) {
+                continue;
+            }
+            PcodeStorage returned = pcodeStorageExpression(operation.getOutput());
+            if (!isMessageRootCandidate(returned, readBufferParameter) ||
+                returned.offset != 0L) {
+                continue;
+            }
+            scores.computeIfAbsent(returned.base, ignored -> new MessageRootScore())
+                .preReadReturnAliases++;
+        }
+
+        String selected = null;
+        int selectedScore = Integer.MIN_VALUE;
+        boolean ambiguous = false;
+        for (Map.Entry<String, MessageRootScore> entry : scores.entrySet()) {
+            MessageRootScore score = entry.getValue();
+            if (score.callUses == 0) {
+                continue;
+            }
+            int value = score.score();
+            if (value > selectedScore) {
+                selected = entry.getKey();
+                selectedScore = value;
+                ambiguous = false;
+            }
+            else if (value == selectedScore) {
+                ambiguous = true;
+            }
+        }
+        return ambiguous ? null : selected;
+    }
+
+    private boolean isMessageRootCandidate(
+        PcodeStorage storage,
+        String readBufferParameter) {
+
+        return storage != null &&
+            storage.offset >= 0L &&
+            formalParameterSlot(storage) != null &&
+            !storage.base.equals(readBufferParameter);
+    }

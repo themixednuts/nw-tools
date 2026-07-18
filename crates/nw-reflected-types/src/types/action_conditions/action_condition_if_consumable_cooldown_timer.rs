@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfConsumableCooldownTimer;
+pub struct ActionConditionIfConsumableCooldownTimer {}
 
 impl AzRtti for ActionConditionIfConsumableCooldownTimer {
     const NAME: &'static str = "ActionConditionIfConsumableCooldownTimer";

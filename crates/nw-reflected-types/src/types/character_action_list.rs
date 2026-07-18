@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct CharacterActionList;
+pub struct CharacterActionList {}
 
 impl AzRtti for CharacterActionList {
     const NAME: &'static str = "CharacterActionList";

@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfItemInSlotBroken;
+pub struct ActionConditionIfItemInSlotBroken {}
 
 impl AzRtti for ActionConditionIfItemInSlotBroken {
     const NAME: &'static str = "ActionConditionIfItemInSlotBroken";

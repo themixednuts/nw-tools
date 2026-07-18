@@ -3,6 +3,7 @@
 //! Follows `dev/Gems/CryLegacy/Code/Source/CryAction/Mannequin/AnimationDatabaseManager.cpp`.
 
 pub mod blend_space;
+pub mod fragment_audio;
 pub mod reflected;
 pub mod source_transform;
 
@@ -28,6 +29,10 @@ pub use blend_space::{
     COMBINED_BLEND_SPACE_SOURCE_SCHEMA, CombinedBlendSpace, CombinedBlendSpaceDimension,
     CombinedBlendSpaceSource, blend_space_source_path, is_legacy_blend_space_source,
     motion_parameter_id,
+};
+pub use fragment_audio::{
+    AUDIO_PROCEDURAL_TYPE, CHARACTER_EVENT_PROCEDURAL_TYPE, DO_NOTHING_TRIGGER, MannequinAudioClip,
+    MannequinAudioKind, MannequinFragmentAudio,
 };
 pub use source_transform::{
     MANNEQUIN_ACTIONS_SOURCE_SCHEMA, MANNEQUIN_ANIMATION_DATABASE_SOURCE_SCHEMA,

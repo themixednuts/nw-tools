@@ -24,12 +24,13 @@ use nw_datasheet::{
 };
 
 use affinity::apply_type_affinity;
+pub use color::is_hex_color_text;
 use evidence::{enum_shape_matches_source_token, parse_schema_bool};
 use foreign_keys::{
     apply_foreign_key_family_affinity, build_key_lookup, collect_key_indexes, infer_foreign_keys,
 };
 use number::NumberStats;
-use rules::scalar_enum_column_affinity;
+use rules::{scalar_enum_column_affinity, scalar_enum_shape_by_name};
 use syntax::{StringStats, is_empty_cell_for_column, schema_tokens};
 
 pub use model::*;
@@ -41,12 +42,39 @@ pub use range::{
     range_u32_from_text,
 };
 
+/// Returns the reflected semantic enum assigned to a logical row column.
+///
+/// Manager emitters use this same catalog as schema inference so generated
+/// semantic APIs cannot drift from the row schema they project.
+#[must_use]
+pub fn semantic_enum_shape_for_column(
+    row_type_name: &str,
+    column_name: &str,
+) -> Option<GameSystemEnumShape> {
+    scalar_enum_column_affinity(row_type_name, column_name)
+}
+
+/// Returns a reflected semantic enum by its canonical type identity.
+///
+/// This is used when a projection already carries its validated semantic type
+/// and needs the source discriminants without depending on a target language's
+/// generated conversion traits.
+#[must_use]
+pub fn semantic_enum_shape_by_name(name: &str) -> Option<GameSystemEnumShape> {
+    scalar_enum_shape_by_name(name)
+}
+
 const FOREIGN_KEY_CONFIDENCE_THRESHOLD: f64 = 0.80;
 const FOREIGN_KEY_MIN_CHECKED_VALUES: usize = 2;
 const FOREIGN_KEY_FAMILY_CONFIDENCE_THRESHOLD: f64 = 0.95;
 const FOREIGN_KEY_FAMILY_MIN_CHECKED_VALUES: usize = 20;
 const TYPE_AFFINITY_CONFIDENCE_THRESHOLD: f64 = 0.80;
 const NATIVE_NUMERIC_TEXT_CONFIDENCE_THRESHOLD: f64 = 0.75;
+
+#[must_use]
+pub fn native_float_prefix(value: &str) -> Option<&str> {
+    evidence::native_float_prefix(value)
+}
 
 #[derive(Debug, Clone)]
 struct ColumnAnalysis {

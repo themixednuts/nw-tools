@@ -1,0 +1,278 @@
+import ghidra.program.model.pcode.PcodeBlock;
+
+    private void applyContainerCodecGuards(
+        HighFunction high,
+        List<ContainerCodecCall> codecs) {
+
+        if (high == null || codecs == null || codecs.isEmpty()) {
+            return;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        for (ContainerCodecCall codec : codecs) {
+            applyContainerCodecGuards(high, operations, codec);
+        }
+    }
+
+    private void applyContainerCodecGuards(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        ContainerCodecCall codec) {
+
+        if (codec == null) {
+            return;
+        }
+        if (codec.operation != null) {
+            codec.guards.addAll(containerCodecGuards(
+                high,
+                operations,
+                codec.operation));
+        }
+    }
+
+    private List<ContainerCodecGuard> containerCodecGuards(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST member) {
+
+        if (!(member.getParent() instanceof PcodeBlockBasic memberBlock)) {
+            return List.of();
+        }
+        ArrayList<ContainerCodecGuard> result = new ArrayList<>();
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CBRANCH ||
+                operation.getNumInputs() < 2 ||
+                !(operation.getParent() instanceof PcodeBlockBasic guardBlock) ||
+                guardBlock.getOutSize() != 2 ||
+                !NetworkSchemaControlFlow.dominates(high, guardBlock, memberBlock)) {
+                continue;
+            }
+            PcodeBlock selectedSuccessor = uniqueGuardSuccessor(
+                guardBlock,
+                memberBlock);
+            if (selectedSuccessor == null) {
+                continue;
+            }
+            ContainerCodecGuard guard = containerCodecGuard(
+                high,
+                operations,
+                operation,
+                guardBlock,
+                selectedSuccessor);
+            if (guard != null && result.stream().noneMatch(existing ->
+                    sameContainerCodecGuard(existing, guard))) {
+                result.add(guard);
+            }
+        }
+        result.sort(Comparator.comparing(
+            ContainerCodecGuard::branch,
+            Comparator.nullsLast(Address::compareTo)));
+        return List.copyOf(result);
+    }
+
+    private PcodeBlock uniqueGuardSuccessor(
+        PcodeBlockBasic guardBlock,
+        PcodeBlockBasic memberBlock) {
+
+        PcodeBlock selected = null;
+        for (int edge = 0; edge < guardBlock.getOutSize(); edge++) {
+            PcodeBlock successor = guardBlock.getOut(edge);
+            PcodeBlock leaf = successor == null ? null : successor.getFrontLeaf();
+            if (!(leaf instanceof PcodeBlockBasic basic) ||
+                basic != memberBlock && !NetworkSchemaControlFlow.reaches(basic, memberBlock)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = successor;
+        }
+        return selected;
+    }
+
+    private ContainerCodecGuard containerCodecGuard(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST branch,
+        PcodeBlockBasic guardBlock,
+        PcodeBlock selectedSuccessor) {
+
+        GuardCondition condition = guardCondition(
+            branch.getInput(branch.getNumInputs() - 1),
+            false,
+            new LinkedHashSet<>());
+        if (condition == null) {
+            return null;
+        }
+        boolean memberOnTrue = guardBlock.getTrueOut() == selectedSuccessor;
+        if (condition.negated()) {
+            memberOnTrue = !memberOnTrue;
+        }
+        String kind = condition.storageAddress() != null
+            ? "global-boolean"
+            : condition.mask() == null
+            ? "boolean-storage"
+            : "storage-bit-mask";
+        ExternalConditionRecovery externalRecovery =
+            condition.storageAddress() == null
+                ? null
+                : recoverExternalBooleanCondition(
+                    high,
+                    operations,
+                    branch,
+                    guardBlock,
+                    condition.storageAddress());
+        ContainerExternalBooleanCondition externalCondition = externalRecovery == null
+            ? null
+            : externalRecovery.condition();
+        return new ContainerCodecGuard(
+            branch.getSeqnum().getTarget(),
+            kind,
+            condition.comparison(),
+            memberOnTrue,
+            condition.storage() == null ? null : condition.storage().base,
+            condition.storage() == null ? null : condition.storage().offset,
+            condition.storageAddress(),
+            condition.mask(),
+            externalCondition,
+            externalRecovery == null ? null : externalRecovery.diagnostic(),
+            externalCondition == null
+                ? "dominating-cbranch-pcode-storage"
+                : "dominating-cbranch-pcode-storage+external-condition-proof");
+    }
+
+    private GuardCondition guardCondition(
+        Varnode node,
+        boolean negated,
+        Set<String> active) {
+
+        if (node == null || !active.add(pcodeSsaNodeKey(node))) {
+            return null;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return null;
+        }
+        if (definition.getOpcode() == PcodeOp.COPY ||
+            definition.getOpcode() == PcodeOp.CAST) {
+            return guardCondition(definition.getInput(0), negated, active);
+        }
+        if (definition.getOpcode() == PcodeOp.BOOL_NEGATE) {
+            return guardCondition(definition.getInput(0), !negated, active);
+        }
+        if ((definition.getOpcode() != PcodeOp.INT_EQUAL &&
+            definition.getOpcode() != PcodeOp.INT_NOTEQUAL) ||
+            definition.getNumInputs() != 2) {
+            return null;
+        }
+        int zeroSlot = constantZeroSlot(definition);
+        if (zeroSlot < 0) {
+            return null;
+        }
+        Varnode value = definition.getInput(1 - zeroSlot);
+        String comparison = definition.getOpcode() == PcodeOp.INT_EQUAL
+            ? "equal-zero"
+            : "not-equal-zero";
+        PcodeOp valueDefinition = value.getDef();
+        Long mask = null;
+        if (valueDefinition != null &&
+            valueDefinition.getOpcode() == PcodeOp.INT_AND &&
+            valueDefinition.getNumInputs() == 2) {
+            int constantSlot = singleConstantSlot(valueDefinition);
+            if (constantSlot < 0) {
+                return null;
+            }
+            mask = NetworkSchemaIntegerEvaluator.evaluate(
+                valueDefinition.getInput(constantSlot));
+            value = valueDefinition.getInput(1 - constantSlot);
+        }
+        PcodeStorage storage = pcodeLoadedStorageExpression(value);
+        Address storageAddress = storage == null
+            ? absoluteLoadedStorageAddress(value)
+            : null;
+        return storage == null && storageAddress == null
+            ? null
+            : new GuardCondition(
+                storage,
+                storageAddress,
+                mask,
+                comparison,
+                negated);
+    }
+
+    private Address absoluteLoadedStorageAddress(Varnode node) {
+        Address direct = pcodeAddress(node);
+        if (isProgramAddress(direct)) {
+            return direct;
+        }
+        PcodeOp definition = node == null ? null : node.getDef();
+        while (definition != null &&
+            (definition.getOpcode() == PcodeOp.COPY ||
+                definition.getOpcode() == PcodeOp.CAST ||
+                definition.getOpcode() == PcodeOp.INDIRECT) &&
+            definition.getNumInputs() > 0) {
+            node = definition.getInput(0);
+            direct = pcodeAddress(node);
+            if (isProgramAddress(direct)) {
+                return direct;
+            }
+            definition = node.getDef();
+        }
+        if (definition == null || definition.getOpcode() != PcodeOp.LOAD ||
+            definition.getNumInputs() < 2) {
+            return null;
+        }
+        Varnode pointer = definition.getInput(1);
+        Address address = pcodeAddress(pointer);
+        Long evaluated = address == null
+            ? NetworkSchemaIntegerEvaluator.evaluate(pointer)
+            : null;
+        return address != null
+            ? address
+            : evaluated == null ? null : absoluteAddress(evaluated);
+    }
+
+    private int constantZeroSlot(PcodeOp operation) {
+        for (int slot = 0; slot < operation.getNumInputs(); slot++) {
+            Long value = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(slot));
+            if (value != null && value == 0L) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    private int singleConstantSlot(PcodeOp operation) {
+        int selected = -1;
+        for (int slot = 0; slot < operation.getNumInputs(); slot++) {
+            if (NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(slot)) == null) {
+                continue;
+            }
+            if (selected >= 0) {
+                return -1;
+            }
+            selected = slot;
+        }
+        return selected;
+    }
+
+    private boolean sameContainerCodecGuard(
+        ContainerCodecGuard left,
+        ContainerCodecGuard right) {
+
+        return Objects.equals(left.branch(), right.branch()) &&
+            left.kind().equals(right.kind()) &&
+            left.condition().equals(right.condition()) &&
+            left.memberOnTrue() == right.memberOnTrue() &&
+            Objects.equals(left.storageBase(), right.storageBase()) &&
+            Objects.equals(left.storageOffset(), right.storageOffset()) &&
+            Objects.equals(left.storageAddress(), right.storageAddress()) &&
+            Objects.equals(left.mask(), right.mask());
+    }
+
+    private record GuardCondition(
+        PcodeStorage storage,
+        Address storageAddress,
+        Long mask,
+        String comparison,
+        boolean negated) {
+    }

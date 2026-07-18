@@ -373,7 +373,7 @@ pub use self::action_condition_true::ActionConditionTrue;
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionCondition;
+pub struct ActionCondition {}
 
 impl AzRtti for ActionCondition {
     const NAME: &'static str = "ActionCondition";

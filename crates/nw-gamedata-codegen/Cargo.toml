@@ -16,15 +16,17 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22.1"
 clap = { workspace = true, features = ["derive"] }
 flate2.workspace = true
-gofmt.workspace = true
 heck.workspace = true
 nw-asset = { workspace = true, features = ["oodle"] }
 nw-datasheet.workspace = true
 nw-gamedata-manager-specs = { path = "../nw-gamedata-manager-specs" }
 nw-pak = { workspace = true, features = ["oodle"] }
 nw-serialize-codegen.workspace = true
+oxc_ast = "0.135"
+oxc_ast_visit = "0.135"
 oxc_allocator.workspace = true
 oxc_codegen.workspace = true
 oxc_parser.workspace = true
@@ -32,6 +34,7 @@ oxc_span.workspace = true
 prettyplease.workspace = true
 proc-macro2.workspace = true
 quote.workspace = true
+rayon.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true

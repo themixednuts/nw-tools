@@ -1,0 +1,455 @@
+    private PcodeStorage instructionCallRegisterStorage(
+        Function owner,
+        PcodeOp operation,
+        Function callTarget,
+        String register) {
+
+        ForwardArgState state = instructionStateBeforeCall(owner, operation, callTarget);
+        return state == null
+            ? null
+            : pcodeStorageFromTrackedValue(state.registers.get(register));
+    }
+
+    private PcodeStorage instructionCallArgumentStorage(
+        Function owner,
+        PcodeOp operation,
+        Function callTarget,
+        int argumentSlot) {
+
+        if (argumentSlot < 1 ||
+            argumentSlot > provenCallArgumentCount(operation, callTarget)) {
+            return null;
+        }
+        ForwardArgState state = instructionStateBeforeCall(owner, operation, callTarget);
+        return pcodeStorageFromTrackedValue(win64CallArgumentValue(state, argumentSlot));
+    }
+
+    private Set<PcodeStorage> instructionCallArgumentStorageDependencies(
+        Function owner,
+        PcodeOp operation,
+        Function callTarget,
+        int argumentSlot) {
+
+        if (argumentSlot < 1 ||
+            argumentSlot > provenCallArgumentCount(operation, callTarget)) {
+            return Set.of();
+        }
+        ForwardArgState state = instructionStateBeforeCall(owner, operation, callTarget);
+        TrackedValue value = win64CallArgumentValue(state, argumentSlot);
+        return value == null ? Set.of() : value.storageDependencies;
+    }
+
+    private TrackedValue win64CallArgumentValue(
+        ForwardArgState state,
+        int argumentSlot) {
+
+        if (state == null || argumentSlot < 1) {
+            return null;
+        }
+        if (argumentSlot <= 4) {
+            return state.registers.get(win64ArgumentRegister(argumentSlot));
+        }
+        Integer stackSlot = win64StackArgumentSlot(state, argumentSlot);
+        return stackSlot == null ? null : state.valuesByStackSlot.get(stackSlot);
+    }
+
+    private Integer win64StackArgumentSlot(
+        ForwardArgState state,
+        int argumentSlot) {
+
+        if (state == null || argumentSlot < 5) {
+            return null;
+        }
+        TrackedValue stackPointer = state.registers.get("RSP");
+        if (stackPointer == null || stackPointer.stackOffset == null) {
+            return null;
+        }
+        long displacement = 0x20L + (long)(argumentSlot - 5) * 8L;
+        long slot = (long)stackPointer.stackOffset + displacement;
+        return slot < Integer.MIN_VALUE || slot > Integer.MAX_VALUE
+            ? null
+            : (int)slot;
+    }
+
+    private ForwardArgState instructionStateBeforeCall(
+        Function owner,
+        PcodeOp operation,
+        Function expectedTarget) {
+
+        if (owner == null || operation == null ||
+            (operation.getOpcode() != PcodeOp.CALL &&
+                operation.getOpcode() != PcodeOp.CALLIND) ||
+            operation.getSeqnum() == null) {
+            return null;
+        }
+
+        Address callsite = operation.getSeqnum().getTarget();
+        Instruction callInstruction = currentProgram.getListing().getInstructionAt(callsite);
+        if (!isExpectedCall(callInstruction, operation, expectedTarget)) {
+            return null;
+        }
+        ForwardArgState state = abiCallsiteStates(owner).get(callsite.getOffset());
+        return state == null ? null : state.copy();
+    }
+
+    private boolean isExpectedCall(
+        Instruction instruction,
+        PcodeOp operation,
+        Function expectedTarget) {
+
+        if (instruction == null || !instruction.getFlowType().isCall()) {
+            return false;
+        }
+        if (expectedTarget == null) {
+            return true;
+        }
+        if (operation.getOpcode() != PcodeOp.CALL) {
+            return false;
+        }
+        Address rawTarget = callTarget(instruction);
+        Address resolvedTarget = resolvedCodeTarget(rawTarget);
+        Address expectedEntry = expectedTarget.getEntryPoint();
+        return Objects.equals(rawTarget, expectedEntry) ||
+            Objects.equals(resolvedTarget, expectedEntry);
+    }
+
+    private Map<Long, ForwardArgState> abiCallsiteStates(Function owner) {
+        if (owner == null) {
+            return Map.of();
+        }
+        String key = functionCacheKey("abi-callsite-states", owner);
+        Map<Long, ForwardArgState> cached = abiCallsiteStateCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        HighFunction high = highFunction(owner);
+        PcodeBlockBasic entryBlock = functionEntryBlock(high, owner);
+        if (high == null || entryBlock == null) {
+            abiCallsiteStateCache.put(key, Map.of());
+            return Map.of();
+        }
+        Map<Integer, ForwardArgState> blockEntries = abiBlockEntryStates(
+            owner,
+            high,
+            entryBlock);
+        LinkedHashMap<Long, ForwardArgState> callsites = new LinkedHashMap<>();
+        for (PcodeBlockBasic block : high.getBasicBlocks()) {
+            ForwardArgState input = blockEntries.get(block.getIndex());
+            if (input == null) {
+                continue;
+            }
+            ForwardArgState state = input.copy();
+            for (Instruction instruction : blockInstructions(owner, block)) {
+                if (instruction.getFlowType().isCall()) {
+                    mergeCallsiteState(
+                        callsites,
+                        instruction.getMinAddress().getOffset(),
+                        state);
+                }
+                observeForwardInstruction(instruction, state, false);
+            }
+        }
+        Map<Long, ForwardArgState> result = Collections.unmodifiableMap(callsites);
+        abiCallsiteStateCache.put(key, result);
+        return result;
+    }
+
+    private void mergeCallsiteState(
+        Map<Long, ForwardArgState> callsites,
+        long callsite,
+        ForwardArgState candidate) {
+
+        ForwardArgState current = callsites.get(callsite);
+        if (current == null) {
+            callsites.put(callsite, candidate.copy());
+        }
+        else {
+            current.retainCommonDataflowFrom(candidate);
+        }
+    }
+
+    private Map<Integer, ForwardArgState> abiBlockEntryStates(
+        Function owner,
+        HighFunction high,
+        PcodeBlockBasic entryBlock) {
+
+        LinkedHashMap<Integer, ForwardArgState> entries = new LinkedHashMap<>();
+        entries.put(entryBlock.getIndex(), newAbiParamForwardArgState());
+        ArrayDeque<PcodeBlockBasic> pending = new ArrayDeque<>();
+        LinkedHashSet<Integer> queued = new LinkedHashSet<>();
+        pending.add(entryBlock);
+        queued.add(entryBlock.getIndex());
+
+        while (!pending.isEmpty()) {
+            if (monitor.isCancelled()) {
+                return entries;
+            }
+            PcodeBlockBasic block = pending.removeFirst();
+            queued.remove(block.getIndex());
+            ForwardArgState input = entries.get(block.getIndex());
+            if (input == null) {
+                continue;
+            }
+            ForwardArgState output = input.copy();
+            for (Instruction instruction : blockInstructions(owner, block)) {
+                observeForwardInstruction(instruction, output, false);
+            }
+            for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(block)) {
+                ForwardArgState current = entries.get(successor.getIndex());
+                boolean changed;
+                if (current == null) {
+                    entries.put(successor.getIndex(), output.copy());
+                    changed = true;
+                }
+                else {
+                    changed = current.retainCommonDataflowFrom(output);
+                }
+                if (changed && queued.add(successor.getIndex())) {
+                    pending.addLast(successor);
+                }
+            }
+        }
+        return entries;
+    }
+
+    private PcodeBlockBasic functionEntryBlock(HighFunction high, Function function) {
+        if (high == null || function == null) {
+            return null;
+        }
+        Address entry = function.getEntryPoint();
+        PcodeBlockBasic selected = null;
+        for (PcodeBlockBasic block : high.getBasicBlocks()) {
+            Address start = block.getStart();
+            Address stop = block.getStop();
+            if (start == null || stop == null ||
+                entry.compareTo(start) < 0 || entry.compareTo(stop) > 0) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = block;
+        }
+        return selected;
+    }
+
+    private List<Instruction> blockInstructions(
+        Function function,
+        PcodeBlockBasic block) {
+
+        if (function == null || block == null ||
+            block.getStart() == null || block.getStop() == null) {
+            return List.of();
+        }
+        ArrayList<Instruction> result = new ArrayList<>();
+        for (Instruction instruction : functionInstructions(function)) {
+            Address address = instruction.getMinAddress();
+            if (address.compareTo(block.getStart()) >= 0 &&
+                address.compareTo(block.getStop()) <= 0) {
+                result.add(instruction);
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private ForwardArgState newAbiParamForwardArgState() {
+        ForwardArgState state = new ForwardArgState();
+        state.registers.put("RCX", TrackedValue.baseOffset("param_1", 0));
+        state.registers.put("RDX", TrackedValue.baseOffset("param_2", 0));
+        state.registers.put("R8", TrackedValue.baseOffset("param_3", 0));
+        state.registers.put("R9", TrackedValue.baseOffset("param_4", 0));
+        state.registers.put("RSP", TrackedValue.stackOffset(0));
+        return state;
+    }
+
+    private int win64RegisterParameterCandidateCount(HighFunction high) {
+        return Math.max(4, high.getLocalSymbolMap().getNumParams());
+    }
+
+    private PcodeStorage pcodeStorageFromTrackedValue(TrackedValue value) {
+        if (value == null) {
+            return null;
+        }
+        if (value.thisOffset != null) {
+            return new PcodeStorage("this", value.thisOffset);
+        }
+        if (value.stackOffset != null) {
+            return new PcodeStorage("stack", value.stackOffset);
+        }
+        if (value.baseKey != null && value.baseOffset != null) {
+            return new PcodeStorage(value.baseKey, value.baseOffset);
+        }
+        return null;
+    }
+
+    private PcodeStorage provenCallArgumentStorage(
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        int argumentSlot) {
+
+        if (owner == null || operation == null ||
+            (operation.getOpcode() != PcodeOp.CALL &&
+                operation.getOpcode() != PcodeOp.CALLIND) ||
+            argumentSlot < 1 ||
+            argumentSlot > provenCallArgumentCount(operation, target)) {
+            return null;
+        }
+
+        PcodeStorage pcode = argumentSlot < operation.getNumInputs()
+            ? pcodeStorageExpression(operation.getInput(argumentSlot))
+            : null;
+        PcodeStorage instruction = instructionCallArgumentStorage(
+            owner,
+            operation,
+            target,
+            argumentSlot);
+        if (pcode != null && instruction != null &&
+            !pcode.sameLocation(instruction)) {
+            return null;
+        }
+        return pcode != null ? pcode : instruction;
+    }
+
+    private Long provenCallArgumentImmediate(
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        int argumentSlot) {
+
+        if (owner == null || operation == null ||
+            (operation.getOpcode() != PcodeOp.CALL &&
+                operation.getOpcode() != PcodeOp.CALLIND) ||
+            argumentSlot < 1 ||
+            argumentSlot > provenCallArgumentCount(operation, target)) {
+            return null;
+        }
+
+        Long pcode = argumentSlot < operation.getNumInputs()
+            ? NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(argumentSlot))
+            : null;
+        ForwardArgState state = instructionStateBeforeCall(owner, operation, target);
+        TrackedValue value = win64CallArgumentValue(state, argumentSlot);
+        Long instruction = value == null ? null : value.immediate;
+        if (pcode != null && instruction != null && !pcode.equals(instruction)) {
+            return null;
+        }
+        return pcode != null ? pcode : instruction;
+    }
+
+    private String win64ArgumentRegister(int argumentSlot) {
+        return switch (argumentSlot) {
+            case 1 -> "RCX";
+            case 2 -> "RDX";
+            case 3 -> "R8";
+            case 4 -> "R9";
+            default -> throw new IllegalArgumentException(
+                "Win64 register argument slot must be in 1..=4");
+        };
+    }
+
+    private int encodedCallArgumentCount(PcodeOp operation) {
+        return operation == null
+            ? 0
+            : Math.max(0, operation.getNumInputs() - 1);
+    }
+
+    private int provenCallArgumentCount(PcodeOp operation, Function target) {
+        int encoded = encodedCallArgumentCount(operation);
+        if (operation == null || operation.getOpcode() != PcodeOp.CALL || target == null ||
+            !Objects.equals(target, pcodeCallTarget(operation))) {
+            return encoded;
+        }
+        HighFunction callee = highFunction(target);
+        int declared = callee == null || callee.getLocalSymbolMap() == null
+            ? 0
+            : Math.max(0, callee.getLocalSymbolMap().getNumParams());
+        return Math.max(
+            Math.max(encoded, declared),
+            machineRegisterArgumentCount(target));
+    }
+
+    private int machineRegisterArgumentCount(Function function) {
+        if (function == null) {
+            return 0;
+        }
+        String key = functionCacheKey("machine-register-argument-count", function);
+        Integer cached = machineRegisterArgumentCountCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        HighFunction high = highFunction(function);
+        int highest = 0;
+        if (high != null) {
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                for (int slot = 0; slot < operation.getNumInputs(); slot++) {
+                    highest = Math.max(
+                        highest,
+                        highestMachineParameterSlot(
+                            operation.getInput(slot),
+                            new LinkedHashSet<>()));
+                }
+            }
+        }
+        highest = Math.min(4, highest);
+        machineRegisterArgumentCountCache.put(key, highest);
+        return highest;
+    }
+
+    private int highestMachineParameterSlot(Varnode node, Set<String> seen) {
+        if (node == null || node.isConstant() || !seen.add(pcodeSsaNodeKey(node))) {
+            return 0;
+        }
+
+        Integer direct = formalParameterSlot(node);
+        int highest = direct == null || direct > 4 ? 0 : direct;
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return highest;
+        }
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            highest = Math.max(
+                highest,
+                highestMachineParameterSlot(definition.getInput(slot), seen));
+        }
+        return highest;
+    }
+
+    private Integer uniqueAbiCallArgumentSlot(
+        PcodeOp operation,
+        PcodeStorage expected) {
+
+        if (operation == null || expected == null ||
+            operation.getOpcode() != PcodeOp.CALL ||
+            operation.getSeqnum() == null) {
+            return null;
+        }
+        Function owner = functionContaining(operation.getSeqnum().getTarget());
+        Function target = pcodeCallTarget(operation);
+        if (owner == null || target == null) {
+            return null;
+        }
+
+        ForwardArgState state = instructionStateBeforeCall(owner, operation, target);
+        if (state == null) {
+            return null;
+        }
+
+        String[] registers = { "RCX", "RDX", "R8", "R9" };
+        int registerArgumentCount = Math.min(4, provenCallArgumentCount(operation, target));
+        Integer selected = null;
+        for (int index = 0; index < registerArgumentCount; index++) {
+            PcodeStorage storage = pcodeStorageFromTrackedValue(
+                state.registers.get(registers[index]));
+            if (!expected.sameLocation(storage)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = index + 1;
+        }
+        return selected;
+    }

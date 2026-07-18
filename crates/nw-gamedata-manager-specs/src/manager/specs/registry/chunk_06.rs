@@ -81,8 +81,7 @@ pub(super) fn specs() -> Vec<NativeManagerSpec> {
             "crate::CameraSettingsDataManager",
             vec![product_asset_resource(
                 "libs/camera/gamecamera.xml",
-                "newworld_plugin::assets::camera_settings::GameCameraSettingsAsset",
-                "newworld_plugin::assets::camera_settings::GameCameraSettings",
+                NativeManagerProductKind::GameCameraSettings,
                 "game_camera_settings",
                 "settings",
                 "settings",
@@ -94,8 +93,7 @@ pub(super) fn specs() -> Vec<NativeManagerSpec> {
             "crate::ArmorOffsetDataManager",
             vec![product_asset_resource(
                 "sharedassets/genericassets/items/armoroffsets.aoffdb",
-                "newworld_plugin::assets::armor_offset_database::ArmorOffsetDatabaseAsset",
-                "newworld_plugin::assets::armor_offset_database::ArmorOffsetDatabase",
+                NativeManagerProductKind::ArmorOffsetDatabase,
                 "armor_offset_database",
                 "database",
                 "database",
@@ -110,8 +108,7 @@ pub(super) fn specs() -> Vec<NativeManagerSpec> {
             "crate::EquipTypesDataManager",
             vec![product_asset_resource(
                 "sharedassets/genericassets/items/equiptypesdatabase.equipdb",
-                "newworld_plugin::assets::equip_types_database::EquipTypesDatabaseAsset",
-                "newworld_plugin::assets::equip_types_database::EquipTypesDatabase",
+                NativeManagerProductKind::EquipTypesDatabase,
                 "equip_types_database",
                 "database",
                 "database",
@@ -123,8 +120,7 @@ pub(super) fn specs() -> Vec<NativeManagerSpec> {
             "crate::GameDebugSettingsManager",
             vec![product_asset_resource(
                 "sharedassets/genericassets/debug/gamedebugsettings.gds",
-                "newworld_plugin::assets::game_debug_settings::GameDebugSettingsAsset",
-                "newworld_plugin::assets::game_debug_settings::GameDebugSettings",
+                NativeManagerProductKind::GameDebugSettings,
                 "game_debug_settings",
                 "settings",
                 "settings",
@@ -136,8 +132,7 @@ pub(super) fn specs() -> Vec<NativeManagerSpec> {
             "crate::UiDataManager",
             vec![product_asset_resource(
                 "sharedassets/genericassets/ui/uidatabase.uidb",
-                "newworld_plugin::assets::ui_database::UiDatabaseAsset",
-                "newworld_plugin::assets::ui_database::UiDatabase",
+                NativeManagerProductKind::UiDatabase,
                 "ui_database",
                 "database",
                 "database",
@@ -556,7 +551,7 @@ pub(super) fn specs() -> Vec<NativeManagerSpec> {
                 ),
                 projection_field(
                     "max_total_housing_items_without_perks",
-                    "Max Number Total Housing Items without Perks",
+                    "Max Number Total Housing Items (Without Perks)",
                     "max_number_total_housing_items_without_perks",
                     NativeProjectionTransform::NonZeroU32,
                 ),

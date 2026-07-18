@@ -1,0 +1,261 @@
+    private PcodeOpAST boundedNormalizedBooleanOperation(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST readCall,
+        RawPcodeWrite rawRead) {
+
+        Integer width = rawRead == null
+            ? null
+            : wireShapeByteWidth(rawRead.wireEvidence.layout);
+        if (high == null || operations == null || readCall == null ||
+            width == null || width != Byte.BYTES) {
+            return null;
+        }
+        Varnode rawValue = rawReadOutputValue(
+            readCall,
+            rawRead.storage,
+            operations);
+        PcodeOpAST guard = boundedBooleanRangeGuardForValue(
+            high,
+            operations,
+            readCall,
+            rawValue);
+        if (guard == null || rawValue == null) {
+            return null;
+        }
+        PcodeOpAST selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.INT_NOTEQUAL ||
+                operation.getOutput() == null ||
+                operation.getOutput().getSize() != Byte.BYTES ||
+                !NetworkSchemaControlFlow.precedes(high, guard, operation) ||
+                !isNormalizedBooleanValue(operation.getOutput(), rawRead.storage) ||
+                !pcodeNodeDependsOn(
+                    operation.getOutput(),
+                    rawValue,
+                    new LinkedHashSet<>(),
+                    0) ||
+                !booleanGuardSelectsNormalization(guard, operation, operations)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = operation;
+        }
+        return selected;
+    }
+
+    private CodecWireTrace optionalUnmarshalCodecTrace(
+        Function function,
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock,
+        Set<PcodeBlockBasic> collapsedEventBlocks,
+        UnmarshalTerminalFlow terminalFlow) {
+
+        NetworkSchemaFlowSequence.OptionalSuffixResult<CodecWireEvent> optional =
+            terminalFlow.terminals().isEmpty()
+                ? NetworkSchemaFlowSequence.analyzeOptionalSuffix(
+                    high,
+                    eventsByBlock,
+                    collapsedEventBlocks,
+                    (left, right) -> sameWireEvidence(
+                        left.wireEvidence(),
+                        right.wireEvidence()))
+                : NetworkSchemaFlowSequence.analyzeOptionalSuffix(
+                    high,
+                    eventsByBlock,
+                    collapsedEventBlocks,
+                    terminalFlow.terminals(),
+                    Set.of(),
+                    terminalFlow.excludedEdges(),
+                    (left, right) -> sameWireEvidence(
+                        left.wireEvidence(),
+                        right.wireEvidence()));
+        if (!optional.hasOptionalSuffix() || optional.distinctSequenceCount() != 2 ||
+            optional.requiredEvents().size() != 1) {
+            return null;
+        }
+
+        CodecWireEvent presence = optional.requiredEvents().get(0);
+        if (!"bool".equals(presence.wireEvidence().shape) ||
+            !presence.wireEvidence().hasProvenSemantics() ||
+            !presenceBooleanControlsOptionalEvents(
+                high,
+                operations,
+                eventsByBlock,
+                presence,
+                optional.optionalEvents())) {
+            return null;
+        }
+
+        WireShape inner = orderedCodecWireEvidence(
+            optional.optionalEvents(),
+            "unmarshal-cfg-optional-body");
+        if (inner == null || inner.layout == null) {
+            return null;
+        }
+        String layout = "optional<" + inner.layout + ">";
+        WireShape shape = inner.hasProvenSemantics()
+            ? WireShape.semantic(
+                "optional<" + inner.shape + ">",
+                layout,
+                "unmarshal-cfg-presence-prefixed-optional")
+            : WireShape.layout(
+                layout,
+                "unmarshal-cfg-presence-prefixed-optional");
+        CodecWireTrace result = new CodecWireTrace();
+        result.events.add(new CodecWireEvent(
+            unmarshalNativeTypeFromTarget(function),
+            shape,
+            presence.callsite(),
+            function.getEntryPoint(),
+            fullFunctionName(function)));
+        return result;
+    }
+
+    private boolean presenceBooleanControlsOptionalEvents(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock,
+        CodecWireEvent presence,
+        List<CodecWireEvent> optionalEvents) {
+
+        PcodeOpAST readCall = pcodeCallAt(high, presence.callsite());
+        if (readCall == null) {
+            return false;
+        }
+        Function target = pcodeCallTarget(readCall);
+        RawPcodeWrite rawRead = pcodeReadRawWrite(readCall, target);
+        PcodeOpAST normalization = boundedNormalizedBooleanOperation(
+            high,
+            operations,
+            readCall,
+            rawRead);
+        PcodeOpAST branch = normalization == null
+            ? null
+            : uniqueConditionalBranch(normalization.getOutput(), operations);
+        if (branch == null ||
+            !(branch.getParent() instanceof PcodeBlockBasic branchBlock) ||
+            NetworkSchemaControlFlow.successors(branchBlock).size() != 2 ||
+            !NetworkSchemaControlFlow.precedes(high, readCall, branch)) {
+            return false;
+        }
+
+        LinkedHashSet<PcodeBlockBasic> optionalBlocks = new LinkedHashSet<>();
+        for (CodecWireEvent event : optionalEvents) {
+            PcodeBlockBasic block = uniqueEventBlock(eventsByBlock, event);
+            if (block == null || !NetworkSchemaControlFlow.dominates(
+                    high,
+                    branchBlock,
+                    block)) {
+                return false;
+            }
+            optionalBlocks.add(block);
+        }
+        int bodyEdges = 0;
+        for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(branchBlock)) {
+            boolean reachesAll = optionalBlocks.stream().allMatch(block ->
+                successor == block || NetworkSchemaControlFlow.reaches(successor, block));
+            boolean reachesAny = optionalBlocks.stream().anyMatch(block ->
+                successor == block || NetworkSchemaControlFlow.reaches(successor, block));
+            if (reachesAll) {
+                bodyEdges++;
+            }
+            else if (reachesAny) {
+                return false;
+            }
+        }
+        return bodyEdges == 1;
+    }
+
+    private Varnode rawReadOutputValue(
+        PcodeOpAST readCall,
+        PcodeStorage storage,
+        List<PcodeOpAST> operations) {
+
+        if (readCall == null || readCall.getSeqnum() == null || storage == null) {
+            return null;
+        }
+        Varnode selected = null;
+        Address callsite = readCall.getSeqnum().getTarget();
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.INDIRECT ||
+                operation.getOutput() == null || operation.getSeqnum() == null ||
+                !callsite.equals(operation.getSeqnum().getTarget()) ||
+                !storage.sameLocation(
+                    pcodeStorageExpression(operation.getOutput()))) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = operation.getOutput();
+        }
+        return selected;
+    }
+
+    private PcodeOpAST boundedBooleanRangeGuardForValue(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST readCall,
+        Varnode rawValue) {
+
+        if (rawValue == null) {
+            return null;
+        }
+        PcodeOpAST selected = null;
+        for (PcodeOpAST comparison : operations) {
+            if ((comparison.getOpcode() != PcodeOp.INT_LESS &&
+                    comparison.getOpcode() != PcodeOp.INT_LESSEQUAL) ||
+                comparison.getNumInputs() != 2 ||
+                comparison.getOutput() == null ||
+                !NetworkSchemaControlFlow.precedes(high, readCall, comparison)) {
+                continue;
+            }
+            boolean acceptsAtMostOne = pcodeNodeDependsOn(
+                    comparison.getInput(0),
+                    rawValue,
+                    new LinkedHashSet<>(),
+                    0) &&
+                NetworkSchemaIntegerEvaluator.equals(
+                    comparison.getInput(1),
+                    comparison.getOpcode() == PcodeOp.INT_LESS ? 2L : 1L);
+            boolean rejectsAboveOne = pcodeNodeDependsOn(
+                    comparison.getInput(1),
+                    rawValue,
+                    new LinkedHashSet<>(),
+                    0) &&
+                NetworkSchemaIntegerEvaluator.equals(
+                    comparison.getInput(0),
+                    comparison.getOpcode() == PcodeOp.INT_LESS ? 1L : 2L);
+            if ((!acceptsAtMostOne && !rejectsAboveOne) ||
+                !pcodeValueFeedsConditionalBranch(comparison.getOutput())) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = comparison;
+        }
+        return selected;
+    }
+
+    private PcodeBlockBasic uniqueEventBlock(
+        Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock,
+        CodecWireEvent event) {
+
+        PcodeBlockBasic selected = null;
+        for (Map.Entry<PcodeBlockBasic, List<CodecWireEvent>> entry :
+                eventsByBlock.entrySet()) {
+            if (entry.getValue().stream().noneMatch(candidate -> candidate == event)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = entry.getKey();
+        }
+        return selected;
+    }

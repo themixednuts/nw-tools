@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfFacingVelocityAngleDiff;
+pub struct ActionConditionIfFacingVelocityAngleDiff {}
 
 impl AzRtti for ActionConditionIfFacingVelocityAngleDiff {
     const NAME: &'static str = "ActionConditionIfFacingVelocityAngleDiff";

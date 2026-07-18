@@ -13,7 +13,7 @@ use catalog::{ColumnRule, matching_rule_value};
 
 pub(super) use boolean::column_has_boolean_affinity;
 pub(super) use color::color_column_has_affinity;
-pub(super) use enums::scalar_enum_column_affinity;
+pub(super) use enums::{scalar_enum_column_affinity, scalar_enum_shape_by_name};
 pub(super) use list::{
     SemanticListRowKey, SemanticListSeparators, column_has_list_affinity,
     row_type_specific_list_affinity,

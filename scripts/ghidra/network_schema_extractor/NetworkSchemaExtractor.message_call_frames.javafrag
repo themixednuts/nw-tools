@@ -1,0 +1,279 @@
+    private record MessageCallFrameOutput(
+        String parameterBase,
+        NestedTypeShape shape,
+        Address firstCallsite,
+        int firstOperationOrder) {}
+
+    private void applyMessageCallFrameBoundaries(
+        MessageUnmarshalPlan plan,
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        Map<String, PcodeStorage> arguments) {
+
+        if (plan == null || owner == null || operation == null || target == null ||
+            arguments == null || arguments.isEmpty()) {
+            return;
+        }
+        List<MessageCallFrameOutput> outputs = messageCallFrameOutputs(target);
+        if (outputs.isEmpty()) {
+            return;
+        }
+
+        HashMap<String, Integer> bindingCounts = new HashMap<>();
+        for (MessageCallFrameOutput output : outputs) {
+            PcodeStorage binding = arguments.get(output.parameterBase());
+            if (!isRootMessageStorage(plan, binding) || binding.offset == 0L) {
+                continue;
+            }
+            bindingCounts.merge(storageKey(binding), 1, Integer::sum);
+        }
+
+        for (MessageCallFrameOutput output : outputs) {
+            PcodeStorage binding = arguments.get(output.parameterBase());
+            if (!isRootMessageStorage(plan, binding) || binding.offset == 0L ||
+                bindingCounts.getOrDefault(storageKey(binding), 0) != 1) {
+                continue;
+            }
+            FieldCall field = addPcodeMessageField(
+                plan,
+                operation.getSeqnum().getTarget(),
+                binding,
+                null,
+                "message-unmarshal-call-frame-boundary",
+                Integer.MAX_VALUE);
+            field.callFrameBoundaryProven = true;
+            applyNestedTypeShapeToField(
+                field,
+                output.shape(),
+                "message-unmarshal-call-frame-output-shape");
+        }
+    }
+
+    private List<MessageCallFrameOutput> messageCallFrameOutputs(Function function) {
+        if (function == null) {
+            return List.of();
+        }
+        String key = functionCacheKey("message-call-frame-outputs", function);
+        List<MessageCallFrameOutput> cached = messageCallFrameOutputCache.get(key);
+        if (cached != null) {
+            runMetrics.increment("messageCallFrameOutputCacheHits");
+            return cached;
+        }
+        runMetrics.increment("messageCallFrameOutputCacheMisses");
+        if (!messageCallFrameOutputActive.add(key)) {
+            return List.of();
+        }
+
+        List<MessageCallFrameOutput> result;
+        try {
+            result = recoverMessageCallFrameOutputs(function);
+        }
+        finally {
+            messageCallFrameOutputActive.remove(key);
+        }
+        result = List.copyOf(result);
+        messageCallFrameOutputCache.put(key, result);
+        return result;
+    }
+
+    private List<MessageCallFrameOutput> recoverMessageCallFrameOutputs(
+        Function function) {
+
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return List.of();
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> byBase =
+            nestedDirectTypeMemberCandidates(function, high);
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (!isAnonymousMessageHelperCall(function, operation, target)) {
+                continue;
+            }
+            Map<String, PcodeStorage> arguments = callArgumentStorageMap(
+                function,
+                operation,
+                Collections.emptyMap());
+            for (MessageCallFrameOutput nested : messageCallFrameOutputs(target)) {
+                PcodeStorage binding = arguments.get(nested.parameterBase());
+                appendTranslatedMessageCallFrameMembers(
+                    byBase,
+                    binding,
+                    nested.shape(),
+                    operation,
+                    target);
+            }
+        }
+        return buildMessageCallFrameOutputs(function, operations, byBase);
+    }
+
+    private boolean isAnonymousMessageHelperCall(
+        Function owner,
+        PcodeOp operation,
+        Function target) {
+
+        if (owner == null || operation == null || target == null ||
+            owner.getEntryPoint().equals(target.getEntryPoint())) {
+            return false;
+        }
+        if (pcodeReadRawWrite(operation, target) != null) {
+            return false;
+        }
+        String nativeType = unmarshalNativeTypeFromTarget(target);
+        return wireShapeEvidenceFromUnmarshalTarget(target, nativeType) == null;
+    }
+
+    private void appendTranslatedMessageCallFrameMembers(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        PcodeStorage binding,
+        NestedTypeShape nested,
+        PcodeOp operation,
+        Function target) {
+
+        if (byBase == null || binding == null || nested == null ||
+            nested.members.isEmpty()) {
+            return;
+        }
+        for (NestedTypeMember member : nested.members) {
+            WireShape wireEvidence = nestedMemberWireEvidence(member);
+            if (wireEvidence == null) {
+                continue;
+            }
+            PcodeStorage storage = binding.plus(member.offset);
+            addNestedTypeMemberCandidate(
+                byBase,
+                storage,
+                member.nativeType,
+                wireEvidence,
+                operation,
+                target,
+                "message-call-frame-callee-output");
+            markNestedTypeMemberWireOrder(
+                byBase,
+                storage,
+                "cfg-call-order+callee-output-order");
+            Map<Long, NestedTypeMember> translated = byBase.get(storage.base);
+            NestedTypeMember added = translated == null
+                ? null
+                : translated.get(storage.offset);
+            if (added != null && member.typeId != null &&
+                Boolean.TRUE.equals(member.typeIdentityProven)) {
+                added.typeId = member.typeId;
+                added.typeIdSource = member.typeIdSource;
+                added.typeIdentityProven = true;
+                added.typeIdentitySource = member.typeIdentitySource;
+            }
+        }
+    }
+
+    private List<MessageCallFrameOutput> buildMessageCallFrameOutputs(
+        Function function,
+        List<PcodeOpAST> operations,
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase) {
+
+        if (function == null || byBase == null || byBase.isEmpty()) {
+            return List.of();
+        }
+        HashMap<Long, Integer> operationOrder = new HashMap<>();
+        for (int index = 0; index < operations.size(); index++) {
+            Address address = operations.get(index).getSeqnum().getTarget();
+            operationOrder.putIfAbsent(address.getOffset(), index);
+        }
+
+        ArrayList<MessageCallFrameOutput> result = new ArrayList<>();
+        for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry :
+            byBase.entrySet()) {
+            if (!isLikelyOutputParameterBase(entry.getKey())) {
+                continue;
+            }
+            ArrayList<NestedTypeMember> members =
+                new ArrayList<>(entry.getValue().values());
+            if (!isCompleteMessageCallFrameOutput(members)) {
+                continue;
+            }
+            members.sort((left, right) -> compareMessageCallFrameMembers(
+                left,
+                right,
+                operationOrder));
+            for (int index = 0; index < members.size(); index++) {
+                NestedTypeMember member = members.get(index);
+                member.index = index;
+                member.name = "_" + index;
+            }
+
+            NestedTypeShape shape = new NestedTypeShape();
+            shape.typeNameSource = "ghidra-call-frame";
+            shape.function = function.getEntryPoint();
+            shape.functionName = fullFunctionName(function);
+            shape.memberBase = entry.getKey();
+            shape.memberNameSource = "synthetic-offset";
+            shape.memberNamesProven = false;
+            shape.layoutProven = true;
+            shape.wireOrderProven = true;
+            shape.wireOrderSource = "cfg-success-flow";
+            shape.validation = "call-frame-output-parameter";
+            shape.members.addAll(members);
+            applyNestedTypeMemberNames(shape);
+
+            NestedTypeMember first = members.get(0);
+            int firstOrder = messageCallFrameOperationOrder(first, operationOrder);
+            result.add(new MessageCallFrameOutput(
+                entry.getKey(),
+                shape,
+                first.callsite,
+                firstOrder));
+        }
+        result.sort(Comparator
+            .comparingInt(MessageCallFrameOutput::firstOperationOrder)
+            .thenComparing(MessageCallFrameOutput::parameterBase));
+        return result;
+    }
+
+    private boolean isCompleteMessageCallFrameOutput(
+        List<NestedTypeMember> members) {
+
+        if (members == null || members.isEmpty() ||
+            members.size() > NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
+            return false;
+        }
+        for (NestedTypeMember member : members) {
+            if (member == null || Boolean.TRUE.equals(member.typeConflict) ||
+                member.offset < 0L || member.wireLayout == null ||
+                member.wireOrdinal == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private int compareMessageCallFrameMembers(
+        NestedTypeMember left,
+        NestedTypeMember right,
+        Map<Long, Integer> operationOrder) {
+
+        int order = Integer.compare(
+            messageCallFrameOperationOrder(left, operationOrder),
+            messageCallFrameOperationOrder(right, operationOrder));
+        if (order != 0) {
+            return order;
+        }
+        order = Integer.compare(left.wireOrdinal, right.wireOrdinal);
+        return order != 0 ? order : Long.compare(left.offset, right.offset);
+    }
+
+    private int messageCallFrameOperationOrder(
+        NestedTypeMember member,
+        Map<Long, Integer> operationOrder) {
+
+        if (member == null || member.callsite == null) {
+            return Integer.MAX_VALUE;
+        }
+        return operationOrder.getOrDefault(
+            member.callsite.getOffset(),
+            Integer.MAX_VALUE);
+    }

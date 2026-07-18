@@ -118,16 +118,14 @@ pub(super) fn player_data_manager_spec() -> NativeManagerSpec {
     let products = vec![
         product_asset_resource(
             "sharedassets/genericassets/playerbaseattributes.pbadb",
-            "newworld_plugin::assets::player_base_attributes::PlayerBaseAttributesAsset",
-            "newworld_plugin::assets::player_base_attributes::PlayerBaseAttributes",
+            NativeManagerProductKind::PlayerBaseAttributes,
             "player_base_attributes",
             "attributes",
             "player_base_attributes",
         ),
         product_asset_resource(
             "sharedassets/genericassets/settlementprogression.sprd",
-            "newworld_plugin::assets::settlement_progression_data::SettlementProgressionDataAsset",
-            "newworld_plugin::assets::settlement_progression_data::SettlementProgressionData",
+            NativeManagerProductKind::SettlementProgressionData,
             "settlement_progression_data",
             "data",
             "settlement_progression_data",
@@ -145,7 +143,7 @@ pub(super) fn player_data_manager_spec() -> NativeManagerSpec {
             .map(|product| {
                 NativeProductAssetResource::new(
                     rust_type(product.product.rust_type),
-                    rust_type(product.value_type),
+                    rust_type(product.product.rust_type),
                     ident(product.handle_getter),
                     ident(product.asset_getter),
                     ident(product.manager_getter),
@@ -391,16 +389,14 @@ pub(super) fn item_transform_data_manager_spec() -> NativeManagerSpec {
 pub(super) fn gatherable_data_manager_spec() -> NativeManagerSpec {
     let gathering_database = product_asset_resource(
         "sharedassets/genericassets/gathering/gatheringdatabase.gdb",
-        "newworld_plugin::assets::gathering_database::GatheringDatabaseAsset",
-        "newworld_plugin::assets::gathering_database::GatheringDatabase",
+        NativeManagerProductKind::GatheringDatabase,
         "gathering_database",
         "database",
         "gathering_database",
     );
     let gathering_action_database = product_asset_resource(
         "sharedassets/genericassets/gatheringactiondatabase.gactdb",
-        "newworld_plugin::assets::gathering_database::GatheringActionDatabaseAsset",
-        "newworld_plugin::assets::gathering_database::GatheringActionDatabase",
+        NativeManagerProductKind::GatheringActionDatabase,
         "gathering_action_database",
         "database",
         "gathering_action_database",
@@ -439,8 +435,7 @@ pub(super) fn gatherable_data_manager_spec() -> NativeManagerSpec {
 pub(super) fn social_data_manager_spec() -> NativeManagerSpec {
     let rank_database = product_asset_resource(
         "sharedassets/genericassets/rankdatabase.rankdb",
-        "newworld_plugin::assets::rank_database::SocialRankDatabaseAsset",
-        "newworld_plugin::assets::rank_database::SocialRankDatabase",
+        NativeManagerProductKind::SocialRankDatabase,
         "social_rank_database",
         "database",
         "rank_database",

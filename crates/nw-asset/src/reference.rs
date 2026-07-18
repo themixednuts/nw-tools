@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::AssetReference;
+use crate::{AssetReference, normalize_virtual_path};
 
 /// A target named by an authored asset.
 ///
@@ -64,6 +64,7 @@ pub struct AssetDependency {
     relation: String,
     target: AssetDependencyTarget,
     required: bool,
+    association: Option<String>,
 }
 
 impl AssetDependency {
@@ -73,6 +74,7 @@ impl AssetDependency {
             relation: relation.into(),
             target,
             required: true,
+            association: None,
         }
     }
 
@@ -82,6 +84,7 @@ impl AssetDependency {
             relation: relation.into(),
             target,
             required: false,
+            association: None,
         }
     }
 
@@ -95,6 +98,18 @@ impl AssetDependency {
         Self::optional(relation, AssetDependencyTarget::path(path))
     }
 
+    /// Correlate this dependency with another path selected by the same
+    /// authored record.
+    ///
+    /// Formats use this for paired relationships such as a dynamic slice and
+    /// its exact variant sidecar. The association is graph metadata, not an
+    /// additional dependency.
+    #[must_use]
+    pub fn associated_with_path(mut self, path: impl AsRef<str>) -> Self {
+        self.association = Some(normalize_virtual_path(path.as_ref()));
+        self
+    }
+
     #[must_use]
     pub fn relation(&self) -> &str {
         &self.relation
@@ -103,6 +118,11 @@ impl AssetDependency {
     #[must_use]
     pub const fn target(&self) -> &AssetDependencyTarget {
         &self.target
+    }
+
+    #[must_use]
+    pub fn association(&self) -> Option<&str> {
+        self.association.as_deref()
     }
 
     #[must_use]
@@ -130,5 +150,13 @@ mod tests {
 
         assert_eq!(reference.hint(), Some("Objects\\Hero.MTL"));
         assert!(dependency.is_required());
+    }
+
+    #[test]
+    fn dependency_association_normalizes_the_correlated_path() {
+        let dependency = AssetDependency::optional_path("variant", "Slices/Hero_Red.slice.meta")
+            .associated_with_path("Slices\\Hero.dynamicslice");
+
+        assert_eq!(dependency.association(), Some("slices/hero.dynamicslice"));
     }
 }

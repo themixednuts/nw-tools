@@ -95,6 +95,9 @@ pub struct NameLookup {
     pub uuids: HashMap<Uuid, ArcStr>,
     /// Field-name CRC-32 to field-name string.
     pub crcs: HashMap<u32, ArcStr>,
+    /// Reflected enum UUID to its SerializeContext wire-storage UUID.
+    #[serde(default)]
+    pub enum_underlying_types: HashMap<Uuid, Uuid>,
 }
 
 impl NameLookup {
@@ -114,6 +117,7 @@ impl NameLookup {
         Self {
             uuids: HashMap::with_capacity(uuid_capacity),
             crcs: HashMap::with_capacity(crc_capacity),
+            enum_underlying_types: HashMap::new(),
         }
     }
 
@@ -156,6 +160,20 @@ impl NameLookup {
             seen_refs: HashSet::new(),
         };
         walker.visit(root, 0);
+        if let Some(enums) = root
+            .get("enumTypeIdToUnderlyingTypeIdMap")
+            .and_then(Value::as_object)
+        {
+            for (enum_type, underlying_type) in enums {
+                if let (Ok(enum_type), Some(underlying_type)) =
+                    (Uuid::parse_str(enum_type), value_uuid(underlying_type))
+                {
+                    lookup
+                        .enum_underlying_types
+                        .insert(enum_type, underlying_type);
+                }
+            }
+        }
         lookup
     }
 
@@ -214,6 +232,12 @@ impl NameLookup {
     #[must_use]
     pub fn field_name(&self, crc: u32) -> Option<&ArcStr> {
         self.crcs.get(&crc)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn enum_underlying_type(&self, type_id: &Uuid) -> Option<Uuid> {
+        self.enum_underlying_types.get(type_id).copied()
     }
 }
 
@@ -344,6 +368,7 @@ impl FromIterator<(Uuid, ArcStr)> for NameLookup {
         Self {
             uuids: iter.into_iter().collect(),
             crcs: HashMap::new(),
+            enum_underlying_types: HashMap::new(),
         }
     }
 }
@@ -353,6 +378,7 @@ impl FromIterator<(u32, ArcStr)> for NameLookup {
         Self {
             uuids: HashMap::new(),
             crcs: iter.into_iter().collect(),
+            enum_underlying_types: HashMap::new(),
         }
     }
 }
@@ -416,6 +442,10 @@ mod tests {
                     ]
                 },
                 "BBBBBBBB-BBBB-4BBB-BBBB-BBBBBBBBBBBB": { "$ref": "#2" }
+            },
+            "enumTypeIdToUnderlyingTypeIdMap": {
+                "CCCCCCCC-CCCC-4CCC-CCCC-CCCCCCCCCCCC":
+                    "72B9409A-7D1A-4831-9CFE-FCB3FADD3426"
             }
         });
 
@@ -426,6 +456,12 @@ mod tests {
         assert_eq!(
             hashes.field_name(1234).map(ArcStr::as_str),
             Some("m_enabled")
+        );
+        assert_eq!(
+            hashes.enum_underlying_type(
+                &Uuid::parse_str("CCCCCCCC-CCCC-4CCC-CCCC-CCCCCCCCCCCC").unwrap()
+            ),
+            Some(type_ids::U8)
         );
     }
 }

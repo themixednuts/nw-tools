@@ -1,0 +1,346 @@
+    private void applyContainerHelperCodecOffsets(
+        HighFunction high,
+        String writeBufferParameter,
+        List<ContainerCodecCall> codecs) {
+
+        if (high == null || writeBufferParameter == null || codecs == null || codecs.isEmpty()) {
+            return;
+        }
+        Map<String, List<PcodeOpAST>> indirectWrites =
+            containerHelperIndirectWrites(high);
+        for (ContainerCodecCall codec : codecs) {
+            PcodeStorage source = containerHelperCodecSourceStorage(
+                high,
+                codec,
+                writeBufferParameter,
+                indirectWrites);
+            if (source == null || source.offset < 0L || source.offset > 0x100000L) {
+                continue;
+            }
+            codec.elementBase = source.base;
+            codec.elementOffset = source.offset;
+        }
+    }
+
+    private PcodeStorage containerHelperCodecSourceStorage(
+        HighFunction high,
+        ContainerCodecCall codec,
+        String writeBufferParameter,
+        Map<String, List<PcodeOpAST>> indirectWrites) {
+
+        if (high == null || codec == null || codec.operation == null ||
+            codec.operation.getSeqnum() == null) {
+            return null;
+        }
+        Integer valueWidth = codec.nativeType == null
+            ? null
+            : nativeTypeByteWidth(codec.nativeType);
+        if (valueWidth == null && codec.wireEvidence != null) {
+            valueWidth = wireShapeByteWidth(codec.wireEvidence.layout);
+        }
+
+        PcodeStorage selected = null;
+        PcodeOp call = codec.operation;
+        for (int slot = 1; slot < call.getNumInputs(); slot++) {
+            Varnode input = call.getInput(slot);
+            if (input == null || input.isConstant()) {
+                continue;
+            }
+            PcodeStorage source = directParameterPointerStorage(input);
+            if (source == null) {
+                source = parameterValueSourceStorage(
+                    input,
+                    0,
+                    input.getSize(),
+                    new LinkedHashSet<>(),
+                    0);
+            }
+            if (source == null && valueWidth != null && valueWidth > 0) {
+                source = indirectParameterSourceStorage(
+                    call,
+                    input,
+                    valueWidth,
+                    indirectWrites);
+            }
+            if (source == null || writeBufferParameter.equals(source.base)) {
+                continue;
+            }
+            if (selected != null && !selected.sameLocation(source)) {
+                return null;
+            }
+            selected = source;
+        }
+        Function owner = high.getFunction();
+        Function target = codec.target == null
+            ? null
+            : functionAtOrContaining(codec.target);
+        int argumentCount = provenCallArgumentCount(call, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            PcodeStorage source = instructionCallArgumentStorage(
+                owner,
+                call,
+                target,
+                slot);
+            if (!isParameterStorage(source) || writeBufferParameter.equals(source.base)) {
+                continue;
+            }
+            if (selected != null && !selected.sameLocation(source)) {
+                return null;
+            }
+            selected = source;
+        }
+        return selected;
+    }
+
+    private PcodeStorage directParameterPointerStorage(Varnode node) {
+        if (node == null || node.getSize() != currentProgram.getDefaultPointerSize()) {
+            return null;
+        }
+        PcodeStorage storage = pcodeStorageExpression(node);
+        return isParameterStorage(storage) ? storage : null;
+    }
+
+    private PcodeStorage indirectParameterSourceStorage(
+        PcodeOp call,
+        Varnode argument,
+        int valueWidth,
+        Map<String, List<PcodeOpAST>> indirectWrites) {
+
+        PcodeStorage argumentStorage = pcodeStorageExpression(argument);
+        if (argumentStorage == null || valueWidth <= 0) {
+            return null;
+        }
+        PcodeStorage selected = null;
+        String key = containerHelperIndirectWriteKey(
+            call.getSeqnum().getTarget(),
+            argumentStorage);
+        for (PcodeOpAST operation : indirectWrites.getOrDefault(key, List.of())) {
+            PcodeStorage source = parameterValueSourceStorage(
+                operation.getInput(0),
+                0,
+                valueWidth,
+                new LinkedHashSet<>(),
+                0);
+            if (source == null || selected != null && !selected.sameLocation(source)) {
+                return null;
+            }
+            selected = source;
+        }
+        return selected;
+    }
+
+    private Map<String, List<PcodeOpAST>> containerHelperIndirectWrites(
+        HighFunction high) {
+
+        LinkedHashMap<String, List<PcodeOpAST>> result = new LinkedHashMap<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.INDIRECT ||
+                operation.getOutput() == null || operation.getNumInputs() == 0 ||
+                operation.getSeqnum() == null) {
+                continue;
+            }
+            PcodeStorage output = pcodeStorageExpression(operation.getOutput());
+            String key = containerHelperIndirectWriteKey(
+                operation.getSeqnum().getTarget(),
+                output);
+            if (key != null) {
+                result.computeIfAbsent(key, ignored -> new ArrayList<>()).add(operation);
+            }
+        }
+        return result;
+    }
+
+    private String containerHelperIndirectWriteKey(
+        Address callsite,
+        PcodeStorage storage) {
+
+        return callsite == null || storage == null
+            ? null
+            : callsite.getOffset() + "|" + storage.expression();
+    }
+
+    private PcodeStorage parameterValueSourceStorage(
+        Varnode node,
+        int byteOffset,
+        int byteLength,
+        Set<String> active,
+        int depth) {
+
+        if (node == null || byteOffset < 0 || byteLength <= 0 || depth > 64 ||
+            byteOffset > node.getSize() || byteLength > node.getSize() - byteOffset ||
+            !active.add(pcodeNodeKey(node) + ':' + byteOffset + ':' + byteLength)) {
+            return null;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return null;
+        }
+        int opcode = definition.getOpcode();
+        if (opcode == PcodeOp.LOAD && definition.getNumInputs() >= 2) {
+            PcodeStorage source = directParameterSourceStorage(definition.getInput(1));
+            return source == null ? null : source.plus(byteOffset);
+        }
+        if (opcode == PcodeOp.COPY || opcode == PcodeOp.CAST ||
+            opcode == PcodeOp.INDIRECT) {
+            return parameterValueSourceStorage(
+                definition.getInput(0),
+                byteOffset,
+                byteLength,
+                active,
+                depth + 1);
+        }
+        if (opcode == PcodeOp.INT_ZEXT || opcode == PcodeOp.INT_SEXT) {
+            int sourceSize = definition.getInput(0).getSize();
+            int sourceLength = Math.min(byteLength, sourceSize - byteOffset);
+            return sourceLength <= 0
+                ? null
+                : parameterValueSourceStorage(
+                    definition.getInput(0),
+                    byteOffset,
+                    sourceLength,
+                    active,
+                    depth + 1);
+        }
+        if (opcode == PcodeOp.SUBPIECE && definition.getNumInputs() >= 2 &&
+            definition.getInput(1).isConstant()) {
+            long dropped = definition.getInput(1).getOffset();
+            if (dropped > Integer.MAX_VALUE - byteOffset) {
+                return null;
+            }
+            return parameterValueSourceStorage(
+                definition.getInput(0),
+                (int)dropped + byteOffset,
+                byteLength,
+                active,
+                depth + 1);
+        }
+        if (opcode == PcodeOp.PIECE && definition.getNumInputs() >= 2) {
+            return pieceParameterValueSourceStorage(
+                definition,
+                byteOffset,
+                byteLength,
+                active,
+                depth + 1);
+        }
+        if (opcode == PcodeOp.MULTIEQUAL) {
+            return phiParameterValueSourceStorage(
+                definition,
+                byteOffset,
+                byteLength,
+                active,
+                depth + 1);
+        }
+        return isSourcePreservingValueOperation(opcode)
+            ? derivedParameterValueSourceStorage(definition, active, depth + 1)
+            : null;
+    }
+
+    private PcodeStorage pieceParameterValueSourceStorage(
+        PcodeOp definition,
+        int byteOffset,
+        int byteLength,
+        Set<String> active,
+        int depth) {
+
+        Varnode high = definition.getInput(0);
+        Varnode low = definition.getInput(1);
+        int lowSize = low.getSize();
+        int end = byteOffset + byteLength;
+        if (end <= lowSize) {
+            return parameterValueSourceStorage(
+                low,
+                byteOffset,
+                byteLength,
+                active,
+                depth);
+        }
+        if (byteOffset >= lowSize) {
+            return parameterValueSourceStorage(
+                high,
+                byteOffset - lowSize,
+                byteLength,
+                active,
+                depth);
+        }
+        return null;
+    }
+
+    private PcodeStorage phiParameterValueSourceStorage(
+        PcodeOp definition,
+        int byteOffset,
+        int byteLength,
+        Set<String> active,
+        int depth) {
+
+        PcodeStorage selected = null;
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            PcodeStorage source = parameterValueSourceStorage(
+                definition.getInput(slot),
+                byteOffset,
+                byteLength,
+                new LinkedHashSet<>(active),
+                depth);
+            if (source == null || selected != null && !selected.sameLocation(source)) {
+                return null;
+            }
+            selected = source;
+        }
+        return selected;
+    }
+
+    private PcodeStorage derivedParameterValueSourceStorage(
+        PcodeOp definition,
+        Set<String> active,
+        int depth) {
+
+        PcodeStorage selected = null;
+        boolean sawSource = false;
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            Varnode input = definition.getInput(slot);
+            if (input == null || input.isConstant()) {
+                continue;
+            }
+            PcodeStorage source = parameterValueSourceStorage(
+                input,
+                0,
+                input.getSize(),
+                new LinkedHashSet<>(active),
+                depth);
+            if (source == null) {
+                return null;
+            }
+            if (selected != null && !selected.sameLocation(source)) {
+                return null;
+            }
+            selected = source;
+            sawSource = true;
+        }
+        return sawSource ? selected : null;
+    }
+
+    private boolean isSourcePreservingValueOperation(int opcode) {
+        return switch (opcode) {
+            case PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL,
+                PcodeOp.INT_LESS, PcodeOp.INT_SLESS,
+                PcodeOp.INT_LESSEQUAL, PcodeOp.INT_SLESSEQUAL,
+                PcodeOp.INT_NEGATE, PcodeOp.INT_2COMP,
+                PcodeOp.INT_AND, PcodeOp.INT_OR, PcodeOp.INT_XOR,
+                PcodeOp.INT_LEFT, PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT,
+                PcodeOp.BOOL_NEGATE, PcodeOp.BOOL_XOR,
+                PcodeOp.BOOL_AND, PcodeOp.BOOL_OR,
+                PcodeOp.FLOAT_ABS, PcodeOp.FLOAT_NEG,
+                PcodeOp.FLOAT_FLOAT2FLOAT, PcodeOp.FLOAT_INT2FLOAT,
+                PcodeOp.FLOAT_TRUNC, PcodeOp.FLOAT_CEIL,
+                PcodeOp.FLOAT_FLOOR, PcodeOp.FLOAT_ROUND -> true;
+            default -> false;
+        };
+    }
+
+    private PcodeStorage directParameterSourceStorage(Varnode node) {
+        PcodeStorage storage = pcodeStorageExpression(node);
+        return isParameterStorage(storage) ? storage : null;
+    }
+
+    private boolean isParameterStorage(PcodeStorage storage) {
+        return storage != null && pcodeParameterIndex(storage.base) != null;
+    }

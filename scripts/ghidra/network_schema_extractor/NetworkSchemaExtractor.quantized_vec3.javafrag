@@ -1,0 +1,656 @@
+    private WireShape quantizedVec3UnmarshalShape(
+        Function function,
+        String readBufferParameter,
+        List<CodecWireEvent> events) {
+
+        return quantizedVec3UnmarshalShape(
+            function,
+            readBufferParameter,
+            events,
+            null);
+    }
+
+    private WireShape quantizedVec3UnmarshalShape(
+        Function function,
+        String readBufferParameter,
+        List<CodecWireEvent> events,
+        HandlerWireShapeEvidence evidence) {
+
+        if (function == null || readBufferParameter == null || events.size() != 3 ||
+            events.stream().anyMatch(event ->
+                event.wireEvidence() == null ||
+                !"u8".equals(event.wireEvidence().shape) ||
+                !"fixed-bytes-1".equals(event.wireEvidence().layout))) {
+            setQuantizedVec3Diagnostic(evidence, "not-three-u8-events");
+            return null;
+        }
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            setQuantizedVec3Diagnostic(evidence, "high-function-missing");
+            return null;
+        }
+        List<DecodedByteOutput> outputs = decodedByteOutputs(high, events);
+        if (outputs.size() != events.size()) {
+            setQuantizedVec3Diagnostic(
+                evidence,
+                "decoded-output-count:" + outputs.size() + "/" + events.size());
+            return null;
+        }
+
+        LinkedHashMap<String, LinkedHashMap<Long, QuantizedFloatComponent>> componentsByBase =
+            new LinkedHashMap<>();
+        LinkedHashMap<String, LinkedHashSet<Long>> conflictsByBase = new LinkedHashMap<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.STORE || operation.getNumInputs() < 3) {
+                continue;
+            }
+            PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+            if (!isQuantizedVec3OutputBase(destination)) {
+                continue;
+            }
+            LinkedHashMap<Long, QuantizedFloatComponent> components =
+                componentsByBase.computeIfAbsent(
+                    destination.base,
+                    ignored -> new LinkedHashMap<>());
+            LinkedHashSet<Long> conflicts = conflictsByBase.computeIfAbsent(
+                destination.base,
+                ignored -> new LinkedHashSet<>());
+            collectQuantizedFloatComponents(
+                operation.getInput(2),
+                destination.offset,
+                outputs,
+                components,
+                conflicts,
+                new LinkedHashSet<>(),
+                0);
+        }
+
+        Long selectedRange = null;
+        int matchCount = 0;
+        for (Map.Entry<String, LinkedHashMap<Long, QuantizedFloatComponent>> entry :
+                componentsByBase.entrySet()) {
+            Map<Long, QuantizedFloatComponent> components = entry.getValue();
+            Set<Long> conflicts = conflictsByBase.getOrDefault(
+                entry.getKey(),
+                new LinkedHashSet<>());
+            ArrayList<Long> offsets = new ArrayList<>(components.keySet());
+            Collections.sort(offsets);
+            for (long firstOffset : offsets) {
+                QuantizedFloatComponent x = components.get(firstOffset);
+                QuantizedFloatComponent y = components.get(firstOffset + Float.BYTES);
+                QuantizedFloatComponent z = components.get(firstOffset + 2L * Float.BYTES);
+                if (x == null || y == null || z == null ||
+                    conflicts.contains(firstOffset) ||
+                    conflicts.contains(firstOffset + Float.BYTES) ||
+                    conflicts.contains(firstOffset + 2L * Float.BYTES) ||
+                    x.range() != y.range() || x.range() != z.range() ||
+                    !distinctDecodedComponents(x, y, z)) {
+                    continue;
+                }
+                selectedRange = x.range();
+                matchCount++;
+            }
+        }
+        setQuantizedVec3Diagnostic(
+            evidence,
+            "bases:" + componentsByBase.size() +
+                ",components:" + componentsByBase.values().stream()
+                    .mapToInt(Map::size)
+                    .sum() +
+                ",conflicts:" + conflictsByBase.values().stream()
+                    .mapToInt(Set::size)
+                    .sum() +
+                ",matches:" + matchCount);
+        return matchCount == 1
+            ? WireShape.semantic(
+                "delta-vec3<" + selectedRange + ">",
+                "composite<u8,u8,u8>",
+                "unmarshal-pcode-three-byte-affine-vec3")
+            : null;
+    }
+
+    private void setQuantizedVec3Diagnostic(
+        HandlerWireShapeEvidence evidence,
+        String diagnostic) {
+
+        if (evidence != null) {
+            evidence.quantizedVec3Diagnostic = diagnostic;
+        }
+    }
+
+    private boolean isQuantizedVec3OutputBase(PcodeStorage storage) {
+        return storage != null && storage.base != null &&
+            !"stack".equals(storage.base) &&
+            ("param_1".equals(storage.base) || storage.base.startsWith("input:"));
+    }
+
+    private List<DecodedByteOutput> decodedByteOutputs(
+        HighFunction high,
+        List<CodecWireEvent> events) {
+
+        if (high == null || events == null || events.isEmpty()) {
+            return List.of();
+        }
+        ArrayList<Address> expectedTargets = new ArrayList<>(events.size());
+        LinkedHashSet<Address> targetSet = new LinkedHashSet<>();
+        for (CodecWireEvent event : events) {
+            Address target = event.target() == null
+                ? null
+                : resolvedCodeTarget(event.target());
+            if (target == null) {
+                return List.of();
+            }
+            expectedTargets.add(target);
+            targetSet.add(target);
+        }
+
+        ArrayList<PcodeOpAST> calls = new ArrayList<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Address targetAddress = target == null
+                ? null
+                : resolvedCodeTarget(target.getEntryPoint());
+            if (targetSet.contains(targetAddress)) {
+                calls.add(operation);
+            }
+        }
+        if (calls.size() != events.size()) {
+            return List.of();
+        }
+
+        ArrayList<DecodedByteOutput> result = new ArrayList<>();
+        for (int index = 0; index < calls.size(); index++) {
+            PcodeOpAST operation = calls.get(index);
+            Address callsite = operation.getSeqnum().getTarget();
+            Function target = pcodeCallTarget(operation);
+            Address callTarget = target == null
+                ? null
+                : resolvedCodeTarget(target.getEntryPoint());
+            if (callsite == null || callTarget == null ||
+                !expectedTargets.get(index).equals(callTarget)) {
+                return List.of();
+            }
+            PcodeStorage storage = pcodeScalarUnmarshalOutputStorage(
+                operation,
+                Byte.BYTES);
+            if (!isPcodeLocalTempStorage(storage) ||
+                result.stream().anyMatch(output ->
+                    output.callsite().equals(callsite) ||
+                    output.storage().sameLocation(storage))) {
+                return List.of();
+            }
+            result.add(new DecodedByteOutput(storage, callsite));
+        }
+        return List.copyOf(result);
+    }
+
+    private void collectQuantizedFloatComponents(
+        Varnode value,
+        long destinationOffset,
+        List<DecodedByteOutput> outputs,
+        Map<Long, QuantizedFloatComponent> components,
+        Set<Long> conflicts,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || depth > 32 ||
+            !active.add(pcodeSsaNodeKey(value))) {
+            return;
+        }
+        try {
+            if (value.getSize() == Float.BYTES) {
+                FloatAffine affine = floatAffine(
+                    value,
+                    new LinkedHashSet<>(),
+                    0);
+                Long range = affine == null ? null : deltaRange(affine);
+                DecodedByteOutput output = affine == null
+                    ? null
+                    : decodedByteOutput(outputs, affine.source());
+                if (range == null || output == null) {
+                    return;
+                }
+                QuantizedFloatComponent candidate = new QuantizedFloatComponent(
+                    range,
+                    affine.source(),
+                    output.callsite());
+                QuantizedFloatComponent previous = components.putIfAbsent(
+                    destinationOffset,
+                    candidate);
+                if (previous != null && !previous.sameEvidence(candidate)) {
+                    conflicts.add(destinationOffset);
+                }
+                return;
+            }
+
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                return;
+            }
+            if (definition.getOpcode() == PcodeOp.PIECE &&
+                definition.getNumInputs() == 2) {
+                Varnode high = definition.getInput(0);
+                Varnode low = definition.getInput(1);
+                collectQuantizedFloatComponents(
+                    low,
+                    destinationOffset,
+                    outputs,
+                    components,
+                    conflicts,
+                    active,
+                    depth + 1);
+                collectQuantizedFloatComponents(
+                    high,
+                    destinationOffset + low.getSize(),
+                    outputs,
+                    components,
+                    conflicts,
+                    active,
+                    depth + 1);
+                return;
+            }
+            if ((definition.getOpcode() == PcodeOp.COPY ||
+                    definition.getOpcode() == PcodeOp.CAST) &&
+                definition.getNumInputs() == 1) {
+                collectQuantizedFloatComponents(
+                    definition.getInput(0),
+                    destinationOffset,
+                    outputs,
+                    components,
+                    conflicts,
+                    active,
+                    depth + 1);
+            }
+        }
+        finally {
+            active.remove(pcodeSsaNodeKey(value));
+        }
+    }
+
+    private FloatAffine floatAffine(
+        Varnode value,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || depth > 48 ||
+            !active.add(pcodeSsaNodeKey(value))) {
+            return null;
+        }
+        try {
+            Double constant = staticF32Value(value, new LinkedHashSet<>(), 0);
+            if (constant != null) {
+                return FloatAffine.constant(constant);
+            }
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                PcodeStorage source = pcodeLoadedStorageExpression(value);
+                return source == null ? null : FloatAffine.variable(source);
+            }
+            return switch (definition.getOpcode()) {
+                case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.FLOAT_FLOAT2FLOAT ->
+                    floatAffine(definition.getInput(0), active, depth + 1);
+                case PcodeOp.FLOAT_INT2FLOAT -> {
+                    IntegerAffine integer = integerAffine(
+                        definition.getInput(0),
+                        new LinkedHashSet<>(),
+                        0);
+                    yield integer == null
+                        ? null
+                        : new FloatAffine(integer.scale(), integer.offset(), integer.source());
+                }
+                case PcodeOp.FLOAT_ADD -> combineFloatAffine(
+                    floatAffine(definition.getInput(0), active, depth + 1),
+                    floatAffine(definition.getInput(1), active, depth + 1),
+                    false);
+                case PcodeOp.FLOAT_SUB -> combineFloatAffine(
+                    floatAffine(definition.getInput(0), active, depth + 1),
+                    floatAffine(definition.getInput(1), active, depth + 1),
+                    true);
+                case PcodeOp.FLOAT_MULT -> multiplyFloatAffine(
+                    floatAffine(definition.getInput(0), active, depth + 1),
+                    floatAffine(definition.getInput(1), active, depth + 1));
+                case PcodeOp.FLOAT_DIV -> divideFloatAffine(
+                    floatAffine(definition.getInput(0), active, depth + 1),
+                    floatAffine(definition.getInput(1), active, depth + 1));
+                case PcodeOp.MULTIEQUAL -> equalFloatAffineInputs(
+                    definition,
+                    active,
+                    depth + 1);
+                case PcodeOp.LOAD -> {
+                    PcodeStorage source = pcodeLoadedStorageExpression(value);
+                    yield source == null ? null : FloatAffine.variable(source);
+                }
+                default -> null;
+            };
+        }
+        finally {
+            active.remove(pcodeSsaNodeKey(value));
+        }
+    }
+
+    private IntegerAffine integerAffine(
+        Varnode value,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || depth > 48 ||
+            !active.add(pcodeSsaNodeKey(value))) {
+            return null;
+        }
+        try {
+            if (value.isConstant()) {
+                return IntegerAffine.constant(value.getOffset());
+            }
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                PcodeStorage source = pcodeLoadedStorageExpression(value);
+                return source == null ? null : IntegerAffine.variable(source);
+            }
+            return switch (definition.getOpcode()) {
+                case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT,
+                    PcodeOp.INT_SEXT, PcodeOp.SUBPIECE ->
+                    integerAffine(definition.getInput(0), active, depth + 1);
+                case PcodeOp.INDIRECT -> {
+                    PcodeStorage source = pcodeStorageExpression(value);
+                    yield isPcodeLocalTempStorage(source)
+                        ? IntegerAffine.variable(source)
+                        : null;
+                }
+                case PcodeOp.INT_ADD -> combineIntegerAffine(
+                    integerAffine(definition.getInput(0), active, depth + 1),
+                    integerAffine(definition.getInput(1), active, depth + 1),
+                    false);
+                case PcodeOp.INT_SUB -> combineIntegerAffine(
+                    integerAffine(definition.getInput(0), active, depth + 1),
+                    integerAffine(definition.getInput(1), active, depth + 1),
+                    true);
+                case PcodeOp.INT_MULT -> multiplyIntegerAffine(
+                    integerAffine(definition.getInput(0), active, depth + 1),
+                    integerAffine(definition.getInput(1), active, depth + 1));
+                case PcodeOp.LOAD -> {
+                    PcodeStorage source = pcodeLoadedStorageExpression(value);
+                    yield source == null ? null : IntegerAffine.variable(source);
+                }
+                case PcodeOp.MULTIEQUAL -> equalIntegerAffineInputs(
+                    definition,
+                    active,
+                    depth + 1);
+                default -> null;
+            };
+        }
+        finally {
+            active.remove(pcodeSsaNodeKey(value));
+        }
+    }
+
+    private Double staticF32Value(Varnode value, Set<String> active, int depth) {
+        if (value == null || value.getSize() != Float.BYTES || depth > 16 ||
+            !active.add(pcodeSsaNodeKey(value))) {
+            return null;
+        }
+        try {
+            if (value.isConstant()) {
+                float decoded = Float.intBitsToFloat((int)value.getOffset());
+                return Float.isFinite(decoded) ? (double)decoded : null;
+            }
+            Address direct = value.getAddress();
+            if (isProgramAddress(direct)) {
+                float decoded = Float.intBitsToFloat(getInt(direct));
+                return Float.isFinite(decoded) ? (double)decoded : null;
+            }
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                return null;
+            }
+            if ((definition.getOpcode() == PcodeOp.COPY ||
+                    definition.getOpcode() == PcodeOp.CAST) &&
+                definition.getNumInputs() == 1) {
+                return staticF32Value(definition.getInput(0), active, depth + 1);
+            }
+            if (definition.getOpcode() != PcodeOp.LOAD ||
+                definition.getNumInputs() < 2) {
+                return null;
+            }
+            Long rawAddress = NetworkSchemaIntegerEvaluator.evaluate(
+                definition.getInput(1));
+            Address address = rawAddress == null ? null : absoluteAddress(rawAddress);
+            if (!isProgramAddress(address)) {
+                return null;
+            }
+            float decoded = Float.intBitsToFloat(getInt(address));
+            return Float.isFinite(decoded) ? (double)decoded : null;
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+        finally {
+            active.remove(pcodeSsaNodeKey(value));
+        }
+    }
+
+    private FloatAffine combineFloatAffine(
+        FloatAffine left,
+        FloatAffine right,
+        boolean subtract) {
+
+        if (left == null || right == null ||
+            left.source() != null && right.source() != null &&
+                !left.source().sameLocation(right.source())) {
+            return null;
+        }
+        double sign = subtract ? -1.0 : 1.0;
+        return new FloatAffine(
+            left.scale() + sign * right.scale(),
+            left.offset() + sign * right.offset(),
+            left.source() == null ? right.source() : left.source());
+    }
+
+    private FloatAffine multiplyFloatAffine(FloatAffine left, FloatAffine right) {
+        if (left == null || right == null ||
+            left.source() != null && right.source() != null) {
+            return null;
+        }
+        FloatAffine variable = left.source() == null ? right : left;
+        FloatAffine constant = left.source() == null ? left : right;
+        return new FloatAffine(
+            variable.scale() * constant.offset(),
+            variable.offset() * constant.offset(),
+            variable.source());
+    }
+
+    private FloatAffine divideFloatAffine(FloatAffine left, FloatAffine right) {
+        return left == null || right == null || right.source() != null ||
+            right.offset() == 0.0
+            ? null
+            : new FloatAffine(
+                left.scale() / right.offset(),
+                left.offset() / right.offset(),
+                left.source());
+    }
+
+    private FloatAffine equalFloatAffineInputs(
+        PcodeOp definition,
+        Set<String> active,
+        int depth) {
+
+        FloatAffine selected = null;
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            FloatAffine candidate = floatAffine(
+                definition.getInput(slot),
+                new LinkedHashSet<>(active),
+                depth);
+            if (candidate == null ||
+                selected != null && !selected.same(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private IntegerAffine combineIntegerAffine(
+        IntegerAffine left,
+        IntegerAffine right,
+        boolean subtract) {
+
+        if (left == null || right == null ||
+            left.source() != null && right.source() != null &&
+                !left.source().sameLocation(right.source())) {
+            return null;
+        }
+        double sign = subtract ? -1.0 : 1.0;
+        return new IntegerAffine(
+            left.scale() + sign * right.scale(),
+            left.offset() + sign * right.offset(),
+            left.source() == null ? right.source() : left.source());
+    }
+
+    private IntegerAffine multiplyIntegerAffine(
+        IntegerAffine left,
+        IntegerAffine right) {
+
+        if (left == null || right == null ||
+            left.source() != null && right.source() != null) {
+            return null;
+        }
+        IntegerAffine variable = left.source() == null ? right : left;
+        IntegerAffine constant = left.source() == null ? left : right;
+        return new IntegerAffine(
+            variable.scale() * constant.offset(),
+            variable.offset() * constant.offset(),
+            variable.source());
+    }
+
+    private IntegerAffine equalIntegerAffineInputs(
+        PcodeOp definition,
+        Set<String> active,
+        int depth) {
+
+        IntegerAffine selected = null;
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            IntegerAffine candidate = integerAffine(
+                definition.getInput(slot),
+                new LinkedHashSet<>(active),
+                depth);
+            if (candidate == null ||
+                selected != null && !selected.same(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Long deltaRange(FloatAffine affine) {
+        if (affine == null || affine.source() == null ||
+            !Double.isFinite(affine.scale()) ||
+            !Double.isFinite(affine.offset()) ||
+            affine.scale() <= 0.0 || affine.offset() >= 0.0) {
+            return null;
+        }
+        long range = Math.round(-affine.offset());
+        if (range <= 0L || range > Integer.MAX_VALUE ||
+            !approximately(affine.offset(), -range) ||
+            !approximately(affine.scale(), 2.0 * range / 255.0)) {
+            return null;
+        }
+        return range;
+    }
+
+    private boolean approximately(double left, double right) {
+        double scale = Math.max(1.0, Math.max(Math.abs(left), Math.abs(right)));
+        return Math.abs(left - right) <= scale * 1.0e-5;
+    }
+
+    private DecodedByteOutput decodedByteOutput(
+        List<DecodedByteOutput> outputs,
+        PcodeStorage source) {
+
+        DecodedByteOutput selected = null;
+        for (DecodedByteOutput candidate : outputs) {
+            if (!candidate.storage().sameLocation(source)) {
+                continue;
+            }
+            if (selected != null && !selected.callsite().equals(candidate.callsite())) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private boolean distinctDecodedComponents(
+        QuantizedFloatComponent x,
+        QuantizedFloatComponent y,
+        QuantizedFloatComponent z) {
+
+        return !x.source().sameLocation(y.source()) &&
+            !x.source().sameLocation(z.source()) &&
+            !y.source().sameLocation(z.source()) &&
+            !x.callsite().equals(y.callsite()) &&
+            !x.callsite().equals(z.callsite()) &&
+            !y.callsite().equals(z.callsite());
+    }
+
+    private record FloatAffine(double scale, double offset, PcodeStorage source) {
+        static FloatAffine constant(double value) {
+            return new FloatAffine(0.0, value, null);
+        }
+
+        static FloatAffine variable(PcodeStorage source) {
+            return new FloatAffine(1.0, 0.0, source);
+        }
+
+        boolean same(FloatAffine other) {
+            return other != null && approximately(scale, other.scale) &&
+                approximately(offset, other.offset) &&
+                (source == null
+                    ? other.source == null
+                    : other.source != null && source.sameLocation(other.source));
+        }
+
+        private static boolean approximately(double left, double right) {
+            double magnitude = Math.max(1.0, Math.max(Math.abs(left), Math.abs(right)));
+            return Math.abs(left - right) <= magnitude * 1.0e-7;
+        }
+    }
+
+    private record IntegerAffine(double scale, double offset, PcodeStorage source) {
+        static IntegerAffine constant(long value) {
+            return new IntegerAffine(0.0, value, null);
+        }
+
+        static IntegerAffine variable(PcodeStorage source) {
+            return new IntegerAffine(1.0, 0.0, source);
+        }
+
+        boolean same(IntegerAffine other) {
+            return other != null && approximately(scale, other.scale) &&
+                approximately(offset, other.offset) &&
+                (source == null
+                    ? other.source == null
+                    : other.source != null && source.sameLocation(other.source));
+        }
+
+        private static boolean approximately(double left, double right) {
+            double magnitude = Math.max(1.0, Math.max(Math.abs(left), Math.abs(right)));
+            return Math.abs(left - right) <= magnitude * 1.0e-7;
+        }
+    }
+
+    private record DecodedByteOutput(PcodeStorage storage, Address callsite) {
+    }
+
+    private record QuantizedFloatComponent(
+        long range,
+        PcodeStorage source,
+        Address callsite) {
+
+        boolean sameEvidence(QuantizedFloatComponent other) {
+            return other != null && range == other.range &&
+                source.sameLocation(other.source) && callsite.equals(other.callsite);
+        }
+    }

@@ -1,0 +1,92 @@
+    private boolean rawWriteArgumentIsNormalizedBoolean(
+        Function owner,
+        PcodeOp operation) {
+
+        if (owner == null || operation == null || operation.getSeqnum() == null) {
+            return false;
+        }
+        HighFunction high = highFunction(owner);
+        if (high == null) {
+            return false;
+        }
+        Function target = pcodeCallTarget(operation);
+        int argumentCount = provenCallArgumentCount(operation, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            PcodeStorage argument = provenCallArgumentStorage(
+                owner,
+                operation,
+                target,
+                slot);
+            if (argument == null) {
+                continue;
+            }
+            Iterator<PcodeOpAST> operations = high.getPcodeOps();
+            while (operations.hasNext()) {
+                PcodeOpAST candidate = operations.next();
+                if (candidate.getOpcode() != PcodeOp.INDIRECT ||
+                    candidate.getOutput() == null || candidate.getNumInputs() == 0 ||
+                    candidate.getSeqnum() == null ||
+                    !operation.getSeqnum().getTarget().equals(
+                        candidate.getSeqnum().getTarget()) ||
+                    !argument.sameLocation(
+                        pcodeStorageExpression(candidate.getOutput()))) {
+                    continue;
+                }
+                if (normalizedBooleanExpression(
+                        candidate.getInput(0),
+                        new LinkedHashSet<>(),
+                        0)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean normalizedBooleanExpression(
+        Varnode value,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || depth > 32 || !active.add(pcodeNodeKey(value))) {
+            return false;
+        }
+        PcodeOp definition = value.getDef();
+        if (definition == null) {
+            return false;
+        }
+        return switch (definition.getOpcode()) {
+            case PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL ->
+                comparisonHasSingleZeroOperand(definition);
+            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INDIRECT,
+                 PcodeOp.BOOL_NEGATE -> definition.getNumInputs() == 1 &&
+                    normalizedBooleanExpression(
+                        definition.getInput(0),
+                        active,
+                        depth + 1);
+            case PcodeOp.MULTIEQUAL -> {
+                boolean allNormalized = definition.getNumInputs() > 0;
+                for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+                    allNormalized &= normalizedBooleanExpression(
+                        definition.getInput(slot),
+                        new LinkedHashSet<>(active),
+                        depth + 1);
+                }
+                yield allNormalized;
+            }
+            default -> false;
+        };
+    }
+
+    private boolean comparisonHasSingleZeroOperand(PcodeOp comparison) {
+        if (comparison == null || comparison.getNumInputs() != 2) {
+            return false;
+        }
+        boolean firstZero = Objects.equals(
+            NetworkSchemaIntegerEvaluator.evaluate(comparison.getInput(0)),
+            0L);
+        boolean secondZero = Objects.equals(
+            NetworkSchemaIntegerEvaluator.evaluate(comparison.getInput(1)),
+            0L);
+        return firstZero != secondZero;
+    }

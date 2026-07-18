@@ -1,0 +1,596 @@
+use super::*;
+
+impl NetworkSchema {
+    pub fn from_ghidra_static_network_report(
+        report: &Value,
+    ) -> Result<Self, NetworkSchemaImportError> {
+        Self::from_ghidra_static_network_report_with_context(report, &CodegenContext::inline())
+    }
+
+    pub fn from_ghidra_static_network_report_with_context(
+        report: &Value,
+        context: &CodegenContext,
+    ) -> Result<Self, NetworkSchemaImportError> {
+        let root = report
+            .as_object()
+            .ok_or(NetworkSchemaImportError::ExpectedObjectRoot)?;
+        if contains_private_source_evidence(report) {
+            return Err(NetworkSchemaImportError::PrivateSourceEvidence);
+        }
+        let registry_entries = array_values(root, "registryEntries")
+            .filter_map(Value::as_object)
+            .collect::<Vec<_>>();
+        let field_registration_function_entries = array_values(root, "fieldRegistrationFunctions")
+            .filter_map(Value::as_object)
+            .collect::<Vec<_>>();
+        let field_handler_vtable_entries = array_values(root, "fieldHandlerVtables")
+            .filter_map(Value::as_object)
+            .collect::<Vec<_>>();
+        let ((types, field_registration_functions), field_handler_vtables) = context.runner().join(
+            || {
+                context.runner().join(
+                    || {
+                        context.runner().map(&registry_entries, |entry| {
+                            network_type_from_registry_entry(entry)
+                        })
+                    },
+                    || {
+                        context
+                            .runner()
+                            .map(&field_registration_function_entries, |entry| {
+                                network_field_registration_function(entry)
+                            })
+                    },
+                )
+            },
+            || {
+                context
+                    .runner()
+                    .map(&field_handler_vtable_entries, |entry| {
+                        network_field_handler_vtable(entry)
+                    })
+            },
+        );
+        let mut schema = Self {
+            schema: NETWORK_SCHEMA_VERSION.to_owned(),
+            sources: vec![NetworkSchemaSource {
+                kind: NetworkSchemaSourceKind::GhidraNetworkStaticReport,
+                path: string(root, "input"),
+                schema: Some(NETWORK_STATIC_REPORT_SCHEMA_VERSION.to_owned()),
+                program: string(root, "program"),
+                image_base: string(root, "imageBase"),
+            }],
+            summary: NetworkSchemaSummary::default(),
+            types,
+            serialize_types: Vec::new(),
+            field_registration_functions,
+            field_handler_vtables,
+        };
+        schema.normalize_derived_shapes();
+        Ok(schema)
+    }
+
+    pub fn normalize_derived_shapes(&mut self) {
+        for vtable in &mut self.field_handler_vtables {
+            if vtable.should_suppress_replicated_container_wire_shape() {
+                vtable.wire_shape = None;
+                vtable.wire_shape_source = None;
+                vtable.delta_wire_shape = None;
+                vtable.full_wire_shape = None;
+            }
+        }
+        let projections = field_handler_projections(&self.field_handler_vtables);
+        for network_type in &mut self.types {
+            enrich_fields_from_handler_projections(&mut network_type.fields, &projections);
+        }
+        for function in &mut self.field_registration_functions {
+            enrich_fields_from_handler_projections(&mut function.fields, &projections);
+        }
+        self.suppress_under_shaped_container_wire_shapes();
+        promote_replicated_state_capabilities(self);
+        self.summary = self.build_summary();
+    }
+
+    fn suppress_under_shaped_container_wire_shapes(&mut self) {
+        let structured_container_vtables = self
+            .field_handler_vtables
+            .iter()
+            .filter(|vtable| vtable.should_suppress_replicated_container_wire_shape())
+            .filter_map(|vtable| vtable.address.as_deref())
+            .collect::<BTreeSet<_>>();
+        if structured_container_vtables.is_empty() {
+            return;
+        }
+
+        for network_type in &mut self.types {
+            suppress_field_wire_shapes_for_vtables(
+                &mut network_type.fields,
+                &structured_container_vtables,
+            );
+        }
+        for function in &mut self.field_registration_functions {
+            suppress_field_wire_shapes_for_vtables(
+                &mut function.fields,
+                &structured_container_vtables,
+            );
+        }
+    }
+
+    pub fn merge_typeindex_root(
+        &mut self,
+        typeindex: &Value,
+        source_path: Option<String>,
+    ) -> Result<NetworkTypeIndexMergeReport, NetworkSchemaImportError> {
+        let root = typeindex
+            .as_object()
+            .ok_or(NetworkSchemaImportError::ExpectedTypeIndexArray)?;
+        let type_ids = root
+            .get("typeIndex")
+            .and_then(Value::as_array)
+            .ok_or(NetworkSchemaImportError::ExpectedTypeIndexArray)?;
+        let type_indices = type_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                value
+                    .as_str()
+                    .and_then(parse_uuid)
+                    .zip(u32::try_from(index).ok())
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut report = NetworkTypeIndexMergeReport {
+            source_type_count: type_indices.len(),
+            ..NetworkTypeIndexMergeReport::default()
+        };
+        for network_type in &mut self.types {
+            let Some(type_id) = network_type.type_id else {
+                report.unmatched_schema_type_count += 1;
+                continue;
+            };
+            let Some(type_index) = type_indices.get(&type_id).copied() else {
+                report.unmatched_schema_type_count += 1;
+                continue;
+            };
+
+            report.matched_type_count += 1;
+            match network_type.type_index {
+                Some(existing) if existing == type_index => {
+                    report.matching_type_index_count += 1;
+                    network_type.evidence.push(typeindex_evidence(
+                        type_index,
+                        NetworkConfidence::Exact,
+                        None,
+                    ));
+                }
+                Some(existing) => {
+                    report.conflicting_type_index_count += 1;
+                    network_type.evidence.push(typeindex_evidence(
+                        type_index,
+                        NetworkConfidence::Weak,
+                        Some(format!("typeindex.json={type_index}, existing={existing}")),
+                    ));
+                }
+                None => {
+                    report.filled_type_index_count += 1;
+                    network_type.type_index = Some(type_index);
+                    network_type.evidence.push(typeindex_evidence(
+                        type_index,
+                        NetworkConfidence::Exact,
+                        None,
+                    ));
+                }
+            }
+        }
+        self.sources.push(NetworkSchemaSource {
+            kind: NetworkSchemaSourceKind::TypeIndex,
+            path: source_path,
+            schema: None,
+            program: None,
+            image_base: None,
+        });
+        self.summary = self.build_summary();
+        Ok(report)
+    }
+
+    pub fn merge_serialize_codegen_unit(
+        &mut self,
+        unit: &SerializeCodegenUnit,
+        source_path: Option<String>,
+    ) -> NetworkSerializeMergeReport {
+        let index = unit.index();
+        let name_index = serialize_items_by_name(unit);
+        let selected_value_types =
+            selected_value_type_info_by_handler_vtable(&self.field_handler_vtables);
+        let mut report = NetworkSerializeMergeReport {
+            source_type_count: unit.items.len(),
+            ..NetworkSerializeMergeReport::default()
+        };
+        self.merge_serialize_type_index(unit, &index);
+
+        for network_type in &mut self.types {
+            let Some((item, confidence, source)) =
+                serialize_match(network_type, &index, &name_index, &mut report)
+            else {
+                merge_field_serialize_types(
+                    network_type,
+                    &index,
+                    &selected_value_types,
+                    &mut report,
+                );
+                continue;
+            };
+            report.matched_type_count += 1;
+            if network_type.name.is_none() {
+                network_type.name = Some(item.source_name.clone());
+                network_type.name_source = Some(source.clone());
+                report.filled_name_count += 1;
+            }
+            network_type.serialize = Some(network_serialize_type(item, &index));
+            network_type.evidence.push(NetworkEvidence {
+                kind: NetworkEvidenceKind::SerializeContext,
+                source,
+                address: None,
+                detail: Some(item.source_name.clone()),
+                confidence,
+            });
+            merge_field_serialize_types(network_type, &index, &selected_value_types, &mut report);
+        }
+
+        self.sources.push(NetworkSchemaSource {
+            kind: NetworkSchemaSourceKind::SerializeContext,
+            path: source_path,
+            schema: None,
+            program: None,
+            image_base: None,
+        });
+        self.summary = self.build_summary();
+        report
+    }
+
+    pub fn merge_serialize_type_catalog(
+        &mut self,
+        catalog: &crate::catalog::ReflectedTypeCatalog,
+    ) -> NetworkSerializeCatalogMergeReport {
+        let required_type_ids = crate::network_selection::required_serialize_type_ids(self);
+        let mut merged = self
+            .serialize_types
+            .iter()
+            .cloned()
+            .map(|serialize| (serialize.type_id, serialize))
+            .collect::<BTreeMap<_, _>>();
+        let mut report = NetworkSerializeCatalogMergeReport {
+            required_type_count: required_type_ids.len(),
+            ..NetworkSerializeCatalogMergeReport::default()
+        };
+
+        for type_id in required_type_ids {
+            let Some(generic) = catalog.generic_type(type_id) else {
+                continue;
+            };
+            report.matched_generic_type_count += 1;
+            merged
+                .entry(type_id)
+                .or_insert_with(|| network_serialize_generic_type(generic));
+        }
+
+        self.serialize_types = merged.into_values().collect();
+        self.summary = self.build_summary();
+        report
+    }
+
+    fn merge_serialize_type_index(
+        &mut self,
+        unit: &SerializeCodegenUnit,
+        index: &SerializeCodegenIndex<'_>,
+    ) {
+        let mut merged = self
+            .serialize_types
+            .iter()
+            .cloned()
+            .map(|serialize| (serialize.type_id, serialize))
+            .collect::<BTreeMap<_, _>>();
+        for item in &unit.items {
+            merged
+                .entry(item.source_type_id)
+                .or_insert_with(|| network_serialize_type(item, index));
+        }
+        self.serialize_types = merged.into_values().collect();
+    }
+
+    pub fn merge_message_signatures(
+        &mut self,
+        signatures: &[NetworkMessageSignature],
+        source_path: Option<String>,
+    ) -> NetworkMessageSignatureMergeReport {
+        let mut report = NetworkMessageSignatureMergeReport {
+            source_message_count: signatures.len(),
+            ..NetworkMessageSignatureMergeReport::default()
+        };
+
+        for signature in signatures {
+            let candidates = message_signature_candidates(&self.types, signature);
+            let [network_type_index] = candidates.as_slice() else {
+                if candidates.is_empty() {
+                    report.unmatched_message_count += 1;
+                } else {
+                    report.ambiguous_message_count += 1;
+                }
+                continue;
+            };
+
+            let network_type = &mut self.types[*network_type_index];
+            let source = signature
+                .source
+                .clone()
+                .or_else(|| source_path.clone())
+                .unwrap_or_else(|| "messageSignatures".to_owned());
+            report.matched_message_count += 1;
+            if network_type.fields.is_empty() && !signature.fields.is_empty() {
+                network_type.fields =
+                    network_fields_from_message_signature(&signature.fields, source.clone());
+                report.field_name_filled_count += signature.fields.len();
+                report.native_type_filled_count += signature
+                    .fields
+                    .iter()
+                    .filter(|field| field.native_type.is_some())
+                    .count();
+                report.wire_shape_filled_count += signature
+                    .fields
+                    .iter()
+                    .filter(|field| field.wire_shape.is_some())
+                    .count();
+                continue;
+            }
+
+            if network_type.fields.len() != signature.fields.len() {
+                network_type.field_count_conflict = true;
+                report.field_count_mismatch_count += 1;
+                continue;
+            }
+
+            for (field, field_signature) in
+                network_type.fields.iter_mut().zip(signature.fields.iter())
+            {
+                if let (Some(existing), Some(expected)) = (field.index, field_signature.index)
+                    && existing != expected
+                {
+                    report.field_index_mismatch_count += 1;
+                    continue;
+                }
+
+                if field.name.as_deref().is_none_or(is_placeholder_field_name)
+                    || field_has_native_type_name(field)
+                {
+                    field.name = Some(field_signature.name.clone());
+                    report.field_name_filled_count += 1;
+                } else if field.name.as_deref() != Some(field_signature.name.as_str()) {
+                    report.field_name_conflict_count += 1;
+                }
+
+                if field.native_type.is_none() {
+                    field.native_type = field_signature.native_type.clone();
+                    if field.native_type.is_some() {
+                        report.native_type_filled_count += 1;
+                    }
+                } else if let Some(expected) = field_signature.native_type.as_deref()
+                    && field.native_type.as_deref() != Some(expected)
+                {
+                    field.type_conflict = true;
+                    report.native_type_conflict_count += 1;
+                }
+
+                if field.rust_type.is_none() {
+                    field.rust_type = field_signature.rust_type.clone();
+                }
+
+                if field.wire_shape.is_none()
+                    && let Some(wire_shape) = field_signature.wire_shape.as_ref()
+                {
+                    field.wire_shape = Some(wire_shape.clone());
+                    field.wire_shape_source = Some(source.clone());
+                    report.wire_shape_filled_count += 1;
+                } else if let Some(expected) = field_signature.wire_shape.as_ref()
+                    && field.wire_shape.as_ref() != Some(expected)
+                {
+                    field.wire_conflict = true;
+                    report.wire_shape_conflict_count += 1;
+                }
+
+                field.evidence.push(NetworkEvidence {
+                    kind: NetworkEvidenceKind::MessageSource,
+                    source: source.clone(),
+                    address: None,
+                    detail: Some(field_signature.name.clone()),
+                    confidence: NetworkConfidence::High,
+                });
+            }
+        }
+
+        self.sources.push(NetworkSchemaSource {
+            kind: NetworkSchemaSourceKind::MessageSignatures,
+            path: source_path,
+            schema: None,
+            program: None,
+            image_base: None,
+        });
+        self.summary = self.build_summary();
+        report
+    }
+
+    pub fn merge_field_overrides(
+        &mut self,
+        overrides: &NetworkFieldOverrideFile,
+        source_path: Option<String>,
+    ) -> NetworkFieldOverrideMergeReport {
+        let mut report = NetworkFieldOverrideMergeReport {
+            source_field_count: overrides.fields.len(),
+            ..NetworkFieldOverrideMergeReport::default()
+        };
+
+        for field_override in &overrides.fields {
+            let type_candidates = field_override_type_candidates(&self.types, field_override);
+            let [network_type_index] = type_candidates.as_slice() else {
+                if type_candidates.is_empty() {
+                    report.unmatched_type_count += 1;
+                } else {
+                    report.ambiguous_type_count += 1;
+                }
+                continue;
+            };
+
+            let network_type = &mut self.types[*network_type_index];
+            let field_candidates = field_override_field_candidates(network_type, field_override);
+            let [field_index] = field_candidates.as_slice() else {
+                if field_candidates.is_empty() {
+                    report.unmatched_field_count += 1;
+                } else {
+                    report.ambiguous_field_count += 1;
+                }
+                continue;
+            };
+
+            let source = source_path
+                .clone()
+                .unwrap_or_else(|| "fieldOverrides".to_owned());
+            let field = &mut network_type.fields[*field_index];
+            if let Some(native_type) = field_override.native_type.as_ref()
+                && field.native_type.as_deref() != Some(native_type.as_str())
+            {
+                field.native_type = Some(native_type.clone());
+                report.native_type_updated_count += 1;
+            }
+            if let Some(rust_type) = field_override.rust_type.as_ref()
+                && field.rust_type.as_deref() != Some(rust_type.as_str())
+            {
+                field.rust_type = Some(rust_type.clone());
+                report.rust_type_updated_count += 1;
+            }
+            if let Some(wire_shape) = field_override.wire_shape.as_ref()
+                && field.wire_shape.as_ref() != Some(wire_shape)
+            {
+                field.wire_shape = Some(wire_shape.clone());
+                field.wire_shape_source = Some(
+                    field_override
+                        .wire_shape_source
+                        .clone()
+                        .unwrap_or_else(|| source.clone()),
+                );
+                report.wire_shape_updated_count += 1;
+            } else if let Some(wire_shape_source) = field_override.wire_shape_source.as_ref()
+                && field.wire_shape.is_some()
+                && field.wire_shape_source.as_deref() != Some(wire_shape_source.as_str())
+            {
+                field.wire_shape_source = Some(wire_shape_source.clone());
+                report.wire_shape_updated_count += 1;
+            }
+            if let Some(confidence) = field_override.confidence
+                && field.confidence != confidence
+            {
+                field.confidence = confidence;
+                report.confidence_updated_count += 1;
+            }
+            field.evidence.push(NetworkEvidence {
+                kind: NetworkEvidenceKind::FieldOverride,
+                source: source.clone(),
+                address: None,
+                detail: Some(field_override_detail(field_override)),
+                confidence: field_override.confidence.unwrap_or(NetworkConfidence::High),
+            });
+            report.matched_field_count += 1;
+        }
+
+        self.sources.push(NetworkSchemaSource {
+            kind: NetworkSchemaSourceKind::FieldOverrides,
+            path: source_path,
+            schema: None,
+            program: None,
+            image_base: None,
+        });
+        self.summary = self.build_summary();
+        report
+    }
+
+    #[must_use]
+    pub fn build_summary(&self) -> NetworkSchemaSummary {
+        let register_field_count = self
+            .field_registration_functions
+            .iter()
+            .map(|function| function.fields.len())
+            .sum::<usize>();
+        NetworkSchemaSummary {
+            type_count: self.types.len(),
+            type_registry_entry_count: self.types.len(),
+            typed_type_count: self
+                .types
+                .iter()
+                .filter(|network_type| network_type.type_id.is_some())
+                .count(),
+            named_type_count: self
+                .types
+                .iter()
+                .filter(|network_type| network_type.name.is_some())
+                .count(),
+            register_field_function_count: self.field_registration_functions.len(),
+            register_field_count,
+            typed_register_field_function_count: self
+                .field_registration_functions
+                .iter()
+                .filter(|function| function.owner_type_id.is_some())
+                .count(),
+            high_confidence_field_count: self
+                .types
+                .iter()
+                .flat_map(|network_type| &network_type.fields)
+                .filter(|field| field.confidence.is_high_or_exact())
+                .count(),
+            message_unmarshal_field_count: self
+                .types
+                .iter()
+                .flat_map(|network_type| &network_type.fields)
+                .filter(|field| {
+                    field
+                        .evidence
+                        .iter()
+                        .any(|evidence| evidence.kind == NetworkEvidenceKind::MessageUnmarshal)
+                })
+                .count(),
+            type_index_evidence_count: self
+                .types
+                .iter()
+                .flat_map(|network_type| &network_type.evidence)
+                .filter(|evidence| evidence.kind == NetworkEvidenceKind::TypeIndex)
+                .count(),
+            serialize_source_type_count: self.serialize_types.len(),
+            serialize_type_count: self
+                .types
+                .iter()
+                .filter(|network_type| network_type.serialize.is_some())
+                .count(),
+            serialize_field_type_count: self
+                .types
+                .iter()
+                .flat_map(|network_type| &network_type.fields)
+                .filter(|field| field.serialize.is_some())
+                .count(),
+            serialize_dependency_count: self
+                .types
+                .iter()
+                .filter_map(|network_type| network_type.serialize.as_ref())
+                .map(|serialize| serialize.direct_dependency_type_ids.len())
+                .sum(),
+            field_handler_vtable_count: self.field_handler_vtables.len(),
+            message_source_field_count: self
+                .types
+                .iter()
+                .flat_map(|network_type| &network_type.fields)
+                .filter(|field| {
+                    field
+                        .evidence
+                        .iter()
+                        .any(|evidence| evidence.kind == NetworkEvidenceKind::MessageSource)
+                })
+                .count(),
+        }
+    }
+}

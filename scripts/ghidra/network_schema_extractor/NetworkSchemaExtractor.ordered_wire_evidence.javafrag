@@ -1,0 +1,45 @@
+    private WireShape orderedCodecWireEvidence(
+        List<CodecWireEvent> events,
+        String source) {
+
+        if (events == null || events.isEmpty()) {
+            return null;
+        }
+        ArrayList<WireShape> evidence = new ArrayList<>(events.size());
+        for (CodecWireEvent event : events) {
+            if (event == null) {
+                return null;
+            }
+            evidence.add(event.wireEvidence());
+        }
+        return orderedWireEvidence(evidence, source);
+    }
+
+    private WireShape orderedWireEvidence(
+        List<WireShape> evidence,
+        String source) {
+
+        if (evidence == null || evidence.isEmpty() || evidence.stream().anyMatch(
+                shape -> shape == null || shape.layout == null)) {
+            return null;
+        }
+        ArrayList<String> layouts = new ArrayList<>(evidence.size());
+        ArrayList<String> shapes = new ArrayList<>(evidence.size());
+        boolean semantic = true;
+        for (WireShape shape : evidence) {
+            layouts.add(shape.layout);
+            if (shape.hasProvenSemantics()) {
+                shapes.add(shape.shape);
+            }
+            else {
+                semantic = false;
+            }
+        }
+        String layout = compositeWireShape(layouts);
+        if (layout == null) {
+            return null;
+        }
+        return semantic
+            ? WireShape.semantic(compositeWireShape(shapes), layout, source)
+            : WireShape.layout(layout, source);
+    }

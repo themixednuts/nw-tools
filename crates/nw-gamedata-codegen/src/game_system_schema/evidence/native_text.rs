@@ -152,7 +152,7 @@ pub(in crate::game_system_schema) fn parse_native_numeric_text(
     }
 }
 
-pub(crate) fn native_float_prefix(value: &str) -> Option<&str> {
+pub fn native_float_prefix(value: &str) -> Option<&str> {
     let value = value.trim_start();
     let bytes = value.as_bytes();
     let mut index = 0;

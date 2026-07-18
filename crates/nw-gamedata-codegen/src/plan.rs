@@ -1,22 +1,14 @@
 use std::collections::BTreeSet;
 
-use crate::asset_access::GameAssetAccessCodegenPlan;
 use crate::game_system_schema::GameSystemDataTablesSchemaReport;
 use crate::manager::ManagerCodegenPlan;
-use crate::project::StandaloneProjectCodegenPlan;
 use crate::schema::GameDataCompileMode;
-use crate::system::SystemCodegenPlan;
-use crate::target::{GameDataProduct, GameDataTargetPlan};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameDataCodegenPlan {
     mode: GameDataCompileMode,
-    targets: Vec<GameDataTargetPlan>,
     tables: TableCodegenPlan,
     managers: ManagerCodegenPlan,
-    systems: SystemCodegenPlan,
-    game_asset_access: GameAssetAccessCodegenPlan,
-    standalone_projects: StandaloneProjectCodegenPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,38 +23,17 @@ impl GameDataCodegenPlan {
     pub fn from_schema_report(
         mode: GameDataCompileMode,
         schema_report: &GameSystemDataTablesSchemaReport,
-        targets: Vec<GameDataTargetPlan>,
     ) -> Self {
-        let game_asset_access = GameAssetAccessCodegenPlan::from_targets(&targets);
-        let standalone_projects =
-            StandaloneProjectCodegenPlan::from_targets(&targets, &game_asset_access);
         Self {
             mode,
-            targets,
             tables: TableCodegenPlan::from_schema_report(schema_report),
-            managers: ManagerCodegenPlan::new(),
-            systems: SystemCodegenPlan::new(),
-            game_asset_access,
-            standalone_projects,
+            managers: ManagerCodegenPlan::validated_native_for_schema(schema_report),
         }
-    }
-
-    #[must_use]
-    pub fn target_plans_for(&self, product: GameDataProduct) -> Vec<&GameDataTargetPlan> {
-        self.targets
-            .iter()
-            .filter(|target| target.supports_product(product))
-            .collect()
     }
 
     #[must_use]
     pub const fn mode(&self) -> GameDataCompileMode {
         self.mode
-    }
-
-    #[must_use]
-    pub fn targets(&self) -> &[GameDataTargetPlan] {
-        &self.targets
     }
 
     #[must_use]
@@ -73,40 +44,6 @@ impl GameDataCodegenPlan {
     #[must_use]
     pub const fn managers(&self) -> &ManagerCodegenPlan {
         &self.managers
-    }
-
-    #[must_use]
-    pub const fn systems(&self) -> &SystemCodegenPlan {
-        &self.systems
-    }
-
-    #[must_use]
-    pub const fn game_asset_access(&self) -> &GameAssetAccessCodegenPlan {
-        &self.game_asset_access
-    }
-
-    #[must_use]
-    pub const fn standalone_projects(&self) -> &StandaloneProjectCodegenPlan {
-        &self.standalone_projects
-    }
-
-    #[must_use]
-    pub fn with_managers(mut self, managers: ManagerCodegenPlan) -> Self {
-        self.managers = managers;
-        self
-    }
-
-    #[must_use]
-    pub fn with_systems(mut self, systems: SystemCodegenPlan) -> Self {
-        self.systems = systems;
-        self
-    }
-
-    #[must_use]
-    pub fn standalone_targets_are_self_contained(&self) -> bool {
-        self.targets
-            .iter()
-            .all(GameDataTargetPlan::is_self_contained)
     }
 }
 

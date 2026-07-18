@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct CAGEGridAsset;
+pub struct CAGEGridAsset {}
 
 impl AzRtti for CAGEGridAsset {
     const NAME: &'static str = "CAGEGridAsset";

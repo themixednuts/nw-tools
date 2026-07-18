@@ -3,15 +3,11 @@
             return null;
         }
 
-        String callTargetName = fullFunctionName(callTarget);
-        String owner = directUnmarshalOwnerFullName(callTargetName);
+        String owner = directUnmarshalValueTypeName(callTarget);
         if (owner == null) {
-            owner = unmarshalTemplateType(callTargetName);
+            return null;
         }
-        if (owner == null) {
-            owner = directUnmarshalOwnerFullNameFromPrototype(callTarget);
-        }
-        if (owner == null) {
+        if (wireShapeFromNativeType(owner) != null) {
             return null;
         }
 
@@ -30,10 +26,20 @@
             shape.members.isEmpty()) {
             return false;
         }
+        if (Boolean.TRUE.equals(shape.identityProven) && shape.typeId != null) {
+            return addProvenNestedTypeMemberCandidate(
+                byBase,
+                storage,
+                shape,
+                op,
+                target,
+                source);
+        }
 
         boolean added = false;
         for (NestedTypeMember member : shape.members) {
-            if (member.nativeType == null || member.wireShape == null) {
+            WireShape wireEvidence = nestedMemberWireEvidence(member);
+            if (wireEvidence == null) {
                 continue;
             }
             LinkedHashMap<Long, NestedTypeMember> members = byBase.get(storage.base);
@@ -42,7 +48,7 @@
                 byBase,
                 storage.plus(member.offset),
                 member.nativeType,
-                member.wireShape,
+                wireEvidence,
                 op,
                 target,
                 source == null ? "pcode-nested-direct-type-call" : source);
@@ -52,20 +58,192 @@
         }
         return added;
     }
+    private boolean addProvenNestedTypeMemberCandidate(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        PcodeStorage storage,
+        NestedTypeShape shape,
+        PcodeOp op,
+        Function target,
+        String source) {
+
+        ArrayList<String> layouts = new ArrayList<>();
+        for (NestedTypeMember nested : shape.members) {
+            WireShape evidence = nestedMemberWireEvidence(nested);
+            if (evidence == null || evidence.layout == null) {
+                return false;
+            }
+            layouts.add(evidence.layout);
+        }
+        String layout = compositeWireShape(layouts);
+        String semantic = wireShapeFromNestedTypeShape(shape);
+        String evidenceSource = source == null
+            ? "pcode-proven-nested-direct-type"
+            : source + "+proven-direct-type";
+        WireShape wireEvidence = semantic == null
+            ? WireShape.layout(layout, evidenceSource)
+            : WireShape.semantic(semantic, layout, evidenceSource);
+        addNestedTypeMemberCandidate(
+            byBase,
+            storage,
+            shape.typeNameFull == null ? shape.typeName : shape.typeNameFull,
+            wireEvidence,
+            op,
+            target,
+            evidenceSource);
+
+        LinkedHashMap<Long, NestedTypeMember> members = byBase.get(storage.base);
+        NestedTypeMember member = members == null ? null : members.get(storage.offset);
+        if (member == null || Boolean.TRUE.equals(member.typeConflict)) {
+            return false;
+        }
+        member.typeId = shape.typeId;
+        member.typeIdSource = shape.typeIdSource;
+        member.typeIdentityProven = true;
+        member.typeIdentitySource = shape.identitySource;
+        if (shape.nativeSize != null && shape.nativeSize > 0 &&
+            shape.nativeSize <= Integer.MAX_VALUE) {
+            member.byteWidth = shape.nativeSize.intValue();
+        }
+        return true;
+    }
+    private void proveDirectTypeIdentity(NestedTypeShape shape, Function target) {
+        if (shape == null || target == null || shape.members.isEmpty()) {
+            return;
+        }
+
+        LinkedHashMap<String, String> evidenceByTypeId = new LinkedHashMap<>();
+        addDirectTypeIdentityCandidate(
+            evidenceByTypeId,
+            directUnmarshalValueTypeName(target),
+            "ghidra-direct-unmarshal-value-type");
+        if (evidenceByTypeId.size() > 1) {
+            recordNestedTypeShapeReject("conflicting-direct-type-identity");
+            return;
+        }
+        Map.Entry<String, String> evidence = evidenceByTypeId.isEmpty()
+            ? null
+            : evidenceByTypeId.entrySet().iterator().next();
+        SerializeTypeInfo reflected = evidence == null
+            ? uniqueSerializeTypeForObservedNativeLayout(shape)
+            : serializeTypesById.get(evidence.getKey());
+        if (reflected == null) {
+            return;
+        }
+        String identitySource = evidence == null
+            ? "ghidra-pcode-output-layout+unique-serialize-native-layout"
+            : evidence.getValue();
+        if (!nativeLayoutMatchesSerializeType(shape, reflected)) {
+            if (evidence == null ||
+                !proveSparseDirectTypeIdentity(shape, reflected, evidence)) {
+                recordNestedTypeShapeReject("direct-type-identity-layout-mismatch");
+            }
+            return;
+        }
+        shape.typeId = reflected.typeId;
+        shape.typeIdSource = identitySource;
+        shape.identityProven = true;
+        shape.identitySource = identitySource + "+exact-native-layout";
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(reflected.name);
+        shape.typeNameFull = reflected.name;
+        shape.typeNameSource = identitySource;
+        enrichKnownSerializeIdentity(shape);
+    }
+
+    private SerializeTypeInfo uniqueSerializeTypeForObservedNativeLayout(
+        NestedTypeShape shape) {
+
+        Long nativeSize = observedNativeSize(shape);
+        List<SerializeWireSlot> observed = observedNativeWireLayout(shape);
+        if (nativeSize == null || observed.isEmpty()) {
+            return null;
+        }
+        String observedLayout = nativeWireLayoutKey(nativeSize, observed);
+        SerializeTypeInfo selected = null;
+        for (SerializeTypeInfo candidate : serializeTypesWithExactNativeSize(nativeSize)) {
+            List<SerializeWireSlot> expected = serializeTypeNativeWireLayout(candidate.typeId);
+            if (expected.isEmpty() || !observedLayout.equals(
+                    nativeWireLayoutKey(nativeSize, expected))) {
+                continue;
+            }
+            if (selected != null && !uuidEquals(selected.typeId, candidate.typeId)) {
+                recordNestedTypeShapeReject("ambiguous-direct-type-native-layout");
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private boolean proveSparseDirectTypeIdentity(
+        NestedTypeShape shape,
+        SerializeTypeInfo reflected,
+        Map.Entry<String, String> evidence) {
+
+        if (shape == null || reflected == null || evidence == null ||
+            !reflected.layoutFields.isEmpty()) {
+            return false;
+        }
+        String typeId = normalizeUuid(reflected.typeId);
+        LinkedHashSet<Long> declaredSizes = serializeDeclaredSizesByTypeId.get(typeId);
+        Long observedSize = observedNativeSize(shape);
+        boolean completeWireSequence = "wire-sequence".equals(shape.memberBase) &&
+            Boolean.TRUE.equals(shape.memberCoverageProven) &&
+            Boolean.TRUE.equals(shape.wireOrderProven);
+        if (declaredSizes == null || declaredSizes.size() != 1 ||
+            observedSize == null && !completeWireSequence) {
+            return false;
+        }
+        long declaredSize = declaredSizes.iterator().next();
+        if (declaredSize <= 0L || observedSize != null && observedSize > declaredSize) {
+            return false;
+        }
+        shape.typeId = reflected.typeId;
+        shape.typeIdSource = evidence.getValue();
+        shape.identityProven = true;
+        shape.identitySource = evidence.getValue() +
+            (completeWireSequence
+                ? "+complete-wire-sequence+declared-native-size"
+                : "+callee-output-parameter+declared-native-size");
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(reflected.name);
+        shape.typeNameFull = reflected.name;
+        shape.typeNameSource = evidence.getValue();
+        shape.factory = reflected.factory;
+        shape.azRttiAddress = reflected.azRttiAddress;
+        shape.nativeSize = declaredSize;
+        shape.nativeSizeSource = "serialize-field-data-size";
+        shape.validation = appendValidation(
+            shape.validation,
+            completeWireSequence
+                ? "typed-complete-wire-sequence"
+                : "typed-output-members-within-declared-native-size");
+        return true;
+    }
+
+    private void addDirectTypeIdentityCandidate(
+        Map<String, String> evidenceByTypeId,
+        String typeName,
+        String source) {
+
+        SerializeTypeInfo reflected = serializeTypeForTypeName(typeName);
+        String typeId = reflected == null ? null : normalizeUuid(reflected.typeId);
+        if (typeId != null) {
+            evidenceByTypeId.putIfAbsent(typeId, source);
+        }
+    }
 
     private void addNestedTypeMemberCandidate(
         Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
         PcodeStorage storage,
         String nativeType,
-        String wireShape,
+        WireShape wireEvidence,
         PcodeOp op,
         Function target,
         String source) {
 
         boolean allowLocalTempStorage =
             source != null && source.startsWith("container-value-pcode");
-        if (byBase == null || storage == null || nativeType == null ||
-            wireShape == null ||
+        if (byBase == null || storage == null || wireEvidence == null ||
+            wireEvidence.layout == null ||
             (!allowLocalTempStorage && isPcodeLocalTempStorage(storage))) {
             return;
         }
@@ -76,8 +254,32 @@
         }
         NestedTypeMember existing = members.get(storage.offset);
         if (existing != null) {
-            if (!existing.nativeType.equals(nativeType)) {
+            if ((existing.nativeType != null && nativeType != null &&
+                    !existing.nativeType.equals(nativeType)) ||
+                (existing.wireLayout != null &&
+                    !existing.wireLayout.equals(wireEvidence.layout))) {
                 existing.typeConflict = true;
+            }
+            if (existing.nativeType == null) {
+                existing.nativeType = nativeType;
+            }
+            if (existing.wireShape == null) {
+                existing.wireShape = wireEvidence.shape;
+                existing.wireShapeSource = wireEvidence.source == null
+                    ? source
+                    : wireEvidence.source;
+            }
+            if (existing.wireLayout == null) {
+                existing.wireLayout = wireEvidence.layout;
+                existing.wireLayoutSource = wireEvidence.layoutSource == null
+                    ? source
+                    : wireEvidence.layoutSource;
+            }
+            if (existing.byteWidth == null) {
+                existing.byteWidth = nativeTypeByteWidth(nativeType);
+                if (existing.byteWidth == null) {
+                    existing.byteWidth = wireShapeByteWidth(wireEvidence.layout);
+                }
             }
             return;
         }
@@ -85,19 +287,40 @@
         NestedTypeMember member = new NestedTypeMember();
         member.offset = storage.offset;
         member.nativeType = nativeType;
-        member.wireShape = wireShape;
+        member.wireShape = wireEvidence.shape;
+        member.wireShapeSource = wireEvidence.source == null ? source : wireEvidence.source;
+        member.wireLayout = wireEvidence.layout;
+        member.wireLayoutSource = wireEvidence.layoutSource == null
+            ? source
+            : wireEvidence.layoutSource;
         member.byteWidth = nativeTypeByteWidth(nativeType);
         if (member.byteWidth == null) {
-            member.byteWidth = wireShapeByteWidth(wireShape);
+            member.byteWidth = wireShapeByteWidth(wireEvidence.layout);
         }
         member.name = "_" + members.size();
         member.nameSource = "synthetic-offset";
         member.nameProven = false;
-        member.evidenceSource = source;
         member.callsite = op == null ? null : op.getSeqnum().getTarget();
         member.target = target == null ? null : target.getEntryPoint();
         member.targetName = fullFunctionName(target);
         members.put(storage.offset, member);
+    }
+
+    private WireShape nestedMemberWireEvidence(NestedTypeMember member) {
+        if (member == null || member.wireLayout == null && member.wireShape == null) {
+            return null;
+        }
+        String layout = member.wireLayout == null ? member.wireShape : member.wireLayout;
+        if (member.wireShape != null) {
+            String source = member.wireShapeSource == null
+                ? "nested-type-member-pcode"
+                : member.wireShapeSource;
+            return WireShape.semantic(member.wireShape, layout, source);
+        }
+        String source = member.wireLayoutSource == null
+            ? "nested-type-member-pcode"
+            : member.wireLayoutSource;
+        return WireShape.layout(layout, source);
     }
 
     private NestedTypeShape directTypeShapeFromCandidates(
@@ -117,7 +340,7 @@
                 continue;
             }
             matches++;
-            normalizeGenericDirectTypeMemberOffsets(members);
+            normalizeGenericDirectTypeMemberOffsets(members, entry.getKey());
 
             for (int i = 0; i < members.size(); i++) {
                 NestedTypeMember member = members.get(i);
@@ -131,13 +354,13 @@
             shape.typeNameSource = anonymousHelper ? "anonymous-helper" : "ghidra-symbol";
             shape.function = target.getEntryPoint();
             shape.functionName = targetName;
-            applySerializeIdentity(shape, owner);
             shape.memberBase = entry.getKey();
             shape.memberNameSource = "synthetic-offset";
             shape.memberNamesProven = false;
             shape.validation = "layout-consistent-direct-type";
             shape.members.addAll(members);
             applyNestedTypeMemberNames(shape);
+            applyLabeledMemberName(shape, "ActorRequestId", "targetLocalId");
             selected = shape;
         }
         if (matches > 1) {
@@ -174,8 +397,14 @@
         return true;
     }
 
-    private void normalizeGenericDirectTypeMemberOffsets(List<NestedTypeMember> members) {
+    private void normalizeGenericDirectTypeMemberOffsets(
+        List<NestedTypeMember> members,
+        String memberBase) {
+
         if (members == null || members.isEmpty()) {
+            return;
+        }
+        if ("this".equals(memberBase) || pcodeParameterIndex(memberBase) != null) {
             return;
         }
         long baseOffset = members.get(0).offset;
@@ -185,176 +414,6 @@
         for (NestedTypeMember member : members) {
             member.nativeOffset = member.offset;
             member.offset -= baseOffset;
-        }
-    }
-
-    private NestedTypeShape actorRequestIdShapeFromCandidates(
-        String owner,
-        Function target,
-        String targetName,
-        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase) {
-
-        NestedTypeShape selected = null;
-        int matches = 0;
-        for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry : byBase.entrySet()) {
-            ArrayList<NestedTypeMember> members =
-                new ArrayList<>(entry.getValue().values());
-            members.sort((left, right) -> Long.compare(left.offset, right.offset));
-            if (!isActorRequestIdMemberShape(members)) {
-                continue;
-            }
-            matches++;
-            normalizeActorRequestIdMemberOffsets(members);
-
-            for (int i = 0; i < members.size(); i++) {
-                members.get(i).index = i;
-                members.get(i).name = "_" + i;
-            }
-
-            NestedTypeShape shape = new NestedTypeShape();
-            shape.typeName = NetworkSchemaText.sourceTypeLeaf(owner);
-            shape.typeNameFull = owner;
-            shape.typeNameSource = "ghidra-symbol";
-            shape.function = target.getEntryPoint();
-            shape.functionName = targetName;
-            applySerializeIdentity(shape, owner);
-            shape.memberBase = entry.getKey();
-            shape.memberNameSource = "synthetic-offset";
-            shape.memberNamesProven = false;
-            shape.validation = "layout-consistent-two-u64";
-            shape.members.addAll(members);
-            applyNestedTypeMemberNames(shape);
-            applyActorRequestIdNativeMemberNames(shape);
-            selected = shape;
-        }
-        if (matches > 1) {
-            recordNestedTypeShapeReject("ambiguous-member-base");
-            return null;
-        }
-        if (selected == null) {
-            recordNestedTypeShapeReject("actor-request-id-shape-mismatch");
-        }
-        return selected;
-    }
-
-    private void applySerializeIdentity(NestedTypeShape shape, String typeName) {
-        if (shape == null || typeName == null) {
-            return;
-        }
-        if (isWireNativeSourceTypeName(typeName)) {
-            return;
-        }
-        SerializeTypeInfo reflected = serializeTypeForTypeName(typeName);
-        if (reflected == null) {
-            String typeId = typeIdForTypeName(typeName);
-            if (typeId != null && !isBuiltinTypeId(typeId)) {
-                shape.typeId = typeId;
-                shape.typeIdSource = "az-type-id-fold";
-            }
-            return;
-        }
-        shape.typeId = reflected.typeId;
-        shape.typeIdSource = "serialize-context-name";
-        shape.factory = reflected.factory;
-        shape.azRttiAddress = reflected.azRttiAddress;
-    }
-
-    private boolean isBuiltinTypeId(String typeId) {
-        String normalized = normalizeUuid(typeId);
-        if (normalized == null) {
-            return false;
-        }
-        return uuidEquals(normalized, CHAR_TYPE_ID) ||
-            uuidEquals(normalized, S8_TYPE_ID) ||
-            uuidEquals(normalized, SHORT_TYPE_ID) ||
-            uuidEquals(normalized, INT_TYPE_ID) ||
-            uuidEquals(normalized, LONG_TYPE_ID) ||
-            uuidEquals(normalized, S64_TYPE_ID) ||
-            uuidEquals(normalized, U8_TYPE_ID) ||
-            uuidEquals(normalized, U16_TYPE_ID) ||
-            uuidEquals(normalized, U32_TYPE_ID) ||
-            uuidEquals(normalized, ULONG_TYPE_ID) ||
-            uuidEquals(normalized, U64_TYPE_ID) ||
-            uuidEquals(normalized, FLOAT_TYPE_ID) ||
-            uuidEquals(normalized, DOUBLE_TYPE_ID) ||
-            uuidEquals(normalized, BOOL_TYPE_ID);
-    }
-
-    private boolean isWireNativeSourceTypeName(String typeName) {
-        String normalized = normalizeNativeType(typeName);
-        if (normalized == null || normalized.isEmpty()) {
-            return false;
-        }
-        if (wireShapeFromNativeType(normalized) != null) {
-            return true;
-        }
-        if (normalized.startsWith("AZStd::fixed_vector<")
-            || normalized.startsWith("fixed_vector<")
-            || normalized.startsWith("AZStd::vector<")
-            || normalized.startsWith("vector<")
-            || normalized.startsWith("AZStd::array<")
-            || normalized.startsWith("array<")) {
-            return true;
-        }
-        String leaf = NetworkSchemaText.sourceTypeLeaf(normalized);
-        if (leaf == null) {
-            return false;
-        }
-        return switch (leaf) {
-            case "ActorId",
-                "ActorRef",
-                "AssetId",
-                "BaselineableFragment",
-                "BaselineableFragmentRef",
-                "ClientActorHash",
-                "ClientContextId",
-                "ComponentId",
-                "ConnTicket",
-                "Duration",
-                "FieldGroup",
-                "FieldVector",
-                "Fragment",
-                "HubAddress",
-                "HubId",
-                "InterestId",
-                "LoginToken",
-                "MovementInteractionId",
-                "ProxyAddress",
-                "SequenceNumber",
-                "SyncedTimestamp",
-                "Timestamp",
-                "TypeIndex",
-                "TypeIndexCrc" -> true;
-            default -> false;
-        };
-    }
-
-    private boolean isActorRequestIdMemberShape(List<NestedTypeMember> members) {
-        if (members == null || members.size() != 2) {
-            return false;
-        }
-        NestedTypeMember first = members.get(0);
-        NestedTypeMember second = members.get(1);
-        boolean wireRelative = first.offset == 0L && second.offset == 8L;
-        boolean nativeBaseObject = first.offset == 8L && second.offset == 16L;
-        return (wireRelative || nativeBaseObject) &&
-            "u64".equals(wireShapeFromNativeType(first.nativeType)) &&
-            "u64".equals(wireShapeFromNativeType(second.nativeType)) &&
-            !Boolean.TRUE.equals(first.typeConflict) &&
-            !Boolean.TRUE.equals(second.typeConflict);
-    }
-
-    private void normalizeActorRequestIdMemberOffsets(List<NestedTypeMember> members) {
-        if (members == null || members.size() != 2) {
-            return;
-        }
-        NestedTypeMember first = members.get(0);
-        NestedTypeMember second = members.get(1);
-        if (first.offset == 8L && second.offset == 16L) {
-            first.nativeOffset = first.offset;
-            second.nativeOffset = second.offset;
-            first.offset = 0L;
-            second.offset = 8L;
         }
     }
 
@@ -405,78 +464,109 @@
         shape.datatypePath = selected.getPathName();
     }
 
-    private void applyActorRequestIdNativeMemberNames(NestedTypeShape shape) {
-        if (shape == null ||
-            !"ActorRequestId".equals(shape.typeName) ||
-            !isActorRequestIdMemberShape(shape.members)) {
+    private void applyLabeledMemberName(
+        NestedTypeShape shape,
+        String expectedType,
+        String label) {
+
+        if (shape == null || !expectedType.equals(shape.typeName)) {
             return;
         }
-        if (!hasActorRequestIdTargetLocalIdProof()) {
+        Integer memberIndex = provenLabeledMemberIndex(shape, label);
+        if (memberIndex == null) {
             return;
         }
 
-        NestedTypeMember targetLocalId = shape.members.get(0);
-        targetLocalId.name = "targetLocalId";
-        targetLocalId.nameSource = "rmidispatch-targetLocalId-xref";
-        targetLocalId.nameProven = true;
-        targetLocalId.nameEvidence =
-            "Amazon::Hub::FindActorFacetTarget logs qword [message+0x08] with native string targetLocalId";
-
+        NestedTypeMember member = shape.members.get(memberIndex);
+        member.name = label;
+        member.nameSource = "ghidra-pcode-labeled-member";
+        member.nameProven = true;
+        member.nameEvidence = "native label and member load share one p-code call";
         if (!Boolean.TRUE.equals(shape.memberNamesProven)) {
-            shape.memberNameSource = "partial-rmidispatch-xref";
+            shape.memberNameSource = "partial-ghidra-pcode-labeled-member";
             shape.memberNamesProven = false;
         }
     }
 
-    private boolean hasActorRequestIdTargetLocalIdProof() {
-        Address functionAddress = currentProgram.getImageBase().add(FIND_ACTOR_FACET_TARGET_RVA);
-        Function function = functionAtOrContaining(functionAddress);
-        if (function == null || !function.getEntryPoint().equals(functionAddress)) {
-            recordNestedTypeShapeReject("targetLocalId-proof-missing-dispatch-function");
-            return false;
+    private Integer provenLabeledMemberIndex(NestedTypeShape shape, String label) {
+        Address labelAddress = exactAsciiStringAddress(label);
+        if (labelAddress == null) {
+            recordNestedTypeShapeReject("labeled-member-string-missing");
+            return null;
         }
 
-        if (!instructionContains(
-                FIND_ACTOR_FACET_TARGET_MESSAGE_COPY_RVA,
-                "mov",
-                "rsi",
-                "rcx") ||
-            !instructionContains(
-                FIND_ACTOR_FACET_TARGET_TARGET_OFFSET_RVA,
-                "mov",
-                "r14d",
-                "8") ||
-            !instructionContains(
-                FIND_ACTOR_FACET_TARGET_TARGET_ADD_RVA,
-                "add",
-                "r14",
-                "rsi") ||
-            !instructionContains(
-                FIND_ACTOR_FACET_TARGET_TARGET_LOAD_RVA,
-                "mov",
-                "r8",
-                "[r14]")) {
-            recordNestedTypeShapeReject("targetLocalId-proof-instruction-mismatch");
-            return false;
+        LinkedHashSet<Integer> candidates = new LinkedHashSet<>();
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(labelAddress);
+        while (references.hasNext()) {
+            Reference reference = references.next();
+            Function function = functionAtOrContaining(reference.getFromAddress());
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                continue;
+            }
+            Iterator<PcodeOpAST> ops = high.getPcodeOps();
+            while (ops.hasNext()) {
+                PcodeOpAST op = ops.next();
+                if (op.getOpcode() != PcodeOp.CALL ||
+                    !pcodeCallHasAddressArgument(op, labelAddress)) {
+                    continue;
+                }
+                for (int i = 1; i < op.getNumInputs(); i++) {
+                    PcodeStorage storage = pcodeLoadedStorageExpression(op.getInput(i));
+                    Integer memberIndex = nestedMemberIndexAtNativeOffset(shape, storage);
+                    if (memberIndex != null) {
+                        candidates.add(memberIndex);
+                    }
+                }
+            }
         }
+        if (candidates.size() != 1) {
+            recordNestedTypeShapeReject(
+                candidates.isEmpty()
+                    ? "labeled-member-flow-missing"
+                    : "ambiguous-labeled-member-flow");
+            return null;
+        }
+        return candidates.iterator().next();
+    }
 
-        Address targetLocalId = exactAsciiStringAddress("targetLocalId");
-        if (targetLocalId == null) {
-            recordNestedTypeShapeReject("targetLocalId-proof-string-missing");
-            return false;
+    private boolean pcodeCallHasAddressArgument(PcodeOp op, Address expected) {
+        for (int i = 1; i < op.getNumInputs(); i++) {
+            if (expected.equals(pcodeAddress(op.getInput(i)))) {
+                return true;
+            }
+            Long value = NetworkSchemaIntegerEvaluator.evaluate(op.getInput(i));
+            if (value != null && expected.equals(absoluteAddress(value))) {
+                return true;
+            }
         }
-        Instruction nameInstruction =
-            instructionAtRva(FIND_ACTOR_FACET_TARGET_TARGET_NAME_RVA);
-        if (nameInstruction == null ||
-            !instructionReferences(nameInstruction, targetLocalId) ||
-            !instructionContains(
-                FIND_ACTOR_FACET_TARGET_TARGET_NAME_RVA,
-                "lea",
-                "rdx")) {
-            recordNestedTypeShapeReject("targetLocalId-proof-xref-missing");
-            return false;
+        return false;
+    }
+
+    private Integer nestedMemberIndexAtNativeOffset(
+        NestedTypeShape shape,
+        PcodeStorage storage) {
+
+        if (storage == null ||
+            !("this".equals(storage.base) || pcodeParameterIndex(storage.base) != null)) {
+            return null;
         }
-        return true;
+        Integer selected = null;
+        for (int i = 0; i < shape.members.size(); i++) {
+            NestedTypeMember member = shape.members.get(i);
+            long nativeOffset = member.nativeOffset == null
+                ? member.offset
+                : member.nativeOffset;
+            if (nativeOffset != storage.offset) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = i;
+        }
+        return selected;
     }
 
     private Address exactAsciiStringAddress(String value) {
@@ -491,65 +581,6 @@
             selected = address;
         }
         return selected;
-    }
-
-    private Instruction instructionAtRva(long rva) {
-        Address address = currentProgram.getImageBase().add(rva);
-        Instruction instruction = currentProgram.getListing().getInstructionAt(address);
-        if (instruction != null) {
-            return instruction;
-        }
-        try {
-            disassemble(address);
-        }
-        catch (Exception ignored) {
-        }
-        return currentProgram.getListing().getInstructionAt(address);
-    }
-
-    private boolean instructionReferences(Instruction instruction, Address target) {
-        if (instruction == null || target == null) {
-            return false;
-        }
-        for (Reference reference : instruction.getReferencesFrom()) {
-            if (target.equals(reference.getToAddress())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean instructionContains(long rva, String mnemonic, String... tokens) {
-        Instruction instruction = instructionAtRva(rva);
-        if (instruction == null) {
-            return false;
-        }
-        String text = instructionText(instruction);
-        if (!text.startsWith(mnemonic.toLowerCase(Locale.ROOT) + " ")) {
-            return false;
-        }
-        for (String token : tokens) {
-            if (!text.contains(token.toLowerCase(Locale.ROOT))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private String instructionText(Instruction instruction) {
-        StringBuilder text = new StringBuilder(
-            instruction.getMnemonicString().toLowerCase(Locale.ROOT));
-        for (int i = 0; i < instruction.getNumOperands(); i++) {
-            text.append(i == 0 ? ' ' : ',');
-            text.append(
-                instruction.getDefaultOperandRepresentation(i).toLowerCase(Locale.ROOT));
-        }
-        return text.toString()
-            .replace("qword ptr ", "")
-            .replace("byte ptr ", "")
-            .replace("dword ptr ", "")
-            .replace("0x08", "8")
-            .replace("0x8", "8");
     }
 
     private List<Structure> nestedTypeStructures(NestedTypeShape shape) {
@@ -695,6 +726,27 @@
         if (shape == null) {
             return null;
         }
+        if (shape.startsWith("composite<") && shape.endsWith(">")) {
+            List<String> members = NetworkSchemaText.splitTopLevel(
+                shape.substring("composite<".length(), shape.length() - 1));
+            if (members.isEmpty()) {
+                return null;
+            }
+            int width = 0;
+            for (String member : members) {
+                Integer memberWidth = wireShapeByteWidth(member);
+                if (memberWidth == null) {
+                    return null;
+                }
+                try {
+                    width = Math.addExact(width, memberWidth);
+                }
+                catch (ArithmeticException ignored) {
+                    return null;
+                }
+            }
+            return width;
+        }
         if (shape.startsWith("fixed-bytes-")) {
             Long byteLength = NetworkSchemaText.parseIntegerLiteral(shape.substring("fixed-bytes-".length()));
             return byteLength == null ||
@@ -703,17 +755,26 @@
                     ? null
                     : byteLength.intValue();
         }
+        if (isPackedPositionShape(shape)) {
+            return 10;
+        }
+        if (shape.startsWith("delta-vec3<") && shape.endsWith(">")) {
+            return 3;
+        }
         if (vectorElementWireShape(shape) != null) {
             return 24;
         }
         return switch (shape) {
             case "bool", "u8" -> 1;
-            case "u16" -> 2;
-            case "u32", "f32" -> 4;
-            case "u64", "f64", "vec2" -> 8;
-            case "uuid", "vec4" -> 16;
+            case "u16", "half-f32" -> 2;
+            case "u32", "f32", "vec2-comp" -> 4;
+            case "vec3-comp", "vec3-comp-norm" -> 6;
+            case "u64", "f64", "vec2", "quat-comp", "quat-comp-norm" -> 8;
+            case "uuid", "vec4", "quat", "aabb2d" -> 16;
             case "vec3" -> 12;
-            case "transform" -> 48;
+            case "aabb3d" -> 24;
+            case "mat3" -> 36;
+            case "transform", "affine3" -> 48;
             default -> null;
         };
     }
@@ -722,12 +783,7 @@
         if (target == null) {
             return null;
         }
-
-        String pcodeType = scalarOutputStoreNativeTypeFromPcode(target);
-        if (pcodeType != null) {
-            return pcodeType;
-        }
-        return scalarOutputStoreNativeTypeFromInstructionFlow(target);
+        return scalarOutputStoreNativeTypeFromPcode(target);
     }
 
     private String scalarOutputStoreNativeTypeFromPcode(Function target) {
@@ -759,36 +815,6 @@
         return selectedScalarOutputCandidate(candidateTypes);
     }
 
-    private String scalarOutputStoreNativeTypeFromInstructionFlow(Function target) {
-        ForwardArgState state = new ForwardArgState();
-        state.registers.put("RCX", TrackedValue.baseOffset("arg:RCX", 0));
-        state.registers.put("RDX", TrackedValue.baseOffset("arg:RDX", 0));
-        state.registers.put("R8", TrackedValue.baseOffset("arg:R8", 0));
-        state.registers.put("R9", TrackedValue.baseOffset("arg:R9", 0));
-        state.registers.put("RSP", TrackedValue.stackOffset(0));
-
-        LinkedHashMap<String, String> candidateTypes = new LinkedHashMap<>();
-        for (Instruction instruction : functionInstructions(target)) {
-            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-            if ("MOV".equals(mnemonic) && isMemoryWriteMnemonic(mnemonic)) {
-                TrackedValue storage =
-                    trackedBaseOffsetForMemoryOperand(instruction, 0, state.registers);
-                if (isInstructionScalarOutputPointerStorage(storage)) {
-                    String nativeType =
-                        scalarNativeTypeFromByteWidth(instructionMemoryWriteByteWidth(instruction));
-                    if (nativeType != null) {
-                        String previous = candidateTypes.putIfAbsent(storage.baseKey, nativeType);
-                        if (previous != null && !previous.equals(nativeType)) {
-                            return null;
-                        }
-                    }
-                }
-            }
-            observeForwardInstruction(instruction, state, false);
-        }
-        return selectedScalarOutputCandidate(candidateTypes);
-    }
-
     private String selectedScalarOutputCandidate(Map<String, String> candidateTypes) {
         if (candidateTypes == null || candidateTypes.isEmpty()) {
             return null;
@@ -812,35 +838,6 @@
                 storage.base.matches("p[lub]?Var\\d*"));
     }
 
-    private boolean isInstructionScalarOutputPointerStorage(TrackedValue storage) {
-        return storage != null &&
-            storage.baseKey != null &&
-            storage.baseOffset != null &&
-            storage.baseOffset == 0 &&
-            storage.baseKey.matches("arg:(R8|R9)");
-    }
-
-    private int instructionMemoryWriteByteWidth(Instruction instruction) {
-        String text = NetworkSchemaX86.operandText(instruction, 0);
-        if (text == null) {
-            return -1;
-        }
-        String lower = text.toLowerCase(Locale.ROOT);
-        if (lower.contains("byte ptr")) {
-            return 1;
-        }
-        if (lower.contains("word ptr")) {
-            return 2;
-        }
-        if (lower.contains("dword ptr")) {
-            return 4;
-        }
-        if (lower.contains("qword ptr")) {
-            return 8;
-        }
-        return -1;
-    }
-
     private String scalarNativeTypeFromByteWidth(int byteWidth) {
         return switch (byteWidth) {
             case 1 -> "u8";
@@ -855,46 +852,9 @@
         nestedTypeShapeRejectCounts.merge(reason, 1, Integer::sum);
     }
 
-    private Set<String> pcodeMessageStorageBases(HighFunction high) {
-        LinkedHashSet<String> bases = new LinkedHashSet<>();
-        bases.add("this");
-        bases.add("_Dst");
-        bases.add("param_3");
-
-        Iterator<PcodeOpAST> ops = high.getPcodeOps();
-        while (ops.hasNext()) {
-            PcodeOpAST op = ops.next();
-            if (op.getOpcode() != PcodeOp.CALL || op.getOutput() == null) {
-                continue;
-            }
-            Function target = pcodeCallTarget(op);
-            Integer returnedCallInputSlot = returnedCallInputSlot(target);
-            if (returnedCallInputSlot != null && returnedCallInputSlot < op.getNumInputs()) {
-                PcodeStorage inputStorage = pcodeStorageExpression(op.getInput(returnedCallInputSlot));
-                if (isPcodeMessageStorage(inputStorage, bases)) {
-                    addPcodeAliasStorageBases(bases, op.getOutput());
-                    continue;
-                }
-            }
-            if (isLikelyConstructorTarget(target)) {
-                String name = pcodeHighName(op.getOutput());
-                if (name != null) {
-                    bases.add(name);
-                }
-            }
-        }
-        return bases;
-    }
-
     private boolean isPcodeMessageStorage(PcodeStorage storage, Set<String> messageBases) {
         return storage != null &&
             messageBases != null &&
             messageBases.contains(storage.base) &&
             isLikelyMessageStorage(storage.expression());
     }
-
-    private void addPcodeAliasStorageBases(Set<String> bases, Varnode seed) {
-        if (bases == null || seed == null) {
-            return;
-        }
-        ArrayDeque<Varnode> pending = new ArrayDeque<>();

@@ -16,10 +16,14 @@ pub mod character_action_grid_cell_value;
 pub mod character_action_grid_list_cache;
 pub mod character_action_list;
 pub mod components;
+pub mod deprecated_collision_type;
+pub mod dynamic_hit_volume_config;
 pub mod edit_crc;
 pub mod effect_data;
 pub mod faction_type;
+pub mod game_rigid_body_config;
 pub mod gdeid;
+pub mod hit_volume_state;
 pub mod instanced_loot_type;
 pub mod interaction_ui_actions;
 pub mod javelin;
@@ -29,7 +33,10 @@ pub mod material_handle;
 pub mod material_set;
 pub mod paperdoll_slot_alias;
 pub mod paperdoll_slot_types;
+pub mod query_shape_base;
+pub mod rock_n_roll;
 pub mod sequence_event;
+pub mod serializable_water_quadtree;
 pub mod simple_asset_references;
 pub mod terrain_validation_data;
 pub mod vegetation_descriptor;
@@ -161,17 +168,17 @@ pub use self::asset_data::{
     AISpawnLocation, AdditiveConversationCameraMovementData, AssetData, AzLightingParams,
     AzMaterialAssetData, AzMaterialLayer, AzTextureSlot, AzTextureSlotSettings, BuildableStateData,
     BuildableStateDatabase, BuildableStateEnum, CAGEActionListAsset, CAGEGridAsset, CampTierData,
-    CharacterCreationData, CharacterCreationDatabase, ChunkEntityTrace, ChunkTraceAsset,
-    CollisionFilterColor, CollisionFiltersAsset, CombatDebugSettings, ContractBuySellFeeData,
-    ContractConfigData, CreditModifierData, CrestColorData, CrestData, CrestDatabase,
-    DailyBonusData, DefaultAppearanceData, EditableCollisionFilter, EncounterEntry,
+    CellIndex, CharacterCreationData, CharacterCreationDatabase, ChunkEntityTrace, ChunkEntry,
+    ChunkTraceAsset, CollisionFilterColor, CollisionFiltersAsset, CombatDebugSettings,
+    ContractBuySellFeeData, ContractConfigData, CreditModifierData, CrestColorData, CrestData,
+    CrestDatabase, DailyBonusData, DefaultAppearanceData, EditableCollisionFilter, EncounterEntry,
     EventCreditData, EventNotificationData, EventNotificationDatabase, FactionData,
     FactionInfluenceConfigData, FishingData, GameDebugSettings, GameEventDatabase, GatherGameData,
     GatherableRegionEntry, GatheringAction, GatheringActionData, GatheringActionDatabase,
-    GatheringData, GatheringDatabase, GatheringTypeData, GuaranteedItemTransferData, GuildRankData,
-    GuildSiegeWindowRegionData, GuildTreasuryData, IGCData, InputEventBindings,
-    InputEventBindingsAsset, InputEventGroup, InputMapAsset, InputSubComponent,
-    InstancedSlayerScriptPart, InteractOptionData, ItemRarityData, ItemType,
+    GatheringData, GatheringDatabase, GatheringTypeData, GridGenericAssetAssetData,
+    GuaranteedItemTransferData, GuildRankData, GuildSiegeWindowRegionData, GuildTreasuryData,
+    IGCData, InputEventBindings, InputEventBindingsAsset, InputEventGroup, InputMapAsset,
+    InputSubComponent, InstancedSlayerScriptPart, InteractOptionData, ItemRarityData, ItemType,
     MilestoneCorrectionData, MilestoneCorrectionEntryData, NPCData, PerkGenerationData,
     PerkTierData, PlayerAttributeData, PlayerBaseAttributes, PlayerTeleportContext,
     ProgressionCategoryEntry, ProgressionSpawnerEntry, ProgressionValidationAchievementData,
@@ -214,16 +221,30 @@ pub use self::components::{
     AudioPreloadComponent, AudioRtpcComponent, AudioSetTriggerOverrideComponent,
     AudioSetTriggerOverrideComponentClientFacet, AudioSetTriggerOverrideComponentServerFacet,
     AudioShapeComponent, AudioSplineComponent, AudioSwitchComponent, AudioTriggerComponent,
-    CharacterAnimationManagerComponent, ClientFacet, Facet, FacetedComponent, MannequinComponent,
-    MannequinScopeComponent, MaterialOverrideInfo, MotionParameterSmoothingSettings, ServerFacet,
+    BoxShapeComponent, BoxShapeConfig, CapsuleShapeComponent, CapsuleShapeConfig,
+    CharacterAnimationManagerComponent, CharacterControllerComponent, CharacterControllerConfig,
+    CharacterPhysicsComponent, ClientFacet, CryPlayerPhysicsConfiguration, Facet, FacetedComponent,
+    GameRigidBodyComponent, GameRigidBodyComponentClientFacet, GameRigidBodyComponentServerFacet,
+    GameRigidBodyServerFacetConfig, GameTransformComponent, GameTransformComponentClientFacet,
+    GameTransformComponentServerFacet, HitVolumeComponent, HitVolumeComponentClientFacet,
+    HitVolumeComponentServerFacet, MannequinComponent, MannequinScopeComponent,
+    MaterialOverrideInfo, MeshColliderComponent, MotionParameterSmoothingSettings, NetBindable,
+    PhysicsComponent, PhysicsSystemComponent, PlayerDimensions, PlayerDynamics,
+    PrimitiveColliderComponent, PrimitiveColliderConfig, RigidBodyComponent,
+    RigidBodyConfiguration, RigidPhysicsComponent, RigidPhysicsConfig, ServerFacet,
     SimpleAnimationComponent, SkinnedMeshComponent, SkinnedMeshComponentRenderNode,
-    SkinnedRenderOptions, TriggerOverridePair,
+    SkinnedRenderOptions, SphereShapeComponent, SphereShapeConfig, StaticPhysicsComponent,
+    StaticPhysicsConfig, TransformComponent, TriggerOverridePair,
 };
 
+pub use self::deprecated_collision_type::DEPRECATEDCollisionType;
+pub use self::dynamic_hit_volume_config::DynamicHitVolumeConfig;
 pub use self::edit_crc::EditCrc;
 pub use self::effect_data::EffectData;
 pub use self::faction_type::FactionType;
+pub use self::game_rigid_body_config::GameRigidBodyConfig;
 pub use self::gdeid::GDEID;
+pub use self::hit_volume_state::HitVolumeState;
 pub use self::instanced_loot_type::InstancedLootType;
 pub use self::interaction_ui_actions::InteractionUIActions;
 pub use self::javelin::EditEnumItemClasses;
@@ -234,6 +255,12 @@ pub use self::material_set::{MaterialEntry, MaterialProperties, MaterialSet, Mat
 
 pub use self::paperdoll_slot_alias::PaperdollSlotAlias;
 pub use self::paperdoll_slot_types::PaperdollSlotTypes;
+pub use self::query_shape_base::{
+    QueryShape, QueryShapeAabb, QueryShapeBox, QueryShapeCapsule, QueryShapeCylinder,
+    QueryShapePoint, QueryShapeSphere,
+};
+
+pub use self::rock_n_roll::CharacterDesc;
 pub use self::sequence_event::{
     AttackHeightRetargeting, AudioPreload, AudioTriggerB73C9B69, AudioTriggerCC4062C6,
     CAGEAttachment, CAGECastSpell, CAGEDamage, CAGEPayManaCost, CAGERangedAttack, CharacterEvent,
@@ -245,6 +272,7 @@ pub use self::sequence_event::{
     TestSequenceEvent, TrackTimeInSequence, Transition,
 };
 
+pub use self::serializable_water_quadtree::{SerializableWaterQuadtree, WaterNodeData};
 pub use self::simple_asset_references::{SimpleAssetReferenceBase, SimpleAssetReferenceBinkAsset};
 
 pub use self::terrain_validation_data::TerrainValidationData;

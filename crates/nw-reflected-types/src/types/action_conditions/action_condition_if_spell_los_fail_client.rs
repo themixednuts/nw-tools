@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfSpellLosFailClient;
+pub struct ActionConditionIfSpellLosFailClient {}
 
 impl AzRtti for ActionConditionIfSpellLosFailClient {
     const NAME: &'static str = "ActionConditionIfSpellLosFailClient";

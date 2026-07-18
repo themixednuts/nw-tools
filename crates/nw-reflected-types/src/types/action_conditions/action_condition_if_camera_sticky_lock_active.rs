@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfCameraStickyLockActive;
+pub struct ActionConditionIfCameraStickyLockActive {}
 
 impl AzRtti for ActionConditionIfCameraStickyLockActive {
     const NAME: &'static str = "ActionConditionIfCameraStickyLockActive";

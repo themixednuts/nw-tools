@@ -1,0 +1,830 @@
+    private boolean hasGuardedCursorAdvance(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST cursorStore,
+        PcodeStorage cursor) {
+
+        if (!(cursorStore.getParent() instanceof PcodeBlockBasic storeBlock)) {
+            return false;
+        }
+        Varnode advancedPointer = cursorStore.getInput(2);
+        PcodeMemoryPath advancedPath = pcodeMemoryPath(advancedPointer, 1);
+        if (advancedPath == null) {
+            return false;
+        }
+        for (PcodeOpAST comparison : operations) {
+            if (!isOrderedPointerComparison(comparison) ||
+                comparison.getOutput() == null ||
+                !NetworkSchemaControlFlow.precedes(high, comparison, cursorStore)) {
+                continue;
+            }
+            PcodeStorage first = pcodeLoadedStorageExpression(comparison.getInput(0));
+            PcodeStorage second = pcodeLoadedStorageExpression(comparison.getInput(1));
+            boolean firstIsAdvance = advancedPath.equals(
+                pcodeMemoryPath(comparison.getInput(0), 1));
+            boolean secondIsAdvance = advancedPath.equals(
+                pcodeMemoryPath(comparison.getInput(1), 1));
+            PcodeStorage limit = firstIsAdvance && !secondIsAdvance
+                ? second
+                : secondIsAdvance && !firstIsAdvance ? first : null;
+            if (limit == null || !limit.base.equals(cursor.base) ||
+                limit.offset == cursor.offset) {
+                continue;
+            }
+            PcodeOpAST branch = uniqueConditionalBranch(
+                comparison.getOutput(),
+                operations);
+            if (branch == null ||
+                !(branch.getParent() instanceof PcodeBlockBasic guardBlock) ||
+                !NetworkSchemaControlFlow.dominates(high, guardBlock, storeBlock)) {
+                continue;
+            }
+            int pathsToStore = 0;
+            for (int edge = 0; edge < guardBlock.getOutSize(); edge++) {
+                PcodeBlock successor = guardBlock.getOut(edge);
+                PcodeBlock leaf = successor == null ? null : successor.getFrontLeaf();
+                if (leaf instanceof PcodeBlockBasic basic &&
+                    NetworkSchemaControlFlow.reaches(basic, storeBlock)) {
+                    pathsToStore++;
+                }
+            }
+            if (pathsToStore == 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isOrderedPointerComparison(PcodeOp operation) {
+        return operation != null && switch (operation.getOpcode()) {
+            case PcodeOp.INT_LESS, PcodeOp.INT_LESSEQUAL,
+                PcodeOp.INT_SLESS, PcodeOp.INT_SLESSEQUAL -> true;
+            default -> false;
+        };
+    }
+
+    private PcodeOpAST uniqueConditionalBranch(
+        Varnode condition,
+        List<PcodeOpAST> operations) {
+
+        PcodeOpAST selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CBRANCH ||
+                operation.getNumInputs() < 2 ||
+                !pcodeNodeDependsOn(
+                    operation.getInput(operation.getNumInputs() - 1),
+                    condition,
+                    new LinkedHashSet<>(),
+                    0)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = operation;
+        }
+        return selected;
+    }
+
+    private CursorAdvanceEvidence cursorAdvance(
+        Varnode node,
+        PcodeStorage cursor,
+        Set<String> seen) {
+
+        if (node == null || cursor == null || !seen.add(pcodeNodeKey(node))) {
+            return null;
+        }
+        PcodeOp def = node.getDef();
+        if (def == null) {
+            return null;
+        }
+        switch (def.getOpcode()) {
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.INDIRECT:
+                return def.getNumInputs() == 0
+                    ? null
+                    : cursorAdvance(def.getInput(0), cursor, seen);
+            case PcodeOp.INT_ADD:
+            case PcodeOp.PTRADD:
+                return cursorAdvanceFromAddition(def, cursor);
+            case PcodeOp.MULTIEQUAL:
+                return mergedCursorAdvance(def, cursor, seen);
+            default:
+                return null;
+        }
+    }
+
+    private CursorAdvanceEvidence cursorAdvanceFromAddition(
+        PcodeOp def,
+        PcodeStorage cursor) {
+
+        for (int valueSlot = 0; valueSlot < def.getNumInputs(); valueSlot++) {
+            Varnode sourcePointer = def.getInput(valueSlot);
+            PcodeStorage value = pcodeLoadedStorageExpression(sourcePointer);
+            if (!cursor.sameLocation(value)) {
+                continue;
+            }
+            long delta = 1L;
+            for (int slot = 0; slot < def.getNumInputs(); slot++) {
+                if (slot == valueSlot) {
+                    continue;
+                }
+                Long factor = NetworkSchemaIntegerEvaluator.evaluate(def.getInput(slot));
+                if (factor == null) {
+                    return null;
+                }
+                try {
+                    delta = Math.multiplyExact(delta, factor);
+                }
+                catch (ArithmeticException ignored) {
+                    return null;
+                }
+            }
+            return new CursorAdvanceEvidence(delta, sourcePointer);
+        }
+        return null;
+    }
+
+    private CursorAdvanceEvidence mergedCursorAdvance(
+        PcodeOp def,
+        PcodeStorage cursor,
+        Set<String> seen) {
+
+        CursorAdvanceEvidence selected = null;
+        for (int slot = 0; slot < def.getNumInputs(); slot++) {
+            CursorAdvanceEvidence value = cursorAdvance(
+                def.getInput(slot),
+                cursor,
+                new LinkedHashSet<>(seen));
+            if (value == null || selected != null &&
+                (selected.byteCount() != value.byteCount() ||
+                    !samePcodeValue(selected.sourcePointer(), value.sourcePointer()))) {
+                return null;
+            }
+            selected = value;
+        }
+        return selected;
+    }
+
+    private PcodeOpAST uniqueCursorDataLoadBefore(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST cursorStore,
+        Varnode sourcePointer,
+        int byteWidth) {
+
+        PcodeOpAST selected = null;
+        for (PcodeOpAST candidate : operations) {
+            if (candidate.getOpcode() != PcodeOp.LOAD ||
+                candidate.getNumInputs() < 2 ||
+                candidate.getOutput() == null ||
+                candidate.getOutput().getSize() < byteWidth ||
+                !NetworkSchemaControlFlow.precedes(
+                    high,
+                    candidate,
+                    cursorStore)) {
+                continue;
+            }
+            if (!pcodeValueAliases(candidate.getInput(1), sourcePointer, new LinkedHashSet<>())) {
+                continue;
+            }
+            if (candidate.getOutput().getSize() != byteWidth &&
+                !hasLowByteExtractionBefore(
+                    high,
+                    operations,
+                    candidate,
+                    cursorStore,
+                    byteWidth)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected != null
+            ? selected
+            : contiguousCursorDataLoadsBefore(
+                high,
+                operations,
+                cursorStore,
+                sourcePointer,
+                byteWidth);
+    }
+
+    private PcodeOpAST contiguousCursorDataLoadsBefore(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST cursorStore,
+        Varnode sourcePointer,
+        int byteWidth) {
+
+        PcodeMemoryPath sourcePath = pcodeMemoryPath(sourcePointer, 1);
+        if (sourcePath == null || byteWidth <= 0) {
+            return null;
+        }
+        boolean[] covered = new boolean[byteWidth];
+        PcodeOpAST first = null;
+        for (PcodeOpAST candidate : operations) {
+            if (candidate.getOpcode() != PcodeOp.LOAD ||
+                candidate.getNumInputs() < 2 || candidate.getOutput() == null ||
+                candidate.getOutput().getSize() <= 0 ||
+                candidate.getOutput().getSize() > byteWidth ||
+                candidate.getParent() != cursorStore.getParent() ||
+                !NetworkSchemaControlFlow.precedes(high, candidate, cursorStore) ||
+                !loadedValueFeedsStoreBefore(
+                    high,
+                    operations,
+                    candidate,
+                    cursorStore)) {
+                continue;
+            }
+            PcodeMemoryPath candidatePath = pcodeMemoryPath(candidate.getInput(1), 1);
+            Long relativeOffset = relativeMemoryOffset(candidatePath, sourcePath);
+            if (relativeOffset == null || relativeOffset < 0L) {
+                continue;
+            }
+            int start;
+            int end;
+            try {
+                start = Math.toIntExact(relativeOffset);
+                end = Math.addExact(start, candidate.getOutput().getSize());
+            }
+            catch (ArithmeticException ignored) {
+                return null;
+            }
+            if (end > byteWidth) {
+                continue;
+            }
+            for (int index = start; index < end; index++) {
+                if (covered[index]) {
+                    return null;
+                }
+                covered[index] = true;
+            }
+            if (first == null ||
+                NetworkSchemaControlFlow.precedes(high, candidate, first)) {
+                first = candidate;
+            }
+        }
+        for (boolean byteCovered : covered) {
+            if (!byteCovered) {
+                return null;
+            }
+        }
+        return first;
+    }
+
+    private Long relativeMemoryOffset(
+        PcodeMemoryPath candidate,
+        PcodeMemoryPath source) {
+
+        if (candidate == null || source == null ||
+            !candidate.root().equals(source.root()) ||
+            !candidate.dereferenceOffsets().equals(source.dereferenceOffsets())) {
+            return null;
+        }
+        try {
+            return Math.subtractExact(candidate.offset(), source.offset());
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private boolean loadedValueFeedsStoreBefore(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST load,
+        PcodeOpAST cursorStore) {
+
+        for (PcodeOpAST store : operations) {
+            if (store.getOpcode() != PcodeOp.STORE || store.getNumInputs() < 3 ||
+                !NetworkSchemaControlFlow.precedes(high, load, store) ||
+                !NetworkSchemaControlFlow.precedes(high, store, cursorStore)) {
+                continue;
+            }
+            if (pcodeNodeDependsOn(
+                store.getInput(2),
+                load.getOutput(),
+                new LinkedHashSet<>(),
+                0)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasLowByteExtractionBefore(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST load,
+        PcodeOpAST cursorStore,
+        int byteWidth) {
+
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.SUBPIECE ||
+                operation.getNumInputs() != 2 ||
+                operation.getOutput() == null ||
+                operation.getOutput().getSize() != byteWidth ||
+                !operation.getInput(1).isConstant() ||
+                operation.getInput(1).getOffset() != 0L ||
+                !NetworkSchemaControlFlow.precedes(high, load, operation) ||
+                !NetworkSchemaControlFlow.precedes(
+                    high,
+                    operation,
+                    cursorStore)) {
+                continue;
+            }
+            if (pcodeNodeDependsOn(
+                    operation.getInput(0),
+                    load.getOutput(),
+                    new LinkedHashSet<>(),
+                    0)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean samePcodeValue(Varnode left, Varnode right) {
+        return left != null && right != null &&
+            pcodeSsaNodeKey(left).equals(pcodeSsaNodeKey(right));
+    }
+
+    private boolean pcodeValueAliases(
+        Varnode candidate,
+        Varnode expected,
+        Set<String> seen) {
+
+        return pcodeValueForwardsTo(candidate, expected, seen) ||
+            pcodeValueForwardsTo(expected, candidate, new LinkedHashSet<>());
+    }
+
+    private boolean pcodeValueForwardsTo(
+        Varnode candidate,
+        Varnode expected,
+        Set<String> seen) {
+
+        if (samePcodeValue(candidate, expected)) {
+            return true;
+        }
+        if (candidate == null || expected == null ||
+            !seen.add(pcodeSsaNodeKey(candidate) + "->" + pcodeSsaNodeKey(expected))) {
+            return false;
+        }
+        PcodeOp def = candidate.getDef();
+        if (def == null || def.getNumInputs() == 0) {
+            return false;
+        }
+        switch (def.getOpcode()) {
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.INDIRECT:
+                return pcodeValueForwardsTo(def.getInput(0), expected, seen);
+            case PcodeOp.MULTIEQUAL:
+                for (int slot = 0; slot < def.getNumInputs(); slot++) {
+                    if (!pcodeValueForwardsTo(
+                            def.getInput(slot),
+                            expected,
+                            new LinkedHashSet<>(seen))) {
+                        return false;
+                    }
+                }
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void recoverPcodeMessageGraph(
+        MessageUnmarshalPlan plan,
+        Function wrapper) {
+
+        MessageGraphRoots roots = discoverMessageGraphRoots(wrapper);
+        if (roots == null) {
+            recordPcodeMessageGraphReject(plan, "message-root-or-buffer-ambiguous", wrapper);
+            return;
+        }
+        plan.rootStorageBase = roots.rootParameter();
+        plan.readBufferParameter = roots.readBufferParameter();
+        plan.rootEvidenceSource = roots.evidenceSource();
+        LinkedHashMap<String, PcodeStorage> rootStorage = new LinkedHashMap<>();
+        rootStorage.put(
+            roots.rootParameter(),
+            new PcodeStorage(roots.rootParameter(), 0L));
+        recoverPcodeMessageGraph(
+            plan,
+            wrapper,
+            roots.readBufferParameter(),
+            rootStorage,
+            new LinkedHashSet<>(),
+            new int[] {0});
+    }
+
+    private void recoverPcodeMessageGraph(
+        MessageUnmarshalPlan plan,
+        Function function,
+        String readBufferParameter,
+        Map<String, PcodeStorage> callerParamStorage,
+        Set<String> activeContexts,
+        int[] operationOrder) {
+
+        if (plan == null || function == null || readBufferParameter == null) {
+            return;
+        }
+        String context = pcodeMessageContextKey(
+            function,
+            readBufferParameter,
+            callerParamStorage);
+        if (!activeContexts.add(context)) {
+            recordPcodeMessageGraphReject(plan, "message-helper-cycle", function);
+            return;
+        }
+
+        try {
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                recordPcodeMessageGraphReject(plan, "message-helper-decompile-failed", function);
+                return;
+            }
+            HashMap<String, String> tempNativeTypes = new HashMap<>();
+            HashMap<String, String> tempWireShapes = new HashMap<>();
+            for (PcodeOpAST op : orderedPcodeOps(high)) {
+                int order = operationOrder[0]++;
+                plan.pcodeOrderByCallsite.putIfAbsent(
+                    op.getSeqnum().getTarget().toString(),
+                    order);
+                if (op.getOpcode() == PcodeOp.CALL) {
+                    recoverPcodeMessageGraphCall(
+                        plan,
+                        function,
+                        op,
+                        readBufferParameter,
+                        callerParamStorage,
+                        activeContexts,
+                        operationOrder,
+                        order,
+                        tempNativeTypes,
+                        tempWireShapes);
+                    continue;
+                }
+                if (op.getOpcode() == PcodeOp.STORE) {
+                    recoverPcodeMessageGraphStore(
+                        plan,
+                        op,
+                        callerParamStorage,
+                        order,
+                        tempNativeTypes,
+                        tempWireShapes);
+                }
+            }
+        }
+        finally {
+            activeContexts.remove(context);
+        }
+    }
+
+    private void recoverPcodeMessageGraphCall(
+        MessageUnmarshalPlan plan,
+        Function owner,
+        PcodeOp op,
+        String readBufferParameter,
+        Map<String, PcodeStorage> callerParamStorage,
+        Set<String> activeContexts,
+        int[] operationOrder,
+        int order,
+        Map<String, String> tempNativeTypes,
+        Map<String, String> tempWireShapes) {
+
+        Function target = pcodeCallTarget(op);
+        if (target == null) {
+            recordPcodeMessageGraphReject(plan, "message-call-target-unresolved", null);
+            return;
+        }
+        PcodeStorage callerReadBuffer = translatedAbsoluteHelperStorage(
+            new PcodeStorage(readBufferParameter, 0L),
+            callerParamStorage);
+        Integer readBufferSlot = provenCallArgumentSlot(
+            owner,
+            op,
+            target,
+            callerReadBuffer);
+        if (readBufferSlot == null) {
+            return;
+        }
+
+        Map<String, PcodeStorage> arguments = callArgumentStorageMap(
+            owner,
+            op,
+            callerParamStorage);
+        RawPcodeWrite rawRead = pcodeReadRawWrite(op, target);
+        if (rawRead != null) {
+            PcodeStorage rawStorage = translatedAbsoluteHelperStorage(
+                rawRead.storage,
+                callerParamStorage);
+            if (isRootMessageStorage(plan, rawStorage)) {
+                FieldCall field = addPcodeMessageField(
+                    plan,
+                    op.getSeqnum().getTarget(),
+                    rawStorage,
+                    rawRead.nativeType,
+                    "message-unmarshal-pcode-stack-readraw",
+                    order);
+                applyMessageFieldWireShape(
+                    field,
+                    rawRead.wireEvidence.shape,
+                    rawRead.wireEvidence.source);
+                applyWireEvidence(field, rawRead.wireEvidence);
+                if (op instanceof PcodeOpAST readCall) {
+                    applyConstructorFieldTypeIdentity(
+                        field,
+                        rawConstructorFieldIdentity(
+                            owner,
+                            highFunction(owner),
+                            readCall,
+                            rawRead));
+                }
+            }
+            else {
+                putPcodeTempUnmarshal(
+                    tempNativeTypes,
+                    tempWireShapes,
+                    rawStorage,
+                    rawRead.nativeType,
+                    rawRead.wireEvidence.shape);
+            }
+            return;
+        }
+        String nativeType = unmarshalNativeTypeFromTarget(target);
+        WireShape wireEvidence = wireShapeEvidenceFromUnmarshalTarget(target, nativeType);
+        String wireShape = wireEvidence == null ? null : wireEvidence.shape;
+        NestedTypeShape nestedShape = null;
+        NestedDirectTypeCallShape translatedShape = null;
+        if (wireShape == null && nativeType != null) {
+            translatedShape = recoverNestedDirectTypeCallShape(
+                owner,
+                op,
+                target,
+                nativeType,
+                callerParamStorage);
+            nestedShape = translatedShape == null
+                ? recoverNestedDirectTypeShape(target, nativeType)
+                : translatedShape.shape;
+            wireShape = wireShapeFromNestedTypeShape(nestedShape);
+            if (wireShape != null) {
+                wireEvidence = WireShape.semantic(
+                    wireShape,
+                    "message-unmarshal-pcode-stack-nested-shape");
+            }
+        }
+
+        PcodeStorage output = translatedShape == null
+            ? nestedDirectTypeCallOutputStorage(
+                owner,
+                op,
+                nestedShape,
+                callerParamStorage)
+            : translatedShape.storage;
+        if (wireEvidence != null && isRootMessageStorage(plan, output)) {
+            FieldCall field = addPcodeMessageField(
+                plan,
+                op.getSeqnum().getTarget(),
+                output,
+                nativeType,
+                "message-unmarshal-pcode-stack",
+                order);
+            applyWireEvidence(field, wireEvidence);
+            applyNestedTypeShapeToField(
+                field,
+                nestedShape,
+                "message-unmarshal-pcode-stack-nested-shape");
+            return;
+        }
+
+        observePcodeTempUnmarshal(
+            tempNativeTypes,
+            tempWireShapes,
+            op,
+            nativeType,
+            wireShape);
+        if (!hasRootMessageArgument(plan, arguments)) {
+            return;
+        }
+        applyMessageCallFrameBoundaries(plan, owner, op, target, arguments);
+        if (plan.helper == null) {
+            plan.helperCallsite = op.getSeqnum().getTarget();
+            plan.helper = target.getEntryPoint();
+            plan.helperName = fullFunctionName(target);
+        }
+        recoverPcodeMessageGraph(
+            plan,
+            target,
+            "param_" + readBufferSlot,
+            arguments,
+            activeContexts,
+            operationOrder);
+    }
+
+    private void recoverPcodeMessageGraphStore(
+        MessageUnmarshalPlan plan,
+        PcodeOp op,
+        Map<String, PcodeStorage> callerParamStorage,
+        int order,
+        Map<String, String> tempNativeTypes,
+        Map<String, String> tempWireShapes) {
+
+        if (op.getNumInputs() < 3) {
+            return;
+        }
+        PcodeStorage storage = translatedAbsoluteHelperStorage(
+            pcodeStorageExpression(op.getInput(1)),
+            callerParamStorage);
+        if (!isRootMessageStorage(plan, storage)) {
+            return;
+        }
+        String wireShape = pcodeNetworkValueWireShape(
+            op.getInput(2),
+            tempWireShapes,
+            new LinkedHashSet<>());
+        if (wireShape == null) {
+            return;
+        }
+        String nativeType = pcodeValueNativeType(op.getInput(2), tempNativeTypes);
+        if (nativeType == null) {
+            nativeType = nativeTypeFromWireShape(wireShape);
+        }
+        FieldCall field = addPcodeMessageField(
+            plan,
+            op.getSeqnum().getTarget(),
+            storage,
+            nativeType,
+            "message-unmarshal-pcode-stack-store",
+            order);
+        applyMessageFieldWireShape(
+            field,
+            wireShape,
+            "message-unmarshal-pcode-stack-store");
+    }
+
+    private String pcodeNetworkValueWireShape(
+        Varnode node,
+        Map<String, String> tempWireShapes,
+        Set<String> seen) {
+
+        if (node == null) {
+            return null;
+        }
+        String tempShape = pcodeTempWireShape(node, tempWireShapes);
+        if (tempShape != null) {
+            return tempShape;
+        }
+        if (!seen.add(pcodeNodeKey(node))) {
+            return null;
+        }
+        PcodeOp def = node.getDef();
+        if (def == null || def.getNumInputs() == 0) {
+            return null;
+        }
+        switch (def.getOpcode()) {
+            case PcodeOp.COPY:
+            case PcodeOp.CAST:
+            case PcodeOp.INT_ZEXT:
+            case PcodeOp.INT_SEXT:
+            case PcodeOp.SUBPIECE:
+            case PcodeOp.INDIRECT:
+                return pcodeNetworkValueWireShape(
+                    def.getInput(0),
+                    tempWireShapes,
+                    seen);
+            case PcodeOp.INT_EQUAL:
+            case PcodeOp.INT_NOTEQUAL:
+            case PcodeOp.INT_LESS:
+            case PcodeOp.INT_LESSEQUAL:
+            case PcodeOp.INT_SLESS:
+            case PcodeOp.INT_SLESSEQUAL:
+            case PcodeOp.BOOL_AND:
+            case PcodeOp.BOOL_OR:
+            case PcodeOp.BOOL_XOR:
+            case PcodeOp.BOOL_NEGATE:
+                return hasNetworkValueInput(def, tempWireShapes, seen) && node.getSize() == 1
+                    ? "bool"
+                    : null;
+            case PcodeOp.MULTIEQUAL:
+                return mergedNetworkValueWireShape(def, tempWireShapes, seen);
+            default:
+                return null;
+        }
+    }
+
+    private boolean hasNetworkValueInput(
+        PcodeOp op,
+        Map<String, String> tempWireShapes,
+        Set<String> seen) {
+
+        for (int slot = 0; slot < op.getNumInputs(); slot++) {
+            Varnode input = op.getInput(slot);
+            if (input != null && !input.isConstant() &&
+                pcodeNetworkValueWireShape(
+                    input,
+                    tempWireShapes,
+                    new LinkedHashSet<>(seen)) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String mergedNetworkValueWireShape(
+        PcodeOp op,
+        Map<String, String> tempWireShapes,
+        Set<String> seen) {
+
+        String selected = null;
+        for (int slot = 0; slot < op.getNumInputs(); slot++) {
+            String shape = pcodeNetworkValueWireShape(
+                op.getInput(slot),
+                tempWireShapes,
+                new LinkedHashSet<>(seen));
+            if (shape == null || selected != null && !selected.equals(shape)) {
+                return null;
+            }
+            selected = shape;
+        }
+        return selected;
+    }
+
+    private boolean hasRootMessageArgument(
+        MessageUnmarshalPlan plan,
+        Map<String, PcodeStorage> arguments) {
+
+        if (arguments == null || arguments.isEmpty()) {
+            return false;
+        }
+        for (PcodeStorage storage : arguments.values()) {
+            if (isRootMessageStorage(plan, storage)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isRootMessageStorage(
+        MessageUnmarshalPlan plan,
+        PcodeStorage storage) {
+
+        if (storage == null || plan.rootStorageBase == null ||
+            !plan.rootStorageBase.equals(storage.base) || storage.offset < 0L) {
+            return false;
+        }
+        return plan.instanceSize == null || storage.offset < plan.instanceSize;
+    }
+
+    private String pcodeMessageContextKey(
+        Function function,
+        String readBufferParameter,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        StringBuilder key = new StringBuilder(function.getEntryPoint().toString())
+            .append('|')
+            .append(readBufferParameter);
+        if (callerParamStorage == null || callerParamStorage.isEmpty()) {
+            return key.toString();
+        }
+        ArrayList<String> parameters = new ArrayList<>(callerParamStorage.keySet());
+        Collections.sort(parameters);
+        for (String parameter : parameters) {
+            PcodeStorage storage = callerParamStorage.get(parameter);
+            key.append('|').append(parameter).append('=');
+            if (storage != null) {
+                key.append(storage.base).append(':').append(storage.offset);
+            }
+        }
+        return key.toString();
+    }
+
+    private void recordPcodeMessageGraphReject(
+        MessageUnmarshalPlan plan,
+        String reason,
+        Function function) {
+
+        pcodeMessageFieldRejectedCount++;
+        pcodeMessageFieldRejectCounts.merge(reason, 1, Integer::sum);
+        if (plan == null ||
+            plan.rejectedPcodeFields.size() >= PCODE_MESSAGE_REJECT_SAMPLE_LIMIT) {
+            return;
+        }
+        JsonObject evidence = new JsonObject();
+        evidence.addProperty("kind", "pcode-message-stack");
+        evidence.addProperty("reason", reason);
+        if (function != null) {
+            NetworkSchemaJson.add(
+                evidence,
+                "function",
+                formatAddress(function.getEntryPoint()));
+            NetworkSchemaJson.add(evidence, "functionName", fullFunctionName(function));
+        }
+        plan.rejectedPcodeFields.add(evidence);
+    }
+}

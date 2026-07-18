@@ -61,7 +61,7 @@ pub use self::execution_activity::{
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct Activity;
+pub struct Activity {}
 
 impl AzRtti for Activity {
     const NAME: &'static str = "Activity";

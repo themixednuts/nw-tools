@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct MaterialOverride2B488EC0;
+pub struct MaterialOverride2B488EC0 {}
 
 impl AzRtti for MaterialOverride2B488EC0 {
     const NAME: &'static str = "MaterialOverride";

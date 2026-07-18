@@ -1,128 +1,3 @@
-        if (!isPlausibleTypeName(typeName)) {
-            TypeNameDecode providerTableName =
-                typeNameFromRttiProviderTable(providerTable, typeId);
-            if (providerTableName != null && isPlausibleTypeName(providerTableName.typeName)) {
-                typeName = providerTableName.typeName;
-                nameSource = providerTableName.typeNameSource;
-            }
-        }
-        if (!isPlausibleTypeName(typeName)) {
-            SerializeTypeInfo reflected = serializeTypesById.get(normalizeUuid(typeId));
-            if (reflected != null && isPlausibleTypeName(reflected.name)) {
-                typeName = reflected.name;
-                nameSource = "serialize-type-id";
-            }
-        }
-        if (!isPlausibleTypeName(typeName)) {
-            HookTypeEvidence hook = registrationHooksByTypeId.get(normalizeUuid(typeId));
-            if (hook != null && isPlausibleTypeName(hook.typeName)) {
-                typeName = hook.typeName;
-                nameSource = hook.typeNameSource();
-            }
-        }
-        if (!isPlausibleTypeName(typeName)) {
-            Address target = resolvedCodeTarget(provider);
-            if (!Objects.equals(target, provider)) {
-                typeName = typeNameFromRttiHelperFunctionName(target);
-                if (isPlausibleTypeName(typeName)) {
-                    nameSource = "resolved-rtti-helper-function-name";
-                }
-            }
-        }
-        if (!isPlausibleTypeName(typeName)) {
-            TypeNameDecode nearbyName =
-                typeNameNearTypeIdString(typeIdDecode.sourceAddress, provider);
-            if (nearbyName != null && isPlausibleTypeName(nearbyName.typeName)) {
-                typeName = nearbyName.typeName;
-                nameSource = nearbyName.typeNameSource;
-            }
-        }
-
-        return new NativeTypeInfoEvidence(
-            providerTable,
-            isPlausibleTypeName(typeName) ? typeName : null,
-            typeId,
-            "rtti-provider-vtable",
-            nameSource);
-    }
-
-    private TypeNameDecode typeNameFromRttiProviderTable(Address providerTable, String typeId) {
-        AzRttiEvidence evidence = decodeAzRttiFromVtable(providerTable);
-        if (evidence == null) {
-            return null;
-        }
-
-        String typeName = providerAnyTypeNameForTypeId(evidence, typeId);
-        if (!isPlausibleTypeName(typeName)) {
-            return null;
-        }
-
-        TypeNameDecode decode = new TypeNameDecode();
-        decode.provider = providerTable;
-        decode.typeName = typeName;
-        decode.typeNameSource = "az-rtti-provider-table";
-        return decode;
-    }
-
-    private TypeNameDecode typeNameNearTypeIdString(Address typeIdString, Address provider) {
-        if (!isProgramAddress(typeIdString)) {
-            return null;
-        }
-
-        TypeNameDecode best = null;
-        int bestScore = Integer.MIN_VALUE;
-        for (int delta = 1; delta <= 0x80; delta++) {
-            Address candidate = subtract(typeIdString, delta);
-            if (!isProgramAddress(candidate)) {
-                continue;
-            }
-
-            String name = readPrintableString(candidate);
-            if (!isLikelyRuntimeTypeName(name) ||
-                !isSimpleTypeNameGetterReference(candidate)) {
-                continue;
-            }
-
-            int score = runtimeTypeNameScore(name) - delta;
-            if (best != null && score <= bestScore) {
-                continue;
-            }
-
-            TypeNameDecode decode = new TypeNameDecode();
-            decode.provider = provider;
-            decode.typeName = name;
-            decode.typeNameSource = "nearby-type-name-getter";
-            decode.typeNameAddress = candidate;
-            best = decode;
-            bestScore = score;
-        }
-        return best;
-    }
-
-    private boolean isSimpleTypeNameGetterReference(Address stringAddress) {
-        if (!isProgramAddress(stringAddress)) {
-            return false;
-        }
-
-        ReferenceIterator references =
-            currentProgram.getReferenceManager().getReferencesTo(stringAddress);
-        while (references.hasNext()) {
-            Address referenceAddress = references.next().getFromAddress();
-            if (Objects.equals(stringAddressReturnedBySimpleFunction(referenceAddress), stringAddress)) {
-                return true;
-            }
-
-            Function function = functionAtOrContaining(referenceAddress);
-            if (function != null &&
-                Objects.equals(
-                    stringAddressReturnedBySimpleFunction(function.getEntryPoint()),
-                    stringAddress)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private boolean hasStructuredContainerValue(
         List<String> deltaShapes,
         List<String> fullShapes) {
@@ -134,15 +9,27 @@
     }
 
     private WireShape scalarContainerWireShape(ContainerWireShape container) {
-        if (container == null) {
-            return null;
-        }
-        if (container.primaryShape != null) {
-            return container.primaryShape;
-        }
-        return pairedContainerWireShapeFromDeltaKeyAndFullValue(
-            container.deltaMarshalShapes,
-            container.fullMarshalShapes);
+        return container == null ? null : container.primaryShape;
+    }
+
+    private List<String> wireEvidenceTokens(List<WireShape> evidence) {
+        return evidence.stream()
+            .map(item -> item.shape == null ? item.layout : item.shape)
+            .filter(Objects::nonNull)
+            .toList();
+    }
+
+    private List<String> provenWireShapes(List<WireShape> evidence) {
+        return evidence.stream().allMatch(WireShape::hasProvenSemantics)
+            ? evidence.stream().map(item -> item.shape).toList()
+            : Collections.emptyList();
+    }
+
+    private List<String> wireLayouts(List<WireShape> evidence) {
+        return evidence.stream()
+            .map(item -> item.layout)
+            .filter(Objects::nonNull)
+            .toList();
     }
 
     private WireShape pairedContainerWireShapeFromDeltaKeyAndFullValue(
@@ -162,25 +49,28 @@
                     stripTrailingContainerCount(
                         fullValueShapes.subList(1, fullValueShapes.size())));
                 if (valuesWithoutKey.size() == 1) {
-                    return new WireShape(
+                    return WireShape.semantic(
                         containerShape(keyShape, valuesWithoutKey.get(0)),
                         "replicated-container-delta-key-full-key-value");
                 }
             }
             return null;
         }
-        return new WireShape(
+        return WireShape.semantic(
             containerShape(keyShape, fullValueShapes.get(0)),
             "replicated-container-delta-key-full-value");
     }
 
     private String containerShapeFromDeltaMarshalShapes(List<String> shapes) {
-        int sequenceIndex = shapes.indexOf("sequence-number");
-        String keyShape = previousDataShape(shapes, sequenceIndex < 0 ? shapes.size() : sequenceIndex);
+        int sequenceIndex = containerSequenceMarkerIndex(shapes);
+        if (sequenceIndex < 0) {
+            return null;
+        }
+        String keyShape = previousDataShape(shapes, sequenceIndex);
         List<String> valueShapes = replicatedContainerDeltaValueShapes(shapes);
         String valueShape = valueShapes.size() == 1
             ? valueShapes.get(0)
-            : nextDataShape(shapes, Math.max(0, sequenceIndex + 1));
+            : nextDataShape(shapes, sequenceIndex + 1);
         return containerShape(keyShape, valueShape);
     }
 
@@ -200,90 +90,189 @@
 
     private void collectOrderedMarshalShapes(
         Address address,
-        int depth,
-        Set<String> seen,
-        ArrayList<String> shapes) {
+        String writeBufferParameter,
+        ArrayList<WireShape> shapes) {
 
-        Address targetAddress = resolvedCodeTarget(address);
-        if (!isExecutableAddress(targetAddress)) {
-            return;
-        }
-
-        WireShape named = wireShapeFromFunctionName(targetAddress);
-        if (named != null) {
-            shapes.add(named.shape);
-            return;
-        }
-
-        if (looksLikeBoolMarshal(targetAddress)) {
-            shapes.add("bool");
-            return;
-        }
-
-        Integer fixedRawLength = fixedRawMarshalLength(targetAddress);
-        if (fixedRawLength != null && fixedRawLength > 0) {
-            shapes.add(rawWriteShape(fixedRawLength));
-            return;
-        }
-
-        if (!seen.add(targetAddress.toString())) {
-            return;
-        }
-
-        Function function = functionAtOrContaining(targetAddress);
-        if (function == null || depth <= 0) {
-            return;
-        }
-
-        int count = 0;
-        Integer lastR8Length = null;
-        for (Instruction instruction : functionInstructions(function)) {
-            if (instruction.getMinAddress().compareTo(targetAddress) < 0) {
-                continue;
-            }
-            if (count++ >= VTABLE_SCAN_LIMIT) {
-                break;
-            }
-            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-            if ("MOV".equals(mnemonic)) {
-                String destination = NetworkSchemaX86.registerOperand(instruction, 0);
-                Long immediate = literalOperandValue(instruction, 1);
-                if ("R8".equals(destination) && immediate != null &&
-                    immediate > 0 && immediate <= 0x1000) {
-                    lastR8Length = immediate.intValue();
-                }
-            }
-            if (!instruction.getFlowType().isCall()) {
-                if (instruction.getFlowType().isJump()) {
-                    Address jump = branchTarget(instruction);
-                    if (isExecutableAddress(jump) &&
-                        jump.compareTo(instruction.getMinAddress()) > 0) {
-                        collectOrderedMarshalShapes(jump, depth - 1, seen, shapes);
-                    }
-                    if (instruction.getFlowType().isUnConditional()) {
-                        break;
-                    }
-                }
-                if (instruction.getFlowType().isTerminal()) {
-                    break;
-                }
-                continue;
-            }
-            if (isVirtualRawWriteDispatch(instruction) && lastR8Length != null) {
-                shapes.add(rawWriteShape(lastR8Length));
-                lastR8Length = null;
-                continue;
-            }
-            Address call = callTarget(instruction);
-            if (isExecutableAddress(call)) {
-                collectOrderedMarshalShapes(call, depth - 1, seen, shapes);
-            }
-            lastR8Length = null;
+        NetworkSchemaFlowSequence.Result<WireShape> sequence = marshalShapeSequence(
+            address,
+            writeBufferParameter,
+            new LinkedHashSet<>());
+        if (sequence.complete()) {
+            shapes.addAll(sequence.events());
         }
     }
 
-    private String rawWriteShape(int length) {
-        return length == 1 ? "u8" : "fixed-bytes-" + length;
+    private NetworkSchemaFlowSequence.Result<WireShape> marshalShapeSequence(
+        Address address,
+        String writeBufferParameter,
+        Set<String> activeContexts) {
+
+        Address targetAddress = resolvedCodeTarget(address);
+        if (!isExecutableAddress(targetAddress) || writeBufferParameter == null) {
+            return marshalShapeSequenceFailure(
+                NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+        }
+
+        Function function = functionAtOrContaining(targetAddress);
+        if (function == null) {
+            return marshalShapeSequenceFailure(
+                NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+        }
+        WireShape leaf = validatedMarshalLeaf(function, writeBufferParameter);
+        if (leaf != null) {
+            return new NetworkSchemaFlowSequence.Result<>(
+                NetworkSchemaFlowSequence.Status.COMPLETE,
+                List.of(leaf));
+        }
+        String context = function.getEntryPoint() + "|" + writeBufferParameter;
+        if (!activeContexts.add(context)) {
+            return marshalShapeSequenceFailure(
+                NetworkSchemaFlowSequence.Status.CYCLIC_EVENTS);
+        }
+        try {
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                return marshalShapeSequenceFailure(
+                    NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+            }
+            Map<PcodeBlockBasic, List<WireShape>> shapesByBlock = new HashMap<>();
+            PcodeStorage writeBuffer = new PcodeStorage(writeBufferParameter, 0L);
+            for (PcodeOpAST op : orderedPcodeOps(high)) {
+                if (op.getOpcode() == PcodeOp.CALL) {
+                    Function called = pcodeCallTarget(op);
+                    Integer pcodeSlot = uniqueCallArgumentSlot(op, writeBuffer);
+                    if (called == null) {
+                        if (pcodeSlot != null) {
+                            return marshalShapeSequenceFailure(
+                                NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                        }
+                        continue;
+                    }
+                    Integer writeBufferSlot = provenCallArgumentSlot(
+                        function,
+                        op,
+                        called,
+                        writeBuffer);
+                    if (writeBufferSlot == null) {
+                        continue;
+                    }
+                    String calledBufferParameter = "param_" + writeBufferSlot;
+                    WireShape calledLeaf = validatedMarshalLeaf(
+                        called,
+                        calledBufferParameter);
+                    if (calledLeaf != null) {
+                        if (!addMarshalShapesForOperation(
+                                shapesByBlock,
+                                op,
+                                List.of(calledLeaf))) {
+                            return marshalShapeSequenceFailure(
+                                NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                        }
+                        continue;
+                    }
+                    NetworkSchemaFlowSequence.Result<WireShape> nested =
+                        marshalShapeSequence(
+                        called.getEntryPoint(),
+                        calledBufferParameter,
+                        activeContexts);
+                    if (!nested.complete()) {
+                        return nested;
+                    }
+                    if (!addMarshalShapesForOperation(
+                            shapesByBlock,
+                            op,
+                            nested.events())) {
+                        return marshalShapeSequenceFailure(
+                            NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                    }
+                    continue;
+                }
+                if (op.getOpcode() == PcodeOp.CALLIND) {
+                    Integer byteLength = provenVirtualRawWriteLength(
+                        function,
+                        op,
+                        writeBufferParameter);
+                    if (byteLength != null) {
+                        boolean normalizedBoolean = byteLength == Byte.BYTES &&
+                            rawWriteArgumentIsNormalizedBoolean(function, op);
+                        WireShape rawWrite = normalizedBoolean
+                            ? WireShape.semantic(
+                                "bool",
+                                fixedByteLayout(byteLength),
+                                "marshal-pcode-normalized-boolean-write")
+                            : WireShape.layout(
+                                fixedByteLayout(byteLength),
+                                "marshal-pcode-raw-width-layout");
+                        if (!addMarshalShapesForOperation(
+                                shapesByBlock,
+                                op,
+                                List.of(rawWrite))) {
+                            return marshalShapeSequenceFailure(
+                                NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                        }
+                    }
+                }
+            }
+            NetworkSchemaFlowSequence.Result<WireShape> sequence =
+                NetworkSchemaFlowSequence.analyze(
+                high,
+                shapesByBlock,
+                this::sameWireEvidence);
+            return collapseValidatedMarshalSequence(function, sequence);
+        }
+        finally {
+            activeContexts.remove(context);
+        }
+    }
+
+    private boolean addMarshalShapesForOperation(
+        Map<PcodeBlockBasic, List<WireShape>> shapesByBlock,
+        PcodeOpAST operation,
+        List<WireShape> shapes) {
+
+        if (shapes.isEmpty()) {
+            return true;
+        }
+        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+        if (block == null) {
+            return false;
+        }
+        shapesByBlock.computeIfAbsent(block, ignored -> new ArrayList<>()).addAll(shapes);
+        return true;
+    }
+
+    private NetworkSchemaFlowSequence.Result<WireShape> marshalShapeSequenceFailure(
+        NetworkSchemaFlowSequence.Status status) {
+
+        return new NetworkSchemaFlowSequence.Result<>(status, List.of());
+    }
+
+    private List<PcodeOpAST> orderedPcodeOps(HighFunction high) {
+        return NetworkSchemaControlFlow.orderedOperations(high);
+    }
+
+    private Integer pcodeVirtualRawWriteLength(PcodeOp op, String writeBufferParameter) {
+        if (op == null || op.getOpcode() != PcodeOp.CALLIND || op.getNumInputs() < 2) {
+            return null;
+        }
+        PcodeVirtualDispatch target = pcodeVirtualDispatch(op.getInput(0));
+        if (target == null || target.objectOffset() != 0L ||
+            target.slotOffset() != 0x40L ||
+            !target.root().isStorage(writeBufferParameter)) {
+            return null;
+        }
+
+        if (op.getNumInputs() <= 3) {
+            return null;
+        }
+        Long byteLength = NetworkSchemaIntegerEvaluator.evaluate(op.getInput(3));
+        return byteLength != null && byteLength > 0L && byteLength <= 0x1000L
+            ? byteLength.intValue()
+            : null;
+    }
+
+    private String fixedByteLayout(int length) {
+        return "fixed-bytes-" + length;
     }
 
     private String previousDataShape(List<String> shapes, int beforeIndex) {
@@ -306,261 +295,57 @@
         return null;
     }
 
-    private String firstDataShape(List<String> shapes) {
-        return nextDataShape(shapes, 0);
-    }
-
-    private String secondDataShape(List<String> shapes) {
-        String first = firstDataShape(shapes);
-        if (first == null) {
-            return null;
-        }
-        boolean sawFirst = false;
-        for (String shape : shapes) {
-            if (!isReplicatedContainerDataShape(shape)) {
-                continue;
-            }
-            if (sawFirst) {
-                return shape;
-            }
-            if (shape.equals(first)) {
-                sawFirst = true;
-            }
-        }
-        return null;
-    }
-
-    private List<String> replicatedContainerDataShapes(List<String> shapes) {
-        ArrayList<String> result = new ArrayList<>();
-        for (String shape : shapes) {
-            if (isReplicatedContainerDataShape(shape)) {
-                result.add(shape);
-            }
-        }
-        return result;
-    }
-
     private boolean isReplicatedContainerDataShape(String shape) {
         return shape != null &&
             !"vlq-u32".equals(shape) &&
-            !"sequence-number".equals(shape);
+            !isContainerSequenceMarker(shape);
     }
 
-    private WireShape classifyMarshalPath(Address address) {
-        if (!isExecutableAddress(address)) {
-            return null;
+    private int containerSequenceMarkerIndex(List<String> shapes) {
+        if (shapes == null) {
+            return -1;
         }
-
-        Deque<MarshalPathFrame> stack = new ArrayDeque<>();
-        LinkedHashSet<String> seen = new LinkedHashSet<>();
-        stack.push(new MarshalPathFrame(address, ""));
-
-        while (!stack.isEmpty()) {
-            MarshalPathFrame frame = stack.pop();
-            Address targetAddress = resolvedCodeTarget(frame.address);
-            if (!isExecutableAddress(targetAddress) || !seen.add(targetAddress.toString())) {
-                continue;
-            }
-
-            WireShape named = wireShapeFromFunctionName(targetAddress);
-            if (named != null) {
-                return frame.wrap(named);
-            }
-
-            if (looksLikeBoolMarshal(targetAddress)) {
-                return frame.wrap(new WireShape("bool", "marshal-bool-instructions"));
-            }
-
-            Integer fixedRawLength = fixedRawMarshalLength(targetAddress);
-            if (fixedRawLength != null) {
-                if (fixedRawLength == 1) {
-                    return frame.wrap(new WireShape("u8", "marshal-raw-write-length"));
-                }
-                if (fixedRawLength > 1) {
-                    return frame.wrap(new WireShape(
-                        "fixed-bytes-" + fixedRawLength,
-                        "marshal-raw-write-length"));
-                }
-            }
-
-            Function function = functionAtOrContaining(targetAddress);
-            if (function == null) {
-                continue;
-            }
-
-            int count = 0;
-            for (Instruction instruction : functionInstructions(function)) {
-                if (instruction.getMinAddress().compareTo(targetAddress) < 0) {
-                    continue;
-                }
-                if (count++ >= VTABLE_SCAN_LIMIT) {
-                    break;
-                }
-                if (!instruction.getFlowType().isCall()) {
-                    continue;
-                }
-                Address target = callTarget(instruction);
-                if (isExecutableAddress(target)) {
-                    stack.push(frame.nested(target));
-                }
+        for (int index = 0; index < shapes.size(); index++) {
+            if (isContainerSequenceMarker(shapes.get(index))) {
+                return index;
             }
         }
-        return null;
+        return -1;
     }
 
-    private Integer fixedRawMarshalLength(Address address) {
-        Integer linearLength = fixedRawMarshalLengthFromLinearInstructions(address);
-        if (linearLength != null) {
-            return linearLength;
-        }
-
-        Function function = functionAtOrContaining(address);
-        if (function == null) {
-            return null;
-        }
-
-        Integer lastR8Length = null;
-        int count = 0;
-        for (Instruction instruction : functionInstructions(function)) {
-            if (instruction.getMinAddress().compareTo(address) < 0) {
-                continue;
-            }
-            if (count++ >= VTABLE_SCAN_LIMIT) {
-                break;
-            }
-
-            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-            if ("MOV".equals(mnemonic)) {
-                String destination = NetworkSchemaX86.registerOperand(instruction, 0);
-                Long immediate = literalOperandValue(instruction, 1);
-                if ("R8".equals(destination) && immediate != null &&
-                    immediate >= 0 && immediate <= 0x1000) {
-                    lastR8Length = immediate.intValue();
-                }
-            }
-            else if ("JMP".equals(mnemonic) && isVirtualRawWriteJump(instruction)) {
-                return lastR8Length;
-            }
-            else if (instruction.getFlowType().isCall()) {
-                return null;
-            }
-        }
-        return null;
+    private boolean isContainerSequenceMarker(String shape) {
+        return "sequence-number".equals(shape) || "optional<vlq-u64>".equals(shape);
     }
 
-    private Integer fixedRawMarshalLengthFromLinearInstructions(Address address) {
-        Integer lastR8Length = null;
-        int count = 0;
-        for (Instruction instruction :
-            currentProgram.getListing().getInstructions(address, true)) {
-            if (count++ >= VTABLE_SCAN_LIMIT) {
-                break;
-            }
-            Address instructionAddress = instruction.getMinAddress();
-            if (instructionAddress.compareTo(address) < 0 ||
-                !isExecutableAddress(instructionAddress)) {
-                break;
-            }
+    private WireShape classifyMarshalPath(
+        Address address,
+        HandlerWireShapeEvidence handlerEvidence) {
 
-            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-            if ("MOV".equals(mnemonic)) {
-                String destination = NetworkSchemaX86.registerOperand(instruction, 0);
-                Long immediate = literalOperandValue(instruction, 1);
-                if ("R8".equals(destination) && immediate != null &&
-                    immediate > 0 && immediate <= 0x1000) {
-                    lastR8Length = immediate.intValue();
-                }
-            }
-            else if ("JMP".equals(mnemonic) && isVirtualRawWriteJump(instruction)) {
-                return lastR8Length;
-            }
-            else if ("RET".equals(mnemonic) || "CCH".equals(mnemonic)) {
-                break;
-            }
-            else if (instruction.getFlowType().isCall()) {
-                return null;
-            }
+        Address targetAddress = resolvedCodeTarget(address);
+        Function function = isExecutableAddress(targetAddress)
+            ? functionAtOrContaining(targetAddress)
+            : null;
+        FixedSequenceShape fixedSequence = fixedSequenceShape(
+            function,
+            "param_2",
+            NetworkSchemaCodecClassifier.CodecDirection.ENCODE);
+        if (fixedSequence != null && fixedSequence.wireEvidence != null) {
+            handlerEvidence.marshalSequence = fixedSequence;
+            return fixedSequence.wireEvidence;
         }
-        return null;
-    }
-
-    private boolean isVirtualRawWriteJump(Instruction instruction) {
-        return "JMP".equals(NetworkSchemaX86.upperMnemonic(instruction)) && isVirtualRawWriteDispatch(instruction);
-    }
-
-    private boolean isVirtualRawWriteDispatch(Instruction instruction) {
-        String operand = NetworkSchemaX86.operandText(instruction, 0);
-        if (operand == null) {
-            return false;
+        WireShape countedSequence = handlerCountedMarshalShape(
+            function,
+            "param_2");
+        if (countedSequence != null) {
+            return countedSequence;
         }
-        String normalized = operand
-            .replace(" ", "")
-            .toUpperCase(Locale.ROOT);
-        return normalized.contains("[RAX+0X40]") ||
-            normalized.contains("[RAX+40H]");
-    }
-
-    private WireShape wireShapeFromFunctionName(Address address) {
-        Function function = functionAtOrContaining(address);
-        if (function == null) {
-            return null;
+        ArrayList<WireShape> shapes = new ArrayList<>();
+        collectOrderedMarshalShapes(address, "param_2", shapes);
+        WireShape packedPosition = packedPositionMarshalShape(function, shapes);
+        if (packedPosition != null) {
+            return packedPosition;
         }
-        String name = fullFunctionName(function);
-        WireShape generic = wireShapeFromMarshalFunctionName(name);
-        if (generic != null) {
-            return generic;
-        }
-        if (name.contains("GridMate::Marshaler<u8>::Marshal")) {
-            return new WireShape("u8", "marshal-function-name");
-        }
-        if (name.contains("GridMate::Marshaler<u16>::Marshal")) {
-            return new WireShape("u16", "marshal-function-name");
-        }
-        if (name.contains("GridMate::Marshaler<u32>::Marshal")) {
-            return new WireShape("u32", "marshal-function-name");
-        }
-        if (name.contains("GridMate::Marshaler<u64>::Marshal")) {
-            return new WireShape("u64", "marshal-function-name");
-        }
-        if (name.contains("GridMate::Marshaler<f32>::Marshal")) {
-            return new WireShape("f32", "marshal-function-name");
-        }
-        if (name.contains("GridMate::HalfMarshaler::Marshal")) {
-            return new WireShape("half-f32", "marshal-function-name");
-        }
-        if (name.contains("GridMate::VlqU32Marshaler::Marshal")) {
-            return new WireShape("vlq-u32", "marshal-function-name");
-        }
-        if (name.contains("GridMate::VlqU64Marshaler::Marshal") ||
-            name.contains("Amazon::Pervasives::VlqU64Marshaler::Marshal")) {
-            return new WireShape("vlq-u64", "marshal-function-name");
-        }
-        if (name.contains("Amazon::Pervasives::Marshaller<Amazon::Hub::SequenceNumber>::Marshal")) {
-            return new WireShape("sequence-number", "marshal-function-name");
-        }
-        if (name.contains("GridMate::QuatCompNormMarshaler::Marshal") ||
-            name.contains("GridMate::QuatCompressSmallestThree")) {
-            return new WireShape("quat-comp-norm", "marshal-function-name");
-        }
-        if (name.contains("GridMate::QuatSmallestThreeQuantizedMarshaler::Marshal")) {
-            return new WireShape("quat-smallest-three", "marshal-function-name");
-        }
-        return null;
-    }
-
-    private WireShape wireShapeFromMarshalFunctionName(String name) {
-        if (name == null || !name.contains("::Marshal")) {
-            return null;
-        }
-
-        String custom = wireShapeFromMarshallerType(name);
-        if (custom != null) {
-            return new WireShape(custom, "marshal-function-name");
-        }
-
-        String nativeType = marshalFunctionTemplateType(name);
-        String shape = wireShapeFromNativeType(nativeType);
-        return shape == null ? null : new WireShape(shape, "marshal-function-name");
+        return orderedWireEvidence(shapes, "marshal-cfg-exact-call-stack");
     }
 
     private String marshalFunctionTemplateType(String name) {
@@ -569,15 +354,10 @@
             return null;
         }
 
-        int marshaller = name.indexOf("Marshaller<");
-        if (marshaller < 0) {
-            marshaller = name.indexOf("Marshaler<");
+        int templateStart = marshalClassTemplateStart(name);
+        if (templateStart < 0) {
+            templateStart = marshalMethodTemplateStart(name);
         }
-        if (marshaller < 0) {
-            return null;
-        }
-
-        int templateStart = name.indexOf('<', marshaller);
         int templateEnd = NetworkSchemaText.matchingIndex(name, templateStart, '<', '>');
         if (templateStart < 0 || templateEnd < 0) {
             return null;
@@ -587,40 +367,20 @@
         return nativeType.isEmpty() ? null : nativeType;
     }
 
-    private boolean looksLikeBoolMarshal(Address address) {
-        Function function = functionAtOrContaining(address);
-        if (function == null) {
-            return false;
+    private int marshalClassTemplateStart(String name) {
+        int marshaller = name.indexOf("Marshaller<");
+        if (marshaller < 0) {
+            marshaller = name.indexOf("Marshaler<");
         }
+        return marshaller < 0 ? -1 : name.indexOf('<', marshaller);
+    }
 
-        boolean sawSetcc = false;
-        boolean sawOneByteLength = false;
-        int count = 0;
-        for (Instruction instruction : functionInstructions(function)) {
-            if (instruction.getMinAddress().compareTo(address) < 0) {
-                continue;
-            }
-            if (count++ >= VTABLE_SCAN_LIMIT) {
-                break;
-            }
-
-            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-            if (mnemonic != null && mnemonic.startsWith("SET")) {
-                sawSetcc = true;
-            }
-            if ("MOV".equals(mnemonic)) {
-                String destination = NetworkSchemaX86.registerOperand(instruction, 0);
-                Long immediate = literalOperandValue(instruction, 1);
-                if (("R8".equals(destination) || "RDX".equals(destination)) &&
-                    immediate != null && immediate == 1L) {
-                    sawOneByteLength = true;
-                }
-            }
-            if ("RET".equals(mnemonic) || "CCH".equals(mnemonic)) {
-                break;
-            }
+    private int marshalMethodTemplateStart(String name) {
+        int method = name.indexOf("::Marshal<");
+        if (method < 0) {
+            method = name.indexOf("::Unmarshal<");
         }
-        return sawSetcc && sawOneByteLength;
+        return method < 0 ? -1 : name.indexOf('<', method);
     }
 
     private Address absoluteAddress(long value) {
@@ -806,30 +566,6 @@
         return hasNonRipRegister ? null : absoluteCandidate;
     }
 
-    private Integer memoryDisplacementForThisLikeOperand(Instruction instruction, int operandIndex) {
-        Object[] objects = NetworkSchemaX86.operandObjects(instruction, operandIndex);
-        String baseRegister = null;
-        int displacement = 0;
-        for (Object object : objects) {
-            if (object instanceof Register register) {
-                String name = NetworkSchemaX86.canonicalRegisterName(register.getName());
-                if (!"RIP".equals(name) && !"RSP".equals(name)) {
-                    if (baseRegister != null && !baseRegister.equals(name)) {
-                        return null;
-                    }
-                    baseRegister = name;
-                }
-            }
-            else if (object instanceof Scalar scalar) {
-                long value = scalar.getSignedValue();
-                if (value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE) {
-                    displacement += (int)value;
-                }
-            }
-        }
-        return baseRegister != null && displacement != 0 ? displacement : null;
-    }
-
     private TrackedValue trackedLeaValue(
         Instruction instruction,
         ForwardArgState state) {
@@ -886,6 +622,15 @@
         value = trackedFormattedFieldNamePointerLoadValue(instruction, operandIndex, state);
         if (value != null) {
             return value;
+        }
+
+        value = trackedBaseOffsetForMemoryOperand(
+            instruction,
+            operandIndex,
+            state.registers);
+        PcodeStorage dependency = pcodeStorageFromTrackedValue(value);
+        if (dependency != null) {
+            return TrackedValue.storageDependency(dependency);
         }
 
         Address address = referencedAddress(instruction, operandIndex);

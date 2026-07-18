@@ -1,0 +1,31 @@
+    private HandlerContainerTypeEvidence handlerContainerTypeEvidence(
+        String handlerTypeName,
+        String handlerTypeSource) {
+
+        NetworkTemplateType type = parseNetworkTemplateType(handlerTypeName);
+        if (type == null || !"ReplicatedMapFieldHandler".equals(type.simpleName) ||
+            type.args.size() < 2) {
+            return null;
+        }
+
+        String storageType = type.args.size() >= 3 ? type.args.get(2) : null;
+        if (storageType != null && !isMapStorageType(storageType)) {
+            return null;
+        }
+        return new HandlerContainerTypeEvidence(
+            ContainerStorageKind.INDEX_MAP,
+            type.args.get(0),
+            type.args.get(1),
+            storageType,
+            type.args.size() >= 4 ? type.args.get(3) : null,
+            type.args.size() >= 5 ? type.args.get(4) : null,
+            handlerTypeSource);
+    }
+
+    private boolean isMapStorageType(String nativeType) {
+        GenericType type = parseGenericTemplateType(nativeType);
+        return type != null && switch (type.simpleName) {
+            case "map", "unordered_map", "unordered_flat_map" -> true;
+            default -> false;
+        };
+    }

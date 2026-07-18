@@ -29,6 +29,7 @@ pub mod naming;
 pub mod native;
 pub mod network_rust;
 pub mod network_schema;
+pub mod network_selection;
 pub mod reference;
 pub mod role;
 pub mod rust;
@@ -129,22 +130,28 @@ pub use naming::{
 };
 pub use native::{NativeSymbol, NativeSymbolIndex, NativeSymbolUse, NativeSymbolUseKind};
 pub use network_rust::{
-    NETWORK_RUST_EMITTER_VERSION, NetworkReplicatedStateEmitOptions, NetworkRustEmitError,
+    NETWORK_RUST_EMITTER_VERSION, NetworkEvidenceIssue, NetworkEvidenceIssueKind,
+    NetworkFixedSequenceFieldReport, NetworkReplicatedStateEmitOptions, NetworkRustEmitError,
     NetworkRustEmitter, NetworkRustGenerationReport, NetworkRustOutput,
     NetworkStateFieldShapeReport, NetworkStateGenerationPlanReport,
 };
 pub use network_schema::{
     NETWORK_SCHEMA_VERSION, NetworkAzRtti, NetworkAzRttiProvider, NetworkConfidence,
+    NetworkContainerCodec, NetworkContainerMemberSemantics, NetworkContainerPlanDiagnostic,
     NetworkEvidence, NetworkEvidenceKind, NetworkField, NetworkFieldOverride,
     NetworkFieldOverrideFile, NetworkFieldOverrideMergeReport, NetworkFieldRegistrationFunction,
-    NetworkHandler, NetworkMessageFieldSignature, NetworkMessageSignature,
-    NetworkMessageSignatureMergeReport, NetworkNativeTypeInfoEvidence, NetworkRegistrationHook,
-    NetworkReplicatedContainerWireShape, NetworkSchema, NetworkSchemaImportError,
-    NetworkSchemaSource, NetworkSchemaSourceKind, NetworkSchemaSummary, NetworkSerializeKind,
+    NetworkFixedSequenceShape, NetworkFixedSequenceStorageKind, NetworkFixedSequenceWireShape,
+    NetworkGhidraOverlayMergeReport, NetworkHandler, NetworkMessageFieldSignature,
+    NetworkMessageSignature, NetworkMessageSignatureMergeReport, NetworkNativeTypeInfoEvidence,
+    NetworkRegistrationHook, NetworkReplicatedContainerPlan, NetworkReplicatedContainerWireShape,
+    NetworkReplicatedStateAbiEvidence, NetworkReplicatedStateAbiFunction,
+    NetworkReplicatedStateAbiKind, NetworkSchema, NetworkSchemaImportError, NetworkSchemaSource,
+    NetworkSchemaSourceKind, NetworkSchemaSummary, NetworkSerializeField, NetworkSerializeKind,
     NetworkSerializeMergeReport, NetworkSerializeRole, NetworkSerializeType, NetworkType,
     NetworkTypeCapability, NetworkTypeIndexMergeReport, NetworkVirtualFunction,
     NetworkWireScalarShape, NetworkWireShape,
 };
+pub use network_selection::{NetworkSerializeRootPlan, NetworkSerializeRootPlanner};
 pub use reference::{
     ReferenceExpansionContext, ReferenceIndex, ReferenceKey, ReferencePathSegment, ReferenceReport,
 };

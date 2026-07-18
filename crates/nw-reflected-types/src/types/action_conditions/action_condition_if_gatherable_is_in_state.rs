@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfGatherableIsInState;
+pub struct ActionConditionIfGatherableIsInState {}
 
 impl AzRtti for ActionConditionIfGatherableIsInState {
     const NAME: &'static str = "ActionConditionIfGatherableIsInState";

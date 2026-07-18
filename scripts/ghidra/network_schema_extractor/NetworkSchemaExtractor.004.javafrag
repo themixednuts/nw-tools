@@ -16,8 +16,17 @@
         ReferenceIterator references =
             currentProgram.getReferenceManager().getReferencesTo(queueRegistrationHook);
         while (references.hasNext()) {
+            if (monitor.isCancelled()) {
+                break;
+            }
             Reference reference = references.next();
             queuedRegistrationReferenceCount++;
+            if (queuedRegistrationReferenceCount % 512 == 0) {
+                println(
+                    "Queued registration progress: references=" +
+                    queuedRegistrationReferenceCount +
+                    ", decoded=" + queuedRegistrationDecodedCount);
+            }
 
             Function owner = functionContaining(reference.getFromAddress());
             if (owner == null) {
@@ -70,16 +79,34 @@
     private void collectDirectRegisterTypeProviders(Map<String, HookTypeEvidence> result) {
         directRegisterTypeReferenceCount = 0;
         directRegisterTypeDecodedCount = 0;
+        directRegisterTypeCoveredCount = 0;
         directRegisterTypeNoFunctionCount = 0;
         directRegisterTypeNoTypeIdCount = 0;
         directRegisterTypeFailureSamples = new JsonArray();
+        LinkedHashSet<Address> coveredRegisterThunks = new LinkedHashSet<>();
+        for (HookTypeEvidence hook : result.values()) {
+            Address registerThunk = resolvedCodeTarget(hook.registerThunk);
+            if (isExecutableAddress(registerThunk)) {
+                coveredRegisterThunks.add(registerThunk);
+            }
+        }
         Address registerType =
             currentProgram.getImageBase().add(TYPE_REGISTRY_REGISTER_TYPE_RVA);
         ReferenceIterator references =
             currentProgram.getReferenceManager().getReferencesTo(registerType);
         while (references.hasNext()) {
+            if (monitor.isCancelled()) {
+                break;
+            }
             Reference reference = references.next();
             directRegisterTypeReferenceCount++;
+            if (directRegisterTypeReferenceCount % 512 == 0) {
+                println(
+                    "Direct RegisterType progress: references=" +
+                    directRegisterTypeReferenceCount +
+                    ", covered=" + directRegisterTypeCoveredCount +
+                    ", decoded=" + directRegisterTypeDecodedCount);
+            }
 
             Function owner = functionContaining(reference.getFromAddress());
             if (owner == null) {
@@ -92,6 +119,10 @@
                     null,
                     null,
                     null);
+                continue;
+            }
+            if (coveredRegisterThunks.contains(owner.getEntryPoint())) {
+                directRegisterTypeCoveredCount++;
                 continue;
             }
 
@@ -155,62 +186,31 @@
     private HookTypeEvidence decodeDirectRegisterTypeProvider(
         Function owner,
         Address registerTypeCallsite) {
-
-        List<Instruction> instructions = functionInstructions(owner);
-        int registerTypeInstruction = -1;
-        for (int i = 0; i < instructions.size(); i++) {
-            Address instructionAddress = instructions.get(i).getMinAddress();
-            if (instructionAddress.equals(registerTypeCallsite)) {
-                registerTypeInstruction = i;
-                break;
-            }
-            if (instructionAddress.compareTo(registerTypeCallsite) > 0) {
-                break;
-            }
-        }
-        if (registerTypeInstruction < 0) {
+        TypeIdDecode typeId = typeIdForRegisterTypeCall(owner, registerTypeCallsite);
+        if (typeId == null) {
             return null;
         }
+        TypeNameDecode typeName = decodeTypeNameFromReturnFlow(
+            typeId.function,
+            typeId.provider);
 
-        int firstCandidate =
-            Math.max(0, registerTypeInstruction - BACKWARD_ARGUMENT_SCAN_LIMIT);
-        for (int i = registerTypeInstruction - 1; i >= firstCandidate; i--) {
-            Instruction instruction = instructions.get(i);
-            if (!instruction.getFlowType().isCall()) {
-                continue;
-            }
-
-            Address target = callTarget(instruction);
-            TypeIdDecode typeId = decodeDirectTypeIdProvider(target);
-            if (typeId == null) {
-                continue;
-            }
-
-            TypeNameDecode typeName = decodeTypeNameFromReferencedStrings(
-                typeId.function,
-                typeId.provider);
-
-            HookTypeEvidence hook = new HookTypeEvidence();
-            hook.source = "direct-register-type";
-            hook.typeId = typeId.typeId;
-            hook.typeName = typeName == null ? null : typeName.typeName;
-            hook.hookFunction = owner.getEntryPoint();
-            hook.registerThunk = owner.getEntryPoint();
-            hook.typeProvider = typeId.provider;
-            hook.uuidSource = typeId.sourceAddress;
-            enrichHookMessageHandler(hook);
-            return hook;
-        }
-        return null;
+        HookTypeEvidence hook = new HookTypeEvidence();
+        hook.source = "direct-register-type-pcode";
+        hook.typeId = typeId.typeId;
+        hook.typeName = typeName == null ? null : typeName.typeName;
+        hook.typeNameEvidenceSource = typeName == null ? null : typeName.typeNameSource;
+        hook.hookFunction = owner.getEntryPoint();
+        hook.registerThunk = owner.getEntryPoint();
+        hook.typeProvider = typeId.provider;
+        hook.uuidSource = typeId.sourceAddress;
+        return hook;
     }
 
     private HookTypeEvidence partialDirectRegisterTypeProvider(
         Function owner,
         Address registerTypeCallsite) {
 
-        Address typeProvider = typeProviderCandidateBeforeRegisterType(
-            owner == null ? null : owner.getEntryPoint(),
-            registerTypeCallsite);
+        Address typeProvider = typeProviderForRegisterTypeCall(owner, registerTypeCallsite);
         if (typeProvider == null) {
             return null;
         }
@@ -230,7 +230,14 @@
             return parsed;
         }
 
-        if (!"InstallRegistrationHook".equals(symbol.getName())) {
+        boolean registrationHook = false;
+        for (String templateName : REGISTRATION_HOOK_TEMPLATE_NAMES) {
+            if (templateName.equals(symbol.getName())) {
+                registrationHook = true;
+                break;
+            }
+        }
+        if (!registrationHook) {
             return null;
         }
 
@@ -253,12 +260,20 @@
             return null;
         }
 
-        String marker = "InstallRegistrationHook<";
-        int start = value.indexOf(marker);
+        int start = -1;
+        int markerLength = 0;
+        for (String templateName : REGISTRATION_HOOK_TEMPLATE_NAMES) {
+            String marker = templateName + "<";
+            int candidate = value.indexOf(marker);
+            if (candidate >= 0 && (start < 0 || candidate < start)) {
+                start = candidate;
+                markerLength = marker.length();
+            }
+        }
         if (start < 0) {
             return null;
         }
-        start += marker.length();
+        start += markerLength;
 
         int depth = 1;
         for (int index = start; index < value.length(); index++) {
@@ -322,7 +337,6 @@
             hook.registerThunk = hookFunction.getEntryPoint();
             hook.typeProvider = directTypeId.provider;
             hook.uuidSource = directTypeId.sourceAddress;
-            enrichHookMessageHandler(hook);
             return hook;
         }
 
@@ -334,11 +348,11 @@
         Address helperTable,
         String typeName) {
 
-        if (helperTable == null || !isPlausibleTypeName(typeName)) {
+        if (helperTable == null) {
             return null;
         }
 
-        Address registerThunk = resolvedCodeTarget(readPointer(helperTable.add(0x10)));
+        Address registerThunk = registrationCodePointer(helperTable.add(0x10));
         TypeIdDecode typeId = decodeRegistrationThunkTypeId(registerThunk);
         if (typeId == null) {
             HookTypeEvidence hook = new HookTypeEvidence();
@@ -346,7 +360,7 @@
             hook.hookFunction = hookFunction;
             hook.helperTable = helperTable;
             hook.registerThunk = registerThunk;
-            hook.typeProvider = typeProviderCandidateBeforeRegisterType(registerThunk, null);
+            hook.typeProvider = null;
             String slotTypeName = registrationHookTypeNameFromSlot(helperTable, 3);
             if (isPlausibleTypeName(slotTypeName)) {
                 hook.slotTypeName = slotTypeName;
@@ -362,7 +376,6 @@
         hook.registerThunk = registerThunk;
         hook.typeProvider = typeId.provider;
         hook.uuidSource = typeId.sourceAddress;
-        enrichHookMessageHandler(hook);
 
         String slotTypeName = registrationHookTypeNameFromSlot(helperTable, 3);
         if (isPlausibleTypeName(slotTypeName)) {
@@ -393,7 +406,7 @@
                     continue;
                 }
 
-                Address registerThunk = resolvedCodeTarget(readPointer(helperTable.add(0x10)));
+                Address registerThunk = registrationCodePointer(helperTable.add(0x10));
                 TypeIdDecode typeId = decodeRegistrationThunkTypeId(registerThunk);
                 if (typeId == null) {
                     continue;
@@ -409,227 +422,84 @@
                 hook.uuidSource = typeId.sourceAddress;
                 hook.typeDescriptor = typeDescriptor;
                 hook.slotTypeNameFunction = slotFunction.getEntryPoint();
-                enrichHookMessageHandler(hook);
                 return hook;
             }
         }
         return null;
     }
 
-    private Address typeProviderCandidateBeforeRegisterType(
-        Address registerThunk,
-        Address registerTypeCallsite) {
-
-        Function function = functionAtOrContaining(registerThunk);
-        if (function == null) {
-            return null;
-        }
-
-        List<Instruction> instructions = functionInstructions(function);
-        int registerTypeInstruction = -1;
-        Address registerType = currentProgram.getImageBase().add(TYPE_REGISTRY_REGISTER_TYPE_RVA);
-        for (int i = 0; i < instructions.size(); i++) {
-            Instruction instruction = instructions.get(i);
-            if (registerTypeCallsite != null && instruction.getMinAddress().equals(registerTypeCallsite)) {
-                registerTypeInstruction = i;
-                break;
-            }
-            if (instruction.getFlowType().isCall() &&
-                registerType.equals(resolvedCodeTarget(callTarget(instruction)))) {
-                registerTypeInstruction = i;
-                break;
-            }
-        }
-
-        if (registerTypeInstruction >= 0) {
-            int firstCandidate =
-                Math.max(0, registerTypeInstruction - BACKWARD_ARGUMENT_SCAN_LIMIT);
-            for (int i = registerTypeInstruction - 1; i >= firstCandidate; i--) {
-                Instruction instruction = instructions.get(i);
-                if (!instruction.getFlowType().isCall()) {
-                    continue;
-                }
-                Address target = resolvedCodeTarget(callTarget(instruction));
-                if (isExecutableAddress(target)) {
-                    return target;
-                }
-            }
-        }
-
-        int count = 0;
-        for (Instruction instruction : instructions) {
-            if (count++ >= VTABLE_SCAN_LIMIT) {
-                break;
-            }
-            if (!instruction.getFlowType().isCall()) {
-                continue;
-            }
-            Address target = resolvedCodeTarget(callTarget(instruction));
-            if (isExecutableAddress(target)) {
-                return target;
-            }
-        }
-        return null;
-    }
-
-    private void enrichHookMessageHandler(HookTypeEvidence hook) {
-        if (hook == null || hook.typeProvider == null) {
-            return;
-        }
-        Address handlerVtable = recoverMessageHandlerVtable(hook.typeProvider);
-        if (handlerVtable == null) {
-            return;
-        }
-
-        hook.handlerVtable = handlerVtable;
-        hook.createInstance = messageHandlerSlot(handlerVtable, MESSAGE_HANDLER_CREATE_INSTANCE_SLOT);
-        hook.marshal = messageHandlerSlot(handlerVtable, MESSAGE_HANDLER_MARSHAL_SLOT);
-        hook.unmarshal = messageHandlerSlot(handlerVtable, MESSAGE_HANDLER_UNMARSHAL_SLOT);
-    }
-
-    private Address recoverMessageHandlerVtable(Address typeProvider) {
-        Function function = functionAtOrContaining(typeProvider);
-        if (function == null) {
-            return null;
-        }
-
-        int count = 0;
-        for (Instruction instruction : functionInstructions(function)) {
-            if (count++ >= MESSAGE_HANDLER_PROVIDER_SCAN_LIMIT) {
-                break;
-            }
-
-            for (Address candidate : referencedAddresses(instruction)) {
-                if (isMessageHandlerVtable(candidate)) {
-                    return candidate;
-                }
-            }
-        }
-        return null;
-    }
-
-    private boolean isMessageHandlerVtable(Address address) {
-        if (!isProgramAddress(address)) {
-            return false;
-        }
-
-        Address createInstance = messageHandlerSlot(address, MESSAGE_HANDLER_CREATE_INSTANCE_SLOT);
-        Address marshal = messageHandlerSlot(address, MESSAGE_HANDLER_MARSHAL_SLOT);
-        Address unmarshal = messageHandlerSlot(address, MESSAGE_HANDLER_UNMARSHAL_SLOT);
-        if (!isExecutableAddress(createInstance) ||
-            !isExecutableAddress(marshal) ||
-            !isExecutableAddress(unmarshal)) {
-            return false;
-        }
-
-        Function unmarshalFunction = functionAtOrContaining(unmarshal);
-        return looksLikeMessageUnmarshalHelper(decompileC(unmarshalFunction));
-    }
-
-    private Address messageHandlerSlot(Address vtable, int slot) {
-        if (!isProgramAddress(vtable)) {
-            return null;
-        }
-        return resolvedCodeTarget(readPointer(vtable.add(slot * 8L)));
-    }
-
-    private String messageHandlerSlotName(int slot) {
-        if (slot == MESSAGE_HANDLER_CREATE_INSTANCE_SLOT) {
-            return "CreateInstance";
-        }
-        if (slot == MESSAGE_HANDLER_MARSHAL_SLOT) {
-            return "Marshal";
-        }
-        if (slot == MESSAGE_HANDLER_UNMARSHAL_SLOT) {
-            return "Unmarshal";
-        }
-        return null;
-    }
-
-    private Address findRegistrationHelperTable(Function function) {
-        int count = 0;
-        for (Instruction instruction : functionInstructions(function)) {
-            if (count++ >= BACKWARD_ARGUMENT_SCAN_LIMIT) {
-                break;
-            }
-            if (!"LEA".equals(NetworkSchemaX86.upperMnemonic(instruction))) {
-                continue;
-            }
-            for (Address address : referencedAddresses(instruction)) {
-                if (isRegistrationHelperTable(address)) {
-                    return address;
-                }
-            }
-        }
-        return null;
-    }
-
-    private Address findRegistrationHelperTable(Function function, Address callsite) {
-        List<Instruction> instructions = functionInstructions(function);
-        int callIndex = instructionIndexAtOrBefore(instructions, callsite);
-        if (callIndex < 0) {
-            return findRegistrationHelperTable(function);
-        }
-
-        int first = Math.max(0, callIndex - BACKWARD_ARGUMENT_SCAN_LIMIT);
-        for (int i = callIndex; i >= first; i--) {
-            Instruction instruction = instructions.get(i);
-            for (Address address : referencedAddresses(instruction)) {
-                if (isRegistrationHelperTable(address)) {
-                    return address;
-                }
-            }
-        }
-
-        return null;
-    }
-
-    private int instructionIndexAtOrBefore(List<Instruction> instructions, Address address) {
-        if (address == null) {
-            return -1;
-        }
-        for (int i = 0; i < instructions.size(); i++) {
-            Instruction instruction = instructions.get(i);
-            Address start = instruction.getMinAddress();
-            Address end = instruction.getMaxAddress();
-            if (start.compareTo(address) <= 0 && end.compareTo(address) >= 0) {
-                return i;
-            }
-            if (start.compareTo(address) > 0) {
-                break;
-            }
-        }
-        return -1;
-    }
-
     private boolean isRegistrationHelperTable(Address address) {
         if (!isProgramAddress(address)) {
             return false;
         }
-        Address slot2 = resolvedCodeTarget(readPointer(address.add(0x10)));
-        Address slot3 = resolvedCodeTarget(readPointer(address.add(0x18)));
-        Address slot4 = resolvedCodeTarget(readPointer(address.add(0x20)));
-        return isExecutableAddress(slot2) &&
+        String cacheKey = addressCacheKey("registration-helper-table", address);
+        Boolean cached = registrationHelperTableCache.get(cacheKey);
+        if (cached != null) {
+            runMetrics.increment("registrationHelperTableCacheHits");
+            return cached;
+        }
+        runMetrics.increment("registrationHelperTableCacheMisses");
+        Address slot0 = registrationCodePointer(address);
+        Address slot1 = registrationCodePointer(address.add(0x8));
+        Address slot2 = registrationCodePointer(address.add(0x10));
+        Address slot3 = registrationCodePointer(address.add(0x18));
+        Address slot4 = registrationCodePointer(address.add(0x20));
+        boolean callableLayout = Objects.equals(slot0, slot1) &&
+            isExecutableAddress(slot0) &&
+            isExecutableAddress(slot2) &&
             isExecutableAddress(slot3) &&
-            isExecutableAddress(slot4) &&
-            isPlausibleTypeName(registrationHookTypeNameFromSlot(address, 3));
+            isExecutableAddress(slot4);
+        if (!callableLayout) {
+            registrationHelperTableCache.put(cacheKey, false);
+            return false;
+        }
+
+        boolean result = isPlausibleTypeName(registrationHookTypeNameFromSlot(address, 3));
+        if (!result) {
+            result = decodeRegistrationThunkTypeId(slot2) != null;
+        }
+        registrationHelperTableCache.put(cacheKey, result);
+        return result;
     }
 
     private String registrationHookTypeNameFromSlot(Address helperTable, int slot) {
-        Address target = resolvedCodeTarget(readPointer(helperTable.add(slot * 8L)));
-        Address typeDescriptor = stringAddressReturnedBySimpleFunction(target);
+        if (!isProgramAddress(helperTable) || slot < 0) {
+            return null;
+        }
+        String cacheKey = addressCacheKey(
+            "registration-hook-slot-name:" + slot,
+            helperTable);
+        Optional<String> cached = registrationHookSlotTypeNameCache.get(cacheKey);
+        if (cached != null) {
+            runMetrics.increment("registrationHookSlotNameCacheHits");
+            return cached.orElse(null);
+        }
+        runMetrics.increment("registrationHookSlotNameCacheMisses");
+        Address typeDescriptor = registrationHookTypeDescriptorFromSlot(helperTable, slot);
         if (!isProgramAddress(typeDescriptor)) {
+            registrationHookSlotTypeNameCache.put(cacheKey, Optional.empty());
             return null;
         }
         Symbol symbol = currentProgram.getSymbolTable().getPrimarySymbol(typeDescriptor);
         if (symbol != null) {
             String typeName = parseInstallRegistrationHookTypeName(symbol.getName(true));
             if (typeName != null) {
+                registrationHookSlotTypeNameCache.put(cacheKey, Optional.of(typeName));
                 return typeName;
             }
         }
 
-        return parseMsvcInstallRegistrationHookTypeDescriptor(typeDescriptor);
+        String result = parseMsvcInstallRegistrationHookTypeDescriptor(typeDescriptor);
+        registrationHookSlotTypeNameCache.put(cacheKey, Optional.ofNullable(result));
+        return result;
+    }
+
+    private Address registrationHookTypeDescriptorFromSlot(Address helperTable, int slot) {
+        if (!isProgramAddress(helperTable) || slot < 0) {
+            return null;
+        }
+        Address target = registrationCodePointer(helperTable.add(slot * 8L));
+        return uniqueAddressReturnedByFunction(target);
     }
 
     private String parseMsvcInstallRegistrationHookTypeDescriptor(Address typeDescriptor) {
@@ -642,12 +512,20 @@
             return null;
         }
 
-        String marker = "InstallRegistrationHook@";
-        int markerIndex = descriptorName.indexOf(marker);
+        int markerIndex = -1;
+        int markerLength = 0;
+        for (String templateName : REGISTRATION_HOOK_TEMPLATE_NAMES) {
+            String marker = templateName + "@";
+            int candidate = descriptorName.indexOf(marker);
+            if (candidate >= 0 && (markerIndex < 0 || candidate < markerIndex)) {
+                markerIndex = candidate;
+                markerLength = marker.length();
+            }
+        }
         if (markerIndex < 0) {
             return null;
         }
-        int start = markerIndex + marker.length();
+        int start = markerIndex + markerLength;
         int end = descriptorName.indexOf("@Hub@Amazon@@", start);
         if (end < 0 || end <= start) {
             return null;
@@ -684,22 +562,37 @@
         if (function == null) {
             return null;
         }
-
-        int count = 0;
-        for (Instruction instruction : functionInstructions(function)) {
-            if (count++ >= VTABLE_SCAN_LIMIT) {
-                break;
-            }
-            if (!instruction.getFlowType().isCall()) {
+        String cacheKey = functionCacheKey("registration-thunk-type-id", function);
+        Optional<TypeIdDecode> cached = registrationThunkTypeIdCache.get(cacheKey);
+        if (cached != null) {
+            runMetrics.increment("registrationThunkTypeIdCacheHits");
+            return cached.orElse(null);
+        }
+        runMetrics.increment("registrationThunkTypeIdCacheMisses");
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            registrationThunkTypeIdCache.put(cacheKey, Optional.empty());
+            return null;
+        }
+        LinkedHashMap<String, TypeIdDecode> decodedByTypeId = new LinkedHashMap<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
                 continue;
             }
-            Address target = callTarget(instruction);
-            TypeIdDecode typeId = decodeDirectTypeIdProvider(target);
-            if (typeId != null) {
-                return typeId;
+            PcodeCallTargetInfo target = pcodeCallTargetInfo(operation);
+            if (target == null || !isExecutableAddress(target.resolvedTarget)) {
+                continue;
+            }
+            TypeIdDecode typeId = decodeDirectTypeIdProvider(target.resolvedTarget);
+            if (typeId != null && typeId.typeId != null) {
+                decodedByTypeId.putIfAbsent(normalizeUuid(typeId.typeId), typeId);
             }
         }
-        return null;
+        TypeIdDecode result = decodedByTypeId.size() == 1
+            ? decodedByTypeId.values().iterator().next()
+            : null;
+        registrationThunkTypeIdCache.put(cacheKey, Optional.ofNullable(result));
+        return result;
     }
 
     private JsonArray hookTypeNamesJson(Map<String, HookTypeEvidence> hooksById) {
@@ -715,6 +608,9 @@
 
         LinkedHashMap<String, Address> vtableAddresses = new LinkedHashMap<>();
         LinkedHashMap<String, Integer> fieldCounts = new LinkedHashMap<>();
+        LinkedHashMap<String, List<FieldCall>> fieldsByVtable = new LinkedHashMap<>();
+        LinkedHashMap<String, LinkedHashSet<String>> handlerTypeNames = new LinkedHashMap<>();
+        LinkedHashMap<String, String> handlerTypeSources = new LinkedHashMap<>();
         for (RegistrationFunction function : registrationFunctions.values()) {
             for (FieldCall field : function.fields) {
                 if (field.handlerVtable == null) {
@@ -723,24 +619,63 @@
                 String key = field.handlerVtable.toString();
                 vtableAddresses.putIfAbsent(key, field.handlerVtable);
                 fieldCounts.put(key, fieldCounts.getOrDefault(key, 0) + 1);
+                fieldsByVtable.computeIfAbsent(key, ignored -> new ArrayList<>()).add(field);
+                if (field.handlerTypeName != null &&
+                    parseNetworkTemplateType(field.handlerTypeName) != null) {
+                    handlerTypeNames
+                        .computeIfAbsent(key, ignored -> new LinkedHashSet<>())
+                        .add(field.handlerTypeName);
+                    String source = field.handlerConstruction == null
+                        ? "handler-vtable-template"
+                        : "handler-constructor-template";
+                    if (!handlerTypeSources.containsKey(key) ||
+                        "handler-constructor-template".equals(source)) {
+                        handlerTypeSources.put(key, source);
+                    }
+                }
             }
         }
 
         JsonArray array = new JsonArray();
         for (Map.Entry<String, Address> entry : vtableAddresses.entrySet()) {
             int fieldCount = fieldCounts.getOrDefault(entry.getKey(), 0);
-            array.add(fieldHandlerVtableJson(entry.getValue(), fieldCount));
+            Set<String> names = handlerTypeNames.getOrDefault(
+                entry.getKey(),
+                new LinkedHashSet<>());
+            String handlerTypeName = names.size() == 1
+                ? names.iterator().next()
+                : null;
+            array.add(fieldHandlerVtableJson(
+                entry.getValue(),
+                fieldCount,
+                handlerTypeName,
+                handlerTypeName == null ? null : handlerTypeSources.get(entry.getKey()),
+                fieldsByVtable.getOrDefault(entry.getKey(), Collections.emptyList())));
         }
         return array;
     }
 
-    private JsonObject fieldHandlerVtableJson(Address address, int fieldCount) {
+    private JsonObject fieldHandlerVtableJson(
+        Address address,
+        int fieldCount,
+        String handlerTypeName,
+        String handlerTypeSource,
+        List<FieldCall> fields) {
+
         JsonObject object = new JsonObject();
         object.addProperty("address", formatAddress(address));
         object.addProperty("fieldCount", fieldCount);
+        NetworkSchemaJson.add(object, "handlerTypeName", handlerTypeName);
+        NetworkSchemaJson.add(object, "handlerTypeSource", handlerTypeSource);
+        HandlerContainerTypeEvidence handlerContainerType =
+            handlerContainerTypeEvidence(handlerTypeName, handlerTypeSource);
+        if (handlerContainerType != null) {
+            object.add("handlerContainerType", handlerContainerType.toJson());
+        }
         FieldHandlerShape shape = fieldHandlerShape(address);
         if (shape != null) {
             object.addProperty("handlerKind", shape.kind);
+            NetworkSchemaJson.add(object, "handlerKindSource", shape.kindSource);
             object.addProperty("vtableSlots", shape.vtableSlots);
             object.addProperty("physicalFieldCount", shape.physicalFieldCount);
         }
@@ -748,6 +683,8 @@
         JsonArray slots = new JsonArray();
         Address marshal = null;
         Address marshalTarget = null;
+        Address unmarshal = null;
+        Address unmarshalTarget = null;
         int slotCount = shape == null
             ? FIELD_HANDLER_CONTAINER_VTABLE_SLOTS
             : shape.vtableSlots;
@@ -767,31 +704,115 @@
                 NetworkSchemaJson.add(object, "marshalTarget", formatAddress(marshalTarget));
             }
             else if (slot == FIELD_HANDLER_UNMARSHAL_SLOT) {
-                Address unmarshal = target;
-                Address unmarshalTarget = terminalJumpTarget(target);
+                unmarshal = target;
+                unmarshalTarget = terminalJumpTarget(target);
                 object.addProperty("unmarshal", formatAddress(unmarshal));
                 NetworkSchemaJson.add(object, "unmarshalTarget", formatAddress(unmarshalTarget));
             }
         }
         ContainerWireShape containerWireShape = shape == null ? null : shape.containerWireShape;
-        WireShape wireShape = shape == null ? classifyWireShape(marshal, marshalTarget) : shape.wireShape;
-        if (wireShape != null) {
+        HandlerWireShapeEvidence handlerEvidence = shape == null
+            ? classifyHandlerWireShape(
+                marshal,
+                marshalTarget,
+                unmarshal,
+                unmarshalTarget)
+            : shape.handlerWireEvidence;
+        WireShape wireShape = shape == null
+            ? handlerEvidence.selected
+            : shape.wireShape;
+        HandlerValueTypeRecovery valueType = containerWireShape == null
+            ? consensusHandlerValueType(fields)
+            : null;
+        WireShape semanticValueShape = remoteServerGdeRefHandlerShape(
+            address,
+            wireShape,
+            handlerEvidence,
+            valueType,
+            marshalTarget == null ? marshal : marshalTarget,
+            unmarshalTarget == null ? unmarshal : unmarshalTarget);
+        if (semanticValueShape != null) {
+            wireShape = semanticValueShape;
+        }
+        if (wireShape != null && wireShape.shape != null) {
             object.addProperty("wireShape", wireShape.shape);
             object.addProperty("wireShapeSource", wireShape.source);
         }
+        if (wireShape != null && wireShape.layout != null) {
+            object.addProperty("wireLayout", wireShape.layout);
+            object.addProperty("wireLayoutSource", wireShape.layoutSource);
+        }
+        if (handlerEvidence != null) {
+            object.add("wireShapeEvidence", handlerWireShapeEvidenceJson(handlerEvidence));
+            if (handlerEvidence.selectedSequence != null) {
+                object.add(
+                    "fixedSequenceShape",
+                    handlerEvidence.selectedSequence.toJson(addressFormatter));
+            }
+        }
         if (containerWireShape != null) {
-            NetworkSchemaJson.add(object, "deltaWireShape", containerWireShape.deltaShape);
-            NetworkSchemaJson.add(object, "fullWireShape", containerWireShape.fullShape);
+            if (containerWireShape.deltaShape != null) {
+                NetworkSchemaJson.add(
+                    object,
+                    "deltaWireShape",
+                    containerWireShape.deltaShape.shape);
+                NetworkSchemaJson.add(
+                    object,
+                    "deltaWireLayout",
+                    containerWireShape.deltaShape.layout);
+            }
+            if (containerWireShape.fullShape != null) {
+                NetworkSchemaJson.add(
+                    object,
+                    "fullWireShape",
+                    containerWireShape.fullShape.shape);
+                NetworkSchemaJson.add(
+                    object,
+                    "fullWireLayout",
+                    containerWireShape.fullShape.layout);
+            }
             NetworkSchemaJson.add(object, "keyNativeType", containerWireShape.keyNativeType);
             NetworkSchemaJson.add(object, "keyNativeTypeSource", containerWireShape.keyNativeTypeSource);
-            object.add("deltaMarshalShapes", NetworkSchemaJson.stringArray(containerWireShape.deltaMarshalShapes));
-            object.add("fullMarshalShapes", NetworkSchemaJson.stringArray(containerWireShape.fullMarshalShapes));
+            object.add(
+                "deltaMarshalShapes",
+                NetworkSchemaJson.stringArray(
+                    provenWireShapes(containerWireShape.deltaMarshalEvidence)));
+            object.add(
+                "fullMarshalShapes",
+                NetworkSchemaJson.stringArray(
+                    provenWireShapes(containerWireShape.fullMarshalEvidence)));
+            object.add(
+                "deltaMarshalLayouts",
+                NetworkSchemaJson.stringArray(
+                    wireLayouts(containerWireShape.deltaMarshalEvidence)));
+            object.add(
+                "fullMarshalLayouts",
+                NetworkSchemaJson.stringArray(
+                    wireLayouts(containerWireShape.fullMarshalEvidence)));
+            if (containerWireShape.fullContainerPlan != null) {
+                object.add(
+                    "fullContainerPlan",
+                    containerWireShape.fullContainerPlan.toJson(addressFormatter));
+            }
+            if (!containerWireShape.fullContainerPlanDiagnostics.isEmpty()) {
+                JsonArray diagnostics = new JsonArray();
+                for (ContainerPlanDiagnostic diagnostic :
+                        containerWireShape.fullContainerPlanDiagnostics) {
+                    diagnostics.add(diagnostic.toJson(addressFormatter));
+                }
+                object.add("fullContainerPlanDiagnostics", diagnostics);
+            }
             if (containerWireShape.valueTypeInfo != null) {
                 object.add(
                     "valueTypeInfo",
                     containerWireShape.valueTypeInfo.toJson(addressFormatter));
                 NetworkSchemaJson.add(object, "valueTypeName", containerWireShape.valueTypeInfo.name);
                 NetworkSchemaJson.add(object, "valueTypeId", containerWireShape.valueTypeInfo.typeId);
+                NetworkSchemaJson.add(object, "valueTypeSource", containerWireShape.valueTypeInfo.source);
+                NetworkSchemaJson.add(
+                    object,
+                    "valueTypeNameSource",
+                    containerWireShape.valueTypeInfo.nameSource);
                 NetworkSchemaJson.add(object, "valueTypeInfoAddress", formatAddress(containerWireShape.valueTypeInfo.address));
             }
             if (containerWireShape.valueTypeShape != null) {
@@ -814,6 +835,25 @@
                 object.add("valueTypeInfoCandidates", candidates);
             }
         }
+        else {
+            if (valueType != null) {
+                object.add("valueTypeShape", valueType.typeShape().toJson(addressFormatter));
+                if (valueType.typeInfo() != null) {
+                    object.add("valueTypeInfo", valueType.typeInfo().toJson(addressFormatter));
+                    NetworkSchemaJson.add(object, "valueTypeName", valueType.typeInfo().name);
+                    NetworkSchemaJson.add(object, "valueTypeId", valueType.typeInfo().typeId);
+                    NetworkSchemaJson.add(object, "valueTypeSource", valueType.typeInfo().source);
+                    NetworkSchemaJson.add(
+                        object,
+                        "valueTypeNameSource",
+                        valueType.typeInfo().nameSource);
+                    NetworkSchemaJson.add(
+                        object,
+                        "valueTypeInfoAddress",
+                        formatAddress(valueType.typeInfo().address));
+                }
+            }
+        }
         object.add("vtableDiagnostics", vtableDiagnostics(
             address,
             shape,
@@ -821,6 +861,72 @@
             null));
         object.add("slots", slots);
         return object;
+    }
+
+    private JsonObject handlerWireShapeEvidenceJson(HandlerWireShapeEvidence evidence) {
+        JsonObject object = new JsonObject();
+        NetworkSchemaJson.add(object, "resolution", evidence.resolution);
+        NetworkSchemaJson.add(object, "conflict", evidence.conflict);
+        NetworkSchemaJson.add(
+            object,
+            "unmarshalReadBufferParameter",
+            evidence.unmarshalReadBufferParameter);
+        if (evidence.unmarshalEventCount != null) {
+            object.addProperty("unmarshalEventCount", evidence.unmarshalEventCount);
+        }
+        NetworkSchemaJson.add(
+            object,
+            "unmarshalDiagnostic",
+            evidence.unmarshalDiagnostic);
+        NetworkSchemaJson.add(
+            object,
+            "quantizedVec3Diagnostic",
+            evidence.quantizedVec3Diagnostic);
+        if (!evidence.unmarshalEvents.isEmpty()) {
+            JsonArray events = new JsonArray();
+            for (CodecWireEvent event : evidence.unmarshalEvents) {
+                JsonObject value = new JsonObject();
+                NetworkSchemaJson.add(value, "nativeType", event.nativeType());
+                NetworkSchemaJson.add(value, "shape", event.wireEvidence().shape);
+                NetworkSchemaJson.add(value, "layout", event.wireEvidence().layout);
+                NetworkSchemaJson.add(value, "source", event.wireEvidence().source);
+                NetworkSchemaJson.add(value, "layoutSource", event.wireEvidence().layoutSource);
+                NetworkSchemaJson.add(value, "callsite", formatAddress(event.callsite()));
+                NetworkSchemaJson.add(value, "target", formatAddress(event.target()));
+                NetworkSchemaJson.add(value, "targetName", event.targetName());
+                events.add(value);
+            }
+            object.add("unmarshalEvents", events);
+        }
+        addDirectionalWireShape(object, "marshal", evidence.marshal);
+        addDirectionalWireShape(object, "unmarshal", evidence.unmarshal);
+        if (evidence.marshalSequence != null) {
+            object.add(
+                "marshalFixedSequence",
+                evidence.marshalSequence.toJson(addressFormatter));
+        }
+        if (evidence.unmarshalSequence != null) {
+            object.add(
+                "unmarshalFixedSequence",
+                evidence.unmarshalSequence.toJson(addressFormatter));
+        }
+        return object;
+    }
+
+    private void addDirectionalWireShape(
+        JsonObject object,
+        String direction,
+        WireShape shape) {
+
+        if (shape == null) {
+            return;
+        }
+        JsonObject value = new JsonObject();
+        NetworkSchemaJson.add(value, "shape", shape.shape);
+        NetworkSchemaJson.add(value, "source", shape.source);
+        NetworkSchemaJson.add(value, "layout", shape.layout);
+        NetworkSchemaJson.add(value, "layoutSource", shape.layoutSource);
+        object.add(direction, value);
     }
 
     private FieldHandlerShape fieldHandlerShape(Address vtable) {
@@ -841,47 +947,36 @@
     private FieldHandlerShape recoverFieldHandlerShape(Address vtable) {
         String handlerTypeName = fieldHandlerTypeName(null, vtable);
         NetworkTemplateType handlerType = parseNetworkTemplateType(handlerTypeName);
-        WireShape templateWireShape = wireShapeFromHandlerTypeName(handlerTypeName);
 
         ContainerWireShape container = classifyReplicatedContainerWireShape(vtable);
         if (container != null) {
             return new FieldHandlerShape(
                 "replicated-container",
+                "self-vtable-slot14-slot15-dispatch",
                 FIELD_HANDLER_CONTAINER_VTABLE_SLOTS,
                 container.primaryShape,
                 container,
-                1);
-        }
-
-        if (isReplicatedContainerHandlerType(handlerType)) {
-            return new FieldHandlerShape(
-                "replicated-container",
-                FIELD_HANDLER_CONTAINER_VTABLE_SLOTS,
-                templateWireShape,
                 null,
                 1);
         }
 
         Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
         Address marshalTarget = terminalJumpTarget(marshal);
-        WireShape wireShape = classifyWireShape(marshal, marshalTarget);
-        if (wireShape == null) {
-            wireShape = templateWireShape;
-        }
+        Address unmarshal = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        Address unmarshalTarget = terminalJumpTarget(unmarshal);
+        HandlerWireShapeEvidence wireEvidence = classifyHandlerWireShape(
+            marshal,
+            marshalTarget,
+            unmarshal,
+            unmarshalTarget);
         return new FieldHandlerShape(
             fieldHandlerKindFromType(handlerType),
+            handlerType == null ? null : "ghidra-handler-template-type",
             FIELD_HANDLER_SCALAR_VTABLE_SLOTS,
-            wireShape,
+            wireEvidence.selected,
             null,
-            physicalFieldCountFromHandlerType(handlerType));
-    }
-
-    private boolean isReplicatedContainerHandlerType(NetworkTemplateType type) {
-        return type != null &&
-            (type.simpleName.equals("ReplicatedContainer") ||
-                type.simpleName.equals("ReplicatedMapFieldHandler") ||
-                type.simpleName.equals("ReplicatedVectorFieldHandler") ||
-                type.simpleName.equals("ReplicatedSetFieldHandler"));
+            wireEvidence,
+            1);
     }
 
     private String fieldHandlerKindFromType(NetworkTemplateType type) {

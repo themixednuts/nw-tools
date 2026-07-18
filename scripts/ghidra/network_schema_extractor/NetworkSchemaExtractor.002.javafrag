@@ -2,7 +2,6 @@
     private boolean isStackRegister(String register) {
         return "RBP".equals(register) || "RSP".equals(register);
     }
-
     private Integer directFieldCursorOffsetFromMoveSource(
         Instruction instruction,
         ForwardArgState state,
@@ -30,7 +29,6 @@
 
         return trackedThisOffsetForMemoryOperand(instruction, 1, state.registers);
     }
-
     private void clearVolatileCursorRegisters(Map<String, Integer> cursorOffsetByRegister) {
         cursorOffsetByRegister.remove("RAX");
         cursorOffsetByRegister.remove("RCX");
@@ -154,50 +152,12 @@
             return null;
         }
 
-        AzRttiEvidence best =
-            decodeValueAzRttiFromVptrWrites(
-                unmarshal,
-                registryTypeId,
-                expectedTypeName,
-                "unmarshal-vptr-write-value",
-                0);
-        int bestScore = best == null
-            ? Integer.MIN_VALUE
-            : valueAzRttiEvidenceScore(best, registryTypeId, expectedTypeName, 0, 0);
-
-        int callOrder = 0;
-        for (Instruction instruction : linearInstructions(unmarshal, REGISTRY_HANDLER_RTTI_SCAN_LIMIT)) {
-            if (!instruction.getFlowType().isCall()) {
-                continue;
-            }
-
-            Address target = resolvedCodeTarget(callTarget(instruction));
-            if (!isExecutableAddress(target)) {
-                continue;
-            }
-
-            AzRttiEvidence candidate =
-                decodeValueAzRttiFromVptrWrites(
-                    target,
-                    registryTypeId,
-                    expectedTypeName,
-                    "unmarshal-constructor-vtable-write-value",
-                    1);
-            if (candidate == null || candidate.typeId == null) {
-                callOrder++;
-                continue;
-            }
-
-            int score =
-                valueAzRttiEvidenceScore(candidate, registryTypeId, expectedTypeName, 1, callOrder);
-            if (score >= bestScore) {
-                best = candidate;
-                bestScore = score;
-            }
-            callOrder++;
-        }
-
-        return best;
+        return decodeValueAzRttiFromVptrWrites(
+            unmarshal,
+            registryTypeId,
+            expectedTypeName,
+            "unmarshal-vptr-write-value",
+            0);
     }
 
     private AzRttiEvidence decodeValueAzRttiFromVptrWrites(
@@ -375,98 +335,47 @@
         boolean identityOnly) {
 
         AzRttiScanResult result = new AzRttiScanResult();
-        Deque<HandlerScanFrame> stack = new ArrayDeque<>();
-        stack.addFirst(new HandlerScanFrame(handler, 0));
-
-        LinkedHashSet<String> seenFunctions = new LinkedHashSet<>();
         int bestNameOnlyScore = Integer.MIN_VALUE;
-
-        while (!stack.isEmpty() && seenFunctions.size() < REGISTRY_HANDLER_RTTI_FUNCTION_LIMIT) {
-            HandlerScanFrame frame = stack.removeFirst();
-            Address functionAddress = resolvedCodeTarget(frame.address);
-            if (!isExecutableAddress(functionAddress) ||
-                !seenFunctions.add(functionAddress.toString())) {
+        for (VtableWrite write : handlerVtableWrites(handler)) {
+            AzRttiEvidence evidence = decodeAzRttiFromVtable(write.vtable);
+            if (evidence == null || !evidence.hasIdentity()) {
                 continue;
             }
-
-            for (VtableWrite write : handlerVtableWrites(functionAddress)) {
-                AzRttiEvidence evidence = decodeAzRttiFromVtable(write.vtable);
-                if (evidence == null || !evidence.hasIdentity()) {
-                    continue;
-                }
-                boolean matchesRegistryTypeId =
-                    registryTypeId != null && evidenceHasTypeId(evidence, registryTypeId);
-                if (identityOnly && registryTypeId != null &&
-                    !matchesRegistryTypeId) {
-                    continue;
-                }
-                if (identityOnly && matchesRegistryTypeId) {
-                    evidence.typeId = registryTypeId;
-                    String foldedTypeName = providerTypeNameForTypeId(evidence, registryTypeId);
-                    if (isConcreteNetworkTypeName(foldedTypeName)) {
-                        evidence.typeName = foldedTypeName;
-                        evidence.typeNameSource = "rtti-provider-graph";
-                    }
-                    else {
-                        evidence.typeName = null;
-                        evidence.typeNameSource = null;
-                    }
-                }
-                if (evidence.typeId != null) {
-                    int score = azRttiEvidenceScore(
-                        evidence,
-                        write,
-                        registryTypeId,
-                        frame.depth);
-                    if (score >= result.exactScore) {
-                        evidence.source =
-                            azRttiSourceForWrite(identityOnly, false, write);
-                        evidence.sourceInstruction = write.instruction;
-                        evidence.constructorVptrWrites =
-                            singleVptrWriteChain(write, evidence, null);
-                        result.exact = evidence;
-                        result.exactScore = score;
-                    }
-                    continue;
-                }
-
-                if (isLikelyRuntimeTypeName(evidence.typeName)) {
-                    int score = azRttiEvidenceScore(
-                        evidence,
-                        write,
-                        registryTypeId,
-                        frame.depth);
-                    if (score >= bestNameOnlyScore) {
-                        evidence.source =
-                            azRttiSourceForWrite(identityOnly, true, write);
-                        evidence.sourceInstruction = write.instruction;
-                        evidence.constructorVptrWrites =
-                            singleVptrWriteChain(write, evidence, null);
-                        result.nameOnly = evidence;
-                        result.nameOnlyScore = score;
-                        bestNameOnlyScore = score;
-                    }
-                }
-            }
-
-            if (frame.depth >= REGISTRY_HANDLER_RTTI_CALL_DEPTH) {
+            boolean matchesRegistryTypeId =
+                registryTypeId != null && evidenceHasTypeId(evidence, registryTypeId);
+            if (identityOnly && registryTypeId != null && !matchesRegistryTypeId) {
                 continue;
             }
-
-            ArrayList<Address> callees = new ArrayList<>();
-            for (Instruction instruction :
-                linearInstructions(functionAddress, REGISTRY_HANDLER_RTTI_SCAN_LIMIT)) {
-                if (!instruction.getFlowType().isCall()) {
-                    continue;
+            if (identityOnly && matchesRegistryTypeId) {
+                evidence.typeId = registryTypeId;
+                String foldedTypeName = providerTypeNameForTypeId(evidence, registryTypeId);
+                if (isConcreteNetworkTypeName(foldedTypeName)) {
+                    evidence.typeName = foldedTypeName;
+                    evidence.typeNameSource = "rtti-provider-graph";
                 }
-
-                Address target = resolvedCodeTarget(callTarget(instruction));
-                if (isExecutableAddress(target)) {
-                    callees.add(target);
+                else {
+                    evidence.typeName = null;
+                    evidence.typeNameSource = null;
                 }
             }
-            for (int i = callees.size() - 1; i >= 0; i--) {
-                stack.addFirst(new HandlerScanFrame(callees.get(i), frame.depth + 1));
+            int score = azRttiEvidenceScore(evidence, write, registryTypeId, 0);
+            if (evidence.typeId != null) {
+                if (score >= result.exactScore) {
+                    evidence.source = azRttiSourceForWrite(identityOnly, false, write);
+                    evidence.sourceInstruction = write.instruction;
+                    evidence.constructorVptrWrites = singleVptrWriteChain(write, evidence, null);
+                    result.exact = evidence;
+                    result.exactScore = score;
+                }
+            }
+            else if (isLikelyRuntimeTypeName(evidence.typeName) &&
+                score >= bestNameOnlyScore) {
+                evidence.source = azRttiSourceForWrite(identityOnly, true, write);
+                evidence.sourceInstruction = write.instruction;
+                evidence.constructorVptrWrites = singleVptrWriteChain(write, evidence, null);
+                result.nameOnly = evidence;
+                result.nameOnlyScore = score;
+                bestNameOnlyScore = score;
             }
         }
 
@@ -700,10 +609,6 @@
         if (cached != null) {
             return cached;
         }
-        if (activeConstructors.size() >= CONSTRUCTOR_VTABLE_RECURSION_LIMIT) {
-            return List.of();
-        }
-
         String activeKey = target.toString();
         if (!activeConstructors.add(activeKey)) {
             return List.of();
@@ -728,173 +633,8 @@
         Address functionAddress,
         Set<String> activeConstructors,
         boolean includeArgumentObjectWrites) {
-
-        functionAtOrContaining(functionAddress);
-        ArrayList<VtableWrite> result = new ArrayList<>();
-        ForwardArgState state = newForwardArgState();
-
-        for (Instruction instruction :
-            linearInstructions(functionAddress, REGISTRY_HANDLER_RTTI_SCAN_LIMIT)) {
-
-            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-            if (mnemonic == null) {
-                continue;
-            }
-
-            if (instruction.getFlowType().isCall()) {
-                collectVectorConstructorVtableWrites(
-                    instruction,
-                    state,
-                    result,
-                    activeConstructors);
-                collectDirectConstructorCallVtableWrites(
-                    instruction,
-                    state,
-                    result,
-                    activeConstructors);
-                observeForwardInstruction(instruction, state, false);
-                continue;
-            }
-
-            if (isMemoryWriteMnemonic(mnemonic)) {
-                Integer offset =
-                    trackedThisOffsetForMemoryOperand(instruction, 0, state.registers);
-                TrackedValue baseOffset = includeArgumentObjectWrites
-                    ? trackedBaseOffsetForMemoryOperand(instruction, 0, state.registers)
-                    : null;
-                TrackedValue source = "MOV".equals(mnemonic)
-                    ? trackedOperandValue(instruction, 1, state)
-                    : null;
-                if (offset != null && source != null &&
-                    source.address != null && isVtableLike(source.address)) {
-                    result.add(new VtableWrite(
-                        functionAddress,
-                        instruction.getMinAddress(),
-                        source.address,
-                        result.size(),
-                        offset,
-                        "constructor-vtable-write"));
-                }
-                else if (source != null &&
-                    source.address != null &&
-                    isVtableLike(source.address) &&
-                    isArgumentObjectVtableWrite(baseOffset)) {
-                    result.add(new VtableWrite(
-                        functionAddress,
-                        instruction.getMinAddress(),
-                        source.address,
-                        result.size(),
-                        null,
-                        baseOffset.baseKey,
-                        baseOffset.baseOffset,
-                        "argument-object-vtable-write"));
-                }
-            }
-
-            observeForwardInstruction(instruction, state, false);
-        }
-
-        return result;
-    }
-
-    private boolean isArgumentObjectVtableWrite(TrackedValue value) {
-        return value != null &&
-            "arg:R8".equals(value.baseKey) &&
-            value.baseOffset != null &&
-            value.baseOffset >= 0 &&
-            value.baseOffset <= 0x1000 &&
-            value.baseOffset % 8 == 0;
-    }
-
-    private void collectDirectConstructorCallVtableWrites(
-        Instruction instruction,
-        ForwardArgState state,
-        List<VtableWrite> result,
-        Set<String> activeConstructors) {
-
-        TrackedValue receiver = state.registers.get("RCX");
-        if (receiver == null || receiver.thisOffset == null) {
-            return;
-        }
-
-        Address constructor = resolvedCodeTarget(callTarget(instruction));
-        if (!isExecutableAddress(constructor)) {
-            return;
-        }
-        if (isVectorConstructorIteratorCall(constructor)) {
-            return;
-        }
-
-        for (VtableWrite write : constructorVtableWrites(
-            constructor,
+        return recoverConstructorVtableWritesPcode(
+            functionAddress,
             activeConstructors,
-            false)) {
-            if (write.thisOffset == null) {
-                continue;
-            }
-            Integer projected =
-                NetworkSchemaX86.addOffsets(receiver.thisOffset, write.thisOffset.longValue());
-            if (projected == null) {
-                continue;
-            }
-            result.add(new VtableWrite(
-                write.function,
-                write.instruction,
-                write.vtable,
-                result.size(),
-                projected,
-                prefixPattern("constructor-call", write.pattern)));
-        }
+            includeArgumentObjectWrites);
     }
-
-    private void collectVectorConstructorVtableWrites(
-        Instruction instruction,
-        ForwardArgState state,
-        List<VtableWrite> result,
-        Set<String> activeConstructors) {
-
-        Address call = resolvedCodeTarget(callTarget(instruction));
-        if (!isVectorConstructorIteratorCall(call)) {
-            return;
-        }
-
-        TrackedValue base = state.registers.get("RCX");
-        TrackedValue elementSize = state.registers.get("RDX");
-        TrackedValue elementCount = state.registers.get("R8");
-        TrackedValue constructorValue = state.registers.get("R9");
-        if (base == null || base.thisOffset == null ||
-            elementSize == null || elementSize.immediate == null ||
-            elementCount == null || elementCount.immediate == null ||
-            constructorValue == null || constructorValue.address == null) {
-            return;
-        }
-
-        long count = elementCount.immediate;
-        long size = elementSize.immediate;
-        if (count <= 0 || count > 256 || size <= 0 || size > 0x1000) {
-            return;
-        }
-
-        Address constructor = resolvedCodeTarget(constructorValue.address);
-        List<VtableWrite> writes = constructorVtableWrites(
-            constructor,
-            activeConstructors,
-            false);
-        if (writes.isEmpty()) {
-            return;
-        }
-
-        for (long i = 0; i < count; i++) {
-            long elementOffset = base.thisOffset.longValue() + (i * size);
-            if (elementOffset < Integer.MIN_VALUE || elementOffset > Integer.MAX_VALUE) {
-                continue;
-            }
-            for (VtableWrite write : writes) {
-                if (write.thisOffset == null) {
-                    continue;
-                }
-                Integer projected = NetworkSchemaX86.addOffsets((int)elementOffset, write.thisOffset.longValue());
-                if (projected == null) {
-                    continue;
-                }
-                result.add(new VtableWrite(

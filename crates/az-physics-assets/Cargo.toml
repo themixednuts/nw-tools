@@ -1,0 +1,19 @@
+[package]
+name = "az-physics-assets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Offline parsers for Lumberyard AzPhysics filter and material assets"
+
+[lints]
+workspace = true
+
+[dependencies]
+nw-objectstream.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

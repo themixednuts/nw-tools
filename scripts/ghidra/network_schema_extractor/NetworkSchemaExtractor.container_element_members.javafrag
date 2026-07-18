@@ -1,0 +1,267 @@
+    private Map<String, LinkedHashMap<Long, NestedTypeMember>>
+        rootedContainerElementMembers(
+            Address unmarshalFull,
+            Long expectedElementStride) {
+
+        LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> candidates =
+            new LinkedHashMap<>();
+        if (expectedElementStride == null || expectedElementStride <= 0L) {
+            return candidates;
+        }
+        collectRootedContainerElementMembers(
+            functionAtOrContaining(resolvedCodeTarget(unmarshalFull)),
+            "param_2",
+            expectedElementStride,
+            new LinkedHashSet<>(),
+            candidates,
+            0);
+        LinkedHashMap<Long, NestedTypeMember> element = candidates.get("element");
+        if (element == null || element.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        LinkedHashMap<Long, NestedTypeMember> decodedMembers = new LinkedHashMap<>();
+        for (Map.Entry<Long, NestedTypeMember> entry : element.entrySet()) {
+            NestedTypeMember member = entry.getValue();
+            if (member != null && (member.wireShape != null || member.wireLayout != null)) {
+                decodedMembers.put(entry.getKey(), member);
+            }
+        }
+        if (decodedMembers.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> result =
+            new LinkedHashMap<>();
+        result.put("element", decodedMembers);
+        return result;
+    }
+
+    private void collectRootedContainerElementMembers(
+        Function function,
+        String bufferParameter,
+        long expectedElementStride,
+        Set<String> active,
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> candidates,
+        int depth) {
+
+        if (function == null || bufferParameter == null || depth > 8) {
+            return;
+        }
+        String context = function.getEntryPoint() + "|" + bufferParameter;
+        if (!active.add(context)) {
+            return;
+        }
+        try {
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                return;
+            }
+            boolean foundElementLoop = false;
+            List<PcodeOpAST> operations = orderedPcodeOps(high);
+            for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+                for (PcodeOpAST induction :
+                        affinePointerInductions(loop, expectedElementStride)) {
+                    foundElementLoop = true;
+                    collectRootedContainerLoopMembers(
+                        function,
+                        bufferParameter,
+                        loop,
+                        induction.getOutput(),
+                        expectedElementStride,
+                        operations,
+                        candidates);
+                }
+            }
+            if (foundElementLoop) {
+                return;
+            }
+
+            PcodeStorage readBuffer = new PcodeStorage(bufferParameter, 0L);
+            for (PcodeOpAST operation : operations) {
+                if (operation.getOpcode() != PcodeOp.CALL) {
+                    continue;
+                }
+                Function target = pcodeCallTarget(operation);
+                Integer bufferSlot = provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    readBuffer);
+                if (bufferSlot == null || target == null ||
+                    validatedUnmarshalLeaf(target, "param_" + bufferSlot) != null) {
+                    continue;
+                }
+                collectRootedContainerElementMembers(
+                    target,
+                    "param_" + bufferSlot,
+                    expectedElementStride,
+                    active,
+                    candidates,
+                    depth + 1);
+            }
+        }
+        finally {
+            active.remove(context);
+        }
+    }
+
+    private void collectRootedContainerLoopMembers(
+        Function owner,
+        String bufferParameter,
+        NetworkSchemaNaturalLoop loop,
+        Varnode elementRoot,
+        long elementStride,
+        List<PcodeOpAST> operations,
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> candidates) {
+
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (target == null) {
+                continue;
+            }
+            PcodeStorage readBuffer = new PcodeStorage(bufferParameter, 0L);
+            if (provenCallArgumentSlot(
+                    owner,
+                    operation,
+                    target,
+                    readBuffer) == null) {
+                continue;
+            }
+
+            Map<String, PcodeStorage> rootedArguments = elementRootedCallArguments(
+                operation,
+                elementRoot,
+                elementStride);
+            if (rootedArguments.size() > 1) {
+                addRootedContainerCallBoundaries(
+                    candidates,
+                    rootedArguments,
+                    operation,
+                    target);
+                collectContainerValuePcodeMemberCandidates(
+                    candidates,
+                    target,
+                    rootedArguments);
+                continue;
+            }
+
+            RawPcodeWrite rawWrite = pcodeReadRawWrite(operation, target);
+            if (rawWrite != null) {
+                Varnode output = storageVarnodeForCallOutput(operation, rawWrite.storage);
+                Long offset = elementRelativeOffset(output, elementRoot, elementStride);
+                if (offset != null) {
+                    addNestedTypeMemberCandidate(
+                        candidates,
+                        new PcodeStorage("element", offset),
+                        rawWrite.nativeType,
+                        rawWrite.wireEvidence,
+                        operation,
+                        target,
+                        "container-element-rooted-read-raw");
+                    markNestedTypeMemberWireOrder(
+                        candidates,
+                        new PcodeStorage("element", offset),
+                        "cfg-element-call-order");
+                }
+                continue;
+            }
+
+            String nativeType = unmarshalNativeTypeFromTarget(target);
+            WireShape wireEvidence = wireShapeEvidenceFromUnmarshalTarget(target, nativeType);
+            if (wireEvidence != null && operation.getNumInputs() >= 3) {
+                Varnode output = operation.getInput(operation.getNumInputs() - 2);
+                Long offset = elementRelativeOffset(output, elementRoot, elementStride);
+                if (offset != null) {
+                    addNestedTypeMemberCandidate(
+                        candidates,
+                        new PcodeStorage("element", offset),
+                        nativeType,
+                        wireEvidence,
+                        operation,
+                        target,
+                        "container-element-rooted-unmarshal");
+                    markNestedTypeMemberWireOrder(
+                        candidates,
+                        new PcodeStorage("element", offset),
+                        "cfg-element-call-order");
+                    continue;
+                }
+            }
+
+            if (!rootedArguments.isEmpty()) {
+                addRootedContainerCallBoundaries(
+                    candidates,
+                    rootedArguments,
+                    operation,
+                    target);
+                collectContainerValuePcodeMemberCandidates(
+                    candidates,
+                    target,
+                    rootedArguments);
+            }
+        }
+    }
+
+    private Map<String, PcodeStorage> elementRootedCallArguments(
+        PcodeOp operation,
+        Varnode elementRoot,
+        long elementStride) {
+
+        if (operation == null || operation.getOpcode() != PcodeOp.CALL) {
+            return Collections.emptyMap();
+        }
+        LinkedHashMap<String, PcodeStorage> result = new LinkedHashMap<>();
+        for (int slot = 1; slot < operation.getNumInputs(); slot++) {
+            Long offset = elementRelativeOffset(
+                operation.getInput(slot),
+                elementRoot,
+                elementStride);
+            if (offset != null) {
+                result.put("param_" + slot, new PcodeStorage("element", offset));
+            }
+        }
+        return result;
+    }
+
+    private void addRootedContainerCallBoundaries(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> candidates,
+        Map<String, PcodeStorage> rootedArguments,
+        PcodeOp operation,
+        Function target) {
+
+        LinkedHashMap<Long, NestedTypeMember> members =
+            candidates.computeIfAbsent("element", ignored -> new LinkedHashMap<>());
+        for (PcodeStorage storage : rootedArguments.values()) {
+            if (!"element".equals(storage.base) || members.containsKey(storage.offset) ||
+                members.size() >= NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
+                continue;
+            }
+            NestedTypeMember member = new NestedTypeMember();
+            member.index = members.size();
+            member.offset = storage.offset;
+            member.name = "_" + members.size();
+            member.nameSource = "synthetic-offset";
+            member.nameProven = false;
+            member.callsite = operation.getSeqnum().getTarget();
+            member.target = target.getEntryPoint();
+            member.targetName = fullFunctionName(target);
+            members.put(storage.offset, member);
+        }
+    }
+
+    private Long elementRelativeOffset(
+        Varnode node,
+        Varnode elementRoot,
+        long elementStride) {
+
+        Long offset = pcodeConstantOffsetFromRoot(
+            node,
+            elementRoot,
+            new LinkedHashSet<>(),
+            0);
+        return offset != null && offset >= 0L && offset < elementStride
+            ? offset
+            : null;
+    }

@@ -236,7 +236,8 @@ pub fn missing_reflected_type_name(type_id: Uuid) -> String {
 
 #[must_use]
 pub fn rust_field_ident(source_name: &str) -> String {
-    let mut ident = split_identifier_words(strip_member_prefix(source_name))
+    let source_name = source_name.replace("(s)", "s").replace("(S)", "S");
+    let mut ident = split_identifier_words(strip_member_prefix(&source_name))
         .into_iter()
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>()
@@ -976,6 +977,7 @@ mod tests {
     fn normalizes_member_field_names() {
         assert_eq!(rust_field_ident("m_targetEntity"), "target_entity");
         assert_eq!(rust_field_ident("m_GDERef"), "gde_ref");
+        assert_eq!(rust_field_ident("Reward(s)"), "rewards");
         assert_eq!(rust_field_ident("type"), "type_");
     }
 

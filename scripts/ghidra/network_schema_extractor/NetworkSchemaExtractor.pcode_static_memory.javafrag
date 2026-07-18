@@ -1,0 +1,23 @@
+    private PcodeMemoryPath pcodeStaticMemoryPath(Varnode node) {
+        if (node == null) {
+            return null;
+        }
+
+        Address direct = pcodeAddress(node);
+        if (isProgramAddress(direct)) {
+            PcodeMemoryPath root = PcodeMemoryPath.staticRoot(direct);
+            return node.getAddress() != null && node.getAddress().isMemoryAddress()
+                ? root.dereference()
+                : root;
+        }
+        if (node.getDef() != null) {
+            return null;
+        }
+
+        Long value = NetworkSchemaIntegerEvaluator.evaluate(node);
+        Address evaluated = value == null ? null : absoluteAddress(value);
+        return isProgramAddress(evaluated)
+            ? PcodeMemoryPath.staticRoot(evaluated)
+            : null;
+    }
+

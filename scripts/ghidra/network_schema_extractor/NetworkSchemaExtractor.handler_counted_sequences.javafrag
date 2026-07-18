@@ -1,0 +1,73 @@
+    private WireShape handlerCountedMarshalShape(
+        Function function,
+        String writeBufferParameter) {
+
+        if (function == null || writeBufferParameter == null) {
+            return null;
+        }
+        ContainerCodecMembers codecs = collectContainerCodecMembers(
+            function,
+            writeBufferParameter,
+            new LinkedHashSet<>(),
+            0,
+            new ArrayList<>());
+        if (!codecs.exact() || !codecs.optionalMembers().isEmpty() ||
+            codecs.members().size() != 1) {
+            return null;
+        }
+        return soleCountedSequenceEvidence(
+            codecs.members().get(0),
+            Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
+
+    private WireShape soleCountedSequenceEvidence(
+        ContainerCodecCall codec,
+        Set<ContainerCodecCall> seen) {
+
+        if (codec == null || !seen.add(codec) || !codec.optionalMembers.isEmpty()) {
+            return null;
+        }
+        if ("counted-sequence".equals(codec.memberSemantics)) {
+            return "complete".equals(codec.analysisStatus)
+                ? codec.wireEvidence
+                : null;
+        }
+        if (codec.wireEvidence != null || codec.members.size() != 1 ||
+            codec.analysisStatus != null && !"complete".equals(codec.analysisStatus)) {
+            return null;
+        }
+        return soleCountedSequenceEvidence(codec.members.get(0), seen);
+    }
+
+    private WireShape handlerCountedUnmarshalShape(
+        Function function,
+        String readBufferParameter,
+        List<CodecWireEvent> events) {
+
+        if (function == null || readBufferParameter == null || events == null) {
+            return null;
+        }
+        Map<String, CollectionOutputShape> collections =
+            collectionOutputShapesByParameterFromPcode(function);
+        if (collections.size() != 1) {
+            return null;
+        }
+        CollectionOutputShape collection = collections.values().iterator().next();
+        if (collection.storage == null ||
+            readBufferParameter.equals(collection.storage.base) ||
+            collection.wireEvidence == null) {
+            return null;
+        }
+        LinkedHashSet<Address> expectedCallsites =
+            new LinkedHashSet<>(collection.codecCallsites);
+        expectedCallsites.add(collection.countCallsite);
+        LinkedHashSet<Address> actualCallsites = new LinkedHashSet<>();
+        for (CodecWireEvent event : events) {
+            if (event.callsite() == null || !actualCallsites.add(event.callsite())) {
+                return null;
+            }
+        }
+        return expectedCallsites.equals(actualCallsites)
+            ? collection.wireEvidence
+            : null;
+    }

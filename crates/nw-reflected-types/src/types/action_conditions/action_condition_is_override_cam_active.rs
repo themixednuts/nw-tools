@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIsOverrideCamActive;
+pub struct ActionConditionIsOverrideCamActive {}
 
 impl AzRtti for ActionConditionIsOverrideCamActive {
     const NAME: &'static str = "ActionConditionIsOverrideCamActive";

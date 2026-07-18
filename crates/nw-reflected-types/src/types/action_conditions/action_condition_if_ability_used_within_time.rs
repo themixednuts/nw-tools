@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfAbilityUsedWithinTime;
+pub struct ActionConditionIfAbilityUsedWithinTime {}
 
 impl AzRtti for ActionConditionIfAbilityUsedWithinTime {
     const NAME: &'static str = "ActionConditionIfAbilityUsedWithinTime";

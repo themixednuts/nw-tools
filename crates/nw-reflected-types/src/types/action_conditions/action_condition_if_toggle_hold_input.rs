@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfToggleHoldInput;
+pub struct ActionConditionIfToggleHoldInput {}
 
 impl AzRtti for ActionConditionIfToggleHoldInput {
     const NAME: &'static str = "ActionConditionIfToggleHoldInput";

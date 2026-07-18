@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfInGearSetPanel;
+pub struct ActionConditionIfInGearSetPanel {}
 
 impl AzRtti for ActionConditionIfInGearSetPanel {
     const NAME: &'static str = "ActionConditionIfInGearSetPanel";

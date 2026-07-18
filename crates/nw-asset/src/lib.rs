@@ -7,6 +7,7 @@ mod reference;
 mod store;
 
 pub mod catalog;
+pub mod uuid;
 
 pub use catalog::{
     ASSET_CATALOG_OPTIMIZED_PATH, ASSET_CATALOG_PATH, AssetCatalog, Catalog, Error, GuidAssetInfo,

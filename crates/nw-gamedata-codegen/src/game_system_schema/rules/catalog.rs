@@ -8,6 +8,10 @@ pub(in crate::game_system_schema) struct ColumnRule<T> {
 }
 
 impl<T: Copy> ColumnRule<T> {
+    pub(in crate::game_system_schema) const fn value(self) -> T {
+        self.value
+    }
+
     pub(in crate::game_system_schema) const fn exact(
         row_type_name: &'static str,
         column_name: &'static str,

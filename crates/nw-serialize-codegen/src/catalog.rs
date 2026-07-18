@@ -416,6 +416,10 @@ impl ReflectedTypeCatalog {
         self.generic_types_by_id.get(&type_id)
     }
 
+    pub fn generic_types(&self) -> impl Iterator<Item = &ReflectedGenericType> {
+        self.generic_types_by_id.values()
+    }
+
     pub fn component_scaffold_types(&self) -> impl Iterator<Item = &ReflectedType> {
         self.types_by_id
             .values()

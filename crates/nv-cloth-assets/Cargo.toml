@@ -1,0 +1,17 @@
+[package]
+name = "nv-cloth-assets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Offline parser for Lumberyard NvCloth material and cooked-fabric assets"
+
+[lints]
+workspace = true
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+thiserror.workspace = true

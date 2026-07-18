@@ -23,7 +23,7 @@ pub use self::action_condition_not::ActionConditionNot;
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionSingleChild;
+pub struct ActionConditionSingleChild {}
 
 impl AzRtti for ActionConditionSingleChild {
     const NAME: &'static str = "ActionConditionSingleChild";

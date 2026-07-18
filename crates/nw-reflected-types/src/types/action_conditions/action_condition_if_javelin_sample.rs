@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfJavelinSample;
+pub struct ActionConditionIfJavelinSample {}
 
 impl AzRtti for ActionConditionIfJavelinSample {
     const NAME: &'static str = "ActionConditionIfJavelinSample";

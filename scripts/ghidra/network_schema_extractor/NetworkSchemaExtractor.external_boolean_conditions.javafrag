@@ -1,0 +1,761 @@
+    private final Map<String, ExternalConditionRecovery>
+        externalBooleanConditionCache = new HashMap<>();
+
+    private ExternalConditionRecovery recoverExternalBooleanCondition(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST branch,
+        PcodeBlockBasic guardBlock,
+        Address conditionStorage) {
+
+        if (high == null || branch == null || guardBlock == null ||
+            !isProgramAddress(conditionStorage)) {
+            return ExternalConditionRecovery.unresolved("invalid-input");
+        }
+        String key = high.getFunction().getEntryPoint() + ":" +
+            branch.getSeqnum().getTarget() + ":" + conditionStorage;
+        ExternalConditionRecovery cached =
+            externalBooleanConditionCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        ArrayList<ExternalResolverEvidence> candidates = new ArrayList<>();
+        LinkedHashMap<String, Integer> rejects = new LinkedHashMap<>();
+        int reachableCalls = 0;
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALLIND ||
+                operation.getNumInputs() < 2 ||
+                !pcodeCanReachGuard(operation, guardBlock)) {
+                continue;
+            }
+            reachableCalls++;
+            ExternalResolverProbe probe = externalResolverEvidence(
+                operation,
+                conditionStorage);
+            ExternalResolverEvidence candidate = probe.evidence();
+            if (candidate != null && candidates.stream().noneMatch(existing ->
+                    existing.sameIdentity(candidate))) {
+                candidates.add(candidate);
+            }
+            else if (candidate == null) {
+                rejects.merge(probe.diagnostic(), 1, Integer::sum);
+            }
+        }
+
+        ExternalConditionRecovery result = candidates.size() == 1
+            ? completeExternalBooleanCondition(candidates.get(0))
+            : ExternalConditionRecovery.unresolved(
+                candidates.isEmpty()
+                    ? "resolver-evidence-missing:reachable=" + reachableCalls +
+                        ",rejects=" + rejects
+                    : "resolver-evidence-ambiguous:" + candidates.size());
+        externalBooleanConditionCache.put(key, result);
+        return result;
+    }
+
+    private boolean pcodeCanReachGuard(
+        PcodeOpAST operation,
+        PcodeBlockBasic guardBlock) {
+
+        if (!(operation.getParent() instanceof PcodeBlockBasic source)) {
+            return false;
+        }
+        if (source == guardBlock) {
+            return operation.getSeqnum().getTarget().compareTo(
+                guardBlock.getStop()) <= 0;
+        }
+        return NetworkSchemaControlFlow.reaches(source, guardBlock);
+    }
+
+    private ExternalResolverProbe externalResolverEvidence(
+        PcodeOpAST call,
+        Address conditionStorage) {
+
+        PcodeVirtualDispatch dispatch = pcodeVirtualDispatch(call.getInput(0));
+        Address staticRoot = dispatch == null
+            ? null
+            : dispatch.root().staticAddress();
+        Address object = dispatch == null
+            ? null
+            : addProgramOffset(staticRoot, dispatch.objectOffset());
+        if (!isProgramAddress(object) || dispatch.slotOffset() < 0L ||
+            (dispatch.slotOffset() % Long.BYTES) != 0L) {
+            return ExternalResolverProbe.rejected("static-dispatch-unresolved");
+        }
+        Address receiver = staticPcodeAddress(call.getInput(1));
+        if (!object.equals(receiver)) {
+            return ExternalResolverProbe.rejected("static-receiver-mismatch");
+        }
+        Address vtable = readPointer(object);
+        if (!isProgramAddress(vtable)) {
+            return ExternalResolverProbe.rejected("vtable-unresolved");
+        }
+        long slotValue = dispatch.slotOffset() / Long.BYTES;
+        if (slotValue > 31L) {
+            return ExternalResolverProbe.rejected("vtable-slot-out-of-range");
+        }
+        int slot = (int) slotValue;
+        Address slotAddress = addProgramOffset(vtable, dispatch.slotOffset());
+        Address target = resolvedCodeTarget(readPointer(slotAddress));
+        if (!isExecutableAddress(target)) {
+            return ExternalResolverProbe.rejected("vtable-target-unresolved");
+        }
+        Integer verifiedSlot = exactVtableSlot(vtable, target, 32);
+        Function resolver = functionExactlyAt(target);
+        if (!Integer.valueOf(slot).equals(verifiedSlot)) {
+            return ExternalResolverProbe.rejected("vtable-slot-unresolved");
+        }
+        if (resolver == null) {
+            return ExternalResolverProbe.rejected("resolver-function-missing");
+        }
+        long conditionOffset = conditionStorage.getOffset() - object.getOffset();
+        if (!resolverWritesByteAt(resolver, conditionOffset)) {
+            return ExternalResolverProbe.rejected("resolver-write-unproven");
+        }
+        ExternalOwnerEvidence owner = externalConditionOwner(vtable, object);
+        return owner == null
+            ? ExternalResolverProbe.rejected("owner-adjustor-unproven")
+            : ExternalResolverProbe.proven(new ExternalResolverEvidence(
+                object,
+                vtable,
+                slot,
+                resolver,
+                conditionStorage,
+                conditionOffset,
+                owner));
+    }
+
+    private Integer exactVtableSlot(Address vtable, Address target, int limit) {
+        if (!isProgramAddress(vtable) || !isExecutableAddress(target)) {
+            return null;
+        }
+        Integer selected = null;
+        for (int slot = 0; slot < limit; slot++) {
+            Address candidate = resolvedCodeTarget(readPointer(vtable.add(slot * 8L)));
+            if (!target.equals(candidate)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = slot;
+        }
+        return selected;
+    }
+
+    private boolean resolverWritesByteAt(Function resolver, long offset) {
+        HighFunction high = highFunction(resolver);
+        if (high == null) {
+            return false;
+        }
+        boolean found = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            PcodeStorageWrite write = storageWrite(operation);
+            if (write == null || write.value() == null ||
+                write.value().getSize() != 1) {
+                continue;
+            }
+            PcodeStorage storage = writtenStorage(operation);
+            if (storage == null || !"param_1".equals(storage.base) ||
+                storage.offset != offset) {
+                continue;
+            }
+            found = true;
+        }
+        return found;
+    }
+
+    private ExternalOwnerEvidence externalConditionOwner(
+        Address vtable,
+        Address object) {
+
+        Address destructorThunk = resolvedCodeTarget(readPointer(vtable));
+        Function thunk = functionExactlyAt(destructorThunk);
+        HighFunction high = highFunction(thunk);
+        if (high == null) {
+            return null;
+        }
+        ExternalOwnerEvidence selected = null;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL ||
+                operation.getNumInputs() < 2) {
+                continue;
+            }
+            PcodeStorage receiver = pcodeStorageExpression(operation.getInput(1));
+            if (receiver == null || !"param_1".equals(receiver.base) ||
+                receiver.offset >= 0) {
+                continue;
+            }
+            PcodeCallTargetInfo callTarget = pcodeCallTargetInfo(operation);
+            Address completeDestructor = callTarget == null
+                ? null
+                : callTarget.targetAddress();
+            if (!isExecutableAddress(completeDestructor)) {
+                continue;
+            }
+            Address owner = addProgramOffset(object, receiver.offset);
+            if (owner == null) {
+                continue;
+            }
+            ExternalOwnerEvidence candidate = new ExternalOwnerEvidence(
+                owner,
+                -receiver.offset,
+                destructorThunk,
+                completeDestructor);
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private ExternalConditionRecovery completeExternalBooleanCondition(
+        ExternalResolverEvidence resolver) {
+
+        ExternalNameEvidence name = externalConditionName(resolver);
+        if (name == null) {
+            return ExternalConditionRecovery.unresolved("name-initializer-unproven");
+        }
+        ExternalDefaultProbe defaultProbe = externalConditionDefault(resolver, name);
+        ExternalDefaultEvidence defaultEvidence = defaultProbe.evidence();
+        if (defaultEvidence == null) {
+            return ExternalConditionRecovery.unresolved(
+                "default-value-flow-unproven:" + defaultProbe.diagnostic());
+        }
+        return ExternalConditionRecovery.proven(new ContainerExternalBooleanCondition(
+            resolver.object(),
+            resolver.vtable(),
+            resolver.slot(),
+            resolver.resolver().getEntryPoint(),
+            resolver.conditionStorage(),
+            resolver.conditionOffset(),
+            resolver.owner().owner(),
+            resolver.owner().subobjectOffset(),
+            resolver.owner().destructorThunk(),
+            resolver.owner().completeDestructor(),
+            name.initializer().getEntryPoint(),
+            name.field(),
+            name.offset(),
+            name.begin(),
+            name.end(),
+            name.value(),
+            defaultEvidence.defaultValue(),
+            defaultEvidence.write(),
+            defaultEvidence.callsite(),
+            defaultEvidence.target(),
+            "static-vtable-dispatch+adjustor-thunk+initializer-writes+resolver-default-flow"));
+    }
+
+    private ExternalNameEvidence externalConditionName(
+        ExternalResolverEvidence evidence) {
+
+        LinkedHashSet<Long> offsets = resolverObjectArgumentOffsets(evidence.resolver());
+        ArrayList<ExternalNameEvidence> candidates = new ArrayList<>();
+        for (long offset : offsets) {
+            Address field = addProgramOffset(evidence.object(), offset);
+            if (field == null) {
+                continue;
+            }
+            for (Function initializer : functionsReferencing(field)) {
+                ExternalNameEvidence candidate = externalNameWrittenBy(
+                    initializer,
+                    field,
+                    offset);
+                if (candidate != null && candidates.stream().noneMatch(existing ->
+                        existing.sameIdentity(candidate))) {
+                    candidates.add(candidate);
+                }
+            }
+        }
+        return candidates.size() == 1 ? candidates.get(0) : null;
+    }
+
+    private LinkedHashSet<Long> resolverObjectArgumentOffsets(Function resolver) {
+        LinkedHashSet<Long> offsets = new LinkedHashSet<>();
+        HighFunction high = highFunction(resolver);
+        if (high == null) {
+            return offsets;
+        }
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL &&
+                operation.getOpcode() != PcodeOp.CALLIND) {
+                continue;
+            }
+            for (int slot = 1; slot < operation.getNumInputs(); slot++) {
+                PcodeStorage storage = pcodeStorageExpression(operation.getInput(slot));
+                if (storage != null && "param_1".equals(storage.base) &&
+                    storage.offset >= 0 && storage.offset <= 0x200) {
+                    offsets.add(storage.offset);
+                }
+            }
+        }
+        return offsets;
+    }
+
+    private Set<Function> functionsReferencing(Address address) {
+        LinkedHashSet<Function> functions = new LinkedHashSet<>();
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(address);
+        while (references.hasNext()) {
+            Function function = functionContaining(references.next().getFromAddress());
+            if (function != null) {
+                functions.add(function);
+            }
+        }
+        return functions;
+    }
+
+    private ExternalNameEvidence externalNameWrittenBy(
+        Function initializer,
+        Address field,
+        long offset) {
+
+        HighFunction high = highFunction(initializer);
+        if (high == null) {
+            return null;
+        }
+        HashMap<Long, Byte> bytes = new HashMap<>();
+        long start = field.getOffset();
+        long end = start + 16;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            StaticPcodeWrite write = staticPcodeWrite(operation);
+            if (write == null || write.address().getOffset() < start ||
+                write.address().getOffset() >= end) {
+                continue;
+            }
+            for (int index = 0; index < write.width(); index++) {
+                long destination = write.address().getOffset() + index;
+                if (destination >= end) {
+                    break;
+                }
+                bytes.put(destination, (byte) (write.value() >>> (index * 8)));
+            }
+        }
+        Long beginValue = littleEndianLong(bytes, start);
+        Long endValue = littleEndianLong(bytes, start + 8);
+        if (beginValue == null || endValue == null) {
+            return null;
+        }
+        Address begin = absoluteAddress(beginValue);
+        Address spanEnd = absoluteAddress(endValue);
+        String value = exactPrintableSpan(begin, spanEnd);
+        return value == null
+            ? null
+            : new ExternalNameEvidence(
+                initializer,
+                field,
+                offset,
+                begin,
+                spanEnd,
+                value);
+    }
+
+    private StaticPcodeWrite staticPcodeWrite(PcodeOpAST operation) {
+        Address destination;
+        Varnode value;
+        if (operation.getOpcode() == PcodeOp.STORE && operation.getNumInputs() >= 3) {
+            destination = staticPcodeAddress(operation.getInput(1));
+            value = operation.getInput(2);
+        }
+        else if (operation.getOpcode() == PcodeOp.COPY && operation.getOutput() != null) {
+            destination = pcodeAddress(operation.getOutput());
+            value = operation.getInput(0);
+        }
+        else {
+            return null;
+        }
+        Long constant = NetworkSchemaIntegerEvaluator.evaluate(value);
+        int width = value == null ? 0 : value.getSize();
+        return !isProgramAddress(destination) || constant == null ||
+            width <= 0 || width > Long.BYTES
+                ? null
+                : new StaticPcodeWrite(destination, constant, width);
+    }
+
+    private Long littleEndianLong(Map<Long, Byte> bytes, long address) {
+        long result = 0;
+        for (int index = 0; index < Long.BYTES; index++) {
+            Byte value = bytes.get(address + index);
+            if (value == null) {
+                return null;
+            }
+            result |= (long) Byte.toUnsignedInt(value) << (index * 8);
+        }
+        return result;
+    }
+
+    private String exactPrintableSpan(Address begin, Address end) {
+        if (!isProgramAddress(begin) || !isProgramAddress(end)) {
+            return null;
+        }
+        long length = end.getOffset() - begin.getOffset();
+        if (length <= 0 || length > 256) {
+            return null;
+        }
+        byte[] bytes = new byte[(int) length];
+        try {
+            currentProgram.getMemory().getBytes(begin, bytes);
+            if (currentProgram.getMemory().getByte(end) != 0) {
+                return null;
+            }
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+        for (byte value : bytes) {
+            int unsigned = Byte.toUnsignedInt(value);
+            if (unsigned < 0x20 || unsigned > 0x7e) {
+                return null;
+            }
+        }
+        return new String(bytes, StandardCharsets.US_ASCII);
+    }
+
+    private ExternalDefaultProbe externalConditionDefault(
+        ExternalResolverEvidence resolver,
+        ExternalNameEvidence name) {
+
+        HighFunction high = highFunction(resolver.resolver());
+        if (high == null) {
+            return ExternalDefaultProbe.rejected("missing-high-function");
+        }
+        ArrayList<ExternalDefaultEvidence> candidates = new ArrayList<>();
+        LinkedHashMap<String, Integer> rejects = new LinkedHashMap<>();
+        int conditionWrites = 0;
+        for (PcodeOpAST writeOperation : orderedPcodeOps(high)) {
+            PcodeStorageWrite conditionWrite = storageWrite(writeOperation);
+            PcodeStorage conditionStorage = writtenStorage(writeOperation);
+            if (conditionWrite == null || conditionStorage == null ||
+                !"param_1".equals(conditionStorage.base) ||
+                conditionStorage.offset != resolver.conditionOffset() ||
+                conditionWrite.value().getSize() != Byte.BYTES) {
+                continue;
+            }
+            conditionWrites++;
+            PcodeStorage resultStorage = pcodeStorageExpression(conditionWrite.value());
+            if (resultStorage == null) {
+                rejects.merge("result-storage-unproven", 1, Integer::sum);
+                continue;
+            }
+            for (PcodeOpAST call : orderedPcodeOps(high)) {
+                ExternalDefaultProbe probe = externalDefaultResolverCall(
+                    high,
+                    resolver,
+                    name,
+                    conditionWrite,
+                    resultStorage,
+                    call);
+                ExternalDefaultEvidence candidate = probe.evidence();
+                if (candidate != null && candidates.stream().noneMatch(existing ->
+                        existing.sameIdentity(candidate))) {
+                    candidates.add(candidate);
+                }
+                else if (candidate == null && probe.diagnostic() != null) {
+                    rejects.merge(probe.diagnostic(), 1, Integer::sum);
+                }
+            }
+        }
+        return candidates.size() == 1
+            ? ExternalDefaultProbe.proven(candidates.get(0))
+            : ExternalDefaultProbe.rejected(
+                "condition-writes=" + conditionWrites +
+                    ",candidates=" + candidates.size() +
+                    ",rejects=" + rejects);
+    }
+
+    private ExternalDefaultProbe externalDefaultResolverCall(
+        HighFunction high,
+        ExternalResolverEvidence resolver,
+        ExternalNameEvidence name,
+        PcodeStorageWrite conditionWrite,
+        PcodeStorage resultStorage,
+        PcodeOpAST call) {
+
+        if ((call.getOpcode() != PcodeOp.CALL && call.getOpcode() != PcodeOp.CALLIND) ||
+            !NetworkSchemaControlFlow.precedes(high, call, conditionWrite.operation())) {
+            return ExternalDefaultProbe.rejected("not-preceding-call");
+        }
+        Function target = pcodeCallTarget(call);
+        Address targetAddress = target == null ? null : target.getEntryPoint();
+        PcodeStorage nameStorage = new PcodeStorage("param_1", name.offset());
+        boolean resultFlow = statusProducedByCall(
+            conditionWrite.value(),
+            resultStorage,
+            call,
+            NetworkSchemaControlFlow.parentBlock(call)) ||
+            callCarriesResultStorage(call, resultStorage);
+        if (!isExecutableAddress(targetAddress)) {
+            return ExternalDefaultProbe.rejected("call-target-unproven");
+        }
+        if (!hasUniqueProvenCallStorageArgument(call, nameStorage)) {
+            return ExternalDefaultProbe.rejected("name-argument-unproven");
+        }
+        if (!resultFlow) {
+            return ExternalDefaultProbe.rejected("result-flow-unproven");
+        }
+        PcodeStorageWrite defaultWrite = latestDominatingStorageWrite(
+            high,
+            call,
+            resultStorage);
+        Long defaultByte = defaultWrite == null
+            ? null
+            : NetworkSchemaIntegerEvaluator.evaluateByte(defaultWrite.value(), 0);
+        if (defaultByte == null && defaultWrite != null &&
+            defaultWrite.operation().getOpcode() != PcodeOp.STORE) {
+            defaultByte = NetworkSchemaIntegerEvaluator.evaluateOutputByte(
+                defaultWrite.operation(),
+                0);
+        }
+        if (defaultWrite == null) {
+            return ExternalDefaultProbe.rejected("default-write-unproven");
+        }
+        if (defaultByte == null || defaultByte > 1L) {
+            return ExternalDefaultProbe.rejected("default-byte-unproven");
+        }
+        return ExternalDefaultProbe.proven(new ExternalDefaultEvidence(
+            defaultWrite.operation().getSeqnum().getTarget(),
+            call.getSeqnum().getTarget(),
+            targetAddress,
+            defaultByte == 1L));
+    }
+
+    private boolean hasUniqueProvenCallStorageArgument(
+        PcodeOpAST call,
+        PcodeStorage expected) {
+
+        if (call == null || expected == null) {
+            return false;
+        }
+        Function owner = call.getSeqnum() == null
+            ? null
+            : functionContaining(call.getSeqnum().getTarget());
+        Function target = pcodeCallTarget(call);
+        int matches = 0;
+        for (int slot = 1; slot < call.getNumInputs(); slot++) {
+            PcodeStorage actual = provenCallArgumentStorage(
+                owner,
+                call,
+                target,
+                slot);
+            if (actual != null && expected.sameLocation(actual)) {
+                matches++;
+            }
+        }
+        return matches == 1;
+    }
+
+    private Address staticPcodeAddress(Varnode node) {
+        return staticPcodeAddress(node, new HashSet<>());
+    }
+
+    private Address staticPcodeAddress(Varnode node, Set<String> active) {
+        if (node == null || !active.add(pcodeSsaNodeKey(node))) {
+            return null;
+        }
+        try {
+            Address direct = pcodeAddress(node);
+            if (isProgramAddress(direct)) {
+                return direct;
+            }
+            Long constant = NetworkSchemaIntegerEvaluator.evaluate(node);
+            if (constant != null) {
+                Address address = absoluteAddress(constant);
+                if (isProgramAddress(address)) {
+                    return address;
+                }
+            }
+            PcodeOp definition = node.getDef();
+            if (definition == null) {
+                return null;
+            }
+            return switch (definition.getOpcode()) {
+                case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INDIRECT,
+                    PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT ->
+                    staticPcodeAddress(definition.getInput(0), active);
+                case PcodeOp.LOAD -> definition.getNumInputs() < 2
+                    ? null
+                    : readPointer(staticPcodeAddress(definition.getInput(1), active));
+                case PcodeOp.INT_ADD, PcodeOp.INT_SUB, PcodeOp.PTRSUB ->
+                    staticPcodeAffineAddress(definition, active);
+                case PcodeOp.PTRADD -> staticPcodeIndexedAddress(definition, active);
+                case PcodeOp.MULTIEQUAL -> staticPcodeMergedAddress(definition, active);
+                default -> null;
+            };
+        }
+        finally {
+            active.remove(pcodeSsaNodeKey(node));
+        }
+    }
+
+    private Address staticPcodeAffineAddress(PcodeOp definition, Set<String> active) {
+        if (definition.getNumInputs() < 2) {
+            return null;
+        }
+        for (int baseSlot = 0; baseSlot < 2; baseSlot++) {
+            Address base = staticPcodeAddress(definition.getInput(baseSlot), active);
+            Long delta = NetworkSchemaIntegerEvaluator.evaluate(
+                definition.getInput(1 - baseSlot));
+            if (base == null || delta == null) {
+                continue;
+            }
+            long signedDelta = signedPcodeConstant(
+                delta,
+                definition.getInput(1 - baseSlot).getSize());
+            if (definition.getOpcode() == PcodeOp.INT_SUB && baseSlot == 0) {
+                signedDelta = -signedDelta;
+            }
+            return addProgramOffset(base, signedDelta);
+        }
+        return null;
+    }
+
+    private Address staticPcodeIndexedAddress(PcodeOp definition, Set<String> active) {
+        if (definition.getNumInputs() < 3) {
+            return null;
+        }
+        Address base = staticPcodeAddress(definition.getInput(0), active);
+        Long index = NetworkSchemaIntegerEvaluator.evaluate(definition.getInput(1));
+        Long scale = NetworkSchemaIntegerEvaluator.evaluate(definition.getInput(2));
+        if (base == null || index == null || scale == null) {
+            return null;
+        }
+        try {
+            return addProgramOffset(base, Math.multiplyExact(index, scale));
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private Address staticPcodeMergedAddress(PcodeOp definition, Set<String> active) {
+        Address selected = null;
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            Address candidate = staticPcodeAddress(definition.getInput(slot), active);
+            if (candidate == null) {
+                return null;
+            }
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private long signedPcodeConstant(long value, int size) {
+        if (size <= 0 || size >= Long.BYTES) {
+            return value;
+        }
+        int bits = size * 8;
+        long mask = (1L << bits) - 1;
+        long sign = 1L << (bits - 1);
+        value &= mask;
+        return (value & sign) == 0 ? value : value | ~mask;
+    }
+
+    private Address addProgramOffset(Address address, long offset) {
+        if (!isProgramAddress(address)) {
+            return null;
+        }
+        try {
+            Address result = address.add(offset);
+            return isProgramAddress(result) ? result : null;
+        }
+        catch (AddressOutOfBoundsException ignored) {
+            return null;
+        }
+    }
+
+    private record ExternalResolverEvidence(
+        Address object,
+        Address vtable,
+        int slot,
+        Function resolver,
+        Address conditionStorage,
+        long conditionOffset,
+        ExternalOwnerEvidence owner) {
+
+        boolean sameIdentity(ExternalResolverEvidence other) {
+            return object.equals(other.object) &&
+                resolver.getEntryPoint().equals(other.resolver.getEntryPoint()) &&
+                conditionStorage.equals(other.conditionStorage);
+        }
+    }
+
+    private record ExternalResolverProbe(
+        ExternalResolverEvidence evidence,
+        String diagnostic) {
+
+        static ExternalResolverProbe proven(ExternalResolverEvidence evidence) {
+            return new ExternalResolverProbe(evidence, "proven");
+        }
+
+        static ExternalResolverProbe rejected(String diagnostic) {
+            return new ExternalResolverProbe(null, diagnostic);
+        }
+    }
+
+    private record ExternalConditionRecovery(
+        ContainerExternalBooleanCondition condition,
+        String diagnostic) {
+
+        static ExternalConditionRecovery proven(
+            ContainerExternalBooleanCondition condition) {
+            return new ExternalConditionRecovery(condition, "proven");
+        }
+
+        static ExternalConditionRecovery unresolved(String diagnostic) {
+            return new ExternalConditionRecovery(null, diagnostic);
+        }
+    }
+
+    private record ExternalOwnerEvidence(
+        Address owner,
+        long subobjectOffset,
+        Address destructorThunk,
+        Address completeDestructor) {
+    }
+
+    private record ExternalNameEvidence(
+        Function initializer,
+        Address field,
+        long offset,
+        Address begin,
+        Address end,
+        String value) {
+
+        boolean sameIdentity(ExternalNameEvidence other) {
+            return field.equals(other.field) && begin.equals(other.begin) &&
+                end.equals(other.end) && value.equals(other.value);
+        }
+    }
+
+    private record ExternalDefaultEvidence(
+        Address write,
+        Address callsite,
+        Address target,
+        boolean defaultValue) {
+
+        boolean sameIdentity(ExternalDefaultEvidence other) {
+            return callsite.equals(other.callsite) && target.equals(other.target) &&
+                defaultValue == other.defaultValue;
+        }
+    }
+
+    private record ExternalDefaultProbe(
+        ExternalDefaultEvidence evidence,
+        String diagnostic) {
+
+        static ExternalDefaultProbe proven(ExternalDefaultEvidence evidence) {
+            return new ExternalDefaultProbe(evidence, "proven");
+        }
+
+        static ExternalDefaultProbe rejected(String diagnostic) {
+            return new ExternalDefaultProbe(null, diagnostic);
+        }
+    }
+
+    private record StaticPcodeWrite(Address address, long value, int width) {
+    }

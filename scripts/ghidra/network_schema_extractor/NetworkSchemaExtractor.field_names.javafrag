@@ -1,0 +1,180 @@
+    private TrackedValue formattedFieldNameCallValue(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        if (!instruction.getFlowType().isCall()) {
+            return null;
+        }
+
+        TrackedValue destination = state.registers.get("RCX");
+        TrackedValue formatValue = state.registers.get("RDX");
+        TrackedValue indexValue = state.registers.get("R8");
+        if (destination == null || destination.stackOffset == null ||
+            formatValue == null || formatValue.address == null ||
+            indexValue == null || indexValue.immediate == null ||
+            !isProvenStringFormatter(instruction)) {
+            return null;
+        }
+
+        String format = readPrintableString(formatValue.address);
+        String fieldName = renderFormattedFieldName(format, indexValue.immediate);
+        return fieldName == null
+            ? null
+            : TrackedValue.fieldName(formatValue.address, fieldName);
+    }
+
+    private boolean isProvenStringFormatter(Instruction instruction) {
+        Address targetAddress = resolvedCodeTarget(callTarget(instruction));
+        Function target = functionAtOrContaining(targetAddress);
+        return target != null &&
+            Integer.valueOf(1).equals(returnedParameterSlot(target)) &&
+            forwardsFormatParameterToSink(target, 2, 0, new LinkedHashSet<>());
+    }
+
+    private boolean forwardsFormatParameterToSink(
+        Function function,
+        int formatParameterSlot,
+        int depth,
+        Set<String> active) {
+
+        if (function == null || depth > 4) {
+            return false;
+        }
+        String activeKey = function.getEntryPoint() + ":" + formatParameterSlot;
+        if (!active.add(activeKey)) {
+            return false;
+        }
+        try {
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                return false;
+            }
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (operation.getOpcode() != PcodeOp.CALL) {
+                    continue;
+                }
+                Function target = pcodeCallTarget(operation);
+                if (target == null) {
+                    continue;
+                }
+
+                Integer sinkInput = formatSinkInput(target);
+                if (sinkInput != null) {
+                    if (sinkInput < operation.getNumInputs() &&
+                        valueIsFormalParameter(
+                            operation.getInput(sinkInput),
+                            formatParameterSlot)) {
+                        return true;
+                    }
+                    continue;
+                }
+
+                for (int input = 1; input < operation.getNumInputs(); input++) {
+                    if (!valueIsFormalParameter(
+                            operation.getInput(input),
+                            formatParameterSlot)) {
+                        continue;
+                    }
+                    if (forwardsFormatParameterToSink(
+                            target,
+                            input,
+                            depth + 1,
+                            active)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        finally {
+            active.remove(activeKey);
+        }
+    }
+
+    private boolean valueIsFormalParameter(Varnode value, int parameterSlot) {
+        PcodeStorage storage = pcodeStorageExpression(value);
+        return storage != null &&
+            storage.offset == 0L &&
+            Integer.valueOf(parameterSlot).equals(formalParameterSlot(storage));
+    }
+
+    private Integer formatSinkInput(Function function) {
+        String name = fullFunctionName(function);
+        if (name == null) {
+            return null;
+        }
+        String normalized = name.toLowerCase(Locale.ROOT);
+        if (normalized.contains("__stdio_common_vsnprintf_s")) {
+            return 5;
+        }
+        if (normalized.contains("__stdio_common_vsprintf")) {
+            return 4;
+        }
+        return null;
+    }
+
+    private StringDecode trackedFieldNameDecode(TrackedValue value) {
+        if (value == null) {
+            return null;
+        }
+        if (value.fieldName != null) {
+            return new StringDecode(value.fieldNameAddress, value.fieldName);
+        }
+        return readFieldNameAtOrThroughPointer(value.address);
+    }
+
+    private String renderFormattedFieldName(String format, long index) {
+        if (!isLikelyFieldNameFormat(format) || index < 0 || index > 4096) {
+            return null;
+        }
+
+        Matcher matcher = Pattern.compile("%(0?)(\\d*)[du]").matcher(format);
+        if (!matcher.find()) {
+            return null;
+        }
+        int start = matcher.start();
+        int end = matcher.end();
+        String widthText = matcher.group(2);
+        boolean zeroPadded = "0".equals(matcher.group(1));
+        if (matcher.find()) {
+            return null;
+        }
+
+        String number = Long.toUnsignedString(index);
+        if (!widthText.isEmpty()) {
+            int width;
+            try {
+                width = Integer.parseInt(widthText);
+            }
+            catch (NumberFormatException ignored) {
+                return null;
+            }
+            if (!zeroPadded || width < number.length() || width > 32) {
+                return null;
+            }
+            number = "0".repeat(width - number.length()) + number;
+        }
+
+        String rendered = format.substring(0, start) + number + format.substring(end);
+        return isLikelyFieldName(rendered) ? rendered : null;
+    }
+
+    private boolean isLikelyFieldNameFormat(String value) {
+        if (value == null || value.isBlank() || value.length() > 96 ||
+            value.indexOf(' ') >= 0 || value.indexOf('\\') >= 0 ||
+            value.indexOf('/') >= 0) {
+            return false;
+        }
+        Matcher matcher = Pattern.compile("%(0?)(\\d*)[du]").matcher(value);
+        if (!matcher.find()) {
+            return false;
+        }
+        String withoutPlaceholder =
+            value.substring(0, matcher.start()) + "0" + value.substring(matcher.end());
+        return withoutPlaceholder.indexOf('%') < 0 &&
+            isLikelyFieldName(withoutPlaceholder);
+    }
+
+    private boolean isLikelyFieldName(String value) {
+        return value != null && value.matches("[A-Za-z_][A-Za-z0-9_]*");
+    }

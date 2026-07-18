@@ -4,6 +4,7 @@ use std::array::TryFromSliceError;
 use std::fmt::Write as _;
 use std::str::Utf8Error;
 
+use crc32fast::Hasher;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -507,6 +508,9 @@ pub trait FieldAccess {
 ///
 /// This is useful when a decoder reads fields in serialized order:
 /// each successful lookup advances the cursor past the matched child.
+/// Binary ObjectStreams identify fields with AZ's case-insensitive name
+/// CRC, so lookup also honors that CRC when a global name table resolves a
+/// case-colliding field to a different spelling.
 #[derive(Debug, Clone)]
 pub struct FieldCursor<'a> {
     remaining: &'a [Element],
@@ -1358,15 +1362,43 @@ pub fn field_name(element: &(impl ElementValue + ?Sized)) -> String {
 }
 
 fn field_eq(element: &Element, field: &str) -> bool {
-    element.field().is_some_and(|value| value.as_str() == field)
+    element
+        .field()
+        .is_some_and(|value| value.eq_ignore_ascii_case(field))
+        || element.name_crc() == Some(az_field_name_crc(field))
 }
 
 fn matching_field<'f>(element: &Element, fields: &[&'f str]) -> Option<&'f str> {
-    let actual = element.field()?;
+    if let Some(actual) = element.field() {
+        if let Some(field) = fields
+            .iter()
+            .copied()
+            .find(|field| actual.eq_ignore_ascii_case(field))
+        {
+            return Some(field);
+        }
+    }
+
+    let name_crc = element.name_crc()?;
     fields
         .iter()
         .copied()
-        .find(|field| actual.as_str() == *field)
+        .find(|field| az_field_name_crc(field) == name_crc)
+}
+
+/// Compute the field-name CRC used by AZ ObjectStream element headers.
+///
+/// SerializeContext registers field names case-insensitively. A binary
+/// stream therefore cannot distinguish spellings such as `sliceAssetId`
+/// and `SliceAssetId`; schema-aware readers must compare this normalized
+/// CRC instead of trusting the spelling selected by a global name table.
+#[must_use]
+pub fn az_field_name_crc(field: &str) -> u32 {
+    let mut hasher = Hasher::new();
+    for byte in field.bytes() {
+        hasher.update(&[byte.to_ascii_lowercase()]);
+    }
+    hasher.finalize()
 }
 
 #[cfg(test)]
@@ -2067,6 +2099,29 @@ mod tests {
             "Third"
         );
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn field_lookup_uses_az_case_insensitive_name_crc() {
+        assert_eq!(az_field_name_crc("sliceAssetId"), 490_585_507);
+        assert_eq!(
+            az_field_name_crc("sliceAssetId"),
+            az_field_name_crc("SliceAssetId")
+        );
+
+        let mut child = leaf("name-selected-from-another-class", types::BOOL, [1]);
+        child.name_crc = Some(az_field_name_crc("sliceAssetId"));
+        let element = Element::new(types::AZSTD_VECTOR).with_children([child]);
+
+        let mut cursor = FieldCursor::from_element(&element);
+        assert_eq!(
+            cursor.find("sliceAssetId").map(Element::data),
+            Some(Some(&[1][..]))
+        );
+
+        let fields = ElementFields::new(&element);
+        let mut fields = fields;
+        assert!(fields.field("SliceAssetId").is_some());
     }
 
     #[test]

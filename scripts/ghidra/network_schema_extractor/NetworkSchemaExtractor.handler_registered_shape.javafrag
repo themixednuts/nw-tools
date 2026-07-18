@@ -1,0 +1,207 @@
+    private void indexRegistryUnmarshalEntries(List<RegistryEntry> registry) {
+        registryEntriesByUnmarshal.clear();
+        for (RegistryEntry entry : registry) {
+            Address address = parseCapturedAddress(entry.unmarshal);
+            Function function = functionAtOrContaining(address);
+            if (function == null) {
+                continue;
+            }
+            registryEntriesByUnmarshal
+                .computeIfAbsent(function.getEntryPoint().toString(), ignored -> new ArrayList<>())
+                .add(entry);
+        }
+    }
+
+    private NestedTypeShape registeredHandlerValueShape(
+        Function handlerUnmarshal,
+        NestedTypeShape layout) {
+
+        if (handlerUnmarshal == null || layout == null || layout.nativeSize == null ||
+            !Boolean.TRUE.equals(layout.layoutProven)) {
+            return null;
+        }
+
+        LinkedHashMap<String, RegisteredHandlerValue> candidates = new LinkedHashMap<>();
+        for (Function helper : directPcodeCallTargets(handlerUnmarshal)) {
+            ReferenceIterator references = currentProgram.getReferenceManager()
+                .getReferencesTo(helper.getEntryPoint());
+            while (references.hasNext()) {
+                Reference reference = references.next();
+                if (!reference.getReferenceType().isCall()) {
+                    continue;
+                }
+                Function caller = functionContaining(reference.getFromAddress());
+                if (caller == null) {
+                    continue;
+                }
+                List<RegistryEntry> entries =
+                    registryEntriesByUnmarshal.get(caller.getEntryPoint().toString());
+                if (entries == null) {
+                    continue;
+                }
+                for (RegistryEntry entry : entries) {
+                    RegisteredHandlerValue candidate = registeredHandlerValue(
+                        entry,
+                        helper,
+                        layout.nativeSize);
+                    if (candidate != null) {
+                        candidates.putIfAbsent(candidate.typeId(), candidate);
+                    }
+                }
+            }
+        }
+        if (candidates.size() != 1) {
+            if (candidates.size() > 1) {
+                recordNestedTypeShapeReject("ambiguous-registered-handler-value");
+            }
+            return null;
+        }
+
+        RegisteredHandlerValue value = candidates.values().iterator().next();
+        layout.typeId = value.typeId();
+        layout.typeIdSource = "typeregistry-unmarshal-shared-helper";
+        layout.identityProven = true;
+        layout.identitySource =
+            "shared-unmarshal-helper+registry-create-instance-size+handler-storage-window";
+        layout.typeNameFull = value.typeName();
+        layout.typeName = NetworkSchemaText.sourceTypeLeaf(value.typeName());
+        layout.typeNameSource = value.hook().typeNameSource();
+        layout.vtable = value.vtable();
+        layout.validation =
+            "shared-unmarshal-helper+exact-allocation-storage-size+complete-layout";
+        layout.nativeSizeSource =
+            "field-handler-is-default-storage-pair+registry-create-instance";
+        return layout;
+    }
+
+    private RegisteredHandlerValue registeredHandlerValue(
+        RegistryEntry entry,
+        Function sharedHelper,
+        long nativeSize) {
+
+        String typeId = normalizeUuid(entry.uuid);
+        Address createInstance = parseCapturedAddress(entry.createInstance);
+        Long allocatedSize = recoverCreateInstanceSize(createInstance);
+        if (typeId == null || isZeroUuid(typeId) || allocatedSize == null ||
+            allocatedSize != nativeSize ||
+            !registryUnmarshalCalls(entry, sharedHelper.getEntryPoint())) {
+            return null;
+        }
+
+        RegistryValueHook hook = registryValueHook(entry, typeId);
+        if (hook == null || !isPlausibleTypeName(hook.evidence().typeName)) {
+            return null;
+        }
+        return new RegisteredHandlerValue(
+            typeId,
+            hook.evidence().typeName,
+            hook.evidence(),
+            hook.valueVtable());
+    }
+
+    private boolean registryUnmarshalCalls(RegistryEntry entry, Address helper) {
+        Function unmarshal = functionAtOrContaining(parseCapturedAddress(entry.unmarshal));
+        return directPcodeCallTargets(unmarshal).stream()
+            .anyMatch(target -> target.getEntryPoint().equals(helper));
+    }
+
+    private List<Function> directPcodeCallTargets(Function function) {
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return List.of();
+        }
+        LinkedHashMap<String, Function> targets = new LinkedHashMap<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (target != null) {
+                targets.putIfAbsent(target.getEntryPoint().toString(), target);
+            }
+        }
+        return List.copyOf(targets.values());
+    }
+
+    private RegistryValueHook registryValueHook(RegistryEntry entry, String typeId) {
+        HookTypeEvidence known = registrationHooksByTypeId.get(typeId);
+        if (known != null && isPlausibleTypeName(known.typeName)) {
+            return new RegistryValueHook(known, null);
+        }
+
+        Address unmarshal = parseCapturedAddress(entry.unmarshal);
+        LinkedHashMap<String, RegistryValueHook> hooks = new LinkedHashMap<>();
+        for (VtableWrite write : handlerVtableWrites(unmarshal)) {
+            Address provider = resolvedCodeTarget(readPointer(write.vtable));
+            if (!isExecutableAddress(provider)) {
+                continue;
+            }
+            ReferenceIterator providerReferences =
+                currentProgram.getReferenceManager().getReferencesTo(provider);
+            while (providerReferences.hasNext()) {
+                Reference providerReference = providerReferences.next();
+                if (!providerReference.getReferenceType().isCall()) {
+                    continue;
+                }
+                Function registerThunk = functionContaining(providerReference.getFromAddress());
+                if (registerThunk == null) {
+                    continue;
+                }
+                TypeIdDecode decoded =
+                    decodeRegistrationThunkTypeId(registerThunk.getEntryPoint());
+                if (decoded == null || !uuidEquals(decoded.typeId, typeId)) {
+                    continue;
+                }
+                collectRegistryValueHooks(
+                    hooks,
+                    registerThunk.getEntryPoint(),
+                    write.vtable,
+                    typeId);
+            }
+        }
+        if (hooks.size() != 1) {
+            return null;
+        }
+        RegistryValueHook selected = hooks.values().iterator().next();
+        registrationHooksByTypeId.putIfAbsent(typeId, selected.evidence());
+        return selected;
+    }
+
+    private void collectRegistryValueHooks(
+        Map<String, RegistryValueHook> hooks,
+        Address registerThunk,
+        Address valueVtable,
+        String typeId) {
+
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(registerThunk);
+        while (references.hasNext()) {
+            Address helperTable = subtract(references.next().getFromAddress(), 0x10L);
+            if (!isRegistrationHelperTable(helperTable)) {
+                continue;
+            }
+            String typeName = registrationHookTypeNameFromSlot(helperTable, 3);
+            HookTypeEvidence hook = decodeRegistrationHelperTable(
+                registerThunk,
+                helperTable,
+                typeName);
+            if (hook == null || !uuidEquals(hook.typeId, typeId) ||
+                !isPlausibleTypeName(typeName)) {
+                continue;
+            }
+            hook.source = "registry-value-registration-graph";
+            hooks.putIfAbsent(typeName, new RegistryValueHook(hook, valueVtable));
+        }
+    }
+
+    private record RegistryValueHook(
+        HookTypeEvidence evidence,
+        Address valueVtable) {
+    }
+
+    private record RegisteredHandlerValue(
+        String typeId,
+        String typeName,
+        HookTypeEvidence hook,
+        Address vtable) {
+    }

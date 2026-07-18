@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfOnSlope;
+pub struct ActionConditionIfOnSlope {}
 
 impl AzRtti for ActionConditionIfOnSlope {
     const NAME: &'static str = "ActionConditionIfOnSlope";

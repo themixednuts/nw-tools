@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct SetAudioSwitchState;
+pub struct SetAudioSwitchState {}
 
 impl AzRtti for SetAudioSwitchState {
     const NAME: &'static str = "SetAudioSwitchState";

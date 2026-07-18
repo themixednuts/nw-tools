@@ -1,0 +1,247 @@
+    private TypeIdDecode decodeTypeIdFromPcodeFlow(
+        Address function,
+        Address provider,
+        boolean followProviderCalls) {
+
+        if (!isExecutableAddress(provider)) {
+            return null;
+        }
+        String cacheKey = addressCacheKey(
+            "type-id-flow:" +
+                (function == null ? "<none>" : Long.toUnsignedString(function.getOffset())) +
+                ":" + followProviderCalls,
+            provider);
+        Optional<TypeIdDecode> cached = typeIdFlowCache.get(cacheKey);
+        if (cached != null) {
+            runMetrics.increment("typeIdFlowCacheHits");
+            return cached.orElse(null);
+        }
+        runMetrics.increment("typeIdFlowCacheMisses");
+
+        Deque<HandlerScanFrame> pending = new ArrayDeque<>();
+        pending.addLast(new HandlerScanFrame(provider, 0));
+        LinkedHashSet<String> seenFunctions = new LinkedHashSet<>();
+        LinkedHashSet<String> seenTypeIds = new LinkedHashSet<>();
+        TypeIdDecode result = null;
+
+        while (!pending.isEmpty()) {
+            HandlerScanFrame frame = pending.removeFirst();
+            Address current = resolvedCodeTarget(frame.address);
+            Function currentFunction = functionAtOrContaining(current);
+            if (currentFunction == null ||
+                !seenFunctions.add(currentFunction.getEntryPoint().toString())) {
+                continue;
+            }
+            HighFunction high = highFunction(currentFunction);
+            if (high == null) {
+                continue;
+            }
+
+            LinkedHashSet<Address> relevantCallees = new LinkedHashSet<>();
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                for (Varnode input : identityEvidenceInputs(operation)) {
+                    LinkedHashSet<Address> addresses = new LinkedHashSet<>();
+                    collectPcodeAddressOrigins(input, addresses, new LinkedHashSet<>());
+                    for (Address address : addresses) {
+                        PcodeIdentityLiteral literal = pcodeIdentityLiteral(address, frame.depth);
+                        if (literal == null || !seenTypeIds.add(literal.typeId())) {
+                            continue;
+                        }
+                        incrementCount(typeIdSourceCounts, literal.source());
+                        if (result == null) {
+                            result = new TypeIdDecode();
+                            result.function = function;
+                            result.provider = currentFunction.getEntryPoint();
+                            result.typeId = literal.typeId();
+                            result.typeIdSource = literal.source();
+                            result.sourceAddress = literal.address();
+                        }
+                        result.typeIdChain.add(typeIdChainEntry(
+                            currentFunction.getEntryPoint(),
+                            literal.typeId(),
+                            literal.source(),
+                            literal.address(),
+                            frame.depth,
+                            result.typeIdChain.size()));
+                    }
+                    if (followProviderCalls && isIdentityFlowSink(operation)) {
+                        collectPcodeCallOrigins(
+                            input,
+                            relevantCallees,
+                            new LinkedHashSet<>());
+                    }
+                }
+            }
+
+            if (!followProviderCalls) {
+                continue;
+            }
+            for (Address callee : relevantCallees) {
+                if (!callee.equals(currentFunction.getEntryPoint())) {
+                    pending.addLast(new HandlerScanFrame(callee, frame.depth + 1));
+                }
+            }
+        }
+        typeIdFlowCache.put(cacheKey, Optional.ofNullable(result));
+        return result;
+    }
+
+    private List<Varnode> identityEvidenceInputs(PcodeOpAST operation) {
+        if (operation == null) {
+            return List.of();
+        }
+        int first;
+        switch (operation.getOpcode()) {
+            case PcodeOp.CALL:
+            case PcodeOp.CALLIND:
+                first = 1;
+                break;
+            case PcodeOp.RETURN:
+                first = 1;
+                break;
+            case PcodeOp.INT_EQUAL:
+            case PcodeOp.INT_NOTEQUAL:
+            case PcodeOp.CBRANCH:
+                first = operation.getOpcode() == PcodeOp.CBRANCH ? 1 : 0;
+                break;
+            default:
+                return List.of();
+        }
+        ArrayList<Varnode> result = new ArrayList<>();
+        for (int slot = first; slot < operation.getNumInputs(); slot++) {
+            result.add(operation.getInput(slot));
+        }
+        return result;
+    }
+
+    private boolean isIdentityFlowSink(PcodeOpAST operation) {
+        if (operation == null) {
+            return false;
+        }
+        return switch (operation.getOpcode()) {
+            case PcodeOp.RETURN, PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL, PcodeOp.CBRANCH -> true;
+            default -> false;
+        };
+    }
+
+    private PcodeIdentityLiteral pcodeIdentityLiteral(Address address, int callDepth) {
+        if (!isProgramAddress(address)) {
+            return null;
+        }
+        String typeId = canonicalUuidFromExactString(readPrintableString(address));
+        String sourceKind = "pcode-string-operand";
+        if (typeId == null) {
+            typeId = canonicalUuidFromNativeUuidLiteral(address);
+            if (typeId == null || isZeroUuid(typeId)) {
+                return null;
+            }
+            sourceKind = "pcode-native-uuid-operand";
+        }
+        String source = callDepth == 0
+            ? sourceKind
+            : "provider-call-" + sourceKind;
+        return new PcodeIdentityLiteral(typeId, address, source);
+    }
+
+    private TypeNameDecode decodeTypeNameFromReturnFlow(Address function, Address provider) {
+        if (!isExecutableAddress(provider)) {
+            return null;
+        }
+        String cacheKey = addressCacheKey(
+            "type-name-flow:" +
+                (function == null ? "<none>" : Long.toUnsignedString(function.getOffset())),
+            provider);
+        Optional<TypeNameDecode> cached = typeNameFlowCache.get(cacheKey);
+        if (cached != null) {
+            runMetrics.increment("typeNameFlowCacheHits");
+            return cached.orElse(null);
+        }
+        runMetrics.increment("typeNameFlowCacheMisses");
+
+        Deque<Address> pending = new ArrayDeque<>();
+        pending.addLast(provider);
+        LinkedHashSet<String> seenFunctions = new LinkedHashSet<>();
+        LinkedHashMap<String, Address> names = new LinkedHashMap<>();
+        Address selectedProvider = null;
+
+        while (!pending.isEmpty()) {
+            Address current = resolvedCodeTarget(pending.removeFirst());
+            Function currentFunction = functionAtOrContaining(current);
+            if (currentFunction == null ||
+                !seenFunctions.add(currentFunction.getEntryPoint().toString())) {
+                continue;
+            }
+            HighFunction high = highFunction(currentFunction);
+            if (high == null) {
+                continue;
+            }
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (operation.getOpcode() != PcodeOp.RETURN ||
+                    operation.getNumInputs() < 2) {
+                    continue;
+                }
+                Varnode value = operation.getInput(operation.getNumInputs() - 1);
+                LinkedHashSet<Address> addresses = new LinkedHashSet<>();
+                collectPcodeAddressOrigins(value, addresses, new LinkedHashSet<>());
+                for (Address address : addresses) {
+                    String name = readPrintableString(address);
+                    if (isLikelyRuntimeTypeName(name)) {
+                        names.putIfAbsent(name, address);
+                        selectedProvider = currentFunction.getEntryPoint();
+                    }
+                }
+                LinkedHashSet<Address> callees = new LinkedHashSet<>();
+                collectPcodeCallOrigins(value, callees, new LinkedHashSet<>());
+                pending.addAll(callees);
+            }
+        }
+
+        if (names.size() != 1) {
+            typeNameFlowCache.put(cacheKey, Optional.empty());
+            return null;
+        }
+        Map.Entry<String, Address> selected = names.entrySet().iterator().next();
+        TypeNameDecode decode = new TypeNameDecode();
+        decode.function = function;
+        decode.provider = selectedProvider == null ? provider : selectedProvider;
+        decode.typeName = selected.getKey();
+        decode.typeNameSource = "pcode-return-string";
+        decode.typeNameAddress = selected.getValue();
+        typeNameFlowCache.put(cacheKey, Optional.of(decode));
+        return decode;
+    }
+
+    private Address stringAddressReturnedBySimpleFunction(Address function) {
+        TypeNameDecode decode = decodeTypeNameFromReturnFlow(function, resolvedCodeTarget(function));
+        return decode == null ? null : decode.typeNameAddress;
+    }
+
+    private Address uniqueAddressReturnedByFunction(Address functionAddress) {
+        Function function = functionAtOrContaining(resolvedCodeTarget(functionAddress));
+        if (function == null) {
+            return null;
+        }
+        String key = functionCacheKey("returned-address", function);
+        Optional<Address> cached = returnedAddressCache.get(key);
+        if (cached != null) {
+            return cached.orElse(null);
+        }
+
+        HighFunction high = highFunction(function);
+        LinkedHashSet<Address> candidates = new LinkedHashSet<>();
+        if (high != null) {
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (operation.getOpcode() != PcodeOp.RETURN ||
+                    operation.getNumInputs() < 2) {
+                    continue;
+                }
+                collectPcodeAddressOrigins(
+                    operation.getInput(operation.getNumInputs() - 1),
+                    candidates,
+                    new LinkedHashSet<>());
+            }
+        }
+        Address result = candidates.size() == 1 ? candidates.iterator().next() : null;
+        returnedAddressCache.put(key, Optional.ofNullable(result));
+        return result;
+    }

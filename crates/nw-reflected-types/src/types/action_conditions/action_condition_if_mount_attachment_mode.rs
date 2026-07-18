@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfMountAttachmentMode;
+pub struct ActionConditionIfMountAttachmentMode {}
 
 impl AzRtti for ActionConditionIfMountAttachmentMode {
     const NAME: &'static str = "ActionConditionIfMountAttachmentMode";

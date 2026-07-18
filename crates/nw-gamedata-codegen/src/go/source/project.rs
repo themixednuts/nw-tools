@@ -1,8 +1,6 @@
+use super::{GoSourceEmitError, format_go_source};
 use crate::emit::GameDataCodegenFile;
 use crate::project::{GO_TOOLCHAIN, GO_VERSION};
-use crate::target::GameDataProduct;
-
-use super::{GoSourceEmitError, format_go_source, is_go_identifier};
 
 mod game_assets;
 
@@ -14,8 +12,6 @@ pub struct GoStandaloneProject {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoStandaloneProjectOptions {
     module_path: String,
-    package_name: String,
-    include_product_placeholders: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,8 +24,6 @@ impl Default for GoStandaloneProjectOptions {
     fn default() -> Self {
         Self {
             module_path: "example.com/newworld/gamedata".to_owned(),
-            package_name: "gamedata".to_owned(),
-            include_product_placeholders: true,
         }
     }
 }
@@ -43,69 +37,42 @@ impl super::GoSourceEmitter {
         &self,
         options: &GoStandaloneProjectOptions,
     ) -> Result<GoStandaloneProject, GoSourceEmitError> {
-        if !is_go_identifier(options.package_name()) {
-            return Err(GoSourceEmitError::PackageName {
-                package_name: options.package_name().to_owned(),
-            });
-        }
-
         let mut files = vec![
             GoStandaloneProjectFile::new("go.mod", go_mod_source(options.module_path())),
-            GoStandaloneProjectFile::new("gamedata.go", gamedata_root_source(options)?),
+            GoStandaloneProjectFile::new("go.sum", go_sum_source()),
+            GoStandaloneProjectFile::new("assets/loader.go", assets_source(options)?),
+            GoStandaloneProjectFile::new("types/types.go", game_assets::types_go_source()?),
         ];
-        if options.include_product_placeholders {
-            if self
-                .target
-                .supports_product(GameDataProduct::SemanticManagers)
-            {
-                files.push(GoStandaloneProjectFile::new(
-                    "managers/managers.go",
-                    format_go_source("package managers\n")?,
-                ));
-            }
-            if self.target.supports_product(GameDataProduct::Systems) {
-                files.push(GoStandaloneProjectFile::new(
-                    "systems/systems.go",
-                    format_go_source("package systems\n")?,
-                ));
-            }
-        }
-        if self
-            .target
-            .supports_product(GameDataProduct::GameAssetAccess)
-        {
-            files.extend([
-                GoStandaloneProjectFile::new(
-                    "gameassets/catalog.go",
-                    game_assets::catalog_go_source()?,
-                ),
-                GoStandaloneProjectFile::new(
-                    "gameassets/datasheet.go",
-                    game_assets::datasheet_go_source()?,
-                ),
-                GoStandaloneProjectFile::new(
-                    "gameassets/filesystem.go",
-                    game_assets::filesystem_go_source()?,
-                ),
-                GoStandaloneProjectFile::new(
-                    "gameassets/localization.go",
-                    game_assets::localization_go_source()?,
-                ),
-                GoStandaloneProjectFile::new(
-                    "gameassets/objectstream.go",
-                    game_assets::object_stream_go_source()?,
-                ),
-                GoStandaloneProjectFile::new(
-                    "gameassets/oodle_unsupported.go",
-                    game_assets::oodle_unsupported_go_source()?,
-                ),
-                GoStandaloneProjectFile::new(
-                    "gameassets/oodle_windows.go",
-                    game_assets::oodle_windows_go_source()?,
-                ),
-                GoStandaloneProjectFile::new("gameassets/pak.go", game_assets::pak_go_source()?),
-            ]);
-        }
+        files.extend([
+            GoStandaloneProjectFile::new(
+                "internal/gameassets/catalog.go",
+                game_assets::catalog_go_source()?,
+            ),
+            GoStandaloneProjectFile::new(
+                "internal/gameassets/datasheet.go",
+                game_assets::datasheet_go_source()?,
+            ),
+            GoStandaloneProjectFile::new(
+                "internal/gameassets/localization.go",
+                game_assets::localization_go_source()?,
+            ),
+            GoStandaloneProjectFile::new(
+                "internal/gameassets/objectstream.go",
+                game_assets::object_stream_go_source()?,
+            ),
+            GoStandaloneProjectFile::new(
+                "internal/gameassets/oodle_unsupported.go",
+                game_assets::oodle_unsupported_go_source()?,
+            ),
+            GoStandaloneProjectFile::new(
+                "internal/gameassets/oodle_windows.go",
+                game_assets::oodle_windows_go_source()?,
+            ),
+            GoStandaloneProjectFile::new(
+                "internal/gameassets/pak.go",
+                game_assets::pak_go_source()?,
+            ),
+        ]);
         Ok(GoStandaloneProject { files })
     }
 }
@@ -132,28 +99,15 @@ impl GoStandaloneProject {
 
 impl GoStandaloneProjectOptions {
     #[must_use]
-    pub fn new(module_path: impl Into<String>, package_name: impl Into<String>) -> Self {
+    pub fn new(module_path: impl Into<String>) -> Self {
         Self {
             module_path: module_path.into(),
-            package_name: package_name.into(),
-            include_product_placeholders: true,
         }
     }
 
     #[must_use]
     pub fn module_path(&self) -> &str {
         &self.module_path
-    }
-
-    #[must_use]
-    pub fn package_name(&self) -> &str {
-        &self.package_name
-    }
-
-    #[must_use]
-    pub const fn with_product_placeholders(mut self, include: bool) -> Self {
-        self.include_product_placeholders = include;
-        self
     }
 }
 
@@ -183,32 +137,36 @@ impl GoStandaloneProjectFile {
 }
 
 fn go_mod_source(module_path: &str) -> String {
-    format!("module {module_path}\n\ngo {GO_VERSION}\n\ntoolchain {GO_TOOLCHAIN}\n")
+    format!(
+        "module {module_path}\n\ngo {GO_VERSION}\n\ntoolchain {GO_TOOLCHAIN}\n\nrequire github.com/google/uuid v1.6.0\n"
+    )
 }
 
-fn gamedata_root_source(options: &GoStandaloneProjectOptions) -> Result<String, GoSourceEmitError> {
+fn go_sum_source() -> String {
+    concat!(
+        "github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=\n",
+        "github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=\n",
+    )
+    .to_owned()
+}
+
+fn assets_source(options: &GoStandaloneProjectOptions) -> Result<String, GoSourceEmitError> {
     format_go_source(&format!(
         r#"
-package {}
+package assets
 
 import (
-	"{}/gameassets"
-	"{}/managers"
+	gameassets "{}/internal/gameassets"
 )
 
 type AssetLoader = gameassets.AssetLoader
-type Managers = managers.Managers
+type Catalog = gameassets.AssetCatalog
+type CatalogEntry = gameassets.AssetCatalogEntry
 
-func OpenDir(assetRoot string, pakPaths ...string) (*AssetLoader, error) {{
-	return gameassets.OpenDir(assetRoot, pakPaths...)
-}}
-
-func OpenManagers(loader *AssetLoader) (*Managers, error) {{
-	return managers.Open(loader)
+func Open(assetRoot string) (*AssetLoader, error) {{
+	return gameassets.Open(assetRoot)
 }}
 "#,
-        options.package_name(),
-        options.module_path(),
         options.module_path(),
     ))
 }
@@ -219,11 +177,10 @@ mod tests {
 
     #[test]
     fn standalone_project_uses_current_go_toolchain() {
-        let emitter = crate::go::source::GoSourceEmitter::standalone();
+        let emitter = crate::go::source::GoSourceEmitter;
         let project = emitter
             .emit_standalone_project_with_options(&GoStandaloneProjectOptions::new(
                 "example.com/acme/newworld-gamedata",
-                "nwgamedata",
             ))
             .expect("go project");
         let go_mod = project
@@ -232,27 +189,31 @@ mod tests {
             .find(|file| file.path() == "go.mod")
             .expect("go.mod")
             .source();
-        let root = project
+        let assets = project
             .files()
             .iter()
-            .find(|file| file.path() == "gamedata.go")
-            .expect("gamedata.go")
+            .find(|file| file.path() == "assets/loader.go")
+            .expect("assets loader")
+            .source();
+        let go_sum = project
+            .files()
+            .iter()
+            .find(|file| file.path() == "go.sum")
+            .expect("go.sum")
             .source();
 
         assert!(go_mod.contains("module example.com/acme/newworld-gamedata"));
         assert!(go_mod.contains("go 1.26"));
         assert!(go_mod.contains("toolchain go1.26.4"));
-        assert!(root.contains("package nwgamedata"));
-        assert!(root.contains("\"example.com/acme/newworld-gamedata/gameassets\""));
-        assert!(root.contains("\"example.com/acme/newworld-gamedata/managers\""));
-        assert!(root.contains("type AssetLoader = gameassets.AssetLoader"));
-        assert!(root.contains("type Managers = managers.Managers"));
+        assert!(go_sum.contains("github.com/google/uuid v1.6.0"));
         assert!(
-            root.contains(
-                "func OpenDir(assetRoot string, pakPaths ...string) (*AssetLoader, error)"
-            )
+            project
+                .files()
+                .iter()
+                .all(|file| file.path() != "gamedata.go")
         );
-        assert!(root.contains("func OpenManagers(loader *AssetLoader) (*Managers, error)"));
+        assert!(assets.contains("type AssetLoader = gameassets.AssetLoader"));
+        assert!(assets.contains("func Open(assetRoot string) (*AssetLoader, error)"));
         assert!(
             project
                 .files()
@@ -263,7 +224,7 @@ mod tests {
             project
                 .files()
                 .iter()
-                .any(|file| file.path() == "managers/managers.go")
+                .all(|file| file.path() != "managers/managers.go")
         );
         assert!(
             project
@@ -275,23 +236,22 @@ mod tests {
             project
                 .files()
                 .iter()
-                .any(|file| file.path() == "systems/systems.go")
+                .all(|file| file.path() != "systems/systems.go")
         );
         assert!(
             project
                 .files()
                 .iter()
-                .any(|file| file.path() == "gameassets/pak.go")
+                .any(|file| file.path() == "internal/gameassets/pak.go")
         );
     }
 
     #[test]
     fn source_format_standalone_project_emits_pak_oodle_runtime_files() {
-        let emitter = crate::go::source::GoSourceEmitter::standalone();
+        let emitter = crate::go::source::GoSourceEmitter;
         let project = emitter
             .emit_standalone_project_with_options(&GoStandaloneProjectOptions::new(
                 "example.com/acme/newworld-gamedata",
-                "nwgamedata",
             ))
             .expect("go project");
 
@@ -300,30 +260,17 @@ mod tests {
             .iter()
             .map(|file| file.path())
             .collect::<Vec<_>>();
-        assert!(paths.contains(&"gameassets/pak.go"));
-        assert!(paths.contains(&"gameassets/oodle_windows.go"));
-        assert!(paths.contains(&"gameassets/oodle_unsupported.go"));
+        assert!(paths.contains(&"internal/gameassets/pak.go"));
+        assert!(paths.contains(&"internal/gameassets/oodle_windows.go"));
+        assert!(paths.contains(&"internal/gameassets/oodle_unsupported.go"));
         assert!(
             project
                 .files()
                 .iter()
-                .find(|file| file.path() == "gameassets/oodle_windows.go")
+                .find(|file| file.path() == "internal/gameassets/oodle_windows.go")
                 .expect("windows oodle runtime")
                 .source()
                 .contains("OodleLZ_Decompress")
         );
-    }
-
-    #[test]
-    fn standalone_project_rejects_invalid_go_package_name() {
-        let emitter = crate::go::source::GoSourceEmitter::standalone();
-        let error = emitter
-            .emit_standalone_project_with_options(&GoStandaloneProjectOptions::new(
-                "example.com/acme/newworld-gamedata",
-                "newworld-gamedata",
-            ))
-            .expect_err("invalid package name");
-
-        assert!(matches!(error, GoSourceEmitError::PackageName { .. }));
     }
 }

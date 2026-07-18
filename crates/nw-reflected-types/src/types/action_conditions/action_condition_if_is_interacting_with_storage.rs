@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfIsInteractingWithStorage;
+pub struct ActionConditionIfIsInteractingWithStorage {}
 
 impl AzRtti for ActionConditionIfIsInteractingWithStorage {
     const NAME: &'static str = "ActionConditionIfIsInteractingWithStorage";

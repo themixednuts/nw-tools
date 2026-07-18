@@ -1,0 +1,503 @@
+    private void applyContainerCodecElementOffsets(
+        NetworkSchemaNaturalLoop loop,
+        List<ContainerCodecCall> codecs) {
+
+        if (loop == null || codecs == null || codecs.isEmpty()) {
+            return;
+        }
+        List<Long> selectedOffsets = null;
+        Varnode selectedRoot = null;
+        for (PcodeOpAST induction : containerElementInductions(loop)) {
+            ArrayList<Long> offsets = new ArrayList<>(codecs.size());
+            for (ContainerCodecCall codec : codecs) {
+                Long offset = containerCodecElementOffset(
+                    loop,
+                    codec,
+                    induction.getOutput());
+                if (offset == null) {
+                    offsets.clear();
+                    break;
+                }
+                offsets.add(offset);
+            }
+            if (offsets.isEmpty()) {
+                continue;
+            }
+            if (selectedOffsets != null) {
+                return;
+            }
+            selectedOffsets = List.copyOf(offsets);
+            selectedRoot = induction.getOutput();
+        }
+        if (selectedOffsets == null) {
+            return;
+        }
+        for (int index = 0; index < codecs.size(); index++) {
+            ContainerCodecCall codec = codecs.get(index);
+            codec.elementBase = "element";
+            codec.elementOffset = selectedOffsets.get(index);
+            projectContainerLoopCodecMemberOffsets(codec, selectedRoot);
+        }
+    }
+
+    private void projectContainerLoopCodecMemberOffsets(
+        ContainerCodecCall codec,
+        Varnode elementRoot) {
+
+        if (codec == null || codec.operation == null || elementRoot == null ||
+            codec.members.isEmpty()) {
+            return;
+        }
+        List<ContainerCodecCall> leaves = physicalContainerCodecLeaves(codec.members);
+        if (leaves == null || leaves.isEmpty()) {
+            return;
+        }
+
+        ArrayList<Long> translated = new ArrayList<>(leaves.size());
+        for (ContainerCodecCall leaf : leaves) {
+            Integer formalSlot = pcodeParameterIndex(leaf.elementBase);
+            if (formalSlot == null || leaf.elementOffset == null ||
+                formalSlot >= codec.operation.getNumInputs()) {
+                return;
+            }
+            Long argumentOffset = pcodeConstantOffsetFromRoot(
+                codec.operation.getInput(formalSlot),
+                elementRoot,
+                new LinkedHashSet<>(),
+                0);
+            Long absoluteOffset = argumentOffset == null
+                ? null
+                : addExactOrNull(argumentOffset, leaf.elementOffset);
+            if (absoluteOffset == null || absoluteOffset < 0L ||
+                absoluteOffset > 0x100000L) {
+                return;
+            }
+            translated.add(absoluteOffset);
+        }
+        for (int index = 0; index < leaves.size(); index++) {
+            ContainerCodecCall leaf = leaves.get(index);
+            leaf.elementBase = "element";
+            leaf.elementOffset = translated.get(index);
+        }
+    }
+
+    private Long containerCodecElementOffset(
+        NetworkSchemaNaturalLoop loop,
+        ContainerCodecCall codec,
+        Varnode elementRoot) {
+
+        PcodeOp operation = codec == null ? null : codec.operation;
+        if (loop == null || operation == null || elementRoot == null) {
+            return null;
+        }
+        Integer valueWidth = codec.nativeType == null
+            ? null
+            : nativeTypeByteWidth(codec.nativeType);
+        if (valueWidth == null && codec.wireEvidence != null) {
+            valueWidth = wireShapeByteWidth(codec.wireEvidence.layout);
+        }
+        Function owner = operation.getSeqnum() == null
+            ? null
+            : functionContaining(operation.getSeqnum().getTarget());
+        Function target = pcodeCallTarget(operation);
+        Long selected = null;
+        int argumentCount = provenCallArgumentCount(operation, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            Varnode input = slot < operation.getNumInputs()
+                ? operation.getInput(slot)
+                : null;
+            Long offset = input == null || input.isConstant()
+                ? null
+                : pcodeConstantOffsetFromRoot(
+                    input,
+                    elementRoot,
+                    new LinkedHashSet<>(),
+                    0);
+            if (offset == null) {
+                PcodeStorage argumentStorage = provenCallArgumentStorage(
+                    owner,
+                    operation,
+                    target,
+                    slot);
+                offset = containerIndirectArgumentSourceOffset(
+                    loop,
+                    operation,
+                    argumentStorage,
+                    elementRoot,
+                    valueWidth);
+            }
+            if (offset == null || offset < 0L || offset > 0x100000L) {
+                continue;
+            }
+            if (selected != null && !selected.equals(offset)) {
+                return null;
+            }
+            selected = offset;
+        }
+        return selected;
+    }
+
+    private Long containerIndirectArgumentSourceOffset(
+        NetworkSchemaNaturalLoop loop,
+        PcodeOp call,
+        PcodeStorage argumentStorage,
+        Varnode elementRoot,
+        Integer valueWidth) {
+
+        if (argumentStorage == null || call.getSeqnum() == null) {
+            return null;
+        }
+        Long selected = null;
+        for (PcodeBlockBasic block : loop.body()) {
+            var iterator = block.getIterator();
+            while (iterator.hasNext()) {
+                PcodeOp operation = iterator.next();
+                if (operation.getOpcode() != PcodeOp.INDIRECT ||
+                    operation.getOutput() == null || operation.getNumInputs() == 0 ||
+                    operation.getSeqnum() == null ||
+                    !call.getSeqnum().getTarget().equals(operation.getSeqnum().getTarget()) ||
+                    !argumentStorage.sameLocation(
+                        pcodeStorageExpression(operation.getOutput()))) {
+                    continue;
+                }
+                Varnode value = operation.getInput(0);
+                int byteLength = valueWidth == null ? value.getSize() : valueWidth;
+                Long offset = loadedElementOffset(
+                    value,
+                    elementRoot,
+                    0,
+                    byteLength,
+                    new LinkedHashSet<>(),
+                    0);
+                if (offset == null) {
+                    continue;
+                }
+                if (selected != null && !selected.equals(offset)) {
+                    return null;
+                }
+                selected = offset;
+            }
+        }
+        return selected;
+    }
+
+    private Long loadedElementOffset(
+        Varnode value,
+        Varnode elementRoot,
+        int byteOffset,
+        int byteLength,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || elementRoot == null || byteOffset < 0 || byteLength <= 0 ||
+            byteOffset > value.getSize() || byteLength > value.getSize() - byteOffset ||
+            depth > 48 || !active.add(
+                pcodeNodeKey(value) + ':' + byteOffset + ':' + byteLength)) {
+            return null;
+        }
+        PcodeOp definition = value.getDef();
+        if (definition == null) {
+            return null;
+        }
+        return switch (definition.getOpcode()) {
+            case PcodeOp.LOAD -> loadedElementMemoryOffset(
+                definition,
+                elementRoot,
+                byteOffset);
+            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INDIRECT ->
+                definition.getNumInputs() == 0
+                    ? null
+                    : loadedElementOffset(
+                        definition.getInput(0),
+                        elementRoot,
+                        byteOffset,
+                        byteLength,
+                        active,
+                        depth + 1);
+            case PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT ->
+                loadedElementExtensionOffset(
+                    definition,
+                    elementRoot,
+                    byteOffset,
+                    byteLength,
+                    active,
+                    depth + 1);
+            case PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL ->
+                loadedElementBooleanComparisonOffset(
+                    definition,
+                    elementRoot,
+                    byteOffset,
+                    byteLength,
+                    active,
+                    depth + 1);
+            case PcodeOp.BOOL_NEGATE ->
+                byteOffset == 0 && byteLength == 1 && definition.getNumInputs() == 1
+                    ? loadedElementOffset(
+                        definition.getInput(0),
+                        elementRoot,
+                        0,
+                        definition.getInput(0).getSize(),
+                        active,
+                        depth + 1)
+                    : null;
+            case PcodeOp.SUBPIECE -> loadedElementSubpieceOffset(
+                definition,
+                elementRoot,
+                byteOffset,
+                byteLength,
+                active,
+                depth + 1);
+            case PcodeOp.PIECE -> loadedElementPieceOffset(
+                definition,
+                elementRoot,
+                byteOffset,
+                byteLength,
+                active,
+                depth + 1);
+            case PcodeOp.MULTIEQUAL -> mergedLoadedElementOffset(
+                definition,
+                elementRoot,
+                byteOffset,
+                byteLength,
+                active,
+                depth + 1);
+            default -> null;
+        };
+    }
+
+    private Long loadedElementBooleanComparisonOffset(
+        PcodeOp comparison,
+        Varnode elementRoot,
+        int byteOffset,
+        int byteLength,
+        Set<String> active,
+        int depth) {
+
+        if (byteOffset != 0 || byteLength != 1 || comparison.getNumInputs() != 2) {
+            return null;
+        }
+        Varnode value = null;
+        for (int slot = 0; slot < 2; slot++) {
+            Varnode candidateZero = comparison.getInput(slot);
+            Long zero = NetworkSchemaIntegerEvaluator.evaluate(candidateZero);
+            if (zero == null || zero != 0L) {
+                continue;
+            }
+            Varnode candidateValue = comparison.getInput(1 - slot);
+            if (candidateValue.isConstant() || value != null) {
+                return null;
+            }
+            value = candidateValue;
+        }
+        return value == null
+            ? null
+            : loadedElementOffset(
+                value,
+                elementRoot,
+                0,
+                value.getSize(),
+                active,
+                depth);
+    }
+
+    private Long loadedElementMemoryOffset(
+        PcodeOp load,
+        Varnode elementRoot,
+        int byteOffset) {
+
+        if (load.getNumInputs() < 2) {
+            return null;
+        }
+        Long base = pcodeConstantOffsetFromRoot(
+            load.getInput(1),
+            elementRoot,
+            new LinkedHashSet<>(),
+            0);
+        return base == null ? null : addExactOrNull(base, (long)byteOffset);
+    }
+
+    private Long loadedElementExtensionOffset(
+        PcodeOp extension,
+        Varnode elementRoot,
+        int byteOffset,
+        int byteLength,
+        Set<String> active,
+        int depth) {
+
+        if (extension.getNumInputs() == 0) {
+            return null;
+        }
+        Varnode source = extension.getInput(0);
+        return byteOffset > source.getSize() || byteLength > source.getSize() - byteOffset
+            ? null
+            : loadedElementOffset(
+                source,
+                elementRoot,
+                byteOffset,
+                byteLength,
+                active,
+                depth);
+    }
+
+    private Long loadedElementSubpieceOffset(
+        PcodeOp subpiece,
+        Varnode elementRoot,
+        int byteOffset,
+        int byteLength,
+        Set<String> active,
+        int depth) {
+
+        if (subpiece.getNumInputs() < 2 || !subpiece.getInput(1).isConstant()) {
+            return null;
+        }
+        long dropped = subpiece.getInput(1).getOffset();
+        if (dropped > Integer.MAX_VALUE - byteOffset) {
+            return null;
+        }
+        return loadedElementOffset(
+            subpiece.getInput(0),
+            elementRoot,
+            (int)dropped + byteOffset,
+            byteLength,
+            active,
+            depth);
+    }
+
+    private Long loadedElementPieceOffset(
+        PcodeOp piece,
+        Varnode elementRoot,
+        int byteOffset,
+        int byteLength,
+        Set<String> active,
+        int depth) {
+
+        if (piece.getNumInputs() < 2) {
+            return null;
+        }
+        Varnode high = piece.getInput(0);
+        Varnode low = piece.getInput(1);
+        int lowSize = low.getSize();
+        int end = byteOffset + byteLength;
+        if (end <= lowSize) {
+            return loadedElementOffset(
+                low,
+                elementRoot,
+                byteOffset,
+                byteLength,
+                active,
+                depth);
+        }
+        if (byteOffset >= lowSize) {
+            return loadedElementOffset(
+                high,
+                elementRoot,
+                byteOffset - lowSize,
+                byteLength,
+                active,
+                depth);
+        }
+        return null;
+    }
+
+    private Long mergedLoadedElementOffset(
+        PcodeOp merge,
+        Varnode elementRoot,
+        int byteOffset,
+        int byteLength,
+        Set<String> active,
+        int depth) {
+
+        Long selected = null;
+        for (int slot = 0; slot < merge.getNumInputs(); slot++) {
+            Long offset = loadedElementOffset(
+                merge.getInput(slot),
+                elementRoot,
+                byteOffset,
+                byteLength,
+                new LinkedHashSet<>(active),
+                depth);
+            if (offset == null || selected != null && !selected.equals(offset)) {
+                return null;
+            }
+            selected = offset;
+        }
+        return selected;
+    }
+
+    private List<PcodeOpAST> containerElementInductions(NetworkSchemaNaturalLoop loop) {
+        ArrayList<PcodeOpAST> result = new ArrayList<>();
+        for (PcodeBlockBasic block : loop.body()) {
+            var iterator = block.getIterator();
+            while (iterator.hasNext()) {
+                PcodeOp operation = iterator.next();
+                if (!(operation instanceof PcodeOpAST phi) ||
+                    phi.getOpcode() != PcodeOp.MULTIEQUAL || phi.getOutput() == null ||
+                    phi.getOutput().getSize() != currentProgram.getDefaultPointerSize() ||
+                    inductionFromPhi(phi) == null) {
+                    continue;
+                }
+                result.add(phi);
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private ContainerCodecPartition indexMapCodecPartition(
+        List<ContainerCodecCall> codecs) {
+
+        if (codecs == null || codecs.size() < 2) {
+            return null;
+        }
+        Long keyOffset = codecs.get(0).elementOffset;
+        if (keyOffset == null) {
+            return null;
+        }
+        for (int index = 1; index < codecs.size(); index++) {
+            Long offset = codecs.get(index).elementOffset;
+            if (offset == null || offset <= keyOffset) {
+                return null;
+            }
+        }
+        return new ContainerCodecPartition(
+            List.of(codecs.get(0)),
+            List.copyOf(codecs.subList(1, codecs.size())));
+    }
+
+    private List<PcodeCodecCall> loopReadBufferCodecCalls(
+        Function function,
+        NetworkSchemaNaturalLoop loop,
+        String readBufferParameter,
+        List<PcodeOpAST> operations) {
+
+        if (function == null || loop == null || readBufferParameter == null ||
+            operations == null) {
+            return List.of();
+        }
+        PcodeStorage readBuffer = new PcodeStorage(readBufferParameter, 0L);
+        ArrayList<PcodeCodecCall> result = new ArrayList<>();
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (target == null || provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    readBuffer) == null) {
+                continue;
+            }
+            result.add(new PcodeCodecCall(operation, directCallWireEvidence(operation)));
+        }
+        return List.copyOf(result);
+    }
+
+    private record ContainerCodecPartition(
+        List<ContainerCodecCall> keyCodecs,
+        List<ContainerCodecCall> valueCodecs) {
+
+        ContainerCodecPartition {
+            keyCodecs = List.copyOf(keyCodecs);
+            valueCodecs = List.copyOf(valueCodecs);
+        }
+    }

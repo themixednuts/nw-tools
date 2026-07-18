@@ -97,31 +97,11 @@ final class ArgState {
     HandlerConstruction handlerConstruction;
     List<HandlerConstructorWrite> handlerConstructorWrites;
 
-    void fillMissingFrom(ArgState fallback) {
-        if (nameAddress == null) {
-            nameAddress = fallback.nameAddress;
-            name = fallback.name;
-        }
-        if (!groupKnown && fallback.groupKnown) {
-            groupKnown = true;
-            group = fallback.group;
-        }
-        if (!handlerKnown && fallback.handlerKnown) {
-            handlerKnown = true;
-            handlerOffset = fallback.handlerOffset;
-            handlerExpression = fallback.handlerExpression;
-            handlerVtable = fallback.handlerVtable;
-            handlerConstruction = fallback.handlerConstruction;
-            handlerConstructorWrites = fallback.handlerConstructorWrites;
-        } else if (handlerVtable == null) {
-            handlerVtable = fallback.handlerVtable;
-        }
-        if (handlerConstruction == null) {
-            handlerConstruction = fallback.handlerConstruction;
-        }
-        if (handlerConstructorWrites == null) {
-            handlerConstructorWrites = fallback.handlerConstructorWrites;
-        }
+}
+
+record ObjectOffset(String base, int offset) {
+    ObjectOffset {
+        Objects.requireNonNull(base, "base");
     }
 }
 
@@ -131,9 +111,10 @@ final class ForwardArgState {
     final Map<Integer, HandlerConstruction> handlerConstructionsByThisOffset = new HashMap<>();
     final Map<Integer, List<HandlerConstructorWrite>> constructorWritesByHandlerOffset =
             new HashMap<>();
-    final Map<String, Address> vtablesByBaseOffset = new HashMap<>();
-    final Map<String, HandlerConstruction> handlerConstructionsByBaseOffset = new HashMap<>();
-    final Map<String, List<HandlerConstructorWrite>> constructorWritesByBaseOffset =
+    final Map<ObjectOffset, Address> vtablesByBaseOffset = new HashMap<>();
+    final Map<ObjectOffset, HandlerConstruction> handlerConstructionsByBaseOffset =
+            new HashMap<>();
+    final Map<ObjectOffset, List<HandlerConstructorWrite>> constructorWritesByBaseOffset =
             new HashMap<>();
     final Set<String> allocatorDispatchRegisters = new LinkedHashSet<>();
     final Map<Integer, TrackedValue> valuesByThisOffset = new HashMap<>();
@@ -169,7 +150,7 @@ final class ForwardArgState {
         }
         vtablesByBaseOffset.putAll(other.vtablesByBaseOffset);
         handlerConstructionsByBaseOffset.putAll(other.handlerConstructionsByBaseOffset);
-        for (Map.Entry<String, List<HandlerConstructorWrite>> entry :
+        for (Map.Entry<ObjectOffset, List<HandlerConstructorWrite>> entry :
                 other.constructorWritesByBaseOffset.entrySet()) {
             constructorWritesByBaseOffset.put(entry.getKey(), new ArrayList<>(entry.getValue()));
         }
@@ -182,7 +163,7 @@ final class ForwardArgState {
         if (!compatibleAddressMap(vtablesByThisOffset, other.vtablesByThisOffset)) {
             return false;
         }
-        if (!compatibleAddressMapByString(vtablesByBaseOffset, other.vtablesByBaseOffset)) {
+        if (!compatibleAddressMap(vtablesByBaseOffset, other.vtablesByBaseOffset)) {
             return false;
         }
         if (!compatibleRegister("RCX", other)) {
@@ -209,7 +190,7 @@ final class ForwardArgState {
                 other.handlerConstructionsByThisOffset.entrySet()) {
             handlerConstructionsByThisOffset.putIfAbsent(entry.getKey(), entry.getValue());
         }
-        for (Map.Entry<String, HandlerConstruction> entry :
+        for (Map.Entry<ObjectOffset, HandlerConstruction> entry :
                 other.handlerConstructionsByBaseOffset.entrySet()) {
             handlerConstructionsByBaseOffset.putIfAbsent(entry.getKey(), entry.getValue());
         }
@@ -219,7 +200,7 @@ final class ForwardArgState {
                     .computeIfAbsent(entry.getKey(), ignored -> new ArrayList<>())
                     .addAll(entry.getValue());
         }
-        for (Map.Entry<String, List<HandlerConstructorWrite>> entry :
+        for (Map.Entry<ObjectOffset, List<HandlerConstructorWrite>> entry :
                 other.constructorWritesByBaseOffset.entrySet()) {
             constructorWritesByBaseOffset
                     .computeIfAbsent(entry.getKey(), ignored -> new ArrayList<>())
@@ -233,6 +214,48 @@ final class ForwardArgState {
             valuesByThisOffset.putIfAbsent(entry.getKey(), entry.getValue().copy());
         }
         return true;
+    }
+
+    boolean retainCommonDataflowFrom(ForwardArgState other) {
+        boolean changed = retainCommonValues(registers, other.registers);
+        changed |= retainCommonValues(valuesByStackSlot, other.valuesByStackSlot);
+        changed |= retainCommonValues(valuesByThisOffset, other.valuesByThisOffset);
+        changed |= retainCommonSet(allocatorDispatchRegisters, other.allocatorDispatchRegisters);
+        if (!Objects.equals(zeroFlag, other.zeroFlag) && zeroFlag != null) {
+            zeroFlag = null;
+            changed = true;
+        }
+        if (!Objects.equals(compareSigned, other.compareSigned) && compareSigned != null) {
+            compareSigned = null;
+            changed = true;
+        }
+        if (!Objects.equals(compareUnsigned, other.compareUnsigned) && compareUnsigned != null) {
+            compareUnsigned = null;
+            changed = true;
+        }
+        return changed;
+    }
+
+    private static <K> boolean retainCommonValues(
+            Map<K, TrackedValue> values,
+            Map<K, TrackedValue> other) {
+        boolean changed = false;
+        var iterator = values.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<K, TrackedValue> entry = iterator.next();
+            TrackedValue candidate = other.get(entry.getKey());
+            if (candidate == null || !entry.getValue().sameValue(candidate)) {
+                iterator.remove();
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    private static <T> boolean retainCommonSet(Set<T> values, Set<T> other) {
+        int previousSize = values.size();
+        values.retainAll(other);
+        return values.size() != previousSize;
     }
 
     private boolean compatibleRegister(String register, ForwardArgState other) {
@@ -256,9 +279,9 @@ final class ForwardArgState {
         }
     }
 
-    private static boolean compatibleAddressMap(
-            Map<Integer, Address> left, Map<Integer, Address> right) {
-        for (Map.Entry<Integer, Address> entry : right.entrySet()) {
+    private static <K> boolean compatibleAddressMap(
+            Map<K, Address> left, Map<K, Address> right) {
+        for (Map.Entry<K, Address> entry : right.entrySet()) {
             Address existing = left.get(entry.getKey());
             if (existing != null && !existing.equals(entry.getValue())) {
                 return false;
@@ -267,14 +290,4 @@ final class ForwardArgState {
         return true;
     }
 
-    private static boolean compatibleAddressMapByString(
-            Map<String, Address> left, Map<String, Address> right) {
-        for (Map.Entry<String, Address> entry : right.entrySet()) {
-            Address existing = left.get(entry.getKey());
-            if (existing != null && !existing.equals(entry.getValue())) {
-                return false;
-            }
-        }
-        return true;
-    }
 }

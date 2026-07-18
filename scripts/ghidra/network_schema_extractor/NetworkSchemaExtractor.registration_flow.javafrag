@@ -1,0 +1,775 @@
+    private PcodeOpAST directCallAt(
+        Function owner,
+        Address callsite,
+        Address expectedTarget) {
+
+        HighFunction high = highFunction(owner);
+        if (high == null || callsite == null || expectedTarget == null) {
+            return null;
+        }
+        PcodeOpAST selected = null;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL ||
+                !callsite.equals(operation.getSeqnum().getTarget())) {
+                continue;
+            }
+            PcodeCallTargetInfo target = pcodeCallTargetInfo(operation);
+            if (target == null || !expectedTarget.equals(target.resolvedTarget)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = operation;
+        }
+        return selected;
+    }
+
+    private Address findRegistrationHelperTable(Function owner) {
+        if (owner == null) {
+            return null;
+        }
+        Address queueRegistrationHook =
+            currentProgram.getImageBase().add(QUEUE_REGISTRATION_HOOK_RVA);
+        Address selected = null;
+        for (Instruction instruction : functionInstructions(owner)) {
+            if (!instruction.getFlowType().isCall() ||
+                !queueRegistrationHook.equals(resolvedCodeTarget(callTarget(instruction)))) {
+                continue;
+            }
+            Address helperTable = findRegistrationHelperTable(
+                owner,
+                instruction.getMinAddress());
+            if (helperTable == null) {
+                continue;
+            }
+            if (selected != null && !selected.equals(helperTable)) {
+                return null;
+            }
+            selected = helperTable;
+        }
+        return selected;
+    }
+
+    private Address findRegistrationHelperTable(Function owner, Address callsite) {
+        if (owner == null || callsite == null) {
+            return null;
+        }
+        ForwardArgState state = abiCallsiteStates(owner).get(callsite.getOffset());
+        if (state == null) {
+            return null;
+        }
+
+        LinkedHashSet<Address> candidates = new LinkedHashSet<>();
+        TrackedValue object = state.registers.get("RCX");
+        collectRegistrationHelperTableCandidate(candidates, object);
+        if (object != null && object.stackOffset != null) {
+            collectRegistrationHelperTableCandidate(
+                candidates,
+                state.valuesByStackSlot.get(object.stackOffset));
+        }
+        if (object != null && object.thisOffset != null) {
+            collectRegistrationHelperTableCandidate(
+                candidates,
+                state.valuesByThisOffset.get(object.thisOffset));
+        }
+        candidates.removeIf(candidate -> !isRegistrationHelperTable(candidate));
+        return candidates.size() == 1 ? candidates.iterator().next() : null;
+    }
+
+    private void collectRegistrationHelperTableCandidate(
+        Set<Address> candidates,
+        TrackedValue value) {
+
+        if (value == null || !isProgramAddress(value.address)) {
+            return;
+        }
+        candidates.add(value.address);
+    }
+
+    private PcodeStorageWrite latestDominatingStorageWrite(
+        HighFunction high,
+        PcodeOpAST before,
+        PcodeStorage destination) {
+
+        PcodeStorageWrite selected = null;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (!NetworkSchemaControlFlow.precedes(high, operation, before)) {
+                continue;
+            }
+            PcodeStorageWrite candidate = storageWrite(operation);
+            if (candidate == null) {
+                continue;
+            }
+            PcodeStorage candidateStorage = writtenStorage(candidate.operation());
+            if (candidateStorage == null || !destination.sameLocation(candidateStorage)) {
+                continue;
+            }
+            if (selected == null) {
+                selected = candidate;
+                continue;
+            }
+            if (NetworkSchemaControlFlow.precedes(
+                high,
+                selected.operation(),
+                candidate.operation())) {
+                selected = candidate;
+            }
+            else if (!NetworkSchemaControlFlow.precedes(
+                high,
+                candidate.operation(),
+                selected.operation())) {
+                return null;
+            }
+        }
+        return selected;
+    }
+
+    private PcodeStorageWrite storageWrite(PcodeOpAST operation) {
+        if (operation == null) {
+            return null;
+        }
+        if (operation.getOpcode() == PcodeOp.STORE) {
+            return operation.getNumInputs() < 3
+                ? null
+                : new PcodeStorageWrite(operation, operation.getInput(2));
+        }
+        return operation.getOutput() == null
+            ? null
+            : new PcodeStorageWrite(operation, operation.getOutput());
+    }
+
+    private PcodeStorage writtenStorage(PcodeOpAST operation) {
+        if (operation == null) {
+            return null;
+        }
+        if (operation.getOpcode() == PcodeOp.STORE) {
+            return operation.getNumInputs() < 2
+                ? null
+                : pcodeStorageExpression(operation.getInput(1));
+        }
+        return pcodeStorageExpression(operation.getOutput());
+    }
+
+    private void collectPcodeAddressOrigins(
+        Varnode node,
+        Set<Address> result,
+        Set<String> seen) {
+
+        if (node == null || !seen.add(pcodeNodeKey(node))) {
+            return;
+        }
+        Address direct = pcodeAddress(node);
+        if (isProgramAddress(direct)) {
+            result.add(direct);
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null || definition.getOpcode() == PcodeOp.CALL) {
+            return;
+        }
+        int firstInput = definition.getOpcode() == PcodeOp.LOAD ? 1 : 0;
+        for (int slot = firstInput; slot < definition.getNumInputs(); slot++) {
+            collectPcodeAddressOrigins(definition.getInput(slot), result, seen);
+        }
+    }
+
+    private TypeIdDecode typeIdForRegisterTypeCall(
+        Function owner,
+        Address callsite) {
+
+        Address registerType =
+            currentProgram.getImageBase().add(TYPE_REGISTRY_REGISTER_TYPE_RVA);
+        PcodeOpAST call = directCallAt(owner, callsite, registerType);
+        HighFunction high = highFunction(owner);
+        if (call == null || high == null || call.getNumInputs() < 3) {
+            return null;
+        }
+
+        LinkedHashSet<Address> providers = registerTypeProviderOrigins(high, call);
+        LinkedHashMap<String, TypeIdDecode> decodedByTypeId = new LinkedHashMap<>();
+        for (Address provider : providers) {
+            TypeIdDecode decoded = decodeDirectTypeIdProvider(provider);
+            if (decoded == null || decoded.typeId == null) {
+                continue;
+            }
+            decodedByTypeId.putIfAbsent(normalizeUuid(decoded.typeId), decoded);
+        }
+        return decodedByTypeId.size() == 1
+            ? decodedByTypeId.values().iterator().next()
+            : null;
+    }
+
+    private Address typeProviderForRegisterTypeCall(
+        Function owner,
+        Address callsite) {
+
+        Address registerType =
+            currentProgram.getImageBase().add(TYPE_REGISTRY_REGISTER_TYPE_RVA);
+        PcodeOpAST call = directCallAt(owner, callsite, registerType);
+        HighFunction high = highFunction(owner);
+        if (call == null || high == null) {
+            return null;
+        }
+        LinkedHashSet<Address> providers = registerTypeProviderOrigins(high, call);
+        return providers.size() == 1 ? providers.iterator().next() : null;
+    }
+
+    private LinkedHashSet<Address> registerTypeProviderOrigins(
+        HighFunction high,
+        PcodeOpAST registerCall) {
+
+        LinkedHashSet<Address> result = new LinkedHashSet<>();
+        if (high == null || registerCall == null || registerCall.getNumInputs() < 3) {
+            return result;
+        }
+        PcodeStorage descriptorPair = pcodeStorageExpression(registerCall.getInput(2));
+        if (descriptorPair == null) {
+            return result;
+        }
+
+        Address callsite = registerCall.getSeqnum().getTarget();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.INDIRECT ||
+                operation.getOutput() == null ||
+                !Objects.equals(callsite, operation.getSeqnum().getTarget())) {
+                continue;
+            }
+            PcodeStorage output = pcodeStorageExpression(operation.getOutput());
+            if (!storageWithin(output, descriptorPair, 16L) ||
+                operation.getNumInputs() == 0) {
+                continue;
+            }
+            collectPcodeCallOrigins(
+                operation.getInput(0),
+                result,
+                new LinkedHashSet<>());
+        }
+
+        for (long offset = 0; offset < 16L; offset += 8L) {
+            PcodeStorageWrite write = latestDominatingStorageWrite(
+                high,
+                registerCall,
+                descriptorPair.plus(offset));
+            if (write != null) {
+                collectPcodeCallOrigins(
+                    write.value(),
+                    result,
+                    new LinkedHashSet<>());
+            }
+        }
+        result.remove(registerCall.getSeqnum().getTarget());
+        return result;
+    }
+
+    private boolean storageWithin(
+        PcodeStorage candidate,
+        PcodeStorage base,
+        long byteLength) {
+
+        if (candidate == null || base == null || byteLength <= 0L ||
+            !Objects.equals(candidate.base, base.base)) {
+            return false;
+        }
+        long relative = candidate.offset - base.offset;
+        return relative >= 0L && relative < byteLength;
+    }
+
+    private void collectPcodeCallOrigins(
+        Varnode node,
+        Set<Address> result,
+        Set<String> seen) {
+
+        if (node == null || !seen.add(pcodeNodeKey(node))) {
+            return;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return;
+        }
+        if (definition.getOpcode() == PcodeOp.CALL) {
+            PcodeCallTargetInfo target = pcodeCallTargetInfo(definition);
+            if (target != null && isExecutableAddress(target.resolvedTarget)) {
+                result.add(target.resolvedTarget);
+            }
+            return;
+        }
+
+        int firstInput = definition.getOpcode() == PcodeOp.LOAD ? 1 : 0;
+        if (definition.getOpcode() == PcodeOp.INDIRECT) {
+            firstInput = 0;
+        }
+        int inputCount = definition.getOpcode() == PcodeOp.INDIRECT
+            ? Math.min(1, definition.getNumInputs())
+            : definition.getNumInputs();
+        for (int slot = firstInput; slot < inputCount; slot++) {
+            Varnode input = definition.getInput(slot);
+            if (input != null && !input.isConstant()) {
+                collectPcodeCallOrigins(input, result, seen);
+            }
+        }
+    }
+
+    private PcodeOpAST uniquePcodeCallOrigin(Varnode node) {
+        LinkedHashSet<PcodeOpAST> origins = new LinkedHashSet<>();
+        collectPcodeCallOriginOperations(node, origins, new LinkedHashSet<>());
+        return origins.size() == 1 ? origins.iterator().next() : null;
+    }
+
+    private void collectPcodeCallOriginOperations(
+        Varnode node,
+        Set<PcodeOpAST> result,
+        Set<String> seen) {
+
+        if (node == null || !seen.add(pcodeNodeKey(node))) {
+            return;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return;
+        }
+        if (definition instanceof PcodeOpAST ast &&
+            (definition.getOpcode() == PcodeOp.CALL ||
+                definition.getOpcode() == PcodeOp.CALLIND)) {
+            result.add(ast);
+            return;
+        }
+        int firstInput = definition.getOpcode() == PcodeOp.LOAD ? 1 : 0;
+        int inputCount = definition.getOpcode() == PcodeOp.INDIRECT
+            ? Math.min(1, definition.getNumInputs())
+            : definition.getNumInputs();
+        for (int slot = firstInput; slot < inputCount; slot++) {
+            Varnode input = definition.getInput(slot);
+            if (input != null && !input.isConstant()) {
+                collectPcodeCallOriginOperations(input, result, seen);
+            }
+        }
+    }
+
+    private boolean isPcodeAllocatorCall(PcodeOpAST call) {
+        if (call == null) {
+            return false;
+        }
+        if (call.getOpcode() == PcodeOp.CALL) {
+            return isNamedAllocatorFunction(fullFunctionName(pcodeCallTarget(call)));
+        }
+        if (call.getOpcode() != PcodeOp.CALLIND || call.getNumInputs() < 4) {
+            return false;
+        }
+        PcodeStorage receiver = pcodeStorageExpression(call.getInput(1));
+        return receiver != null && pcodeValueDependsOnStorage(
+            call.getInput(0),
+            receiver,
+            new LinkedHashSet<>());
+    }
+
+    private boolean pcodeValueDependsOnStorage(
+        Varnode node,
+        PcodeStorage expected,
+        Set<String> seen) {
+
+        if (node == null || expected == null || !seen.add(pcodeNodeKey(node))) {
+            return false;
+        }
+        PcodeStorage storage = pcodeStorageExpression(node);
+        if (storage != null && Objects.equals(storage.base, expected.base) &&
+            storage.offset >= expected.offset) {
+            return true;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null || definition.getOpcode() == PcodeOp.CALL ||
+            definition.getOpcode() == PcodeOp.CALLIND) {
+            return false;
+        }
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            Varnode input = definition.getInput(slot);
+            if (input != null && !input.isConstant() &&
+                pcodeValueDependsOnStorage(input, expected, seen)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    private List<FieldCall> recoverRegisterFieldCallsFromPcode(Function owner) {
+        HighFunction high = highFunction(owner);
+        if (high == null) {
+            registerFieldLoopRejectCounts.merge("pcode-owner-decompile-failed", 1, Integer::sum);
+            return Collections.emptyList();
+        }
+
+        Address registerField = currentProgram.getImageBase().add(REGISTER_FIELD_RVA);
+        ForwardArgState constructionState = constructorFieldState(owner);
+        ArrayList<FieldCall> fields = new ArrayList<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            PcodeCallTargetInfo target = pcodeCallTargetInfo(operation);
+            if (target == null || !registerField.equals(target.resolvedTarget)) {
+                continue;
+            }
+            ArgState arguments = registerFieldArgumentsFromPcode(
+                owner,
+                operation,
+                constructionState);
+            FieldCall field = fieldCallFromArgState(
+                owner,
+                operation.getSeqnum().getTarget(),
+                fields.size(),
+                arguments);
+            field.evidenceSource = "register-field-pcode-call-arguments";
+            fields.add(field);
+        }
+        return fields;
+    }
+
+    private ForwardArgState constructorFieldState(Function owner) {
+        if (owner == null) {
+            return newForwardArgState();
+        }
+        ForwardArgState inherited = inheritedForwardArgState(owner, new LinkedHashSet<>());
+        ForwardArgState result = inherited == null ? newForwardArgState() : inherited.copy();
+        for (VtableWrite write : handlerVtableWrites(owner.getEntryPoint())) {
+            if (write == null || write.vtable == null) {
+                continue;
+            }
+            Function constructor = functionAtOrContaining(write.function);
+            HandlerConstruction construction = new HandlerConstruction(
+                write.pattern,
+                write.instruction,
+                write.function,
+                fullFunctionName(constructor),
+                write.vtable);
+            if (write.thisOffset != null) {
+                result.vtablesByThisOffset.put(write.thisOffset, write.vtable);
+                result.handlerConstructionsByThisOffset.put(write.thisOffset, construction);
+            }
+            else if (write.baseKey != null && write.baseOffset != null) {
+                ObjectOffset key = baseOffsetKey(write.baseKey, write.baseOffset);
+                result.vtablesByBaseOffset.put(key, write.vtable);
+                result.handlerConstructionsByBaseOffset.put(key, construction);
+            }
+        }
+        return result;
+    }
+
+    private ArgState registerFieldArgumentsFromPcode(
+        Function owner,
+        PcodeOpAST call,
+        ForwardArgState constructionState) {
+
+        ArgState result = new ArgState();
+        if (owner == null || call == null) {
+            return result;
+        }
+
+        ForwardArgState abi = instructionStateBeforeCall(
+            owner,
+            call,
+            pcodeCallTarget(call));
+        StringDecode pcodeName = null;
+        if (call.getNumInputs() > 2) {
+            pcodeName = uniquePcodeFieldName(call.getInput(2));
+        }
+        TrackedValue abiNameValue = abi == null ? null : abi.registers.get("RDX");
+        StringDecode abiName = trackedFieldNameDecode(abiNameValue);
+        StringDecode name = agreeingFieldName(pcodeName, abiName);
+        if (name != null) {
+            result.nameAddress = name.address;
+            result.name = name.value;
+        }
+
+        PcodeStorage pcodeReceiver = call.getNumInputs() > 1
+            ? pcodeStorageExpression(call.getInput(1))
+            : null;
+        PcodeStorage pcodeAbsoluteHandler = null;
+        if (call.getNumInputs() > 3) {
+            pcodeAbsoluteHandler = pcodeStorageExpression(call.getInput(3));
+            if (pcodeAbsoluteHandler == null) {
+                pcodeAbsoluteHandler = pcodeLoadedStorageExpression(call.getInput(3));
+            }
+        }
+        PcodeStorage pcodeHandler = pcodeAbsoluteHandler;
+        pcodeHandler = registerFieldRelativeHandler(
+            pcodeReceiver,
+            pcodeHandler,
+            "pcode");
+        PcodeStorage abiReceiver = abi == null
+            ? null
+            : pcodeStorageFromTrackedValue(abi.registers.get("RCX"));
+        PcodeStorage abiAbsoluteHandler = abi == null
+            ? null
+            : pcodeStorageFromTrackedValue(abi.registers.get("R8"));
+        PcodeStorage abiHandler = abiAbsoluteHandler;
+        abiHandler = registerFieldRelativeHandler(abiReceiver, abiHandler, "abi");
+        PcodeStorage handler = agreeingRegisterFieldStorage(
+            pcodeHandler,
+            abiHandler,
+            "handler");
+        PcodeStorage absoluteHandler = agreeingRegisterFieldStorage(
+            pcodeAbsoluteHandler,
+            abiAbsoluteHandler,
+            "absolute-handler");
+        if (handler != null) {
+            applyPcodeHandlerArgument(
+                result,
+                handler,
+                absoluteHandler,
+                constructionState,
+                abi);
+        }
+
+        Long pcodeGroup = null;
+        if (call.getNumInputs() > 4) {
+            pcodeGroup = NetworkSchemaIntegerEvaluator.evaluate(call.getInput(4));
+        }
+        TrackedValue abiGroupValue = abi == null ? null : abi.registers.get("R9");
+        Long abiGroup = abiGroupValue == null ? null : abiGroupValue.immediate;
+        Long group = agreeingRegisterFieldInteger(pcodeGroup, abiGroup, "group");
+        if (group != null && group >= Integer.MIN_VALUE && group <= Integer.MAX_VALUE) {
+            result.groupKnown = true;
+            result.group = group.intValue();
+        }
+        return result;
+    }
+
+    private PcodeStorage registerFieldRelativeHandler(
+        PcodeStorage receiver,
+        PcodeStorage handler,
+        String source) {
+
+        if (handler == null) {
+            return null;
+        }
+        if (receiver == null) {
+            registerFieldLoopRejectCounts.merge(
+                "register-field-" + source + "-receiver-unavailable",
+                1,
+                Integer::sum);
+            return null;
+        }
+        if (!Objects.equals(receiver.base, handler.base)) {
+            registerFieldLoopRejectCounts.merge(
+                "register-field-" + source + "-receiver-handler-base-conflict",
+                1,
+                Integer::sum);
+            return null;
+        }
+        try {
+            return new PcodeStorage("this", Math.subtractExact(handler.offset, receiver.offset));
+        }
+        catch (ArithmeticException overflow) {
+            registerFieldLoopRejectCounts.merge(
+                "register-field-" + source + "-receiver-handler-offset-overflow",
+                1,
+                Integer::sum);
+            return null;
+        }
+    }
+
+    private StringDecode agreeingFieldName(StringDecode pcode, StringDecode abi) {
+        if (pcode == null) {
+            return abi;
+        }
+        if (abi == null) {
+            return pcode;
+        }
+        if (Objects.equals(pcode.value, abi.value)) {
+            return pcode;
+        }
+        registerFieldLoopRejectCounts.merge(
+            "register-field-name-source-conflict",
+            1,
+            Integer::sum);
+        return null;
+    }
+
+    private PcodeStorage agreeingRegisterFieldStorage(
+        PcodeStorage pcode,
+        PcodeStorage abi,
+        String role) {
+
+        if (pcode == null) {
+            return abi;
+        }
+        if (abi == null) {
+            return pcode;
+        }
+        if (pcode.sameLocation(abi)) {
+            return pcode;
+        }
+        registerFieldLoopRejectCounts.merge(
+            "register-field-" + role + "-source-conflict",
+            1,
+            Integer::sum);
+        return null;
+    }
+
+    private Long agreeingRegisterFieldInteger(Long pcode, Long abi, String role) {
+        if (pcode == null) {
+            return abi;
+        }
+        if (abi == null) {
+            return pcode;
+        }
+        if (pcode.equals(abi)) {
+            return pcode;
+        }
+        registerFieldLoopRejectCounts.merge(
+            "register-field-" + role + "-source-conflict",
+            1,
+            Integer::sum);
+        return null;
+    }
+
+    private StringDecode uniquePcodeFieldName(Varnode node) {
+        LinkedHashSet<Address> origins = new LinkedHashSet<>();
+        collectPcodeAddressOrigins(node, origins, new LinkedHashSet<>());
+        StringDecode selected = null;
+        for (Address origin : origins) {
+            StringDecode candidate = readFieldNameAtOrThroughPointer(origin);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.value.equals(candidate.value)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private void applyPcodeHandlerArgument(
+        ArgState result,
+        PcodeStorage handler,
+        PcodeStorage absoluteHandler,
+        ForwardArgState constructionState,
+        ForwardArgState callsiteState) {
+
+        if (result == null || handler == null) {
+            return;
+        }
+        result.handlerKnown = true;
+        result.handlerExpression = handler.expression();
+        if (handler.offset < Integer.MIN_VALUE || handler.offset > Integer.MAX_VALUE) {
+            return;
+        }
+        int offset = Math.toIntExact(handler.offset);
+        result.handlerOffset = offset;
+        HandlerArgumentEvidence selected = null;
+        for (ForwardArgState state : new ForwardArgState[] {
+            callsiteState,
+            constructionState
+        }) {
+            HandlerArgumentEvidence candidate = handlerArgumentEvidence(
+                state,
+                offset,
+                absoluteHandler);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.agreesWith(candidate)) {
+                registerFieldLoopRejectCounts.merge(
+                    "register-field-handler-construction-source-conflict",
+                    1,
+                    Integer::sum);
+                return;
+            }
+            if (selected == null || selected.construction() == null) {
+                selected = candidate;
+            }
+        }
+        if (selected == null) {
+            return;
+        }
+        result.handlerVtable = selected.vtable();
+        result.handlerConstruction = selected.construction();
+        result.handlerConstructorWrites = selected.constructorWrites();
+    }
+
+    private HandlerArgumentEvidence handlerArgumentEvidence(
+        ForwardArgState state,
+        int relativeOffset,
+        PcodeStorage absoluteHandler) {
+
+        if (state == null) {
+            return null;
+        }
+        Address vtable = state.vtablesByThisOffset.get(relativeOffset);
+        HandlerConstruction construction =
+            state.handlerConstructionsByThisOffset.get(relativeOffset);
+        List<HandlerConstructorWrite> writes =
+            state.constructorWritesByHandlerOffset.get(relativeOffset);
+        if (vtable == null && absoluteHandler != null &&
+            absoluteHandler.base != null &&
+            absoluteHandler.offset >= Integer.MIN_VALUE &&
+            absoluteHandler.offset <= Integer.MAX_VALUE) {
+            ObjectOffset key = baseOffsetKey(
+                absoluteHandler.base,
+                Math.toIntExact(absoluteHandler.offset));
+            vtable = state.vtablesByBaseOffset.get(key);
+            construction = state.handlerConstructionsByBaseOffset.get(key);
+            writes = state.constructorWritesByBaseOffset.get(key);
+        }
+        if (vtable == null) {
+            return uniqueRootIndependentHandlerEvidence(state, relativeOffset);
+        }
+        return vtable == null
+            ? null
+            : new HandlerArgumentEvidence(vtable, construction, writes);
+    }
+
+    private HandlerArgumentEvidence uniqueRootIndependentHandlerEvidence(
+        ForwardArgState state,
+        int relativeOffset) {
+
+        List<ObjectOffset> candidates = state.vtablesByBaseOffset.keySet().stream()
+            .filter(key -> key.offset() == relativeOffset)
+            .sorted(Comparator.comparing(ObjectOffset::base))
+            .toList();
+        Address vtable = null;
+        HandlerConstruction construction = null;
+        ArrayList<HandlerConstructorWrite> writes = new ArrayList<>();
+        for (ObjectOffset key : candidates) {
+            Address candidate = state.vtablesByBaseOffset.get(key);
+            if (candidate == null) {
+                continue;
+            }
+            if (vtable != null && !vtable.equals(candidate)) {
+                registerFieldLoopRejectCounts.merge(
+                    "register-field-relative-offset-vtable-conflict",
+                    1,
+                    Integer::sum);
+                return null;
+            }
+            vtable = candidate;
+            if (construction == null) {
+                construction = state.handlerConstructionsByBaseOffset.get(key);
+            }
+            List<HandlerConstructorWrite> candidateWrites =
+                state.constructorWritesByBaseOffset.get(key);
+            if (candidateWrites != null) {
+                writes.addAll(candidateWrites);
+            }
+        }
+        if (vtable == null) {
+            return null;
+        }
+        registerFieldLoopRejectCounts.merge(
+            "register-field-relative-offset-root-collapsed",
+            1,
+            Integer::sum);
+        return new HandlerArgumentEvidence(
+            vtable,
+            construction,
+            writes.isEmpty() ? null : List.copyOf(writes));
+    }
+
+    private record HandlerArgumentEvidence(
+        Address vtable,
+        HandlerConstruction construction,
+        List<HandlerConstructorWrite> constructorWrites) {
+
+        boolean agreesWith(HandlerArgumentEvidence other) {
+            return other != null && Objects.equals(vtable, other.vtable);
+        }
+    }

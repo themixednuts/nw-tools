@@ -2,9 +2,9 @@
 //!
 //! Every validated [`NativeManagerSpec`] is emitted into the generated manager
 //! manifest. Codegen derives each manager surface from its inputs and
-//! [`NativeManagerShape`]: table-only requirement managers are direct schema
-//! table resources, while shaped managers expose semantic manager APIs only for
-//! behavior represented by their validated native shape.
+//! [`NativeManagerShape`]: table-only managers are direct schema managers,
+//! asset-backed managers expose their decoded product types, and shaped
+//! managers expose the behavior represented by their validated native shape.
 //!
 //! - [`NativeManagerInput::Table`] lowers to a cooked-table product requirement
 //!   in the runtime manifest.
@@ -64,6 +64,66 @@ pub enum NativeManagerProductFormat {
     ObjectStream,
     Xml,
     Binary,
+}
+
+/// Canonical identity of a decoded non-datasheet manager product.
+///
+/// This is deliberately independent of an engine asset wrapper. Standalone
+/// targets decode the value directly, while repository adapters may resolve
+/// the same identity to distinct loader and decoded-value types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum NativeManagerProductKind {
+    ArmorOffsetDatabase,
+    CraftingStationDatabase,
+    EquipTypesDatabase,
+    GameCameraSettings,
+    GameDebugSettings,
+    GatheringActionDatabase,
+    GatheringDatabase,
+    PlayerBaseAttributes,
+    SettlementProgressionData,
+    SocialRankDatabase,
+    UiDatabase,
+}
+
+impl NativeManagerProductKind {
+    pub const ALL: [Self; 11] = [
+        Self::ArmorOffsetDatabase,
+        Self::CraftingStationDatabase,
+        Self::EquipTypesDatabase,
+        Self::GameCameraSettings,
+        Self::GameDebugSettings,
+        Self::GatheringActionDatabase,
+        Self::GatheringDatabase,
+        Self::PlayerBaseAttributes,
+        Self::SettlementProgressionData,
+        Self::SocialRankDatabase,
+        Self::UiDatabase,
+    ];
+
+    #[must_use]
+    pub const fn canonical_type_path(self) -> &'static str {
+        match self {
+            Self::ArmorOffsetDatabase => "gamedata::products::ArmorOffsetDatabase",
+            Self::CraftingStationDatabase => "gamedata::products::CraftingStationDatabase",
+            Self::EquipTypesDatabase => "gamedata::products::EquipTypesDatabase",
+            Self::GameCameraSettings => "gamedata::products::GameCameraSettings",
+            Self::GameDebugSettings => "gamedata::products::GameDebugSettings",
+            Self::GatheringActionDatabase => "gamedata::products::GatheringActionDatabase",
+            Self::GatheringDatabase => "gamedata::products::GatheringDatabase",
+            Self::PlayerBaseAttributes => "gamedata::products::PlayerBaseAttributes",
+            Self::SettlementProgressionData => "gamedata::products::SettlementProgressionData",
+            Self::SocialRankDatabase => "gamedata::products::SocialRankDatabase",
+            Self::UiDatabase => "gamedata::products::UiDatabase",
+        }
+    }
+
+    #[must_use]
+    pub fn from_canonical_type_path(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.canonical_type_path() == value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,11 +236,87 @@ pub enum NativeManagerShape {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GeneratedManagerSurface {
-    AvailabilityResource,
-    TypedAssetResource,
-    NativeApiManager,
+pub enum ManagerSurfaceKind {
+    DirectSchemaManager,
+    AssetBackedManager,
+    SemanticManager,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NativeManagerEvidenceDisposition {
+    RuntimeWorldState,
+    RuntimeService,
+    RuntimeAssetService,
+    AbstractBase,
+    OrphanRtti,
+    ShippingSourceAbsent,
+    NoDataSurface,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NativeManagerEvidenceDispositionEntry {
+    pub ghidra_class: &'static str,
+    pub disposition: NativeManagerEvidenceDisposition,
+}
+
+/// Native manager RTTI descriptors that intentionally do not produce a
+/// standalone source-asset manager. This is evidence coverage, not a codegen
+/// selection mechanism.
+pub const NON_STANDALONE_MANAGER_EVIDENCE: &[NativeManagerEvidenceDispositionEntry] = &[
+    NativeManagerEvidenceDispositionEntry {
+        ghidra_class: "Javelin::ClaimPrismDataManager",
+        disposition: NativeManagerEvidenceDisposition::RuntimeWorldState,
+    },
+    NativeManagerEvidenceDispositionEntry {
+        ghidra_class: "Javelin::CustomizableCharacterDataManager",
+        disposition: NativeManagerEvidenceDisposition::OrphanRtti,
+    },
+    NativeManagerEvidenceDispositionEntry {
+        ghidra_class: "Javelin::FriendsDataManager",
+        disposition: NativeManagerEvidenceDisposition::RuntimeService,
+    },
+    NativeManagerEvidenceDispositionEntry {
+        ghidra_class: "Javelin::KitItemDataManager",
+        disposition: NativeManagerEvidenceDisposition::ShippingSourceAbsent,
+    },
+    NativeManagerEvidenceDispositionEntry {
+        ghidra_class: "Javelin::PlayerTeleportDataManager",
+        disposition: NativeManagerEvidenceDisposition::OrphanRtti,
+    },
+    NativeManagerEvidenceDispositionEntry {
+        ghidra_class: "Javelin::PvpBalanceDataManager",
+        disposition: NativeManagerEvidenceDisposition::AbstractBase,
+    },
+    NativeManagerEvidenceDispositionEntry {
+        ghidra_class: "Javelin::SectorDataManager",
+        disposition: NativeManagerEvidenceDisposition::RuntimeWorldState,
+    },
+    NativeManagerEvidenceDispositionEntry {
+        ghidra_class: "Javelin::TerritoryLandmarkDataManager",
+        disposition: NativeManagerEvidenceDisposition::RuntimeAssetService,
+    },
+    NativeManagerEvidenceDispositionEntry {
+        ghidra_class: "Javelin::TradeskillBonusDataManager",
+        disposition: NativeManagerEvidenceDisposition::OrphanRtti,
+    },
+    NativeManagerEvidenceDispositionEntry {
+        ghidra_class: "Javelin::VoiceOverDataManager",
+        disposition: NativeManagerEvidenceDisposition::NoDataSurface,
+    },
+];
+
+/// Validated generated managers outside the `*DataManager` RTTI inventory.
+/// This includes mapping/registry managers and specialization-backed managers
+/// whose concrete class has no standalone RTTI0 row.
+pub const GENERATED_MANAGERS_OUTSIDE_DATAMANAGER_RTTI: &[&str] = &[
+    "Javelin::CooldownsPlayerManager",
+    "Javelin::CurrencyExchangeMappingManager",
+    "Javelin::GameDebugSettingsManager",
+    "Javelin::MetaAchievementDataManager",
+    "Javelin::StaticTradeskillRankDataMappingManager",
+    "Javelin::TimelineRegistryManager",
+    "Javelin::VitalsModifierMappingManager",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeOneTableCrcIndexManager {
@@ -393,9 +529,6 @@ pub struct NativeTableFamilyCrcKeyProjectionManager {
     trim_key: bool,
     reject_zero_crc: bool,
     duplicate_key_policy: NativeDuplicateKeyPolicy,
-    source_row_field: Option<RustIdentifier>,
-    source_row_method: Option<RustIdentifier>,
-    source_row_by_crc_method: Option<RustIdentifier>,
     source_handle_field: Option<RustIdentifier>,
     source_handle_method: Option<NativeSourceHandleMethod>,
     row_filters: Vec<NativeCrcProjectionRowFilter>,
@@ -1542,6 +1675,7 @@ pub enum NativeProjectionTransform {
     OptionalFirstString,
     OptionalStringDefaultEmpty,
     TypedCell,
+    OptionalTypedCell,
     OptionalTypedCellDefaultValue,
     U8Enum,
     OptionalU8EnumDefaultValue,
@@ -1584,6 +1718,7 @@ pub enum NativeProjectionTransform {
     ForeignKeyRowList,
     OptionalForeignKeyRowListDefaultEmpty,
     EnumString,
+    EnumStringSkipInvalid,
     EnumStringRejectDefault,
     NonZeroU32,
     OptionalNonZeroU32,
@@ -1936,24 +2071,21 @@ impl NativeManagerShape {
     }
 
     #[must_use]
-    pub fn resource_surface(&self) -> GeneratedManagerSurface {
+    pub fn surface_kind(&self) -> ManagerSurfaceKind {
         match self {
-            Self::RequirementsOnly => GeneratedManagerSurface::AvailabilityResource,
-            Self::ProductAssetResource(_) => GeneratedManagerSurface::TypedAssetResource,
+            Self::RequirementsOnly => ManagerSurfaceKind::DirectSchemaManager,
+            Self::ProductAssetResource(_) => ManagerSurfaceKind::AssetBackedManager,
             Self::ComposedResource(manager) if manager.has_product_arguments() => {
-                GeneratedManagerSurface::TypedAssetResource
+                ManagerSurfaceKind::AssetBackedManager
             }
-            Self::ComposedResource(_) => GeneratedManagerSurface::AvailabilityResource,
-            _ => GeneratedManagerSurface::NativeApiManager,
+            Self::ComposedResource(_) => ManagerSurfaceKind::SemanticManager,
+            _ => ManagerSurfaceKind::SemanticManager,
         }
     }
 
     #[must_use]
     pub fn exposes_native_api(&self) -> bool {
-        matches!(
-            self.resource_surface(),
-            GeneratedManagerSurface::NativeApiManager
-        )
+        matches!(self.surface_kind(), ManagerSurfaceKind::SemanticManager)
     }
 
     #[must_use]
@@ -2410,6 +2542,153 @@ impl NativeManagerShape {
     #[must_use]
     pub const fn composed_resource(manager: NativeComposedResourceManager) -> Self {
         Self::ComposedResource(manager)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{
+        GENERATED_MANAGERS_OUTSIDE_DATAMANAGER_RTTI, NON_STANDALONE_MANAGER_EVIDENCE,
+        NativeManagerInput, NativeManagerProductKind, NativeManagerShape,
+        validated_native_manager_specs,
+    };
+
+    #[test]
+    fn every_validated_manager_has_one_concrete_surface_shape() {
+        let managers = validated_native_manager_specs();
+        let missing = managers
+            .iter()
+            .filter(|manager| manager.shape().is_none())
+            .map(|manager| manager.rust_type().as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "validated managers without a generated surface shape: {}",
+            missing.join(", ")
+        );
+    }
+
+    #[test]
+    fn validated_manager_identities_are_unique() {
+        let managers = validated_native_manager_specs();
+        let mut ghidra_classes = BTreeSet::new();
+        let mut rust_types = BTreeSet::new();
+
+        for manager in &managers {
+            assert!(
+                ghidra_classes.insert(manager.ghidra_class().as_str()),
+                "duplicate native manager class: {}",
+                manager.ghidra_class().as_str()
+            );
+            assert!(
+                rust_types.insert(manager.rust_type().as_str()),
+                "duplicate generated manager type: {}",
+                manager.rust_type().as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_semantic_and_product_types_are_standalone_identities() {
+        let managers = validated_native_manager_specs();
+        for manager in &managers {
+            for input in manager.inputs() {
+                if let NativeManagerInput::Product(product) = input {
+                    let identity = product.rust_type().as_str();
+                    assert!(
+                        NativeManagerProductKind::from_canonical_type_path(identity).is_some(),
+                        "manager {} uses non-canonical product identity {identity}",
+                        manager.rust_type()
+                    );
+                }
+            }
+
+            let Some(shape) = manager.shape() else {
+                continue;
+            };
+            let rendered = format!("{shape:?}");
+            assert!(
+                !rendered.contains("newworld_plugin"),
+                "manager {} shared shape leaks newworld_plugin: {rendered}",
+                manager.rust_type()
+            );
+
+            if let NativeManagerShape::ProductAssetResource(products) = shape {
+                for product in products.products() {
+                    assert_eq!(
+                        product.product_type(),
+                        product.value_type(),
+                        "shared product identity must not encode an asset wrapper"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_rtti_inventory_has_a_complete_standalone_disposition() {
+        let inventory = include_str!("../resources/newworld-3-26-datamanager-rtti.txt")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                line.split_once('|')
+                    .expect("RTTI inventory rows use class|offset")
+                    .0
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(inventory.len(), 205, "live manager RTTI inventory drifted");
+
+        let generated = validated_native_manager_specs()
+            .into_iter()
+            .map(|manager| manager.ghidra_class().as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let non_standalone = NON_STANDALONE_MANAGER_EVIDENCE
+            .iter()
+            .map(|entry| entry.ghidra_class)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            non_standalone.len(),
+            NON_STANDALONE_MANAGER_EVIDENCE.len(),
+            "duplicate non-standalone manager evidence"
+        );
+        assert!(
+            generated.is_disjoint(
+                &non_standalone
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect()
+            ),
+            "a manager cannot be generated and classified as non-standalone"
+        );
+
+        let covered = generated
+            .iter()
+            .map(String::as_str)
+            .chain(non_standalone.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let missing = inventory.difference(&covered).copied().collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "live RTTI managers without standalone semantics or evidence disposition: {}",
+            missing.join(", ")
+        );
+
+        let extra_generated = generated
+            .iter()
+            .map(String::as_str)
+            .filter(|manager| !inventory.contains(manager))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            extra_generated,
+            GENERATED_MANAGERS_OUTSIDE_DATAMANAGER_RTTI
+                .iter()
+                .copied()
+                .collect(),
+            "generated managers outside the DataManager RTTI inventory require explicit evidence"
+        );
     }
 }
 
@@ -3352,9 +3631,6 @@ impl NativeTableFamilyCrcKeyProjectionManager {
             trim_key,
             reject_zero_crc,
             duplicate_key_policy,
-            source_row_field: None,
-            source_row_method: None,
-            source_row_by_crc_method: None,
             source_handle_field: None,
             source_handle_method: None,
             row_filters: Vec::new(),
@@ -3389,12 +3665,12 @@ impl NativeTableFamilyCrcKeyProjectionManager {
         self.table_module.as_ref().unwrap_or(&self.module)
     }
 
-    projection_common_methods!();
-
     manager_common_methods! {
-        source_row_by_crc_method => with_source_row_by_crc_method,
         ids_method => with_ids_method,
-        crc_ids_method => with_crc_ids_method
+        crc_ids_method => with_crc_ids_method,
+        rows_method => with_rows_method,
+        len_method => with_len_method,
+        is_empty_method => with_is_empty_method
     }
 
     #[must_use]

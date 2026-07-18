@@ -1,5 +1,4 @@
 use crate::emit::GameDataCodegenFile;
-use crate::target::{GameDataProduct, GameDataTargetPlan};
 
 use super::{TypeScriptSourceEmitError, format_typescript_source};
 
@@ -17,7 +16,6 @@ pub struct TypeScriptStandaloneProject {
 pub struct TypeScriptStandaloneProjectOptions {
     package_name: String,
     pack_entries: Vec<String>,
-    include_product_placeholders: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +29,6 @@ impl Default for TypeScriptStandaloneProjectOptions {
         Self {
             package_name: "newworld-gamedata".to_owned(),
             pack_entries: vec!["src/index.ts".to_owned()],
-            include_product_placeholders: true,
         }
     }
 }
@@ -60,56 +57,31 @@ impl super::TypeScriptSourceEmitter {
                 "vite.config.ts",
                 format_typescript_source(&viteplus_config(options.pack_entries()))?,
             ),
-            TypeScriptStandaloneProjectFile::new("src/index.ts", index_ts_source(&self.target)?),
+            TypeScriptStandaloneProjectFile::new("src/index.ts", index_ts_source()?),
+            TypeScriptStandaloneProjectFile::new("src/values.ts", game_assets::values_ts_source()?),
         ];
-        if options.include_product_placeholders {
-            if self
-                .target
-                .supports_product(GameDataProduct::SemanticManagers)
-            {
-                files.push(TypeScriptStandaloneProjectFile::new(
-                    "src/managers/index.ts",
-                    "export {};\n",
-                ));
-            }
-            if self.target.supports_product(GameDataProduct::Systems) {
-                files.push(TypeScriptStandaloneProjectFile::new(
-                    "src/systems/index.ts",
-                    "export {};\n",
-                ));
-            }
-        }
-        if self
-            .target
-            .supports_product(GameDataProduct::GameAssetAccess)
-        {
-            files.extend([
-                TypeScriptStandaloneProjectFile::new(
-                    "src/game-assets/catalog.ts",
-                    game_assets::catalog_ts_source()?,
-                ),
-                TypeScriptStandaloneProjectFile::new(
-                    "src/game-assets/datasheet.ts",
-                    game_assets::datasheet_ts_source()?,
-                ),
-                TypeScriptStandaloneProjectFile::new(
-                    "src/game-assets/filesystem.ts",
-                    game_assets::filesystem_ts_source()?,
-                ),
-                TypeScriptStandaloneProjectFile::new(
-                    "src/game-assets/localization.ts",
-                    game_assets::localization_ts_source()?,
-                ),
-                TypeScriptStandaloneProjectFile::new(
-                    "src/game-assets/object-stream.ts",
-                    game_assets::object_stream_ts_source()?,
-                ),
-                TypeScriptStandaloneProjectFile::new(
-                    "src/game-assets/pak.ts",
-                    game_assets::pak_ts_source()?,
-                ),
-            ]);
-        }
+        files.extend([
+            TypeScriptStandaloneProjectFile::new(
+                "src/game-assets/catalog.ts",
+                game_assets::catalog_ts_source()?,
+            ),
+            TypeScriptStandaloneProjectFile::new(
+                "src/game-assets/datasheet.ts",
+                game_assets::datasheet_ts_source()?,
+            ),
+            TypeScriptStandaloneProjectFile::new(
+                "src/game-assets/localization.ts",
+                game_assets::localization_ts_source()?,
+            ),
+            TypeScriptStandaloneProjectFile::new(
+                "src/game-assets/object-stream.ts",
+                game_assets::object_stream_ts_source()?,
+            ),
+            TypeScriptStandaloneProjectFile::new(
+                "src/game-assets/loader.ts",
+                game_assets::pak_ts_source()?,
+            ),
+        ]);
         Ok(TypeScriptStandaloneProject { files })
     }
 }
@@ -140,19 +112,12 @@ impl TypeScriptStandaloneProjectOptions {
         Self {
             package_name: package_name.into(),
             pack_entries: vec!["src/index.ts".to_owned()],
-            include_product_placeholders: true,
         }
     }
 
     #[must_use]
     pub fn with_pack_entries(mut self, pack_entries: impl IntoIterator<Item = String>) -> Self {
         self.pack_entries = pack_entries.into_iter().collect();
-        self
-    }
-
-    #[must_use]
-    pub const fn with_product_placeholders(mut self, include: bool) -> Self {
-        self.include_product_placeholders = include;
         self
     }
 
@@ -192,45 +157,27 @@ impl TypeScriptStandaloneProjectFile {
     }
 }
 
-fn index_ts_source(target: &GameDataTargetPlan) -> Result<String, TypeScriptSourceEmitError> {
-    let mut source = String::new();
-    if target.supports_product(GameDataProduct::SemanticManagers) {
-        source.push_str("export * from \"./managers/index.js\";\n");
-    }
-    if target.supports_product(GameDataProduct::Systems) {
-        source.push_str("export * from \"./systems/index.js\";\n");
-    }
-    if target.supports_product(GameDataProduct::GameAssetAccess) {
-        source.push_str(
-            r#"export * from "./game-assets/catalog.js";
-export * from "./game-assets/datasheet.js";
-export * from "./game-assets/filesystem.js";
-export * from "./game-assets/localization.js";
-export * from "./game-assets/object-stream.js";
-export * from "./game-assets/pak.js";
+fn index_ts_source() -> Result<String, TypeScriptSourceEmitError> {
+    format_typescript_source(
+        r#"export * from "./managers/index.js";
+export { type AssetCatalog, type AssetCatalogEntry, normalizeVirtualPath } from "./game-assets/catalog.js";
+export { AssetLoader, type AssetLoaderOptions } from "./game-assets/loader.js";
+export { AssetId, Crc32, Uuid, Vector3, type AssetReference, type AssetType } from "./values.js";
 "#,
-        );
-    }
-    if source.is_empty() {
-        source.push_str("export {};\n");
-    }
-    format_typescript_source(&source)
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::project::{
         TYPESCRIPT_NODE_TYPES, TYPESCRIPT_PACKAGE_MANAGER, VITE_PLUS_CORE_OVERRIDE,
         VITE_PLUS_TEST_OVERRIDE, VITE_PLUS_VERSION,
     };
-    use crate::target::GameDataRuntimeProfile;
-
-    use super::*;
 
     #[test]
     fn standalone_project_uses_viteplus_current_package_template() {
-        let emitter = crate::typescript::source::TypeScriptSourceEmitter::standalone();
-        assert_eq!(emitter.target.runtime(), GameDataRuntimeProfile::Standalone);
+        let emitter = crate::typescript::source::TypeScriptSourceEmitter;
 
         let project = emitter
             .emit_standalone_project_with_options(&TypeScriptStandaloneProjectOptions::new(
@@ -256,7 +203,7 @@ mod tests {
             .expect("index")
             .source();
 
-        assert_eq!(project.files().len(), 12);
+        assert_eq!(project.files().len(), 10);
         assert!(package_json.contains("\"name\": \"@azoth/newworld-gamedata\""));
         assert!(package_json.contains("\"fast-xml-parser\": \"5.9.3\""));
         assert!(package_json.contains(&format!("\"vite-plus\": \"{VITE_PLUS_VERSION}\"")));
@@ -271,9 +218,9 @@ mod tests {
         assert!(vite_config.contains("from \"vite-plus\""));
         assert!(vite_config.contains("entry: [\"src/index.ts\"]"));
         assert!(index.contains("./managers/index.js"));
-        assert!(index.contains("./systems/index.js"));
+        assert!(!index.contains("./systems/index.js"));
         assert!(!index.contains("./tables/index.js"));
-        assert!(index.contains("./game-assets/pak.js"));
+        assert!(index.contains("./game-assets/loader.js"));
         assert!(!index.contains("./products/index.js"));
         assert!(
             project
@@ -285,7 +232,7 @@ mod tests {
             project
                 .files()
                 .iter()
-                .any(|file| file.path() == "src/managers/index.ts")
+                .all(|file| file.path() != "src/managers/index.ts")
         );
         assert!(
             project
@@ -297,13 +244,19 @@ mod tests {
             project
                 .files()
                 .iter()
-                .any(|file| file.path() == "src/systems/index.ts")
+                .all(|file| file.path() != "src/systems/index.ts")
         );
         assert!(
             project
                 .files()
                 .iter()
-                .any(|file| file.path() == "src/game-assets/pak.ts")
+                .any(|file| file.path() == "src/game-assets/loader.ts")
+        );
+        assert!(
+            project
+                .files()
+                .iter()
+                .all(|file| file.path() != "src/game-assets/pak.ts")
         );
     }
 }

@@ -5,24 +5,9 @@ import (
 	"fmt"
 	"math"
 	"strings"
-)
 
-var objectStreamExtensions = map[string]struct{}{
-	"slice":        {},
-	"dynamicslice": {},
-	"spawnable":   {},
-	"uicanvas":    {},
-	"aoffdb":      {},
-	"equipdb":     {},
-	"gds":         {},
-	"uidb":        {},
-	"pbadb":       {},
-	"sprd":        {},
-	"gdb":         {},
-	"gactdb":      {},
-	"rankdb":      {},
-	"craftstationdb": {},
-}
+	gametypes "example.com/newworld/gamedata/types"
+)
 
 const (
 	objectStreamTagBinary byte = 0
@@ -33,11 +18,6 @@ const (
 	objectStreamHasVer    byte = 1 << 7
 	objectStreamSizeMask  byte = 0x07
 )
-
-type ObjectStreamAsset struct {
-	Path  string
-	Bytes []byte
-}
 
 type ObjectStream struct {
 	Version  uint32
@@ -53,27 +33,6 @@ type ObjectStreamElement struct {
 	TypeID  string
 	Data    []byte
 	Children []ObjectStreamElement
-}
-
-type Vec3 struct {
-	X float32
-	Y float32
-	Z float32
-}
-
-func IsObjectStreamPath(path string) bool {
-	extension := strings.ToLower(pathExtension(path))
-	_, ok := objectStreamExtensions[extension]
-	return ok
-}
-
-func pathExtension(path string) string {
-	path = strings.TrimRight(path, "/\\")
-	index := strings.LastIndex(path, ".")
-	if index < 0 || index == len(path)-1 {
-		return ""
-	}
-	return path[index+1:]
 }
 
 func ParseObjectStream(bytes []byte) (ObjectStream, error) {
@@ -234,11 +193,11 @@ func ObjectStreamF32(element *ObjectStreamElement) (float32, error) {
 	return math.Float32frombits(binary.BigEndian.Uint32(element.Data)), nil
 }
 
-func ObjectStreamVec3(element *ObjectStreamElement) (Vec3, error) {
+func ObjectStreamVec3(element *ObjectStreamElement) (gametypes.Vector3, error) {
 	if err := requireObjectStreamLength(element, 12); err != nil {
-		return Vec3{}, err
+		return gametypes.Vector3{}, err
 	}
-	return Vec3{
+	return gametypes.Vector3{
 		X: math.Float32frombits(binary.BigEndian.Uint32(element.Data[0:4])),
 		Y: math.Float32frombits(binary.BigEndian.Uint32(element.Data[4:8])),
 		Z: math.Float32frombits(binary.BigEndian.Uint32(element.Data[8:12])),

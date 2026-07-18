@@ -8,22 +8,21 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
 
 const (
-	PakCompressionStored   uint16 = 0
-	PakCompressionDeflated uint16 = 8
-	PakCompressionOodle    uint16 = 15
+	pakCompressionStored   uint16 = 0
+	pakCompressionDeflated uint16 = 8
+	pakCompressionOodle    uint16 = 15
 
 	azcsZlib uint32 = 0x73887d3a
 	azcsZstd uint32 = 0x72fd505e
 )
 
-type PakEntryInfo struct {
+type pakEntryInfo struct {
 	Name              string
 	Index             int
 	CompressedSize    uint64
@@ -31,11 +30,11 @@ type PakEntryInfo struct {
 	CompressionMethod uint16
 }
 
-type PakArchive struct {
+type pakArchive struct {
 	Path string
 
 	reader  *zip.ReadCloser
-	entries []PakEntryInfo
+	entries []pakEntryInfo
 	byName  map[string]int
 }
 
@@ -45,26 +44,26 @@ type AssetLoader struct {
 	entriesByPath   map[string]pakEntryRef
 }
 
-type UnsupportedPakCompressionError struct {
+type unsupportedPakCompressionError struct {
 	EntryName string
 	Method    uint16
 }
 
 type mountedPakArchive struct {
 	mountRoot string
-	archive   *PakArchive
+	archive   *pakArchive
 }
 
 type pakEntryRef struct {
-	archive *PakArchive
-	entry   PakEntryInfo
+	archive *pakArchive
+	entry   pakEntryInfo
 }
 
-func (err UnsupportedPakCompressionError) Error() string {
+func (err unsupportedPakCompressionError) Error() string {
 	return fmt.Sprintf("pak entry %s uses unsupported compression method %d", err.EntryName, err.Method)
 }
 
-func OpenPakArchive(path string) (*PakArchive, error) {
+func openPakArchive(path string) (*pakArchive, error) {
 	resolvedPath, err := canonicalPath(path)
 	if err != nil {
 		return nil, fmt.Errorf("resolve pak path %s: %w", path, err)
@@ -75,11 +74,11 @@ func OpenPakArchive(path string) (*PakArchive, error) {
 		return nil, err
 	}
 
-	entries := make([]PakEntryInfo, 0, len(reader.File))
+	entries := make([]pakEntryInfo, 0, len(reader.File))
 	byName := make(map[string]int, len(reader.File))
 	for index, file := range reader.File {
 		lookupName := NormalizeArchivePath(file.Name)
-		entries = append(entries, PakEntryInfo{
+		entries = append(entries, pakEntryInfo{
 			Name:              file.Name,
 			Index:             index,
 			CompressedSize:    file.CompressedSize64,
@@ -91,7 +90,7 @@ func OpenPakArchive(path string) (*PakArchive, error) {
 		}
 	}
 
-	return &PakArchive{
+	return &pakArchive{
 		Path:    resolvedPath,
 		reader:  reader,
 		entries: entries,
@@ -99,25 +98,25 @@ func OpenPakArchive(path string) (*PakArchive, error) {
 	}, nil
 }
 
-func (archive *PakArchive) Close() error {
+func (archive *pakArchive) Close() error {
 	return archive.reader.Close()
 }
 
-func (archive *PakArchive) Entries() []PakEntryInfo {
-	entries := make([]PakEntryInfo, len(archive.entries))
+func (archive *pakArchive) Entries() []pakEntryInfo {
+	entries := make([]pakEntryInfo, len(archive.entries))
 	copy(entries, archive.entries)
 	return entries
 }
 
-func (archive *PakArchive) Entry(name string) (PakEntryInfo, bool) {
+func (archive *pakArchive) Entry(name string) (pakEntryInfo, bool) {
 	index, ok := archive.byName[NormalizeArchivePath(name)]
 	if !ok {
-		return PakEntryInfo{}, false
+		return pakEntryInfo{}, false
 	}
 	return archive.entries[index], true
 }
 
-func (archive *PakArchive) Read(name string) ([]byte, error) {
+func (archive *pakArchive) Read(name string) ([]byte, error) {
 	entry, ok := archive.Entry(name)
 	if !ok {
 		return nil, fmt.Errorf("pak entry not found in %s: %s", archive.Path, name)
@@ -125,12 +124,12 @@ func (archive *PakArchive) Read(name string) ([]byte, error) {
 	return archive.ReadEntry(entry)
 }
 
-func (archive *PakArchive) ReadEntry(entry PakEntryInfo) ([]byte, error) {
+func (archive *pakArchive) ReadEntry(entry pakEntryInfo) ([]byte, error) {
 	if entry.Index < 0 || entry.Index >= len(archive.reader.File) {
 		return nil, fmt.Errorf("pak entry index %d out of bounds", entry.Index)
 	}
 	file := archive.reader.File[entry.Index]
-	if file.Method == PakCompressionOodle {
+	if file.Method == pakCompressionOodle {
 		stream, err := file.OpenRaw()
 		if err != nil {
 			return nil, err
@@ -145,8 +144,8 @@ func (archive *PakArchive) ReadEntry(entry PakEntryInfo) ([]byte, error) {
 		}
 		return peelAzcs(bytes)
 	}
-	if file.Method != PakCompressionStored && file.Method != PakCompressionDeflated {
-		return nil, UnsupportedPakCompressionError{EntryName: file.Name, Method: file.Method}
+	if file.Method != pakCompressionStored && file.Method != pakCompressionDeflated {
+		return nil, unsupportedPakCompressionError{EntryName: file.Name, Method: file.Method}
 	}
 	stream, err := file.Open()
 	if err != nil {
@@ -164,24 +163,16 @@ func (archive *PakArchive) ReadEntry(entry PakEntryInfo) ([]byte, error) {
 	return peelAzcs(bytes)
 }
 
-func OpenDir(assetRoot string, pakPaths ...string) (_ *AssetLoader, err error) {
+func Open(assetRoot string) (_ *AssetLoader, err error) {
 	originalRoot := assetRoot
 	assetRoot, err = canonicalPath(assetRoot)
 	if err != nil {
 		return nil, fmt.Errorf("resolve asset root %s: %w", originalRoot, err)
 	}
 
-	if len(pakPaths) == 0 {
-		collected, err := CollectPakPaths(assetRoot)
-		if err != nil {
-			return nil, err
-		}
-		pakPaths = collected
-	} else {
-		pakPaths, err = canonicalPakPaths(pakPaths)
-		if err != nil {
-			return nil, err
-		}
+	pakPaths, err := collectPakPaths(assetRoot)
+	if err != nil {
+		return nil, err
 	}
 	if len(pakPaths) == 0 {
 		return nil, fmt.Errorf("no .pak files found under %s", assetRoot)
@@ -201,7 +192,7 @@ func OpenDir(assetRoot string, pakPaths ...string) (_ *AssetLoader, err error) {
 	claimedPaths := make(map[string]struct{})
 
 	for _, pakPath := range pakPaths {
-		archive, err := OpenPakArchive(pakPath)
+		archive, err := openPakArchive(pakPath)
 		if err != nil {
 			return nil, err
 		}
@@ -266,28 +257,7 @@ func (loader *AssetLoader) entry(path string) (pakEntryRef, bool) {
 	return pakEntryRef{}, false
 }
 
-func IsManagerAssetPath(path string) bool {
-	normalized := NormalizeVirtualPath(path)
-	if normalized == "libs/camera/gamecamera.xml" {
-		return true
-	}
-	switch strings.ToLower(pathExtension(normalized)) {
-	case "aoffdb", "equipdb", "gds", "uidb", "pbadb", "sprd", "gdb", "gactdb", "rankdb", "craftstationdb":
-		return true
-	default:
-		return false
-	}
-}
-
-func LoadRascCatalogFromLooseFile(path string) (AssetCatalog, error) {
-	bytes, err := os.ReadFile(path)
-	if err != nil {
-		return AssetCatalog{}, err
-	}
-	return ParseRascCatalog(bytes)
-}
-
-func CollectPakPaths(root string) ([]string, error) {
+func collectPakPaths(root string) ([]string, error) {
 	resolvedRoot, err := canonicalPath(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve pak root %s: %w", root, err)
@@ -333,19 +303,6 @@ func canonicalPath(path string) (string, error) {
 		return "", err
 	}
 	return filepath.EvalSymlinks(absolute)
-}
-
-func canonicalPakPaths(paths []string) ([]string, error) {
-	resolved := make([]string, 0, len(paths))
-	for _, path := range paths {
-		resolvedPath, err := canonicalPath(path)
-		if err != nil {
-			return nil, fmt.Errorf("resolve pak path %s: %w", path, err)
-		}
-		resolved = append(resolved, resolvedPath)
-	}
-	sort.Strings(resolved)
-	return resolved, nil
 }
 
 func closeMountedArchives(mountedArchives []mountedPakArchive) error {

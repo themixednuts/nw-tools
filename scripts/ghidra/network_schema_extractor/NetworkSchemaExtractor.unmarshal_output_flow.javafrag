@@ -1,0 +1,107 @@
+    private Integer unmarshalOutputParameterSlot(Function function) {
+        if (function == null || function.getEntryPoint() == null) {
+            return null;
+        }
+        String key = functionCacheKey("unmarshal-output-slot", function);
+        Integer cached = unmarshalOutputParameterSlotCache.get(key);
+        if (cached != null) {
+            return cached > 0 ? cached : null;
+        }
+        if (!unmarshalOutputParameterSlotActive.add(key)) {
+            return null;
+        }
+
+        Integer selected = null;
+        try {
+            List<String> readBuffers = readBufferParameters(function);
+            if (readBuffers.isEmpty()) {
+                return null;
+            }
+            LinkedHashSet<Integer> candidates = new LinkedHashSet<>();
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                return null;
+            }
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                collectDirectUnmarshalOutputCandidate(candidates, operation);
+                collectNestedUnmarshalOutputCandidate(
+                    candidates,
+                    function,
+                    operation);
+            }
+
+            Integer returnedSlot = returnedParameterSlot(function);
+            if (returnedSlot != null) {
+                candidates.remove(returnedSlot);
+            }
+            for (String readBuffer : readBuffers) {
+                Integer readBufferSlot = pcodeParameterIndex(readBuffer);
+                if (readBufferSlot != null) {
+                    candidates.remove(readBufferSlot);
+                }
+            }
+            selected = candidates.size() == 1
+                ? candidates.iterator().next()
+                : null;
+            return selected;
+        }
+        finally {
+            unmarshalOutputParameterSlotActive.remove(key);
+            unmarshalOutputParameterSlotCache.put(
+                key,
+                selected == null ? -1 : selected);
+        }
+    }
+
+    private void collectDirectUnmarshalOutputCandidate(
+        Set<Integer> candidates,
+        PcodeOpAST operation) {
+
+        if (candidates == null || operation == null) {
+            return;
+        }
+        if (operation.getOpcode() == PcodeOp.STORE && operation.getNumInputs() >= 3) {
+            addFormalOutputCandidate(
+                candidates,
+                pcodeStorageExpression(operation.getInput(1)));
+            return;
+        }
+        if (operation.getOpcode() != PcodeOp.CALL) {
+            return;
+        }
+        RawPcodeWrite rawWrite = pcodeReadRawWrite(
+            operation,
+            pcodeCallTarget(operation));
+        if (rawWrite != null) {
+            addFormalOutputCandidate(candidates, rawWrite.storage);
+        }
+    }
+
+    private void collectNestedUnmarshalOutputCandidate(
+        Set<Integer> candidates,
+        Function owner,
+        PcodeOpAST operation) {
+
+        if (candidates == null || owner == null || operation == null ||
+            operation.getOpcode() != PcodeOp.CALL) {
+            return;
+        }
+        Function target = pcodeCallTarget(operation);
+        Integer outputSlot = unmarshalOutputParameterSlot(target);
+        if (outputSlot == null) {
+            return;
+        }
+        addFormalOutputCandidate(
+            candidates,
+            provenCallArgumentStorage(owner, operation, target, outputSlot));
+    }
+
+    private void addFormalOutputCandidate(
+        Set<Integer> candidates,
+        PcodeStorage storage) {
+
+        Integer slot = formalParameterSlot(storage);
+        if (slot != null) {
+            candidates.add(slot);
+        }
+    }

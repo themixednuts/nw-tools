@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfP2PTrading;
+pub struct ActionConditionIfP2PTrading {}
 
 impl AzRtti for ActionConditionIfP2PTrading {
     const NAME: &'static str = "ActionConditionIfP2PTrading";

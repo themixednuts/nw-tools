@@ -1,0 +1,78 @@
+    private record SequenceLoopStorage(
+        PcodeOpAST induction,
+        PcodeStorage data,
+        PcodeStorage end,
+        long stride) {
+    }
+
+    private record SequenceBranchDirection(
+        PcodeBlockBasic accepted,
+        PcodeBlockBasic rejected) {
+    }
+
+    private record SequenceCapacityGuard(
+        PcodeOpAST comparison,
+        PcodeOpAST branch,
+        PcodeBlockBasic accepted,
+        PcodeBlockBasic rejected,
+        long capacity) {
+    }
+
+    private record SequenceCountBranches(
+        PcodeOpAST accepted,
+        PcodeOpAST rejected) {
+    }
+
+    private record LinkedSequenceGuard(
+        PcodeStorage count,
+        SequenceCapacityGuard guard) {
+    }
+
+    private record LinkedSequenceStorage(
+        PcodeOpAST induction,
+        PcodeStorage sentinel,
+        PcodeStorage count,
+        SequenceCapacityGuard guard,
+        long nextOffset) {
+    }
+
+    private record ContainerIteration(
+        List<ContainerCodecCall> events,
+        WireShape element,
+        List<ContainerCodecCall> codecs) {
+    }
+
+    private record ContainerIterationAnalysis(
+        ContainerIteration iteration,
+        String rejectReason) {
+
+        static ContainerIterationAnalysis complete(ContainerIteration iteration) {
+            return new ContainerIterationAnalysis(iteration, null);
+        }
+
+        static ContainerIterationAnalysis rejected(String reason) {
+            return new ContainerIterationAnalysis(null, reason);
+        }
+    }
+
+    private record ContainerSequenceSummary(
+        ContainerCodecCall codec,
+        List<PcodeOpAST> emissionOperations,
+        Set<PcodeOpAST> elementOperations) {
+    }
+
+    private record ContainerSequenceAnalysis(
+        ContainerSequenceSummary summary,
+        String rejectReason) {
+
+        static ContainerSequenceAnalysis complete(ContainerSequenceSummary summary) {
+            return new ContainerSequenceAnalysis(summary, null);
+        }
+
+        static ContainerSequenceAnalysis rejected(String reason) {
+            return new ContainerSequenceAnalysis(null, reason);
+        }
+    }
+
+    private record ContainerSequenceAction(ContainerCodecCall codec, boolean emit) {
+    }

@@ -4,10 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"strings"
 )
-
-const DatasheetExtension = "datasheet"
 
 const (
 	datasheetNameCRCOffset       = 0x04
@@ -24,7 +21,7 @@ const (
 	datasheetCellRecordSize      = 8
 )
 
-var DatasheetVersions = map[uint32]struct{}{
+var datasheetVersions = map[uint32]struct{}{
 	0x11: {},
 	0x12: {},
 }
@@ -77,29 +74,12 @@ type DatasheetCellValue struct {
 	Boolean bool
 }
 
-type DatasheetAsset struct {
-	Path  string
-	Bytes []byte
-}
-
-func IsDatasheetPath(path string) bool {
-	return strings.HasSuffix(strings.ToLower(path), "."+DatasheetExtension)
-}
-
-func IsDatasheetBytes(bytes []byte) bool {
-	if len(bytes) < 4 {
-		return false
-	}
-	_, ok := DatasheetVersions[binary.LittleEndian.Uint32(bytes[:4])]
-	return ok
-}
-
 func ParseDatasheet(bytes []byte) (Datasheet, error) {
 	version, err := readDatasheetU32(bytes, 0x00, "datasheet version")
 	if err != nil {
 		return Datasheet{}, err
 	}
-	if _, ok := DatasheetVersions[version]; !ok {
+	if _, ok := datasheetVersions[version]; !ok {
 		return Datasheet{}, fmt.Errorf("unsupported datasheet version %#x", version)
 	}
 

@@ -1,11 +1,10 @@
 import { existsSync } from "node:fs";
-import { open, readdir, readFile, realpath, type FileHandle } from "node:fs/promises";
+import { open, readdir, realpath, type FileHandle } from "node:fs/promises";
 import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { inflateRawSync, inflateSync } from "node:zlib";
 
 import { ASSET_CATALOG_PATH, type AssetCatalog, normalizeVirtualPath, parseRascCatalog } from "./catalog.js";
-import { type DatasheetAsset, isDatasheetPath } from "./datasheet.js";
 
 const ZIP_LOCAL_FILE_HEADER_SIGNATURE = 0x04034b50;
 const ZIP_CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50;
@@ -27,15 +26,14 @@ const OODLE_DLL_NAMES = ["oo2core_9_win64.dll", "oo2core_8_win64.dll"] as const;
 
 const UTF8_DECODER = new TextDecoder();
 const dynamicImport = (specifier: string): Promise<unknown> => import(specifier);
-const ASSET_LOADER_SOURCE = Symbol.for("@nw-tools/asset-loader/source");
 
-export enum PakCompressionMethod {
+enum PakCompressionMethod {
   Stored = 0,
   Deflated = 8,
   Oodle = 15
 }
 
-export interface PakEntryInfo {
+interface PakEntryInfo {
   readonly name: string;
   readonly index: number;
   readonly compressedSize: number;
@@ -44,24 +42,11 @@ export interface PakEntryInfo {
   readonly localHeaderOffset: number;
 }
 
-interface PakDatasheetSource {
-  readonly catalog: AssetCatalog;
-  readonly datasheets: readonly DatasheetAsset[];
-  readonly assets: readonly BinaryAsset[];
+export interface AssetLoaderOptions {
+  readonly oodleLibrary?: string;
 }
 
-interface BinaryAsset {
-  readonly path: string;
-  readonly bytes: Uint8Array;
-}
-
-export interface AssetLoaderOptions extends PakReadOptions {
-  readonly pakPaths?: readonly string[];
-}
-
-export interface PakReadOptions {
-  readonly oodleDllPath?: string;
-}
+type ArchiveReadOptions = AssetLoaderOptions;
 
 interface MountedPakArchive {
   readonly mountRoot: string;
@@ -117,7 +102,7 @@ interface LoadedOodle {
 let cachedOodleKey: string | undefined;
 let cachedOodle: Promise<LoadedOodle> | undefined;
 
-export class PakArchive {
+class PakArchive {
   readonly path: string;
   readonly entries: readonly PakEntryInfo[];
 
@@ -165,7 +150,7 @@ export class PakArchive {
     return this.byName.get(name) ?? this.byName.get(normalizeArchivePath(name));
   }
 
-  async read(name: string, options: PakReadOptions = {}): Promise<Uint8Array> {
+  async read(name: string, options: ArchiveReadOptions = {}): Promise<Uint8Array> {
     const entry = this.entry(name);
     if (entry === undefined) {
       throw new Error(`pak entry not found in ${this.path}: ${name}`);
@@ -173,7 +158,7 @@ export class PakArchive {
     return this.readEntry(entry, options);
   }
 
-  async readEntry(entry: PakEntryInfo, options: PakReadOptions = {}): Promise<Uint8Array> {
+  async readEntry(entry: PakEntryInfo, options: ArchiveReadOptions = {}): Promise<Uint8Array> {
     const localHeader = await this.readRange(entry.localHeaderOffset, ZIP_LOCAL_FILE_HEADER_FIXED_LENGTH, `${this.path}:${entry.name} local header`);
     const signature = readUint32(localHeader, 0, `${this.path}:${entry.name} local header signature`);
     if (signature !== ZIP_LOCAL_FILE_HEADER_SIGNATURE) {
@@ -203,7 +188,7 @@ export class PakArchive {
   }
 }
 
-export class UnsupportedPakCompressionError extends Error {
+class UnsupportedPakCompressionError extends Error {
   readonly entryName: string;
   readonly method: number;
 
@@ -215,7 +200,7 @@ export class UnsupportedPakCompressionError extends Error {
   }
 }
 
-export async function openPakArchive(path: string): Promise<PakArchive> {
+async function openPakArchive(path: string): Promise<PakArchive> {
   return PakArchive.open(path);
 }
 
@@ -223,18 +208,18 @@ export class AssetLoader {
   readonly catalog: AssetCatalog;
   private readonly mountedArchives: readonly MountedPakArchive[];
   private readonly entriesByPath: ReadonlyMap<string, PakEntryRef>;
-  private readonly options: PakReadOptions;
+  private readonly options: ArchiveReadOptions;
 
-  private constructor(catalog: AssetCatalog, mountedArchives: readonly MountedPakArchive[], entriesByPath: ReadonlyMap<string, PakEntryRef>, options: PakReadOptions) {
+  private constructor(catalog: AssetCatalog, mountedArchives: readonly MountedPakArchive[], entriesByPath: ReadonlyMap<string, PakEntryRef>, options: ArchiveReadOptions) {
     this.catalog = catalog;
     this.mountedArchives = mountedArchives;
     this.entriesByPath = entriesByPath;
     this.options = options;
   }
 
-  static async fromDir(assetRoot: string, options: AssetLoaderOptions = {}): Promise<AssetLoader> {
+  static async open(assetRoot: string, options: AssetLoaderOptions = {}): Promise<AssetLoader> {
     const root = await realpath(assetRoot);
-    const pakPaths = await canonicalPakPaths(options.pakPaths ?? (await collectPakPaths(root)));
+    const pakPaths = await canonicalPakPaths(await collectPakPaths(root));
     pakPaths.sort((left, right) => left.localeCompare(right));
     if (pakPaths.length === 0) {
       throw new Error(`no .pak files found under ${root}`);
@@ -276,12 +261,16 @@ export class AssetLoader {
     await closeMountedArchives(this.mountedArchives);
   }
 
-  async read(path: string, options: PakReadOptions = {}): Promise<Uint8Array> {
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.close();
+  }
+
+  async read(path: string): Promise<Uint8Array> {
     const located = this.entry(path);
     if (located === undefined) {
       throw new Error(`asset ${path} was not present in selected paks`);
     }
-    return located.archive.readEntry(located.entry, { ...this.options, ...options });
+    return located.archive.readEntry(located.entry, this.options);
   }
 
   private entry(path: string): PakEntryRef | undefined {
@@ -298,42 +287,6 @@ export class AssetLoader {
     return undefined;
   }
 
-  async [ASSET_LOADER_SOURCE](): Promise<PakDatasheetSource> {
-    const datasheets: DatasheetAsset[] = [];
-    const assets: BinaryAsset[] = [];
-    for (const entry of this.catalog.entries) {
-      if (!isDatasheetPath(entry.relativePath) && !isManagerAssetPath(entry.relativePath)) {
-        continue;
-      }
-      const path = normalizeVirtualPath(entry.relativePath);
-      const bytes = await this.read(path);
-      if (isDatasheetPath(path)) {
-        datasheets.push({
-          path,
-          bytes
-        });
-      } else {
-        assets.push({
-          path,
-          bytes
-        });
-      }
-    }
-    return { catalog: this.catalog, datasheets, assets };
-  }
-}
-
-export function isManagerAssetPath(path: string): boolean {
-  const normalized = normalizeVirtualPath(path);
-  if (normalized === "libs/camera/gamecamera.xml") {
-    return true;
-  }
-  const extension = normalized.split(".").pop()?.toLowerCase();
-  return extension === "aoffdb" || extension === "equipdb" || extension === "gds" || extension === "uidb" || extension === "pbadb" || extension === "sprd" || extension === "gdb" || extension === "gactdb" || extension === "rankdb" || extension === "craftstationdb";
-}
-
-export async function loadRascCatalogFromLooseFile(path: string): Promise<AssetCatalog> {
-  return parseRascCatalog(await readFile(path));
 }
 
 async function loadCatalogFromPaks(mountedArchives: readonly MountedPakArchive[]): Promise<AssetCatalog> {
@@ -653,7 +606,7 @@ function findEndOfCentralDirectory(path: string, bytes: Uint8Array, archiveSize:
   throw new Error(`zip end-of-central-directory not found in ${path}`);
 }
 
-async function decompressPakEntry(entry: PakEntryInfo, compressed: Uint8Array, options: PakReadOptions): Promise<Uint8Array> {
+async function decompressPakEntry(entry: PakEntryInfo, compressed: Uint8Array, options: ArchiveReadOptions): Promise<Uint8Array> {
   switch (entry.compressionMethod) {
     case PakCompressionMethod.Stored:
       return compressed;
@@ -666,8 +619,8 @@ async function decompressPakEntry(entry: PakEntryInfo, compressed: Uint8Array, o
   }
 }
 
-async function decompressOodle(entry: PakEntryInfo, compressed: Uint8Array, options: PakReadOptions): Promise<Uint8Array> {
-  const loaded = await loadOodle(options.oodleDllPath);
+async function decompressOodle(entry: PakEntryInfo, compressed: Uint8Array, options: ArchiveReadOptions): Promise<Uint8Array> {
+  const loaded = await loadOodle(options.oodleLibrary);
   const output = new Uint8Array(entry.uncompressedSize);
   const decoded = loaded.decompress(
     compressed,
@@ -738,7 +691,7 @@ async function loadOodleUncached(explicitDllPath?: string): Promise<LoadedOodle>
       lastError = error;
     }
   }
-  throw new Error(`Oodle library not found. Set OODLE_DLL or pass oodleDllPath. Last error: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+  throw new Error(`Oodle library not found. Set OODLE_DLL or pass oodleLibrary. Last error: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }
 
 function oodleCandidatePaths(explicitDllPath?: string): string[] {

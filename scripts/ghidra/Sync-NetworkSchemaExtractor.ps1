@@ -9,12 +9,20 @@ $sourceNames = @(
     'NetworkSchemaAddressFormatter.java',
     'NetworkSchemaX86.java',
     'NetworkSchemaText.java',
-    'NetworkSchemaTextParser.java',
     'NetworkSchemaJson.java',
     'NetworkSchemaModels.java',
     'NetworkSchemaTypeModels.java',
+    'NetworkSchemaContainerModels.java',
     'NetworkSchemaStack.java',
     'NetworkSchemaPcode.java'
+    'NetworkSchemaControlFlow.java'
+    'NetworkSchemaFlowSequence.java'
+    'NetworkSchemaNaturalLoop.java'
+    'NetworkSchemaCodecClassifier.java'
+    'NetworkSchemaIntegerEvaluator.java'
+    'NetworkSchemaPcodeConstants.java'
+    'NetworkSchemaWireShape.java'
+    'NetworkSchemaRunMetrics.java'
 )
 
 if (!(Test-Path -LiteralPath $OutDir)) {
@@ -23,7 +31,7 @@ if (!(Test-Path -LiteralPath $OutDir)) {
 
 $extractorDir = Join-Path $SourceDir 'network_schema_extractor'
 $extractorFragments = Get-ChildItem -LiteralPath $extractorDir -Filter 'NetworkSchemaExtractor.*.javafrag' |
-    Sort-Object Name
+    Sort-Object @{ Expression = { $_.Name -eq 'NetworkSchemaExtractor.codec_trace.javafrag' } }, Name
 
 if ($extractorFragments.Count -eq 0) {
     throw "Missing extractor fragments under: $extractorDir"

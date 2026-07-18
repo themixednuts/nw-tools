@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfCurrentGamemodeAllowsMounts;
+pub struct ActionConditionIfCurrentGamemodeAllowsMounts {}
 
 impl AzRtti for ActionConditionIfCurrentGamemodeAllowsMounts {
     const NAME: &'static str = "ActionConditionIfCurrentGamemodeAllowsMounts";

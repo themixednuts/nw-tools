@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfForcingMountWalk;
+pub struct ActionConditionIfForcingMountWalk {}
 
 impl AzRtti for ActionConditionIfForcingMountWalk {
     const NAME: &'static str = "ActionConditionIfForcingMountWalk";

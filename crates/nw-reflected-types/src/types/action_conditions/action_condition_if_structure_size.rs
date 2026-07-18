@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfStructureSize;
+pub struct ActionConditionIfStructureSize {}
 
 impl AzRtti for ActionConditionIfStructureSize {
     const NAME: &'static str = "ActionConditionIfStructureSize";

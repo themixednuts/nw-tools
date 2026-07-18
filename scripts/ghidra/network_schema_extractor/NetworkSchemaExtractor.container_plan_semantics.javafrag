@@ -1,0 +1,69 @@
+    private void reconcileFullContainerValueSemantics(
+        FullContainerPlan plan,
+        Address unmarshalFull) {
+
+        if (plan == null || plan.storageKind != ContainerStorageKind.VECTOR ||
+            plan.elementStride == null || plan.elementStride <= 0L ||
+            plan.valueCodecs.isEmpty()) {
+            return;
+        }
+        List<ContainerCodecCall> logicalCodecs = logicalContainerCodecLeaves(plan.valueCodecs);
+        LinkedHashMap<Long, NestedTypeMember> members =
+            rootedContainerElementMembers(unmarshalFull, plan.elementStride).get("element");
+        List<NestedTypeMember> ordered = members == null
+            ? null
+            : provenWireOrderedMembers(members.values());
+        if (logicalCodecs == null || ordered == null ||
+            ordered.size() != logicalCodecs.size()) {
+            return;
+        }
+
+        ArrayList<WireShape> reconciled = new ArrayList<>(ordered.size());
+        for (int index = 0; index < ordered.size(); index++) {
+            ContainerCodecCall codec = logicalCodecs.get(index);
+            NestedTypeMember member = ordered.get(index);
+            WireShape marshal = codec == null ? null : codec.wireEvidence;
+            String unmarshalShape = member == null ? null : member.wireShape;
+            String unmarshalLayout = member == null
+                ? null
+                : member.wireLayout == null ? member.wireShape : member.wireLayout;
+            if (marshal == null || marshal.layout == null ||
+                unmarshalShape == null || unmarshalLayout == null) {
+                return;
+            }
+            if (marshal.hasProvenSemantics()) {
+                if (!containerLogicalWireShapeMatches(
+                        codec,
+                        unmarshalShape,
+                        unmarshalLayout)) {
+                    return;
+                }
+                reconciled.add(marshal);
+                continue;
+            }
+            Integer marshalWidth = wireShapeByteWidth(marshal.layout);
+            Integer unmarshalWidth = wireShapeByteWidth(unmarshalLayout);
+            if (!marshal.layout.equals(unmarshalLayout) &&
+                (marshalWidth == null || !marshalWidth.equals(unmarshalWidth))) {
+                return;
+            }
+            reconciled.add(WireShape.semantic(
+                unmarshalShape,
+                marshal.layout,
+                "marshal-full+unmarshal-full-ordinal-agreement"));
+        }
+
+        for (int index = 0; index < reconciled.size(); index++) {
+            ContainerCodecCall codec = logicalCodecs.get(index);
+            NestedTypeMember member = ordered.get(index);
+            codec.wireEvidence = reconciled.get(index);
+            codec.evidenceSource = "marshal-full+unmarshal-full-ordinal-agreement";
+            if (codec.nativeType == null) {
+                codec.nativeType = member.nativeType;
+            }
+            if (codec.typeId == null && Boolean.TRUE.equals(member.typeIdentityProven)) {
+                codec.typeId = member.typeId;
+                codec.typeIdSource = member.typeIdSource;
+            }
+        }
+    }

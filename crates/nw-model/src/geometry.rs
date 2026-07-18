@@ -7,6 +7,7 @@
 
 use cry_chunk::{CgfFile, MeshChunk, MeshSubset, MeshSubsetBoneIds};
 use glam::{Mat3, Mat4, Quat, Vec2, Vec3};
+use serde::Serialize;
 
 use crate::math;
 
@@ -30,6 +31,10 @@ pub struct Primitive {
     pub joints: Option<Vec<[u16; 4]>>,
     /// Per-vertex joint weights (normalized), for skinned meshes.
     pub weights: Option<Vec<[f32; 4]>>,
+    /// Influences 5-8 from a 2× bone-mapping stream (glTF `JOINTS_1`), if present.
+    pub joints2: Option<Vec<[u16; 4]>>,
+    /// Weights for influences 5-8 (glTF `WEIGHTS_1`), if present.
+    pub weights2: Option<Vec<[f32; 4]>>,
     /// Cry subset material slot (index into the material's sub-materials).
     pub material_id: i32,
 }
@@ -39,6 +44,8 @@ pub struct Primitive {
 pub struct Mesh {
     pub name: String,
     pub primitives: Vec<Primitive>,
+    /// Semantic use of this geometry in the authored Cry graph.
+    pub role: MeshRole,
     /// Skeleton index used by this mesh's JOINTS/WEIGHTS streams.
     pub skin: Option<usize>,
     /// Cry node LOD suffix (`$lodN`), when present.
@@ -47,6 +54,15 @@ pub struct Mesh {
     pub shadow_proxy: bool,
     /// Optional CDF socket placement for rigid bone/face attachments.
     pub attachment: Option<MeshAttachment>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MeshRole {
+    #[default]
+    Render,
+    PhysicsProxy,
+    ClothSimulation,
 }
 
 #[derive(Debug, Clone)]
@@ -197,7 +213,8 @@ impl Model {
             let Some(mesh) = cgf.meshes().get(&node.object_id) else {
                 continue;
             };
-            if name.to_ascii_lowercase().starts_with("$physics_proxy") {
+            let is_physics_proxy = name.to_ascii_lowercase().starts_with("$physics_proxy");
+            if is_physics_proxy {
                 auxiliary_nodes.push(AuxiliaryNode {
                     name: name.to_owned(),
                     role: AuxiliaryNodeRole::PhysicsProxy,
@@ -207,7 +224,6 @@ impl Model {
                     transform: node.transform,
                     properties: node.properties.clone(),
                 });
-                continue;
             }
             let skinned = stream_id(mesh, KIND_BONE_MAPPING).is_some();
             // Skinned vertices live in bind/model space — the skin handles placement,
@@ -217,7 +233,7 @@ impl Model {
             } else {
                 node_world_matrix(cgf, node.parent_id, math::node_matrix(node.transform))
             };
-            if let Some(out) = build_mesh(
+            if let Some(mut out) = build_mesh(
                 cgf,
                 mesh,
                 heap,
@@ -226,6 +242,9 @@ impl Model {
                 skinned,
                 skeletons.first().map_or(0, |value| value.bones.len()),
             )? {
+                if is_physics_proxy {
+                    out.role = MeshRole::PhysicsProxy;
+                }
                 meshes.push(out);
             }
         }
@@ -288,6 +307,13 @@ impl Model {
     }
 
     #[must_use]
+    pub fn has_render_geometry(&self) -> bool {
+        self.meshes
+            .iter()
+            .any(|mesh| mesh.role == MeshRole::Render && !mesh.primitives.is_empty())
+    }
+
+    #[must_use]
     pub fn vertex_count(&self) -> usize {
         self.meshes
             .iter()
@@ -323,8 +349,28 @@ impl Model {
     /// are remapped by controller ID/name to the receiving skeleton.
     pub fn append_skinned_geometry(
         &mut self,
+        other: Self,
+        target: usize,
+    ) -> Result<(), ModelBuildError> {
+        self.append_skinned_geometry_with_role(other, target, MeshRole::Render)
+    }
+
+    /// Merge the simulation `.skin` of a `CA_VCLOTH` attachment. It shares the
+    /// character skeleton, but remains explicitly distinguishable from the
+    /// attachment's render skin in glTF node metadata.
+    pub fn append_cloth_simulation_geometry(
+        &mut self,
+        other: Self,
+        target: usize,
+    ) -> Result<(), ModelBuildError> {
+        self.append_skinned_geometry_with_role(other, target, MeshRole::ClothSimulation)
+    }
+
+    fn append_skinned_geometry_with_role(
+        &mut self,
         mut other: Self,
         target: usize,
+        role: MeshRole,
     ) -> Result<(), ModelBuildError> {
         let target_skeleton = self
             .skeletons
@@ -348,6 +394,7 @@ impl Model {
                 .collect::<Vec<_>>()
         });
         for mesh in &mut other.meshes {
+            mesh.role = role;
             if mesh.skin.is_some() {
                 mesh.skin = Some(target);
             }
@@ -622,6 +669,7 @@ fn build_mesh(
     Ok(Some(Mesh {
         name: name.to_string(),
         primitives,
+        role: MeshRole::Render,
         skin: skinned.then_some(0),
         lod: node_lod(name),
         shadow_proxy: name.to_ascii_lowercase().contains("shadowproxy"),
@@ -652,6 +700,8 @@ fn build_primitive(
         subset,
         heap,
         Vec3Transform::Point(options.world),
+        // Positions loader accepts elemSize 12 or 8 (half x3).
+        true,
     )
     .ok_or_else(|| ModelBuildError::MissingPositions {
         mesh: options.mesh_name.to_owned(),
@@ -671,6 +721,8 @@ fn build_primitive(
         subset,
         heap,
         Vec3Transform::Direction(normal_transform),
+        // Normals loader (FUN_7ff606c3b500 @ 0x7ff606c3b500) accepts elemSize 12 only.
+        false,
     )
     .or_else(|| {
         derive_normals_from_tangents(cgf, mesh, subset, heap)
@@ -680,18 +732,21 @@ fn build_primitive(
         derive_normals_from_qtangents(cgf, mesh, subset, heap)
             .map(|normals| transform_gltf_normals(normals, normal_transform))
     });
-    let (joints, weights) = if options.skinned {
-        let (joints, weights) = read_bone_mapping(cgf, mesh, subset, bone_palette, heap)
-            .ok_or_else(|| ModelBuildError::MissingBoneMapping {
+    let (joints, weights, joints2, weights2) = if options.skinned {
+        let mapping = read_bone_mapping(cgf, mesh, subset, bone_palette, heap).ok_or_else(|| {
+            ModelBuildError::MissingBoneMapping {
                 mesh: options.mesh_name.to_owned(),
                 subset: subset_index,
-            })?;
-        if let Some(joint) = joints
+            }
+        })?;
+        let out_of_range = mapping
+            .joints
             .iter()
+            .chain(mapping.joints2.iter().flatten())
             .flatten()
             .copied()
-            .find(|joint| usize::from(*joint) >= options.skeleton_len)
-        {
+            .find(|joint| usize::from(*joint) >= options.skeleton_len);
+        if let Some(joint) = out_of_range {
             return Err(ModelBuildError::JointOutOfRange {
                 mesh: options.mesh_name.to_owned(),
                 subset: subset_index,
@@ -699,9 +754,14 @@ fn build_primitive(
                 skeleton_len: options.skeleton_len,
             });
         }
-        (Some(joints), Some(weights))
+        (
+            Some(mapping.joints),
+            Some(mapping.weights),
+            mapping.joints2,
+            mapping.weights2,
+        )
     } else {
-        (None, None)
+        (None, None, None, None)
     };
 
     Ok(Primitive {
@@ -711,6 +771,8 @@ fn build_primitive(
         indices,
         joints,
         weights,
+        joints2,
+        weights2,
         material_id: subset.material_id,
     })
 }
@@ -764,8 +826,18 @@ fn derive_normals_from_qtangents(
     Some(out)
 }
 
-/// Per-vertex skin binding: joint indices (×4) and normalized weights (×4).
-type BoneMapping = (Vec<[u16; 4]>, Vec<[f32; 4]>);
+/// One influence set for a subset: joint indices (×4) and normalized weights (×4).
+type InfluenceSet = (Vec<[u16; 4]>, Vec<[f32; 4]>);
+
+/// Per-vertex skin binding for a subset: primary joint indices/weights (×4)
+/// plus an optional second influence set (influences 5-8) surfaced from a 2×
+/// bone-mapping stream.
+struct BoneMapping {
+    joints: Vec<[u16; 4]>,
+    weights: Vec<[f32; 4]>,
+    joints2: Option<Vec<[u16; 4]>>,
+    weights2: Option<Vec<[f32; 4]>>,
+}
 
 /// Read the per-vertex bone mapping (joint indices + weights) for a subset.
 /// Stride 8 = 4×u8 joints + 4×u8 weights; stride 12 = 4×u16 joints + 4×u8 weights.
@@ -777,64 +849,122 @@ fn read_bone_mapping(
     heap: &[u8],
 ) -> Option<BoneMapping> {
     let id = stream_id(mesh, KIND_BONE_MAPPING)?;
-    let count = subset.num_vertices;
-    let (data, stride, base): (&[u8], usize, usize) =
+    let mesh_vertices = usize::try_from(mesh.vertex_count).ok()?;
+    let (data, stride, start, entry_count): (&[u8], usize, usize, usize) =
         if let Some(stream) = cgf.data_streams().get(&id) {
-            let stride = stream.element_size;
-            (
-                stream.data,
-                stride,
-                stride.checked_mul(subset.first_vertex)?,
-            )
+            (stream.data, stream.element_size, 0, stream.element_count)
         } else if let Some(data_ref) = cgf.data_refs().get(&id) {
             let stride = data_ref.stride;
-            (heap, stride, data_ref.offset + stride * subset.first_vertex)
+            (heap, stride, data_ref.offset, data_ref.size.checked_div(stride)?)
         } else {
             return None;
         };
+    decode_bone_mapping(
+        data,
+        stride,
+        start,
+        entry_count,
+        mesh_vertices,
+        subset,
+        bone_palette,
+    )
+}
 
-    let mut joints = Vec::with_capacity(count);
-    let mut weights = Vec::with_capacity(count);
-    for i in 0..count {
-        let o = base + i * stride;
-        let (joint, raw_weights) = match stride {
-            8 => (
-                map_subset_bone_ids(
-                    [
-                        u8_at(data, o)?,
-                        u8_at(data, o + 1)?,
-                        u8_at(data, o + 2)?,
-                        u8_at(data, o + 3)?,
-                    ],
-                    bone_palette?,
-                )?,
+/// Decode a bone-mapping stream against the engine's entry-count rule.
+///
+/// The loader @ 0x7ff606c39640 accepts a stream with either exactly
+/// vertex-count entries or exactly 2× vertex-count ("wrong # vertices %d
+/// (expected %d or %d)"); the second half is the 5th-8th influence set. Any
+/// other count is rejected.
+fn decode_bone_mapping(
+    data: &[u8],
+    stride: usize,
+    start: usize,
+    entry_count: usize,
+    mesh_vertices: usize,
+    subset: &MeshSubset,
+    bone_palette: Option<&MeshSubsetBoneIds>,
+) -> Option<BoneMapping> {
+    let has_second_set = if entry_count == mesh_vertices {
+        false
+    } else if entry_count == mesh_vertices.checked_mul(2)? {
+        true
+    } else {
+        return None;
+    };
+
+    let read_set = |half: usize| -> Option<InfluenceSet> {
+        let mut joints = Vec::with_capacity(subset.num_vertices);
+        let mut weights = Vec::with_capacity(subset.num_vertices);
+        for i in 0..subset.num_vertices {
+            let vertex = half
+                .checked_mul(mesh_vertices)?
+                .checked_add(subset.first_vertex)?
+                .checked_add(i)?;
+            let o = start.checked_add(vertex.checked_mul(stride)?)?;
+            let (joint, raw_weights) = read_bone_entry(data, o, stride, bone_palette)?;
+            joints.push(joint);
+            weights.push(normalize_weights(raw_weights));
+        }
+        Some((joints, weights))
+    };
+
+    let (joints, weights) = read_set(0)?;
+    let (joints2, weights2) = if has_second_set {
+        let (joints2, weights2) = read_set(1)?;
+        (Some(joints2), Some(weights2))
+    } else {
+        (None, None)
+    };
+    Some(BoneMapping {
+        joints,
+        weights,
+        joints2,
+        weights2,
+    })
+}
+
+/// Read one bone-mapping entry (4 joints + 4 raw u8 weights) at a byte offset.
+fn read_bone_entry(
+    data: &[u8],
+    o: usize,
+    stride: usize,
+    bone_palette: Option<&MeshSubsetBoneIds>,
+) -> Option<([u16; 4], [u8; 4])> {
+    match stride {
+        8 => Some((
+            map_subset_bone_ids(
                 [
-                    u8_at(data, o + 4)?,
-                    u8_at(data, o + 5)?,
-                    u8_at(data, o + 6)?,
-                    u8_at(data, o + 7)?,
+                    u8_at(data, o)?,
+                    u8_at(data, o + 1)?,
+                    u8_at(data, o + 2)?,
+                    u8_at(data, o + 3)?,
                 ],
-            ),
-            12 => (
-                [
-                    u16_at(data, o)?,
-                    u16_at(data, o + 2)?,
-                    u16_at(data, o + 4)?,
-                    u16_at(data, o + 6)?,
-                ],
-                [
-                    u8_at(data, o + 8)?,
-                    u8_at(data, o + 9)?,
-                    u8_at(data, o + 10)?,
-                    u8_at(data, o + 11)?,
-                ],
-            ),
-            _ => return None,
-        };
-        joints.push(joint);
-        weights.push(normalize_weights(raw_weights));
+                bone_palette?,
+            )?,
+            [
+                u8_at(data, o + 4)?,
+                u8_at(data, o + 5)?,
+                u8_at(data, o + 6)?,
+                u8_at(data, o + 7)?,
+            ],
+        )),
+        12 => Some((
+            [
+                u16_at(data, o)?,
+                u16_at(data, o + 2)?,
+                u16_at(data, o + 4)?,
+                u16_at(data, o + 6)?,
+            ],
+            [
+                u8_at(data, o + 8)?,
+                u8_at(data, o + 9)?,
+                u8_at(data, o + 10)?,
+                u8_at(data, o + 11)?,
+            ],
+        )),
+        _ => None,
     }
-    Some((joints, weights))
 }
 
 /// Maps the compact per-subset u8 indices used by New World's stride-8 stream
@@ -894,6 +1024,7 @@ fn read_vec3_stream(
     subset: &MeshSubset,
     heap: &[u8],
     transform: Vec3Transform<'_>,
+    allow_half: bool,
 ) -> Option<Vec<Vec3>> {
     let id = stream_id(mesh, kind)?;
     let count = subset.num_vertices;
@@ -915,19 +1046,7 @@ fn read_vec3_stream(
         let base = size.checked_mul(subset.first_vertex)?;
         for i in 0..count {
             let o = base + i * size;
-            let raw = match size {
-                12 => [
-                    f32_at(stream.data, o)?,
-                    f32_at(stream.data, o + 4)?,
-                    f32_at(stream.data, o + 8)?,
-                ],
-                8 => [
-                    half_at(stream.data, o)?,
-                    half_at(stream.data, o + 2)?,
-                    half_at(stream.data, o + 4)?,
-                ],
-                _ => return None,
-            };
+            let raw = decode_stream_vec3(stream.data, o, size, allow_half)?;
             push(&mut out, raw);
         }
     } else if let Some(data_ref) = cgf.data_refs().get(&id) {
@@ -950,6 +1069,25 @@ fn read_vec3_stream(
         return None;
     }
     Some(out)
+}
+
+/// Decode one inline `DataStream` vec3 element. `allow_half` gates the 8-byte
+/// half x3 layout: the positions loader accepts elemSize 12 or 8, but the
+/// normals loader (FUN_7ff606c3b500 @ 0x7ff606c3b500) accepts elemSize 12 only.
+fn decode_stream_vec3(data: &[u8], offset: usize, size: usize, allow_half: bool) -> Option<[f32; 3]> {
+    match size {
+        12 => Some([
+            f32_at(data, offset)?,
+            f32_at(data, offset + 4)?,
+            f32_at(data, offset + 8)?,
+        ]),
+        8 if allow_half => Some([
+            half_at(data, offset)?,
+            half_at(data, offset + 2)?,
+            half_at(data, offset + 4)?,
+        ]),
+        _ => None,
+    }
 }
 
 fn transform_gltf_normals(normals: Vec<Vec3>, cry_normal_matrix: Mat3) -> Vec<Vec3> {
@@ -1131,5 +1269,92 @@ mod tests {
         assert_eq!(node_lod("body$lod2"), Some(2));
         assert_eq!(node_lod("body$LOD12_extra"), Some(12));
         assert_eq!(node_lod("body"), None);
+    }
+
+    fn subset(first_vertex: usize, num_vertices: usize) -> MeshSubset {
+        MeshSubset {
+            first_index: 0,
+            num_indices: 0,
+            first_vertex,
+            num_vertices,
+            material_id: 0,
+            radius: 0.0,
+            center: [0.0; 3],
+        }
+    }
+
+    fn palette_1234() -> MeshSubsetBoneIds {
+        let mut ids = [0_u16; 128];
+        ids[..4].copy_from_slice(&[10, 11, 12, 13]);
+        MeshSubsetBoneIds { count: 4, ids }
+    }
+
+    #[test]
+    fn double_bone_mapping_stream_surfaces_second_influence_set() {
+        // Loader @ 0x7ff606c39640 accepts 2× vertex-count entries; the second
+        // half is the 5th-8th influence set (stride-8, palette-remapped).
+        let palette = palette_1234();
+        // mesh_vertices = 2, entry_count = 4 (= 2×): influences 1-4 then 5-8.
+        let data: Vec<u8> = vec![
+            0, 1, 2, 3, 255, 0, 0, 0, // v0 influences 1-4
+            1, 0, 0, 0, 128, 127, 0, 0, // v1 influences 1-4
+            2, 3, 0, 1, 255, 0, 0, 0, // v0 influences 5-8
+            3, 2, 1, 0, 0, 0, 0, 0, // v1 influences 5-8 (zero weights)
+        ];
+
+        let mapping = decode_bone_mapping(&data, 8, 0, 4, 2, &subset(0, 2), Some(&palette)).unwrap();
+
+        assert_eq!(mapping.joints, [[10, 11, 12, 13], [11, 10, 10, 10]]);
+        assert_eq!(
+            mapping.joints2,
+            Some(vec![[12, 13, 10, 11], [13, 12, 11, 10]])
+        );
+        assert_eq!(mapping.weights[0], [1.0, 0.0, 0.0, 0.0]);
+        // All-zero weights normalize to bone-0, same as the primary set.
+        assert_eq!(mapping.weights2.unwrap()[1], [1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn single_bone_mapping_stream_has_no_second_set() {
+        let palette = palette_1234();
+        let data: Vec<u8> = vec![
+            0, 1, 2, 3, 255, 0, 0, 0, // v0
+            1, 0, 0, 0, 255, 0, 0, 0, // v1
+        ];
+
+        let mapping = decode_bone_mapping(&data, 8, 0, 2, 2, &subset(0, 2), Some(&palette)).unwrap();
+
+        assert_eq!(mapping.joints.len(), 2);
+        assert!(mapping.joints2.is_none());
+        assert!(mapping.weights2.is_none());
+    }
+
+    #[test]
+    fn bone_mapping_stream_rejects_other_multiples() {
+        // 3× vertex-count is neither the single nor the double form.
+        let palette = palette_1234();
+        let data = vec![0_u8; 8 * 6];
+
+        assert!(decode_bone_mapping(&data, 8, 0, 6, 2, &subset(0, 2), Some(&palette)).is_none());
+    }
+
+    #[test]
+    fn normals_stream_rejects_half_precision_element() {
+        // Six bytes: enough for a half x3 read; the decoded value is irrelevant
+        // to the accept/reject decision.
+        let data = [0x00, 0x3c, 0x00, 0x00, 0x00, 0x00];
+        // Positions accept the 8-byte half x3 layout; normals do not.
+        assert!(decode_stream_vec3(&data, 0, 8, true).is_some());
+        assert!(decode_stream_vec3(&data, 0, 8, false).is_none());
+    }
+
+    #[test]
+    fn vec3_stream_accepts_full_float_element_for_both() {
+        let mut data = Vec::new();
+        for value in [1.0_f32, 2.0, 3.0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(decode_stream_vec3(&data, 0, 12, true), Some([1.0, 2.0, 3.0]));
+        assert_eq!(decode_stream_vec3(&data, 0, 12, false), Some([1.0, 2.0, 3.0]));
     }
 }

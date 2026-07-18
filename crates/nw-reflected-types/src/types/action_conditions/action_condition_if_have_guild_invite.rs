@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfHaveGuildInvite;
+pub struct ActionConditionIfHaveGuildInvite {}
 
 impl AzRtti for ActionConditionIfHaveGuildInvite {
     const NAME: &'static str = "ActionConditionIfHaveGuildInvite";

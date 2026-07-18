@@ -1,0 +1,992 @@
+    private Map<PcodeOpAST, ContainerSequenceAction> containerSequenceActions(
+        Function function,
+        HighFunction high,
+        String writeBufferParameter,
+        Set<String> active,
+        List<ContainerPlanDiagnostic> diagnostics) {
+
+        IdentityHashMap<PcodeOpAST, ContainerSequenceAction> actions =
+            new IdentityHashMap<>();
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            ContainerSequenceAnalysis analysis = analyzeContainerSequence(
+                function,
+                high,
+                loop,
+                operations,
+                writeBufferParameter,
+                active,
+                diagnostics);
+            ContainerSequenceSummary summary = analysis.summary();
+            if (summary == null) {
+                continue;
+            }
+            boolean conflict = summary.elementOperations().stream().anyMatch(actions::containsKey) ||
+                summary.emissionOperations().stream().anyMatch(actions::containsKey);
+            if (conflict) {
+                continue;
+            }
+            for (PcodeOpAST operation : summary.elementOperations()) {
+                actions.put(operation, new ContainerSequenceAction(summary.codec(), false));
+            }
+            for (PcodeOpAST operation : summary.emissionOperations()) {
+                actions.put(operation, new ContainerSequenceAction(summary.codec(), true));
+            }
+        }
+        return actions;
+    }
+
+    private ContainerSequenceAnalysis analyzeContainerSequence(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        String writeBufferParameter,
+        Set<String> active,
+        List<ContainerPlanDiagnostic> diagnostics) {
+
+        SequenceLoopStorage storage = sequenceLoopStorage(high, loop, operations);
+        if (storage == null) {
+            return analyzeLinkedContainerSequence(
+                function,
+                high,
+                loop,
+                operations,
+                writeBufferParameter,
+                active,
+                diagnostics);
+        }
+        ContainerIterationAnalysis iterationAnalysis = analyzeContainerIteration(
+            function,
+            high,
+            loop,
+            operations,
+            writeBufferParameter,
+            active,
+            diagnostics);
+        ContainerIteration iteration = iterationAnalysis.iteration();
+        if (iteration == null) {
+            return ContainerSequenceAnalysis.rejected(iterationAnalysis.rejectReason());
+        }
+
+        SequenceCapacityGuard guard = sequenceCapacityGuard(
+            high,
+            loop,
+            operations,
+            storage);
+        if (guard == null) {
+            return staticSequenceAnalysis(
+                high,
+                loop,
+                operations,
+                storage,
+                iteration);
+        }
+        List<PcodeOpAST> countCalls = sequenceCountCalls(
+            function,
+            high,
+            loop,
+            operations,
+            writeBufferParameter,
+            storage,
+            guard);
+        if (countCalls == null) {
+            return ContainerSequenceAnalysis.rejected("missing-partitioned-count-calls");
+        }
+
+        String elementShape = iteration.element().shape == null
+            ? iteration.element().layout
+            : iteration.element().shape;
+        if (elementShape == null || iteration.element().layout == null) {
+            return ContainerSequenceAnalysis.rejected("missing-logical-element-shape");
+        }
+        boolean inlineFixed = isInlineFixedSequenceStorage(storage, guard.capacity());
+        String logicalShape = inlineFixed
+            ? "fixed-vector<" + elementShape + "," + guard.capacity() + ">"
+            : "vec<" + elementShape + ">";
+        String logicalLayout = "vec<" + iteration.element().layout + ">";
+        ContainerCodecCall codec = new ContainerCodecCall();
+        codec.operation = countCalls.get(0);
+        codec.callsite = countCalls.get(0).getSeqnum().getTarget();
+        codec.wireEvidence = WireShape.semantic(
+            logicalShape,
+            logicalLayout,
+            inlineFixed
+                ? "cfg-bounded-inline-sequence"
+                : "cfg-bounded-dynamic-sequence");
+        codec.evidenceSource = inlineFixed
+            ? "container-fixed-sequence"
+            : "container-counted-sequence";
+        codec.memberSemantics = "counted-sequence";
+        codec.analysisStatus = "complete";
+        codec.members.add(sequenceCountCodec(countCalls.get(0)));
+        codec.members.addAll(iteration.events());
+
+        LinkedHashSet<PcodeOpAST> elementOperations = new LinkedHashSet<>();
+        iteration.codecs().forEach(member -> elementOperations.add(member.operation));
+        return ContainerSequenceAnalysis.complete(new ContainerSequenceSummary(
+            codec,
+            List.copyOf(countCalls),
+            Set.copyOf(elementOperations)));
+    }
+
+    private ContainerSequenceAnalysis staticSequenceAnalysis(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        SequenceLoopStorage storage,
+        ContainerIteration iteration) {
+
+        FixedSequenceStorage fixed = fixedSequenceStorage(high, loop, operations);
+        if (fixed == null || !fixed.data().sameLocation(storage.data()) ||
+            !fixed.end().sameLocation(storage.end()) || fixed.stride() != storage.stride() ||
+            fixed.capacity() <= 0) {
+            return ContainerSequenceAnalysis.rejected("missing-capacity-guard");
+        }
+        String elementShape = iteration.element().shape == null
+            ? iteration.element().layout
+            : iteration.element().shape;
+        if (elementShape == null || iteration.element().layout == null) {
+            return ContainerSequenceAnalysis.rejected("missing-logical-element-shape");
+        }
+        ContainerCodecCall codec = new ContainerCodecCall();
+        codec.operation = iteration.events().get(0).operation;
+        codec.callsite = codec.operation.getSeqnum().getTarget();
+        codec.wireEvidence = WireShape.semantic(
+            "fixed-array<" + elementShape + "," + fixed.capacity() + ">",
+            "fixed-array<" + iteration.element().layout + "," + fixed.capacity() + ">",
+            "cfg-static-sequence");
+        codec.evidenceSource = "container-static-sequence";
+        codec.memberSemantics = "fixed-sequence";
+        codec.analysisStatus = "complete";
+        for (int index = 0; index < fixed.capacity(); index++) {
+            codec.members.addAll(iteration.events());
+        }
+        LinkedHashSet<PcodeOpAST> elementOperations = new LinkedHashSet<>();
+        iteration.codecs().forEach(member -> elementOperations.add(member.operation));
+        return ContainerSequenceAnalysis.complete(new ContainerSequenceSummary(
+            codec,
+            List.of(codec.operation),
+            Set.copyOf(elementOperations)));
+    }
+
+    private ContainerIterationAnalysis analyzeContainerIteration(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        String writeBufferParameter,
+        Set<String> active,
+        List<ContainerPlanDiagnostic> diagnostics) {
+
+        List<ContainerCodecCall> codecs = fullContainerLoopCodecs(
+            function,
+            high,
+            loop,
+            writeBufferParameter,
+            active,
+            diagnostics);
+        if (codecs.isEmpty() || codecs.stream().anyMatch(codec -> codec.operation == null)) {
+            return ContainerIterationAnalysis.rejected("missing-element-codecs");
+        }
+        Map<PcodeBlockBasic, List<ContainerCodecCall>> codecsByBlock = new HashMap<>();
+        for (ContainerCodecCall codec : codecs) {
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(codec.operation);
+            if (block == null) {
+                return ContainerIterationAnalysis.rejected("unmapped-element-codec-block");
+            }
+            codecsByBlock.computeIfAbsent(block, ignored -> new ArrayList<>()).add(codec);
+        }
+        NetworkSchemaFlowSequence.Result<ContainerCodecCall> sequence =
+            NetworkSchemaFlowSequence.analyzeLoopIteration(
+                loop,
+                codecsByBlock,
+                (left, right) -> left == right);
+        if (!sequence.complete() || sequence.events().isEmpty()) {
+            return ContainerIterationAnalysis.rejected("iteration-" + sequence.status());
+        }
+        List<ContainerCodecCall> leaves = physicalContainerCodecLeaves(sequence.events());
+        WireShape element = sequenceElementWireEvidence(leaves);
+        return element == null
+            ? ContainerIterationAnalysis.rejected("missing-element-wire-evidence")
+            : ContainerIterationAnalysis.complete(new ContainerIteration(
+                sequence.events(),
+                element,
+                codecs));
+    }
+
+    private ContainerSequenceAnalysis analyzeLinkedContainerSequence(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        String writeBufferParameter,
+        Set<String> active,
+        List<ContainerPlanDiagnostic> diagnostics) {
+
+        LinkedSequenceStorage storage = linkedSequenceStorage(high, loop, operations);
+        if (storage == null) {
+            return ContainerSequenceAnalysis.rejected("missing-sequence-storage");
+        }
+        ContainerIterationAnalysis iterationAnalysis = analyzeContainerIteration(
+            function,
+            high,
+            loop,
+            operations,
+            writeBufferParameter,
+            active,
+            diagnostics);
+        ContainerIteration iteration = iterationAnalysis.iteration();
+        if (iteration == null) {
+            return ContainerSequenceAnalysis.rejected(iterationAnalysis.rejectReason());
+        }
+        SequenceCountBranches branches = partitionedSequenceCountCalls(
+            function,
+            operations,
+            writeBufferParameter,
+            storage.guard());
+        if (branches == null || loop.contains(branches.accepted()) ||
+            loop.contains(branches.rejected()) ||
+            !NetworkSchemaControlFlow.dominates(
+                high,
+                NetworkSchemaControlFlow.parentBlock(branches.accepted()),
+                loop.header()) ||
+            !callReferencesSequenceCount(
+                function,
+                branches.accepted(),
+                writeBufferParameter,
+                storage.count()) ||
+            !callHasExplicitZeroValue(branches.rejected())) {
+            return ContainerSequenceAnalysis.rejected("missing-partitioned-count-calls");
+        }
+
+        String elementShape = iteration.element().shape == null
+            ? iteration.element().layout
+            : iteration.element().shape;
+        if (elementShape == null || iteration.element().layout == null) {
+            return ContainerSequenceAnalysis.rejected("missing-logical-element-shape");
+        }
+        ContainerCodecCall codec = new ContainerCodecCall();
+        codec.operation = branches.accepted();
+        codec.callsite = branches.accepted().getSeqnum().getTarget();
+        codec.wireEvidence = WireShape.semantic(
+            "vec<" + elementShape + ">",
+            "vec<" + iteration.element().layout + ">",
+            "cfg-linked-counted-sequence");
+        codec.evidenceSource = "container-linked-sequence";
+        codec.memberSemantics = "counted-sequence";
+        codec.analysisStatus = "complete";
+        codec.members.add(sequenceCountCodec(branches.accepted()));
+        codec.members.addAll(iteration.events());
+
+        LinkedHashSet<PcodeOpAST> elementOperations = new LinkedHashSet<>();
+        iteration.codecs().forEach(member -> elementOperations.add(member.operation));
+        return ContainerSequenceAnalysis.complete(new ContainerSequenceSummary(
+            codec,
+            List.of(branches.accepted(), branches.rejected()),
+            Set.copyOf(elementOperations)));
+    }
+
+    private LinkedSequenceStorage linkedSequenceStorage(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        LinkedSequenceStorage selected = null;
+        var iterator = loop.header().getIterator();
+        while (iterator.hasNext()) {
+            PcodeOp operation = iterator.next();
+            if (!(operation instanceof PcodeOpAST phi) ||
+                phi.getOpcode() != PcodeOp.MULTIEQUAL || phi.getOutput() == null ||
+                phi.getOutput().getSize() != currentProgram.getDefaultPointerSize() ||
+                affinePointerInductionStride(phi) != null) {
+                continue;
+            }
+            PcodeStorage initial = null;
+            Long nextOffset = null;
+            for (int slot = 0; slot < phi.getNumInputs(); slot++) {
+                Varnode input = phi.getInput(slot);
+                Long candidateOffset = linkedLoadOffsetFromRoot(
+                    input,
+                    phi.getOutput(),
+                    new LinkedHashSet<>(),
+                    0);
+                if (candidateOffset != null) {
+                    if (nextOffset != null && !nextOffset.equals(candidateOffset)) {
+                        return null;
+                    }
+                    nextOffset = candidateOffset;
+                    continue;
+                }
+                PcodeStorage candidate = pcodeLoadedStorageExpression(input);
+                if (candidate == null) {
+                    candidate = pcodeStorageExpression(input);
+                }
+                if (candidate != null) {
+                    if (initial != null && !initial.sameLocation(candidate)) {
+                        return null;
+                    }
+                    initial = candidate;
+                }
+            }
+            PcodeStorage sentinel = linkedSequenceSentinel(loop, operations, phi);
+            LinkedSequenceGuard guard = linkedSequenceGuard(high, loop, operations, sentinel);
+            if (initial == null || sentinel == null || !initial.sameLocation(sentinel) ||
+                nextOffset == null || nextOffset < 0L || guard == null) {
+                continue;
+            }
+            LinkedSequenceStorage candidate = new LinkedSequenceStorage(
+                phi,
+                sentinel,
+                guard.count(),
+                guard.guard(),
+                nextOffset);
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Long linkedLoadOffsetFromRoot(
+        Varnode node,
+        Varnode root,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || root == null || depth > 32 || !seen.add(pcodeNodeKey(node))) {
+            return null;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null || definition.getOpcode() == PcodeOp.CALL ||
+            definition.getOpcode() == PcodeOp.CALLIND) {
+            return null;
+        }
+        if (definition.getOpcode() == PcodeOp.LOAD && definition.getNumInputs() >= 2) {
+            return pcodeConstantOffsetFromRoot(
+                definition.getInput(1),
+                root,
+                new LinkedHashSet<>(),
+                0);
+        }
+        Long selected = null;
+        int inputs = definition.getOpcode() == PcodeOp.INDIRECT
+            ? Math.min(1, definition.getNumInputs())
+            : definition.getNumInputs();
+        for (int slot = 0; slot < inputs; slot++) {
+            Long candidate = linkedLoadOffsetFromRoot(
+                definition.getInput(slot),
+                root,
+                new LinkedHashSet<>(seen),
+                depth + 1);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private PcodeStorage linkedSequenceSentinel(
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeOpAST induction) {
+
+        PcodeStorage selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CBRANCH ||
+                operation.getNumInputs() < 2) {
+                continue;
+            }
+            Varnode condition = operation.getInput(operation.getNumInputs() - 1);
+            PcodeOp comparison = condition.getDef();
+            if (comparison == null || comparison.getNumInputs() != 2 ||
+                !pcodeNodeDependsOn(
+                    condition,
+                    induction.getOutput(),
+                    new LinkedHashSet<>(),
+                    0)) {
+                continue;
+            }
+            for (int slot = 0; slot < comparison.getNumInputs(); slot++) {
+                Varnode input = comparison.getInput(slot);
+                if (pcodeNodeDependsOn(
+                        input,
+                        induction.getOutput(),
+                        new LinkedHashSet<>(),
+                        0)) {
+                    continue;
+                }
+                PcodeStorage candidate = pcodeStorageExpression(input);
+                if (candidate == null) {
+                    candidate = pcodeLoadedStorageExpression(input);
+                }
+                if (candidate != null) {
+                    if (selected != null && !selected.sameLocation(candidate)) {
+                        return null;
+                    }
+                    selected = candidate;
+                }
+            }
+        }
+        return selected;
+    }
+
+    private LinkedSequenceGuard linkedSequenceGuard(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeStorage sentinel) {
+
+        LinkedSequenceGuard selected = null;
+        for (PcodeOpAST comparison : operations) {
+            if (!isOrderedIntegerComparison(comparison) || comparison.getNumInputs() != 2 ||
+                comparison.getOutput() == null || loop.contains(comparison)) {
+                continue;
+            }
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(comparison);
+            if (block == null || !NetworkSchemaControlFlow.dominates(high, block, loop.header())) {
+                continue;
+            }
+            PcodeOpAST branch = branchUsingComparison(block, comparison);
+            SequenceBranchDirection direction = sequenceBranchDirection(branch, loop);
+            Long capacity = boundedSequenceCapacity(comparison);
+            PcodeStorage count = uniqueComparisonStorage(comparison, sentinel);
+            if (branch == null || direction == null || capacity == null || capacity <= 0L ||
+                capacity > 0x2000000L || count == null) {
+                continue;
+            }
+            LinkedSequenceGuard candidate = new LinkedSequenceGuard(
+                count,
+                new SequenceCapacityGuard(
+                    comparison,
+                    branch,
+                    direction.accepted(),
+                    direction.rejected(),
+                    capacity));
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private PcodeStorage uniqueComparisonStorage(
+        PcodeOpAST comparison,
+        PcodeStorage excluded) {
+
+        LinkedHashMap<String, PcodeStorage> candidates = new LinkedHashMap<>();
+        for (int slot = 0; slot < comparison.getNumInputs(); slot++) {
+            Varnode operand = comparison.getInput(slot);
+            if (operand == null || operand.isConstant()) {
+                continue;
+            }
+            PcodeStorage storage = pcodeLoadedStorageExpression(operand);
+            if (storage == null || !storage.base.matches("param_\\d+") ||
+                excluded != null && excluded.sameLocation(storage)) {
+                continue;
+            }
+            candidates.putIfAbsent(storageKey(storage), storage);
+        }
+        return candidates.size() == 1 ? candidates.values().iterator().next() : null;
+    }
+
+    private SequenceLoopStorage sequenceLoopStorage(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        SequenceLoopStorage selected = null;
+        for (PcodeOpAST induction : affineSequenceInductions(loop)) {
+            Long stride = affinePointerInductionStride(induction);
+            PcodeStorage data = sequenceInitialStorage(induction);
+            if (stride == null || stride <= 0L || data == null ||
+                !isSequenceStorageBase(data.base) ||
+                !loopConditionDependsOn(high, loop, induction.getOutput())) {
+                continue;
+            }
+            PcodeStorage end = fixedSequenceEndStorage(loop, operations, induction, data);
+            if (end == null || !end.base.equals(data.base) || end.offset <= data.offset) {
+                continue;
+            }
+            SequenceLoopStorage candidate = new SequenceLoopStorage(
+                induction,
+                data,
+                end,
+                stride);
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private boolean isSequenceStorageBase(String base) {
+        return base != null && (base.matches("param_\\d+") || "stack".equals(base));
+    }
+
+    private PcodeStorage sequenceInitialStorage(PcodeOpAST induction) {
+        PcodeStorage selected = null;
+        for (int slot = 0; slot < induction.getNumInputs(); slot++) {
+            Varnode input = induction.getInput(slot);
+            if (affineStepFromPhi(
+                    input,
+                    induction.getOutput(),
+                    new LinkedHashSet<>(),
+                    0) != null) {
+                continue;
+            }
+            PcodeStorage storage = pcodeStorageExpression(input);
+            if (storage == null) {
+                storage = pcodeLoadedStorageExpression(input);
+            }
+            if (storage == null) {
+                continue;
+            }
+            if (selected != null && !selected.sameLocation(storage)) {
+                return null;
+            }
+            selected = storage;
+        }
+        return selected;
+    }
+
+    private SequenceCapacityGuard sequenceCapacityGuard(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        SequenceLoopStorage storage) {
+
+        ArrayList<SequenceCapacityGuard> candidates = new ArrayList<>();
+        for (PcodeOpAST comparison : operations) {
+            if (!isOrderedIntegerComparison(comparison) || comparison.getNumInputs() != 2 ||
+                comparison.getOutput() == null || loop.contains(comparison)) {
+                continue;
+            }
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(comparison);
+            if (block == null || !NetworkSchemaControlFlow.dominates(
+                    high,
+                    block,
+                    loop.header())) {
+                continue;
+            }
+            PcodeOpAST branch = branchUsingComparison(block, comparison);
+            SequenceBranchDirection direction = sequenceBranchDirection(branch, loop);
+            if (branch == null || direction == null ||
+                !comparisonReferencesSequenceStorage(comparison, storage)) {
+                continue;
+            }
+            Long capacity = boundedSequenceCapacity(comparison);
+            if (capacity == null || capacity <= 0L || capacity > 0x2000000L) {
+                continue;
+            }
+            candidates.add(new SequenceCapacityGuard(
+                comparison,
+                branch,
+                direction.accepted(),
+                direction.rejected(),
+                capacity));
+        }
+        SequenceCapacityGuard selected = null;
+        for (SequenceCapacityGuard candidate : candidates) {
+            PcodeBlockBasic candidateBlock = NetworkSchemaControlFlow.parentBlock(
+                candidate.branch());
+            boolean nearest = candidates.stream().allMatch(other ->
+                other == candidate || NetworkSchemaControlFlow.dominates(
+                    high,
+                    NetworkSchemaControlFlow.parentBlock(other.branch()),
+                    candidateBlock));
+            if (!nearest) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private PcodeOpAST branchUsingComparison(
+        PcodeBlockBasic block,
+        PcodeOpAST comparison) {
+
+        PcodeOpAST selected = null;
+        var iterator = block.getIterator();
+        while (iterator.hasNext()) {
+            PcodeOp operation = iterator.next();
+            if (!(operation instanceof PcodeOpAST branch) ||
+                branch.getOpcode() != PcodeOp.CBRANCH || branch.getNumInputs() < 2 ||
+                !pcodeNodeDependsOn(
+                    branch.getInput(branch.getNumInputs() - 1),
+                    comparison.getOutput(),
+                    new LinkedHashSet<>(),
+                    0)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = branch;
+        }
+        return selected;
+    }
+
+    private SequenceBranchDirection sequenceBranchDirection(
+        PcodeOpAST branch,
+        NetworkSchemaNaturalLoop loop) {
+
+        if (branch == null) {
+            return null;
+        }
+        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(branch);
+        List<PcodeBlockBasic> successors = block == null
+            ? List.of()
+            : NetworkSchemaControlFlow.successors(block);
+        if (successors.size() != 2) {
+            return null;
+        }
+        Address destination = branch.getInput(0).getAddress();
+        PcodeBlockBasic trueSuccessor = successors.stream()
+            .filter(successor -> Objects.equals(successor.getStart(), destination))
+            .findFirst()
+            .orElse(null);
+        if (trueSuccessor == null) {
+            return null;
+        }
+        PcodeBlockBasic falseSuccessor = successors.get(0) == trueSuccessor
+            ? successors.get(1)
+            : successors.get(0);
+        boolean trueReaches = NetworkSchemaControlFlow.reaches(
+            trueSuccessor,
+            loop.header());
+        boolean falseReaches = NetworkSchemaControlFlow.reaches(
+            falseSuccessor,
+            loop.header());
+        if (trueReaches == falseReaches) {
+            return null;
+        }
+        return trueReaches
+            ? new SequenceBranchDirection(trueSuccessor, falseSuccessor)
+            : new SequenceBranchDirection(falseSuccessor, trueSuccessor);
+    }
+
+    private boolean comparisonReferencesSequenceStorage(
+        PcodeOpAST comparison,
+        SequenceLoopStorage storage) {
+
+        LinkedHashMap<String, PcodeStorage> referenced = new LinkedHashMap<>();
+        collectPcodeStorages(
+            comparison.getInput(0),
+            referenced,
+            new LinkedHashSet<>(),
+            0);
+        collectPcodeStorages(
+            comparison.getInput(1),
+            referenced,
+            new LinkedHashSet<>(),
+            0);
+        boolean hasData = referenced.values().stream().anyMatch(storage.data()::sameLocation);
+        boolean hasEnd = referenced.values().stream().anyMatch(storage.end()::sameLocation);
+        return hasData && hasEnd;
+    }
+
+    private Long boundedSequenceCapacity(PcodeOpAST comparison) {
+
+        int constantSlot = comparison.getInput(0).isConstant()
+            ? 0
+            : comparison.getInput(1).isConstant() ? 1 : -1;
+        if (constantSlot < 0) {
+            return null;
+        }
+        Long threshold = NetworkSchemaIntegerEvaluator.evaluate(
+            comparison.getInput(constantSlot));
+        if (threshold == null || threshold < 0L) {
+            return null;
+        }
+        boolean variableOnLeft = constantSlot == 1;
+        return switch (comparison.getOpcode()) {
+            case PcodeOp.INT_LESS, PcodeOp.INT_SLESS ->
+                variableOnLeft ? threshold - 1L : threshold;
+            case PcodeOp.INT_LESSEQUAL, PcodeOp.INT_SLESSEQUAL ->
+                variableOnLeft ? threshold : threshold - 1L;
+            default -> null;
+        };
+    }
+
+    private List<PcodeOpAST> sequenceCountCalls(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        String writeBufferParameter,
+        SequenceLoopStorage storage,
+        SequenceCapacityGuard guard) {
+
+        SequenceCountBranches branches = partitionedSequenceCountCalls(
+            function,
+            operations,
+            writeBufferParameter,
+            guard);
+        if (branches == null) {
+            return null;
+        }
+        PcodeOpAST accepted = branches.accepted();
+        PcodeOpAST rejected = branches.rejected();
+        if (loop.contains(accepted) || loop.contains(rejected) ||
+            !NetworkSchemaControlFlow.dominates(
+                high,
+                NetworkSchemaControlFlow.parentBlock(accepted),
+                loop.header()) ||
+            !callReferencesSequenceStorage(
+                function,
+                accepted,
+                writeBufferParameter,
+                storage) ||
+            !callHasExplicitZeroValue(rejected)) {
+            return null;
+        }
+        return List.of(accepted, rejected);
+    }
+
+    private SequenceCountBranches partitionedSequenceCountCalls(
+        Function function,
+        List<PcodeOpAST> operations,
+        String writeBufferParameter,
+        SequenceCapacityGuard guard) {
+
+        Set<PcodeBlockBasic> acceptedReachable = reachableBlocksFrom(guard.accepted());
+        Set<PcodeBlockBasic> rejectedReachable = reachableBlocksFrom(guard.rejected());
+        HashSet<PcodeBlockBasic> shared = new HashSet<>(acceptedReachable);
+        shared.retainAll(rejectedReachable);
+        HashSet<PcodeBlockBasic> acceptedRegion = new HashSet<>(acceptedReachable);
+        acceptedRegion.removeAll(shared);
+        HashSet<PcodeBlockBasic> rejectedRegion = new HashSet<>(rejectedReachable);
+        rejectedRegion.removeAll(shared);
+
+        PcodeOpAST accepted = uniqueSequenceCountCall(
+            function,
+            operations,
+            writeBufferParameter,
+            acceptedRegion);
+        PcodeOpAST rejected = uniqueSequenceCountCall(
+            function,
+            operations,
+            writeBufferParameter,
+            rejectedRegion);
+        return accepted == null || rejected == null
+            ? null
+            : new SequenceCountBranches(accepted, rejected);
+    }
+
+    private PcodeOpAST uniqueSequenceCountCall(
+        Function function,
+        List<PcodeOpAST> operations,
+        String writeBufferParameter,
+        Set<PcodeBlockBasic> region) {
+
+        PcodeStorage writeBuffer = new PcodeStorage(writeBufferParameter, 0L);
+        PcodeOpAST selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL ||
+                !region.contains(NetworkSchemaControlFlow.parentBlock(operation))) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Integer bufferSlot = provenCallArgumentSlot(
+                function,
+                operation,
+                target,
+                writeBuffer);
+            WireShape evidence = target == null || bufferSlot == null
+                ? null
+                : validatedMarshalLeaf(target, "param_" + bufferSlot);
+            if (evidence == null || !"vlq-u32".equals(evidence.shape)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = operation;
+        }
+        return selected;
+    }
+
+    private Set<PcodeBlockBasic> reachableBlocksFrom(PcodeBlockBasic root) {
+        HashSet<PcodeBlockBasic> result = new HashSet<>();
+        ArrayList<PcodeBlockBasic> pending = new ArrayList<>();
+        pending.add(root);
+        while (!pending.isEmpty()) {
+            PcodeBlockBasic block = pending.remove(pending.size() - 1);
+            if (!result.add(block)) {
+                continue;
+            }
+            pending.addAll(NetworkSchemaControlFlow.successors(block));
+        }
+        return Set.copyOf(result);
+    }
+
+    private boolean callReferencesSequenceStorage(
+        Function owner,
+        PcodeOpAST call,
+        String writeBufferParameter,
+        SequenceLoopStorage storage) {
+
+        LinkedHashMap<String, PcodeStorage> referenced = new LinkedHashMap<>();
+        for (int slot = 1; slot < call.getNumInputs(); slot++) {
+            collectPcodeStorages(
+                call.getInput(slot),
+                referenced,
+                new LinkedHashSet<>(),
+                0);
+        }
+        if (referenced.values().stream().anyMatch(storage.data()::sameLocation) &&
+            referenced.values().stream().anyMatch(storage.end()::sameLocation)) {
+            return true;
+        }
+
+        Function target = pcodeCallTarget(call);
+        Integer bufferSlot = provenCallArgumentSlot(
+            owner,
+            call,
+            target,
+            new PcodeStorage(writeBufferParameter, 0L));
+        if (bufferSlot == null) {
+            return false;
+        }
+        int argumentCount = provenCallArgumentCount(call, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            if (slot == bufferSlot) {
+                continue;
+            }
+            Set<PcodeStorage> dependencies = instructionCallArgumentStorageDependencies(
+                owner,
+                call,
+                target,
+                slot);
+            if (dependencies.stream().anyMatch(storage.data()::sameLocation) &&
+                dependencies.stream().anyMatch(storage.end()::sameLocation)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean callReferencesSequenceCount(
+        Function owner,
+        PcodeOpAST call,
+        String writeBufferParameter,
+        PcodeStorage count) {
+
+        LinkedHashMap<String, PcodeStorage> referenced = new LinkedHashMap<>();
+        for (int slot = 1; slot < call.getNumInputs(); slot++) {
+            collectPcodeStorages(
+                call.getInput(slot),
+                referenced,
+                new LinkedHashSet<>(),
+                0);
+        }
+        if (referenced.values().stream().anyMatch(count::sameLocation)) {
+            return true;
+        }
+
+        Function target = pcodeCallTarget(call);
+        Integer bufferSlot = provenCallArgumentSlot(
+            owner,
+            call,
+            target,
+            new PcodeStorage(writeBufferParameter, 0L));
+        if (bufferSlot == null) {
+            return false;
+        }
+        int argumentCount = provenCallArgumentCount(call, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            if (slot == bufferSlot) {
+                continue;
+            }
+            if (instructionCallArgumentStorageDependencies(owner, call, target, slot)
+                .stream()
+                .anyMatch(count::sameLocation)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean callHasExplicitZeroValue(PcodeOpAST call) {
+        Function owner = call == null || call.getSeqnum() == null
+            ? null
+            : functionContaining(call.getSeqnum().getTarget());
+        Function target = pcodeCallTarget(call);
+        int argumentCount = provenCallArgumentCount(call, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            Long value = provenCallArgumentImmediate(owner, call, target, slot);
+            if (value != null && value == 0L) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private WireShape sequenceElementWireEvidence(List<ContainerCodecCall> codecs) {
+        if (codecs == null || codecs.isEmpty()) {
+            return null;
+        }
+        ArrayList<String> shapes = new ArrayList<>();
+        ArrayList<String> layouts = new ArrayList<>();
+        for (ContainerCodecCall codec : codecs) {
+            if (codec.wireEvidence == null || codec.wireEvidence.layout == null) {
+                return null;
+            }
+            layouts.add(codec.wireEvidence.layout);
+            shapes.add(codec.wireEvidence.shape == null
+                ? codec.wireEvidence.layout
+                : codec.wireEvidence.shape);
+        }
+        String shape = compositeWireShape(shapes);
+        String layout = compositeWireShape(layouts);
+        return shape == null || layout == null
+            ? null
+            : WireShape.semantic(shape, layout, "cfg-loop-iteration-codec-agreement");
+    }
+
+    private boolean isInlineFixedSequenceStorage(
+        SequenceLoopStorage storage,
+        long capacity) {
+
+        if (capacity <= 0L || capacity > 0xffffL) {
+            return false;
+        }
+        long bytes;
+        long aligned;
+        try {
+            bytes = Math.multiplyExact(capacity, storage.stride());
+            long alignment = currentProgram.getDefaultPointerSize();
+            aligned = Math.multiplyExact(
+                Math.floorDiv(Math.addExact(bytes, alignment - 1L), alignment),
+                alignment);
+        }
+        catch (ArithmeticException ignored) {
+            return false;
+        }
+        return storage.end().offset - storage.data().offset == aligned;
+    }
+
+    private ContainerCodecCall sequenceCountCodec(PcodeOpAST countCall) {
+        ContainerCodecCall codec = new ContainerCodecCall();
+        codec.operation = countCall;
+        codec.callsite = countCall.getSeqnum().getTarget();
+        codec.target = pcodeCallTarget(countCall).getEntryPoint();
+        codec.targetName = fullFunctionName(pcodeCallTarget(countCall));
+        codec.wireEvidence = WireShape.semantic(
+            "vlq-u32",
+            "cfg-bounded-sequence-count");
+        codec.evidenceSource = "container-sequence-count";
+        return codec;
+    }

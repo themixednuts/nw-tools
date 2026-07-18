@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfHomingOverrideTargetSet;
+pub struct ActionConditionIfHomingOverrideTargetSet {}
 
 impl AzRtti for ActionConditionIfHomingOverrideTargetSet {
     const NAME: &'static str = "ActionConditionIfHomingOverrideTargetSet";

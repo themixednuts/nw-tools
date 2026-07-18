@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct UsePaperdollItem;
+pub struct UsePaperdollItem {}
 
 impl AzRtti for UsePaperdollItem {
     const NAME: &'static str = "UsePaperdollItem";

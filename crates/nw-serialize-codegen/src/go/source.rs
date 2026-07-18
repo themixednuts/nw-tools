@@ -11,7 +11,7 @@ use crate::naming::{rust_field_ident, rust_type_ident, rust_variant_ident};
 use crate::types::ResolvedType;
 
 use super::support;
-use super::types::{GoTypeOptions, GoTypeRenderer};
+use super::types::{GoTypeOptions, GoTypeRenderer, go_exported_identifier};
 
 mod error;
 mod project;
@@ -23,6 +23,8 @@ pub use project::{GoStandaloneProject, GoStandaloneProjectFile};
 pub struct GoSourceOptions {
     pub package_name: String,
     pub include_support_aliases: bool,
+    pub use_support_aliases: bool,
+    pub idiomatic_initialisms: bool,
 }
 
 impl Default for GoSourceOptions {
@@ -30,6 +32,8 @@ impl Default for GoSourceOptions {
         Self {
             package_name: "types".to_owned(),
             include_support_aliases: true,
+            use_support_aliases: true,
+            idiomatic_initialisms: false,
         }
     }
 }
@@ -64,7 +68,8 @@ impl GoSourceEmitter {
         }
 
         let type_renderer = GoTypeRenderer::new(GoTypeOptions {
-            use_support_aliases: options.include_support_aliases,
+            use_support_aliases: options.use_support_aliases,
+            idiomatic_initialisms: options.idiomatic_initialisms,
         });
 
         for item in dependency_ordered_codegen_items(unit)
@@ -77,6 +82,7 @@ impl GoSourceEmitter {
                         item,
                         &type_renderer,
                         options.include_support_aliases,
+                        options.idiomatic_initialisms,
                         &mut out,
                     );
                 }
@@ -84,6 +90,7 @@ impl GoSourceEmitter {
                     item,
                     &type_renderer,
                     options.include_support_aliases,
+                    options.idiomatic_initialisms,
                     &mut out,
                 ),
             }
@@ -137,16 +144,18 @@ impl GoSourceEmitter {
         item: &SerializeCodegenItem,
         type_renderer: &GoTypeRenderer,
         include_support_aliases: bool,
+        idiomatic_initialisms: bool,
         out: &mut String,
     ) {
-        let type_name = rust_type_ident(&item.source_name);
+        let type_name = go_type_name(&item.source_name, idiomatic_initialisms);
         out.push_str("type ");
         out.push_str(&type_name);
         out.push_str(" struct {\n");
         let mut used_field_names = BTreeMap::new();
         let mut used_json_field_names = BTreeMap::new();
         for field in item.fields.iter().filter(|field| !field.is_base_class) {
-            let field_name = unique_go_field_name(field, &mut used_field_names);
+            let field_name =
+                unique_go_field_name(field, &mut used_field_names, idiomatic_initialisms);
             let json_field_name =
                 unique_go_json_field_name_for_field(field, &field_name, &mut used_json_field_names);
             out.push('\t');
@@ -168,10 +177,11 @@ impl GoSourceEmitter {
         item: &SerializeCodegenItem,
         type_renderer: &GoTypeRenderer,
         include_support_aliases: bool,
+        idiomatic_initialisms: bool,
         out: &mut String,
     ) {
-        let type_name = rust_type_ident(&item.source_name);
-        let variant_names = go_enum_variant_names(item, &type_name);
+        let type_name = go_type_name(&item.source_name, idiomatic_initialisms);
+        let variant_names = go_enum_variant_names(item, &type_name, idiomatic_initialisms);
         let raw_type = item
             .enum_underlying_type
             .as_ref()
@@ -236,13 +246,23 @@ fn render_go_field_type(
     }
 }
 
-fn go_enum_variant_names(item: &SerializeCodegenItem, type_name: &str) -> Vec<String> {
+fn go_enum_variant_names(
+    item: &SerializeCodegenItem,
+    type_name: &str,
+    idiomatic_initialisms: bool,
+) -> Vec<String> {
     let mut used = BTreeMap::<String, usize>::new();
     item.variants
         .iter()
         .enumerate()
         .map(|(index, variant)| {
-            let base = format!("{type_name}{}", rust_variant_ident(&variant.source_name));
+            let variant_name = rust_variant_ident(&variant.source_name);
+            let variant_name = if idiomatic_initialisms {
+                go_exported_identifier(&variant_name)
+            } else {
+                variant_name
+            };
+            let base = format!("{type_name}{variant_name}");
             unique_variant_name(base, variant, index, &mut used)
         })
         .collect()
@@ -337,11 +357,38 @@ fn go_string_literal(value: &str) -> String {
 }
 
 fn format_go_source(source: &str) -> Result<String, GoSourceEmitError> {
-    let bytes = gofmt::formatter::format(source).map_err(GoSourceEmitError::Format)?;
-    let formatted = String::from_utf8(bytes)?;
+    let formatted = run_gofmt(source)?;
     let spaced = space_go_top_level_declarations(&formatted);
-    validate_go_source(&spaced)?;
-    Ok(spaced)
+    let formatted = run_gofmt(&spaced)?;
+    validate_go_source(&formatted)?;
+    Ok(formatted)
+}
+
+fn run_gofmt(source: &str) -> Result<String, GoSourceEmitError> {
+    let mut child = std::process::Command::new("gofmt")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| GoSourceEmitError::Format(format!("start gofmt: {error}")))?;
+    {
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .expect("gofmt stdin is piped")
+            .write_all(source.as_bytes())
+            .map_err(|error| GoSourceEmitError::Format(format!("write gofmt input: {error}")))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| GoSourceEmitError::Format(format!("wait for gofmt: {error}")))?;
+    if !output.status.success() {
+        return Err(GoSourceEmitError::Format(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(Into::into)
 }
 
 fn space_go_top_level_declarations(source: &str) -> String {
@@ -506,7 +553,10 @@ fn reject_unresolved_types(unit: &SerializeCodegenUnit) -> Result<(), GoSourceEm
     Ok(())
 }
 
-fn go_field_name(source_name: &str) -> String {
+fn go_field_name(source_name: &str, idiomatic_initialisms: bool) -> String {
+    if idiomatic_initialisms {
+        return go_exported_identifier(source_name);
+    }
     let rust_name = rust_field_ident(source_name);
     rust_name
         .split('_')
@@ -515,14 +565,24 @@ fn go_field_name(source_name: &str) -> String {
         .collect::<String>()
 }
 
+fn go_type_name(source_name: &str, idiomatic_initialisms: bool) -> String {
+    let rust_name = rust_type_ident(source_name);
+    if idiomatic_initialisms {
+        go_exported_identifier(&rust_name)
+    } else {
+        rust_name
+    }
+}
+
 fn unique_go_field_name(
     field: &crate::ir::SerializeCodegenField,
     used: &mut BTreeMap<String, usize>,
+    idiomatic_initialisms: bool,
 ) -> String {
     let base = if field.is_base_class {
-        go_base_class_field_name(field)
+        go_base_class_field_name(field, idiomatic_initialisms)
     } else {
-        go_field_name(&field.source_name)
+        go_field_name(&field.source_name, idiomatic_initialisms)
     };
     if !used.contains_key(&base) {
         used.insert(base.clone(), 1);
@@ -543,14 +603,17 @@ fn unique_go_field_name(
     candidate
 }
 
-fn go_base_class_field_name(field: &crate::ir::SerializeCodegenField) -> String {
+fn go_base_class_field_name(
+    field: &crate::ir::SerializeCodegenField,
+    idiomatic_initialisms: bool,
+) -> String {
     let ResolvedType::Named { source_name, .. } = &field.resolved_type else {
         return "Base".to_owned();
     };
     if source_name.contains("::") {
-        go_field_name(&source_name.replace("::", "_"))
+        go_field_name(&source_name.replace("::", "_"), idiomatic_initialisms)
     } else {
-        go_field_name(&rust_type_ident(source_name))
+        go_field_name(&rust_type_ident(source_name), idiomatic_initialisms)
     }
 }
 
@@ -1612,6 +1675,8 @@ mod tests {
                 &GoSourceOptions {
                     package_name: "type".to_owned(),
                     include_support_aliases: false,
+                    use_support_aliases: false,
+                    idiomatic_initialisms: false,
                 },
             )
             .expect_err("keyword package name should fail");

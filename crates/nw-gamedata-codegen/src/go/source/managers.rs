@@ -5,57 +5,213 @@ use nw_datasheet::ColumnType;
 
 use crate::compiler::GameDataCompileUnit;
 use crate::emit::GameDataCodegenFile;
-use crate::game_system_schema::GameSystemTableSchema;
 use crate::go::source::format_go_source;
+use crate::manager::{NativeManagerProductKind, NativeManagerShape};
 use crate::manager_records::{
-    DirectManagerSurface, ItemDataManagerSurface, ManagerSurface, ManagerSurfaceDependency,
-    SemanticLookupKind, SemanticManagerKey, SemanticManagerRecord, SemanticNumericKeyType,
-    SemanticProjectionTransform, SemanticRowFilterPredicate, default_direct_manager_row_type,
-    go_field_name, go_method_name, lower_camel, manager_surface_dependencies, manager_surface_name,
-    manager_surfaces, semantic_manager_record_unit,
+    CompositionManagerKind, CompositionManagerSurface, DirectManagerSurface, DirectManagerTable,
+    ItemDataManagerSurface, ManagerSurface, SemanticLookupKind, SemanticManagerKey,
+    SemanticManagerRecord, SemanticNumericKeyType, SemanticProjectionTransform,
+    SemanticRowFilterPredicate, default_direct_manager_row_type, go_field_name, go_local_name,
+    go_method_name, manager_accessor_domain, manager_surface_name, manager_surfaces,
+    semantic_enum_default_variant, semantic_enum_type_name, semantic_manager_record_unit,
 };
-use crate::naming::{to_snake_ident, to_upper_camel_ident};
 use nw_serialize_codegen::{
     GoSourceEmitter as SerializeGoSourceEmitter, GoSourceOptions as SerializeGoSourceOptions,
 };
 
-const DEFAULT_GO_GAMEASSETS_IMPORT: &str = "example.com/newworld/gamedata/gameassets";
+mod native;
 
-pub(super) fn emit_manager_files(unit: &GameDataCompileUnit) -> Result<Vec<GameDataCodegenFile>> {
-    let surfaces = manager_surfaces(unit)?;
-    Ok(vec![GameDataCodegenFile::new(
-        "managers/managers.go",
-        manager_source(unit, false, &surfaces)?,
-    )])
-}
+const DEFAULT_GO_GAMEASSETS_IMPORT: &str = "example.com/newworld/gamedata/internal/gameassets";
+const DEFAULT_GO_ASSETS_IMPORT: &str = "example.com/newworld/gamedata/assets";
+const DEFAULT_GO_TYPES_IMPORT: &str = "example.com/newworld/gamedata/types";
 
 pub(super) fn emit_dynamic_manager_files(
     unit: &GameDataCompileUnit,
 ) -> Result<Vec<GameDataCodegenFile>> {
     let surfaces = manager_surfaces(unit)?;
     let records = semantic_records(&surfaces);
-    let mut files = vec![GameDataCodegenFile::new(
-        "managers/managers.go",
-        manager_source(unit, true, &surfaces)?,
-    )];
+    let manager_source = manager_source(unit, &surfaces)?;
+    let mut files = split_go_manager_source(&manager_source)?;
+    files.extend([
+        GameDataCodegenFile::new(
+            "managers/datasheet_catalog.go",
+            datasheet_catalog_go_source()?,
+        ),
+        GameDataCodegenFile::binary(
+            "managers/datasheet_catalog.json.gz",
+            crate::rust::source::tables::compressed_datasheet_catalog_json(unit)?,
+        ),
+    ]);
     if !records.is_empty() {
         files.push(GameDataCodegenFile::new(
-            "managers/types.go",
+            "types/manager_rows.go",
             manager_record_types_source(&records)?,
         ));
     }
     Ok(files)
 }
 
-fn manager_source(
-    unit: &GameDataCompileUnit,
-    dynamic_assets: bool,
-    surfaces: &[ManagerSurface],
-) -> Result<String> {
-    if !dynamic_assets {
-        return manifest_source(unit, surfaces);
+fn split_go_manager_source(source: &str) -> Result<Vec<GameDataCodegenFile>> {
+    const TARGET_LINES: usize = 800;
+
+    let mut parser = treesitter_types_go::tree_sitter::Parser::new();
+    parser
+        .set_language(&treesitter_types_go::tree_sitter_go::LANGUAGE.into())
+        .map_err(|error| anyhow::anyhow!("configure Go parser: {error}"))?;
+    let tree = parser
+        .parse(source.as_bytes(), None)
+        .ok_or_else(|| anyhow::anyhow!("parse formatted Go manager source"))?;
+    let root = tree.root_node();
+    if root.has_error() {
+        anyhow::bail!("formatted Go manager source contains a syntax error");
     }
 
+    let mut declarations = Vec::<String>::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "package_clause" | "import_declaration" | "comment"
+        ) {
+            continue;
+        }
+        let text = child
+            .utf8_text(source.as_bytes())
+            .map_err(|error| anyhow::anyhow!("read Go declaration: {error}"))?
+            .trim();
+        if !text.is_empty() {
+            declarations.push(text.to_owned());
+        }
+    }
+
+    let mut chunks = Vec::<String>::new();
+    let mut current = String::new();
+    let mut current_lines = 0usize;
+    for declaration in declarations {
+        let declaration_lines = declaration.lines().count() + 2;
+        if !current.is_empty() && current_lines + declaration_lines > TARGET_LINES {
+            chunks.push(std::mem::take(&mut current));
+            current_lines = 0;
+        }
+        current.push_str(&declaration);
+        current.push_str("\n\n");
+        current_lines += declaration_lines;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, body)| {
+            let file_name = go_manager_chunk_name(&body, index);
+            let source = go_manager_chunk_source(&body)?;
+            Ok(GameDataCodegenFile::new(
+                format!("managers/{file_name}"),
+                source,
+            ))
+        })
+        .collect()
+}
+
+fn go_manager_chunk_name(body: &str, index: usize) -> String {
+    let first_name = body
+        .lines()
+        .find_map(|line| {
+            let line = line.trim_start();
+            for prefix in ["type ", "func ", "const ", "var "] {
+                if let Some(rest) = line.strip_prefix(prefix) {
+                    let rest = rest.trim_start_matches('(').trim_start();
+                    let candidate = rest
+                        .split(|character: char| {
+                            !character.is_ascii_alphanumeric() && character != '_'
+                        })
+                        .next()
+                        .unwrap_or_default();
+                    if !candidate.is_empty() {
+                        return Some(candidate);
+                    }
+                }
+            }
+            None
+        })
+        .unwrap_or("part");
+    let name = crate::naming::to_snake_ident(first_name, "part");
+    format!("{index:03}_{name}.go")
+}
+
+fn go_manager_chunk_source(body: &str) -> Result<String> {
+    let qualifiers = go_import_qualifiers(body)?;
+    let imports = [
+        ("binary", "encoding/binary"),
+        ("fmt", "fmt"),
+        ("html", "html"),
+        ("iter", "iter"),
+        ("math", "math"),
+        ("regexp", "regexp"),
+        ("sort", "sort"),
+        ("slices", "slices"),
+        ("strconv", "strconv"),
+        ("strings", "strings"),
+        ("sync", "sync"),
+        ("assets", DEFAULT_GO_ASSETS_IMPORT),
+        ("gameassets", DEFAULT_GO_GAMEASSETS_IMPORT),
+        ("gametypes", DEFAULT_GO_TYPES_IMPORT),
+        ("uuid", "github.com/google/uuid"),
+    ]
+    .into_iter()
+    .filter(|(qualifier, _)| qualifiers.contains(*qualifier))
+    .map(|(qualifier, path)| match qualifier {
+        "gameassets" | "gametypes" => format!("\t{qualifier} {path:?}\n"),
+        _ => format!("\t{path:?}\n"),
+    })
+    .collect::<String>();
+    let import_block = if imports.is_empty() {
+        String::new()
+    } else {
+        format!("\nimport (\n{imports})\n")
+    };
+    format_go_source(&format!("package managers\n{import_block}\n{body}")).map_err(Into::into)
+}
+
+fn go_import_qualifiers(source: &str) -> Result<BTreeSet<String>> {
+    let parse_source = format!("package managers\n\n{source}");
+    let mut parser = treesitter_types_go::tree_sitter::Parser::new();
+    parser
+        .set_language(&treesitter_types_go::tree_sitter_go::LANGUAGE.into())
+        .map_err(|error| anyhow::anyhow!("configure Go parser: {error}"))?;
+    let tree = parser
+        .parse(parse_source.as_bytes(), None)
+        .ok_or_else(|| anyhow::anyhow!("parse Go declarations before import synthesis"))?;
+    if tree.root_node().has_error() {
+        anyhow::bail!("Go declarations contain a syntax error before import synthesis");
+    }
+
+    let mut qualifiers = BTreeSet::new();
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+        let qualifier = match node.kind() {
+            "selector_expression" => node.child_by_field_name("operand"),
+            "qualified_type" => node.child_by_field_name("package"),
+            _ => None,
+        };
+        let Some(qualifier) = qualifier else {
+            continue;
+        };
+        qualifiers.insert(
+            qualifier
+                .utf8_text(parse_source.as_bytes())
+                .map_err(|error| anyhow::anyhow!("read Go import qualifier: {error}"))?
+                .to_owned(),
+        );
+    }
+    Ok(qualifiers)
+}
+
+fn manager_source(unit: &GameDataCompileUnit, surfaces: &[ManagerSurface]) -> Result<String> {
     let mut source = format!(
         r#"
 package managers
@@ -64,6 +220,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"html"
+	"iter"
 	"math"
 	"regexp"
 	"sort"
@@ -71,53 +228,22 @@ import (
 	"strings"
 
 	"{}"
+	"{}"
+	gametypes "{}"
+	"github.com/google/uuid"
 )
 
-type DatasheetCellKind string
-
-const (
-	DatasheetCellString  DatasheetCellKind = "string"
-	DatasheetCellNumber  DatasheetCellKind = "number"
-	DatasheetCellBoolean DatasheetCellKind = "boolean"
-)
-
-type ColumnSchema struct {{
-	Name      string
-	FieldName string
-	CRC       uint32
-	Kind      DatasheetCellKind
-	RowKey    bool
-	Required  bool
+type columnSchema struct {{
+	Name   string `json:"name"`
+	CRC    uint32 `json:"crc"`
+	RowKey bool   `json:"row_key"`
 }}
 
-type TableSchema struct {{
-	Name        string
-	NameCRC     uint32
-	RowType     string
-	RowTypeCRC  uint32
-	RowCount    int
-	Sources     []string
-	Columns     []ColumnSchema
-}}
-
-type managerDependencyKind string
-
-const (
-	managerDependencyTable   managerDependencyKind = "table"
-	managerDependencyAsset   managerDependencyKind = "asset"
-	managerDependencyManager managerDependencyKind = "manager"
-)
-
-type managerDependency struct {{
-	Kind        managerDependencyKind
-	Name        string
-	Row         string
-	Path        string
-}}
-
-type managerDefinition struct {{
-	Name         string
-	Dependencies []managerDependency
+type tableSchema struct {{
+	Name    string         `json:"name"`
+	RowType string         `json:"row_type"`
+	Sources []string       `json:"sources"`
+	Columns []columnSchema `json:"columns"`
 }}
 
 type dynamicTableRow struct {{
@@ -129,99 +255,719 @@ type dynamicTableRow struct {{
 }}
 
 type dynamicTable struct {{
-	Schema        TableSchema
-	Sheets        []gameassets.Datasheet
-	Rows          []dynamicTableRow
-	RowsByKey     map[string]dynamicTableRow
-	RowsByLookupKey map[string]dynamicTableRow
-	DuplicateKeys map[string][]dynamicTableRow
-}}
-
-type assetSource struct {{
-	Catalog    gameassets.AssetCatalog
-	Datasheets []gameassets.DatasheetAsset
-	Assets     []binaryAsset
-}}
-
-type binaryAsset struct {{
-	Path  string
-	Bytes []byte
+	Schema     tableSchema
+	Rows       []dynamicTableRow
+	ColumnCRCs map[string]uint32
 }}
 
 type Rows[T any] interface {{
-	Rows() ([]T, error)
+	Rows() iter.Seq[T]
+}}
+
+func rowValues[T any](values []T) iter.Seq[T] {{
+	return func(yield func(T) bool) {{
+		for index := range values {{
+			if !yield(values[index]) {{
+				return
+			}}
+		}}
+	}}
+}}
+
+func rowCopy[T any](value T) *T {{
+	return &value
+}}
+
+func exactUint32(value float32) (uint32, bool) {{
+	if value < 0 || value >= 4294967296 || value != float32(uint32(value)) {{
+		return 0, false
+	}}
+	return uint32(value), true
+}}
+
+func stringValue(value *string) string {{
+	if value == nil {{
+		return ""
+	}}
+	return *value
+}}
+
+func float32Value(value *float32) float32 {{
+	if value == nil {{
+		return 0
+	}}
+	return *value
+}}
+
+func parseFloat32OrZero(value string) float32 {{
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 32)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {{
+		return 0
+	}}
+	return float32(parsed)
+}}
+
+func boolFromText(value string) bool {{
+	value = strings.TrimSpace(value)
+	switch strings.ToLower(value) {{
+	case "true", "yes":
+		return true
+	case "false", "no", "":
+		return false
+	}}
+	parsed, err := strconv.ParseFloat(value, 64)
+	return err == nil && parsed != 0
+}}
+
+func boolPointer(value bool) *bool {{ return &value }}
+
+func optionalNumberBool(value *float32) *bool {{
+	if value == nil {{ return nil }}
+	return boolPointer(*value != 0)
+}}
+
+func optionalBoolFromText(value string) *bool {{
+	if strings.TrimSpace(value) == "" {{ return nil }}
+	return boolPointer(boolFromText(value))
+}}
+
+func parseStoreProductType(value string) (gametypes.StoreProductType, error) {{
+	switch strings.TrimSpace(value) {{
+	case "Invalid": return gametypes.StoreProductTypeInvalid, nil
+	case "ApparelSkin": return gametypes.StoreProductTypeApparelSkin, nil
+	case "ApparelSkinSet": return gametypes.StoreProductTypeApparelSkinSet, nil
+	case "Bundle": return gametypes.StoreProductTypeBundle, nil
+	case "Campskin": return gametypes.StoreProductTypeCampskin, nil
+	case "Emote": return gametypes.StoreProductTypeEmote, nil
+	case "EmotePermit": return gametypes.StoreProductTypeEmotePermit, nil
+	case "GuildCrestPack": return gametypes.StoreProductTypeGuildCrestPack, nil
+	case "HousePet": return gametypes.StoreProductTypeHousePet, nil
+	case "HousingItem": return gametypes.StoreProductTypeHousingItem, nil
+	case "HousingSet": return gametypes.StoreProductTypeHousingSet, nil
+	case "InstrumentSkinDrum": return gametypes.StoreProductTypeInstrumentSkinDrum, nil
+	case "InstrumentSkinFlute": return gametypes.StoreProductTypeInstrumentSkinFlute, nil
+	case "InstrumentSkinGuitar": return gametypes.StoreProductTypeInstrumentSkinGuitar, nil
+	case "InstrumentSkinMandolin": return gametypes.StoreProductTypeInstrumentSkinMandolin, nil
+	case "InstrumentSkinUprightBass": return gametypes.StoreProductTypeInstrumentSkinUprightBass, nil
+	case "ItemDyePack": return gametypes.StoreProductTypeItemDyePack, nil
+	case "Loadout": return gametypes.StoreProductTypeLoadout, nil
+	case "MarksOfFortune": return gametypes.StoreProductTypeMarksOfFortune, nil
+	case "Mount": return gametypes.StoreProductTypeMount, nil
+	case "MountAttachment": return gametypes.StoreProductTypeMountAttachment, nil
+	case "MountDye": return gametypes.StoreProductTypeMountDye, nil
+	case "MountBear": return gametypes.StoreProductTypeMountBear, nil
+	case "MountHorse": return gametypes.StoreProductTypeMountHorse, nil
+	case "MountLion": return gametypes.StoreProductTypeMountLion, nil
+	case "MountTurkey": return gametypes.StoreProductTypeMountTurkey, nil
+	case "MountWolf": return gametypes.StoreProductTypeMountWolf, nil
+	case "Service": return gametypes.StoreProductTypeService, nil
+	case "Title": return gametypes.StoreProductTypeTitle, nil
+	case "Token": return gametypes.StoreProductTypeToken, nil
+	case "TokenSingle": return gametypes.StoreProductTypeTokenSingle, nil
+	case "TokenPack": return gametypes.StoreProductTypeTokenPack, nil
+	case "ToolSkin": return gametypes.StoreProductTypeToolSkin, nil
+	case "ToolSkinSet": return gametypes.StoreProductTypeToolSkinSet, nil
+	case "WeaponSkinBlunderbass": return gametypes.StoreProductTypeWeaponSkinBlunderbass, nil
+	case "WeaponSkinBow": return gametypes.StoreProductTypeWeaponSkinBow, nil
+	case "WeaponSkinFireStaff": return gametypes.StoreProductTypeWeaponSkinFireStaff, nil
+	case "WeaponSkinFlail": return gametypes.StoreProductTypeWeaponSkinFlail, nil
+	case "WeaponSkinGreatAxe": return gametypes.StoreProductTypeWeaponSkinGreatAxe, nil
+	case "WeaponSkinGreatsword": return gametypes.StoreProductTypeWeaponSkinGreatsword, nil
+	case "WeaponSkinHatchet": return gametypes.StoreProductTypeWeaponSkinHatchet, nil
+	case "WeaponSkinIceGauntlet": return gametypes.StoreProductTypeWeaponSkinIceGauntlet, nil
+	case "WeaponSkinKiteshield": return gametypes.StoreProductTypeWeaponSkinKiteshield, nil
+	case "WeaponSkinLifeStaff": return gametypes.StoreProductTypeWeaponSkinLifeStaff, nil
+	case "WeaponSkinMusket": return gametypes.StoreProductTypeWeaponSkinMusket, nil
+	case "WeaponSkinRapier": return gametypes.StoreProductTypeWeaponSkinRapier, nil
+	case "WeaponSkinShield": return gametypes.StoreProductTypeWeaponSkinShield, nil
+	case "WeaponSkinSpear": return gametypes.StoreProductTypeWeaponSkinSpear, nil
+	case "WeaponSkinSword": return gametypes.StoreProductTypeWeaponSkinSword, nil
+	case "WeaponSkinVoidGauntlet": return gametypes.StoreProductTypeWeaponSkinVoidGauntlet, nil
+	case "WeaponSkinWarhammer": return gametypes.StoreProductTypeWeaponSkinWarhammer, nil
+	default: return 0, fmt.Errorf("unknown StoreProductType value %q", value)
+	}}
+}}
+
+type RowRef[TTable ~string, TRow any] struct {{
+	table TTable
+	path  string
+	key   string
+}}
+
+func (ref RowRef[TTable, TRow]) Table() TTable {{ return ref.table }}
+func (ref RowRef[TTable, TRow]) Key() string {{ return ref.key }}
+
+type RowSlot[TTable ~string, TRow any] struct {{
+	table    TTable
+	path     string
+	rowIndex int
+}}
+
+func (slot RowSlot[TTable, TRow]) Table() TTable {{ return slot.table }}
+func (slot RowSlot[TTable, TRow]) RowIndex() int {{ return slot.rowIndex }}
+
+type RowEntry[TTable ~string, TRow any] struct {{
+	Ref  RowRef[TTable, TRow]
+	Slot RowSlot[TTable, TRow]
+	Row  TRow
+}}
+
+type TableReference struct {{
+	Path string
+	Key  string
+}}
+
+type RowSet[TTable ~string, TRow any] struct {{
+	entries      []RowEntry[TTable, TRow]
+	tableIndexes map[string]*rowTableIndex
+	tableOrder   []TTable
+}}
+
+type rowTableIndex struct {{
+	entries   []int
+	byKey     map[string]int
+	byRowIndex map[int]int
+}}
+
+func newRowSet[TTable ~string, TRow any](entries []RowEntry[TTable, TRow]) RowSet[TTable, TRow] {{
+	tableIndexes := make(map[string]*rowTableIndex)
+	tableOrder := make([]TTable, 0)
+	for entryIndex := range entries {{
+		entry := &entries[entryIndex]
+		tableKey := normalizeDataPath(string(entry.Ref.table))
+		index := tableIndexes[tableKey]
+		if index == nil {{
+			index = &rowTableIndex{{
+				byKey:      make(map[string]int),
+				byRowIndex: make(map[int]int),
+			}}
+			tableIndexes[tableKey] = index
+			tableOrder = append(tableOrder, entry.Ref.table)
+		}}
+		index.entries = append(index.entries, entryIndex)
+		key := normalizeLookupKey(entry.Ref.key)
+		if _, exists := index.byKey[key]; !exists {{
+			index.byKey[key] = entryIndex
+		}}
+		if _, exists := index.byRowIndex[entry.Slot.rowIndex]; !exists {{
+			index.byRowIndex[entry.Slot.rowIndex] = entryIndex
+		}}
+	}}
+	return RowSet[TTable, TRow]{{
+		entries:      entries,
+		tableIndexes: tableIndexes,
+		tableOrder:   tableOrder,
+	}}
+}}
+
+func (rows RowSet[TTable, TRow]) Len() int {{
+	return len(rows.entries)
+}}
+
+func (rows RowSet[TTable, TRow]) Empty() bool {{
+	return len(rows.entries) == 0
+}}
+
+func (rows RowSet[TTable, TRow]) Rows() iter.Seq[RowEntry[TTable, TRow]] {{
+	return func(yield func(RowEntry[TTable, TRow]) bool) {{
+		for index := range rows.entries {{
+			if !yield(rows.entries[index]) {{
+				return
+			}}
+		}}
+	}}
+}}
+
+func (rows RowSet[TTable, TRow]) table(table TTable) TableRows[TTable, TRow] {{
+	return TableRows[TTable, TRow]{{rows: &rows, table: table}}
+}}
+
+func (rows RowSet[TTable, TRow]) Get(ref RowRef[TTable, TRow]) *TRow {{
+	index := rows.tableIndex(ref.table)
+	if index == nil {{
+		return nil
+	}}
+	entryIndex, exists := index.byKey[normalizeLookupKey(ref.key)]
+	if !exists {{
+		return nil
+	}}
+	row := rows.entries[entryIndex].Row
+	return &row
+}}
+
+func (rows RowSet[TTable, TRow]) RowByIndex(slot RowSlot[TTable, TRow]) *TRow {{
+	index := rows.tableIndex(slot.table)
+	if index == nil {{
+		return nil
+	}}
+	entryIndex, exists := index.byRowIndex[slot.rowIndex]
+	if !exists {{
+		return nil
+	}}
+	row := rows.entries[entryIndex].Row
+	return &row
+}}
+
+func (rows RowSet[TTable, TRow]) RowKeyByIndex(slot RowSlot[TTable, TRow]) (string, bool) {{
+	index := rows.tableIndex(slot.table)
+	if index == nil {{
+		return "", false
+	}}
+	entryIndex, exists := index.byRowIndex[slot.rowIndex]
+	if !exists {{
+		return "", false
+	}}
+	return rows.entries[entryIndex].Ref.key, true
+}}
+
+func (rows RowSet[TTable, TRow]) tableIndex(table TTable) *rowTableIndex {{
+	normalized := normalizeDataPath(string(table))
+	if index := rows.tableIndexes[normalized]; index != nil {{
+		return index
+	}}
+	for _, candidate := range rows.tableOrder {{
+		candidateKey := normalizeDataPath(string(candidate))
+		if tablePathMatches(candidateKey, normalized) {{
+			return rows.tableIndexes[candidateKey]
+		}}
+	}}
+	return nil
+}}
+
+type TableRows[TTable ~string, TRow any] struct {{
+	rows  *RowSet[TTable, TRow]
+	table TTable
+}}
+
+func (rows TableRows[TTable, TRow]) Table() TTable {{
+	return rows.table
+}}
+
+func (rows TableRows[TTable, TRow]) Rows() iter.Seq[RowEntry[TTable, TRow]] {{
+	return func(yield func(RowEntry[TTable, TRow]) bool) {{
+		index := rows.rows.tableIndex(rows.table)
+		if index == nil {{
+			return
+		}}
+		for _, entryIndex := range index.entries {{
+			if !yield(rows.rows.entries[entryIndex]) {{
+				return
+			}}
+		}}
+	}}
+}}
+
+func (rows TableRows[TTable, TRow]) Get(key string) *TRow {{
+	return rows.rows.Get(RowRef[TTable, TRow]{{table: rows.table, key: key}})
+}}
+
+func (rows TableRows[TTable, TRow]) RowByIndex(rowIndex int) *TRow {{
+	return rows.rows.RowByIndex(RowSlot[TTable, TRow]{{table: rows.table, rowIndex: rowIndex}})
+}}
+
+func (rows TableRows[TTable, TRow]) RowKeyByIndex(rowIndex int) (string, bool) {{
+	return rows.rows.RowKeyByIndex(RowSlot[TTable, TRow]{{table: rows.table, rowIndex: rowIndex}})
 }}
 
 "#,
-        DEFAULT_GO_GAMEASSETS_IMPORT,
+        DEFAULT_GO_ASSETS_IMPORT, DEFAULT_GO_GAMEASSETS_IMPORT, DEFAULT_GO_TYPES_IMPORT,
     );
 
     let readable_row_types = direct_schema_row_types(surfaces);
     push_schema_row_types(&mut source, unit, &readable_row_types);
-    push_table_schemas(&mut source, unit);
-    push_managers(&mut source, unit, surfaces);
+    push_go_enum_parsers(&mut source, surfaces);
     push_direct_row_family_types(&mut source, unit, surfaces);
     push_manager_surface_types(&mut source, unit, surfaces);
     source.push_str(PRODUCT_MANAGER_RUNTIME_GO);
     source.push_str(DYNAMIC_MANAGER_RUNTIME_GO);
     push_go_managers_facade(&mut source, surfaces);
 
-    format_go_source(&source).map_err(Into::into)
+    format_go_source(&qualify_go_shared_types(&source, surfaces)?).map_err(Into::into)
+}
+
+fn qualify_go_shared_types(source: &str, surfaces: &[ManagerSurface]) -> Result<String> {
+    let mut shared_types = ["CRC32", "UUID", "AssetID", "AssetReference", "Vector3"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    shared_types.extend(
+        semantic_records(surfaces)
+            .into_iter()
+            .map(|record| go_method_name(&record.record_type_name)),
+    );
+    for shape in semantic_enum_shapes(surfaces) {
+        let enum_type = go_method_name(&shape.name);
+        shared_types.insert(enum_type.clone());
+        shared_types.extend(
+            shape
+                .variants
+                .into_iter()
+                .map(|variant| format!("{enum_type}{}", go_method_name(&variant.name))),
+        );
+    }
+
+    let mut parser = treesitter_types_go::tree_sitter::Parser::new();
+    parser
+        .set_language(&treesitter_types_go::tree_sitter_go::LANGUAGE.into())
+        .map_err(|error| anyhow::anyhow!("configure Go parser: {error}"))?;
+    let tree = parser.parse(source.as_bytes(), None).ok_or_else(|| {
+        anyhow::anyhow!("parse Go manager source before shared-type qualification")
+    })?;
+    if tree.root_node().has_error() {
+        anyhow::bail!("Go manager source contains a syntax error before shared-type qualification");
+    }
+
+    let mut replacements = Vec::new();
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+        if !matches!(node.kind(), "identifier" | "type_identifier") {
+            continue;
+        }
+        let identifier = node
+            .utf8_text(source.as_bytes())
+            .map_err(|error| anyhow::anyhow!("read Go identifier: {error}"))?;
+        if !shared_types.contains(identifier) {
+            continue;
+        }
+        let start = node.start_byte();
+        if source.as_bytes()[..start].ends_with(b"gametypes.") {
+            continue;
+        }
+        if go_identifier_is_struct_literal_field(node) {
+            continue;
+        }
+        replacements.push((start, node.end_byte(), identifier));
+    }
+
+    let mut qualified = source.to_owned();
+    replacements.sort_unstable_by_key(|(start, _, _)| *start);
+    for (start, end, identifier) in replacements.into_iter().rev() {
+        qualified.replace_range(start..end, &format!("gametypes.{identifier}"));
+    }
+    Ok(qualified)
+}
+
+fn go_identifier_is_struct_literal_field(node: treesitter_types_go::tree_sitter::Node<'_>) -> bool {
+    let Some(literal_element) = node.parent() else {
+        return false;
+    };
+    if literal_element.kind() != "literal_element" {
+        return false;
+    }
+    let Some(keyed_element) = literal_element.parent() else {
+        return false;
+    };
+    if keyed_element.kind() != "keyed_element" {
+        return false;
+    }
+    let Some(key) = keyed_element.child_by_field_name("key") else {
+        return false;
+    };
+    if key.start_byte() != literal_element.start_byte()
+        || key.end_byte() != literal_element.end_byte()
+    {
+        return false;
+    }
+    let Some(literal_value) = keyed_element.parent() else {
+        return false;
+    };
+    if literal_value.kind() != "literal_value" {
+        return false;
+    }
+    let Some(composite_literal) = literal_value.parent() else {
+        return false;
+    };
+    if composite_literal.kind() != "composite_literal" {
+        return false;
+    }
+    let Some(literal_type) = composite_literal.child_by_field_name("type") else {
+        return false;
+    };
+    !matches!(
+        literal_type.kind(),
+        "map_type" | "slice_type" | "array_type" | "implicit_length_array_type"
+    )
+}
+
+fn datasheet_catalog_go_source() -> Result<String> {
+    format_go_source(
+        r#"
+package managers
+
+import (
+	"bytes"
+	"compress/gzip"
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"io"
+)
+
+//go:embed datasheet_catalog.json.gz
+var compressedDatasheetCatalog []byte
+
+func loadTableSchemas() ([]tableSchema, error) {
+	reader, err := gzip.NewReader(bytes.NewReader(compressedDatasheetCatalog))
+	if err != nil {
+		return nil, fmt.Errorf("open generated datasheet catalog: %w", err)
+	}
+	jsonBytes, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("read generated datasheet catalog: %w", readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close generated datasheet catalog: %w", closeErr)
+	}
+	var schemas []tableSchema
+	if err := json.Unmarshal(jsonBytes, &schemas); err != nil {
+		return nil, fmt.Errorf("decode generated datasheet catalog: %w", err)
+	}
+	return schemas, nil
+}
+"#,
+    )
+    .map_err(Into::into)
 }
 
 fn semantic_records(surfaces: &[ManagerSurface]) -> Vec<SemanticManagerRecord> {
     surfaces
         .iter()
-        .filter_map(|surface| match surface {
-            ManagerSurface::Semantic(record) => Some(record.clone()),
+        .flat_map(|surface| match surface {
+            ManagerSurface::Semantic(record) => vec![record.clone()],
+            ManagerSurface::Native {
+                semantic_projections,
+                ..
+            } => semantic_projections.clone(),
             ManagerSurface::Direct(_)
             | ManagerSurface::ItemData(_)
-            | ManagerSurface::ProductBacked(_) => None,
+            | ManagerSurface::Composition(_)
+            | ManagerSurface::ProductBacked(_) => Vec::new(),
         })
         .collect()
+}
+
+fn semantic_enum_shapes(
+    surfaces: &[ManagerSurface],
+) -> Vec<crate::game_system_schema::GameSystemEnumShape> {
+    let mut shapes = BTreeMap::new();
+    for shape in surfaces
+        .iter()
+        .flat_map(|surface| match surface {
+            ManagerSurface::Semantic(record) => std::slice::from_ref(record),
+            ManagerSurface::Native {
+                semantic_projections,
+                ..
+            } => semantic_projections.as_slice(),
+            ManagerSurface::Direct(_)
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::Composition(_)
+            | ManagerSurface::ProductBacked(_) => &[],
+        })
+        .flat_map(|record| record.fields.iter())
+        .filter_map(|field| field.enum_shape.as_ref())
+    {
+        shapes
+            .entry(shape.name.clone())
+            .or_insert_with(|| shape.clone());
+    }
+    shapes.into_values().collect()
+}
+
+fn semantic_pair_first_enum_shapes(
+    surfaces: &[ManagerSurface],
+) -> Vec<crate::game_system_schema::GameSystemEnumShape> {
+    let mut shapes = BTreeMap::new();
+    for shape in surfaces
+        .iter()
+        .flat_map(|surface| match surface {
+            ManagerSurface::Semantic(record) => std::slice::from_ref(record),
+            ManagerSurface::Native {
+                semantic_projections,
+                ..
+            } => semantic_projections.as_slice(),
+            ManagerSurface::Direct(_)
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::Composition(_)
+            | ManagerSurface::ProductBacked(_) => &[],
+        })
+        .flat_map(|record| record.fields.iter())
+        .filter_map(|field| field.pair_first_enum_shape.as_ref())
+    {
+        shapes
+            .entry(shape.name.clone())
+            .or_insert_with(|| shape.clone());
+    }
+    shapes.into_values().collect()
+}
+
+fn push_go_enum_parsers(source: &mut String, surfaces: &[ManagerSurface]) {
+    for shape in semantic_enum_shapes(surfaces) {
+        let enum_type = go_method_name(&shape.name);
+        source.push_str(&format!(
+            "func parse{enum_type}(source string) ({enum_type}, error) {{\n\tswitch strings.TrimSpace(source) {{\n"
+        ));
+        let mut tokens = BTreeMap::<String, String>::new();
+        for variant in &shape.variants {
+            let variant_name = go_method_name(&variant.name);
+            tokens
+                .entry(variant.name.clone())
+                .or_insert_with(|| variant_name.clone());
+            for token in &variant.source_tokens {
+                tokens
+                    .entry(token.clone())
+                    .or_insert_with(|| variant_name.clone());
+            }
+        }
+        for (token, variant) in tokens {
+            source.push_str(&format!(
+                "\tcase {}:\n\t\treturn {enum_type}{variant}, nil\n",
+                go_string(&token)
+            ));
+        }
+        source.push_str(&format!(
+            "\tdefault:\n\t\treturn 0, fmt.Errorf(\"unknown {} value %q\", source)\n\t}}\n}}\n\n",
+            shape.name
+        ));
+    }
+    for shape in semantic_pair_first_enum_shapes(surfaces) {
+        let parser = go_pair_enum_parser_name(&shape.name);
+        source.push_str(&format!(
+            "func {parser}(source string) (uint8, error) {{\n\tswitch strings.TrimSpace(source) {{\n"
+        ));
+        let mut tokens = BTreeMap::<String, i64>::new();
+        for variant in &shape.variants {
+            tokens
+                .entry(variant.name.clone())
+                .or_insert(variant.discriminant);
+            for token in &variant.source_tokens {
+                tokens.entry(token.clone()).or_insert(variant.discriminant);
+            }
+        }
+        for (token, discriminant) in tokens {
+            source.push_str(&format!(
+                "\tcase {}:\n\t\treturn {discriminant}, nil\n",
+                go_string(&token)
+            ));
+        }
+        source.push_str(&format!(
+            "\tdefault:\n\t\tvalue, err := strconv.ParseUint(strings.TrimSpace(source), 10, 8)\n\t\tif err != nil {{ return 0, fmt.Errorf(\"unknown {} value %q\", source) }}\n\t\treturn uint8(value), nil\n\t}}\n}}\n\n",
+            shape.name
+        ));
+    }
+}
+
+fn go_pair_enum_parser_name(enum_name: &str) -> String {
+    format!("parse{}Discriminant", go_method_name(enum_name))
 }
 
 fn direct_schema_row_types(surfaces: &[ManagerSurface]) -> BTreeSet<String> {
     let mut row_types = BTreeSet::new();
     for surface in surfaces {
-        let ManagerSurface::Direct(manager) = surface else {
-            continue;
+        let manager = match surface {
+            ManagerSurface::Direct(manager) => manager.clone(),
+            ManagerSurface::Native { manager, shape, .. } => {
+                go_effective_native_manager_surface(manager, shape)
+            }
+            ManagerSurface::Semantic(_)
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::Composition(_)
+            | ManagerSurface::ProductBacked(_) => continue,
         };
-        row_types.extend(
-            manager
-                .tables
-                .iter()
-                .map(|table| table.row_type_name.clone()),
-        );
+        row_types.extend(manager.tables.into_iter().map(|table| table.row_type_name));
     }
     row_types
 }
 
 fn go_manager_accessor_name(manager_name: &str) -> String {
-    to_upper_camel_ident(
-        manager_name.strip_suffix("Manager").unwrap_or(manager_name),
-        "manager",
-    )
+    go_method_name(manager_accessor_domain(manager_name))
+}
+
+fn go_manager_dependency_name(manager_name: &str) -> String {
+    go_method_name(manager_name.strip_suffix("Manager").unwrap_or(manager_name))
 }
 
 fn go_manager_constructor_name(manager_type: &str) -> String {
     format!("new{manager_type}")
 }
 
-#[derive(Debug, Clone)]
-struct GoSchemaRow {
-    type_name: String,
-    source_row_type: String,
-    fields: Vec<GoSchemaField>,
+fn go_manager_resources_expression<'a>(
+    manager_name: &str,
+    tables: impl IntoIterator<Item = (&'a str, &'a str)>,
+    asset_paths: impl IntoIterator<Item = &'a str>,
+) -> String {
+    format!(
+        "cache.resourcesForTables({}, {}, {})",
+        go_string(manager_name),
+        go_table_selector_slice(tables),
+        go_string_slice(asset_paths)
+    )
+}
+
+fn go_table_selector_slice<'a>(tables: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    let tables = tables
+        .into_iter()
+        .map(|(name, row_type)| {
+            format!(
+                "{{name: {}, rowType: {}}}",
+                go_string(name),
+                go_string(row_type)
+            )
+        })
+        .collect::<Vec<_>>();
+    if tables.is_empty() {
+        "nil".to_owned()
+    } else {
+        format!(
+            "[]tableSelector{{\n\t{}\n}}",
+            tables
+                .into_iter()
+                .map(|table| format!("{table},"))
+                .collect::<Vec<_>>()
+                .join("\n\t")
+        )
+    }
+}
+
+fn go_direct_manager_resources_expression(manager: &DirectManagerSurface) -> String {
+    let row_types = manager
+        .tables
+        .iter()
+        .map(|table| table.row_type_name.as_str())
+        .collect::<BTreeSet<_>>();
+    format!(
+        "cache.resourcesForRows({}, {}, {})",
+        go_string(&manager.manager_name),
+        go_string_slice(row_types),
+        go_string_slice(manager.products.iter().map(|product| product.path.as_str()))
+    )
+}
+
+fn go_string_slice<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    let values = values.into_iter().map(go_string).collect::<Vec<_>>();
+    if values.is_empty() {
+        "nil".to_owned()
+    } else {
+        format!("[]string{{{}}}", values.join(", "))
+    }
 }
 
 #[derive(Debug, Clone)]
-struct GoSchemaField {
-    source_name: String,
-    field_name: String,
-    column_type: ColumnType,
-    required: bool,
-    row_key: bool,
+pub(super) struct GoSchemaRow {
+    pub(super) type_name: String,
+    pub(super) source_row_type: String,
+    pub(super) fields: Vec<GoSchemaField>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct GoSchemaField {
+    pub(super) source_name: String,
+    pub(super) field_name: String,
+    pub(super) column_type: ColumnType,
+    pub(super) required: bool,
+    pub(super) row_key: bool,
 }
 
 fn push_schema_row_types(
@@ -272,24 +1018,20 @@ fn push_loot_bucket_schema_row_type(source: &mut String) {
     source.push_str(
         r#"
 type LootBucketDataSchemaRow struct {
-	RowPlaceholders      string
-	Entries              []LootBucketDataEntry
-	LootBiasingDisabled  []LootBucketBiasingDisabled
+	RowPlaceholders string
+	Entries         []LootBucketDataSlotEntry
 }
 
-type LootBucketDataEntry struct {
-	Slot       uint16
-	LootBucket *string
-	Tags       *string
-	MatchOne   *string
-	Item       *string
-	Quantity   *string
-	Odds       *string
-}
-
-type LootBucketBiasingDisabled struct {
-	Slot     uint16
-	Disabled bool
+type LootBucketDataSlotEntry struct {
+	Slot                  uint16
+	LootBucket            *string
+	FilterLootedItems     *string
+	LootBiasingDisabled   *string
+	Tags                  *string
+	MatchOne              *string
+	Item                  *string
+	Quantity              *string
+	Odds                  *string
 }
 
 func readLootBucketDataSchemaRow(table *dynamicTable, row dynamicTableRow) (LootBucketDataSchemaRow, error) {
@@ -298,9 +1040,17 @@ func readLootBucketDataSchemaRow(table *dynamicTable, row dynamicTableRow) (Loot
 		return LootBucketDataSchemaRow{}, err
 	}
 
-	entries := []LootBucketDataEntry{}
-	for _, slot := range numberedColumnSlots(table, []string{"LootBucket", "Tags", "MatchOne", "Item", "Quantity", "Odds"}) {
+	entries := []LootBucketDataSlotEntry{}
+	for _, slot := range numberedColumnSlots(table, []string{"LootBucket", "FilterLootedItems", "LootBiasingDisabled", "Tags", "MatchOne", "Item", "Quantity", "Odds"}) {
 		lootBucket, err := optionalCellText(table, row, numberedColumnName("LootBucket", slot))
+		if err != nil {
+			return LootBucketDataSchemaRow{}, err
+		}
+		filterLootedItems, err := optionalCellText(table, row, numberedColumnName("FilterLootedItems", slot))
+		if err != nil {
+			return LootBucketDataSchemaRow{}, err
+		}
+		lootBiasingDisabled, err := optionalCellText(table, row, numberedColumnName("LootBiasingDisabled", slot))
 		if err != nil {
 			return LootBucketDataSchemaRow{}, err
 		}
@@ -324,34 +1074,24 @@ func readLootBucketDataSchemaRow(table *dynamicTable, row dynamicTableRow) (Loot
 		if err != nil {
 			return LootBucketDataSchemaRow{}, err
 		}
-		if lootBucket != nil || tags != nil || matchOne != nil || item != nil || quantity != nil || odds != nil {
-			entries = append(entries, LootBucketDataEntry{
-				Slot: slot,
-				LootBucket: lootBucket,
-				Tags: tags,
-				MatchOne: matchOne,
-				Item: item,
-				Quantity: quantity,
-				Odds: odds,
+		if lootBucket != nil || filterLootedItems != nil || lootBiasingDisabled != nil || tags != nil || matchOne != nil || item != nil || quantity != nil || odds != nil {
+			entries = append(entries, LootBucketDataSlotEntry{
+				Slot:                slot,
+				LootBucket:          lootBucket,
+				FilterLootedItems:   filterLootedItems,
+				LootBiasingDisabled: lootBiasingDisabled,
+				Tags:                tags,
+				MatchOne:            matchOne,
+				Item:                item,
+				Quantity:            quantity,
+				Odds:                odds,
 			})
-		}
-	}
-
-	lootBiasingDisabled := []LootBucketBiasingDisabled{}
-	for _, slot := range numberedColumnSlots(table, []string{"LootBiasingDisabled"}) {
-		disabled, err := optionalCellBoolText(table, row, numberedColumnName("LootBiasingDisabled", slot))
-		if err != nil {
-			return LootBucketDataSchemaRow{}, err
-		}
-		if disabled != nil {
-			lootBiasingDisabled = append(lootBiasingDisabled, LootBucketBiasingDisabled{Slot: slot, Disabled: *disabled})
 		}
 	}
 
 	return LootBucketDataSchemaRow{
 		RowPlaceholders: rowPlaceholders,
-		Entries: entries,
-		LootBiasingDisabled: lootBiasingDisabled,
+		Entries:         entries,
 	}, nil
 }
 
@@ -516,7 +1256,7 @@ fn go_schema_reader_name(row_type: &str) -> String {
 }
 
 fn go_schema_row_type_name(row_type: &str) -> String {
-    format!("{}SchemaRow", to_upper_camel_ident(row_type, "Schema"))
+    format!("{}SchemaRow", go_field_name(row_type))
 }
 
 #[cfg(test)]
@@ -527,12 +1267,36 @@ mod tests {
         GameSystemColumnSchema, GameSystemColumnValueShape, GameSystemDataTablesSchemaReport,
         GameSystemTableSchema,
     };
-    use crate::manager_records::{DirectManagerTable, ItemDataManagerTable, SemanticLookupMethod};
+    use crate::manager_records::{
+        DirectManagerTable, DirectProductAsset, ItemDataManagerTable, SemanticLookupMethod,
+    };
     use crate::plan::GameDataCodegenPlan;
     use crate::schema::GameDataCompileMode;
-    use crate::target::{GameDataTargetLanguage, GameDataTargetPlan};
 
     use super::*;
+
+    #[test]
+    fn semantic_resources_use_exact_table_schema_identity() {
+        let expression = go_manager_resources_expression(
+            "ExampleManager",
+            [("SharedTable", "ExampleRow")],
+            std::iter::empty(),
+        );
+
+        assert!(expression.contains("cache.resourcesForTables("));
+        assert!(expression.contains("{name: \"SharedTable\", rowType: \"ExampleRow\"},"));
+        assert!(!expression.contains("cache.resources("));
+    }
+
+    #[test]
+    fn skip_empty_semantic_keys_accept_missing_cells() {
+        let mut source = String::new();
+        push_go_key_materializer(&mut source, &semantic_lookup_record());
+
+        assert!(source.contains("optionalStringCell"));
+        assert!(source.contains("keyTextValue == nil"));
+        assert!(!source.contains("requiredStringCell"));
+    }
 
     #[test]
     fn merged_schema_column_type_is_lossless_for_mixed_source_columns() {
@@ -559,14 +1323,16 @@ mod tests {
             tables: vec![
                 crate::manager_records::SemanticManagerTable {
                     table_name: "ExampleA".to_owned(),
+                    row_type_name: "ExampleRow".to_owned(),
                 },
                 crate::manager_records::SemanticManagerTable {
                     table_name: "ExampleB".to_owned(),
+                    row_type_name: "ExampleRow".to_owned(),
                 },
             ],
             key: Some(SemanticManagerKey::Crc {
                 key_field: "example_id".to_owned(),
-                crc_field: "example_id_crc".to_owned(),
+                crc_field: "example_id_crc32".to_owned(),
                 key_column: "ExampleID".to_owned(),
                 skip_empty_key: true,
                 trim_key: true,
@@ -585,12 +1351,19 @@ mod tests {
         };
         let mut source = String::new();
         push_go_semantic_materializer(&mut source, &record);
+        let record_types = manager_record_types_source(std::slice::from_ref(&record))
+            .expect("semantic record types");
+
+        assert!(source.contains("ExampleIDCRC32: keyCRC"));
+        assert!(record_types.contains("ExampleIDCRC32 CRC32"));
+        assert!(!source.contains("ExampleIDCrc32"));
+        assert!(!record_types.contains("ExampleIDCrc32"));
 
         let seen_index = source
             .find("\tseen := map[any]struct{}{}")
             .expect("materializer should track duplicate keys");
         let table_loop_index = source
-            .find("\tfor _, tableName := range []string{")
+            .find("\tfor _, table := range resources.tableOrder {")
             .expect("materializer should iterate tables");
         let row_loop_index = source
             .find("\t\tfor _, sourceRow := range table.Rows {")
@@ -605,36 +1378,42 @@ mod tests {
     fn direct_schema_manager_uses_rows_contract_for_primary_row_type() {
         let unit = damage_compile_unit();
         let manager = damage_manager_surface();
-        let methods = direct_go_schema_methods(&unit, &manager);
+        let methods = direct_go_schema_methods(&unit, &manager, true);
+        let resources = go_direct_manager_resources_expression(&manager);
 
-        assert!(
-            methods.contains("func (manager *DamageDataManager) Rows() ([]DamageDataEntry, error)")
-        );
+        assert!(resources.contains("cache.resourcesForRows"));
+        assert!(resources.contains("\"AfflictionData\""));
+        assert!(resources.contains("\"DamageTypeData\""));
+        assert!(methods.contains(
+            "func (manager *DamageDataManager) Rows() iter.Seq[RowEntry[DamageDataTable, DamageDataSchemaRow]]"
+        ));
+        assert!(methods.contains(
+            "func (manager *DamageDataManager) Table(table DamageDataTable) TableRows[DamageDataTable, DamageDataSchemaRow]"
+        ));
+        assert!(methods.contains("type DamageDataTable string"));
         assert!(
             methods.contains(
-                "func (manager *DamageDataManager) Table(table string) DamageDataTableRows"
+            "func (table DamageDataTable) Ref(key string) RowRef[DamageDataTable, DamageDataSchemaRow]"
             )
         );
-        assert!(methods.contains(
-            "func (manager *DamageDataManager) Get(ref DamageDataRef) (*DamageDataSchemaRow, error)"
-        ));
-        assert!(methods.contains(
-            "func (manager *DamageDataManager) RowByIndex(slot DamageDataSlot) (*DamageDataSchemaRow, error)"
-        ));
+        assert!(!methods.contains("Table(table string)"));
         assert!(
             methods
-                .contains("func (manager *DamageDataManager) AfflictionData() AfflictionDataRows")
+                .contains(
+                    "func (manager *DamageDataManager) Row(ref RowRef[DamageDataTable, DamageDataSchemaRow]) *DamageDataSchemaRow"
+                )
         );
-        assert!(
-            methods
-                .contains("func (manager *DamageDataManager) DamageTypeData() DamageTypeDataRows")
-        );
-        assert!(!methods.contains(
-            "func (manager *DamageDataManager) AfflictionDataRows() ([]AfflictionDataSchemaRow, error)"
+        assert!(methods.contains(
+            "func (manager *DamageDataManager) RowByIndex(slot RowSlot[DamageDataTable, DamageDataSchemaRow]) *DamageDataSchemaRow"
         ));
-        assert!(!methods.contains(
-            "func (manager *DamageDataManager) DamageTypeDataRows() ([]DamageTypeDataSchemaRow, error)"
+        assert!(methods.contains(
+            "func (manager *DamageDataManager) AfflictionDataRows() RowSet[DamageDataAfflictionDataTable, AfflictionDataSchemaRow]"
         ));
+        assert!(methods.contains(
+            "func (manager *DamageDataManager) DamageTypeDataRows() RowSet[DamageDataDamageTypeDataTable, DamageTypeDataSchemaRow]"
+        ));
+        assert!(!methods.contains("func (manager *DamageDataManager) AfflictionData() RowSet"));
+        assert!(!methods.contains("func (manager *DamageDataManager) DamageTypeData() RowSet"));
         assert!(!methods.contains(
             "func (manager *DamageDataManager) AfflictionData(key string) (*AfflictionDataSchemaRow, error)"
         ));
@@ -650,26 +1429,531 @@ mod tests {
     }
 
     #[test]
+    fn generic_direct_manager_uses_typed_table_selection() {
+        let schema_report = GameSystemDataTablesSchemaReport {
+            tables: vec![
+                schema_table(
+                    "ExamplePrimary",
+                    "ExampleData",
+                    vec![schema_column("ExampleID", ColumnType::String, true)],
+                ),
+                schema_table(
+                    "ExampleSecondary",
+                    "ExampleData",
+                    vec![schema_column("ExampleID", ColumnType::String, true)],
+                ),
+            ],
+            diagnostics: Vec::new(),
+            type_affinities: Vec::new(),
+        };
+        let codegen_plan = GameDataCodegenPlan::from_schema_report(
+            GameDataCompileMode::SourceFormat,
+            &schema_report,
+        );
+        let unit = GameDataCompileUnit::new(schema_report.clone(), schema_report, codegen_plan);
+        let manager = DirectManagerSurface {
+            manager_name: "ExampleDataManager".to_owned(),
+            manager_class_name: "ExampleDataManager".to_owned(),
+            tables: vec![
+                DirectManagerTable {
+                    table_name: "ExamplePrimary".to_owned(),
+                    row_type_name: "ExampleData".to_owned(),
+                },
+                DirectManagerTable {
+                    table_name: "ExampleSecondary".to_owned(),
+                    row_type_name: "ExampleData".to_owned(),
+                },
+            ],
+            products: Vec::new(),
+        };
+
+        let methods = direct_go_schema_methods(&unit, &manager, true);
+
+        assert!(methods.contains("type ExampleDataTable string"));
+        assert!(methods.contains(
+            "func (manager *ExampleDataManager) Table(table ExampleDataTable) TableRows[ExampleDataTable, ExampleDataSchemaRow]"
+        ));
+        assert!(methods.contains(
+            "func (table ExampleDataTable) Ref(key string) RowRef[ExampleDataTable, ExampleDataSchemaRow]"
+        ));
+        assert!(!methods.contains("Table(table string)"));
+    }
+
+    #[test]
+    fn every_direct_and_native_table_surface_uses_typed_table_selection() {
+        let managers = crate::manager::validated_native_manager_specs();
+        let surfaces = crate::manager_records::manager_surfaces_from_managers(&managers)
+            .expect("manager surfaces");
+        let row_types = surfaces
+            .iter()
+            .filter_map(|surface| match surface {
+                ManagerSurface::Direct(manager) | ManagerSurface::Native { manager, .. } => Some(
+                    manager
+                        .tables
+                        .iter()
+                        .map(|table| table.row_type_name.clone()),
+                ),
+                ManagerSurface::Semantic(_)
+                | ManagerSurface::ItemData(_)
+                | ManagerSurface::Composition(_)
+                | ManagerSurface::ProductBacked(_) => None,
+            })
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        let schema_report = GameSystemDataTablesSchemaReport {
+            tables: row_types
+                .into_iter()
+                .map(|row_type| {
+                    schema_table(
+                        &row_type,
+                        &row_type,
+                        vec![schema_column("ID", ColumnType::String, true)],
+                    )
+                })
+                .collect(),
+            diagnostics: Vec::new(),
+            type_affinities: Vec::new(),
+        };
+        let codegen_plan = GameDataCodegenPlan::from_schema_report(
+            GameDataCompileMode::SourceFormat,
+            &schema_report,
+        );
+        let unit = GameDataCompileUnit::new(schema_report.clone(), schema_report, codegen_plan);
+
+        for surface in &surfaces {
+            let manager = match surface {
+                ManagerSurface::Direct(manager) | ManagerSurface::Native { manager, .. } => manager,
+                ManagerSurface::Semantic(_)
+                | ManagerSurface::ItemData(_)
+                | ManagerSurface::Composition(_)
+                | ManagerSurface::ProductBacked(_) => continue,
+            };
+            if manager.tables.is_empty() {
+                continue;
+            }
+            let methods = direct_go_schema_methods(&unit, manager, true);
+            assert!(
+                methods.contains("Table string"),
+                "{} must emit a manager-specific typed table identifier",
+                manager.manager_name
+            );
+            assert!(
+                !methods.contains("Table(table string)"),
+                "{} must not expose stringly table selection",
+                manager.manager_name
+            );
+            assert!(
+                methods.contains("Ref(key string) RowRef["),
+                "{} must construct typed row references",
+                manager.manager_name
+            );
+        }
+    }
+
+    #[test]
+    fn composition_managers_build_indexes_and_emit_complete_surfaces() {
+        assert!(REPLICATION_DATA_MANAGER_GO.contains("indexByID map[gametypes.CRC32]uint16"));
+        let index_of = REPLICATION_DATA_MANAGER_GO
+            .split("func (manager *ReplicationDataManager) IndexOf")
+            .nth(1)
+            .expect("IndexOf method")
+            .split("func (manager *ReplicationDataManager) IDs")
+            .next()
+            .expect("IndexOf body");
+        assert!(!index_of.contains("for "));
+
+        assert!(
+            !STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_GO
+                .contains("type StaticTradeskillRankDataMappingManager struct{}")
+        );
+        assert!(
+            STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_GO
+                .contains("tradeskillRanksByName map[gametypes.CRC32]int")
+        );
+        assert!(STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_GO.contains(
+            "func (manager *StaticTradeskillRankDataMappingManager) TradeskillRanks() iter.Seq"
+        ));
+        assert!(
+            STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_GO
+                .contains("ranks.ExperienceDataRows().Rows()")
+        );
+        assert!(CURRENCY_EXCHANGE_MAPPING_MANAGER_GO.contains("mappingsByEndpoint map"));
+        assert!(VITALS_MODIFIER_MAPPING_MANAGER_GO.contains("entriesByID map"));
+    }
+
+    #[test]
+    #[should_panic(expected = "declares unsupported product type")]
+    fn declared_products_cannot_silently_disappear_from_go_output() {
+        let manager = DirectManagerSurface {
+            manager_name: "UnsupportedProductManager".to_owned(),
+            manager_class_name: "UnsupportedProductManager".to_owned(),
+            tables: Vec::new(),
+            products: vec![DirectProductAsset {
+                path: "sharedassets/example.unsupported".to_owned(),
+                product_type: "UnsupportedProduct".to_owned(),
+                value_type: "example::UnsupportedProduct".to_owned(),
+                manager_getter: "unsupported_product".to_owned(),
+            }],
+        };
+
+        let _ = go_product_storage(&manager);
+    }
+
+    #[test]
+    fn every_residual_native_manager_has_an_explicit_indexed_go_contract() {
+        let managers = crate::manager::validated_native_manager_specs();
+        let surfaces = crate::manager_records::manager_surfaces_from_managers(&managers)
+            .expect("manager surfaces");
+        let mut covered = 0usize;
+        for surface in &surfaces {
+            let ManagerSurface::Native { manager, shape, .. } = surface else {
+                continue;
+            };
+            if !is_residual_go_native_shape(shape) {
+                continue;
+            }
+            let effective = go_effective_native_manager_surface(manager, shape);
+            let schema_report = GameSystemDataTablesSchemaReport {
+                tables: residual_contract_schema_tables(surface, &surfaces),
+                diagnostics: Vec::new(),
+                type_affinities: Vec::new(),
+            };
+            let codegen_plan = GameDataCodegenPlan::from_schema_report(
+                GameDataCompileMode::SourceFormat,
+                &schema_report,
+            );
+            let unit = GameDataCompileUnit::new(schema_report.clone(), schema_report, codegen_plan);
+            let augmentation =
+                native::residual_native_manager_augmentation(&unit, &effective, shape);
+            assert!(
+                !augmentation.fields.is_empty() || !augmentation.methods.is_empty(),
+                "{} emitted an empty native contract",
+                manager.manager_name
+            );
+            assert!(
+                !augmentation.initializers.is_empty() || effective.tables.is_empty(),
+                "{} did not build its indexes during construction",
+                manager.manager_name
+            );
+            assert!(
+                !augmentation.methods.contains("Table(table string)"),
+                "{} leaked stringly table selection",
+                manager.manager_name
+            );
+            let contract = format!("{}{}", augmentation.declarations, augmentation.methods);
+            format_go_source(&format!("package managers\n\n{contract}")).unwrap_or_else(|error| {
+                panic!(
+                    "{} emitted invalid Go syntax: {error}",
+                    manager.manager_name
+                )
+            });
+            let marker = residual_native_contract_marker(shape);
+            assert!(
+                contract.contains(marker),
+                "{} omitted native contract marker {marker}",
+                manager.manager_name
+            );
+            if matches!(shape, NativeManagerShape::VitalsData(_)) {
+                assert!(
+                    contract.contains("VitalsLevelVariantDataSchemaRow"),
+                    "VitalsDataManager must own level-variant rows, not its VitalsBaseDataManager dependency rows"
+                );
+            }
+            let emitted = format!(
+                "{}{}{}{}",
+                augmentation.declarations,
+                augmentation.fields,
+                augmentation.initializers,
+                augmentation.methods
+            );
+            assert!(
+                !emitted.contains("native") && !emitted.contains("Native"),
+                "{} leaked an implementation-history marker",
+                manager.manager_name
+            );
+            covered += 1;
+        }
+        assert!(
+            covered >= 40,
+            "expected every residual native manager surface"
+        );
+    }
+
+    #[test]
+    fn every_generic_projection_lowers_before_residual_go_dispatch() {
+        let managers = crate::manager::validated_native_manager_specs();
+        let surfaces = crate::manager_records::manager_surfaces_from_managers(&managers)
+            .expect("manager surfaces");
+        let empty_report = GameSystemDataTablesSchemaReport {
+            tables: Vec::new(),
+            diagnostics: Vec::new(),
+            type_affinities: Vec::new(),
+        };
+        let codegen_plan = GameDataCodegenPlan::from_schema_report(
+            GameDataCompileMode::SourceFormat,
+            &empty_report,
+        );
+        let unit = GameDataCompileUnit::new(empty_report.clone(), empty_report, codegen_plan);
+        let mut projection_managers = 0usize;
+
+        for manager in &managers {
+            let shape = manager.shape().expect("validated manager shape");
+            if !is_generic_semantic_projection_shape(shape) {
+                continue;
+            }
+            projection_managers += 1;
+            let manager_name = manager
+                .rust_type()
+                .as_str()
+                .rsplit("::")
+                .next()
+                .expect("manager type name");
+            let records =
+                crate::manager_records::semantic_projection_records(manager_name, manager, shape)
+                    .expect("generic projection shape must enter semantic projection lowering")
+                    .expect("generic projection lowering must succeed");
+            assert!(
+                !records.is_empty(),
+                "{manager_name} lowered to no semantic projection records"
+            );
+
+            if let Some(ManagerSurface::Native {
+                manager,
+                shape,
+                semantic_projections,
+                ..
+            }) = surfaces.iter().find(|surface| {
+                crate::manager_records::manager_surface_name(surface) == manager_name
+            }) {
+                assert_eq!(semantic_projections, &records);
+                let augmentation =
+                    go_native_manager_augmentation(&unit, manager, shape, semantic_projections);
+                assert!(
+                    !augmentation.fields.is_empty() && !augmentation.methods.is_empty(),
+                    "{manager_name} did not emit its semantic projection contract"
+                );
+            }
+        }
+
+        assert!(
+            projection_managers >= 10,
+            "expected the validated generic semantic projection family"
+        );
+    }
+
+    #[test]
+    fn grouped_semantic_projection_emits_one_typed_go_manager() {
+        let managers = crate::manager::validated_native_manager_specs();
+        let surfaces = crate::manager_records::manager_surfaces_from_managers(&managers)
+            .expect("manager surfaces");
+        let surface = surfaces
+            .iter()
+            .find(|surface| {
+                crate::manager_records::manager_surface_name(surface) == "AffixDataManager"
+            })
+            .expect("AffixDataManager surface")
+            .clone();
+        let schema_report = GameSystemDataTablesSchemaReport {
+            tables: residual_contract_schema_tables(&surface, &surfaces),
+            diagnostics: Vec::new(),
+            type_affinities: Vec::new(),
+        };
+        let codegen_plan = GameDataCodegenPlan::from_schema_report(
+            GameDataCompileMode::SourceFormat,
+            &schema_report,
+        );
+        let unit = GameDataCompileUnit::new(schema_report.clone(), schema_report, codegen_plan);
+        let source = manager_source(&unit, &[surface]).expect("grouped Go manager source");
+
+        assert!(source.contains("materializeAffixDataProjection0"));
+        assert!(source.contains("materializeAffixStatDataProjection1"));
+        assert!(
+            source
+                .contains("func (manager *AffixDataManager) Rows() iter.Seq[gametypes.AffixData]")
+        );
+        assert!(source.contains(
+            "func (manager *AffixDataManager) AffixStats() iter.Seq[gametypes.AffixStatData]"
+        ));
+        assert!(!source.contains("func (manager *AffixDataManager) Rows() iter.Seq[*RowEntry["));
+    }
+
+    fn residual_contract_schema_tables(
+        root: &ManagerSurface,
+        surfaces: &[ManagerSurface],
+    ) -> Vec<GameSystemTableSchema> {
+        let mut pending = vec![crate::manager_records::manager_surface_name(root).to_owned()];
+        let mut seen_managers = BTreeSet::new();
+        let mut tables = BTreeMap::<(String, String), DirectManagerTable>::new();
+
+        while let Some(manager_name) = pending.pop() {
+            if !seen_managers.insert(manager_name.clone()) {
+                continue;
+            }
+            let surface = surfaces
+                .iter()
+                .find(|surface| {
+                    crate::manager_records::manager_surface_name(surface) == manager_name
+                })
+                .unwrap_or_else(|| panic!("missing dependency surface {manager_name}"));
+            match surface {
+                ManagerSurface::Direct(manager) | ManagerSurface::ProductBacked(manager) => {
+                    for table in &manager.tables {
+                        tables.insert(
+                            (table.table_name.clone(), table.row_type_name.clone()),
+                            table.clone(),
+                        );
+                    }
+                }
+                ManagerSurface::Native {
+                    manager,
+                    shape,
+                    dependencies,
+                    ..
+                } => {
+                    for table in go_effective_native_manager_surface(manager, shape).tables {
+                        tables.insert(
+                            (table.table_name.clone(), table.row_type_name.clone()),
+                            table,
+                        );
+                    }
+                    pending.extend(dependencies.iter().cloned());
+                }
+                ManagerSurface::Semantic(manager) => {
+                    for table in &manager.tables {
+                        let table = DirectManagerTable {
+                            table_name: table.table_name.clone(),
+                            row_type_name: table.row_type_name.clone(),
+                        };
+                        tables.insert(
+                            (table.table_name.clone(), table.row_type_name.clone()),
+                            table,
+                        );
+                    }
+                }
+                ManagerSurface::ItemData(manager) => {
+                    for table in &manager.tables {
+                        let table = DirectManagerTable {
+                            table_name: table.table_name.clone(),
+                            row_type_name: table.row_type_name.clone(),
+                        };
+                        tables.insert(
+                            (table.table_name.clone(), table.row_type_name.clone()),
+                            table,
+                        );
+                    }
+                }
+                ManagerSurface::Composition(manager) => {
+                    pending.extend(manager.dependencies.iter().cloned());
+                }
+            }
+        }
+
+        tables
+            .into_values()
+            .map(|table| {
+                schema_table(
+                    &table.table_name,
+                    &table.row_type_name,
+                    residual_contract_columns(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
     fn item_data_manager_uses_rows_contract() {
         let mut source = String::new();
         push_item_data_manager_type(&mut source, &item_data_manager_surface());
 
-        assert!(source.contains("func (manager *ItemDataManager) Rows() ([]ItemData, error)"));
-        assert!(source.contains("func (manager *ItemDataManager) Items() []ItemData"));
+        assert!(source.contains("func (manager *ItemDataManager) Rows() iter.Seq[ItemData]"));
+        assert!(!source.contains("func (manager *ItemDataManager) Items()"));
     }
 
     #[test]
     fn semantic_into_crc_lookup_accepts_string_or_crc_key() {
         let mut source = String::new();
         push_semantic_manager_type(&mut source, &semantic_lookup_record());
+        let source = format_go_source(&source).expect("semantic manager source should parse");
 
         assert!(source.contains(
-            "func (manager *StaticBackstoryDataManager) Backstory(backstoryId any) *StaticBackstoryData"
+            "func (manager *StaticBackstoryDataManager) Backstory(backstoryID CRC32) *StaticBackstoryData"
         ));
-        assert!(source.contains("key, ok := crc32LookupKey(backstoryId)"));
         assert!(source.contains(
             "func (manager *StaticBackstoryDataManager) BackstoryByKey(backstoryKey string) *StaticBackstoryData"
         ));
+    }
+
+    #[test]
+    fn semantic_managers_emit_only_consumed_indexes() {
+        let mut record = semantic_lookup_record();
+        record.lookup_methods.clear();
+        let mut source = String::new();
+
+        push_semantic_manager_type(&mut source, &record);
+
+        assert!(!source.contains("entriesByKey"));
+        assert!(!source.contains("entriesBySourceRow"));
+    }
+
+    #[test]
+    fn skip_invalid_enum_projection_continues_without_fabricating_a_variant() {
+        let mut record = semantic_lookup_record();
+        record.fields.push(skip_invalid_enum_field());
+        let mut source = String::new();
+
+        push_go_semantic_materializer(&mut source, &record);
+
+        assert!(source.contains(
+            "missionGoalTypeValue, err := requiredEnumCell(table, sourceRow, \"MissionGoalType\", parseMissionGoalType)"
+        ));
+        assert!(source.contains("if err != nil {\n\t\t\t\tcontinue"));
+        assert!(!source.contains("MissionGoalTypeInvalid"));
+    }
+
+    #[test]
+    fn numeric_key_conversion_preserves_uint32_values() {
+        assert_eq!(
+            go_numeric_key_as_u32("row.Level", SemanticNumericKeyType::U8),
+            "uint32(row.Level)"
+        );
+        assert_eq!(
+            go_numeric_key_as_u32("row.Level", SemanticNumericKeyType::U32),
+            "row.Level"
+        );
+    }
+
+    #[test]
+    fn import_synthesis_uses_syntax_qualifiers_instead_of_substrings() {
+        let qualifiers = go_import_qualifiers(
+            "func read(row gameassets.DatasheetRow) iter.Seq[gametypes.CRC32] { return nil }",
+        )
+        .expect("import qualifiers");
+
+        assert!(qualifiers.contains("gameassets"));
+        assert!(qualifiers.contains("gametypes"));
+        assert!(qualifiers.contains("iter"));
+        assert!(!qualifiers.contains("assets"));
+    }
+
+    #[test]
+    fn shared_type_qualification_preserves_struct_literal_field_names() {
+        let source = r#"
+package managers
+
+type Example struct {
+	AssetID AssetID
+}
+
+func example() Example {
+	return Example{AssetID: AssetID{}}
+}
+"#;
+        let qualified =
+            qualify_go_shared_types(source, &[]).expect("qualify shared Go types structurally");
+
+        assert!(qualified.contains("AssetID gametypes.AssetID"));
+        assert!(qualified.contains("Example{AssetID: gametypes.AssetID{}}"));
+        assert!(!qualified.contains("gametypes.AssetID:"));
     }
 
     fn damage_compile_unit() -> GameDataCompileUnit {
@@ -677,7 +1961,6 @@ mod tests {
         let codegen_plan = GameDataCodegenPlan::from_schema_report(
             GameDataCompileMode::SourceFormat,
             &schema_report,
-            vec![GameDataTargetPlan::standalone(GameDataTargetLanguage::Go)],
         );
         GameDataCompileUnit::new(schema_report.clone(), schema_report, codegen_plan)
     }
@@ -714,6 +1997,7 @@ mod tests {
             tables: vec![ItemDataManagerTable {
                 variant_name: "Master".to_owned(),
                 table_name: "MasterItemDefinitions".to_owned(),
+                row_type_name: "MasterItemDefinitions".to_owned(),
             }],
         }
     }
@@ -724,7 +2008,15 @@ mod tests {
             manager_class_name: "StaticBackstoryDataManager".to_owned(),
             record_type_name: "StaticBackstoryData".to_owned(),
             tables: Vec::new(),
-            key: None,
+            key: Some(SemanticManagerKey::Crc {
+                key_field: "backstory_id".to_owned(),
+                crc_field: "backstory_crc".to_owned(),
+                key_column: "BackstoryID".to_owned(),
+                skip_empty_key: true,
+                trim_key: true,
+                reject_zero_crc: true,
+                duplicate_key_policy: crate::manager::NativeDuplicateKeyPolicy::FirstWins,
+            }),
             source_row_field: None,
             source_row_method: None,
             row_filters: Vec::new(),
@@ -745,6 +2037,24 @@ mod tests {
             rows_method: None,
             len_method: None,
             is_empty_method: None,
+        }
+    }
+
+    fn skip_invalid_enum_field() -> crate::manager_records::SemanticRecordField {
+        crate::manager_records::SemanticRecordField {
+            name: "mission_goal_type".to_owned(),
+            column: "MissionGoalType".to_owned(),
+            transform: SemanticProjectionTransform::EnumStringSkipInvalid,
+            value_type: Some("MissionGoalType".to_owned()),
+            default_value: None,
+            reference_field: None,
+            u16_max_exclusive: None,
+            enum_shape: Some(crate::game_system_schema::GameSystemEnumShape {
+                name: "MissionGoalType".to_owned(),
+                representation: crate::game_system_schema::GameSystemEnumRepresentation::U8,
+                variants: Vec::new(),
+            }),
+            pair_first_enum_shape: None,
         }
     }
 
@@ -821,191 +2131,441 @@ mod tests {
             },
         }
     }
-}
 
-fn manifest_source(unit: &GameDataCompileUnit, surfaces: &[ManagerSurface]) -> Result<String> {
-    let mut source = String::from(
-        r#"
-package managers
-
-type managerDependencyKind string
-
-const (
-	managerDependencyTable   managerDependencyKind = "table"
-	managerDependencyAsset   managerDependencyKind = "asset"
-	managerDependencyManager managerDependencyKind = "manager"
-)
-
-type managerDependency struct {
-	Kind        managerDependencyKind
-	Name        string
-	Row         string
-	Path        string
-}
-
-type managerDefinition struct {
-	Name         string
-	Dependencies []managerDependency
-}
-
-"#,
-    );
-
-    push_managers(&mut source, unit, surfaces);
-    source.push_str(
-        r#"
-func managerByName(name string) *managerDefinition {
-	for i := range managers {
-		if managers[i].Name == name {
-			return &managers[i]
-		}
-	}
-	return nil
-}
-"#,
-    );
-
-    format_go_source(&source).map_err(Into::into)
-}
-
-fn push_table_schemas(source: &mut String, unit: &GameDataCompileUnit) {
-    source.push_str("var TableSchemas = []TableSchema{\n");
-    for table in &unit.schema_report().tables {
-        push_table_schema(source, table);
-    }
-    source.push_str("}\n\n");
-    source.push_str(
-        r#"
-func TableSchemaByName(name string) *TableSchema {
-	for i := range TableSchemas {
-		if TableSchemas[i].Name == name {
-			return &TableSchemas[i]
-		}
-	}
-	return nil
-}
-
-func TableSchemaByNameAndRow(name string, rowType string) *TableSchema {
-	for i := range TableSchemas {
-		if TableSchemas[i].Name == name && TableSchemas[i].RowType == rowType {
-			return &TableSchemas[i]
-		}
-	}
-	return nil
-}
-
-func TableSchemaBySourcePath(sourcePath string) *TableSchema {
-	normalized := normalizeDataPath(sourcePath)
-	for i := range TableSchemas {
-		for _, candidate := range TableSchemas[i].Sources {
-			if normalizeDataPath(candidate) == normalized {
-				return &TableSchemas[i]
-			}
-		}
-	}
-	return nil
-}
-
-"#,
-    );
-}
-
-fn push_table_schema(source: &mut String, table: &GameSystemTableSchema) {
-    source.push_str("\t{\n");
-    source.push_str(&format!("\t\tName: {},\n", go_string(&table.table_name)));
-    source.push_str(&format!("\t\tNameCRC: {},\n", table.table_name_crc));
-    source.push_str(&format!(
-        "\t\tRowType: {},\n",
-        go_string(&table.row_type_name)
-    ));
-    source.push_str(&format!("\t\tRowTypeCRC: {},\n", table.row_type_crc));
-    source.push_str(&format!("\t\tRowCount: {},\n", table.row_count));
-    source.push_str("\t\tSources: []string{");
-    for (index, source_path) in table.sources.iter().enumerate() {
-        if index > 0 {
-            source.push_str(", ");
-        }
-        source.push_str(&go_string(source_path));
-    }
-    source.push_str("},\n");
-    source.push_str("\t\tColumns: []ColumnSchema{\n");
-    for column in &table.columns {
-        source.push_str("\t\t\t{\n");
-        source.push_str(&format!("\t\t\t\tName: {},\n", go_string(&column.name)));
-        source.push_str(&format!(
-            "\t\t\t\tFieldName: {},\n",
-            go_string(&to_snake_ident(&column.name, "column"))
-        ));
-        source.push_str(&format!("\t\t\t\tCRC: {},\n", column.crc));
-        source.push_str(&format!(
-            "\t\t\t\tKind: {},\n",
-            cell_kind(column.declared_type)
-        ));
-        source.push_str(&format!("\t\t\t\tRowKey: {},\n", column.row_key));
-        source.push_str(&format!("\t\t\t\tRequired: {},\n", column.required));
-        source.push_str("\t\t\t},\n");
-    }
-    source.push_str("\t\t},\n");
-    source.push_str("\t},\n");
-}
-
-fn push_managers(source: &mut String, unit: &GameDataCompileUnit, surfaces: &[ManagerSurface]) {
-    source.push_str("var managers = []managerDefinition{\n");
-    let contracts = unit.codegen_plan_ref().managers().contracts();
-    for surface in surfaces {
-        let manager_name = manager_surface_name(surface);
-        let Some(contract) = contracts
+    fn residual_contract_columns() -> Vec<GameSystemColumnSchema> {
+        const STRING_COLUMNS: &[&str] = &[
+            "UIPriority",
+            "OutputQty",
+            "AbilityID",
+            "AfflictionID",
+            "Attribute",
+            "Buff1",
+            "Buff2",
+            "Buff3",
+            "Buff4",
+            "Buff5",
+            "Buff6",
+            "BuffBucketID",
+            "BuffType1",
+            "BuffType2",
+            "BuffType3",
+            "BuffType4",
+            "BuffType5",
+            "BuffType6",
+            "Bucket1",
+            "BucketID",
+            "CampSkinID",
+            "CardAndRowID",
+            "Category",
+            "ChapterID",
+            "ChapterRewardID",
+            "ChapterType",
+            "CraftingCategory",
+            "ContainerTypeID",
+            "ContributionID",
+            "ConversionID",
+            "CostumeChangeID",
+            "DamageID",
+            "DarknessID",
+            "DungeonTileID",
+            "Dungeon",
+            "Dungeon2",
+            "Dungeon3",
+            "DungeonMiniBoss",
+            "DungeonBoss",
+            "DynamicDifficultyID",
+            "Effect Name",
+            "ElementalMutationID",
+            "EquipmentSetID",
+            "ItemIds",
+            "ItemID",
+            "Ingredient1",
+            "Ingredient2",
+            "Ingredient3",
+            "Ingredient4",
+            "Ingredient5",
+            "Ingredient6",
+            "Ingredient7",
+            "FromItemID",
+            "GameEventIDRankAmazing",
+            "GameEventIDRankBad",
+            "GameEventIDRankGreat",
+            "GameEventIDRankOkay",
+            "GatherableID",
+            "GatheringAction",
+            "GatheringType",
+            "FootprintID",
+            "StructureFootprintID",
+            "JourneyTaskID",
+            "LootBucketID",
+            "MountID",
+            "ObjectiveID",
+            "TimedRaceNodeTypeId",
+            "ParticleID",
+            "PrefabPath",
+            "ProfileName",
+            "ProfileType",
+            "ProgressionPointID",
+            "PointPoolID",
+            "PoolCategory",
+            "TerritoryBonusCategory",
+            "RequiredCategoricalProgressionID",
+            "RequiredProgressionPointID",
+            "Description",
+            "UpgradeCardDescription",
+            "UpgradeCardSprite",
+            "UpgradeCardIcon",
+            "UpgradeCardCategory",
+            "UpgradeCardStat",
+            "PromotionMutationID",
+            "Promotion1",
+            "Promotion2",
+            "Promotion3",
+            "QuickCourseID",
+            "PathReferenceQuickCourseID",
+            "AudioGroup",
+            "RewardID",
+            "Reward(s)",
+            "Tag1",
+            "MatchOne1",
+            "Type1",
+            "SelectOnceOnly1",
+            "ExcludeTypeStage1",
+            "ExcludeTypeShop1",
+            "RotationalQueueID",
+            "QueueStartTime",
+            "QueueEndTime",
+            "QueueGameModes",
+            "Notes",
+            "RuleID",
+            "Category",
+            "Hub",
+            "Zone",
+            "SheetID",
+            "Instrument",
+            "Pages",
+            "Slot01",
+            "Slot02",
+            "Slot03",
+            "Slot04",
+            "Slot05",
+            "SongID",
+            "StatusEffect_1",
+            "StatusEffect_2",
+            "GameModeIds",
+            "StatusID",
+            "EffectCategories",
+            "StoreCategory",
+            "CategoryText",
+            "DisplayName",
+            "PortraitImage",
+            "LandscapeImage",
+            "SquareImage",
+            "ThumbnailImage",
+            "TypeDescription",
+            "ChildCategoryList",
+            "StoreProductTypeList",
+            "StoreProductType",
+            "StructurePieceID",
+            "TaskID",
+            "TerritoryName",
+            "TrackedStatID",
+            "TradeSkillType",
+            "UniqueTagID",
+            "CampSkinID",
+            "ItemID",
+            "RequiredAchievementID",
+            "Entitlement",
+            "GameEvent",
+            "Item",
+            "Name",
+            "Color",
+            "SpecColor",
+            "CategoricalProgressionId",
+            "IconPath",
+            "HiResIconPath",
+            "VitalsID",
+            "BaseVitalsID",
+            "AbilityID",
+            "ConversionID",
+            "FromItemID",
+            "ToItemID",
+            "FeatureID",
+            "WeaponName",
+            "WhisperID",
+            "WhisperVfxID",
+            "WorldEncounterID",
+            "AffectedCreatureTypes",
+            "MaxHealthMod",
+            "CostumeChangeID",
+            "CostumeChangeMesh",
+            "DungeonTileID",
+            "DungeonTileId",
+            "Connections",
+            "VariationAssetPaths",
+            "SupportedRoomTypes",
+            "ContainerTypeID",
+            "EquipLoadCCStatusEffectCategories",
+            "DarknessID",
+            "DarknessLevels",
+            "DarknessActivationSpec",
+            "DarknessGroupSpec",
+            "DifficultyScalingGroup",
+            "DifficultyScalingTable",
+            "Effect Name",
+            "Group",
+            "BalanceTarget",
+            "BalanceCategory",
+            "AbilityBaseDamageAdjustment",
+            "AffixStatAdjustment",
+            "IncomingHealAdjustment",
+            "ConsumableHealAdjustment",
+            "HEAD_SLOT_Left",
+            "HEAD_SLOT_Right",
+            "CHEST_SLOT_Left",
+            "CHEST_SLOT_Right",
+            "HANDS_SLOT_Left",
+            "HANDS_SLOT_Right",
+            "LEGS_SLOT_Left",
+            "LEGS_SLOT_Right",
+            "FEET_SLOT_Left",
+            "FEET_SLOT_Right",
+            "ActivitiesTaskID",
+            "RecipeID",
+            "TableType",
+            "ReusableScoreboardTabId",
+            "BuffBucketID",
+            "ContributionID",
+            "DynamicDifficultyID",
+            "ItemIds",
+            "Chapter",
+            "ChapterID",
+            "ChapterRewardID",
+            "ChapterType",
+            "RewardType",
+        ];
+        const NUMBER_COLUMNS: &[&str] = &[
+            "Index",
+            "EntitlementIndex",
+            "CategoryOrder",
+            "Quantity",
+            "BuyCategoricalProgressionCost",
+            "MaxEvents",
+            "MinDistance",
+            "QueueStartIndex",
+            "GameModeTimeSpan",
+            "StartingTimerSeconds",
+            "NodeTimeOverrideMultiplier",
+            "DetectionRadius",
+            "AddTimeSeconds",
+            "MaxLevel",
+            "RequiredCharacterLevel",
+            "RequiredCategoricalProgressionLevel",
+            "RequiredProgressionPointLevel",
+            "TreeID",
+            "TreeRowPosition",
+            "ExpectedParticipantCount",
+            "ScalingFactorMin",
+            "ScalingFactorMax",
+            "FunctionCoefficient",
+            "Rotations",
+            "TileSize",
+            "Weight",
+            "MeshRenderZPosOffset",
+            "TerritoryType",
+            "DarknessDuration",
+            "Max Number",
+            "Priority",
+            "Constants",
+            "PotencyAdjustment",
+            "DurationAdjustment",
+            "WeaponBaseDamageAdjustment",
+            "SelfHealAdjustment",
+            "CooldownAdjustment",
+            "ColorAmount",
+            "ColorOverride",
+            "SpecAmount",
+            "MaskGlossShift",
+            "TradeSkillRewardXP",
+            "SubRewardPerc1",
+            "SubRewardPerc2",
+            "BuffPotency1",
+            "BuffPotency2",
+            "BuffPotency3",
+            "BuffPotency4",
+            "BuffPotency5",
+            "BuffPotency6",
+            "ChapterIndex",
+            "DifficultyTier",
+            "Level",
+            "LevelDisparity",
+            "MaximumInfluence",
+            "RewardIndex",
+            "RewardID1",
+            "RandomWeights1",
+            "BudgetContribution1",
+            "SortOrder",
+            "MaxRoll",
+            "Qty1",
+            "Qty2",
+            "Qty3",
+            "Qty4",
+            "Qty5",
+            "Qty6",
+            "Qty7",
+            "TerritoryID",
+        ];
+        const BOOLEAN_COLUMNS: &[&str] = &[
+            "IsEntitlement",
+            "IsEnabled",
+            "RollOnPresent",
+            "UseLevelGS",
+            "Disabled",
+            "IsTimed",
+            "AccumulateTime",
+            "UseTimeOverride",
+            "IsAbility",
+            "DoNotSpendPoint",
+            "MatchesPlayerSkeleton",
+            "UpdateEnabled",
+            "KeepPerks",
+            "Bought",
+            "Sold",
+            "InContracts",
+        ];
+        STRING_COLUMNS
             .iter()
-            .find(|contract| semantic_type_name(contract.manager().as_str()) == manager_name)
-        else {
-            continue;
-        };
-        let dependencies = manager_surface_dependencies(surface, contract.inputs());
-        source.push_str("\t{\n");
-        source.push_str(&format!("\t\tName: {},\n", go_string(manager_name)));
-        source.push_str("\t\tDependencies: []managerDependency{\n");
-        for dependency in &dependencies {
-            push_manager_dependency(source, dependency);
-        }
-        source.push_str("\t\t},\n");
-        source.push_str("\t},\n");
+            .map(|name| schema_column(name, ColumnType::String, true))
+            .chain(
+                NUMBER_COLUMNS
+                    .iter()
+                    .map(|name| schema_column(name, ColumnType::Number, true)),
+            )
+            .chain(
+                BOOLEAN_COLUMNS
+                    .iter()
+                    .map(|name| schema_column(name, ColumnType::Boolean, true)),
+            )
+            .collect()
     }
-    source.push_str("}\n\n");
-}
 
-fn push_manager_dependency(source: &mut String, input: &ManagerSurfaceDependency) {
-    match input {
-        ManagerSurfaceDependency::Table { name, row } => {
-            source.push_str("\t\t\t{\n");
-            source.push_str("\t\t\t\tKind: managerDependencyTable,\n");
-            source.push_str(&format!("\t\t\t\tName: {},\n", go_string(name)));
-            source.push_str(&format!("\t\t\t\tRow: {},\n", go_string(row)));
-            source.push_str("\t\t\t},\n");
-        }
-        ManagerSurfaceDependency::Asset { path } => {
-            source.push_str("\t\t\t{\n");
-            source.push_str("\t\t\t\tKind: managerDependencyAsset,\n");
-            source.push_str(&format!("\t\t\t\tPath: {},\n", go_string(path)));
-            source.push_str("\t\t\t},\n");
-        }
-        ManagerSurfaceDependency::Manager { name } => {
-            source.push_str("\t\t\t{\n");
-            source.push_str("\t\t\t\tKind: managerDependencyManager,\n");
-            source.push_str(&format!("\t\t\t\tName: {},\n", go_string(name)));
-            source.push_str("\t\t\t},\n");
-        }
+    fn is_residual_go_native_shape(shape: &NativeManagerShape) -> bool {
+        !matches!(
+            shape,
+            NativeManagerShape::RequirementsOnly
+                | NativeManagerShape::AbilityData(_)
+                | NativeManagerShape::OneTableCrcIndex(_)
+                | NativeManagerShape::TableFamilyCrcIndex(_)
+                | NativeManagerShape::OneTableOwnedStringCrcIndex(_)
+                | NativeManagerShape::TableFamilyOwnedStringCrcIndex(_)
+                | NativeManagerShape::OneTableCrcKeyProjection(_)
+                | NativeManagerShape::MultiTableCrcKeyProjection(_)
+                | NativeManagerShape::TableFamilyCrcKeyProjection(_)
+                | NativeManagerShape::TableFamilyFallbackCrcKeyProjection(_)
+                | NativeManagerShape::TableFamilyPartitionedCrcKeyProjection(_)
+                | NativeManagerShape::OneTableNumericKeyProjection(_)
+                | NativeManagerShape::TableFamilyNumericKeyProjection(_)
+                | NativeManagerShape::OneTableEnumKeyProjection(_)
+                | NativeManagerShape::OneTableStringKeyProjection(_)
+                | NativeManagerShape::OneTableRowProjection(_)
+                | NativeManagerShape::OneTableExperience(_)
+                | NativeManagerShape::ItemData(_)
+                | NativeManagerShape::ItemConversionData(_)
+                | NativeManagerShape::DamageData(_)
+                | NativeManagerShape::VitalsData(_)
+                | NativeManagerShape::StatusEffectData(_)
+                | NativeManagerShape::CurrencyExchangeMapping(_)
+                | NativeManagerShape::TradeskillRankData(_)
+                | NativeManagerShape::StaticTradeskillRankDataMapping(_)
+                | NativeManagerShape::VitalsModifierMapping(_)
+                | NativeManagerShape::ReplicationData(_)
+                | NativeManagerShape::ProductAssetResource(_)
+                | NativeManagerShape::ComposedResource(_)
+        )
     }
-}
 
-fn semantic_type_name(path: &str) -> &str {
-    path.rsplit("::").next().unwrap_or(path)
-}
+    fn is_generic_semantic_projection_shape(shape: &NativeManagerShape) -> bool {
+        matches!(
+            shape,
+            NativeManagerShape::OneTableCrcIndex(_)
+                | NativeManagerShape::TableFamilyCrcIndex(_)
+                | NativeManagerShape::OneTableOwnedStringCrcIndex(_)
+                | NativeManagerShape::TableFamilyOwnedStringCrcIndex(_)
+                | NativeManagerShape::OneTableCrcKeyProjection(_)
+                | NativeManagerShape::MultiTableCrcKeyProjection(_)
+                | NativeManagerShape::TableFamilyCrcKeyProjection(_)
+                | NativeManagerShape::TableFamilyFallbackCrcKeyProjection(_)
+                | NativeManagerShape::TableFamilyPartitionedCrcKeyProjection(_)
+                | NativeManagerShape::OneTableNumericKeyProjection(_)
+                | NativeManagerShape::TableFamilyNumericKeyProjection(_)
+                | NativeManagerShape::OneTableEnumKeyProjection(_)
+                | NativeManagerShape::OneTableStringKeyProjection(_)
+                | NativeManagerShape::OneTableRowProjection(_)
+        )
+    }
 
-fn cell_kind(column_type: ColumnType) -> &'static str {
-    match column_type {
-        ColumnType::String => "DatasheetCellString",
-        ColumnType::Number => "DatasheetCellNumber",
-        ColumnType::Boolean => "DatasheetCellBoolean",
+    fn residual_native_contract_marker(shape: &NativeManagerShape) -> &'static str {
+        match shape {
+            NativeManagerShape::ObjectivesData(_) => "ObjectiveTaskDataFromID",
+            NativeManagerShape::ContributionData(_) => "ContributionDataByKey",
+            NativeManagerShape::BuffBucketData(_) => "VisitAllBuffsFromID",
+            NativeManagerShape::StructureData(_) => "StructurePieceDataFromID",
+            NativeManagerShape::ReusableScoreboardData(_) => "ReusableScoreboardDataFromID",
+            NativeManagerShape::MountHitVolumeData(_) => "MountHitVolumeFromMountTypeID",
+            NativeManagerShape::OneTableCampSkin(_) => "CampSkinDataFromID",
+            NativeManagerShape::OneTableEmote(_) => "EmoteDataFromID",
+            NativeManagerShape::OneTableStoreCategory(_) => "StoreCategoryPropertiesFromID",
+            NativeManagerShape::OneTableStoreProduct(_) => "StoreProductDataFromID",
+            NativeManagerShape::OneTableRewardTrackItem(_) => "RewardTrackItemFromID",
+            NativeManagerShape::OneTableWorldEventRule(_) => "WorldEventRuleByCRC32",
+            NativeManagerShape::QuickCourseData(_) => "NodeTypeByCRC32",
+            NativeManagerShape::RotationalQueueData(_) => "RotationalQueueFromID",
+            NativeManagerShape::DynamicDifficultyData(_) => "DynamicDifficultyStatusEffectPotency",
+            NativeManagerShape::ProgressionPointData(_) => "ProgressionPointFromID",
+            NativeManagerShape::EntitlementData(_) => "EntitlementsForReward",
+            NativeManagerShape::EquipmentSetData(_) => "SetsForPerk",
+            NativeManagerShape::OneTablePvpBalance(_) => "Balances",
+            NativeManagerShape::OneTableDyeColor(_) => "DyeColorDataFromIndex",
+            NativeManagerShape::RewardTrackData(_) => "RewardTrackSlot",
+            NativeManagerShape::PostSkillCapProgression(_) => "PostSkillCapProgressionDataFromID",
+            NativeManagerShape::WhisperData(_) => "WhisperVfxFromID",
+            NativeManagerShape::OneTableCostumeChange(_) => "CostumeChangeDataFromID",
+            NativeManagerShape::OneTableCrestPart(_) => "CrestPartDataFromIndex",
+            NativeManagerShape::OneTableDungeonTile(_) => "DungeonTileStaticDataByKey",
+            NativeManagerShape::OneTableLevelDisparity(_) => {
+                "ClampedLevelDisparityDataForLevelsWithPlayerLevelCap"
+            }
+            NativeManagerShape::OneTableEncumbrance(_) => "EncumbranceDataFromID",
+            NativeManagerShape::OneTableDifficultyScaling(_) => "DifficultyScalingDataFromID",
+            NativeManagerShape::OneTableDarkness(_) => "DarknessDataByCRC32",
+            NativeManagerShape::OneTableParticleData(_) => "ParticleDataFromID",
+            NativeManagerShape::CharacterAttributeData(_) => "ClampedAttributeData",
+            NativeManagerShape::GovernanceData(_) => "GovernanceRows",
+            NativeManagerShape::LootBucketData(_) => "LootBucketSlot",
+            NativeManagerShape::TerritoryDefinitionsData(_) => "TerritoryForAchievement",
+            NativeManagerShape::StatModifierData(_) => "FromID",
+            NativeManagerShape::SeasonsRewardsData(_) => "RewardsByType",
+            NativeManagerShape::SeasonsTrackedStatData(_) => "TrackedStatFromID",
+            NativeManagerShape::SeasonsRewardsActivitiesTasksData(_) => "ActivityTaskByKey",
+            NativeManagerShape::SeasonsRewardsBattlePassData(_) => "RankBySeasonKey",
+            NativeManagerShape::SeasonsRewardsCardTemplateData(_) => "CardTemplateByKey",
+            NativeManagerShape::SeasonsRewardsChapterData(_) => "ChapterByKindIndex",
+            NativeManagerShape::SeasonsRewardsJourneyData(_) => "JourneysForChapter",
+            NativeManagerShape::SongBookSheetData(_) => "SheetIDsForPage",
+            NativeManagerShape::SongBookData(_) => "SheetIDsForInstrument",
+            NativeManagerShape::ElementalMutationStaticData(_) => "PossibleElementalStatusEffects",
+            NativeManagerShape::PromotionMutationStaticData(_) => {
+                "PossiblePromotionalStatusEffectsForElement"
+            }
+            NativeManagerShape::MusicalRewardsData(_) => "RewardForGameEvent",
+            NativeManagerShape::CombatProfilesData(_) => "ActiveAbilityProfileByKey",
+            NativeManagerShape::ItemTransformData(_) => "TransformByKey",
+            NativeManagerShape::GatherableData(_) => "GatheringActionByKey",
+            NativeManagerShape::SocialData(_) => "RankBySecurityLevel",
+            NativeManagerShape::PlayerData(_) => "HasPlayerBaseAttributes",
+            NativeManagerShape::RecipeData(_) => "CraftingRecipeDataByResult",
+            _ => panic!("pre-lowered shape reached residual marker test: {shape:?}"),
+        }
     }
 }
 
@@ -1019,8 +2579,10 @@ fn manager_record_types_source(records: &[SemanticManagerRecord]) -> Result<Stri
         .emit(
             &unit,
             &SerializeGoSourceOptions {
-                package_name: "managers".to_owned(),
+                package_name: "types".to_owned(),
                 include_support_aliases: false,
+                use_support_aliases: true,
+                idiomatic_initialisms: true,
             },
         )
         .map_err(|err| anyhow::anyhow!("emit Go manager record types: {err}"))
@@ -1037,8 +2599,22 @@ fn push_manager_surface_types(
     for surface in surfaces {
         match surface {
             ManagerSurface::Direct(manager) => push_direct_manager_type(source, unit, manager),
+            ManagerSurface::Native {
+                manager,
+                shape,
+                dependencies,
+                semantic_projections,
+            } => push_native_manager_type(
+                source,
+                unit,
+                manager,
+                shape,
+                dependencies,
+                semantic_projections,
+            ),
             ManagerSurface::Semantic(record) => push_semantic_manager_type(source, record),
             ManagerSurface::ItemData(manager) => push_item_data_manager_type(source, manager),
+            ManagerSurface::Composition(manager) => push_composition_manager_type(source, manager),
             ManagerSurface::ProductBacked(manager) => {
                 push_product_backed_manager_type(source, manager)
             }
@@ -1047,62 +2623,1251 @@ fn push_manager_surface_types(
     source.push_str(SEMANTIC_MANAGER_RUNTIME_GO);
 }
 
+fn push_composition_manager_type(source: &mut String, manager: &CompositionManagerSurface) {
+    source.push_str(match manager.kind {
+        CompositionManagerKind::CurrencyExchangeMapping => CURRENCY_EXCHANGE_MAPPING_MANAGER_GO,
+        CompositionManagerKind::ReplicationData => REPLICATION_DATA_MANAGER_GO,
+        CompositionManagerKind::StaticTradeskillRankDataMapping => {
+            STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_GO
+        }
+        CompositionManagerKind::VitalsModifierMapping => VITALS_MODIFIER_MAPPING_MANAGER_GO,
+    });
+}
+
+const CURRENCY_EXCHANGE_MAPPING_MANAGER_GO: &str = r#"
+type CurrencyExchangeEndpointKind uint8
+
+const (
+	CurrencyExchangeEndpointCurrency CurrencyExchangeEndpointKind = iota
+	CurrencyExchangeEndpointCategoricalProgression
+)
+
+type CurrencyExchangeEndpoint struct {
+	Kind CurrencyExchangeEndpointKind
+	ID   gametypes.CRC32
+}
+
+func CurrencyEndpoint() CurrencyExchangeEndpoint {
+	return CurrencyExchangeEndpoint{Kind: CurrencyExchangeEndpointCurrency}
+}
+
+func CategoricalProgressionEndpoint(id gametypes.CRC32) CurrencyExchangeEndpoint {
+	return CurrencyExchangeEndpoint{Kind: CurrencyExchangeEndpointCategoricalProgression, ID: id}
+}
+
+type CurrencyExchangeMapping struct {
+	Source   CurrencyExchangeEndpoint
+	Target   CurrencyExchangeEndpoint
+	Exchange gametypes.CurrencyExchangeData
+}
+
+type currencyExchangeEndpointPair struct {
+	source CurrencyExchangeEndpoint
+	target CurrencyExchangeEndpoint
+}
+
+type CurrencyExchangeMappingManager struct {
+	mappings           []CurrencyExchangeMapping
+	mappingsByEndpoint map[currencyExchangeEndpointPair]int
+}
+
+func newCurrencyExchangeMappingManager(
+	exchanges *CurrencyExchangeDataManager,
+	progressions *CategoricalProgressionDataManager,
+) (*CurrencyExchangeMappingManager, error) {
+	manager := &CurrencyExchangeMappingManager{mappingsByEndpoint: map[currencyExchangeEndpointPair]int{}}
+	for exchange := range exchanges.Rows() {
+		source, ok := currencyExchangeEndpoint(exchange.FromCurrencyCRC, exchange.FromCurrencyIsCategoricalProgression, progressions)
+		if !ok { continue }
+		target, ok := currencyExchangeEndpoint(exchange.ToCurrencyCRC, exchange.ToCurrencyIsCategoricalProgression, progressions)
+		if !ok { continue }
+		if source.Kind == CurrencyExchangeEndpointCategoricalProgression && target.Kind == CurrencyExchangeEndpointCategoricalProgression && source.ID == target.ID { continue }
+		key := currencyExchangeEndpointPair{source: source, target: target}
+		if _, exists := manager.mappingsByEndpoint[key]; exists { continue }
+		manager.mappingsByEndpoint[key] = len(manager.mappings)
+		manager.mappings = append(manager.mappings, CurrencyExchangeMapping{Source: source, Target: target, Exchange: exchange})
+	}
+	return manager, nil
+}
+
+func (manager *CurrencyExchangeMappingManager) Mapping(source, target CurrencyExchangeEndpoint) *CurrencyExchangeMapping {
+	index, ok := manager.mappingsByEndpoint[currencyExchangeEndpointPair{source: source, target: target}]
+	if !ok { return nil }
+	return rowCopy(manager.mappings[index])
+}
+
+func (manager *CurrencyExchangeMappingManager) CurrencyExchange(source, target CurrencyExchangeEndpoint) *gametypes.CurrencyExchangeData {
+	mapping := manager.Mapping(source, target)
+	if mapping == nil { return nil }
+	return rowCopy(mapping.Exchange)
+}
+
+func (manager *CurrencyExchangeMappingManager) ConversionID(source, target CurrencyExchangeEndpoint) (gametypes.CRC32, bool) {
+	exchange := manager.CurrencyExchange(source, target)
+	if exchange == nil { return 0, false }
+	return exchange.ConversionCRC, true
+}
+
+func (manager *CurrencyExchangeMappingManager) Mappings() iter.Seq[CurrencyExchangeMapping] { return rowValues(manager.mappings) }
+func (manager *CurrencyExchangeMappingManager) Len() int { return len(manager.mappings) }
+func (manager *CurrencyExchangeMappingManager) IsEmpty() bool { return len(manager.mappings) == 0 }
+
+func currencyExchangeEndpoint(id gametypes.CRC32, categorical bool, progressions *CategoricalProgressionDataManager) (CurrencyExchangeEndpoint, bool) {
+	if !categorical { return CurrencyEndpoint(), true }
+	progression := progressions.CategoricalProgressionDataFromID(id)
+	if progression == nil { return CurrencyExchangeEndpoint{}, false }
+	return CategoricalProgressionEndpoint(progression.CategoricalProgressionIDCRC), true
+}
+"#;
+
+const REPLICATION_DATA_MANAGER_GO: &str = r#"
+type ReplicationDataManager struct {
+	ids      []gametypes.CRC32
+	indexByID map[gametypes.CRC32]uint16
+}
+
+func newReplicationDataManager(perks *PerkDataManager) (*ReplicationDataManager, error) {
+	ids := []gametypes.CRC32{0}
+	for id := range perks.PerkIds() { ids = append(ids, id) }
+	indexByID := make(map[gametypes.CRC32]uint16, len(ids))
+	for index, id := range ids {
+		if index > 0xffff { break }
+		if _, exists := indexByID[id]; !exists { indexByID[id] = uint16(index) }
+	}
+	return &ReplicationDataManager{ids: ids, indexByID: indexByID}, nil
+}
+
+func (manager *ReplicationDataManager) IDAt(index uint16) gametypes.CRC32 {
+	if int(index) >= len(manager.ids) { return 0 }
+	return manager.ids[index]
+}
+
+func (manager *ReplicationDataManager) IndexOf(id gametypes.CRC32) uint16 {
+	return manager.indexByID[id]
+}
+
+func (manager *ReplicationDataManager) IDs() iter.Seq[gametypes.CRC32] {
+	return func(yield func(gametypes.CRC32) bool) {
+		for _, id := range manager.ids { if !yield(id) { return } }
+	}
+}
+func (manager *ReplicationDataManager) Len() int { return len(manager.ids) }
+func (manager *ReplicationDataManager) IsEmpty() bool { return len(manager.ids) == 0 }
+"#;
+
+const VITALS_MODIFIER_MAPPING_MANAGER_GO: &str = r#"
+type VitalsModifierMapping struct {
+	Key string
+	ID  gametypes.CRC32
+}
+
+type VitalsModifierMappingManager struct {
+	entries     []VitalsModifierMapping
+	entriesByID map[gametypes.CRC32]int
+}
+
+func newVitalsModifierMappingManager(vitals *VitalsDataManager, damage *DamageDataManager, items *ItemDataManager) (*VitalsModifierMappingManager, error) {
+	manager := &VitalsModifierMappingManager{entriesByID: map[gametypes.CRC32]int{}}
+	for entry := range vitals.Rows() { manager.insertLowercase(entry.Key) }
+	for entry := range damage.DamageTypes() { manager.insertLowercase(entry.Key) }
+	for entry := range damage.Rows() {
+		manager.insertLowercase(normalizeWeaponCategory(entry.WeaponCategory))
+	}
+	manager.insertLowercase("Physical")
+	manager.insertLowercase("Elemental")
+	for item := range items.Rows() { manager.insertItemAliases(item.ItemID, item.ItemIDCRC) }
+	return manager, nil
+}
+
+func (manager *VitalsModifierMappingManager) Get(id gametypes.CRC32) *VitalsModifierMapping {
+	index, ok := manager.entriesByID[id]
+	if !ok { return nil }
+	return rowCopy(manager.entries[index])
+}
+
+func (manager *VitalsModifierMappingManager) ByKey(key string) *VitalsModifierMapping {
+	return manager.Get(gametypes.CRC32(crc32Lowercase(key)))
+}
+
+func (manager *VitalsModifierMappingManager) Rows() iter.Seq[VitalsModifierMapping] { return rowValues(manager.entries) }
+func (manager *VitalsModifierMappingManager) Len() int { return len(manager.entries) }
+func (manager *VitalsModifierMappingManager) IsEmpty() bool { return len(manager.entries) == 0 }
+
+func (manager *VitalsModifierMappingManager) insertLowercase(raw string) {
+	key := strings.TrimSpace(raw)
+	if key != "" { manager.insertWithID(key, gametypes.CRC32(crc32Lowercase(key))) }
+}
+
+func (manager *VitalsModifierMappingManager) insertItemAliases(raw string, id gametypes.CRC32) {
+	key := strings.TrimSpace(raw)
+	if key == "" || id == 0 { return }
+	index := manager.insertWithID(key, id)
+	lowercaseID := gametypes.CRC32(crc32Lowercase(key))
+	if lowercaseID != 0 {
+		if _, exists := manager.entriesByID[lowercaseID]; !exists { manager.entriesByID[lowercaseID] = index }
+	}
+}
+
+func (manager *VitalsModifierMappingManager) insertWithID(key string, id gametypes.CRC32) int {
+	if id == 0 { return 0 }
+	if index, exists := manager.entriesByID[id]; exists { return index }
+	index := len(manager.entries)
+	manager.entriesByID[id] = index
+	manager.entries = append(manager.entries, VitalsModifierMapping{Key: key, ID: id})
+	return index
+}
+
+func normalizeWeaponCategory(value string) string {
+	normalized := strings.TrimSpace(value)
+	if normalized == "" || strings.EqualFold(normalized, "none") { return "Default" }
+	return normalized
+}
+"#;
+
+const STATIC_TRADESKILL_RANK_DATA_MAPPING_MANAGER_GO: &str = r#"
+type StaticTradeskillRankDataMapping struct {
+	CategoricalProgressionID gametypes.CRC32
+	Table                    TradeskillRankDataTable
+	Rank                     TradeskillRank
+}
+
+type PlayerLevelDisplayNameMapping struct {
+	DisplayNameID gametypes.CRC32
+	Rank          TradeskillRank
+}
+
+type StaticTradeskillRankDataMappingManager struct {
+	playerLevels          []PlayerLevelDisplayNameMapping
+	playerLevelsByName    map[gametypes.CRC32]TradeskillRank
+	tradeskillRanks       []StaticTradeskillRankDataMapping
+	tradeskillRanksByName map[gametypes.CRC32]int
+}
+
+func newStaticTradeskillRankDataMappingManager(
+	experience *ExperienceDataManager,
+	player *PlayerDataManager,
+	progressions *CategoricalProgressionDataManager,
+	ranks *TradeskillRankDataManager,
+) (*StaticTradeskillRankDataMappingManager, error) {
+	manager := &StaticTradeskillRankDataMappingManager{
+		playerLevelsByName:    make(map[gametypes.CRC32]TradeskillRank),
+		tradeskillRanksByName: make(map[gametypes.CRC32]int),
+	}
+	maxPlayerLevel := float32(0)
+	for entry := range experience.Rows() {
+		if entry.Row.LevelNumber > maxPlayerLevel { maxPlayerLevel = entry.Row.LevelNumber }
+	}
+	manager.cachePlayerLevels(maxPlayerLevel, ranks)
+	if err := manager.cacheTradeskillRanks(player, progressions, ranks); err != nil {
+		return nil, err
+	}
+	return manager, nil
+}
+
+func (manager *StaticTradeskillRankDataMappingManager) PlayerLevelForDisplayName(displayName gametypes.CRC32) (TradeskillRank, bool) {
+	rank, ok := manager.playerLevelsByName[displayName]
+	return rank, ok
+}
+
+func (manager *StaticTradeskillRankDataMappingManager) TradeskillRankForDisplayName(displayName gametypes.CRC32) *StaticTradeskillRankDataMapping {
+	index, ok := manager.tradeskillRanksByName[displayName]
+	if !ok { return nil }
+	return rowCopy(manager.tradeskillRanks[index])
+}
+
+func (manager *StaticTradeskillRankDataMappingManager) PlayerLevels() iter.Seq[PlayerLevelDisplayNameMapping] {
+	return func(yield func(PlayerLevelDisplayNameMapping) bool) {
+		for _, mapping := range manager.playerLevels { if !yield(mapping) { return } }
+	}
+}
+
+func (manager *StaticTradeskillRankDataMappingManager) TradeskillRanks() iter.Seq[StaticTradeskillRankDataMapping] {
+	return rowValues(manager.tradeskillRanks)
+}
+
+func (manager *StaticTradeskillRankDataMappingManager) Len() int {
+	return len(manager.playerLevels) + len(manager.tradeskillRanks)
+}
+
+func (manager *StaticTradeskillRankDataMappingManager) IsEmpty() bool { return manager.Len() == 0 }
+
+func (manager *StaticTradeskillRankDataMappingManager) cachePlayerLevels(maxPlayerLevel float32, ranks *TradeskillRankDataManager) {
+	// The source XP-level projection currently has no display-name field. Preserve
+	// that behavior: only cache rows when a future merged schema supplies one.
+	for entry := range ranks.ExperienceDataRows().Rows() {
+		if entry.Row.LevelNumber < 0 || entry.Row.LevelNumber > maxPlayerLevel { continue }
+		if entry.Row.BlueprintID == nil || strings.TrimSpace(*entry.Row.BlueprintID) == "" { continue }
+		displayNameID := gametypes.CRC32(crc32Lowercase(*entry.Row.BlueprintID))
+		if displayNameID == 0 { continue }
+		rank, ok := tradeskillRankFromFloat(entry.Row.LevelNumber)
+		if !ok { continue }
+		if _, exists := manager.playerLevelsByName[displayNameID]; exists { continue }
+		manager.playerLevelsByName[displayNameID] = rank
+		manager.playerLevels = append(manager.playerLevels, PlayerLevelDisplayNameMapping{DisplayNameID: displayNameID, Rank: rank})
+	}
+}
+
+func (manager *StaticTradeskillRankDataMappingManager) cacheTradeskillRanks(
+	player *PlayerDataManager,
+	progressions *CategoricalProgressionDataManager,
+	ranks *TradeskillRankDataManager,
+) error {
+	for _, tradeskill := range allTradeskillTypes {
+		progressionID, err := player.CategoricalProgressionID(tradeskill)
+		if err != nil { return err }
+		if progressionID == nil { continue }
+		progression := progressions.CategoricalProgressionDataFromID(*progressionID)
+		if progression == nil || progression.RankTableID == nil { continue }
+		table := TradeskillRankDataTable(strings.TrimSpace(*progression.RankTableID))
+		for entry := range ranks.Table(table).Rows() {
+			rank, ok := tradeskillRankFromFloat(entry.Row.Level)
+			if !ok || uint32(rank) > progression.MaxLevel || entry.Row.DisplayName == nil { continue }
+			displayNameID := gametypes.CRC32(crc32Lowercase(strings.TrimSpace(*entry.Row.DisplayName)))
+			if displayNameID == 0 { continue }
+			if _, exists := manager.tradeskillRanksByName[displayNameID]; exists { continue }
+			index := len(manager.tradeskillRanks)
+			manager.tradeskillRanksByName[displayNameID] = index
+			manager.tradeskillRanks = append(manager.tradeskillRanks, StaticTradeskillRankDataMapping{
+				CategoricalProgressionID: *progressionID,
+				Table: table,
+				Rank: rank,
+			})
+		}
+	}
+	return nil
+}
+
+func tradeskillRankFromFloat(raw float32) (TradeskillRank, bool) {
+	if raw < 0 || raw > 65535 || raw != float32(uint16(raw)) { return 0, false }
+	return TradeskillRank(uint16(raw)), true
+}
+
+var allTradeskillTypes = [...]TradeskillType{
+	TradeskillWeaponsmithing, TradeskillArmoring, TradeskillJewelcrafting, TradeskillArcana,
+	TradeskillCooking, TradeskillFurnishing, TradeskillEngineering, TradeskillSmelting,
+	TradeskillWoodworking, TradeskillLeatherworking, TradeskillWeaving, TradeskillStonecutting,
+	TradeskillSkinning, TradeskillMining, TradeskillLogging, TradeskillHarvesting,
+	TradeskillFishing, TradeskillAzothStaff, TradeskillMusician, TradeskillRiding,
+}
+"#;
+
 fn push_direct_manager_type(
     source: &mut String,
     unit: &GameDataCompileUnit,
     manager: &DirectManagerSurface,
 ) {
-    let manager_type = &manager.manager_class_name;
-    let constructor = go_manager_constructor_name(manager_type);
+    push_direct_manager_type_with_dependencies(source, unit, manager, &[]);
+}
+
+fn push_direct_manager_type_with_dependencies(
+    source: &mut String,
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+    dependencies: &[String],
+) {
+    push_manager_type_with_dependencies(
+        source,
+        unit,
+        manager,
+        dependencies,
+        &GoNativeManagerAugmentation::default(),
+    );
+}
+
+#[derive(Debug, Default)]
+pub(super) struct GoNativeManagerAugmentation {
+    pub(super) declarations: String,
+    pub(super) fields: String,
+    pub(super) field_values: String,
+    pub(super) initializers: String,
+    pub(super) methods: String,
+}
+
+fn go_receiver_method_count(source: &str, receiver_type: &str, method_name: &str) -> usize {
+    let parse_source = format!("package managers\n\n{source}");
+    let mut parser = treesitter_types_go::tree_sitter::Parser::new();
+    parser
+        .set_language(&treesitter_types_go::tree_sitter_go::LANGUAGE.into())
+        .expect("configure the bundled Go grammar");
+    let Some(tree) = parser.parse(parse_source.as_bytes(), None) else {
+        return 0;
+    };
+    if tree.root_node().has_error() {
+        return 0;
+    }
+
+    let mut count = 0;
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+        if node.kind() != "method_declaration" {
+            continue;
+        }
+        let Some(name) = node.child_by_field_name("name") else {
+            continue;
+        };
+        let Some(receiver) = node.child_by_field_name("receiver") else {
+            continue;
+        };
+        let Ok(name) = name.utf8_text(parse_source.as_bytes()) else {
+            continue;
+        };
+        let Ok(receiver) = receiver.utf8_text(parse_source.as_bytes()) else {
+            continue;
+        };
+        if name == method_name
+            && receiver
+                .split(|character: char| !character.is_alphanumeric())
+                .any(|part| part == receiver_type)
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn push_manager_type_with_dependencies(
+    source: &mut String,
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+    dependencies: &[String],
+    augmentation: &GoNativeManagerAugmentation,
+) {
+    let manager_type = go_method_name(&manager.manager_class_name);
+    let constructor = go_manager_constructor_name(&manager_type);
+    let manager_resources = go_direct_manager_resources_expression(manager);
     let mut product_methods = direct_go_product_methods(manager);
-    product_methods.push_str(&special_go_manager_extra_methods(manager_type));
-    let row_methods = direct_go_schema_methods(unit, manager);
+    product_methods.push_str(&special_go_manager_extra_methods(
+        &manager.manager_class_name,
+    ));
+    let semantic_rows = go_receiver_method_count(&augmentation.methods, &manager_type, "Rows") == 1;
+    let row_methods = direct_go_schema_methods(unit, manager, !semantic_rows);
+    let row_specs = go_direct_row_specs(unit, manager);
+    let default_row_type = go_direct_default_row_spec(unit, manager).map(|row| row.source_row_type);
+    let row_fields = row_specs
+        .iter()
+        .map(|row| {
+            let table_type = go_direct_table_type_name(
+                manager,
+                &row.source_row_type,
+                default_row_type.as_deref() == Some(row.source_row_type.as_str()),
+            );
+            format!(
+                "\t{} RowSet[{}, {}]\n",
+                go_direct_row_field_name(&row.source_row_type),
+                table_type,
+                row.type_name
+            )
+        })
+        .collect::<String>();
+    let row_initializers = row_specs
+        .iter()
+        .map(|row| {
+            let field = go_direct_row_field_name(&row.source_row_type);
+            let reader = go_schema_reader_name(&row.source_row_type);
+            let table_type = go_direct_table_type_name(
+                manager,
+                &row.source_row_type,
+                default_row_type.as_deref() == Some(row.source_row_type.as_str()),
+            );
+            let resolver = go_direct_table_resolver_name(&table_type);
+            format!(
+                "\t{field}Entries, err := schemaFamilyEntries(resources, {:?}, {reader}, {resolver})\n\tif err != nil {{\n\t\treturn nil, err\n\t}}\n\t{field} := newRowSet({field}Entries)\n",
+                row.source_row_type
+            )
+        })
+        .collect::<String>();
+    let row_field_values = row_specs
+        .iter()
+        .map(|row| {
+            let field = go_direct_row_field_name(&row.source_row_type);
+            format!("\t\t{field}: {field},\n")
+        })
+        .collect::<String>();
+    let (product_fields, product_initializers, product_field_values) = go_product_storage(manager);
+    let dependency_parameters = dependencies
+        .iter()
+        .map(|dependency| {
+            format!(
+                ", _{} *{}",
+                go_local_name(&go_manager_dependency_name(dependency)),
+                go_method_name(dependency)
+            )
+        })
+        .collect::<String>();
+    source.push_str(&augmentation.declarations);
     source.push_str(&format!(
         r#"
 type {manager_type} struct {{
-	instance *managerInstance
+{row_fields}{augmentation_fields}
+{product_fields}
 }}
 
-func {constructor}(cache *managerCache) (*{manager_type}, error) {{
-	instance, err := cache.manager({})
+func {constructor}(cache *managerCache{dependency_parameters}) (*{manager_type}, error) {{
+	resources, err := {manager_resources}
 	if err != nil {{
 		return nil, err
 	}}
-	return &{manager_type}{{instance: instance}}, nil
+{row_initializers}
+{product_initializers}
+	manager := &{manager_type}{{
+{row_field_values}{product_field_values}{augmentation_field_values}	}}
+{augmentation_initializers}	return manager, nil
 }}
 
 {row_methods}
-{product_methods}
+{product_methods}{augmentation_methods}
 "#,
-        go_string(&manager.manager_name)
+        augmentation_fields = augmentation.fields,
+        augmentation_field_values = augmentation.field_values,
+        augmentation_initializers = augmentation.initializers,
+        augmentation_methods = augmentation.methods,
     ));
 }
 
-fn direct_go_schema_methods(unit: &GameDataCompileUnit, manager: &DirectManagerSurface) -> String {
+fn push_native_manager_type(
+    source: &mut String,
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+    shape: &NativeManagerShape,
+    dependencies: &[String],
+    semantic_projections: &[SemanticManagerRecord],
+) {
+    debug_assert!(shape.exposes_native_api());
+    let effective_manager = go_effective_native_manager_surface(manager, shape);
+    let augmentation =
+        go_native_manager_augmentation(unit, &effective_manager, shape, semantic_projections);
+    push_manager_type_with_dependencies(
+        source,
+        unit,
+        &effective_manager,
+        dependencies,
+        &augmentation,
+    );
+}
+
+fn go_effective_native_manager_surface(
+    manager: &DirectManagerSurface,
+    shape: &NativeManagerShape,
+) -> DirectManagerSurface {
+    let mut effective = manager.clone();
+    if let NativeManagerShape::RecipeData(shape) = shape {
+        for table in shape.tables() {
+            let candidate = DirectManagerTable {
+                table_name: table.table_name().as_str().to_owned(),
+                row_type_name: table.row_type_name().as_str().to_owned(),
+            };
+            if !effective.tables.contains(&candidate) {
+                effective.tables.push(candidate);
+            }
+        }
+    }
+    effective
+}
+
+fn go_native_manager_augmentation(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+    shape: &NativeManagerShape,
+    semantic_projections: &[SemanticManagerRecord],
+) -> GoNativeManagerAugmentation {
+    if !semantic_projections.is_empty() {
+        return go_semantic_projection_augmentation(manager, semantic_projections);
+    }
+    match shape {
+        NativeManagerShape::OneTableExperience(_) => go_experience_manager_augmentation(),
+        NativeManagerShape::TradeskillRankData(_) => {
+            go_tradeskill_rank_manager_augmentation(unit, manager)
+        }
+        NativeManagerShape::DamageData(_) => go_damage_manager_augmentation(unit, manager),
+        NativeManagerShape::AbilityData(_)
+        | NativeManagerShape::VitalsData(_)
+        | NativeManagerShape::StatusEffectData(_)
+        | NativeManagerShape::ItemConversionData(_)
+        | NativeManagerShape::ItemTransformData(_) => {
+            native::residual_native_manager_augmentation(unit, manager, shape)
+        }
+        shape => native::residual_native_manager_augmentation(unit, manager, shape),
+    }
+}
+
+fn go_semantic_projection_augmentation(
+    manager: &DirectManagerSurface,
+    records: &[SemanticManagerRecord],
+) -> GoNativeManagerAugmentation {
+    let manager_type = go_method_name(&manager.manager_class_name);
+    let mut augmentation = GoNativeManagerAugmentation::default();
+
+    for (projection_index, record) in records.iter().enumerate() {
+        debug_assert_eq!(record.manager_name, manager.manager_name);
+        let record_type = go_method_name(&record.record_type_name);
+        let stem = go_local_name(&format!("{} projection", record.record_type_name));
+        let entries = format!("{stem}Entries");
+        let by_key = format!("{stem}ByKey");
+        let by_source_row = format!("{stem}BySourceRow");
+        let rows_variable = format!("{stem}Rows");
+        let materializer_name = format!("{record_type}Projection{projection_index}");
+
+        let mut materializer_record = record.clone();
+        materializer_record.manager_class_name = materializer_name.clone();
+        push_go_semantic_materializer(&mut augmentation.declarations, &materializer_record);
+
+        augmentation
+            .fields
+            .push_str(&format!("\t{entries} []{record_type}\n"));
+        if !record.lookup_methods.is_empty() {
+            augmentation
+                .fields
+                .push_str(&format!("\t{by_key} map[{}]int\n", go_key_map_type(record)));
+        }
+        if record.source_row_method.is_some() {
+            augmentation
+                .fields
+                .push_str(&format!("\t{by_source_row} map[uint32]int\n"));
+        }
+
+        augmentation.initializers.push_str(&format!(
+            "\t{rows_variable}, err := materialize{materializer_name}(resources)\n\tif err != nil {{ return nil, err }}\n\tmanager.{entries} = {rows_variable}\n"
+        ));
+        if !record.lookup_methods.is_empty() {
+            augmentation.initializers.push_str(&format!(
+                "\tmanager.{by_key} = make(map[{}]int)\n",
+                go_key_map_type(record)
+            ));
+        }
+        if record.source_row_method.is_some() {
+            augmentation.initializers.push_str(&format!(
+                "\tmanager.{by_source_row} = make(map[uint32]int)\n"
+            ));
+        }
+        if !record.lookup_methods.is_empty() || record.source_row_method.is_some() {
+            augmentation
+                .initializers
+                .push_str(&format!("\tfor index := range manager.{entries} {{\n"));
+            if !record.lookup_methods.is_empty() {
+                let expression = go_row_index_expression(record)
+                    .expect("semantic projection lookup requires a key")
+                    .replace("rows[index]", &format!("manager.{entries}[index]"));
+                augmentation
+                    .initializers
+                    .push_str(&format!("\t\tmanager.{by_key}[{expression}] = index\n"));
+            }
+            if record.source_row_method.is_some() {
+                let field = record
+                    .source_row_field
+                    .as_ref()
+                    .expect("semantic projection source-row lookup requires a field");
+                augmentation.initializers.push_str(&format!(
+                    "\t\tmanager.{by_source_row}[manager.{entries}[index].{}] = index\n",
+                    go_field_name(field)
+                ));
+            }
+            augmentation.initializers.push_str("\t}\n");
+        }
+
+        push_go_projection_methods(
+            &mut augmentation.methods,
+            &manager_type,
+            record,
+            &entries,
+            &by_key,
+            &by_source_row,
+            projection_index == 0,
+        );
+    }
+
+    augmentation
+}
+
+fn push_go_projection_methods(
+    source: &mut String,
+    manager_type: &str,
+    record: &SemanticManagerRecord,
+    entries: &str,
+    by_key: &str,
+    by_source_row: &str,
+    canonical_rows: bool,
+) {
+    let record_type = go_method_name(&record.record_type_name);
+    for method in &record.lookup_methods {
+        let method_name = go_method_name(&method.name);
+        let parameter = go_local_name(&method.parameter);
+        let (parameter_type, key) = match method.kind {
+            SemanticLookupKind::CrcStringKey => (
+                "string".to_owned(),
+                format!("CRC32(crc32Lowercase({parameter}))"),
+            ),
+            SemanticLookupKind::CrcKey | SemanticLookupKind::IntoCrcKey => {
+                ("CRC32".to_owned(), parameter.clone())
+            }
+            SemanticLookupKind::NumericKey(key_type) => (
+                go_numeric_key_type(key_type).to_owned(),
+                go_numeric_key_as_u32(&parameter, key_type),
+            ),
+            SemanticLookupKind::StringKey => (
+                "string".to_owned(),
+                format!("normalizeStringKey({parameter})"),
+            ),
+        };
+        source.push_str(&format!(
+            "func (manager *{manager_type}) {method_name}({parameter} {parameter_type}) *{record_type} {{ index, ok := manager.{by_key}[{key}]; if !ok {{ return nil }}; return rowCopy(manager.{entries}[index]) }}\n\n"
+        ));
+    }
+    if let Some(method) = &record.source_row_method {
+        let method = go_method_name(method);
+        source.push_str(&format!(
+            "func (manager *{manager_type}) {method}(row uint32) *{record_type} {{ index, ok := manager.{by_source_row}[row]; if !ok {{ return nil }}; return rowCopy(manager.{entries}[index]) }}\n\n"
+        ));
+    }
+    if let Some(method) = &record.ids_method {
+        let method = go_method_name(method);
+        let id_type = go_ids_type(record);
+        let expression =
+            go_ids_expression(record).replace("manager.entries", &format!("manager.{entries}"));
+        source.push_str(&format!(
+            "func (manager *{manager_type}) {method}() iter.Seq[{id_type}] {{ return func(yield func({id_type}) bool) {{ for index := range manager.{entries} {{ if !yield({expression}) {{ return }} }} }} }}\n\n"
+        ));
+    }
+    if canonical_rows {
+        source.push_str(&format!(
+            "func (manager *{manager_type}) Rows() iter.Seq[{record_type}] {{ return rowValues(manager.{entries}) }}\n\n"
+        ));
+    }
+    if let Some(method) = &record.rows_method {
+        let method = go_method_name(method);
+        if method != "Rows" {
+            source.push_str(&format!(
+                "func (manager *{manager_type}) {method}() iter.Seq[{record_type}] {{ return rowValues(manager.{entries}) }}\n\n"
+            ));
+        }
+    }
+    if let Some(method) = &record.len_method {
+        let method = go_method_name(method);
+        source.push_str(&format!(
+            "func (manager *{manager_type}) {method}() int {{ return len(manager.{entries}) }}\n\n"
+        ));
+    }
+    if let Some(method) = &record.is_empty_method {
+        let method = go_method_name(method);
+        source.push_str(&format!(
+            "func (manager *{manager_type}) {method}() bool {{ return len(manager.{entries}) == 0 }}\n\n"
+        ));
+    }
+}
+
+fn go_table_path_cases(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+    row_type: &str,
+    table_type: &str,
+) -> String {
+    manager
+        .tables
+        .iter()
+        .filter(|table| table.row_type_name == row_type)
+        .flat_map(|input| {
+            unit.schema_report()
+                .tables
+                .iter()
+                .filter(move |table| {
+                    table.table_name == input.table_name
+                        && table.row_type_name == input.row_type_name
+                })
+                .flat_map(move |table| {
+                    table.sources.iter().map(move |source| {
+                        format!(
+                            "\tcase {:?}:\n\t\treturn {table_type}({:?}), true\n",
+                            source.replace('\\', "/").to_ascii_lowercase(),
+                            input.table_name
+                        )
+                    })
+                })
+        })
+        .collect()
+}
+
+fn go_damage_manager_augmentation(
+    _unit: &GameDataCompileUnit,
+    _manager: &DirectManagerSurface,
+) -> GoNativeManagerAugmentation {
+    GoNativeManagerAugmentation {
+        declarations: r#"
+type DamageDataRef struct { Table DamageDataTable; ID gametypes.CRC32 }
+type DamageDataSlot struct { Table DamageDataTable; RowIndex int }
+
+type StaticDamageData struct {
+	Ref DamageDataRef
+	Slot DamageDataSlot
+	Key string
+	ID gametypes.CRC32
+	WeaponCategory string
+	WeaponCategoryID gametypes.CRC32
+	Source RowRef[DamageDataTable, DamageDataSchemaRow]
+}
+
+type StaticDamageTypeData struct {
+	Key string
+	ID gametypes.CRC32
+	NumericID uint8
+	Source RowRef[DamageDataDamageTypeDataTable, DamageTypeDataSchemaRow]
+}
+
+type StaticAfflictionData struct {
+	Key string
+	ID gametypes.CRC32
+	NumericID uint8
+	Source RowRef[DamageDataAfflictionDataTable, AfflictionDataSchemaRow]
+}
+"#
+        .to_owned(),
+        fields: r#"	damage []StaticDamageData
+	damageByRef map[DamageDataRef]int
+	damageBySlot map[DamageDataSlot]int
+	damageTypes []StaticDamageTypeData
+	damageTypesByID map[gametypes.CRC32]int
+	afflictions []StaticAfflictionData
+	afflictionsByID map[gametypes.CRC32]int
+	weaponCategories []string
+	weaponCategoriesByID map[gametypes.CRC32]struct{}
+"#
+        .to_owned(),
+        field_values: r#"		damageByRef: make(map[DamageDataRef]int),
+		damageBySlot: make(map[DamageDataSlot]int),
+		damageTypesByID: make(map[gametypes.CRC32]int),
+		afflictionsByID: make(map[gametypes.CRC32]int),
+		weaponCategoriesByID: make(map[gametypes.CRC32]struct{}),
+"#
+        .to_owned(),
+        initializers: r#"	for source := range manager.damageDataRows.Rows() {
+		table := source.Ref.Table()
+		key := strings.TrimSpace(source.Row.DamageID)
+		id := gametypes.CRC32(crc32Lowercase(key))
+		if key == "" || id == 0 { continue }
+		ref := DamageDataRef{Table: table, ID: id}
+		slot := DamageDataSlot{Table: table, RowIndex: source.Slot.RowIndex()}
+		if _, exists := manager.damageByRef[ref]; exists { continue }
+		if _, exists := manager.damageBySlot[slot]; exists { continue }
+		category := "Default"
+		if source.Row.WeaponCategory != nil {
+			candidate := strings.TrimSpace(*source.Row.WeaponCategory)
+			if candidate != "" && !strings.EqualFold(candidate, "none") { category = candidate }
+		}
+		categoryID := gametypes.CRC32(crc32Lowercase(category))
+		if _, exists := manager.weaponCategoriesByID[categoryID]; !exists && categoryID != 0 {
+			manager.weaponCategoriesByID[categoryID] = struct{}{}
+			manager.weaponCategories = append(manager.weaponCategories, category)
+		}
+		index := len(manager.damage)
+		manager.damageByRef[ref] = index
+		manager.damageBySlot[slot] = index
+		manager.damage = append(manager.damage, StaticDamageData{Ref: ref, Slot: slot, Key: key, ID: id, WeaponCategory: category, WeaponCategoryID: categoryID, Source: source.Ref})
+	}
+	for source := range manager.damageTypeDataRows.Rows() {
+		key := strings.TrimSpace(source.Row.TypeID)
+		id := gametypes.CRC32(crc32Lowercase(key))
+		if key == "" || id == 0 || source.Row.IntID == nil { continue }
+		raw, ok := exactUint32(*source.Row.IntID)
+		if !ok || raw > 255 { continue }
+		if _, exists := manager.damageTypesByID[id]; exists { continue }
+		manager.damageTypesByID[id] = len(manager.damageTypes)
+		manager.damageTypes = append(manager.damageTypes, StaticDamageTypeData{Key: key, ID: id, NumericID: uint8(raw), Source: source.Ref})
+	}
+	for source := range manager.afflictionDataRows.Rows() {
+		key := strings.TrimSpace(source.Row.AfflictionID)
+		id := gametypes.CRC32(crc32Lowercase(key))
+		if key == "" || id == 0 || source.Row.IntID == nil { continue }
+		raw, ok := exactUint32(*source.Row.IntID)
+		if !ok || raw >= 255 { continue }
+		if _, exists := manager.afflictionsByID[id]; exists { continue }
+		manager.afflictionsByID[id] = len(manager.afflictions)
+		manager.afflictions = append(manager.afflictions, StaticAfflictionData{Key: key, ID: id, NumericID: uint8(raw), Source: source.Ref})
+	}
+"#
+        .to_owned(),
+        methods: r#"func (manager *DamageDataManager) Damage(ref DamageDataRef) *StaticDamageData {
+	index, ok := manager.damageByRef[ref]
+	if !ok { return nil }
+	return rowCopy(manager.damage[index])
+}
+
+func (manager *DamageDataManager) DamageBySlot(slot DamageDataSlot) *StaticDamageData {
+	index, ok := manager.damageBySlot[slot]
+	if !ok { return nil }
+	return rowCopy(manager.damage[index])
+}
+
+func (manager *DamageDataManager) DamageByID(table DamageDataTable, id gametypes.CRC32) *StaticDamageData {
+	return manager.Damage(DamageDataRef{Table: table, ID: id})
+}
+
+func (manager *DamageDataManager) DamageByKey(table DamageDataTable, key string) *StaticDamageData {
+	return manager.DamageByID(table, gametypes.CRC32(crc32Lowercase(key)))
+}
+
+func (manager *DamageDataManager) Resolve(ref TableReference) *StaticDamageData {
+	table, ok := ParseDamageDataTable(ref.Path)
+	if !ok { return nil }
+	return manager.DamageByKey(table, ref.Key)
+}
+
+func (manager *DamageDataManager) DamageRefBySlot(slot DamageDataSlot) (DamageDataRef, bool) {
+	data := manager.DamageBySlot(slot)
+	if data == nil { return DamageDataRef{}, false }
+	return data.Ref, true
+}
+
+func (manager *DamageDataManager) DamageKeyBySlot(slot DamageDataSlot) (string, bool) {
+	data := manager.DamageBySlot(slot)
+	if data == nil { return "", false }
+	return data.Key, true
+}
+
+func (manager *DamageDataManager) DamageType(id gametypes.CRC32) *StaticDamageTypeData {
+	index, ok := manager.damageTypesByID[id]
+	if !ok { return nil }
+	return rowCopy(manager.damageTypes[index])
+}
+
+func (manager *DamageDataManager) DamageTypeByKey(key string) *StaticDamageTypeData {
+	return manager.DamageType(gametypes.CRC32(crc32Lowercase(key)))
+}
+
+func (manager *DamageDataManager) Affliction(id gametypes.CRC32) *StaticAfflictionData {
+	index, ok := manager.afflictionsByID[id]
+	if !ok { return nil }
+	return rowCopy(manager.afflictions[index])
+}
+
+func (manager *DamageDataManager) AfflictionByKey(key string) *StaticAfflictionData {
+	return manager.Affliction(gametypes.CRC32(crc32Lowercase(key)))
+}
+
+func (manager *DamageDataManager) Rows() iter.Seq[StaticDamageData] { return rowValues(manager.damage) }
+func (manager *DamageDataManager) DamageTypes() iter.Seq[StaticDamageTypeData] { return rowValues(manager.damageTypes) }
+func (manager *DamageDataManager) Afflictions() iter.Seq[StaticAfflictionData] { return rowValues(manager.afflictions) }
+func (manager *DamageDataManager) WeaponCategories() iter.Seq[string] {
+	return func(yield func(string) bool) { for _, category := range manager.weaponCategories { if !yield(category) { return } } }
+}
+func (manager *DamageDataManager) Len() int { return len(manager.damage) }
+func (manager *DamageDataManager) IsEmpty() bool { return len(manager.damage) == 0 }
+
+"#
+        .to_owned(),
+    }
+}
+
+fn go_experience_manager_augmentation() -> GoNativeManagerAugmentation {
+    GoNativeManagerAugmentation {
+        fields: r#"	experienceByLevel map[uint32]int
+	gearScoreThresholds []experienceThreshold
+	xpThresholds []experienceThreshold
+	maxLevel uint32
+	hasExperience bool
+"#
+        .to_owned(),
+        field_values: "\t\texperienceByLevel: make(map[uint32]int),\n".to_owned(),
+        declarations: r#"
+type experienceThreshold struct { threshold uint32; level uint32 }
+"#
+        .to_owned(),
+        initializers: r#"	for index := range manager.experienceDataRows.entries {
+		row := rowCopy(manager.experienceDataRows.entries[index].Row)
+		level, ok := exactUint32(row.LevelNumber)
+		if !ok { continue }
+		if _, exists := manager.experienceByLevel[level]; exists { continue }
+		manager.experienceByLevel[level] = index
+		if !manager.hasExperience || level > manager.maxLevel { manager.maxLevel = level }
+		manager.hasExperience = true
+		if row.MaxEquippableGearScore != nil {
+			if threshold, ok := exactUint32(*row.MaxEquippableGearScore); ok && threshold != 0 {
+				manager.gearScoreThresholds = append(manager.gearScoreThresholds, experienceThreshold{threshold: threshold, level: level})
+			}
+		}
+		threshold := uint32(0)
+		if row.XPToLevel != nil { threshold, _ = exactUint32(*row.XPToLevel) }
+		manager.xpThresholds = append(manager.xpThresholds, experienceThreshold{threshold: threshold, level: level})
+	}
+	sort.Slice(manager.gearScoreThresholds, func(left, right int) bool { return manager.gearScoreThresholds[left].threshold < manager.gearScoreThresholds[right].threshold })
+	sort.Slice(manager.xpThresholds, func(left, right int) bool { return manager.xpThresholds[left].threshold < manager.xpThresholds[right].threshold })
+"#
+        .to_owned(),
+        methods: r#"func (manager *ExperienceDataManager) ExperienceDataFromID(level uint32) *ExperienceDataSchemaRow {
+	index, ok := manager.experienceByLevel[level]
+	if !ok { return nil }
+	return rowCopy(manager.experienceDataRows.entries[index].Row)
+}
+
+func (manager *ExperienceDataManager) ExperienceData(level uint32) *ExperienceDataSchemaRow {
+	return manager.ExperienceDataFromID(level)
+}
+
+func (manager *ExperienceDataManager) ExperienceDataForMaxEquippableGearScore(gearScore uint32) *ExperienceDataSchemaRow {
+	index := sort.Search(len(manager.gearScoreThresholds), func(index int) bool { return gearScore <= manager.gearScoreThresholds[index].threshold })
+	if index == len(manager.gearScoreThresholds) { return nil }
+	return manager.ExperienceDataFromID(manager.gearScoreThresholds[index].level)
+}
+
+func (manager *ExperienceDataManager) LevelForXP(xp uint64) uint32 {
+	level := uint32(0)
+	for _, threshold := range manager.xpThresholds {
+		if uint64(threshold.threshold) > xp { break }
+		if threshold.level > level { level = threshold.level }
+	}
+	return level
+}
+
+func (manager *ExperienceDataManager) MaxLevel() (uint32, bool) { return manager.maxLevel, manager.hasExperience }
+func (manager *ExperienceDataManager) Len() int { return len(manager.experienceByLevel) }
+func (manager *ExperienceDataManager) IsEmpty() bool { return len(manager.experienceByLevel) == 0 }
+
+"#
+        .to_owned(),
+    }
+}
+
+fn go_tradeskill_rank_manager_augmentation(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+) -> GoNativeManagerAugmentation {
+    let table_cases = manager
+        .tables
+        .iter()
+        .filter(|table| table.row_type_name == "TradeskillRankData")
+        .flat_map(|input| {
+            unit.schema_report()
+                .tables
+                .iter()
+                .filter(move |table| {
+                    table.table_name == input.table_name
+                        && table.row_type_name == input.row_type_name
+                })
+                .flat_map(move |table| {
+                    table.sources.iter().map(move |source| {
+                        format!(
+                            "\tcase {:?}:\n\t\treturn TradeskillRankDataTable({:?}), true\n",
+                            source.replace('\\', "/").to_ascii_lowercase(),
+                            input.table_name
+                        )
+                    })
+                })
+        })
+        .collect::<String>();
+    GoNativeManagerAugmentation {
+        declarations: format!(
+            r#"
+type TradeskillRank uint16
+
+type PlayerLevelRankData struct {{
+	Rank TradeskillRank
+	Source RowRef[TradeskillRankDataExperienceDataTable, ExperienceDataSchemaRow]
+}}
+
+type StaticTradeskillRankData struct {{
+	Table TradeskillRankDataTable
+	Rank TradeskillRank
+	DisplayName *string
+	DisplayNameID gametypes.CRC32
+	Source RowRef[TradeskillRankDataTable, TradeskillRankDataSchemaRow]
+}}
+
+type tradeskillRankKey struct {{ table TradeskillRankDataTable; rank TradeskillRank }}
+
+func tradeskillRankTableFromPath(path string) (TradeskillRankDataTable, bool) {{
+	switch normalizeDataPath(path) {{
+{table_cases}	default:
+		return "", false
+	}}
+}}
+"#
+        ),
+        fields: r#"	playerLevelsByRank map[TradeskillRank]int
+	playerLevels []PlayerLevelRankData
+	tradeskillRanksByKey map[tradeskillRankKey]int
+	tradeskillRanks []StaticTradeskillRankData
+"#
+        .to_owned(),
+        field_values: r#"		playerLevelsByRank: make(map[TradeskillRank]int),
+		tradeskillRanksByKey: make(map[tradeskillRankKey]int),
+"#
+        .to_owned(),
+        initializers: r#"	for source := range manager.experienceDataRows.Rows() {
+		raw, ok := exactUint32(source.Row.LevelNumber)
+		if !ok || raw > 65535 { continue }
+		rank := TradeskillRank(raw)
+		if _, exists := manager.playerLevelsByRank[rank]; exists { continue }
+		manager.playerLevelsByRank[rank] = len(manager.playerLevels)
+		manager.playerLevels = append(manager.playerLevels, PlayerLevelRankData{Rank: rank, Source: source.Ref})
+	}
+	for source := range manager.tradeskillRankDataRows.Rows() {
+		table := source.Ref.Table()
+		raw, ok := exactUint32(source.Row.Level)
+		if !ok || raw > 65535 { continue }
+		rank := TradeskillRank(raw)
+		key := tradeskillRankKey{table: table, rank: rank}
+		if _, exists := manager.tradeskillRanksByKey[key]; exists { continue }
+		var displayName *string
+		if source.Row.DisplayName != nil {
+			trimmed := strings.TrimSpace(*source.Row.DisplayName)
+			if trimmed != "" { displayName = &trimmed }
+		}
+		displayNameID := gametypes.CRC32(0)
+		if displayName != nil { displayNameID = gametypes.CRC32(crc32Lowercase(*displayName)) }
+		manager.tradeskillRanksByKey[key] = len(manager.tradeskillRanks)
+		manager.tradeskillRanks = append(manager.tradeskillRanks, StaticTradeskillRankData{Table: table, Rank: rank, DisplayName: displayName, DisplayNameID: displayNameID, Source: source.Ref})
+	}
+"#
+        .to_owned(),
+        methods: r#"func (manager *TradeskillRankDataManager) PlayerLevelRow(rank TradeskillRank) *PlayerLevelRankData {
+	index, ok := manager.playerLevelsByRank[rank]
+	if !ok { return nil }
+	return rowCopy(manager.playerLevels[index])
+}
+
+func (manager *TradeskillRankDataManager) TradeskillRank(table TradeskillRankDataTable, rank TradeskillRank) *StaticTradeskillRankData {
+	index, ok := manager.tradeskillRanksByKey[tradeskillRankKey{table: table, rank: rank}]
+	if !ok { return nil }
+	return rowCopy(manager.tradeskillRanks[index])
+}
+
+func (manager *TradeskillRankDataManager) PlayerLevels() iter.Seq[PlayerLevelRankData] { return rowValues(manager.playerLevels) }
+func (manager *TradeskillRankDataManager) TradeskillRanks() iter.Seq[StaticTradeskillRankData] { return rowValues(manager.tradeskillRanks) }
+func (manager *TradeskillRankDataManager) Len() int { return len(manager.playerLevels) + len(manager.tradeskillRanks) }
+func (manager *TradeskillRankDataManager) IsEmpty() bool { return manager.Len() == 0 }
+
+"#
+        .to_owned(),
+    }
+}
+
+fn push_direct_typed_table_api(
+    source: &mut String,
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+) {
+    let row_specs = go_direct_row_specs(unit, manager);
+    let Some(default_row) = go_direct_default_row_spec(unit, manager) else {
+        return;
+    };
+    let manager_type = go_method_name(&manager.manager_class_name);
+
+    for row_spec in &row_specs {
+        let is_default = row_spec.source_row_type == default_row.source_row_type;
+        let row_name = go_method_name(&row_spec.source_row_type);
+        let table_type = go_direct_table_type_name(manager, &row_spec.source_row_type, is_default);
+        let resolver = go_direct_table_resolver_name(&table_type);
+        let method_prefix = if is_default { "" } else { row_name.as_str() };
+        let table_rows_method = if is_default {
+            "Table".to_owned()
+        } else {
+            format!("{method_prefix}Table")
+        };
+        let row_field = go_direct_row_field_name(&row_spec.source_row_type);
+        let schema_row_type = &row_spec.type_name;
+        let tables = manager
+            .tables
+            .iter()
+            .filter(|table| table.row_type_name == row_spec.source_row_type)
+            .collect::<Vec<_>>();
+        if tables.is_empty() {
+            continue;
+        }
+
+        source.push_str(&format!("type {table_type} string\n\nconst (\n"));
+        for table in tables {
+            let variant = go_method_name(&table.table_name);
+            source.push_str(&format!(
+                "\t{table_type}{variant} {table_type} = {:?}\n",
+                table.table_name
+            ));
+        }
+        let table_cases =
+            go_table_path_cases(unit, manager, &row_spec.source_row_type, &table_type);
+        source.push_str(&format!(
+            r#")
+
+func (table {table_type}) Name() string {{ return string(table) }}
+
+func (table {table_type}) Ref(key string) RowRef[{table_type}, {schema_row_type}] {{
+	return RowRef[{table_type}, {schema_row_type}]{{table: table, key: key}}
+}}
+
+func (table {table_type}) Slot(rowIndex int) RowSlot[{table_type}, {schema_row_type}] {{
+	return RowSlot[{table_type}, {schema_row_type}]{{table: table, rowIndex: rowIndex}}
+}}
+
+func {resolver}(path string) ({table_type}, bool) {{
+	switch normalizeDataPath(path) {{
+{table_cases}	default:
+		return "", false
+	}}
+}}
+
+func (manager *{manager_type}) {table_rows_method}(table {table_type}) TableRows[{table_type}, {schema_row_type}] {{
+	return manager.{row_field}.table(table)
+}}
+
+"#
+        ));
+    }
+}
+
+pub(super) fn go_direct_table_type_name(
+    manager: &DirectManagerSurface,
+    source_row_type: &str,
+    is_default: bool,
+) -> String {
+    let manager_type = go_method_name(&manager.manager_class_name);
+    let manager_stem = manager_type
+        .strip_suffix("Manager")
+        .unwrap_or(&manager_type);
+    if is_default {
+        format!("{manager_stem}Table")
+    } else {
+        format!("{manager_stem}{}Table", go_method_name(source_row_type))
+    }
+}
+
+fn go_direct_table_resolver_name(table_type: &str) -> String {
+    format!("Parse{}", go_method_name(table_type))
+}
+
+fn direct_go_schema_methods(
+    unit: &GameDataCompileUnit,
+    manager: &DirectManagerSurface,
+    include_primary_rows: bool,
+) -> String {
     let default_row_type = go_direct_default_row_spec(unit, manager).map(|row| row.source_row_type);
     let mut source = String::new();
+    push_direct_typed_table_api(&mut source, unit, manager);
     for row_spec in go_direct_row_specs(unit, manager) {
         let row_type = &row_spec.source_row_type;
         let is_default_row_type = default_row_type.as_deref() == Some(row_type.as_str());
         if is_default_row_type {
-            source.push_str(&go_direct_primary_row_family_methods(manager, &row_spec));
+            source.push_str(&go_direct_primary_row_family_methods(
+                manager,
+                &row_spec,
+                include_primary_rows,
+            ));
         } else {
-            let accessor = go_method_name(row_type);
-            let family_type = go_direct_row_family_type(row_type);
+            let accessor = format!("{}Rows", go_method_name(row_type));
+            let field = go_direct_row_field_name(row_type);
+            let schema_row_type = &row_spec.type_name;
+            let table_type = go_direct_table_type_name(manager, row_type, false);
             source.push_str(&format!(
-                r#"func (manager *{manager_type}) {accessor}() {family_type} {{
-	return {family_type}{{instance: manager.instance}}
+                r#"func (manager *{manager_type}) {accessor}() RowSet[{table_type}, {schema_row_type}] {{
+	return manager.{field}
 }}
 
 "#,
-                manager_type = manager.manager_class_name
+                manager_type = go_method_name(&manager.manager_class_name)
             ));
         }
     }
     source
 }
 
-fn go_direct_row_specs(
+pub(super) fn go_direct_row_specs(
     unit: &GameDataCompileUnit,
     manager: &DirectManagerSurface,
 ) -> Vec<GoSchemaRow> {
@@ -1124,7 +3889,7 @@ fn go_direct_row_specs(
         .collect()
 }
 
-fn go_direct_default_row_spec(
+pub(super) fn go_direct_default_row_spec(
     unit: &GameDataCompileUnit,
     manager: &DirectManagerSurface,
 ) -> Option<GoSchemaRow> {
@@ -1133,550 +3898,422 @@ fn go_direct_default_row_spec(
         .iter()
         .map(|row| row.source_row_type.clone())
         .collect::<Vec<_>>();
-    let default_row_type = default_direct_manager_row_type(&manager.manager_name, &row_types)?;
-    row_specs
-        .into_iter()
-        .find(|row| row.source_row_type == default_row_type)
+    let default_row_type = default_direct_manager_row_type(&manager.manager_name, &row_types);
+    default_row_type
+        .and_then(|default_row_type| {
+            row_specs
+                .iter()
+                .find(|row| row.source_row_type == default_row_type)
+                .cloned()
+        })
+        .or_else(|| row_specs.into_iter().next())
 }
 
 fn push_direct_row_family_types(
-    source: &mut String,
-    unit: &GameDataCompileUnit,
-    surfaces: &[ManagerSurface],
+    _source: &mut String,
+    _unit: &GameDataCompileUnit,
+    _surfaces: &[ManagerSurface],
 ) {
-    let mut emitted = BTreeSet::new();
-    for surface in surfaces {
-        let ManagerSurface::Direct(manager) = surface else {
-            continue;
-        };
-        for row_spec in go_direct_row_specs(unit, manager) {
-            if emitted.insert(row_spec.source_row_type.clone()) {
-                push_direct_row_family_type(source, &row_spec);
-            }
-        }
-    }
-}
-
-fn push_direct_row_family_type(source: &mut String, row_spec: &GoSchemaRow) {
-    let source_row_type = &row_spec.source_row_type;
-    let row_type = &row_spec.type_name;
-    let ref_type = go_direct_row_ref_type(source_row_type);
-    let slot_type = go_direct_row_slot_type(source_row_type);
-    let entry_type = go_direct_entry_type(source_row_type);
-    let family_type = go_direct_row_family_type(source_row_type);
-    let table_rows_type = go_direct_table_rows_type(source_row_type);
-    let reader = go_schema_reader_name(source_row_type);
-    let entry_fn = go_direct_entry_fn(source_row_type);
-    source.push_str(&format!(
-        r#"
-type {ref_type} struct {{
-	Table string
-	Row   string
-}}
-
-type {slot_type} struct {{
-	Table    string
-	RowIndex int
-}}
-
-type {entry_type} struct {{
-	Ref      {ref_type}
-	RowIndex int
-	Row      {row_type}
-}}
-
-type {family_type} struct {{
-	instance *managerInstance
-}}
-
-func (view {family_type}) Rows() ([]{entry_type}, error) {{
-	return schemaFamilyEntries(view.instance, {source_row_type:?}, {reader}, {entry_fn})
-}}
-
-func (view {family_type}) Table(table string) {table_rows_type} {{
-	return {table_rows_type}{{instance: view.instance, table: table}}
-}}
-
-func (view {family_type}) Get(ref {ref_type}) (*{row_type}, error) {{
-	return view.Table(ref.Table).Get(ref.Row)
-}}
-
-func (view {family_type}) RowByIndex(slot {slot_type}) (*{row_type}, error) {{
-	return view.Table(slot.Table).RowByIndex(slot.RowIndex)
-}}
-
-func (view {family_type}) RowKeyByIndex(slot {slot_type}) *string {{
-	return view.Table(slot.Table).RowKeyByIndex(slot.RowIndex)
-}}
-
-type {table_rows_type} struct {{
-	instance *managerInstance
-	table   string
-}}
-
-func (view {table_rows_type}) TableName() string {{
-	return view.table
-}}
-
-func (view {table_rows_type}) Rows() ([]{entry_type}, error) {{
-	return schemaTableEntries(view.instance, view.table, {source_row_type:?}, {reader}, {entry_fn})
-}}
-
-func (view {table_rows_type}) Get(key string) (*{row_type}, error) {{
-	return schemaTableRow(view.instance, view.table, {source_row_type:?}, key, {reader})
-}}
-
-func (view {table_rows_type}) RowByIndex(rowIndex int) (*{row_type}, error) {{
-	return schemaTableRowByIndex(view.instance, view.table, {source_row_type:?}, rowIndex, {reader})
-}}
-
-func (view {table_rows_type}) RowKeyByIndex(rowIndex int) *string {{
-	return schemaTableRowKeyByIndex(view.instance, view.table, {source_row_type:?}, rowIndex)
-}}
-
-func {entry_fn}(table *dynamicTable, row dynamicTableRow, data {row_type}) {entry_type} {{
-	return {entry_type}{{
-		Ref: {ref_type}{{
-			Table: table.Schema.Name,
-			Row:   row.Key,
-		}},
-		RowIndex: row.RowIndex,
-		Row:      data,
-	}}
-}}
-
-"#
-    ));
 }
 
 fn go_direct_primary_row_family_methods(
     manager: &DirectManagerSurface,
     row_spec: &GoSchemaRow,
+    include_rows: bool,
 ) -> String {
     let source_row_type = &row_spec.source_row_type;
     let row_type = &row_spec.type_name;
-    let ref_type = go_direct_row_ref_type(source_row_type);
-    let slot_type = go_direct_row_slot_type(source_row_type);
-    let entry_type = go_direct_entry_type(source_row_type);
-    let family_type = go_direct_row_family_type(source_row_type);
-    let table_rows_type = go_direct_table_rows_type(source_row_type);
-    format!(
-        r#"func (manager *{manager_type}) Rows() ([]{entry_type}, error) {{
-	return {family_type}{{instance: manager.instance}}.Rows()
-}}
-
-func (manager *{manager_type}) Table(table string) {table_rows_type} {{
-	return {family_type}{{instance: manager.instance}}.Table(table)
-}}
-
-func (manager *{manager_type}) Get(ref {ref_type}) (*{row_type}, error) {{
-	return {family_type}{{instance: manager.instance}}.Get(ref)
-}}
-
-func (manager *{manager_type}) RowByIndex(slot {slot_type}) (*{row_type}, error) {{
-	return {family_type}{{instance: manager.instance}}.RowByIndex(slot)
-}}
-
-func (manager *{manager_type}) RowKeyByIndex(slot {slot_type}) *string {{
-	return {family_type}{{instance: manager.instance}}.RowKeyByIndex(slot)
+    let field = go_direct_row_field_name(source_row_type);
+    let table_type = go_direct_table_type_name(manager, source_row_type, true);
+    let resolver = go_direct_table_resolver_name(&table_type);
+    let rows = if include_rows {
+        format!(
+            r#"func (manager *{manager_type}) Rows() iter.Seq[RowEntry[{table_type}, {row_type}]] {{
+	return manager.{field}.Rows()
 }}
 
 "#,
-        manager_type = manager.manager_class_name
+            manager_type = go_method_name(&manager.manager_class_name)
+        )
+    } else {
+        let accessor = format!("{}Rows", go_method_name(source_row_type));
+        format!(
+            r#"func (manager *{manager_type}) {accessor}() RowSet[{table_type}, {row_type}] {{
+	return manager.{field}
+}}
+
+"#,
+            manager_type = go_method_name(&manager.manager_class_name)
+        )
+    };
+    format!(
+        r#"{rows}func (manager *{manager_type}) Row(ref RowRef[{table_type}, {row_type}]) *{row_type} {{
+	return manager.{field}.Get(ref)
+}}
+
+func (manager *{manager_type}) ResolveRow(ref TableReference) *{row_type} {{
+	table, ok := {resolver}(ref.Path)
+	if !ok {{
+		return nil
+	}}
+	return manager.{field}.table(table).Get(ref.Key)
+}}
+
+func (manager *{manager_type}) RowByIndex(slot RowSlot[{table_type}, {row_type}]) *{row_type} {{
+	return manager.{field}.RowByIndex(slot)
+}}
+
+func (manager *{manager_type}) RowKeyByIndex(slot RowSlot[{table_type}, {row_type}]) (string, bool) {{
+	return manager.{field}.RowKeyByIndex(slot)
+}}
+
+"#,
+        manager_type = go_method_name(&manager.manager_class_name)
     )
 }
 
-fn go_direct_row_ref_type(source_row_type: &str) -> String {
-    format!("{}Ref", to_upper_camel_ident(source_row_type, "Row"))
+pub(super) fn go_direct_row_field_name(source_row_type: &str) -> String {
+    go_local_name(&format!("{source_row_type}Rows"))
 }
 
-fn go_direct_row_slot_type(source_row_type: &str) -> String {
-    format!("{}Slot", to_upper_camel_ident(source_row_type, "Row"))
+fn go_product_info(
+    value_type: &str,
+) -> Option<(NativeManagerProductKind, &'static str, &'static str)> {
+    let kind = NativeManagerProductKind::from_canonical_type_path(value_type)?;
+    let info = match kind {
+        NativeManagerProductKind::ArmorOffsetDatabase => {
+            ("ArmorOffsetDatabase", "parseArmorOffsetDatabase")
+        }
+        NativeManagerProductKind::EquipTypesDatabase => {
+            ("EquipTypesDatabase", "parseEquipTypesDatabase")
+        }
+        NativeManagerProductKind::GameDebugSettings => {
+            ("GameDebugSettings", "parseGameDebugSettings")
+        }
+        NativeManagerProductKind::PlayerBaseAttributes => {
+            ("PlayerBaseAttributes", "parsePlayerBaseAttributes")
+        }
+        NativeManagerProductKind::SettlementProgressionData => (
+            "SettlementProgressionData",
+            "parseSettlementProgressionData",
+        ),
+        NativeManagerProductKind::UiDatabase => ("UIDatabase", "parseUIDatabase"),
+        NativeManagerProductKind::GameCameraSettings => {
+            ("GameCameraSettings", "parseGameCameraSettings")
+        }
+        NativeManagerProductKind::GatheringDatabase => {
+            ("GatheringDatabase", "parseGatheringDatabase")
+        }
+        NativeManagerProductKind::GatheringActionDatabase => {
+            ("GatheringActionDatabase", "parseGatheringActionDatabase")
+        }
+        NativeManagerProductKind::CraftingStationDatabase => {
+            ("CraftingStationDatabase", "parseCraftingStationDatabase")
+        }
+        NativeManagerProductKind::SocialRankDatabase => {
+            ("SocialRankDatabase", "parseSocialRankDatabase")
+        }
+    };
+    Some((kind, info.0, info.1))
 }
 
-fn go_direct_entry_type(source_row_type: &str) -> String {
-    format!("{}Entry", to_upper_camel_ident(source_row_type, "Row"))
-}
-
-fn go_direct_row_family_type(source_row_type: &str) -> String {
-    format!("{}Rows", to_upper_camel_ident(source_row_type, "Rows"))
-}
-
-fn go_direct_table_rows_type(source_row_type: &str) -> String {
-    format!("{}TableRows", to_upper_camel_ident(source_row_type, "Rows"))
-}
-
-fn go_direct_entry_fn(source_row_type: &str) -> String {
-    lower_camel(&format!("{source_row_type}Entry"))
+fn go_product_storage(manager: &DirectManagerSurface) -> (String, String, String) {
+    let mut fields = String::new();
+    let mut initializers = String::new();
+    let mut field_values = String::new();
+    let mut seen = BTreeSet::new();
+    for product in &manager.products {
+        let (_, type_name, parser) = go_product_info(&product.value_type).unwrap_or_else(|| {
+            panic!(
+                "Go product manager {} declares unsupported product type {} at {}",
+                manager.manager_name, product.value_type, product.path
+            )
+        });
+        let field = go_local_name(type_name);
+        if !seen.insert(field.clone()) {
+            continue;
+        }
+        fields.push_str(&format!("\t{field} *{type_name}\n"));
+        initializers.push_str(&format!(
+            "\t{field}Bytes, err := resources.requiredAssetBytes({})\n\tif err != nil {{\n\t\treturn nil, err\n\t}}\n\t{field}, err := {parser}({field}Bytes)\n\tif err != nil {{\n\t\treturn nil, err\n\t}}\n",
+            go_string(&product.path)
+        ));
+        field_values.push_str(&format!("\t\t{field}: {field},\n"));
+    }
+    (fields, initializers, field_values)
 }
 
 fn direct_go_product_methods(manager: &DirectManagerSurface) -> String {
     let mut source = String::new();
+    let manager_type = go_method_name(&manager.manager_class_name);
     for product in &manager.products {
-        let path = go_string(&product.path);
         let getter = go_method_name(&product.manager_getter);
-        match product.value_type.as_str() {
-            "newworld_plugin::assets::armor_offset_database::ArmorOffsetDatabase" => {
+        let (kind, type_name, _) = go_product_info(&product.value_type).unwrap_or_else(|| {
+            panic!(
+                "Go product manager {} declares unsupported product type {} at {}",
+                manager.manager_name, product.value_type, product.path
+            )
+        });
+        let field = go_local_name(type_name);
+        match kind {
+            NativeManagerProductKind::ArmorOffsetDatabase => {
                 source.push_str(&format!(
-                    r#"func (manager *{manager_type}) {getter}() (*ArmorOffsetDatabase, error) {{
-	bytes, err := manager.instance.requiredAssetBytes({path})
-	if err != nil {{
-		return nil, err
-	}}
-	return ParseArmorOffsetDatabase(bytes)
+                    r#"func (manager *{manager_type}) {getter}() *ArmorOffsetDatabase {{
+	return manager.{field}
 }}
 
-func (manager *{manager_type}) ArmorOffset(name string) (*ArmorOffsetData, error) {{
-	database, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return ArmorOffsetByName(database, name), nil
+func (manager *{manager_type}) ArmorOffset(name string) *ArmorOffsetData {{
+	return armorOffsetByName(manager.{getter}(), name)
 }}
 
-func (manager *{manager_type}) FurthestAttachmentOffset(armorOffsetNames []string, attachmentName string, currentPosition Vec3) (*AttachmentOffsetData, error) {{
-	database, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return FurthestArmorAttachmentOffset(database, armorOffsetNames, attachmentName, currentPosition), nil
+func (manager *{manager_type}) FurthestAttachmentOffset(armorOffsetNames []string, attachmentName string, currentPosition Vector3) *AttachmentOffsetData {{
+	return furthestArmorAttachmentOffset(manager.{getter}(), armorOffsetNames, attachmentName, currentPosition)
 }}
 
 "#,
                     getter = getter,
-                    path = path,
-                    manager_type = manager.manager_class_name,
+                    manager_type = &manager_type,
                 ));
             }
-            "newworld_plugin::assets::equip_types_database::EquipTypesDatabase" => {
+            NativeManagerProductKind::EquipTypesDatabase => {
                 source.push_str(&format!(
-                    r#"func (manager *{manager_type}) {getter}() (*EquipTypesDatabase, error) {{
-	bytes, err := manager.instance.requiredAssetBytes({path})
-	if err != nil {{
-		return nil, err
-	}}
-	return ParseEquipTypesDatabase(bytes)
+                    r#"func (manager *{manager_type}) {getter}() *EquipTypesDatabase {{
+	return manager.{field}
 }}
 
-func (manager *{manager_type}) EquipTypes() ([]EquipTypeData, error) {{
-	database, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return database.EquipTypes, nil
+func (manager *{manager_type}) EquipTypes() []EquipTypeData {{
+	return manager.{getter}().EquipTypes
 }}
 
 "#,
                     getter = getter,
-                    path = path,
-                    manager_type = manager.manager_class_name,
+                    manager_type = &manager_type,
                 ));
             }
-            "newworld_plugin::assets::game_debug_settings::GameDebugSettings" => {
+            NativeManagerProductKind::GameDebugSettings => {
                 source.push_str(&format!(
-                    r#"func (manager *{manager_type}) {getter}() (*GameDebugSettings, error) {{
-	bytes, err := manager.instance.requiredAssetBytes({path})
-	if err != nil {{
-		return nil, err
-	}}
-	return ParseGameDebugSettings(bytes)
+                    r#"func (manager *{manager_type}) {getter}() *GameDebugSettings {{
+	return manager.{field}
 }}
 
-func (manager *{manager_type}) Combat() (*CombatDebugSettings, error) {{
-	settings, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return &settings.CombatSettings, nil
+func (manager *{manager_type}) Combat() *CombatDebugSettings {{
+	return rowCopy(manager.{getter}().CombatSettings)
 }}
 
-func (manager *{manager_type}) DisabledCombatToggleCount() (int, error) {{
-	combat, err := manager.Combat()
-	if err != nil {{
-		return 0, err
-	}}
-	return DisabledCombatToggleCount(*combat), nil
+func (manager *{manager_type}) DisabledCombatToggleCount() int {{
+	return disabledCombatToggleCount(*manager.Combat())
 }}
 
 "#,
                     getter = getter,
-                    path = path,
-                    manager_type = manager.manager_class_name,
+                    manager_type = &manager_type,
                 ));
             }
-            "newworld_plugin::assets::ui_database::UiDatabase" => {
+            NativeManagerProductKind::UiDatabase => {
                 source.push_str(&format!(
-                    r#"func (manager *{manager_type}) {getter}() (*UiDatabase, error) {{
-	bytes, err := manager.instance.requiredAssetBytes({path})
-	if err != nil {{
-		return nil, err
-	}}
-	return ParseUiDatabase(bytes)
+                    r#"func (manager *{manager_type}) {getter}() *UIDatabase {{
+	return manager.{field}
 }}
 
-func (manager *{manager_type}) InteractOptions() ([]InteractOptionData, error) {{
-	database, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return database.UnifiedInteractData.InteractOptions, nil
+func (manager *{manager_type}) InteractOptions() []InteractOptionData {{
+	return manager.{getter}().UnifiedInteractData.InteractOptions
 }}
 
-func (manager *{manager_type}) InteractOption(id any) (*InteractOptionData, error) {{
-	options, err := manager.InteractOptions()
-	if err != nil {{
-		return nil, err
-	}}
-	return InteractOptionByID(options, id), nil
+func (manager *{manager_type}) InteractOption(id CRC32) *InteractOptionData {{
+	return interactOptionByID(manager.InteractOptions(), id)
 }}
 
-func (manager *{manager_type}) InteractOptionsByCategory(category int32) ([]InteractOptionData, error) {{
-	options, err := manager.InteractOptions()
-	if err != nil {{
-		return nil, err
-	}}
-	return InteractOptionsByCategory(options, category), nil
+func (manager *{manager_type}) InteractOptionByName(name string) *InteractOptionData {{
+	return manager.InteractOption(gametypes.CRC32FromStringLower(name))
+}}
+
+func (manager *{manager_type}) InteractOptionsByCategory(category int32) iter.Seq[InteractOptionData] {{
+	return interactOptionsByCategory(manager.InteractOptions(), category)
 }}
 
 "#,
                     getter = getter,
-                    path = path,
-                    manager_type = manager.manager_class_name,
+                    manager_type = &manager_type,
                 ));
             }
-            "newworld_plugin::assets::camera_settings::GameCameraSettings" => {
+            NativeManagerProductKind::GameCameraSettings => {
                 source.push_str(&format!(
-                    r#"func (manager *{manager_type}) {getter}() (*GameCameraSettings, error) {{
-	bytes, err := manager.instance.requiredAssetBytes({path})
-	if err != nil {{
-		return nil, err
-	}}
-	return ParseGameCameraSettings(bytes)
+                    r#"func (manager *{manager_type}) {getter}() *GameCameraSettings {{
+	return manager.{field}
 }}
 
-func (manager *{manager_type}) CameraStates() ([]CameraStateSettings, error) {{
-	settings, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return settings.CameraStates, nil
+func (manager *{manager_type}) CameraStates() []CameraStateSettings {{
+	return manager.{getter}().CameraStates
 }}
 
 "#,
                     getter = getter,
-                    path = path,
-                    manager_type = manager.manager_class_name,
+                    manager_type = &manager_type,
                 ));
             }
-            "newworld_plugin::assets::player_base_attributes::PlayerBaseAttributes" => {
+            NativeManagerProductKind::PlayerBaseAttributes => {
                 source.push_str(&format!(
-                    r#"func (manager *{manager_type}) {getter}() (*PlayerBaseAttributes, error) {{
-	bytes, err := manager.instance.requiredAssetBytes({path})
-	if err != nil {{
-		return nil, err
-	}}
-	return ParsePlayerBaseAttributes(bytes)
+                    r#"func (manager *{manager_type}) {getter}() *PlayerBaseAttributes {{
+	return manager.{field}
 }}
 
-func (manager *{manager_type}) PlayerAttributeData() (*PlayerAttributeData, error) {{
-	attributes, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return &attributes.PlayerAttributeData, nil
+func (manager *{manager_type}) PlayerAttributeData() *PlayerAttributeData {{
+	return rowCopy(manager.{getter}().PlayerAttributeData)
 }}
 
-func (manager *{manager_type}) MaxPerks(rarityLevel int) (*int32, error) {{
-	data, err := manager.PlayerAttributeData()
-	if err != nil {{
-		return nil, err
-	}}
+func (manager *{manager_type}) MaxPerks(rarityLevel int) *int32 {{
+	data := manager.PlayerAttributeData()
 	if rarityLevel < 0 || rarityLevel >= len(data.ItemRarityData) {{
-		return nil, nil
+		return nil
 	}}
 	value := data.ItemRarityData[rarityLevel].MaxPerkCount
-	return &value, nil
+	return &value
 }}
 
 "#,
                     getter = getter,
-                    path = path,
-                    manager_type = manager.manager_class_name,
+                    manager_type = &manager_type,
                 ));
             }
-            "newworld_plugin::assets::settlement_progression_data::SettlementProgressionData" => {
+            NativeManagerProductKind::SettlementProgressionData => {
                 source.push_str(&format!(
-                    r#"func (manager *{manager_type}) {getter}() (*SettlementProgressionData, error) {{
-	bytes, err := manager.instance.requiredAssetBytes({path})
-	if err != nil {{
-		return nil, err
-	}}
-	return ParseSettlementProgressionData(bytes)
+                    r#"func (manager *{manager_type}) {getter}() *SettlementProgressionData {{
+	return manager.{field}
 }}
 
-func (manager *{manager_type}) SettlementProgressionCategories() ([]ProgressionCategoryEntry, error) {{
-	data, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return data.SettlementProgressionCategories, nil
+func (manager *{manager_type}) SettlementProgressionCategories() []ProgressionCategoryEntry {{
+	return manager.{getter}().SettlementProgressionCategories
 }}
 
 "#,
                     getter = getter,
-                    path = path,
-                    manager_type = manager.manager_class_name,
+                    manager_type = &manager_type,
                 ));
             }
-            "newworld_plugin::assets::gathering_database::GatheringDatabase" => {
+            NativeManagerProductKind::GatheringDatabase => {
                 source.push_str(&format!(
-                    r#"func (manager *{manager_type}) {getter}() (*GatheringDatabase, error) {{
-	bytes, err := manager.instance.requiredAssetBytes({path})
-	if err != nil {{
-		return nil, err
-	}}
-	return ParseGatheringDatabase(bytes)
+                    r#"func (manager *{manager_type}) {getter}() *GatheringDatabase {{
+	return manager.{field}
 }}
 
-func (manager *{manager_type}) GatheringData() (*GatheringData, error) {{
-	database, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return &database.GatheringData, nil
+func (manager *{manager_type}) GatheringData() *GatheringData {{
+	return rowCopy(manager.{getter}().GatheringData)
 }}
 
-func (manager *{manager_type}) GatheringTypes() ([]GatheringTypeData, error) {{
-	data, err := manager.GatheringData()
-	if err != nil {{
-		return nil, err
-	}}
-	return data.GatheringTypes, nil
+func (manager *{manager_type}) GatheringTypes() []GatheringTypeData {{
+	return manager.GatheringData().GatheringTypes
 }}
 
-func (manager *{manager_type}) GatheringActions() ([]GatheringAction, error) {{
-	data, err := manager.GatheringData()
-	if err != nil {{
-		return nil, err
-	}}
-	return data.GatheringActions, nil
+func (manager *{manager_type}) GatheringActions() []GatheringAction {{
+	return manager.GatheringData().GatheringActions
 }}
 
 "#,
                     getter = getter,
-                    path = path,
-                    manager_type = manager.manager_class_name,
+                    manager_type = &manager_type,
                 ));
             }
-            "newworld_plugin::assets::gathering_database::GatheringActionDatabase" => {
+            NativeManagerProductKind::GatheringActionDatabase => {
                 source.push_str(&format!(
-                    r#"func (manager *{manager_type}) {getter}() (*GatheringActionDatabase, error) {{
-	bytes, err := manager.instance.requiredAssetBytes({path})
-	if err != nil {{
-		return nil, err
-	}}
-	return ParseGatheringActionDatabase(bytes)
+                    r#"func (manager *{manager_type}) {getter}() *GatheringActionDatabase {{
+	return manager.{field}
 }}
 
-func (manager *{manager_type}) GatheringActionData() ([]GatheringActionData, error) {{
-	database, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return database.GatheringActions, nil
+func (manager *{manager_type}) GatheringActionData() []GatheringActionData {{
+	return manager.{getter}().GatheringActions
 }}
 
 "#,
                     getter = getter,
-                    path = path,
-                    manager_type = manager.manager_class_name,
+                    manager_type = &manager_type,
                 ));
             }
-            "newworld_plugin::assets::crafting_station_database::CraftingStationDatabase" => {
+            NativeManagerProductKind::CraftingStationDatabase => {
                 source.push_str(&format!(
-                    r#"func (manager *{manager_type}) {getter}() (*CraftingStationDatabase, error) {{
-	bytes, err := manager.instance.requiredAssetBytes({path})
-	if err != nil {{
-		return nil, err
-	}}
-	return ParseCraftingStationDatabase(bytes)
+                    r#"func (manager *{manager_type}) {getter}() *CraftingStationDatabase {{
+	return manager.{field}
 }}
 
-func (manager *{manager_type}) CraftingStations() ([]CraftingStationData, error) {{
-	database, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return database.CraftingStations, nil
+func (manager *{manager_type}) CraftingStations() []CraftingStationData {{
+	return manager.{getter}().CraftingStations
 }}
 
 "#,
                     getter = getter,
-                    path = path,
-                    manager_type = manager.manager_class_name,
+                    manager_type = &manager_type,
                 ));
             }
-            "newworld_plugin::assets::rank_database::SocialRankDatabase" => {
+            NativeManagerProductKind::SocialRankDatabase => {
                 source.push_str(&format!(
-                    r#"func (manager *{manager_type}) {getter}() (*SocialRankDatabase, error) {{
-	bytes, err := manager.instance.requiredAssetBytes({path})
-	if err != nil {{
-		return nil, err
-	}}
-	return ParseSocialRankDatabase(bytes)
+                    r#"func (manager *{manager_type}) {getter}() *SocialRankDatabase {{
+	return manager.{field}
 }}
 
-func (manager *{manager_type}) Ranks() ([]SocialRankData, error) {{
-	database, err := manager.{getter}()
-	if err != nil {{
-		return nil, err
-	}}
-	return database.Ranks, nil
+func (manager *{manager_type}) Ranks() []SocialRankData {{
+	return manager.{getter}().Ranks
 }}
 
 "#,
                     getter = getter,
-                    path = path,
-                    manager_type = manager.manager_class_name,
+                    manager_type = &manager_type,
                 ));
             }
-            _ => {}
         }
     }
     source
 }
 
 fn push_product_backed_manager_type(source: &mut String, manager: &DirectManagerSurface) {
-    let manager_type = &manager.manager_class_name;
-    let constructor = go_manager_constructor_name(manager_type);
+    let manager_type = go_method_name(&manager.manager_class_name);
+    let constructor = go_manager_constructor_name(&manager_type);
+    let manager_resources = go_manager_resources_expression(
+        &manager.manager_name,
+        manager
+            .tables
+            .iter()
+            .map(|table| (table.table_name.as_str(), table.row_type_name.as_str())),
+        manager.products.iter().map(|product| product.path.as_str()),
+    );
     let mut product_methods = direct_go_product_methods(manager);
-    product_methods.push_str(&special_go_manager_extra_methods(manager_type));
+    product_methods.push_str(&special_go_manager_extra_methods(
+        &manager.manager_class_name,
+    ));
+    let (product_fields, product_initializers, product_field_values) = go_product_storage(manager);
     source.push_str(&format!(
         r#"
 type {manager_type} struct {{
-	instance *managerInstance
+{product_fields}
 }}
 
 func {constructor}(cache *managerCache) (*{manager_type}, error) {{
-	instance, err := cache.manager({})
+	resources, err := {manager_resources}
 	if err != nil {{
 		return nil, err
 	}}
-	return &{manager_type}{{instance: instance}}, nil
+{product_initializers}
+	return &{manager_type}{{
+{product_field_values}	}}, nil
 }}
 
 {product_methods}
-"#,
-        go_string(&manager.manager_name)
+"#
     ));
 }
 
 fn push_item_data_manager_type(source: &mut String, manager: &ItemDataManagerSurface) {
-    let manager_type = &manager.manager_class_name;
-    let factory = go_manager_constructor_name(manager_type);
-    let table_type = &manager.table_type_name;
-    let handle_type = &manager.handle_type_name;
-    let data_type = &manager.data_type_name;
+    let manager_type = go_method_name(&manager.manager_class_name);
+    let factory = go_manager_constructor_name(&manager_type);
+    let table_type = go_method_name(&manager.table_type_name);
+    let handle_type = go_method_name(&manager.handle_type_name);
+    let data_type = go_method_name(&manager.data_type_name);
+    let manager_resources = go_manager_resources_expression(
+        &manager.manager_name,
+        manager
+            .tables
+            .iter()
+            .map(|table| (table.table_name.as_str(), table.row_type_name.as_str())),
+        std::iter::empty(),
+    );
     let const_entries = manager
         .tables
         .iter()
@@ -1693,6 +4330,18 @@ fn push_item_data_manager_type(source: &mut String, manager: &ItemDataManagerSur
         .iter()
         .map(|table| format!("\t{table_type}{},\n", table.variant_name))
         .collect::<String>();
+    let table_selector_arms = manager
+        .tables
+        .iter()
+        .map(|table| {
+            format!(
+                "\tcase {table_type}{}:\n\t\treturn tableSelector{{name: {}, rowType: {}}}\n",
+                table.variant_name,
+                go_string(&table.table_name),
+                go_string(&table.row_type_name)
+            )
+        })
+        .collect::<String>();
 
     source.push_str(&format!(
         r#"
@@ -1705,6 +4354,13 @@ func (table {table_type}) TableName() string {{
 	return string(table)
 }}
 
+func (table {table_type}) selector() tableSelector {{
+	switch table {{
+{table_selector_arms}	default:
+		panic("unknown {table_type}")
+	}}
+}}
+
 type {handle_type} struct {{
 	Table {table_type}
 	Row   uint32
@@ -1712,8 +4368,9 @@ type {handle_type} struct {{
 
 type {data_type} struct {{
 	SourceHandle             {handle_type}
+	Definition               MasterItemDefinitionsSchemaRow
 	ItemID                   string
-	ItemIDCrc                uint32
+	ItemIDCRC                CRC32
 	Name                     *string
 	Description              *string
 	ItemType                 *string
@@ -1730,45 +4387,39 @@ var itemDataManagerTables = []{table_type}{{
 {table_list}}}
 
 type {manager_type} struct {{
-	instance  *managerInstance
 	items     []{data_type}
-	itemsByID map[uint32]int
+	itemsByID map[CRC32]int
 }}
 
 func {factory}(cache *managerCache) (*{manager_type}, error) {{
-	instance, err := cache.manager({})
+	resources, err := {manager_resources}
 	if err != nil {{
 		return nil, err
 	}}
-	return new{manager_type}FromInstance(instance)
-}}
-
-func new{manager_type}FromInstance(instance *managerInstance) (*{manager_type}, error) {{
-	items, err := materialize{manager_type}(instance)
+	items, err := materialize{manager_type}(resources)
 	if err != nil {{
 		return nil, err
 	}}
 	manager := &{manager_type}{{
-		instance:  instance,
 		items:     items,
-		itemsByID: map[uint32]int{{}},
+		itemsByID: map[CRC32]int{{}},
 	}}
 	for index := range items {{
-		manager.itemsByID[items[index].ItemIDCrc] = index
+		manager.itemsByID[items[index].ItemIDCRC] = index
 	}}
 	return manager, nil
 }}
 
 func (manager *{manager_type}) Get(itemID string) *{data_type} {{
-	return manager.GetFromID(crc32Lowercase(itemID))
+	return manager.GetFromID(CRC32(crc32Lowercase(itemID)))
 }}
 
-func (manager *{manager_type}) GetFromID(itemID uint32) *{data_type} {{
+func (manager *{manager_type}) GetFromID(itemID CRC32) *{data_type} {{
 	index, ok := manager.itemsByID[itemID]
 	if !ok {{
 		return nil
 	}}
-	return &manager.items[index]
+	return rowCopy(manager.items[index])
 }}
 
 func (manager *{manager_type}) ByIndex(index uint32) *{data_type} {{
@@ -1779,15 +4430,11 @@ func (manager *{manager_type}) ByIndex(index uint32) *{data_type} {{
 	if int(zeroBased) >= len(manager.items) {{
 		return nil
 	}}
-	return &manager.items[zeroBased]
+	return rowCopy(manager.items[zeroBased])
 }}
 
-func (manager *{manager_type}) Rows() ([]{data_type}, error) {{
-	return manager.items, nil
-}}
-
-func (manager *{manager_type}) Items() []{data_type} {{
-	return manager.items
+func (manager *{manager_type}) Rows() iter.Seq[{data_type}] {{
+	return rowValues(manager.items)
 }}
 
 func (manager *{manager_type}) Len() int {{
@@ -1798,11 +4445,11 @@ func (manager *{manager_type}) IsEmpty() bool {{
 	return len(manager.items) == 0
 }}
 
-func materialize{manager_type}(instance *managerInstance) ([]{data_type}, error) {{
+func materialize{manager_type}(resources *managerResources) ([]{data_type}, error) {{
 	items := []{data_type}{{}}
-	seen := map[uint32]struct{{}}{{}}
+	seen := map[CRC32]struct{{}}{{}}
 	for _, tableID := range itemDataManagerTables {{
-		table := instance.table(tableID.TableName())
+		table := resources.table(tableID.selector())
 		if table == nil {{
 			return nil, fmt.Errorf("manager {manager_type} table %s was not loaded", tableID.TableName())
 		}}
@@ -1813,24 +4460,25 @@ func materialize{manager_type}(instance *managerInstance) ([]{data_type}, error)
 	return items, nil
 }}
 
-func cache{manager_type}Rows(items *[]{data_type}, seen map[uint32]struct{{}}, tableID {table_type}, table *dynamicTable) error {{
+func cache{manager_type}Rows(items *[]{data_type}, seen map[CRC32]struct{{}}, tableID {table_type}, table *dynamicTable) error {{
 	for _, sourceRow := range table.Rows {{
-		itemID, err := requiredStringCell(table, sourceRow, "ItemID")
+		definition, err := readMasterItemDefinitionsSchemaRow(table, sourceRow)
 		if err != nil {{
 			return err
 		}}
+		itemID := definition.ItemID
 		itemID = strings.TrimSpace(itemID)
 		if itemID == "" {{
 			continue
 		}}
-		itemIDCrc := crc32Lowercase(itemID)
-		if itemIDCrc == 0 {{
+		itemIDCRC := CRC32(crc32Lowercase(itemID))
+		if itemIDCRC == 0 {{
 			continue
 		}}
-		if _, exists := seen[itemIDCrc]; exists {{
+		if _, exists := seen[itemIDCRC]; exists {{
 			continue
 		}}
-		seen[itemIDCrc] = struct{{}}{{}}
+		seen[itemIDCRC] = struct{{}}{{}}
 		name, err := optionalStringCell(table, sourceRow, "Name")
 		if err != nil {{
 			return err
@@ -1892,8 +4540,9 @@ func cache{manager_type}Rows(items *[]{data_type}, seen map[uint32]struct{{}}, t
 				Table: tableID,
 				Row:   uint32(sourceRow.RowIndex + 1),
 			}},
+			Definition:               definition,
 			ItemID:                   itemID,
-			ItemIDCrc:                itemIDCrc,
+			ItemIDCRC:                itemIDCRC,
 			Name:                     name,
 			Description:              description,
 			ItemType:                 itemType,
@@ -1909,119 +4558,150 @@ func cache{manager_type}Rows(items *[]{data_type}, seen map[uint32]struct{{}}, t
 	return nil
 }}
 
-"#,
-        go_string(&manager.manager_name)
+"#
     ));
 }
 
 fn push_semantic_manager_type(source: &mut String, record: &SemanticManagerRecord) {
-    let manager_type = &record.manager_class_name;
-    let record_type = &record.record_type_name;
-    let constructor = go_manager_constructor_name(manager_type);
+    let manager_type = go_method_name(&record.manager_class_name);
+    let record_type = go_method_name(&record.record_type_name);
+    let constructor = go_manager_constructor_name(&manager_type);
+    let manager_resources = go_manager_resources_expression(
+        &record.manager_name,
+        record
+            .tables
+            .iter()
+            .map(|table| (table.table_name.as_str(), table.row_type_name.as_str())),
+        std::iter::empty(),
+    );
     let by_key_field = "entriesByKey";
     let by_source_row_field = "entriesBySourceRow";
-    let key_map_type = go_key_map_type(record);
+    let has_key_index = !record.lookup_methods.is_empty();
+    let has_source_row_index = record.source_row_method.is_some();
+    assert!(
+        !has_key_index || record.key.is_some(),
+        "{manager_type} exposes key lookups without a semantic key"
+    );
+    assert!(
+        !has_source_row_index || record.source_row_field.is_some(),
+        "{manager_type} exposes a source-row lookup without a source-row field"
+    );
+    let key_index_field = has_key_index
+        .then(|| format!("\t{by_key_field} map[{}]int\n", go_key_map_type(record)))
+        .unwrap_or_default();
+    let source_row_index_field = has_source_row_index
+        .then_some("\tentriesBySourceRow map[uint32]int\n")
+        .unwrap_or_default();
+    let key_index_initializer = has_key_index
+        .then(|| {
+            format!(
+                "\t\t{by_key_field}: map[{}]int{{}},\n",
+                go_key_map_type(record)
+            )
+        })
+        .unwrap_or_default();
+    let source_row_index_initializer = has_source_row_index
+        .then_some("\t\tentriesBySourceRow: map[uint32]int{},\n")
+        .unwrap_or_default();
+    let mut index_build = String::new();
+    if has_key_index || has_source_row_index {
+        index_build.push_str("\tfor index := range rows {\n");
+        if has_key_index {
+            let index_expression = go_row_index_expression(record)
+                .expect("semantic manager key index requires a semantic key");
+            index_build.push_str(&format!(
+                "\t\tmanager.{by_key_field}[{index_expression}] = index\n"
+            ));
+        }
+        if has_source_row_index {
+            let field = record
+                .source_row_field
+                .as_ref()
+                .expect("source-row index requires a source-row field");
+            index_build.push_str(&format!(
+                "\t\tmanager.{by_source_row_field}[rows[index].{}] = index\n",
+                go_field_name(field)
+            ));
+        }
+        index_build.push_str("\t}\n");
+    }
     source.push_str(&format!(
         r#"
 type {manager_type} struct {{
-	instance *managerInstance
 	entries []{record_type}
-	{by_key_field} map[{key_map_type}]int
-	{by_source_row_field} map[uint32]int
+{key_index_field}{source_row_index_field}
 }}
 
 func {constructor}(cache *managerCache) (*{manager_type}, error) {{
-	instance, err := cache.manager({})
+	resources, err := {manager_resources}
 	if err != nil {{
 		return nil, err
 	}}
-	return new{manager_type}FromInstance(instance)
-}}
-
-func new{manager_type}FromInstance(instance *managerInstance) (*{manager_type}, error) {{
-	rows, err := materialize{manager_type}(instance)
+	rows, err := materialize{manager_type}(resources)
 	if err != nil {{
 		return nil, err
 	}}
 	manager := &{manager_type}{{
-		instance: instance,
 		entries: rows,
-		{by_key_field}: map[{key_map_type}]int{{}},
-		{by_source_row_field}: map[uint32]int{{}},
+{key_index_initializer}{source_row_index_initializer}
 	}}
-	for index := range rows {{
-"#,
-        go_string(&record.manager_name)
-    ));
-    if let Some(index_expression) = go_row_index_expression(record) {
-        source.push_str(&format!(
-            "\t\tmanager.{by_key_field}[{index_expression}] = index\n"
-        ));
-    }
-    if let Some(field) = &record.source_row_field {
-        source.push_str(&format!(
-            "\t\tmanager.{by_source_row_field}[rows[index].{}] = index\n",
-            go_field_name(field)
-        ));
-    }
-    source.push_str(&format!(
-        r#"	}}
-	return manager, nil
-}}
-
+{index_build}
 "#
     ));
+    source.push_str(
+        r#"	return manager, nil
+}
+
+"#,
+    );
 
     for method in &record.lookup_methods {
         let method_name = go_method_name(&method.name);
-        let parameter_name = lower_camel(&method.parameter);
+        let parameter_name = go_local_name(&method.parameter);
         match method.kind {
             SemanticLookupKind::CrcStringKey => source.push_str(&format!(
                 r#"func (manager *{manager_type}) {method_name}({parameter_name} string) *{record_type} {{
-	index, ok := manager.{by_key_field}[crc32Lowercase({parameter_name})]
+	index, ok := manager.{by_key_field}[CRC32(crc32Lowercase({parameter_name}))]
 	if !ok {{
 		return nil
 	}}
-	return &manager.entries[index]
+	return rowCopy(manager.entries[index])
 }}
 
 "#
             )),
             SemanticLookupKind::CrcKey => source.push_str(&format!(
-                r#"func (manager *{manager_type}) {method_name}({parameter_name} uint32) *{record_type} {{
+                r#"func (manager *{manager_type}) {method_name}({parameter_name} CRC32) *{record_type} {{
 	index, ok := manager.{by_key_field}[{parameter_name}]
 	if !ok {{
 		return nil
 	}}
-	return &manager.entries[index]
+	return rowCopy(manager.entries[index])
 }}
 
 "#
             )),
             SemanticLookupKind::IntoCrcKey => source.push_str(&format!(
-                r#"func (manager *{manager_type}) {method_name}({parameter_name} any) *{record_type} {{
-	key, ok := crc32LookupKey({parameter_name})
+                r#"func (manager *{manager_type}) {method_name}({parameter_name} CRC32) *{record_type} {{
+	index, ok := manager.{by_key_field}[{parameter_name}]
 	if !ok {{
 		return nil
 	}}
-	index, ok := manager.{by_key_field}[key]
-	if !ok {{
-		return nil
-	}}
-	return &manager.entries[index]
+	return rowCopy(manager.entries[index])
 }}
 
 "#
             )),
             SemanticLookupKind::NumericKey(key_type) => {
                 let parameter_type = go_numeric_key_type(key_type);
+                let key_value = go_numeric_key_as_u32(&parameter_name, key_type);
                 source.push_str(&format!(
                     r#"func (manager *{manager_type}) {method_name}({parameter_name} {parameter_type}) *{record_type} {{
-	index, ok := manager.{by_key_field}[uint32({parameter_name})]
+	index, ok := manager.{by_key_field}[{key_value}]
 	if !ok {{
 		return nil
 	}}
-	return &manager.entries[index]
+	return rowCopy(manager.entries[index])
 }}
 
 "#
@@ -2033,7 +4713,7 @@ func new{manager_type}FromInstance(instance *managerInstance) (*{manager_type}, 
 	if !ok {{
 		return nil
 	}}
-	return &manager.entries[index]
+	return rowCopy(manager.entries[index])
 }}
 
 "#
@@ -2048,7 +4728,7 @@ func new{manager_type}FromInstance(instance *managerInstance) (*{manager_type}, 
 	if !ok {{
 		return nil
 	}}
-	return &manager.entries[index]
+	return rowCopy(manager.entries[index])
 }}
 
 "#
@@ -2059,20 +4739,22 @@ func new{manager_type}FromInstance(instance *managerInstance) (*{manager_type}, 
         let id_type = go_ids_type(record);
         let id_expression = go_ids_expression(record);
         source.push_str(&format!(
-            r#"func (manager *{manager_type}) {method_name}() []{id_type} {{
-	ids := make([]{id_type}, 0, len(manager.entries))
-	for index := range manager.entries {{
-		ids = append(ids, {id_expression})
+            r#"func (manager *{manager_type}) {method_name}() iter.Seq[{id_type}] {{
+	return func(yield func({id_type}) bool) {{
+		for index := range manager.entries {{
+			if !yield({id_expression}) {{
+				return
+			}}
+		}}
 	}}
-	return ids
 }}
 
 "#
         ));
     }
     source.push_str(&format!(
-        r#"func (manager *{manager_type}) Rows() ([]{record_type}, error) {{
-	return manager.entries, nil
+        r#"func (manager *{manager_type}) Rows() iter.Seq[{record_type}] {{
+	return rowValues(manager.entries)
 }}
 
 "#
@@ -2081,8 +4763,8 @@ func new{manager_type}FromInstance(instance *managerInstance) (*{manager_type}, 
         let method_name = go_method_name(method);
         if method_name != "Rows" {
             source.push_str(&format!(
-                r#"func (manager *{manager_type}) {method_name}() []{record_type} {{
-	return manager.entries
+                r#"func (manager *{manager_type}) {method_name}() iter.Seq[{record_type}] {{
+	return rowValues(manager.entries)
 }}
 
 "#
@@ -2110,14 +4792,14 @@ func new{manager_type}FromInstance(instance *managerInstance) (*{manager_type}, 
         ));
     }
 
-    source.push_str(&special_go_manager_extra_methods(manager_type));
+    source.push_str(&special_go_manager_extra_methods(&manager_type));
 
     push_go_semantic_materializer(source, record);
 }
 
 fn special_go_manager_extra_methods(manager_type: &str) -> String {
     match manager_type {
-        "PlayerDataManager" => r#"func (manager *PlayerDataManager) CategoricalProgressionID(tradeskill any) (*uint32, error) {
+        "PlayerDataManager" => r#"func (manager *PlayerDataManager) CategoricalProgressionID(tradeskill TradeskillType) (*CRC32, error) {
 	normalized, err := normalizeTradeskillType(tradeskill)
 	if err != nil {
 		return nil, err
@@ -2125,7 +4807,7 @@ fn special_go_manager_extra_methods(manager_type: &str) -> String {
 	if normalized == "None" || normalized == "WildernessSurvival" {
 		return nil, nil
 	}
-	value := crc32Lowercase(normalized)
+	value := CRC32(crc32Lowercase(normalized))
 	return &value, nil
 }
 
@@ -2136,52 +4818,112 @@ fn special_go_manager_extra_methods(manager_type: &str) -> String {
 }
 
 fn push_go_managers_facade(source: &mut String, surfaces: &[ManagerSurface]) {
-    source.push_str(
-        r#"
-type Managers struct {
-	cache *managerCache
-}
-
-func Open(loader *gameassets.AssetLoader) (*Managers, error) {
-	source, err := assetSourceFromLoader(loader)
-	if err != nil {
-		return nil, err
-	}
-	return &Managers{cache: newManagerCacheFromSource(source)}, nil
-}
-
-"#,
-    );
-
+    let mut fields = String::new();
+    let mut methods = String::new();
     let mut seen = BTreeSet::new();
     for surface in surfaces {
         let manager_name = manager_surface_name(surface);
         if !seen.insert(manager_name) {
             continue;
         }
-        let manager_type = match surface {
+        let manager_type = go_method_name(match surface {
             ManagerSurface::Direct(manager) | ManagerSurface::ProductBacked(manager) => {
                 manager.manager_class_name.as_str()
             }
+            ManagerSurface::Native { manager, .. } => manager.manager_class_name.as_str(),
             ManagerSurface::Semantic(record) => record.manager_class_name.as_str(),
             ManagerSurface::ItemData(manager) => manager.manager_class_name.as_str(),
-        };
+            ManagerSurface::Composition(manager) => manager.manager_class_name.as_str(),
+        });
         let accessor = go_manager_accessor_name(&manager_name);
-        let constructor = go_manager_constructor_name(manager_type);
-        source.push_str(&format!(
+        let constructor = go_manager_constructor_name(&manager_type);
+        let field = go_local_name(&accessor);
+        fields.push_str(&format!(
+            "\t{field}Once sync.Once\n\t{field} *{manager_type}\n\t{field}Err error\n"
+        ));
+        let (dependencies, arguments) = match surface {
+            ManagerSurface::Composition(manager) => {
+                go_lazy_manager_dependencies(&field, &manager.dependencies)
+            }
+            ManagerSurface::Native { dependencies, .. } => {
+                let (load, names) = go_lazy_manager_dependencies(&field, dependencies);
+                let arguments = if names.is_empty() {
+                    "managers.cache".to_owned()
+                } else {
+                    format!("managers.cache, {names}")
+                };
+                (load, arguments)
+            }
+            ManagerSurface::Direct(_)
+            | ManagerSurface::Semantic(_)
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::ProductBacked(_) => (String::new(), "managers.cache".to_owned()),
+        };
+        methods.push_str(&format!(
             r#"func (managers *Managers) {accessor}() (*{manager_type}, error) {{
-	return {constructor}(managers.cache)
+	managers.{field}Once.Do(func() {{
+{dependencies}		value, err := {constructor}({arguments})
+		if err != nil {{
+			managers.{field}Err = &ManagerLoadError{{Manager: {manager_name:?}, Err: err}}
+			return
+		}}
+		managers.{field} = value
+	}})
+	return managers.{field}, managers.{field}Err
 }}
 
 "#
         ));
     }
+    source.push_str(&format!(
+        r#"
+type ManagerLoadError struct {{
+	Manager string
+	Err error
+}}
+
+func (err *ManagerLoadError) Error() string {{
+	return fmt.Sprintf("load %s: %v", err.Manager, err.Err)
+}}
+
+func (err *ManagerLoadError) Unwrap() error {{ return err.Err }}
+
+type Managers struct {{
+    cache *managerCache
+{fields}}}
+
+func New(loader *assets.AssetLoader) (*Managers, error) {{
+	tableSchemas, err := loadTableSchemas()
+	if err != nil {{
+		return nil, err
+	}}
+	return &Managers{{cache: newManagerCache(loader, tableSchemas)}}, nil
+}}
+
+{methods}"#
+    ));
+}
+
+fn go_lazy_manager_dependencies(field: &str, dependencies: &[String]) -> (String, String) {
+    let mut load = String::new();
+    let mut names = Vec::new();
+    for dependency in dependencies {
+        let accessor = go_manager_accessor_name(dependency);
+        let local = go_local_name(&accessor);
+        load.push_str(&format!(
+            "\t\t{local}, err := managers.{accessor}()\n\t\tif err != nil {{\n\t\t\tmanagers.{}Err = err\n\t\t\treturn\n\t\t}}\n",
+            field,
+        ));
+        names.push(local);
+    }
+    (load, names.join(", "))
 }
 
 fn go_key_map_type(record: &SemanticManagerRecord) -> &'static str {
     match record.key {
         Some(SemanticManagerKey::String { .. } | SemanticManagerKey::EnumString { .. }) => "string",
-        Some(_) => "uint32",
+        Some(SemanticManagerKey::Crc { .. } | SemanticManagerKey::FallbackCrc { .. }) => "CRC32",
+        Some(SemanticManagerKey::Numeric { .. }) => "uint32",
         None => "uint32",
     }
 }
@@ -2192,8 +4934,13 @@ fn go_row_index_expression(record: &SemanticManagerRecord) -> Option<String> {
         | SemanticManagerKey::FallbackCrc { crc_field, .. } => {
             format!("rows[index].{}", go_field_name(crc_field))
         }
-        SemanticManagerKey::Numeric { key_field, .. } => {
-            format!("uint32(rows[index].{})", go_field_name(key_field))
+        SemanticManagerKey::Numeric {
+            key_field,
+            key_type,
+            ..
+        } => {
+            let field = format!("rows[index].{}", go_field_name(key_field));
+            go_numeric_key_as_u32(&field, *key_type)
         }
         SemanticManagerKey::EnumString { key_field, .. }
         | SemanticManagerKey::String { key_field, .. } => {
@@ -2213,11 +4960,21 @@ fn go_numeric_key_type(key_type: SemanticNumericKeyType) -> &'static str {
     }
 }
 
+fn go_numeric_key_as_u32(value: &str, key_type: SemanticNumericKeyType) -> String {
+    match key_type {
+        SemanticNumericKeyType::U8 | SemanticNumericKeyType::U16 => {
+            format!("uint32({value})")
+        }
+        SemanticNumericKeyType::U32 => value.to_owned(),
+    }
+}
+
 fn go_ids_type(record: &SemanticManagerRecord) -> &'static str {
     match record.key {
         Some(SemanticManagerKey::String { .. } | SemanticManagerKey::EnumString { .. }) => "string",
         Some(SemanticManagerKey::Numeric { key_type, .. }) => go_numeric_key_type(key_type),
-        _ => "uint32",
+        Some(SemanticManagerKey::Crc { .. } | SemanticManagerKey::FallbackCrc { .. }) => "CRC32",
+        None => "uint32",
     }
 }
 
@@ -2237,33 +4994,22 @@ fn go_ids_expression(record: &SemanticManagerRecord) -> String {
 }
 
 fn push_go_semantic_materializer(source: &mut String, record: &SemanticManagerRecord) {
-    let manager_type = &record.manager_class_name;
-    let record_type = &record.record_type_name;
+    let manager_type = go_method_name(&record.manager_class_name);
+    let record_type = go_method_name(&record.record_type_name);
     source.push_str(&format!(
-        r#"func materialize{manager_type}(instance *managerInstance) ([]{record_type}, error) {{
+        r#"func materialize{manager_type}(resources *managerResources) ([]{record_type}, error) {{
 	rows := []{record_type}{{}}
 "#
     ));
     if record.key.is_some() {
         source.push_str("\tseen := map[any]struct{}{}\n");
     }
-    source.push_str(&format!(
+    source.push_str(
         r#"
-	for _, tableName := range []string{{{}}} {{
-		table := instance.table(tableName)
-		if table == nil {{
-			return nil, fmt.Errorf("manager {} missing table %s", tableName)
-		}}
-		for _, sourceRow := range table.Rows {{
+	for _, table := range resources.tableOrder {
+		for _, sourceRow := range table.Rows {
 "#,
-        record
-            .tables
-            .iter()
-            .map(|table| go_string(&table.table_name))
-            .collect::<Vec<_>>()
-            .join(", "),
-        record.manager_name
-    ));
+    );
     push_go_key_materializer(source, record);
     for (filter_index, filter) in record.row_filters.iter().enumerate() {
         let column = go_string(&filter.column);
@@ -2379,12 +5125,39 @@ fn push_go_semantic_materializer(source: &mut String, record: &SemanticManagerRe
     }
     push_go_duplicate_key_policy(source, record);
 
-    for (index, field) in record.fields.iter().enumerate() {
-        source.push_str(&format!(
-            "			{}, err := {}\n			if err != nil {{\n				return nil, err\n			}}\n",
-            field_temp_name(index),
-            go_projection_value(field)
-        ));
+    for field in &record.fields {
+        let local = field_temp_name(field);
+        let value = go_projection_value(field);
+        if matches!(
+            field.transform,
+            SemanticProjectionTransform::EnumStringSkipInvalid
+                | SemanticProjectionTransform::EnumStringRejectDefault
+        ) {
+            source.push_str(&format!(
+                "			{local}, err := {value}\n			if err != nil {{\n				continue\n			}}\n"
+            ));
+        } else {
+            source.push_str(&format!(
+                "			{local}, err := {value}\n			if err != nil {{\n				return nil, err\n			}}\n"
+            ));
+        }
+    }
+    for field in &record.fields {
+        let local = field_temp_name(field);
+        match field.transform {
+            SemanticProjectionTransform::NonEmptyString
+            | SemanticProjectionTransform::NonEmptyStringList => source.push_str(&format!(
+                "\t\t\tif len({local}) == 0 {{\n\t\t\t\tcontinue\n\t\t\t}}\n"
+            )),
+            SemanticProjectionTransform::EnumStringRejectDefault => {
+                let enum_type = go_method_name(semantic_enum_type_name(field));
+                let default = go_method_name(semantic_enum_default_variant(field));
+                source.push_str(&format!(
+                    "\t\t\tif {local} == {enum_type}{default} {{\n\t\t\t\tcontinue\n\t\t\t}}\n"
+                ));
+            }
+            _ => {}
+        }
     }
     source.push_str(&format!("			row := {record_type}{{\n"));
     if let Some(field) = &record.source_row_field {
@@ -2394,11 +5167,11 @@ fn push_go_semantic_materializer(source: &mut String, record: &SemanticManagerRe
         ));
     }
     push_go_key_row_fields(source, record);
-    for (index, field) in record.fields.iter().enumerate() {
+    for field in &record.fields {
         source.push_str(&format!(
             "\t\t\t\t{}: {},\n",
             go_field_name(&field.name),
-            field_temp_name(index)
+            field_temp_name(field)
         ));
     }
     source.push_str(
@@ -2431,14 +5204,28 @@ fn push_go_key_materializer(source: &mut String, record: &SemanticManagerRecord)
             reject_zero_crc,
             ..
         } => {
-            source.push_str(&format!(
-                r#"			keyText, err := requiredStringCell(table, sourceRow, {})
+            let column = go_string(key_column);
+            if *skip_empty_key {
+                source.push_str(&format!(
+                    r#"			keyTextValue, err := optionalStringCell(table, sourceRow, {column})
 			if err != nil {{
 				return nil, err
 			}}
-"#,
-                go_string(key_column)
-            ));
+			if keyTextValue == nil {{
+				continue
+			}}
+			keyText := *keyTextValue
+"#
+                ));
+            } else {
+                source.push_str(&format!(
+                    r#"			keyText, err := requiredStringCell(table, sourceRow, {column})
+			if err != nil {{
+				return nil, err
+			}}
+"#
+                ));
+            }
             if *trim_key {
                 source.push_str("\t\t\tkeyValue := strings.TrimSpace(keyText)\n");
             } else {
@@ -2452,7 +5239,7 @@ fn push_go_key_materializer(source: &mut String, record: &SemanticManagerRecord)
 "#,
                 );
             }
-            source.push_str("\t\t\tkeyCRC := crc32Lowercase(keyValue)\n");
+            source.push_str("\t\t\tkeyCRC := CRC32(crc32Lowercase(keyValue))\n");
             if *reject_zero_crc {
                 source.push_str(
                     r#"			if keyCRC == 0 {
@@ -2505,7 +5292,7 @@ fn push_go_key_materializer(source: &mut String, record: &SemanticManagerRecord)
                 );
             }
             source.push_str(
-                r#"			keyCRC := crc32Lowercase(keyValue)
+                r#"			keyCRC := CRC32(crc32Lowercase(keyValue))
 			seenKey := keyCRC
 "#,
             );
@@ -2526,14 +5313,28 @@ fn push_go_key_materializer(source: &mut String, record: &SemanticManagerRecord)
             trim_key,
             ..
         } => {
-            source.push_str(&format!(
-                r#"			keyText, err := requiredStringCell(table, sourceRow, {})
+            let column = go_string(key_column);
+            if *skip_empty_key {
+                source.push_str(&format!(
+                    r#"			keyTextValue, err := optionalStringCell(table, sourceRow, {column})
 			if err != nil {{
 				return nil, err
 			}}
-"#,
-                go_string(key_column)
-            ));
+			if keyTextValue == nil {{
+				continue
+			}}
+			keyText := *keyTextValue
+"#
+                ));
+            } else {
+                source.push_str(&format!(
+                    r#"			keyText, err := requiredStringCell(table, sourceRow, {column})
+			if err != nil {{
+				return nil, err
+			}}
+"#
+                ));
+            }
             if *trim_key {
                 source.push_str("\t\t\tkeyValue := strings.TrimSpace(keyText)\n");
             } else {
@@ -2554,14 +5355,28 @@ fn push_go_key_materializer(source: &mut String, record: &SemanticManagerRecord)
             skip_empty_key,
             ..
         } => {
-            source.push_str(&format!(
-                r#"			keyValue, err := requiredStringCell(table, sourceRow, {})
+            let column = go_string(key_column);
+            if *skip_empty_key {
+                source.push_str(&format!(
+                    r#"			keyValuePointer, err := optionalStringCell(table, sourceRow, {column})
 			if err != nil {{
 				return nil, err
 			}}
-"#,
-                go_string(key_column)
-            ));
+			if keyValuePointer == nil {{
+				continue
+			}}
+			keyValue := *keyValuePointer
+"#
+                ));
+            } else {
+                source.push_str(&format!(
+                    r#"			keyValue, err := requiredStringCell(table, sourceRow, {column})
+			if err != nil {{
+				return nil, err
+			}}
+"#
+                ));
+            }
             if *skip_empty_key {
                 source.push_str(
                     r#"			if keyValue == "" {
@@ -2674,15 +5489,32 @@ fn go_numeric_key_value(
     }
 }
 
-fn field_temp_name(index: usize) -> String {
-    format!("fieldValue{index}")
+fn field_temp_name(field: &crate::manager_records::SemanticRecordField) -> String {
+    field_temp_name_by_name(&field.name)
+}
+
+fn field_temp_name_by_name(field_name: &str) -> String {
+    format!("{}Value", go_local_name(field_name))
 }
 
 fn go_projection_value(field: &crate::manager_records::SemanticRecordField) -> String {
     let column = go_string(&field.column);
     match field.transform {
-        SemanticProjectionTransform::String => {
+        SemanticProjectionTransform::String | SemanticProjectionTransform::NonEmptyString => {
             format!("requiredStringCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::EnumString
+        | SemanticProjectionTransform::EnumStringSkipInvalid
+        | SemanticProjectionTransform::EnumStringRejectDefault => {
+            let enum_type = go_method_name(semantic_enum_type_name(field));
+            format!("requiredEnumCell(table, sourceRow, {column}, parse{enum_type})")
+        }
+        SemanticProjectionTransform::EnumDefault => {
+            let enum_type = go_method_name(semantic_enum_type_name(field));
+            let default = go_method_name(semantic_enum_default_variant(field));
+            format!(
+                "enumCellOr(table, sourceRow, {column}, {enum_type}{default}, parse{enum_type})"
+            )
         }
         SemanticProjectionTransform::StringDefaultEmpty => {
             format!("stringCellDefaultEmpty(table, sourceRow, {column})")
@@ -2692,6 +5524,9 @@ fn go_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         }
         SemanticProjectionTransform::OptionalString => {
             format!("optionalStringCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::OptionalFirstString => {
+            format!("optionalFirstStringCell(table, sourceRow, {column})")
         }
         SemanticProjectionTransform::StringList => {
             format!("stringListCell(table, sourceRow, {column})")
@@ -2708,17 +5543,59 @@ fn go_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         SemanticProjectionTransform::OptionalBool => {
             format!("optionalBoolCell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::BoolDefaultFalse => {
+            format!("boolCellDefaultFalse(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::Crc32NonZeroBool => {
+            let reference = field
+                .reference_field
+                .as_deref()
+                .expect("CRC presence projections have reference fields");
+            format!(
+                "func() (bool, error) {{ return {} != 0, nil }}()",
+                field_temp_name_by_name(reference)
+            )
+        }
         SemanticProjectionTransform::U8 => {
             format!("requiredUint8Cell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::NonZeroU8 => {
+            format!("requiredNonZeroUint8Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::U8DefaultZero => {
+            format!("uint8CellDefault(table, sourceRow, {column}, 0)")
+        }
+        SemanticProjectionTransform::U8DefaultMax => {
+            format!("uint8CellDefault(table, sourceRow, {column}, 0xff)")
+        }
         SemanticProjectionTransform::U16 => {
             format!("requiredUint16Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::NonZeroU16 => {
+            format!("requiredNonZeroUint16Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::U16BelowMax => {
+            let max = field
+                .u16_max_exclusive
+                .expect("capped u16 projections have a maximum");
+            format!(
+                "func() (uint16, error) {{ value, err := requiredUint16Cell(table, sourceRow, {column}); if err != nil {{ return 0, err }}; if uint32(value) >= {max} {{ return 0, fmt.Errorf(\"row %s:%d %s exceeds supported cap {max}\", sourceRow.SourcePath, sourceRow.RowIndex+1, {column}) }}; return value, nil }}()"
+            )
         }
         SemanticProjectionTransform::U32 => {
             format!("requiredUint32Cell(table, sourceRow, {column})")
         }
         SemanticProjectionTransform::OptionalU32 => {
             format!("optionalUint32Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::U32DefaultZero => {
+            format!("uint32CellDefaultZero(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::NonZeroU32 => {
+            format!("requiredNonZeroUint32Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::OptionalNonZeroU32 => {
+            format!("optionalNonZeroUint32Cell(table, sourceRow, {column})")
         }
         SemanticProjectionTransform::I32 => {
             format!("requiredInt32Cell(table, sourceRow, {column})")
@@ -2729,6 +5606,22 @@ fn go_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         SemanticProjectionTransform::OptionalF32 => {
             format!("optionalFloat32Cell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::F32MinutesToSeconds => {
+            format!("float32MinutesToSecondsCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::F32UpperBound10000ZeroIsDefault => {
+            format!("upperBoundCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::F32LowerBound10000CappedToField => {
+            let reference = field
+                .reference_field
+                .as_deref()
+                .expect("lower-bound projections have reference fields");
+            format!(
+                "lowerBoundCell(table, sourceRow, {column}, {})",
+                field_temp_name_by_name(reference)
+            )
+        }
         SemanticProjectionTransform::F32List => {
             format!("float32ListCell(table, sourceRow, {column})")
         }
@@ -2736,7 +5629,25 @@ fn go_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
             format!("int32ListCell(table, sourceRow, {column})")
         }
         SemanticProjectionTransform::Crc32 => {
-            format!("requiredCrc32Cell(table, sourceRow, {column})")
+            format!("requiredCRC32Cell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::LowercaseCrcString => {
+            format!("lowercaseCrcStringCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::LowercaseCrcStringDefaultZero => {
+            format!("lowercaseCrcStringDefaultZero(table, sourceRow, {column}, false)")
+        }
+        SemanticProjectionTransform::FirstLowercaseCrcStringDefaultZero => {
+            format!("lowercaseCrcStringDefaultZero(table, sourceRow, {column}, true)")
+        }
+        SemanticProjectionTransform::TrimmedLowercaseCrcStringDefaultZero => {
+            format!("trimmedLowercaseCrcStringDefaultZero(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::OptionalCrc32 => {
+            format!("optionalCrc32Cell(table, sourceRow, {column}, false)")
+        }
+        SemanticProjectionTransform::OptionalCrc32ZeroAsNone => {
+            format!("optionalCrc32Cell(table, sourceRow, {column}, true)")
         }
         SemanticProjectionTransform::Crc32List => {
             format!("crc32ListCell(table, sourceRow, {column})")
@@ -2744,17 +5655,20 @@ fn go_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         SemanticProjectionTransform::OptionalLowercaseCrcString => {
             format!("optionalLowercaseCrcStringCell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::OptionalTrimmedLowercaseCrcString => {
+            format!("optionalTrimmedLowercaseCrcStringCell(table, sourceRow, {column})")
+        }
         SemanticProjectionTransform::LowercaseCrcStringList => {
             format!("lowercaseCrcStringListCell(table, sourceRow, {column})")
         }
-        SemanticProjectionTransform::RowIndex => {
-            format!("requiredUint32Cell(table, sourceRow, {column})")
+        SemanticProjectionTransform::ForeignKey => {
+            format!("requiredStringCell(table, sourceRow, {column})")
         }
-        SemanticProjectionTransform::OptionalRowIndex => {
-            format!("optionalUint32Cell(table, sourceRow, {column})")
+        SemanticProjectionTransform::OptionalForeignKey => {
+            format!("optionalStringCell(table, sourceRow, {column})")
         }
-        SemanticProjectionTransform::RowIndexList => {
-            format!("uint32ListCell(table, sourceRow, {column})")
+        SemanticProjectionTransform::ForeignKeyList => {
+            format!("stringListCell(table, sourceRow, {column})")
         }
         SemanticProjectionTransform::F32RangeInclusive => {
             format!("float32RangeCell(table, sourceRow, {column})")
@@ -2762,26 +5676,53 @@ fn go_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         SemanticProjectionTransform::U32RangeInclusive => {
             format!("uint32RangeCell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::OptionalCrc32F32PairList => {
+            format!("optionalCRC32Float32PairListCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::OptionalU8F32PairList => {
+            let enum_shape = field
+                .pair_first_enum_shape
+                .as_ref()
+                .expect("u8 pair-list projections have a reconciled enum schema");
+            let parser = go_pair_enum_parser_name(&enum_shape.name);
+            format!("optionalUint8Float32PairListCell(table, sourceRow, {column}, {parser})")
+        }
     }
 }
 
 const SEMANTIC_MANAGER_RUNTIME_GO: &str = r#"
-func rowCell(table *dynamicTable, row dynamicTableRow, columnName string) (*gameassets.DatasheetCellValue, bool) {
-	var column *ColumnSchema
-	for index := range table.Schema.Columns {
-		if columnMatches(&table.Schema.Columns[index], columnName) {
-			column = &table.Schema.Columns[index]
-			break
-		}
+func requiredEnumCell[T any](table *dynamicTable, row dynamicTableRow, columnName string, parse func(string) (T, error)) (T, error) {
+	var zero T
+	value, err := requiredStringCell(table, row, columnName)
+	if err != nil {
+		return zero, err
 	}
-	if column == nil {
+	return parse(value)
+}
+
+func enumCellOr[T any](table *dynamicTable, row dynamicTableRow, columnName string, fallback T, parse func(string) (T, error)) (T, error) {
+	value, err := optionalStringCell(table, row, columnName)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	if value == nil {
+		return fallback, nil
+	}
+	return parse(*value)
+}
+
+func rowCell(table *dynamicTable, row dynamicTableRow, columnName string) (*gameassets.DatasheetCellValue, bool) {
+	columnCRC, ok := table.ColumnCRCs[columnName]
+	if !ok {
 		return nil, false
 	}
-	slot, ok := row.ColumnSlots[column.CRC]
+	slot, ok := row.ColumnSlots[columnCRC]
 	if !ok || slot < 0 || slot >= len(row.Row.Cells) {
 		return nil, false
 	}
-	return &row.Row.Cells[slot].Value, true
+	value := row.Row.Cells[slot].Value
+	return &value, true
 }
 
 func requiredStringCell(table *dynamicTable, row dynamicTableRow, columnName string) (string, error) {
@@ -2876,6 +5817,23 @@ func stringCellDefaultEmpty(table *dynamicTable, row dynamicTableRow, columnName
 	return *text, nil
 }
 
+func optionalFirstStringCell(table *dynamicTable, row dynamicTableRow, columnName string) (*string, error) {
+	values, err := optionalStringListCell(table, row, columnName)
+	if err != nil || values == nil || len(*values) == 0 {
+		return nil, err
+	}
+	value := (*values)[0]
+	return &value, nil
+}
+
+func boolCellDefaultFalse(table *dynamicTable, row dynamicTableRow, columnName string) (bool, error) {
+	value, err := optionalBoolCell(table, row, columnName)
+	if err != nil || value == nil {
+		return false, err
+	}
+	return *value, nil
+}
+
 func requiredFloat32Cell(table *dynamicTable, row dynamicTableRow, columnName string) (float32, error) {
 	value, ok := rowCell(table, row, columnName)
 	if !ok {
@@ -2927,7 +5885,7 @@ func numberCellValue(value *gameassets.DatasheetCellValue, row dynamicTableRow, 
 			return float32(parsed), true, nil
 		}
 	}
-	return 0, false, fmt.Errorf("row %s:%d has non-number %s", row.SourcePath, row.RowIndex+1, columnName)
+	return 0, false, fmt.Errorf("row %s:%d has non-number %s=%q", row.SourcePath, row.RowIndex+1, columnName, value.String)
 }
 
 func requiredUint32Cell(table *dynamicTable, row dynamicTableRow, columnName string) (uint32, error) {
@@ -2950,6 +5908,36 @@ func optionalUint32Cell(table *dynamicTable, row dynamicTableRow, columnName str
 	return &normalized, nil
 }
 
+func uint32CellDefaultZero(table *dynamicTable, row dynamicTableRow, columnName string) (uint32, error) {
+	value, err := optionalUint32Cell(table, row, columnName)
+	if err != nil || value == nil {
+		return 0, err
+	}
+	return *value, nil
+}
+
+func requiredNonZeroUint32Cell(table *dynamicTable, row dynamicTableRow, columnName string) (uint32, error) {
+	value, err := requiredUint32Cell(table, row, columnName)
+	if err != nil {
+		return 0, err
+	}
+	if value == 0 {
+		return 0, fmt.Errorf("row %s:%d %s must be non-zero", row.SourcePath, row.RowIndex+1, columnName)
+	}
+	return value, nil
+}
+
+func optionalNonZeroUint32Cell(table *dynamicTable, row dynamicTableRow, columnName string) (*uint32, error) {
+	value, err := optionalUint32Cell(table, row, columnName)
+	if err != nil || value == nil {
+		return nil, err
+	}
+	if *value == 0 {
+		return nil, fmt.Errorf("row %s:%d %s must be non-zero", row.SourcePath, row.RowIndex+1, columnName)
+	}
+	return value, nil
+}
+
 func requiredUint16Cell(table *dynamicTable, row dynamicTableRow, columnName string) (uint16, error) {
 	value, err := requiredUint32Cell(table, row, columnName)
 	if err != nil {
@@ -2959,6 +5947,17 @@ func requiredUint16Cell(table *dynamicTable, row dynamicTableRow, columnName str
 		return 0, fmt.Errorf("row %s:%d %s exceeds u16", row.SourcePath, row.RowIndex+1, columnName)
 	}
 	return uint16(value), nil
+}
+
+func requiredNonZeroUint16Cell(table *dynamicTable, row dynamicTableRow, columnName string) (uint16, error) {
+	value, err := requiredUint16Cell(table, row, columnName)
+	if err != nil {
+		return 0, err
+	}
+	if value == 0 {
+		return 0, fmt.Errorf("row %s:%d %s must be non-zero", row.SourcePath, row.RowIndex+1, columnName)
+	}
+	return value, nil
 }
 
 func optionalUint16Cell(table *dynamicTable, row dynamicTableRow, columnName string) (*uint16, error) {
@@ -2996,6 +5995,25 @@ func optionalUint8Cell(table *dynamicTable, row dynamicTableRow, columnName stri
 	return &converted, nil
 }
 
+func uint8CellDefault(table *dynamicTable, row dynamicTableRow, columnName string, defaultValue uint8) (uint8, error) {
+	value, err := optionalUint8Cell(table, row, columnName)
+	if err != nil || value == nil {
+		return defaultValue, err
+	}
+	return *value, nil
+}
+
+func requiredNonZeroUint8Cell(table *dynamicTable, row dynamicTableRow, columnName string) (uint8, error) {
+	value, err := requiredUint8Cell(table, row, columnName)
+	if err != nil {
+		return 0, err
+	}
+	if value == 0 {
+		return 0, fmt.Errorf("row %s:%d %s must be non-zero", row.SourcePath, row.RowIndex+1, columnName)
+	}
+	return value, nil
+}
+
 func requiredInt32Cell(table *dynamicTable, row dynamicTableRow, columnName string) (int32, error) {
 	value, err := requiredFloat32Cell(table, row, columnName)
 	if err != nil {
@@ -3007,60 +6025,126 @@ func requiredInt32Cell(table *dynamicTable, row dynamicTableRow, columnName stri
 	return int32(value), nil
 }
 
-func requiredCrc32Cell(table *dynamicTable, row dynamicTableRow, columnName string) (uint32, error) {
+func requiredCRC32Cell(table *dynamicTable, row dynamicTableRow, columnName string) (CRC32, error) {
 	value, ok := rowCell(table, row, columnName)
 	if !ok {
 		return 0, fmt.Errorf("row %s:%d missing crc %s", row.SourcePath, row.RowIndex+1, columnName)
 	}
 	switch value.Kind {
 	case gameassets.DatasheetCellNumber:
-		return normalizeUint32(value.Number)
+		normalized, err := normalizeUint32(value.Number)
+		return CRC32(normalized), err
 	case gameassets.DatasheetCellString:
-		return crc32Lowercase(value.String), nil
+		return CRC32(crc32Lowercase(value.String)), nil
 	default:
 		return 0, fmt.Errorf("row %s:%d has non-crc %s", row.SourcePath, row.RowIndex+1, columnName)
 	}
 }
 
-func optionalCrc32Cell(table *dynamicTable, row dynamicTableRow, columnName string) (*uint32, error) {
+func optionalCrc32Cell(table *dynamicTable, row dynamicTableRow, columnName string, zeroAsNone bool) (*CRC32, error) {
 	value, ok := rowCell(table, row, columnName)
 	if !ok {
 		return nil, nil
 	}
-	var crc uint32
+	var crc CRC32
 	var err error
 	switch value.Kind {
 	case gameassets.DatasheetCellNumber:
-		crc, err = normalizeUint32(value.Number)
+		var normalized uint32
+		normalized, err = normalizeUint32(value.Number)
+		crc = CRC32(normalized)
 	case gameassets.DatasheetCellString:
 		if value.String == "" {
 			return nil, nil
 		}
-		crc = crc32Lowercase(value.String)
+		crc = CRC32(crc32Lowercase(value.String))
 	default:
 		return nil, fmt.Errorf("row %s:%d has non-crc %s", row.SourcePath, row.RowIndex+1, columnName)
 	}
-	if err != nil || crc == 0 {
+	if err != nil || zeroAsNone && crc == 0 {
 		return nil, err
 	}
 	return &crc, nil
 }
 
-func lowercaseCrcStringCell(table *dynamicTable, row dynamicTableRow, columnName string) (uint32, error) {
+func lowercaseCrcStringCell(table *dynamicTable, row dynamicTableRow, columnName string) (CRC32, error) {
 	text, err := requiredStringCell(table, row, columnName)
 	if err != nil {
 		return 0, err
 	}
-	return crc32Lowercase(text), nil
+	return CRC32(crc32Lowercase(text)), nil
 }
 
-func optionalLowercaseCrcStringCell(table *dynamicTable, row dynamicTableRow, columnName string) (*uint32, error) {
+func optionalLowercaseCrcStringCell(table *dynamicTable, row dynamicTableRow, columnName string) (*CRC32, error) {
 	text, err := optionalStringCell(table, row, columnName)
 	if err != nil || text == nil {
 		return nil, err
 	}
-	crc := crc32Lowercase(*text)
+	crc := CRC32(crc32Lowercase(*text))
 	return &crc, nil
+}
+
+func optionalTrimmedLowercaseCrcStringCell(table *dynamicTable, row dynamicTableRow, columnName string) (*CRC32, error) {
+	text, err := optionalStringCell(table, row, columnName)
+	if err != nil || text == nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(*text)
+	if trimmed == "" {
+		return nil, nil
+	}
+	crc := CRC32(crc32Lowercase(trimmed))
+	return &crc, nil
+}
+
+func lowercaseCrcStringDefaultZero(table *dynamicTable, row dynamicTableRow, columnName string, first bool) (CRC32, error) {
+	if first {
+		value, err := optionalFirstStringCell(table, row, columnName)
+		if err != nil || value == nil {
+			return 0, err
+		}
+		return CRC32(crc32Lowercase(*value)), nil
+	}
+	value, err := optionalStringCell(table, row, columnName)
+	if err != nil || value == nil {
+		return 0, err
+	}
+	return CRC32(crc32Lowercase(*value)), nil
+}
+
+func trimmedLowercaseCrcStringDefaultZero(table *dynamicTable, row dynamicTableRow, columnName string) (CRC32, error) {
+	value, err := optionalStringCell(table, row, columnName)
+	if err != nil || value == nil {
+		return 0, err
+	}
+	return CRC32(crc32Lowercase(strings.TrimSpace(*value))), nil
+}
+
+func float32MinutesToSecondsCell(table *dynamicTable, row dynamicTableRow, columnName string) (float32, error) {
+	value, err := requiredFloat32Cell(table, row, columnName)
+	return value * 60, err
+}
+
+func upperBoundCell(table *dynamicTable, row dynamicTableRow, columnName string) (float32, error) {
+	value, err := requiredFloat32Cell(table, row, columnName)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(float64(value)) || float32(math.Abs(float64(value))) <= 1.1920929e-7 {
+		return 10000, nil
+	}
+	return min(max(value, 0), 10000), nil
+}
+
+func lowerBoundCell(table *dynamicTable, row dynamicTableRow, columnName string, upperBound float32) (float32, error) {
+	value, err := requiredFloat32Cell(table, row, columnName)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(float64(value)) {
+		value = 0
+	}
+	return min(min(max(value, 0), 10000), upperBound), nil
 }
 
 func plusJoinedListCell(table *dynamicTable, row dynamicTableRow, columnName string) (string, error) {
@@ -3160,77 +6244,134 @@ func uint32ListCell(table *dynamicTable, row dynamicTableRow, columnName string)
 	return out, nil
 }
 
-func crc32ListCell(table *dynamicTable, row dynamicTableRow, columnName string) ([]uint32, error) {
+func crc32ListCell(table *dynamicTable, row dynamicTableRow, columnName string) ([]CRC32, error) {
 	value, ok := rowCell(table, row, columnName)
 	if !ok {
-		return []uint32{}, nil
+		return []CRC32{}, nil
 	}
 	if value.Kind == gameassets.DatasheetCellNumber {
 		normalized, err := normalizeUint32(value.Number)
 		if err != nil {
 			return nil, err
 		}
-		return []uint32{normalized}, nil
+		return []CRC32{CRC32(normalized)}, nil
 	}
 	if value.Kind != gameassets.DatasheetCellString {
 		return nil, fmt.Errorf("row %s:%d has non-crc-list %s", row.SourcePath, row.RowIndex+1, columnName)
 	}
 	parts := splitDesignerList(value.String)
-	out := make([]uint32, 0, len(parts))
+	out := make([]CRC32, 0, len(parts))
 	for _, part := range parts {
 		if number, err := strconv.ParseFloat(part, 32); err == nil {
 			normalized, err := normalizeUint32(float32(number))
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, normalized)
+			out = append(out, CRC32(normalized))
 		} else {
-			out = append(out, crc32Lowercase(part))
+			out = append(out, CRC32(crc32Lowercase(part)))
 		}
 	}
 	return out, nil
 }
 
-func lowercaseCrcStringListCell(table *dynamicTable, row dynamicTableRow, columnName string) ([]uint32, error) {
+func lowercaseCrcStringListCell(table *dynamicTable, row dynamicTableRow, columnName string) ([]CRC32, error) {
 	values, err := stringListCell(table, row, columnName)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]uint32, 0, len(values))
+	out := make([]CRC32, 0, len(values))
 	for _, value := range values {
 		if value != "" {
-			out = append(out, crc32Lowercase(value))
+			out = append(out, CRC32(crc32Lowercase(value)))
 		}
 	}
 	return out, nil
 }
 
-func float32RangeCell(table *dynamicTable, row dynamicTableRow, columnName string) (struct{ First, Second float32 }, error) {
-	values, err := numberRangeValues(table, row, columnName)
-	if err != nil {
-		return struct{ First, Second float32 }{}, err
+func optionalCRC32Float32PairListCell(table *dynamicTable, row dynamicTableRow, columnName string) (*[]struct{ First CRC32; Second float32 }, error) {
+	return optionalPairListCell(table, row, columnName, func(source string) (CRC32, error) {
+		if value, err := strconv.ParseUint(source, 10, 32); err == nil {
+			return CRC32(value), nil
+		}
+		return CRC32(crc32Lowercase(source)), nil
+	})
+}
+
+func optionalUint8Float32PairListCell(table *dynamicTable, row dynamicTableRow, columnName string, parseFirst func(string) (uint8, error)) (*[]struct{ First uint8; Second float32 }, error) {
+	return optionalPairListCell(table, row, columnName, parseFirst)
+}
+
+func optionalPairListCell[T any](table *dynamicTable, row dynamicTableRow, columnName string, parseFirst func(string) (T, error)) (*[]struct{ First T; Second float32 }, error) {
+	value, ok := rowCell(table, row, columnName)
+	if !ok ||
+		(value.Kind == gameassets.DatasheetCellNumber && value.Number == 0) ||
+		(value.Kind == gameassets.DatasheetCellBoolean && !value.Boolean) ||
+		(value.Kind == gameassets.DatasheetCellString && strings.TrimSpace(value.String) == "") {
+		return nil, nil
 	}
-	if len(values) < 2 {
+	if value.Kind != gameassets.DatasheetCellString {
+		return nil, fmt.Errorf("row %s:%d has non-pair-list %s", row.SourcePath, row.RowIndex+1, columnName)
+	}
+	entries := splitDesignerList(value.String)
+	pairs := make([]struct{ First T; Second float32 }, 0, len(entries))
+	for _, entry := range entries {
+		firstSource, secondSource, found := strings.Cut(entry, "=")
+		if !found {
+			return nil, fmt.Errorf("row %s:%d has invalid pair in %s", row.SourcePath, row.RowIndex+1, columnName)
+		}
+		first, err := parseFirst(strings.TrimSpace(firstSource))
+		if err != nil {
+			return nil, err
+		}
+		second, err := strconv.ParseFloat(strings.TrimSpace(secondSource), 32)
+		if err != nil || math.IsNaN(second) || math.IsInf(second, 0) {
+			return nil, fmt.Errorf("row %s:%d has invalid number in %s", row.SourcePath, row.RowIndex+1, columnName)
+		}
+		pairs = append(pairs, struct{ First T; Second float32 }{First: first, Second: float32(second)})
+	}
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	return &pairs, nil
+}
+
+func float32RangeCell(table *dynamicTable, row dynamicTableRow, columnName string) (struct{ First, Second float32 }, error) {
+	value, ok := rowCell(table, row, columnName)
+	if !ok {
 		return struct{ First, Second float32 }{}, fmt.Errorf("row %s:%d missing range %s", row.SourcePath, row.RowIndex+1, columnName)
 	}
-	return struct{ First, Second float32 }{First: float32(values[0]), Second: float32(values[1])}, nil
+	if value.Kind == gameassets.DatasheetCellNumber && !float32IsFinite(value.Number) {
+		return struct{ First, Second float32 }{}, fmt.Errorf("row %s:%d missing range %s", row.SourcePath, row.RowIndex+1, columnName)
+	}
+	if value.Kind == gameassets.DatasheetCellNumber {
+		return struct{ First, Second float32 }{First: value.Number, Second: value.Number}, nil
+	}
+	if value.Kind != gameassets.DatasheetCellString {
+		return struct{ First, Second float32 }{}, fmt.Errorf("row %s:%d has non-number range %s", row.SourcePath, row.RowIndex+1, columnName)
+	}
+	first, second := float32RangeFromText(value.String)
+	return struct{ First, Second float32 }{First: first, Second: second}, nil
 }
 
 func uint32RangeCell(table *dynamicTable, row dynamicTableRow, columnName string) (struct{ First, Second uint32 }, error) {
-	values, err := numberRangeValues(table, row, columnName)
-	if err != nil {
-		return struct{ First, Second uint32 }{}, err
+	value, ok := rowCell(table, row, columnName)
+	if !ok {
+		return struct{ First, Second uint32 }{}, fmt.Errorf("row %s:%d missing unsigned range %s", row.SourcePath, row.RowIndex+1, columnName)
 	}
-	if len(values) < 2 {
-		return struct{ First, Second uint32 }{}, fmt.Errorf("row %s:%d missing range %s", row.SourcePath, row.RowIndex+1, columnName)
+	if value.Kind == gameassets.DatasheetCellNumber {
+		endpoint, err := normalizeUint32(value.Number)
+		if err != nil {
+			return struct{ First, Second uint32 }{}, err
+		}
+		return struct{ First, Second uint32 }{First: endpoint, Second: endpoint}, nil
 	}
-	first, err := normalizeUint32(float32(values[0]))
-	if err != nil {
-		return struct{ First, Second uint32 }{}, err
+	if value.Kind != gameassets.DatasheetCellString {
+		return struct{ First, Second uint32 }{}, fmt.Errorf("row %s:%d has invalid unsigned range %s", row.SourcePath, row.RowIndex+1, columnName)
 	}
-	second, err := normalizeUint32(float32(values[1]))
+	first, second, err := uint32RangeFromText(value.String)
 	if err != nil {
-		return struct{ First, Second uint32 }{}, err
+		return struct{ First, Second uint32 }{}, fmt.Errorf("row %s:%d has invalid unsigned range %s: %w", row.SourcePath, row.RowIndex+1, columnName, err)
 	}
 	return struct{ First, Second uint32 }{First: first, Second: second}, nil
 }
@@ -3258,29 +6399,6 @@ func numberListCell(table *dynamicTable, row dynamicTableRow, columnName string)
 	return out, nil
 }
 
-func numberRangeValues(table *dynamicTable, row dynamicTableRow, columnName string) ([]float64, error) {
-	value, ok := rowCell(table, row, columnName)
-	if !ok {
-		return []float64{}, nil
-	}
-	if value.Kind == gameassets.DatasheetCellString {
-		return parseDesignerNumbers(splitDesignerRange(value.String), row, columnName)
-	}
-	return numberListCell(table, row, columnName)
-}
-
-func parseDesignerNumbers(parts []string, row dynamicTableRow, columnName string) ([]float64, error) {
-	out := make([]float64, 0, len(parts))
-	for _, part := range parts {
-		number, err := strconv.ParseFloat(part, 64)
-		if err != nil {
-			return nil, fmt.Errorf("row %s:%d has invalid number in %s", row.SourcePath, row.RowIndex+1, columnName)
-		}
-		out = append(out, number)
-	}
-	return out, nil
-}
-
 func splitDesignerList(value string) []string {
 	parts := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == '+' })
 	out := make([]string, 0, len(parts))
@@ -3293,23 +6411,47 @@ func splitDesignerList(value string) []string {
 	return out
 }
 
-func splitDesignerRange(value string) []string {
-	listed := splitDesignerList(value)
-	if len(listed) >= 2 {
-		return listed[:2]
-	}
-	text := strings.TrimSpace(value)
-	for index := 1; index < len(text); index++ {
-		if text[index] != '-' {
-			continue
+func float32RangeFromText(value string) (float32, float32) {
+	parts := strings.Split(strings.TrimSpace(value), "-")
+	if len(parts) == 1 {
+		endpoint, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 32)
+		if err == nil && !math.IsInf(endpoint, 0) && !math.IsNaN(endpoint) {
+			return float32(endpoint), float32(endpoint)
 		}
-		left := strings.TrimSpace(text[:index])
-		right := strings.TrimSpace(text[index+1:])
-		if left != "" && right != "" {
-			return []string{left, right}
+		return 0, 0
+	}
+	if len(parts) == 2 {
+		first, firstErr := strconv.ParseFloat(strings.TrimSpace(parts[0]), 32)
+		second, secondErr := strconv.ParseFloat(strings.TrimSpace(parts[1]), 32)
+		if firstErr == nil && secondErr == nil && !math.IsInf(first, 0) && !math.IsInf(second, 0) && !math.IsNaN(first) && !math.IsNaN(second) {
+			if first <= second {
+				return float32(first), float32(second)
+			}
+			return float32(second), float32(first)
 		}
 	}
-	return listed
+	return 0, 0
+}
+
+func uint32RangeFromText(value string) (uint32, uint32, error) {
+	parts := strings.Split(strings.TrimSpace(value), "-")
+	if len(parts) == 1 && strings.TrimSpace(parts[0]) != "" {
+		endpoint, err := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 32)
+		return uint32(endpoint), uint32(endpoint), err
+	}
+	if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != "" {
+		first, firstErr := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 32)
+		if firstErr != nil {
+			return 0, 0, firstErr
+		}
+		second, secondErr := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 32)
+		return uint32(first), uint32(second), secondErr
+	}
+	return 0, 0, fmt.Errorf("invalid u32 range")
+}
+
+func float32IsFinite(value float32) bool {
+	return !math.IsInf(float64(value), 0) && !math.IsNaN(float64(value))
 }
 
 func normalizeUint32(value float32) (uint32, error) {
@@ -3323,89 +6465,13 @@ func normalizeStringKey(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
-var crc32Table = func() [256]uint32 {
-	var table [256]uint32
-	for index := uint32(0); index < 256; index++ {
-		crc := index
-		for bit := 0; bit < 8; bit++ {
-			if crc&1 != 0 {
-				crc = 0xedb88320 ^ (crc >> 1)
-			} else {
-				crc >>= 1
-			}
-		}
-		table[index] = crc
-	}
-	return table
-}()
-
 func crc32Lowercase(value string) uint32 {
-	crc := uint32(0xffffffff)
-	for index := 0; index < len(value); index++ {
-		b := value[index]
-		if b >= 'A' && b <= 'Z' {
-			b += 32
-		}
-		crc = crc32Table[(crc^uint32(b))&0xff] ^ (crc >> 8)
-	}
-	return crc ^ 0xffffffff
-}
-
-func crc32LookupKey(value any) (uint32, bool) {
-	switch typed := value.(type) {
-	case uint32:
-		return typed, true
-	case uint:
-		if uint64(typed) > 4294967295 {
-			return 0, false
-		}
-		return uint32(typed), true
-	case uint64:
-		if typed > 4294967295 {
-			return 0, false
-		}
-		return uint32(typed), true
-	case uint16:
-		return uint32(typed), true
-	case uint8:
-		return uint32(typed), true
-	case int:
-		if typed < 0 || uint64(typed) > math.MaxUint32 {
-			return 0, false
-		}
-		return uint32(typed), true
-	case int64:
-		if typed < 0 || typed > 4294967295 {
-			return 0, false
-		}
-		return uint32(typed), true
-	case int32:
-		if typed < 0 {
-			return 0, false
-		}
-		return uint32(typed), true
-	case int16:
-		if typed < 0 {
-			return 0, false
-		}
-		return uint32(typed), true
-	case int8:
-		if typed < 0 {
-			return 0, false
-		}
-		return uint32(typed), true
-	case string:
-		return crc32Lowercase(typed), true
-	default:
-		return 0, false
-	}
+	return gametypes.CRC32FromStringLower(value).Value()
 }
 
 "#;
 
 const PRODUCT_MANAGER_RUNTIME_GO: &str = r#"
-type Vec3 = gameassets.Vec3
-
 const AllInteractOptionsCategory int32 = 0x15
 
 type ArmorOffsetDatabase struct {
@@ -3419,8 +6485,8 @@ type ArmorOffsetData struct {
 
 type AttachmentOffsetData struct {
 	Attachment      string
-	Position        Vec3
-	RotationDegrees Vec3
+	Position        Vector3
+	RotationDegrees Vector3
 }
 
 type EquipTypesDatabase struct {
@@ -3430,17 +6496,17 @@ type EquipTypesDatabase struct {
 type EquipTypeData struct {
 	Name                                   string
 	Attachment                             string
-	AttachmentOffsetPosition               Vec3
-	AttachmentOffsetRotationDegrees        Vec3
+	AttachmentOffsetPosition               Vector3
+	AttachmentOffsetRotationDegrees        Vector3
 	SheathData                             string
-	SheathOffsetPosition                   Vec3
-	SheathOffsetRotationDegrees            Vec3
+	SheathOffsetPosition                   Vector3
+	SheathOffsetRotationDegrees            Vector3
 	OffHandAttachment                      string
-	OffHandAttachmentOffsetPosition        Vec3
-	OffHandAttachmentOffsetRotationDegrees Vec3
+	OffHandAttachmentOffsetPosition        Vector3
+	OffHandAttachmentOffsetRotationDegrees Vector3
 	OffHandSheathData                      string
-	OffHandSheathOffsetPosition            Vec3
-	OffHandSheathOffsetRotationDegrees     Vec3
+	OffHandSheathOffsetPosition            Vector3
+	OffHandSheathOffsetRotationDegrees     Vector3
 }
 
 type GameDebugSettings struct {
@@ -3454,7 +6520,7 @@ type CombatDebugSettings struct {
 	DisableDurabilityPenaltyOnDeath  bool
 }
 
-type UiDatabase struct {
+type UIDatabase struct {
 	UnifiedInteractData UnifiedInteractData
 }
 
@@ -3508,7 +6574,7 @@ type InteractOptionData struct {
 	ExcludedStatusEffects                          []EffectData
 	DelayBeforeAddingRemovingEffect                float32
 	RemoveAddedEffectsOnInteractionEnd             bool
-	CheckPvpFlagIsSet                              bool
+	CheckPVPFlagIsSet                              bool
 	FactionRequired                                bool
 	ShowInstancedLootItemCount                      bool
 	RequiredAchievementName                        string
@@ -3539,12 +6605,37 @@ type CameraStateTransition struct {
 
 type TradeskillType string
 
-type EditCrc struct {
+const (
+	TradeskillNone               TradeskillType = "None"
+	TradeskillWeaponsmithing     TradeskillType = "Weaponsmithing"
+	TradeskillArmoring           TradeskillType = "Armoring"
+	TradeskillJewelcrafting      TradeskillType = "Jewelcrafting"
+	TradeskillArcana             TradeskillType = "Arcana"
+	TradeskillCooking            TradeskillType = "Cooking"
+	TradeskillFurnishing         TradeskillType = "Furnishing"
+	TradeskillEngineering        TradeskillType = "Engineering"
+	TradeskillSmelting           TradeskillType = "Smelting"
+	TradeskillWoodworking        TradeskillType = "Woodworking"
+	TradeskillLeatherworking     TradeskillType = "Leatherworking"
+	TradeskillWeaving            TradeskillType = "Weaving"
+	TradeskillStonecutting       TradeskillType = "Stonecutting"
+	TradeskillSkinning           TradeskillType = "Skinning"
+	TradeskillMining             TradeskillType = "Mining"
+	TradeskillLogging            TradeskillType = "Logging"
+	TradeskillHarvesting         TradeskillType = "Harvesting"
+	TradeskillWildernessSurvival TradeskillType = "WildernessSurvival"
+	TradeskillFishing            TradeskillType = "Fishing"
+	TradeskillAzothStaff         TradeskillType = "AzothStaff"
+	TradeskillMusician           TradeskillType = "Musician"
+	TradeskillRiding             TradeskillType = "Riding"
+)
+
+type EditCRC struct {
 	ValueStr string
-	ValueCrc uint32
+	ValueCRC CRC32
 }
 
-type ColorRgba struct {
+type ColorRGBA struct {
 	R float32
 	G float32
 	B float32
@@ -3554,13 +6645,6 @@ type ColorRgba struct {
 type IntRange struct {
 	Min int32
 	Max int32
-}
-
-type AssetReference struct {
-	Guid      string
-	SubID     uint32
-	AssetType string
-	Hint      string
 }
 
 type SimpleAssetReferenceTextureAsset struct {
@@ -3595,7 +6679,7 @@ type ItemRarityData struct {
 
 type PerkGenerationData struct {
 	PerkDataPerTier             []PerkTierData
-	CraftingResultLootBucketID  uint32
+	CraftingResultLootBucketID  CRC32
 	CraftingResultLootBucket    string
 	RollPerkOnUpgradeGS         int32
 	RollPerkOnUpgradeTier       int32
@@ -3609,16 +6693,16 @@ type PerkTierData struct {
 	GeneralGearScorePerkCount  map[int32][]IntRange
 	CraftingGearScorePerkCount map[int32][]IntRange
 	AttributePerkBucket        string
-	AttributePerkBucketID      uint32
+	AttributePerkBucketID      CRC32
 }
 
 type GuildSiegeWindowRegionData struct {
 	StartHour  uint32
 	EndHour    uint32
 	UTCOffset  int32
-	DstRuleID  uint32
+	DSTRuleID  CRC32
 	DstRule    string
-	ObservesDst bool
+	ObservesDST bool
 }
 
 type FactionInfluenceConfigData struct {
@@ -3637,27 +6721,27 @@ type FactionInfluenceConfigData struct {
 	UnderDogPVPInfluenceGain         float32
 	UnderDogPVPInfluenceGainCap      float32
 	MinimumInfluenceThresholdForWar  float32
-	InfluenceRaceAttackerWinGameEventID EditCrc
-	InfluenceRaceDefenderWinGameEventID EditCrc
-	InfluenceRaceLoseGameEventID     EditCrc
+	InfluenceRaceAttackerWinGameEventID EditCRC
+	InfluenceRaceDefenderWinGameEventID EditCRC
+	InfluenceRaceLoseGameEventID     EditCRC
 }
 
 type ValidGroupData struct {
 	Names      []string
 	Objectives []string
 	IconPaths  []string
-	Colors     []ColorRgba
+	Colors     []ColorRGBA
 }
 
 type WarData struct {
-	DeployableLimits map[uint32]WarDeployableLimitData
+	DeployableLimits map[CRC32]WarDeployableLimitData
 }
 
 type WarDeployableLimitData struct {
-	ID             uint32
+	ID             CRC32
 	DisplayName    string
 	BuildableNames []string
-	BuildableIDs   []uint32
+	BuildableIDs   []CRC32
 	AttackerLimits [3]int32
 	DefenderLimit  int32
 }
@@ -3747,7 +6831,7 @@ const (
 	crc32TypeID       = "9f4e062e-06a0-46d4-85df-e0da96467d3a"
 	colorTypeID       = "7894072a-9050-4f0f-901b-34b1a0d29417"
 	assetTypeID       = "77a19d40-8731-4d3c-9041-1b43047366a4"
-	editCrcTypeID     = "9a339de9-0d6e-4708-922f-f46af04370e9"
+	editCRCTypeID     = "9a339de9-0d6e-4708-922f-f46af04370e9"
 	simpleTextureAssetReferenceTypeID = "68e92460-5c0c-4031-9620-6f1a08763243"
 	simpleAssetReferenceBaseTypeID = "e16ca6c5-5c78-4ad9-8e9b-f8c1fb4d1db8"
 
@@ -3861,44 +6945,28 @@ const (
 	socialGuildRankPrivilegeIDsFieldCRC uint32 = 2614315740
 )
 
-var tradeskillTypes = []string{
-	"Weaponsmithing", "Armoring", "Jewelcrafting", "Arcana", "Cooking", "Furnishing",
-	"Engineering", "Smelting", "Woodworking", "Leatherworking", "Weaving", "Stonecutting",
-	"Skinning", "Mining", "Logging", "Harvesting", "WildernessSurvival", "Fishing",
-	"AzothStaff", "Musician", "Riding",
+var tradeskillTypes = []TradeskillType{
+	TradeskillWeaponsmithing, TradeskillArmoring, TradeskillJewelcrafting, TradeskillArcana,
+	TradeskillCooking, TradeskillFurnishing, TradeskillEngineering, TradeskillSmelting,
+	TradeskillWoodworking, TradeskillLeatherworking, TradeskillWeaving, TradeskillStonecutting,
+	TradeskillSkinning, TradeskillMining, TradeskillLogging, TradeskillHarvesting,
+	TradeskillWildernessSurvival, TradeskillFishing, TradeskillAzothStaff, TradeskillMusician,
+	TradeskillRiding,
 }
 
-func normalizeTradeskillType(value any) (string, error) {
-	switch value := value.(type) {
-	case uint8:
-		return normalizeTradeskillType(int(value))
-	case uint32:
-		return normalizeTradeskillType(int(value))
-	case int:
-		if value == 255 {
-			return "None", nil
-		}
-		if value >= 0 && value < len(tradeskillTypes) {
-			return tradeskillTypes[value], nil
-		}
-		return "", fmt.Errorf("unknown TradeskillType value %d", value)
-	case string:
-		normalized := strings.TrimSpace(value)
-		if normalized == "None" {
-			return normalized, nil
-		}
-		for _, candidate := range tradeskillTypes {
-			if candidate == normalized {
-				return normalized, nil
-			}
-		}
-		return "", fmt.Errorf("unknown TradeskillType %s", value)
-	default:
-		return normalizeTradeskillType(fmt.Sprint(value))
+func normalizeTradeskillType(value TradeskillType) (string, error) {
+	if value == TradeskillNone {
+		return string(value), nil
 	}
+	for _, candidate := range tradeskillTypes {
+		if candidate == value {
+			return string(value), nil
+		}
+	}
+	return "", fmt.Errorf("unknown TradeskillType %s", value)
 }
 
-func ParsePlayerBaseAttributes(bytes []byte) (*PlayerBaseAttributes, error) {
+func parsePlayerBaseAttributes(bytes []byte) (*PlayerBaseAttributes, error) {
 	root, err := strictObjectStreamRoot(bytes, playerBaseAttributesTypeID)
 	if err != nil {
 		return nil, err
@@ -3974,7 +7042,7 @@ func parsePerkGenerationData(element *gameassets.ObjectStreamElement) (PerkGener
 		if err != nil { return out, err }
 		out.PerkDataPerTier = append(out.PerkDataPerTier, value)
 	}
-	if out.CraftingResultLootBucketID, err = requiredCrc32FieldByName(element, "Crafting Result Loot Bucket Id"); err != nil { return out, err }
+	if out.CraftingResultLootBucketID, err = requiredCRC32FieldByName(element, "Crafting Result Loot Bucket Id"); err != nil { return out, err }
 	if out.CraftingResultLootBucket, err = requiredStringFieldByName(element, "Crafting Result Loot Bucket"); err != nil { return out, err }
 	if out.RollPerkOnUpgradeGS, err = requiredI32FieldByName(element, "Roll Perk On Upgrade GS"); err != nil { return out, err }
 	if out.RollPerkOnUpgradeTier, err = requiredI32FieldByName(element, "Roll Perk On Upgrade Tier"); err != nil { return out, err }
@@ -3995,7 +7063,7 @@ func parsePerkTierData(element *gameassets.ObjectStreamElement) (PerkTierData, e
 	if err != nil { return out, err }
 	if out.CraftingGearScorePerkCount, err = parseI32RangeMap(crafting); err != nil { return out, err }
 	if out.AttributePerkBucket, err = requiredStringFieldByName(element, "Attribute Perk Bucket"); err != nil { return out, err }
-	if out.AttributePerkBucketID, err = requiredCrc32FieldByName(element, "Attribute Perk Bucket Id"); err != nil { return out, err }
+	if out.AttributePerkBucketID, err = requiredCRC32FieldByName(element, "Attribute Perk Bucket Id"); err != nil { return out, err }
 	return out, nil
 }
 
@@ -4040,9 +7108,9 @@ func parseGuildRegion(element *gameassets.ObjectStreamElement) (GuildSiegeWindow
 	if out.StartHour, err = requiredU32FieldByName(element, "Start Hour"); err != nil { return out, err }
 	if out.EndHour, err = requiredU32FieldByName(element, "End Hour"); err != nil { return out, err }
 	if out.UTCOffset, err = requiredI32FieldByName(element, "UTCOffset"); err != nil { return out, err }
-	if out.DstRuleID, err = requiredCrc32FieldByName(element, "DstRuleId"); err != nil { return out, err }
+	if out.DSTRuleID, err = requiredCRC32FieldByName(element, "DstRuleId"); err != nil { return out, err }
 	if out.DstRule, err = requiredStringFieldByName(element, "DstRule"); err != nil { return out, err }
-	if out.ObservesDst, err = requiredBoolFieldByName(element, "ObservesDst"); err != nil { return out, err }
+	if out.ObservesDST, err = requiredBoolFieldByName(element, "ObservesDst"); err != nil { return out, err }
 	return out, nil
 }
 
@@ -4066,13 +7134,13 @@ func parseFactionInfluenceConfig(element *gameassets.ObjectStreamElement) (Facti
 	if out.MinimumInfluenceThresholdForWar, err = requiredF32FieldByName(element, "MinimumInfluenceThresholdForWar"); err != nil { return out, err }
 	attackerWin, err := requiredFieldByName(element, "Influence Race Attacker Win GameEventId")
 	if err != nil { return out, err }
-	if out.InfluenceRaceAttackerWinGameEventID, err = parseEditCrc(attackerWin); err != nil { return out, err }
+	if out.InfluenceRaceAttackerWinGameEventID, err = parseEditCRC(attackerWin); err != nil { return out, err }
 	defenderWin, err := requiredFieldByName(element, "Influence Race Defender Win GameEventId")
 	if err != nil { return out, err }
-	if out.InfluenceRaceDefenderWinGameEventID, err = parseEditCrc(defenderWin); err != nil { return out, err }
+	if out.InfluenceRaceDefenderWinGameEventID, err = parseEditCRC(defenderWin); err != nil { return out, err }
 	raceLose, err := requiredFieldByName(element, "Influence Race Lose GameEventId")
 	if err != nil { return out, err }
-	if out.InfluenceRaceLoseGameEventID, err = parseEditCrc(raceLose); err != nil { return out, err }
+	if out.InfluenceRaceLoseGameEventID, err = parseEditCRC(raceLose); err != nil { return out, err }
 	return out, nil
 }
 
@@ -4085,7 +7153,7 @@ func parseValidGroupData(element *gameassets.ObjectStreamElement) (ValidGroupDat
 	colors, err := requiredFieldByName(element, "Colors")
 	if err != nil { return out, err }
 	for index := range colors.Children {
-		color, err := readColorRgba(&colors.Children[index])
+		color, err := readColorRGBA(&colors.Children[index])
 		if err != nil { return out, err }
 		out.Colors = append(out.Colors, color)
 	}
@@ -4093,12 +7161,12 @@ func parseValidGroupData(element *gameassets.ObjectStreamElement) (ValidGroupDat
 }
 
 func parseWarData(element *gameassets.ObjectStreamElement) (WarData, error) {
-	out := WarData{DeployableLimits: map[uint32]WarDeployableLimitData{}}
+	out := WarData{DeployableLimits: map[CRC32]WarDeployableLimitData{}}
 	limits, err := requiredFieldByName(element, "Deployable Limits")
 	if err != nil { return out, err }
 	for index := range limits.Children {
 		pair := &limits.Children[index]
-		key, err := requiredCrc32FieldByName(pair, "value1")
+		key, err := requiredCRC32FieldByName(pair, "value1")
 		if err != nil { return out, err }
 		valueElement, err := requiredFieldByName(pair, "value2")
 		if err != nil { return out, err }
@@ -4112,10 +7180,10 @@ func parseWarData(element *gameassets.ObjectStreamElement) (WarData, error) {
 func parseWarDeployableLimit(element *gameassets.ObjectStreamElement) (WarDeployableLimitData, error) {
 	var out WarDeployableLimitData
 	var err error
-	if out.ID, err = requiredCrc32FieldByName(element, "m_id"); err != nil { return out, err }
+	if out.ID, err = requiredCRC32FieldByName(element, "m_id"); err != nil { return out, err }
 	if out.DisplayName, err = requiredStringFieldByName(element, "m_displayName"); err != nil { return out, err }
 	if out.BuildableNames, err = requiredStringSequenceByName(element, "m_buildableNames"); err != nil { return out, err }
-	if out.BuildableIDs, err = requiredCrc32SequenceByName(element, "m_buildableIds"); err != nil { return out, err }
+	if out.BuildableIDs, err = requiredCRC32SequenceByName(element, "m_buildableIds"); err != nil { return out, err }
 	attackerLimits, err := requiredFieldByName(element, "m_attackerLimits")
 	if err != nil { return out, err }
 	if out.AttackerLimits, err = readI32Triple(attackerLimits); err != nil { return out, err }
@@ -4123,7 +7191,7 @@ func parseWarDeployableLimit(element *gameassets.ObjectStreamElement) (WarDeploy
 	return out, nil
 }
 
-func ParseSettlementProgressionData(bytes []byte) (*SettlementProgressionData, error) {
+func parseSettlementProgressionData(bytes []byte) (*SettlementProgressionData, error) {
 	root, err := strictObjectStreamRoot(bytes, settlementProgressionDataTypeID)
 	if err != nil { return nil, err }
 	categories, err := requiredTypedChild(root, settlementProgressionCategoriesFieldCRC, settlementProgressionCategoryVectorTypeID)
@@ -4170,7 +7238,7 @@ func parseProgressionSpawnerEntry(element *gameassets.ObjectStreamElement) (Prog
 	return out, nil
 }
 
-func ParseGatheringDatabase(bytes []byte) (*GatheringDatabase, error) {
+func parseGatheringDatabase(bytes []byte) (*GatheringDatabase, error) {
 	root, err := strictObjectStreamRoot(bytes, gatheringDatabaseTypeID)
 	if err != nil { return nil, err }
 	dataElement, err := requiredTypedChild(root, gatheringDataFieldCRC, gatheringDataTypeID)
@@ -4223,7 +7291,7 @@ func parseGatheringAction(element *gameassets.ObjectStreamElement) (GatheringAct
 	return GatheringAction{Name: name, MannequinTag: tag}, nil
 }
 
-func ParseGatheringActionDatabase(bytes []byte) (*GatheringActionDatabase, error) {
+func parseGatheringActionDatabase(bytes []byte) (*GatheringActionDatabase, error) {
 	root, err := strictObjectStreamRoot(bytes, gatheringActionDatabaseTypeID)
 	if err != nil { return nil, err }
 	actionsElement, err := requiredTypedChild(root, gatheringActionsFieldCRC, gatheringActionDataVectorTypeID)
@@ -4246,7 +7314,7 @@ func parseGatheringActionData(element *gameassets.ObjectStreamElement) (Gatherin
 	return GatheringActionData{Name: name, MannequinTag: tag}, nil
 }
 
-func ParseCraftingStationDatabase(bytes []byte) (*CraftingStationDatabase, error) {
+func parseCraftingStationDatabase(bytes []byte) (*CraftingStationDatabase, error) {
 	root, err := strictObjectStreamRoot(bytes, craftingStationDatabaseTypeID)
 	if err != nil { return nil, err }
 	stations, err := requiredTypedChild(root, craftingStationsFieldCRC, craftingStationDataVectorTypeID)
@@ -4273,7 +7341,7 @@ func parseCraftingStationData(element *gameassets.ObjectStreamElement) (Crafting
 	return out, nil
 }
 
-func ParseSocialRankDatabase(bytes []byte) (*SocialRankDatabase, error) {
+func parseSocialRankDatabase(bytes []byte) (*SocialRankDatabase, error) {
 	root, err := strictObjectStreamRoot(bytes, socialRankDatabaseTypeID)
 	if err != nil { return nil, err }
 	ranks, err := requiredTypedChild(root, socialRanksFieldCRC, socialRankDataVectorTypeID)
@@ -4312,7 +7380,7 @@ func parseSocialGuildRankData(element *gameassets.ObjectStreamElement) (SocialGu
 	return out, nil
 }
 
-func ParseArmorOffsetDatabase(bytes []byte) (*ArmorOffsetDatabase, error) {
+func parseArmorOffsetDatabase(bytes []byte) (*ArmorOffsetDatabase, error) {
 	root, err := strictObjectStreamRoot(bytes, armorOffsetDatabaseTypeID)
 	if err != nil {
 		return nil, err
@@ -4374,20 +7442,20 @@ func parseAttachmentOffsetData(element *gameassets.ObjectStreamElement) (Attachm
 	return AttachmentOffsetData{Attachment: attachment, Position: position, RotationDegrees: rotation}, nil
 }
 
-func ArmorOffsetByName(database *ArmorOffsetDatabase, name string) *ArmorOffsetData {
+func armorOffsetByName(database *ArmorOffsetDatabase, name string) *ArmorOffsetData {
 	for index := range database.Offsets {
 		if database.Offsets[index].Name == name {
-			return &database.Offsets[index]
+			return rowCopy(database.Offsets[index])
 		}
 	}
 	return nil
 }
 
-func FurthestArmorAttachmentOffset(database *ArmorOffsetDatabase, armorOffsetNames []string, attachmentName string, currentPosition Vec3) *AttachmentOffsetData {
+func furthestArmorAttachmentOffset(database *ArmorOffsetDatabase, armorOffsetNames []string, attachmentName string, currentPosition Vector3) *AttachmentOffsetData {
 	var best *AttachmentOffsetData
 	bestLength := vec3Length(currentPosition)
 	for _, offsetName := range armorOffsetNames {
-		offset := ArmorOffsetByName(database, offsetName)
+		offset := armorOffsetByName(database, offsetName)
 		if offset == nil {
 			continue
 		}
@@ -4406,7 +7474,7 @@ func FurthestArmorAttachmentOffset(database *ArmorOffsetDatabase, armorOffsetNam
 	return best
 }
 
-func ParseEquipTypesDatabase(bytes []byte) (*EquipTypesDatabase, error) {
+func parseEquipTypesDatabase(bytes []byte) (*EquipTypesDatabase, error) {
 	root, err := strictObjectStreamRoot(bytes, equipTypesDatabaseTypeID)
 	if err != nil {
 		return nil, err
@@ -4499,7 +7567,7 @@ func parseEquipTypeData(element *gameassets.ObjectStreamElement) (EquipTypeData,
 	}, nil
 }
 
-func ParseGameDebugSettings(bytes []byte) (*GameDebugSettings, error) {
+func parseGameDebugSettings(bytes []byte) (*GameDebugSettings, error) {
 	root, err := strictObjectStreamRoot(bytes, gameDebugSettingsTypeID)
 	if err != nil {
 		return nil, err
@@ -4532,7 +7600,7 @@ func ParseGameDebugSettings(bytes []byte) (*GameDebugSettings, error) {
 	}}, nil
 }
 
-func DisabledCombatToggleCount(combat CombatDebugSettings) int {
+func disabledCombatToggleCount(combat CombatDebugSettings) int {
 	count := 0
 	if combat.DisablePlayerLootDropOnDeath { count++ }
 	if combat.DisableWeaponDurability { count++ }
@@ -4541,7 +7609,7 @@ func DisabledCombatToggleCount(combat CombatDebugSettings) int {
 	return count
 }
 
-func ParseUiDatabase(bytes []byte) (*UiDatabase, error) {
+func parseUIDatabase(bytes []byte) (*UIDatabase, error) {
 	root, err := strictObjectStreamRoot(bytes, uiDatabaseTypeID)
 	if err != nil {
 		return nil, err
@@ -4554,7 +7622,7 @@ func ParseUiDatabase(bytes []byte) (*UiDatabase, error) {
 	if err != nil {
 		return nil, err
 	}
-	database := &UiDatabase{}
+	database := &UIDatabase{}
 	for index := range optionsElement.Children {
 		option, err := parseInteractOptionData(&optionsElement.Children[index])
 		if err != nil {
@@ -4610,7 +7678,7 @@ func parseInteractOptionData(element *gameassets.ObjectStreamElement) (InteractO
 	if option.ExcludedStatusEffects, err = parseEffects(&element.Children[33]); err != nil { return InteractOptionData{}, err }
 	if option.DelayBeforeAddingRemovingEffect, err = f32Child(element, 34); err != nil { return InteractOptionData{}, err }
 	if option.RemoveAddedEffectsOnInteractionEnd, err = boolChild(element, 35); err != nil { return InteractOptionData{}, err }
-	if option.CheckPvpFlagIsSet, err = boolChild(element, 36); err != nil { return InteractOptionData{}, err }
+	if option.CheckPVPFlagIsSet, err = boolChild(element, 36); err != nil { return InteractOptionData{}, err }
 	if option.FactionRequired, err = boolChild(element, 37); err != nil { return InteractOptionData{}, err }
 	if option.ShowInstancedLootItemCount, err = boolChild(element, 38); err != nil { return InteractOptionData{}, err }
 	if option.RequiredAchievementName, err = stringChild(element, 39); err != nil { return InteractOptionData{}, err }
@@ -4622,37 +7690,30 @@ func parseInteractOptionData(element *gameassets.ObjectStreamElement) (InteractO
 	return option, nil
 }
 
-func InteractOptionByID(options []InteractOptionData, id any) *InteractOptionData {
-	var key uint32
-	switch value := id.(type) {
-	case uint32:
-		key = value
-	case int:
-		key = uint32(value)
-	case string:
-		key = crc32Lowercase(value)
-	default:
-		key = crc32Lowercase(fmt.Sprint(value))
-	}
+func interactOptionByID(options []InteractOptionData, id CRC32) *InteractOptionData {
 	for index := range options {
-		if crc32Lowercase(options[index].Name) == key {
-			return &options[index]
+		if gametypes.CRC32FromStringLower(options[index].Name) == id {
+			return rowCopy(options[index])
 		}
 	}
 	return nil
 }
 
-func InteractOptionsByCategory(options []InteractOptionData, category int32) []InteractOptionData {
-	var out []InteractOptionData
-	for _, option := range options {
-		if option.InteractOptionCategory == category || option.InteractOptionCategory == AllInteractOptionsCategory {
-			out = append(out, option)
+func interactOptionsByCategory(options []InteractOptionData, category int32) iter.Seq[InteractOptionData] {
+	return func(yield func(InteractOptionData) bool) {
+		for index := range options {
+			option := options[index]
+			if option.InteractOptionCategory != category && option.InteractOptionCategory != AllInteractOptionsCategory {
+				continue
+			}
+			if !yield(option) {
+				return
+			}
 		}
 	}
-	return out
 }
 
-func ParseGameCameraSettings(bytes []byte) (*GameCameraSettings, error) {
+func parseGameCameraSettings(bytes []byte) (*GameCameraSettings, error) {
 	xml := strings.TrimPrefix(string(bytes), "\ufeff")
 	settings := &GameCameraSettings{Fields: xmlFields(xml)}
 	settings.DefaultStateName = settings.Fields["defaultStateName"]
@@ -4710,10 +7771,10 @@ func requiredStringField(element *gameassets.ObjectStreamElement, nameCRC uint32
 	return gameassets.ObjectStreamString(child), nil
 }
 
-func requiredVec3Field(element *gameassets.ObjectStreamElement, nameCRC uint32) (Vec3, error) {
+func requiredVec3Field(element *gameassets.ObjectStreamElement, nameCRC uint32) (Vector3, error) {
 	child, err := requiredTypedChild(element, nameCRC, vector3TypeID)
 	if err != nil {
-		return Vec3{}, err
+		return Vector3{}, err
 	}
 	return gameassets.ObjectStreamVec3(child)
 }
@@ -4778,12 +7839,12 @@ func requiredBoolFieldByName(element *gameassets.ObjectStreamElement, fieldName 
 	return requiredBoolField(element, crc32Lowercase(fieldName))
 }
 
-func requiredCrc32FieldByName(element *gameassets.ObjectStreamElement, fieldName string) (uint32, error) {
+func requiredCRC32FieldByName(element *gameassets.ObjectStreamElement, fieldName string) (CRC32, error) {
 	child, err := requiredFieldByName(element, fieldName)
 	if err != nil {
 		return 0, err
 	}
-	return readCrc32(child)
+	return readCRC32(child)
 }
 
 func requiredStringSequenceByName(element *gameassets.ObjectStreamElement, fieldName string) ([]string, error) {
@@ -4794,14 +7855,14 @@ func requiredStringSequenceByName(element *gameassets.ObjectStreamElement, field
 	return readStringVector(child)
 }
 
-func requiredCrc32SequenceByName(element *gameassets.ObjectStreamElement, fieldName string) ([]uint32, error) {
+func requiredCRC32SequenceByName(element *gameassets.ObjectStreamElement, fieldName string) ([]CRC32, error) {
 	child, err := requiredFieldByName(element, fieldName)
 	if err != nil {
 		return nil, err
 	}
-	values := make([]uint32, 0, len(child.Children))
+	values := make([]CRC32, 0, len(child.Children))
 	for index := range child.Children {
-		value, err := readCrc32(&child.Children[index])
+		value, err := readCRC32(&child.Children[index])
 		if err != nil {
 			return nil, err
 		}
@@ -4822,33 +7883,35 @@ func readStringVector(element *gameassets.ObjectStreamElement) ([]string, error)
 	return values, nil
 }
 
-func readCrc32(element *gameassets.ObjectStreamElement) (uint32, error) {
+func readCRC32(element *gameassets.ObjectStreamElement) (CRC32, error) {
 	if err := gameassets.RequireObjectStreamType(element, crc32TypeID); err != nil {
 		return 0, err
 	}
 	if len(element.Data) == 4 {
-		return gameassets.ObjectStreamU32(element)
+	value, err := gameassets.ObjectStreamU32(element)
+	return CRC32(value), err
 	}
 	value, err := gameassets.RequiredChildByNameCRC(element, crc32Lowercase("Value"))
 	if err != nil {
 		return 0, err
 	}
-	return gameassets.ObjectStreamU32(value)
+	raw, err := gameassets.ObjectStreamU32(value)
+	return CRC32(raw), err
 }
 
-func parseEditCrc(element *gameassets.ObjectStreamElement) (EditCrc, error) {
-	if err := gameassets.RequireObjectStreamType(element, editCrcTypeID); err != nil {
-		return EditCrc{}, err
+func parseEditCRC(element *gameassets.ObjectStreamElement) (EditCRC, error) {
+	if err := gameassets.RequireObjectStreamType(element, editCRCTypeID); err != nil {
+		return EditCRC{}, err
 	}
 	valueStr, err := requiredStringFieldByName(element, "m_valueStr")
 	if err != nil {
-		return EditCrc{}, err
+		return EditCRC{}, err
 	}
-	valueCrc, err := requiredCrc32FieldByName(element, "m_valueCrc")
+	valueCRC, err := requiredCRC32FieldByName(element, "m_valueCrc")
 	if err != nil {
-		return EditCrc{}, err
+		return EditCRC{}, err
 	}
-	return EditCrc{ValueStr: valueStr, ValueCrc: valueCrc}, nil
+	return EditCRC{ValueStr: valueStr, ValueCRC: valueCRC}, nil
 }
 
 func readI32Triple(element *gameassets.ObjectStreamElement) ([3]int32, error) {
@@ -4876,14 +7939,14 @@ func readI32Value(element *gameassets.ObjectStreamElement) (int32, error) {
 	return 0, fmt.Errorf("ObjectStream element %s is not an i32 value", element.TypeID)
 }
 
-func readColorRgba(element *gameassets.ObjectStreamElement) (ColorRgba, error) {
+func readColorRGBA(element *gameassets.ObjectStreamElement) (ColorRGBA, error) {
 	if err := gameassets.RequireObjectStreamType(element, colorTypeID); err != nil {
-		return ColorRgba{}, err
+		return ColorRGBA{}, err
 	}
 	if len(element.Data) != 16 {
-		return ColorRgba{}, fmt.Errorf("ObjectStream color has %d bytes, expected 16", len(element.Data))
+		return ColorRGBA{}, fmt.Errorf("ObjectStream color has %d bytes, expected 16", len(element.Data))
 	}
-	return ColorRgba{
+	return ColorRGBA{
 		R: math.Float32frombits(binary.BigEndian.Uint32(element.Data[0:4])),
 		G: math.Float32frombits(binary.BigEndian.Uint32(element.Data[4:8])),
 		B: math.Float32frombits(binary.BigEndian.Uint32(element.Data[8:12])),
@@ -4936,11 +7999,18 @@ func readAssetReference(element *gameassets.ObjectStreamElement) (AssetReference
 		} else {
 			subID = binary.BigEndian.Uint32(data[16:20])
 		}
+		guid, err := uuid.FromBytes(data[0:16])
+		if err != nil {
+			return AssetReference{}, fmt.Errorf("decode AZ::Data::Asset id: %w", err)
+		}
+		assetType, err := uuid.FromBytes(data[layout.assetTypeOffset : layout.assetTypeOffset+16])
+		if err != nil {
+			return AssetReference{}, fmt.Errorf("decode AZ::Data::Asset type: %w", err)
+		}
 		return AssetReference{
-			Guid: uuidFromBytes(data[0:16]),
-			SubID: subID,
-			AssetType: uuidFromBytes(data[layout.assetTypeOffset:layout.assetTypeOffset+16]),
-			Hint: string(data[layout.hintOffset:]),
+			ID:        AssetID{GUID: guid, SubID: subID},
+			AssetType: assetType,
+			Hint:      string(data[layout.hintOffset:]),
 		}, nil
 	}
 	return AssetReference{}, fmt.Errorf("unsupported AZ::Data::Asset layout with %d bytes", len(data))
@@ -4959,10 +8029,6 @@ func readTextureReference(element *gameassets.ObjectStreamElement) (SimpleAssetR
 		return SimpleAssetReferenceTextureAsset{}, err
 	}
 	return SimpleAssetReferenceTextureAsset{AssetPath: assetPath}, nil
-}
-
-func uuidFromBytes(bytes []byte) string {
-	return fmt.Sprintf("%x-%x-%x-%x-%x", bytes[0:4], bytes[4:6], bytes[6:8], bytes[8:10], bytes[10:16])
 }
 
 func childAt(element *gameassets.ObjectStreamElement, index int, typeID ...string) (*gameassets.ObjectStreamElement, error) {
@@ -5086,7 +8152,7 @@ func firstStringDescendant(element *gameassets.ObjectStreamElement) string {
 	return ""
 }
 
-func vec3Length(value Vec3) float64 {
+func vec3Length(value Vector3) float64 {
 	return math.Sqrt(float64(value.X*value.X + value.Y*value.Y + value.Z*value.Z))
 }
 
@@ -5132,38 +8198,29 @@ func firstPresent(values ...string) string {
 "#;
 
 const DYNAMIC_MANAGER_RUNTIME_GO: &str = r#"
-type managerInstance struct {
-	definition       managerDefinition
-	tables           map[string]*dynamicTable
-	assets           []string
-	assetBytesByPath map[string][]byte
-	managers         map[string]*managerInstance
+type tableSelector struct {
+	name    string
+	rowType string
 }
 
-func (instance *managerInstance) table(name string) *dynamicTable {
-	return instance.tables[name]
+type managerResources struct {
+	managerName string
+	tables      map[tableSelector]*dynamicTable
+	tableOrder  []*dynamicTable
+	assets      map[string][]byte
 }
 
-func (instance *managerInstance) manager(name string) *managerInstance {
-	return instance.managers[name]
+func (resources *managerResources) table(selector tableSelector) *dynamicTable {
+	return resources.tables[selector]
 }
 
-func (instance *managerInstance) assetBytes(path ...string) ([]byte, bool) {
-	requested := ""
-	if len(path) > 0 {
-		requested = path[0]
-	} else if len(instance.assets) == 1 {
-		requested = instance.assets[0]
-	}
-	if requested == "" {
-		return nil, false
-	}
-	normalized := normalizeDataPath(requested)
-	if bytes, ok := instance.assetBytesByPath[normalized]; ok {
+func (resources *managerResources) assetBytes(path string) ([]byte, bool) {
+	normalized := normalizeDataPath(path)
+	if bytes, ok := resources.assets[normalized]; ok {
 		return bytes, true
 	}
 	suffix := "/" + normalized
-	for candidate, bytes := range instance.assetBytesByPath {
+	for candidate, bytes := range resources.assets {
 		if strings.HasSuffix(candidate, suffix) {
 			return bytes, true
 		}
@@ -5171,310 +8228,182 @@ func (instance *managerInstance) assetBytes(path ...string) ([]byte, bool) {
 	return nil, false
 }
 
-func (instance *managerInstance) requiredAssetBytes(path ...string) ([]byte, error) {
-	bytes, ok := instance.assetBytes(path...)
+func (resources *managerResources) requiredAssetBytes(path string) ([]byte, error) {
+	bytes, ok := resources.assetBytes(path)
 	if !ok {
-		requested := "<single>"
-		if len(path) > 0 {
-			requested = path[0]
-		}
-		return nil, fmt.Errorf("manager %s asset %s was not loaded", instance.definition.Name, requested)
+		return nil, fmt.Errorf("manager %s asset %s was not loaded", resources.managerName, path)
 	}
 	return bytes, nil
 }
 
-func schemaRows[T any](instance *managerInstance, rowType string, read func(*dynamicTable, dynamicTableRow) (T, error)) ([]T, error) {
-	rows := []T{}
-	for _, table := range instance.allTables() {
+func schemaFamilyEntries[TTable ~string, TRow any](resources *managerResources, rowType string, read func(*dynamicTable, dynamicTableRow) (TRow, error), resolveTable func(string) (TTable, bool)) ([]RowEntry[TTable, TRow], error) {
+	entries := []RowEntry[TTable, TRow]{}
+	for _, table := range resources.tableOrder {
 		if table.Schema.RowType != rowType {
 			continue
 		}
 		for _, sourceRow := range table.Rows {
+			tableID, ok := resolveTable(sourceRow.SourcePath)
+			if !ok {
+				return nil, fmt.Errorf("manager %s cannot resolve source %s to a typed table", resources.managerName, sourceRow.SourcePath)
+			}
 			row, err := read(table, sourceRow)
 			if err != nil {
 				return nil, err
 			}
-			rows = append(rows, row)
-		}
-	}
-	return rows, nil
-}
-
-func schemaFamilyEntries[T any, Entry any](instance *managerInstance, rowType string, read func(*dynamicTable, dynamicTableRow) (T, error), entry func(*dynamicTable, dynamicTableRow, T) Entry) ([]Entry, error) {
-	entries := []Entry{}
-	for _, table := range instance.allTables() {
-		if table.Schema.RowType != rowType {
-			continue
-		}
-		for _, sourceRow := range table.Rows {
-			row, err := read(table, sourceRow)
-			if err != nil {
-				return nil, err
-			}
-			entries = append(entries, entry(table, sourceRow, row))
+			entries = append(entries, RowEntry[TTable, TRow]{
+				Ref:  RowRef[TTable, TRow]{table: tableID, path: sourceRow.SourcePath, key: sourceRow.Key},
+				Slot: RowSlot[TTable, TRow]{table: tableID, path: sourceRow.SourcePath, rowIndex: sourceRow.RowIndex},
+				Row:  row,
+			})
 		}
 	}
 	return entries, nil
-}
-
-func schemaTableEntries[T any, Entry any](instance *managerInstance, tableName string, rowType string, read func(*dynamicTable, dynamicTableRow) (T, error), entry func(*dynamicTable, dynamicTableRow, T) Entry) ([]Entry, error) {
-	table := instance.tableByNameAndRow(tableName, rowType)
-	if table == nil {
-		return []Entry{}, nil
-	}
-	entries := make([]Entry, 0, len(table.Rows))
-	for _, sourceRow := range table.Rows {
-		row, err := read(table, sourceRow)
-		if err != nil {
-			return nil, err
-		}
-		entries = append(entries, entry(table, sourceRow, row))
-	}
-	return entries, nil
-}
-
-func schemaRow[T any](instance *managerInstance, rowType string, key any, read func(*dynamicTable, dynamicTableRow) (T, error), keyOf func(T) any) (*T, error) {
-	lookupKey := normalizeLookupKey(key)
-	rows, err := schemaRows(instance, rowType, read)
-	if err != nil {
-		return nil, err
-	}
-	for index := range rows {
-		if normalizeLookupKey(keyOf(rows[index])) == lookupKey {
-			return &rows[index], nil
-		}
-	}
-	return nil, nil
-}
-
-func schemaTableRow[T any](instance *managerInstance, tableName string, rowType string, key any, read func(*dynamicTable, dynamicTableRow) (T, error)) (*T, error) {
-	table, row := instance.schemaTableDynamicRow(tableName, rowType, key)
-	if table == nil || row == nil {
-		return nil, nil
-	}
-	out, err := read(table, *row)
-	if err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-func schemaTableRowByIndex[T any](instance *managerInstance, tableName string, rowType string, rowIndex int, read func(*dynamicTable, dynamicTableRow) (T, error)) (*T, error) {
-	table := instance.tableByNameAndRow(tableName, rowType)
-	if table == nil || rowIndex < 0 || rowIndex >= len(table.Rows) {
-		return nil, nil
-	}
-	out, err := read(table, table.Rows[rowIndex])
-	if err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-func schemaTableRowKeyByIndex(instance *managerInstance, tableName string, rowType string, rowIndex int) *string {
-	table := instance.tableByNameAndRow(tableName, rowType)
-	if table == nil || rowIndex < 0 || rowIndex >= len(table.Rows) {
-		return nil
-	}
-	key := table.Rows[rowIndex].Key
-	return &key
-}
-
-func (instance *managerInstance) schemaTableDynamicRow(tableName string, rowType string, key any) (*dynamicTable, *dynamicTableRow) {
-	table := instance.tableByNameAndRow(tableName, rowType)
-	if table == nil {
-		return nil, nil
-	}
-	row, ok := table.RowsByLookupKey[normalizeLookupKey(key)]
-	if !ok {
-		return table, nil
-	}
-	return table, &row
-}
-
-func (instance *managerInstance) tableByNameAndRow(tableName string, rowType string) *dynamicTable {
-	table := instance.table(tableName)
-	if table == nil || table.Schema.RowType != rowType {
-		return nil
-	}
-	return table
-}
-
-func (instance *managerInstance) allTables() []*dynamicTable {
-	seen := map[*dynamicTable]struct{}{}
-	tables := []*dynamicTable{}
-	for _, table := range instance.tables {
-		if table == nil {
-			continue
-		}
-		if _, exists := seen[table]; exists {
-			continue
-		}
-		seen[table] = struct{}{}
-		tables = append(tables, table)
-	}
-	return tables
 }
 
 type managerCache struct {
-	datasheetsByPath map[string]gameassets.DatasheetAsset
-	assetsByPath     map[string][]byte
-	tableCache       map[string]*dynamicTable
-	managerCache     map[string]*managerInstance
+	mu           sync.Mutex
+	loader       *assets.AssetLoader
+	assetsByPath map[string][]byte
+	tableSchemas []tableSchema
+	tableCache   map[string]*dynamicTable
 }
 
-func assetSourceFromLoader(loader *gameassets.AssetLoader) (*assetSource, error) {
-	source := &assetSource{
-		Catalog:    loader.Catalog,
-		Datasheets: []gameassets.DatasheetAsset{},
-		Assets:     []binaryAsset{},
+func newManagerCache(loader *assets.AssetLoader, tableSchemas []tableSchema) *managerCache {
+	return &managerCache{
+		loader:       loader,
+		assetsByPath: map[string][]byte{},
+		tableSchemas: tableSchemas,
+		tableCache:   map[string]*dynamicTable{},
 	}
-	for _, entry := range loader.Catalog.Entries {
-		if !gameassets.IsDatasheetPath(entry.RelativePath) && !gameassets.IsManagerAssetPath(entry.RelativePath) {
+}
+
+func (cache *managerCache) tableSchema(selector tableSelector) (*tableSchema, error) {
+	var found *tableSchema
+	for index := range cache.tableSchemas {
+		if cache.tableSchemas[index].Name != selector.name || cache.tableSchemas[index].RowType != selector.rowType {
 			continue
 		}
-		path := gameassets.NormalizeVirtualPath(entry.RelativePath)
-		bytes, err := loader.Read(path)
+		if found != nil {
+			return nil, fmt.Errorf("duplicate table schema %s:%s", selector.name, selector.rowType)
+		}
+		found = &cache.tableSchemas[index]
+	}
+	if found == nil {
+		return nil, fmt.Errorf("unknown table %s:%s", selector.name, selector.rowType)
+	}
+	return found, nil
+}
+
+func (cache *managerCache) resourcesForTables(managerName string, selectors []tableSelector, assetPaths []string) (*managerResources, error) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	schemas := make([]*tableSchema, 0, len(selectors))
+	for _, selector := range selectors {
+		schema, err := cache.tableSchema(selector)
+		if err != nil {
+			return nil, fmt.Errorf("manager %s: %w", managerName, err)
+		}
+		schemas = append(schemas, schema)
+	}
+	return cache.resourcesFromSchemas(managerName, schemas, assetPaths)
+}
+
+func (cache *managerCache) resourcesForRows(managerName string, rowTypes []string, assetPaths []string) (*managerResources, error) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	requested := make(map[string]struct{}, len(rowTypes))
+	missing := make(map[string]struct{}, len(rowTypes))
+	for _, rowType := range rowTypes {
+		requested[rowType] = struct{}{}
+		missing[rowType] = struct{}{}
+	}
+	schemas := make([]*tableSchema, 0)
+	for index := range cache.tableSchemas {
+		schema := &cache.tableSchemas[index]
+		if _, ok := requested[schema.RowType]; !ok {
+			continue
+		}
+		schemas = append(schemas, schema)
+		delete(missing, schema.RowType)
+	}
+	if len(missing) != 0 {
+		missingRows := make([]string, 0, len(missing))
+		for rowType := range missing {
+			missingRows = append(missingRows, rowType)
+		}
+		sort.Strings(missingRows)
+		return nil, fmt.Errorf("manager %s uses unknown row types %s", managerName, strings.Join(missingRows, ", "))
+	}
+	return cache.resourcesFromSchemas(managerName, schemas, assetPaths)
+}
+
+func (cache *managerCache) resourcesFromSchemas(managerName string, schemas []*tableSchema, assetPaths []string) (*managerResources, error) {
+	resources := &managerResources{
+		managerName: managerName,
+		tables:      map[tableSelector]*dynamicTable{},
+		assets:      map[string][]byte{},
+	}
+	for _, schema := range schemas {
+		table, err := cache.buildTable(schema)
 		if err != nil {
 			return nil, err
 		}
-		if gameassets.IsDatasheetPath(path) {
-			source.Datasheets = append(source.Datasheets, gameassets.DatasheetAsset{
-				Path:  path,
-				Bytes: bytes,
-			})
-		} else {
-			source.Assets = append(source.Assets, binaryAsset{
-				Path:  path,
-				Bytes: bytes,
-			})
+		resources.tables[tableSelector{name: schema.Name, rowType: schema.RowType}] = table
+		resources.tableOrder = append(resources.tableOrder, table)
+	}
+	for _, path := range assetPaths {
+		bytes, err := cache.requiredAssetBytes(path)
+		if err != nil {
+			return nil, fmt.Errorf("manager %s: %w", managerName, err)
 		}
+		resources.assets[normalizeDataPath(path)] = bytes
 	}
-	return source, nil
+	return resources, nil
 }
 
-func newManagerCacheFromSource(source *assetSource) *managerCache {
-	datasheetsByPath := make(map[string]gameassets.DatasheetAsset, len(source.Datasheets))
-	for _, asset := range source.Datasheets {
-		datasheetsByPath[normalizeDataPath(asset.Path)] = asset
-	}
-	assetsByPath := make(map[string][]byte, len(source.Assets))
-	for _, asset := range source.Assets {
-		assetsByPath[normalizeDataPath(asset.Path)] = asset.Bytes
-	}
-	return &managerCache{
-		datasheetsByPath: datasheetsByPath,
-		assetsByPath:     assetsByPath,
-		tableCache:       map[string]*dynamicTable{},
-		managerCache:     map[string]*managerInstance{},
-	}
-}
-
-func (runtime *managerCache) manager(name string) (*managerInstance, error) {
-	definition := managerByName(name)
-	if definition == nil {
-		return nil, fmt.Errorf("unknown manager %s", name)
-	}
-	return runtime.buildManager(definition, map[string]struct{}{})
-}
-
-func (runtime *managerCache) buildManager(definition *managerDefinition, stack map[string]struct{}) (*managerInstance, error) {
-	if cached := runtime.managerCache[definition.Name]; cached != nil {
-		return cached, nil
-	}
-	if _, exists := stack[definition.Name]; exists {
-		return nil, fmt.Errorf("manager dependency cycle at %s", definition.Name)
-	}
-	stack[definition.Name] = struct{}{}
-
-	instance := &managerInstance{
-		definition:       *definition,
-		tables:           map[string]*dynamicTable{},
-		assets:           []string{},
-		assetBytesByPath: map[string][]byte{},
-		managers:         map[string]*managerInstance{},
-	}
-
-	for _, dependency := range definition.Dependencies {
-		switch dependency.Kind {
-		case managerDependencyTable:
-			schema := TableSchemaByNameAndRow(dependency.Name, dependency.Row)
-			if schema == nil {
-				return nil, fmt.Errorf("manager %s depends on unknown table %s/%s", definition.Name, dependency.Name, dependency.Row)
-			}
-			table, err := runtime.buildTable(schema)
-			if err != nil {
-				return nil, err
-			}
-			instance.tables[dependency.Name] = table
-			instance.tables[schema.Name] = table
-			instance.tables[schema.Name+":"+schema.RowType] = table
-		case managerDependencyAsset:
-			instance.assets = append(instance.assets, dependency.Path)
-			bytes, ok := runtime.assetBytes(dependency.Path)
-			if !ok {
-				return nil, fmt.Errorf("asset %s was not loaded", dependency.Path)
-			}
-			instance.assetBytesByPath[normalizeDataPath(dependency.Path)] = bytes
-		case managerDependencyManager:
-			dependencyDefinition := managerByName(dependency.Name)
-			if dependencyDefinition == nil {
-				return nil, fmt.Errorf("manager %s depends on unknown manager %s", definition.Name, dependency.Name)
-			}
-			manager, err := runtime.buildManager(dependencyDefinition, stack)
-			if err != nil {
-				return nil, err
-			}
-			instance.managers[dependency.Name] = manager
-		}
-	}
-
-	delete(stack, definition.Name)
-	runtime.managerCache[definition.Name] = instance
-	return instance, nil
-}
-
-func (runtime *managerCache) buildTable(schema *TableSchema) (*dynamicTable, error) {
+func (cache *managerCache) buildTable(schema *tableSchema) (*dynamicTable, error) {
 	cacheKey := schema.Name + ":" + schema.RowType
-	if cached := runtime.tableCache[cacheKey]; cached != nil {
+	if cached := cache.tableCache[cacheKey]; cached != nil {
 		return cached, nil
 	}
 
-	var rowKeyColumn *ColumnSchema
+	var rowKeyColumn *columnSchema
 	for i := range schema.Columns {
 		if schema.Columns[i].RowKey {
 			rowKeyColumn = &schema.Columns[i]
 			break
 		}
 	}
-	if rowKeyColumn == nil {
-		return nil, fmt.Errorf("table %s has no row-key column", schema.Name)
-	}
-
 	table := &dynamicTable{
-		Schema:          *schema,
-		Sheets:          []gameassets.Datasheet{},
-		Rows:            []dynamicTableRow{},
-		RowsByKey:       map[string]dynamicTableRow{},
-		RowsByLookupKey: map[string]dynamicTableRow{},
-		DuplicateKeys:   map[string][]dynamicTableRow{},
+		Schema:     *schema,
+		Rows:       []dynamicTableRow{},
+		ColumnCRCs: map[string]uint32{},
+	}
+	for _, column := range schema.Columns {
+		table.ColumnCRCs[column.Name] = column.CRC
 	}
 
 	for _, sourcePath := range schema.Sources {
-		asset, ok := runtime.datasheetAsset(sourcePath)
-		if !ok {
-			return nil, fmt.Errorf("datasheet source %s was not loaded", sourcePath)
-		}
-		sheet, err := gameassets.ParseDatasheet(asset.Bytes)
+		bytes, err := cache.requiredAssetBytes(sourcePath)
 		if err != nil {
 			return nil, err
+		}
+		sheet, err := gameassets.ParseDatasheet(bytes)
+		if err != nil {
+			return nil, err
+		}
+		if rowKeyColumn == nil {
+			if len(sheet.Rows) != 0 {
+				return nil, fmt.Errorf("non-empty datasheet source %s has no row-key column", sourcePath)
+			}
+			continue
 		}
 		columnSlots := columnSlotsForSheet(schema, &sheet)
 		rowKeySlot, ok := columnSlots[rowKeyColumn.CRC]
 		if !ok {
 			return nil, fmt.Errorf("datasheet source %s missing row-key column %s", sourcePath, rowKeyColumn.Name)
 		}
-		table.Sheets = append(table.Sheets, sheet)
 		for rowIndex, row := range sheet.Rows {
 			keyCell := row.Cells[rowKeySlot]
 			key, ok := rowKeyValue(keyCell.Value)
@@ -5482,35 +8411,21 @@ func (runtime *managerCache) buildTable(schema *TableSchema) (*dynamicTable, err
 				continue
 			}
 			dynamicRow := dynamicTableRow{
-				SourcePath:  asset.Path,
+				SourcePath:  normalizeDataPath(sourcePath),
 				RowIndex:    rowIndex,
 				Key:         key,
 				Row:         row,
 				ColumnSlots: columnSlots,
 			}
 			table.Rows = append(table.Rows, dynamicRow)
-			if _, exists := table.RowsByKey[key]; !exists {
-				table.RowsByKey[key] = dynamicRow
-			}
-			lookupKey := normalizeLookupKey(key)
-			if existing, exists := table.RowsByLookupKey[lookupKey]; exists {
-				duplicates := table.DuplicateKeys[lookupKey]
-				if len(duplicates) == 0 {
-					duplicates = append(duplicates, existing)
-				}
-				duplicates = append(duplicates, dynamicRow)
-				table.DuplicateKeys[lookupKey] = duplicates
-			} else {
-				table.RowsByLookupKey[lookupKey] = dynamicRow
-			}
 		}
 	}
 
-	runtime.tableCache[cacheKey] = table
+	cache.tableCache[cacheKey] = table
 	return table, nil
 }
 
-func columnSlotsForSheet(schema *TableSchema, sheet *gameassets.Datasheet) map[uint32]int {
+func columnSlotsForSheet(schema *tableSchema, sheet *gameassets.Datasheet) map[uint32]int {
 	slots := map[uint32]int{}
 	for _, column := range schema.Columns {
 		for index := range sheet.Columns {
@@ -5523,27 +8438,13 @@ func columnSlotsForSheet(schema *TableSchema, sheet *gameassets.Datasheet) map[u
 	return slots
 }
 
-func (runtime *managerCache) datasheetAsset(sourcePath string) (gameassets.DatasheetAsset, bool) {
-	normalized := normalizeDataPath(sourcePath)
-	if asset, ok := runtime.datasheetsByPath[normalized]; ok {
-		return asset, true
-	}
-	suffix := "/" + normalized
-	for path, asset := range runtime.datasheetsByPath {
-		if strings.HasSuffix(path, suffix) {
-			return asset, true
-		}
-	}
-	return gameassets.DatasheetAsset{}, false
-}
-
-func (runtime *managerCache) assetBytes(path string) ([]byte, bool) {
+func (cache *managerCache) assetBytes(path string) ([]byte, bool) {
 	normalized := normalizeDataPath(path)
-	if bytes, ok := runtime.assetsByPath[normalized]; ok {
+	if bytes, ok := cache.assetsByPath[normalized]; ok {
 		return bytes, true
 	}
 	suffix := "/" + normalized
-	for candidate, bytes := range runtime.assetsByPath {
+	for candidate, bytes := range cache.assetsByPath {
 		if strings.HasSuffix(candidate, suffix) {
 			return bytes, true
 		}
@@ -5551,13 +8452,17 @@ func (runtime *managerCache) assetBytes(path string) ([]byte, bool) {
 	return nil, false
 }
 
-func managerByName(name string) *managerDefinition {
-	for i := range managers {
-		if managers[i].Name == name {
-			return &managers[i]
-		}
+func (cache *managerCache) requiredAssetBytes(path string) ([]byte, error) {
+	bytes, ok := cache.assetBytes(path)
+	if ok {
+		return bytes, nil
 	}
-	return nil
+	bytes, err := cache.loader.Read(path)
+	if err != nil {
+		return nil, fmt.Errorf("read asset %s: %w", path, err)
+	}
+	cache.assetsByPath[normalizeDataPath(path)] = bytes
+	return bytes, nil
 }
 
 func rowKeyValue(value gameassets.DatasheetCellValue) (string, bool) {
@@ -5604,15 +8509,17 @@ func normalizeLookupKey(key any) string {
 	return strings.ToLower(strings.TrimSpace(fmt.Sprint(key)))
 }
 
-func columnMatches(column *ColumnSchema, name string) bool {
-	return column.Name == name || column.FieldName == name
-}
-
 func normalizeDataPath(path string) string {
 	path = strings.ReplaceAll(path, "\\", "/")
 	for strings.Contains(path, "//") {
 		path = strings.ReplaceAll(path, "//", "/")
 	}
 	return strings.ToLower(path)
+}
+
+func tablePathMatches(left string, right string) bool {
+	left = normalizeDataPath(left)
+	right = normalizeDataPath(right)
+	return left == right || strings.HasSuffix(left, "/"+right) || strings.HasSuffix(right, "/"+left)
 }
 "#;

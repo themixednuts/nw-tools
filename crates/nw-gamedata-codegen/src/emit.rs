@@ -1,29 +1,11 @@
 use std::path::PathBuf;
 
 use crate::compiler::GameDataCompileUnit;
-use crate::target::{
-    GameDataAssetSourcePlan, GameDataDataFormat, GameDataRuntimeProfile, GameDataTargetLanguage,
-    GameDataTargetPlan,
-};
-use thiserror::Error;
-
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum GameDataEmitterConfigError {
-    #[error(
-        "{emitter:?} emitter does not support target {target_language:?}/{runtime:?}/{asset_source:?}/{data_format:?}"
-    )]
-    UnsupportedTarget {
-        emitter: GameDataTargetLanguage,
-        target_language: GameDataTargetLanguage,
-        runtime: GameDataRuntimeProfile,
-        asset_source: GameDataAssetSourcePlan,
-        data_format: GameDataDataFormat,
-    },
-}
+use crate::target::GameDataTargetLanguage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameDataCodegenOutput {
-    target: GameDataTargetPlan,
+    language: GameDataTargetLanguage,
     files: Vec<GameDataCodegenFile>,
 }
 
@@ -40,23 +22,15 @@ enum GameDataCodegenFileContents {
 }
 
 pub trait GameDataEmitter {
-    fn target(&self) -> GameDataTargetPlan;
-
-    fn target_language(&self) -> GameDataTargetLanguage {
-        self.target().language()
-    }
-
-    fn supports_target(&self, target: &GameDataTargetPlan) -> bool {
-        target.supports_language(self.target_language())
-    }
+    fn target_language(&self) -> GameDataTargetLanguage;
 
     fn emit(&self, unit: &GameDataCompileUnit) -> anyhow::Result<GameDataCodegenOutput>;
 }
 
 impl GameDataCodegenOutput {
     #[must_use]
-    pub fn new(target: GameDataTargetPlan, files: Vec<GameDataCodegenFile>) -> Self {
-        Self { target, files }
+    pub fn new(language: GameDataTargetLanguage, files: Vec<GameDataCodegenFile>) -> Self {
+        Self { language, files }
     }
 
     #[must_use]
@@ -65,8 +39,8 @@ impl GameDataCodegenOutput {
     }
 
     #[must_use]
-    pub const fn target(&self) -> &GameDataTargetPlan {
-        &self.target
+    pub const fn language(&self) -> GameDataTargetLanguage {
+        self.language
     }
 
     #[must_use]
@@ -126,18 +100,5 @@ impl GameDataCodegenFile {
             panic!("{} is a binary codegen file", self.path.display());
         };
         (self.path, contents)
-    }
-}
-
-impl GameDataEmitterConfigError {
-    #[must_use]
-    pub fn unsupported(emitter: GameDataTargetLanguage, target: &GameDataTargetPlan) -> Self {
-        Self::UnsupportedTarget {
-            emitter,
-            target_language: target.language(),
-            runtime: target.runtime(),
-            asset_source: target.source(),
-            data_format: target.data_format(),
-        }
     }
 }

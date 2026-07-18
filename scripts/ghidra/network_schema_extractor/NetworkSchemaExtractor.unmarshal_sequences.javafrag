@@ -1,0 +1,464 @@
+    private Map<PcodeOpAST, UnmarshalSequenceAction> unmarshalSequenceActions(
+        Function function,
+        HighFunction high,
+        String readBufferParameter,
+        Set<String> activeContexts,
+        Map<String, CodecWireTrace> completedContexts) {
+
+        IdentityHashMap<PcodeOpAST, UnmarshalSequenceAction> actions =
+            new IdentityHashMap<>();
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            UnmarshalSequenceSummary summary = staticUnmarshalSequence(
+                function,
+                high,
+                loop,
+                operations,
+                readBufferParameter,
+                activeContexts,
+                completedContexts);
+            if (summary == null || summary.operations().stream().anyMatch(actions::containsKey)) {
+                continue;
+            }
+            for (PcodeOpAST operation : summary.operations()) {
+                actions.put(operation, new UnmarshalSequenceAction(summary.events(), false));
+            }
+            actions.put(
+                summary.emissionOperation(),
+                new UnmarshalSequenceAction(summary.events(), true));
+        }
+        return actions;
+    }
+
+    private UnmarshalSequenceSummary staticUnmarshalSequence(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        String readBufferParameter,
+        Set<String> activeContexts,
+        Map<String, CodecWireTrace> completedContexts) {
+
+        UnmarshalStaticSequenceStorage storage = unmarshalStaticSequenceStorage(
+            high,
+            loop,
+            operations);
+        if (storage == null) {
+            return null;
+        }
+        List<PcodeOpAST> inductions = List.of(storage.induction());
+
+        Map<PcodeBlockBasic, List<UnmarshalIterationEvent>> eventsByBlock = new HashMap<>();
+        ArrayList<PcodeOpAST> eventOperations = new ArrayList<>();
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || !operationTouchesSequenceElement(
+                    operation,
+                    inductions,
+                    storage.stride())) {
+                continue;
+            }
+            List<CodecWireEvent> events = unmarshalOperationEvents(
+                function,
+                high,
+                operations,
+                operation,
+                readBufferParameter,
+                activeContexts,
+                completedContexts);
+            if (events.isEmpty()) {
+                continue;
+            }
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+            if (block == null) {
+                return null;
+            }
+            UnmarshalIterationEvent event = new UnmarshalIterationEvent(
+                operation,
+                List.copyOf(events));
+            eventsByBlock.computeIfAbsent(block, ignored -> new ArrayList<>()).add(event);
+            eventOperations.add(operation);
+        }
+        if (eventsByBlock.isEmpty()) {
+            return null;
+        }
+
+        NetworkSchemaFlowSequence.Result<UnmarshalIterationEvent> iteration =
+            NetworkSchemaFlowSequence.analyzeLoopIteration(
+                loop,
+                eventsByBlock,
+                (left, right) -> left == right);
+        if (!iteration.complete() || iteration.events().isEmpty()) {
+            return null;
+        }
+        ArrayList<CodecWireEvent> elementEvents = new ArrayList<>();
+        for (UnmarshalIterationEvent event : iteration.events()) {
+            elementEvents.addAll(event.events());
+        }
+        if (elementEvents.isEmpty() || elementEvents.stream().anyMatch(event ->
+                event.wireEvidence() == null || event.wireEvidence().layout == null)) {
+            return null;
+        }
+
+        ArrayList<CodecWireEvent> expanded = new ArrayList<>(
+            Math.multiplyExact(elementEvents.size(), storage.iterations()));
+        for (int index = 0; index < storage.iterations(); index++) {
+            expanded.addAll(elementEvents);
+        }
+        PcodeOpAST emission = iteration.events().get(0).operation();
+        return new UnmarshalSequenceSummary(
+            List.copyOf(expanded),
+            emission,
+            Set.copyOf(eventOperations));
+    }
+
+    private UnmarshalStaticSequenceStorage unmarshalStaticSequenceStorage(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        FixedSequenceStorage direct = fixedSequenceStorage(high, loop, operations);
+        if (direct != null) {
+            PcodeOpAST countCall = fixedSequenceCountCall(
+                high,
+                loop,
+                operations,
+                NetworkSchemaCodecClassifier.CodecDirection.DECODE);
+            if (countCall != null && hasFixedSequenceCapacityGuard(
+                    high,
+                    loop,
+                    operations,
+                    direct,
+                    countCall,
+                    NetworkSchemaCodecClassifier.CodecDirection.DECODE) &&
+                countControlsFixedSequenceExtent(
+                    high,
+                    loop,
+                    operations,
+                    direct,
+                    countCall)) {
+                return new UnmarshalStaticSequenceStorage(
+                    direct.induction(),
+                    direct.stride(),
+                    1);
+            }
+        }
+
+        Integer capacity = counterControlledLoopTripCount(high, loop);
+        if (capacity == null) {
+            return null;
+        }
+        UnmarshalStaticSequenceStorage selected = null;
+        for (PcodeOpAST induction : affineSequenceInductions(loop)) {
+            Long stride = affinePointerInductionStride(induction);
+            PcodeStorage initial = fixedSequenceInitialStorage(induction);
+            if (stride == null || stride <= 0L || initial == null ||
+                !initial.base.matches("param_\\d+") ||
+                loopConditionDependsOn(high, loop, induction.getOutput())) {
+                continue;
+            }
+            UnmarshalStaticSequenceStorage candidate =
+                new UnmarshalStaticSequenceStorage(induction, stride, capacity);
+            if (selected != null) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Integer counterControlledLoopTripCount(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop) {
+
+        Integer selected = null;
+        var iterator = loop.header().getIterator();
+        while (iterator.hasNext()) {
+            PcodeOp operation = iterator.next();
+            if (!(operation instanceof PcodeOpAST induction) ||
+                induction.getOpcode() != PcodeOp.MULTIEQUAL ||
+                induction.getOutput() == null) {
+                continue;
+            }
+            Long step = affinePointerInductionStride(induction);
+            Long initial = inductionInitialConstant(induction);
+            if (step == null || step <= 0L || initial == null) {
+                continue;
+            }
+            Integer candidate = loopTripCountForInduction(
+                high,
+                loop,
+                induction,
+                initial,
+                step);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Long inductionInitialConstant(PcodeOpAST induction) {
+        Long selected = null;
+        for (int slot = 0; slot < induction.getNumInputs(); slot++) {
+            Varnode input = induction.getInput(slot);
+            if (affineStepFromPhi(
+                    input,
+                    induction.getOutput(),
+                    new LinkedHashSet<>(),
+                    0) != null) {
+                continue;
+            }
+            Long candidate = NetworkSchemaIntegerEvaluator.evaluate(input);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Integer loopTripCountForInduction(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        PcodeOpAST induction,
+        long initial,
+        long step) {
+
+        Integer selected = null;
+        for (PcodeOpAST comparison : orderedPcodeOps(high)) {
+            if (!loop.contains(comparison) || !isOrderedIntegerComparison(comparison)) {
+                continue;
+            }
+            int constantSlot = comparison.getInput(0).isConstant()
+                ? 0
+                : comparison.getInput(1).isConstant() ? 1 : -1;
+            if (constantSlot < 0) {
+                continue;
+            }
+            int variableSlot = 1 - constantSlot;
+            Long threshold = NetworkSchemaIntegerEvaluator.evaluate(
+                comparison.getInput(constantSlot));
+            Long offset = affineOffsetFromPhi(
+                comparison.getInput(variableSlot),
+                induction.getOutput(),
+                new LinkedHashSet<>(),
+                0);
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(comparison);
+            PcodeOpAST branch = branchUsingComparison(block, comparison);
+            SequenceBranchDirection direction = sequenceBranchDirection(branch, loop);
+            if (threshold == null || offset == null || branch == null || direction == null) {
+                continue;
+            }
+            Boolean trueContinues = branchTrueContinuesLoop(branch, loop);
+            if (trueContinues == null) {
+                continue;
+            }
+            Integer candidate = evaluateLoopTripCount(
+                comparison.getOpcode(),
+                constantSlot,
+                threshold,
+                initial,
+                offset,
+                step,
+                trueContinues);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Long affineOffsetFromPhi(
+        Varnode node,
+        Varnode phi,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || phi == null || depth > 24 ||
+            !seen.add(pcodeNodeKey(node))) {
+            return null;
+        }
+        if (sameVarnodeIdentity(node, phi)) {
+            return 0L;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return null;
+        }
+        if ((definition.getOpcode() == PcodeOp.INT_ADD ||
+             definition.getOpcode() == PcodeOp.INT_SUB) &&
+            definition.getNumInputs() == 2) {
+            Long constant = NetworkSchemaIntegerEvaluator.evaluate(definition.getInput(1));
+            Long base = affineOffsetFromPhi(
+                definition.getInput(0),
+                phi,
+                seen,
+                depth + 1);
+            if (constant != null && base != null) {
+                try {
+                    return definition.getOpcode() == PcodeOp.INT_ADD
+                        ? Math.addExact(base, constant)
+                        : Math.subtractExact(base, constant);
+                }
+                catch (ArithmeticException ignored) {
+                    return null;
+                }
+            }
+            if (definition.getOpcode() == PcodeOp.INT_ADD) {
+                constant = NetworkSchemaIntegerEvaluator.evaluate(definition.getInput(0));
+                base = affineOffsetFromPhi(
+                    definition.getInput(1),
+                    phi,
+                    seen,
+                    depth + 1);
+                if (constant != null && base != null) {
+                    try {
+                        return Math.addExact(base, constant);
+                    }
+                    catch (ArithmeticException ignored) {
+                        return null;
+                    }
+                }
+            }
+            return null;
+        }
+        return transparentPcodeDefinition(definition)
+            ? affineOffsetFromPhi(
+                definition.getInput(0),
+                phi,
+                seen,
+                depth + 1)
+            : null;
+    }
+
+    private Boolean branchTrueContinuesLoop(
+        PcodeOpAST branch,
+        NetworkSchemaNaturalLoop loop) {
+
+        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(branch);
+        List<PcodeBlockBasic> successors = block == null
+            ? List.of()
+            : NetworkSchemaControlFlow.successors(block);
+        if (successors.size() != 2 || branch.getNumInputs() < 1) {
+            return null;
+        }
+        Address destination = branch.getInput(0).getAddress();
+        PcodeBlockBasic trueSuccessor = successors.stream()
+            .filter(successor -> Objects.equals(successor.getStart(), destination))
+            .findFirst()
+            .orElse(null);
+        if (trueSuccessor == null) {
+            return null;
+        }
+        PcodeBlockBasic falseSuccessor = successors.get(0) == trueSuccessor
+            ? successors.get(1)
+            : successors.get(0);
+        boolean trueReaches = NetworkSchemaControlFlow.reaches(
+            trueSuccessor,
+            loop.header());
+        boolean falseReaches = NetworkSchemaControlFlow.reaches(
+            falseSuccessor,
+            loop.header());
+        return trueReaches == falseReaches ? null : trueReaches;
+    }
+
+    private Integer evaluateLoopTripCount(
+        int opcode,
+        int constantSlot,
+        long threshold,
+        long initial,
+        long offset,
+        long step,
+        boolean trueContinues) {
+
+        for (int iteration = 1; iteration <= 0xffff; iteration++) {
+            long induction;
+            long variable;
+            try {
+                induction = Math.addExact(
+                    initial,
+                    Math.multiplyExact((long)iteration - 1L, step));
+                variable = Math.addExact(induction, offset);
+            }
+            catch (ArithmeticException ignored) {
+                return null;
+            }
+            long left = constantSlot == 0 ? threshold : variable;
+            long right = constantSlot == 0 ? variable : threshold;
+            boolean condition = switch (opcode) {
+                case PcodeOp.INT_LESS -> Long.compareUnsigned(left, right) < 0;
+                case PcodeOp.INT_LESSEQUAL -> Long.compareUnsigned(left, right) <= 0;
+                case PcodeOp.INT_SLESS -> left < right;
+                case PcodeOp.INT_SLESSEQUAL -> left <= right;
+                default -> false;
+            };
+            boolean continues = trueContinues ? condition : !condition;
+            if (!continues) {
+                return iteration;
+            }
+        }
+        return null;
+    }
+
+    private List<CodecWireEvent> unmarshalOperationEvents(
+        Function function,
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST operation,
+        String readBufferParameter,
+        Set<String> activeContexts,
+        Map<String, CodecWireTrace> completedContexts) {
+
+        ArrayList<CodecWireEvent> events = new ArrayList<>();
+        if (operation.getOpcode() == PcodeOp.CALL) {
+            collectCodecCallEvents(
+                function,
+                high,
+                operations,
+                operation,
+                new PcodeStorage(readBufferParameter, 0L),
+                activeContexts,
+                completedContexts,
+                events);
+            return List.copyOf(events);
+        }
+        CodecWireEvent direct = directCursorReadEvent(
+            high,
+            operation,
+            operations,
+            readBufferParameter);
+        return direct == null ? List.of() : List.of(direct);
+    }
+
+    private record UnmarshalIterationEvent(
+        PcodeOpAST operation,
+        List<CodecWireEvent> events) {
+    }
+
+    private record UnmarshalSequenceSummary(
+        List<CodecWireEvent> events,
+        PcodeOpAST emissionOperation,
+        Set<PcodeOpAST> operations) {
+    }
+
+    private record UnmarshalSequenceAction(
+        List<CodecWireEvent> events,
+        boolean emit) {
+    }
+
+    private record UnmarshalStaticSequenceStorage(
+        PcodeOpAST induction,
+        long stride,
+        int iterations) {
+    }

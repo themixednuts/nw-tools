@@ -1,0 +1,202 @@
+    private final Map<String, List<HelperStoreRelation>> helperStoreRelationCache =
+        new HashMap<>();
+    private final LinkedHashMap<String, Integer> helperStoreRelationRejectCounts =
+        new LinkedHashMap<>();
+    private final JsonArray helperStoreRelationRejectSamples = new JsonArray();
+    private long helperStoreRelationsRecovered;
+    private long helperStoreRelationsApplied;
+
+    private boolean addHelperStoreRelationMembers(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        Function owner,
+        PcodeOpAST call,
+        Function target,
+        Map<String, String> tempNativeTypes,
+        Map<String, String> tempWireShapes,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        if (byBase == null || owner == null || call == null || target == null) {
+            return false;
+        }
+
+        boolean added = false;
+        for (HelperStoreRelation relation : helperStoreRelations(target)) {
+            if (relation.sourceSlot() >= call.getNumInputs()) {
+                recordHelperStoreRelationReject(
+                    "source-argument-missing",
+                    call,
+                    target,
+                    relation,
+                    null);
+                continue;
+            }
+            PcodeStorage destination = provenCallArgumentStorage(
+                owner,
+                call,
+                target,
+                relation.destinationSlot());
+            destination = translatedAbsoluteHelperStorage(
+                destination == null ? null : destination.plus(relation.destinationOffset()),
+                callerParamStorage);
+            if (destination == null) {
+                recordHelperStoreRelationReject(
+                    "destination-translation-unproven",
+                    call,
+                    target,
+                    relation,
+                    null);
+                continue;
+            }
+
+            Varnode source = call.getInput(relation.sourceSlot());
+            String nativeType = pcodeValueNativeType(source, tempNativeTypes);
+            nativeType = pcodeNativeTypeAtValueWidth(nativeType, relation.valueWidth());
+            PcodeCallTargetInfo sourceTarget = pcodeValueCallTargetInfo(source);
+            WireShape wireEvidence = pcodeStoredValueWireEvidence(
+                source,
+                tempWireShapes,
+                tempNativeTypes,
+                sourceTarget,
+                nativeType);
+            if (wireEvidence == null) {
+                recordHelperStoreRelationReject(
+                    "source-wire-lineage-unproven",
+                    call,
+                    target,
+                    relation,
+                    destination);
+                continue;
+            }
+
+            LinkedHashMap<Long, NestedTypeMember> members = byBase.get(destination.base);
+            int before = members == null ? 0 : members.size();
+            addNestedTypeMemberCandidate(
+                byBase,
+                destination,
+                nativeType,
+                wireEvidence,
+                call,
+                target,
+                "helper-formal-store-relation");
+            markNestedTypeMemberWireOrder(
+                byBase,
+                destination,
+                "cfg-helper-store-order");
+            members = byBase.get(destination.base);
+            boolean relationAdded = members != null && members.size() > before;
+            if (relationAdded) {
+                helperStoreRelationsApplied++;
+                added = true;
+            }
+            else {
+                recordHelperStoreRelationReject(
+                    "destination-member-conflict",
+                    call,
+                    target,
+                    relation,
+                    destination);
+            }
+        }
+        return added;
+    }
+
+    private List<HelperStoreRelation> helperStoreRelations(Function target) {
+        if (target == null || target.getEntryPoint() == null) {
+            return List.of();
+        }
+        String key = functionCacheKey("helper-store-relations", target);
+        return helperStoreRelationCache.computeIfAbsent(
+            key,
+            ignored -> recoverHelperStoreRelations(target));
+    }
+
+    private List<HelperStoreRelation> recoverHelperStoreRelations(Function target) {
+        HighFunction high = highFunction(target);
+        if (high == null) {
+            return List.of();
+        }
+
+        LinkedHashMap<String, HelperStoreRelation> relations = new LinkedHashMap<>();
+        LinkedHashSet<String> conflicts = new LinkedHashSet<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.STORE || operation.getNumInputs() < 3) {
+                continue;
+            }
+            PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+            PcodeStorage source = pcodeStorageExpression(operation.getInput(2));
+            Integer destinationSlot = formalParameterSlot(destination);
+            Integer sourceSlot = formalParameterSlot(source);
+            int valueWidth = operation.getInput(2).getSize();
+            if (destinationSlot == null || sourceSlot == null ||
+                destinationSlot.equals(sourceSlot) || destination.offset < 0L ||
+                source.offset != 0L || valueWidth <= 0 || valueWidth > 16) {
+                continue;
+            }
+
+            HelperStoreRelation candidate = new HelperStoreRelation(
+                destinationSlot,
+                destination.offset,
+                sourceSlot,
+                valueWidth);
+            String location = destinationSlot + ":" + destination.offset;
+            HelperStoreRelation previous = relations.putIfAbsent(location, candidate);
+            if (previous != null && !previous.equals(candidate)) {
+                conflicts.add(location);
+            }
+        }
+        conflicts.forEach(relations::remove);
+        List<HelperStoreRelation> result = List.copyOf(relations.values());
+        helperStoreRelationsRecovered += result.size();
+        return result;
+    }
+
+    private void recordHelperStoreRelationReject(
+        String reason,
+        PcodeOpAST call,
+        Function target,
+        HelperStoreRelation relation,
+        PcodeStorage destination) {
+
+        helperStoreRelationRejectCounts.merge(reason, 1, Integer::sum);
+        if (helperStoreRelationRejectSamples.size() >= 32) {
+            return;
+        }
+        JsonObject sample = new JsonObject();
+        NetworkSchemaJson.add(sample, "reason", reason);
+        NetworkSchemaJson.add(
+            sample,
+            "callsite",
+            call == null || call.getSeqnum() == null
+                ? null
+                : formatAddress(call.getSeqnum().getTarget()));
+        NetworkSchemaJson.add(
+            sample,
+            "target",
+            target == null ? null : formatAddress(target.getEntryPoint()));
+        if (relation != null) {
+            sample.addProperty("destinationSlot", relation.destinationSlot());
+            sample.addProperty(
+                "destinationOffset",
+                "0x" + Long.toHexString(relation.destinationOffset()));
+            sample.addProperty("sourceSlot", relation.sourceSlot());
+            sample.addProperty("valueWidth", relation.valueWidth());
+        }
+        addPcodeStorageDiagnostic(sample, "destination", destination);
+        helperStoreRelationRejectSamples.add(sample);
+    }
+
+    private JsonObject helperStoreRelationDiagnosticsJson() {
+        JsonObject diagnostics = new JsonObject();
+        diagnostics.addProperty("recovered", helperStoreRelationsRecovered);
+        diagnostics.addProperty("applied", helperStoreRelationsApplied);
+        diagnostics.add("rejectSummary", countMapJson(helperStoreRelationRejectCounts));
+        diagnostics.add("rejectSamples", helperStoreRelationRejectSamples.deepCopy());
+        return diagnostics;
+    }
+
+    private record HelperStoreRelation(
+        int destinationSlot,
+        long destinationOffset,
+        int sourceSlot,
+        int valueWidth) {
+    }

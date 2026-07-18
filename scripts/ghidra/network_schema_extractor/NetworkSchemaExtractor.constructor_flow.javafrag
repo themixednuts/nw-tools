@@ -1,0 +1,302 @@
+    private List<VtableWrite> recoverConstructorVtableWritesPcode(
+        Address functionAddress,
+        Set<String> activeConstructors,
+        boolean includeArgumentObjectWrites) {
+
+        Function function = functionAtOrContaining(functionAddress);
+        HighFunction high = highFunction(function);
+        if (function == null || high == null) {
+            return List.of();
+        }
+
+        ArrayList<VtableWrite> result = new ArrayList<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() == PcodeOp.STORE) {
+                appendPcodeVtableStore(
+                    result,
+                    function,
+                    operation,
+                    includeArgumentObjectWrites);
+                continue;
+            }
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            PcodeCallTargetInfo target = pcodeCallTargetInfo(operation);
+            if (target == null || !isExecutableAddress(target.resolvedTarget)) {
+                continue;
+            }
+            Function constructorFunction =
+                functionAtOrContaining(target.resolvedTarget);
+            PcodeStorage receiver = provenCallArgumentStorage(
+                function,
+                operation,
+                constructorFunction,
+                1);
+            if (!isPcodeObjectStorage(receiver, includeArgumentObjectWrites)) {
+                continue;
+            }
+            if (isPcodeVectorConstructorIteratorCall(operation, target.resolvedTarget)) {
+                appendPcodeVectorConstructorWrites(
+                    result,
+                    function,
+                    operation,
+                    receiver,
+                    activeConstructors,
+                    includeArgumentObjectWrites);
+                continue;
+            }
+            appendPcodeConstructorCallWrites(
+                result,
+                function,
+                operation,
+                receiver,
+                target.resolvedTarget,
+                activeConstructors,
+                includeArgumentObjectWrites);
+        }
+        return result;
+    }
+
+    private void appendPcodeVtableStore(
+        List<VtableWrite> result,
+        Function function,
+        PcodeOpAST store,
+        boolean includeArgumentObjectWrites) {
+
+        if (store.getNumInputs() < 3) {
+            return;
+        }
+        PcodeStorage destination = pcodeStorageExpression(store.getInput(1));
+        Address vtable = uniquePcodeVtableAddress(store.getInput(2));
+        if (destination == null || vtable == null) {
+            return;
+        }
+        appendProjectedVtableWrite(
+            result,
+            function.getEntryPoint(),
+            store.getSeqnum().getTarget(),
+            vtable,
+            destination,
+            "pcode-vtable-store",
+            includeArgumentObjectWrites);
+    }
+
+    private Address uniquePcodeVtableAddress(Varnode value) {
+        LinkedHashSet<Address> candidates = new LinkedHashSet<>();
+        collectPcodeAddressOrigins(value, candidates, new LinkedHashSet<>());
+        candidates.removeIf(candidate -> !isVtableLike(candidate));
+        return candidates.size() == 1 ? candidates.iterator().next() : null;
+    }
+
+    private boolean isPcodeObjectStorage(
+        PcodeStorage storage,
+        boolean includeArgumentObjectWrites) {
+
+        if (storage == null || "stack".equals(storage.base)) {
+            return false;
+        }
+        return includeArgumentObjectWrites || "param_1".equals(storage.base);
+    }
+
+    private void appendPcodeConstructorCallWrites(
+        List<VtableWrite> result,
+        Function owner,
+        PcodeOpAST call,
+        PcodeStorage receiver,
+        Address constructor,
+        Set<String> activeConstructors,
+        boolean includeArgumentObjectWrites) {
+
+        for (VtableWrite write : constructorVtableWrites(
+            constructor,
+            activeConstructors,
+            false)) {
+            if (write.thisOffset == null) {
+                continue;
+            }
+            appendProjectedVtableWrite(
+                result,
+                write.function == null ? owner.getEntryPoint() : write.function,
+                write.instruction == null ? call.getSeqnum().getTarget() : write.instruction,
+                write.vtable,
+                receiver.plus(write.thisOffset),
+                prefixPattern("pcode-constructor-call", write.pattern),
+                includeArgumentObjectWrites);
+        }
+    }
+
+    private void appendProjectedVtableWrite(
+        List<VtableWrite> result,
+        Address function,
+        Address instruction,
+        Address vtable,
+        PcodeStorage destination,
+        String pattern,
+        boolean includeArgumentObjectWrites) {
+
+        if (destination == null || !isVtableLike(vtable) ||
+            destination.offset < Integer.MIN_VALUE ||
+            destination.offset > Integer.MAX_VALUE) {
+            return;
+        }
+        int offset = (int)destination.offset;
+        if ("param_1".equals(destination.base)) {
+            result.add(new VtableWrite(
+                function,
+                instruction,
+                vtable,
+                result.size(),
+                offset,
+                pattern));
+        }
+        else if (includeArgumentObjectWrites && !"stack".equals(destination.base)) {
+            result.add(new VtableWrite(
+                function,
+                instruction,
+                vtable,
+                result.size(),
+                null,
+                destination.base,
+                offset,
+                pattern));
+        }
+    }
+
+    private boolean isPcodeVectorConstructorIteratorCall(
+        PcodeOpAST call,
+        Address target) {
+
+        if (call == null || call.getNumInputs() < 5 ||
+            !isPcodeVectorConstructorIteratorFunction(target)) {
+            return false;
+        }
+        Long elementSize = NetworkSchemaIntegerEvaluator.evaluate(call.getInput(2));
+        Long elementCount = NetworkSchemaIntegerEvaluator.evaluate(call.getInput(3));
+        return elementSize != null && elementSize > 0L &&
+            elementCount != null && elementCount > 0L &&
+            uniquePcodeExecutableAddress(call.getInput(4)) != null;
+    }
+
+    private boolean isPcodeVectorConstructorIteratorFunction(Address target) {
+        Function function = functionAtOrContaining(target);
+        if (function == null) {
+            return false;
+        }
+        String key = functionCacheKey("vector-constructor-iterator", function);
+        Boolean cached = vectorConstructorIteratorCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        HighFunction high = highFunction(function);
+        boolean result = high != null && hasBackwardPcodeBranch(function);
+        if (result) {
+            boolean sawElementCall = false;
+            boolean sawStrideAdvance = false;
+            boolean sawCountBound = false;
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (operation.getOpcode() == PcodeOp.CALLIND) {
+                    for (int slot = 1; slot < operation.getNumInputs(); slot++) {
+                        if (pcodeValueDependsOnStorage(
+                            operation.getInput(slot),
+                            new PcodeStorage("param_1", 0L),
+                            new LinkedHashSet<>())) {
+                            sawElementCall = true;
+                            break;
+                        }
+                    }
+                }
+                else if (operation.getOpcode() == PcodeOp.INT_ADD &&
+                    operation.getNumInputs() == 2) {
+                    boolean element = pcodeValueDependsOnStorage(
+                        operation.getInput(0),
+                        new PcodeStorage("param_1", 0L),
+                        new LinkedHashSet<>()) || pcodeValueDependsOnStorage(
+                            operation.getInput(1),
+                            new PcodeStorage("param_1", 0L),
+                            new LinkedHashSet<>());
+                    boolean stride = pcodeValueDependsOnStorage(
+                        operation.getInput(0),
+                        new PcodeStorage("param_2", 0L),
+                        new LinkedHashSet<>()) || pcodeValueDependsOnStorage(
+                            operation.getInput(1),
+                            new PcodeStorage("param_2", 0L),
+                            new LinkedHashSet<>());
+                    sawStrideAdvance |= element && stride;
+                }
+                else if ((operation.getOpcode() == PcodeOp.INT_EQUAL ||
+                    operation.getOpcode() == PcodeOp.INT_NOTEQUAL ||
+                    operation.getOpcode() == PcodeOp.INT_LESS ||
+                    operation.getOpcode() == PcodeOp.INT_LESSEQUAL) &&
+                    operation.getNumInputs() == 2) {
+                    sawCountBound |= pcodeValueDependsOnStorage(
+                        operation.getInput(0),
+                        new PcodeStorage("param_3", 0L),
+                        new LinkedHashSet<>()) || pcodeValueDependsOnStorage(
+                            operation.getInput(1),
+                            new PcodeStorage("param_3", 0L),
+                            new LinkedHashSet<>());
+                }
+            }
+            result = sawElementCall && sawStrideAdvance && sawCountBound;
+        }
+        vectorConstructorIteratorCache.put(key, result);
+        return result;
+    }
+
+    private Address uniquePcodeExecutableAddress(Varnode value) {
+        LinkedHashSet<Address> candidates = new LinkedHashSet<>();
+        collectPcodeAddressOrigins(value, candidates, new LinkedHashSet<>());
+        candidates.removeIf(candidate -> !isExecutableAddress(candidate));
+        return candidates.size() == 1 ? candidates.iterator().next() : null;
+    }
+
+    private void appendPcodeVectorConstructorWrites(
+        List<VtableWrite> result,
+        Function owner,
+        PcodeOpAST call,
+        PcodeStorage base,
+        Set<String> activeConstructors,
+        boolean includeArgumentObjectWrites) {
+
+        Long elementSize = NetworkSchemaIntegerEvaluator.evaluate(call.getInput(2));
+        Long elementCount = NetworkSchemaIntegerEvaluator.evaluate(call.getInput(3));
+        Address constructor = uniquePcodeExecutableAddress(call.getInput(4));
+        if (elementSize == null || elementSize <= 0L ||
+            elementCount == null || elementCount <= 0L || constructor == null) {
+            return;
+        }
+        List<VtableWrite> writes = constructorVtableWrites(
+            constructor,
+            activeConstructors,
+            false);
+        for (long index = 0; index < elementCount; index++) {
+            long elementOffset;
+            try {
+                elementOffset = Math.multiplyExact(index, elementSize);
+            }
+            catch (ArithmeticException ignored) {
+                return;
+            }
+            for (VtableWrite write : writes) {
+                if (write.thisOffset == null) {
+                    continue;
+                }
+                PcodeStorage destination;
+                try {
+                    destination = base.plus(Math.addExact(elementOffset, write.thisOffset));
+                }
+                catch (ArithmeticException ignored) {
+                    return;
+                }
+                appendProjectedVtableWrite(
+                    result,
+                    write.function == null ? owner.getEntryPoint() : write.function,
+                    write.instruction == null ? call.getSeqnum().getTarget() : write.instruction,
+                    write.vtable,
+                    destination,
+                    prefixPattern("pcode-vector-constructor", write.pattern),
+                    includeArgumentObjectWrites);
+            }
+        }
+    }

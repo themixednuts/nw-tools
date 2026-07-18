@@ -1,0 +1,165 @@
+    private Map<PcodeOpAST, UnmarshalCollectionAction> unmarshalCollectionActions(
+        Function function,
+        HighFunction high,
+        String readBufferParameter,
+        List<PcodeOpAST> operations) {
+
+        IdentityHashMap<PcodeOpAST, UnmarshalCollectionAction> actions =
+            new IdentityHashMap<>();
+        Map<Address, CollectionOutputShape> localCollections =
+            containerCollectionOutputs(function);
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            PcodeOpAST count = nearestCountCallForLoop(function, high, loop, operations);
+            CollectionOutputShape shape = count == null
+                ? null
+                : localCollections.get(count.getSeqnum().getTarget());
+            if (shape == null || !Objects.equals(
+                    shape.loopHeader,
+                    loop.header().getStart())) {
+                continue;
+            }
+            ContainerCodecCall boundary = unmarshalCollectionBoundary(
+                count,
+                pcodeCallTarget(count),
+                shape.wireEvidence,
+                "container-helper-unmarshal-local-collection");
+            if (!putUnmarshalCollectionAction(actions, count, boundary, true)) {
+                return null;
+            }
+            for (PcodeOpAST operation : operations) {
+                if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL ||
+                    !shape.codecCallsites.contains(operation.getSeqnum().getTarget())) {
+                    continue;
+                }
+                if (!putUnmarshalCollectionAction(actions, operation, boundary, false)) {
+                    return null;
+                }
+            }
+        }
+
+        HashMap<String, String> tempNativeTypes = new HashMap<>();
+        HashMap<String, String> tempWireShapes = new HashMap<>();
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            InterproceduralCollectionCall collection = interproceduralCollectionCall(
+                function,
+                operation,
+                target,
+                tempNativeTypes,
+                tempWireShapes,
+                Collections.emptyMap());
+            if (collection != null) {
+                PcodeOpAST count = uniqueUnmarshalCountProducer(
+                    high,
+                    operations,
+                    operation,
+                    collection.count());
+                if (count == null) {
+                    return null;
+                }
+                ContainerCodecCall boundary = unmarshalCollectionBoundary(
+                    count,
+                    target,
+                    collection.wireEvidence(),
+                    "container-helper-unmarshal-interprocedural-collection");
+                if (!putUnmarshalCollectionAction(actions, count, boundary, true) ||
+                    !putUnmarshalCollectionAction(actions, operation, boundary, false)) {
+                    return null;
+                }
+                continue;
+            }
+
+            Integer bufferSlot = provenCallArgumentSlot(
+                function,
+                operation,
+                target,
+                new PcodeStorage(readBufferParameter, 0L));
+            if (target == null || bufferSlot == null) {
+                continue;
+            }
+            WireShape evidence = pcodeReadRawWireEvidence(operation, target);
+            if (evidence == null) {
+                evidence = validatedUnmarshalLeaf(target, "param_" + bufferSlot);
+            }
+            String nativeType = unmarshalNativeTypeFromTarget(target);
+            observePcodeTempUnmarshal(
+                tempNativeTypes,
+                tempWireShapes,
+                operation,
+                nativeType,
+                evidence == null
+                    ? null
+                    : firstNonEmpty(evidence.shape, evidence.layout));
+        }
+        return actions;
+    }
+
+    private PcodeOpAST uniqueUnmarshalCountProducer(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST consumer,
+        PcodeStorage countStorage) {
+
+        PcodeOpAST selected = null;
+        for (PcodeOpAST candidate : operations) {
+            if (candidate.getOpcode() != PcodeOp.CALL ||
+                !NetworkSchemaControlFlow.precedes(high, candidate, consumer)) {
+                continue;
+            }
+            Function target = pcodeCallTarget(candidate);
+            WireShape evidence = directCallWireEvidence(candidate);
+            String nativeType = unmarshalNativeTypeFromTarget(target);
+            PcodeStorage output = pcodeScalarUnmarshalOutputStorage(
+                candidate,
+                nativeType);
+            if (evidence == null || !"vlq-u32".equals(evidence.shape) ||
+                output == null || !countStorage.sameLocation(output)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private ContainerCodecCall unmarshalCollectionBoundary(
+        PcodeOpAST count,
+        Function target,
+        WireShape evidence,
+        String source) {
+
+        ContainerCodecCall boundary = new ContainerCodecCall();
+        boundary.operation = count;
+        boundary.callsite = count.getSeqnum().getTarget();
+        boundary.target = target == null ? null : target.getEntryPoint();
+        boundary.targetName = target == null ? null : fullFunctionName(target);
+        boundary.wireEvidence = evidence;
+        boundary.evidenceSource = source;
+        boundary.memberSemantics = evidence != null && evidence.layout != null &&
+            evidence.layout.startsWith("vec<")
+                ? "counted-sequence"
+                : "fixed-sequence";
+        boundary.analysisStatus = "complete";
+        return boundary;
+    }
+
+    private boolean putUnmarshalCollectionAction(
+        Map<PcodeOpAST, UnmarshalCollectionAction> actions,
+        PcodeOpAST operation,
+        ContainerCodecCall codec,
+        boolean emit) {
+
+        UnmarshalCollectionAction candidate = new UnmarshalCollectionAction(codec, emit);
+        UnmarshalCollectionAction previous = actions.putIfAbsent(operation, candidate);
+        return previous == null || previous.codec() == codec && previous.emit() == emit;
+    }
+
+    private record UnmarshalCollectionAction(
+        ContainerCodecCall codec,
+        boolean emit) {
+    }

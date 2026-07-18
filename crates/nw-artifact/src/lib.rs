@@ -1,9 +1,12 @@
-//! Content-addressed output packages shared by all exporters.
+//! Catalog-mirroring output packages shared by all exporters.
 //!
-//! A package has ordinary manifest/artifact files plus a single shared blob
-//! directory. Blobs are named by SHA-256, so independently exported assets can
-//! reference identical geometry, animation, texture, audio, or other payloads
-//! without writing duplicate bytes.
+//! A package holds ordinary manifest/artifact files alongside their external
+//! resources, laid out to mirror the game's own asset-catalog directory tree.
+//! Raw dependency payloads keep their exact pak paths; derived payloads sit
+//! next to the source (`<caf>.bin`) or next to the manifest (`<model>.bin`,
+//! decoded `.png` at the texture's path). Identical bytes claimed at the same
+//! normalized path are written once; a within-run path collision that carries
+//! different bytes is disambiguated with a short content-hash infix.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -16,7 +19,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
 
-const SHARED_DIRECTORY: &str = "_shared/sha256";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// SHA-256 identity of one immutable shared payload.
@@ -58,7 +60,7 @@ impl fmt::Display for ContentId {
     }
 }
 
-/// Reference to one payload already present in the package's shared store.
+/// Reference to one payload already published at its catalog path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredBlob {
     content_id: ContentId,
@@ -84,12 +86,16 @@ impl StoredBlob {
 }
 
 type SharedWrite = OnceLock<Result<(), Arc<io::Error>>>;
-type SharedWrites = HashMap<(ContentId, String), Arc<SharedWrite>>;
+/// Identity registry keyed by normalized package-relative path. The stored
+/// [`ContentId`] records which payload first claimed the path so a later claim
+/// with differing bytes can be disambiguated instead of clobbering it.
+type SharedWrites = HashMap<String, (ContentId, Arc<SharedWrite>)>;
 
 /// Thread-safe writer for one structured export root.
 ///
 /// Clone this value into batch jobs. Concurrent attempts to publish the same
-/// content wait on one write and all receive the same [`StoredBlob`].
+/// content at the same path wait on one write and all receive the same
+/// [`StoredBlob`].
 #[derive(Clone)]
 pub struct PackageWriter {
     root: Arc<PathBuf>,
@@ -119,30 +125,48 @@ impl PackageWriter {
         &self.root
     }
 
-    /// Store immutable bytes under `_shared/sha256/<digest>.<extension>`.
+    /// Store immutable bytes at the package-relative `path`, mirroring the
+    /// game's asset-catalog directory tree.
+    ///
+    /// The path is normalized (forward slashes, ASCII-lowercase) so the same
+    /// authored asset arriving with different casing resolves to one file. The
+    /// first payload to claim a normalized path wins it: identical bytes already
+    /// on disk from a previous run are reused, differing bytes are replaced.
+    /// A later claim on the same path within this run that carries *different*
+    /// content is written to a disambiguated sibling — the first 12 hex chars of
+    /// its SHA-256 are inserted before the final extension segment
+    /// (`attack.caf` → `attack.<12hex>.caf`). The returned
+    /// [`StoredBlob`] reports the final path actually used.
     ///
     /// # Errors
     ///
-    /// Returns an error for an unsafe extension or failed filesystem write.
-    pub fn store(&self, bytes: &[u8], extension: &str) -> Result<StoredBlob, PackageError> {
-        validate_extension(extension)?;
-        let extension = extension.to_ascii_lowercase();
+    /// Returns an error if the path escapes the package or the write fails.
+    pub fn store_at(
+        &self,
+        path: impl AsRef<Path>,
+        bytes: &[u8],
+    ) -> Result<StoredBlob, PackageError> {
+        let normalized = normalize_store_path(path.as_ref())?;
         let content_id = ContentId::for_bytes(bytes);
-        let relative_path =
-            PathBuf::from(SHARED_DIRECTORY).join(format!("{content_id}.{extension}"));
-        let destination = self.root.join(&relative_path);
-        let cell = {
+        let (final_path, cell) = {
             let mut writes = self
                 .writes
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            Arc::clone(
-                writes
-                    .entry((content_id, extension))
-                    .or_insert_with(|| Arc::new(OnceLock::new())),
-            )
+            let target = match writes.get(&normalized) {
+                Some((existing, _)) if *existing != content_id => {
+                    suffixed_path(&normalized, content_id)
+                }
+                _ => normalized,
+            };
+            let entry = writes
+                .entry(target.clone())
+                .or_insert_with(|| (content_id, Arc::new(OnceLock::new())));
+            (target, Arc::clone(&entry.1))
         };
-        let result = cell.get_or_init(|| publish_blob(&destination, bytes).map_err(Arc::new));
+        let destination = self.root.join(&final_path);
+        let result =
+            cell.get_or_init(|| publish_at(&destination, content_id, bytes).map_err(Arc::new));
         if let Err(source) = result {
             return Err(PackageError::Io {
                 path: destination,
@@ -151,13 +175,13 @@ impl PackageWriter {
         }
         Ok(StoredBlob {
             content_id,
-            relative_path,
+            relative_path: PathBuf::from(final_path),
             byte_len: bytes.len(),
         })
     }
 
-    /// URI from an artifact to a shared blob, using forward slashes as required
-    /// by glTF and other URI-based formats.
+    /// URI from an artifact to a stored resource, using forward slashes as
+    /// required by glTF and other URI-based formats.
     ///
     /// # Errors
     ///
@@ -244,8 +268,6 @@ impl PackageWriter {
 pub enum PackageError {
     #[error("package artifact path must be relative and contained: {0}")]
     UnsafeArtifact(PathBuf),
-    #[error("shared blob extension must contain only ASCII letters or digits: {0:?}")]
-    UnsafeExtension(String),
     #[error("I/O error at {path}")]
     Io {
         path: PathBuf,
@@ -254,11 +276,37 @@ pub enum PackageError {
     },
 }
 
-fn validate_extension(extension: &str) -> Result<(), PackageError> {
-    if extension.is_empty() || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-        return Err(PackageError::UnsafeExtension(extension.to_string()));
+/// Normalize a package-relative resource path: forward slashes, ASCII-lowercase,
+/// then reject anything that is absolute or escapes the package root.
+fn normalize_store_path(path: &Path) -> Result<String, PackageError> {
+    let normalized: String = path
+        .to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character == '\\' {
+                '/'
+            } else {
+                character.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    validate_relative(Path::new(&normalized))?;
+    Ok(normalized)
+}
+
+/// Insert the first 12 hex chars of `content_id` before the final extension
+/// segment of `path` (`a/attack.caf` → `a/attack.<12hex>.caf`). The
+/// result is content-derived, so it cannot collide with a differing payload.
+fn suffixed_path(path: &str, content_id: ContentId) -> String {
+    let hex12: String = content_id.to_string().chars().take(12).collect();
+    let name_start = path.rfind('/').map_or(0, |slash| slash + 1);
+    match path[name_start..].rfind('.') {
+        Some(dot) => {
+            let dot = name_start + dot;
+            format!("{}.{hex12}{}", &path[..dot], &path[dot..])
+        }
+        None => format!("{path}.{hex12}"),
     }
-    Ok(())
 }
 
 fn validate_relative(path: &Path) -> Result<&Path, PackageError> {
@@ -297,13 +345,13 @@ fn relative_path(from: &Path, to: &Path) -> PathBuf {
     relative
 }
 
-fn publish_blob(destination: &Path, bytes: &[u8]) -> io::Result<()> {
-    if existing_blob_matches(destination, bytes.len())? {
+fn publish_at(destination: &Path, content_id: ContentId, bytes: &[u8]) -> io::Result<()> {
+    if existing_file_matches(destination, content_id)? {
         return Ok(());
     }
     let parent = destination
         .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "blob has no parent"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "resource has no parent"))?;
     std::fs::create_dir_all(parent)?;
     let (temporary, mut file) = create_temporary(destination)?;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
@@ -311,16 +359,7 @@ fn publish_blob(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         return Err(error);
     }
     drop(file);
-    match std::fs::rename(&temporary, destination) {
-        Ok(()) => Ok(()),
-        Err(_) if existing_blob_matches(destination, bytes.len())? => {
-            std::fs::remove_file(temporary)
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(temporary);
-            Err(error)
-        }
-    }
+    replace_artifact(&temporary, destination)
 }
 
 fn create_temporary(destination: &Path) -> io::Result<(PathBuf, std::fs::File)> {
@@ -368,9 +407,12 @@ fn replace_artifact(temporary: &Path, destination: &Path) -> io::Result<()> {
     }
 }
 
-fn existing_blob_matches(path: &Path, expected_len: usize) -> io::Result<bool> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file() && metadata.len() == expected_len as u64),
+/// Whether the file already on disk at `path` hashes to `content_id`. A plain
+/// length match is no longer sufficient identity now that paths (not digests)
+/// name resources, so the existing bytes are hashed and compared.
+fn existing_file_matches(path: &Path, content_id: ContentId) -> io::Result<bool> {
+    match std::fs::read(path) {
+        Ok(existing) => Ok(ContentId::for_bytes(&existing) == content_id),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
@@ -381,22 +423,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deduplicates_shared_bytes_and_builds_nested_uri() {
+    fn stores_at_catalog_path_and_builds_relative_uri() {
         let temp = tempfile::tempdir().unwrap();
         let writer = PackageWriter::new(temp.path()).unwrap();
-        let first = writer.store(b"same payload", "BIN").unwrap();
-        let second = writer.store(b"same payload", "bin").unwrap();
+        let blob = writer
+            .store_at("textures/alligator/alligator_diff.png", b"decoded png")
+            .unwrap();
+
+        assert_eq!(
+            blob.relative_path(),
+            Path::new("textures/alligator/alligator_diff.png")
+        );
+        assert_eq!(
+            writer
+                .uri_from(
+                    "objects/characters/npc/natural/alligator/alligator.gltf",
+                    &blob
+                )
+                .unwrap(),
+            "../../../../../textures/alligator/alligator_diff.png"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join(blob.relative_path())).unwrap(),
+            b"decoded png"
+        );
+    }
+
+    #[test]
+    fn dedupes_same_path_and_is_case_insensitive() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = PackageWriter::new(temp.path()).unwrap();
+        let first = writer
+            .store_at("slices/tree_oak.slice.meta", b"slice metadata")
+            .unwrap();
+        // Same authored asset, different casing and separators, same bytes.
+        let second = writer
+            .store_at("SLICES\\TREE_OAK.SLICE.META", b"slice metadata")
+            .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(
-            writer
-                .uri_from("objects/characters/hero.gltf", &first)
-                .unwrap(),
-            "../../_shared/sha256/e94045d2493922f0ce901226bf668cfe954f6b503bfab1fef09370af7e972812.bin"
+            first.relative_path(),
+            Path::new("slices/tree_oak.slice.meta")
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("slices")).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn disambiguates_within_run_collision_with_content_infix() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = PackageWriter::new(temp.path()).unwrap();
+        let first = writer
+            .store_at("animations/attack.caf", b"skeleton A channels")
+            .unwrap();
+        // Same derived path, different bytes (e.g. retargeted onto another skeleton).
+        let second = writer
+            .store_at("animations/attack.caf", b"skeleton B channels")
+            .unwrap();
+
+        assert_eq!(first.relative_path(), Path::new("animations/attack.caf"));
+        let hex12: String = second.content_id().to_string().chars().take(12).collect();
+        assert_eq!(
+            second.relative_path(),
+            Path::new(&format!("animations/attack.{hex12}.caf"))
         );
         assert_eq!(
             std::fs::read(temp.path().join(first.relative_path())).unwrap(),
-            b"same payload"
+            b"skeleton A channels"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join(second.relative_path())).unwrap(),
+            b"skeleton B channels"
+        );
+    }
+
+    #[test]
+    fn cross_run_reuses_identical_and_replaces_differing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        // A previous run leaves a file at the same path.
+        PackageWriter::new(temp.path())
+            .unwrap()
+            .store_at("objects/alligator.bin", b"original geometry")
+            .unwrap();
+
+        // Identical bytes from a fresh registry are reused without rewriting.
+        let reused = PackageWriter::new(temp.path())
+            .unwrap()
+            .store_at("objects/alligator.bin", b"original geometry")
+            .unwrap();
+        assert_eq!(reused.relative_path(), Path::new("objects/alligator.bin"));
+        assert_eq!(
+            std::fs::read(temp.path().join(reused.relative_path())).unwrap(),
+            b"original geometry"
+        );
+
+        // Differing bytes replace the superseded file in place.
+        let replaced = PackageWriter::new(temp.path())
+            .unwrap()
+            .store_at("objects/alligator.bin", b"rebuilt geometry")
+            .unwrap();
+        assert_eq!(replaced.relative_path(), Path::new("objects/alligator.bin"));
+        assert_eq!(
+            std::fs::read(temp.path().join(replaced.relative_path())).unwrap(),
+            b"rebuilt geometry"
         );
     }
 
@@ -408,6 +540,10 @@ mod tests {
             writer.write("../outside", b"no"),
             Err(PackageError::UnsafeArtifact(_))
         ));
+        assert!(matches!(
+            writer.store_at("../outside.bin", b"no"),
+            Err(PackageError::UnsafeArtifact(_))
+        ));
     }
 
     #[test]
@@ -417,7 +553,11 @@ mod tests {
         let handles = (0..8)
             .map(|_| {
                 let writer = writer.clone();
-                std::thread::spawn(move || writer.store(&vec![7; 64 * 1024], "dat").unwrap())
+                std::thread::spawn(move || {
+                    writer
+                        .store_at("meshes/shared.bin", &vec![7; 64 * 1024])
+                        .unwrap()
+                })
             })
             .collect::<Vec<_>>();
         let blobs = handles
@@ -426,9 +566,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(blobs.windows(2).all(|pair| pair[0] == pair[1]));
         assert_eq!(
-            std::fs::read_dir(temp.path().join(SHARED_DIRECTORY))
-                .unwrap()
-                .count(),
+            std::fs::read_dir(temp.path().join("meshes")).unwrap().count(),
             1
         );
     }

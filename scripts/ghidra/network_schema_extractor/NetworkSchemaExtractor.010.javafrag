@@ -1,22 +1,3 @@
-            if (targetInfo.target != null) {
-                NetworkSchemaJson.add(reject, "targetName", fullFunctionName(targetInfo.target));
-            }
-            if (targetInfo.containing != null) {
-                NetworkSchemaJson.add(reject, "containingTarget", formatAddress(targetInfo.containing.getEntryPoint()));
-                NetworkSchemaJson.add(reject, "containingTargetName", fullFunctionName(targetInfo.containing));
-            }
-        }
-        if (storage != null) {
-            NetworkSchemaJson.add(reject, "storageBase", storage.base);
-            reject.addProperty("storageBaseOffset", "0x" + Long.toHexString(storage.offset));
-            NetworkSchemaJson.add(reject, "storageExpression", storage.expression());
-        }
-        if (argStorageEvidence != null && argStorageEvidence.size() != 0) {
-            reject.add("argStorage", argStorageEvidence);
-        }
-        plan.rejectedPcodeFields.add(reject);
-    }
-
     private FieldCall addRawMessageField(
         MessageUnmarshalPlan plan,
         Address callsite,
@@ -73,8 +54,6 @@
         }
         if (field.nativeType == null) {
             field.nativeType = nativeType;
-            field.wireShape = wireShapeFromNativeType(nativeType);
-            field.wireShapeSource = field.wireShape == null ? null : source;
             addMessageFieldTypeEvidence(field, nativeType, source, targetName, targetKind);
             return;
         }
@@ -89,8 +68,6 @@
                 addMessageFieldTypeEvidence(field, nativeType, source, targetName, targetKind);
                 field.sourceTypeName = appendDistinctType(field.sourceTypeName, field.nativeType);
                 field.nativeType = nativeType;
-                field.wireShape = wireShapeFromNativeType(nativeType);
-                field.wireShapeSource = field.wireShape == null ? null : source;
                 field.confidence = source;
                 return;
             }
@@ -217,201 +194,6 @@
         return existing + "," + value;
     }
 
-    private void enrichMessageFieldsFromSourceSignatures(
-        RegistryEntry entry,
-        MessageUnmarshalPlan plan) {
-
-        List<MessageSourceSignature> signatures = recoverMessageSourceSignatures(entry, plan);
-        plan.sourceSignatures.addAll(signatures);
-        List<String> sourceNames = sourceMessageFieldNames(entry.name, plan);
-        Address sourceAddress = signatures.isEmpty() ? null : signatures.get(0).stringAddress;
-
-        for (int i = 0; i < plan.fields.size(); i++) {
-            FieldCall field = plan.fields.get(i);
-            if (i < sourceNames.size()) {
-                field.name = sourceNames.get(i);
-                field.nameSource = signatures.isEmpty()
-                    ? "source-message-name-table"
-                    : "msvc-rtti-source-signature";
-                field.nameSourceAddress = sourceAddress;
-                field.sourceTypeName = sourceTypeNameForMessageField(entry.name, i, field);
-                continue;
-            }
-
-            String derived = sourceFieldNameFromType(field.nativeType);
-            if (derived != null && isGeneratedFieldName(field.name)) {
-                field.name = derived;
-                field.nameSource = "message-native-type-name";
-                field.nameSourceAddress = sourceAddress;
-                field.sourceTypeName = field.nativeType;
-            }
-        }
-    }
-
-    private List<MessageSourceSignature> recoverMessageSourceSignatures(
-        RegistryEntry entry,
-        MessageUnmarshalPlan plan) {
-
-        ArrayList<MessageSourceSignature> result = new ArrayList<>();
-        LinkedHashSet<String> tokens = sourceSignatureSearchTokens(entry, plan);
-        LinkedHashSet<String> seenStrings = new LinkedHashSet<>();
-        for (String token : tokens) {
-            for (Address stringAddress : asciiStringsContaining(token)) {
-                String value = readPrintableString(stringAddress);
-                if (!sourceSignatureMatchesMessagePlan(value, entry, plan) ||
-                    !seenStrings.add(formatAddress(stringAddress))) {
-                    continue;
-                }
-
-                MessageSourceSignature signature = new MessageSourceSignature();
-                signature.stringAddress = stringAddress;
-                signature.mangledName = value;
-                signature.typeDescriptor = msvcTypeDescriptorForString(stringAddress);
-                enrichSourceSignatureXrefs(signature);
-                result.add(signature);
-                if (result.size() >= 4) {
-                    return result;
-                }
-            }
-        }
-        return result;
-    }
-
-    private LinkedHashSet<String> sourceSignatureSearchTokens(
-        RegistryEntry entry,
-        MessageUnmarshalPlan plan) {
-
-        LinkedHashSet<String> result = new LinkedHashSet<>();
-        for (String templateType : plan.templateTypes) {
-            String leaf = NetworkSchemaText.sourceTypeLeaf(templateType);
-            if (leaf != null && leaf.length() >= 8 && !"AZStd::string".equals(templateType)) {
-                result.add(leaf);
-            }
-        }
-        String messageLeaf = messageLeafName(entry.name);
-        if (messageLeaf != null && messageLeaf.length() >= 8) {
-            result.add(messageLeaf);
-        }
-        return result;
-    }
-
-    private boolean sourceSignatureMatchesMessagePlan(
-        String value,
-        RegistryEntry entry,
-        MessageUnmarshalPlan plan) {
-
-        if (value == null || !value.contains("<lambda_")) {
-            return false;
-        }
-
-        int matchedTypes = 0;
-        for (String templateType : plan.templateTypes) {
-            String leaf = NetworkSchemaText.sourceTypeLeaf(templateType);
-            if (leaf != null && value.contains(leaf)) {
-                matchedTypes++;
-            }
-        }
-
-        if (matchedTypes >= Math.min(2, Math.max(1, plan.templateTypes.size()))) {
-            return true;
-        }
-
-        String messageLeaf = messageLeafName(entry.name);
-        return messageLeaf != null && value.contains(messageLeaf);
-    }
-
-    private void enrichSourceSignatureXrefs(MessageSourceSignature signature) {
-        if (signature == null || !isProgramAddress(signature.typeDescriptor)) {
-            return;
-        }
-
-        ReferenceIterator descriptorReferences =
-            currentProgram.getReferenceManager().getReferencesTo(signature.typeDescriptor);
-        while (descriptorReferences.hasNext()) {
-            Reference reference = descriptorReferences.next();
-            Function provider = functionContaining(reference.getFromAddress());
-            if (provider == null) {
-                continue;
-            }
-            signature.addProvider(provider, this);
-            collectSourceSignatureProviderRefs(signature, provider);
-        }
-    }
-
-    private void collectSourceSignatureProviderRefs(
-        MessageSourceSignature signature,
-        Function provider) {
-
-        ReferenceIterator providerReferences =
-            currentProgram.getReferenceManager().getReferencesTo(provider.getEntryPoint());
-        while (providerReferences.hasNext()) {
-            Reference reference = providerReferences.next();
-            Address from = reference.getFromAddress();
-            if (isExecutableAddress(from)) {
-                Function caller = functionContaining(from);
-                if (caller != null) {
-                    collectSourceCallGraph(signature, caller, SOURCE_SIGNATURE_CALL_GRAPH_DEPTH);
-                }
-                continue;
-            }
-
-            signature.tableReferences.add(formatAddress(from));
-            collectFunctionPointersNear(signature, from);
-        }
-    }
-
-    private void collectFunctionPointersNear(MessageSourceSignature signature, Address address) {
-        Address start = subtract(address, SOURCE_SIGNATURE_XREF_SCAN_BYTES);
-        if (!isProgramAddress(start)) {
-            start = address;
-        }
-
-        for (int offset = 0; offset <= SOURCE_SIGNATURE_XREF_SCAN_BYTES * 2; offset += 8) {
-            Address pointerAddress = start.add(offset);
-            Address pointer = readPointer(pointerAddress);
-            Address target = resolvedCodeTarget(pointer);
-            Function function = functionAtOrContaining(target);
-            if (function == null || signature.sourceFunctions.size() >=
-                SOURCE_SIGNATURE_CALL_GRAPH_LIMIT) {
-                continue;
-            }
-            collectSourceCallGraph(signature, function, SOURCE_SIGNATURE_CALL_GRAPH_DEPTH);
-        }
-    }
-
-    private void collectSourceCallGraph(
-        MessageSourceSignature signature,
-        Function function,
-        int depth) {
-
-        if (function == null ||
-            signature.sourceFunctions.size() >= SOURCE_SIGNATURE_CALL_GRAPH_LIMIT) {
-            return;
-        }
-        boolean inserted = signature.addSourceFunction(function, this);
-        if (!inserted || depth <= 0) {
-            return;
-        }
-
-        int calls = 0;
-        for (Instruction instruction : functionInstructions(function)) {
-            if (calls >= SOURCE_SIGNATURE_CALL_GRAPH_LIMIT ||
-                signature.sourceFunctions.size() >= SOURCE_SIGNATURE_CALL_GRAPH_LIMIT) {
-                break;
-            }
-            if (!instruction.getFlowType().isCall()) {
-                continue;
-            }
-            Function target = functionAtOrContaining(resolvedCodeTarget(callTarget(instruction)));
-            if (target == null) {
-                continue;
-            }
-            calls++;
-            signature.addCallTarget(function, instruction.getMinAddress(), target, this);
-            collectSourceCallGraph(signature, target, depth - 1);
-        }
-    }
-
     private List<Address> asciiStringsContaining(String token) {
         if (token == null || token.isEmpty()) {
             return List.of();
@@ -482,111 +264,6 @@
         return cursor;
     }
 
-    private Address msvcTypeDescriptorForString(Address stringAddress) {
-        String value = readPrintableString(stringAddress);
-        if (value == null || !value.startsWith(".?A")) {
-            return null;
-        }
-        Address typeDescriptor = subtract(stringAddress, 0x10);
-        return isProgramAddress(typeDescriptor) ? typeDescriptor : null;
-    }
-
-    private List<String> sourceMessageFieldNames(String messageName, MessageUnmarshalPlan plan) {
-        String leaf = messageLeafName(messageName);
-        if ("RegistrationRequestV3Msg".equals(leaf) && plan.fields.size() == 7) {
-            return List.of(
-                "TypeIndexCrc",
-                "ClientVersion",
-                "ConnTicket",
-                "LoginToken",
-                "AuthToken",
-                "ImpersonateInfo",
-                "UseCapabilities");
-        }
-        if ("RegistrationRequestV2Msg".equals(leaf) && plan.fields.size() == 6) {
-            return List.of(
-                "TypeIndexCrc",
-                "ClientVersion",
-                "ConnTicket",
-                "LoginToken",
-                "ImpersonateInfo",
-                "UseCapabilities");
-        }
-        if ("RegistrationRequestMsg".equals(leaf) && plan.fields.size() == 6) {
-            return List.of(
-                "TypeIndexCrc",
-                "ClientVersion",
-                "ConnTicket",
-                "LoginToken",
-                "ImpersonateId",
-                "UseCapabilities");
-        }
-        return List.of();
-    }
-
-    private String sourceTypeNameForMessageField(
-        String messageName,
-        int index,
-        FieldCall field) {
-
-        String leaf = messageLeafName(messageName);
-        if ("RegistrationRequestV3Msg".equals(leaf)) {
-            return switch (index) {
-                case 0 -> "AZ::Crc32";
-                case 1 -> "Amazon::Configuration::ClientVersionTokenMap";
-                case 2 -> "std::string";
-                case 3 -> "Amazon::REP::LoginToken";
-                case 4 -> "Amazon::REP::AuthToken";
-                case 5 -> "Amazon::REP::ImpersonatedValues";
-                case 6 -> "bool";
-                default -> field.nativeType;
-            };
-        }
-        if ("RegistrationRequestV2Msg".equals(leaf)) {
-            return switch (index) {
-                case 0 -> "AZ::Crc32";
-                case 1 -> "Amazon::Configuration::ClientVersionTokenMap";
-                case 2 -> "std::string";
-                case 3 -> "Amazon::REP::LoginToken";
-                case 4 -> "Amazon::REP::ImpersonatedValues";
-                case 5 -> "bool";
-                default -> field.nativeType;
-            };
-        }
-        if ("RegistrationRequestMsg".equals(leaf)) {
-            return switch (index) {
-                case 0 -> "AZ::Crc32";
-                case 1 -> "Amazon::Configuration::ClientVersionTokenMap";
-                case 2 -> "std::string";
-                case 3 -> "Amazon::REP::LoginToken";
-                case 4 -> "Amazon::REP::CharacterId";
-                case 5 -> "bool";
-                default -> field.nativeType;
-            };
-        }
-        return field.nativeType;
-    }
-
-    private String sourceFieldNameFromType(String nativeType) {
-        String leaf = NetworkSchemaText.sourceTypeLeaf(nativeType);
-        if (leaf == null || leaf.isEmpty() ||
-            leaf.startsWith("u") ||
-            "bool".equals(leaf) ||
-            "string".equalsIgnoreCase(leaf)) {
-            return null;
-        }
-        return leaf;
-    }
-
-    private String messageLeafName(String value) {
-        String leaf = NetworkSchemaText.sourceTypeLeaf(value);
-        if (leaf == null) {
-            return null;
-        }
-        int template = leaf.indexOf('<');
-        return template >= 0 ? leaf.substring(0, template) : leaf;
-    }
-
     private boolean isGeneratedFieldName(String value) {
         return value != null && value.matches("field_\\d+");
     }
@@ -597,58 +274,35 @@
             return createInstanceSizeCache.get(key);
         }
         Function function = functionAtOrContaining(createInstance);
-        if (function == null) {
+        HighFunction high = highFunction(function);
+        if (high == null) {
             if (key != null) {
                 createInstanceSizeCache.put(key, null);
             }
             return null;
         }
 
-        Long ecx = null;
-        int count = 0;
-        for (Instruction instruction : functionInstructions(function)) {
-            if (count++ >= 16) {
-                break;
-            }
-            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
-            if ("MOV".equals(mnemonic) && ("ECX".equals(destination) || "RCX".equals(destination))) {
-                ecx = literalOperandValue(instruction, 1);
+        LinkedHashSet<Long> sizes = new LinkedHashSet<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL || operation.getNumInputs() < 2) {
                 continue;
             }
-            if (instruction.getFlowType().isCall() && ecx != null) {
-                if (key != null) {
-                    createInstanceSizeCache.put(key, ecx);
-                }
-                return ecx;
+            Function target = pcodeCallTarget(operation);
+            if (target == null ||
+                !isNamedAllocatorFunction(fullFunctionName(target)) &&
+                    !isAllocatorReturnFunction(target)) {
+                continue;
+            }
+            Long size = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(1));
+            if (size != null && size > 0L) {
+                sizes.add(size);
             }
         }
+        Long size = sizes.size() == 1 ? sizes.iterator().next() : null;
         if (key != null) {
-            createInstanceSizeCache.put(key, ecx);
+            createInstanceSizeCache.put(key, size);
         }
-        return ecx;
-    }
-
-    private MessageConstructorCall findMessageConstructorCall(Function wrapper, Address beforeCallsite) {
-        MessageConstructorCall result = null;
-        for (Instruction instruction : functionInstructions(wrapper)) {
-            if (beforeCallsite != null && instruction.getMinAddress().compareTo(beforeCallsite) >= 0) {
-                break;
-            }
-            if (!instruction.getFlowType().isCall()) {
-                continue;
-            }
-            Address target = callTarget(instruction);
-            Function function = functionAtOrContaining(target);
-            if (function == null) {
-                continue;
-            }
-            result = new MessageConstructorCall();
-            result.callsite = instruction.getMinAddress();
-            result.target = function.getEntryPoint();
-            result.targetName = fullFunctionName(function);
-        }
-        return result;
+        return size;
     }
 
     private Long storageByteOffsetFromExpression(String expression) {
@@ -710,121 +364,6 @@
         return identity != null && field != null && identity.equals(field.storageIdentity);
     }
 
-    private void refineMessageFieldsFromHelper(MessageUnmarshalPlan plan) {
-        if (plan == null || plan.helper == null) {
-            return;
-        }
-        Function helper = functionAtOrContaining(plan.helper);
-        String helperText = decompileC(helper);
-        if (helperText == null) {
-            return;
-        }
-
-        List<String> helperParams = textParser.parameterNamesFromDecompiledFunction(helperText);
-        HashMap<String, FieldCall> fieldsByHelperParam = new HashMap<>();
-        for (int i = 2; i < helperParams.size(); i++) {
-            int fieldIndex = i - 2;
-            if (fieldIndex >= 0 && fieldIndex < plan.fields.size()) {
-                fieldsByHelperParam.put(helperParams.get(i), plan.fields.get(fieldIndex));
-            }
-        }
-
-        refineDirectBoolWrites(helperText, fieldsByHelperParam);
-        refineNestedBoolWrites(helper, helperText, fieldsByHelperParam);
-    }
-
-    private void refineDirectBoolWrites(
-        String helperText,
-        Map<String, FieldCall> fieldsByHelperParam) {
-
-        for (String target : textParser.boolPointerWriteTargets(helperText)) {
-            FieldCall field = fieldsByHelperParam.get(target);
-            if (field != null && field.nativeType == null) {
-                field.nativeType = "bool";
-                field.wireShape = "bool";
-                field.wireShapeSource = "message-helper-bool-write";
-            }
-        }
-    }
-
-    private void refineNestedBoolWrites(
-        Function helper,
-        String helperText,
-        Map<String, FieldCall> fieldsByHelperParam) {
-
-        List<ParsedUnmarshalCall> calls = textParser.parseUnmarshalCalls(helperText);
-        if (calls.isEmpty()) {
-            return;
-        }
-
-        Map<String, Set<Integer>> boolParameterIndices = nestedBoolParameterIndices(helper);
-        for (ParsedUnmarshalCall call : calls) {
-            Set<Integer> indices = boolParameterIndices.get(call.templateType);
-            if (indices == null || indices.isEmpty()) {
-                continue;
-            }
-            for (Integer index : indices) {
-                if (index == null || index < 0 || index >= call.args.size()) {
-                    continue;
-                }
-                String argName = bareArgumentName(call.args.get(index));
-                FieldCall field = fieldsByHelperParam.get(argName);
-                if (field != null && field.nativeType == null) {
-                    field.nativeType = "bool";
-                    field.wireShape = "bool";
-                    field.wireShapeSource = "nested-unmarshal-bool-write";
-                }
-            }
-        }
-    }
-
-    private Map<String, Set<Integer>> nestedBoolParameterIndices(Function helper) {
-        if (helper == null) {
-            return Collections.emptyMap();
-        }
-        String key = functionCacheKey("nested-bool-parameters", helper);
-        Map<String, Set<Integer>> cached = nestedBoolParameterIndicesCache.get(key);
-        if (cached != null) {
-            return cached;
-        }
-        LinkedHashMap<String, Set<Integer>> result = new LinkedHashMap<>();
-        for (Instruction instruction : functionInstructions(helper)) {
-            if (!instruction.getFlowType().isCall()) {
-                continue;
-            }
-            Function target = functionAtOrContaining(callTarget(instruction));
-            if (target == null) {
-                continue;
-            }
-            String targetName = fullFunctionName(target);
-            String templateType = unmarshalTemplateType(targetName);
-            if (templateType == null) {
-                continue;
-            }
-            String targetText = decompileC(target);
-            Set<Integer> boolIndices = textParser.boolParameterIndices(targetText);
-            if (!boolIndices.isEmpty()) {
-                result.computeIfAbsent(templateType, ignored -> new LinkedHashSet<>())
-                    .addAll(boolIndices);
-            }
-        }
-        Map<String, Set<Integer>> cachedResult = immutableStringSetMap(result);
-        nestedBoolParameterIndicesCache.put(key, cachedResult);
-        return cachedResult;
-    }
-
-    private Map<String, Set<Integer>> immutableStringSetMap(
-        LinkedHashMap<String, Set<Integer>> value) {
-
-        LinkedHashMap<String, Set<Integer>> cached = new LinkedHashMap<>();
-        for (Map.Entry<String, Set<Integer>> entry : value.entrySet()) {
-            cached.put(
-                entry.getKey(),
-                Collections.unmodifiableSet(new LinkedHashSet<>(entry.getValue())));
-        }
-        return Collections.unmodifiableMap(cached);
-    }
-
     private boolean isLikelyMessageStorage(String expression) {
         if (expression == null) {
             return false;
@@ -838,37 +377,12 @@
             value.matches("\\b(p[lub]?Var\\d+|p[lub]?Var)\\s*\\+\\s*(0x[0-9a-fA-F]+|\\d+).*");
     }
 
-    private boolean isLikelyTemporaryStorage(String expression) {
-        if (expression == null) {
-            return false;
-        }
-        String value = NetworkSchemaText.normalizedExpression(expression);
-        return value != null && value.matches("local_[A-Za-z0-9_]+(\\[[0-9]+\\])?");
-    }
-
     private String firstIdentifier(String expression) {
         if (expression == null) {
             return null;
         }
         Matcher matcher = Pattern.compile("\\b[A-Za-z_][A-Za-z0-9_]*\\b").matcher(expression);
         return matcher.find() ? matcher.group() : null;
-    }
-
-    private String helperParameterFromExpression(
-        String expression,
-        Map<String, FieldCall> fieldsByHelperParam) {
-
-        if (expression == null || fieldsByHelperParam.isEmpty()) {
-            return null;
-        }
-        Matcher matcher = Pattern.compile("\\b[A-Za-z_][A-Za-z0-9_]*\\b").matcher(expression);
-        while (matcher.find()) {
-            String token = matcher.group();
-            if (fieldsByHelperParam.containsKey(token)) {
-                return token;
-            }
-        }
-        return null;
     }
 
     private String exactHelperParameterFromExpression(

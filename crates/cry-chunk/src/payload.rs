@@ -30,7 +30,6 @@ impl MeshStreamKind {
 }
 
 const MESH_SUBSETS_BONE_IDS: i32 = 0x0002;
-const MESH_SUBSETS_DECOMPRESSED_MATERIAL: i32 = 0x0001;
 const MESH_SUBSETS_TEXEL_DENSITY: i32 = 0x0004;
 const MESH_SUBSETS_NEW_WORLD_METRICS: i32 = 0x0008;
 const MAX_MESH_SUBSETS: usize = 256;
@@ -313,9 +312,7 @@ pub struct DataStreamChunk<'a> {
 pub struct MeshSubsetsChunk {
     pub flags: i32,
     pub subsets: Vec<MeshSubset>,
-    pub decompressed_materials: Vec<i32>,
     pub bone_ids: Vec<MeshSubsetBoneIds>,
-    pub texel_densities: Vec<f32>,
     pub new_world_metrics: Vec<[f32; 5]>,
 }
 
@@ -1612,14 +1609,8 @@ fn decode_mesh_subsets<'a>(
                 )?;
             }
 
-            let mut decompressed_materials = Vec::new();
-            if flags & MESH_SUBSETS_DECOMPRESSED_MATERIAL != 0 {
-                for _ in 0..count {
-                    decompressed_materials
-                        .push_payload("mesh subset decompressed materials", reader.read_i32()?)?;
-                }
-            }
-
+            // Loader @ 0x7ff606cd52f0 checks only bits 1/2/3; bit 0
+            // (decompressed materials) has no read or skip in the engine.
             let mut bone_ids = Vec::new();
             if flags & MESH_SUBSETS_BONE_IDS != 0 {
                 for _ in 0..count {
@@ -1645,12 +1636,13 @@ fn decode_mesh_subsets<'a>(
                 }
             }
 
-            let mut texel_densities = Vec::new();
             if flags & MESH_SUBSETS_TEXEL_DENSITY != 0 {
-                for _ in 0..count {
-                    texel_densities
-                        .push_payload("mesh subset texel densities", reader.read_f32()?)?;
-                }
+                // Loader @ 0x7ff606cd52f0 hard-errors "HAS_SUBSET_TEXEL_DENSITY is obsolte"
+                // (sic) when this bit is set; there is no array to read.
+                return Err(ChunkPayloadError::InvalidChunkLayout {
+                    chunk_type: ChunkType::MeshSubsets,
+                    reason: "HAS_SUBSET_TEXEL_DENSITY is obsolte",
+                });
             }
 
             let mut new_world_metrics = Vec::new();
@@ -1673,9 +1665,7 @@ fn decode_mesh_subsets<'a>(
             Ok(ChunkPayload::MeshSubsets(MeshSubsetsChunk {
                 flags,
                 subsets,
-                decompressed_materials,
                 bone_ids,
-                texel_densities,
                 new_world_metrics,
             }))
         }

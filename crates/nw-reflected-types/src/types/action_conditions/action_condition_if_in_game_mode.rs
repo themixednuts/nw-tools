@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfInGameMode;
+pub struct ActionConditionIfInGameMode {}
 
 impl AzRtti for ActionConditionIfInGameMode {
     const NAME: &'static str = "ActionConditionIfInGameMode";

@@ -1,0 +1,505 @@
+    private NestedTypeShape unreflectedContainerValueShape(
+        NativeTypeInfoEvidence candidate,
+        Function function,
+        Address vtable,
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        FullContainerPlan fullContainerPlan) {
+
+        List<ContainerCodecCall> valueLeaves = fullContainerPlan == null
+            ? null
+            : logicalContainerCodecLeaves(fullContainerPlan.valueCodecs);
+        String preconditionFailure = unreflectedContainerShapePreconditionFailure(
+            candidate,
+            fullContainerPlan,
+            valueLeaves);
+        if (preconditionFailure != null) {
+            recordNestedTypeShapeReject(preconditionFailure);
+            return null;
+        }
+
+        NestedTypeShape selected = null;
+        for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry : byBase.entrySet()) {
+            NestedTypeShape shape = unreflectedContainerValueShapeForBase(
+                candidate,
+                function,
+                vtable,
+                entry.getKey(),
+                entry.getValue(),
+                valueLeaves);
+            if (shape == null) {
+                continue;
+            }
+            if (selected != null) {
+                recordNestedTypeShapeReject("ambiguous-unreflected-container-output-root");
+                return null;
+            }
+            selected = shape;
+        }
+        return selected != null
+            ? selected
+            : customCodecWireProjection(candidate, function, vtable, fullContainerPlan);
+    }
+
+    private NestedTypeShape customCodecWireProjection(
+        NativeTypeInfoEvidence candidate,
+        Function function,
+        Address vtable,
+        FullContainerPlan plan) {
+
+        if (!isProvenContainerValueTypeEvidence(candidate) ||
+            !isPlausibleTypeName(candidate.name) ||
+            candidate.nativeSize == null || plan == null ||
+            !candidate.nativeSize.equals(plan.elementStride) ||
+            !"complete-conditional-physical-agreement".equals(
+                plan.unmarshalReconciliation)) {
+            return null;
+        }
+        List<ContainerCodecCall> encoded = logicalContainerCodecLeaves(plan.valueCodecs);
+        List<ContainerCodecCall> decoded = logicalContainerCodecLeaves(plan.unmarshalCodecs);
+        if (!sameLogicalContainerCodecSequence(encoded, decoded)) {
+            recordNestedTypeShapeReject("custom-codec-wire-sequence-mismatch");
+            return null;
+        }
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeId = normalizeUuid(candidate.typeId);
+        shape.typeIdSource = candidate.source;
+        shape.identityProven = true;
+        shape.identitySource = candidate.source + "+exact-custom-codec-helper";
+        shape.typeNameFull = candidate.name;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(candidate.name);
+        shape.typeNameSource = candidate.nameSource;
+        shape.function = function.getEntryPoint();
+        shape.functionName = fullFunctionName(function);
+        shape.vtable = vtable;
+        shape.memberBase = "wire";
+        shape.memberNameSource = "synthetic-wire-ordinal";
+        shape.memberNamesProven = false;
+        shape.layoutProven = true;
+        shape.memberCoverageProven = true;
+        shape.wireOrderProven = true;
+        shape.wireOrderSource = "marshal+unmarshal-custom-codec-order";
+        shape.validation = "exact-custom-codec-wire-projection+partial-native-member-map";
+        shape.nativeSize = candidate.nativeSize;
+        shape.nativeSizeSource = candidate.nativeSizeSource;
+        for (int index = 0; index < encoded.size(); index++) {
+            shape.members.add(customCodecWireMember(encoded.get(index), index));
+        }
+        return shape;
+    }
+
+    private boolean sameLogicalContainerCodecSequence(
+        List<ContainerCodecCall> encoded,
+        List<ContainerCodecCall> decoded) {
+
+        if (encoded == null || decoded == null || encoded.isEmpty() ||
+            encoded.size() != decoded.size()) {
+            return false;
+        }
+        for (int index = 0; index < encoded.size(); index++) {
+            ContainerCodecCall left = encoded.get(index);
+            ContainerCodecCall right = decoded.get(index);
+            if (left == null || right == null || left.wireEvidence == null ||
+                right.wireEvidence == null ||
+                !NetworkSchemaWireShape.equivalentBySemanticOrLayout(
+                    left.wireEvidence.shape,
+                    left.wireEvidence.layout,
+                    right.wireEvidence.shape,
+                    right.wireEvidence.layout)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private NestedTypeMember customCodecWireMember(
+        ContainerCodecCall codec,
+        int index) {
+
+        NestedTypeMember member = new NestedTypeMember();
+        member.index = index;
+        member.offset = index;
+        member.nativeOffset = codec.elementOffset;
+        member.name = "field_" + index;
+        member.nameSource = "synthetic-wire-ordinal";
+        member.nameProven = false;
+        member.nativeType = codec.nativeType;
+        member.typeId = normalizeUuid(codec.typeId);
+        member.typeIdSource = codec.typeIdSource;
+        member.typeIdentityProven = codec.typeIdentityProven;
+        member.wireShape = codec.wireEvidence.shape;
+        member.wireShapeSource = codec.wireEvidence.source;
+        member.wireLayout = codec.wireEvidence.layout;
+        member.wireLayoutSource = codec.wireEvidence.layoutSource;
+        member.byteWidth = wireShapeByteWidth(codec.wireEvidence.layout);
+        member.wireOrdinal = index;
+        member.wireOrderSource = "marshal+unmarshal-custom-codec-order";
+        member.callsite = codec.callsite;
+        member.target = codec.target;
+        member.targetName = codec.targetName;
+        return member;
+    }
+
+    private String unreflectedContainerShapePreconditionFailure(
+        NativeTypeInfoEvidence candidate,
+        FullContainerPlan plan,
+        List<ContainerCodecCall> valueCodecs) {
+
+        String layoutFailure = containerValueLayoutPreconditionFailure(plan, valueCodecs);
+        if (layoutFailure != null) {
+            return layoutFailure;
+        }
+        if (!isProvenContainerValueTypeEvidence(candidate)) {
+            return "unreflected-value-missing-construction-evidence";
+        }
+        if (!isPlausibleTypeName(candidate.name)) {
+            return "unreflected-value-missing-type-name";
+        }
+        if (plan.elementStride != null && !plan.elementStride.equals(candidate.nativeSize)) {
+            return "unreflected-value-stride-size-mismatch";
+        }
+        return null;
+    }
+
+    private NestedTypeShape anonymousContainerValueShape(
+        Function function,
+        Address vtable,
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        FullContainerPlan plan) {
+
+        List<List<ContainerCodecCall>> codecSequences =
+            provenContainerValueCodecSequences(plan);
+        if (codecSequences.isEmpty() || plan.elementStride == null) {
+            recordNestedTypeShapeReject("container-value-layout-missing-proven-codec-sequence");
+            return null;
+        }
+
+        NestedTypeShape selected = null;
+        for (List<ContainerCodecCall> valueCodecs : codecSequences) {
+            for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry : byBase.entrySet()) {
+                NestedTypeShape shape = containerValueLayoutShapeForBase(
+                    function,
+                    vtable,
+                    entry.getKey(),
+                    entry.getValue(),
+                    valueCodecs,
+                    plan.elementStride,
+                    "container-affine-element-stride");
+                if (shape == null) {
+                    continue;
+                }
+                if (selected != null && !sameContainerValueLayout(selected, shape)) {
+                    recordNestedTypeShapeReject("ambiguous-anonymous-container-output-root");
+                    return null;
+                }
+                selected = shape;
+            }
+        }
+        return selected;
+    }
+
+    private List<List<ContainerCodecCall>> provenContainerValueCodecSequences(
+        FullContainerPlan plan) {
+
+        if (plan == null || plan.elementStride == null || plan.elementStride <= 0L) {
+            return List.of();
+        }
+        LinkedHashMap<String, List<ContainerCodecCall>> sequences = new LinkedHashMap<>();
+        addProvenContainerValueCodecSequence(
+            sequences,
+            logicalContainerCodecLeaves(plan.valueCodecs));
+        addProvenContainerValueCodecSequence(
+            sequences,
+            physicalContainerCodecLeaves(plan.valueCodecs));
+        return List.copyOf(sequences.values());
+    }
+
+    private void addProvenContainerValueCodecSequence(
+        Map<String, List<ContainerCodecCall>> sequences,
+        List<ContainerCodecCall> codecs) {
+
+        if (codecs == null || codecs.isEmpty() || codecs.stream().anyMatch(codec ->
+                codec == null || (isStructuredContainerCodec(codec)
+                    ? physicalContainerCodecLeaves(codec.members) == null
+                    : codec.wireEvidence == null || codec.wireEvidence.layout == null))) {
+            return;
+        }
+        String key = codecs.stream()
+            .map(codec -> isStructuredContainerCodec(codec)
+                ? "type:" + normalizeUuid(codec.typeId)
+                : "wire:" + codec.wireEvidence.layout)
+            .collect(Collectors.joining("|"));
+        sequences.putIfAbsent(key, List.copyOf(codecs));
+    }
+
+    private boolean sameContainerValueLayout(
+        NestedTypeShape left,
+        NestedTypeShape right) {
+
+        if (left == null || right == null ||
+            !Objects.equals(left.nativeSize, right.nativeSize) ||
+            left.members.size() != right.members.size()) {
+            return false;
+        }
+        for (int index = 0; index < left.members.size(); index++) {
+            NestedTypeMember leftMember = left.members.get(index);
+            NestedTypeMember rightMember = right.members.get(index);
+            if (leftMember.offset != rightMember.offset ||
+                !Objects.equals(leftMember.wireShape, rightMember.wireShape) ||
+                !Objects.equals(leftMember.wireLayout, rightMember.wireLayout)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String containerValueLayoutPreconditionFailure(
+        FullContainerPlan plan,
+        List<ContainerCodecCall> valueCodecs) {
+
+        if (plan == null || plan.elementStride == null || plan.elementStride <= 0L ||
+            valueCodecs == null || valueCodecs.isEmpty()) {
+            return "container-value-layout-missing-logical-codecs-or-stride";
+        }
+        if (valueCodecs.stream().anyMatch(codec ->
+                isStructuredContainerCodec(codec)
+                    ? physicalContainerCodecLeaves(codec.members) == null
+                    : codec.wireEvidence == null || codec.wireEvidence.layout == null)) {
+            return "container-value-layout-unproven-physical-codec";
+        }
+        return null;
+    }
+
+    private NestedTypeShape unreflectedContainerValueShapeForBase(
+        NativeTypeInfoEvidence candidate,
+        Function function,
+        Address vtable,
+        String base,
+        LinkedHashMap<Long, NestedTypeMember> observed,
+        List<ContainerCodecCall> expectedCodecs) {
+
+        NestedTypeShape shape = containerValueLayoutShapeForBase(
+            function,
+            vtable,
+            base,
+            observed,
+            expectedCodecs,
+            candidate.nativeSize,
+            candidate.nativeSizeSource);
+        if (shape == null) {
+            return null;
+        }
+        shape.typeId = normalizeUuid(candidate.typeId);
+        shape.typeIdSource = candidate.source;
+        shape.identityProven = true;
+        shape.identitySource = candidate.source + "+complete-unmarshal-layout";
+        shape.typeNameFull = candidate.name;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(candidate.name);
+        shape.typeNameSource = candidate.nameSource;
+        shape.validation = "element-vptr+native-size+" + shape.validation;
+        return shape;
+    }
+
+    private NestedTypeShape containerValueLayoutShapeForBase(
+        Function function,
+        Address vtable,
+        String base,
+        LinkedHashMap<Long, NestedTypeMember> observed,
+        List<ContainerCodecCall> expectedCodecs,
+        long nativeSize,
+        String nativeSizeSource) {
+
+        List<NestedTypeMember> ordered = observed == null
+            ? null
+            : provenWireOrderedMembers(observed.values());
+        if (ordered == null) {
+            recordNestedTypeShapeReject("unreflected-value-unproven-wire-order");
+            return null;
+        }
+        if (ordered.isEmpty() || ordered.size() != expectedCodecs.size()) {
+            recordNestedTypeShapeReject("unreflected-value-logical-field-count-mismatch");
+            return null;
+        }
+
+        ArrayList<NestedTypeMember> members = new ArrayList<>(ordered.size());
+        ArrayList<NestedTypeMember> nativeOrder = new ArrayList<>(ordered.size());
+        for (int index = 0; index < ordered.size(); index++) {
+            NestedTypeMember source = ordered.get(index);
+            ContainerCodecCall expected = expectedCodecs.get(index);
+            String mismatch = unreflectedContainerMemberMismatch(
+                source,
+                expected,
+                nativeSize);
+            if (mismatch != null) {
+                recordNestedTypeShapeReject(
+                    "unreflected-value-member-" + mismatch + "-at-" + index);
+                return null;
+            }
+            NestedTypeMember member = copyNestedTypeMember(source);
+            member.index = index;
+            member.nativeOffset = source.offset;
+            member.name = "field_" + index;
+            member.nameSource = "synthetic-wire-ordinal";
+            member.nameProven = false;
+            member.nameEvidence = null;
+            if (member.nativeType == null) {
+                member.nativeType = expected.nativeType;
+            }
+            if ("counted-sequence".equals(expected.memberSemantics) ||
+                "fixed-sequence".equals(expected.memberSemantics)) {
+                member.wireShape = expected.wireEvidence.shape;
+                member.wireShapeSource = expected.wireEvidence.source;
+                member.wireLayout = expected.wireEvidence.layout;
+                member.wireLayoutSource = expected.wireEvidence.layoutSource;
+                member.byteWidth = logicalContainerMemberByteWidth(source, expected);
+            }
+            members.add(member);
+            nativeOrder.add(member);
+        }
+        nativeOrder.sort((left, right) -> Long.compare(left.offset, right.offset));
+        for (int index = 0; index < nativeOrder.size(); index++) {
+            NestedTypeMember member = nativeOrder.get(index);
+            long limit = index + 1 < nativeOrder.size()
+                ? nativeOrder.get(index + 1).offset
+                : nativeSize;
+            if (member.offset < 0L || member.offset >= limit) {
+                recordNestedTypeShapeReject("unreflected-value-invalid-native-order");
+                return null;
+            }
+            if (member.byteWidth == null) {
+                continue;
+            }
+            long end;
+            try {
+                end = Math.addExact(member.offset, member.byteWidth.longValue());
+            }
+            catch (ArithmeticException ignored) {
+                recordNestedTypeShapeReject("unreflected-value-native-span-overflow");
+                return null;
+            }
+            if (end > limit) {
+                recordNestedTypeShapeReject("unreflected-value-overlapping-native-span");
+                return null;
+            }
+        }
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.identityProven = false;
+        shape.typeName = "Value";
+        shape.typeNameSource = "synthetic-anonymous-composite";
+        shape.function = function.getEntryPoint();
+        shape.functionName = fullFunctionName(function);
+        shape.vtable = vtable;
+        shape.memberBase = base;
+        shape.memberNameSource = "synthetic-wire-ordinal";
+        shape.memberNamesProven = false;
+        shape.layoutProven = true;
+        shape.memberCoverageProven = true;
+        shape.wireOrderProven = true;
+        shape.wireOrderSource = "cfg-recursive-unmarshal-order+marshal-ordinal-agreement";
+        shape.validation = "complete-nonoverlapping-wire-layout";
+        shape.nativeSize = nativeSize;
+        shape.nativeSizeSource = nativeSizeSource;
+        shape.members.addAll(members);
+        return shape;
+    }
+
+    private String unreflectedContainerMemberMismatch(
+        NestedTypeMember member,
+        ContainerCodecCall expected,
+        long nativeSize) {
+
+        if (member == null || member.offset < 0L || member.offset >= nativeSize) {
+            return "invalid-native-storage";
+        }
+        if (isStructuredContainerCodec(expected)) {
+            if (!Boolean.TRUE.equals(member.typeIdentityProven) ||
+                !uuidEquals(member.typeId, expected.typeId)) {
+                return "structured-type-identity-mismatch";
+            }
+            return null;
+        }
+        if (expected == null || expected.wireEvidence == null ||
+            expected.wireEvidence.layout == null) {
+            return "unproven-expected-codec";
+        }
+        if (member.wireShape == null && member.wireLayout == null) {
+            return "missing-observed-codec";
+        }
+        String observedLayout = member.wireLayout == null
+            ? member.wireShape
+            : member.wireLayout;
+        String observedShape = member.wireShape == null
+            ? canonicalLayoutWireShape(observedLayout)
+            : member.wireShape;
+        String expectedLayout = expected.wireEvidence.layout;
+        if (!containerLogicalWireShapeMatches(
+                expected,
+                observedShape,
+                observedLayout)) {
+            return "semantic-shape-mismatch";
+        }
+        if ("fixed-sequence".equals(expected.memberSemantics) ||
+            "counted-sequence".equals(expected.memberSemantics)) {
+            return null;
+        }
+        if (Objects.equals(expectedLayout, observedLayout)) {
+            return null;
+        }
+        Integer observedWidth = wireShapeByteWidth(observedLayout);
+        Integer expectedWidth = wireShapeByteWidth(expectedLayout);
+        return observedWidth != null && observedWidth.equals(expectedWidth)
+            ? null
+            : "physical-width-mismatch";
+    }
+
+    private Integer logicalContainerMemberByteWidth(
+        NestedTypeMember observed,
+        ContainerCodecCall expected) {
+
+        if (observed == null || expected == null ||
+            !"fixed-sequence".equals(expected.memberSemantics) ||
+            observed.byteWidth == null || observed.byteWidth <= 0) {
+            return observed == null ? null : observed.byteWidth;
+        }
+        List<ContainerCodecCall> leaves = physicalContainerCodecLeaves(expected.members);
+        if (leaves == null || leaves.isEmpty() || leaves.stream().anyMatch(leaf ->
+                leaf.wireEvidence == null || !wireShapeMatchesExpected(
+                    leaf.wireEvidence.shape,
+                    observed.wireShape == null
+                        ? canonicalLayoutWireShape(observed.wireLayout)
+                        : observed.wireShape))) {
+            return null;
+        }
+        try {
+            return Math.multiplyExact(observed.byteWidth, leaves.size());
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private boolean containerLogicalWireShapeMatches(
+        ContainerCodecCall expected,
+        String observedShape,
+        String observedLayout) {
+
+        if (NetworkSchemaWireShape.equivalentBySemanticOrLayout(
+                expected.wireEvidence.shape,
+                expected.wireEvidence.layout,
+                observedShape,
+                observedLayout)) {
+            return true;
+        }
+        if ("fixed-sequence".equals(expected.memberSemantics)) {
+            List<ContainerCodecCall> leaves = physicalContainerCodecLeaves(expected.members);
+            return leaves != null && !leaves.isEmpty() && leaves.stream().allMatch(leaf ->
+                leaf.wireEvidence != null && wireShapeMatchesExpected(
+                    leaf.wireEvidence.shape,
+                    observedShape));
+        }
+        return "counted-sequence".equals(expected.memberSemantics) &&
+            expected.wireEvidence.shape != null &&
+            expected.wireEvidence.shape.startsWith("fixed-vector<") &&
+            Objects.equals(expected.wireEvidence.layout, observedLayout);
+    }

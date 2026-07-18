@@ -1,5 +1,4 @@
-export const DATASHEET_EXTENSION = "datasheet" as const;
-export const DATASHEET_VERSIONS = [0x11, 0x12] as const;
+const DATASHEET_VERSIONS = [0x11, 0x12] as const;
 const DATASHEET_NAME_CRC_OFFSET = 0x04;
 const DATASHEET_NAME_STRING_OFFSET = 0x08;
 const DATASHEET_TYPE_CRC_OFFSET = 0x0c;
@@ -12,11 +11,6 @@ const DATASHEET_DATA_END_OFFSET = 0x38;
 const DATASHEET_U32_SIZE = 4;
 const DATASHEET_COLUMN_RECORD_SIZE = 12;
 const DATASHEET_CELL_RECORD_SIZE = 8;
-
-export interface DatasheetAsset {
-  readonly path: string;
-  readonly bytes: Uint8Array;
-}
 
 export enum DatasheetColumnType {
   String = 0x01,
@@ -50,18 +44,6 @@ export interface DatasheetCell {
 }
 
 export type DatasheetCellValue = { readonly kind: "string"; readonly value: string } | { readonly kind: "number"; readonly value: number } | { readonly kind: "boolean"; readonly value: boolean };
-
-export function isDatasheetPath(path: string): boolean {
-  return path.toLowerCase().endsWith(`.${DATASHEET_EXTENSION}`);
-}
-
-export function isDatasheetBytes(bytes: Uint8Array): boolean {
-  if (bytes.byteLength < 4) {
-    return false;
-  }
-  const version = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0, true);
-  return DATASHEET_VERSIONS.includes(version as 0x11 | 0x12);
-}
 
 export function parseDatasheet(bytes: Uint8Array): Datasheet {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);

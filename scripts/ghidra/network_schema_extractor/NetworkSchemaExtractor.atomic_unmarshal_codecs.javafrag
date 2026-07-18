@@ -1,0 +1,106 @@
+    private WireShape validatedAtomicUnmarshalCodecEvidence(
+        Function function,
+        String nativeType) {
+
+        if (function == null || nativeType == null) {
+            return null;
+        }
+        String semanticShape = wireShapeFromNativeType(nativeType);
+        String readBuffer = uniqueReadBufferParameter(function);
+        if (semanticShape == null || readBuffer == null) {
+            return null;
+        }
+
+        CodecWireTrace trace = traceUnmarshalCodec(
+            function,
+            readBuffer,
+            new LinkedHashSet<>(),
+            new HashMap<>());
+        if (trace == null || trace.events.size() != 1) {
+            return null;
+        }
+        CodecWireEvent event = trace.events.get(0);
+        WireShape evidence = event.wireEvidence();
+        return evidence != null &&
+            semanticShape.equals(evidence.shape) &&
+            function.getEntryPoint().equals(event.target())
+                ? evidence
+                : null;
+    }
+
+    private void applyAtomicUnmarshalNativeSpan(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        PcodeStorage storage,
+        Function function,
+        WireShape wireEvidence) {
+
+        if (byBase == null || storage == null || function == null ||
+            wireEvidence == null || !wireEvidence.hasProvenSemantics()) {
+            return;
+        }
+        Integer outputSlot = unmarshalOutputParameterSlot(function);
+        Integer span = contiguousFormalOutputSpan(function, outputSlot);
+        LinkedHashMap<Long, NestedTypeMember> members = byBase.get(storage.base);
+        NestedTypeMember member = members == null ? null : members.get(storage.offset);
+        if (span != null && member != null && !Boolean.TRUE.equals(member.typeConflict)) {
+            member.byteWidth = span;
+        }
+    }
+
+    private Integer contiguousFormalOutputSpan(
+        Function function,
+        Integer outputSlot) {
+
+        if (function == null || outputSlot == null || outputSlot <= 0) {
+            return null;
+        }
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return null;
+        }
+
+        String outputBase = "param_" + outputSlot;
+        ArrayList<long[]> ranges = new ArrayList<>();
+        long maximum = 0L;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3) {
+                continue;
+            }
+            PcodeStorage destination = writtenStorage(operation);
+            int width = operation.getInput(2).getSize();
+            if (destination == null || !outputBase.equals(destination.base) ||
+                destination.offset < 0L || width <= 0) {
+                continue;
+            }
+            long end;
+            try {
+                end = Math.addExact(destination.offset, width);
+            }
+            catch (ArithmeticException ignored) {
+                return null;
+            }
+            if (end > 4096L) {
+                return null;
+            }
+            ranges.add(new long[] {destination.offset, end});
+            maximum = Math.max(maximum, end);
+        }
+        if (ranges.isEmpty() || maximum <= 0L || maximum > Integer.MAX_VALUE) {
+            return null;
+        }
+
+        boolean[] covered = new boolean[(int) maximum];
+        for (long[] range : ranges) {
+            for (int index = Math.toIntExact(range[0]);
+                    index < Math.toIntExact(range[1]); index++) {
+                covered[index] = true;
+            }
+        }
+        for (boolean value : covered) {
+            if (!value) {
+                return null;
+            }
+        }
+        return covered.length;
+    }

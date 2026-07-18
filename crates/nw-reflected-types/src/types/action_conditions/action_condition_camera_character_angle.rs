@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionCameraCharacterAngle;
+pub struct ActionConditionCameraCharacterAngle {}
 
 impl AzRtti for ActionConditionCameraCharacterAngle {
     const NAME: &'static str = "ActionConditionCameraCharacterAngle";

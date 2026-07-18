@@ -1,0 +1,51 @@
+# Reviewed New World legacy-to-native mapping exception data.
+#
+# Home: nw-tools only (never shipped in Azoth project/engine configuration,
+# native sources, catalogs, packages, or runtime products). Loaded by
+# `nw_tools::native_port::exception`. Unknown, duplicate, unused, or stale
+# entries fail the port.
+#
+# These are the five GameData tables from the 2026-07-16 inventory whose
+# decoded table schema is still `unknown`. Their canonical destinations are
+# decided by ADR 0027, but publication is blocked until the table schema and
+# asset-bearing column declarations are reviewed rather than guessed.
+#
+# Source of truth: docs/adr/0027-native-asset-roots-and-taxonomy.md.
+
+schema = "newworld.legacy-port-map/v1"
+revision = 1
+
+[[exceptions]]
+legacy_type = "gamedata-table"
+legacy_path = "gamedata/unknown/attack_types.ron"
+canonical_path = "gameplay/gamedata/combat/attack_types.ron"
+publication = "blocked"
+reason = "Route is fixed; publication is blocked until the AttackTypes schema and asset columns are reviewed"
+
+[[exceptions]]
+legacy_type = "gamedata-table"
+legacy_path = "gamedata/unknown/housing_system_messaging.ron"
+canonical_path = "gameplay/gamedata/housing/system_messaging.ron"
+publication = "blocked"
+reason = "Route is fixed; publication is blocked until the empty-table schema is reviewed"
+
+[[exceptions]]
+legacy_type = "gamedata-table"
+legacy_path = "gamedata/unknown/random_encounter_definitions.ron"
+canonical_path = "gameplay/gamedata/world/random_encounter_definitions.ron"
+publication = "blocked"
+reason = "Route is fixed; publication is blocked until the RandomEncounterDefinitions schema and asset columns are reviewed"
+
+[[exceptions]]
+legacy_type = "gamedata-table"
+legacy_path = "gamedata/unknown/refining_recipes.ron"
+canonical_path = "gameplay/gamedata/crafting/refining_recipes.ron"
+publication = "blocked"
+reason = "Route is fixed; publication is blocked until the RefiningRecipes schema and asset columns are reviewed"
+
+[[exceptions]]
+legacy_type = "gamedata-table"
+legacy_path = "gamedata/unknown/socketables.ron"
+canonical_path = "gameplay/gamedata/building/socketables.ron"
+publication = "blocked"
+reason = "Route is fixed; publication is blocked until the Socketables schema and asset columns are reviewed"

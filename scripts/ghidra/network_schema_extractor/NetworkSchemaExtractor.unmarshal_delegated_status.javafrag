@@ -1,0 +1,418 @@
+    private enum UnmarshalStatusByte {
+        UNSET,
+        FAILURE,
+        SUCCESS,
+        UNKNOWN
+    }
+
+    private record StatusByteWrite(String base, UnmarshalStatusByte value) {
+    }
+
+    private record UnmarshalTerminalFlow(
+        Set<PcodeBlockBasic> terminals,
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> excludedEdges,
+        String status) {
+
+        static UnmarshalTerminalFlow unresolved(String status) {
+            return new UnmarshalTerminalFlow(Set.of(), Map.of(), status);
+        }
+    }
+
+    private UnmarshalStatusByte effectiveUnmarshalStatusByte(
+        HighFunction high,
+        PcodeOpAST operation,
+        StatusByteWrite write,
+        Set<String> active,
+        int depth) {
+
+        if (write.value() != UnmarshalStatusByte.UNKNOWN) {
+            return write.value();
+        }
+        NormalizedStatusSource normalized = terminalNormalizedStatusSource(operation);
+        if (normalized == null || !normalized.trueMeansSuccess()) {
+            return UnmarshalStatusByte.UNKNOWN;
+        }
+        PcodeStorage status = pcodeStorageExpression(normalized.value());
+        if (status == null) {
+            return UnmarshalStatusByte.UNKNOWN;
+        }
+
+        PcodeOpAST producer = null;
+        Integer producerResultSlot = null;
+        Function producerTarget = null;
+        Function owner = high.getFunction();
+        for (PcodeOpAST candidate : orderedPcodeOps(high)) {
+            if (candidate.getOpcode() != PcodeOp.CALL ||
+                !NetworkSchemaControlFlow.precedes(high, candidate, operation)) {
+                continue;
+            }
+            Function target = pcodeCallTarget(candidate);
+            boolean returnedResult = statusLoadedFromCallResult(
+                normalized.value(),
+                candidate);
+            boolean storedResult = statusProducedByCall(
+                normalized.value(),
+                status,
+                candidate,
+                NetworkSchemaControlFlow.parentBlock(candidate));
+            if (!returnedResult && !storedResult) {
+                continue;
+            }
+            Integer resultSlot = returnedResult
+                ? returnedParameterSlot(target)
+                : delegatedResultArgumentSlot(
+                    owner,
+                    candidate,
+                    target,
+                    status);
+            if (target == null || resultSlot == null ||
+                resultSlot >= candidate.getNumInputs()) {
+                continue;
+            }
+            UnmarshalTerminalFlow nested = successfulUnmarshalTerminalFlow(
+                highFunction(target),
+                "param_" + resultSlot,
+                active,
+                depth + 1);
+            if (nested.terminals().isEmpty()) {
+                continue;
+            }
+            if (producer != null) {
+                return UnmarshalStatusByte.UNKNOWN;
+            }
+            producer = candidate;
+            producerResultSlot = resultSlot;
+            producerTarget = target;
+        }
+        return producer != null && producerTarget != null && producerResultSlot != null
+            ? UnmarshalStatusByte.SUCCESS
+            : UnmarshalStatusByte.UNKNOWN;
+    }
+
+    private NormalizedStatusSource terminalNormalizedStatusSource(PcodeOpAST store) {
+        if (store == null || store.getOpcode() != PcodeOp.STORE ||
+            store.getNumInputs() < 3 || store.getInput(2).getSize() != Byte.BYTES) {
+            return null;
+        }
+        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(store);
+        if (block == null || !isTerminatingPcodeBlock(block)) {
+            return null;
+        }
+        boolean afterStore = false;
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (operation == store) {
+                afterStore = true;
+                continue;
+            }
+            if (!afterStore) {
+                continue;
+            }
+            if (operation.getOpcode() == PcodeOp.CALL ||
+                operation.getOpcode() == PcodeOp.CALLIND ||
+                operation.getOpcode() == PcodeOp.CBRANCH ||
+                operation.getOpcode() == PcodeOp.BRANCH ||
+                operation.getOpcode() == PcodeOp.BRANCHIND) {
+                return null;
+            }
+        }
+        return normalizedStatusSource(
+            store.getInput(2),
+            true,
+            new LinkedHashSet<>(),
+            0);
+    }
+
+    private NormalizedStatusSource normalizedStatusSource(
+        Varnode value,
+        boolean orientation,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || depth > 48 || !active.add(pcodeSsaNodeKey(value))) {
+            return null;
+        }
+        try {
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                return null;
+            }
+            return switch (definition.getOpcode()) {
+                case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT,
+                    PcodeOp.INT_SEXT, PcodeOp.INDIRECT -> normalizedStatusSource(
+                        definition.getInput(0),
+                        orientation,
+                        active,
+                        depth + 1);
+                case PcodeOp.SUBPIECE ->
+                    definition.getNumInputs() == 2 &&
+                        NetworkSchemaIntegerEvaluator.equals(definition.getInput(1), 0L)
+                    ? normalizedStatusSource(
+                        definition.getInput(0),
+                        orientation,
+                        active,
+                        depth + 1)
+                    : null;
+                case PcodeOp.BOOL_NEGATE -> definition.getNumInputs() == 1
+                    ? normalizedStatusSource(
+                        definition.getInput(0),
+                        !orientation,
+                        active,
+                        depth + 1)
+                    : null;
+                case PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL ->
+                    normalizedZeroComparison(definition, orientation);
+                default -> null;
+            };
+        }
+        finally {
+            active.remove(pcodeSsaNodeKey(value));
+        }
+    }
+
+    private NormalizedStatusSource normalizedZeroComparison(
+        PcodeOp comparison,
+        boolean orientation) {
+
+        if (comparison.getNumInputs() != 2) {
+            return null;
+        }
+        int zeroSlot = NetworkSchemaIntegerEvaluator.equals(comparison.getInput(0), 0L)
+            ? 0
+            : NetworkSchemaIntegerEvaluator.equals(comparison.getInput(1), 0L)
+                ? 1
+                : -1;
+        if (zeroSlot < 0) {
+            return null;
+        }
+        boolean nonzeroMeansTrue = comparison.getOpcode() == PcodeOp.INT_NOTEQUAL;
+        return new NormalizedStatusSource(
+            comparison.getInput(1 - zeroSlot),
+            orientation == nonzeroMeansTrue);
+    }
+
+    private Integer delegatedResultArgumentSlot(
+        Function owner,
+        PcodeOpAST call,
+        Function target,
+        PcodeStorage status) {
+
+        Integer selected = null;
+        for (int slot = 1; slot < call.getNumInputs(); slot++) {
+            PcodeStorage argument = provenCallArgumentStorage(owner, call, target, slot);
+            if (argument == null || !Objects.equals(argument.base, status.base) ||
+                status.offset - argument.offset != 1L) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = slot;
+        }
+        return selected;
+    }
+
+    private record NormalizedStatusSource(Varnode value, boolean trueMeansSuccess) {
+    }
+
+    private Map<PcodeBlockBasic, UnmarshalStatusByte> terminalIncomingStatus(
+        HighFunction high,
+        PcodeBlockBasic block,
+        String resultBase) {
+
+        PcodeOpAST selected = null;
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (!(operation instanceof PcodeOpAST ast)) {
+                continue;
+            }
+            StatusByteWrite write = unmarshalStatusByteWrite(ast);
+            if (write != null && resultBase.equals(write.base()) &&
+                write.value() == UnmarshalStatusByte.UNKNOWN) {
+                selected = ast;
+            }
+        }
+        if (selected == null) {
+            return null;
+        }
+
+        PcodeOp phi = statusPhiDefinition(
+            selected.getInput(2),
+            new LinkedHashSet<>(),
+            0);
+        if (phi == null || phi.getNumInputs() != block.getInSize()) {
+            return terminalIncomingInstructionStatus(high, block, selected);
+        }
+        LinkedHashMap<PcodeBlockBasic, UnmarshalStatusByte> result =
+            new LinkedHashMap<>();
+        for (int index = 0; index < phi.getNumInputs(); index++) {
+            if (!(block.getIn(index) instanceof PcodeBlockBasic predecessor)) {
+                return null;
+            }
+            UnmarshalStatusByte status = scalarReturnStatus(
+                phi.getInput(index),
+                new LinkedHashSet<>(),
+                0);
+            if (status != UnmarshalStatusByte.SUCCESS &&
+                status != UnmarshalStatusByte.FAILURE) {
+                return null;
+            }
+            UnmarshalStatusByte previous = result.put(predecessor, status);
+            if (previous != null && previous != status) {
+                return null;
+            }
+        }
+        return Map.copyOf(result);
+    }
+
+    private Map<PcodeBlockBasic, UnmarshalStatusByte> terminalIncomingInstructionStatus(
+        HighFunction high,
+        PcodeBlockBasic block,
+        PcodeOpAST store) {
+
+        if (high == null || block == null || store == null || store.getSeqnum() == null) {
+            return null;
+        }
+        Address storeAddress = store.getSeqnum().getTarget();
+        Instruction storeInstruction = currentProgram.getListing().getInstructionAt(storeAddress);
+        Object[] sourceObjects = storeInstruction == null
+            ? new Object[0]
+            : storeInstruction.getOpObjects(1);
+        List<PcodeBlockBasic> predecessors = NetworkSchemaControlFlow.predecessors(block);
+        if (sourceObjects.length != 1 || !(sourceObjects[0] instanceof Register sourceRegister) ||
+            predecessors.isEmpty()) {
+            return null;
+        }
+        Map<Integer, Long> values = NetworkSchemaPcodeConstants.incomingRegisterValues(
+            currentProgram,
+            high,
+            block,
+            storeAddress,
+            sourceRegister,
+            monitor);
+        if (values.size() != predecessors.size()) {
+            return null;
+        }
+        LinkedHashMap<PcodeBlockBasic, UnmarshalStatusByte> result = new LinkedHashMap<>();
+        for (PcodeBlockBasic predecessor : predecessors) {
+            Long immediate = values.get(predecessor.getIndex());
+            UnmarshalStatusByte status = immediate == null
+                ? null
+                : statusFromLowByte(immediate);
+            if (status == null) {
+                return null;
+            }
+            result.put(predecessor, status);
+        }
+        return Map.copyOf(result);
+    }
+
+    private Set<UnmarshalStatusByte> terminalInternalInstructionStatus(
+        HighFunction high,
+        PcodeBlockBasic block,
+        String resultBase) {
+
+        if (high == null || block == null || resultBase == null) {
+            return null;
+        }
+        PcodeOpAST selected = null;
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (!(operation instanceof PcodeOpAST ast)) {
+                continue;
+            }
+            StatusByteWrite write = unmarshalStatusByteWrite(ast);
+            if (write != null && resultBase.equals(write.base()) &&
+                write.value() == UnmarshalStatusByte.UNKNOWN) {
+                selected = ast;
+            }
+        }
+        if (selected == null || selected.getSeqnum() == null) {
+            return null;
+        }
+        Address storeAddress = selected.getSeqnum().getTarget();
+        Instruction storeInstruction = currentProgram.getListing().getInstructionAt(storeAddress);
+        Object[] sourceObjects = storeInstruction == null
+            ? new Object[0]
+            : storeInstruction.getOpObjects(1);
+        if (sourceObjects.length != 1 || !(sourceObjects[0] instanceof Register sourceRegister)) {
+            return null;
+        }
+        Map<Address, Long> values =
+            NetworkSchemaPcodeConstants.incomingInstructionRegisterValues(
+                currentProgram,
+                storeAddress,
+                sourceRegister,
+                monitor);
+        if (values.isEmpty()) {
+            return null;
+        }
+        LinkedHashSet<UnmarshalStatusByte> result = new LinkedHashSet<>();
+        for (Map.Entry<Address, Long> entry : values.entrySet()) {
+            UnmarshalStatusByte status = statusFromLowByte(entry.getValue());
+            if (status != UnmarshalStatusByte.SUCCESS &&
+                status != UnmarshalStatusByte.FAILURE) {
+                return null;
+            }
+            result.add(status);
+        }
+        return result.isEmpty() ? null : Set.copyOf(result);
+    }
+
+    private PcodeOp statusPhiDefinition(
+        Varnode value,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || depth > 48 || !active.add(pcodeSsaNodeKey(value))) {
+            return null;
+        }
+        try {
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                return null;
+            }
+            return switch (definition.getOpcode()) {
+                case PcodeOp.MULTIEQUAL -> definition;
+                case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT,
+                    PcodeOp.INT_SEXT, PcodeOp.INDIRECT -> statusPhiDefinition(
+                        definition.getInput(0),
+                        active,
+                        depth + 1);
+                case PcodeOp.SUBPIECE ->
+                    definition.getNumInputs() == 2 &&
+                        NetworkSchemaIntegerEvaluator.equals(definition.getInput(1), 0L)
+                    ? statusPhiDefinition(
+                        definition.getInput(0),
+                        active,
+                        depth + 1)
+                    : null;
+                default -> null;
+            };
+        }
+        finally {
+            active.remove(pcodeSsaNodeKey(value));
+        }
+    }
+
+    private Map<PcodeBlockBasic, Set<PcodeBlockBasic>> mergeExcludedEdges(
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> left,
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> right) {
+
+        HashMap<PcodeBlockBasic, LinkedHashSet<PcodeBlockBasic>> merged = new HashMap<>();
+        for (Map<PcodeBlockBasic, Set<PcodeBlockBasic>> source : List.of(left, right)) {
+            for (Map.Entry<PcodeBlockBasic, Set<PcodeBlockBasic>> entry : source.entrySet()) {
+                merged.computeIfAbsent(entry.getKey(), ignored -> new LinkedHashSet<>())
+                    .addAll(entry.getValue());
+            }
+        }
+        HashMap<PcodeBlockBasic, Set<PcodeBlockBasic>> result = new HashMap<>();
+        for (Map.Entry<PcodeBlockBasic, LinkedHashSet<PcodeBlockBasic>> entry :
+                merged.entrySet()) {
+            result.put(entry.getKey(), Set.copyOf(entry.getValue()));
+        }
+        return Map.copyOf(result);
+    }

@@ -37,7 +37,6 @@
             .computeIfAbsent(handlerOffset, ignored -> new ArrayList<>())
             .add(write);
     }
-
     private void observeHandlerConstructorMemsetCall(
         Instruction instruction,
         ForwardArgState state) {
@@ -80,7 +79,6 @@
             .computeIfAbsent(handlerOffset, ignored -> new ArrayList<>())
             .add(write);
     }
-
     private Integer enclosingHandlerOffset(int writeOffset, ForwardArgState state) {
         Integer best = null;
         Integer next = null;
@@ -199,7 +197,7 @@
         ForwardArgState state) {
 
         Address call = resolvedCodeTarget(callTarget(instruction));
-        if (!isVectorConstructorIteratorCall(call)) {
+        if (!isPcodeVectorConstructorIteratorFunction(call)) {
             return;
         }
 
@@ -216,7 +214,7 @@
 
         long count = elementCount.immediate;
         long size = elementSize.immediate;
-        if (count <= 0 || count > 256 || size <= 0 || size > 0x1000) {
+        if (count <= 0 || size <= 0) {
             return;
         }
 
@@ -227,7 +225,15 @@
         }
 
         for (long i = 0; i < count; i++) {
-            long elementOffset = base.thisOffset.longValue() + (i * size);
+            long elementOffset;
+            try {
+                elementOffset = Math.addExact(
+                    base.thisOffset.longValue(),
+                    Math.multiplyExact(i, size));
+            }
+            catch (ArithmeticException ignored) {
+                return;
+            }
             if (elementOffset < Integer.MIN_VALUE || elementOffset > Integer.MAX_VALUE) {
                 continue;
             }
@@ -289,159 +295,18 @@
         }
     }
 
-    private Address fieldHandlerConstructorVtable(Address address) {
-        Address target = resolvedCodeTarget(address);
-        if (!isExecutableAddress(target)) {
-            return null;
-        }
-
-        String key = addressCacheKey("field-handler-constructor-vtable", target);
-        if (fieldHandlerConstructorVtableCache.containsKey(key)) {
-            return fieldHandlerConstructorVtableCache.get(key);
-        }
-
-        Address result = recoverFieldHandlerConstructorVtable(target);
-        fieldHandlerConstructorVtableCache.put(key, result);
-        return result;
-    }
-
-    private Address recoverFieldHandlerConstructorVtable(Address target) {
-        for (VtableWrite write : constructorVtableWrites(target)) {
-            if (write.thisOffset != null && write.thisOffset == 0) {
-                return write.vtable;
-            }
-        }
-        return null;
-    }
-
-    private Address vtableWrittenToTrackedThis(
-        Instruction instruction,
-        ForwardArgState state) {
-
-        if (!"MOV".equals(NetworkSchemaX86.upperMnemonic(instruction))) {
-            return null;
-        }
-
-        Integer offset = trackedThisOffsetForMemoryOperand(instruction, 0, state.registers);
-        TrackedValue source = trackedOperandValue(instruction, 1, state);
-        if (offset != null && offset == 0 && source != null &&
-            source.address != null && isVtableLike(source.address)) {
-            return source.address;
-        }
-        return null;
-    }
-
-    private void observeArgumentAssignment(Instruction instruction, ArgState state) {
-        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-        if (mnemonic == null) {
-            return;
-        }
-
-        String destination = NetworkSchemaX86.registerOperand(instruction, 0);
-        if (destination != null) {
-            if ("RDX".equals(destination) && state.nameAddress == null) {
-            Address address = referencedAddress(instruction, 1);
-                StringDecode decoded = readFieldNameAtOrThroughPointer(address);
-                if (decoded != null) {
-                    state.nameAddress = decoded.address;
-                    state.name = decoded.value;
-                }
-            }
-            else if ("R8".equals(destination) && !state.handlerKnown) {
-                state.handlerKnown = true;
-                Integer offset = memoryDisplacementForThisLikeOperand(instruction, 1);
-                if (offset != null) {
-                    state.handlerOffset = offset;
-                    state.handlerExpression = "this+0x" + Integer.toHexString(offset);
-                }
-                else {
-                    Address address = referencedAddress(instruction, 1);
-                    if (address != null) {
-                        state.handlerExpression = formatAddress(address);
-                    }
-                    else {
-                        state.handlerExpression = NetworkSchemaX86.operandText(instruction, 1);
-                    }
-                }
-            }
-            else if ("R9".equals(destination) && !state.groupKnown) {
-                Long immediate = literalOperandValue(instruction, 1);
-                if (immediate != null) {
-                    state.group = immediate.intValue();
-                    state.groupKnown = true;
-                }
-            }
-        }
-
-        if (!state.groupKnown &&
-            ("XOR".equals(mnemonic) || "SUB".equals(mnemonic)) &&
-            "R9".equals(NetworkSchemaX86.registerOperand(instruction, 0)) &&
-            "R9".equals(NetworkSchemaX86.registerOperand(instruction, 1))) {
-            state.group = 0;
-            state.groupKnown = true;
-        }
-    }
-
     private Address findInstanceVtable(Function function) {
-        HashMap<String, Address> registerAddresses = new HashMap<>();
-        int count = 0;
-        for (Instruction instruction : functionInstructions(function)) {
-            if (count++ >= VTABLE_SCAN_LIMIT) {
-                break;
-            }
-
-            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
-            if ("LEA".equals(mnemonic) && destination != null) {
-                Address address = referencedAddress(instruction, 1);
-                if (address != null && isVtableLike(address)) {
-                    registerAddresses.put(destination, address);
-                }
-                else {
-                    registerAddresses.remove(destination);
-                }
-                continue;
-            }
-
-            if ("MOV".equals(mnemonic)) {
-                String source = NetworkSchemaX86.registerOperand(instruction, 1);
-                if (destination != null) {
-                    if (source != null && registerAddresses.containsKey(source)) {
-                        registerAddresses.put(destination, registerAddresses.get(source));
-                    }
-                    else {
-                        registerAddresses.remove(destination);
-                    }
-                }
-
-                if (source != null && registerAddresses.containsKey(source) &&
-                    isZeroDisplacementMemoryOperand(instruction, 0)) {
-                    return registerAddresses.get(source);
-                }
+        if (function == null) {
+            return null;
+        }
+        Address selected = null;
+        for (VtableWrite write : constructorVtableWrites(function.getEntryPoint())) {
+            if (write.thisOffset != null && write.thisOffset == 0 &&
+                isVtableLike(write.vtable)) {
+                selected = write.vtable;
             }
         }
-        return null;
-    }
-
-    private boolean isZeroDisplacementMemoryOperand(Instruction instruction, int operandIndex) {
-        Object[] objects = NetworkSchemaX86.operandObjects(instruction, operandIndex);
-        boolean hasRegister = false;
-        int displacement = 0;
-        for (Object object : objects) {
-            if (object instanceof Register register) {
-                String name = NetworkSchemaX86.canonicalRegisterName(register.getName());
-                if (!"RSP".equals(name) && !"RIP".equals(name)) {
-                    hasRegister = true;
-                }
-            }
-            else if (object instanceof Scalar scalar) {
-                long value = scalar.getSignedValue();
-                if (value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE) {
-                    displacement += (int)value;
-                }
-            }
-        }
-        return hasRegister && displacement == 0;
+        return selected;
     }
 
     private JsonArray virtualFunctionSlots(Address vtable) {
@@ -497,9 +362,7 @@
         String roleSource = null;
         if (handlerShape != null) {
             role = handlerShape.kind;
-            roleSource = handlerShape.containerWireShape == null
-                ? "field-handler-shape"
-                : "replicated-container-shape";
+            roleSource = handlerShape.kindSource;
         }
         else if (fragmentMetadata != null) {
             role = "fragment";
@@ -602,67 +465,27 @@
     }
 
     private Long constantReturnValue(Address address) {
-        if (!isExecutableAddress(address)) {
+        Function function = functionAtOrContaining(address);
+        HighFunction high = highFunction(function);
+        if (function == null || high == null) {
             return null;
         }
-
-        Long returnValue = null;
-        int count = 0;
-        for (Instruction instruction : linearInstructions(address, CONSTANT_RETURN_SCAN_LIMIT)) {
-            if (count++ >= CONSTANT_RETURN_SCAN_LIMIT) {
-                break;
+        Long selected = null;
+        boolean sawValue = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.RETURN ||
+                operation.getNumInputs() < 2) {
+                continue;
             }
-
-            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-            if (mnemonic == null) {
+            Long value = NetworkSchemaIntegerEvaluator.evaluate(
+                operation.getInput(operation.getNumInputs() - 1));
+            if (value == null || (sawValue && !value.equals(selected))) {
                 return null;
             }
-            if ("RET".equals(mnemonic)) {
-                return returnValue;
-            }
-            if ("CCH".equals(mnemonic) || "NOP".equals(mnemonic)) {
-                continue;
-            }
-
-            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
-            if (("XOR".equals(mnemonic) || "SUB".equals(mnemonic)) &&
-                isReturnRegister(destination) &&
-                destination.equals(NetworkSchemaX86.registerOperand(instruction, 1))) {
-                returnValue = 0L;
-                continue;
-            }
-
-            if ("MOV".equals(mnemonic) && isReturnRegister(destination)) {
-            Long immediate = literalOperandValue(instruction, 1);
-                if (immediate == null) {
-                    return null;
-                }
-                returnValue = immediate;
-                continue;
-            }
-
-            if ("MOVZX".equals(mnemonic) && isReturnRegister(destination)) {
-                String source = NetworkSchemaX86.registerOperand(instruction, 1);
-                if (!isReturnRegister(source) || returnValue == null) {
-                    return null;
-                }
-                continue;
-            }
-
-            if ("ADD".equals(mnemonic) || "SUB".equals(mnemonic)) {
-                String stackRegister = NetworkSchemaX86.registerOperand(instruction, 0);
-                if ("RSP".equals(stackRegister) && literalOperandValue(instruction, 1) != null) {
-                    continue;
-                }
-            }
-
-            return null;
+            selected = value;
+            sawValue = true;
         }
-        return null;
-    }
-
-    private boolean isReturnRegister(String register) {
-        return "AL".equals(register) || "RAX".equals(register);
+        return sawValue ? selected : null;
     }
 
     private String fragmentCategoryName(Integer value) {
@@ -769,87 +592,7 @@
         Address function,
         Address provider,
         boolean followProviderCalls) {
-        Deque<HandlerScanFrame> stack = new ArrayDeque<>();
-        stack.addFirst(new HandlerScanFrame(provider, 0));
-        LinkedHashSet<String> seen = new LinkedHashSet<>();
-        LinkedHashSet<String> seenTypeIds = new LinkedHashSet<>();
-        TypeIdDecode result = null;
-
-        while (!stack.isEmpty()) {
-            HandlerScanFrame frame = stack.removeFirst();
-            Address current = resolvedCodeTarget(frame.address);
-            if (!isExecutableAddress(current) || !seen.add(current.toString())) {
-                continue;
-            }
-
-            List<Instruction> instructions =
-                reachableInstructions(current, REGISTRY_HANDLER_RTTI_SCAN_LIMIT);
-            if (instructions.isEmpty()) {
-                continue;
-            }
-
-            ArrayList<Address> callees = new ArrayList<>();
-            boolean foundUuidInFrame = false;
-            for (Instruction instruction : instructions) {
-                for (Address target : referencedAddresses(instruction)) {
-                    String sourceKind = "referencedString";
-                    String uuid = canonicalUuidFromExactString(readPrintableString(target));
-                    if (uuid == null && isNativeUuidLiteralReference(instruction, target)) {
-                        uuid = canonicalUuidFromNativeUuidLiteral(target);
-                        if (uuid == null) {
-                            incrementCount(nativeUuidRejectCounts, "bad-layout");
-                        }
-                        else if (!registryTypeIds.contains(normalizeUuid(uuid))) {
-                            incrementCount(nativeUuidRejectCounts, "not-in-registry");
-                            uuid = null;
-                        }
-                        sourceKind = "nativeUuidLiteral";
-                    }
-                    if (uuid == null) {
-                        continue;
-                    }
-
-                    foundUuidInFrame = true;
-                    String source = frame.depth == 0
-                        ? sourceKind
-                        : "providerCall" + Character.toUpperCase(sourceKind.charAt(0)) +
-                            sourceKind.substring(1);
-                    incrementCount(typeIdSourceCounts, source);
-                    if (result == null) {
-                        result = new TypeIdDecode();
-                        result.function = function;
-                        result.provider = current;
-                        result.typeId = uuid;
-                        result.typeIdSource = source;
-                        result.sourceAddress = target;
-                    }
-                    if (seenTypeIds.add(uuid)) {
-                        int chainIndex = result.typeIdChain.size();
-                        result.typeIdChain.add(typeIdChainEntry(
-                            current,
-                            uuid,
-                            source,
-                            target,
-                            frame.depth,
-                            chainIndex));
-                    }
-                }
-
-                if (!followProviderCalls || frame.depth >= REGISTRY_HANDLER_RTTI_CALL_DEPTH ||
-                    foundUuidInFrame ||
-                    !instruction.getFlowType().isCall()) {
-                    continue;
-                }
-                Address target = resolvedCodeTarget(callTarget(instruction));
-                if (isExecutableAddress(target)) {
-                    callees.add(target);
-                }
-            }
-            for (int i = callees.size() - 1; i >= 0; i--) {
-                stack.addFirst(new HandlerScanFrame(callees.get(i), frame.depth + 1));
-            }
-        }
-        return result;
+        return decodeTypeIdFromPcodeFlow(function, provider, followProviderCalls);
     }
 
     private JsonObject typeIdChainEntry(
@@ -870,31 +613,3 @@
         object.addProperty("azRttiRole", chainIndex == 0 ? "self" : "baseOrInterface");
         return object;
     }
-
-    private TypeNameDecode decodeTypeNameFromReferencedStrings(Address function, Address provider) {
-        List<Instruction> instructions =
-            linearInstructions(provider, REGISTRY_HANDLER_RTTI_SCAN_LIMIT);
-        if (instructions.isEmpty()) {
-            return null;
-        }
-
-        TypeNameDecode best = null;
-        int bestScore = Integer.MIN_VALUE;
-        for (Instruction instruction : instructions) {
-            for (Address target : referencedAddresses(instruction)) {
-                String name = readPrintableString(target);
-                if (!isLikelyRuntimeTypeName(name)) {
-                    continue;
-                }
-                int score = runtimeTypeNameScore(name);
-                if (best != null && score < bestScore) {
-                    continue;
-                }
-
-                TypeNameDecode decode = new TypeNameDecode();
-                decode.function = function;
-                decode.provider = provider;
-                decode.typeName = name;
-                decode.typeNameSource = "referencedString";
-                decode.typeNameAddress = target;
-                best = decode;

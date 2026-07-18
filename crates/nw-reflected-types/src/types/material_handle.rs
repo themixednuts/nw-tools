@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct MaterialHandle;
+pub struct MaterialHandle {}
 
 impl AzRtti for MaterialHandle {
     const NAME: &'static str = "MaterialHandle";

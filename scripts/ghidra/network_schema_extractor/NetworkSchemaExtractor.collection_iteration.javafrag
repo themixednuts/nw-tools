@@ -1,0 +1,207 @@
+    private record CollectionElementCodec(
+        PcodeOpAST operation,
+        List<CodecWireEvent> events) {
+
+        CollectionElementCodec {
+            events = List.copyOf(events);
+        }
+    }
+
+    private record CollectionIteration(
+        WireShape wireEvidence,
+        Set<Address> codecCallsites) {
+
+        CollectionIteration {
+            codecCallsites = Set.copyOf(codecCallsites);
+        }
+    }
+
+    private record CollectionElementSequence(
+        List<PcodeCodecCall> codecs,
+        Set<Address> consumedCallsites) {
+
+        CollectionElementSequence {
+            codecs = List.copyOf(codecs);
+            consumedCallsites = Set.copyOf(consumedCallsites);
+        }
+    }
+
+    private CollectionIteration collectionIteration(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeStorage readBuffer,
+        SequenceExtent extent) {
+
+        if (function == null || high == null || loop == null || readBuffer == null ||
+            extent == null) {
+            return null;
+        }
+        HashMap<PcodeBlockBasic, List<CollectionElementCodec>> codecsByBlock =
+            new HashMap<>();
+        LinkedHashSet<Address> callsites = new LinkedHashSet<>();
+        Map<String, CodecWireTrace> completed = new HashMap<>();
+        Set<String> active = new LinkedHashSet<>();
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (target == null) {
+                continue;
+            }
+            PcodeStorage targetReadBuffer = callTargetReadBufferStorage(
+                high,
+                operations,
+                operation,
+                target,
+                readBuffer,
+                active);
+            if (targetReadBuffer == null) {
+                continue;
+            }
+            if (!unmarshalCodecWritesSequenceElement(
+                    function,
+                    high,
+                    loop,
+                    operations,
+                    operation,
+                    extent,
+                    readBuffer)) {
+                recordNestedTypeShapeReject(
+                    "dynamic-collection-element-store-unproven");
+                return null;
+            }
+            CodecWireTrace nested = traceUnmarshalCodec(
+                target,
+                targetReadBuffer,
+                active,
+                completed);
+            if (nested == null || nested.events.isEmpty()) {
+                recordNestedTypeShapeReject(
+                    "dynamic-collection-element-codec-unproven");
+                return null;
+            }
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+            if (block == null) {
+                return null;
+            }
+            codecsByBlock.computeIfAbsent(block, ignored -> new ArrayList<>()).add(
+                new CollectionElementCodec(operation, nested.events));
+            callsites.add(operation.getSeqnum().getTarget());
+        }
+        if (codecsByBlock.isEmpty()) {
+            return null;
+        }
+
+        NetworkSchemaFlowSequence.Result<CollectionElementCodec> sequence =
+            NetworkSchemaFlowSequence.analyzeLoopIteration(
+                loop,
+                codecsByBlock,
+                this::sameCollectionElementCodec);
+        if (!sequence.complete() || sequence.events().isEmpty()) {
+            recordNestedTypeShapeReject(
+                "dynamic-collection-iteration-" + sequence.status());
+            return null;
+        }
+        ArrayList<CodecWireEvent> events = new ArrayList<>();
+        sequence.events().forEach(codec -> events.addAll(codec.events()));
+        WireShape evidence = dynamicSequenceWireEvidence(events);
+        return evidence == null
+            ? null
+            : new CollectionIteration(evidence, callsites);
+    }
+
+    private boolean sameCollectionElementCodec(
+        CollectionElementCodec left,
+        CollectionElementCodec right) {
+
+        if (left.events().size() != right.events().size()) {
+            return false;
+        }
+        for (int index = 0; index < left.events().size(); index++) {
+            if (!sameWireEvidence(
+                    left.events().get(index).wireEvidence(),
+                    right.events().get(index).wireEvidence())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private CollectionElementSequence loopElementCodecs(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        HashMap<String, String> tempNativeTypes = new HashMap<>();
+        HashMap<String, String> tempWireShapes = new HashMap<>();
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            WireShape evidence = directCallWireEvidence(operation);
+            observePcodeTempUnmarshal(
+                tempNativeTypes,
+                tempWireShapes,
+                operation,
+                unmarshalNativeTypeFromTarget(target),
+                evidence == null ? null : firstNonEmpty(evidence.shape, evidence.layout));
+        }
+
+        IdentityHashMap<PcodeOpAST, WireShape> nestedCollections = new IdentityHashMap<>();
+        Set<PcodeOpAST> nestedHelpers = Collections.newSetFromMap(new IdentityHashMap<>());
+        LinkedHashSet<Address> consumedCallsites = new LinkedHashSet<>();
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            InterproceduralCollectionCall collection = interproceduralCollectionCall(
+                owner,
+                operation,
+                pcodeCallTarget(operation),
+                tempNativeTypes,
+                tempWireShapes,
+                Collections.emptyMap());
+            if (collection == null) {
+                continue;
+            }
+            PcodeOpAST count = uniqueUnmarshalCountProducer(
+                high,
+                operations,
+                operation,
+                collection.count());
+            if (count == null || !loop.contains(count) ||
+                nestedCollections.putIfAbsent(count, collection.wireEvidence()) != null) {
+                recordNestedTypeShapeReject("nested-loop-collection-boundary-ambiguous");
+                return null;
+            }
+            nestedHelpers.add(operation);
+            consumedCallsites.add(count.getSeqnum().getTarget());
+            consumedCallsites.add(operation.getSeqnum().getTarget());
+        }
+
+        ArrayList<PcodeCodecCall> result = new ArrayList<>();
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            WireShape nested = nestedCollections.get(operation);
+            if (nested != null) {
+                result.add(new PcodeCodecCall(operation, nested));
+                continue;
+            }
+            if (nestedHelpers.contains(operation)) {
+                continue;
+            }
+            WireShape evidence = directCallWireEvidence(operation);
+            if (evidence != null && evidence.layout != null) {
+                result.add(new PcodeCodecCall(operation, evidence));
+                consumedCallsites.add(operation.getSeqnum().getTarget());
+            }
+        }
+        return new CollectionElementSequence(result, consumedCallsites);
+    }

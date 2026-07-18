@@ -1,0 +1,75 @@
+    private void recordRegistryAnalysisCost(
+        RegistryEntry entry,
+        JsonObject row,
+        long startedNanos,
+        long requestsBefore,
+        long missesBefore,
+        long pcodeMissesBefore) {
+
+        JsonObject messageUnmarshal = object(row, "messageUnmarshal");
+        String kind = row.has("constructorMatches")
+            ? "registered-fields"
+            : messageUnmarshal != null && messageUnmarshal.has("delegatedCodec")
+                ? "delegated-codec"
+                : messageUnmarshal != null ? "message" : "unresolved";
+        int fieldCount = row.has("fields") ? row.getAsJsonArray("fields").size() : 0;
+        registryAnalysisCosts.add(new RegistryAnalysisCost(
+            entry.typeIndex,
+            string(row, "typeName"),
+            kind,
+            Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L),
+            Math.max(0L, runMetrics.counter("highFunctionRequests") - requestsBefore),
+            Math.max(0L, runMetrics.counter("highFunctionMisses") - missesBefore),
+            Math.max(0L, runMetrics.counter("pcodeMemoryPathMisses") - pcodeMissesBefore),
+            fieldCount));
+    }
+
+    private JsonArray registryAnalysisHotspotsJson() {
+        ArrayList<RegistryAnalysisCost> costs = new ArrayList<>(registryAnalysisCosts);
+        costs.sort((left, right) -> {
+            int elapsedOrder = Long.compare(right.elapsedMillis(), left.elapsedMillis());
+            if (elapsedOrder != 0) {
+                return elapsedOrder;
+            }
+            int missOrder = Long.compare(right.highFunctionMisses(), left.highFunctionMisses());
+            if (missOrder != 0) {
+                return missOrder;
+            }
+            return Integer.compare(
+                left.typeIndex() == null ? Integer.MAX_VALUE : left.typeIndex(),
+                right.typeIndex() == null ? Integer.MAX_VALUE : right.typeIndex());
+        });
+
+        JsonArray result = new JsonArray();
+        int limit = Math.min(64, costs.size());
+        for (int i = 0; i < limit; i++) {
+            result.add(costs.get(i).toJson());
+        }
+        return result;
+    }
+
+    private record RegistryAnalysisCost(
+        Integer typeIndex,
+        String typeName,
+        String kind,
+        long elapsedMillis,
+        long highFunctionRequests,
+        long highFunctionMisses,
+        long pcodeMemoryPathMisses,
+        int fieldCount) {
+
+        JsonObject toJson() {
+            JsonObject object = new JsonObject();
+            if (typeIndex != null) {
+                object.addProperty("typeIndex", typeIndex);
+            }
+            NetworkSchemaJson.add(object, "typeName", typeName);
+            object.addProperty("kind", kind);
+            object.addProperty("elapsedMillis", elapsedMillis);
+            object.addProperty("highFunctionRequests", highFunctionRequests);
+            object.addProperty("highFunctionMisses", highFunctionMisses);
+            object.addProperty("pcodeMemoryPathMisses", pcodeMemoryPathMisses);
+            object.addProperty("fieldCount", fieldCount);
+            return object;
+        }
+    }

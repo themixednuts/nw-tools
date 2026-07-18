@@ -1,0 +1,985 @@
+import ghidra.program.model.pcode.PcodeBlockBasic;
+
+    private FullContainerPlanRecovery recoverFullContainerPlan(Address marshalFull) {
+        ArrayList<ContainerPlanDiagnostic> diagnostics = new ArrayList<>();
+        Function function = functionAtOrContaining(resolvedCodeTarget(marshalFull));
+        if (function == null) {
+            diagnostics.add(containerPlanDiagnostic(
+                null, null, null, null,
+                "entry", "marshal-full-function-unresolved",
+                null, null, null, null, null));
+            return new FullContainerPlanRecovery(null, diagnostics);
+        }
+        FullContainerPlan plan = recoverFullContainerPlanNode(
+            function,
+            "param_2",
+            new LinkedHashSet<>(),
+            0,
+            diagnostics);
+        if (plan != null) {
+            plan.marshalFull = function.getEntryPoint();
+        }
+        return new FullContainerPlanRecovery(plan, diagnostics);
+    }
+
+    private FullContainerPlan recoverFullContainerPlanNode(
+        Function function,
+        String writeBufferParameter,
+        Set<String> active,
+        int helperDepth,
+        List<ContainerPlanDiagnostic> diagnostics) {
+
+        if (function == null || writeBufferParameter == null || helperDepth > 8) {
+            diagnostics.add(containerPlanDiagnostic(
+                function, null, null, null,
+                "function", "invalid-helper-boundary",
+                writeBufferParameter, null, null, null, null));
+            return null;
+        }
+        String context = function.getEntryPoint() + "|" + writeBufferParameter;
+        if (!active.add(context)) {
+            diagnostics.add(containerPlanDiagnostic(
+                function, null, null, null,
+                "function", "recursive-helper-boundary",
+                writeBufferParameter, null, null, null, null));
+            return null;
+        }
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            active.remove(context);
+            diagnostics.add(containerPlanDiagnostic(
+                function, null, null, null,
+                "function", "decompile-unavailable",
+                writeBufferParameter, null, null, null, null));
+            return null;
+        }
+
+        FullContainerPlan selected = null;
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            List<ContainerCodecCall> codecs = fullContainerLoopCodecs(
+                function,
+                high,
+                loop,
+                writeBufferParameter,
+                active,
+                diagnostics);
+            if (codecs.isEmpty()) {
+                diagnostics.add(containerPlanDiagnostic(
+                    function, loop.header().getStart(), null, null,
+                    "loop", "no-buffer-connected-codecs",
+                    writeBufferParameter, null, null, 0, null));
+                continue;
+            }
+            ContainerLoopInduction induction = containerLoopInduction(loop, codecs);
+            if (induction == null) {
+                diagnostics.add(containerPlanDiagnostic(
+                    function, loop.header().getStart(), null, null,
+                    "loop", "induction-ambiguous-or-unproven",
+                    writeBufferParameter, null, null, codecs.size(), null));
+                continue;
+            }
+            FullContainerPlan plan = new FullContainerPlan();
+            plan.analysisFunction = function.getEntryPoint();
+            plan.loopHeader = loop.header().getStart();
+            plan.storageKind = induction.storageKind();
+            plan.elementStride = induction.stride();
+            plan.inductionSource = induction.source();
+            plan.helperDepth = helperDepth;
+            if (induction.storageKind() == ContainerStorageKind.INDEX_MAP) {
+                ContainerCodecPartition partition = indexMapCodecPartition(codecs);
+                if (partition == null) {
+                    diagnostics.add(containerPlanDiagnostic(
+                        function, loop.header().getStart(), null, null,
+                        "loop", "index-map-member-storage-order-unproven",
+                        writeBufferParameter, null, null, codecs.size(), induction.source()));
+                    continue;
+                }
+                plan.keyCodecs.addAll(partition.keyCodecs());
+                plan.valueCodecs.addAll(partition.valueCodecs());
+            }
+            else {
+                plan.valueCodecs.addAll(codecs);
+            }
+            if (selected != null) {
+                diagnostics.add(containerPlanDiagnostic(
+                    function, loop.header().getStart(), null, null,
+                    "loop", "multiple-container-loops",
+                    writeBufferParameter, null, null, codecs.size(), induction.source()));
+                return null;
+            }
+            selected = plan;
+        }
+        if (selected == null) {
+            selected = delegatedFullContainerPlan(
+                function,
+                high,
+                writeBufferParameter,
+                active,
+                helperDepth,
+                diagnostics);
+        }
+        active.remove(context);
+        return selected;
+    }
+
+    private List<ContainerCodecCall> fullContainerLoopCodecs(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        String writeBufferParameter,
+        Set<String> active,
+        List<ContainerPlanDiagnostic> diagnostics) {
+
+        ArrayList<ContainerCodecCall> result = new ArrayList<>();
+        PcodeStorage writeBuffer = new PcodeStorage(writeBufferParameter, 0L);
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (!loop.contains(operation)) {
+                continue;
+            }
+            ContainerCodecCall codec = switch (operation.getOpcode()) {
+                case PcodeOp.CALL -> fullContainerDirectCodec(
+                    function,
+                    operation,
+                    writeBuffer,
+                    active,
+                    diagnostics);
+                case PcodeOp.CALLIND -> fullContainerRawCodec(
+                    function,
+                    operation,
+                    writeBufferParameter,
+                    diagnostics);
+                default -> null;
+            };
+            if (codec != null) {
+                result.add(codec);
+            }
+        }
+        applyContainerCodecElementOffsets(loop, result);
+        return List.copyOf(result);
+    }
+
+    private ContainerCodecCall fullContainerDirectCodec(
+        Function owner,
+        PcodeOpAST operation,
+        PcodeStorage writeBuffer,
+        Set<String> active,
+        List<ContainerPlanDiagnostic> diagnostics) {
+
+        Function target = pcodeCallTarget(operation);
+        Integer bufferSlot = provenCallArgumentSlot(
+            owner,
+            operation,
+            target,
+            writeBuffer);
+        if (bufferSlot == null || target == null) {
+            diagnostics.add(callArgumentDiagnostic(
+                owner,
+                operation,
+                target,
+                writeBuffer,
+                target == null ? "call-target-unresolved" : "write-buffer-argument-unproven"));
+            return null;
+        }
+        String targetName = fullFunctionName(target);
+        String nativeType = marshalFunctionTemplateType(targetName);
+        WireShape wireEvidence = nativeType == null
+            ? null
+            : semanticWireEvidenceForNativeType(nativeType);
+        if (nativeType == null) {
+            wireEvidence = validatedMarshalLeaf(target, "param_" + bufferSlot);
+        }
+        ContainerCodecCall structured = structuredContainerCodec(
+            operation,
+            target,
+            nativeType,
+            "param_" + bufferSlot,
+            active,
+            0,
+            diagnostics,
+            "full-container-loop-structured-value");
+        if (structured != null) {
+            return structured;
+        }
+        if (wireEvidence == null) {
+            ContainerCodecCall boundary = containerHelperBoundary(
+                operation,
+                target,
+                "param_" + bufferSlot,
+                active,
+                0,
+                diagnostics,
+                "full-container-loop-helper-boundary");
+            if (boundary != null) {
+                return boundary;
+            }
+            diagnostics.add(callArgumentDiagnostic(
+                owner,
+                operation,
+                target,
+                writeBuffer,
+                "helper-codec-members-unresolved"));
+            return null;
+        }
+
+        ContainerCodecCall codec = new ContainerCodecCall();
+        codec.operation = operation;
+        codec.callsite = operation.getSeqnum().getTarget();
+        codec.target = target.getEntryPoint();
+        codec.targetName = targetName;
+        codec.nativeType = nativeType;
+        codec.wireEvidence = wireEvidence;
+        codec.evidenceSource = nativeType == null
+            ? "full-container-loop-leaf-codec"
+            : "full-container-loop-marshal-template";
+        if (nativeType != null) {
+            applyContainerCodecTypeIdentity(codec, nativeType);
+        }
+        return codec;
+    }
+
+    private ContainerCodecCall fullContainerRawCodec(
+        Function owner,
+        PcodeOpAST operation,
+        String writeBufferParameter,
+        List<ContainerPlanDiagnostic> diagnostics) {
+
+        Integer byteLength = provenVirtualRawWriteLength(
+            owner,
+            operation,
+            writeBufferParameter);
+        if (byteLength == null) {
+            diagnostics.add(containerPlanDiagnostic(
+                owner,
+                null,
+                operation.getSeqnum().getTarget(),
+                null,
+                "raw-write",
+                "virtual-write-raw-unproven",
+                writeBufferParameter,
+                null,
+                instructionAbiCallArgumentSlot(
+                    owner,
+                    operation,
+                    null,
+                    new PcodeStorage(writeBufferParameter, 0L)),
+                null,
+                null));
+            return null;
+        }
+        ContainerCodecCall codec = new ContainerCodecCall();
+        codec.operation = operation;
+        codec.callsite = operation.getSeqnum().getTarget();
+        boolean normalizedBoolean = byteLength == Byte.BYTES &&
+            rawWriteArgumentIsNormalizedBoolean(owner, operation);
+        codec.wireEvidence = normalizedBoolean
+            ? WireShape.semantic(
+                "bool",
+                fixedByteLayout(byteLength),
+                "full-container-loop-normalized-boolean-write")
+            : WireShape.layout(
+                fixedByteLayout(byteLength),
+                "full-container-loop-write-raw");
+        codec.evidenceSource = normalizedBoolean
+            ? "full-container-loop-normalized-boolean-write"
+            : "full-container-loop-write-raw";
+        return codec;
+    }
+
+    private FullContainerPlan delegatedFullContainerPlan(
+        Function function,
+        HighFunction high,
+        String writeBufferParameter,
+        Set<String> active,
+        int helperDepth,
+        List<ContainerPlanDiagnostic> diagnostics) {
+
+        PcodeStorage writeBuffer = new PcodeStorage(writeBufferParameter, 0L);
+        FullContainerPlan selected = null;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Integer bufferSlot = provenCallArgumentSlot(
+                function,
+                operation,
+                target,
+                writeBuffer);
+            if (bufferSlot == null || target == null ||
+                marshalFunctionTemplateType(fullFunctionName(target)) != null ||
+                validatedMarshalLeaf(target, "param_" + bufferSlot) != null) {
+                continue;
+            }
+            FullContainerPlan candidate = recoverFullContainerPlanNode(
+                target,
+                "param_" + bufferSlot,
+                active,
+                helperDepth + 1,
+                diagnostics);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private ContainerCodecMembers collectContainerCodecMembers(
+        Function function,
+        String writeBufferParameter,
+        Set<String> active,
+        int depth,
+        List<ContainerPlanDiagnostic> diagnostics) {
+
+        if (function == null || writeBufferParameter == null || depth > 8) {
+            return ContainerCodecMembers.unresolved("invalid-helper-context");
+        }
+        String context = "codec-members|" + function.getEntryPoint() + "|" +
+            writeBufferParameter;
+        if (!active.add(context)) {
+            return ContainerCodecMembers.unresolved("recursive-helper-context");
+        }
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            active.remove(context);
+            return ContainerCodecMembers.unresolved("decompile-failed");
+        }
+
+        ArrayList<ContainerCodecCall> result = new ArrayList<>();
+        Map<PcodeBlockBasic, List<ContainerCodecCall>> membersByBlock = new HashMap<>();
+        boolean nestedExact = true;
+        boolean allMembersMapped = true;
+        String nestedStatus = null;
+        PcodeStorage writeBuffer = new PcodeStorage(writeBufferParameter, 0L);
+        Map<PcodeOpAST, ContainerSequenceAction> sequenceActions = containerSequenceActions(
+            function,
+            high,
+            writeBufferParameter,
+            active,
+            diagnostics);
+        LinkedHashSet<PcodeBlockBasic> collapsedSequenceEventBlocks =
+            new LinkedHashSet<>();
+        for (Map.Entry<PcodeOpAST, ContainerSequenceAction> entry :
+                sequenceActions.entrySet()) {
+            if (!entry.getValue().emit()) {
+                continue;
+            }
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(entry.getKey());
+            if (block != null) {
+                collapsedSequenceEventBlocks.add(block);
+            }
+        }
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            ContainerSequenceAction sequence = sequenceActions.get(operation);
+            if (sequence != null) {
+                if (sequence.emit()) {
+                    result.add(sequence.codec());
+                    allMembersMapped &= addContainerCodecMembersForOperation(
+                        membersByBlock,
+                        operation,
+                        List.of(sequence.codec()));
+                }
+                continue;
+            }
+            if (operation.getOpcode() == PcodeOp.CALLIND) {
+                ContainerCodecCall raw = fullContainerRawCodec(
+                    function,
+                    operation,
+                    writeBufferParameter,
+                    diagnostics);
+                if (raw != null) {
+                    result.add(raw);
+                    allMembersMapped &= addContainerCodecMembersForOperation(
+                        membersByBlock,
+                        operation,
+                        List.of(raw));
+                }
+                continue;
+            }
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Integer bufferSlot = provenCallArgumentSlot(
+                function,
+                operation,
+                target,
+                writeBuffer);
+            if (bufferSlot == null || target == null) {
+                diagnostics.add(callArgumentDiagnostic(
+                    function,
+                    operation,
+                    target,
+                    writeBuffer,
+                    target == null
+                        ? "helper-call-target-unresolved"
+                        : "helper-write-buffer-argument-unproven"));
+                continue;
+            }
+            String targetName = fullFunctionName(target);
+            String nativeType = marshalFunctionTemplateType(targetName);
+            WireShape nativeWire = nativeType == null
+                ? null
+                : semanticWireEvidenceForNativeType(nativeType);
+            WireShape leaf = nativeType == null
+                ? validatedMarshalLeaf(target, "param_" + bufferSlot)
+                : null;
+            ContainerCodecCall structured = structuredContainerCodec(
+                operation,
+                target,
+                nativeType,
+                "param_" + bufferSlot,
+                active,
+                depth + 1,
+                diagnostics,
+                "container-helper-structured-value");
+            if (structured != null) {
+                result.add(structured);
+                allMembersMapped &= addContainerCodecMembersForOperation(
+                    membersByBlock,
+                    operation,
+                    List.of(structured));
+                continue;
+            }
+            if (nativeWire != null || leaf != null) {
+                ContainerCodecCall member = new ContainerCodecCall();
+                member.operation = operation;
+                member.callsite = operation.getSeqnum().getTarget();
+                member.target = target.getEntryPoint();
+                member.targetName = targetName;
+                member.nativeType = nativeType;
+                member.wireEvidence = nativeWire == null ? leaf : nativeWire;
+                member.evidenceSource = nativeType == null
+                    ? "container-helper-leaf-codec"
+                    : "container-helper-marshal-template";
+                if (nativeType != null) {
+                    applyContainerCodecTypeIdentity(member, nativeType);
+                }
+                result.add(member);
+                allMembersMapped &= addContainerCodecMembersForOperation(
+                    membersByBlock,
+                    operation,
+                    List.of(member));
+                continue;
+            }
+            ContainerCodecMembers nested = collectContainerCodecMembers(
+                target,
+                "param_" + bufferSlot,
+                active,
+                depth + 1,
+                diagnostics);
+            translateContainerHelperMemberStorage(
+                function,
+                operation,
+                target,
+                nested.members());
+            nestedExact &= nested.exact();
+            if (!nested.exact()) {
+                nestedStatus = mergeContainerCodecAnalysisStatus(
+                    nestedStatus,
+                    nested.analysisStatus());
+            }
+            if (!nested.members().isEmpty() || !nested.optionalMembers().isEmpty()) {
+                ContainerCodecCall boundary = new ContainerCodecCall();
+                boundary.operation = operation;
+                boundary.callsite = operation.getSeqnum().getTarget();
+                boundary.target = target.getEntryPoint();
+                boundary.targetName = targetName;
+                boundary.evidenceSource = "container-helper-boundary";
+                boundary.memberSemantics = !nested.optionalMembers().isEmpty()
+                    ? "optional-suffix"
+                    : nested.linear()
+                        ? "linear-sequence"
+                        : "cfg-reachable";
+                boundary.analysisStatus = nested.analysisStatus();
+                boundary.members.addAll(nested.members());
+                boundary.optionalMembers.addAll(nested.optionalMembers());
+                result.add(boundary);
+                allMembersMapped &= addContainerCodecMembersForOperation(
+                    membersByBlock,
+                    operation,
+                    List.of(boundary));
+            }
+        }
+        active.remove(context);
+        NetworkSchemaFlowSequence.Result<ContainerCodecCall> flow =
+            NetworkSchemaFlowSequence.analyze(
+                high,
+                membersByBlock,
+                collapsedSequenceEventBlocks,
+                (left, right) -> left == right);
+        NetworkSchemaFlowSequence.OptionalSuffixResult<ContainerCodecCall> optional =
+            !flow.complete() && nestedExact && allMembersMapped &&
+                flow.status() == NetworkSchemaFlowSequence.Status.DIVERGENT_PATHS
+                ? NetworkSchemaFlowSequence.analyzeOptionalSuffix(
+                    high,
+                    membersByBlock,
+                    collapsedSequenceEventBlocks,
+                    (left, right) -> left == right)
+                : null;
+        boolean linear = nestedExact && allMembersMapped && flow.complete();
+        boolean optionalExact = optional != null && optional.hasOptionalSuffix();
+        boolean exact = linear || optionalExact;
+        String analysisStatus = linear
+            ? "complete"
+            : optionalExact
+                ? "optional-suffix"
+            : nestedStatus != null
+                ? "nested:" + nestedStatus
+                : !allMembersMapped
+                    ? "unmapped-codec-event"
+                    : switch (flow.status()) {
+                        case COMPLETE -> "complete";
+                        case DIVERGENT_PATHS -> "divergent-paths";
+                        case CYCLIC_EVENTS -> "cyclic-events";
+                        case NO_TERMINATING_PATH -> "no-terminating-path";
+                    };
+        List<ContainerCodecCall> requiredMembers = linear
+            ? flow.events()
+            : optionalExact
+                ? optional.requiredEvents()
+                : result;
+        List<ContainerCodecCall> optionalMembers = optionalExact
+            ? optional.optionalEvents()
+            : List.of();
+        if (exact) {
+            applyContainerHelperCodecOffsets(
+                high,
+                writeBufferParameter,
+                requiredMembers);
+            applyContainerHelperCodecOffsets(
+                high,
+                writeBufferParameter,
+                optionalMembers);
+        }
+        applyContainerCodecGuards(high, result);
+        return new ContainerCodecMembers(
+            requiredMembers,
+            optionalMembers,
+            linear,
+            exact,
+            analysisStatus);
+    }
+
+    private String mergeContainerCodecAnalysisStatus(String current, String candidate) {
+        if (candidate == null || candidate.isBlank()) {
+            return current;
+        }
+        if (current == null || current.equals(candidate)) {
+            return candidate;
+        }
+        return "multiple-non-linear-helpers";
+    }
+
+    private boolean addContainerCodecMembersForOperation(
+        Map<PcodeBlockBasic, List<ContainerCodecCall>> membersByBlock,
+        PcodeOpAST operation,
+        List<ContainerCodecCall> members) {
+
+        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+        if (block == null) {
+            return false;
+        }
+        membersByBlock.computeIfAbsent(block, ignored -> new ArrayList<>()).addAll(members);
+        return true;
+    }
+
+    private Integer provenVirtualRawWriteLength(
+        Function owner,
+        PcodeOp operation,
+        String writeBufferParameter) {
+
+        if (operation == null || operation.getOpcode() != PcodeOp.CALLIND ||
+            operation.getNumInputs() < 2 || writeBufferParameter == null) {
+            return null;
+        }
+        PcodeVirtualDispatch dispatch = pcodeVirtualDispatch(operation.getInput(0));
+        if (dispatch == null || dispatch.objectOffset() != 0L ||
+            dispatch.slotOffset() != 0x40L) {
+            return null;
+        }
+
+        PcodeStorage expected = new PcodeStorage(writeBufferParameter, 0L);
+        boolean pcodeReceiver = dispatch.root().isStorage(writeBufferParameter);
+        Integer abiSlot = instructionAbiCallArgumentSlot(
+            owner,
+            operation,
+            null,
+            expected);
+        boolean abiReceiver = Integer.valueOf(1).equals(abiSlot);
+        if (!pcodeReceiver && !abiReceiver) {
+            return null;
+        }
+        if (pcodeReceiver && abiSlot != null && !abiReceiver) {
+            return null;
+        }
+
+        Long byteLength = provenCallArgumentImmediate(
+            owner,
+            operation,
+            null,
+            3);
+        return byteLength != null && byteLength > 0L && byteLength <= 0x1000L
+            ? byteLength.intValue()
+            : null;
+    }
+
+    private Integer provenCallArgumentSlot(
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        PcodeStorage expected) {
+
+        Integer pcodeSlot = uniqueCallArgumentSlot(operation, expected);
+        Integer abiSlot = instructionAbiCallArgumentSlot(
+            owner,
+            operation,
+            target,
+            expected);
+        if (pcodeSlot != null && abiSlot != null && !pcodeSlot.equals(abiSlot)) {
+            return null;
+        }
+        return pcodeSlot != null ? pcodeSlot : abiSlot;
+    }
+
+    private Integer instructionAbiCallArgumentSlot(
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        PcodeStorage expected) {
+
+        if (expected == null) {
+            return null;
+        }
+        ForwardArgState state = instructionStateBeforeCall(owner, operation, target);
+        if (state == null) {
+            return null;
+        }
+        Integer selected = null;
+        int argumentCount = provenCallArgumentCount(operation, target);
+        for (int argumentSlot = 1; argumentSlot <= argumentCount; argumentSlot++) {
+            PcodeStorage actual = pcodeStorageFromTrackedValue(
+                win64CallArgumentValue(state, argumentSlot));
+            if (!expected.sameLocation(actual)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = argumentSlot;
+        }
+        return selected;
+    }
+
+    private ContainerPlanDiagnostic callArgumentDiagnostic(
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        PcodeStorage expected,
+        String reason) {
+
+        return containerPlanDiagnostic(
+            owner,
+            null,
+            operation == null || operation.getSeqnum() == null
+                ? null
+                : operation.getSeqnum().getTarget(),
+            target,
+            "call",
+            reason,
+            expected == null ? null : expected.expression(),
+            uniqueCallArgumentSlot(operation, expected),
+            instructionAbiCallArgumentSlot(owner, operation, target, expected),
+            null,
+            null);
+    }
+
+    private ContainerPlanDiagnostic containerPlanDiagnostic(
+        Function function,
+        Address loopHeader,
+        Address callsite,
+        Function target,
+        String stage,
+        String reason,
+        String expectedStorage,
+        Integer pcodeBufferSlot,
+        Integer abiBufferSlot,
+        Integer codecCount,
+        String induction) {
+
+        return new ContainerPlanDiagnostic(
+            function == null ? null : function.getEntryPoint(),
+            loopHeader,
+            callsite,
+            target == null ? null : target.getEntryPoint(),
+            fullFunctionName(target),
+            stage,
+            reason,
+            expectedStorage,
+            pcodeBufferSlot,
+            abiBufferSlot,
+            codecCount,
+            induction);
+    }
+
+    private WireShape semanticWireEvidenceForNativeType(String nativeType) {
+        String wireShape = wireShapeFromNativeType(nativeType);
+        return wireShape == null
+            ? null
+            : WireShape.semantic(
+                wireShape,
+                "full-container-loop-marshal-template");
+    }
+
+    private void applyContainerCodecTypeIdentity(
+        ContainerCodecCall codec,
+        String nativeType) {
+
+        SerializeTypeInfo exact = exactSerializeTypeForTypeName(nativeType);
+        SerializeTypeInfo reflected = exact == null
+            ? serializeTypeForTypeName(nativeType)
+            : exact;
+        codec.typeId = reflected == null
+            ? typeIdForTypeName(nativeType)
+            : reflected.typeId;
+        codec.typeIdSource = reflected == null
+            ? "az-type-info-fold"
+            : exact == null
+                ? "serialize-unique-leaf-name"
+                : "serialize-exact-name";
+    }
+
+    private SerializeTypeInfo exactSerializeTypeForTypeName(String typeName) {
+        if (typeName == null || typeName.isBlank()) {
+            return null;
+        }
+        List<SerializeTypeInfo> candidates = serializeTypesByName.get(typeName.trim());
+        return candidates != null && candidates.size() == 1 ? candidates.get(0) : null;
+    }
+
+    private ContainerLoopInduction containerLoopInduction(
+        NetworkSchemaNaturalLoop loop) {
+
+        ContainerLoopInduction selected = null;
+        for (PcodeBlockBasic block : loop.body()) {
+            var operations = block.getIterator();
+            while (operations.hasNext()) {
+                PcodeOp operation = operations.next();
+                if (!(operation instanceof PcodeOpAST phi) ||
+                    phi.getOpcode() != PcodeOp.MULTIEQUAL ||
+                    phi.getOutput() == null ||
+                    phi.getOutput().getSize() != currentProgram.getDefaultPointerSize()) {
+                    continue;
+                }
+                ContainerLoopInduction candidate = inductionFromPhi(phi);
+                if (candidate == null) {
+                    continue;
+                }
+                if (selected != null && !selected.equals(candidate)) {
+                    return null;
+                }
+                selected = candidate;
+            }
+        }
+        return selected;
+    }
+
+    private ContainerLoopInduction containerLoopInduction(
+        NetworkSchemaNaturalLoop loop,
+        List<ContainerCodecCall> codecs) {
+
+        if (loop == null || codecs == null || codecs.isEmpty()) {
+            return null;
+        }
+        ContainerLoopInduction selected = null;
+        List<Long> selectedOffsets = null;
+        for (PcodeOpAST phi : containerElementInductions(loop)) {
+            ArrayList<Long> offsets = new ArrayList<>(codecs.size());
+            for (ContainerCodecCall codec : codecs) {
+                Long offset = containerCodecElementOffset(loop, codec, phi.getOutput());
+                if (offset == null) {
+                    offsets.clear();
+                    break;
+                }
+                offsets.add(offset);
+            }
+            if (offsets.size() != codecs.size()) {
+                continue;
+            }
+            ContainerLoopInduction candidate = inductionFromPhi(phi);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null &&
+                (!selected.equals(candidate) || !selectedOffsets.equals(offsets))) {
+                return null;
+            }
+            selected = candidate;
+            selectedOffsets = List.copyOf(offsets);
+        }
+        return selected;
+    }
+
+    private ContainerLoopInduction inductionFromPhi(PcodeOpAST phi) {
+        Long stride = null;
+        boolean linked = false;
+        for (int slot = 0; slot < phi.getNumInputs(); slot++) {
+            Varnode input = phi.getInput(slot);
+            Long candidateStride = affineStepFromPhi(
+                input,
+                phi.getOutput(),
+                new LinkedHashSet<>(),
+                0);
+            if (candidateStride != null && candidateStride > 0 && candidateStride <= 0x100000L) {
+                if (stride != null && !stride.equals(candidateStride)) {
+                    return null;
+                }
+                stride = candidateStride;
+            }
+            linked |= linkedAdvanceFromPhi(
+                input,
+                phi.getOutput(),
+                new LinkedHashSet<>(),
+                0);
+        }
+        if (linked == (stride != null)) {
+            return null;
+        }
+        return linked
+            ? new ContainerLoopInduction(
+                ContainerStorageKind.INDEX_MAP,
+                null,
+                "cfg-natural-loop-linked-node-induction")
+            : new ContainerLoopInduction(
+                ContainerStorageKind.VECTOR,
+                stride,
+                "cfg-natural-loop-affine-pointer-induction");
+    }
+
+    private Long affineStepFromPhi(
+        Varnode node,
+        Varnode phi,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || phi == null || depth > 24 || !seen.add(pcodeNodeKey(node))) {
+            return null;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return null;
+        }
+        if (definition.getOpcode() == PcodeOp.INT_ADD && definition.getNumInputs() == 2) {
+            for (int constantSlot = 0; constantSlot < 2; constantSlot++) {
+                Long constant = NetworkSchemaIntegerEvaluator.evaluate(
+                    definition.getInput(constantSlot));
+                Varnode base = definition.getInput(1 - constantSlot);
+                if (constant != null && pcodeNodeDependsOn(
+                    base,
+                    phi,
+                    new LinkedHashSet<>(),
+                    0)) {
+                    return constant;
+                }
+            }
+            return null;
+        }
+        if (definition.getOpcode() == PcodeOp.PTRADD && definition.getNumInputs() == 3 &&
+            pcodeNodeDependsOn(
+                definition.getInput(0),
+                phi,
+                new LinkedHashSet<>(),
+                0)) {
+            Long index = NetworkSchemaIntegerEvaluator.evaluate(definition.getInput(1));
+            Long scale = NetworkSchemaIntegerEvaluator.evaluate(definition.getInput(2));
+            if (index != null && scale != null) {
+                try {
+                    return Math.multiplyExact(index, scale);
+                }
+                catch (ArithmeticException ignored) {
+                    return null;
+                }
+            }
+        }
+        return transparentPcodeDefinition(definition)
+            ? affineStepFromPhi(
+                definition.getInput(0),
+                phi,
+                seen,
+                depth + 1)
+            : null;
+    }
+
+    private boolean linkedAdvanceFromPhi(
+        Varnode node,
+        Varnode phi,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || phi == null || depth > 24 || !seen.add(pcodeNodeKey(node))) {
+            return false;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return false;
+        }
+        if (definition.getOpcode() == PcodeOp.LOAD && definition.getNumInputs() >= 2) {
+            return pcodeNodeDependsOn(
+                definition.getInput(1),
+                phi,
+                new LinkedHashSet<>(),
+                0);
+        }
+        return transparentPcodeDefinition(definition) && linkedAdvanceFromPhi(
+            definition.getInput(0),
+            phi,
+            seen,
+            depth + 1);
+    }
+
+    private boolean pcodeNodeDependsOn(
+        Varnode node,
+        Varnode expected,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || expected == null || depth > 48) {
+            return false;
+        }
+        if (sameVarnodeIdentity(node, expected)) {
+            return true;
+        }
+        if (!seen.add(pcodeNodeKey(node))) {
+            return false;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null || definition.getOpcode() == PcodeOp.CALL ||
+            definition.getOpcode() == PcodeOp.CALLIND) {
+            return false;
+        }
+        int inputs = definition.getOpcode() == PcodeOp.INDIRECT
+            ? Math.min(1, definition.getNumInputs())
+            : definition.getNumInputs();
+        for (int slot = 0; slot < inputs; slot++) {
+            Varnode input = definition.getInput(slot);
+            if (input != null && !input.isConstant() && pcodeNodeDependsOn(
+                input,
+                expected,
+                seen,
+                depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean transparentPcodeDefinition(PcodeOp definition) {
+        return definition != null && definition.getNumInputs() > 0 && switch (definition.getOpcode()) {
+            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INDIRECT,
+                PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT, PcodeOp.SUBPIECE -> true;
+            default -> false;
+        };
+    }

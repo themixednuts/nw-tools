@@ -1,0 +1,246 @@
+    private ConstructorFieldTypeIdentity rawConstructorFieldIdentity(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        PcodeOpAST readCall,
+        RawPcodeWrite raw) {
+
+        if (function == null || high == null || loop == null || readCall == null ||
+            raw == null || raw.storage == null || raw.wireEvidence == null) {
+            return null;
+        }
+        Integer byteWidth = wireShapeByteWidth(raw.wireEvidence.layout);
+        if (byteWidth == null || byteWidth <= 0) {
+            return null;
+        }
+
+        LinkedHashMap<String, ConstructorFieldTypeIdentity> identities =
+            new LinkedHashMap<>();
+        for (PcodeOpAST candidate : orderedPcodeOps(high)) {
+            if (candidate.getOpcode() != PcodeOp.CALL ||
+                loop != null && !loop.contains(candidate) ||
+                !NetworkSchemaControlFlow.precedes(high, candidate, readCall)) {
+                continue;
+            }
+            Function initializer = pcodeCallTarget(candidate);
+            PcodeStorage receiver = provenCallArgumentStorage(
+                function,
+                candidate,
+                initializer,
+                1);
+            if (initializer == null || receiver == null ||
+                !receiver.sameLocation(raw.storage)) {
+                continue;
+            }
+            ConstructorFieldTypeIdentity identity = constructorFieldTypeIdentity(
+                initializer,
+                byteWidth);
+            if (identity != null) {
+                identities.putIfAbsent(identity.identityKey(), identity);
+            }
+        }
+        return identities.size() == 1
+            ? identities.values().iterator().next()
+            : null;
+    }
+
+    private ConstructorFieldTypeIdentity rawConstructorFieldIdentity(
+        Function function,
+        HighFunction high,
+        PcodeOpAST readCall,
+        RawPcodeWrite raw) {
+
+        return rawConstructorFieldIdentity(
+            function,
+            high,
+            null,
+            readCall,
+            raw);
+    }
+
+    private ConstructorFieldTypeIdentity constructorFieldTypeIdentity(
+        Function initializer,
+        long byteWidth) {
+
+        Address target = initializer == null
+            ? null
+            : resolvedCodeTarget(initializer.getEntryPoint());
+        if (!isExecutableAddress(target) || byteWidth <= 0L) {
+            return null;
+        }
+        String key = target + "|" + byteWidth;
+        Optional<ConstructorFieldTypeIdentity> cached =
+            constructorFieldTypeIdentityCache.get(key);
+        if (cached != null) {
+            return cached.orElse(null);
+        }
+
+        LinkedHashMap<String, ConstructorFieldTypeIdentity> identities =
+            new LinkedHashMap<>();
+        LinkedHashSet<String> visitedCallers = new LinkedHashSet<>();
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(target);
+        while (references.hasNext() && !monitor.isCancelled()) {
+            Reference reference = references.next();
+            Function caller = functionAtOrContaining(reference.getFromAddress());
+            if (caller == null ||
+                !visitedCallers.add(caller.getEntryPoint().toString())) {
+                continue;
+            }
+            collectConstructorFieldTypeIdentities(
+                caller,
+                target,
+                byteWidth,
+                identities);
+            if (identities.size() > 1) {
+                break;
+            }
+        }
+
+        ConstructorFieldTypeIdentity result = identities.size() == 1
+            ? identities.values().iterator().next()
+            : null;
+        constructorFieldTypeIdentityCache.put(key, Optional.ofNullable(result));
+        return result;
+    }
+
+    private void collectConstructorFieldTypeIdentities(
+        Function caller,
+        Address initializer,
+        long byteWidth,
+        Map<String, ConstructorFieldTypeIdentity> identities) {
+
+        HighFunction high = highFunction(caller);
+        if (high == null) {
+            return;
+        }
+        Address ownerVtable = findInstanceVtable(caller);
+        AzRttiEvidence ownerRtti = decodeAzRttiFromVtable(ownerVtable);
+        String ownerTypeId = ownerRtti == null
+            ? null
+            : canonicalUuidFromString(ownerRtti.typeId);
+        SerializeTypeInfo owner = ownerTypeId == null
+            ? null
+            : serializeTypesById.get(normalizeUuid(ownerTypeId));
+        if (owner == null) {
+            return;
+        }
+
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Address body = target == null
+                ? null
+                : resolvedCodeTarget(target.getEntryPoint());
+            if (!initializer.equals(body)) {
+                continue;
+            }
+            PcodeStorage receiver = provenCallArgumentStorage(
+                caller,
+                operation,
+                target,
+                1);
+            if (receiver == null || !"param_1".equals(receiver.base)) {
+                continue;
+            }
+            SerializeFieldInfo field = exactSerializeField(
+                owner,
+                receiver.offset,
+                byteWidth);
+            if (field == null) {
+                continue;
+            }
+            String typeId = canonicalUuidFromString(field.typeId);
+            SerializeTypeInfo fieldType = typeId == null
+                ? null
+                : serializeTypesById.get(normalizeUuid(typeId));
+            String typeName = firstNonEmpty(
+                field.typeName,
+                fieldType == null ? null : fieldType.name);
+            if (typeId == null || typeName == null || typeName.trim().isEmpty()) {
+                continue;
+            }
+            ConstructorFieldTypeIdentity identity = new ConstructorFieldTypeIdentity(
+                typeId,
+                typeName.trim(),
+                initializer,
+                caller.getEntryPoint(),
+                ownerVtable,
+                ownerTypeId,
+                owner.name,
+                field.name,
+                receiver.offset,
+                byteWidth);
+            identities.putIfAbsent(identity.identityKey(), identity);
+        }
+    }
+
+    private SerializeFieldInfo exactSerializeField(
+        SerializeTypeInfo owner,
+        long offset,
+        long byteWidth) {
+
+        SerializeFieldInfo selected = null;
+        for (SerializeFieldInfo field : owner.fields) {
+            if (field.baseClass || field.offset == null || field.dataSize == null ||
+                field.offset != offset || field.dataSize != byteWidth) {
+                continue;
+            }
+            if (selected != null &&
+                (!Objects.equals(selected.typeId, field.typeId) ||
+                    !Objects.equals(selected.name, field.name))) {
+                return null;
+            }
+            selected = field;
+        }
+        return selected;
+    }
+
+    private void applyConstructorFieldTypeIdentity(
+        ContainerCodecCall codec,
+        ConstructorFieldTypeIdentity identity) {
+
+        if (codec == null || identity == null) {
+            return;
+        }
+        codec.nativeType = identity.typeName;
+        codec.typeId = identity.typeId;
+        codec.typeIdSource = "constructor-receiver+owner-rtti+serialize-field-offset";
+        codec.typeIdentityProven = true;
+        codec.evidenceSource =
+            "unmarshal-dominating-constructor+owner-rtti+serialize-field-offset";
+    }
+
+    private void applyConstructorFieldTypeIdentity(
+        FieldCall field,
+        ConstructorFieldTypeIdentity identity) {
+
+        if (field == null || identity == null ||
+            field.nativeType != null && !field.nativeType.equals(identity.typeName)) {
+            return;
+        }
+        field.nativeType = identity.typeName;
+        field.sourceTypeName = identity.typeName;
+        field.sourceTypeId = identity.typeId;
+        field.sourceTypeIdSource =
+            "dominating-constructor-receiver+owner-rtti+serialize-field-offset";
+        field.sourceTypeIdentityProven = true;
+        addMessageFieldTypeEvidence(
+            field,
+            identity.typeName,
+            field.sourceTypeIdSource,
+            formatAddress(identity.initializer),
+            "constructor-field-type");
+
+        String wireShape = firstNonEmpty(
+            wireShapeFromSerializeTypeId(identity.typeId),
+            wireShapeFromNativeType(identity.typeName));
+        Integer wireWidth = wireShapeByteWidth(wireShape);
+        if (wireShape != null && wireWidth != null &&
+            wireWidth.longValue() == identity.byteWidth) {
+            field.wireShape = wireShape;
+            field.wireShapeSource = field.sourceTypeIdSource;
+        }
+    }

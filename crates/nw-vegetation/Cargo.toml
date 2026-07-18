@@ -1,0 +1,19 @@
+[package]
+name = "nw-vegetation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Legacy New World vegetation and distribution format parsers"
+
+[dependencies]
+glam.workspace = true
+nw-asset.workspace = true
+nw-objectstream.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

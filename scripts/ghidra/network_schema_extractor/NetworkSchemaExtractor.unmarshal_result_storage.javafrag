@@ -1,0 +1,30 @@
+    private String returnedUnmarshalResultBase(
+        HighFunction high,
+        Set<String> candidates) {
+
+        if (high == null || candidates == null || candidates.isEmpty()) {
+            return null;
+        }
+        String returnedBase = null;
+        int returnCount = 0;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.RETURN) {
+                continue;
+            }
+            returnCount++;
+            if (operation.getNumInputs() < 2) {
+                return null;
+            }
+            PcodeStorage returned = pcodeStorageExpression(
+                operation.getInput(operation.getNumInputs() - 1));
+            if (returned == null || returned.offset != 0L ||
+                !candidates.contains(returned.base)) {
+                return null;
+            }
+            if (returnedBase != null && !returnedBase.equals(returned.base)) {
+                return null;
+            }
+            returnedBase = returned.base;
+        }
+        return returnCount == 0 ? null : returnedBase;
+    }

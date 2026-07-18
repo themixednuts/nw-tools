@@ -4,25 +4,6 @@
         }
         return "replicated-field";
     }
-
-    private int physicalFieldCountFromHandlerType(NetworkTemplateType type) {
-        if (type == null) {
-            return 1;
-        }
-        if (type.simpleName.equals("DeltaCompressedReplicatedFieldHandler") ||
-            type.simpleName.equals("DeltaCompressedReplicatedFieldHandlerBase") ||
-            type.simpleName.equals("DeltaCompressedCounterHandler")) {
-            return 2;
-        }
-        if (type.simpleName.equals("DynamicDeltaReplicatedFieldHandler")) {
-            return 3;
-        }
-        if (type.simpleName.equals("FloatTimerDeltaReplicatedField")) {
-            return 4;
-        }
-        return 1;
-    }
-
     private String fieldHandlerTypeName(
         HandlerConstruction construction,
         Address vtable) {
@@ -45,7 +26,6 @@
         }
         return null;
     }
-
     private String handlerTypeNameFromQualifiedName(String qualifiedName) {
         if (qualifiedName == null || qualifiedName.isBlank()) {
             return null;
@@ -730,86 +710,27 @@
         return result;
     }
 
-    private MessageUnmarshalPlan recoverMessageUnmarshalPlan(
-        RegistryEntry entry,
-        HookTypeEvidence hookType) {
-
-        Address createInstanceAddress = firstAddress(
-            parseCapturedAddress(entry.createInstance),
-            hookType == null ? null : hookType.createInstance);
-        Address unmarshalAddress = firstAddress(
-            parseCapturedAddress(entry.unmarshal),
-            hookType == null ? null : hookType.unmarshal);
+    private MessageUnmarshalPlan recoverMessageUnmarshalPlan(RegistryEntry entry) {
+        Address createInstanceAddress = parseCapturedAddress(entry.createInstance);
+        Address unmarshalAddress = parseCapturedAddress(entry.unmarshal);
         Function wrapper = functionAtOrContaining(unmarshalAddress);
         if (wrapper == null) {
             return null;
         }
 
-        MessageHelperCall helperCall = findMessageHelperCall(wrapper);
-        String wrapperText = decompileC(wrapper);
-        if (helperCall == null) {
-            return recoverFallbackMessageUnmarshalPlan(
-                entry,
-                wrapper,
-                wrapperText,
-                createInstanceAddress);
-        }
-
-        ParsedUnmarshalFieldsCall parsedCall = textParser.parseUnmarshalFieldsCall(wrapperText);
-        if (parsedCall == null) {
-            return recoverFallbackMessageUnmarshalPlan(
-                entry,
-                wrapper,
-                wrapperText,
-                createInstanceAddress);
-        }
-
         MessageUnmarshalPlan plan = newMessageUnmarshalPlan(entry, wrapper, createInstanceAddress);
-        plan.templateTypes.addAll(parsedCall.templateTypes);
-        plan.helperCallsite = helperCall.callsite;
-        plan.helper = helperCall.target;
-        plan.helperName = helperCall.targetName;
-        MessageConstructorCall constructor = findMessageConstructorCall(wrapper, helperCall.callsite);
-        if (constructor != null) {
-            plan.instanceConstructorCallsite = constructor.callsite;
-            plan.instanceConstructor = constructor.target;
-            plan.instanceConstructorName = constructor.targetName;
+        plan.delegatedCodec = delegatedFragmentCodec(wrapper);
+        if (plan.delegatedCodec == null) {
+            recoverPcodeMessageGraph(plan, wrapper);
         }
-
-        int templateIndex = 0;
-        for (int i = 0; i < parsedCall.fieldArgs.size(); i++) {
-            ParsedArgument arg = parsedCall.fieldArgs.get(i);
-            String castNativeType = nativeTypeFromCast(arg.castType);
-            String nativeType = castNativeType;
-            if (templateIndex < parsedCall.templateTypes.size()) {
-                String templateType = parsedCall.templateTypes.get(templateIndex);
-                if (shouldUseTemplateType(castNativeType, templateType)) {
-                    nativeType = templateType;
-                    templateIndex++;
-                }
-                else if (castNativeType != null &&
-                    templateMatchesCast(templateType, castNativeType)) {
-                    nativeType = templateType;
-                    templateIndex++;
-                }
-            }
-
-            FieldCall field = new FieldCall();
-            field.index = i;
-            field.callsite = plan.helperCallsite;
-            field.name = "field_" + i;
-            field.nativeType = nativeType;
-            field.storageExpression = arg.expression;
-            field.storageOffset = storageByteOffsetFromExpression(arg.expression);
-            field.wireShape = wireShapeFromNativeType(nativeType);
-            field.wireShapeSource = field.wireShape == null
-                ? null
-                : "message-unmarshal-native-type";
-            field.confidence = "message-unmarshal-call";
-            plan.fields.add(field);
+        else {
+            plan.readBufferParameter = plan.delegatedCodec.readBufferStorage.base;
+            plan.rootEvidenceSource = plan.delegatedCodec.evidenceSource;
         }
-        refineMessageFieldsFromHelper(plan);
-        enrichMessageFieldsFromSourceSignatures(entry, plan);
+        if (plan.fields.isEmpty() && plan.delegatedCodec == null) {
+            return null;
+        }
+        normalizeMessageFields(plan);
         return plan;
     }
 
@@ -829,72 +750,3 @@
         }
         return plan;
     }
-
-    private MessageUnmarshalPlan recoverFallbackMessageUnmarshalPlan(
-        RegistryEntry entry,
-        Function wrapper,
-        String wrapperText,
-        Address createInstanceAddress) {
-
-        if (wrapperText == null) {
-            return null;
-        }
-
-        MessageUnmarshalPlan plan =
-            newMessageUnmarshalPlan(entry, wrapper, createInstanceAddress);
-        recoverPcodeMessageFields(plan, wrapper);
-        recoverInlineMessageFields(plan, wrapper.getEntryPoint(), wrapperText);
-        recoverHelperArgumentMessageFields(plan, wrapper, wrapperText);
-        recoverDirectObjectStoreMessageFields(plan, wrapper.getEntryPoint(), wrapperText);
-        if (plan.fields.isEmpty()) {
-            return null;
-        }
-        sortMessageFieldsByRecoveryOrder(plan);
-        enrichMessageFieldsFromSourceSignatures(entry, plan);
-        return plan;
-    }
-
-    private void recoverPcodeMessageFields(MessageUnmarshalPlan plan, Function wrapper) {
-        HighFunction high = highFunction(wrapper);
-        if (high == null) {
-            return;
-        }
-
-        Set<String> messageBases = pcodeMessageStorageBases(high);
-        HashMap<String, String> tempNativeTypes = new HashMap<>();
-        HashMap<String, String> tempWireShapes = new HashMap<>();
-        int recoveryOrder = 0;
-        Iterator<PcodeOpAST> ops = high.getPcodeOps();
-        while (ops.hasNext()) {
-            PcodeOpAST op = ops.next();
-            if (op.getOpcode() != PcodeOp.CALL) {
-                if (op.getOpcode() == PcodeOp.STORE) {
-                    recoverPcodeMessageStore(
-                        plan,
-                        op,
-                        messageBases,
-                        tempNativeTypes,
-                        tempWireShapes,
-                        recoveryOrder++);
-                }
-                continue;
-            }
-
-            PcodeCallTargetInfo targetInfo = pcodeCallTargetInfo(op);
-            Function target = targetInfo == null ? null : targetInfo.target;
-            if (target == null) {
-                recordPcodeMessageReject(
-                    plan,
-                    "pcode-call",
-                    "call-target-unresolved",
-                    op,
-                    targetInfo,
-                    null,
-                    null);
-                continue;
-            }
-            String nativeType = unmarshalNativeTypeFromTarget(target);
-            String targetWireShape = unmarshalWireShapeFromTarget(target);
-            if (nativeType == null && targetWireShape != null) {
-                nativeType = nativeTypeFromWireShape(targetWireShape);
-            }

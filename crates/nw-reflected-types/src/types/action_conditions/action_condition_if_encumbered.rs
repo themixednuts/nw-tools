@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfEncumbered;
+pub struct ActionConditionIfEncumbered {}
 
 impl AzRtti for ActionConditionIfEncumbered {
     const NAME: &'static str = "ActionConditionIfEncumbered";

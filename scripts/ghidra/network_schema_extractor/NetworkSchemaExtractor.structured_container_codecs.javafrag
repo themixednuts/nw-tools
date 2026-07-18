@@ -1,0 +1,106 @@
+    private ContainerCodecCall structuredContainerCodec(
+        PcodeOpAST operation,
+        Function target,
+        String nativeType,
+        String writeBufferParameter,
+        Set<String> active,
+        int depth,
+        List<ContainerPlanDiagnostic> diagnostics,
+        String source) {
+
+        if (operation == null || target == null ||
+            nativeType != null && semanticWireEvidenceForNativeType(nativeType) != null) {
+            return null;
+        }
+        ContainerCodecMembers nested = collectContainerCodecMembers(
+            target,
+            writeBufferParameter,
+            active,
+            depth,
+            diagnostics);
+        if (nested.members().isEmpty() && nested.optionalMembers().isEmpty()) {
+            return null;
+        }
+        NestedTypeShape directShape = nativeType == null
+            ? uniqueSerializeContainerHelperShape(target, nested)
+            : recoverNestedDirectTypeShape(target, nativeType);
+        if (directShape == null || !Boolean.TRUE.equals(directShape.identityProven) ||
+            directShape.typeId == null) {
+            return null;
+        }
+
+        ContainerCodecCall codec = new ContainerCodecCall();
+        codec.operation = operation;
+        codec.callsite = operation.getSeqnum().getTarget();
+        codec.target = target.getEntryPoint();
+        codec.targetName = fullFunctionName(target);
+        codec.nativeType = nativeType == null
+            ? directShape.typeNameFull
+            : nativeType;
+        codec.evidenceSource = source;
+        codec.memberSemantics = !nested.optionalMembers().isEmpty()
+            ? "optional-suffix"
+            : nested.linear()
+                ? "structured-value"
+                : "cfg-reachable";
+        codec.analysisStatus = nested.analysisStatus();
+        codec.members.addAll(nested.members());
+        codec.optionalMembers.addAll(nested.optionalMembers());
+        codec.typeId = directShape.typeId;
+        codec.typeIdSource = directShape.typeIdSource;
+        codec.typeIdentityProven = true;
+        codec.sourceTypeLayoutComplete =
+            Boolean.TRUE.equals(directShape.memberCoverageProven) &&
+            Boolean.TRUE.equals(directShape.memberNamesProven) &&
+            directShape.members.stream().allMatch(member ->
+                Boolean.TRUE.equals(member.nameProven) &&
+                Boolean.TRUE.equals(member.typeIdentityProven));
+        return codec;
+    }
+
+    private boolean isStructuredContainerCodec(ContainerCodecCall codec) {
+        return codec != null &&
+            "structured-value".equals(codec.memberSemantics) &&
+            codec.nativeType != null &&
+            codec.typeId != null &&
+            codec.typeIdentityProven &&
+            !codec.members.isEmpty();
+    }
+
+    private ContainerCodecCall containerHelperBoundary(
+        PcodeOpAST operation,
+        Function target,
+        String writeBufferParameter,
+        Set<String> active,
+        int depth,
+        List<ContainerPlanDiagnostic> diagnostics,
+        String source) {
+
+        if (operation == null || target == null || writeBufferParameter == null) {
+            return null;
+        }
+        ContainerCodecMembers helper = collectContainerCodecMembers(
+            target,
+            writeBufferParameter,
+            active,
+            depth,
+            diagnostics);
+        if (helper.members().isEmpty() && helper.optionalMembers().isEmpty()) {
+            return null;
+        }
+        ContainerCodecCall boundary = new ContainerCodecCall();
+        boundary.operation = operation;
+        boundary.callsite = operation.getSeqnum().getTarget();
+        boundary.target = target.getEntryPoint();
+        boundary.targetName = fullFunctionName(target);
+        boundary.evidenceSource = source;
+        boundary.memberSemantics = !helper.optionalMembers().isEmpty()
+            ? "optional-suffix"
+            : helper.linear()
+                ? "linear-sequence"
+                : "cfg-reachable";
+        boundary.analysisStatus = helper.analysisStatus();
+        boundary.members.addAll(helper.members());
+        boundary.optionalMembers.addAll(helper.optionalMembers());
+        return boundary;
+    }

@@ -1,0 +1,865 @@
+    private final Map<String, String> codecWireTraceDiagnostics = new HashMap<>();
+
+    private NestedTypeShape directWireSequenceShape(
+        Function target,
+        String owner,
+        String targetName) {
+
+        if (target == null) {
+            return null;
+        }
+        CodecWireTrace trace = traceUnmarshalCodec(
+            target,
+            "param_4",
+            new LinkedHashSet<>(),
+            new HashMap<>());
+        if (trace == null || trace.events.size() < 2) {
+            return null;
+        }
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(owner);
+        shape.typeNameFull = owner;
+        shape.typeNameSource = owner == null ? "pcode-wire-sequence" : "ghidra-symbol";
+        shape.function = target.getEntryPoint();
+        shape.functionName = targetName;
+        shape.memberBase = "wire-sequence";
+        shape.memberNameSource = "synthetic-wire-order";
+        shape.memberNamesProven = false;
+        shape.validation = "pcode-read-buffer-call-stack-wire-sequence";
+
+        for (int index = 0; index < trace.events.size(); index++) {
+            CodecWireEvent event = trace.events.get(index);
+            NestedTypeMember member = new NestedTypeMember();
+            member.index = index;
+            member.offset = index;
+            member.name = "_" + index;
+            member.nameSource = "synthetic-wire-order";
+            member.nameProven = false;
+            member.nativeType = event.nativeType();
+            WireShape wireEvidence = event.wireEvidence();
+            member.wireShape = wireEvidence.shape;
+            member.wireShapeSource = wireEvidence.source;
+            member.wireLayout = wireEvidence.layout;
+            member.wireLayoutSource = wireEvidence.layoutSource;
+            member.byteWidth = wireShapeByteWidth(wireEvidence.layout);
+            member.wireOrdinal = index;
+            member.wireOrderSource = "cfg-recursive-unmarshal-order";
+            member.callsite = event.callsite();
+            member.target = event.target();
+            member.targetName = event.targetName();
+            shape.members.add(member);
+        }
+        shape.memberCoverageProven = true;
+        shape.wireOrderProven = true;
+        shape.wireOrderSource = "cfg-recursive-unmarshal-order";
+        return shape;
+    }
+
+    private boolean sameNestedWireSequence(
+        NestedTypeShape left,
+        NestedTypeShape right) {
+
+        if (left == null || right == null) {
+            return false;
+        }
+        List<NestedTypeMember> leftWireOrder = provenWireOrderedMembers(left.members);
+        if (leftWireOrder == null || leftWireOrder.size() != right.members.size()) {
+            return false;
+        }
+        for (int index = 0; index < leftWireOrder.size(); index++) {
+            String leftShape = canonicalLayoutWireShape(leftWireOrder.get(index).wireLayout);
+            String rightShape = canonicalLayoutWireShape(right.members.get(index).wireLayout);
+            if (leftShape == null || !leftShape.equals(rightShape)) {
+                return false;
+            }
+        }
+        left.members.clear();
+        left.members.addAll(leftWireOrder);
+        left.memberCoverageProven = true;
+        left.wireOrderProven = true;
+        left.wireOrderSource = "cfg-recursive-unmarshal-order";
+        return true;
+    }
+
+    private CodecWireTrace traceUnmarshalCodec(
+        Function function,
+        String readBufferParameter,
+        Set<String> activeContexts,
+        Map<String, CodecWireTrace> completedContexts) {
+
+        return readBufferParameter == null
+            ? null
+            : traceUnmarshalCodec(
+                function,
+                new PcodeStorage(readBufferParameter, 0L),
+                activeContexts,
+                completedContexts);
+    }
+
+    private CodecWireTrace traceUnmarshalCodec(
+        Function function,
+        PcodeStorage readBuffer,
+        Set<String> activeContexts,
+        Map<String, CodecWireTrace> completedContexts) {
+
+        if (function == null || readBuffer == null) {
+            return null;
+        }
+        String context = function.getEntryPoint() + "|" + readBuffer.expression();
+        CodecWireTrace completed = completedContexts.get(context);
+        if (completed != null) {
+            return new CodecWireTrace(completed.events);
+        }
+        if (!activeContexts.add(context)) {
+            recordNestedTypeShapeReject("codec-wire-call-cycle");
+            return unresolvedCodecWireTrace(context, "call-cycle");
+        }
+
+        try {
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                return unresolvedCodecWireTrace(context, "missing-high-function");
+            }
+            String directParameter = readBuffer.offset == 0L ? readBuffer.base : null;
+            if (directParameter != null) {
+                WireShape leaf = validatedUnmarshalLeaf(function, directParameter);
+                if (leaf != null) {
+                    CodecWireTrace result = new CodecWireTrace(List.of(
+                        new CodecWireEvent(
+                            unmarshalNativeTypeFromTarget(function),
+                            leaf,
+                            function.getEntryPoint(),
+                            function.getEntryPoint(),
+                            fullFunctionName(function))));
+                    completedContexts.put(context, new CodecWireTrace(result.events));
+                    return result;
+                }
+            }
+
+            CodecWireTrace body = new CodecWireTrace();
+            Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock = new HashMap<>();
+            Set<PcodeBlockBasic> collapsedEventBlocks = new HashSet<>();
+            List<PcodeOpAST> operations = orderedPcodeOps(high);
+            Map<PcodeOpAST, UnmarshalSequenceAction> sequenceActions =
+                directParameter == null
+                ? Collections.emptyMap()
+                : unmarshalSequenceActions(
+                    function,
+                    high,
+                    directParameter,
+                    activeContexts,
+                    completedContexts);
+            Map<PcodeOpAST, UnmarshalCollectionAction> collectionActions =
+                directParameter == null
+                ? Collections.emptyMap()
+                : unmarshalCollectionActions(
+                    function,
+                    high,
+                    directParameter,
+                    operations);
+            if (collectionActions == null) {
+                return unresolvedCodecWireTrace(
+                    context,
+                    "ambiguous-collection-actions");
+            }
+            for (PcodeOpAST op : operations) {
+                UnmarshalSequenceAction sequence = sequenceActions.get(op);
+                UnmarshalCollectionAction collection = collectionActions.get(op);
+                if (collection != null) {
+                    if (collection.emit()) {
+                        ContainerCodecCall codec = collection.codec();
+                        CodecWireEvent event = new CodecWireEvent(
+                            null,
+                            codec.wireEvidence,
+                            codec.callsite,
+                            codec.target,
+                            codec.targetName);
+                        body.events.add(event);
+                        if (!addUnmarshalEventsForOperation(
+                                eventsByBlock,
+                                op,
+                                List.of(event),
+                                collapsedEventBlocks)) {
+                            return unresolvedCodecWireTrace(
+                                context,
+                                "collection-event-block-missing");
+                        }
+                    }
+                    continue;
+                }
+                if (sequence != null) {
+                    if (sequence.emit()) {
+                        body.events.addAll(sequence.events());
+                        if (!addUnmarshalEventsForOperation(
+                                eventsByBlock,
+                                op,
+                                sequence.events(),
+                                collapsedEventBlocks)) {
+                            return unresolvedCodecWireTrace(
+                                context,
+                                "sequence-event-block-missing");
+                        }
+                    }
+                    continue;
+                }
+                if (op.getOpcode() == PcodeOp.CALL) {
+                    int eventStart = body.events.size();
+                    String callFailure = collectCodecCallEvents(
+                        function,
+                        high,
+                        operations,
+                        op,
+                        readBuffer,
+                        activeContexts,
+                        completedContexts,
+                        body.events);
+                    if (callFailure != null) {
+                        return unresolvedCodecWireTrace(context, callFailure);
+                    }
+                    if (!addUnmarshalEventsForOperation(
+                            eventsByBlock,
+                            op,
+                            body.events.subList(eventStart, body.events.size()),
+                            null)) {
+                        return unresolvedCodecWireTrace(
+                            context,
+                            "call-event-block-missing");
+                    }
+                    continue;
+                }
+                CodecWireEvent directRead = directParameter == null
+                    ? null
+                    : directCursorReadEvent(
+                    high,
+                    op,
+                    operations,
+                    directParameter);
+                if (directRead != null) {
+                    body.events.add(directRead);
+                    if (!addUnmarshalEventsForOperation(
+                            eventsByBlock,
+                            op,
+                            List.of(directRead),
+                            null)) {
+                        return unresolvedCodecWireTrace(
+                            context,
+                            "direct-read-event-block-missing");
+                    }
+                }
+            }
+
+            UnmarshalTerminalFlow terminalFlow = successfulUnmarshalTerminalFlow(high);
+            NetworkSchemaFlowSequence.Result<CodecWireEvent> sequence =
+                terminalFlow.terminals().isEmpty()
+                ? NetworkSchemaFlowSequence.analyze(
+                    high,
+                    eventsByBlock,
+                    collapsedEventBlocks,
+                    (left, right) -> sameWireEvidence(
+                        left.wireEvidence(),
+                        right.wireEvidence()))
+                : NetworkSchemaFlowSequence.analyze(
+                    high,
+                    eventsByBlock,
+                    collapsedEventBlocks,
+                    terminalFlow.terminals(),
+                    Set.of(),
+                    terminalFlow.excludedEdges(),
+                    (left, right) -> sameWireEvidence(
+                        left.wireEvidence(),
+                        right.wireEvidence()));
+            if (!sequence.complete()) {
+                CodecWireTrace optional = optionalUnmarshalCodecTrace(
+                    function,
+                    high,
+                    operations,
+                    eventsByBlock,
+                    collapsedEventBlocks,
+                    terminalFlow);
+                if (optional == null) {
+                    recordNestedTypeShapeReject(
+                        "codec-wire-" + sequence.status().name().toLowerCase(Locale.ROOT));
+                    return unresolvedCodecWireTrace(
+                        context,
+                        "flow-" + sequence.status().name().toLowerCase(Locale.ROOT) +
+                            ":terminal=" + terminalFlow.status() +
+                            ":events=" + body.events.size());
+                }
+                CodecWireTrace result = directParameter == null
+                    ? optional
+                    : collapseValidatedCodecShape(function, directParameter, optional);
+                completedContexts.put(context, new CodecWireTrace(result.events));
+                codecWireTraceDiagnostics.put(
+                    context,
+                    "complete-presence-prefixed-optional:" + result.events.size());
+                return result;
+            }
+            CodecWireTrace exact = new CodecWireTrace(sequence.events());
+            CodecWireTrace result = directParameter == null
+                ? exact
+                : collapseValidatedCodecShape(function, directParameter, exact);
+            completedContexts.put(context, new CodecWireTrace(result.events));
+            codecWireTraceDiagnostics.put(context, "complete:" + result.events.size());
+            return result;
+        }
+        finally {
+            activeContexts.remove(context);
+        }
+    }
+
+    private CodecWireTrace unresolvedCodecWireTrace(
+        String context,
+        String diagnostic) {
+
+        codecWireTraceDiagnostics.put(context, diagnostic);
+        return null;
+    }
+
+    private String codecWireTraceDiagnostic(
+        Function function,
+        PcodeStorage readBuffer) {
+
+        if (function == null || readBuffer == null) {
+            return null;
+        }
+        return codecWireTraceDiagnostics.get(
+            function.getEntryPoint() + "|" + readBuffer.expression());
+    }
+
+    private boolean addUnmarshalEventsForOperation(
+        Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock,
+        PcodeOpAST operation,
+        List<CodecWireEvent> events,
+        Set<PcodeBlockBasic> collapsedEventBlocks) {
+
+        if (events.isEmpty()) {
+            return true;
+        }
+        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+        if (block == null) {
+            return false;
+        }
+        eventsByBlock.computeIfAbsent(block, ignored -> new ArrayList<>()).addAll(events);
+        if (collapsedEventBlocks != null) {
+            collapsedEventBlocks.add(block);
+        }
+        return true;
+    }
+
+    private String collectCodecCallEvents(
+        Function owner,
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOp op,
+        PcodeStorage readBuffer,
+        Set<String> activeContexts,
+        Map<String, CodecWireTrace> completedContexts,
+        List<CodecWireEvent> events) {
+
+        Function target = pcodeCallTarget(op);
+        if (target == null) {
+            return null;
+        }
+        PcodeStorage targetReadBuffer = callTargetReadBufferStorage(
+            high,
+            operations,
+            op,
+            target,
+            readBuffer,
+            activeContexts);
+        if (targetReadBuffer == null) {
+            return null;
+        }
+
+        WireShape rawEvidence = pcodeReadRawWireEvidence(op, target);
+        if (rawEvidence != null) {
+            RawPcodeWrite rawRead = pcodeReadRawWrite(op, target);
+            WireShape evidence = op instanceof PcodeOpAST readCall
+                && rawRead != null
+                ? boundedNormalizedBooleanReadEvidence(
+                    high,
+                    operations,
+                    readCall,
+                    rawRead)
+                : null;
+            events.add(new CodecWireEvent(
+                rawRead == null ? null : rawRead.nativeType,
+                evidence == null ? rawEvidence : evidence,
+                op.getSeqnum().getTarget(),
+                target.getEntryPoint(),
+                fullFunctionName(target)));
+            return null;
+        }
+
+        CodecWireTrace nested = traceUnmarshalCodec(
+            target,
+            targetReadBuffer,
+            activeContexts,
+            completedContexts);
+        if (nested != null) {
+            events.addAll(nested.events);
+            return null;
+        }
+        String nestedDiagnostic = codecWireTraceDiagnostic(target, targetReadBuffer);
+        return "nested-codec-unresolved:" + formatAddress(target.getEntryPoint()) +
+            ":" + Objects.toString(nestedDiagnostic, "unknown");
+    }
+
+    private Integer uniqueCallArgumentSlot(PcodeOp op, PcodeStorage expected) {
+        if (op == null || expected == null) {
+            return null;
+        }
+        Integer selected = null;
+        for (int slot = 1; slot < op.getNumInputs(); slot++) {
+            PcodeStorage direct = pcodeStorageExpression(op.getInput(slot));
+            PcodeStorage loaded = pcodeLoadedStorageExpression(op.getInput(slot));
+            if (!expected.sameLocation(direct) && !expected.sameLocation(loaded)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = slot;
+        }
+        return selected == null
+            ? uniqueAbiCallArgumentSlot(op, expected)
+            : selected;
+    }
+
+    private PcodeStorage callTargetReadBufferStorage(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOp call,
+        Function target,
+        PcodeStorage readBuffer,
+        Set<String> activeContexts) {
+
+        Integer directSlot = provenCallArgumentSlot(
+            high.getFunction(),
+            call,
+            target,
+            readBuffer);
+        if (directSlot != null) {
+            return new PcodeStorage("param_" + directSlot, 0L);
+        }
+
+        PcodeStorage selected = null;
+        int argumentCount = provenCallArgumentCount(call, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            PcodeStorage object = provenCallArgumentStorage(
+                high.getFunction(),
+                call,
+                target,
+                slot);
+            if (object == null) {
+                continue;
+            }
+            for (PcodeOpAST operation : operations) {
+                PcodeStorageWrite write = storageWrite(operation);
+                if (write == null || !(call instanceof PcodeOpAST callAst) ||
+                    !NetworkSchemaControlFlow.precedes(high, operation, callAst) ||
+                    !referencesStorage(write.value(), readBuffer)) {
+                    continue;
+                }
+                PcodeStorage destination = writtenStorage(operation);
+                if (destination == null || !destination.base.equals(object.base) ||
+                    destination.offset < object.offset) {
+                    continue;
+                }
+                PcodeStorage candidate = new PcodeStorage(
+                    "param_" + slot,
+                    destination.offset - object.offset);
+                if (!hasReadBufferFlow(target, candidate, activeContexts)) {
+                    continue;
+                }
+                if (selected != null && !selected.sameLocation(candidate)) {
+                    return null;
+                }
+                selected = candidate;
+            }
+        }
+        return selected;
+    }
+
+    private CodecWireTrace collapseValidatedCodecShape(
+        Function function,
+        String readBufferParameter,
+        CodecWireTrace body) {
+
+        if (body.events.isEmpty()) {
+            return body;
+        }
+        String nativeType = unmarshalNativeTypeFromTarget(function);
+        WireShape candidate = wireShapeEvidenceFromUnmarshalTarget(
+            function,
+            nativeType,
+            readBufferParameter);
+        if (candidate == null) {
+            candidate = packedPositionUnmarshalShape(function, body.events);
+        }
+        if (candidate == null) {
+            candidate = quantizedVec3UnmarshalShape(
+                function,
+                readBufferParameter,
+                body.events);
+        }
+        if (candidate == null) {
+            DeclaredCodecShape declared = declaredCodecShape(function);
+            Integer width = declared == null
+                ? null
+                : wireShapeByteWidth(declared.shape());
+            if (width != null) {
+                candidate = WireShape.semantic(
+                    declared.shape(),
+                    fixedByteLayout(width),
+                    "unmarshal-codec-specialization+pcode-body-width");
+            }
+        }
+        if (candidate == null ||
+            !codecShapeMatchesBody(
+                function,
+                readBufferParameter,
+                candidate,
+                body.events)) {
+            return body;
+        }
+        CodecWireEvent first = body.events.get(0);
+        CodecWireTrace result = new CodecWireTrace();
+        result.events.add(new CodecWireEvent(
+            nativeType,
+            candidate,
+            first.callsite(),
+            function.getEntryPoint(),
+            fullFunctionName(function)));
+        return result;
+    }
+
+    private boolean codecShapeMatchesBody(
+        Function function,
+        String readBufferParameter,
+        WireShape candidate,
+        List<CodecWireEvent> events) {
+
+        NetworkSchemaCodecClassifier.VariableIntegerCodec structural =
+            NetworkSchemaCodecClassifier.variableIntegerCodec(highFunction(function));
+        if (candidate.shape != null && structural != null &&
+            structural.direction() == NetworkSchemaCodecClassifier.CodecDirection.DECODE &&
+            candidate.shape.equals(structural.shape())) {
+            return true;
+        }
+        if (isPackedPositionShape(candidate.shape)) {
+            return matchesPackedPositionUnmarshalEvents(events) &&
+                hasPackedPositionOutputFlow(function);
+        }
+        if (candidate.shape != null && candidate.shape.startsWith("delta-vec3<")) {
+            return quantizedVec3UnmarshalShape(
+                function,
+                readBufferParameter,
+                events) != null;
+        }
+        if ("vec3-smallest-three".equals(candidate.shape) ||
+            "quat-smallest-three".equals(candidate.shape) ||
+            "entity-ref".equals(candidate.shape)) {
+            WireShape validated = validatedUnmarshalLeaf(
+                function,
+                readBufferParameter);
+            return validated != null && candidate.shape.equals(validated.shape);
+        }
+        if ("optional<vlq-u64>".equals(candidate.layout)) {
+            return events.size() == 2 &&
+                "fixed-bytes-1".equals(events.get(0).wireEvidence().layout) &&
+                "vlq-u64".equals(events.get(1).wireEvidence().shape);
+        }
+        if ("string".equals(candidate.shape)) {
+            return events.size() >= 2 &&
+                events.stream().anyMatch(event ->
+                    "vlq-u32".equals(event.wireEvidence().shape)) &&
+                events.stream().anyMatch(event ->
+                    "fixed-bytes-1".equals(event.wireEvidence().layout));
+        }
+        if ("length-prefixed-bytes".equals(candidate.layout)) {
+            return events.stream().anyMatch(event ->
+                "vlq-u32".equals(event.wireEvidence().shape));
+        }
+        Integer expectedWidth = wireShapeByteWidth(candidate.layout);
+        if (expectedWidth == null) {
+            return false;
+        }
+        long observedWidth = 0L;
+        for (CodecWireEvent event : events) {
+            Integer width = wireShapeByteWidth(event.wireEvidence().layout);
+            if (width == null) {
+                return false;
+            }
+            observedWidth += width;
+            if (observedWidth > Integer.MAX_VALUE) {
+                return false;
+            }
+        }
+        return observedWidth == expectedWidth &&
+            codecSemanticBodyMatches(candidate.shape, events.stream()
+                .map(CodecWireEvent::wireEvidence)
+                .toList());
+    }
+
+    private boolean matchesCodecEventShapes(
+        List<CodecWireEvent> events,
+        String... expectedShapes) {
+
+        if (events.size() != expectedShapes.length) {
+            return false;
+        }
+        for (int index = 0; index < expectedShapes.length; index++) {
+            if (!expectedShapes[index].equals(events.get(index).wireEvidence().shape)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private WireShape packedPositionMarshalShape(
+        Function function,
+        List<WireShape> shapes) {
+
+        if (!matchesPackedPositionMarshalShapes(shapes) ||
+            !hasPackedPositionInputFlow(function)) {
+            return null;
+        }
+        PackedPositionBounds bounds = packedPositionBounds(function);
+        if (bounds == null) {
+            return null;
+        }
+        return WireShape.semantic(
+            bounds.wireShape(),
+            fixedByteLayout(10),
+            "marshal-pcode-packed-position-components");
+    }
+
+    private WireShape packedPositionUnmarshalShape(
+        Function function,
+        List<CodecWireEvent> events) {
+
+        if (!matchesPackedPositionUnmarshalEvents(events) ||
+            !hasPackedPositionOutputFlow(function)) {
+            return null;
+        }
+        PackedPositionBounds bounds = packedPositionBounds(function);
+        if (bounds == null) {
+            return null;
+        }
+        return WireShape.semantic(
+            bounds.wireShape(),
+            fixedByteLayout(10),
+            "unmarshal-pcode-packed-position-components");
+    }
+
+    private boolean isPackedPositionShape(String shape) {
+        return shape != null && shape.startsWith("packed-position<") &&
+            shape.endsWith(">");
+    }
+
+    private PackedPositionBounds packedPositionBounds(Function function) {
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return null;
+        }
+        PackedPositionBounds selected = null;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL || operation.getNumInputs() < 4) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (!isFloat16MarshalerConstructor(target)) {
+                continue;
+            }
+            PackedPositionBounds candidate = new PackedPositionBounds(
+                staticF32Evidence(operation.getInput(2)),
+                staticF32Evidence(operation.getInput(3)),
+                operation.getSeqnum().getTarget());
+            if (!candidate.isValid() ||
+                selected != null && !selected.sameRange(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private boolean isFloat16MarshalerConstructor(Function function) {
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return false;
+        }
+        boolean minimumStore = false;
+        boolean rangeStore = false;
+        boolean clampStore = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.STORE || operation.getNumInputs() < 3) {
+                continue;
+            }
+            PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+            if (destination == null || !"param_1".equals(destination.base)) {
+                continue;
+            }
+            Varnode value = operation.getInput(2);
+            minimumStore |= destination.offset == 0L &&
+                pcodeParameterValue(value, 2);
+            rangeStore |= destination.offset == Float.BYTES &&
+                isFloatParameterDifference(value, 3, 2);
+            clampStore |= destination.offset == 2L * Float.BYTES &&
+                pcodeParameterValue(value, 4);
+        }
+        return minimumStore && rangeStore && clampStore;
+    }
+
+    private boolean isFloatParameterDifference(
+        Varnode value,
+        int leftParameter,
+        int rightParameter) {
+
+        PcodeOp definition = value == null ? null : value.getDef();
+        return definition != null && definition.getOpcode() == PcodeOp.FLOAT_SUB &&
+            definition.getNumInputs() == 2 &&
+            pcodeParameterValue(definition.getInput(0), leftParameter) &&
+            pcodeParameterValue(definition.getInput(1), rightParameter);
+    }
+
+    private boolean pcodeParameterValue(Varnode value, int parameter) {
+        PcodeStorage storage = pcodeStorageExpression(value);
+        return storage != null && storage.offset == 0L &&
+            ("param_" + parameter).equals(storage.base);
+    }
+
+    private StaticF32Evidence staticF32Evidence(Varnode value) {
+        if (value == null || value.getSize() != Float.BYTES) {
+            return null;
+        }
+        if (value.isConstant()) {
+            return new StaticF32Evidence((int)value.getOffset(), null);
+        }
+        Address address = value.getAddress();
+        if (!isProgramAddress(address)) {
+            return null;
+        }
+        try {
+            return new StaticF32Evidence(getInt(address), address);
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private boolean matchesPackedPositionMarshalShapes(List<WireShape> shapes) {
+        return shapes.size() == 3 &&
+            "f32".equals(shapes.get(0).shape) &&
+            "f32".equals(shapes.get(1).shape) &&
+            "fixed-bytes-2".equals(shapes.get(2).layout);
+    }
+
+    private boolean matchesPackedPositionUnmarshalEvents(List<CodecWireEvent> events) {
+        return events.size() == 3 &&
+            "f32".equals(events.get(0).wireEvidence().shape) &&
+            "f32".equals(events.get(1).wireEvidence().shape) &&
+            "fixed-bytes-2".equals(events.get(2).wireEvidence().layout);
+    }
+
+    private boolean hasPackedPositionInputFlow(Function function) {
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return false;
+        }
+        LinkedHashSet<Long> offsets = new LinkedHashSet<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.LOAD || operation.getOutput() == null ||
+                operation.getOutput().getSize() != Float.BYTES ||
+                operation.getNumInputs() < 2) {
+                continue;
+            }
+            PcodeStorage storage = pcodeStorageExpression(operation.getInput(1));
+            if (storage != null && "param_1".equals(storage.base)) {
+                offsets.add(storage.offset);
+            }
+        }
+        return offsets.equals(new LinkedHashSet<>(List.of(0x10L, 0x14L, 0x18L)));
+    }
+
+    private boolean hasPackedPositionOutputFlow(Function function) {
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return false;
+        }
+        boolean lowerHalf = false;
+        boolean upperHalf = false;
+        boolean successFlag = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.STORE || operation.getNumInputs() < 3) {
+                continue;
+            }
+            PcodeStorage storage = pcodeStorageExpression(operation.getInput(1));
+            if (storage == null || !"param_1".equals(storage.base)) {
+                continue;
+            }
+            int width = operation.getInput(2).getSize();
+            lowerHalf |= storage.offset == 0x10L && width == Long.BYTES;
+            upperHalf |= storage.offset == 0x18L && width == Long.BYTES;
+            successFlag |= storage.offset == 0x40L && width == Byte.BYTES &&
+                NetworkSchemaIntegerEvaluator.equals(operation.getInput(2), 1L);
+        }
+        return lowerHalf && upperHalf && successFlag;
+    }
+
+    private boolean isVariableCodecShape(String shape) {
+        return "string".equals(shape) ||
+            "vlq-u32".equals(shape) ||
+            "vlq-u64".equals(shape) ||
+            "sequence-number".equals(shape) ||
+            "entity-ref".equals(shape) ||
+            "transform-compressor".equals(shape) ||
+            "vec3-comp-norm".equals(shape) ||
+            "vec3-smallest-three".equals(shape) ||
+            "quat-comp-norm".equals(shape) ||
+            "quat-smallest-three".equals(shape);
+    }
+
+    private CodecWireEvent directCursorReadEvent(
+        HighFunction high,
+        PcodeOpAST op,
+        List<PcodeOpAST> operations,
+        String readBufferParameter) {
+
+        if (op == null || op.getOpcode() != PcodeOp.STORE || op.getNumInputs() < 3) {
+            return null;
+        }
+        PcodeStorage cursor = pcodeStorageExpression(op.getInput(1));
+        if (cursor == null || !readBufferParameter.equals(cursor.base)) {
+            return null;
+        }
+        CursorAdvanceEvidence advance = cursorAdvance(
+            op.getInput(2),
+            cursor,
+            new LinkedHashSet<>());
+        if (advance == null || advance.byteCount() <= 0L ||
+            advance.byteCount() > 0x1000L ||
+            !hasGuardedCursorAdvance(high, operations, op, cursor)) {
+            return null;
+        }
+
+        PcodeOpAST dataLoad = uniqueCursorDataLoadBefore(
+            high,
+            operations,
+            op,
+            advance.sourcePointer(),
+            Math.toIntExact(advance.byteCount()));
+        if (dataLoad == null) {
+            return null;
+        }
+        return new CodecWireEvent(
+            null,
+            WireShape.layout(
+                fixedByteLayout(Math.toIntExact(advance.byteCount())),
+                "pcode-read-buffer-cursor-advance"),
+            op.getSeqnum().getTarget(),
+            null,
+            null);
+    }

@@ -18,6 +18,5 @@ oodle = ["nw-pak/oodle"]
 nw-filesystem.workspace = true
 nw-jobs.workspace = true
 nw-pak.workspace = true
-sha1.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

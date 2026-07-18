@@ -1,0 +1,427 @@
+    private void collectContainerMapValueTypeInfo(
+        Address unmarshalFull,
+        FullContainerPlan plan,
+        Map<String, NativeTypeInfoEvidence> candidates) {
+
+        NativeTypeInfoEvidence evidence = containerMapValueTypeInfo(
+            unmarshalFull,
+            plan);
+        putNativeTypeInfoCandidate(candidates, evidence);
+    }
+
+    private NativeTypeInfoEvidence containerMapValueTypeInfo(
+        Address unmarshalFull,
+        FullContainerPlan plan) {
+
+        if (plan == null || plan.storageKind != ContainerStorageKind.INDEX_MAP ||
+            !isExecutableAddress(unmarshalFull)) {
+            return null;
+        }
+        Long valueOrigin = containerMapValueOrigin(plan);
+        if (valueOrigin == null || valueOrigin < 0L) {
+            return null;
+        }
+
+        Function function = functionAtOrContaining(resolvedCodeTarget(unmarshalFull));
+        HighFunction high = highFunction(function);
+        if (function == null || high == null) {
+            return null;
+        }
+        Address temporaryVtable = containerMapTemporaryValueVtable(
+            function,
+            high,
+            plan);
+        if (temporaryVtable == null) {
+            recordNestedTypeShapeReject("map-value-stack-vptr-unproven");
+            return null;
+        }
+
+        LinkedHashMap<String, NativeTypeInfoEvidence> matches = new LinkedHashMap<>();
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            List<PcodeCodecCall> codecs = loopReadBufferCodecCalls(
+                function,
+                loop,
+                "param_2",
+                operations);
+            PcodeOpAST insertion = uniqueContainerInsertionCall(
+                function,
+                high,
+                loop,
+                operations,
+                codecs,
+                "param_2");
+            Function target = insertion == null ? null : pcodeCallTarget(insertion);
+            NativeTypeInfoEvidence candidate = linkedNodeValueTypeInfo(
+                target,
+                valueOrigin,
+                temporaryVtable,
+                plan);
+            String identity = nativeTypeInfoIdentityKey(candidate);
+            if (identity != null) {
+                matches.putIfAbsent(identity, candidate);
+            }
+        }
+        if (matches.size() != 1) {
+            if (matches.size() > 1) {
+                recordNestedTypeShapeReject("ambiguous-map-node-value-vptr");
+            }
+            return null;
+        }
+        return matches.values().iterator().next();
+    }
+
+    private Address containerMapTemporaryValueVtable(
+        Function function,
+        HighFunction high,
+        FullContainerPlan plan) {
+
+        LinkedHashSet<Address> matches = new LinkedHashSet<>();
+        PcodeStorage readBuffer = new PcodeStorage("param_2", 0L);
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
+                    continue;
+                }
+                Function target = pcodeCallTarget(operation);
+                Integer bufferSlot = provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    readBuffer);
+                if (target == null || bufferSlot == null ||
+                    validatedUnmarshalLeaf(target, "param_" + bufferSlot) != null) {
+                    continue;
+                }
+                ContainerCodecMembers nested = collectContainerUnmarshalCodecMembers(
+                    target,
+                    "param_" + bufferSlot,
+                    new LinkedHashSet<>(),
+                    0);
+                if (!nested.exact() || nested.members().isEmpty() ||
+                    !samePhysicalContainerCodecSequence(
+                        plan.valueCodecs,
+                        nested.members())) {
+                    continue;
+                }
+                PcodeStorage output = containerValueUnmarshalOutputStorage(
+                    operation,
+                    Collections.emptyMap());
+                Address vtable = dominantStorageVtableBefore(
+                    high,
+                    operation,
+                    output);
+                if (vtable != null) {
+                    matches.add(vtable);
+                }
+            }
+        }
+        return matches.size() == 1 ? matches.iterator().next() : null;
+    }
+
+    private Address dominantStorageVtableBefore(
+        HighFunction high,
+        PcodeOpAST boundary,
+        PcodeStorage storage) {
+
+        if (high == null || boundary == null || storage == null) {
+            return null;
+        }
+        ArrayList<StorageVtableWrite> writes = new ArrayList<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (!NetworkSchemaControlFlow.precedes(high, operation, boundary)) {
+                continue;
+            }
+            PcodeStorage destination;
+            Address vtable;
+            if (operation.getOpcode() == PcodeOp.STORE &&
+                operation.getNumInputs() >= 3) {
+                destination = pcodeStorageExpression(operation.getInput(1));
+                vtable = uniquePcodeVtableAddress(operation.getInput(2));
+            }
+            else if (operation.getOutput() != null) {
+                destination = pcodeStorageExpression(operation.getOutput());
+                vtable = uniquePcodeVtableAddress(operation.getOutput());
+            }
+            else {
+                continue;
+            }
+            if (vtable != null && storage.sameLocation(destination)) {
+                writes.add(new StorageVtableWrite(operation, vtable));
+            }
+        }
+        if (writes.isEmpty()) {
+            return null;
+        }
+        StorageVtableWrite selected = writes.get(writes.size() - 1);
+        for (int index = 0; index + 1 < writes.size(); index++) {
+            if (!NetworkSchemaControlFlow.precedes(
+                    high,
+                    writes.get(index).operation(),
+                    selected.operation())) {
+                return null;
+            }
+        }
+        return selected.vtable();
+    }
+
+    private PcodeOpAST uniqueContainerInsertionCall(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        List<PcodeCodecCall> codecs,
+        String readBufferParameter) {
+
+        if (owner == null || high == null || loop == null || codecs == null ||
+            codecs.isEmpty()) {
+            return null;
+        }
+        PcodeOpAST selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL ||
+                directCallWireEvidence(operation) != null ||
+                codecs.stream().anyMatch(codec -> !NetworkSchemaControlFlow.precedes(
+                    high,
+                    codec.operation(),
+                    operation))) {
+                continue;
+            }
+            String insertionOwner = uniqueFormalParameterExcept(
+                owner,
+                operation,
+                readBufferParameter);
+            if (insertionOwner == null || insertionOwner.equals(readBufferParameter)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = operation;
+        }
+        return selected;
+    }
+
+    private NativeTypeInfoEvidence linkedNodeValueTypeInfo(
+        Function insertion,
+        long valueOrigin,
+        Address expectedVtable,
+        FullContainerPlan plan) {
+
+        if (insertion == null || expectedVtable == null) {
+            return null;
+        }
+        ArrayList<Function> level = new ArrayList<>();
+        level.add(insertion);
+        LinkedHashSet<Address> visited = new LinkedHashSet<>();
+        for (int depth = 0; depth <= 3 && !level.isEmpty() && visited.size() < 64; depth++) {
+            LinkedHashMap<String, NativeTypeInfoEvidence> matches = new LinkedHashMap<>();
+            ArrayList<Function> next = new ArrayList<>();
+            for (Function function : level) {
+                if (function == null || !visited.add(function.getEntryPoint())) {
+                    continue;
+                }
+                HighFunction high = highFunction(function);
+                if (high == null) {
+                    continue;
+                }
+                for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                    if (operation.getOpcode() != PcodeOp.CALL) {
+                        continue;
+                    }
+                    NativeTypeInfoEvidence candidate = linkedNodeAllocationValueTypeInfo(
+                        high,
+                        operation,
+                        valueOrigin,
+                        expectedVtable,
+                        plan);
+                    String identity = nativeTypeInfoIdentityKey(candidate);
+                    if (identity != null) {
+                        matches.putIfAbsent(identity, candidate);
+                    }
+                    Function target = pcodeCallTarget(operation);
+                    if (target != null && !visited.contains(target.getEntryPoint())) {
+                        next.add(target);
+                    }
+                }
+            }
+            if (!matches.isEmpty()) {
+                return matches.size() == 1
+                    ? matches.values().iterator().next()
+                    : null;
+            }
+            level = next;
+        }
+        return null;
+    }
+
+    private NativeTypeInfoEvidence linkedNodeAllocationValueTypeInfo(
+        HighFunction high,
+        PcodeOpAST allocation,
+        long valueOrigin,
+        Address expectedVtable,
+        FullContainerPlan plan) {
+
+        Varnode allocationRoot = allocation == null ? null : allocation.getOutput();
+        if (high == null || allocationRoot == null ||
+            allocationRoot.getSize() != currentProgram.getDefaultPointerSize()) {
+            return null;
+        }
+        LinkedHashSet<Long> allocationSizes = new LinkedHashSet<>();
+        for (int slot = 1; slot < allocation.getNumInputs(); slot++) {
+            Long constant = NetworkSchemaIntegerEvaluator.evaluate(allocation.getInput(slot));
+            if (constant != null && constant > valueOrigin && constant <= 0x1000000L) {
+                allocationSizes.add(constant);
+            }
+        }
+        if (allocationSizes.size() != 1) {
+            return null;
+        }
+        long allocationSize = allocationSizes.iterator().next();
+        long nativeSize = allocationSize - valueOrigin;
+        if (nativeSize <= 0L || !containerMapValueLayoutFits(
+                plan,
+                valueOrigin,
+                nativeSize)) {
+            return null;
+        }
+
+        LinkedHashSet<Address> vtables = new LinkedHashSet<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3 ||
+                !NetworkSchemaControlFlow.precedes(high, allocation, operation)) {
+                continue;
+            }
+            Long offset = pcodeConstantOffsetFromRoot(
+                operation.getInput(1),
+                allocationRoot,
+                new LinkedHashSet<>(),
+                0);
+            Address vtable = offset != null && offset == valueOrigin
+                ? uniquePcodeVtableAddress(operation.getInput(2))
+                : null;
+            if (vtable != null) {
+                vtables.add(vtable);
+            }
+        }
+        if (vtables.size() != 1 || !expectedVtable.equals(vtables.iterator().next())) {
+            return null;
+        }
+
+        AzRttiEvidence rtti = decodeAzRttiFromVtable(expectedVtable);
+        String name = rtti == null ? null : rtti.selectedProviderTypeName();
+        if (rtti != null && !isPlausibleTypeName(name) &&
+            isPlausibleTypeName(rtti.typeName)) {
+            name = rtti.typeName;
+        }
+        if (rtti == null || rtti.typeId == null && !isPlausibleTypeName(name)) {
+            return null;
+        }
+        return new NativeTypeInfoEvidence(
+            expectedVtable,
+            name,
+            normalizeUuid(rtti.typeId),
+            "unmarshal-full-element-vptr+linked-node-allocation+stack-vptr-agreement",
+            isPlausibleTypeName(name) ? "az-rtti-vtable-provider" : null,
+            nativeSize,
+            "linked-node-allocation-size-minus-value-offset");
+    }
+
+    private boolean containerMapValueLayoutFits(
+        FullContainerPlan plan,
+        long valueOrigin,
+        long nativeSize) {
+
+        List<ContainerCodecCall> leaves = plan == null
+            ? null
+            : physicalContainerCodecLeaves(plan.valueCodecs);
+        if (leaves == null || leaves.isEmpty()) {
+            return false;
+        }
+        for (ContainerCodecCall leaf : leaves) {
+            Integer width = leaf == null || leaf.wireEvidence == null
+                ? null
+                : wireShapeByteWidth(leaf.wireEvidence.layout);
+            Long offset = leaf == null || leaf.elementOffset == null
+                ? null
+                : subtractExactOrNull(leaf.elementOffset, valueOrigin);
+            Long end = offset == null || width == null
+                ? null
+                : addExactOrNull(offset, width.longValue());
+            if (offset == null || offset < 0L || end == null || end > nativeSize) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private NestedTypeShape applyConstructedContainerValueIdentity(
+        NestedTypeShape shape,
+        List<NativeTypeInfoEvidence> candidates) {
+
+        if (shape == null || Boolean.TRUE.equals(shape.identityProven) ||
+            candidates == null || candidates.isEmpty()) {
+            return shape;
+        }
+        NativeTypeInfoEvidence selected = null;
+        for (NativeTypeInfoEvidence candidate : candidates) {
+            if (!isProvenContainerValueTypeEvidence(candidate)) {
+                continue;
+            }
+            if (selected != null && !sameNativeTypeInfoIdentity(selected, candidate)) {
+                recordNestedTypeShapeReject(
+                    "conflicting-container-plan-construction-identities");
+                return null;
+            }
+            selected = candidate;
+        }
+        if (selected == null || selected.typeId == null ||
+            !isPlausibleTypeName(selected.name) ||
+            !containerShapeFitsNativeSize(shape, selected.nativeSize)) {
+            return shape;
+        }
+
+        shape.typeId = normalizeUuid(selected.typeId);
+        shape.typeIdSource = selected.source;
+        shape.identityProven = true;
+        shape.identitySource = selected.source + "+complete-container-plan-layout";
+        shape.typeNameFull = selected.name;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(selected.name);
+        shape.typeNameSource = selected.nameSource;
+        shape.vtable = selected.address;
+        shape.nativeSize = selected.nativeSize;
+        shape.nativeSizeSource = selected.nativeSizeSource;
+        shape.validation = appendValidation(
+            shape.validation,
+            "constructed-value-identity+complete-container-plan-layout");
+        return shape;
+    }
+
+    private boolean containerShapeFitsNativeSize(
+        NestedTypeShape shape,
+        Long nativeSize) {
+
+        if (shape == null || nativeSize == null || nativeSize <= 0L ||
+            shape.members.isEmpty()) {
+            return false;
+        }
+        for (NestedTypeMember member : shape.members) {
+            Integer width = member == null
+                ? null
+                : nativeTypeByteWidth(member.nativeType);
+            if (width == null && member != null) {
+                width = member.byteWidth;
+            }
+            Long end = member == null || width == null || width <= 0
+                ? null
+                : addExactOrNull(member.offset, width.longValue());
+            if (end == null || member.offset < 0L || end > nativeSize) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private record StorageVtableWrite(PcodeOpAST operation, Address vtable) {
+    }

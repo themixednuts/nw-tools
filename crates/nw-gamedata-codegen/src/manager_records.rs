@@ -1,17 +1,24 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
+use nw_datasheet::{ColumnType, game_system::Crc32};
+use nw_serialize_codegen::go::{go_exported_identifier, go_initialism};
 use nw_serialize_codegen::{
     ReflectedTypeRole, ResolvedType, ScalarType, SequenceKind, SerializeCodegenField,
-    SerializeCodegenItem, SerializeCodegenItemKind, SerializeCodegenUnit,
+    SerializeCodegenItem, SerializeCodegenItemKind, SerializeCodegenUnit, SerializeCodegenVariant,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::compiler::GameDataCompileUnit;
+use crate::game_system_schema::{
+    GameSystemColumnSchema, GameSystemColumnValueShape, GameSystemDataTablesSchemaReport,
+    GameSystemEnumRepresentation, GameSystemEnumShape, GameSystemListAtomShape,
+    GameSystemListElementShape,
+};
 use crate::manager::{
-    ManagerContractInput, NativeComposedResourceArgument, NativeComposedResourceManager,
-    NativeCrcIndexLookupMethod, NativeCrcIndexLookupParameterKind, NativeCrcProjectionRowFilter,
+    NativeComposedResourceArgument, NativeComposedResourceManager, NativeCrcIndexLookupMethod,
+    NativeCrcIndexLookupParameterKind, NativeCrcProjectionRowFilter,
     NativeCrcProjectionRowFilterPredicate, NativeDuplicateKeyPolicy, NativeGatherableDataManager,
     NativeItemDataManager, NativeManagerInput, NativeManagerShape, NativeManagerSpec,
     NativeNumericKeyType, NativeNumericLookupMethod, NativeNumericLookupParameterKind,
@@ -29,8 +36,15 @@ use crate::manager::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ManagerSurface {
     Direct(DirectManagerSurface),
+    Native {
+        manager: DirectManagerSurface,
+        shape: NativeManagerShape,
+        dependencies: Vec<String>,
+        semantic_projections: Vec<SemanticManagerRecord>,
+    },
     Semantic(SemanticManagerRecord),
     ItemData(ItemDataManagerSurface),
+    Composition(CompositionManagerSurface),
     ProductBacked(DirectManagerSurface),
 }
 
@@ -39,9 +53,43 @@ pub(crate) fn manager_surface_name(surface: &ManagerSurface) -> &str {
         ManagerSurface::Direct(manager) | ManagerSurface::ProductBacked(manager) => {
             &manager.manager_name
         }
+        ManagerSurface::Native { manager, .. } => &manager.manager_name,
         ManagerSurface::Semantic(manager) => &manager.manager_name,
         ManagerSurface::ItemData(manager) => &manager.manager_name,
+        ManagerSurface::Composition(manager) => &manager.manager_name,
     }
+}
+
+/// Domain noun used by generated facade accessors.
+///
+/// The facade already supplies the manager context, so native-facing framing
+/// such as `Static`, `Data`, and `Manager` is redundant at call sites.
+pub(crate) fn manager_accessor_domain(manager_name: &str) -> &str {
+    let without_manager = manager_name.strip_suffix("Manager").unwrap_or(manager_name);
+    let without_static = without_manager
+        .strip_prefix("Static")
+        .filter(|name| !name.is_empty())
+        .unwrap_or(without_manager);
+    without_static
+        .strip_suffix("Data")
+        .filter(|name| !name.is_empty())
+        .unwrap_or(without_static)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompositionManagerKind {
+    CurrencyExchangeMapping,
+    ReplicationData,
+    StaticTradeskillRankDataMapping,
+    VitalsModifierMapping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompositionManagerSurface {
+    pub manager_name: String,
+    pub manager_class_name: String,
+    pub kind: CompositionManagerKind,
+    pub dependencies: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,13 +127,6 @@ pub(crate) fn default_direct_manager_row_type<'a>(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ManagerSurfaceDependency {
-    Table { name: String, row: String },
-    Asset { path: String },
-    Manager { name: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ItemDataManagerSurface {
     pub manager_name: String,
     pub manager_class_name: String,
@@ -99,6 +140,7 @@ pub(crate) struct ItemDataManagerSurface {
 pub(crate) struct ItemDataManagerTable {
     pub variant_name: String,
     pub table_name: String,
+    pub row_type_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +164,7 @@ pub(crate) struct SemanticManagerRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SemanticManagerTable {
     pub table_name: String,
+    pub row_type_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,37 +222,71 @@ pub(crate) struct SemanticRecordField {
     pub name: String,
     pub column: String,
     pub transform: SemanticProjectionTransform,
+    pub value_type: Option<String>,
+    pub default_value: Option<String>,
+    pub reference_field: Option<String>,
+    pub u16_max_exclusive: Option<u32>,
+    pub enum_shape: Option<GameSystemEnumShape>,
+    pub pair_first_enum_shape: Option<GameSystemEnumShape>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SemanticProjectionTransform {
     String,
+    NonEmptyString,
     StringDefaultEmpty,
     PlusJoinedList,
     OptionalString,
+    OptionalFirstString,
+    EnumString,
+    EnumStringSkipInvalid,
+    EnumStringRejectDefault,
+    EnumDefault,
     StringList,
     NonEmptyStringList,
     OptionalStringList,
     Bool,
     OptionalBool,
+    BoolDefaultFalse,
+    Crc32NonZeroBool,
     U8,
+    NonZeroU8,
+    U8DefaultZero,
+    U8DefaultMax,
     U16,
+    NonZeroU16,
+    U16BelowMax,
     U32,
     OptionalU32,
+    U32DefaultZero,
+    NonZeroU32,
+    OptionalNonZeroU32,
     I32,
     F32,
     OptionalF32,
+    F32MinutesToSeconds,
+    F32UpperBound10000ZeroIsDefault,
+    F32LowerBound10000CappedToField,
     F32List,
     I32List,
     Crc32,
+    LowercaseCrcString,
+    LowercaseCrcStringDefaultZero,
+    FirstLowercaseCrcStringDefaultZero,
+    OptionalCrc32,
+    OptionalCrc32ZeroAsNone,
     Crc32List,
     OptionalLowercaseCrcString,
+    OptionalTrimmedLowercaseCrcString,
+    TrimmedLowercaseCrcStringDefaultZero,
     LowercaseCrcStringList,
-    RowIndex,
-    OptionalRowIndex,
-    RowIndexList,
+    ForeignKey,
+    OptionalForeignKey,
+    ForeignKeyList,
     F32RangeInclusive,
     U32RangeInclusive,
+    OptionalCrc32F32PairList,
+    OptionalU8F32PairList,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,112 +326,543 @@ pub(crate) enum SemanticLookupKind {
 }
 
 pub(crate) fn manager_surfaces(unit: &GameDataCompileUnit) -> Result<Vec<ManagerSurface>> {
-    manager_surfaces_from_managers(unit.codegen_plan_ref().managers().managers())
+    manager_surfaces_for_schema(
+        unit.codegen_plan_ref().managers().managers(),
+        unit.strict_schema_report(),
+    )
+}
+
+pub(crate) fn manager_surfaces_for_schema(
+    managers: &[NativeManagerSpec],
+    schema: &GameSystemDataTablesSchemaReport,
+) -> Result<Vec<ManagerSurface>> {
+    let mut surfaces = manager_surfaces_from_managers(managers)?;
+    validate_direct_manager_row_families(&surfaces, schema)?;
+    reconcile_semantic_records_with_source_schema(&mut surfaces, schema)?;
+    Ok(surfaces)
+}
+
+fn validate_direct_manager_row_families(
+    surfaces: &[ManagerSurface],
+    schema: &GameSystemDataTablesSchemaReport,
+) -> Result<()> {
+    let mut diagnostics = Vec::new();
+    for manager in surfaces.iter().filter_map(|surface| match surface {
+        ManagerSurface::Direct(manager) | ManagerSurface::Native { manager, .. } => Some(manager),
+        ManagerSurface::Semantic(_)
+        | ManagerSurface::ItemData(_)
+        | ManagerSurface::Composition(_)
+        | ManagerSurface::ProductBacked(_) => None,
+    }) {
+        let mut declared_by_row = BTreeMap::<&str, BTreeSet<&str>>::new();
+        for table in &manager.tables {
+            declared_by_row
+                .entry(&table.row_type_name)
+                .or_default()
+                .insert(&table.table_name);
+        }
+        for (row_type, declared) in declared_by_row {
+            let available = schema
+                .tables
+                .iter()
+                .filter(|table| table.row_type_name == row_type)
+                .map(|table| table.table_name.as_str())
+                .collect::<BTreeSet<_>>();
+            let unknown = declared.difference(&available).copied().collect::<Vec<_>>();
+            let uncovered = available.difference(&declared).copied().collect::<Vec<_>>();
+            if unknown.is_empty() && uncovered.is_empty() {
+                continue;
+            }
+            diagnostics.push(format!(
+                "manager `{}` row family `{row_type}` does not match the source schema (unknown declarations: [{}]; uncovered tables: [{}])",
+                manager.manager_name,
+                unknown.join(", "),
+                uncovered.join(", ")
+            ));
+        }
+    }
+    if !diagnostics.is_empty() {
+        bail!(
+            "standalone direct-manager/schema reconciliation failed:\n{}",
+            diagnostics.join("\n")
+        );
+    }
+    Ok(())
+}
+
+fn reconcile_semantic_records_with_source_schema(
+    surfaces: &mut [ManagerSurface],
+    schema: &GameSystemDataTablesSchemaReport,
+) -> Result<()> {
+    let mut diagnostics = Vec::new();
+    for record in surfaces.iter_mut().filter_map(|surface| match surface {
+        ManagerSurface::Semantic(record) => Some(record),
+        ManagerSurface::Direct(_)
+        | ManagerSurface::Native { .. }
+        | ManagerSurface::ItemData(_)
+        | ManagerSurface::Composition(_)
+        | ManagerSurface::ProductBacked(_) => None,
+    }) {
+        let table_keys = record
+            .tables
+            .iter()
+            .map(|table| (table.table_name.as_str(), table.row_type_name.as_str()))
+            .collect::<BTreeSet<_>>();
+        for field in &mut record.fields {
+            let column_crc = Crc32::from_str_lower(&field.column).value();
+            let source_columns = schema
+                .tables
+                .iter()
+                .filter(|table| {
+                    table_keys.contains(&(table.table_name.as_str(), table.row_type_name.as_str()))
+                })
+                .filter_map(|table| table.columns.iter().find(|column| column.crc == column_crc))
+                .collect::<Vec<_>>();
+            let Some(first) = source_columns.first() else {
+                diagnostics.push(format!(
+                    "manager `{}` field `{}` references missing column `{}` in tables {}",
+                    record.manager_name,
+                    field.name,
+                    field.column,
+                    table_keys
+                        .iter()
+                        .map(|(table, row)| format!("{table}:{row}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                continue;
+            };
+            field.column = first.name.clone();
+
+            if semantic_transform_is_enum(field.transform) {
+                let enum_shape =
+                    match merged_enum_shape(&record.manager_name, &field.name, &source_columns) {
+                        Ok(enum_shape) => enum_shape,
+                        Err(error) => {
+                            diagnostics.push(error.to_string());
+                            continue;
+                        }
+                    };
+                if let Some(value_type) = field.value_type.as_deref() {
+                    let expected = semantic_type_name(value_type);
+                    if enum_shape.name != expected {
+                        diagnostics.push(format!(
+                            "manager `{}` field `{}` expects enum `{expected}`, but column `{}` is `{}`",
+                            record.manager_name,
+                            field.name,
+                            field.column,
+                            enum_shape.name
+                        ));
+                        continue;
+                    }
+                }
+                field.enum_shape = Some(enum_shape);
+            }
+            if field.transform == SemanticProjectionTransform::OptionalU8F32PairList {
+                match merged_pair_first_enum_shape(
+                    &record.manager_name,
+                    &field.name,
+                    &source_columns,
+                ) {
+                    Ok(enum_shape) => field.pair_first_enum_shape = Some(enum_shape),
+                    Err(error) => diagnostics.push(error.to_string()),
+                }
+            }
+        }
+        append_unrepresented_schema_fields(record, schema);
+    }
+    if !diagnostics.is_empty() {
+        bail!(
+            "standalone manager/schema reconciliation failed:\n{}",
+            diagnostics.join("\n")
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct MergedSemanticSourceColumn {
+    name: String,
+    declared_type: ColumnType,
+    row_key: bool,
+}
+
+fn append_unrepresented_schema_fields(
+    record: &mut SemanticManagerRecord,
+    schema: &GameSystemDataTablesSchemaReport,
+) {
+    let table_keys = record
+        .tables
+        .iter()
+        .map(|table| (table.table_name.as_str(), table.row_type_name.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut columns = BTreeMap::<u32, MergedSemanticSourceColumn>::new();
+    for column in schema
+        .tables
+        .iter()
+        .filter(|table| {
+            table_keys.contains(&(table.table_name.as_str(), table.row_type_name.as_str()))
+        })
+        .flat_map(|table| &table.columns)
+    {
+        columns
+            .entry(column.crc)
+            .and_modify(|merged| {
+                merged.declared_type =
+                    merge_semantic_column_type(merged.declared_type, column.declared_type);
+                merged.row_key |= column.row_key;
+            })
+            .or_insert_with(|| MergedSemanticSourceColumn {
+                name: column.name.clone(),
+                declared_type: column.declared_type,
+                row_key: column.row_key,
+            });
+    }
+
+    let key_columns = semantic_key_columns(record)
+        .into_iter()
+        .map(|column| Crc32::from_str_lower(column).value())
+        .collect::<BTreeSet<_>>();
+    let mut occupied_names = semantic_record_field_names(record);
+    for (column_crc, column) in columns {
+        if key_columns.contains(&column_crc)
+            || record.fields.iter().any(|field| {
+                Crc32::from_str_lower(&field.column).value() == column_crc
+                    && semantic_transform_preserves_source_cell(
+                        field.transform,
+                        column.declared_type,
+                        column.row_key,
+                    )
+            })
+        {
+            continue;
+        }
+
+        let base_name = crate::naming::to_snake_ident(&column.name, "field");
+        let name = unique_semantic_source_field_name(&base_name, &mut occupied_names);
+        record.fields.push(SemanticRecordField {
+            name,
+            column: column.name,
+            transform: semantic_source_cell_transform(column.declared_type, column.row_key),
+            value_type: None,
+            default_value: None,
+            reference_field: None,
+            u16_max_exclusive: None,
+            enum_shape: None,
+            pair_first_enum_shape: None,
+        });
+    }
+}
+
+fn merge_semantic_column_type(left: ColumnType, right: ColumnType) -> ColumnType {
+    match (left, right) {
+        (ColumnType::String, _) | (_, ColumnType::String) => ColumnType::String,
+        (ColumnType::Number, _) | (_, ColumnType::Number) => ColumnType::Number,
+        (ColumnType::Boolean, ColumnType::Boolean) => ColumnType::Boolean,
+    }
+}
+
+fn semantic_key_columns(record: &SemanticManagerRecord) -> Vec<&str> {
+    match record.key.as_ref() {
+        Some(SemanticManagerKey::Crc { key_column, .. })
+        | Some(SemanticManagerKey::Numeric { key_column, .. })
+        | Some(SemanticManagerKey::EnumString { key_column, .. })
+        | Some(SemanticManagerKey::String { key_column, .. }) => vec![key_column],
+        Some(SemanticManagerKey::FallbackCrc {
+            primary_key_column,
+            fallback_key_column,
+            ..
+        }) => vec![primary_key_column, fallback_key_column],
+        None => Vec::new(),
+    }
+}
+
+fn semantic_record_field_names(record: &SemanticManagerRecord) -> BTreeSet<String> {
+    let mut names = record
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<BTreeSet<_>>();
+    if let Some(source_row_field) = &record.source_row_field {
+        names.insert(source_row_field.clone());
+    }
+    match record.key.as_ref() {
+        Some(SemanticManagerKey::Crc {
+            key_field,
+            crc_field,
+            ..
+        })
+        | Some(SemanticManagerKey::FallbackCrc {
+            key_field,
+            crc_field,
+            ..
+        }) => {
+            names.insert(key_field.clone());
+            names.insert(crc_field.clone());
+        }
+        Some(SemanticManagerKey::Numeric { key_field, .. })
+        | Some(SemanticManagerKey::EnumString { key_field, .. })
+        | Some(SemanticManagerKey::String { key_field, .. }) => {
+            names.insert(key_field.clone());
+        }
+        None => {}
+    }
+    names
+}
+
+fn unique_semantic_source_field_name(
+    base_name: &str,
+    occupied_names: &mut BTreeSet<String>,
+) -> String {
+    if occupied_names.insert(base_name.to_owned()) {
+        return base_name.to_owned();
+    }
+    let source_name = format!("{base_name}_source");
+    if occupied_names.insert(source_name.clone()) {
+        return source_name;
+    }
+    let mut suffix = 2_u32;
+    loop {
+        let candidate = format!("{source_name}_{suffix}");
+        if occupied_names.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn semantic_source_cell_transform(
+    declared_type: ColumnType,
+    row_key: bool,
+) -> SemanticProjectionTransform {
+    match (declared_type, row_key) {
+        (ColumnType::String, true) => SemanticProjectionTransform::String,
+        (ColumnType::String, false) => SemanticProjectionTransform::OptionalString,
+        (ColumnType::Number, true) => SemanticProjectionTransform::F32,
+        (ColumnType::Number, false) => SemanticProjectionTransform::OptionalF32,
+        (ColumnType::Boolean, true) => SemanticProjectionTransform::Bool,
+        (ColumnType::Boolean, false) => SemanticProjectionTransform::OptionalBool,
+    }
+}
+
+fn semantic_transform_preserves_source_cell(
+    transform: SemanticProjectionTransform,
+    declared_type: ColumnType,
+    row_key: bool,
+) -> bool {
+    transform == semantic_source_cell_transform(declared_type, row_key)
+}
+
+fn semantic_transform_is_enum(transform: SemanticProjectionTransform) -> bool {
+    matches!(
+        transform,
+        SemanticProjectionTransform::EnumString
+            | SemanticProjectionTransform::EnumStringSkipInvalid
+            | SemanticProjectionTransform::EnumStringRejectDefault
+            | SemanticProjectionTransform::EnumDefault
+    )
+}
+
+pub(crate) fn semantic_enum_type_name(field: &SemanticRecordField) -> &str {
+    &field
+        .enum_shape
+        .as_ref()
+        .expect("enum projection fields have reconciled enum schemas")
+        .name
+}
+
+pub(crate) fn semantic_enum_default_variant(field: &SemanticRecordField) -> &str {
+    if let Some(default) = field.default_value.as_deref() {
+        return semantic_type_name(default);
+    }
+    field
+        .enum_shape
+        .as_ref()
+        .and_then(|shape| {
+            shape
+                .variants
+                .iter()
+                .find(|variant| variant.discriminant == 0)
+        })
+        .map(|variant| variant.name.as_str())
+        .expect("defaulted enum projections have a zero-discriminant variant")
+}
+
+fn merged_enum_shape(
+    manager_name: &str,
+    field_name: &str,
+    columns: &[&GameSystemColumnSchema],
+) -> Result<GameSystemEnumShape> {
+    let mut shapes = columns
+        .iter()
+        .filter_map(|column| match &column.value_shape {
+            GameSystemColumnValueShape::Enum { enum_shape } => Some(enum_shape),
+            _ => None,
+        });
+    let Some(first) = shapes.next() else {
+        bail!(
+            "manager `{manager_name}` field `{field_name}` is an enum, but its source column has no enum schema"
+        );
+    };
+    for shape in shapes {
+        if shape != first {
+            bail!(
+                "manager `{manager_name}` field `{field_name}` resolves to conflicting enum schemas `{}` and `{}`",
+                first.name,
+                shape.name
+            );
+        }
+    }
+    Ok(first.clone())
+}
+
+fn merged_pair_first_enum_shape(
+    manager_name: &str,
+    field_name: &str,
+    columns: &[&GameSystemColumnSchema],
+) -> Result<GameSystemEnumShape> {
+    let mut shapes = columns.iter().filter_map(|column| {
+        let GameSystemColumnValueShape::String {
+            list: Some(list), ..
+        } = &column.value_shape
+        else {
+            return None;
+        };
+        let Some(GameSystemListElementShape::Pair {
+            first: GameSystemListAtomShape::Enum { enum_shape },
+            ..
+        }) = list.element_shape.as_ref()
+        else {
+            return None;
+        };
+        Some(enum_shape)
+    });
+    let Some(first) = shapes.next() else {
+        bail!(
+            "manager `{manager_name}` field `{field_name}` expects an enum-keyed pair list, but its source column has no pair enum schema"
+        );
+    };
+    if first.representation != GameSystemEnumRepresentation::U8 {
+        bail!(
+            "manager `{manager_name}` field `{field_name}` pair enum `{}` is not u8-backed",
+            first.name
+        );
+    }
+    for shape in shapes {
+        if shape != first {
+            bail!(
+                "manager `{manager_name}` field `{field_name}` resolves to conflicting pair enum schemas `{}` and `{}`",
+                first.name,
+                shape.name
+            );
+        }
+    }
+    Ok(first.clone())
 }
 
 pub(crate) fn manager_surfaces_from_managers(
     managers: &[NativeManagerSpec],
 ) -> Result<Vec<ManagerSurface>> {
-    managers
+    let surfaces = managers
         .iter()
         .filter_map(|manager| manager_surface(manager).transpose())
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    topologically_order_manager_surfaces(surfaces)
 }
 
-pub(crate) fn manager_surface_dependencies(
-    surface: &ManagerSurface,
-    inputs: &[ManagerContractInput<'_>],
-) -> Vec<ManagerSurfaceDependency> {
-    let table_keys = surface_table_dependencies(surface);
-    let table_names = surface_table_name_dependencies(surface);
-    let asset_paths = surface_asset_dependencies(surface);
-
-    inputs
+fn topologically_order_manager_surfaces(
+    surfaces: Vec<ManagerSurface>,
+) -> Result<Vec<ManagerSurface>> {
+    let names = surfaces
         .iter()
-        .filter_map(|input| match input {
-            ManagerContractInput::Table {
-                name,
-                row,
-                product_path: _,
-            } => {
-                let name = name.as_str();
-                let row = row.as_str();
-                (table_keys.contains(&(name.to_owned(), row.to_owned()))
-                    || table_names.contains(name))
-                .then(|| ManagerSurfaceDependency::Table {
-                    name: name.to_owned(),
-                    row: row.to_owned(),
-                })
-            }
-            ManagerContractInput::Asset {
-                path,
-                asset_type: _,
-            } => {
-                let path = path.as_str();
-                asset_paths
-                    .contains(path)
-                    .then(|| ManagerSurfaceDependency::Asset {
-                        path: path.to_owned(),
-                    })
-            }
-            ManagerContractInput::Manager { manager } => {
-                let manager = semantic_type_name(manager.as_str()).to_owned();
-                Some(ManagerSurfaceDependency::Manager { name: manager })
-            }
+        .map(|surface| manager_surface_name(surface).to_owned())
+        .collect::<BTreeSet<_>>();
+    let missing_dependencies = surfaces
+        .iter()
+        .flat_map(|surface| {
+            surface_manager_dependencies(surface)
+                .iter()
+                .filter(|dependency| !names.contains(*dependency))
+                .map(move |dependency| format!("{} <- {dependency}", manager_surface_name(surface)))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if !missing_dependencies.is_empty() {
+        bail!(
+            "manager dependencies without generated surfaces: {}",
+            missing_dependencies.join("; ")
+        );
+    }
+    let mut remaining = surfaces;
+    let mut emitted = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(remaining.len());
+
+    while !remaining.is_empty() {
+        let Some(index) = remaining.iter().position(|surface| {
+            surface_manager_dependencies(surface)
+                .iter()
+                .all(|dependency| emitted.contains(dependency))
+        }) else {
+            let blocked = remaining
+                .iter()
+                .map(|surface| {
+                    let waiting = surface_manager_dependencies(surface)
+                        .iter()
+                        .filter(|dependency| !emitted.contains(*dependency))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    format!(
+                        "{} <- [{}]",
+                        manager_surface_name(surface),
+                        waiting.join(", ")
+                    )
+                })
+                .collect::<Vec<_>>();
+            bail!("manager dependency cycle: {}", blocked.join("; "));
+        };
+        let surface = remaining.remove(index);
+        emitted.insert(manager_surface_name(&surface).to_owned());
+        ordered.push(surface);
+    }
+    Ok(ordered)
 }
 
-fn surface_table_dependencies(surface: &ManagerSurface) -> BTreeSet<(String, String)> {
+fn surface_manager_dependencies(surface: &ManagerSurface) -> &[String] {
     match surface {
-        ManagerSurface::Direct(manager) => manager
-            .tables
-            .iter()
-            .map(|table| (table.table_name.clone(), table.row_type_name.clone()))
-            .collect(),
-        ManagerSurface::Semantic(_)
+        ManagerSurface::Native { dependencies, .. } => dependencies,
+        ManagerSurface::Composition(manager) => &manager.dependencies,
+        ManagerSurface::Direct(_)
+        | ManagerSurface::Semantic(_)
         | ManagerSurface::ItemData(_)
-        | ManagerSurface::ProductBacked(_) => BTreeSet::new(),
-    }
-}
-
-fn surface_table_name_dependencies(surface: &ManagerSurface) -> BTreeSet<&str> {
-    match surface {
-        ManagerSurface::Semantic(record) => record
-            .tables
-            .iter()
-            .map(|table| table.table_name.as_str())
-            .collect(),
-        ManagerSurface::ItemData(manager) => manager
-            .tables
-            .iter()
-            .map(|table| table.table_name.as_str())
-            .collect(),
-        ManagerSurface::Direct(_) | ManagerSurface::ProductBacked(_) => BTreeSet::new(),
-    }
-}
-
-fn surface_asset_dependencies(surface: &ManagerSurface) -> BTreeSet<&str> {
-    match surface {
-        ManagerSurface::Direct(manager) | ManagerSurface::ProductBacked(manager) => manager
-            .products
-            .iter()
-            .map(|product| product.path.as_str())
-            .collect(),
-        ManagerSurface::Semantic(_) | ManagerSurface::ItemData(_) => BTreeSet::new(),
+        | ManagerSurface::ProductBacked(_) => &[],
     }
 }
 
 pub(crate) fn semantic_manager_record_unit(
     records: &[SemanticManagerRecord],
 ) -> SerializeCodegenUnit {
-    SerializeCodegenUnit {
-        items: records.iter().map(record_codegen_item).collect(),
+    let mut enum_shapes = BTreeMap::<String, GameSystemEnumShape>::new();
+    for shape in records
+        .iter()
+        .flat_map(|record| record.fields.iter())
+        .filter_map(|field| field.enum_shape.as_ref())
+    {
+        match enum_shapes.get(&shape.name) {
+            Some(existing) => debug_assert_eq!(existing, shape),
+            None => {
+                enum_shapes.insert(shape.name.clone(), shape.clone());
+            }
+        }
     }
+    let mut items = enum_shapes
+        .values()
+        .map(enum_codegen_item)
+        .collect::<Vec<_>>();
+    items.extend(records.iter().map(record_codegen_item));
+    SerializeCodegenUnit { items }
 }
 
 pub(crate) fn ts_field_name(source_name: &str) -> String {
-    lower_camel(source_name)
+    nw_serialize_codegen::typescript::source::typescript_field_name(source_name)
 }
 
 pub(crate) fn ts_method_name(source_name: &str) -> String {
@@ -367,6 +875,29 @@ pub(crate) fn go_field_name(source_name: &str) -> String {
 
 pub(crate) fn go_method_name(source_name: &str) -> String {
     exported_identifier(source_name, "Method")
+}
+
+pub(crate) fn go_local_name(source_name: &str) -> String {
+    let snake = crate::naming::to_snake_ident(source_name, "value");
+    let mut parts = snake.split('_').filter(|part| !part.is_empty());
+    let Some(first) = parts.next() else {
+        return "value".to_owned();
+    };
+    let mut out = go_initialism(first)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| first.to_owned());
+    for part in parts {
+        if let Some(initialism) = go_initialism(part) {
+            out.push_str(initialism);
+        } else {
+            let mut chars = part.chars();
+            if let Some(first) = chars.next() {
+                out.push(first.to_ascii_uppercase());
+                out.extend(chars);
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn lower_camel(source_name: &str) -> String {
@@ -409,7 +940,7 @@ pub(crate) fn upper_camel(source_name: &str) -> String {
 }
 
 fn exported_identifier(source_name: &str, fallback_prefix: &str) -> String {
-    let ident = upper_camel(source_name);
+    let ident = go_exported_identifier(source_name);
     if is_identifier(&ident) {
         ident
     } else {
@@ -429,7 +960,7 @@ fn is_identifier(value: &str) -> bool {
 fn manager_surface(manager: &NativeManagerSpec) -> Result<Option<ManagerSurface>> {
     let manager_name = semantic_type_name(manager.rust_type().as_str()).to_owned();
     let Some(shape) = manager.shape() else {
-        return Ok(None);
+        bail!("validated manager `{manager_name}` has no generated surface shape");
     };
     if let NativeManagerShape::ItemData(shape) = shape {
         return Ok(Some(ManagerSurface::ItemData(item_data_manager_surface(
@@ -437,20 +968,78 @@ fn manager_surface(manager: &NativeManagerSpec) -> Result<Option<ManagerSurface>
             shape,
         ))));
     }
+    if let Some(kind) = composition_manager_kind(shape) {
+        return Ok(Some(ManagerSurface::Composition(
+            CompositionManagerSurface {
+                manager_class_name: manager_name.clone(),
+                manager_name,
+                kind,
+                dependencies: manager_dependency_names(manager),
+            },
+        )));
+    }
     if let Some(record) = semantic_manager_record(&manager_name, manager, shape) {
         return Ok(Some(ManagerSurface::Semantic(record?)));
     }
     let products = direct_products(manager, shape)?;
-    if is_product_backed_surface(shape, &products) {
+    if is_product_backed_surface(shape, &products) && !shape.exposes_native_api() {
         return Ok(Some(ManagerSurface::ProductBacked(
             product_backed_manager_surface(manager_name, products),
         )));
     }
+    let semantic_projections = if shape.exposes_native_api() {
+        semantic_projection_records(&manager_name, manager, shape)
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let direct = direct_manager_surface(manager_name, manager, products);
     if direct.tables.is_empty() && direct.products.is_empty() {
-        return Ok(None);
+        bail!(
+            "validated manager `{}` has neither a table nor asset-backed generated surface",
+            direct.manager_name
+        );
     }
-    Ok(Some(ManagerSurface::Direct(direct)))
+    if shape.exposes_native_api() {
+        Ok(Some(ManagerSurface::Native {
+            manager: direct,
+            shape: shape.clone(),
+            dependencies: manager_dependency_names(manager),
+            semantic_projections,
+        }))
+    } else {
+        Ok(Some(ManagerSurface::Direct(direct)))
+    }
+}
+
+fn manager_dependency_names(manager: &NativeManagerSpec) -> Vec<String> {
+    manager
+        .inputs()
+        .iter()
+        .filter_map(|input| match input {
+            NativeManagerInput::Manager(manager) => {
+                Some(semantic_type_name(manager.as_str()).to_owned())
+            }
+            NativeManagerInput::Table(_) | NativeManagerInput::Product(_) => None,
+        })
+        .collect()
+}
+
+fn composition_manager_kind(shape: &NativeManagerShape) -> Option<CompositionManagerKind> {
+    match shape {
+        NativeManagerShape::CurrencyExchangeMapping(_) => {
+            Some(CompositionManagerKind::CurrencyExchangeMapping)
+        }
+        NativeManagerShape::ReplicationData(_) => Some(CompositionManagerKind::ReplicationData),
+        NativeManagerShape::StaticTradeskillRankDataMapping(_) => {
+            Some(CompositionManagerKind::StaticTradeskillRankDataMapping)
+        }
+        NativeManagerShape::VitalsModifierMapping(_) => {
+            Some(CompositionManagerKind::VitalsModifierMapping)
+        }
+        _ => None,
+    }
 }
 
 fn is_product_backed_surface(shape: &NativeManagerShape, products: &[DirectProductAsset]) -> bool {
@@ -508,6 +1097,7 @@ fn item_data_manager_table(table: &NativeTableFamilyTable) -> ItemDataManagerTab
     ItemDataManagerTable {
         variant_name: table.variant().as_str().to_owned(),
         table_name: table.table_name().as_str().to_owned(),
+        row_type_name: table.row_type_name().as_str().to_owned(),
     }
 }
 
@@ -528,26 +1118,8 @@ fn direct_products(
     };
     products
         .into_iter()
-        .filter(|product| supported_product_value_type(product.value_type().as_str()))
         .map(|product| direct_product(manager, product))
         .collect()
-}
-
-fn supported_product_value_type(value_type: &str) -> bool {
-    matches!(
-        value_type,
-        "newworld_plugin::assets::armor_offset_database::ArmorOffsetDatabase"
-            | "newworld_plugin::assets::equip_types_database::EquipTypesDatabase"
-            | "newworld_plugin::assets::game_debug_settings::GameDebugSettings"
-            | "newworld_plugin::assets::player_base_attributes::PlayerBaseAttributes"
-            | "newworld_plugin::assets::settlement_progression_data::SettlementProgressionData"
-            | "newworld_plugin::assets::ui_database::UiDatabase"
-            | "newworld_plugin::assets::camera_settings::GameCameraSettings"
-            | "newworld_plugin::assets::gathering_database::GatheringDatabase"
-            | "newworld_plugin::assets::gathering_database::GatheringActionDatabase"
-            | "newworld_plugin::assets::crafting_station_database::CraftingStationDatabase"
-            | "newworld_plugin::assets::rank_database::SocialRankDatabase"
-    )
 }
 
 fn recipe_data_products(shape: &NativeRecipeDataManager) -> Vec<&NativeProductAssetResource> {
@@ -664,6 +1236,24 @@ fn semantic_manager_record(
     }
 }
 
+pub(crate) fn semantic_projection_records(
+    manager_name: &str,
+    manager: &NativeManagerSpec,
+    shape: &NativeManagerShape,
+) -> Option<Result<Vec<SemanticManagerRecord>>> {
+    match shape {
+        NativeManagerShape::MultiTableCrcKeyProjection(shape) => Some(
+            shape
+                .projections()
+                .iter()
+                .map(|projection| one_table_crc_record(manager_name, projection))
+                .collect(),
+        ),
+        _ => semantic_manager_record(manager_name, manager, shape)
+            .map(|record| record.map(|record| vec![record])),
+    }
+}
+
 fn one_table_crc_index_record(
     manager_name: &str,
     shape: &NativeOneTableCrcIndexManager,
@@ -672,7 +1262,7 @@ fn one_table_crc_index_record(
         manager_name: manager_name.to_owned(),
         manager_class_name: manager_name.to_owned(),
         record_type_name: shape.row_alias().as_str().to_owned(),
-        tables: one_table(shape.table_name().as_str()),
+        tables: one_table(shape.table_name().as_str(), shape.row_type_name().as_str()),
         key: Some(SemanticManagerKey::Crc {
             key_field: shape.row_key_method().as_str().to_owned(),
             crc_field: crc_index_field_name(shape.row_crc_method()),
@@ -739,7 +1329,7 @@ fn one_table_owned_string_crc_index_record(
         manager_name: manager_name.to_owned(),
         manager_class_name: manager_name.to_owned(),
         record_type_name: shape.indexed_type().as_str().to_owned(),
-        tables: one_table(shape.table_name().as_str()),
+        tables: one_table(shape.table_name().as_str(), shape.row_type_name().as_str()),
         key: Some(SemanticManagerKey::Crc {
             key_field: shape.indexed_key_field().as_str().to_owned(),
             crc_field: "crc".to_owned(),
@@ -805,7 +1395,7 @@ fn one_table_crc_record(
         manager_name: manager_name.to_owned(),
         manager_class_name: manager_name.to_owned(),
         record_type_name: shape.data_type().as_str().to_owned(),
-        tables: one_table(shape.table_name().as_str()),
+        tables: one_table(shape.table_name().as_str(), shape.row_type_name().as_str()),
         key: Some(SemanticManagerKey::Crc {
             key_field: shape.key_field().as_str().to_owned(),
             crc_field: shape.crc_field().as_str().to_owned(),
@@ -851,12 +1441,8 @@ fn table_family_crc_record(
             reject_zero_crc: shape.reject_zero_crc(),
             duplicate_key_policy: shape.duplicate_key_policy(),
         }),
-        source_row_field: shape
-            .source_row_field()
-            .map(|field| field.as_str().to_owned()),
-        source_row_method: shape
-            .source_row_method()
-            .map(|method| method.as_str().to_owned()),
+        source_row_field: None,
+        source_row_method: None,
         row_filters: row_filters(shape.row_filters(), shape.fields())?,
         fields: record_fields(shape.fields())?,
         lookup_methods: crc_lookup_methods(shape.methods()),
@@ -951,7 +1537,7 @@ fn one_table_numeric_record(
         manager_name: manager_name.to_owned(),
         manager_class_name: manager_name.to_owned(),
         record_type_name: shape.data_type().as_str().to_owned(),
-        tables: one_table(shape.table_name().as_str()),
+        tables: one_table(shape.table_name().as_str(), shape.row_type_name().as_str()),
         key: Some(SemanticManagerKey::Numeric {
             key_field: shape.key_field().as_str().to_owned(),
             key_column: shape.key_column().as_str().to_owned(),
@@ -1014,7 +1600,7 @@ fn one_table_enum_record(
         manager_name: manager_name.to_owned(),
         manager_class_name: manager_name.to_owned(),
         record_type_name: shape.data_type().as_str().to_owned(),
-        tables: one_table(shape.table_name().as_str()),
+        tables: one_table(shape.table_name().as_str(), shape.row_type_name().as_str()),
         key: Some(SemanticManagerKey::EnumString {
             key_field: shape.key_field().as_str().to_owned(),
             key_column: shape.key_column().as_str().to_owned(),
@@ -1056,7 +1642,7 @@ fn one_table_string_record(
         manager_name: manager_name.to_owned(),
         manager_class_name: manager_name.to_owned(),
         record_type_name: shape.data_type().as_str().to_owned(),
-        tables: one_table(shape.table_name().as_str()),
+        tables: one_table(shape.table_name().as_str(), shape.row_type_name().as_str()),
         key: Some(SemanticManagerKey::String {
             key_field: shape.key_field().as_str().to_owned(),
             key_column: shape.key_column().as_str().to_owned(),
@@ -1085,7 +1671,7 @@ fn one_table_row_record(
         manager_name: manager_name.to_owned(),
         manager_class_name: manager_name.to_owned(),
         record_type_name: shape.data_type().as_str().to_owned(),
-        tables: one_table(shape.table_name().as_str()),
+        tables: one_table(shape.table_name().as_str(), shape.row_type_name().as_str()),
         key: None,
         source_row_field: shape
             .source_row_field()
@@ -1105,9 +1691,10 @@ fn one_table_row_record(
     })
 }
 
-fn one_table(table_name: &str) -> Vec<SemanticManagerTable> {
+fn one_table(table_name: &str, row_type_name: &str) -> Vec<SemanticManagerTable> {
     vec![SemanticManagerTable {
         table_name: table_name.to_owned(),
+        row_type_name: row_type_name.to_owned(),
     }]
 }
 
@@ -1116,6 +1703,7 @@ fn family_tables(tables: &[NativeTableFamilyTable]) -> Vec<SemanticManagerTable>
         .iter()
         .map(|table| SemanticManagerTable {
             table_name: table.table_name().as_str().to_owned(),
+            row_type_name: table.row_type_name().as_str().to_owned(),
         })
         .collect()
 }
@@ -1127,6 +1715,7 @@ fn manager_input_tables(manager: &NativeManagerSpec) -> Vec<SemanticManagerTable
         .filter_map(|input| match input {
             NativeManagerInput::Table(table) => Some(SemanticManagerTable {
                 table_name: table.table_name().as_str().to_owned(),
+                row_type_name: table.row_type_name().as_str().to_owned(),
             }),
             NativeManagerInput::Product(_) | NativeManagerInput::Manager(_) => None,
         })
@@ -1243,37 +1832,77 @@ fn record_fields(fields: &[NativeProjectionField]) -> Result<Vec<SemanticRecordF
     fields
         .iter()
         .map(|field| {
+            let transform = semantic_transform(field).with_context(|| {
+                format!(
+                    "field `{}` column `{}`",
+                    field.field().as_str(),
+                    field.column().as_str()
+                )
+            })?;
             Ok(SemanticRecordField {
-                name: field.field().as_str().to_owned(),
+                name: standalone_projection_field_name(field),
                 column: field.column().as_str().to_owned(),
-                transform: semantic_transform(field.transform()).with_context(|| {
-                    format!(
-                        "field `{}` column `{}`",
-                        field.field().as_str(),
-                        field.column().as_str()
-                    )
-                })?,
+                transform,
+                value_type: field.value_type().map(|value| value.as_str().to_owned()),
+                default_value: field.default_value().map(|value| value.as_str().to_owned()),
+                reference_field: field
+                    .reference_field()
+                    .map(|value| value.as_str().to_owned()),
+                u16_max_exclusive: field.u16_max_exclusive(),
+                enum_shape: None,
+                pair_first_enum_shape: None,
             })
         })
         .collect()
 }
 
-fn semantic_transform(transform: NativeProjectionTransform) -> Result<SemanticProjectionTransform> {
+fn standalone_projection_field_name(field: &NativeProjectionField) -> String {
+    let name = field.field().as_str();
+    match field.transform() {
+        NativeProjectionTransform::ForeignKeyRow
+        | NativeProjectionTransform::OptionalForeignKeyRow => name
+            .strip_suffix("_row")
+            .map_or_else(|| name.to_owned(), |prefix| format!("{prefix}_key")),
+        NativeProjectionTransform::ForeignKeyRowList
+        | NativeProjectionTransform::OptionalForeignKeyRowListDefaultEmpty => name
+            .strip_suffix("_rows")
+            .map_or_else(|| name.to_owned(), |prefix| format!("{prefix}_keys")),
+        _ => name.to_owned(),
+    }
+}
+
+fn semantic_transform(field: &NativeProjectionField) -> Result<SemanticProjectionTransform> {
+    let transform = field.transform();
     Ok(match transform {
-        NativeProjectionTransform::String
-        | NativeProjectionTransform::NonEmptyString
-        | NativeProjectionTransform::EnumString
-        | NativeProjectionTransform::EnumStringRejectDefault
-        | NativeProjectionTransform::TypedCell
-        | NativeProjectionTransform::OptionalTypedCellDefaultValue
-        | NativeProjectionTransform::ForeignKeyTargetKey => SemanticProjectionTransform::String,
+        NativeProjectionTransform::String | NativeProjectionTransform::ForeignKeyTargetKey => {
+            SemanticProjectionTransform::String
+        }
+        NativeProjectionTransform::NonEmptyString => SemanticProjectionTransform::NonEmptyString,
+        NativeProjectionTransform::EnumString => SemanticProjectionTransform::EnumString,
+        NativeProjectionTransform::EnumStringSkipInvalid => {
+            SemanticProjectionTransform::EnumStringSkipInvalid
+        }
+        NativeProjectionTransform::EnumStringRejectDefault => {
+            SemanticProjectionTransform::EnumStringRejectDefault
+        }
+        NativeProjectionTransform::TypedCell
+        | NativeProjectionTransform::OptionalTypedCellDefaultValue => {
+            semantic_typed_cell_transform(field)?
+        }
+        NativeProjectionTransform::OptionalTypedCell => {
+            semantic_optional_typed_cell_transform(field)?
+        }
+        NativeProjectionTransform::U8Enum => SemanticProjectionTransform::EnumString,
+        NativeProjectionTransform::OptionalU8EnumDefaultValue => {
+            SemanticProjectionTransform::EnumDefault
+        }
         NativeProjectionTransform::OptionalStringDefaultEmpty => {
             SemanticProjectionTransform::StringDefaultEmpty
         }
         NativeProjectionTransform::PlusJoinedList => SemanticProjectionTransform::PlusJoinedList,
-        NativeProjectionTransform::OptionalString
-        | NativeProjectionTransform::OptionalFirstString => {
-            SemanticProjectionTransform::OptionalString
+        NativeProjectionTransform::OptionalString => SemanticProjectionTransform::OptionalString,
+        NativeProjectionTransform::OptionalFirstString => {
+            SemanticProjectionTransform::OptionalFirstString
         }
         NativeProjectionTransform::StringList => SemanticProjectionTransform::StringList,
         NativeProjectionTransform::NonEmptyStringList => {
@@ -1282,45 +1911,68 @@ fn semantic_transform(transform: NativeProjectionTransform) -> Result<SemanticPr
         NativeProjectionTransform::OptionalStringList => {
             SemanticProjectionTransform::OptionalStringList
         }
-        NativeProjectionTransform::Bool
-        | NativeProjectionTransform::OptionalBoolDefaultFalse
-        | NativeProjectionTransform::Crc32NonZeroBool => SemanticProjectionTransform::Bool,
+        NativeProjectionTransform::Bool => SemanticProjectionTransform::Bool,
         NativeProjectionTransform::OptionalBool => SemanticProjectionTransform::OptionalBool,
-        NativeProjectionTransform::U8
-        | NativeProjectionTransform::OptionalU8DefaultZero
-        | NativeProjectionTransform::OptionalU8DefaultMax
-        | NativeProjectionTransform::U8Enum
-        | NativeProjectionTransform::OptionalU8EnumDefaultValue => SemanticProjectionTransform::U8,
-        NativeProjectionTransform::U32ToU16BelowMax => SemanticProjectionTransform::U16,
-        NativeProjectionTransform::U32
-        | NativeProjectionTransform::OptionalU32DefaultZero
-        | NativeProjectionTransform::NonZeroU32 => SemanticProjectionTransform::U32,
-        NativeProjectionTransform::OptionalU32 | NativeProjectionTransform::OptionalNonZeroU32 => {
-            SemanticProjectionTransform::OptionalU32
+        NativeProjectionTransform::OptionalBoolDefaultFalse => {
+            SemanticProjectionTransform::BoolDefaultFalse
+        }
+        NativeProjectionTransform::Crc32NonZeroBool => {
+            SemanticProjectionTransform::Crc32NonZeroBool
+        }
+        NativeProjectionTransform::U8 => SemanticProjectionTransform::U8,
+        NativeProjectionTransform::OptionalU8DefaultZero => {
+            SemanticProjectionTransform::U8DefaultZero
+        }
+        NativeProjectionTransform::OptionalU8DefaultMax => {
+            SemanticProjectionTransform::U8DefaultMax
+        }
+        NativeProjectionTransform::U32ToU16BelowMax => SemanticProjectionTransform::U16BelowMax,
+        NativeProjectionTransform::U32 => SemanticProjectionTransform::U32,
+        NativeProjectionTransform::OptionalU32 => SemanticProjectionTransform::OptionalU32,
+        NativeProjectionTransform::OptionalU32DefaultZero => {
+            SemanticProjectionTransform::U32DefaultZero
+        }
+        NativeProjectionTransform::NonZeroU32 => SemanticProjectionTransform::NonZeroU32,
+        NativeProjectionTransform::OptionalNonZeroU32 => {
+            SemanticProjectionTransform::OptionalNonZeroU32
         }
         NativeProjectionTransform::I32 => SemanticProjectionTransform::I32,
-        NativeProjectionTransform::F32
-        | NativeProjectionTransform::F32MinutesToSeconds
-        | NativeProjectionTransform::F32UpperBound10000ZeroIsDefault
-        | NativeProjectionTransform::F32LowerBound10000CappedToField => {
-            SemanticProjectionTransform::F32
+        NativeProjectionTransform::F32 => SemanticProjectionTransform::F32,
+        NativeProjectionTransform::F32MinutesToSeconds => {
+            SemanticProjectionTransform::F32MinutesToSeconds
+        }
+        NativeProjectionTransform::F32UpperBound10000ZeroIsDefault => {
+            SemanticProjectionTransform::F32UpperBound10000ZeroIsDefault
+        }
+        NativeProjectionTransform::F32LowerBound10000CappedToField => {
+            SemanticProjectionTransform::F32LowerBound10000CappedToField
         }
         NativeProjectionTransform::OptionalF32 => SemanticProjectionTransform::OptionalF32,
         NativeProjectionTransform::F32ListDefaultEmpty => SemanticProjectionTransform::F32List,
         NativeProjectionTransform::I32ListDefaultEmpty => SemanticProjectionTransform::I32List,
-        NativeProjectionTransform::Crc32
-        | NativeProjectionTransform::LowercaseCrcString
-        | NativeProjectionTransform::ForeignKeyTargetLowercaseCrc
-        | NativeProjectionTransform::OptionalLowercaseCrcStringDefaultZero
-        | NativeProjectionTransform::OptionalFirstLowercaseCrcStringDefaultZero
-        | NativeProjectionTransform::OptionalTrimmedLowercaseCrcStringDefaultZero => {
-            SemanticProjectionTransform::Crc32
+        NativeProjectionTransform::Crc32 => SemanticProjectionTransform::Crc32,
+        NativeProjectionTransform::LowercaseCrcString
+        | NativeProjectionTransform::ForeignKeyTargetLowercaseCrc => {
+            SemanticProjectionTransform::LowercaseCrcString
         }
-        NativeProjectionTransform::OptionalCrc32
-        | NativeProjectionTransform::OptionalCrc32ZeroAsNone
-        | NativeProjectionTransform::OptionalLowercaseCrcString
-        | NativeProjectionTransform::OptionalTrimmedLowercaseCrcString => {
+        NativeProjectionTransform::OptionalLowercaseCrcStringDefaultZero => {
+            SemanticProjectionTransform::LowercaseCrcStringDefaultZero
+        }
+        NativeProjectionTransform::OptionalFirstLowercaseCrcStringDefaultZero => {
+            SemanticProjectionTransform::FirstLowercaseCrcStringDefaultZero
+        }
+        NativeProjectionTransform::OptionalTrimmedLowercaseCrcStringDefaultZero => {
+            SemanticProjectionTransform::TrimmedLowercaseCrcStringDefaultZero
+        }
+        NativeProjectionTransform::OptionalCrc32 => SemanticProjectionTransform::OptionalCrc32,
+        NativeProjectionTransform::OptionalCrc32ZeroAsNone => {
+            SemanticProjectionTransform::OptionalCrc32ZeroAsNone
+        }
+        NativeProjectionTransform::OptionalLowercaseCrcString => {
             SemanticProjectionTransform::OptionalLowercaseCrcString
+        }
+        NativeProjectionTransform::OptionalTrimmedLowercaseCrcString => {
+            SemanticProjectionTransform::OptionalTrimmedLowercaseCrcString
         }
         NativeProjectionTransform::CrcList
         | NativeProjectionTransform::OptionalCrcListDefaultEmpty => {
@@ -1330,13 +1982,13 @@ fn semantic_transform(transform: NativeProjectionTransform) -> Result<SemanticPr
         | NativeProjectionTransform::TrimmedLowercaseCrcStringList => {
             SemanticProjectionTransform::LowercaseCrcStringList
         }
-        NativeProjectionTransform::ForeignKeyRow => SemanticProjectionTransform::RowIndex,
+        NativeProjectionTransform::ForeignKeyRow => SemanticProjectionTransform::ForeignKey,
         NativeProjectionTransform::OptionalForeignKeyRow => {
-            SemanticProjectionTransform::OptionalRowIndex
+            SemanticProjectionTransform::OptionalForeignKey
         }
         NativeProjectionTransform::ForeignKeyRowList
         | NativeProjectionTransform::OptionalForeignKeyRowListDefaultEmpty => {
-            SemanticProjectionTransform::RowIndexList
+            SemanticProjectionTransform::ForeignKeyList
         }
         NativeProjectionTransform::F32RangeInclusive => {
             SemanticProjectionTransform::F32RangeInclusive
@@ -1345,6 +1997,44 @@ fn semantic_transform(transform: NativeProjectionTransform) -> Result<SemanticPr
             SemanticProjectionTransform::U32RangeInclusive
         }
     })
+}
+
+fn semantic_typed_cell_transform(
+    field: &NativeProjectionField,
+) -> Result<SemanticProjectionTransform> {
+    let value_type = field
+        .value_type()
+        .context("typed-cell transform has no value type")?
+        .as_str();
+    let leaf = value_type.rsplit("::").next().unwrap_or(value_type);
+    match leaf {
+        "u8" => Ok(SemanticProjectionTransform::U8),
+        "NonZeroU8" => Ok(SemanticProjectionTransform::NonZeroU8),
+        "u16" => Ok(SemanticProjectionTransform::U16),
+        "NonZeroU16" => Ok(SemanticProjectionTransform::NonZeroU16),
+        "u32" => Ok(SemanticProjectionTransform::U32),
+        "NonZeroU32" => Ok(SemanticProjectionTransform::NonZeroU32),
+        "i32" => Ok(SemanticProjectionTransform::I32),
+        "f32" => Ok(SemanticProjectionTransform::F32),
+        "String" => Ok(SemanticProjectionTransform::String),
+        _ => bail!("unsupported standalone typed-cell value type `{value_type}`"),
+    }
+}
+
+fn semantic_optional_typed_cell_transform(
+    field: &NativeProjectionField,
+) -> Result<SemanticProjectionTransform> {
+    let value_type = field
+        .value_type()
+        .context("optional typed-cell transform has no value type")?
+        .as_str();
+    match value_type {
+        "Vec<(az_core::crc::Crc32, f32)>" => {
+            Ok(SemanticProjectionTransform::OptionalCrc32F32PairList)
+        }
+        "Vec<(u8, f32)>" => Ok(SemanticProjectionTransform::OptionalU8F32PairList),
+        _ => bail!("unsupported standalone optional typed-cell value type `{value_type}`"),
+    }
 }
 
 fn crc_lookup_methods(methods: &[NativeCrcIndexLookupMethod]) -> Vec<SemanticLookupMethod> {
@@ -1418,11 +2108,7 @@ fn record_codegen_item(record: &SemanticManagerRecord) -> SerializeCodegenItem {
         push_key_codegen_fields(&source_name, key, &mut fields);
     }
     fields.extend(record.fields.iter().map(|field| {
-        record_codegen_field(
-            &source_name,
-            &field.name,
-            resolved_type_for_transform(field.transform),
-        )
+        record_codegen_field(&source_name, &field.name, resolved_type_for_field(field))
     }));
 
     SerializeCodegenItem {
@@ -1438,6 +2124,41 @@ fn record_codegen_item(record: &SemanticManagerRecord) -> SerializeCodegenItem {
         fields,
         variants: Vec::new(),
     }
+}
+
+fn enum_codegen_item(shape: &GameSystemEnumShape) -> SerializeCodegenItem {
+    SerializeCodegenItem {
+        source_type_id: semantic_enum_type_id(&shape.name),
+        source_name: shape.name.clone(),
+        role: ReflectedTypeRole::SupportType,
+        is_reflection_marker: false,
+        is_abstract: Some(false),
+        factory: None,
+        rtti_base_chain: Vec::new(),
+        kind: SerializeCodegenItemKind::Enum,
+        enum_underlying_type: Some(ResolvedType::Scalar(match shape.representation {
+            GameSystemEnumRepresentation::U8 => ScalarType::U8,
+            GameSystemEnumRepresentation::I32 => ScalarType::I32,
+            GameSystemEnumRepresentation::U32 | GameSystemEnumRepresentation::Crc32 => {
+                ScalarType::U32
+            }
+        })),
+        fields: Vec::new(),
+        variants: shape
+            .variants
+            .iter()
+            .map(|variant| SerializeCodegenVariant {
+                source_name: variant.name.clone(),
+                value_u64: u64::try_from(variant.discriminant).ok(),
+                value_u32: u32::try_from(variant.discriminant).ok(),
+                value_i32: i32::try_from(variant.discriminant).ok(),
+            })
+            .collect(),
+    }
+}
+
+fn semantic_enum_type_id(name: &str) -> Uuid {
+    deterministic_uuid(&format!("NewWorld::GameData::Enum::{name}"))
 }
 
 fn push_key_codegen_fields(
@@ -1459,7 +2180,7 @@ fn push_key_codegen_fields(
             fields.push(record_codegen_field(
                 source_name,
                 crc_field,
-                ResolvedType::Scalar(ScalarType::U32),
+                ResolvedType::Scalar(ScalarType::Crc32),
             ));
         }
         SemanticManagerKey::FallbackCrc {
@@ -1481,7 +2202,7 @@ fn push_key_codegen_fields(
             fields.push(record_codegen_field(
                 source_name,
                 crc_field,
-                ResolvedType::Scalar(ScalarType::U32),
+                ResolvedType::Scalar(ScalarType::Crc32),
             ));
         }
         SemanticManagerKey::Numeric {
@@ -1524,37 +2245,85 @@ fn record_codegen_field(
     }
 }
 
-fn resolved_type_for_transform(transform: SemanticProjectionTransform) -> ResolvedType {
+fn resolved_type_for_field(field: &SemanticRecordField) -> ResolvedType {
+    let transform = field.transform;
     match transform {
         SemanticProjectionTransform::String
+        | SemanticProjectionTransform::NonEmptyString
         | SemanticProjectionTransform::StringDefaultEmpty
-        | SemanticProjectionTransform::PlusJoinedList => ResolvedType::Scalar(ScalarType::String),
-        SemanticProjectionTransform::OptionalString => optional(ScalarType::String),
+        | SemanticProjectionTransform::PlusJoinedList
+        | SemanticProjectionTransform::ForeignKey => ResolvedType::Scalar(ScalarType::String),
+        SemanticProjectionTransform::EnumString
+        | SemanticProjectionTransform::EnumStringSkipInvalid
+        | SemanticProjectionTransform::EnumStringRejectDefault
+        | SemanticProjectionTransform::EnumDefault => {
+            let shape = field
+                .enum_shape
+                .as_ref()
+                .expect("enum projection fields have reconciled enum schemas");
+            ResolvedType::Named {
+                type_id: semantic_enum_type_id(&shape.name),
+                source_name: shape.name.clone(),
+            }
+        }
+        SemanticProjectionTransform::OptionalString
+        | SemanticProjectionTransform::OptionalFirstString
+        | SemanticProjectionTransform::OptionalForeignKey => optional(ScalarType::String),
         SemanticProjectionTransform::StringList
-        | SemanticProjectionTransform::NonEmptyStringList => vector(ScalarType::String),
+        | SemanticProjectionTransform::NonEmptyStringList
+        | SemanticProjectionTransform::ForeignKeyList => vector(ScalarType::String),
         SemanticProjectionTransform::OptionalStringList => ResolvedType::Optional {
             value: Box::new(vector(ScalarType::String)),
         },
-        SemanticProjectionTransform::Bool => ResolvedType::Scalar(ScalarType::Bool),
+        SemanticProjectionTransform::Bool
+        | SemanticProjectionTransform::BoolDefaultFalse
+        | SemanticProjectionTransform::Crc32NonZeroBool => ResolvedType::Scalar(ScalarType::Bool),
         SemanticProjectionTransform::OptionalBool => optional(ScalarType::Bool),
-        SemanticProjectionTransform::U8 => ResolvedType::Scalar(ScalarType::U8),
-        SemanticProjectionTransform::U16 => ResolvedType::Scalar(ScalarType::U16),
+        SemanticProjectionTransform::U8
+        | SemanticProjectionTransform::NonZeroU8
+        | SemanticProjectionTransform::U8DefaultZero
+        | SemanticProjectionTransform::U8DefaultMax => ResolvedType::Scalar(ScalarType::U8),
+        SemanticProjectionTransform::U16
+        | SemanticProjectionTransform::NonZeroU16
+        | SemanticProjectionTransform::U16BelowMax => ResolvedType::Scalar(ScalarType::U16),
         SemanticProjectionTransform::U32
-        | SemanticProjectionTransform::Crc32
-        | SemanticProjectionTransform::RowIndex => ResolvedType::Scalar(ScalarType::U32),
+        | SemanticProjectionTransform::U32DefaultZero
+        | SemanticProjectionTransform::NonZeroU32 => ResolvedType::Scalar(ScalarType::U32),
         SemanticProjectionTransform::OptionalU32
+        | SemanticProjectionTransform::OptionalNonZeroU32 => optional(ScalarType::U32),
+        SemanticProjectionTransform::Crc32
+        | SemanticProjectionTransform::LowercaseCrcString
+        | SemanticProjectionTransform::LowercaseCrcStringDefaultZero
+        | SemanticProjectionTransform::FirstLowercaseCrcStringDefaultZero
+        | SemanticProjectionTransform::TrimmedLowercaseCrcStringDefaultZero => {
+            ResolvedType::Scalar(ScalarType::Crc32)
+        }
+        SemanticProjectionTransform::OptionalCrc32
+        | SemanticProjectionTransform::OptionalCrc32ZeroAsNone
         | SemanticProjectionTransform::OptionalLowercaseCrcString
-        | SemanticProjectionTransform::OptionalRowIndex => optional(ScalarType::U32),
+        | SemanticProjectionTransform::OptionalTrimmedLowercaseCrcString => {
+            optional(ScalarType::Crc32)
+        }
         SemanticProjectionTransform::I32 => ResolvedType::Scalar(ScalarType::I32),
-        SemanticProjectionTransform::F32 => ResolvedType::Scalar(ScalarType::F32),
+        SemanticProjectionTransform::F32
+        | SemanticProjectionTransform::F32MinutesToSeconds
+        | SemanticProjectionTransform::F32UpperBound10000ZeroIsDefault
+        | SemanticProjectionTransform::F32LowerBound10000CappedToField => {
+            ResolvedType::Scalar(ScalarType::F32)
+        }
         SemanticProjectionTransform::OptionalF32 => optional(ScalarType::F32),
         SemanticProjectionTransform::F32List => vector(ScalarType::F32),
         SemanticProjectionTransform::I32List => vector(ScalarType::I32),
         SemanticProjectionTransform::Crc32List
-        | SemanticProjectionTransform::LowercaseCrcStringList
-        | SemanticProjectionTransform::RowIndexList => vector(ScalarType::U32),
+        | SemanticProjectionTransform::LowercaseCrcStringList => vector(ScalarType::Crc32),
         SemanticProjectionTransform::F32RangeInclusive => pair(ScalarType::F32),
         SemanticProjectionTransform::U32RangeInclusive => pair(ScalarType::U32),
+        SemanticProjectionTransform::OptionalCrc32F32PairList => {
+            optional_pair_list(ScalarType::Crc32, ScalarType::F32)
+        }
+        SemanticProjectionTransform::OptionalU8F32PairList => {
+            optional_pair_list(ScalarType::U8, ScalarType::F32)
+        }
     }
 }
 
@@ -1587,6 +2356,19 @@ fn pair(scalar: ScalarType) -> ResolvedType {
     }
 }
 
+fn optional_pair_list(first: ScalarType, second: ScalarType) -> ResolvedType {
+    ResolvedType::Optional {
+        value: Box::new(ResolvedType::Sequence {
+            kind: SequenceKind::Vector,
+            element: Box::new(ResolvedType::Pair {
+                first: Box::new(ResolvedType::Scalar(first)),
+                second: Box::new(ResolvedType::Scalar(second)),
+            }),
+            capacity: None,
+        }),
+    }
+}
+
 fn deterministic_uuid(value: &str) -> Uuid {
     let digest = Sha256::digest(value.as_bytes());
     let mut bytes = [0u8; 16];
@@ -1608,6 +2390,244 @@ mod tests {
 
     use super::*;
 
+    fn composition_surface(name: &str, dependencies: &[&str]) -> ManagerSurface {
+        ManagerSurface::Composition(CompositionManagerSurface {
+            manager_name: name.to_owned(),
+            manager_class_name: name.to_owned(),
+            kind: CompositionManagerKind::ReplicationData,
+            dependencies: dependencies
+                .iter()
+                .map(|dependency| (*dependency).to_owned())
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn manager_dependencies_require_generated_surfaces() {
+        let error = topologically_order_manager_surfaces(vec![composition_surface(
+            "DependentManager",
+            &["MissingManager"],
+        )])
+        .expect_err("missing manager dependency must fail generation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("DependentManager <- MissingManager")
+        );
+    }
+
+    #[test]
+    fn manager_dependencies_are_emitted_before_consumers() {
+        let ordered = topologically_order_manager_surfaces(vec![
+            composition_surface("DependentManager", &["DependencyManager"]),
+            composition_surface("DependencyManager", &[]),
+        ])
+        .expect("acyclic manager dependencies");
+
+        assert_eq!(manager_surface_name(&ordered[0]), "DependencyManager");
+        assert_eq!(manager_surface_name(&ordered[1]), "DependentManager");
+    }
+
+    #[test]
+    fn manager_dependency_cycles_fail_generation() {
+        let error = topologically_order_manager_surfaces(vec![
+            composition_surface("FirstManager", &["SecondManager"]),
+            composition_surface("SecondManager", &["FirstManager"]),
+        ])
+        .expect_err("manager dependency cycle must fail generation");
+
+        assert!(error.to_string().contains("manager dependency cycle"));
+    }
+
+    #[test]
+    fn every_declared_product_is_present_on_its_generated_manager_surface() {
+        let managers = validated_native_manager_specs();
+        let surfaces = manager_surfaces_from_managers(&managers).expect("manager surfaces");
+
+        for manager in &managers {
+            let expected = manager
+                .inputs()
+                .iter()
+                .filter(|input| matches!(input, NativeManagerInput::Product(_)))
+                .count();
+            if expected == 0 {
+                continue;
+            }
+            let name = semantic_type_name(manager.rust_type().as_str());
+            let actual = surfaces
+                .iter()
+                .find(|surface| manager_surface_name(surface) == name)
+                .map(|surface| match surface {
+                    ManagerSurface::Direct(manager)
+                    | ManagerSurface::Native { manager, .. }
+                    | ManagerSurface::ProductBacked(manager) => manager.products.len(),
+                    ManagerSurface::Semantic(_)
+                    | ManagerSurface::ItemData(_)
+                    | ManagerSurface::Composition(_) => 0,
+                })
+                .expect("validated managers have generated surfaces");
+            assert_eq!(
+                actual, expected,
+                "manager `{name}` dropped declared product inputs"
+            );
+        }
+    }
+
+    #[test]
+    fn go_names_use_the_serialize_emitter_initialism_policy() {
+        assert_eq!(go_field_name("event_id_crc32"), "EventIDCRC32");
+        assert_eq!(go_field_name("asset_uuid"), "AssetUUID");
+        assert_eq!(go_method_name("ui_data_by_id"), "UIDataByID");
+    }
+
+    #[test]
+    fn standalone_projection_ir_preserves_manager_semantics() {
+        let managers = validated_native_manager_specs();
+        let surfaces = manager_surfaces_from_managers(&managers).expect("manager surfaces");
+        let leaderboard_rewards = surfaces
+            .iter()
+            .find_map(|surface| match surface {
+                ManagerSurface::Semantic(record)
+                    if record.manager_name == "LeaderboardRewardsDataManager" =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("LeaderboardRewardsDataManager semantic surface");
+        assert_eq!(
+            leaderboard_rewards
+                .fields
+                .iter()
+                .find(|field| field.column == "Rotation")
+                .expect("Rotation projection")
+                .transform,
+            SemanticProjectionTransform::EnumString
+        );
+
+        let mission_weights = surfaces
+            .iter()
+            .find_map(|surface| match surface {
+                ManagerSurface::Semantic(record)
+                    if record.manager_name == "MissionWeightsDataManager" =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("MissionWeightsDataManager semantic surface");
+        assert_eq!(
+            mission_weights
+                .fields
+                .iter()
+                .find(|field| field.column == "MissionGoalType")
+                .expect("MissionGoalType projection")
+                .transform,
+            SemanticProjectionTransform::EnumStringSkipInvalid
+        );
+    }
+
+    #[test]
+    fn semantic_records_include_every_unrepresented_source_column() {
+        let mut record = SemanticManagerRecord {
+            manager_name: "ExampleDataManager".to_owned(),
+            manager_class_name: "ExampleDataManager".to_owned(),
+            record_type_name: "ExampleData".to_owned(),
+            tables: one_table("ExampleData", "ExampleData"),
+            key: Some(SemanticManagerKey::Crc {
+                key_field: "item_key".to_owned(),
+                crc_field: "item_id".to_owned(),
+                key_column: "ItemID".to_owned(),
+                skip_empty_key: true,
+                trim_key: false,
+                reject_zero_crc: false,
+                duplicate_key_policy: NativeDuplicateKeyPolicy::FirstWins,
+            }),
+            source_row_field: None,
+            source_row_method: None,
+            row_filters: Vec::new(),
+            fields: vec![SemanticRecordField {
+                name: "name".to_owned(),
+                column: "Name".to_owned(),
+                transform: SemanticProjectionTransform::OptionalString,
+                value_type: None,
+                default_value: None,
+                reference_field: None,
+                u16_max_exclusive: None,
+                enum_shape: None,
+                pair_first_enum_shape: None,
+            }],
+            lookup_methods: Vec::new(),
+            ids_method: None,
+            rows_method: None,
+            len_method: None,
+            is_empty_method: None,
+        };
+        let schema = GameSystemDataTablesSchemaReport {
+            tables: vec![crate::game_system_schema::GameSystemTableSchema {
+                table_name: "ExampleData".to_owned(),
+                table_name_crc: Crc32::from_str_lower("ExampleData").value(),
+                row_type_name: "ExampleData".to_owned(),
+                row_type_crc: Crc32::from_str_lower("ExampleData").value(),
+                row_count: 1,
+                sources: vec!["example.datasheet".to_owned()],
+                columns: vec![
+                    test_source_column("ItemID", ColumnType::String, true),
+                    test_source_column("Name", ColumnType::String, false),
+                    test_source_column("Hidden", ColumnType::Boolean, false),
+                    test_source_column("BaseDamage", ColumnType::Number, false),
+                ],
+            }],
+            diagnostics: Vec::new(),
+            type_affinities: Vec::new(),
+        };
+
+        append_unrepresented_schema_fields(&mut record, &schema);
+
+        assert_eq!(
+            record
+                .fields
+                .iter()
+                .filter(|field| field.column == "Name")
+                .count(),
+            1
+        );
+        assert!(record.fields.iter().all(|field| field.column != "ItemID"));
+        assert!(record.fields.iter().any(|field| {
+            field.name == "hidden" && field.transform == SemanticProjectionTransform::OptionalBool
+        }));
+        assert!(record.fields.iter().any(|field| {
+            field.name == "base_damage"
+                && field.transform == SemanticProjectionTransform::OptionalF32
+        }));
+    }
+
+    fn test_source_column(
+        name: &str,
+        declared_type: ColumnType,
+        row_key: bool,
+    ) -> GameSystemColumnSchema {
+        GameSystemColumnSchema {
+            name: name.to_owned(),
+            crc: Crc32::from_str_lower(name).value(),
+            declared_type,
+            row_key,
+            required: row_key,
+            non_empty_rows: 1,
+            empty_rows: 0,
+            distinct_values: 1,
+            value_shape: GameSystemColumnValueShape::String {
+                identifier_like: true,
+                localized_key_like: false,
+                asset_path_like: false,
+                expression_like: false,
+                list: None,
+                foreign_keys: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn manager_surfaces_emit_direct_or_implemented_semantic_apis_without_selection_lists() {
         let managers = validated_native_manager_specs();
@@ -1617,22 +2637,59 @@ mod tests {
             .iter()
             .map(|surface| match surface {
                 ManagerSurface::Direct(manager) => manager.manager_name.clone(),
+                ManagerSurface::Native { manager, .. } => manager.manager_name.clone(),
                 ManagerSurface::Semantic(manager) => manager.manager_name.clone(),
                 ManagerSurface::ItemData(manager) => manager.manager_name.clone(),
+                ManagerSurface::Composition(manager) => manager.manager_name.clone(),
                 ManagerSurface::ProductBacked(manager) => manager.manager_name.clone(),
             })
             .collect::<BTreeSet<_>>();
-        assert!(!emitted_names.is_empty());
+        let planned_names = managers
+            .iter()
+            .map(|manager| semantic_type_name(manager.rust_type().as_str()).to_owned())
+            .collect::<BTreeSet<_>>();
+        let missing_names = planned_names
+            .difference(&emitted_names)
+            .cloned()
+            .collect::<Vec<_>>();
         assert!(
-            surfaces
-                .iter()
-                .any(|surface| matches!(surface, ManagerSurface::Direct(_)))
+            missing_names.is_empty(),
+            "validated manager shapes without generated surfaces: {}",
+            missing_names.join(", ")
         );
+        let degraded_native_apis = surfaces
+            .iter()
+            .filter_map(|surface| match surface {
+                ManagerSurface::Direct(surface) => managers
+                    .iter()
+                    .find(|manager| {
+                        semantic_type_name(manager.rust_type().as_str()) == surface.manager_name
+                    })
+                    .and_then(|manager| manager.shape())
+                    .filter(|shape| shape.exposes_native_api())
+                    .map(|_| surface.manager_name.clone()),
+                ManagerSurface::Semantic(_)
+                | ManagerSurface::Native { .. }
+                | ManagerSurface::ItemData(_)
+                | ManagerSurface::Composition(_)
+                | ManagerSurface::ProductBacked(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            degraded_native_apis.is_empty(),
+            "native API managers degraded to direct table wrappers: {}",
+            degraded_native_apis.join(", ")
+        );
+        assert!(!emitted_names.is_empty());
         for surface in surfaces.iter().filter_map(|surface| match surface {
-            ManagerSurface::Direct(surface) | ManagerSurface::ProductBacked(surface) => {
-                Some(surface)
+            ManagerSurface::Direct(surface)
+            | ManagerSurface::Native {
+                manager: surface, ..
             }
-            ManagerSurface::Semantic(_) | ManagerSurface::ItemData(_) => None,
+            | ManagerSurface::ProductBacked(surface) => Some(surface),
+            ManagerSurface::Semantic(_)
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::Composition(_) => None,
         }) {
             assert!(
                 !surface.tables.is_empty() || !surface.products.is_empty(),
@@ -1644,8 +2701,10 @@ mod tests {
         for surface in surfaces.iter().filter_map(|surface| match surface {
             ManagerSurface::ProductBacked(surface) => Some(surface),
             ManagerSurface::Direct(_)
+            | ManagerSurface::Native { .. }
             | ManagerSurface::Semantic(_)
-            | ManagerSurface::ItemData(_) => None,
+            | ManagerSurface::ItemData(_)
+            | ManagerSurface::Composition(_) => None,
         }) {
             let manager = managers
                 .iter()
@@ -1660,49 +2719,7 @@ mod tests {
                 "`{}` product-backed surface should only be used for validated product-backed manager shapes",
                 surface.manager_name
             );
-            let dependencies = manager_surface_dependencies(
-                &ManagerSurface::ProductBacked(surface.clone()),
-                &manager.contract().inputs(),
-            );
-            assert!(
-                dependencies.iter().all(|dependency| !matches!(
-                    dependency,
-                    ManagerSurfaceDependency::Table { .. }
-                )),
-                "`{}` product-backed surface must not load table dependencies",
-                surface.manager_name
-            );
         }
-        let product_backed_names = surfaces
-            .iter()
-            .filter_map(|surface| match surface {
-                ManagerSurface::ProductBacked(surface) => Some(surface.manager_name.clone()),
-                ManagerSurface::Direct(_)
-                | ManagerSurface::Semantic(_)
-                | ManagerSurface::ItemData(_) => None,
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            product_backed_names,
-            BTreeSet::from([
-                "ArmorOffsetDataManager".to_owned(),
-                "CameraSettingsDataManager".to_owned(),
-                "EquipTypesDataManager".to_owned(),
-                "GameDebugSettingsManager".to_owned(),
-                "GatherableDataManager".to_owned(),
-                "PlayerDataManager".to_owned(),
-                "RecipeDataManager".to_owned(),
-                "SocialDataManager".to_owned(),
-                "UiDataManager".to_owned(),
-            ]),
-            "standalone product-backed manager set should match the documented parsed product surfaces"
-        );
-
-        assert!(
-            !emitted_names.contains("CurrencyExchangeMappingManager"),
-            "manager-composition algorithms without generated semantic methods must not emit empty direct surfaces"
-        );
-
         let backstory = surfaces
             .iter()
             .find_map(|surface| match surface {
@@ -1728,6 +2745,73 @@ mod tests {
         assert_eq!(
             backstory_by_key_lookup.kind,
             SemanticLookupKind::CrcStringKey
+        );
+
+        let mutation_perks = surfaces
+            .iter()
+            .find_map(|surface| match surface {
+                ManagerSurface::Semantic(record)
+                    if record.manager_name == "ElementalMutationPerksStaticDataManager" =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("ElementalMutationPerksStaticDataManager semantic surface");
+        let bucket2 = mutation_perks
+            .fields
+            .iter()
+            .find(|field| field.column == "InjectedPerkBucket2")
+            .expect("InjectedPerkBucket2 projection");
+        assert_eq!(bucket2.name, "injected_perk_bucket2_key");
+        assert_eq!(bucket2.transform, SemanticProjectionTransform::ForeignKey);
+        assert!(
+            mutation_perks
+                .fields
+                .iter()
+                .all(|field| !field.name.ends_with("_row"))
+        );
+
+        let leaderboard_rewards = surfaces
+            .iter()
+            .find_map(|surface| match surface {
+                ManagerSurface::Semantic(record)
+                    if record.manager_name == "LeaderboardRewardsDataManager" =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("LeaderboardRewardsDataManager semantic surface");
+        assert_eq!(
+            leaderboard_rewards
+                .fields
+                .iter()
+                .find(|field| field.column == "Rotation")
+                .expect("Rotation projection")
+                .transform,
+            SemanticProjectionTransform::EnumString
+        );
+
+        let mutation_difficulty = surfaces
+            .iter()
+            .find_map(|surface| match surface {
+                ManagerSurface::Semantic(record)
+                    if record.manager_name == "MutationDifficultyStaticDataManager" =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("MutationDifficultyStaticDataManager semantic surface");
+        assert_eq!(
+            mutation_difficulty
+                .fields
+                .iter()
+                .find(|field| field.column == "DifficultyTier")
+                .expect("DifficultyTier projection")
+                .transform,
+            SemanticProjectionTransform::NonZeroU8
         );
     }
 }

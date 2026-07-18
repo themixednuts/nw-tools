@@ -25,7 +25,7 @@ pub use self::action_condition_xor::ActionConditionXor;
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionMultiChild;
+pub struct ActionConditionMultiChild {}
 
 impl AzRtti for ActionConditionMultiChild {
     const NAME: &'static str = "ActionConditionMultiChild";

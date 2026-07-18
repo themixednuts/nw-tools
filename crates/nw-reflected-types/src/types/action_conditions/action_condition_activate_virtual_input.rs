@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionActivateVirtualInput;
+pub struct ActionConditionActivateVirtualInput {}
 
 impl AzRtti for ActionConditionActivateVirtualInput {
     const NAME: &'static str = "ActionConditionActivateVirtualInput";

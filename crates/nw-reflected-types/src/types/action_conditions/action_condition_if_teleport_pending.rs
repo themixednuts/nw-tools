@@ -17,7 +17,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     bevy_reflect::Reflect,
 )]
 #[reflect(Serialize, Deserialize)]
-pub struct ActionConditionIfTeleportPending;
+pub struct ActionConditionIfTeleportPending {}
 
 impl AzRtti for ActionConditionIfTeleportPending {
     const NAME: &'static str = "ActionConditionIfTeleportPending";

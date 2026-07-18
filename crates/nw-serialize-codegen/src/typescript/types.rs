@@ -4,12 +4,14 @@ use crate::types::{ResolvedType, ScalarType, SequenceKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeScriptTypeOptions {
     pub use_support_aliases: bool,
+    pub immutable: bool,
 }
 
 impl Default for TypeScriptTypeOptions {
     fn default() -> Self {
         Self {
             use_support_aliases: true,
+            immutable: false,
         }
     }
 }
@@ -35,9 +37,16 @@ impl TypeScriptTypeRenderer {
                 element,
                 capacity,
             } => self.render_sequence(*kind, element, *capacity),
-            ResolvedType::Map { key, value, .. } => {
-                format!("Map<{}, {}>", self.render(key), self.render(value))
-            }
+            ResolvedType::Map { key, value, .. } => format!(
+                "{}<{}, {}>",
+                if self.options.immutable {
+                    "ReadonlyMap"
+                } else {
+                    "Map"
+                },
+                self.render(key),
+                self.render(value)
+            ),
             ResolvedType::Asset { .. } => "Asset".to_owned(),
             ResolvedType::Uid { .. } => "Uuid".to_owned(),
             ResolvedType::ReplicatedField { value } => {
@@ -46,12 +55,26 @@ impl TypeScriptTypeRenderer {
             ResolvedType::RangedInteger { value, .. } => self.render(value),
             ResolvedType::ByteStream => "Uint8Array".to_owned(),
             ResolvedType::Pair { first, second } => {
-                format!("[{}, {}]", self.render(first), self.render(second))
+                format!(
+                    "{}[{}, {}]",
+                    if self.options.immutable {
+                        "readonly "
+                    } else {
+                        ""
+                    },
+                    self.render(first),
+                    self.render(second)
+                )
             }
             ResolvedType::Pointer { target, .. } => self.render_nullable(target),
             ResolvedType::Optional { value } => self.render_nullable(value),
             ResolvedType::Tuple { elements } => format!(
-                "[{}]",
+                "{}[{}]",
+                if self.options.immutable {
+                    "readonly "
+                } else {
+                    ""
+                },
                 elements
                     .iter()
                     .map(|element| self.render(element))
@@ -104,17 +127,42 @@ impl TypeScriptTypeRenderer {
         let element = self.render(element);
         match (kind, capacity) {
             (SequenceKind::Array, Some(capacity)) => {
-                format!("FixedArray<{element}, {capacity}>")
+                self.render_fixed_collection(format!("FixedArray<{element}, {capacity}>"))
             }
             (SequenceKind::FixedVector, Some(capacity)) => {
-                format!("FixedVector<{element}, {capacity}>")
+                self.render_fixed_collection(format!("FixedVector<{element}, {capacity}>"))
             }
-            (SequenceKind::BitSet, Some(capacity)) => format!("BitSet<{capacity}>"),
-            (SequenceKind::Set | SequenceKind::UnorderedSet, _) => format!("Set<{element}>"),
+            (SequenceKind::BitSet, Some(capacity)) => {
+                self.render_fixed_collection(format!("BitSet<{capacity}>"))
+            }
+            (SequenceKind::Set | SequenceKind::UnorderedSet, _) => format!(
+                "{}<{element}>",
+                if self.options.immutable {
+                    "ReadonlySet"
+                } else {
+                    "Set"
+                }
+            ),
             _ => {
                 let needs_parens = element_needs_array_parens(&element);
-                format!("{}[]", parenthesize_array_element(element, needs_parens))
+                format!(
+                    "{}{}[]",
+                    if self.options.immutable {
+                        "readonly "
+                    } else {
+                        ""
+                    },
+                    parenthesize_array_element(element, needs_parens)
+                )
             }
+        }
+    }
+
+    fn render_fixed_collection(&self, rendered: String) -> String {
+        if self.options.immutable {
+            format!("Readonly<{rendered}>")
+        } else {
+            rendered
         }
     }
 
@@ -137,7 +185,7 @@ pub(super) fn parenthesize_array_element(rendered: String, needs_parens: bool) -
 }
 
 pub(super) fn element_needs_array_parens(rendered: &str) -> bool {
-    rendered.contains(" | ")
+    rendered.contains(" | ") || rendered.starts_with("readonly ")
 }
 
 #[cfg(test)]
@@ -166,6 +214,7 @@ mod tests {
     fn renders_wire_primitives_when_support_aliases_are_disabled() {
         let renderer = TypeScriptTypeRenderer::new(TypeScriptTypeOptions {
             use_support_aliases: false,
+            immutable: false,
         });
 
         assert_eq!(
@@ -322,6 +371,26 @@ mod tests {
                 capacity: None,
             }),
             "(number | null)[]"
+        );
+    }
+
+    #[test]
+    fn immutable_mode_renders_nested_readonly_collections() {
+        let renderer = TypeScriptTypeRenderer::new(TypeScriptTypeOptions {
+            use_support_aliases: true,
+            immutable: true,
+        });
+
+        assert_eq!(
+            renderer.render(&ResolvedType::Sequence {
+                kind: SequenceKind::Vector,
+                element: Box::new(ResolvedType::Pair {
+                    first: Box::new(ResolvedType::Scalar(ScalarType::Crc32)),
+                    second: Box::new(ResolvedType::Scalar(ScalarType::F32)),
+                }),
+                capacity: None,
+            }),
+            "readonly (readonly [Crc32, number])[]"
         );
     }
 }
