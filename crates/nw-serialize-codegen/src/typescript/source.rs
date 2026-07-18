@@ -486,10 +486,8 @@ fn wrap_long_typescript_reexport_line(line: &str) -> Option<String> {
 
     let (keyword, rest) = if let Some(rest) = line.strip_prefix("export type { ") {
         ("export type", rest)
-    } else if let Some(rest) = line.strip_prefix("export { ") {
-        ("export", rest)
     } else {
-        return None;
+        ("export", line.strip_prefix("export { ")?)
     };
     let (names, module) = rest.split_once(" } from ")?;
     let module = module.strip_suffix(';')?;

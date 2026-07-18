@@ -991,10 +991,8 @@ impl SearchObjectStream {
 
         let mut rows = Vec::new();
         for result in batch.into_completed() {
-            match result {
-                Ok(mut hits) => rows.append(&mut hits),
-                Err(error) => return Err(error),
-            }
+            let mut hits = result?;
+            rows.append(&mut hits);
         }
 
         Ok(rows)

@@ -796,11 +796,10 @@ fn derive_normals_from_qtangents(
                 stride,
                 stride.checked_mul(subset.first_vertex)?,
             )
-        } else if let Some(data_ref) = cgf.data_refs().get(&id) {
+        } else {
+            let data_ref = cgf.data_refs().get(&id)?;
             let stride = data_ref.stride;
             (heap, stride, data_ref.offset + stride * subset.first_vertex)
-        } else {
-            return None;
         };
     if stride < 8 {
         return None;
@@ -854,7 +853,8 @@ fn read_bone_mapping(
     let (data, stride, start, entry_count): (&[u8], usize, usize, usize) =
         if let Some(stream) = cgf.data_streams().get(&id) {
             (stream.data, stream.element_size, 0, stream.element_count)
-        } else if let Some(data_ref) = cgf.data_refs().get(&id) {
+        } else {
+            let data_ref = cgf.data_refs().get(&id)?;
             let stride = data_ref.stride;
             (
                 heap,
@@ -862,8 +862,6 @@ fn read_bone_mapping(
                 data_ref.offset,
                 data_ref.size.checked_div(stride)?,
             )
-        } else {
-            return None;
         };
     decode_bone_mapping(
         data,
@@ -1055,7 +1053,8 @@ fn read_vec3_stream(
             let raw = decode_stream_vec3(stream.data, o, size, allow_half)?;
             push(&mut out, raw);
         }
-    } else if let Some(data_ref) = cgf.data_refs().get(&id) {
+    } else {
+        let data_ref = cgf.data_refs().get(&id)?;
         let stride = data_ref.stride;
         let base = data_ref.offset + stride * subset.first_vertex;
         for i in 0..count {
@@ -1071,8 +1070,6 @@ fn read_vec3_stream(
             };
             push(&mut out, raw);
         }
-    } else {
-        return None;
     }
     Some(out)
 }
@@ -1136,7 +1133,8 @@ fn read_uv_stream(
             };
             out.push(uv);
         }
-    } else if let Some(data_ref) = cgf.data_refs().get(&id) {
+    } else {
+        let data_ref = cgf.data_refs().get(&id)?;
         let stride = data_ref.stride;
         let base = data_ref.offset + stride * subset.first_vertex;
         for i in 0..count {
@@ -1148,8 +1146,6 @@ fn read_uv_stream(
             };
             out.push(uv);
         }
-    } else {
-        return None;
     }
     Some(out)
 }
@@ -1170,11 +1166,10 @@ fn read_indices(
         if let Some(stream) = cgf.data_streams().get(&id) {
             let stride = stream.element_size;
             (stream.data, stride, stride.checked_mul(subset.first_index)?)
-        } else if let Some(data_ref) = cgf.data_refs().get(&id) {
+        } else {
+            let data_ref = cgf.data_refs().get(&id)?;
             let stride = data_ref.stride;
             (heap, stride, data_ref.offset + stride * subset.first_index)
-        } else {
-            return None;
         };
 
     for i in 0..count {

@@ -1261,13 +1261,7 @@ fn unresolved_parameter_reason(name: &str, parameter_id: Option<u8>) -> Option<S
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        if value.trim().is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    })
+    value.filter(|value| !value.trim().is_empty())
 }
 
 fn ensure_example_attributes(

@@ -4072,7 +4072,7 @@ func (manager *{manager_type}) FurthestAttachmentOffset(armorOffsetNames []strin
 
 "#,
                     getter = getter,
-                    manager_type = &manager_type,
+                    manager_type = manager_type,
                 ));
             }
             NativeManagerProductKind::EquipTypesDatabase => {
@@ -4087,7 +4087,7 @@ func (manager *{manager_type}) EquipTypes() []EquipTypeData {{
 
 "#,
                     getter = getter,
-                    manager_type = &manager_type,
+                    manager_type = manager_type,
                 ));
             }
             NativeManagerProductKind::GameDebugSettings => {
@@ -4106,7 +4106,7 @@ func (manager *{manager_type}) DisabledCombatToggleCount() int {{
 
 "#,
                     getter = getter,
-                    manager_type = &manager_type,
+                    manager_type = manager_type,
                 ));
             }
             NativeManagerProductKind::UiDatabase => {
@@ -4133,7 +4133,7 @@ func (manager *{manager_type}) InteractOptionsByCategory(category int32) iter.Se
 
 "#,
                     getter = getter,
-                    manager_type = &manager_type,
+                    manager_type = manager_type,
                 ));
             }
             NativeManagerProductKind::GameCameraSettings => {
@@ -4148,7 +4148,7 @@ func (manager *{manager_type}) CameraStates() []CameraStateSettings {{
 
 "#,
                     getter = getter,
-                    manager_type = &manager_type,
+                    manager_type = manager_type,
                 ));
             }
             NativeManagerProductKind::PlayerBaseAttributes => {
@@ -4172,7 +4172,7 @@ func (manager *{manager_type}) MaxPerks(rarityLevel int) *int32 {{
 
 "#,
                     getter = getter,
-                    manager_type = &manager_type,
+                    manager_type = manager_type,
                 ));
             }
             NativeManagerProductKind::SettlementProgressionData => {
@@ -4187,7 +4187,7 @@ func (manager *{manager_type}) SettlementProgressionCategories() []ProgressionCa
 
 "#,
                     getter = getter,
-                    manager_type = &manager_type,
+                    manager_type = manager_type,
                 ));
             }
             NativeManagerProductKind::GatheringDatabase => {
@@ -4210,7 +4210,7 @@ func (manager *{manager_type}) GatheringActions() []GatheringAction {{
 
 "#,
                     getter = getter,
-                    manager_type = &manager_type,
+                    manager_type = manager_type,
                 ));
             }
             NativeManagerProductKind::GatheringActionDatabase => {
@@ -4225,7 +4225,7 @@ func (manager *{manager_type}) GatheringActionData() []GatheringActionData {{
 
 "#,
                     getter = getter,
-                    manager_type = &manager_type,
+                    manager_type = manager_type,
                 ));
             }
             NativeManagerProductKind::CraftingStationDatabase => {
@@ -4240,7 +4240,7 @@ func (manager *{manager_type}) CraftingStations() []CraftingStationData {{
 
 "#,
                     getter = getter,
-                    manager_type = &manager_type,
+                    manager_type = manager_type,
                 ));
             }
             NativeManagerProductKind::SocialRankDatabase => {
@@ -4255,7 +4255,7 @@ func (manager *{manager_type}) Ranks() []SocialRankData {{
 
 "#,
                     getter = getter,
-                    manager_type = &manager_type,
+                    manager_type = manager_type,
                 ));
             }
         }
