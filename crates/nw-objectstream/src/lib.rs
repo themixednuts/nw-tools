@@ -33,6 +33,7 @@ pub mod schema;
 pub mod serialize;
 pub mod slice_meta;
 pub mod stats;
+pub mod tag_component;
 pub mod type_uuid;
 pub mod types;
 pub mod value;

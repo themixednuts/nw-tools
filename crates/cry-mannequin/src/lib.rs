@@ -32,7 +32,7 @@ pub use blend_space::{
 };
 pub use fragment_audio::{
     AUDIO_PROCEDURAL_TYPE, CHARACTER_EVENT_PROCEDURAL_TYPE, DO_NOTHING_TRIGGER, MannequinAudioClip,
-    MannequinAudioKind, MannequinFragmentAudio,
+    MannequinAudioKind, MannequinCharacterEventOption, MannequinFragmentAudio,
 };
 pub use source_transform::{
     MANNEQUIN_ACTIONS_SOURCE_SCHEMA, MANNEQUIN_ANIMATION_DATABASE_SOURCE_SCHEMA,

@@ -534,6 +534,13 @@ pub(crate) trait AssetSource: Sync + nw_asset_graph::AssetSource {
     /// Resolve the material set for a mesh, using whatever the source affords —
     /// the catalog (install) or a sibling-directory scan (filesystem).
     fn materials(&self, cgf: &[u8], mesh: &MeshRef) -> Option<nw_model::MaterialSet>;
+
+    /// Whether serialized asset hints may identify products absent from a catalog.
+    /// Filesystem and in-memory test sources opt in; install sources require the
+    /// catalog identity to resolve.
+    fn allows_asset_hint_fallback(&self) -> bool {
+        false
+    }
 }
 
 /// Parse the first `.mtl` among `keys` that this source can read.
@@ -634,6 +641,10 @@ impl AssetSource for Tree {
         best.and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|xml| xml.parse::<nw_model::MaterialSet>().ok())
             .or_else(|| first_material(self, mesh.mtl_candidates()))
+    }
+
+    fn allows_asset_hint_fallback(&self) -> bool {
+        true
     }
 }
 

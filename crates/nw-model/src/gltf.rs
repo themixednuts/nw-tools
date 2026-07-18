@@ -13,6 +13,7 @@ use cry_animation::{AnimationClip, AnimationEvent, CafRootMotion};
 use glam::{Quat, Vec2, Vec3, Vec3A, Vec4};
 use serde::Serialize;
 
+use crate::animation_audio::{CryMannequinAnimationAudio, CryMannequinAudioClip};
 use crate::geometry::{AuxiliaryNode, AuxiliaryNodeRole, MeshRole, Model, Skeleton};
 use crate::material::{MapSlot, MaterialSet, SubMaterial};
 use crate::physics::{PhysicsScene, PhysicsSceneError, PhysicsVisualRole};
@@ -177,7 +178,10 @@ struct MaterialExtensions {
         skip_serializing_if = "Option::is_none"
     )]
     emissive_strength: Option<KhrMaterialsEmissiveStrength>,
-    #[serde(rename = "KHR_materials_unlit", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "KHR_materials_unlit",
+        skip_serializing_if = "Option::is_none"
+    )]
     unlit: Option<KhrMaterialsUnlit>,
 }
 
@@ -332,42 +336,6 @@ struct CryAnimationExtras {
     /// `audioTriggers` table as animevents.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     cry_mannequin_audio: Vec<CryMannequinAudioClip>,
-}
-
-/// One Mannequin fragment audio clip attached to a glTF animation.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CryMannequinAudioClip {
-    /// The audio key that resolves through `extras.audioTriggers`: an ATL
-    /// `StartTrigger` for a `type="Audio"` clip, or the resolved Wwise event
-    /// name for a `type="CharacterEvent"` clip (e.g. `Play_SFX_Alligator_Bite`).
-    pub trigger: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_trigger: Option<String>,
-    /// For a `type="CharacterEvent"` clip, the short `CharacterEventName` the
-    /// character audio handler expanded (e.g. `Bite`); `None` for a direct
-    /// `type="Audio"` ATL clip.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub character_event: Option<String>,
-    /// Skeleton joint the sound rides (e.g. `bind_mouth_web`).
-    pub joint: String,
-    /// Seconds from the clip start: an `Audio` clip's `<Blend StartTime>` or a
-    /// `CharacterEvent` clip's `<Blend ExitTime>`.
-    pub start_time: f32,
-    /// Owning Mannequin fragment name (e.g. `Attack_Bite`).
-    pub fragment: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub tags: String,
-}
-
-/// Mannequin fragment audio grouped by the glTF animation it attaches to. Carried
-/// on [`CryAssetExtras`] (not serialized there) so the exporter can distribute each
-/// animation's clips into its per-animation `cryMannequinAudio` extras.
-#[derive(Debug, Clone)]
-pub struct CryMannequinAnimationAudio {
-    /// Animation name that matches a fragment's AnimLayer `<Animation name>`.
-    pub animation: String,
-    pub clips: Vec<CryMannequinAudioClip>,
 }
 
 #[derive(Serialize)]

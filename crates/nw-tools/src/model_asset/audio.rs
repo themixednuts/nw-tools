@@ -5,10 +5,15 @@
 
 use super::*;
 
+mod catalog;
+
+use catalog::AudioCatalogs;
+
 /// Default ATL / preload documents shipped under `libs/gameaudio/wwise/`.
 const ATL_CONTROLS_PATH: &str = "libs/gameaudio/wwise/atl_controls.xml";
 const ATL_PRELOAD_PATH: &str = "libs/gameaudio/wwise/preloaddata.xml";
 const ATL_DEFAULT_CONTROLS_PATH: &str = "libs/gameaudio/wwise/default_controls.xml";
+const AUDIO_TAG_DATA_PATH: &str = "libs/gameaudio/wwise/audio_tag_data.csv";
 
 /// Resolve animation-event audio triggers end-to-end through the authored
 /// catalogs and ship the exact banks/media each trigger needs.
@@ -43,11 +48,48 @@ pub(super) fn resolve_animation_audio_triggers(
     ensure_atl_control_sources(source, resolved)?;
     let catalogs = AudioCatalogs::load(source, resolved)?;
 
-    // Expand Mannequin `CharacterEvent` short names (`Bite`, `VOX_Attack1`) to
-    // shipped Wwise events, or drop the clip when the catalog confirms none —
-    // this rewrites each clip's `trigger` in place so it flows through the same
-    // trigger→bank→HIRC pipeline below.
-    resolve_mannequin_character_events(&catalogs, resolved);
+    let mut unresolved_contexts = std::collections::BTreeSet::new();
+    for entry in &mut resolved.extras.mannequin_audio {
+        for clip in &mut entry.clips {
+            character_event::map_clip(clip, &catalogs);
+            if clip.character_event.is_some() && clip.context.is_none() {
+                unresolved_contexts.insert(format!(
+                    "{} (no same-entity receiver context)",
+                    clip.character_event.as_deref().unwrap_or_default()
+                ));
+            } else if clip.context.as_ref().is_some_and(|context| {
+                context.receivers.iter().any(|receiver| {
+                    matches!(
+                        receiver,
+                        nw_model::CryCharacterEventReceiver::CommonNpcAudio { .. }
+                            | nw_model::CryCharacterEventReceiver::MountAudio { .. }
+                    )
+                })
+            }) && clip
+                .dispatches
+                .iter()
+                .all(|dispatch| dispatch.valid_tag.is_none())
+            {
+                let context = clip.context.as_ref().expect("checked above");
+                unresolved_contexts.insert(format!(
+                    "{} entity {} in {} (no ValidTag CRC match)",
+                    clip.character_event.as_deref().unwrap_or_default(),
+                    context.entity_id,
+                    context.scene_path
+                ));
+            }
+        }
+    }
+    if !unresolved_contexts.is_empty() {
+        eprintln!(
+            "note: {} CharacterEvent receiver context(s) produced no tag-scoped audio: {}",
+            unresolved_contexts.len(),
+            unresolved_contexts
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let mut triggers = collect_animation_audio_triggers(resolved);
     if triggers.is_empty() {
@@ -131,21 +173,36 @@ fn collect_animation_audio_triggers(resolved: &ResolvedAsset) -> Vec<AudioCandid
             }
         }
     }
-    // Mannequin fragment audio clips fire ATL triggers directly (creature
-    // vocals/actions). They resolve like a direct `sound` event: the trigger name
-    // is the ATL control itself.
     for entry in &resolved.extras.mannequin_audio {
         for clip in &entry.clips {
-            for trigger in [Some(clip.trigger.as_str()), clip.stop_trigger.as_deref()]
-                .into_iter()
-                .flatten()
-            {
-                let trigger = trigger.trim();
-                if !trigger.is_empty() {
-                    triggers.push(AudioCandidate {
-                        parameter: trigger.to_owned(),
-                        is_footstep: false,
-                    });
+            if clip.character_event.is_none() {
+                for trigger in [Some(clip.trigger.as_str()), clip.stop_trigger.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let trigger = trigger.trim();
+                    if !trigger.is_empty() {
+                        triggers.push(AudioCandidate {
+                            parameter: trigger.to_owned(),
+                            is_footstep: false,
+                        });
+                    }
+                }
+            }
+            for dispatch in &clip.dispatches {
+                for operation in &dispatch.operations {
+                    let nw_model::CryCharacterEventOperation::AudioControl { control, .. } =
+                        operation
+                    else {
+                        continue;
+                    };
+                    let control = control.trim();
+                    if !control.is_empty() {
+                        triggers.push(AudioCandidate {
+                            parameter: control.to_owned(),
+                            is_footstep: false,
+                        });
+                    }
                 }
             }
         }
@@ -157,93 +214,18 @@ fn collect_animation_audio_triggers(resolved: &ResolvedAsset) -> Vec<AudioCandid
 /// gates as audio with a parameter, or any Mannequin fragment-audio clip. Used to
 /// skip the catalog load on assets with no audio.
 fn has_any_audio_work(resolved: &ResolvedAsset) -> bool {
-    let has_animevent = resolved.animations.iter().any(|animation| {
-        animation.clip.events.iter().any(|event| {
-            audio_event_kind(event).is_some() && !event.parameter.trim().is_empty()
-        })
-    });
+    let has_animevent =
+        resolved.animations.iter().any(|animation| {
+            animation.clip.events.iter().any(|event| {
+                audio_event_kind(event).is_some() && !event.parameter.trim().is_empty()
+            })
+        });
     has_animevent
         || resolved
             .extras
             .mannequin_audio
             .iter()
             .any(|entry| !entry.clips.is_empty())
-}
-
-/// Expand every Mannequin `CharacterEvent` clip's short name to a shipped Wwise
-/// event through the catalog, rewriting the clip's `trigger` in place. A clip
-/// whose short name the catalog confirms as no event is dropped (never shipped
-/// with a guessed trigger), matching the footstep surface discipline.
-fn resolve_mannequin_character_events(catalogs: &AudioCatalogs, resolved: &mut ResolvedAsset) {
-    let tags = catalogs.character_audio_tags();
-    let mut dropped: Vec<String> = Vec::new();
-    for entry in &mut resolved.extras.mannequin_audio {
-        entry.clips.retain_mut(|clip| {
-            let Some(short_name) = clip.character_event.clone() else {
-                // A direct `type="Audio"` ATL clip already carries a real trigger.
-                return true;
-            };
-            match catalogs.resolve_character_event(&tags, &short_name) {
-                Some(event) => {
-                    clip.trigger = event;
-                    true
-                }
-                None => {
-                    dropped.push(short_name);
-                    false
-                }
-            }
-        });
-    }
-    if !dropped.is_empty() {
-        dropped.sort();
-        dropped.dedup();
-        eprintln!(
-            "note: {} Mannequin CharacterEvent name(s) matched no catalog event and were dropped: {}",
-            dropped.len(),
-            dropped.join(", ")
-        );
-    }
-}
-
-/// The character audio tag(s) a Wwise event name carries: the token after
-/// `Play_`/`Stop_` and an optional `SFX`/`VOX`/`MMFX` type token
-/// (`Play_SFX_Aligator_Body_Mvt` → `Aligator`, `Play_Alligator_Breathing` →
-/// `Alligator`). `None` when the name does not fit the template.
-fn character_tag_from_event(name: &str) -> Option<String> {
-    let mut parts = name.split('_').filter(|part| !part.is_empty());
-    let verb = parts.next()?;
-    if !verb.eq_ignore_ascii_case("Play") && !verb.eq_ignore_ascii_case("Stop") {
-        return None;
-    }
-    let second = parts.next()?;
-    let tag = if audio_type_token(second).is_some() {
-        parts.next()?
-    } else {
-        second
-    };
-    (!tag.is_empty()).then(|| tag.to_owned())
-}
-
-/// The canonical Wwise audio type token (`SFX`/`VOX`/`MMFX`) a token names,
-/// case-insensitively, or `None`.
-fn audio_type_token(token: &str) -> Option<&'static str> {
-    ["SFX", "VOX", "MMFX"]
-        .into_iter()
-        .find(|candidate| token.eq_ignore_ascii_case(candidate))
-}
-
-/// Split a `SFX_`/`VOX_`/`MMFX_` prefix off a short character-event name:
-/// `VOX_Attack1` → `(Some("VOX"), Some("Attack1"))`; anything else →
-/// `(None, None)`.
-fn split_audio_type_prefix(name: &str) -> (Option<&'static str>, Option<String>) {
-    if let Some((first, rest)) = name.split_once('_')
-        && let Some(token) = audio_type_token(first)
-        && !rest.is_empty()
-    {
-        return (Some(token), Some(rest.to_owned()));
-    }
-    (None, None)
 }
 
 /// `Some(true)` for a footstep event (parameter → FX library), `Some(false)` for
@@ -274,6 +256,7 @@ fn ensure_atl_control_sources(
         ATL_CONTROLS_PATH,
         ATL_PRELOAD_PATH,
         ATL_DEFAULT_CONTROLS_PATH,
+        AUDIO_TAG_DATA_PATH,
         cry_audio::WWISE_TRIGGER_BANK_MAP_FILE,
     ] {
         if has_source_asset(&resolved.extras, path) {
@@ -325,8 +308,8 @@ fn resolve_one_audio_trigger(
     if event_names.is_empty() {
         // Fallback: an ATL trigger that is itself an authored Wwise event name.
         for atl_trigger in &atl_triggers {
-            if catalogs.knows_event_name(atl_trigger) {
-                event_names.push(atl_trigger.clone());
+            if let Some(canonical) = catalogs.canonical_event_name(atl_trigger) {
+                event_names.push(canonical);
             }
         }
     }
@@ -519,7 +502,10 @@ fn accumulate_surface_branches(
 }
 
 fn branch_entry(branches: &mut Vec<SurfaceBranch>, switch_id: u32) -> &mut SurfaceBranch {
-    if let Some(index) = branches.iter().position(|entry| entry.switch_id == switch_id) {
+    if let Some(index) = branches
+        .iter()
+        .position(|entry| entry.switch_id == switch_id)
+    {
         return &mut branches[index];
     }
     branches.push(SurfaceBranch {
@@ -697,7 +683,8 @@ impl<'a> BankStore<'a> {
             .read(path)
             .and_then(|bytes| cry_audio::WwiseSoundBank::parse(&bytes).ok())
             .map(Arc::new);
-        self.parsed.insert(path.to_ascii_lowercase(), parsed.clone());
+        self.parsed
+            .insert(path.to_ascii_lowercase(), parsed.clone());
         parsed
     }
 
@@ -709,646 +696,5 @@ impl<'a> BankStore<'a> {
     }
 }
 
-fn parse_audio_controls_document(
-    source: &dyn AssetSource,
-    path: &str,
-) -> Result<Option<cry_audio::AudioControlsSource>> {
-    let Some(bytes) = source.read(path) else {
-        return Ok(None);
-    };
-    let xml =
-        str::from_utf8(&bytes).with_context(|| format!("decode UTF-8 ATL controls {path}"))?;
-    let controls = cry_audio::AudioControlsSource::from_xml(path, xml)
-        .with_context(|| format!("parse ATL controls {path}"))?;
-    Ok(Some(controls))
-}
-
-fn collect_wwise_event_names(reference: &cry_audio::AudioBackendReference, out: &mut Vec<String>) {
-    if reference.kind == cry_audio::AudioBackendReferenceKind::WwiseEvent {
-        if let Some(name) = reference
-            .wwise_name
-            .as_deref()
-            .or(reference.atl_name.as_deref())
-        {
-            let name = name.trim();
-            if !name.is_empty() {
-                out.push(name.to_owned());
-            }
-        }
-    }
-    for child in &reference.children {
-        collect_wwise_event_names(child, out);
-    }
-}
-
-/// Collect every `wwise_name` in a backend-reference subtree (a switch definition
-/// nests `WwiseSwitch` → `WwiseValue`); the switch-state value name the engine
-/// hashes is among them.
-fn collect_wwise_value_names(reference: &cry_audio::AudioBackendReference, out: &mut Vec<String>) {
-    if let Some(name) = reference.wwise_name.as_deref().or(reference.atl_name.as_deref()) {
-        let name = name.trim();
-        if !name.is_empty() {
-            out.push(name.to_owned());
-        }
-    }
-    for child in &reference.children {
-        collect_wwise_value_names(child, out);
-    }
-}
-
-/// The authored audio catalogs, parsed once per export to drive trigger
-/// resolution without any name/stem matching.
-struct AudioCatalogs {
-    /// Every loaded ATL control document (discovery + `--audio`).
-    controls: Vec<cry_audio::AudioControlsSource>,
-    /// Wwise trigger-bank map entries (empty when the install ships none).
-    trigger_bank_map: Vec<cry_audio::WwiseTriggerBankMapEntry>,
-    /// `AZ::Crc32(bank stem)` → catalog bank path, over the whole preload
-    /// catalog. Lets the trigger-bank map's crc fields resolve to bank paths.
-    crc_to_bank: std::collections::HashMap<u32, String>,
-    /// Preload config-group bank sets, for the fallback bank lookup. A group
-    /// bundles an event bank with its media bank(s), so the whole group is the
-    /// candidate set once one member defines the event.
-    preload_groups: Vec<Vec<String>>,
-    /// Wwise event name → id, from the shipped event-id mapping CSVs.
-    event_ids: std::collections::HashMap<String, u32>,
-}
-
-impl AudioCatalogs {
-    fn load(source: &dyn AssetSource, resolved: &ResolvedAsset) -> Result<Self> {
-        let mut controls = Vec::new();
-        for asset in &resolved.extras.source_assets {
-            if matches!(asset.kind, nw_model::CrySourceAssetKind::AudioControls) {
-                if let Some(document) = parse_audio_controls_document(source, &asset.path)? {
-                    controls.push(document);
-                }
-            }
-        }
-
-        let mut crc_to_bank = std::collections::HashMap::new();
-        let mut preload_groups = Vec::new();
-        for control in &controls {
-            for group in preload_bank_groups(control) {
-                for path in &group {
-                    crc_to_bank
-                        .entry(cry_audio::az_crc32(bank_stem(path).as_bytes()))
-                        .or_insert_with(|| path.clone());
-                }
-                if !group.is_empty() {
-                    preload_groups.push(group);
-                }
-            }
-        }
-
-        let trigger_bank_map = source
-            .read(cry_audio::WWISE_TRIGGER_BANK_MAP_FILE)
-            .and_then(|bytes| {
-                cry_audio::WwiseTriggerBankMap::parse(&bytes)
-                    .ok()
-                    .map(|map| map.entries().collect::<Vec<_>>())
-            })
-            .unwrap_or_default();
-
-        let mut event_ids = std::collections::HashMap::new();
-        for asset in &resolved.extras.source_assets {
-            if !matches!(asset.kind, nw_model::CrySourceAssetKind::AudioMapping) {
-                continue;
-            }
-            let Some(bytes) = source.read(&asset.path) else {
-                continue;
-            };
-            // Re-parse the mapping CSV with the typed parser; a malformed or
-            // non-event-id mapping is skipped rather than failing the export.
-            if let Ok(cry_audio::AudioMappingDocument::EventIds(ids)) =
-                cry_audio::parse_audio_mapping(&asset.path, &bytes)
-            {
-                for entry in ids.events {
-                    event_ids.insert(entry.name, entry.id);
-                }
-            }
-        }
-
-        Ok(Self {
-            controls,
-            trigger_bank_map,
-            crc_to_bank,
-            preload_groups,
-            event_ids,
-        })
-    }
-
-    /// The Wwise event name(s) an ATL trigger fans out to, plus its playback
-    /// info. Empty when the parameter is not an authored ATL trigger.
-    fn trigger_events(
-        &self,
-        trigger: &str,
-    ) -> (Vec<String>, Option<nw_model::AudioTriggerPlayback>) {
-        let mut events = Vec::new();
-        let mut playback = None;
-        for control in &self.controls {
-            let Some(atl) = control
-                .triggers
-                .iter()
-                .find(|entry| entry.name.eq_ignore_ascii_case(trigger))
-            else {
-                continue;
-            };
-            for request in &atl.requests {
-                collect_wwise_event_names(request, &mut events);
-            }
-            if playback.is_none() {
-                if let Some(info) = &atl.playback_info {
-                    playback = Some(nw_model::AudioTriggerPlayback {
-                        max_radius: info.max_radius,
-                        max_duration: info.max_duration,
-                    });
-                }
-            }
-        }
-        (events, playback)
-    }
-
-    /// The Wwise object id for an event name: the authored mapping-CSV id when
-    /// present, else the FNV-1 hash the engine derives from the name.
-    fn event_id(&self, name: &str) -> u32 {
-        self.event_ids
-            .iter()
-            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
-            .map(|(_, id)| *id)
-            .unwrap_or_else(|| cry_audio::WwiseNameId::from_name(name).0)
-    }
-
-    fn knows_event_name(&self, name: &str) -> bool {
-        self.canonical_event_name(name).is_some()
-    }
-
-    /// The event-id catalog's canonical spelling of an event name (its exact CSV
-    /// casing), matched case-insensitively, or `None` when no event matches.
-    fn canonical_event_name(&self, name: &str) -> Option<String> {
-        self.event_ids
-            .keys()
-            .find(|candidate| candidate.eq_ignore_ascii_case(name))
-            .cloned()
-    }
-
-    /// Whether an ATL trigger with this exact name is authored in the loaded
-    /// audio-controls (the first hop a `CharacterEvent` short name tries).
-    fn has_trigger(&self, name: &str) -> bool {
-        self.controls.iter().any(|control| {
-            control
-                .triggers
-                .iter()
-                .any(|trigger| trigger.name.eq_ignore_ascii_case(name))
-        })
-    }
-
-    /// The character audio tag(s) the loaded event-id catalog uses, most-frequent
-    /// first — derived from the shipped event names themselves, never hardcoded.
-    /// New World's alligator catalog mixes the correct `Alligator` with the
-    /// misspelled `Aligator`, so both are returned; candidate validation against
-    /// the CSV keeps only names that are real events.
-    fn character_audio_tags(&self) -> Vec<String> {
-        let mut counts: Vec<(String, usize)> = Vec::new();
-        for name in self.event_ids.keys() {
-            let Some(tag) = character_tag_from_event(name) else {
-                continue;
-            };
-            if let Some(entry) = counts
-                .iter_mut()
-                .find(|(existing, _)| existing.eq_ignore_ascii_case(&tag))
-            {
-                entry.1 += 1;
-            } else {
-                counts.push((tag, 1));
-            }
-        }
-        counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-        counts.into_iter().map(|(tag, _)| tag).collect()
-    }
-
-    /// Resolve a Mannequin `CharacterEvent` short name (`Bite`, `VOX_Attack1`) to
-    /// a shipped Wwise event, catalog-validated at every hop:
-    ///   a. the short name is itself an authored ATL trigger → use it directly;
-    ///   b. else derive candidate Wwise event names by the observed template
-    ///      (`Play_SFX_<Tag>_<Name>`, and `Play_<TYPE>_<Tag>_<rest>` for a
-    ///      `VOX_`/`SFX_`/`MMFX_`-prefixed name) over each character tag and keep
-    ///      the first the event-id catalog confirms.
-    /// `None` when nothing in the catalog confirms a candidate (drop, don't guess).
-    fn resolve_character_event(&self, tags: &[String], short_name: &str) -> Option<String> {
-        let short = short_name.trim();
-        if short.is_empty() {
-            return None;
-        }
-        // (a) Direct ATL trigger — resolves through the ATL → event pipeline.
-        if self.has_trigger(short) {
-            return Some(short.to_owned());
-        }
-        // (b) Template-then-validate against the event-id catalog.
-        let (type_token, typed_rest) = split_audio_type_prefix(short);
-        for tag in tags {
-            let default = format!("Play_SFX_{tag}_{short}");
-            if let Some(name) = self.canonical_event_name(&default) {
-                return Some(name);
-            }
-            if let (Some(type_token), Some(rest)) = (type_token, typed_rest.as_deref()) {
-                let typed = format!("Play_{type_token}_{tag}_{rest}");
-                if let Some(name) = self.canonical_event_name(&typed) {
-                    return Some(name);
-                }
-            }
-        }
-        None
-    }
-
-    /// The Wwise switch/state value name(s) an ATL switch definition maps a
-    /// `(group, state)` pair to (e.g. `SurfaceType`/`metal` → `WwiseValue`
-    /// `metal`). These are the strings the engine FNV-hashes into the switch id
-    /// stored in a `CAkSwitchCntr` branch, so a caller validates the hash against
-    /// the authored branch ids. Empty when no ATL switch defines the pair.
-    fn wwise_switch_state_names(&self, group: &str, state: &str) -> Vec<String> {
-        let mut names = Vec::new();
-        for control in &self.controls {
-            for switch in control.switches.iter().chain(&control.states) {
-                if !switch.name.eq_ignore_ascii_case(group) {
-                    continue;
-                }
-                for switch_state in &switch.states {
-                    if !switch_state.name.eq_ignore_ascii_case(state) {
-                        continue;
-                    }
-                    for request in &switch_state.requests {
-                        collect_wwise_value_names(request, &mut names);
-                    }
-                }
-            }
-        }
-        names
-    }
-
-    /// Banks the trigger-bank map associates with an event name. A single record
-    /// carries the event-defining and media-owning bank crcs alongside the
-    /// event's `AZ::Crc32`, so the resolved banks are exactly the record's crc
-    /// fields that name a known preload bank.
-    fn map_banks(&self, event_name: &str) -> Vec<String> {
-        let event = u64::from(cry_audio::AudioControlId::from_name(event_name).0);
-        let mut banks = Vec::new();
-        for entry in &self.trigger_bank_map {
-            let fields = [
-                u64::from(entry.bank_id.0),
-                entry.control_ids[0].0,
-                entry.control_ids[1].0,
-                entry.control_ids[2].0,
-            ];
-            if !fields.contains(&event) {
-                continue;
-            }
-            for field in fields {
-                if let Ok(field) = u32::try_from(field) {
-                    if let Some(path) = self.crc_to_bank.get(&field) {
-                        push_unique_path(&mut banks, path);
-                    }
-                }
-            }
-        }
-        banks
-    }
-
-    /// Fallback for events the trigger-bank map does not cover: the preload
-    /// group whose banks include one whose HIRC defines the event id.
-    ///
-    /// Bank parses are served from `banks`, so each candidate bank is read and
-    /// parsed at most once across the whole resolution — the scan touches only
-    /// the light HIRC index, never a bank's raw media DATA.
-    fn preload_banks_defining_event(&self, banks: &mut BankStore, event_id: u32) -> Vec<String> {
-        let event = cry_audio::WwiseObjectId(event_id);
-        for group in &self.preload_groups {
-            let defines = group
-                .iter()
-                .any(|path| banks.parsed(path).is_some_and(|bank| bank.defines_event(event)));
-            if defines {
-                return group.clone();
-            }
-        }
-        Vec::new()
-    }
-}
-
-/// Bank sets per ATL preload request / config group, as catalog paths.
-fn preload_bank_groups(control: &cry_audio::AudioControlsSource) -> Vec<Vec<String>> {
-    control
-        .preloads
-        .iter()
-        .map(|preload| {
-            let mut banks = Vec::new();
-            for file in preload
-                .files
-                .iter()
-                .chain(preload.config_groups.iter().flat_map(|group| &group.files))
-            {
-                push_unique_path(&mut banks, &preload_bank_path(&file.wwise_name));
-            }
-            banks
-        })
-        .filter(|banks| !banks.is_empty())
-        .collect()
-}
-
-fn preload_bank_path(wwise_name: &str) -> String {
-    let name = normalize_path(wwise_name);
-    if name.contains('/') {
-        name
-    } else {
-        format!("sounds/wwise/{name}")
-    }
-}
-
-/// The bank-name stem the `AZ::Crc32` catalog keys hash: the basename with the
-/// `.bnk` extension removed.
-fn bank_stem(path: &str) -> String {
-    let base = path.rsplit('/').next().unwrap_or(path);
-    base.strip_suffix(".bnk")
-        .unwrap_or(base)
-        .to_ascii_lowercase()
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model_asset::tests::{ContextSource, EmptySource};
-
-    #[test]
-    fn audio_trigger_resolution_is_catalog_driven_not_name_shaped() {
-        let controls = cry_audio::AudioControlsSource::from_xml(
-            "libs/gameaudio/wwise/atl_controls.xml",
-            r#"<ATLConfig atl_name="main">
-                 <AudioTriggers>
-                   <ATLTrigger atl_name="blend_ftsp_alligator">
-                     <WwiseEvent wwise_name="blend_ftsp_alligator"/>
-                   </ATLTrigger>
-                 </AudioTriggers>
-               </ATLConfig>"#,
-        )
-        .unwrap();
-        let mut event_ids = std::collections::HashMap::new();
-        event_ids.insert("Play_BareEvent".to_owned(), 4242u32);
-        let catalogs = AudioCatalogs {
-            controls: vec![controls],
-            trigger_bank_map: Vec::new(),
-            crc_to_bank: std::collections::HashMap::new(),
-            preload_groups: Vec::new(),
-            event_ids,
-        };
-
-        let mut banks = BankStore::new(&EmptySource);
-
-        // A parameter that matches no ATL trigger and no event-id table entry is
-        // dropped — even though its name shape looks exactly like a footstep
-        // blend trigger, there is no prefix acceptance.
-        assert!(
-            resolve_one_audio_trigger(
-                &EmptySource,
-                &mut banks,
-                &catalogs,
-                "blend_ftsp_unlisted",
-                false
-            )
-            .unwrap()
-            .is_none()
-        );
-
-        // Resolves via the ATL trigger → Wwise event.
-        let atl = resolve_one_audio_trigger(
-            &EmptySource,
-            &mut banks,
-            &catalogs,
-            "blend_ftsp_alligator",
-            false,
-        )
-        .unwrap()
-        .expect("ATL trigger resolves");
-        assert_eq!(atl.wwise_events.len(), 1);
-        assert_eq!(atl.wwise_events[0].name, "blend_ftsp_alligator");
-
-        // Resolves as a bare Wwise event name present in the event-id table.
-        let bare =
-            resolve_one_audio_trigger(&EmptySource, &mut banks, &catalogs, "Play_BareEvent", false)
-                .unwrap()
-                .expect("bare event name resolves");
-        assert_eq!(bare.wwise_events[0].id, Some(4242));
-    }
-
-    #[test]
-    fn audio_event_kind_distinguishes_footstep_from_direct_and_ignores_others() {
-        let footstep = cry_animation::AnimationEvent {
-            name: "footstep".into(),
-            name_lowercase_crc32: 0,
-            normalized_time: 0.5,
-            normalized_end_time: 0.5,
-            parameter: "blend_ftsp_alligator".into(),
-            bone: String::new(),
-            second_bone: String::new(),
-            offset: [0.0; 3],
-            direction: [0.0; 3],
-            model: String::new(),
-            source: cry_xml::XmlElement {
-                name: "event".into(),
-                attributes: Default::default(),
-                children: Vec::new(),
-                text: String::new(),
-            },
-        };
-        assert_eq!(audio_event_kind(&footstep), Some(true));
-        let direct = cry_animation::AnimationEvent {
-            name: "sound".into(),
-            ..footstep.clone()
-        };
-        assert_eq!(audio_event_kind(&direct), Some(false));
-        let unrelated = cry_animation::AnimationEvent {
-            name: "hit".into(),
-            parameter: String::new(),
-            ..footstep.clone()
-        };
-        assert_eq!(audio_event_kind(&unrelated), None);
-    }
-
-    fn empty_catalogs() -> AudioCatalogs {
-        AudioCatalogs {
-            controls: Vec::new(),
-            trigger_bank_map: Vec::new(),
-            crc_to_bank: std::collections::HashMap::new(),
-            preload_groups: Vec::new(),
-            event_ids: std::collections::HashMap::new(),
-        }
-    }
-
-    fn metal_fxlib() -> cry_audio::MaterialEffectsLibrary {
-        cry_audio::MaterialEffectsLibrary::from_xml(
-            "libs/materialeffects/fxlibs/blend_ftsp_test.xml",
-            r#"<FXLib type="playerfootstep">
-                 <Effect name="metal">
-                   <Audio trigger="t"><Switch name="SurfaceType" state="metal"/></Audio>
-                 </Effect>
-               </FXLib>"#,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn surface_name_resolves_only_when_the_hash_validates() {
-        let library = metal_fxlib();
-        let catalogs = empty_catalogs();
-        // The FX-library surface state "metal" hashes to the branch switch id →
-        // the branch is tagged.
-        let metal_id = cry_audio::WwiseNameId::from_name("metal").0;
-        assert_eq!(
-            resolve_surface_name(metal_id, Some(&library), &catalogs).as_deref(),
-            Some("metal")
-        );
-        // A switch id that no surface state hash matches (the alligator's real
-        // creature switch) resolves to nothing — kept by id only, never guessed.
-        assert_eq!(
-            resolve_surface_name(0xDEAD_BEEF, Some(&library), &catalogs),
-            None
-        );
-    }
-
-    #[test]
-    fn build_surface_media_marks_default_and_keeps_unresolved_branches_by_id() {
-        let branches = vec![
-            SurfaceBranch {
-                switch_id: cry_audio::WwiseNameId::from_name("metal").0,
-                is_default: true,
-                media: [10u32, 20].into_iter().collect(),
-                sequence: vec![20, 10, 20],
-            },
-            SurfaceBranch {
-                switch_id: 999,
-                is_default: false,
-                media: [30u32].into_iter().collect(),
-                sequence: Vec::new(),
-            },
-        ];
-        let library = metal_fxlib();
-        let catalogs = empty_catalogs();
-        let default_media: std::collections::BTreeSet<u32> = [10, 20].into_iter().collect();
-
-        let out =
-            build_surface_media(branches, &default_media, Some(&library), &catalogs, "blend_ftsp_test");
-        assert_eq!(out.len(), 2);
-        // Default branch: resolved surface, media pool, weighted sequence.
-        assert_eq!(out[0].surface.as_deref(), Some("metal"));
-        assert!(out[0].default);
-        assert_eq!(out[0].media, vec![10, 20]);
-        assert_eq!(out[0].sequence, vec![20, 10, 20]);
-        // Unresolved branch: kept by id, no surface, no sequence.
-        assert_eq!(out[1].surface, None);
-        assert!(!out[1].default);
-        assert_eq!(out[1].switch_id, 999);
-        assert!(out[1].sequence.is_empty());
-    }
-
-    /// A catalog seeded with the real `npc_alligator_events.csv` event names,
-    /// including the mixed `Alligator`/`Aligator` spellings the shipped file uses.
-    fn alligator_event_catalogs() -> AudioCatalogs {
-        let mut event_ids = std::collections::HashMap::new();
-        for (name, id) in [
-            ("Play_SFX_Alligator_Bite", 3440898348u32),
-            ("Play_VOX_Alligator_Attack1", 1858679537),
-            ("Play_VOX_Alligator_Attack2", 1858679538),
-            ("Play_VOX_Alligator_Chatters", 2839370678),
-            ("Play_VOX_Alligator_Alert", 4122091654),
-            ("Play_VOX_Alligator_Hurt", 441453735),
-            ("Play_VOX_Alligator_Death", 1651525330),
-            ("Play_SFX_Aligator_Tail_Whip_Fast", 566522816),
-            ("Play_SFX_Aligator_Tail_Swipe", 2977758565),
-            ("Play_Alligator_Breathing", 2750234764),
-        ] {
-            event_ids.insert(name.to_owned(), id);
-        }
-        AudioCatalogs {
-            controls: Vec::new(),
-            trigger_bank_map: Vec::new(),
-            crc_to_bank: std::collections::HashMap::new(),
-            preload_groups: Vec::new(),
-            event_ids,
-        }
-    }
-
-    #[test]
-    fn character_tag_is_derived_from_event_names_most_frequent_first() {
-        let catalogs = alligator_event_catalogs();
-        let tags = catalogs.character_audio_tags();
-        // `Alligator` (7) outnumbers the misspelled `Aligator` (2), so it leads;
-        // both are present so either spelling's events can be validated.
-        assert_eq!(tags.first().map(String::as_str), Some("Alligator"));
-        assert!(tags.iter().any(|tag| tag == "Aligator"));
-    }
-
-    #[test]
-    fn character_event_resolves_short_name_only_against_the_catalog() {
-        let catalogs = alligator_event_catalogs();
-        let tags = catalogs.character_audio_tags();
-
-        // Bare name → default SFX template, validated against the CSV.
-        assert_eq!(
-            catalogs
-                .resolve_character_event(&tags, "Bite")
-                .as_deref(),
-            Some("Play_SFX_Alligator_Bite")
-        );
-        // `VOX_`-prefixed name → typed template `Play_VOX_<Tag>_<rest>` (the SFX
-        // default `Play_SFX_Alligator_VOX_Attack1` is not in the catalog).
-        assert_eq!(
-            catalogs
-                .resolve_character_event(&tags, "VOX_Attack1")
-                .as_deref(),
-            Some("Play_VOX_Alligator_Attack1")
-        );
-        // A name whose only catalog spelling is the misspelled tag still resolves
-        // because both tags are tried and validated.
-        assert_eq!(
-            catalogs
-                .resolve_character_event(&tags, "Tail_Swipe")
-                .as_deref(),
-            Some("Play_SFX_Aligator_Tail_Swipe")
-        );
-        // A short name no template + catalog combination confirms is dropped, not
-        // guessed.
-        assert_eq!(catalogs.resolve_character_event(&tags, "Nonexistent_Growl"), None);
-    }
-
-    #[test]
-    fn audio_catalogs_builds_event_ids_from_typed_mapping() {
-        // The event-id table is built by re-parsing each AudioMapping CSV with
-        // the typed `cry_audio::parse_audio_mapping`, not by probing the stored
-        // `serde_json::Value` document (which is left `Null` here on purpose).
-        let path = "sounds/wwise/npc_alligator_events.csv";
-        let source =
-            ContextSource::default().with(path, b"Name,Id\nPlay_Alligator,7\nStop_Alligator,9\n");
-        let mut resolved = ResolvedAsset {
-            model: nw_model::Model {
-                meshes: Vec::new(),
-                skeletons: Vec::new(),
-                auxiliary_nodes: Vec::new(),
-            },
-            materials: None,
-            animations: Vec::new(),
-            extras: nw_model::CryAssetExtras::default(),
-            physics: nw_model::PhysicsScene::default(),
-            parsed_animation_assets: std::collections::HashSet::new(),
-        };
-        resolved
-            .extras
-            .source_assets
-            .push(nw_model::CrySourceAsset {
-                path: path.to_owned(),
-                kind: nw_model::CrySourceAssetKind::AudioMapping,
-                document: serde_json::Value::Null,
-            });
-
-        let catalogs = AudioCatalogs::load(&source, &resolved).unwrap();
-        assert_eq!(catalogs.event_id("Play_Alligator"), 7);
-        assert_eq!(catalogs.event_id("Stop_Alligator"), 9);
-        assert!(catalogs.knows_event_name("play_alligator"));
-    }
-}
+mod tests;

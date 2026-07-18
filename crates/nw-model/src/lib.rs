@@ -5,6 +5,7 @@
 //! Materials ([`MaterialSet`], parsed with [`str::parse`]) and textures attach to
 //! the same exporter; skins and animations build on the same [`Model`] over time.
 
+mod animation_audio;
 mod geometry;
 mod gltf;
 mod material;
@@ -12,16 +13,21 @@ pub mod math;
 mod physics;
 pub mod reflected;
 
+pub use animation_audio::{
+    CryAudioSpatialMode, CryBoneAudioBinding, CryCharacterEventCondition,
+    CryCharacterEventDispatch, CryCharacterEventOperation, CryCharacterEventOption,
+    CryCharacterEventPhase, CryCharacterEventReceiver, CryCharacterEventReceiverKind,
+    CryMannequinAnimationAudio, CryMannequinAudioClip, CryMannequinAudioProducer,
+    CryMannequinReceiverContext,
+};
 pub use geometry::{
     AuxiliaryNode, AuxiliaryNodeRole, Bone, Mesh, MeshAttachment, MeshRole, Model, ModelBuildError,
     Primitive, Skeleton, SkeletonPlacement,
 };
 pub use gltf::{
     AudioTriggerMediaRef, AudioTriggerPlayback, AudioTriggerResolution, AudioTriggerSurfaceMedia,
-    AudioTriggerWwiseEvent,
-    CryAssetExtras, CryEmbeddedResource, CryEmbeddedResourceKind, CryMannequinAnimationAudio,
-    CryMannequinAudioClip, CryNonRenderNode,
-    CryNonRenderNodeRole, CryResourcePayload, CrySourceAsset, CrySourceAssetKind,
+    AudioTriggerWwiseEvent, CryAssetExtras, CryEmbeddedResource, CryEmbeddedResourceKind,
+    CryNonRenderNode, CryNonRenderNodeRole, CryResourcePayload, CrySourceAsset, CrySourceAssetKind,
     CryUnboundAnimation, Gltf, GltfAnimationError, GltfPackage, GltfPackageError, GltfResource,
     ModelAnimation, NoMaterials, TextureData, WithMaterials,
 };
@@ -549,14 +555,16 @@ mod tests {
             package
                 .resources()
                 .iter()
-                .any(|resource| resource.path()
-                    == Some("animations/alligator/alligator_idle.caf")),
+                .any(|resource| resource.path() == Some("animations/alligator/alligator_idle.caf")),
             "animation buffer must take the source CAF's catalog path"
         );
         // No derived `.caf.bin` sibling and no raw CryAnimation payload ship.
         assert!(
-            package.resources().iter().all(|resource| resource.path()
-                != Some("animations/alligator/alligator_idle.caf.bin")),
+            package
+                .resources()
+                .iter()
+                .all(|resource| resource.path()
+                    != Some("animations/alligator/alligator_idle.caf.bin")),
             "no `.caf.bin` sibling may exist"
         );
     }
@@ -722,7 +730,10 @@ mod tests {
         );
         assert_eq!(material["alphaMode"], "BLEND");
         assert_eq!(material["doubleSided"], true);
-        assert!(approx(&material["pbrMetallicRoughness"]["metallicFactor"], 0.0));
+        assert!(approx(
+            &material["pbrMetallicRoughness"]["metallicFactor"],
+            0.0
+        ));
         assert!(approx(
             &material["pbrMetallicRoughness"]["roughnessFactor"],
             1.0

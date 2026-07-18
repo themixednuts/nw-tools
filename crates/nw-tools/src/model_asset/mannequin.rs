@@ -1,132 +1,417 @@
-//! Catalog-driven Mannequin fragment-audio discovery and attachment.
+//! Entity-scoped Mannequin receiver discovery and fragment-audio attachment.
 //!
-//! Creature vocal/action sounds (bite, hurt, tail whip, body falls) live in
-//! Mannequin ADB `ProcLayer` `type="Audio"` clips, not CryAnimation animevents,
-//! so the animevent audio pass alone misses them entirely.
-//!
-//! The character's slice (already scanned for hit volumes) names its animation
-//! databases and controller definition in an ActionController-style component as
-//! authored asset-path fields. Those paths are stored as raw strings the asset
-//! graph does not follow, so we read them straight from the ObjectStream — no
-//! filename stemming. Each discovered ADB is shipped with its FragDef/TagDef, its
-//! fragments are parsed for audio clips, and each clip is attached to the glTF
-//! animation matching the fragment's AnimLayer animation. The clip triggers then
-//! resolve through the existing ATL → bank/media pipeline alongside footsteps.
+//! CharacterEvent association is defined by one serialized `AZ::Entity`: its
+//! direct ActionListComponent, ordinary TagComponent, and ScriptComponent values
+//! must co-own the data. Scene-wide string proximity is not an association.
 
 use std::collections::BTreeMap;
 
+use nw_objectstream::asset_reference::read_asset_value;
+use nw_objectstream::query::{az_entity_elements, base_class_of_type};
+use nw_objectstream::value::{
+    child_by_field, read_bool, read_entity_id, read_string, read_string_vector_owned,
+};
+use uuid::{Uuid, uuid};
+
 use super::*;
 
-/// Discover the character's Mannequin databases from its scene slices, ship them
-/// with their FragDef/TagDef, and attach each fragment's audio clips to the glTF
-/// animation its AnimLayer animation names.
-///
-/// `scene_paths` is the model's resolved dependency closure; only legacy
-/// ObjectStream scenes (slices/prefabs) are scanned. A character with no authored
-/// Mannequin linkage leaves `resolved` untouched.
+const ACTION_LIST_COMPONENT_ID: Uuid = uuid!("30ed0ace-51dd-48b9-ba41-2fa6775cd106");
+const SCRIPT_COMPONENT_ID: Uuid = uuid!("8d1bc97e-c55d-4d34-a460-e63c57cd0d4b");
+const SCRIPT_PROPERTY_ID: Uuid = uuid!("d227d737-f1ed-4fb3-a1fb-38e4985d2e7a");
+
+/// Discover entity-owned Mannequin references, preserve direct Audio clips once,
+/// and attach CharacterEvent clips separately for every valid receiver context.
 pub(super) fn attach_fragment_audio(
     source: &dyn AssetSource,
     scene_paths: &[String],
     resolved: &mut ResolvedAsset,
 ) -> Result<()> {
-    let database_paths = discover_mannequin_reference_paths(source, scene_paths)?;
-    if database_paths.is_empty() {
+    let discovery = discover_mannequin_entities(source, scene_paths)?;
+    if discovery.adb_paths.is_empty() {
         return Ok(());
     }
-
-    // Ship every discovered Mannequin document (ADB + controllerdef) and, for each
-    // animation database, its FragDef/TagDef — then merge fragments across all of
-    // them by name so an audio-only fragment pairs with the animation database's
-    // matching animation.
-    let mut merged: BTreeMap<String, MergedFragment> = BTreeMap::new();
-    for path in &database_paths {
+    for path in discovery
+        .adb_paths
+        .iter()
+        .chain(&discovery.controller_paths)
+    {
         add_mannequin_source(source, path, &mut resolved.extras)?;
-        if !cry_mannequin::is_animation_database_name(path) {
+    }
+
+    let merged = merge_databases(source, &discovery.adb_paths, &mut resolved.extras)?;
+    let mut animation_audio = build_animation_audio(&merged, None, ClipSelection::DirectAudio);
+    for context in discovery.contexts {
+        let merged = merge_databases(source, &context.adb_paths, &mut resolved.extras)?;
+        animation_audio.extend(build_animation_audio(
+            &merged,
+            Some(&context),
+            ClipSelection::CharacterEvent,
+        ));
+    }
+    animation_audio.sort_by_key(animation_audio_key);
+    resolved.extras.mannequin_audio = animation_audio;
+    Ok(())
+}
+
+struct MannequinDiscovery {
+    adb_paths: Vec<String>,
+    controller_paths: Vec<String>,
+    contexts: Vec<nw_model::CryMannequinReceiverContext>,
+}
+
+fn discover_mannequin_entities(
+    source: &dyn AssetSource,
+    scene_paths: &[String],
+) -> Result<MannequinDiscovery> {
+    let mut scenes = scene_paths
+        .iter()
+        .filter(|path| is_legacy_scene_asset(path))
+        .map(|path| normalize_path(path))
+        .collect::<Vec<_>>();
+    scenes.sort_by_key(|path| path.to_ascii_lowercase());
+    scenes.dedup_by(|later, earlier| later.eq_ignore_ascii_case(earlier));
+
+    let mut discovery = MannequinDiscovery {
+        adb_paths: Vec::new(),
+        controller_paths: Vec::new(),
+        contexts: Vec::new(),
+    };
+    for scene_path in scenes {
+        let Some(bytes) = source.read(&scene_path) else {
             continue;
+        };
+        let Ok(stream) =
+            nw_objectstream::ObjectStream::from_bytes(&bytes, Some(&OBJECTSTREAM_LOOKUP))
+        else {
+            continue;
+        };
+        for entity in az_entity_elements(stream.elements()) {
+            let Some(components) = child_by_field(entity, "Components") else {
+                continue;
+            };
+            let (adb_paths, controller_paths) = action_list_paths(source, components)
+                .context("read ActionListComponent references")?;
+            if adb_paths.is_empty() {
+                continue;
+            }
+            for path in &adb_paths {
+                push_path(&mut discovery.adb_paths, path.clone());
+            }
+            for path in &controller_paths {
+                push_path(&mut discovery.controller_paths, path.clone());
+            }
+
+            let Some(tags) = nw_objectstream::tag_component::read_entity_tag_component(entity)
+                .with_context(|| format!("read ordinary TagComponent in {scene_path}"))?
+            else {
+                continue;
+            };
+            let receivers = receiver_scripts(source, components).with_context(|| {
+                format!(
+                    "read ScriptComponent receivers on entity {}",
+                    tags.entity_id
+                )
+            })?;
+            if receivers.is_empty() {
+                continue;
+            }
+            let entity_name = child_by_field(entity, "Name")
+                .map(read_string)
+                .transpose()
+                .with_context(|| format!("read Name on entity {}", tags.entity_id))?
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            discovery
+                .contexts
+                .push(nw_model::CryMannequinReceiverContext {
+                    scene_path: scene_path.clone(),
+                    entity_id: tags.entity_id,
+                    entity_name,
+                    tag_crcs: tags.tags,
+                    adb_paths,
+                    controller_paths,
+                    receivers,
+                });
         }
+    }
+    discovery
+        .adb_paths
+        .sort_by_key(|path| path.to_ascii_lowercase());
+    discovery
+        .controller_paths
+        .sort_by_key(|path| path.to_ascii_lowercase());
+    discovery.contexts.sort_by_key(context_key);
+    Ok(discovery)
+}
+
+fn context_key(context: &nw_model::CryMannequinReceiverContext) -> (String, u64, Vec<u32>) {
+    (
+        context.scene_path.to_ascii_lowercase(),
+        context.entity_id,
+        context.tag_crcs.clone(),
+    )
+}
+
+fn animation_audio_key(
+    entry: &nw_model::CryMannequinAnimationAudio,
+) -> (String, Option<(String, u64, Vec<u32>)>) {
+    (
+        entry.animation.to_ascii_lowercase(),
+        entry
+            .clips
+            .first()
+            .and_then(|clip| clip.context.as_ref())
+            .map(context_key),
+    )
+}
+
+fn merge_databases(
+    source: &dyn AssetSource,
+    paths: &[String],
+    extras: &mut nw_model::CryAssetExtras,
+) -> Result<BTreeMap<String, MergedFragment>> {
+    let mut merged = BTreeMap::new();
+    for path in paths {
         let bytes = read_required(source, path)?;
         let database = cry_mannequin::MannequinAnimationDatabaseSource::from_legacy(path, &bytes)
             .with_context(|| format!("parse animation database {path}"))?
             .database;
-        ship_fragment_tag_definitions(source, &database, &mut resolved.extras)?;
+        ship_fragment_tag_definitions(source, &database, extras)?;
         for fragment in database.fragment_audio() {
             merge_fragment(&mut merged, fragment);
         }
     }
-
-    // Ship the character's Wwise event-id catalog so `CharacterEvent` short names
-    // (`Bite`) can be validated against real events during trigger resolution.
-    // The events CSV is not in the model's dependency closure — its banks are only
-    // pulled in later, during trigger resolution — so it is discovered here from
-    // the audio ADB's character stem.
-    ship_character_event_catalogs(source, &database_paths, &mut resolved.extras)?;
-
-    resolved.extras.mannequin_audio = build_animation_audio(&merged);
-    Ok(())
+    Ok(merged)
 }
 
-/// Known ADB role suffixes; stripping one from an ADB basename yields the
-/// character's audio stem (`npc_alligator_audio` → `npc_alligator`).
-const ADB_ROLE_SUFFIXES: &[&str] = &["_audio", "_anims", "_vfx", "_actions"];
-
-/// Ship the character's `sounds/wwise/<char>_events.csv` event-id catalog, derived
-/// from each discovered ADB's character stem and shipped only when the install
-/// actually provides it (existence-validated, never a bare guess). Loaded as an
-/// `AudioMapping` source so audio resolution can validate `CharacterEvent` short
-/// names against it.
-fn ship_character_event_catalogs(
+fn action_list_paths(
     source: &dyn AssetSource,
-    database_paths: &[String],
-    extras: &mut nw_model::CryAssetExtras,
-) -> Result<()> {
-    let mut candidates: Vec<String> = Vec::new();
-    for path in database_paths {
-        if !cry_mannequin::is_animation_database_name(path) {
-            continue;
+    components: &nw_objectstream::Element,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut adbs = Vec::new();
+    let mut controllers = Vec::new();
+    for component in components
+        .children()
+        .iter()
+        .filter(|component| component.id() == &ACTION_LIST_COMPONENT_ID)
+    {
+        for element in component.iter_recursive() {
+            let Some(field) = element.field().map(|field| field.as_str()) else {
+                continue;
+            };
+            let target = match field {
+                field
+                    if field.eq_ignore_ascii_case("m_animationDatabase")
+                        || field.eq_ignore_ascii_case("ScopeADB") =>
+                {
+                    &mut adbs
+                }
+                field if field.eq_ignore_ascii_case("m_controllerDefinition") => &mut controllers,
+                _ => continue,
+            };
+            let path = nw_objectstream::asset_reference::read_asset_path_or_string_owned(element)
+                .with_context(|| format!("read authored Mannequin reference {field}"))?;
+            let Some(path) = path.map(|path| normalize_path(&path)) else {
+                continue;
+            };
+            if !is_mannequin_reference(&path) || source.read(&path).is_none() {
+                continue;
+            }
+            push_path(target, path);
         }
-        let Some(stem) = adb_character_stem(path) else {
+    }
+    adbs.sort_by_key(|path| path.to_ascii_lowercase());
+    controllers.sort_by_key(|path| path.to_ascii_lowercase());
+    Ok((adbs, controllers))
+}
+
+fn receiver_scripts(
+    source: &dyn AssetSource,
+    components: &nw_objectstream::Element,
+) -> Result<Vec<nw_model::CryCharacterEventReceiver>> {
+    let mut receivers = Vec::new();
+    for component in components
+        .children()
+        .iter()
+        .filter(|component| component.id() == &SCRIPT_COMPONENT_ID)
+    {
+        let Some(script) = child_by_field(component, "Script") else {
             continue;
         };
-        let csv = format!("sounds/wwise/{stem}_events.csv");
-        if cry_audio::is_audio_mapping_source(&csv)
-            && !candidates.iter().any(|existing| existing.eq_ignore_ascii_case(&csv))
-        {
-            candidates.push(csv);
-        }
-    }
-    for csv in candidates {
-        if has_source_asset(extras, &csv) {
+        let asset = read_asset_value(script).context("decode ScriptComponent Script asset")?;
+        let asset_id = nw_asset::AssetId::new(asset.guid(), asset.sub_id());
+        let script_path = source
+            .path_by_id(asset_id)
+            .map(|path| normalize_path(&path))
+            .or_else(|| {
+                let hint = normalize_path(asset.hint().trim());
+                (source.allows_asset_hint_fallback() && !hint.is_empty() && source.contains(&hint))
+                    .then_some(hint)
+            });
+        let Some(script_path) = script_path else {
             continue;
-        }
-        if source.read(&csv).is_none() {
+        };
+        let Some(kind) = receiver_script_kind(&script_path) else {
             continue;
-        }
-        add_audio_source(source, &csv, extras)?;
+        };
+        let properties = child_by_field(component, "Properties");
+        let receiver = match kind {
+            ReceiverScriptKind::CommonNpc => {
+                nw_model::CryCharacterEventReceiver::CommonNpcAudio { script_path }
+            }
+            ReceiverScriptKind::Bone => {
+                let (bindings, spawn_sound) = bone_audio_properties(properties)?;
+                nw_model::CryCharacterEventReceiver::BoneAudio {
+                    script_path,
+                    bindings,
+                    spawn_sound,
+                }
+            }
+            ReceiverScriptKind::SubtitleNpc => {
+                nw_model::CryCharacterEventReceiver::SubtitleNpcAudio { script_path }
+            }
+            ReceiverScriptKind::Mount => {
+                nw_model::CryCharacterEventReceiver::MountAudio { script_path }
+            }
+        };
+        receivers.push(receiver);
     }
-    Ok(())
+    receivers.sort_by_key(receiver_key);
+    Ok(receivers)
 }
 
-/// The character audio stem of an ADB path: its basename minus extension and a
-/// trailing role suffix (`.../npc_alligator_audio.adb` → `npc_alligator`).
-fn adb_character_stem(path: &str) -> Option<String> {
-    let base = normalize_path(path);
-    let base = base.rsplit('/').next().unwrap_or(&base);
-    let stem = base.rsplit_once('.').map_or(base, |(stem, _)| stem);
-    if stem.is_empty() {
-        return None;
-    }
-    let lower = stem.to_ascii_lowercase();
-    for suffix in ADB_ROLE_SUFFIXES {
-        if let Some(trimmed) = lower.strip_suffix(suffix)
-            && !trimmed.is_empty()
-        {
-            return Some(trimmed.to_owned());
-        }
-    }
-    Some(lower)
+#[derive(Debug, Clone, Copy)]
+enum ReceiverScriptKind {
+    CommonNpc,
+    Bone,
+    SubtitleNpc,
+    Mount,
 }
 
-/// A fragment gathered across every discovered database, keyed by lowercased name.
+fn receiver_script_kind(path: &str) -> Option<ReceiverScriptKind> {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+    match stem.to_ascii_lowercase().as_str() {
+        "commonnpc_audio" => Some(ReceiverScriptKind::CommonNpc),
+        "boneaudio" => Some(ReceiverScriptKind::Bone),
+        "subtitlenpc_audio" => Some(ReceiverScriptKind::SubtitleNpc),
+        "mountaudio" => Some(ReceiverScriptKind::Mount),
+        _ => None,
+    }
+}
+
+fn receiver_key(receiver: &nw_model::CryCharacterEventReceiver) -> (u8, String) {
+    match receiver {
+        nw_model::CryCharacterEventReceiver::CommonNpcAudio { script_path } => {
+            (0, script_path.to_ascii_lowercase())
+        }
+        nw_model::CryCharacterEventReceiver::BoneAudio { script_path, .. } => {
+            (1, script_path.to_ascii_lowercase())
+        }
+        nw_model::CryCharacterEventReceiver::SubtitleNpcAudio { script_path } => {
+            (2, script_path.to_ascii_lowercase())
+        }
+        nw_model::CryCharacterEventReceiver::MountAudio { script_path } => {
+            (3, script_path.to_ascii_lowercase())
+        }
+    }
+}
+
+fn bone_audio_properties(
+    properties: Option<&nw_objectstream::Element>,
+) -> Result<(Vec<nw_model::CryBoneAudioBinding>, bool)> {
+    let Some(properties) = properties else {
+        return Ok((Vec::new(), false));
+    };
+    let events = script_string_array(properties, "characterEventName")?;
+    let controls = script_string_array(properties, "wwiseEvent")?;
+    let entities = script_entity_array(properties, "audioEntity")?;
+    let spawn_sound = script_bool(properties, "spawnSound")?.unwrap_or(false);
+    let bindings = events
+        .into_iter()
+        .zip(entities)
+        .zip(controls)
+        .filter_map(|((character_event, audio_entity), wwise_event)| {
+            let character_event = character_event.trim().to_owned();
+            let wwise_event = wwise_event.trim().to_owned();
+            (!character_event.is_empty() && !wwise_event.is_empty()).then_some(
+                nw_model::CryBoneAudioBinding {
+                    character_event,
+                    audio_entity,
+                    wwise_event,
+                },
+            )
+        })
+        .collect();
+    Ok((bindings, spawn_sound))
+}
+
+fn script_string_array(properties: &nw_objectstream::Element, name: &str) -> Result<Vec<String>> {
+    let Some(property) = script_property(properties, name)? else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = child_by_field(property, "values") else {
+        return Ok(Vec::new());
+    };
+    read_string_vector_owned(values).with_context(|| format!("read script property {name}"))
+}
+
+fn script_entity_array(properties: &nw_objectstream::Element, name: &str) -> Result<Vec<u64>> {
+    let Some(property) = script_property(properties, name)? else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = child_by_field(property, "values") else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter_recursive()
+        .filter(|element| element.id() == &nw_objectstream::types::ENTITY_ID)
+        .map(read_entity_id)
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("read script property {name}"))
+}
+
+fn script_bool(properties: &nw_objectstream::Element, name: &str) -> Result<Option<bool>> {
+    let Some(property) = script_property(properties, name)? else {
+        return Ok(None);
+    };
+    child_by_field(property, "value")
+        .map(read_bool)
+        .transpose()
+        .with_context(|| format!("read script property {name}"))
+}
+
+fn script_property<'a>(
+    properties: &'a nw_objectstream::Element,
+    wanted: &str,
+) -> Result<Option<&'a nw_objectstream::Element>> {
+    for property in properties.iter_recursive() {
+        let Some(base) = base_class_of_type(property, SCRIPT_PROPERTY_ID) else {
+            continue;
+        };
+        let Some(name) = child_by_field(base, "name") else {
+            continue;
+        };
+        if read_string(name)
+            .context("read ScriptProperty name")?
+            .eq_ignore_ascii_case(wanted)
+        {
+            return Ok(Some(property));
+        }
+    }
+    Ok(None)
+}
+
+fn push_path(paths: &mut Vec<String>, path: String) {
+    if !paths
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&path))
+    {
+        paths.push(path);
+    }
+}
+
 struct MergedFragment {
     fragment: String,
     tags: String,
@@ -159,31 +444,67 @@ fn merge_fragment(
         }
     }
     for clip in fragment.clips {
-        // Dedup only truly identical clips (same trigger/short name, joint, kind,
-        // and fire time) across databases — a fragment can legitimately fire the
-        // same event twice at different clip-relative times, so `start_time` is
-        // part of the identity.
-        if !entry.clips.iter().any(|existing| {
-            existing.trigger.eq_ignore_ascii_case(&clip.trigger)
-                && existing.joint.eq_ignore_ascii_case(&clip.joint)
-                && existing.kind == clip.kind
-                && existing.start_time == clip.start_time
-        }) {
+        if !entry
+            .clips
+            .iter()
+            .any(|existing| clips_equal(existing, &clip))
+        {
             entry.clips.push(clip);
         }
     }
 }
 
-/// Distribute each merged fragment's audio clips onto the animations it plays,
-/// keyed by animation name. Fragments whose audio never pairs with an animation
-/// are reported and dropped.
+fn clips_equal(
+    left: &cry_mannequin::MannequinAudioClip,
+    right: &cry_mannequin::MannequinAudioClip,
+) -> bool {
+    left.trigger.eq_ignore_ascii_case(&right.trigger)
+        && left.stop_trigger == right.stop_trigger
+        && left.joint.eq_ignore_ascii_case(&right.joint)
+        && left.start_time == right.start_time
+        && left.exit_time == right.exit_time
+        && left.option_on_enter == right.option_on_enter
+        && left.option_on_exit == right.option_on_exit
+        && left.proc_layer_ordinal == right.proc_layer_ordinal
+        && left.procedural_ordinal == right.procedural_ordinal
+        && left.kind == right.kind
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ClipSelection {
+    DirectAudio,
+    CharacterEvent,
+}
+
+impl ClipSelection {
+    fn matches(self, clip: &cry_mannequin::MannequinAudioClip) -> bool {
+        matches!(
+            (self, clip.kind),
+            (
+                Self::DirectAudio,
+                cry_mannequin::MannequinAudioKind::AtlTrigger
+            ) | (
+                Self::CharacterEvent,
+                cry_mannequin::MannequinAudioKind::CharacterEvent
+            )
+        )
+    }
+}
+
 fn build_animation_audio(
     merged: &BTreeMap<String, MergedFragment>,
+    context: Option<&nw_model::CryMannequinReceiverContext>,
+    selection: ClipSelection,
 ) -> Vec<nw_model::CryMannequinAnimationAudio> {
-    let mut by_animation: BTreeMap<String, nw_model::CryMannequinAnimationAudio> = BTreeMap::new();
+    let mut by_animation = BTreeMap::<String, nw_model::CryMannequinAnimationAudio>::new();
     let mut orphaned = Vec::new();
     for fragment in merged.values() {
-        if fragment.clips.is_empty() {
+        let clips = fragment
+            .clips
+            .iter()
+            .filter(|clip| selection.matches(clip))
+            .collect::<Vec<_>>();
+        if clips.is_empty() {
             continue;
         }
         if fragment.animations.is_empty() {
@@ -197,26 +518,35 @@ fn build_animation_audio(
                     animation: animation.clone(),
                     clips: Vec::new(),
                 });
-            for clip in &fragment.clips {
-                // A `CharacterEvent` clip's `trigger` still holds the short
-                // `CharacterEventName`; audio resolution (in `audio.rs`) expands
-                // it to a Wwise event or drops the clip. Preserve the short name
-                // as `character_event` for provenance.
-                let character_event = matches!(
-                    clip.kind,
-                    cry_mannequin::MannequinAudioKind::CharacterEvent
-                )
-                .then(|| clip.trigger.clone());
-                entry.clips.push(nw_model::CryMannequinAudioClip {
+            entry.clips.extend(clips.iter().map(|clip| {
+                let character_event =
+                    matches!(clip.kind, cry_mannequin::MannequinAudioKind::CharacterEvent)
+                        .then(|| clip.trigger.clone());
+                nw_model::CryMannequinAudioClip {
                     trigger: clip.trigger.clone(),
                     stop_trigger: clip.stop_trigger.clone(),
                     character_event,
                     joint: clip.joint.clone(),
                     start_time: clip.start_time.unwrap_or(0.0),
+                    exit_time: clip.exit_time,
+                    option_on_enter: clip.option_on_enter.map(convert_option),
+                    option_on_exit: clip.option_on_exit.map(convert_option),
+                    proc_layer_ordinal: clip.proc_layer_ordinal,
+                    procedural_ordinal: clip.procedural_ordinal,
+                    producer: match clip.kind {
+                        cry_mannequin::MannequinAudioKind::AtlTrigger => {
+                            nw_model::CryMannequinAudioProducer::MannequinAudio
+                        }
+                        cry_mannequin::MannequinAudioKind::CharacterEvent => {
+                            nw_model::CryMannequinAudioProducer::MannequinCharacterEvent
+                        }
+                    },
                     fragment: fragment.fragment.clone(),
                     tags: fragment.tags.clone(),
-                });
-            }
+                    context: context.cloned(),
+                    dispatches: Vec::new(),
+                }
+            }));
         }
     }
     if !orphaned.is_empty() {
@@ -229,8 +559,22 @@ fn build_animation_audio(
     by_animation.into_values().collect()
 }
 
-/// Ship the animation database's FragDef and TagDef (the authored `Actions`/`Tags`
-/// XML the ADB header names) as embedded Mannequin sources.
+fn convert_option(
+    option: cry_mannequin::MannequinCharacterEventOption,
+) -> nw_model::CryCharacterEventOption {
+    match option {
+        cry_mannequin::MannequinCharacterEventOption::Enable => {
+            nw_model::CryCharacterEventOption::Enable
+        }
+        cry_mannequin::MannequinCharacterEventOption::Disable => {
+            nw_model::CryCharacterEventOption::Disable
+        }
+        cry_mannequin::MannequinCharacterEventOption::NoEffect => {
+            nw_model::CryCharacterEventOption::NoEffect
+        }
+    }
+}
+
 fn ship_fragment_tag_definitions(
     source: &dyn AssetSource,
     database: &cry_mannequin::MannequinAnimationDatabase,
@@ -253,62 +597,6 @@ fn ship_fragment_tag_definitions(
     Ok(())
 }
 
-/// Scan the model's scene slices for authored Mannequin database and controller
-/// references. A path counts only when the ObjectStream stores it as a string
-/// value that also resolves in the catalog — the authored link, never a guessed
-/// `npc_<name>_anims.adb` stem.
-fn discover_mannequin_reference_paths(
-    source: &dyn AssetSource,
-    scene_paths: &[String],
-) -> Result<Vec<String>> {
-    let mut paths: Vec<String> = Vec::new();
-    for scene in scene_paths.iter().filter(|path| is_legacy_scene_asset(path)) {
-        let Some(bytes) = source.read(scene) else {
-            continue;
-        };
-        let Ok(stream) =
-            nw_objectstream::ObjectStream::from_bytes(&bytes, Some(&OBJECTSTREAM_LOOKUP))
-        else {
-            continue;
-        };
-        let mut strings = Vec::new();
-        for element in stream.elements() {
-            collect_string_leaves(element, &mut strings);
-        }
-        for value in strings {
-            let candidate = normalize_path(&value);
-            if !is_mannequin_reference(&candidate) {
-                continue;
-            }
-            if source.read(&candidate).is_none() {
-                continue;
-            }
-            if !paths
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(&candidate))
-            {
-                paths.push(candidate);
-            }
-        }
-    }
-    paths.sort_by_key(|path| path.to_ascii_lowercase());
-    Ok(paths)
-}
-
-fn collect_string_leaves(element: &nw_objectstream::Element, out: &mut Vec<String>) {
-    if let Ok(value) = nw_objectstream::value::read_string(element) {
-        let value = value.trim();
-        if !value.is_empty() {
-            out.push(value.to_owned());
-        }
-    }
-    for child in element.children() {
-        collect_string_leaves(child, out);
-    }
-}
-
-/// An authored Mannequin animation database (`.adb`) or controller definition —
-/// the audio-bearing databases and the controllerdef the slice references.
 fn is_mannequin_reference(path: &str) -> bool {
     cry_mannequin::is_animation_database_name(path)
         || matches!(
@@ -325,175 +613,5 @@ fn is_legacy_scene_asset(path: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model_asset::tests::ContextSource;
-
-    const ANIMS_ADB: &[u8] = br#"
-        <AnimDB FragDef="animations/mannequin/adb/creature_actions.xml"
-                TagDef="animations/mannequin/adb/creature_tags.xml">
-          <FragmentList>
-            <r_Death>
-              <Fragment BlendOutDuration="0.2" Tags="">
-                <AnimLayer>
-                  <Blend ExitTime="0" StartTime="0" Duration="0"/>
-                  <Animation name="creature_death"/>
-                </AnimLayer>
-              </Fragment>
-            </r_Death>
-            <Attack_Bite>
-              <Fragment BlendOutDuration="0.2" Tags="Young">
-                <AnimLayer>
-                  <Blend ExitTime="0" StartTime="0" Duration="0"/>
-                  <Animation name="creature_bite"/>
-                </AnimLayer>
-                <ProcLayer>
-                  <Blend ExitTime="0" StartTime="0.5" Duration="0"/>
-                  <Procedural type="Audio" contextType="AudioContext">
-                    <ProceduralParams>
-                      <StartTrigger value="play_vox_creature_bite"/>
-                      <StopTrigger value="do_nothing"/>
-                      <AttachmentJoint value="bind_mouth"/>
-                    </ProceduralParams>
-                  </Procedural>
-                </ProcLayer>
-              </Fragment>
-            </Attack_Bite>
-          </FragmentList>
-        </AnimDB>
-    "#;
-
-    // A sibling audio database contributes ProcLayer audio for `r_Death` with no
-    // animation of its own — it must pair with the animation database's animation.
-    const AUDIO_ADB: &[u8] = br#"
-        <AnimDB FragDef="animations/mannequin/adb/creature_actions.xml"
-                TagDef="animations/mannequin/adb/creature_tags.xml">
-          <FragmentList>
-            <r_Death>
-              <Fragment BlendOutDuration="0.2" Tags="">
-                <ProcLayer>
-                  <Blend ExitTime="0" StartTime="0" Duration="0"/>
-                  <Procedural type="Audio" contextType="AudioContext">
-                    <ProceduralParams>
-                      <StartTrigger value="play_bodyfall_big"/>
-                      <StopTrigger value="do_nothing"/>
-                      <AttachmentJoint value="bind_pelvis"/>
-                    </ProceduralParams>
-                  </Procedural>
-                </ProcLayer>
-              </Fragment>
-            </r_Death>
-          </FragmentList>
-        </AnimDB>
-    "#;
-
-    /// A binary ObjectStream slice naming both ADBs as `AZStd::string` fields.
-    fn slice_referencing_adbs() -> Vec<u8> {
-        use nw_objectstream::types;
-        let string_field = |field: &str, value: &str| {
-            format!(
-                r#"<Class name="AZStd::string" field="{field}" value="{value}" type="{{{string}}}"/>"#,
-                string = types::AZSTD_STRING,
-            )
-        };
-        let xml = format!(
-            r#"<ObjectStream version="3"><Class name="ActionControllerComponent" type="{{B1E2C3D4-0000-0000-0000-000000000001}}">{anims}{audio}{other}</Class></ObjectStream>"#,
-            anims = string_field(
-                "animationDatabase",
-                "animations/mannequin/adb/creature_anims.adb"
-            ),
-            audio = string_field(
-                "audioDatabase",
-                "animations/mannequin/adb/creature_audio.adb"
-            ),
-            other = string_field("unrelated", "materials/creature.mtl"),
-        );
-        xml.into_bytes()
-    }
-
-    fn context() -> ContextSource {
-        ContextSource::default()
-            .with("slices/creature.dynamicslice", slice_referencing_adbs())
-            .with("animations/mannequin/adb/creature_anims.adb", ANIMS_ADB)
-            .with("animations/mannequin/adb/creature_audio.adb", AUDIO_ADB)
-            .with(
-                "animations/mannequin/adb/creature_actions.xml",
-                b"<TagDefinition version=\"2\"><Tags/></TagDefinition>".to_vec(),
-            )
-            .with(
-                "animations/mannequin/adb/creature_tags.xml",
-                b"<TagDefinition version=\"2\"><Tags/></TagDefinition>".to_vec(),
-            )
-    }
-
-    #[test]
-    fn discovers_adbs_from_slice_string_fields_only_when_they_resolve() {
-        let source = context();
-        let discovered = discover_mannequin_reference_paths(
-            &source,
-            &["slices/creature.dynamicslice".to_owned()],
-        )
-        .unwrap();
-        assert_eq!(
-            discovered,
-            vec![
-                "animations/mannequin/adb/creature_anims.adb".to_owned(),
-                "animations/mannequin/adb/creature_audio.adb".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn attaches_bite_audio_and_pairs_cross_database_death_audio() {
-        let source = context();
-        let mut resolved = ResolvedAsset {
-            model: nw_model::Model {
-                meshes: Vec::new(),
-                skeletons: Vec::new(),
-                auxiliary_nodes: Vec::new(),
-            },
-            materials: None,
-            animations: Vec::new(),
-            extras: nw_model::CryAssetExtras::default(),
-            physics: nw_model::PhysicsScene::default(),
-            parsed_animation_assets: std::collections::HashSet::new(),
-        };
-        attach_fragment_audio(
-            &source,
-            &["slices/creature.dynamicslice".to_owned()],
-            &mut resolved,
-        )
-        .unwrap();
-
-        let audio = &resolved.extras.mannequin_audio;
-        let bite = audio
-            .iter()
-            .find(|entry| entry.animation == "creature_bite")
-            .expect("bite animation gains its trigger");
-        assert_eq!(bite.clips.len(), 1);
-        assert_eq!(bite.clips[0].trigger, "play_vox_creature_bite");
-        assert_eq!(bite.clips[0].start_time, 0.5);
-        assert_eq!(bite.clips[0].fragment, "Attack_Bite");
-        assert_eq!(bite.clips[0].tags, "Young");
-
-        // The death fragment's audio lives in the sibling audio ADB while its
-        // animation lives in the animation ADB — the merge pairs them by name.
-        let death = audio
-            .iter()
-            .find(|entry| entry.animation == "creature_death")
-            .expect("death animation gains cross-database body-fall audio");
-        assert_eq!(death.clips[0].trigger, "play_bodyfall_big");
-
-        // Both ADBs and their shared FragDef/TagDef ship as embedded resources.
-        let shipped: Vec<&str> = resolved
-            .extras
-            .source_assets
-            .iter()
-            .map(|asset| asset.path.as_str())
-            .collect();
-        assert!(shipped.contains(&"animations/mannequin/adb/creature_anims.adb"));
-        assert!(shipped.contains(&"animations/mannequin/adb/creature_audio.adb"));
-        assert!(shipped.contains(&"animations/mannequin/adb/creature_actions.xml"));
-        assert!(shipped.contains(&"animations/mannequin/adb/creature_tags.xml"));
-    }
-}
+#[path = "mannequin_tests.rs"]
+mod tests;

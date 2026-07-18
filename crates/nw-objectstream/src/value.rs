@@ -1373,6 +1373,13 @@ fn matching_field<'f>(element: &Element, fields: &[&'f str]) -> Option<&'f str> 
         if let Some(field) = fields
             .iter()
             .copied()
+            .find(|field| actual.as_str() == *field)
+        {
+            return Some(field);
+        }
+        if let Some(field) = fields
+            .iter()
+            .copied()
             .find(|field| actual.eq_ignore_ascii_case(field))
         {
             return Some(field);

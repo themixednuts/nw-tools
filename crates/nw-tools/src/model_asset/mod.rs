@@ -16,6 +16,7 @@ use nw_reflected_types::az::rtti::AzRtti;
 use crate::model::{AssetSource, MeshRef};
 
 mod audio;
+mod character_event;
 
 mod animation;
 mod cloth;
@@ -744,6 +745,10 @@ mod tests {
     impl AssetSource for ContextSource {
         fn materials(&self, _cgf: &[u8], _mesh: &MeshRef) -> Option<nw_model::MaterialSet> {
             None
+        }
+
+        fn allows_asset_hint_fallback(&self) -> bool {
+            true
         }
     }
 }
