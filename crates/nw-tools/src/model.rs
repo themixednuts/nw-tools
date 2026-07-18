@@ -335,7 +335,7 @@ impl Model {
         } else {
             None
         };
-        let dependency_index = self.build_model_dependency_index(ctx, &source)?;
+        let dependency_index = self.install_dependency_index(ctx, &source, &install.assets())?;
 
         let batch = ctx.map_results_compact("model", &meshes, Clone::clone, |key, progress| {
             progress.step(|| {
@@ -490,6 +490,7 @@ impl Model {
         })
     }
 
+    /// Build the shared authored-asset dependency index for a filesystem tree.
     fn build_model_dependency_index(
         &self,
         ctx: &RunCtx,
@@ -502,6 +503,26 @@ impl Model {
         nw_asset_graph::AssetDependencyIndex::build_with_runner(source, &paths, &ctx.runner)
             .map(Some)
             .context("build shared authored-asset dependency index")
+    }
+
+    /// Build the shared dependency index for the install, reusing the on-disk
+    /// cache so repeated single-character exports don't each rebuild the whole
+    /// install's reverse graph.
+    fn install_dependency_index(
+        &self,
+        ctx: &RunCtx,
+        source: &Install,
+        assets: &Path,
+    ) -> Result<Option<nw_asset_graph::AssetDependencyIndex>> {
+        if self.format != Container::Gltf {
+            return Ok(None);
+        }
+        let paths = nw_asset_graph::AssetSource::paths_with_extensions(
+            source,
+            MODEL_CONSUMER_EXTENSIONS,
+        )?;
+        source::load_or_build_dependency_index(assets, source, &paths, &ctx.runner)
+            .map(Some)
     }
 }
 

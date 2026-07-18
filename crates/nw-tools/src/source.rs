@@ -285,6 +285,69 @@ fn load_install_catalog(assets: &Path, runner: &nw_jobs::JobRunner) -> Result<As
     Ok(catalog)
 }
 
+/// Fingerprint the install's complete pak set (paths + sizes + mtimes).
+///
+/// The install-global authored-dependency index is derived from every pak, so a
+/// game patch that adds, resizes, or re-times any archive must invalidate the
+/// cached index. The leading version tag also forces a rebuild when the index's
+/// build logic changes even if the paks are untouched.
+#[must_use]
+pub fn dependency_index_fingerprint(assets: &Path) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+
+    const VERSION: &str = "depidx-v1";
+    let paks = PakSet::collect(assets.to_path_buf(), Vec::new()).ok()?;
+    if paks.paths().is_empty() {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    VERSION.hash(&mut hasher);
+    for path in paks.paths() {
+        let metadata = std::fs::metadata(path).ok()?;
+        path.to_string_lossy().hash(&mut hasher);
+        metadata.len().hash(&mut hasher);
+        if let Ok(modified) = metadata.modified()
+            && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            duration.as_secs().hash(&mut hasher);
+        }
+    }
+    Some(format!("{VERSION}:{:016x}", hasher.finish()))
+}
+
+/// Load the install-global authored-dependency index from disk cache, rebuilding
+/// (and re-caching) it only when the pak-set fingerprint changed.
+///
+/// Building the whole-install reverse graph costs ~1–2 min and is identical for
+/// every character exported from the same paks, so the first export builds it and
+/// every later export — each a separate process for a `--filter` run — reuses it.
+///
+/// # Errors
+///
+/// Returns an error only if a fresh build fails; a missing or unwritable cache
+/// degrades silently to an in-memory build.
+pub fn load_or_build_dependency_index(
+    assets: &Path,
+    source: &dyn nw_asset_graph::AssetSource,
+    paths: &[String],
+    runner: &nw_jobs::JobRunner,
+) -> Result<nw_asset_graph::AssetDependencyIndex> {
+    let fingerprint = dependency_index_fingerprint(assets);
+    if let Some(fingerprint) = &fingerprint
+        && let Some(edges) = crate::cache::load_dependency_index(fingerprint)
+    {
+        return Ok(nw_asset_graph::AssetDependencyIndex::from_edges(edges));
+    }
+    let index = nw_asset_graph::AssetDependencyIndex::build_with_runner(source, paths, runner)
+        .context("build shared authored-asset dependency index")?;
+    if let Some(fingerprint) = &fingerprint {
+        if let Err(error) = crate::cache::store_dependency_index(fingerprint, index.edges()) {
+            tracing::debug!("dependency index cache store failed: {error:#}");
+        }
+    }
+    Ok(index)
+}
+
 /// Map a Cry `MtlName` GUID to a Lumberyard catalog [`AssetId`].
 ///
 /// New World's `MtlName` chunks and asset catalog use the same canonical textual

@@ -188,6 +188,138 @@ impl Cache {
     }
 }
 
+/// Magic + format version for the persisted authored-dependency index blob.
+/// Bump the trailing digit whenever the on-disk layout changes.
+const DEP_INDEX_MAGIC: &[u8; 8] = b"NWDEPIX1";
+
+/// Location of the persisted install-global dependency index, beside the catalog.
+#[must_use]
+pub fn dependency_index_path() -> PathBuf {
+    default_path().with_file_name("dependency-index.bin")
+}
+
+/// Load the cached authored-dependency edge set when it matches `fingerprint`.
+///
+/// Rebuilding the whole-install reverse graph costs ~1–2 min and is identical
+/// for every export against the same paks, so it is persisted keyed by a pak-set
+/// fingerprint. Any magic/fingerprint mismatch, truncation, or IO error is a
+/// cache miss (returns `None`) so the caller transparently rebuilds.
+///
+/// The blob is millions of edges (hundreds of MB), so it is streamed through a
+/// buffered reader — never read whole into memory — to keep the peak footprint
+/// at the resident edge set alone.
+#[must_use]
+pub fn load_dependency_index(fingerprint: &str) -> Option<Vec<nw_asset_graph::AssetDependencyEdge>> {
+    let file = std::fs::File::open(dependency_index_path()).ok()?;
+    decode_dependency_index(&mut std::io::BufReader::new(file), fingerprint)
+}
+
+/// Persist the authored-dependency edge set under `fingerprint`, atomically.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory or file cannot be written.
+pub fn store_dependency_index(
+    fingerprint: &str,
+    edges: &[nw_asset_graph::AssetDependencyEdge],
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let path = dependency_index_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Write to a sibling temp file then rename, so a crash mid-write can never
+    // leave a truncated index that would still pass the fingerprint check.
+    // Stream through a buffered writer rather than staging the whole blob in a
+    // Vec, keeping this off the peak while the full index is already resident.
+    let tmp = path.with_extension("bin.tmp");
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+    encode_dependency_index(&mut writer, fingerprint, edges)?;
+    writer.flush()?;
+    drop(writer);
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn encode_dependency_index<W: std::io::Write>(
+    writer: &mut W,
+    fingerprint: &str,
+    edges: &[nw_asset_graph::AssetDependencyEdge],
+) -> std::io::Result<()> {
+    writer.write_all(DEP_INDEX_MAGIC)?;
+    write_blob_str(writer, fingerprint)?;
+    writer.write_all(&(edges.len() as u64).to_le_bytes())?;
+    for edge in edges {
+        write_blob_str(writer, edge.source())?;
+        write_blob_str(writer, edge.target())?;
+        write_blob_str(writer, edge.relation())?;
+        writer.write_all(&[u8::from(edge.is_required())])?;
+        match edge.association() {
+            Some(association) => {
+                writer.write_all(&[1])?;
+                write_blob_str(writer, association)?;
+            }
+            None => writer.write_all(&[0])?,
+        }
+    }
+    Ok(())
+}
+
+fn decode_dependency_index<R: std::io::Read>(
+    reader: &mut R,
+    fingerprint: &str,
+) -> Option<Vec<nw_asset_graph::AssetDependencyEdge>> {
+    let mut magic = [0u8; DEP_INDEX_MAGIC.len()];
+    reader.read_exact(&mut magic).ok()?;
+    if &magic != DEP_INDEX_MAGIC {
+        return None;
+    }
+    if read_blob_str(reader)? != fingerprint {
+        return None;
+    }
+    let mut count_bytes = [0u8; 8];
+    reader.read_exact(&mut count_bytes).ok()?;
+    let count = usize::try_from(u64::from_le_bytes(count_bytes)).ok()?;
+    let mut edges = Vec::with_capacity(count);
+    let mut flag = [0u8; 1];
+    for _ in 0..count {
+        let source = read_blob_str(reader)?;
+        let target = read_blob_str(reader)?;
+        let relation = read_blob_str(reader)?;
+        reader.read_exact(&mut flag).ok()?;
+        let required = flag[0] != 0;
+        reader.read_exact(&mut flag).ok()?;
+        let association = if flag[0] != 0 {
+            Some(read_blob_str(reader)?)
+        } else {
+            None
+        };
+        edges.push(nw_asset_graph::AssetDependencyEdge::new(
+            source,
+            target,
+            relation,
+            required,
+            association,
+        ));
+    }
+    Some(edges)
+}
+
+fn write_blob_str<W: std::io::Write>(writer: &mut W, value: &str) -> std::io::Result<()> {
+    writer.write_all(&(value.len() as u32).to_le_bytes())?;
+    writer.write_all(value.as_bytes())
+}
+
+fn read_blob_str<R: std::io::Read>(reader: &mut R) -> Option<String> {
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes).ok()?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    let mut bytes = vec![0u8; len];
+    reader.read_exact(&mut bytes).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 /// Default cache file location, under the OS cache/data directory.
 #[must_use]
 pub fn default_path() -> PathBuf {
@@ -268,5 +400,44 @@ mod tests {
         let restored = cache.catalog().unwrap();
         assert_eq!(restored.rasc().version(), 6);
         assert_eq!(restored.entries(), replacement.entries());
+    }
+
+    #[test]
+    fn dependency_index_blob_round_trips_and_rejects_stale_fingerprint() {
+        let edges = vec![
+            nw_asset_graph::AssetDependencyEdge::new(
+                "objects/a.cdf".to_owned(),
+                "objects/a_mat.mtl".to_owned(),
+                "cry_model.material".to_owned(),
+                true,
+                None,
+            ),
+            nw_asset_graph::AssetDependencyEdge::new(
+                "world/c.slice".to_owned(),
+                "objects/a.cdf".to_owned(),
+                "objectstream.asset_reference".to_owned(),
+                false,
+                Some("world/c.dynamicslice".to_owned()),
+            ),
+        ];
+        let mut buf = Vec::new();
+        encode_dependency_index(&mut buf, "fp-1", &edges).unwrap();
+
+        // A matching fingerprint rehydrates every edge field.
+        let decoded = decode_dependency_index(&mut buf.as_slice(), "fp-1").unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].source(), "objects/a.cdf");
+        assert_eq!(decoded[0].relation(), "cry_model.material");
+        assert!(decoded[0].is_required());
+        assert_eq!(decoded[0].association(), None);
+        assert_eq!(decoded[1].target(), "objects/a.cdf");
+        assert!(!decoded[1].is_required());
+        assert_eq!(decoded[1].association(), Some("world/c.dynamicslice"));
+
+        // A stale fingerprint (install patched) is a cache miss, forcing a rebuild.
+        assert!(decode_dependency_index(&mut buf.as_slice(), "fp-2").is_none());
+        // Corruption of the magic is likewise rejected.
+        buf[0] ^= 0xff;
+        assert!(decode_dependency_index(&mut buf.as_slice(), "fp-1").is_none());
     }
 }

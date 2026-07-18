@@ -119,6 +119,25 @@ pub struct AssetDependencyEdge {
 }
 
 impl AssetDependencyEdge {
+    /// Construct an edge directly, e.g. when rehydrating a persisted index via
+    /// [`AssetDependencyIndex::from_edges`].
+    #[must_use]
+    pub fn new(
+        source: String,
+        target: String,
+        relation: String,
+        required: bool,
+        association: Option<String>,
+    ) -> Self {
+        Self {
+            source,
+            target,
+            relation,
+            required,
+            association,
+        }
+    }
+
     #[must_use]
     pub fn source(&self) -> &str {
         &self.source
@@ -319,6 +338,26 @@ impl AssetDependencyIndex {
                 }
             }
         }
+        Ok(Self::finalize(edges, unresolved))
+    }
+
+    /// Reconstruct an index from a persisted edge set (for example a disk cache).
+    ///
+    /// Forward and reverse adjacency are rebuilt and edges are re-sorted into the
+    /// same canonical order [`Self::build_with_runner`] produces, so a cached and
+    /// a freshly-built index answer consumer/dependency queries identically. The
+    /// unresolved-dependency listing is not persisted; it is not consulted by the
+    /// reverse/forward projections exporters rely on.
+    #[must_use]
+    pub fn from_edges(edges: Vec<AssetDependencyEdge>) -> Self {
+        Self::finalize(edges, Vec::new())
+    }
+
+    /// Sort edges/unresolved into canonical order and build the adjacency maps.
+    fn finalize(
+        mut edges: Vec<AssetDependencyEdge>,
+        mut unresolved: Vec<UnresolvedDependency>,
+    ) -> Self {
         edges.sort_by(|left, right| {
             left.source
                 .cmp(&right.source)
@@ -352,7 +391,7 @@ impl AssetDependencyIndex {
                 .or_default()
                 .push(edge_index);
         }
-        Ok(index)
+        index
     }
 
     #[must_use]
