@@ -10,9 +10,7 @@ pub mod ranseq;
 
 macro_rules! id_type {
     ($name:ident) => {
-        #[derive(
-            Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize,
-        )]
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         #[repr(transparent)]
         pub struct $name(pub u32);
     };

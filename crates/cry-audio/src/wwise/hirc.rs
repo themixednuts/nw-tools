@@ -315,12 +315,7 @@ impl HircGraph {
         media
     }
 
-    fn collect(
-        &self,
-        node: u32,
-        media: &mut BTreeSet<WwiseMediaId>,
-        visited: &mut HashSet<u32>,
-    ) {
+    fn collect(&self, node: u32, media: &mut BTreeSet<WwiseMediaId>, visited: &mut HashSet<u32>) {
         if !visited.insert(node) {
             return;
         }
@@ -995,14 +990,7 @@ mod tests {
         let objects = vec![
             event(100, &[200]),
             action(200, 300),
-            switch_container(
-                300,
-                0,
-                1000,
-                7,
-                &[400, 500],
-                &[(7, &[400]), (9, &[500])],
-            ),
+            switch_container(300, 0, 1000, 7, &[400, 500], &[(7, &[400]), (9, &[500])]),
             ranseq_container(400, 300, &[402, 401]),
             sound(401, 4001, 400),
             sound(402, 4002, 400),
@@ -1110,7 +1098,10 @@ mod tests {
         ];
         let bytes = bank_with_hirc(&objects);
         let bank = WwiseSoundBank::parse(&bytes).unwrap();
-        assert!(bank.event_switch_branches(&bytes, WwiseObjectId(110)).is_empty());
+        assert!(
+            bank.event_switch_branches(&bytes, WwiseObjectId(110))
+                .is_empty()
+        );
     }
 
     #[test]

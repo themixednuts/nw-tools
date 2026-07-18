@@ -209,7 +209,9 @@ pub fn dependency_index_path() -> PathBuf {
 /// buffered reader — never read whole into memory — to keep the peak footprint
 /// at the resident edge set alone.
 #[must_use]
-pub fn load_dependency_index(fingerprint: &str) -> Option<Vec<nw_asset_graph::AssetDependencyEdge>> {
+pub fn load_dependency_index(
+    fingerprint: &str,
+) -> Option<Vec<nw_asset_graph::AssetDependencyEdge>> {
     let file = std::fs::File::open(dependency_index_path()).ok()?;
     decode_dependency_index(&mut std::io::BufReader::new(file), fingerprint)
 }

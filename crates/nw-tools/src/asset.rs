@@ -1356,8 +1356,7 @@ impl SummaryReport {
         ];
         if theme::caps().interactive
             && !rows.is_empty()
-            && crate::tui::browse("asset summary", stats.clone(), summary_table(&rows), 0)
-                .is_ok()
+            && crate::tui::browse("asset summary", stats.clone(), summary_table(&rows), 0).is_ok()
         {
             return;
         }

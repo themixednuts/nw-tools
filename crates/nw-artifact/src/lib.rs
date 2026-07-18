@@ -467,7 +467,9 @@ mod tests {
             Path::new("slices/tree_oak.slice.meta")
         );
         assert_eq!(
-            std::fs::read_dir(temp.path().join("slices")).unwrap().count(),
+            std::fs::read_dir(temp.path().join("slices"))
+                .unwrap()
+                .count(),
             1
         );
     }
@@ -566,7 +568,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(blobs.windows(2).all(|pair| pair[0] == pair[1]));
         assert_eq!(
-            std::fs::read_dir(temp.path().join("meshes")).unwrap().count(),
+            std::fs::read_dir(temp.path().join("meshes"))
+                .unwrap()
+                .count(),
             1
         );
     }

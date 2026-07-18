@@ -733,12 +733,13 @@ fn build_primitive(
             .map(|normals| transform_gltf_normals(normals, normal_transform))
     });
     let (joints, weights, joints2, weights2) = if options.skinned {
-        let mapping = read_bone_mapping(cgf, mesh, subset, bone_palette, heap).ok_or_else(|| {
-            ModelBuildError::MissingBoneMapping {
-                mesh: options.mesh_name.to_owned(),
-                subset: subset_index,
-            }
-        })?;
+        let mapping =
+            read_bone_mapping(cgf, mesh, subset, bone_palette, heap).ok_or_else(|| {
+                ModelBuildError::MissingBoneMapping {
+                    mesh: options.mesh_name.to_owned(),
+                    subset: subset_index,
+                }
+            })?;
         let out_of_range = mapping
             .joints
             .iter()
@@ -855,7 +856,12 @@ fn read_bone_mapping(
             (stream.data, stream.element_size, 0, stream.element_count)
         } else if let Some(data_ref) = cgf.data_refs().get(&id) {
             let stride = data_ref.stride;
-            (heap, stride, data_ref.offset, data_ref.size.checked_div(stride)?)
+            (
+                heap,
+                stride,
+                data_ref.offset,
+                data_ref.size.checked_div(stride)?,
+            )
         } else {
             return None;
         };
@@ -1074,7 +1080,12 @@ fn read_vec3_stream(
 /// Decode one inline `DataStream` vec3 element. `allow_half` gates the 8-byte
 /// half x3 layout: the positions loader accepts elemSize 12 or 8, but the
 /// normals loader (FUN_7ff606c3b500 @ 0x7ff606c3b500) accepts elemSize 12 only.
-fn decode_stream_vec3(data: &[u8], offset: usize, size: usize, allow_half: bool) -> Option<[f32; 3]> {
+fn decode_stream_vec3(
+    data: &[u8],
+    offset: usize,
+    size: usize,
+    allow_half: bool,
+) -> Option<[f32; 3]> {
     match size {
         12 => Some([
             f32_at(data, offset)?,
@@ -1302,7 +1313,8 @@ mod tests {
             3, 2, 1, 0, 0, 0, 0, 0, // v1 influences 5-8 (zero weights)
         ];
 
-        let mapping = decode_bone_mapping(&data, 8, 0, 4, 2, &subset(0, 2), Some(&palette)).unwrap();
+        let mapping =
+            decode_bone_mapping(&data, 8, 0, 4, 2, &subset(0, 2), Some(&palette)).unwrap();
 
         assert_eq!(mapping.joints, [[10, 11, 12, 13], [11, 10, 10, 10]]);
         assert_eq!(
@@ -1322,7 +1334,8 @@ mod tests {
             1, 0, 0, 0, 255, 0, 0, 0, // v1
         ];
 
-        let mapping = decode_bone_mapping(&data, 8, 0, 2, 2, &subset(0, 2), Some(&palette)).unwrap();
+        let mapping =
+            decode_bone_mapping(&data, 8, 0, 2, 2, &subset(0, 2), Some(&palette)).unwrap();
 
         assert_eq!(mapping.joints.len(), 2);
         assert!(mapping.joints2.is_none());
@@ -1354,7 +1367,13 @@ mod tests {
         for value in [1.0_f32, 2.0, 3.0] {
             data.extend_from_slice(&value.to_le_bytes());
         }
-        assert_eq!(decode_stream_vec3(&data, 0, 12, true), Some([1.0, 2.0, 3.0]));
-        assert_eq!(decode_stream_vec3(&data, 0, 12, false), Some([1.0, 2.0, 3.0]));
+        assert_eq!(
+            decode_stream_vec3(&data, 0, 12, true),
+            Some([1.0, 2.0, 3.0])
+        );
+        assert_eq!(
+            decode_stream_vec3(&data, 0, 12, false),
+            Some([1.0, 2.0, 3.0])
+        );
     }
 }

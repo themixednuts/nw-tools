@@ -194,7 +194,11 @@ impl WwiseRandomContainer {
                 bag.clone()
             } else {
                 let live: Vec<usize> = (0..n).filter(|index| !recent.contains(index)).collect();
-                if live.is_empty() { (0..n).collect() } else { live }
+                if live.is_empty() {
+                    (0..n).collect()
+                } else {
+                    live
+                }
             };
             let chosen = self.weighted_pick(&candidates, &mut rng);
             out.push(self.items[chosen].0);
@@ -419,7 +423,10 @@ mod tests {
             .map(|id| id.0)
             .collect();
         for window in ids.windows(2) {
-            assert_ne!(window[0], window[1], "avoid_repeat=1 must alternate: {ids:?}");
+            assert_ne!(
+                window[0], window[1],
+                "avoid_repeat=1 must alternate: {ids:?}"
+            );
         }
         // With two items the alternation is fully determined by the first pick.
         assert_eq!(ids[0], ids[2]);
