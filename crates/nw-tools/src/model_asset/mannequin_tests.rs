@@ -18,6 +18,60 @@ const ADB: &[u8] = br#"
     "#;
 
 #[test]
+fn character_definition_and_mannequin_family_stay_on_same_entity() {
+    const CDF: &str = "objects/characters/npc/example/example.cdf";
+    let valid = entity_xml(
+        1,
+        "valid",
+        &format!(
+            "{}{}",
+            action_component(),
+            character_definition_component(CDF)
+        ),
+    );
+    let split_action = entity_xml(2, "action only", &action_component());
+    let split_cdf = entity_xml(3, "cdf only", &character_definition_component(CDF));
+    let source = source_with_scene(scene(&[valid, split_action, split_cdf], false)).with(
+        CDF,
+        b"<CharacterDefinition><Model File=\"objects/example.chr\"/></CharacterDefinition>",
+    );
+
+    let contexts = character_mannequin_contexts(&source, &[SCENE.to_owned()]).unwrap();
+
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(contexts[0].cdf_path, CDF);
+    assert_eq!(contexts[0].family.adb_paths, [ADB_PATH]);
+    assert!(contexts[0].family.controller_paths.is_empty());
+}
+
+#[test]
+fn catalog_character_definition_asset_selects_same_entity_context() {
+    const CDF: &str = "objects/characters/npc/example/catalog.cdf";
+    let cdf_guid = uuid!("99999999-bbbb-cccc-dddd-eeeeeeeeeeee");
+    let entity = entity_xml(
+        4,
+        "catalog",
+        &format!(
+            "{}{}",
+            action_component(),
+            character_definition_asset_component(cdf_guid, CDF)
+        ),
+    );
+    let source = CatalogSource {
+        inner: source_with_scene(scene(&[entity], false)).with(
+            CDF,
+            b"<CharacterDefinition><Model File=\"objects/example.chr\"/></CharacterDefinition>",
+        ),
+        by_id: BTreeMap::from([(nw_asset::AssetId::new(cdf_guid, 0), CDF.to_owned())]),
+    };
+
+    let contexts = character_mannequin_contexts(&source, &[SCENE.to_owned()]).unwrap();
+
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(contexts[0].cdf_path, CDF);
+}
+
+#[test]
 fn only_same_entity_components_form_a_receiver_context() {
     let source = source_with_scene(scene(
         &[
@@ -313,6 +367,18 @@ fn tag_component(tag: u32) -> String {
 fn action_component() -> String {
     format!(
         r#"<Class name="ActionListComponent" type="{{30ED0ACE-51DD-48B9-BA41-2FA6775CD106}}"><Class name="AZStd::string" field="m_animationDatabase" value="{ADB_PATH}" type="{{03AAAB3F-5C47-5A66-9EBC-D5FA4DB353C9}}"/></Class>"#
+    )
+}
+
+fn character_definition_component(cdf: &str) -> String {
+    format!(
+        r#"<Class name="CharacterComponent" type="{{15407CAA-4970-4D06-8B5C-612FBA11BB45}}"><Class name="AzFramework::SimpleAssetReference&lt;CharacterDefinitionAsset&gt;" field="m_cdfPath" type="{{A1342558-687A-406A-8BE4-784D6546589D}}"><Class name="SimpleAssetReferenceBase" field="BaseClass1" type="{{E16CA6C5-5C78-4AD9-8E9B-F8C1FB4D1DB8}}"><Class name="AZStd::string" field="AssetPath" value="{cdf}" type="{{03AAAB3F-5C47-5A66-9EBC-D5FA4DB353C9}}"/></Class></Class></Class>"#
+    )
+}
+
+fn character_definition_asset_component(guid: Uuid, hint: &str) -> String {
+    format!(
+        r#"<Class name="CharacterComponent" type="{{15407CAA-4970-4D06-8B5C-612FBA11BB45}}"><Class name="Asset" field="m_characterDefinition" value="id={{{guid}}}:0,type={{82557326-4AE3-416C-95D6-C70635AB7588}},hint={{{hint}}}" type="{{77A19D40-8731-4D3C-9041-1B43047366A4}}"/></Class>"#
     )
 }
 

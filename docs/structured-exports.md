@@ -32,6 +32,15 @@ several characters this way builds the shared authored-asset dependency index on
 for the whole run rather than once per character. Omit `--filter` entirely to
 convert the whole install.
 
+A filtered structured-glTF run also discovers context-owned alternate CDFs. An
+alternate must share a render identity asset with a selected CDF and be selected by
+the exact same entity-owned Mannequin controller/ADB family; it is exported as its
+own manifest, not combined with the source character. This includes phase-specific
+characters that change skeletons or attachments, while excluding unrelated models
+that happen to share a common skeleton. Explicit single-file exports keep their
+one-input/one-output behavior, and unfiltered install exports already select every
+CDF directly.
+
 All exports share one output root, so identical resources (skeletons, animations,
 textures, geometry) are written once and deduplicated across models *and* across
 successive runs into the same root — see the path-normalization rules below.

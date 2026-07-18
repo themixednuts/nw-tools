@@ -495,9 +495,8 @@ fn resolve_single_attachment(
             | AttachmentKind::VertexCloth
             | AttachmentKind::Proxy
             | AttachmentKind::PendulumRow
-            | AttachmentKind::Unknown(_) => {
-                model.append_character_root(child.model, attachment_character_transform(attachment))?
-            }
+            | AttachmentKind::Unknown(_) => model
+                .append_character_root(child.model, attachment_character_transform(attachment))?,
         };
         for mut animation in child.animations {
             animation.skeleton += skeleton_offset;
@@ -846,7 +845,10 @@ mod tests {
         let mut physics = nw_model::PhysicsScene::default();
         let mut extras = nw_model::CryAssetExtras::default();
         let attachments = vec![
-            attachment(AttachmentKind::Unknown("CA_CLOTH".to_owned()), "test/good.cloth"),
+            attachment(
+                AttachmentKind::Unknown("CA_CLOTH".to_owned()),
+                "test/good.cloth",
+            ),
             attachment(AttachmentKind::Skin, "test/bad.skin"),
         ];
 

@@ -25,6 +25,9 @@ mod mannequin;
 mod materials;
 mod physics;
 mod sources;
+mod variants;
+
+pub(crate) use variants::context_variant_cdfs;
 
 use animation::{clip_targets_skeleton, push_animation_assets};
 use materials::resolve_primary_materials;

@@ -6,8 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use nw_objectstream::asset_reference::read_asset_value;
+use nw_objectstream::asset_reference::{read_asset_path_or_string_owned, read_asset_value};
 use nw_objectstream::query::{az_entity_elements, base_class_of_type};
+use nw_objectstream::types;
 use nw_objectstream::value::{
     child_by_field, read_bool, read_entity_id, read_string, read_string_vector_owned,
 };
@@ -18,6 +19,61 @@ use super::*;
 const ACTION_LIST_COMPONENT_ID: Uuid = uuid!("30ed0ace-51dd-48b9-ba41-2fa6775cd106");
 const SCRIPT_COMPONENT_ID: Uuid = uuid!("8d1bc97e-c55d-4d34-a460-e63c57cd0d4b");
 const SCRIPT_PROPERTY_ID: Uuid = uuid!("d227d737-f1ed-4fb3-a1fb-38e4985d2e7a");
+
+/// The authored Mannequin controller/ADB set selecting one character family.
+///
+/// The complete set is deliberately part of the identity: a shared ADB alone
+/// is not enough to associate otherwise unrelated character definitions.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct MannequinFamily {
+    pub(super) adb_paths: Vec<String>,
+    pub(super) controller_paths: Vec<String>,
+}
+
+impl MannequinFamily {
+    fn new(mut adb_paths: Vec<String>, mut controller_paths: Vec<String>) -> Self {
+        for paths in [&mut adb_paths, &mut controller_paths] {
+            paths.sort_by_key(|path| path.to_ascii_lowercase());
+            paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+            for path in paths {
+                path.make_ascii_lowercase();
+            }
+        }
+        Self {
+            adb_paths,
+            controller_paths,
+        }
+    }
+
+    pub(super) fn overlaps(&self, other: &Self) -> bool {
+        self.adb_paths
+            .iter()
+            .chain(&self.controller_paths)
+            .any(|path| {
+                other
+                    .adb_paths
+                    .iter()
+                    .chain(&other.controller_paths)
+                    .any(|candidate| candidate.eq_ignore_ascii_case(path))
+            })
+    }
+
+    pub(super) fn describe(&self) -> String {
+        self.adb_paths
+            .iter()
+            .chain(&self.controller_paths)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// One entity's selected character definition and authored Mannequin family.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct CharacterMannequinContext {
+    pub(super) cdf_path: String,
+    pub(super) family: MannequinFamily,
+}
 
 /// Discover entity-owned Mannequin references, preserve direct Audio clips once,
 /// and attach CharacterEvent clips separately for every valid receiver context.
@@ -53,6 +109,45 @@ pub(super) fn attach_fragment_audio(
     Ok(())
 }
 
+/// Discover the character-definition and Mannequin-family pair authored by each
+/// same-entity ActionList and character-definition reference in `scene_paths`.
+pub(super) fn character_mannequin_contexts(
+    source: &dyn AssetSource,
+    scene_paths: &[String],
+) -> Result<Vec<CharacterMannequinContext>> {
+    let mut contexts = Vec::new();
+    for scene_path in normalized_scene_paths(scene_paths) {
+        let Some(bytes) = source.read(&scene_path) else {
+            continue;
+        };
+        let Ok(stream) =
+            nw_objectstream::ObjectStream::from_bytes(&bytes, Some(&OBJECTSTREAM_LOOKUP))
+        else {
+            continue;
+        };
+        for entity in az_entity_elements(stream.elements()) {
+            let Some(components) = child_by_field(entity, "Components") else {
+                continue;
+            };
+            let (adb_paths, controller_paths) = action_list_paths(source, components)
+                .with_context(|| format!("read ActionListComponent references in {scene_path}"))?;
+            if adb_paths.is_empty() {
+                continue;
+            }
+            let family = MannequinFamily::new(adb_paths, controller_paths);
+            for cdf_path in character_definition_paths(source, components)? {
+                contexts.push(CharacterMannequinContext {
+                    cdf_path,
+                    family: family.clone(),
+                });
+            }
+        }
+    }
+    contexts.sort();
+    contexts.dedup();
+    Ok(contexts)
+}
+
 struct MannequinDiscovery {
     adb_paths: Vec<String>,
     controller_paths: Vec<String>,
@@ -63,20 +158,12 @@ fn discover_mannequin_entities(
     source: &dyn AssetSource,
     scene_paths: &[String],
 ) -> Result<MannequinDiscovery> {
-    let mut scenes = scene_paths
-        .iter()
-        .filter(|path| is_legacy_scene_asset(path))
-        .map(|path| normalize_path(path))
-        .collect::<Vec<_>>();
-    scenes.sort_by_key(|path| path.to_ascii_lowercase());
-    scenes.dedup_by(|later, earlier| later.eq_ignore_ascii_case(earlier));
-
     let mut discovery = MannequinDiscovery {
         adb_paths: Vec::new(),
         controller_paths: Vec::new(),
         contexts: Vec::new(),
     };
-    for scene_path in scenes {
+    for scene_path in normalized_scene_paths(scene_paths) {
         let Some(bytes) = source.read(&scene_path) else {
             continue;
         };
@@ -183,6 +270,57 @@ fn merge_databases(
         }
     }
     Ok(merged)
+}
+
+fn normalized_scene_paths(scene_paths: &[String]) -> Vec<String> {
+    let mut scenes = scene_paths
+        .iter()
+        .filter(|path| is_legacy_scene_asset(path))
+        .map(|path| normalize_path(path))
+        .collect::<Vec<_>>();
+    scenes.sort_by_key(|path| path.to_ascii_lowercase());
+    scenes.dedup_by(|later, earlier| later.eq_ignore_ascii_case(earlier));
+    scenes
+}
+
+fn character_definition_paths(
+    source: &dyn AssetSource,
+    components: &nw_objectstream::Element,
+) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for element in components.iter_recursive() {
+        let path = if element.id() == &types::ASSET && element.data().is_some() {
+            let asset = read_asset_value(element).context("decode entity CDF asset")?;
+            let asset_id = nw_asset::AssetId::new(asset.guid(), asset.sub_id());
+            source
+                .path_by_id(asset_id)
+                .map(|path| normalize_path(&path))
+                .or_else(|| {
+                    let hint = normalize_path(asset.hint().trim());
+                    (source.allows_asset_hint_fallback()
+                        && !hint.is_empty()
+                        && source.contains(&hint))
+                    .then_some(hint)
+                })
+        } else if element
+            .field()
+            .is_some_and(|field| field.eq_ignore_ascii_case("m_cdfPath"))
+        {
+            read_asset_path_or_string_owned(element)
+                .context("read entity m_cdfPath")?
+                .map(|path| normalize_path(&path))
+        } else {
+            None
+        };
+        let Some(path) = path else {
+            continue;
+        };
+        if source_extension(&path) == "cdf" && source.contains(&path) {
+            push_path(&mut paths, path);
+        }
+    }
+    paths.sort_by_key(|path| path.to_ascii_lowercase());
+    Ok(paths)
 }
 
 fn action_list_paths(

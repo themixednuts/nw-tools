@@ -172,8 +172,13 @@ impl Model {
                 .and_then(|stem| stem.to_str())
                 .unwrap_or("model");
             let blend_path = manifest.with_file_name(format!("{stem}.blend"));
-            crate::audio_export::write_playable_blend(&blender, manifest, package_root, &blend_path)
-                .with_context(|| format!("write playable blend {}", blend_path.display()))?;
+            crate::audio_export::write_playable_blend(
+                &blender,
+                manifest,
+                package_root,
+                &blend_path,
+            )
+            .with_context(|| format!("write playable blend {}", blend_path.display()))?;
             eprintln!("blend {}", blend_path.display());
             written += 1;
         }
@@ -312,7 +317,7 @@ impl Model {
     fn export_install(&self, ctx: &RunCtx) -> Result<()> {
         let install = source::locate()?;
         let source = Install::open(ctx, &install.assets())?;
-        let meshes = source.paths_with_extensions(
+        let mut meshes = source.paths_with_extensions(
             &["cgf", "skin", "chr", "cga", "cdf", "caf", "i_caf", "dba"],
             &self.filters,
         );
@@ -326,6 +331,23 @@ impl Model {
             None
         };
         let dependency_index = self.install_dependency_index(ctx, &source, &install.assets())?;
+        if !self.filters.is_empty()
+            && let Some(index) = dependency_index.as_ref()
+        {
+            let roots = meshes
+                .iter()
+                .filter(|path| path_ext(Path::new(path)).as_deref() == Some("cdf"))
+                .cloned()
+                .collect::<Vec<_>>();
+            for root in roots {
+                meshes.extend(
+                    crate::model_asset::context_variant_cdfs(&source, &root, index)
+                        .with_context(|| format!("discover context variants for {root}"))?,
+                );
+            }
+            meshes.sort_by_key(|path| path.to_ascii_lowercase());
+            meshes.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        }
 
         let batch = ctx.map_results_compact("model", &meshes, Clone::clone, |key, progress| {
             progress.step(|| {
@@ -507,12 +529,9 @@ impl Model {
         if self.container != Container::Gltf {
             return Ok(None);
         }
-        let paths = nw_asset_graph::AssetSource::paths_with_extensions(
-            source,
-            MODEL_CONSUMER_EXTENSIONS,
-        )?;
-        source::load_or_build_dependency_index(assets, source, &paths, &ctx.runner)
-            .map(Some)
+        let paths =
+            nw_asset_graph::AssetSource::paths_with_extensions(source, MODEL_CONSUMER_EXTENSIONS)?;
+        source::load_or_build_dependency_index(assets, source, &paths, &ctx.runner).map(Some)
     }
 }
 
