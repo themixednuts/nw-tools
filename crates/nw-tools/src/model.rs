@@ -334,11 +334,15 @@ impl Model {
         if !self.filters.is_empty()
             && let Some(index) = dependency_index.as_ref()
         {
-            let roots = meshes
-                .iter()
-                .filter(|path| path_ext(Path::new(path)).as_deref() == Some("cdf"))
-                .cloned()
-                .collect::<Vec<_>>();
+            let roots = character_roots(&meshes);
+            // A character filter such as `isabella_t2` also matches its `.skin`
+            // and `.chr` leaves. Those are dependency-owned parts whose material
+            // and skeleton context lives in the CDF, not separate export roots.
+            // Prefer complete CDF roots whenever any match; standalone mesh/CAF
+            // queries retain the original all-matches behavior.
+            if !roots.is_empty() {
+                meshes.clone_from(&roots);
+            }
             for root in roots {
                 meshes.extend(
                     crate::model_asset::context_variant_cdfs(&source, &root, index)
@@ -533,6 +537,14 @@ impl Model {
             nw_asset_graph::AssetSource::paths_with_extensions(source, MODEL_CONSUMER_EXTENSIONS)?;
         source::load_or_build_dependency_index(assets, source, &paths, &ctx.runner).map(Some)
     }
+}
+
+fn character_roots(matches: &[String]) -> Vec<String> {
+    matches
+        .iter()
+        .filter(|path| path_ext(Path::new(path)).as_deref() == Some("cdf"))
+        .cloned()
+        .collect()
 }
 
 struct ConvertRequest<'a> {
@@ -1124,6 +1136,20 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn character_filters_prefer_complete_cdf_roots() {
+        let matches = vec![
+            "objects/isabella_t2/isabella_t2.cdf".to_owned(),
+            "objects/isabella_t2/isabella_t2_skel.chr".to_owned(),
+            "objects/isabella_t2/isabella_upperbody.skin".to_owned(),
+        ];
+        assert_eq!(
+            character_roots(&matches),
+            ["objects/isabella_t2/isabella_t2.cdf"]
+        );
+        assert!(character_roots(&["objects/standalone.cgf".to_owned()]).is_empty());
+    }
 
     #[test]
     fn detects_two_channel_ddna_by_empty_blue() {

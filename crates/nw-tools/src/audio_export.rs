@@ -155,17 +155,13 @@ pub(crate) fn write_playable_blend(
     package_root: &Path,
     blend_path: &Path,
 ) -> Result<()> {
-    let document: serde_json::Value = serde_json::from_slice(
-        &fs::read(gltf_path).with_context(|| format!("read {}", gltf_path.display()))?,
-    )
-    .context("parse glTF JSON for blend schedule")?;
     // Blender resolves relative paths against its own working directory, and
     // background mode exits 0 on Python errors unless --python-exit-code is set.
     // Everything crossing the process boundary — including per-sound WAV paths
     // in the schedule — must be absolute.
     let package_root_abs = std::path::absolute(package_root)
         .with_context(|| format!("absolutize {}", package_root.display()))?;
-    let schedule = build_blend_schedule(&document, &package_root_abs)?;
+    let schedule = blend_schedule(gltf_path, &package_root_abs)?;
     let gltf_abs = std::path::absolute(gltf_path)
         .with_context(|| format!("absolutize {}", gltf_path.display()))?;
     let blend_abs = std::path::absolute(blend_path)
@@ -203,6 +199,23 @@ pub(crate) fn write_playable_blend(
         );
     }
     Ok(())
+}
+
+/// Build the exact animation/audio preview plan consumed by both the legacy
+/// one-shot writer and the reusable AZoth extension.
+pub(crate) fn blend_schedule(gltf_path: &Path, package_root: &Path) -> Result<BlendSchedule> {
+    let document: serde_json::Value = serde_json::from_slice(
+        &fs::read(gltf_path).with_context(|| format!("read {}", gltf_path.display()))?,
+    )
+    .context("parse glTF JSON for blend schedule")?;
+    build_blend_schedule(&document, package_root)
+}
+
+pub(crate) fn blend_schedule_document(
+    document: &serde_json::Value,
+    package_root: &Path,
+) -> Result<BlendSchedule> {
+    build_blend_schedule(document, package_root)
 }
 
 /// Blender-side adapter. Deliberately logic-free: it imports the glTF once,

@@ -1,5 +1,6 @@
 mod asset;
 mod audio_export;
+mod azoth;
 mod cache;
 mod dds;
 mod extract;
@@ -55,6 +56,11 @@ impl From<ColorArg> for theme::ColorChoice {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = "Blender bridge for the AZoth extension")]
+    Azoth {
+        #[command(subcommand)]
+        command: azoth::Cmd,
+    },
     #[command(about = "Print the detected New World install paths")]
     Locate,
     #[command(about = "Normalize an archive path")]
@@ -90,6 +96,7 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command {
+        Some(Command::Azoth { command }) => command.run()?,
         Some(Command::Locate) => {
             let install = nw_locator::Install::locate()?;
             let mut report = Report::new("install");

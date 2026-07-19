@@ -1,0 +1,21 @@
+schema_version = "1.0.0"
+id = "azoth"
+version = "0.1.0"
+name = "AZoth"
+tagline = "One-click New World asset workspaces"
+maintainer = "themixednuts"
+type = "add-on"
+tags = ["Import-Export", "Pipeline", "3D View"]
+blender_version_min = "5.2.0"
+license = ["SPDX:MIT"]
+website = "https://github.com/themixednuts/nw-tools"
+
+[permissions]
+files = "Read and write AZoth packages under C:\\nwt"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  ".git/",
+]

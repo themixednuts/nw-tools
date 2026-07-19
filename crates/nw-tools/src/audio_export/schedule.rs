@@ -7,7 +7,7 @@ use anyhow::Result;
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct BlendSchedule {
+pub(crate) struct BlendSchedule {
     /// One fps for the whole file. The glTF importer converts each animation's
     /// second-based keyframe times to frames at the *scene* fps in effect when
     /// it runs, so the adapter must set this on the base scene BEFORE import and
