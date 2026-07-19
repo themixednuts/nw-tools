@@ -9,7 +9,9 @@ whole workflow: import, deterministic categorization, particle/bone attachment,
 shared-library creation, editable rig override, and per-character workspace save.
 Opening an unchanged package again loads that existing workspace immediately.
 Engine helpers stay categorized and one click away in the Outliner, but start
-hidden so the initial viewport is a clean material-preview character view.
+hidden so the initial viewport is a centered material-preview character view.
+**Clean Character View** restores those presentation defaults at any time without
+disabling armature deformation or removing authoring data.
 
 Heavy data lives in `C:\nwt\.azoth\libraries`; the small files in
 `C:\nwt\.azoth\workspaces` link it. Images and decoded WAV previews remain shared

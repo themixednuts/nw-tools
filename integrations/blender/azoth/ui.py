@@ -100,6 +100,7 @@ class AZOTH_PT_main(bpy.types.Panel):
         status.label(text=state.status, icon="CHECKMARK" if "fail" not in state.status.lower() else "ERROR")
         if state.source_path:
             status.label(text=state.source_path, icon="LINKED")
+            status.operator("azoth.clean_character_view", icon="HIDE_OFF")
         if bridge.find_nw_tools() is None:
             status.label(text="Import ready; nw-tools not found for export/audio", icon="INFO")
 

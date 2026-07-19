@@ -5,6 +5,8 @@ from pathlib import Path
 
 import bpy
 
+from . import presentation
+
 
 COLLECTION_PATHS = (
     "Geometry/Render",
@@ -99,7 +101,7 @@ def organize(context, manifest, source_path, imported_objects, imported_data):
         action["azoth.manifest"] = str(Path(manifest).resolve())
 
     _remove_empty_import_collections(root, imported_objects)
-    _configure_visibility(collections)
+    presentation.configure_source_collections(collections)
     return root
 
 
@@ -194,25 +196,6 @@ def _walk_collections(root):
     for child in root.children:
         yield child
         yield from _walk_collections(child)
-
-
-def _configure_visibility(collections):
-    # Engine helpers remain available in their named collections, but a newly
-    # opened workspace should present the authored character, not a wall of
-    # wireframes and emitter markers. Users can reveal any category directly
-    # from the Outliner when they need to inspect it.
-    for path in (
-        "Geometry/Cloth",
-        "Geometry/Shadow Proxies",
-        "Runtime/Particles",
-        "Runtime/Physics/Hit Volumes",
-        "Runtime/Physics/Rigid Bodies",
-        "Runtime/Physics/RockNRoll",
-        "Runtime/Physics/Other",
-        "Diagnostics",
-    ):
-        collections[path].hide_viewport = True
-        collections[path].hide_render = True
 
 
 def _unique_collection_name(base):

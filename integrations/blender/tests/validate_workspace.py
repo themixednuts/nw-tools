@@ -6,6 +6,8 @@ import sys
 
 import bpy
 
+from bl_ext.user_default.azoth import presentation
+
 
 def main():
     args = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
@@ -53,6 +55,79 @@ def main():
     )
     if linked_data == 0:
         raise RuntimeError("workspace contains no shared linked object data")
+    hidden_layers = presentation.hidden_layer_paths(bpy.context, root)
+    expected_hidden_layers = set(presentation.HIDDEN_COLLECTION_PATHS)
+    if hidden_layers != expected_hidden_layers:
+        raise RuntimeError(
+            "workspace helper visibility mismatch: "
+            f"expected {sorted(expected_hidden_layers)}, got {sorted(hidden_layers)}"
+        )
+    root_object_names = {obj.name for obj in root.all_objects}
+    visible_rigs = [
+        obj.name
+        for obj in bpy.context.view_layer.objects
+        if obj.type == "ARMATURE" and obj.name in root_object_names and not obj.hide_get()
+    ]
+    if visible_rigs:
+        raise RuntimeError(f"workspace rig overlays are visible: {visible_rigs}")
+    hidden_rig = next(
+        (
+            obj
+            for obj in bpy.context.view_layer.objects
+            if obj.type == "ARMATURE" and obj.name in root_object_names
+        ),
+        None,
+    )
+    skinned_mesh = next(
+        (
+            obj
+            for obj in root.all_objects
+            if obj.type == "MESH"
+            and any(modifier.type == "ARMATURE" for modifier in obj.modifiers)
+        ),
+        None,
+    )
+    if hidden_rig is None or skinned_mesh is None:
+        raise RuntimeError("workspace has no rigged render mesh for presentation validation")
+    hidden_coordinates = _evaluated_coordinates(skinned_mesh)
+    hidden_rig.hide_set(False, view_layer=bpy.context.view_layer)
+    bpy.context.view_layer.update()
+    visible_coordinates = _evaluated_coordinates(skinned_mesh)
+    hidden_rig.hide_set(True, view_layer=bpy.context.view_layer)
+    bpy.context.view_layer.update()
+    if hidden_coordinates != visible_coordinates:
+        raise RuntimeError("hiding the rig overlay changed evaluated skin deformation")
+    material_areas = [
+        area
+        for area in bpy.context.screen.areas
+        if area.type == "VIEW_3D" and area.spaces.active.shading.type == "MATERIAL"
+    ]
+    if not material_areas:
+        raise RuntimeError("workspace has no material-preview 3D View")
+    incorrectly_framed_areas = [
+        area
+        for area in material_areas
+        if area.spaces.active.region_3d.view_perspective != "ORTHO"
+        or abs(
+            area.spaces.active.region_3d.view_rotation.rotation_difference(
+                presentation.FRONT_VIEW_ROTATION
+            ).angle
+        )
+        > 1.0e-5
+    ]
+    if incorrectly_framed_areas:
+        raise RuntimeError("workspace 3D View is not front-facing and orthographic")
+    _center, render_extent = presentation.render_bounds(root)
+    for area in material_areas:
+        window_region = next(region for region in area.regions if region.type == "WINDOW")
+        expected_distance = presentation.front_view_distance(
+            render_extent,
+            window_region.width,
+            window_region.height,
+            area.spaces.active.lens,
+        )
+        if area.spaces.active.region_3d.view_distance + 1.0e-4 < expected_distance:
+            raise RuntimeError("workspace 3D View crops the render bounds")
 
     playable = next((index for index, item in enumerate(state.animations) if item.audio_count), None)
     audio_strips = 0
@@ -79,10 +154,25 @@ def main():
         "resourceCategories": resource_counts,
         "linkedObjects": sum(obj.library is not None for obj in root.all_objects),
         "linkedData": linked_data,
+        "hiddenHelperLayers": len(hidden_layers),
+        "hiddenRigs": sum(
+            obj.type == "ARMATURE" and obj.name in root_object_names and obj.hide_get()
+            for obj in bpy.context.view_layer.objects
+        ),
+        "materialPreviewAreas": len(material_areas),
         "overrides": sum(obj.override_library is not None for obj in root.all_objects),
         "audioStrips": audio_strips,
     }
     print("AZOTH_ACCEPTANCE=" + json.dumps(result, sort_keys=True))
+
+
+def _evaluated_coordinates(obj):
+    evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    mesh = evaluated.to_mesh()
+    try:
+        return tuple(tuple(vertex.co) for vertex in mesh.vertices[:64])
+    finally:
+        evaluated.to_mesh_clear()
 
 
 main()

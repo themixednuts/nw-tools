@@ -9,7 +9,7 @@ import bpy
 from bpy.props import StringProperty
 from bpy_extras.io_utils import ImportHelper
 
-from . import bridge, metadata, organizer
+from . import bridge, metadata, organizer, presentation
 
 
 _DATA_TABLES = ("objects", "meshes", "armatures", "materials", "images", "actions", "sounds")
@@ -167,6 +167,21 @@ class AZOTH_OT_apply_animation(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class AZOTH_OT_clean_character_view(bpy.types.Operator):
+    bl_idname = "azoth.clean_character_view"
+    bl_label = "Clean Character View"
+    bl_description = "Hide engine helpers and rig overlays, center the render geometry, and show materials"
+
+    @classmethod
+    def poll(cls, context):
+        return presentation.find_scene_root(context.scene) is not None
+
+    def execute(self, context):
+        root = presentation.find_scene_root(context.scene)
+        presentation.configure_workspace(context, root)
+        return {"FINISHED"}
+
+
 def _import_manifest(operator, context, manifest):
     try:
         manifest = manifest.resolve(strict=True)
@@ -233,8 +248,8 @@ def _import_manifest(operator, context, manifest):
             state.status = f"Imported locally; linked workspace failed: {error}"
             operator.report({"WARNING"}, state.status)
     else:
+        presentation.configure_workspace(context, root)
         state.status = f"Imported and organized: {manifest.name}"
-    _material_viewport()
     operator.report({"INFO"}, state.status)
     return {"FINISHED"}
 
@@ -311,6 +326,7 @@ def _make_linked_workspace(context, root, imported, manifest):
     linked = target.collections[0]
     context.scene.collection.children.link(linked)
     organizer.linked_override(context, linked)
+    presentation.configure_workspace(context, linked)
     bpy.ops.object.select_all(action="DESELECT")
     context.view_layer.objects.active = None
     return library, workspace
@@ -424,19 +440,13 @@ def _clear_factory_objects():
         bpy.data.objects.remove(obj, do_unlink=True)
 
 
-def _material_viewport():
-    for screen in bpy.data.screens:
-        for area in screen.areas:
-            if area.type == "VIEW_3D":
-                area.spaces.active.shading.type = "MATERIAL"
-
-
 CLASSES = (
     AZOTH_OT_refresh,
     AZOTH_OT_import_selected,
     AZOTH_OT_import_file,
     AZOTH_OT_export_asset,
     AZOTH_OT_apply_animation,
+    AZOTH_OT_clean_character_view,
 )
 
 
