@@ -1,6 +1,6 @@
 //! Complete Cry character/model graph resolution for glTF export.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str;
 use std::sync::{Arc, LazyLock};
@@ -23,13 +23,17 @@ mod cloth;
 mod dependencies;
 mod mannequin;
 mod materials;
+mod particles;
 mod physics;
 mod sources;
 mod variants;
 
 pub(crate) use variants::context_variant_cdfs;
 
-use animation::{clip_targets_skeleton, push_animation_assets};
+use animation::{
+    AnimationAssetEvaluation, AnimationBindingPolicy, clip_targets_skeleton, push_animation_assets,
+    scope_blend_space_dependencies,
+};
 use materials::resolve_primary_materials;
 use physics::scope_scene_physics;
 use sources::{apply_resolved_dependencies, model_context_assets, resolve_cdf};
@@ -60,7 +64,7 @@ pub(crate) struct ResolvedAsset {
     pub animations: Vec<nw_model::ModelAnimation>,
     pub extras: nw_model::CryAssetExtras,
     pub physics: nw_model::PhysicsScene,
-    parsed_animation_assets: HashSet<(usize, String)>,
+    animation_asset_evaluations: HashMap<AnimationAssetEvaluation, bool>,
 }
 
 struct LoadedEventDatabase {
@@ -156,7 +160,16 @@ pub(crate) fn resolve(
                 animations,
                 extras,
                 physics: nw_model::PhysicsScene::default(),
-                parsed_animation_assets: [(0, normalize_path(source_path))].into_iter().collect(),
+                animation_asset_evaluations: [(
+                    AnimationAssetEvaluation::new(
+                        0,
+                        source_path,
+                        AnimationBindingPolicy::ExplicitPermissive,
+                    ),
+                    true,
+                )]
+                .into_iter()
+                .collect(),
             }
         }
         _ => {
@@ -179,7 +192,7 @@ pub(crate) fn resolve(
                     ..Default::default()
                 },
                 physics: nw_model::PhysicsScene::default(),
-                parsed_animation_assets: HashSet::new(),
+                animation_asset_evaluations: HashMap::new(),
             }
         }
     };
@@ -243,6 +256,7 @@ pub(crate) fn resolve(
     dependency_paths.sort_by_key(|path| normalize_path(path).to_ascii_lowercase());
     dependency_paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     apply_resolved_dependencies(runner, source, &dependency_paths, &mut resolved)?;
+    scope_blend_space_dependencies(source, &mut resolved)?;
     // Discover the creature's Mannequin databases from its scene slices and attach
     // fragment audio (bite/vocal/action sounds) before trigger resolution, so its
     // triggers flow through the same ATL → bank/media pipeline as footsteps.
@@ -260,6 +274,13 @@ pub(crate) fn resolve(
         crate::audio_export::materialize_decoded_waves(source, &mut resolved, &vgmstream)?;
     }
     scope_scene_physics(&resolved.model, &mut resolved.physics);
+    particles::attach_scene_particles(
+        runner,
+        source,
+        &resolved.model,
+        &mut resolved.extras,
+        &dependency_graph,
+    )?;
     Ok(resolved)
 }
 
@@ -596,6 +617,9 @@ fn embedded_kind_for_source(
         }
         nw_model::CrySourceAssetKind::MaterialEffectsFxLibrary => {
             nw_model::CryEmbeddedResourceKind::MaterialEffectsFxLibrary
+        }
+        nw_model::CrySourceAssetKind::ParticleLibrary => {
+            nw_model::CryEmbeddedResourceKind::ParticleLibrary
         }
         nw_model::CrySourceAssetKind::WwiseSoundBank => {
             nw_model::CryEmbeddedResourceKind::WwiseSoundBank

@@ -29,6 +29,13 @@ pub fn read_asset_id(element: &Element) -> Result<AssetId, ObjectStreamValueErro
 
 /// Decode an `AZ::Data::AssetId` and treat the nil sentinel as absent.
 pub fn read_non_nil_asset_id(element: &Element) -> Result<Option<AssetId>, ObjectStreamValueError> {
+    if is_asset_id_type(element)
+        && element.children().is_empty()
+        && element.data().is_none_or(<[u8]>::is_empty)
+    {
+        return Ok(None);
+    }
+
     read_asset_id(element).map(|asset_id| (!asset_id.is_nil()).then_some(asset_id))
 }
 
@@ -87,6 +94,19 @@ mod tests {
         let element = asset_id_element(Uuid::nil(), 0);
 
         assert_eq!(read_non_nil_asset_id(&element).unwrap(), None);
+    }
+
+    #[test]
+    fn empty_default_asset_id_is_optional_absent() {
+        assert_eq!(
+            read_non_nil_asset_id(&Element::new(types::ASSET)).unwrap(),
+            None
+        );
+        assert_eq!(
+            read_non_nil_asset_id(&Element::new(types::ASSET_ID).with_data(Vec::<u8>::new()))
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

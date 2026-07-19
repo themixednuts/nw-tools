@@ -2,8 +2,12 @@ use crate::az::asset::AssetId as AzAssetId;
 use crate::az::rtti::AzRtti;
 use crate::az::uuid::Uuid as AzUuid;
 use crate::types::AzTextureSlotSettings;
+use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 
-#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize, bevy_reflect::Reflect,
+)]
+#[reflect(Serialize, Deserialize)]
 pub struct AzTextureSlot {
     #[serde(rename = "TextureMap", default)]
     pub texture_map: String,
@@ -25,6 +29,7 @@ pub struct AzTextureSlot {
     pub tg_type: i32,
     #[serde(rename = "TexGenProjected", default)]
     pub tex_gen_projected: bool,
+    #[reflect(ignore, clone)]
     #[serde(rename = "TextureModifications", default)]
     pub texture_modifications: arrayvec::ArrayVec<AzTextureSlotSettings, 3>,
 }

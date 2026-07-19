@@ -427,7 +427,7 @@ fn empty_resolved() -> ResolvedAsset {
         animations: Vec::new(),
         extras: nw_model::CryAssetExtras::default(),
         physics: nw_model::PhysicsScene::default(),
-        parsed_animation_assets: std::collections::HashSet::new(),
+        animation_asset_evaluations: std::collections::HashMap::new(),
     }
 }
 

@@ -1,0 +1,17 @@
+[package]
+name = "cry-particles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Loss-preserving legacy CryEngine particle-library parser"
+
+[lints]
+workspace = true
+
+[dependencies]
+cry-xml.workspace = true
+nw-asset.workspace = true
+thiserror.workspace = true

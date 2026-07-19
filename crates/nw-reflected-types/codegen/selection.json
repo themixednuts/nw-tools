@@ -24,7 +24,9 @@
     { "root": "SimpleAssetReferenceCharacterDefinitionAsset", "reason": "CDF character-definition asset reference" },
     { "root": "SimpleAssetReferenceSkinAsset", "reason": "SKIN asset reference" },
     { "root": "SimpleAssetReferenceMeshAsset", "reason": "CGF/CHR mesh asset reference" },
+    { "root": "AttachmentComponent", "reason": "LmbrCentral character attachment source component" },
     { "root": "AttachmentConfiguration", "reason": "LmbrCentral character attachment configuration" },
+    { "root": "ParticleComponent", "reason": "LmbrCentral particle emitter, library, and mesh-particle source configuration" },
     { "root": "SkinnedMeshComponent", "reason": "LmbrCentral skinned-mesh source configuration" },
     { "root": "CharacterAnimationManagerComponent", "reason": "CryLegacy animation manager configuration" },
 

@@ -1,5 +1,6 @@
 use crate::az::rtti::AzRtti;
 use crate::az::uuid::Uuid as AzUuid;
+use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 
 pub mod az_lighting_params;
 pub mod az_material_layer;
@@ -11,7 +12,10 @@ pub use self::az_material_layer::AzMaterialLayer;
 pub use self::az_texture_slot::AzTextureSlot;
 pub use self::az_texture_slot_settings::AzTextureSlotSettings;
 
-#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize, bevy_reflect::Reflect,
+)]
+#[reflect(Serialize, Deserialize)]
 pub struct AzMaterialAssetData {
     #[serde(rename = "MaterialName", default)]
     pub material_name: String,
@@ -27,6 +31,7 @@ pub struct AzMaterialAssetData {
     pub surface_type: String,
     #[serde(rename = "LightingParams", default)]
     pub lighting_params: AzLightingParams,
+    #[reflect(ignore, clone)]
     #[serde(rename = "Textures", default)]
     pub textures: Vec<AzTextureSlot>,
     #[serde(rename = "MaterialLinkName", default)]

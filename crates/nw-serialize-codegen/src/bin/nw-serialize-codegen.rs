@@ -1459,13 +1459,13 @@ edition = "2024"
 rust-version = "1.96"
 
 [dependencies]
-bevy_app = "0.18"
-bevy_ecs = {{ version = "0.18", features = ["serialize"] }}
-bevy_color = {{ version = "0.18", features = ["serialize"] }}
-bevy_math = {{ version = "0.18", features = ["serialize"] }}
-bevy_platform = "0.18"
-bevy_reflect = {{ version = "0.18", features = ["uuid"] }}
-bevy_transform = {{ version = "0.18", features = ["serialize"] }}
+bevy_app = "0.19"
+bevy_ecs = {{ version = "0.19", features = ["serialize"] }}
+bevy_color = {{ version = "0.19", features = ["serialize"] }}
+bevy_math = {{ version = "0.19", features = ["serialize"] }}
+bevy_platform = "0.19"
+bevy_reflect = {{ version = "0.19", features = ["uuid"] }}
+bevy_transform = {{ version = "0.19", features = ["serialize"] }}
 sha1 = "0.11"
 serde = {{ version = "1", features = ["derive", "rc"] }}
 serde_json = "1"
@@ -1490,13 +1490,13 @@ publish.workspace = true
 description = "Vendored behavior-free New World SerializeContext asset types"
 
 [dependencies]
-bevy_app = "0.18"
-bevy_ecs = {{ version = "0.18", features = ["serialize"] }}
-bevy_color = {{ version = "0.18", features = ["serialize"] }}
-bevy_math = {{ version = "0.18", features = ["serialize"] }}
-bevy_platform = "0.18"
-bevy_reflect = {{ version = "0.18", features = ["uuid"] }}
-bevy_transform = {{ version = "0.18", features = ["serialize"] }}
+bevy_app = "0.19"
+bevy_ecs = {{ version = "0.19", features = ["serialize"] }}
+bevy_color = {{ version = "0.19", features = ["serialize"] }}
+bevy_math = {{ version = "0.19", features = ["serialize"] }}
+bevy_platform = "0.19"
+bevy_reflect = {{ version = "0.19", features = ["uuid"] }}
+bevy_transform = {{ version = "0.19", features = ["serialize"] }}
 sha1.workspace = true
 serde = {{ workspace = true, features = ["derive", "rc"] }}
 serde_json.workspace = true

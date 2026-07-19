@@ -42,6 +42,7 @@ az-physics-assets = { version = "0.1.0", path = "crates/az-physics-assets" }
 glam = { version = "0.32", features = ["serde"] }
 bevy_math = { version = "0.19", default-features = false, features = ["std"] }
 bevy_color = { version = "0.19", features = ["serialize"] }
+bevy_transform = { version = "0.19", features = ["serialize"] }
 crc32fast = "1.5.0"
 flate2 = "1.1.9"
 full_moon = { version = "=2.2.0", default-features = false, features = ["lua54"] }
@@ -83,6 +84,7 @@ cry-animation = { version = "0.1.0", path = "crates/cry-animation" }
 cry-audio = { version = "0.1.0", path = "crates/cry-audio" }
 cry-character = { version = "0.1.0", path = "crates/cry-character" }
 cry-mannequin = { version = "0.1.0", path = "crates/cry-mannequin" }
+cry-particles = { version = "0.1.0", path = "crates/cry-particles" }
 cry-xml = { version = "0.1.0", path = "crates/cry-xml" }
 nw-asset = { version = "0.1.0", path = "crates/nw-asset", default-features = false }
 nw-asset-graph = { version = "0.1.0", path = "crates/nw-asset-graph" }

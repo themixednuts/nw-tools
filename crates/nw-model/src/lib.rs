@@ -10,6 +10,7 @@ mod geometry;
 mod gltf;
 mod material;
 pub mod math;
+mod particles;
 mod physics;
 pub mod reflected;
 
@@ -32,6 +33,11 @@ pub use gltf::{
     ModelAnimation, NoMaterials, TextureData, WithMaterials,
 };
 pub use material::{MapSlot, MaterialSet, SubMaterial, TextureRef, TextureSourceKind};
+pub use particles::{
+    CryEntityId, CryParticleAttachment, CryParticleAuthoredPayload, CryParticleEmitter,
+    CryParticleEmitterContext, CryParticlePlacement, CryParticlePlacementIssue,
+    CryParticleTransform, CryParticleUnboundReason, CryUnboundParticleEmitter,
+};
 pub use physics::{
     BvhTree, CompoundChild, ConvexHullExtra, HeightFieldData, HitVolume, PhysicalShape,
     PhysicsComponentContext, PhysicsMaterialFilter, PhysicsScene, PhysicsSceneError,

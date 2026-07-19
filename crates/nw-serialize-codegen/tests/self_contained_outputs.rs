@@ -211,11 +211,11 @@ edition = "2024"
 rust-version = "1.96"
 
 [dependencies]
-bevy_ecs = { version = "0.18", features = ["serialize"] }
-bevy_color = { version = "0.18", features = ["serialize"] }
-bevy_math = { version = "0.18", features = ["serialize"] }
-bevy_reflect = { version = "0.18", features = ["uuid"] }
-bevy_transform = { version = "0.18", features = ["serialize"] }
+bevy_ecs = { version = "0.19", features = ["serialize"] }
+bevy_color = { version = "0.19", features = ["serialize"] }
+bevy_math = { version = "0.19", features = ["serialize"] }
+bevy_reflect = { version = "0.19", features = ["uuid"] }
+bevy_transform = { version = "0.19", features = ["serialize"] }
 sha1 = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

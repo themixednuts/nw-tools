@@ -216,7 +216,7 @@ pub use self::character_action_grid_cell_value::CharacterActionGridCellValue;
 pub use self::character_action_grid_list_cache::CharacterActionGridListCache;
 pub use self::character_action_list::CharacterActionList;
 pub use self::components::{
-    AnimatedLayer, AttachmentConfiguration, AudioAreaEnvironmentComponent,
+    AnimatedLayer, AttachmentComponent, AttachmentConfiguration, AudioAreaEnvironmentComponent,
     AudioEnvironmentComponent, AudioListenerComponent, AudioOverrideComponent,
     AudioPreloadComponent, AudioRtpcComponent, AudioSetTriggerOverrideComponent,
     AudioSetTriggerOverrideComponentClientFacet, AudioSetTriggerOverrideComponentServerFacet,
@@ -229,12 +229,12 @@ pub use self::components::{
     GameTransformComponentServerFacet, HitVolumeComponent, HitVolumeComponentClientFacet,
     HitVolumeComponentServerFacet, MannequinComponent, MannequinScopeComponent,
     MaterialOverrideInfo, MeshColliderComponent, MotionParameterSmoothingSettings, NetBindable,
-    PhysicsComponent, PhysicsSystemComponent, PlayerDimensions, PlayerDynamics,
-    PrimitiveColliderComponent, PrimitiveColliderConfig, RigidBodyComponent,
-    RigidBodyConfiguration, RigidPhysicsComponent, RigidPhysicsConfig, ServerFacet,
-    SimpleAnimationComponent, SkinnedMeshComponent, SkinnedMeshComponentRenderNode,
-    SkinnedRenderOptions, SphereShapeComponent, SphereShapeConfig, StaticPhysicsComponent,
-    StaticPhysicsConfig, TransformComponent, TriggerOverridePair,
+    ParticleComponent, ParticleEmitBoneLayer, ParticleEmitterSettings, PhysicsComponent,
+    PhysicsSystemComponent, PlayerDimensions, PlayerDynamics, PrimitiveColliderComponent,
+    PrimitiveColliderConfig, RigidBodyComponent, RigidBodyConfiguration, RigidPhysicsComponent,
+    RigidPhysicsConfig, ServerFacet, SimpleAnimationComponent, SkinnedMeshComponent,
+    SkinnedMeshComponentRenderNode, SkinnedRenderOptions, SphereShapeComponent, SphereShapeConfig,
+    StaticPhysicsComponent, StaticPhysicsConfig, TransformComponent, TriggerOverridePair,
 };
 
 pub use self::deprecated_collision_type::DEPRECATEDCollisionType;

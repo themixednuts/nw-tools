@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::animation_audio::{CryMannequinAnimationAudio, CryMannequinAudioClip};
 use crate::geometry::{AuxiliaryNode, AuxiliaryNodeRole, MeshRole, Model, Skeleton};
 use crate::material::{MapSlot, MaterialSet, SubMaterial};
+use crate::particles::{CryParticleEmitter, CryUnboundParticleEmitter};
 use crate::physics::{PhysicsScene, PhysicsSceneError, PhysicsVisualRole};
 
 const COMPONENT_FLOAT: u32 = 5126;
@@ -79,6 +80,8 @@ struct CryNodeExtras {
     role: Option<MeshRole>,
     #[serde(skip_serializing_if = "Option::is_none")]
     physics: Option<PhysicsVisualRole>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    particle_emitter: Option<CryParticleEmitter>,
 }
 
 #[derive(Serialize)]
@@ -432,6 +435,14 @@ pub struct CryAssetExtras {
     pub unbound_animations: Vec<CryUnboundAnimation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub physics: Option<PhysicsScene>,
+    /// Build-time particle attachments. Not serialized here: each bound emitter is
+    /// distributed into exactly one glTF node's `particleEmitter` extras.
+    #[serde(skip)]
+    pub particle_emitters: Vec<CryParticleEmitter>,
+    /// Character-owned emitters omitted because their non-empty target bone does
+    /// not exist on the exported primary skeleton.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unbound_particle_emitters: Vec<CryUnboundParticleEmitter>,
     /// Resolved ATL → Wwise event → bank/media chain for animation audio
     /// triggers (`cryEvents[].parameter`). Keyed by trigger name so each
     /// keyframed event resolves in one hop without repeating the fan-out.
@@ -581,6 +592,18 @@ pub enum CryEmbeddedResourceKind {
     /// MaterialEffects `<FXLib>` a footstep parameter names, mapping surfaces to
     /// ATL triggers.
     MaterialEffectsFxLibrary,
+    /// Cry particle-effect library referenced by `ParticleLibraryAssetId`.
+    ParticleLibrary,
+    /// Texture referenced by a selected legacy Cry particle effect.
+    ParticleTexture,
+    /// Streaming segment (`.1`, `.a`, `.a.1`) for a selected particle DDS.
+    ParticleTextureSidecar,
+    /// Material referenced by a selected legacy Cry particle effect.
+    ParticleMaterial,
+    /// Geometry referenced by a selected legacy Cry particle effect.
+    ParticleGeometry,
+    /// Streaming heap for selected particle CGF/CGA geometry.
+    ParticleGeometryHeap,
     WwiseSoundBank,
     WwiseMedia,
     /// Decoded PCM WAV sibling of a Wwise media payload (glTF/Blender-playable).
@@ -627,7 +650,13 @@ impl CryEmbeddedResourceKind {
             Self::MannequinTagDefinition
             | Self::MannequinControllerDefinition
             | Self::AudioControls
-            | Self::MaterialEffectsFxLibrary => "xml",
+            | Self::MaterialEffectsFxLibrary
+            | Self::ParticleLibrary => "xml",
+            Self::ParticleTexture => "dds",
+            Self::ParticleTextureSidecar => "",
+            Self::ParticleMaterial => "mtl",
+            Self::ParticleGeometry => "cgf",
+            Self::ParticleGeometryHeap => "",
             Self::AudioMapping => "csv",
             Self::BlendSpace => "bspace",
             Self::CombinedBlendSpace => "comb",
@@ -679,7 +708,13 @@ impl CryEmbeddedResourceKind {
             | Self::CombinedBlendSpace
             | Self::AudioControls
             | Self::MaterialEffectsFxLibrary
+            | Self::ParticleLibrary
+            | Self::ParticleMaterial
             | Self::PhysicsMaterialSet => "application/xml",
+            Self::ParticleTexture => "image/vnd-ms.dds",
+            Self::ParticleTextureSidecar => "application/octet-stream",
+            Self::ParticleGeometry => "application/x-cry-model",
+            Self::ParticleGeometryHeap => "application/octet-stream",
             Self::AudioMapping => "text/csv",
             Self::WwiseSoundBank => "application/x-wwise-soundbank",
             Self::WwiseMedia => "audio/x-wwise-media",
@@ -770,6 +805,7 @@ pub enum CrySourceAssetKind {
     AudioControls,
     AudioMapping,
     MaterialEffectsFxLibrary,
+    ParticleLibrary,
     WwiseSoundBank,
     WwiseMedia,
     WwiseDecodedWave,
@@ -1872,6 +1908,7 @@ fn build(
                     shadow_proxy: mesh.shadow_proxy,
                     role: (mesh.role != MeshRole::Render).then_some(mesh.role),
                     physics: None,
+                    particle_emitter: None,
                 }),
             ..Node::default()
         };
@@ -1986,11 +2023,75 @@ fn build(
                     shadow_proxy: false,
                     role: None,
                     physics: Some(visual.role),
+                    particle_emitter: None,
                 }),
                 ..Node::default()
             });
             if let Some((parent_node, _)) = bone_parent {
                 builder.nodes[parent_node].children.push(node);
+            } else {
+                root_nodes.push(node);
+            }
+        }
+    }
+
+    if let Some(extras) = extras {
+        for emitter in &extras.particle_emitters {
+            let (bone_parent, local) = match &emitter.placement {
+                crate::particles::CryParticlePlacement::Entity { transform }
+                | crate::particles::CryParticlePlacement::TargetEntity { transform, .. } => {
+                    (None, *transform)
+                }
+                crate::particles::CryParticlePlacement::Bone {
+                    skeleton_index,
+                    bone_name,
+                    transform,
+                    ..
+                } => {
+                    let Some(parent) = model
+                        .skeletons
+                        .get(*skeleton_index)
+                        .and_then(|skeleton| skeleton.bone_index(bone_name))
+                        .and_then(|bone| {
+                            emitted_skeletons
+                                .get(*skeleton_index)
+                                .and_then(|emitted| emitted.joints.get(bone))
+                                .copied()
+                        })
+                    else {
+                        continue;
+                    };
+                    (Some(parent), *transform)
+                }
+            };
+            let translation = crate::math::cry_to_gltf(Vec3::from_array(local.translation));
+            let rotation = crate::math::cry_to_gltf_quat(Quat::from_array(local.rotation));
+            let scale = crate::math::cry_to_gltf_scale(Vec3::from_array(local.scale));
+            let node = builder.nodes.len();
+            builder.nodes.push(Node {
+                name: Some(
+                    emitter
+                        .context
+                        .entity_name
+                        .clone()
+                        .unwrap_or_else(|| emitter.selected_emitter.clone()),
+                ),
+                translation: (!translation.abs_diff_eq(Vec3::ZERO, 0.000_001))
+                    .then_some(translation.to_array()),
+                rotation: (!rotation.abs_diff_eq(Quat::IDENTITY, 0.000_001))
+                    .then_some(rotation.normalize().to_array()),
+                scale: (!scale.abs_diff_eq(Vec3::ONE, 0.000_001)).then_some(scale.to_array()),
+                extras: Some(CryNodeExtras {
+                    cry_lod: None,
+                    shadow_proxy: false,
+                    role: None,
+                    physics: None,
+                    particle_emitter: Some(emitter.clone()),
+                }),
+                ..Node::default()
+            });
+            if let Some(parent) = bone_parent {
+                builder.nodes[parent].children.push(node);
             } else {
                 root_nodes.push(node);
             }
@@ -2570,6 +2671,9 @@ pub enum GltfPackageError {
 /// with `.{extension}` (ASCII case-insensitive); otherwise the extension is
 /// appended.
 fn resource_path(source_path: &str, extension: &str) -> String {
+    if extension.is_empty() {
+        return source_path.to_owned();
+    }
     let suffix = format!(".{extension}");
     if source_path.len() >= suffix.len()
         && source_path[source_path.len() - suffix.len()..].eq_ignore_ascii_case(&suffix)

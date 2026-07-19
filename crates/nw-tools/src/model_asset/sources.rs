@@ -306,7 +306,7 @@ fn resolve_cdf_inner(
     }
 
     let mut animations = Vec::new();
-    let mut parsed_animation_assets = HashSet::new();
+    let mut animation_asset_evaluations = HashMap::new();
     resolve_attachments(
         runner,
         source,
@@ -318,7 +318,7 @@ fn resolve_cdf_inner(
             model: &mut model,
             materials: &mut materials,
             animations: &mut animations,
-            parsed_animation_assets: &mut parsed_animation_assets,
+            animation_asset_evaluations: &mut animation_asset_evaluations,
             physics: &mut physics,
             extras: &mut extras,
         },
@@ -330,7 +330,7 @@ fn resolve_cdf_inner(
         animations,
         extras,
         physics,
-        parsed_animation_assets,
+        animation_asset_evaluations,
     };
     let parameters_path = definition
         .model
@@ -355,7 +355,7 @@ struct AttachmentSink<'a> {
     model: &'a mut nw_model::Model,
     materials: &'a mut Option<nw_model::MaterialSet>,
     animations: &'a mut Vec<nw_model::ModelAnimation>,
-    parsed_animation_assets: &'a mut HashSet<(usize, String)>,
+    animation_asset_evaluations: &'a mut HashMap<AnimationAssetEvaluation, bool>,
     physics: &'a mut nw_model::PhysicsScene,
     extras: &'a mut nw_model::CryAssetExtras,
 }
@@ -375,7 +375,7 @@ fn resolve_attachments(
         model,
         materials,
         animations,
-        parsed_animation_assets,
+        animation_asset_evaluations,
         physics,
         extras,
     } = sink;
@@ -384,7 +384,7 @@ fn resolve_attachments(
             model: &mut *model,
             materials: &mut *materials,
             animations: &mut *animations,
-            parsed_animation_assets: &mut *parsed_animation_assets,
+            animation_asset_evaluations: &mut *animation_asset_evaluations,
             physics: &mut *physics,
             extras: &mut *extras,
         };
@@ -439,7 +439,7 @@ fn resolve_single_attachment(
         model,
         materials,
         animations,
-        parsed_animation_assets,
+        animation_asset_evaluations,
         physics,
         extras,
     } = sink;
@@ -502,8 +502,11 @@ fn resolve_single_attachment(
             animation.skeleton += skeleton_offset;
             animations.push(animation);
         }
-        for (skeleton, path) in child.parsed_animation_assets {
-            parsed_animation_assets.insert((skeleton + skeleton_offset, path));
+        for (evaluation, bound) in child.animation_asset_evaluations {
+            animation_asset_evaluations
+                .entry(evaluation.with_skeleton_offset(skeleton_offset))
+                .and_modify(|previous| *previous |= bound)
+                .or_insert(bound);
         }
         for animation in &mut child.extras.unbound_animations {
             animation.skeleton += skeleton_offset;
@@ -841,7 +844,7 @@ mod tests {
         let mut model = single_bone_model();
         let mut materials = None;
         let mut animations = Vec::new();
-        let mut parsed = HashSet::new();
+        let mut parsed = HashMap::new();
         let mut physics = nw_model::PhysicsScene::default();
         let mut extras = nw_model::CryAssetExtras::default();
         let attachments = vec![
@@ -863,7 +866,7 @@ mod tests {
                 model: &mut model,
                 materials: &mut materials,
                 animations: &mut animations,
-                parsed_animation_assets: &mut parsed,
+                animation_asset_evaluations: &mut parsed,
                 physics: &mut physics,
                 extras: &mut extras,
             },

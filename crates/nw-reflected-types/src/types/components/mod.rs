@@ -23,6 +23,7 @@ pub mod mannequin_component;
 pub mod mannequin_scope_component;
 pub mod mesh_collider_component;
 pub mod motion_parameter_smoothing_settings;
+pub mod particle_component;
 pub mod physics_components;
 pub mod physics_system_component;
 pub mod primitive_collider_component;
@@ -32,7 +33,7 @@ pub mod skinned_mesh_component;
 pub mod sphere_shape_component;
 pub mod transform_component;
 
-pub use self::attachment_component::AttachmentConfiguration;
+pub use self::attachment_component::{AttachmentComponent, AttachmentConfiguration};
 pub use self::audio_area_environment_component::AudioAreaEnvironmentComponent;
 pub use self::audio_environment_component::AudioEnvironmentComponent;
 pub use self::audio_listener_component::AudioListenerComponent;
@@ -67,6 +68,10 @@ pub use self::mannequin_component::MannequinComponent;
 pub use self::mannequin_scope_component::MannequinScopeComponent;
 pub use self::mesh_collider_component::MeshColliderComponent;
 pub use self::motion_parameter_smoothing_settings::MotionParameterSmoothingSettings;
+pub use self::particle_component::{
+    ParticleComponent, ParticleEmitBoneLayer, ParticleEmitterSettings,
+};
+
 pub use self::physics_components::{
     PhysicsComponent, RigidPhysicsComponent, RigidPhysicsConfig, StaticPhysicsComponent,
     StaticPhysicsConfig,

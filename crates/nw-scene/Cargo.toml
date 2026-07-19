@@ -9,6 +9,10 @@ publish.workspace = true
 description = "Legacy New World scene and region format parsers"
 
 [dependencies]
+bevy_color.workspace = true
+bevy_math.workspace = true
+bevy_transform.workspace = true
+nw-asset.workspace = true
 nw-objectstream.workspace = true
 nw-reflected-types.workspace = true
 serde.workspace = true

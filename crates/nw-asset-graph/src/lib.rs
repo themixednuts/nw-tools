@@ -263,6 +263,47 @@ impl AssetDependencyGraph {
             .filter(move |edge| edge.source.eq_ignore_ascii_case(source))
             .map(|edge| edge.target.as_str())
     }
+
+    /// Return the transitive forward projection from `roots`, following only
+    /// edges accepted by `include`.
+    #[must_use]
+    pub fn transitive_dependencies_where<'a, I, F>(
+        &'a self,
+        roots: I,
+        mut include: F,
+    ) -> Vec<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+        F: FnMut(&AssetDependencyEdge) -> bool,
+    {
+        let mut seen = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        for root in roots {
+            let root = normalize_virtual_path(root);
+            if seen.insert(root.to_ascii_lowercase()) {
+                queue.push_back(root);
+            }
+        }
+
+        let mut dependencies = Vec::new();
+        while let Some(current) = queue.pop_front() {
+            for edge in self
+                .edges
+                .iter()
+                .filter(|edge| edge.source.eq_ignore_ascii_case(&current))
+            {
+                if !include(edge) {
+                    continue;
+                }
+                let key = edge.target.to_ascii_lowercase();
+                if seen.insert(key) {
+                    dependencies.push(edge.target.clone());
+                    queue.push_back(edge.target.clone());
+                }
+            }
+        }
+        dependencies
+    }
 }
 
 /// Reusable direct authored-dependency index.
@@ -1027,6 +1068,10 @@ impl<'a> Resolver<'a> {
                     Err(_) => Ok(Vec::new()),
                 }
             }
+            AssetFormat::ParticleLibrary => Ok(cry_particles::ParticleLibrarySource::from_xml(
+                str::from_utf8(bytes)?,
+            )?
+            .asset_dependencies()),
             AssetFormat::CryModel => self.cry_model_dependencies(path, bytes),
             AssetFormat::Texture => self.texture_dependencies(path),
             AssetFormat::RockNRollShape
@@ -1176,11 +1221,8 @@ impl<'a> Resolver<'a> {
     }
 
     fn texture_dependencies(&self, path: &str) -> Result<Vec<AssetDependency>> {
-        let pattern = format!("{}.*", normalize_virtual_path(path));
-        let sidecars = self.source.matching_paths(&pattern)?;
-        Ok(sidecars
+        Ok(texture_streaming_sidecars(self.source, path)?
             .into_iter()
-            .filter(|sidecar| is_texture_sidecar(path, sidecar))
             .map(|sidecar| AssetDependency::required_path("texture.streaming_part", sidecar))
             .collect())
     }
@@ -1432,6 +1474,7 @@ enum AssetFormat {
     Mannequin(cry_mannequin::MannequinXmlKind),
     BlendSpace,
     AudioControls,
+    ParticleLibrary,
     CryModel,
     Texture,
     RockNRollShape,
@@ -1488,6 +1531,9 @@ impl AssetFormat {
         }
         if cry_audio::is_audio_mapping_source(path) {
             return Self::AudioMapping;
+        }
+        if cry_particles::is_legacy_particle_library_source(path) {
+            return Self::ParticleLibrary;
         }
         if let Some(kind) = cry_mannequin::MannequinXmlKind::from_source_path(path) {
             return Self::Mannequin(kind);
@@ -1793,6 +1839,25 @@ fn path_candidates(source_path: &str, authored_path: &str) -> Vec<String> {
     candidates
 }
 
+/// Resolve the shipped streaming segments belonging to one DDS product.
+///
+/// Cry recognizes numeric (`.1`), alpha (`.a`), and alpha-numeric (`.a.1`)
+/// sidecars. Returning normalized, sorted paths gives exporters the same
+/// texture closure as the dependency graph without duplicating format rules.
+pub fn texture_streaming_sidecars(source: &dyn AssetSource, texture: &str) -> Result<Vec<String>> {
+    let texture = normalize_virtual_path(texture);
+    let pattern = format!("{texture}.*");
+    let mut sidecars = source
+        .matching_paths(&pattern)?
+        .into_iter()
+        .map(normalize_virtual_path)
+        .filter(|candidate| is_texture_sidecar(&texture, candidate))
+        .collect::<Vec<_>>();
+    sidecars.sort_by_key(|path| path.to_ascii_lowercase());
+    sidecars.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    Ok(sidecars)
+}
+
 fn is_texture_sidecar(texture: &str, candidate: &str) -> bool {
     let Some(suffix) = candidate.strip_prefix(texture) else {
         return false;
@@ -1928,6 +1993,60 @@ mod tests {
                 .assets()
                 .iter()
                 .any(|path| path == "textures/hero.dds.1")
+        );
+    }
+
+    #[test]
+    fn resolves_particle_library_runtime_resources_and_texture_products() {
+        let source = MemorySource::default()
+            .with(
+                "libs/particles/cfx_test.xml",
+                br#"<ParticleLibrary Name="cFX_Test"><Particles Name="Idle"><Params Texture="textures/fx/smoke.tif" NormalMap="textures/fx/smoke_ddn.dds" Material="materials/fx/smoke.mtl" Geometry="objects/fx/smoke.cgf" StartTrigger="Play_FX"/></Particles></ParticleLibrary>"#,
+            )
+            .with("textures/fx/smoke.dds", b"dds".to_vec())
+            .with("textures/fx/smoke.dds.1", b"mip".to_vec())
+            .with("textures/fx/smoke_ddn.dds", b"normal".to_vec())
+            .with(
+                "materials/fx/smoke.mtl",
+                br#"<Material><Textures><Texture Map="Diffuse" File="textures/fx/material_smoke.tif"/></Textures></Material>"#,
+            )
+            .with("textures/fx/material_smoke.dds", b"material texture".to_vec())
+            .with(
+                "textures/fx/material_smoke.dds.1",
+                b"material texture mip".to_vec(),
+            )
+            .with("objects/fx/smoke.cgf", minimal_cgf());
+
+        let graph = resolve(
+            &source,
+            "libs/particles/cfx_test.xml",
+            &ResolveOptions::default(),
+        )
+        .unwrap();
+
+        assert!(graph.is_complete());
+        for expected in [
+            "textures/fx/smoke.dds",
+            "textures/fx/smoke.dds.1",
+            "textures/fx/smoke_ddn.dds",
+            "materials/fx/smoke.mtl",
+            "objects/fx/smoke.cgf",
+            "textures/fx/material_smoke.dds",
+            "textures/fx/material_smoke.dds.1",
+        ] {
+            assert!(graph.assets().iter().any(|path| path == expected));
+        }
+        assert!(graph.edges().iter().any(|edge| {
+            edge.source() == "libs/particles/cfx_test.xml"
+                && edge.relation() == "particle.texture"
+                && edge.target() == "textures/fx/smoke.dds"
+        }));
+        assert_eq!(
+            graph.transitive_dependencies_where(["materials/fx/smoke.mtl"], |_| true),
+            [
+                "textures/fx/material_smoke.dds".to_owned(),
+                "textures/fx/material_smoke.dds.1".to_owned(),
+            ]
         );
     }
 

@@ -19,6 +19,7 @@ cry-audio.workspace = true
 cry-character.workspace = true
 cry-chunk.workspace = true
 cry-mannequin.workspace = true
+cry-particles.workspace = true
 cry-xml.workspace = true
 crossbeam-channel.workspace = true
 crossterm.workspace = true

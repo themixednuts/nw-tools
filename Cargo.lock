@@ -1112,6 +1112,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cry-particles"
+version = "0.1.0"
+dependencies = [
+ "cry-xml",
+ "nw-asset",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "cry-xml"
 version = "0.1.0"
 dependencies = [
@@ -2406,6 +2415,7 @@ dependencies = [
  "cry-character",
  "cry-chunk",
  "cry-mannequin",
+ "cry-particles",
  "lmbr-central-vshape",
  "nv-cloth-assets",
  "nw-asset",
@@ -2622,6 +2632,10 @@ dependencies = [
 name = "nw-scene"
 version = "0.1.0"
 dependencies = [
+ "bevy_color",
+ "bevy_math",
+ "bevy_transform",
+ "nw-asset",
  "nw-objectstream",
  "nw-reflected-types",
  "serde",
@@ -2691,6 +2705,7 @@ dependencies = [
  "cry-character",
  "cry-chunk",
  "cry-mannequin",
+ "cry-particles",
  "cry-xml",
  "drizzle",
  "drizzle-migrations",
