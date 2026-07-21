@@ -1,2 +1,7 @@
 __pycache__/
 *.py[cod]
+
+# Local nw-tools sidecars (ship in the zip; do not commit)
+azoth/nw-tools
+azoth/nw-tools.exe
+azoth/bin/

@@ -2,7 +2,7 @@
 
 import bpy
 
-from . import bridge, metadata
+from . import bridge, metadata, paths
 
 
 class AZOTH_UL_manifests(bpy.types.UIList):
@@ -71,8 +71,12 @@ class AZOTH_PT_main(bpy.types.Panel):
 
         box = layout.box()
         row = box.row(align=True)
-        row.label(text=str(metadata.OUTPUT_ROOT), icon="FILE_FOLDER")
+        row.label(text=str(paths.package_root()), icon="FILE_FOLDER")
         row.operator("azoth.refresh", text="", icon="FILE_REFRESH")
+        row.operator("azoth.show_preferences", text="", icon="PREFERENCES")
+        prefs = paths.addon_preferences()
+        if prefs is not None:
+            box.prop(prefs, "package_root", text="")
         box.prop(state, "manifest_search", text="", icon="VIEWZOOM")
         box.template_list(
             "AZOTH_UL_manifests",

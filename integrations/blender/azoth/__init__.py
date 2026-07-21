@@ -3,7 +3,7 @@
 import bpy
 from bpy.app.handlers import persistent
 
-from . import operators, organizer, properties, ui
+from . import operators, organizer, preferences, properties, ui
 
 
 bl_info = {
@@ -35,6 +35,7 @@ def _after_load(_unused):
 
 
 def register():
+    preferences.register()
     properties.register()
     operators.register()
     ui.register()
@@ -53,3 +54,4 @@ def unregister():
     ui.unregister()
     operators.unregister()
     properties.unregister()
+    preferences.unregister()

@@ -1,12 +1,14 @@
 """The narrow subprocess bridge to nw-tools-owned transformations."""
 
 import json
-import os
 from pathlib import Path
-import shutil
 import subprocess
 
-from . import metadata
+try:
+    from . import metadata, paths
+except ImportError:  # unittest loads sibling modules from azoth/ on sys.path
+    import metadata  # type: ignore
+    import paths  # type: ignore
 
 
 _SCHEDULE_CACHE = {}
@@ -14,15 +16,7 @@ _DESCRIPTION_CACHE = {}
 
 
 def find_nw_tools():
-    override = os.environ.get("NW_TOOLS")
-    candidates = [
-        Path(override) if override else None,
-        Path(shutil.which("nw-tools") or ""),
-        metadata.OUTPUT_ROOT / "nw-tools.exe",
-        Path(r"E:\Projects\nw-tools\target\release\nw-tools.exe"),
-        Path(r"E:\Projects\nw-tools\target\debug\nw-tools.exe"),
-    ]
-    return next((path for path in candidates if path and path.is_file()), None)
+    return paths.find_nw_tools()
 
 
 def schedule(manifest):
@@ -44,7 +38,7 @@ def schedule(manifest):
             "schedule",
             str(manifest),
             "--package-root",
-            str(metadata.OUTPUT_ROOT),
+            str(paths.package_root()),
         ],
         check=True,
         capture_output=True,
@@ -80,7 +74,7 @@ def describe(manifest):
             "describe",
             str(manifest),
             "--package-root",
-            str(metadata.OUTPUT_ROOT),
+            str(paths.package_root()),
         ],
         check=True,
         capture_output=True,
@@ -98,7 +92,9 @@ def export_command(asset_filter):
     executable = find_nw_tools()
     if executable is None:
         raise FileNotFoundError(
-            "nw-tools was not found. Put nw-tools.exe on PATH, in C:\\nwt, or set NW_TOOLS."
+            "nw-tools was not found. Set Preferences → AZoth → nw-tools, "
+            "put a sidecar next to the extension (or in bin/), add it to PATH, "
+            "or set NW_TOOLS."
         )
     return [
         str(executable),
@@ -108,7 +104,7 @@ def export_command(asset_filter):
         "format",
         "model",
         "--out",
-        str(metadata.OUTPUT_ROOT),
+        str(paths.package_root()),
         "--container",
         "gltf",
         "--filter",

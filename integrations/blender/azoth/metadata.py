@@ -10,11 +10,10 @@ import struct
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 
-
-OUTPUT_ROOT = Path(r"C:\nwt")
-AZOTH_ROOT = OUTPUT_ROOT / ".azoth"
-LIBRARY_ROOT = AZOTH_ROOT / "libraries"
-WORKSPACE_ROOT = AZOTH_ROOT / "workspaces"
+try:
+    from . import paths
+except ImportError:  # unittest loads sibling modules from azoth/ on sys.path
+    import paths  # type: ignore
 
 _GLB_MAGIC = b"glTF"
 _GLB_JSON = 0x4E4F534A
@@ -86,14 +85,16 @@ def _validate_document(value: Any) -> dict[str, Any]:
     return value
 
 
-def scan_manifests(root: Path = OUTPUT_ROOT) -> list[ManifestSummary]:
+def scan_manifests(root: Path | None = None) -> list[ManifestSummary]:
     """Find package containers without pre-parsing their potentially huge JSON."""
 
+    root = paths.package_root() if root is None else root
+    azoth = paths.azoth_root(root)
     if not root.is_dir():
         return []
     found: list[ManifestSummary] = []
     for path in root.rglob("*"):
-        if path.suffix.lower() not in {".gltf", ".glb"} or AZOTH_ROOT in path.parents:
+        if path.suffix.lower() not in {".gltf", ".glb"} or azoth in path.parents or path == azoth:
             continue
         found.append(
             ManifestSummary(
@@ -111,11 +112,12 @@ def scan_manifests(root: Path = OUTPUT_ROOT) -> list[ManifestSummary]:
 
 def resource_records(
     document: dict[str, Any],
-    output_root: Path = OUTPUT_ROOT,
+    output_root: Path | None = None,
     manifest_path: Path | None = None,
 ) -> list[ResourceRecord]:
     """Return one deduplicated, categorized index of every retained resource."""
 
+    output_root = paths.package_root() if output_root is None else output_root
     extras = document.get("extras") or {}
     records: dict[tuple[str, str], ResourceRecord] = {}
 
@@ -245,11 +247,12 @@ def animation_records(document: dict[str, Any]) -> list[AnimationRecord]:
 
 def description_from_document(
     document: dict[str, Any],
-    output_root: Path = OUTPUT_ROOT,
+    output_root: Path | None = None,
     manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     """Compact the fallback parser result before Blender starts its own import."""
 
+    output_root = paths.package_root() if output_root is None else output_root
     extras = document.get("extras") or {}
     return {
         "schemaVersion": 1,
@@ -272,9 +275,10 @@ def description_from_document(
 
 def diagnostics(
     document: dict[str, Any],
-    output_root: Path = OUTPUT_ROOT,
+    output_root: Path | None = None,
     manifest_path: Path | None = None,
 ) -> list[str]:
+    output_root = paths.package_root() if output_root is None else output_root
     issues: list[str] = []
     extras = document.get("extras") or {}
     if extras.get("unboundAnimations"):
@@ -289,16 +293,20 @@ def diagnostics(
     return issues
 
 
-def workspace_paths(manifest: Path, output_root: Path = OUTPUT_ROOT) -> tuple[Path, Path]:
-    """Stable per-asset linked-library and workspace paths under `C:\nwt`."""
+def workspace_paths(manifest: Path, output_root: Path | None = None) -> tuple[Path, Path]:
+    """Stable per-asset linked-library and workspace paths under the package root."""
 
+    output_root = paths.package_root() if output_root is None else output_root
     manifest = manifest.resolve()
     try:
         relative = manifest.relative_to(output_root.resolve())
     except ValueError as error:
         raise ManifestError(f"manifest must be inside {output_root}: {manifest}") from error
     stem = relative.with_suffix("")
-    return LIBRARY_ROOT / stem.with_suffix(".blend"), WORKSPACE_ROOT / stem.with_suffix(".blend")
+    return (
+        paths.library_root(output_root) / stem.with_suffix(".blend"),
+        paths.workspace_root(output_root) / stem.with_suffix(".blend"),
+    )
 
 
 def manifest_identity(path: Path) -> str:

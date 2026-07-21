@@ -11,7 +11,7 @@ license = ["SPDX:MIT"]
 website = "https://github.com/themixednuts/nw-tools"
 
 [permissions]
-files = "Read and write AZoth packages under C:\\nwt"
+files = "Read and write the configured AZoth package root, and optionally launch an nw-tools sidecar"
 
 [build]
 paths_exclude_pattern = [

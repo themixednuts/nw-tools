@@ -9,7 +9,7 @@ import bpy
 from bpy.props import StringProperty
 from bpy_extras.io_utils import ImportHelper
 
-from . import bridge, metadata, organizer, presentation
+from . import bridge, metadata, organizer, paths, presentation
 
 
 _DATA_TABLES = ("objects", "meshes", "armatures", "materials", "images", "actions", "sounds")
@@ -30,13 +30,13 @@ def refresh_manifests(state):
         if item.path == previous:
             selected = index
     state.manifest_index = min(selected, max(0, len(state.manifests) - 1))
-    state.status = f"{len(state.manifests)} package(s) in {metadata.OUTPUT_ROOT}"
+    state.status = f"{len(state.manifests)} package(s) in {paths.package_root()}"
 
 
 class AZOTH_OT_refresh(bpy.types.Operator):
     bl_idname = "azoth.refresh"
     bl_label = "Refresh AZoth Library"
-    bl_description = "Rescan C:\\nwt for nw-tools glTF and GLB packages"
+    bl_description = "Rescan the configured package root for nw-tools glTF and GLB packages"
 
     def execute(self, context):
         refresh_manifests(context.scene.azoth)
@@ -74,12 +74,13 @@ class AZOTH_OT_import_file(bpy.types.Operator, ImportHelper):
 class AZOTH_OT_export_asset(bpy.types.Operator):
     bl_idname = "azoth.export_asset"
     bl_label = "Export from New World"
-    bl_description = "Run nw-tools in parallel and write the complete structured package to C:\\nwt"
+    bl_description = "Run nw-tools in parallel and write the complete structured package to the package root"
     bl_options = {"REGISTER"}
 
     _process = None
     _timer = None
     _log = None
+    _log_path = None
 
     def execute(self, context):
         state = context.scene.azoth
@@ -92,9 +93,10 @@ class AZOTH_OT_export_asset(bpy.types.Operator):
         except FileNotFoundError as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        metadata.AZOTH_ROOT.mkdir(parents=True, exist_ok=True)
-        log_path = metadata.AZOTH_ROOT / "export.log"
-        self._log = log_path.open("w", encoding="utf-8")
+        azoth = paths.azoth_root()
+        azoth.mkdir(parents=True, exist_ok=True)
+        self._log_path = azoth / "export.log"
+        self._log = self._log_path.open("w", encoding="utf-8")
         self._process = subprocess.Popen(
             command,
             stdout=self._log,
@@ -113,7 +115,8 @@ class AZOTH_OT_export_asset(bpy.types.Operator):
         if event.type != "TIMER" or self._process.poll() is None:
             return {"PASS_THROUGH"}
         ok = self._process.returncode == 0
-        message = "Export complete" if ok else "Export failed; see C:\\nwt\\.azoth\\export.log"
+        log_hint = self._log_path if self._log_path is not None else paths.azoth_root() / "export.log"
+        message = "Export complete" if ok else f"Export failed; see {log_hint}"
         return self._finish(context, ok, message)
 
     def _finish(self, context, ok, message):
@@ -183,17 +186,18 @@ class AZOTH_OT_clean_character_view(bpy.types.Operator):
 
 
 def _import_manifest(operator, context, manifest):
+    package = paths.package_root()
     try:
         manifest = manifest.resolve(strict=True)
-        if metadata.OUTPUT_ROOT.resolve() not in manifest.parents:
-            raise metadata.ManifestError(f"AZoth packages must be under {metadata.OUTPUT_ROOT}")
+        if package.resolve() not in manifest.parents:
+            raise metadata.ManifestError(f"AZoth packages must be under {package}")
     except (OSError, metadata.ManifestError) as error:
         operator.report({"ERROR"}, str(error))
         return {"CANCELLED"}
 
     state = context.scene.azoth
     if state.make_linked_workspace:
-        library, workspace = metadata.workspace_paths(manifest)
+        library, workspace = metadata.workspace_paths(manifest, package)
         if _workspace_is_current(manifest, library, workspace):
             if Path(bpy.data.filepath).resolve() == workspace.resolve():
                 state.status = f"Workspace already open: {workspace}"
@@ -210,7 +214,7 @@ def _import_manifest(operator, context, manifest):
     if description is None:
         try:
             document = metadata.load_document(manifest)
-            description = metadata.description_from_document(document, metadata.OUTPUT_ROOT, manifest)
+            description = metadata.description_from_document(document, package, manifest)
             del document
             gc.collect()
         except (OSError, metadata.ManifestError) as error:
