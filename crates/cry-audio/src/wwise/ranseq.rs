@@ -16,30 +16,30 @@
 //! (id-sorted) children array:
 //!
 //! ```text
-//! sLoopCount              u16   @ children_anchor - 24
-//! sLoopModMin             u16   @ -22
-//! sLoopModMax             u16   @ -20
-//! fTransitionTime         f32   @ -18
-//! fTransitionTimeModMin   f32   @ -14
-//! fTransitionTimeModMax   f32   @ -10
-//! wAvoidRepeatCount       u16   @ -6
-//! eTransitionMode         u8    @ -4
-//! eRandomMode             u8    @ -3   (0 = Normal, 1 = Shuffle)
-//! eMode                   u8    @ -2   (0 = Random, 1 = Sequence)
-//! flags                   u8    @ -1   (bit0 bIsUsingWeight, bit1 bReset…,
-//!                                       bit2 bRestartBackward, bit3 bContinuous,
-//!                                       bit4 bIsGlobal)
+//! sLoopCount              u16
+//! sLoopModMin             u16
+//! sLoopModMax             u16
+//! fTransitionTime         f32
+//! fTransitionTimeModMin   f32
+//! fTransitionTimeModMax   f32
+//! wAvoidRepeatCount       u16
+//! eTransitionMode         u8
+//! eRandomMode             u8    (0 = Normal, 1 = Shuffle)
+//! eMode                   u8    (0 = Random, 1 = Sequence)
+//! flags                   u8    (bit0 bIsUsingWeight, bit1 bReset…,
+//!                                bit2 bRestartBackward, bit3 bContinuous,
+//!                                bit4 bIsGlobal)
 //! ```
 //!
 //! then `u32 ulNumChilds; u32[…] childIDs` (id-sorted), then the playlist:
 //! `u16 numPlaylistItem; { AkUniqueID ulPlayID (u32); AkUInt32 weight }[…]`.
-//! Confirmed byte-for-byte across all nine alligator containers, e.g. id
-//! `216394492` (`eMode`=0 Random, `eRandomMode`=1 Shuffle, `wAvoidRepeatCount`=5,
-//! 19 items each weight 50000) and id `93576288` (`eRandomMode`=0 Normal,
-//! `wAvoidRepeatCount`=32, 31 items). Every shipped container has
-//! `bIsUsingWeight`=0, so the authored weights are all the Wwise default (50000)
-//! and selection is uniform; the parser still honours explicit weights.
+//! The 24-byte block is located by structurally skipping `NodeBaseParams`
+//! (bank version 150); confirmed across alligator / gorilla event banks. Every
+//! shipped container has `bIsUsingWeight`=0, so the authored weights are all the
+//! Wwise default (50000) and selection is uniform; the parser still honours
+//! explicit weights.
 
+use super::nodebase::skip_node_base_params_v150;
 use super::{WwiseMediaId, WwiseObjectId};
 
 /// `eMode`: how the playlist is traversed.
@@ -87,8 +87,9 @@ const PLAYLIST_ITEM_LEN: usize = 8;
 impl WwiseRandomContainer {
     /// Parse a `CAkRanSeqCntr` body given the child node ids already recovered by
     /// parent inversion. Returns `None` unless the full typed tail — the 24-byte
-    /// params block, the (set-matched) children array, and the weighted playlist
-    /// — validates by consuming the body exactly. Pure: bytes in, values out.
+    /// params block after a v150 `NodeBaseParams` skip, the (set-matched) children
+    /// array, and the weighted playlist — validates by consuming the body exactly.
+    /// Pure: bytes in, values out.
     #[must_use]
     pub fn parse(body: &[u8], known_children: &[u32]) -> Option<Self> {
         let mut expected = known_children.to_vec();
@@ -98,24 +99,19 @@ impl WwiseRandomContainer {
         if count == 0 {
             return None;
         }
-        let stride = count.checked_mul(4)?.checked_add(4)?;
-        // The children-count anchor cannot begin before the 24-byte params block.
-        let mut p = RANSEQ_PARAMS_LEN;
-        while p.checked_add(stride)? <= body.len() {
-            if read_u32(body, p)? as usize == count {
-                let mut children: Vec<u32> = (0..count)
-                    .map(|index| read_u32(body, p + 4 + index * 4))
-                    .collect::<Option<Vec<u32>>>()?;
-                children.sort_unstable();
-                if children == expected
-                    && let Some(container) = Self::try_tail(body, p, count)
-                {
-                    return Some(container);
-                }
-            }
-            p += 1;
+        let params_at = skip_node_base_params_v150(body, 0)?;
+        let children_at = params_at.checked_add(RANSEQ_PARAMS_LEN)?;
+        if read_u32(body, children_at)? as usize != count {
+            return None;
         }
-        None
+        let mut children: Vec<u32> = (0..count)
+            .map(|index| read_u32(body, children_at + 4 + index * 4))
+            .collect::<Option<Vec<u32>>>()?;
+        children.sort_unstable();
+        if children != expected {
+            return None;
+        }
+        Self::try_tail(body, children_at, count)
     }
 
     fn try_tail(body: &[u8], p: usize, count: usize) -> Option<Self> {
@@ -309,8 +305,8 @@ mod tests {
     use super::*;
 
     /// A `CAkRanSeqCntr` body laid out exactly as bank version 150 stores it:
-    /// the 24-byte params block, the id-sorted children array, then the weighted
-    /// playlist. `flags` bit0 sets `bIsUsingWeight`.
+    /// empty `NodeBaseParams`, the 24-byte params block, the id-sorted children
+    /// array, then the weighted playlist. `flags` bit0 sets `bIsUsingWeight`.
     fn ranseq_body(
         e_mode: u8,
         e_random_mode: u8,
@@ -322,11 +318,7 @@ mod tests {
         children.sort_unstable();
         children.dedup();
 
-        let mut body = Vec::new();
-        // NodeBaseParams stand-in (any bytes; the parser anchors on the children
-        // count, and the params block is read relative to that anchor). Use a
-        // 12-byte head like the real node base so the anchor is unambiguous.
-        body.extend_from_slice(&[0u8; 12]);
+        let mut body = crate::wwise::nodebase::empty_node_base_params_v150(0);
         // 24-byte RanSeqCntrInitialValues block.
         body.extend_from_slice(&1u16.to_le_bytes()); // sLoopCount
         body.extend_from_slice(&0u16.to_le_bytes()); // sLoopModMin

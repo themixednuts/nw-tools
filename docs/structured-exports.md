@@ -27,10 +27,12 @@ is repeatable: each `--filter` adds to a union, so
 nw-tools format model --container gltf --filter alligator.cdf --filter barghestwolf.cdf --out ./out
 ```
 
-exports every mesh whose path contains *either* substring in a single run. Batching
-several characters this way builds the shared authored-asset dependency index once
-for the whole run rather than once per character. Omit `--filter` entirely to
-convert the whole install.
+exports every mesh whose path contains *either* substring in a single run. The
+shared authored-asset dependency index is built once for the whole run; selected
+characters then export **one at a time** so peak memory stays near a single
+resolved package. `--jobs` still parallelizes work *inside* each character
+(animation decode, package resource writes). Omit `--filter` entirely to convert
+the whole install.
 
 A filtered structured-glTF run also discovers context-owned alternate CDFs. An
 alternate must share a render identity asset with a selected CDF and be selected by

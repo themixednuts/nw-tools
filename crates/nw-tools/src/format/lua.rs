@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args};
 use humansize::{DECIMAL, format_size};
-use nw_lua::{bytecode::OpcodeTable, version::LuaVersion};
+use nw_lua::{
+    bytecode::OpcodeTable,
+    version::{LuaTarget, LuaVersion},
+};
 
 use crate::jobs::{JobArgs, RunCtx};
 use crate::support::{collect_matching, ensure_parent, guard_existing, write_guarded};
@@ -42,7 +45,7 @@ pub struct Lua {
 
     /// Override detected version: 51|52|53|54|55 (only 51 supported now).
     #[arg(long, value_name = "VER", value_parser = parse_lua_version)]
-    lua_version: Option<LuaVersion>,
+    lua_version: Option<LuaTarget>,
 
     /// Load a custom opcode-table mapping from file F.
     #[arg(long, value_name = "F")]
@@ -266,31 +269,23 @@ fn render_lua(bytes: &[u8], path: &Path, render: LuaRender<'_>) -> Result<String
 }
 
 fn load_opcode_table(
-    lua_version: Option<LuaVersion>,
+    lua_version: Option<LuaTarget>,
     opcode_table: Option<&Path>,
 ) -> Result<Option<OpcodeTable>> {
-    if let Some(version) = lua_version {
-        ensure_supported_version(version)?;
-    }
-
     let Some(path) = opcode_table else {
-        return lua_version
-            .map(OpcodeTable::builtin)
-            .transpose()
-            .context("load Lua opcode table");
+        return Ok(lua_version.map(OpcodeTable::builtin));
     };
 
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let table = OpcodeTable::from_custom_text(&text).context("parse opcode table")?;
-    ensure_supported_version(table.version)?;
 
     if let Some(version) = lua_version
         && version != table.version
     {
         bail!(
             "opcode table version {} does not match --lua-version {}",
-            version_label(table.version),
-            version_label(version)
+            table.version,
+            version
         );
     }
 
@@ -326,36 +321,17 @@ fn module_stem(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn parse_lua_version(value: &str) -> Result<LuaVersion, String> {
-    match value {
-        "51" => Ok(LuaVersion::V51),
-        "52" => Ok(LuaVersion::V52),
-        "53" => Ok(LuaVersion::V53),
-        "54" => Ok(LuaVersion::V54),
-        "55" => Ok(LuaVersion::V55),
-        _ => Err("expected one of 51, 52, 53, 54, 55".to_string()),
-    }
-}
-
-fn ensure_supported_version(version: LuaVersion) -> Result<()> {
-    if version == LuaVersion::V51 {
-        Ok(())
-    } else {
-        bail!(
-            "unsupported Lua version {}; only Lua 5.1 is supported in this phase",
-            version_label(version)
-        )
-    }
-}
-
-fn version_label(version: LuaVersion) -> &'static str {
-    match version {
-        LuaVersion::V51 => "5.1",
-        LuaVersion::V52 => "5.2",
-        LuaVersion::V53 => "5.3",
-        LuaVersion::V54 => "5.4",
-        LuaVersion::V55 => "5.5",
-    }
+fn parse_lua_version(value: &str) -> Result<LuaTarget, String> {
+    let version = match value {
+        "51" => LuaVersion::V51,
+        "52" => LuaVersion::V52,
+        "53" => LuaVersion::V53,
+        "54" => LuaVersion::V54,
+        "55" => LuaVersion::V55,
+        _ => return Err("expected one of 51, 52, 53, 54, 55".to_string()),
+    };
+    LuaTarget::for_version(version)
+        .map_err(|_| format!("unsupported Lua version {version}; only Lua 5.1 is supported"))
 }
 
 #[cfg(test)]

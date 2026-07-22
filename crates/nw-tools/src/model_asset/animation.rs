@@ -64,30 +64,36 @@ pub(super) fn push_animation_assets(
     let requested_paths = normalized_unique_paths(paths);
     let policy = AnimationBindingPolicy::for_required_mapping(require_mapping);
     let paths = unevaluated_animation_paths(&requested_paths, skeleton, policy, resolved);
-    let decoded = runner.try_map(&paths, |path| {
-        let bytes = read_required(source, path)?;
-        let is_dba = source_extension(path) == "dba";
-        let mut clips = if is_dba {
-            cry_animation::AnimationClip::parse_dba(&bytes)
-                .with_context(|| format!("decode tracks database {path}"))?
-        } else {
-            vec![
-                cry_animation::AnimationClip::parse(path.clone(), &bytes)
-                    .with_context(|| format!("decode animation {path}"))?,
-            ]
-        };
-        if let Some(events) = events {
-            for clip in &mut clips {
-                clip.events = events.events_for(&clip.source_path).cloned().collect();
+    // Decode in host-sized chunks so hundreds of CAF/DBA clips are not all
+    // resident as decoded channel buffers before any of them are evaluated into
+    // the model. Evaluation still needs `&mut resolved`, so it stays serial.
+    let chunk_size = runner.parallelism().max(1);
+    for chunk in paths.chunks(chunk_size) {
+        let decoded = runner.try_map(chunk, |path| {
+            let bytes = read_required(source, path)?;
+            let is_dba = source_extension(path) == "dba";
+            let mut clips = if is_dba {
+                cry_animation::AnimationClip::parse_dba(&bytes)
+                    .with_context(|| format!("decode tracks database {path}"))?
+            } else {
+                vec![
+                    cry_animation::AnimationClip::parse(path.clone(), &bytes)
+                        .with_context(|| format!("decode animation {path}"))?,
+                ]
+            };
+            if let Some(events) = events {
+                for clip in &mut clips {
+                    clip.events = events.events_for(&clip.source_path).cloned().collect();
+                }
             }
+            Ok::<_, anyhow::Error>(DecodedAnimationAsset {
+                path: path.clone(),
+                clips,
+            })
+        })?;
+        for asset in decoded {
+            evaluate_animation_asset(asset, skeleton, policy, resolved)?;
         }
-        Ok::<_, anyhow::Error>(DecodedAnimationAsset {
-            path: path.clone(),
-            clips,
-        })
-    })?;
-    for asset in decoded {
-        evaluate_animation_asset(asset, skeleton, policy, resolved)?;
     }
     scope_animation_dependencies(&requested_paths, resolved);
     if require_mapping {

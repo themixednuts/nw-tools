@@ -21,8 +21,9 @@
 //!   `uInMemoryMediaSize` `u32` @9, `uSourceBits` `u8` @13 }. `NodeBaseParams`
 //!   follows at @14; its `DirectParentID` lands at @22 in these banks.
 //! * Container bodies (`CAkRanSeqCntr` 5, `CAkSwitchCntr` 6, `CAkLayerCntr` 9,
-//!   `CAkActorMixer` 7) begin with `NodeBaseParams`; `DirectParentID` lands at
-//!   @8.
+//!   `CAkActorMixer` 7) begin with `NodeBaseParams`; with no FX/metadata the
+//!   `DirectParentID` lands at @8. Switch / ranseq typed tails are read only
+//!   after a full structural skip of that block (see [`super::nodebase`]).
 //!
 //! # Why parent links
 //!
@@ -30,13 +31,12 @@
 //! `DirectParentID` (early in `NodeBaseParams`), the exact inverse of the
 //! `AkChildren` array that appears only after the full positioning / state /
 //! RTPC tail. Wwise keeps the two encodings consistent, so inverting the parent
-//! edges reproduces the forward child links while parsing an order of magnitude
-//! less of each object. Every read is bounds-checked; an object that cannot be
-//! parsed simply contributes no edge (it is never fatal), so a stray effects
-//! chain on an unreachable node cannot corrupt a reachable subtree.
+//! edges reproduces the forward child links. Every read is bounds-checked; an
+//! object that cannot be parsed simply contributes no edge (it is never fatal).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use super::nodebase::{read_direct_parent_id_v150, skip_node_base_params_v150};
 use super::ranseq::{WwiseRandomContainer, weighted_sequence_seed};
 use super::{WwiseHierarchyObjectKind, WwiseMediaId, WwiseObjectId, WwiseSoundBank};
 
@@ -251,15 +251,12 @@ impl HircGraph {
                 _ => {}
             }
         }
-        // Pass 2: typed switch / random-sequence tails. The default-branch walk
-        // needs, per switch, the node ids of the package whose `ulSwitchID`
-        // equals `ulDefaultSwitch`, and per random/sequence container, its
-        // children in authored playlist order. Both are anchored on the child
-        // set already recovered by parent inversion (Pass 1), then validated by
-        // requiring the typed tail to consume the object body exactly — which
-        // avoids re-parsing the version-fragile positioning / state / RTPC middle
-        // of `NodeBaseParams`. A tail that fails to validate is simply omitted,
-        // so the default walk degrades to the full child set for that node.
+        // Pass 2: typed switch / random-sequence tails. After a structural v150
+        // `NodeBaseParams` skip, the switch group header / ranseq params sit at a
+        // fixed cursor. Child sets from parent inversion still validate the
+        // children array, and the typed tail must consume the body exactly. A
+        // tail that fails to validate is omitted so the default walk degrades to
+        // the full child set for that node.
         for object in &bank.hierarchy {
             let Some(body) = object.data(bytes).and_then(|data| data.get(4..)) else {
                 continue;
@@ -552,36 +549,10 @@ fn read_sound(body: &[u8]) -> Option<(WwiseMediaId, WwiseObjectId)> {
     Some((WwiseMediaId(source_id), parent))
 }
 
-/// Skip the head of `NodeBaseParams` and read `DirectParentID`.
-///
-/// `NodeInitialFxParams`: `bIsOverrideParentFX` `u8`, `uNumFx` `u8`, then when
-/// `uNumFx > 0` a `bitsFXBypass` `u8` and `uNumFx` effect records; then the
-/// Wwise 2019 metadata-effects pair `bIsOverrideParentMetadata` `u8`,
-/// `uNumFxMetadata` `u8` with its own records. `OverrideBusId` `u32` and
-/// `DirectParentID` `u32` follow. Each effect record is 7 bytes: `uFXIndex`
-/// `u8`, `fxID` `u32`, `bIsShareSet` `u8`, `bIsRendered` `u8`.
-fn read_node_parent(body: &[u8], mut cursor: usize) -> Option<WwiseObjectId> {
-    let _override_fx = *body.get(cursor)?;
-    cursor = cursor.checked_add(1)?;
-    let num_fx = *body.get(cursor)?;
-    cursor = cursor.checked_add(1)?;
-    if num_fx > 0 {
-        cursor = cursor.checked_add(1)?; // bitsFXBypass
-        cursor = cursor.checked_add((num_fx as usize).checked_mul(FX_RECORD_LEN)?)?;
-    }
-    let _override_metadata = *body.get(cursor)?;
-    cursor = cursor.checked_add(1)?;
-    let num_fx_metadata = *body.get(cursor)?;
-    cursor = cursor.checked_add(1)?;
-    if num_fx_metadata > 0 {
-        cursor = cursor.checked_add((num_fx_metadata as usize).checked_mul(FX_RECORD_LEN)?)?;
-    }
-    let _override_bus = read_u32(body, cursor)?;
-    cursor = cursor.checked_add(4)?; // OverrideBusId
-    Some(WwiseObjectId(read_u32(body, cursor)?))
+/// Skip the head of `NodeBaseParams` and read `DirectParentID` (bank version 150).
+fn read_node_parent(body: &[u8], cursor: usize) -> Option<WwiseObjectId> {
+    Some(WwiseObjectId(read_direct_parent_id_v150(body, cursor)?))
 }
-
-const FX_RECORD_LEN: usize = 1 + 4 + 1 + 1;
 
 /// `AkSwitchNodeParams` record length in a `CAkSwitchCntr` tail: `ulNodeID`
 /// `u32`, two playback/mode bit-vector bytes, `FadeOutTime` `u32`, `FadeInTime`
@@ -592,62 +563,66 @@ const SWITCH_PARAM_LEN: usize = 4 + 1 + 1 + 4 + 4;
 /// `CAkRanSeqCntr` playlist item length: `AkUInt32` node id + `AkUInt32` weight.
 const PLAYLIST_ITEM_LEN: usize = 4 + 4;
 
+/// Length of the fixed `RanSeqCntrInitialValues` block before the children array.
+const RANSEQ_PARAMS_LEN: usize = 24;
+
 /// A `CAkSwitchCntr`'s full typed tail (default switch + every branch package),
 /// or `None` when it cannot be validated (caller degrades to the full child set).
 ///
-/// # Evidence (bank version 150, `sounds/wwise/ftsp_alligator_events.bnk`)
+/// # Evidence
 ///
-/// After `NodeBaseParams`, a `CAkSwitchCntr` body carries `eGroupType` `u8`,
-/// `ulGroupID` `u32`, `ulDefaultSwitch` `u32`, `bIsContinuousValidation` `u8`,
-/// then the `AkUInt32`-counted children array, then `ulNumSwitchGroups` `u32`
-/// packages (each `ulSwitchID` `u32` + an `AkUInt32`-counted node-id list), then
-/// `ulNumSwitchParams` `u32` records of [`SWITCH_PARAM_LEN`] bytes. In the
-/// alligator switch (`id 61188014`, body length 142) the children array lands at
-/// body offset 46, so `ulDefaultSwitch` (`2108779966`) sits at 41; the container
-/// has four packages over two child blend containers.
-///
-/// Rather than skip the version-fragile positioning / state / RTPC tail of
-/// `NodeBaseParams`, the children array is located by matching the child set
-/// already recovered by parent inversion; the whole switch tail is then required
-/// to consume the body exactly, which uniquely pins the anchor.
+/// Bank version 150 (`sounds/wwise/ftsp_*_events.bnk`) plus Ghidra
+/// `CAkSwitchCntr::SetInitialValues` (`NewWorld 3-26` `FUN_7ff60738ec90`,
+/// HIRC type `0x06` via `FUN_7ff6073065f0` / `FUN_7ff60730d030`):
+/// after `SetNodeBaseParams`, the body carries a **10**-byte header
+/// (`eGroupType` `u8`, `ulGroupID` `u32`, `ulDefaultSwitch` `u32`,
+/// `bIsContinuousValidation` `u8`), the `AkUInt32`-counted children array,
+/// then `ulNumSwitchGroups` packages (`ulSwitchID` + node-id list — engine
+/// `dMalloc(numGroups * 0x28)`, the OOM vector when a false-matched count is
+/// huge), then `ulNumSwitchParams` records of [`SWITCH_PARAM_LEN`] (**0xe**)
+/// bytes. Alligator switch `id 61188014` ends `NodeBaseParams` at offset 36.
 fn parse_switch_tail(body: &[u8], known_children: &[u32]) -> Option<SwitchTail> {
     let expected: HashSet<u32> = known_children.iter().copied().collect();
-    let count = expected.len();
-    if count == 0 {
+    if expected.is_empty() {
         return None;
     }
-    // `ulDefaultSwitch` sits at `p - 5`, `ulGroupID` at `p - 9`, `eGroupType`
-    // at `p - 10`, so the children array cannot begin before offset 10.
-    let stride = count.checked_mul(4)?.checked_add(4)?;
-    let mut p = 10usize;
-    while p.checked_add(stride)? <= body.len() {
-        if read_u32(body, p)? as usize == count
-            && let Some(tail) = try_switch_tail(body, p, &expected)
-        {
-            return Some(tail);
-        }
-        p += 1;
-    }
-    None
+    let cursor = skip_node_base_params_v150(body, 0)?;
+    try_switch_tail(body, cursor, &expected)
 }
 
-fn try_switch_tail(body: &[u8], p: usize, expected: &HashSet<u32>) -> Option<SwitchTail> {
-    let count = expected.len();
+fn try_switch_tail(body: &[u8], mut cursor: usize, expected: &HashSet<u32>) -> Option<SwitchTail> {
+    let _group_type = *body.get(cursor)?;
+    cursor = cursor.checked_add(1)?;
+    let _group_id = read_u32(body, cursor)?;
+    cursor = cursor.checked_add(4)?;
+    let default_switch = read_u32(body, cursor)?;
+    cursor = cursor.checked_add(4)?;
+    let _continuous = *body.get(cursor)?;
+    cursor = cursor.checked_add(1)?;
+
+    let count = read_u32(body, cursor)? as usize;
+    cursor = cursor.checked_add(4)?;
+    if count != expected.len() {
+        return None;
+    }
     let mut children = HashSet::with_capacity(count);
     for index in 0..count {
-        children.insert(read_u32(body, p + 4 + index * 4)?);
+        children.insert(read_u32(body, cursor + index * 4)?);
     }
     if &children != expected {
         return None;
     }
-    // Read (and thereby validate the reach to) the authored group header.
-    let _group_type = *body.get(p.checked_sub(10)?)?;
-    let _group_id = read_u32(body, p.checked_sub(9)?)?;
-    let default_switch = read_u32(body, p.checked_sub(5)?)?;
+    cursor = cursor.checked_add(count.checked_mul(4)?)?;
 
-    let mut cursor = p + 4 + count * 4;
     let num_groups = read_u32(body, cursor)? as usize;
     cursor = cursor.checked_add(4)?;
+    // Bound allocation to what the remaining body can encode: each package is at
+    // least 8 bytes (switch id + node count), and the params count needs 4 more.
+    let remaining = body.len().checked_sub(cursor)?;
+    let max_groups = remaining.saturating_sub(4) / 8;
+    if num_groups > max_groups {
+        return None;
+    }
     let mut packages = Vec::with_capacity(num_groups);
     for _ in 0..num_groups {
         let switch_id = read_u32(body, cursor)?;
@@ -681,36 +656,30 @@ fn try_switch_tail(body: &[u8], p: usize, expected: &HashSet<u32>) -> Option<Swi
 ///
 /// # Evidence (bank version 150, `sounds/wwise/ftsp_alligator_events.bnk`)
 ///
-/// After `NodeBaseParams` and the random/sequence parameters, a `CAkRanSeqCntr`
-/// body carries the `AkUInt32`-counted (id-sorted) children array, then an
-/// `AkUInt16`-counted playlist of [`PLAYLIST_ITEM_LEN`]-byte items (`AkUInt32`
-/// node id + `AkUInt32` weight). The playlist is the authored order (children
-/// are stored sorted); in all eight alligator containers it consumes the body
-/// exactly.
+/// After `NodeBaseParams` and the 24-byte random/sequence parameters, a
+/// `CAkRanSeqCntr` body carries the `AkUInt32`-counted (id-sorted) children
+/// array, then an `AkUInt16`-counted playlist of [`PLAYLIST_ITEM_LEN`]-byte
+/// items (`AkUInt32` node id + `AkUInt32` weight).
 fn parse_ranseq_order(body: &[u8], known_children: &[u32]) -> Option<Vec<u32>> {
     let expected: HashSet<u32> = known_children.iter().copied().collect();
-    let count = expected.len();
-    if count == 0 {
+    if expected.is_empty() {
         return None;
     }
-    let stride = count.checked_mul(4)?.checked_add(4)?;
-    let mut p = 0usize;
-    while p.checked_add(stride)? <= body.len() {
-        if read_u32(body, p)? as usize == count {
-            let mut children = HashSet::with_capacity(count);
-            for index in 0..count {
-                children.insert(read_u32(body, p + 4 + index * 4)?);
-            }
-            if children == expected
-                && let Some(order) =
-                    try_ranseq_playlist(body, p + stride, &expected, known_children)
-            {
-                return Some(order);
-            }
-        }
-        p += 1;
+    let cursor = skip_node_base_params_v150(body, 0)?;
+    let cursor = cursor.checked_add(RANSEQ_PARAMS_LEN)?;
+    let count = read_u32(body, cursor)? as usize;
+    if count != expected.len() {
+        return None;
     }
-    None
+    let mut children = HashSet::with_capacity(count);
+    for index in 0..count {
+        children.insert(read_u32(body, cursor + 4 + index * 4)?);
+    }
+    if children != expected {
+        return None;
+    }
+    let playlist_at = cursor.checked_add(4)?.checked_add(count.checked_mul(4)?)?;
+    try_ranseq_playlist(body, playlist_at, &expected, known_children)
 }
 
 fn try_ranseq_playlist(
@@ -757,6 +726,7 @@ fn read_u32(body: &[u8], offset: usize) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::WwiseSoundBank;
+    use crate::wwise::nodebase::empty_node_base_params_v150;
 
     /// Build one HIRC object: `type` `u8`, `size` `u32` (= 4 + body), `id` `u32`,
     /// then the typed body.
@@ -768,13 +738,9 @@ mod tests {
         bytes
     }
 
-    /// Minimal `NodeBaseParams` head: no effects, `OverrideBusId` 0, the given
-    /// `DirectParentID`.
+    /// Empty v150 `NodeBaseParams` with the given `DirectParentID`.
     fn node_base(parent: u32) -> Vec<u8> {
-        let mut body = vec![0u8, 0, 0, 0]; // override fx, num fx, override meta, num meta
-        body.extend_from_slice(&0u32.to_le_bytes()); // OverrideBusId
-        body.extend_from_slice(&parent.to_le_bytes()); // DirectParentID
-        body
+        empty_node_base_params_v150(parent)
     }
 
     fn sound(id: u32, source: u32, parent: u32) -> Vec<u8> {
@@ -840,27 +806,11 @@ mod tests {
         object(WwiseHierarchyObjectKind::SWITCH_CONTAINER.0, id, &body)
     }
 
-    /// A `CAkRanSeqCntr` with the id-sorted children array and an authored
-    /// playlist (all weights equal) in the given order.
+    /// A `CAkRanSeqCntr` with the 24-byte params block, id-sorted children, and
+    /// an authored playlist (all weights equal) in the given order.
     fn ranseq_container(id: u32, parent: u32, playlist: &[u32]) -> Vec<u8> {
-        let mut sorted: Vec<u32> = playlist.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        let mut body = node_base(parent);
-        body.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
-        for child in &sorted {
-            body.extend_from_slice(&child.to_le_bytes());
-        }
-        body.extend_from_slice(&(playlist.len() as u16).to_le_bytes());
-        for node in playlist {
-            body.extend_from_slice(&node.to_le_bytes());
-            body.extend_from_slice(&50_000u32.to_le_bytes()); // weight
-        }
-        object(
-            WwiseHierarchyObjectKind::RANDOM_SEQUENCE_CONTAINER.0,
-            id,
-            &body,
-        )
+        let weighted: Vec<(u32, u32)> = playlist.iter().map(|node| (*node, 50_000u32)).collect();
+        ranseq_container_full(id, parent, 0, 0, 0, false, &weighted)
     }
 
     /// A `CAkRanSeqCntr` with the full 24-byte `RanSeqCntrInitialValues` block
@@ -923,6 +873,22 @@ mod tests {
         bytes.extend_from_slice(&(hirc.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&hirc);
         bytes
+    }
+
+    #[test]
+    fn switch_tail_rejects_absurd_group_count_without_allocating() {
+        // Valid empty NodeBaseParams, then a forged children array for [1, 2] and
+        // an absurd `ulNumSwitchGroups` that would OOM a naive `Vec::with_capacity`.
+        let mut body = node_base(0);
+        body.push(0); // eGroupType
+        body.extend_from_slice(&0u32.to_le_bytes()); // group id
+        body.extend_from_slice(&0u32.to_le_bytes()); // default switch
+        body.push(0); // continuous
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&3_501_062_356u32.to_le_bytes());
+        assert!(parse_switch_tail(&body, &[1, 2]).is_none());
     }
 
     #[test]
@@ -1163,12 +1129,29 @@ mod tests {
 
     #[test]
     fn event_weighted_sequence_cycles_media_without_a_parseable_random_container() {
-        // The random container here is order-only (no 24-byte params block), so the
-        // weighted parser rejects it and the walk cycles the branch's ordered media.
+        // Truncate after the children array so the weighted/playlist parsers
+        // reject the body; the walk then cycles parent-inversion child order.
+        let mut body = node_base(0);
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&1000.0f32.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&[0, 0, 0, 0]); // modes + flags
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&401u32.to_le_bytes());
+        body.extend_from_slice(&402u32.to_le_bytes());
+        // No playlist → structural ranseq parse fails.
         let objects = vec![
             event(100, &[200]),
             action(200, 300),
-            ranseq_container(300, 0, &[402, 401]),
+            object(
+                WwiseHierarchyObjectKind::RANDOM_SEQUENCE_CONTAINER.0,
+                300,
+                &body,
+            ),
             sound(401, 4001, 300),
             sound(402, 4002, 300),
         ];
@@ -1180,7 +1163,7 @@ mod tests {
             .into_iter()
             .map(|media| media.0)
             .collect();
-        // Ordered default media [4002, 4001] (playlist order) cycled to length 3.
-        assert_eq!(seq, vec![4002, 4001, 4002]);
+        // Parent-inversion child order [401, 402] → media [4001, 4002] cycled.
+        assert_eq!(seq, vec![4001, 4002, 4001]);
     }
 }

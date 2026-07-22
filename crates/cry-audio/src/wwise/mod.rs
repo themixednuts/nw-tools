@@ -6,6 +6,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 pub mod hirc;
+pub mod nodebase;
 pub mod ranseq;
 
 macro_rules! id_type {

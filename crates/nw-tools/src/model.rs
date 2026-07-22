@@ -118,8 +118,9 @@ pub struct Model {
     blender: Option<PathBuf>,
 
     /// Case-insensitive path substring filter (install mode). Repeat `--filter`
-    /// to batch several characters in one run (union match, one dependency-index
-    /// build). Omit to convert the whole install.
+    /// to select several characters in one run (union match, one dependency-index
+    /// build). Characters export one at a time; `--jobs` parallelizes work inside
+    /// each character. Omit to convert the whole install.
     #[arg(long = "filter")]
     filters: Vec<String>,
 
@@ -261,7 +262,11 @@ impl Model {
         Ok(())
     }
 
-    /// Batch-convert every mesh under a directory, in parallel.
+    /// Batch-convert every mesh under a directory.
+    ///
+    /// Characters/meshes run one at a time so a full resolved package (all clips,
+    /// decoded audio, glTF buffers) is never multiplied by host parallelism.
+    /// `--jobs` still parallelizes work *inside* each conversion.
     fn export_tree(&self, ctx: &RunCtx, dir: &Path) -> Result<()> {
         let out_dir = self.out.clone().unwrap_or_else(|| dir.to_path_buf());
         let package = if self.container == Container::Gltf {
@@ -272,12 +277,13 @@ impl Model {
         let meshes = collect_matching(dir, is_mesh_file)?;
         let index_source = Tree::rooted(dir);
         let dependency_index = self.build_model_dependency_index(ctx, &index_source)?;
-        let batch = ctx.map_results_compact(
-            "model",
-            &meshes,
-            |path| display_path(path),
-            |path, progress| {
-                progress.step(|| {
+        let results = export_roots_sequentially(
+            ctx,
+            meshes.len(),
+            |index| display_path(&meshes[index]),
+            |index, job| {
+                let path = &meshes[index];
+                job.step(|| {
                     let source = Tree::around(path);
                     let relative = path.strip_prefix(dir).unwrap_or(path);
                     let artifact = relative.with_extension(self.container.extension());
@@ -307,13 +313,16 @@ impl Model {
                 })
             },
         );
-        let results = batch.into_completed();
         report_batch(&results, dir.display().to_string())?;
         self.write_blends(&out_dir, &exported_manifests(&results))?;
         Ok(())
     }
 
-    /// Convert meshes straight out of the install's paks (+ asset catalog), parallel.
+    /// Convert meshes straight out of the install's paks (+ asset catalog).
+    ///
+    /// Selected characters export sequentially (one resolved package resident at
+    /// a time). Shared dependency-index build and in-character `--jobs`
+    /// parallelism are unchanged.
     fn export_install(&self, ctx: &RunCtx) -> Result<()> {
         let install = source::locate()?;
         let source = Install::open(ctx, &install.assets())?;
@@ -353,34 +362,39 @@ impl Model {
             meshes.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
         }
 
-        let batch = ctx.map_results_compact("model", &meshes, Clone::clone, |key, progress| {
-            progress.step(|| {
-                let artifact = Path::new(key).with_extension(self.container.extension());
-                let out = out_dir.join(&artifact);
-                guard_existing(&out, self.overwrite.into())?;
-                ensure_parent(&out)?;
-                let cgf = source.read(key).with_context(|| format!("read {key}"))?;
-                let heap = source.read(&format!("{key}heap")).unwrap_or_default();
-                let stats = self.convert(
-                    &ctx.runner,
-                    &source,
-                    ConvertRequest {
-                        source_path: key,
-                        cgf: &cgf,
-                        heap: &heap,
-                        mesh: MeshRef::for_key(key),
-                        mtl_override: None,
-                        out: &out,
-                        package: package.as_ref(),
-                        artifact: &artifact,
-                        dependency_index: dependency_index.as_ref(),
-                    },
-                )?;
-                let manifest = package.is_some().then(|| out.clone());
-                Ok(Exported { stats, manifest })
-            })
-        });
-        let results = batch.into_completed();
+        let results = export_roots_sequentially(
+            ctx,
+            meshes.len(),
+            |index| meshes[index].clone(),
+            |index, job| {
+                let key = &meshes[index];
+                job.step(|| {
+                    let artifact = Path::new(key).with_extension(self.container.extension());
+                    let out = out_dir.join(&artifact);
+                    guard_existing(&out, self.overwrite.into())?;
+                    ensure_parent(&out)?;
+                    let cgf = source.read(key).with_context(|| format!("read {key}"))?;
+                    let heap = source.read(&format!("{key}heap")).unwrap_or_default();
+                    let stats = self.convert(
+                        &ctx.runner,
+                        &source,
+                        ConvertRequest {
+                            source_path: key,
+                            cgf: &cgf,
+                            heap: &heap,
+                            mesh: MeshRef::for_key(key),
+                            mtl_override: None,
+                            out: &out,
+                            package: package.as_ref(),
+                            artifact: &artifact,
+                            dependency_index: dependency_index.as_ref(),
+                        },
+                    )?;
+                    let manifest = package.is_some().then(|| out.clone());
+                    Ok(Exported { stats, manifest })
+                })
+            },
+        );
         report_batch(&results, install.assets().display().to_string())?;
         self.write_blends(&out_dir, &exported_manifests(&results))?;
         Ok(())
@@ -545,6 +559,39 @@ fn character_roots(matches: &[String]) -> Vec<String> {
         .filter(|path| path_ext(Path::new(path)).as_deref() == Some("cdf"))
         .cloned()
         .collect()
+}
+
+/// Run one export root at a time so peak memory stays near a single character.
+///
+/// Progress still reports the full batch; cancellation stops scheduling further
+/// roots. Inner conversion work keeps using [`RunCtx::runner`] parallelism.
+fn export_roots_sequentially<N, F>(
+    ctx: &RunCtx,
+    count: usize,
+    name: N,
+    mut export_one: F,
+) -> Vec<Result<Exported>>
+where
+    N: Fn(usize) -> String,
+    F: FnMut(usize, crate::progress::Job) -> Result<Exported>,
+{
+    let progress = ctx.progress.batch_compact("model", count);
+    let mut results = Vec::with_capacity(count);
+    for index in 0..count {
+        if ctx.cancel.is_cancelled() {
+            break;
+        }
+        let job = progress.job(name(index));
+        let result = export_one(index, job.clone());
+        if result.is_ok() {
+            job.finish("done");
+        } else {
+            job.finish("failed");
+        }
+        results.push(result);
+    }
+    progress.finish();
+    results
 }
 
 struct ConvertRequest<'a> {
