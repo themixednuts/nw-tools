@@ -42,7 +42,12 @@ fn cli_decompiles_shopcommon_by_default_and_reparses() {
     full_moon::parse(&stdout).unwrap_or_else(|errors| {
         panic!("CLI decompiled output did not parse:\n{stdout}\n{errors:#?}")
     });
-    assert!(stdout.contains("local Shopcommon = {}"), "{stdout}");
+    assert!(stdout.contains("local Shopcommon = {"), "{stdout}");
+    assert!(stdout.contains("ShopCurrencyType = {"), "{stdout}");
+    assert!(
+        !stdout.contains("Shopcommon.ShopCurrencyType ="),
+        "{stdout}"
+    );
     assert!(stdout.contains("function Shopcommon.OpenShop("), "{stdout}");
     assert!(stdout.contains("return Shopcommon"), "{stdout}");
     assert!(!stdout.contains("local v4_2 = {}"), "{stdout}");
@@ -119,6 +124,40 @@ fn cli_reads_luac_from_stdin() {
     let output = child.wait_with_output().expect("wait for nw-lua");
     let stdout = assert_success(output, "stdin --dis");
     assert!(stdout.contains("GETGLOBAL"), "{stdout}");
+}
+
+#[test]
+fn cli_parallel_batch_decompiles_to_deterministic_output_names() {
+    let output_dir = tempfile::tempdir().expect("create batch output directory");
+    let output = command()
+        .args(["--jobs", "2", "--output"])
+        .arg(output_dir.path())
+        .arg(fixture("shopcommon.luac"))
+        .arg(fixture("linear/local_add.luac"))
+        .output()
+        .expect("run parallel nw-lua batch");
+
+    let stdout = assert_success(output, "parallel batch");
+    assert!(stdout.is_empty(), "batch output belongs in files: {stdout}");
+    for name in ["shopcommon.lua", "local_add.lua"] {
+        let source = fs::read_to_string(output_dir.path().join(name))
+            .unwrap_or_else(|error| panic!("read {name}: {error}"));
+        full_moon::parse(&source)
+            .unwrap_or_else(|errors| panic!("{name} did not parse:\n{source}\n{errors:#?}"));
+    }
+}
+
+#[test]
+fn cli_batch_requires_an_output_directory() {
+    let output = command()
+        .arg(fixture("shopcommon.luac"))
+        .arg(fixture("linear/local_add.luac"))
+        .output()
+        .expect("run invalid nw-lua batch");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("require an output directory"), "{stderr}");
 }
 
 fn assert_success(output: Output, context: &str) -> String {

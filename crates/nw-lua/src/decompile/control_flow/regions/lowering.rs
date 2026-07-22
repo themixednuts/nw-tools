@@ -25,8 +25,13 @@ impl RegionTree {
         booleans: &BooleanAnalysis,
         builder: &mut StatementBuilder<'_>,
     ) -> Result<ast::Block, LuaError> {
-        force_region_loop_phi_values(&self.root, function, builder);
-        let stmts = lower_region(&self.root, function, analysis, names, booleans, builder)?;
+        let mut stmts = Vec::new();
+        if let Some(declaration) = builder.emit_entry_declarations() {
+            stmts.push(declaration);
+        }
+        stmts.extend(lower_region(
+            &self.root, function, analysis, names, booleans, builder,
+        )?);
         Ok(ast::Block::new(stmts))
     }
 }
@@ -54,6 +59,11 @@ fn lower_region(
             Ok(out)
         }
         Region::Linear(linear) => builder.emit_linear_region(linear),
+        Region::Value(region) => {
+            let mut out = builder.emit_linear_region(&region.prefix)?;
+            out.extend(builder.emit_value_region(&region.plan)?);
+            Ok(out)
+        }
         Region::If(region) => lower_if(region, function, analysis, names, booleans, builder),
         Region::While(region) => lower_while(region, function, analysis, names, booleans, builder),
         Region::Repeat(region) => {
@@ -84,7 +94,10 @@ fn lower_if(
         return Ok(stmts);
     }
 
-    let phis = visible_if_phis(region, function);
+    let phis = visible_if_phis(region, function)
+        .into_iter()
+        .filter(|phi| builder.should_materialize_ref(phi.dest))
+        .collect::<Vec<_>>();
     let mut out = builder.emit_linear_region(&region.prefix)?;
     let arm_blocks = region
         .arms
@@ -106,17 +119,23 @@ fn lower_if(
     for arm in &region.arms {
         let cond = lower_condition(arm.condition, function, analysis, booleans, builder)?;
         let mut body = lower_region(&arm.body, function, analysis, names, booleans, builder)?;
-        append_phi_assignments(&mut body, &phis, &arm.blocks, builder)?;
+        append_phi_assignments(&mut body, &phis, &arm.blocks, Some(&arm.body), builder)?;
         arms.push((cond, ast::Block::new(body)));
     }
 
     let else_ = if let Some(else_region) = &region.else_ {
         let mut body = lower_region(else_region, function, analysis, names, booleans, builder)?;
-        append_phi_assignments(&mut body, &phis, &region.else_blocks, builder)?;
+        append_phi_assignments(
+            &mut body,
+            &phis,
+            &region.else_blocks,
+            Some(else_region),
+            builder,
+        )?;
         Some(ast::Block::new(body))
     } else if !region.else_blocks.is_empty() {
         let mut body = Vec::new();
-        append_phi_assignments(&mut body, &phis, &region.else_blocks, builder)?;
+        append_phi_assignments(&mut body, &phis, &region.else_blocks, None, builder)?;
         (!body.is_empty()).then(|| ast::Block::new(body))
     } else {
         None
@@ -146,10 +165,10 @@ fn visible_if_phis(region: &IfRegion, function: &SsaFunction) -> Vec<PhiSource> 
 
 fn numeric_for_control_range_at(function: &SsaFunction, block: usize) -> Option<(u16, u16)> {
     let base = function.blocks.get(block)?.nodes.iter().find_map(|node| {
-        let SsaOp::ForLoop { base, .. } = node.op else {
+        let SsaOp::ForLoop { control, .. } = node.op else {
             return None;
         };
-        Some(base)
+        Some(control.base())
     })?;
     Some((base, base.saturating_add(3)))
 }
@@ -164,6 +183,9 @@ fn lower_boolean_value_if(
     let [phi] = region.phis.as_slice() else {
         return Ok(None);
     };
+    if !builder.should_materialize_ref(phi.dest) {
+        return Ok(None);
+    }
     let [arm] = region.arms.as_slice() else {
         return Ok(None);
     };
@@ -202,6 +224,9 @@ fn lower_simple_phi_value_if(
     let [phi] = region.phis.as_slice() else {
         return Ok(None);
     };
+    if !builder.should_materialize_ref(phi.dest) {
+        return Ok(None);
+    }
     let [arm] = region.arms.as_slice() else {
         return Ok(None);
     };
@@ -290,23 +315,22 @@ fn lower_numeric_for(
 ) -> Result<Vec<Stmt>, LuaError> {
     let base = region.info.base;
     let prep_pc = node(function, region.info.prep_node).map_or(0, |node| node.pc);
-    let setup_defs = [
+    let setup_nodes = [
         region.info.start_node,
         region.info.stop_node,
         region.info.step_node,
+        Some(region.info.prep_node),
     ]
     .into_iter()
     .flatten()
-    .filter_map(|id| node(function, id))
-    .filter_map(|node| node.dest.reg_index().map(|reg| (reg, node.pc)))
     .collect::<Vec<_>>();
-    let mut out = builder.emit_node_ids(region.prefix.nodes.iter().copied(), |node| {
-        matches!(&node.op, SsaOp::ForPrep { base: loop_base, .. } if *loop_base == base)
-            || node
-                .dest
-                .reg_index()
-                .is_some_and(|reg| setup_defs.contains(&(reg, node.pc)))
-    })?;
+    let prefix_nodes = region.prefix.nodes.iter().copied().filter(|id| {
+        !setup_nodes.contains(id)
+            && node(function, *id).is_none_or(|node| {
+                !matches!(&node.op, SsaOp::ForPrep { control, .. } if control.base() == base)
+            })
+    });
+    let mut out = builder.emit_node_ids(prefix_nodes)?;
     let start = expr_for_optional_node(function, builder, region.info.start_node, base, prep_pc)?;
     let stop = expr_for_optional_node(
         function,
@@ -322,18 +346,13 @@ fn lower_numeric_for(
         base.saturating_add(2),
         prep_pc,
     )?;
-    let var = loop_var_name(
-        names,
-        base.saturating_add(3),
-        function,
-        region.info.body_start,
-    );
+    let var = loop_var_name(names, region.info.var, function, region.info.body_start);
     let body = lower_region(&region.body, function, analysis, names, booleans, builder)?;
     out.push(Stmt::NumericFor {
         var,
         start,
         stop,
-        step: (!is_one(&step)).then_some(step),
+        step: (!is_one(&step)).then(|| Box::new(step)),
         body: ast::Block::new(body),
     });
     Ok(out)
@@ -349,30 +368,21 @@ fn lower_generic_for(
 ) -> Result<Vec<Stmt>, LuaError> {
     let base = region.info.base;
     let skip_end = base.saturating_add(2 + region.info.count.max(0) as u16);
-    let setup_range = generic_setup_pc_range(function, region.info.call_node, base, skip_end);
-    let mut out = builder.emit_node_ids(region.prefix.nodes.iter().copied(), |node| {
-        setup_range.is_some_and(|(start, end)| {
-            node.pc >= start
-                && node.pc <= end
-                && (node
-                    .dest
-                    .reg_index()
-                    .is_some_and(|reg| reg >= base && reg <= skip_end)
-                    || matches!(&node.op, SsaOp::SetList { base: table_reg, .. } if *table_reg >= base && *table_reg <= skip_end))
-        })
-    })?;
+    let prefix_nodes = region.prefix.nodes.iter().copied().filter(|id| {
+        !region.setup_nodes.contains(id)
+            && node(function, *id).is_none_or(|node| {
+                !matches!(&node.op, SsaOp::SetList { base: table_reg, .. } if *table_reg >= base && *table_reg <= skip_end)
+            })
+    });
+    let mut out = builder.emit_node_ids(prefix_nodes)?;
 
     let exprs = generic_for_exprs(region, function, analysis, builder)?;
-    let var_base = base.saturating_add(3);
-    let var_names = (0..region.info.count.max(0))
-        .map(|offset| {
-            loop_var_name(
-                names,
-                var_base.saturating_add(u16::try_from(offset).unwrap_or(0)),
-                function,
-                region.info.body_start,
-            )
-        })
+    let var_names = region
+        .info
+        .vars
+        .iter()
+        .copied()
+        .map(|reference| loop_var_name(names, reference, function, region.info.body_start))
         .collect();
     let body = lower_region(&region.body, function, analysis, names, booleans, builder)?;
     out.push(Stmt::GenericFor {
@@ -405,12 +415,16 @@ fn append_phi_assignments(
     body: &mut Vec<Stmt>,
     phis: &[PhiSource],
     blocks: &[usize],
+    owner: Option<&Region>,
     builder: &mut StatementBuilder<'_>,
 ) -> Result<(), LuaError> {
     if matches!(body.last(), Some(Stmt::Return(_) | Stmt::Break)) {
         return Ok(());
     }
     for phi in phis {
+        if owner.is_some_and(|region| region.owns_value(phi.dest)) {
+            continue;
+        }
         if let Some(stmt) =
             builder.phi_value_plan_assignment_if_covered(phi.dest, phi.pc, blocks)?
         {
@@ -439,71 +453,6 @@ fn unique_phi_operand(phi: &PhiSource, blocks: &[usize]) -> Option<SsaRef> {
         result = Some(*operand);
     }
     result
-}
-
-fn force_phi_values(
-    builder: &mut StatementBuilder<'_>,
-    phis: &[PhiSource],
-    exclude_reg: impl Fn(u16) -> bool,
-) {
-    for phi in phis {
-        let Some(reg) = phi.dest.reg_index() else {
-            continue;
-        };
-        if exclude_reg(reg) {
-            continue;
-        }
-        builder.force_materialized(phi.dest);
-        for (_, operand) in &phi.sources {
-            builder.force_materialized(*operand);
-        }
-    }
-}
-
-fn force_region_loop_phi_values(
-    region: &Region,
-    function: &SsaFunction,
-    builder: &mut StatementBuilder<'_>,
-) {
-    match region {
-        Region::Sequence(regions) => {
-            for region in regions {
-                force_region_loop_phi_values(region, function, builder);
-            }
-        }
-        Region::If(region) => {
-            for arm in &region.arms {
-                force_region_loop_phi_values(&arm.body, function, builder);
-            }
-            if let Some(else_) = &region.else_ {
-                force_region_loop_phi_values(else_, function, builder);
-            }
-        }
-        Region::While(region) => {
-            let phis = conditionals::phi_sources(function, region.condition.branch.block);
-            force_phi_values(builder, &phis, |_| false);
-            force_region_loop_phi_values(&region.body, function, builder);
-        }
-        Region::Repeat(region) => {
-            force_region_loop_phi_values(&region.body, function, builder);
-        }
-        Region::NumericFor(region) => {
-            let base = region.info.base;
-            let phis = conditionals::phi_sources(function, region.info.loop_block);
-            force_phi_values(builder, &phis, |reg| {
-                reg >= base && reg <= base.saturating_add(3)
-            });
-            force_region_loop_phi_values(&region.body, function, builder);
-        }
-        Region::GenericFor(region) => {
-            let base = region.info.base;
-            let skip_end = base.saturating_add(2 + region.info.count.max(0) as u16);
-            let phis = conditionals::phi_sources(function, region.info.tfor_block);
-            force_phi_values(builder, &phis, |reg| reg >= base && reg <= skip_end);
-            force_region_loop_phi_values(&region.body, function, builder);
-        }
-        Region::Linear(_) | Region::Break => {}
-    }
 }
 
 fn expr_for_optional_node(
@@ -602,40 +551,17 @@ fn generic_setup_def(
     None
 }
 
-fn loop_var_name(names: &NameResolver<'_>, reg: u16, function: &SsaFunction, block: usize) -> Name {
+fn loop_var_name(
+    names: &NameResolver<'_>,
+    reference: SsaRef,
+    function: &SsaFunction,
+    block: usize,
+) -> Name {
     let pc = function
         .blocks
         .get(block)
         .map_or(0, |block| i32::try_from(block.start_pc).unwrap_or(0));
-    names
-        .binding_for_use(reg, pc)
-        .or_else(|| names.binding_for_def(reg, pc))
-        .map_or_else(
-            || names.synthetic_reg_name(reg),
-            |binding| names.name_for_binding_def(&binding, SsaRef::Reg { reg, ver: 0 }),
-        )
-}
-
-fn generic_setup_pc_range(
-    function: &SsaFunction,
-    call_node: Option<NodeId>,
-    base: u16,
-    skip_end: u16,
-) -> Option<(i32, i32)> {
-    let call_id = call_node?;
-    let block = function.blocks.get(call_id.block)?;
-    let call = block.nodes.get(call_id.node)?;
-    let mut start = call.pc;
-    for node in block.nodes[..call_id.node].iter().rev() {
-        let Some(reg) = node.dest.reg_index() else {
-            break;
-        };
-        if reg < base || reg > skip_end {
-            break;
-        }
-        start = node.pc;
-    }
-    Some((start, call.pc))
+    names.name_for_ref(reference, pc)
 }
 
 fn node(function: &SsaFunction, id: NodeId) -> Option<&SsaNode> {
@@ -742,11 +668,10 @@ fn block_is_phi_value_only(
         .iter()
         .enumerate()
         .all(|(node_index, node)| {
-            node.is_meta_only
-                || Some(NodeId {
-                    block,
-                    node: node_index,
-                }) == def_site
+            Some(NodeId {
+                block,
+                node: node_index,
+            }) == def_site
                 || matches!(node.op, SsaOp::Nop | SsaOp::Jump { .. })
         })
 }

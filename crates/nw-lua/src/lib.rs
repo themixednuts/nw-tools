@@ -207,15 +207,12 @@ fn parse_with_builtin_table(
     bytes: &[u8],
 ) -> Result<(chunk::Chunk, bytecode::OpcodeTable), LuaError> {
     let chunk = parse_chunk(bytes)?;
-    let table = bytecode::OpcodeTable::builtin(chunk.header.version)?;
+    let table = bytecode::OpcodeTable::builtin(chunk.header.version);
     Ok((chunk, table))
 }
 
 fn disassemble_chunk_with_table(chunk: &chunk::Chunk, table: &bytecode::OpcodeTable) -> String {
-    let mut out = format!(
-        "-- Lua {} Disassembly --\n\n",
-        version_label(chunk.header.version)
-    );
+    let mut out = format!("-- Lua {} Disassembly --\n\n", chunk.header.version);
     out.push_str(&disasm::disassemble_proto(&chunk.root, table));
     out
 }
@@ -245,15 +242,29 @@ fn decompile_chunk_with_table_options_and_module_stem(
     options: DecompOptions,
     fallback_module_stem: Option<&str>,
 ) -> Result<String, LuaError> {
-    let ssa = ir::build_ssa(&chunk.root, table);
-    let block = decompile::decompile_proto_with_options_and_module_stem(
-        &chunk.root,
-        &ssa,
+    let block = reconstruct_chunk_with_table_options_and_module_stem(
+        chunk,
         table,
         options,
         fallback_module_stem,
     )?;
     emit::to_source(&block)
+}
+
+fn reconstruct_chunk_with_table_options_and_module_stem(
+    chunk: &chunk::Chunk,
+    table: &bytecode::OpcodeTable,
+    options: DecompOptions,
+    fallback_module_stem: Option<&str>,
+) -> Result<decompile::ast::Block, LuaError> {
+    let ssa = ir::build_ssa(&chunk.root, table);
+    decompile::decompile_proto_with_options_and_module_stem(
+        &chunk.root,
+        &ssa,
+        table,
+        options,
+        fallback_module_stem,
+    )
 }
 
 fn ensure_compatible_table(
@@ -263,8 +274,7 @@ fn ensure_compatible_table(
     if table.version != chunk.header.version {
         return Err(LuaError::Malformed(format!(
             "opcode table version {} does not match chunk version {}",
-            version_label(table.version),
-            version_label(chunk.header.version)
+            table.version, chunk.header.version
         )));
     }
     Ok(())
@@ -284,14 +294,4 @@ fn annotate_source(disassembly: &str, source: &str) -> String {
     out.push('\n');
     out.push_str(source);
     out
-}
-
-fn version_label(version: version::LuaVersion) -> &'static str {
-    match version {
-        version::LuaVersion::V51 => "5.1",
-        version::LuaVersion::V52 => "5.2",
-        version::LuaVersion::V53 => "5.3",
-        version::LuaVersion::V54 => "5.4",
-        version::LuaVersion::V55 => "5.5",
-    }
 }

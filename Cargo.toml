@@ -20,6 +20,12 @@ style = { level = "warn" }
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
 [workspace.dependencies]
 anyhow = "1.0.102"
 blake3 = "1.8.2"

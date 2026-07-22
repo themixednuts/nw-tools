@@ -5,6 +5,7 @@ pub(crate) fn is_inlineable_def(op: &SsaOp) -> bool {
         op,
         SsaOp::Move { .. }
             | SsaOp::LoadK { .. }
+            | SsaOp::LoadLiteral { .. }
             | SsaOp::LoadBool { .. }
             | SsaOp::LoadNil { .. }
             | SsaOp::GetUpval { .. }
@@ -25,6 +26,7 @@ pub(super) fn is_pure_def(op: &SsaOp) -> bool {
         op,
         SsaOp::Move { .. }
             | SsaOp::LoadK { .. }
+            | SsaOp::LoadLiteral { .. }
             | SsaOp::LoadBool { .. }
             | SsaOp::LoadNil { .. }
             | SsaOp::Closure { .. }
@@ -32,30 +34,10 @@ pub(super) fn is_pure_def(op: &SsaOp) -> bool {
     )
 }
 
-pub(super) fn op_uses_ref(op: &SsaOp, needle: SsaRef) -> bool {
-    let mut found = false;
-    for_each_use(op, |reference| {
-        if reference == needle {
-            found = true;
-        }
-    });
-    found
-}
-
 pub(super) fn constructor_mutation_table(op: &SsaOp) -> Option<SsaRef> {
     match op {
         SsaOp::SetTable { table, .. } | SsaOp::SetList { table, .. } => Some(*table),
         _ => None,
-    }
-}
-
-pub(super) fn is_parent_constructor_mutation(node: &SsaNode, child_reg: u16) -> bool {
-    match &node.op {
-        SsaOp::SetTable { table, .. } => table.reg_index().is_some_and(|reg| reg < child_reg),
-        SsaOp::SetList { table, base, .. } => {
-            table.reg_index().is_some_and(|reg| reg < child_reg) && *base < child_reg
-        }
-        _ => false,
     }
 }
 
@@ -79,6 +61,7 @@ pub(super) fn direct_eval_order_refs(op: &SsaOp) -> Vec<SsaRef> {
         SsaOp::Phi { operands, .. } => operands.clone(),
         SsaOp::Nop
         | SsaOp::LoadK { .. }
+        | SsaOp::LoadLiteral { .. }
         | SsaOp::LoadBool { .. }
         | SsaOp::LoadNil { .. }
         | SsaOp::GetUpval { .. }

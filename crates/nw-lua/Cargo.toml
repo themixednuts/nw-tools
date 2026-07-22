@@ -16,9 +16,13 @@ byteorder.workspace = true
 clap.workspace = true
 full_moon.workspace = true
 heck.workspace = true
+nw-jobs.workspace = true
 petgraph.workspace = true
 stylua.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [[bin]]
 name = "nw-lua"

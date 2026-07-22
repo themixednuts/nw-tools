@@ -4,7 +4,10 @@ use crate::{
     LuaError,
     bytecode::OpcodeTable,
     chunk::Proto,
-    decompile::{analysis, ast, boolean, naming::NameResolver, stmt_build::StatementBuilder},
+    decompile::{
+        analysis, ast, boolean, naming::NameResolver, reconstruction::ReconstructionPlan,
+        stmt_build::StatementBuilder,
+    },
     ir::SsaFunction,
 };
 
@@ -29,7 +32,7 @@ pub fn structure(
     let loops = loops::analyze(function, &pc_map);
     let facts = analysis::analyze(function);
     let booleans = boolean::analyze(function, &facts, &loops, &pc_map);
-    RegionTree::build(function, &loops, &pc_map, &booleans)
+    RegionTree::build(function, &facts, &loops, &pc_map, &booleans)
 }
 
 /// Structure and lower a function to the compact Lua AST.
@@ -57,7 +60,17 @@ pub(crate) fn lower_with_names(
     let loops = loops::analyze(function, &pc_map);
     let facts = analysis::analyze(function);
     let booleans = boolean::analyze(function, &facts, &loops, &pc_map);
-    let tree = RegionTree::build(function, &loops, &pc_map, &booleans)?;
-    let mut builder = StatementBuilder::new(proto, function, table, &facts, names, &booleans);
+    let tree = RegionTree::build(function, &facts, &loops, &pc_map, &booleans)?;
+    let plan = ReconstructionPlan::build(
+        proto,
+        function,
+        table,
+        &facts,
+        names,
+        &booleans,
+        Some(&tree),
+    );
+    let mut builder =
+        StatementBuilder::new(proto, function, table, &facts, names, &booleans, &plan);
     tree.lower(function, &facts, names, &booleans, &mut builder)
 }

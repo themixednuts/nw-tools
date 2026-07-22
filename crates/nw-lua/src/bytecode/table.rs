@@ -1,6 +1,6 @@
 //! Opcode tables and instruction field decoding.
 
-use crate::{LuaError, version::LuaVersion};
+use crate::{LuaError, version::LuaTarget};
 
 use super::{Instruction, SemanticOp};
 
@@ -39,7 +39,7 @@ impl InstructionFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpcodeTable {
     /// Lua bytecode version.
-    pub version: LuaVersion,
+    pub version: LuaTarget,
     /// Opcode field width.
     pub op_bits: u8,
     /// A field width.
@@ -64,13 +64,9 @@ pub struct OpcodeTable {
 impl OpcodeTable {
     /// Return a built-in opcode table.
     ///
-    /// # Errors
-    ///
-    /// Returns [`LuaError::UnsupportedVersion`] for versions not implemented in Phase 1.
-    pub fn builtin(version: LuaVersion) -> Result<Self, LuaError> {
+    pub fn builtin(version: LuaTarget) -> Self {
         match version {
-            LuaVersion::V51 => Ok(Self::builtin_51()),
-            version => Err(LuaError::UnsupportedVersion(version.to_byte())),
+            LuaTarget::V51 => Self::builtin_51(),
         }
     }
 
@@ -81,7 +77,7 @@ impl OpcodeTable {
     /// Returns [`LuaError::Malformed`] when a directive, ordinal, or opcode name is invalid.
     pub fn from_custom_text(text: &str) -> Result<Self, LuaError> {
         let mut table = Self {
-            version: LuaVersion::V51,
+            version: LuaTarget::V51,
             op_bits: 6,
             a_bits: 8,
             b_bits: 9,
@@ -322,7 +318,7 @@ impl OpcodeTable {
 
     fn builtin_51() -> Self {
         let mut table = Self {
-            version: LuaVersion::V51,
+            version: LuaTarget::V51,
             op_bits: 6,
             a_bits: 8,
             b_bits: 9,
@@ -427,13 +423,9 @@ impl OpcodeTable {
     }
 }
 
-fn parse_version(value: &str) -> Option<LuaVersion> {
+fn parse_version(value: &str) -> Option<LuaTarget> {
     match value {
-        "51" => Some(LuaVersion::V51),
-        "52" => Some(LuaVersion::V52),
-        "53" => Some(LuaVersion::V53),
-        "54" => Some(LuaVersion::V54),
-        "55" => Some(LuaVersion::V55),
+        "51" => Some(LuaTarget::V51),
         _ => None,
     }
 }

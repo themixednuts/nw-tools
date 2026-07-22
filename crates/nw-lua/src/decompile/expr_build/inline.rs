@@ -4,6 +4,24 @@ impl<'a> ExprBuilder<'a> {
     /// Return whether a value should be inlined at its use site.
     #[must_use]
     pub fn can_inline_ref(&self, reference: SsaRef, use_pc: i32) -> bool {
+        if let Some(can_inline) = self.plan.can_inline_at(reference, use_pc) {
+            return can_inline;
+        }
+
+        let key = (reference, use_pc);
+        if let Some(can_inline) = self.inline_cache.borrow().get(&key).copied() {
+            return can_inline;
+        }
+        if !self.inline_visiting.borrow_mut().insert(key) {
+            return false;
+        }
+        let can_inline = self.compute_can_inline_ref(reference, use_pc);
+        self.inline_visiting.borrow_mut().remove(&key);
+        self.inline_cache.borrow_mut().insert(key, can_inline);
+        can_inline
+    }
+
+    fn compute_can_inline_ref(&self, reference: SsaRef, use_pc: i32) -> bool {
         let Some(node_id) = self.analysis.def_site(reference) else {
             return false;
         };
@@ -116,9 +134,10 @@ impl<'a> ExprBuilder<'a> {
         use_pc: i32,
     ) -> bool {
         let mut redefined = false;
-        for_each_use(op, |reference| {
+        op.visit_uses(|reference, _| {
             if let Some(reg) = reference.reg_index()
                 && self.analysis.has_later_def_before(reg, def_pc, use_pc)
+                && !self.can_inline_ref(reference, def_pc)
             {
                 redefined = true;
             }
@@ -142,20 +161,28 @@ impl<'a> ExprBuilder<'a> {
             return false;
         };
         let block = &self.function.blocks[def_id.block];
-        for current in &block.nodes[def_id.node + 1..use_id.node] {
-            if !node_has_observable_side_effect(&current.op) {
+        for (node_index, current) in block.nodes[def_id.node + 1..use_id.node].iter().enumerate() {
+            if !current.op.effects().blocks_reordering() {
                 continue;
             }
-            let Some(effect_index) = current.dest.reg_index().and_then(|_| {
-                eval_refs
-                    .iter()
-                    .position(|operand| *operand == current.dest)
-            }) else {
+            let current_id = NodeId {
+                block: def_id.block,
+                node: def_id.node + 1 + node_index,
+            };
+            if let Some(table) = self.plan.constructor_for_node(current_id) {
+                let Some(table_index) = self.evaluation_dependency_index(table, use_id) else {
+                    return false;
+                };
+                if table_index <= reference_index {
+                    return false;
+                }
+                continue;
+            }
+            let Some(effect_index) = self.evaluation_dependency_index(current.dest, use_id) else {
                 let Some(table) = constructor_mutation_table(&current.op) else {
                     return false;
                 };
-                let Some(table_index) = eval_refs.iter().position(|operand| *operand == table)
-                else {
+                let Some(table_index) = self.evaluation_dependency_index(table, use_id) else {
                     return false;
                 };
                 if table_index <= reference_index {
@@ -170,7 +197,55 @@ impl<'a> ExprBuilder<'a> {
         true
     }
 
-    pub(super) fn is_stable_named_def(&self, node: &SsaNode) -> bool {
+    fn evaluation_dependency_index(&self, dependency: SsaRef, use_id: NodeId) -> Option<usize> {
+        (dependency != SsaRef::None).then_some(())?;
+        let key = (dependency, use_id);
+        if let Some(index) = self.evaluation_index_cache.borrow().get(&key).copied() {
+            return index;
+        }
+        let index = self
+            .analysis
+            .node(self.function, use_id)
+            .map(|node| direct_eval_order_refs(&node.op))?
+            .iter()
+            .position(|root| self.value_depends_on(*root, dependency, use_id, &mut Vec::new()));
+        self.evaluation_index_cache.borrow_mut().insert(key, index);
+        index
+    }
+
+    fn value_depends_on(
+        &self,
+        value: SsaRef,
+        dependency: SsaRef,
+        before: NodeId,
+        visiting: &mut Vec<SsaRef>,
+    ) -> bool {
+        if value == dependency {
+            return true;
+        }
+        if visiting.contains(&value) {
+            return false;
+        }
+        let Some(def_id) = self.analysis.def_site(value) else {
+            return false;
+        };
+        if def_id.block != before.block || def_id.node >= before.node {
+            return false;
+        }
+        let Some(node) = self.analysis.node(self.function, def_id) else {
+            return false;
+        };
+
+        visiting.push(value);
+        let mut found = false;
+        node.op.visit_uses(|reference, _| {
+            found |= self.value_depends_on(reference, dependency, def_id, visiting);
+        });
+        visiting.pop();
+        found
+    }
+
+    pub(crate) fn is_stable_named_def(&self, node: &SsaNode) -> bool {
         let Some(reg) = node.dest.reg_index() else {
             return false;
         };

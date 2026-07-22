@@ -16,10 +16,11 @@ use super::{
     analysis::{DecompileAnalysis, NodeId},
     boolean::{BooleanAnalysis, ConditionChain, ValuePlan, normalize},
     closure,
-    expr_build::{ExprBuilder, global_expr_from_name, index_expr, is_inlineable_def},
-    multi,
+    expr_build::{ExprBuilder, global_expr_from_name, index_expr},
+    multi::{self, plan::NodeEmission},
     naming::LocalBinding,
     naming::NameResolver,
+    reconstruction::{BindingId, ReconstructionPlan},
     region::LinearRegion,
 };
 
@@ -35,7 +36,8 @@ pub fn build_block(
     names: &NameResolver<'_>,
 ) -> Result<ast::Block, LuaError> {
     let booleans = BooleanAnalysis::empty();
-    StatementBuilder::new(proto, function, table, analysis, names, &booleans).build(region)
+    let plan = ReconstructionPlan::build(proto, function, table, analysis, names, &booleans, None);
+    StatementBuilder::new(proto, function, table, analysis, names, &booleans, &plan).build(region)
 }
 
 mod conditions;
@@ -53,12 +55,9 @@ pub(crate) struct StatementBuilder<'a> {
     analysis: &'a DecompileAnalysis,
     names: &'a NameResolver<'a>,
     booleans: &'a BooleanAnalysis,
+    plan: &'a ReconstructionPlan,
     exprs: ExprBuilder<'a>,
-    declared_locals: HashSet<usize>,
-    declared_synthetic_names: HashSet<Name>,
-    declared_phi_regs: HashSet<u16>,
-    forced_materialized: HashSet<SsaRef>,
-    consumed_nodes: HashSet<NodeId>,
+    pending_declarations: HashSet<BindingId>,
 }
 
 impl<'a> StatementBuilder<'a> {
@@ -69,7 +68,9 @@ impl<'a> StatementBuilder<'a> {
         analysis: &'a DecompileAnalysis,
         names: &'a NameResolver<'a>,
         booleans: &'a BooleanAnalysis,
+        plan: &'a ReconstructionPlan,
     ) -> Self {
+        let pending_declarations = plan.declaration_bindings();
         Self {
             proto,
             function,
@@ -77,12 +78,9 @@ impl<'a> StatementBuilder<'a> {
             analysis,
             names,
             booleans,
-            exprs: ExprBuilder::new(proto, function, table, analysis, names, booleans),
-            declared_locals: names.initially_declared_locals().into_iter().collect(),
-            declared_synthetic_names: HashSet::new(),
-            declared_phi_regs: HashSet::new(),
-            forced_materialized: HashSet::new(),
-            consumed_nodes: HashSet::new(),
+            plan,
+            exprs: ExprBuilder::new(proto, function, table, analysis, names, booleans, plan),
+            pending_declarations,
         }
     }
 
@@ -94,36 +92,44 @@ impl<'a> StatementBuilder<'a> {
         &mut self,
         region: &LinearRegion,
     ) -> Result<Vec<Stmt>, LuaError> {
-        self.emit_node_ids(region.nodes.iter().copied(), |_| false)
+        self.emit_node_ids(region.nodes.iter().copied())
+    }
+
+    pub(crate) fn emit_entry_declarations(&mut self) -> Option<Stmt> {
+        let names = self.plan.entry_declarations().to_vec();
+        (!names.is_empty()).then_some(Stmt::Local {
+            names,
+            attribs: Vec::new(),
+            values: Vec::new(),
+        })
     }
 
     pub(crate) fn emit_node_ids(
         &mut self,
         nodes: impl IntoIterator<Item = NodeId>,
-        skip: impl Fn(&SsaNode) -> bool,
     ) -> Result<Vec<Stmt>, LuaError> {
-        let node_ids = nodes.into_iter().collect::<Vec<_>>();
         let mut stmts = Vec::new();
 
-        for (index, node_id) in node_ids.iter().copied().enumerate() {
-            if self.consumed_nodes.contains(&node_id) {
-                continue;
-            }
+        for node_id in nodes {
             let Some(node) = self.analysis.node(self.function, node_id) else {
                 continue;
             };
-            if node.is_meta_only || skip(node) {
-                continue;
-            }
-            if let Some(emitted) = multi::try_emit(self, &node_ids, index, node_id, node, &skip)? {
-                for consumed in emitted.consumed {
-                    self.consumed_nodes.insert(consumed);
-                }
-                let is_return = matches!(emitted.stmt, Stmt::Return(_));
-                stmts.push(emitted.stmt);
+            if let NodeEmission::Owner(plan) = self.plan.node_emission(node_id).clone() {
+                let emitted = multi::emit(self, &plan)?;
+                let is_return = matches!(emitted.last(), Some(Stmt::Return(_)));
+                stmts.extend(emitted);
                 if is_return {
                     break;
                 }
+                continue;
+            }
+            if matches!(
+                self.plan.node_emission(node_id),
+                NodeEmission::Member { .. }
+            ) {
+                continue;
+            }
+            if matches!(self.plan.node_emission(node_id), NodeEmission::Omitted) {
                 continue;
             }
             if let Some(stmt) = self.emit_node(node_id, node)? {
@@ -177,6 +183,18 @@ impl<'a> StatementBuilder<'a> {
         self.function
     }
 
+    pub(crate) fn will_declare(&self, reference: SsaRef) -> bool {
+        self.plan
+            .binding(reference)
+            .is_some_and(|binding| self.pending_declarations.contains(&binding))
+    }
+
+    pub(crate) fn claim_declaration(&mut self, reference: SsaRef) -> bool {
+        self.plan
+            .binding(reference)
+            .is_some_and(|binding| self.pending_declarations.remove(&binding))
+    }
+
     pub(crate) fn table(&self) -> &'a OpcodeTable {
         self.table
     }
@@ -193,8 +211,8 @@ impl<'a> StatementBuilder<'a> {
         self.names.binding_for_def(reg, pc)
     }
 
-    pub(crate) fn binding_for_use(&self, reg: u16, pc: i32) -> Option<LocalBinding> {
-        self.names.binding_for_use(reg, pc)
+    pub(crate) fn materialization_pc(&self, reference: SsaRef) -> Option<i32> {
+        self.plan.materialization_pc(reference)
     }
 
     pub(crate) fn name_for_ref(&self, reference: SsaRef, pc: i32) -> Name {
@@ -205,25 +223,7 @@ impl<'a> StatementBuilder<'a> {
         self.names.name_for_binding_def(binding, reference)
     }
 
-    pub(crate) fn is_local_declared(&self, index: usize) -> bool {
-        self.declared_locals.contains(&index)
-    }
-
-    pub(crate) fn mark_local_declared(&mut self, index: usize) {
-        self.declared_locals.insert(index);
-    }
-
-    pub(crate) fn mark_synthetic_declared(&mut self, name: Name) {
-        self.declared_synthetic_names.insert(name);
-    }
-
-    pub(crate) fn mark_materialized(&mut self, reference: SsaRef, name: Name) {
-        self.exprs.mark_materialized(reference, name);
-    }
-
-    pub(crate) fn force_materialized(&mut self, reference: SsaRef) {
-        if matches!(reference, SsaRef::Reg { .. }) {
-            self.forced_materialized.insert(reference);
-        }
+    pub(crate) fn activate(&mut self, reference: SsaRef) {
+        self.exprs.activate(reference);
     }
 }

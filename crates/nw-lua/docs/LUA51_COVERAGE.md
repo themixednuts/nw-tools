@@ -93,7 +93,7 @@ Non-finite note: `+inf` and `-inf` round-trip through `1e9999` / `-1e9999` with 
 | `lundump.c` field / behavior | Status | Tests | Notes |
 |---|---|---|---|
 | Signature `\x1bLua` | COVERED+tested | `chunk_parse::parses_shopcommon_lua_51_chunk`, `chunk_reader_handles_lua_51_layout_variants_and_rejects_bad_header_fields` | Bad signatures return `LuaError::BadMagic`. |
-| Version byte `0x51` | COVERED+tested | `chunk_parse::parses_shopcommon_lua_51_chunk`, `cli_phase10::cli_rejects_future_lua_version_override_cleanly` | 5.2-5.5 are version-aware stubs for P11 and are rejected in P10c. |
+| Version byte `0x51` | COVERED+tested | `chunk_parse::parses_shopcommon_lua_51_chunk`, `version::tests::complete_targets_are_narrower_than_recognized_releases`, `cli_phase10::cli_rejects_future_lua_version_override_cleanly` | `LuaVersion` recognizes 5.2-5.5 tags for diagnostics, but only the complete `LuaTarget::V51` capability can enter the pipeline. |
 | Format byte | COVERED+tested | `chunk_reader_handles_lua_51_layout_variants_and_rejects_bad_header_fields` | Official format `0` only; nonzero is rejected. |
 | Endianness flag | COVERED+tested | `chunk_reader_handles_lua_51_layout_variants_and_rejects_bad_header_fields`, `chunk::reader::tests::reads_big_endian_int_and_size_t` | Both little and big endian scalar reads are tested. |
 | `sizeof(int)` | COVERED+tested | `chunk_reader_handles_lua_51_layout_variants_and_rejects_bad_header_fields` | Sizes 1, 2, 4, and 8 are accepted and tested. Other sizes are rejected. |
@@ -134,7 +134,7 @@ Non-finite note: `+inf` and `-inf` round-trip through `1e9999` / `-1e9999` with 
 | Strings | COVERED+tested | `string_literals_recompile_to_exact_lua_51_bytes` |
 | Vararg `...` in main chunk and function | COVERED+tested | `phase7_multi::runtime_equivalence_phase7_vararg_cases`, `vararg_and_tailcall`, `edge_protos_runtime_equivalence` |
 | Table constructor list fields | COVERED+tested | `phase7_multi::runtime_equivalence_phase7_multi_cases`, `opcode_runtime_equivalence_matrix_exercises_all_lua_51_opcodes` |
-| Table constructor named/keyed fields | COVERED+tested | `decompile_phase4::table_field_decompiles_as_table_assignment_and_read`, `emitter_brackets_invalid_ast_field_names_defensively` |
+| Table constructor named/keyed fields | COVERED+tested | `phase9b_idiomatic::exact_newtable_hints_recover_nested_module_constructor_boundary`, `decompile_phase4::table_field_decompiles_as_table_assignment_and_read`, `emitter_brackets_invalid_ast_field_names_defensively` |
 | Table constructor `[expr]` fields | COVERED+tested | `emitter_brackets_invalid_ast_field_names_defensively`, `recovered_reserved_and_invalid_names_are_emitted_safely` |
 | Table constructor trailing multiret | COVERED+tested | `phase7_multi::runtime_equivalence_phase7_multi_cases` (`multiret_in_table`) |
 | Name/global access | COVERED+tested | `opcode_runtime_equivalence_matrix_exercises_all_lua_51_opcodes`, `recovered_reserved_and_invalid_names_are_emitted_safely` |
@@ -160,6 +160,12 @@ Lua 5.1 has no integer subtype, bitwise operators, `goto`, labels, `_ENV`, attri
 - Reserved words / invalid identifiers: defensive lowering now brackets invalid `Global`, `Field`, method fallback, and named table-field forms. Patched bytecode tests cover keyword globals, invalid fields, and keyword method keys.
 - Edge protos: fixed stale upvalue-name precedence so child closures use the parent emitted capture names. Fixed future debug-local binding heuristics so temporary table-constructor values are not mistaken for later generic-for locals.
 
-## P11 Readiness
+## Later-version boundary
 
-For standard Lua 5.1.5 chunks using the default double `lua_Number`, the crate is fully covered by this matrix and ready to layer 5.2-5.5 work. Remaining explicitly unsupported inputs are not Lua 5.1.5 double chunks: later-version chunk formats/opcodes, non-4-byte instruction words, unknown constant tags, unsupported scalar sizes, NaN source emission, and inexact 64-bit integral-number constants.
+For standard Lua 5.1.5 chunks using the default double `lua_Number`, the crate
+is fully covered by this matrix. Later release tags are detected but rejected by
+the single `LuaVersion` to `LuaTarget` boundary. A later target is added only
+after its chunk format, opcode semantics, IR behavior, source syntax, and tests
+are complete end-to-end. Other explicitly unsupported inputs are non-4-byte
+instruction words, unknown constant tags, unsupported scalar sizes, NaN source
+emission, and inexact 64-bit integral-number constants.

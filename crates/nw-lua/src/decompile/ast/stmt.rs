@@ -30,7 +30,7 @@ pub enum Stmt {
         var: Name,
         start: Expr,
         stop: Expr,
-        step: Option<Expr>,
+        step: Option<Box<Expr>>,
         body: Block,
     },
     GenericFor {

@@ -86,7 +86,7 @@ pub(super) fn repeat_stmt(body: Block, cond: Expression) -> Stmt {
         Repeat::new(cond)
             .with_repeat_token(symbol("repeat\n"))
             .with_block(body)
-            .with_until_token(symbol("\nuntil ")),
+            .with_until_token(symbol("until ")),
     )
 }
 

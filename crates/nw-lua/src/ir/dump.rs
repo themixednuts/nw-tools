@@ -97,6 +97,7 @@ fn write_node(out: &mut String, node: &SsaNode, pad: &str) {
         SsaOp::Nop => {}
         SsaOp::Move { src } => write!(out, "{}", ref_to_string(*src)).unwrap(),
         SsaOp::LoadK { idx } => write!(out, "K{idx}").unwrap(),
+        SsaOp::LoadLiteral { value } => write!(out, "{value:?}").unwrap(),
         SsaOp::LoadBool { value, skip_next } => write!(out, "{value} skip={skip_next}").unwrap(),
         SsaOp::LoadNil { start, end } => write!(out, "R{start}..R{end}").unwrap(),
         SsaOp::GetUpval { upval } => write!(out, "U{upval}").unwrap(),
@@ -115,9 +116,15 @@ fn write_node(out: &mut String, node: &SsaNode, pad: &str) {
         )
         .unwrap(),
         SsaOp::NewTable {
-            array_size,
-            hash_size,
-        } => write!(out, "array={array_size} hash={hash_size}").unwrap(),
+            array_hint,
+            hash_hint,
+        } => write!(
+            out,
+            "array={} hash={}",
+            array_hint.encoded(),
+            hash_hint.encoded()
+        )
+        .unwrap(),
         SsaOp::SelfOp {
             table,
             key,
@@ -200,10 +207,12 @@ fn write_node(out: &mut String, node: &SsaNode, pad: &str) {
             write!(out, "base=R{base} count={count} values:").unwrap();
             write_refs(out, values);
         }
-        SsaOp::ForPrep { base, target } | SsaOp::ForLoop { base, target } => {
-            write!(out, "base=R{base} target={target}").unwrap();
+        SsaOp::ForPrep { control, target } | SsaOp::ForLoop { control, target } => {
+            write!(out, "base=R{} target={target}", control.base()).unwrap();
         }
-        SsaOp::TForLoop { base, count } => write!(out, "base=R{base} count={count}").unwrap(),
+        SsaOp::TForLoop { control, count } => {
+            write!(out, "base=R{} count={count}", control.base()).unwrap();
+        }
         SsaOp::SetList {
             base,
             count,
@@ -220,9 +229,6 @@ fn write_node(out: &mut String, node: &SsaNode, pad: &str) {
             write_upvalues(out, upvalues);
         }
         SsaOp::VarArg { base, count } => write!(out, "base=R{base} count={count}").unwrap(),
-    }
-    if node.is_meta_only {
-        write!(out, " meta").expect("writing to String cannot fail");
     }
     writeln!(out).expect("writing to String cannot fail");
 }
@@ -278,6 +284,7 @@ fn kind_name(op: &SsaOp) -> &'static str {
         SsaOp::Phi { .. } => "PHI",
         SsaOp::Move { .. } => "MOVE",
         SsaOp::LoadK { .. } => "LOADK",
+        SsaOp::LoadLiteral { .. } => "LOADLITERAL",
         SsaOp::LoadBool { .. } => "LOADBOOL",
         SsaOp::LoadNil { .. } => "LOADNIL",
         SsaOp::GetUpval { .. } => "GETUPVAL",

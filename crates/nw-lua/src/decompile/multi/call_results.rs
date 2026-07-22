@@ -3,7 +3,6 @@ use crate::{
     decompile::{
         analysis::NodeId,
         ast::{Expr, Name, Stmt},
-        naming::LocalBinding,
         stmt_build::StatementBuilder,
     },
     ir::{SsaNode, SsaRef},
@@ -36,7 +35,7 @@ pub(crate) fn fixed_result_assignment(
     value: Expr,
 ) -> Result<Stmt, LuaError> {
     let slots = result_slots(builder, node_id, node, base, result_count)?;
-    emit_result_assignment(builder, slots, value)
+    emit_result_assignment(builder, slots, node.pc, value)
 }
 
 fn result_slots(
@@ -55,17 +54,14 @@ fn result_slots(
             .def_at_reg(node_id, reg)
             .unwrap_or_else(|| fallback_ref(node, reg));
         let binding = builder.binding_for_def(reg, node.pc);
-        let declared = binding
-            .as_ref()
-            .is_some_and(|binding| builder.is_local_declared(binding.index));
+        let declares = builder.will_declare(reference);
         let name = binding.as_ref().map_or_else(
             || builder.name_for_ref(reference, node.pc),
             |binding| builder.name_for_binding_def(binding, reference),
         );
         slots.push(ResultSlot {
             reference,
-            binding,
-            declared,
+            declares,
             name,
         });
     }
@@ -75,17 +71,20 @@ fn result_slots(
 fn emit_result_assignment(
     builder: &mut StatementBuilder<'_>,
     slots: Vec<ResultSlot>,
+    pc: i32,
     value: Expr,
 ) -> Result<Stmt, LuaError> {
-    let has_declared_target = slots.iter().any(|slot| slot.declared);
-    if has_declared_target
-        && slots
-            .iter()
-            .any(|slot| slot.binding.is_none() || !slot.declared)
-    {
-        return Err(LuaError::Unsupported(
-            "mixed existing and new multi-result targets are deferred".to_string(),
-        ));
+    let declares = slots.iter().all(|slot| slot.declares);
+    if !declares && slots.iter().any(|slot| slot.declares) {
+        return Err(LuaError::Unsupported(format!(
+            "mixed existing and new multi-result targets at pc {}: {}",
+            pc,
+            slots
+                .iter()
+                .map(|slot| format!("{:?}:{}", slot.name, slot.declares))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
 
     let names = slots
@@ -94,24 +93,23 @@ fn emit_result_assignment(
         .collect::<Vec<_>>();
 
     for slot in &slots {
-        builder.mark_materialized(slot.reference, slot.name.clone());
-        if !has_declared_target && let Some(binding) = &slot.binding {
-            builder.mark_local_declared(binding.index);
+        if declares && !builder.claim_declaration(slot.reference) {
+            return Err(LuaError::Malformed(
+                "planned multi-result declaration was already consumed".to_string(),
+            ));
         }
-        if !has_declared_target && slot.binding.is_none() {
-            builder.mark_synthetic_declared(slot.name.clone());
-        }
+        builder.activate(slot.reference);
     }
 
-    if has_declared_target {
-        Ok(Stmt::Assign {
-            targets: names.into_iter().map(Expr::Name).collect(),
-            values: vec![value],
-        })
-    } else {
+    if declares {
         Ok(Stmt::Local {
             names,
             attribs: Vec::new(),
+            values: vec![value],
+        })
+    } else {
+        Ok(Stmt::Assign {
+            targets: names.into_iter().map(Expr::Name).collect(),
             values: vec![value],
         })
     }
@@ -126,7 +124,6 @@ fn fallback_ref(node: &SsaNode, reg: u16) -> SsaRef {
 
 struct ResultSlot {
     reference: SsaRef,
-    binding: Option<LocalBinding>,
-    declared: bool,
+    declares: bool,
     name: Name,
 }

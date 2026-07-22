@@ -2544,8 +2544,10 @@ dependencies = [
  "clap 4.6.1",
  "full_moon",
  "heck 0.5.0",
+ "nw-jobs",
  "petgraph",
  "stylua",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

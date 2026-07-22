@@ -12,6 +12,29 @@ pub struct DomInfo {
     pub dominance_frontiers: Vec<Vec<usize>>,
 }
 
+impl DomInfo {
+    /// Return whether `dominator` dominates `block` in the stored dominator tree.
+    #[must_use]
+    pub fn dominates(&self, dominator: usize, block: usize) -> bool {
+        if dominator == block {
+            return block < self.idom.len();
+        }
+        let mut current = self.idom.get(block).copied().flatten();
+        let mut remaining = self.idom.len();
+        while let Some(candidate) = current {
+            if candidate == dominator {
+                return true;
+            }
+            if remaining == 0 {
+                return false;
+            }
+            remaining -= 1;
+            current = self.idom.get(candidate).copied().flatten();
+        }
+        false
+    }
+}
+
 /// Compute immediate dominators, dominator-tree children, and dominance frontiers.
 #[must_use]
 pub fn analyze(blocks: &[BasicBlock]) -> DomInfo {
@@ -132,6 +155,8 @@ mod tests {
             dom.dominance_frontiers,
             vec![vec![], vec![3], vec![3], vec![]]
         );
+        assert!(dom.dominates(0, 3));
+        assert!(!dom.dominates(1, 3));
     }
 
     #[test]
@@ -151,5 +176,7 @@ mod tests {
             dom.dominance_frontiers,
             vec![vec![], vec![1], vec![1], vec![]]
         );
+        assert!(dom.dominates(1, 2));
+        assert!(!dom.dominates(2, 3));
     }
 }

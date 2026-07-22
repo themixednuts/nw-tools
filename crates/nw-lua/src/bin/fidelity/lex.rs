@@ -178,16 +178,19 @@ fn is_field_access(tokens: &[Token], idx: usize) -> bool {
 }
 
 fn is_synthetic_name(name: &str) -> bool {
-    has_numeric_suffix(name, "v")
-        || has_numeric_suffix(name, "arg")
-        || has_numeric_suffix(name, "up")
+    ["arg", "up", "a", "l", "u", "v"]
+        .iter()
+        .any(|prefix| has_numeric_suffix(name, prefix))
 }
 
 fn has_numeric_suffix(name: &str, prefix: &str) -> bool {
     let Some(rest) = name.strip_prefix(prefix) else {
         return false;
     };
-    !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit())
+    !rest.is_empty()
+        && rest
+            .split('_')
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 fn tokenize(source: &str) -> Vec<Token> {

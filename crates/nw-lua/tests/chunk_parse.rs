@@ -1,7 +1,7 @@
 use nw_lua::{
     chunk::{Constant, Proto},
     parse_chunk,
-    version::LuaVersion,
+    version::LuaTarget,
 };
 
 const SHOPCOMMON: &[u8] = include_bytes!("fixtures/shopcommon.luac");
@@ -10,7 +10,7 @@ const SHOPCOMMON: &[u8] = include_bytes!("fixtures/shopcommon.luac");
 fn parses_shopcommon_lua_51_chunk() {
     let chunk = parse_chunk(SHOPCOMMON).expect("shopcommon chunk parses");
 
-    assert_eq!(chunk.header.version, LuaVersion::V51);
+    assert_eq!(chunk.header.version, LuaTarget::V51);
     assert_eq!(chunk.header.format, 0);
     assert_eq!(chunk.header.instruction_size, 4);
     assert!(!chunk.root.code.is_empty());

@@ -2,33 +2,28 @@
 
 use crate::{
     LuaError,
-    decompile::{analysis::NodeId, ast::Stmt, stmt_build::StatementBuilder},
-    ir::SsaNode,
+    decompile::{ast::Stmt, stmt_build::StatementBuilder},
 };
 
 pub(crate) mod assign;
 pub(crate) mod call_results;
+pub(crate) mod plan;
+pub(crate) mod table_constructor;
 pub(crate) mod table_list;
 pub(crate) mod vararg;
 
-pub(crate) struct MultiEmit {
-    pub stmt: Stmt,
-    pub consumed: Vec<NodeId>,
-}
-
-pub(crate) fn try_emit(
+pub(crate) fn emit(
     builder: &mut StatementBuilder<'_>,
-    node_ids: &[NodeId],
-    index: usize,
-    node_id: NodeId,
-    node: &SsaNode,
-    skip: &dyn Fn(&SsaNode) -> bool,
-) -> Result<Option<MultiEmit>, LuaError> {
-    if let Some(emitted) = table_list::try_emit(builder, node_ids, index, node_id, node, skip)? {
-        return Ok(Some(emitted));
+    plan: &plan::MultiNodePlan,
+) -> Result<Vec<Stmt>, LuaError> {
+    match plan {
+        plan::MultiNodePlan::TableConstructor(plan) => {
+            table_list::emit(builder, plan).map(|stmt| vec![stmt])
+        }
+        plan::MultiNodePlan::CallTransfer(plan) => assign::emit_call_transfer(builder, plan),
+        plan::MultiNodePlan::Swap(plan) => assign::emit_swap(builder, plan).map(|stmt| vec![stmt]),
+        plan::MultiNodePlan::MultiLocal(plan) => {
+            assign::emit_multi_local(builder, plan).map(|stmt| vec![stmt])
+        }
     }
-    if let Some(emitted) = assign::try_emit_swap(builder, node_ids, index, node, skip)? {
-        return Ok(Some(emitted));
-    }
-    assign::try_emit_multi_local(builder, node_ids, index, node, skip)
 }

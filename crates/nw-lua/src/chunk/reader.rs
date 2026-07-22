@@ -272,13 +272,13 @@ fn integer_fits_f64_exactly(value: i64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{chunk::Header, version::LuaVersion};
+    use crate::{chunk::Header, version::LuaTarget};
 
     use super::ByteReader;
 
     fn header(little_endian: bool, int_size: u8, size_t_size: u8) -> Header {
         Header {
-            version: LuaVersion::V51,
+            version: LuaTarget::V51,
             format: 0,
             little_endian,
             int_size,

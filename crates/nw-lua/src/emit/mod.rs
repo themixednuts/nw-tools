@@ -7,7 +7,7 @@ mod validate;
 #[cfg(test)]
 mod tests;
 
-use stylua_lib::{Config, OutputVerification, format_code};
+use stylua_lib::{Config, OutputVerification, format_ast};
 
 use crate::{LuaError, decompile};
 
@@ -24,27 +24,17 @@ const VERIFICATION_STACK_SIZE: usize = 64 * 1024 * 1024;
 pub fn to_source(block: &decompile::ast::Block) -> Result<String, LuaError> {
     validate::block(block)?;
     let lowered = lower_block(block);
-    let raw = lowered.to_string();
-
-    let formatted = format_source(&raw)?;
-
-    assert_parse("formatted stylua output", &formatted)?;
-
-    Ok(formatted)
-}
-
-fn format_source(raw: &str) -> Result<String, LuaError> {
-    run_with_large_stack("stylua format", || {
-        format_code(raw, Config::default(), None, OutputVerification::None)
-            .map_err(|error| format!("stylua rejected emitted Lua: {error}"))
-    })
-}
-
-fn assert_parse(stage: &'static str, source: &str) -> Result<(), LuaError> {
-    run_with_large_stack(stage, || {
-        full_moon::parse(source)
-            .map(|_| ())
-            .map_err(|errors| format!("{stage} did not parse: {errors:#?}"))
+    run_with_large_stack("source emission", move || {
+        let lowered = full_moon::parse("")
+            .map_err(|errors| format!("failed to initialize emitted Lua AST: {errors:#?}"))?
+            .with_nodes(lowered)
+            .update_positions();
+        let formatted = format_ast(lowered, Config::default(), None, OutputVerification::None)
+            .map_err(|error| format!("stylua rejected emitted Lua: {error}"))?
+            .to_string();
+        full_moon::parse(&formatted)
+            .map_err(|errors| format!("formatted stylua output did not parse: {errors:#?}"))?;
+        Ok(formatted)
     })
 }
 

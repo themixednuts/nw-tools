@@ -97,7 +97,8 @@ pub fn run_bytecode_equivalence(name: &str, bytecode: &[u8], args: &[&str]) -> O
 
     fs::write(&paths.bytecode, bytecode).expect("write original bytecode");
     let original_stdout = run_lua(tools.lua, &paths.bytecode, args, "original Lua bytecode");
-    let decompiled = nw_lua::decompile(bytecode).expect("decompile bytecode");
+    let decompiled = nw_lua::decompile(bytecode)
+        .unwrap_or_else(|error| panic!("{name} failed to decompile bytecode: {error}"));
     full_moon::parse(&decompiled).expect("decompiled source reparses with full_moon");
 
     fs::write(&paths.decompiled, &decompiled).expect("write decompiled Lua source");
@@ -129,7 +130,8 @@ fn run_equivalence_inner(
 
     let original_stdout = run_lua(tools.lua, &paths.source, args, "original Lua source");
     let bytecode = fs::read(&paths.bytecode).expect("read compiled bytecode");
-    let decompiled = nw_lua::decompile(&bytecode).expect("decompile bytecode");
+    let decompiled = nw_lua::decompile(&bytecode)
+        .unwrap_or_else(|error| panic!("{name} failed to decompile bytecode: {error}"));
     full_moon::parse(&decompiled).expect("decompiled source reparses with full_moon");
 
     fs::write(&paths.decompiled, &decompiled).expect("write decompiled Lua source");

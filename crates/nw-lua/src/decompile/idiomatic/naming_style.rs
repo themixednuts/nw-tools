@@ -1,8 +1,13 @@
+use std::collections::HashMap;
+
 use bstr::BString;
-use heck::ToUpperCamelCase;
+use heck::{ToLowerCamelCase, ToUpperCamelCase};
 
 use crate::decompile::{
-    ast::{Block, Expr, FunctionName, Name, Stmt, TableField},
+    ast::{
+        BindingId, BindingUsage, Block, Expr, FunctionName, Name, Stmt,
+        binding_spelling_available_in_block, binding_usages_in_block, rename_binding_in_block,
+    },
     naming::is_valid_identifier,
 };
 
@@ -18,48 +23,141 @@ impl Rule for ModuleTableName {
         let Some(stem) = ctx.module_stem.as_deref() else {
             return Rewrite::unchanged(block);
         };
-        let Some(binding) = recognized_module_binding(&block) else {
+        let Some(module) = recognized_module_binding(&block) else {
             return Rewrite::unchanged(block);
         };
-        if !binding.name.is_synthetic() {
+        if !module.name.is_synthetic() {
             return Rewrite::unchanged(block);
         }
 
         let candidate = module_pascal_name(stem);
         let candidate_bytes = BString::from(candidate.as_str());
         if !is_valid_identifier(&candidate_bytes)
-            || binding.name.as_bytes() == candidate_bytes.as_slice()
-            || count_declarations(&block, binding.name.as_bytes()) != 1
-            || count_declarations(&block, candidate_bytes.as_slice()) != 0
-            || contains_global_name(&block, candidate_bytes.as_slice())
+            || module.name.as_bytes() == candidate_bytes.as_slice()
+            || !binding_spelling_available_in_block(
+                &block,
+                &module.identity,
+                candidate_bytes.as_slice(),
+            )
         {
             return Rewrite::unchanged(block);
         }
 
         let mut block = block;
-        let new_name = Name::synthetic(candidate);
-        rename_binding(&mut block, binding.name.as_bytes(), &new_name);
+        rename_binding_in_block(&mut block, &module.identity, candidate_bytes.as_slice());
         Rewrite::changed(block)
+    }
+}
+
+pub struct ConsumerFieldTableName;
+
+impl Rule for ConsumerFieldTableName {
+    fn rewrite_block(&self, block: Block, _ctx: &CleanContext) -> Rewrite<Block> {
+        let usages = binding_usages_in_block(&block);
+        let tables = consumer_field_table_bindings(&block, &usages);
+        if tables.is_empty() {
+            return Rewrite::unchanged(block);
+        }
+
+        let mut block = block;
+        let mut changed = false;
+        for table in tables {
+            let Ok(field) = std::str::from_utf8(table.field.as_bytes()) else {
+                continue;
+            };
+            let candidate = field.to_lower_camel_case();
+            let candidate = BString::from(candidate.as_str());
+            if table.name.as_bytes() == candidate.as_slice()
+                || !is_valid_identifier(&candidate)
+                || !binding_spelling_available_in_block(
+                    &block,
+                    &table.identity,
+                    candidate.as_slice(),
+                )
+            {
+                continue;
+            }
+            rename_binding_in_block(&mut block, &table.identity, candidate.as_slice());
+            changed = true;
+        }
+        if changed {
+            Rewrite::changed(block)
+        } else {
+            Rewrite::unchanged(block)
+        }
     }
 }
 
 #[derive(Debug)]
 struct ModuleBinding {
+    identity: BindingId,
     name: Name,
+}
+
+#[derive(Debug)]
+struct ConsumerFieldTableBinding {
+    identity: BindingId,
+    name: Name,
+    field: Name,
+}
+
+fn consumer_field_table_bindings(
+    block: &Block,
+    usages: &HashMap<BindingId, BindingUsage>,
+) -> Vec<ConsumerFieldTableBinding> {
+    block
+        .0
+        .iter()
+        .enumerate()
+        .filter_map(|(consumer_index, stmt)| {
+            let (value, field) = field_store(stmt)?;
+            let identity = value.binding()?.clone();
+            if !value.is_synthetic() {
+                return None;
+            }
+            let declared = block.0[..consumer_index].iter().any(|stmt| {
+                local_table_name(stmt).is_some_and(|name| name.binding() == Some(&identity))
+            });
+            if !declared {
+                return None;
+            }
+            let usage = usages.get(&identity).copied().unwrap_or_default();
+            (usage.receiver_reads() > 0 && usage.value_reads() == 1).then(|| {
+                ConsumerFieldTableBinding {
+                    identity,
+                    name: value.clone(),
+                    field: field.clone(),
+                }
+            })
+        })
+        .collect()
+}
+
+fn field_store(stmt: &Stmt) -> Option<(&Name, &Name)> {
+    let Stmt::Assign { targets, values } = stmt else {
+        return None;
+    };
+    let ([Expr::Field { name: field, .. }], [Expr::Name(value)]) =
+        (targets.as_slice(), values.as_slice())
+    else {
+        return None;
+    };
+    Some((value, field))
 }
 
 fn recognized_module_binding(block: &Block) -> Option<ModuleBinding> {
     let returned = returned_name(block)?;
-    let table_index = block
-        .0
-        .iter()
-        .position(|stmt| local_table_name(stmt) == Some(returned))?;
+    let identity = returned.binding()?.clone();
+    let table_index = block.0.iter().position(|stmt| {
+        local_table_name(stmt).is_some_and(|name| name.binding() == Some(&identity))
+    })?;
     let has_members = block
         .0
         .iter()
         .enumerate()
-        .any(|(index, stmt)| index > table_index && module_member_stmt(stmt, returned));
+        .any(|(index, stmt)| index > table_index && module_member_stmt(stmt, &identity));
     has_members.then(|| ModuleBinding {
+        identity,
         name: returned.clone(),
     })
 }
@@ -89,12 +187,14 @@ fn local_table_name(stmt: &Stmt) -> Option<&Name> {
     attribs.is_empty().then_some(name)
 }
 
-fn module_member_stmt(stmt: &Stmt, module: &Name) -> bool {
+fn module_member_stmt(stmt: &Stmt, module: &BindingId) -> bool {
     match stmt {
-        Stmt::Assign { targets, .. } => targets
-            .iter()
-            .any(|target| target_base_name(target).is_some_and(|name| name == module)),
-        Stmt::FunctionDecl { name, .. } => path_base(name).is_some_and(|name| name == module),
+        Stmt::Assign { targets, .. } => targets.iter().any(|target| {
+            target_base_name(target).is_some_and(|name| name.binding() == Some(module))
+        }),
+        Stmt::FunctionDecl { name, .. } => {
+            path_base(name).is_some_and(|name| name.binding() == Some(module))
+        }
         _ => false,
     }
 }
@@ -127,270 +227,97 @@ fn normalized_module_stem(stem: &str) -> String {
         .collect()
 }
 
-fn count_declarations(block: &Block, name: &[u8]) -> usize {
-    block
-        .0
-        .iter()
-        .map(|stmt| count_stmt_declarations(stmt, name))
-        .sum()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decompile::ast::FunctionId;
 
-fn count_stmt_declarations(stmt: &Stmt, name: &[u8]) -> usize {
-    match stmt {
-        Stmt::Local { names, .. } => names
-            .iter()
-            .filter(|candidate| candidate.as_bytes() == name)
-            .count(),
-        Stmt::GenericFor { names, body, .. } => {
-            names
-                .iter()
-                .filter(|candidate| candidate.as_bytes() == name)
-                .count()
-                + count_declarations(body, name)
-        }
-        Stmt::NumericFor { var, body, .. } => {
-            usize::from(var.as_bytes() == name) + count_declarations(body, name)
-        }
-        Stmt::Function {
-            name: function_name,
-            body,
-            local,
-        } => {
-            usize::from(*local && function_name.as_bytes() == name)
-                + count_func_declarations(body, name)
-        }
-        Stmt::FunctionDecl { body, .. } => count_func_declarations(body, name),
-        Stmt::Do(body) | Stmt::While { body, .. } | Stmt::Repeat { body, .. } => {
-            count_declarations(body, name)
-        }
-        Stmt::If { arms, else_ } => {
-            arms.iter()
-                .map(|(_, body)| count_declarations(body, name))
-                .sum::<usize>()
-                + else_
-                    .as_ref()
-                    .map_or(0, |body| count_declarations(body, name))
-        }
-        _ => 0,
+    fn bound(name: &str, binding: &BindingId) -> Name {
+        Name::synthetic(name).with_binding(binding.clone())
     }
-}
 
-fn count_func_declarations(body: &crate::decompile::ast::FuncBody, name: &[u8]) -> usize {
-    body.params
-        .iter()
-        .filter(|candidate| candidate.as_bytes() == name)
-        .count()
-        + count_declarations(&body.body, name)
-}
-
-fn contains_global_name(block: &Block, name: &[u8]) -> bool {
-    block.0.iter().any(|stmt| stmt_contains_global(stmt, name))
-}
-
-fn stmt_contains_global(stmt: &Stmt, name: &[u8]) -> bool {
-    match stmt {
-        Stmt::Local { values, .. } => values.iter().any(|expr| expr_contains_global(expr, name)),
-        Stmt::Assign { targets, values } => {
-            targets.iter().any(|expr| expr_contains_global(expr, name))
-                || values.iter().any(|expr| expr_contains_global(expr, name))
-        }
-        Stmt::Call(expr) => expr_contains_global(expr, name),
-        Stmt::Do(body) => contains_global_name(body, name),
-        Stmt::While { cond, body } => {
-            expr_contains_global(cond, name) || contains_global_name(body, name)
-        }
-        Stmt::Repeat { body, cond } => {
-            contains_global_name(body, name) || expr_contains_global(cond, name)
-        }
-        Stmt::NumericFor {
-            start,
-            stop,
-            step,
-            body,
-            ..
-        } => {
-            expr_contains_global(start, name)
-                || expr_contains_global(stop, name)
-                || step
-                    .as_ref()
-                    .is_some_and(|step| expr_contains_global(step, name))
-                || contains_global_name(body, name)
-        }
-        Stmt::GenericFor { exprs, body, .. } => {
-            exprs.iter().any(|expr| expr_contains_global(expr, name))
-                || contains_global_name(body, name)
-        }
-        Stmt::If { arms, else_ } => {
-            arms.iter().any(|(cond, body)| {
-                expr_contains_global(cond, name) || contains_global_name(body, name)
-            }) || else_
-                .as_ref()
-                .is_some_and(|body| contains_global_name(body, name))
-        }
-        Stmt::Function { body, .. } | Stmt::FunctionDecl { body, .. } => {
-            contains_global_name(&body.body, name)
-        }
-        Stmt::Return(values) => values.iter().any(|expr| expr_contains_global(expr, name)),
-        Stmt::Break | Stmt::Goto(_) | Stmt::Label(_) => false,
-    }
-}
-
-fn expr_contains_global(expr: &Expr, name: &[u8]) -> bool {
-    match expr {
-        Expr::Global(candidate) => candidate.as_slice() == name,
-        Expr::Index { obj, key } => {
-            expr_contains_global(obj, name) || expr_contains_global(key, name)
-        }
-        Expr::Field { obj, .. } => expr_contains_global(obj, name),
-        Expr::Call { func, args, .. } => {
-            expr_contains_global(func, name)
-                || args.iter().any(|arg| expr_contains_global(arg, name))
-        }
-        Expr::Function(body) => contains_global_name(&body.body, name),
-        Expr::Table(fields) => fields.iter().any(|field| match field {
-            TableField::List(value) => expr_contains_global(value, name),
-            TableField::Named { value, .. } => expr_contains_global(value, name),
-            TableField::ExprKey { key, value } => {
-                expr_contains_global(key, name) || expr_contains_global(value, name)
-            }
-        }),
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_contains_global(lhs, name) || expr_contains_global(rhs, name)
-        }
-        Expr::Unary { operand, .. } | Expr::Paren(operand) => expr_contains_global(operand, name),
-        _ => false,
-    }
-}
-
-fn rename_binding(block: &mut Block, from: &[u8], to: &Name) {
-    for stmt in &mut block.0 {
-        rename_stmt(stmt, from, to);
-    }
-}
-
-fn rename_stmt(stmt: &mut Stmt, from: &[u8], to: &Name) {
-    match stmt {
-        Stmt::Local { names, values, .. } => {
-            rename_names(names, from, to);
-            for value in values {
-                rename_expr(value, from, to);
-            }
-        }
-        Stmt::Assign { targets, values } => {
-            for target in targets {
-                rename_expr(target, from, to);
-            }
-            for value in values {
-                rename_expr(value, from, to);
-            }
-        }
-        Stmt::Call(expr) => rename_expr(expr, from, to),
-        Stmt::Do(body) => rename_binding(body, from, to),
-        Stmt::While { cond, body } => {
-            rename_expr(cond, from, to);
-            rename_binding(body, from, to);
-        }
-        Stmt::Repeat { body, cond } => {
-            rename_binding(body, from, to);
-            rename_expr(cond, from, to);
-        }
-        Stmt::NumericFor {
-            start,
-            stop,
-            step,
-            body,
-            ..
-        } => {
-            rename_expr(start, from, to);
-            rename_expr(stop, from, to);
-            if let Some(step) = step {
-                rename_expr(step, from, to);
-            }
-            rename_binding(body, from, to);
-        }
-        Stmt::GenericFor { exprs, body, .. } => {
-            for expr in exprs {
-                rename_expr(expr, from, to);
-            }
-            rename_binding(body, from, to);
-        }
-        Stmt::If { arms, else_ } => {
-            for (cond, body) in arms {
-                rename_expr(cond, from, to);
-                rename_binding(body, from, to);
-            }
-            if let Some(body) = else_ {
-                rename_binding(body, from, to);
-            }
-        }
-        Stmt::Function { name, body, local } => {
-            if *local && name.as_bytes() == from {
-                *name = to.clone();
-            }
-            rename_func_body(body, from, to);
-        }
-        Stmt::FunctionDecl { name, body } => {
-            if let Some(first) = name.path.first_mut()
-                && first.as_bytes() == from
-            {
-                *first = to.clone();
-            }
-            rename_func_body(body, from, to);
-        }
-        Stmt::Return(values) => {
-            for value in values {
-                rename_expr(value, from, to);
-            }
-        }
-        Stmt::Break | Stmt::Goto(_) | Stmt::Label(_) => {}
-    }
-}
-
-fn rename_func_body(body: &mut crate::decompile::ast::FuncBody, from: &[u8], to: &Name) {
-    rename_names(&mut body.params, from, to);
-    rename_binding(&mut body.body, from, to);
-}
-
-fn rename_names(names: &mut [Name], from: &[u8], to: &Name) {
-    for name in names {
-        if name.as_bytes() == from {
-            *name = to.clone();
+    fn table_local(name: Name) -> Stmt {
+        Stmt::Local {
+            names: vec![name],
+            attribs: Vec::new(),
+            values: vec![Expr::Table(Vec::new())],
         }
     }
-}
 
-fn rename_expr(expr: &mut Expr, from: &[u8], to: &Name) {
-    match expr {
-        Expr::Name(name) if name.as_bytes() == from => *name = to.clone(),
-        Expr::Index { obj, key } => {
-            rename_expr(obj, from, to);
-            rename_expr(key, from, to);
+    fn field(obj: Expr, name: &str) -> Expr {
+        Expr::Field {
+            obj: Box::new(obj),
+            name: Name::new(name),
         }
-        Expr::Field { obj, .. } => rename_expr(obj, from, to),
-        Expr::Call { func, args, .. } => {
-            rename_expr(func, from, to);
-            for arg in args {
-                rename_expr(arg, from, to);
-            }
+    }
+
+    #[test]
+    fn consumer_field_names_synthetic_table_binding() {
+        let function = FunctionId::root();
+        let options = BindingId::debug_local(&function, 0);
+        let table = BindingId::synthetic(&function, 1);
+        let options_name = Name::new("Options").with_binding(options);
+        let table_name = bound("l1", &table);
+        let block = Block::new(vec![
+            table_local(options_name.clone()),
+            table_local(table_name.clone()),
+            Stmt::Assign {
+                targets: vec![field(Expr::Name(table_name.clone()), "Width")],
+                values: vec![Expr::Integer(10)],
+            },
+            Stmt::Assign {
+                targets: vec![field(Expr::Name(options_name), "Properties")],
+                values: vec![Expr::Name(table_name)],
+            },
+        ]);
+
+        let rewrite = ConsumerFieldTableName.rewrite_block(block, &CleanContext::new(None));
+
+        assert!(rewrite.changed);
+        let Stmt::Local { names, .. } = &rewrite.value.0[1] else {
+            panic!("expected table local")
+        };
+        assert_eq!(names[0].as_bytes(), b"properties");
+        let Stmt::Assign { values, .. } = &rewrite.value.0[3] else {
+            panic!("expected field store")
+        };
+        let [Expr::Name(value)] = values.as_slice() else {
+            panic!("expected stored table binding")
+        };
+        assert_eq!(value.as_bytes(), b"properties");
+    }
+
+    #[test]
+    fn consumer_field_name_skips_numeric_and_dynamic_index_stores() {
+        let function = FunctionId::root();
+        for key in [Expr::Integer(1), Expr::Name(Name::new("key"))] {
+            let options = BindingId::debug_local(&function, 0);
+            let table = BindingId::synthetic(&function, 1);
+            let options_name = Name::new("Options").with_binding(options);
+            let table_name = bound("l1", &table);
+            let block = Block::new(vec![
+                table_local(options_name.clone()),
+                table_local(table_name.clone()),
+                Stmt::Assign {
+                    targets: vec![field(Expr::Name(table_name.clone()), "Width")],
+                    values: vec![Expr::Integer(10)],
+                },
+                Stmt::Assign {
+                    targets: vec![Expr::Index {
+                        obj: Box::new(Expr::Name(options_name.clone())),
+                        key: Box::new(key),
+                    }],
+                    values: vec![Expr::Name(table_name)],
+                },
+            ]);
+
+            let rewrite = ConsumerFieldTableName.rewrite_block(block, &CleanContext::new(None));
+
+            assert!(!rewrite.changed);
+            let Stmt::Local { names, .. } = &rewrite.value.0[1] else {
+                panic!("expected table local")
+            };
+            assert_eq!(names[0].as_bytes(), b"l1");
         }
-        Expr::Function(body) => rename_func_body(body, from, to),
-        Expr::Table(fields) => {
-            for field in fields {
-                match field {
-                    TableField::List(value) => rename_expr(value, from, to),
-                    TableField::Named { value, .. } => rename_expr(value, from, to),
-                    TableField::ExprKey { key, value } => {
-                        rename_expr(key, from, to);
-                        rename_expr(value, from, to);
-                    }
-                }
-            }
-        }
-        Expr::Binary { lhs, rhs, .. } => {
-            rename_expr(lhs, from, to);
-            rename_expr(rhs, from, to);
-        }
-        Expr::Unary { operand, .. } | Expr::Paren(operand) => rename_expr(operand, from, to),
-        _ => {}
     }
 }

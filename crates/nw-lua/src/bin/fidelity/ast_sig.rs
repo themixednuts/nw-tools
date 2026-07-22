@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use full_moon::ast::{Ast, Block, Expression, LastStmt, Stmt};
+use full_moon::ast::{Ast, Block, Expression, Field, LastStmt, Stmt};
 
 #[derive(Debug, Clone, Default)]
 pub struct Metrics {
@@ -15,6 +15,12 @@ pub struct Metrics {
     pub empty_branches: usize,
     pub and_ops: usize,
     pub or_ops: usize,
+    pub table_constructors: usize,
+    pub table_fields: usize,
+    pub local_functions: usize,
+    pub function_declarations: usize,
+    pub function_value_assignments: usize,
+    pub synthetic_locals: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -228,12 +234,14 @@ fn count_stmt(stmt: &Stmt, metrics: &mut Metrics) {
                     .or_default() += 1;
             }
             for expr in assign.expressions().iter() {
+                metrics.function_value_assignments +=
+                    usize::from(matches!(expr, Expression::Function(_)));
                 count_expr(expr, metrics);
             }
         }
         Stmt::Do(stmt) => count_block(stmt.block(), metrics),
         Stmt::FunctionCall(_) => {}
-        Stmt::FunctionDeclaration(_) => {}
+        Stmt::FunctionDeclaration(_) => metrics.function_declarations += 1,
         Stmt::GenericFor(stmt) => {
             metrics.loops += 1;
             for expr in stmt.expressions().iter() {
@@ -261,6 +269,8 @@ fn count_stmt(stmt: &Stmt, metrics: &mut Metrics) {
             if assign.equal_token().is_some() {
                 metrics.assignments += 1;
                 for target in assign.names().iter() {
+                    metrics.synthetic_locals +=
+                        usize::from(is_synthetic_identifier(&compact(target)));
                     *metrics
                         .assignment_targets
                         .entry(compact(target))
@@ -268,10 +278,12 @@ fn count_stmt(stmt: &Stmt, metrics: &mut Metrics) {
                 }
             }
             for expr in assign.expressions().iter() {
+                metrics.function_value_assignments +=
+                    usize::from(matches!(expr, Expression::Function(_)));
                 count_expr(expr, metrics);
             }
         }
-        Stmt::LocalFunction(_) => {}
+        Stmt::LocalFunction(_) => metrics.local_functions += 1,
         Stmt::NumericFor(stmt) => {
             metrics.loops += 1;
             count_expr(stmt.start(), metrics);
@@ -321,8 +333,35 @@ fn count_expr(expr: &Expression, metrics: &mut Metrics) {
         Expression::Parentheses { expression, .. } => count_expr(expression, metrics),
         Expression::UnaryOperator { expression, .. } => count_expr(expression, metrics),
         Expression::Function(_) => {}
+        Expression::TableConstructor(table) => {
+            metrics.table_constructors += 1;
+            metrics.table_fields += table.fields().len();
+            for field in table.fields().iter() {
+                match field {
+                    Field::ExpressionKey { key, value, .. } => {
+                        count_expr(key, metrics);
+                        count_expr(value, metrics);
+                    }
+                    Field::NameKey { value, .. } | Field::NoKey(value) => {
+                        count_expr(value, metrics);
+                    }
+                    _ => {}
+                }
+            }
+        }
         _ => {}
     }
+}
+
+fn is_synthetic_identifier(name: &str) -> bool {
+    ["arg", "up", "a", "l", "u", "v"].iter().any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|suffix| {
+            !suffix.is_empty()
+                && suffix
+                    .split('_')
+                    .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+        })
+    })
 }
 
 fn compact(value: &impl ToString) -> String {
@@ -331,4 +370,32 @@ fn compact(value: &impl ToString) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_shape_metrics_cover_constructor_sugar_and_temporaries() {
+        let ast = full_moon::parse(
+            r#"
+local v1 = { nested = { 1, 2 } }
+local function named()
+    return v1
+end
+Module.call = function()
+    return named()
+end
+"#,
+        )
+        .expect("fixture parses");
+        let root = &signature(&ast).functions[0].metrics;
+
+        assert_eq!(root.table_constructors, 2);
+        assert_eq!(root.table_fields, 3);
+        assert_eq!(root.local_functions, 1);
+        assert_eq!(root.function_value_assignments, 1);
+        assert_eq!(root.synthetic_locals, 1);
+    }
 }

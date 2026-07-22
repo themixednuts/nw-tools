@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use super::compare::{Category, FileDiff, function_category_hits};
@@ -36,16 +36,28 @@ impl Summary {
         }
         self.divergent_functions += diff.divergent_functions();
 
-        for category in &diff.file_categories {
-            *self.file_category_hits.entry(*category).or_default() += 1;
-            self.push_example(
-                *category,
-                Example {
-                    path: diff.path.clone(),
-                    function: "<file>".to_owned(),
-                    detail: lexical_detail(&diff, *category),
-                },
-            );
+        let file_categories = diff
+            .file_categories
+            .iter()
+            .copied()
+            .chain(
+                diff.function_diffs
+                    .iter()
+                    .flat_map(|function| function.categories.iter().copied()),
+            )
+            .collect::<BTreeSet<_>>();
+        for category in file_categories {
+            *self.file_category_hits.entry(category).or_default() += 1;
+            if diff.file_categories.contains(&category) {
+                self.push_example(
+                    category,
+                    Example {
+                        path: diff.path.clone(),
+                        function: "<file>".to_owned(),
+                        detail: lexical_detail(&diff, category),
+                    },
+                );
+            }
         }
 
         for (category, count) in function_category_hits(&diff) {
@@ -135,7 +147,7 @@ impl Summary {
 fn metric_detail(func: &super::compare::FunctionDiff) -> String {
     match &func.decompiled {
         Some(decompiled) => format!(
-            "orig(stmt={},ret={},assign={},if={},elseif={},else={},loop={},empty={}) decomp(stmt={},ret={},assign={},if={},elseif={},else={},loop={},empty={}) decomp_idx={:?}",
+            "orig(stmt={},ret={},assign={},if={},elseif={},else={},loop={},empty={},ctor={}/{},sugar={}/{}/{},temp={}) decomp(stmt={},ret={},assign={},if={},elseif={},else={},loop={},empty={},ctor={}/{},sugar={}/{}/{},temp={}) decomp_idx={:?}",
             func.original.statements,
             func.original.returns,
             func.original.assignments,
@@ -144,6 +156,12 @@ fn metric_detail(func: &super::compare::FunctionDiff) -> String {
             func.original.elses,
             func.original.loops,
             func.original.empty_branches,
+            func.original.table_constructors,
+            func.original.table_fields,
+            func.original.local_functions,
+            func.original.function_declarations,
+            func.original.function_value_assignments,
+            func.original.synthetic_locals,
             decompiled.statements,
             decompiled.returns,
             decompiled.assignments,
@@ -152,6 +170,12 @@ fn metric_detail(func: &super::compare::FunctionDiff) -> String {
             decompiled.elses,
             decompiled.loops,
             decompiled.empty_branches,
+            decompiled.table_constructors,
+            decompiled.table_fields,
+            decompiled.local_functions,
+            decompiled.function_declarations,
+            decompiled.function_value_assignments,
+            decompiled.synthetic_locals,
             func.decompiled_index
         ),
         None => "missing aligned decompiled function".to_owned(),
@@ -188,7 +212,7 @@ fn lexical_detail(diff: &FileDiff, category: Category) -> String {
     }
 }
 
-fn all_categories() -> [Category; 12] {
+fn all_categories() -> [Category; 16] {
     [
         Category::FunctionCount,
         Category::DroppedReturn,
@@ -197,6 +221,10 @@ fn all_categories() -> [Category; 12] {
         Category::AssignmentTargetMismatch,
         Category::ControlFlowCount,
         Category::EmptyDecompiledBranch,
+        Category::UnnecessaryControlFlow,
+        Category::ConstructorShape,
+        Category::DeclarationSugar,
+        Category::ExposedTemporary,
         Category::ShortCircuitLoss,
         Category::ShortCircuitGain,
         Category::BogusNotNumber,

@@ -1,8 +1,10 @@
-//! Lua bytecode version tags.
+//! Lua release detection and supported compiler targets.
+
+use std::fmt;
 
 use crate::error::LuaError;
 
-/// Lua binary chunk versions understood by the crate roadmap.
+/// Lua binary chunk releases recognized at the input boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LuaVersion {
     /// Lua 5.1 (`0x51`).
@@ -44,6 +46,58 @@ impl LuaVersion {
     }
 }
 
+impl fmt::Display for LuaVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::V51 => "5.1",
+            Self::V52 => "5.2",
+            Self::V53 => "5.3",
+            Self::V54 => "5.4",
+            Self::V55 => "5.5",
+        })
+    }
+}
+
+/// A Lua release supported by the complete parse-to-source pipeline.
+///
+/// Keep this enum intentionally narrower than [`LuaVersion`]. Adding a variant
+/// here makes every compiler stage handle that release exhaustively instead of
+/// allowing a partially implemented version to leak into the IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LuaTarget {
+    /// Complete Lua 5.1 pipeline.
+    V51,
+}
+
+impl LuaTarget {
+    /// Resolve a recognized release to a complete compiler target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LuaError::UnsupportedVersion`] until the complete pipeline for
+    /// that release has been implemented and added to this enum.
+    pub const fn for_version(version: LuaVersion) -> Result<Self, LuaError> {
+        match version {
+            LuaVersion::V51 => Ok(Self::V51),
+            version => Err(LuaError::UnsupportedVersion(version.to_byte())),
+        }
+    }
+
+    /// Return the binary chunk release implemented by this target.
+    #[must_use]
+    pub const fn version(self) -> LuaVersion {
+        match self {
+            Self::V51 => LuaVersion::V51,
+        }
+    }
+}
+
+impl fmt::Display for LuaTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.version().fmt(formatter)
+    }
+}
+
 /// Detect the Lua version byte from a binary chunk header.
 ///
 /// # Errors
@@ -61,4 +115,31 @@ pub fn detect_header_version(bytes: &[u8]) -> Result<LuaVersion, LuaError> {
     }
     let byte = bytes[4];
     LuaVersion::from_byte(byte).ok_or(LuaError::UnsupportedVersion(byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LuaTarget, LuaVersion};
+
+    #[test]
+    fn complete_targets_are_narrower_than_recognized_releases() {
+        assert!(matches!(
+            LuaTarget::for_version(LuaVersion::V51),
+            Ok(LuaTarget::V51)
+        ));
+        for version in [
+            LuaVersion::V52,
+            LuaVersion::V53,
+            LuaVersion::V54,
+            LuaVersion::V55,
+        ] {
+            assert!(LuaTarget::for_version(version).is_err());
+        }
+    }
+
+    #[test]
+    fn release_and_target_labels_have_one_owner() {
+        assert_eq!(LuaVersion::V54.to_string(), "5.4");
+        assert_eq!(LuaTarget::V51.to_string(), "5.1");
+    }
 }

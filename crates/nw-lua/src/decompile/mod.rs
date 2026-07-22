@@ -8,8 +8,10 @@ pub mod boolean;
 pub mod closure;
 pub mod control_flow;
 pub mod expr_build;
+mod identifier;
 pub mod idiomatic;
 pub mod naming;
+pub mod reconstruction;
 pub mod region;
 pub mod stmt_build;
 

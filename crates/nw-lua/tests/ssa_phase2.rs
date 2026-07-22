@@ -5,7 +5,7 @@ use nw_lua::{
     chunk::Proto,
     ir::{SsaFunction, SsaOp, build_ssa, dump::dump_function},
     parse_chunk, ssa_dump,
-    version::LuaVersion,
+    version::LuaTarget,
 };
 
 const SHOPCOMMON: &[u8] = include_bytes!("fixtures/shopcommon.luac");
@@ -81,7 +81,7 @@ BB0 [pc 0..14] preds:[] succs:[] idom=-1
 }
 
 fn lua51_table() -> OpcodeTable {
-    OpcodeTable::builtin(LuaVersion::V51).expect("Lua 5.1 table exists")
+    OpcodeTable::builtin(LuaTarget::V51)
 }
 
 fn visit_protos(proto: &Proto, visitor: &mut impl FnMut(&Proto)) {

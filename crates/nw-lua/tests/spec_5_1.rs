@@ -53,12 +53,7 @@ const LUA51_OPCODES: &[&str] = &[
     "VARARG",
 ];
 
-#[test]
-fn opcode_runtime_equivalence_matrix_exercises_all_lua_51_opcodes() {
-    let cases = [
-        OpcodeCase {
-            name: "linear_registers_and_globals",
-            source: r#"
+const SEPARATE_NIL_DECLARATION: &str = r#"
 spec_global = 5
 local a, b
 a = 1
@@ -66,7 +61,14 @@ b = a
 local c = true
 local d = false
 print(spec_global, b, c, d)
-"#,
+"#;
+
+#[test]
+fn opcode_runtime_equivalence_matrix_exercises_all_lua_51_opcodes() {
+    let cases = [
+        OpcodeCase {
+            name: "linear_registers_and_globals",
+            source: SEPARATE_NIL_DECLARATION,
             args: &[],
             opcodes: &[
                 "MOVE",
@@ -226,6 +228,30 @@ print(t[1], t[2], tail("x", "y"))
         expected,
         "direct opcode test coverage mismatch; missing: {:?}",
         expected.difference(&covered).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn dominating_nil_declaration_is_not_replanned_as_a_multi_local_initializer() {
+    let Some(bytecode) = compile_source_bytes(
+        "dominating_nil_declaration",
+        SEPARATE_NIL_DECLARATION,
+        false,
+    ) else {
+        return;
+    };
+    let source = nw_lua::decompile(&bytecode).expect("decompile separate nil declaration");
+    assert_eq!(
+        source,
+        concat!(
+            "spec_global = 5\n",
+            "local a, b\n",
+            "a = 1\n",
+            "b = a\n",
+            "local c = true\n",
+            "local d = false\n",
+            "print(spec_global, b, c, d)\n",
+        )
     );
 }
 

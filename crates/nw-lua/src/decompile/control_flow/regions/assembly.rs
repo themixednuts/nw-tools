@@ -3,11 +3,11 @@ use std::collections::BTreeSet;
 use crate::{
     LuaError,
     decompile::{
-        analysis::NodeId,
-        boolean::{BooleanAnalysis, ConditionChain},
+        analysis::{DecompileAnalysis, NodeId},
+        boolean::{BooleanAnalysis, ConditionChain, ControlComponent},
         region::LinearRegion,
     },
-    ir::SsaFunction,
+    ir::{SsaFunction, SsaOp},
 };
 
 use super::super::{
@@ -19,7 +19,7 @@ use super::super::{
 };
 use super::types::{
     BlockSet, Condition, GenericForRegion, IfArm, IfRegion, NumericForRegion, Region, RegionTree,
-    RepeatRegion, WhileRegion,
+    RepeatRegion, ValueRegion, WhileRegion,
 };
 
 mod branch_specials;
@@ -27,11 +27,12 @@ mod branch_specials;
 impl RegionTree {
     pub fn build(
         function: &SsaFunction,
+        analysis: &DecompileAnalysis,
         loops: &LoopAnalysis,
         pc_map: &[Option<usize>],
         booleans: &BooleanAnalysis,
     ) -> Result<Self, LuaError> {
-        let mut structurer = Structurer::new(function, loops, pc_map, booleans);
+        let mut structurer = Structurer::new(function, analysis, loops, pc_map, booleans);
         let root = structurer.build_sequence(0, None, None)?;
         Ok(Self { root })
     }
@@ -48,10 +49,12 @@ struct SequenceKey {
 
 struct Structurer<'a> {
     function: &'a SsaFunction,
+    analysis: &'a DecompileAnalysis,
     loops: &'a LoopAnalysis,
     pc_map: &'a [Option<usize>],
     booleans: &'a BooleanAnalysis,
     consumed: Vec<bool>,
+    consumed_nodes: Vec<Vec<bool>>,
     loop_headers: BlockSet,
     active_sequences: Vec<SequenceKey>,
     active_natural_headers: Vec<usize>,
@@ -60,16 +63,23 @@ struct Structurer<'a> {
 impl<'a> Structurer<'a> {
     fn new(
         function: &'a SsaFunction,
+        analysis: &'a DecompileAnalysis,
         loops: &'a LoopAnalysis,
         pc_map: &'a [Option<usize>],
         booleans: &'a BooleanAnalysis,
     ) -> Self {
         Self {
             function,
+            analysis,
             loops,
             pc_map,
             booleans,
             consumed: vec![false; function.blocks.len()],
+            consumed_nodes: function
+                .blocks
+                .iter()
+                .map(|block| vec![false; block.nodes.len()])
+                .collect(),
             loop_headers: loops.loop_headers(function.blocks.len()),
             active_sequences: Vec::new(),
             active_natural_headers: Vec::new(),
@@ -160,33 +170,36 @@ impl<'a> Structurer<'a> {
                 continue;
             }
 
-            if let Some(plan) = self.booleans.value_select_start(current)
-                && stop.is_none_or(|stop| plan.merge <= stop)
-                && Some(plan.merge) != stop
-                && plan.merge > current
-            {
-                for block in plan.consumed_blocks() {
-                    if let Some(slot) = self.consumed.get_mut(block) {
-                        *slot = true;
+            if let Some(component) = self.booleans.component_start(current).cloned() {
+                match component {
+                    ControlComponent::Value(plan)
+                        if stop.is_none_or(|stop| plan.merge <= stop) && plan.merge > current =>
+                    {
+                        if let Some(output) = self.analysis.def_site(plan.dest) {
+                            self.consume_node(output);
+                        }
+                        for block in plan.consumed_blocks() {
+                            if let Some(slot) = self.consumed.get_mut(block) {
+                                *slot = true;
+                            }
+                        }
+                        regions.push(Region::Value(Box::new(ValueRegion {
+                            prefix: self.linear_block(current),
+                            plan: plan.clone(),
+                        })));
+                        current = plan.merge;
+                        continue;
                     }
+                    ControlComponent::Condition(chain)
+                        if stop.is_none_or(|stop| chain.merge <= stop) && chain.merge > current =>
+                    {
+                        let (region, next) = self.compound_if_region(chain, stop, loop_exit)?;
+                        regions.push(region);
+                        current = next;
+                        continue;
+                    }
+                    ControlComponent::Condition(_) | ControlComponent::Value(_) => {}
                 }
-                regions.push(Region::Linear(linear_block_covering(
-                    self.function,
-                    current,
-                    plan.consumed_blocks(),
-                )));
-                current = plan.merge;
-                continue;
-            }
-
-            if let Some(chain) = self.booleans.condition_chain(current).cloned()
-                && stop.is_none_or(|stop| chain.merge <= stop)
-                && chain.merge > current
-            {
-                let (region, next) = self.compound_if_region(chain, stop, loop_exit)?;
-                regions.push(region);
-                current = next;
-                continue;
             }
 
             if let Some(branch) = conditionals::branch_info(self.function, current, self.pc_map) {
@@ -198,10 +211,7 @@ impl<'a> Structurer<'a> {
 
             let linear_block_index = current;
             self.consumed[linear_block_index] = true;
-            regions.push(Region::Linear(linear_block(
-                self.function,
-                linear_block_index,
-            )));
+            regions.push(Region::Linear(self.linear_block(linear_block_index)));
             if conditionals::is_terminal_block(self.function, linear_block_index) {
                 break;
             }
@@ -216,7 +226,7 @@ impl<'a> Structurer<'a> {
         self.consumed[info.loop_block] = true;
         let body = self.build_sequence(info.body_start, Some(info.loop_block), Some(info.exit))?;
         Ok(Region::NumericFor(Box::new(NumericForRegion {
-            prefix: linear_block(self.function, info.prep),
+            prefix: self.linear_block(info.prep),
             info,
             body,
         })))
@@ -227,9 +237,11 @@ impl<'a> Structurer<'a> {
         self.consumed[info.tfor_block] = true;
         self.consumed[info.latch_block] = true;
         let body = self.build_sequence(info.body_start, Some(info.tfor_block), Some(info.exit))?;
+        let setup_nodes = generic_for_setup_nodes(self.function, self.analysis, &info);
         Ok(Region::GenericFor(Box::new(GenericForRegion {
-            prefix: linear_block(self.function, info.entry),
+            prefix: self.linear_block(info.entry),
             info,
+            setup_nodes,
             body,
         })))
     }
@@ -266,7 +278,7 @@ impl<'a> Structurer<'a> {
                 |segment| segment.node,
             );
             return Ok(Region::While(Box::new(WhileRegion {
-                prefix: linear_block(self.function, info.header),
+                prefix: self.linear_block(info.header),
                 condition: Condition {
                     branch,
                     inverted: false,
@@ -280,7 +292,7 @@ impl<'a> Structurer<'a> {
         let branch = conditionals::branch_info(self.function, info.header, self.pc_map);
         let Some(branch) = branch else {
             return Ok(Region::While(Box::new(WhileRegion {
-                prefix: linear_block(self.function, info.header),
+                prefix: self.linear_block(info.header),
                 condition: Condition {
                     branch: NodeId {
                         block: info.header,
@@ -308,7 +320,7 @@ impl<'a> Structurer<'a> {
         self.active_natural_headers.pop();
         let body = body?;
         Ok(Region::While(Box::new(WhileRegion {
-            prefix: linear_block(self.function, info.header),
+            prefix: self.linear_block(info.header),
             condition: Condition {
                 branch: branch.node,
                 inverted,
@@ -329,7 +341,7 @@ impl<'a> Structurer<'a> {
         }
         if !self.consumed.get(tail).copied().unwrap_or(true) {
             self.consumed[tail] = true;
-            parts.push(Region::Linear(linear_block(self.function, tail)));
+            parts.push(Region::Linear(self.linear_block(tail)));
         }
         let branch = conditionals::branch_info(self.function, tail, self.pc_map);
         let condition = branch.map_or(
@@ -390,7 +402,7 @@ impl<'a> Structurer<'a> {
 
         Ok((
             Region::If(Box::new(IfRegion {
-                prefix: linear_block(self.function, chain.start),
+                prefix: self.linear_block(chain.start),
                 arms: vec![IfArm {
                     condition: Condition {
                         branch: chain.segments[0].node,
@@ -416,17 +428,7 @@ impl<'a> Structurer<'a> {
         stop: Option<usize>,
         loop_exit: Option<usize>,
     ) -> Result<(Region, usize), LuaError> {
-        if let Some((region, next)) = self.break_if_region(block, branch, loop_exit)? {
-            return Ok((region, next));
-        }
-        if let Some((region, next)) =
-            self.loop_continue_if_region(block, branch, stop, loop_exit)?
-        {
-            return Ok((region, next));
-        }
-        if let Some((region, next)) =
-            self.terminal_guard_if_region(block, branch, stop, loop_exit)?
-        {
+        if let Some((region, next)) = self.special_branch_region(block, branch, stop, loop_exit)? {
             return Ok((region, next));
         }
 
@@ -536,7 +538,7 @@ impl<'a> Structurer<'a> {
             if self.consumed[else_start]
                 && conditionals::is_terminal_block(self.function, else_start)
             {
-                Some(Region::Linear(linear_block(self.function, else_start)))
+                Some(Region::Linear(self.linear_block(else_start)))
             } else {
                 Some(self.build_sequence(else_start, Some(merge), loop_exit)?)
             }
@@ -552,7 +554,7 @@ impl<'a> Structurer<'a> {
 
         Ok((
             Region::If(Box::new(IfRegion {
-                prefix: linear_block(self.function, block),
+                prefix: self.linear_block(block),
                 arms,
                 else_,
                 else_blocks,
@@ -683,6 +685,7 @@ impl<'a> Structurer<'a> {
         }
         conditionals::is_elseif_candidate(
             self.function,
+            self.analysis,
             block,
             if block == merge { usize::MAX } else { merge },
             self.pc_map,
@@ -727,32 +730,112 @@ impl<'a> Structurer<'a> {
         }
         block + 1
     }
-}
 
-fn linear_block(function: &SsaFunction, block: usize) -> LinearRegion {
-    let nodes = function
-        .blocks
-        .get(block)
-        .map(|block_ref| {
-            (0..block_ref.nodes.len())
-                .map(|node| NodeId { block, node })
-                .collect()
-        })
-        .unwrap_or_default();
-    LinearRegion {
-        nodes,
-        covered_blocks: vec![block],
+    fn consume_node(&mut self, id: NodeId) {
+        if let Some(consumed) = self
+            .consumed_nodes
+            .get_mut(id.block)
+            .and_then(|nodes| nodes.get_mut(id.node))
+        {
+            *consumed = true;
+        }
+    }
+
+    fn linear_block(&self, block: usize) -> LinearRegion {
+        let nodes = self
+            .function
+            .blocks
+            .get(block)
+            .map(|block_ref| {
+                (0..block_ref.nodes.len())
+                    .filter(|node| {
+                        !self
+                            .consumed_nodes
+                            .get(block)
+                            .and_then(|nodes| nodes.get(*node))
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                    .map(|node| NodeId { block, node })
+                    .collect()
+            })
+            .unwrap_or_default();
+        LinearRegion {
+            nodes,
+            covered_blocks: vec![block],
+        }
     }
 }
 
-fn linear_block_covering(
+fn generic_for_setup_nodes(
     function: &SsaFunction,
-    block: usize,
-    covered_blocks: impl IntoIterator<Item = usize>,
-) -> LinearRegion {
-    let mut region = linear_block(function, block);
-    region.covered_blocks = covered_blocks.into_iter().collect();
-    region
+    analysis: &DecompileAnalysis,
+    info: &GenericForLoop,
+) -> Vec<NodeId> {
+    let Some(call_id) = info.call_node else {
+        return Vec::new();
+    };
+    let Some(block) = function.blocks.get(call_id.block) else {
+        return Vec::new();
+    };
+    let Some(call) = block.nodes.get(call_id.node) else {
+        return Vec::new();
+    };
+    let SsaOp::Call { func, args, .. } = &call.op else {
+        return Vec::new();
+    };
+
+    let control_end = info.base.saturating_add(2);
+    let mut owned = vec![call_id];
+    let mut pending = std::iter::once(*func)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>();
+    while let Some(reference) = pending.pop() {
+        let Some(id) = analysis.def_site(reference) else {
+            continue;
+        };
+        if id.block != call_id.block || id.node >= call_id.node || owned.contains(&id) {
+            continue;
+        }
+        let Some(node) = block.nodes.get(id.node) else {
+            continue;
+        };
+        let SsaOp::Move { src } = node.op else {
+            continue;
+        };
+        if node
+            .dest
+            .reg_index()
+            .is_some_and(|reg| reg >= info.base && reg <= control_end)
+        {
+            owned.push(id);
+            pending.push(src);
+        }
+    }
+
+    let mut tracked = analysis.defs_at(call_id).to_vec();
+    for node_index in call_id.node + 1..block.nodes.len() {
+        let id = NodeId {
+            block: call_id.block,
+            node: node_index,
+        };
+        let node = &block.nodes[node_index];
+        let SsaOp::Move { src } = node.op else {
+            continue;
+        };
+        let writes_control = node
+            .dest
+            .reg_index()
+            .is_some_and(|reg| reg >= info.base && reg <= control_end);
+        if tracked.contains(&src) || writes_control {
+            owned.push(id);
+            tracked.extend(analysis.defs_at(id).iter().copied());
+        }
+    }
+
+    owned.sort_by_key(|id| (id.block, id.node));
+    owned.dedup();
+    owned
 }
 
 fn max_block(blocks: &BTreeSet<usize>) -> usize {

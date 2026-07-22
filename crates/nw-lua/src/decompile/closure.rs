@@ -41,10 +41,11 @@ pub(crate) fn try_local_function(
     let Some(reg) = node.dest.reg_index() else {
         return Ok(None);
     };
-    let Some(binding) = builder.binding_for_def(reg, node.pc) else {
+    let pc = builder.materialization_pc(node.dest).unwrap_or(node.pc);
+    let Some(binding) = builder.binding_for_def(reg, pc) else {
         return Ok(None);
     };
-    if builder.is_local_declared(binding.index) {
+    if !builder.claim_declaration(node.dest) {
         return Ok(None);
     }
 
@@ -56,8 +57,7 @@ pub(crate) fn try_local_function(
         node,
     )?;
     let name = builder.name_for_binding_def(&binding, node.dest);
-    builder.mark_local_declared(binding.index);
-    builder.mark_materialized(node.dest, name.clone());
+    builder.activate(node.dest);
     Ok(Some(Stmt::Function {
         name,
         body,
@@ -96,8 +96,13 @@ fn function_body(
     let upvalue_names = resolve_upvalue_names(parent_function, parent_names, node, upvalues);
     let param_overrides = parameter_overrides(sub_proto, &upvalue_names);
     let sub_ssa = ir::build_ssa(sub_proto, table);
-    let sub_names =
-        NameResolver::with_overrides(sub_proto, &sub_ssa, upvalue_names, param_overrides);
+    let sub_names = NameResolver::with_overrides(
+        sub_proto,
+        &sub_ssa,
+        parent_names.child_function_id(proto_idx),
+        upvalue_names,
+        param_overrides,
+    );
     let body = decompile_proto_with_names(sub_proto, &sub_ssa, table, &sub_names)?;
     let params = (0..sub_proto.num_params)
         .map(|reg| sub_names.parameter_name(reg))
@@ -112,12 +117,17 @@ fn resolve_upvalue_names(
     node: &SsaNode,
     upvalues: &[UpvalueCapture],
 ) -> Vec<Name> {
+    let binding_pc = closure_binding_pc(node);
     upvalues
         .iter()
         .map(|capture| match capture {
-            UpvalueCapture::ParentLocal(reference) => {
-                parent_names.collapsed_name_for_ref(*reference, node.pc)
-            }
+            UpvalueCapture::ParentLocal(reference) => reference
+                .reg_index()
+                .and_then(|reg| parent_names.binding_for_def(reg, binding_pc))
+                .map_or_else(
+                    || parent_names.collapsed_name_for_ref(*reference, binding_pc),
+                    |binding| parent_names.name_for_binding_def(&binding, *reference),
+                ),
             UpvalueCapture::ParentUpvalue(upvalue) => parent_names.upvalue_name(*upvalue),
         })
         .enumerate()
@@ -129,6 +139,14 @@ fn resolve_upvalue_names(
             }
         })
         .collect()
+}
+
+fn closure_binding_pc(node: &SsaNode) -> i32 {
+    let SsaOp::Closure { upvalues, .. } = &node.op else {
+        return node.pc;
+    };
+    node.pc
+        .saturating_add(i32::try_from(upvalues.len()).unwrap_or(i32::MAX))
 }
 
 fn parameter_overrides(sub_proto: &Proto, upvalue_names: &[Name]) -> Vec<Option<Name>> {

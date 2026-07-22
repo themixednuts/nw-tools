@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 
 use crate::{
     bytecode::SemanticOp,
+    decompile::analysis::DecompileAnalysis,
     ir::{RelOp, SsaFunction, SsaNode, SsaOp, SsaRef},
 };
 
@@ -135,12 +136,10 @@ pub fn is_empty_structural(function: &SsaFunction, block: usize) -> bool {
         return true;
     };
     block.nodes.iter().all(|node| {
-        node.is_meta_only
-            || matches!(
-                node.op,
-                SsaOp::Jump { .. } | SsaOp::Phi { .. } | SsaOp::Nop | SsaOp::Close { .. }
-            )
-            || is_final_empty_return(function, node)
+        matches!(
+            node.op,
+            SsaOp::Jump { .. } | SsaOp::Phi { .. } | SsaOp::Nop | SsaOp::Close { .. }
+        ) || is_final_empty_return(function, node)
     })
 }
 
@@ -182,18 +181,19 @@ pub fn has_unreachable_jump_immediately_before(function: &SsaFunction, block: us
 #[must_use]
 pub fn is_elseif_candidate(
     function: &SsaFunction,
+    analysis: &DecompileAnalysis,
     block: usize,
     merge: usize,
     pc_map: &[Option<usize>],
     loop_headers: &BlockSet,
 ) -> bool {
-    if block == merge
-        || loop_headers.contains(block)
-        || branch_info(function, block, pc_map).is_none()
-    {
+    if block == merge || loop_headers.contains(block) {
         return false;
     }
 
+    let Some(branch) = branch_info(function, block, pc_map) else {
+        return false;
+    };
     let Some(block_ref) = function.blocks.get(block) else {
         return false;
     };
@@ -201,28 +201,35 @@ pub fn is_elseif_candidate(
         return false;
     }
 
-    let mut branches = 0;
-    for node in &block_ref.nodes {
-        match &node.op {
-            SsaOp::Branch { .. } => branches += 1,
-            SsaOp::Phi { .. }
-            | SsaOp::Nop
-            | SsaOp::Jump { .. }
-            | SsaOp::LoadK { .. }
-            | SsaOp::LoadBool { .. }
-            | SsaOp::LoadNil { .. }
-            | SsaOp::GetGlobal { .. }
-            | SsaOp::GetTable { .. }
-            | SsaOp::GetUpval { .. }
-            | SsaOp::Move { .. }
-            | SsaOp::BinOp { .. }
-            | SsaOp::UnOp { .. }
-            | SsaOp::Concat { .. }
-            | SsaOp::Call { .. } => {}
-            _ => return false,
+    let mut condition_nodes = vec![false; block_ref.nodes.len()];
+    let mut pending = Vec::new();
+    block_ref.nodes[branch.node.node]
+        .op
+        .visit_uses(|reference, _| pending.push(reference));
+    while let Some(reference) = pending.pop() {
+        let Some(definition) = analysis.def_site(reference) else {
+            continue;
+        };
+        if definition.block != block || definition.node >= branch.node.node {
+            continue;
         }
+        let Some(owned) = condition_nodes.get_mut(definition.node) else {
+            continue;
+        };
+        if *owned {
+            continue;
+        }
+        *owned = true;
+        block_ref.nodes[definition.node]
+            .op
+            .visit_uses(|operand, _| pending.push(operand));
     }
-    branches == 1
+
+    block_ref.nodes.iter().enumerate().all(|(index, node)| {
+        index == branch.node.node
+            || condition_nodes[index]
+            || matches!(node.op, SsaOp::Phi { .. } | SsaOp::Nop)
+    })
 }
 
 #[must_use]
@@ -238,6 +245,7 @@ pub fn is_pure_condition_block(function: &SsaFunction, block: usize) -> bool {
             | SsaOp::Nop
             | SsaOp::Jump { .. }
             | SsaOp::LoadK { .. }
+            | SsaOp::LoadLiteral { .. }
             | SsaOp::LoadBool { .. }
             | SsaOp::LoadNil { .. }
             | SsaOp::GetGlobal { .. }

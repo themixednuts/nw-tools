@@ -14,6 +14,14 @@ impl<'a> ExprBuilder<'a> {
         match &node.op {
             SsaOp::Move { src } => self.expr_for_ref(*src, node.pc),
             SsaOp::LoadK { idx } => self.const_expr(*idx),
+            SsaOp::LoadLiteral { value } => Ok(match value {
+                ir::SsaLiteral::Nil => Expr::Nil,
+                ir::SsaLiteral::Boolean(true) => Expr::True,
+                ir::SsaLiteral::Boolean(false) => Expr::False,
+                ir::SsaLiteral::Number(bits) => Expr::Number(f64::from_bits(*bits)),
+                ir::SsaLiteral::Integer(value) => Expr::Integer(*value),
+                ir::SsaLiteral::Str(value) => Expr::Str(value.clone()),
+            }),
             SsaOp::LoadBool { value, .. } => Ok(if *value { Expr::True } else { Expr::False }),
             SsaOp::LoadNil { .. } => Ok(Expr::Nil),
             SsaOp::GetUpval { upval } => Ok(Expr::Name(self.names.upvalue_name(*upval))),
@@ -88,6 +96,11 @@ impl<'a> ExprBuilder<'a> {
         node: &SsaNode,
         use_pc: i32,
     ) -> Result<Expr, LuaError> {
+        if matches!(node.op, SsaOp::LoadNil { .. })
+            && node.def_at_reg(reference.reg_index().unwrap_or(u16::MAX)) == Some(reference)
+        {
+            return Ok(Expr::Nil);
+        }
         if let SsaOp::SelfOp {
             table, self_reg, ..
         } = &node.op
@@ -164,10 +177,11 @@ impl<'a> ExprBuilder<'a> {
 
     pub(super) fn materialized_name(&self, reference: SsaRef) -> Option<Name> {
         let value = ValueId::from_ref(reference)?;
-        self.materialized
-            .get(usize::from(value.reg))
-            .and_then(|versions| versions.get(usize::try_from(value.ver).ok()?))
-            .cloned()
-            .flatten()
+        (*self
+            .activated
+            .get(usize::from(value.reg))?
+            .get(usize::try_from(value.ver).ok()?)?)
+        .then(|| self.plan.name(reference))
+        .flatten()
     }
 }

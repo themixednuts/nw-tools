@@ -4,12 +4,12 @@ use crate::{
     decompile::{
         analysis::{DecompileAnalysis, NodeId},
         ast,
-        control_flow::{conditionals, regions::BlockSet},
+        control_flow::conditionals,
     },
     ir::{RelOp, SsaFunction, SsaOp, SsaRef},
 };
 
-use super::{branch_at, branch_info, is_condition_block, is_pure_value_node, phi_sources};
+use super::{ConditionContext, branch_at, branch_info, is_pure_value_node, phi_sources};
 
 mod condition;
 mod guards;

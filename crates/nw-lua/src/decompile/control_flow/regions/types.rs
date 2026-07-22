@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use crate::decompile::{analysis::NodeId, region::LinearRegion};
+use crate::{
+    decompile::{analysis::NodeId, boolean::ValuePlan, region::LinearRegion},
+    ir::SsaRef,
+};
 
 use super::super::{
     conditionals::PhiSource,
@@ -16,12 +19,20 @@ pub struct RegionTree {
 pub enum Region {
     Sequence(Vec<Region>),
     Linear(LinearRegion),
+    Value(Box<ValueRegion>),
     If(Box<IfRegion>),
     While(Box<WhileRegion>),
     Repeat(Box<RepeatRegion>),
     NumericFor(Box<NumericForRegion>),
     GenericFor(Box<GenericForRegion>),
     Break,
+}
+
+/// A value-producing control region lowered as one short-circuit expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueRegion {
+    pub prefix: LinearRegion,
+    pub plan: ValuePlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +85,7 @@ pub struct NumericForRegion {
 pub struct GenericForRegion {
     pub prefix: LinearRegion,
     pub info: GenericForLoop,
+    pub setup_nodes: Vec<NodeId>,
     pub body: Region,
 }
 
@@ -103,6 +115,27 @@ impl BlockSet {
 }
 
 impl Region {
+    /// Return whether this region owns reconstruction of an SSA value.
+    #[must_use]
+    pub fn owns_value(&self, value: SsaRef) -> bool {
+        match self {
+            Region::Sequence(regions) => regions.iter().any(|region| region.owns_value(value)),
+            Region::Value(region) => region.plan.dest == value,
+            Region::If(region) => {
+                region.arms.iter().any(|arm| arm.body.owns_value(value))
+                    || region
+                        .else_
+                        .as_ref()
+                        .is_some_and(|else_| else_.owns_value(value))
+            }
+            Region::While(region) => region.body.owns_value(value),
+            Region::Repeat(region) => region.body.owns_value(value),
+            Region::NumericFor(region) => region.body.owns_value(value),
+            Region::GenericFor(region) => region.body.owns_value(value),
+            Region::Linear(_) | Region::Break => false,
+        }
+    }
+
     #[must_use]
     pub fn blocks(&self) -> Vec<usize> {
         let mut set = BTreeSet::new();
@@ -124,6 +157,16 @@ impl Region {
                 for node in &linear.nodes {
                     out.insert(node.block);
                 }
+            }
+            Region::Value(region) => {
+                for block in &region.prefix.covered_blocks {
+                    out.insert(*block);
+                }
+                for node in &region.prefix.nodes {
+                    out.insert(node.block);
+                }
+                out.extend(region.plan.consumed_blocks());
+                out.insert(region.plan.merge);
             }
             Region::If(region) => {
                 region.prefix.nodes.iter().for_each(|node| {

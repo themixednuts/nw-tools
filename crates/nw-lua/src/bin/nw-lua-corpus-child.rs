@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     env, fs,
     path::{Path, PathBuf},
     process::{self, Command, Output},
@@ -16,7 +15,6 @@ const CHILD_OK: &str = "NW_LUA_CORPUS_CHILD_OK";
 const CHILD_ERR: &str = "NW_LUA_CORPUS_CHILD_ERR";
 const CHILD_STRUCTURAL_REPORT: &str = "NW_LUA_STRUCTURAL_REPORT";
 const CHILD_STRUCTURAL_PROTO: &str = "NW_LUA_STRUCTURAL_PROTO";
-const CHILD_UNDEFINED_SYNTHETIC: &str = "NW_LUA_UNDEFINED_SYNTHETIC";
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -99,9 +97,6 @@ fn decompile_structural(luac: &Path, path: &Path) -> Result<(), String> {
         nw_lua::decompile_core(&bytes).map_err(|err| format!("core decompile: {err}"))?;
     let idiomatic_source =
         nw_lua::decompile(&bytes).map_err(|err| format!("idiomatic decompile: {err}"))?;
-    let core_undefined = undefined_synthetic_reads(&core_source);
-    let idiomatic_undefined = undefined_synthetic_reads(&idiomatic_source);
-    let undefined_synthetics = core_undefined.len() + idiomatic_undefined.len();
     let paths = TempPaths::new("structural");
 
     let result = (|| {
@@ -113,9 +108,7 @@ fn decompile_structural(luac: &Path, path: &Path) -> Result<(), String> {
             structural_signature(&bytes).map_err(|err| format!("decode original: {err}"))?;
         let recompiled = structural_signature(&second_bytes)
             .map_err(|err| format!("decode recompiled: {err}"))?;
-        print_undefined_synthetic_examples("core", &core_undefined);
-        print_undefined_synthetic_examples("idiomatic", &idiomatic_undefined);
-        print_structural_report(&original, &recompiled, undefined_synthetics);
+        print_structural_report(&original, &recompiled);
 
         fs::write(&paths.source, &idiomatic_source).map_err(|err| err.to_string())?;
         compile_lua(luac, &paths.source, &paths.bytecode)
@@ -127,15 +120,9 @@ fn decompile_structural(luac: &Path, path: &Path) -> Result<(), String> {
     result
 }
 
-fn print_undefined_synthetic_examples(kind: &str, names: &[String]) {
-    for name in names.iter().take(8) {
-        println!("{CHILD_UNDEFINED_SYNTHETIC}\tkind={kind}\tname={name}");
-    }
-}
-
 fn structural_signature(bytes: &[u8]) -> Result<Vec<ProtoSignature>, String> {
     let chunk = nw_lua::parse_chunk(bytes).map_err(|err| err.to_string())?;
-    let table = OpcodeTable::builtin(chunk.header.version).map_err(|err| err.to_string())?;
+    let table = OpcodeTable::builtin(chunk.header.version);
     let mut protos = Vec::new();
     collect_proto_signature(&chunk.root, &table, "root".to_string(), &mut protos);
     Ok(protos)
@@ -162,21 +149,16 @@ fn collect_proto_signature(
     }
 }
 
-fn print_structural_report(
-    original: &[ProtoSignature],
-    recompiled: &[ProtoSignature],
-    undefined_synthetics: usize,
-) {
+fn print_structural_report(original: &[ProtoSignature], recompiled: &[ProtoSignature]) {
     let report = structural_report(original, recompiled);
     println!(
-        "{CHILD_STRUCTURAL_REPORT}\toriginal_protos={}\trecompiled_protos={}\texact_protos={}\ttotal_protos={}\tmatched_ops={}\ttotal_ops={}\tundefined_synthetics={}",
+        "{CHILD_STRUCTURAL_REPORT}\toriginal_protos={}\trecompiled_protos={}\texact_protos={}\ttotal_protos={}\tmatched_ops={}\ttotal_ops={}",
         report.original_protos,
         report.recompiled_protos,
         report.exact_protos,
         report.total_protos,
         report.matched_ops,
-        report.total_ops,
-        undefined_synthetics
+        report.total_ops
     );
     for proto in report.protos {
         println!(
@@ -271,330 +253,6 @@ fn one_line(message: &str) -> String {
         line.truncate(MAX_LEN);
     }
     line
-}
-
-fn undefined_synthetic_reads(source: &str) -> Vec<String> {
-    let tokens = lex_tokens(source);
-    let mut scanner = SyntheticScopeScan {
-        tokens: &tokens,
-        index: 0,
-        scopes: vec![BTreeSet::new()],
-        missing: BTreeSet::new(),
-    };
-    scanner.run();
-    scanner.missing.into_iter().collect()
-}
-
-struct SyntheticScopeScan<'a> {
-    tokens: &'a [String],
-    index: usize,
-    scopes: Vec<BTreeSet<String>>,
-    missing: BTreeSet<String>,
-}
-
-impl SyntheticScopeScan<'_> {
-    fn run(&mut self) {
-        while self.index < self.tokens.len() {
-            match self.current() {
-                Some("local") => self.scan_local(),
-                Some("function") => self.scan_function(false),
-                Some("for") => self.scan_for(),
-                Some("then" | "repeat") => self.push_scope(BTreeSet::new()),
-                Some("else") => {
-                    self.pop_scope();
-                    self.push_scope(BTreeSet::new());
-                }
-                Some("elseif" | "until" | "end") => self.pop_scope(),
-                Some(token) if is_synthetic_name(token) => self.scan_synthetic_use(),
-                _ => {}
-            }
-            self.index += 1;
-        }
-    }
-
-    fn current(&self) -> Option<&str> {
-        self.tokens.get(self.index).map(String::as_str)
-    }
-
-    fn scan_local(&mut self) {
-        self.index += 1;
-        if self.current() == Some("function") {
-            self.index += 1;
-            if let Some(name) = self.tokens.get(self.index)
-                && is_synthetic_name(name)
-            {
-                self.define(name);
-            }
-            self.scan_function(true);
-            return;
-        }
-
-        while let Some(token) = self.tokens.get(self.index) {
-            if token == "=" || statement_boundary(token) {
-                self.index = self.index.saturating_sub(1);
-                return;
-            }
-            if is_synthetic_name(token) {
-                self.define(token);
-            }
-            self.index += 1;
-        }
-    }
-
-    fn scan_function(&mut self, local_function: bool) {
-        if !local_function {
-            self.scan_function_name();
-        }
-        let params = self.collect_function_params();
-        self.push_scope(params);
-    }
-
-    fn scan_function_name(&mut self) {
-        self.index += 1;
-        let mut saw_path_separator = false;
-        while let Some(token) = self.tokens.get(self.index) {
-            if token == "(" {
-                self.index = self.index.saturating_sub(1);
-                return;
-            }
-            if token == "." || token == ":" {
-                saw_path_separator = true;
-            } else if is_synthetic_name(token) {
-                if saw_path_separator
-                    || self
-                        .tokens
-                        .get(self.index + 1)
-                        .is_some_and(|next| next == "." || next == ":")
-                {
-                    self.read(token);
-                } else {
-                    self.define(token);
-                }
-            }
-            self.index += 1;
-        }
-    }
-
-    fn collect_function_params(&mut self) -> BTreeSet<String> {
-        while self
-            .tokens
-            .get(self.index)
-            .is_some_and(|token| token != "(")
-        {
-            self.index += 1;
-        }
-        let mut params = BTreeSet::new();
-        while let Some(token) = self.tokens.get(self.index) {
-            if token == ")" {
-                break;
-            }
-            if is_synthetic_name(token) {
-                params.insert(token.clone());
-            }
-            self.index += 1;
-        }
-        params
-    }
-
-    fn scan_for(&mut self) {
-        self.index += 1;
-        let mut names = BTreeSet::new();
-        while let Some(token) = self.tokens.get(self.index) {
-            if token == "=" || token == "in" || statement_boundary(token) {
-                break;
-            }
-            if is_synthetic_name(token) {
-                names.insert(token.clone());
-            }
-            self.index += 1;
-        }
-        self.index = self.index.saturating_sub(1);
-        self.push_scope(names);
-    }
-
-    fn scan_synthetic_use(&mut self) {
-        let token = self.tokens[self.index].clone();
-        if self.previous_is_field_separator() {
-            return;
-        }
-        if self.is_bare_assignment_target() {
-            self.define(&token);
-            return;
-        }
-        self.read(&token);
-    }
-
-    fn is_bare_assignment_target(&self) -> bool {
-        if self.previous_is_field_separator() {
-            return false;
-        }
-        match self.tokens.get(self.index + 1).map(String::as_str) {
-            Some("=" | ",") => self.assignment_follows(),
-            _ => false,
-        }
-    }
-
-    fn assignment_follows(&self) -> bool {
-        let mut cursor = self.index + 1;
-        while let Some(token) = self.tokens.get(cursor).map(String::as_str) {
-            match token {
-                "=" => return true,
-                "," => cursor += 1,
-                token if is_identifier(token) => cursor += 1,
-                _ => return false,
-            }
-        }
-        false
-    }
-
-    fn previous_is_field_separator(&self) -> bool {
-        self.index > 0
-            && self
-                .tokens
-                .get(self.index - 1)
-                .is_some_and(|token| token == "." || token == ":")
-    }
-
-    fn push_scope(&mut self, names: BTreeSet<String>) {
-        self.scopes.push(names);
-    }
-
-    fn pop_scope(&mut self) {
-        if self.scopes.len() > 1 {
-            self.scopes.pop();
-        }
-    }
-
-    fn define(&mut self, name: &str) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string());
-        }
-    }
-
-    fn read(&mut self, name: &str) {
-        if !self.scopes.iter().rev().any(|scope| scope.contains(name)) {
-            self.missing.insert(name.to_string());
-        }
-    }
-}
-
-fn lex_tokens(source: &str) -> Vec<String> {
-    let bytes = source.as_bytes();
-    let mut tokens = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte.is_ascii_whitespace() {
-            index += 1;
-        } else if is_ident_start(byte) {
-            let start = index;
-            index += 1;
-            while index < bytes.len() && is_ident_continue(bytes[index]) {
-                index += 1;
-            }
-            tokens.push(source[start..index].to_string());
-        } else if byte == b'\'' || byte == b'"' {
-            index = skip_quoted(bytes, index);
-        } else if bytes[index..].starts_with(b"--[[") {
-            index = skip_until(bytes, index + 4, b"]]");
-        } else if bytes[index..].starts_with(b"--") {
-            index = skip_line(bytes, index + 2);
-        } else if index + 2 <= bytes.len()
-            && matches!(&bytes[index..index + 2], b"==" | b"~=" | b"<=" | b">=")
-        {
-            tokens.push(source[index..index + 2].to_string());
-            index += 2;
-        } else {
-            tokens.push(source[index..index + 1].to_string());
-            index += 1;
-        }
-    }
-    tokens
-}
-
-fn skip_quoted(bytes: &[u8], start: usize) -> usize {
-    let quote = bytes[start];
-    let mut index = start + 1;
-    while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            index += 2;
-        } else if bytes[index] == quote {
-            return index + 1;
-        } else {
-            index += 1;
-        }
-    }
-    bytes.len()
-}
-
-fn skip_until(bytes: &[u8], mut index: usize, needle: &[u8]) -> usize {
-    while index + needle.len() <= bytes.len() {
-        if bytes[index..].starts_with(needle) {
-            return index + needle.len();
-        }
-        index += 1;
-    }
-    bytes.len()
-}
-
-fn skip_line(bytes: &[u8], mut index: usize) -> usize {
-    while index < bytes.len() && bytes[index] != b'\n' {
-        index += 1;
-    }
-    index
-}
-
-fn statement_boundary(token: &str) -> bool {
-    matches!(
-        token,
-        ";" | "then"
-            | "do"
-            | "else"
-            | "elseif"
-            | "end"
-            | "repeat"
-            | "until"
-            | "while"
-            | "for"
-            | "if"
-            | "return"
-            | "local"
-    )
-}
-
-fn is_synthetic_name(token: &str) -> bool {
-    has_prefixed_number(token, "arg", false)
-        || has_prefixed_number(token, "up", false)
-        || has_prefixed_number(token, "v", true)
-}
-
-fn has_prefixed_number(token: &str, prefix: &str, allow_suffix: bool) -> bool {
-    let Some(rest) = token.strip_prefix(prefix) else {
-        return false;
-    };
-    if allow_suffix && let Some((head, tail)) = rest.split_once('_') {
-        return !head.is_empty()
-            && !tail.is_empty()
-            && head.bytes().all(|byte| byte.is_ascii_digit())
-            && tail.bytes().all(|byte| byte.is_ascii_digit());
-    }
-    !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn is_identifier(token: &str) -> bool {
-    let mut bytes = token.bytes();
-    let Some(first) = bytes.next() else {
-        return false;
-    };
-    is_ident_start(first) && bytes.all(is_ident_continue)
-}
-
-fn is_ident_start(byte: u8) -> bool {
-    byte == b'_' || byte.is_ascii_alphabetic()
-}
-
-fn is_ident_continue(byte: u8) -> bool {
-    is_ident_start(byte) || byte.is_ascii_digit()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,9 +1,10 @@
 use super::*;
+use crate::decompile::reconstruction::ReconstructionPlan;
 use crate::{
     bytecode::OpcodeTable,
     chunk::Proto,
     ir::{BasicBlock, SsaFunction, SsaOp, SsaRef, dom},
-    version::LuaVersion,
+    version::LuaTarget,
 };
 use bstr::BString;
 
@@ -34,9 +35,14 @@ fn single_use_temp_inlines_into_expression() {
     ]);
     let analysis = super::super::analysis::analyze(&function);
     let names = NameResolver::new(&proto, &function);
-    let table = OpcodeTable::builtin(LuaVersion::V51).expect("Lua 5.1 opcode table");
+    let table = OpcodeTable::builtin(LuaTarget::V51);
     let booleans = BooleanAnalysis::empty();
-    let mut builder = ExprBuilder::new(&proto, &function, &table, &analysis, &names, &booleans);
+    let plan = ReconstructionPlan::build(
+        &proto, &function, &table, &analysis, &names, &booleans, None,
+    );
+    let mut builder = ExprBuilder::new(
+        &proto, &function, &table, &analysis, &names, &booleans, &plan,
+    );
 
     assert!(builder.can_inline_ref(reg(0, 1), 1));
     let expr = builder.expr_for_ref(reg(1, 1), 1).expect("expr builds");
@@ -79,16 +85,19 @@ fn multi_use_temp_materializes_as_name() {
     ]);
     let analysis = super::super::analysis::analyze(&function);
     let names = NameResolver::new(&proto, &function);
-    let table = OpcodeTable::builtin(LuaVersion::V51).expect("Lua 5.1 opcode table");
+    let table = OpcodeTable::builtin(LuaTarget::V51);
     let booleans = BooleanAnalysis::empty();
-    let mut builder = ExprBuilder::new(&proto, &function, &table, &analysis, &names, &booleans);
+    let plan = ReconstructionPlan::build(
+        &proto, &function, &table, &analysis, &names, &booleans, None,
+    );
+    let mut builder = ExprBuilder::new(
+        &proto, &function, &table, &analysis, &names, &booleans, &plan,
+    );
 
     assert!(!builder.can_inline_ref(reg(0, 1), 1));
-    builder.mark_materialized(reg(0, 1), Name::from("v0"));
-
     assert_eq!(
         builder.expr_for_ref(reg(0, 1), 1).expect("expr builds"),
-        Expr::Name(Name::from("v0"))
+        Expr::Name(Name::from("l0"))
     );
 }
 
@@ -111,7 +120,7 @@ fn proto_with_constants(constants: Vec<Constant>) -> Proto {
         max_stack: 4,
         num_params: 0,
         is_vararg: 0,
-        version: LuaVersion::V51,
+        version: LuaTarget::V51,
     }
 }
 
@@ -122,7 +131,7 @@ fn function_with_nodes(nodes: Vec<SsaNode>) -> SsaFunction {
         source: BString::from(Vec::new()),
         line_defined: 0,
         last_line_defined: 0,
-        version: LuaVersion::V51,
+        version: LuaTarget::V51,
         num_params: 0,
         is_vararg: 0,
         max_stack: 4,
@@ -140,6 +149,5 @@ fn function_with_nodes(nodes: Vec<SsaNode>) -> SsaFunction {
             use_before_def: Vec::new(),
             live_in: Vec::new(),
         },
-        implicit_defs: Vec::new(),
     }
 }

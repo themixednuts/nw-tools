@@ -1,74 +1,21 @@
 use super::*;
 
-#[derive(Debug, Default)]
-pub(super) struct ConstructorPlan {
-    setlists: Vec<SsaNode>,
-    keyed: Vec<SsaNode>,
-    mutation_count: usize,
-    final_use: Option<NodeId>,
-}
+use crate::decompile::multi::table_constructor::TableConstructorPlan;
 
 impl<'a> ExprBuilder<'a> {
     pub(super) fn table_constructor_expr(&mut self, node: &SsaNode) -> Result<Expr, LuaError> {
-        let Some(table_reg) = node.dest.reg_index() else {
-            return Ok(Expr::Table(Vec::new()));
-        };
-        let plan = if self.can_inline_table_constructor(node.dest, node) {
-            self.constructor_plan(node, table_reg)
-        } else {
-            ConstructorPlan::default()
-        };
-        let mut expr_for_ref = |reference, pc, mode| match mode {
-            multi::table_list::ConstructorValueMode::Normal => self.expr_for_ref(reference, pc),
-            multi::table_list::ConstructorValueMode::FixedLast => {
-                self.expr_for_fixed_last_ref(reference, pc)
-            }
-        };
-        let fields = multi::table_list::fields_from_nodes(
-            plan.setlists.iter(),
-            plan.keyed.iter(),
-            &mut expr_for_ref,
-        )?;
-        Ok(Expr::Table(fields))
+        let plan = self
+            .table_constructor_plan(node)
+            .filter(|plan| self.can_inline_table_constructor_plan(node.dest, node, plan));
+        self.table_expr_from_plan(plan.as_ref())
     }
 
     pub(super) fn table_constructor_value_term_expr(
         &mut self,
         node: &SsaNode,
     ) -> Result<Expr, LuaError> {
-        let Some(table_reg) = node.dest.reg_index() else {
-            return Ok(Expr::Table(Vec::new()));
-        };
-        let plan = self.constructor_plan(node, table_reg);
-        if plan.mutation_count == 0 {
-            return Ok(Expr::Table(Vec::new()));
-        }
-        let mut expr_for_ref = |reference, pc, mode| match mode {
-            multi::table_list::ConstructorValueMode::Normal => self.expr_for_ref(reference, pc),
-            multi::table_list::ConstructorValueMode::FixedLast => {
-                self.expr_for_fixed_last_ref(reference, pc)
-            }
-        };
-        let fields = multi::table_list::fields_from_nodes(
-            plan.setlists.iter(),
-            plan.keyed.iter(),
-            &mut expr_for_ref,
-        )?;
-        Ok(Expr::Table(fields))
-    }
-
-    pub(super) fn node_position(&self, needle: &SsaNode) -> Option<(usize, usize)> {
-        self.function
-            .blocks
-            .iter()
-            .enumerate()
-            .find_map(|(block_index, block)| {
-                block
-                    .nodes
-                    .iter()
-                    .position(|node| node.pc == needle.pc && node.dest == needle.dest)
-                    .map(|node_index| (block_index, node_index))
-            })
+        let plan = self.table_constructor_plan(node);
+        self.table_expr_from_plan(plan.as_ref())
     }
 
     pub(super) fn can_inline_new_table(&self, reference: SsaRef, node: &SsaNode) -> bool {
@@ -79,68 +26,57 @@ impl<'a> ExprBuilder<'a> {
     }
 
     pub(super) fn can_inline_table_constructor(&self, reference: SsaRef, node: &SsaNode) -> bool {
-        if !matches!(&node.op, SsaOp::NewTable { .. }) || self.is_stable_named_def(node) {
-            return false;
-        }
-        let Some(table_reg) = node.dest.reg_index() else {
-            return false;
-        };
-        let plan = self.constructor_plan(node, table_reg);
-        plan.mutation_count > 0
-            && plan.final_use.is_some()
-            && self.analysis.facts(reference).mutating_table_uses == plan.mutation_count
-            && self.analysis.real_use_count(reference) == plan.mutation_count + 1
+        self.table_constructor_plan(node)
+            .is_some_and(|plan| self.can_inline_table_constructor_plan(reference, node, &plan))
     }
 
-    pub(super) fn constructor_plan(&self, node: &SsaNode, table_reg: u16) -> ConstructorPlan {
-        let Some((block, node_index)) = self.node_position(node).or_else(|| {
-            self.analysis
-                .def_site(node.dest)
-                .map(|id| (id.block, id.node))
-        }) else {
-            return ConstructorPlan::default();
-        };
+    fn can_inline_table_constructor_plan(
+        &self,
+        reference: SsaRef,
+        node: &SsaNode,
+        plan: &TableConstructorPlan,
+    ) -> bool {
+        matches!(&node.op, SsaOp::NewTable { .. })
+            && !self.is_stable_named_def(node)
+            && plan.mutation_count() > 0
+            && plan.final_use().is_some()
+            && self.analysis.facts(reference).mutating_table_uses == plan.mutation_count()
+            && self.analysis.real_use_count(reference) == plan.mutation_count() + 1
+    }
 
-        let mut plan = ConstructorPlan::default();
-        let mut saw_setup_effect = false;
-        for (offset, current) in self.function.blocks[block]
-            .nodes
-            .iter()
-            .skip(node_index + 1)
-            .enumerate()
-        {
-            if current.is_meta_only {
-                break;
+    fn table_constructor_plan(&self, node: &SsaNode) -> Option<TableConstructorPlan> {
+        let start = self.analysis.def_site(node.dest)?;
+        TableConstructorPlan::recognize(self.function, self.analysis, start)
+    }
+
+    fn table_expr_from_plan(
+        &mut self,
+        plan: Option<&TableConstructorPlan>,
+    ) -> Result<Expr, LuaError> {
+        let (setlists, keyed) = plan.map_or_else(
+            || (Vec::new(), Vec::new()),
+            |plan| {
+                (
+                    self.nodes_for(plan.setlists()),
+                    self.nodes_for(plan.keyed()),
+                )
+            },
+        );
+        let mut expr_for_ref = |reference, pc, mode| match mode {
+            multi::table_list::ConstructorValueMode::Normal => self.expr_for_ref(reference, pc),
+            multi::table_list::ConstructorValueMode::FixedLast => {
+                self.expr_for_fixed_last_ref(reference, pc)
             }
-            let current_id = NodeId {
-                block,
-                node: node_index + offset + 1,
-            };
-            if multi::table_list::is_matching_setlist(current, node.dest, table_reg) {
-                plan.setlists.push(current.clone());
-                plan.mutation_count += 1;
-                continue;
-            }
-            if multi::table_list::is_matching_settable(current, node.dest, table_reg) {
-                plan.keyed.push(current.clone());
-                plan.mutation_count += 1;
-                continue;
-            }
-            if op_uses_ref(&current.op, node.dest) {
-                if saw_setup_effect && !is_parent_constructor_mutation(current, table_reg) {
-                    return ConstructorPlan::default();
-                }
-                plan.final_use = Some(current_id);
-                break;
-            }
-            if multi::table_list::is_constructor_setup(current, table_reg) {
-                if node_has_observable_side_effect(&current.op) {
-                    saw_setup_effect = true;
-                }
-                continue;
-            }
-            break;
-        }
-        plan
+        };
+        let fields =
+            multi::table_list::fields_from_nodes(setlists.iter(), keyed.iter(), &mut expr_for_ref)?;
+        Ok(Expr::Table(fields))
+    }
+
+    fn nodes_for(&self, ids: &[NodeId]) -> Vec<SsaNode> {
+        ids.iter()
+            .filter_map(|id| self.analysis.node(self.function, *id))
+            .cloned()
+            .collect()
     }
 }

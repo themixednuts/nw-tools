@@ -10,7 +10,21 @@ impl<'a> ExprBuilder<'a> {
     }
 
     pub(super) fn expr_for_value_plan_inner(&mut self, plan: &ValuePlan) -> Result<Expr, LuaError> {
-        let expr = match &plan.kind {
+        let expr = self.expr_for_value_plan_kind(plan, &plan.kind)?;
+        Ok(normalize::normalize(expr))
+    }
+
+    fn expr_for_value_plan_kind(
+        &mut self,
+        plan: &ValuePlan,
+        kind: &ValuePlanKind,
+    ) -> Result<Expr, LuaError> {
+        let expr = match kind {
+            ValuePlanKind::Guarded { guards, value } => Expr::Binary {
+                op: ast::BinOp::And,
+                lhs: Box::new(self.expr_for_condition_segments(guards)?),
+                rhs: Box::new(self.expr_for_value_plan_kind(plan, value)?),
+            },
             ValuePlanKind::Binary { left, op, right } => Expr::Binary {
                 op: op.ast_op(),
                 lhs: Box::new(self.expr_for_value_term(*left, plan.pc)?),
@@ -121,6 +135,52 @@ impl<'a> ExprBuilder<'a> {
                 self.branch_expr_from_node(node, *inverted)?
             }
         };
+        Ok(expr)
+    }
+
+    pub(crate) fn expr_for_condition_segments(
+        &mut self,
+        segments: &[crate::decompile::boolean::ConditionSegment],
+    ) -> Result<Expr, LuaError> {
+        let Some(first) = segments.first() else {
+            return Ok(Expr::True);
+        };
+        let mut and_expr = self.expr_for_condition_segment(first)?;
+        let mut or_terms = Vec::new();
+
+        for pair in segments.windows(2) {
+            let [left, right] = pair else {
+                continue;
+            };
+            let Some(connector) = left.connector else {
+                continue;
+            };
+            let rhs = self.expr_for_condition_segment(right)?;
+            match connector {
+                crate::decompile::boolean::BoolConnector::And => {
+                    and_expr = Expr::Binary {
+                        op: connector.ast_op(),
+                        lhs: Box::new(and_expr),
+                        rhs: Box::new(rhs),
+                    };
+                }
+                crate::decompile::boolean::BoolConnector::Or => {
+                    or_terms.push(and_expr);
+                    and_expr = rhs;
+                }
+            }
+        }
+        or_terms.push(and_expr);
+
+        let mut terms = or_terms.into_iter();
+        let mut expr = terms.next().unwrap_or(Expr::True);
+        for rhs in terms {
+            expr = Expr::Binary {
+                op: ast::BinOp::Or,
+                lhs: Box::new(expr),
+                rhs: Box::new(rhs),
+            };
+        }
         Ok(normalize::normalize(expr))
     }
 

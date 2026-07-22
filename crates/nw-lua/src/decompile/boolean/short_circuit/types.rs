@@ -54,6 +54,12 @@ impl ValuePlan {
 /// Expression payload for a value select.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValuePlanKind {
+    /// A control condition whose successful edge enters another value select,
+    /// while its failed edge supplies `false` to the same PHI.
+    Guarded {
+        guards: Vec<ConditionSegment>,
+        value: Box<ValuePlanKind>,
+    },
     Binary {
         left: ValueTerm,
         op: BoolConnector,

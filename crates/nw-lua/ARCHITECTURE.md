@@ -1,12 +1,16 @@
 # nw-lua — Lua bytecode disassembler & decompiler
 
-A version-aware Lua bytecode (`.luac`) disassembler and SSA-based decompiler, ported
-to idiomatic Rust from the Free Pascal project `cLuaDecompiler`
-(`E:\Projects\LuaDecompiler`, AGPL-3.0 reference — see licensing note below).
+A version-aware Lua bytecode (`.luac`) disassembler and SSA-based decompiler,
+derived algorithmically from
+[`Coldzer0/LuaDecompiler`](https://github.com/Coldzer0/LuaDecompiler) at commit
+`e75c48a73008187e88cc5a50a2dd06b884247923` (the local fixed clone is
+`E:\Projects\LuaDecompiler`). The Free Pascal reference is AGPL-3.0; see the
+licensing note below.
 
-**Primary target: Lua 5.1** (New World / Lumberyard-O3DE ScriptContext ships PUC-Rio
-Lua 5.1 `lundump` bytecode). The architecture is version-aware for 5.1–5.5, but 5.1 is
-made fully correct and validated first; 5.2–5.5 are layered on afterward.
+**Complete target: Lua 5.1** (New World / Lumberyard-O3DE ScriptContext ships PUC-Rio
+Lua 5.1 `lundump` bytecode). `LuaVersion` recognizes 5.1–5.5 only at the input
+boundary. `LuaTarget` admits a release to chunk decoding, SSA, and decompilation
+only after that entire pipeline is implemented; today it contains only 5.1.
 
 > **Licensing:** The upstream reference is AGPL-3.0. The repository owner has chosen to
 > keep `nw-lua` under the workspace's MIT license anyway. Do **not** add AGPL headers.
@@ -35,7 +39,10 @@ disasm::disassemble  ──►  textual disassembly (--dis)                [LuaD
   │  ir::lift + ir::ssa      CFG → dominators → φ → rename           [LuaSSA.pas / LuaSSAPasses.pas]
   ▼
 SsaFunction { blocks, nodes, φ }  ──►  ssa dump (--ssa-dump)
-  │  decompile               SSA → **Lua AST**  (NOT strings)        [LuaDecomp*.inc]
+  │  analyses + structuring  SSA → ControlComponent set + RegionTree + ReconstructionPlan
+  ▼
+ControlComponent set + RegionTree + ReconstructionPlan { values, bindings, node schedule }
+  │  lower                   planned ownership → **Lua AST** (NOT strings)
   ▼
 ast::Block  (structured Stmt/Expr tree)
   │  codegen                 AST → Lua source (pretty-printer)       [replaces EmitNode string concat]
@@ -47,8 +54,9 @@ String  (--dec)
 
 1. **AST, not string pushing.** Decompilation builds a structured tree and materializes it
    into a `full_moon::ast::Block` (the spec-compliant Lua 5.1–5.4 AST) via a thin `emit`
-   builder adapter — never by string concatenation. `stylua` normalizes formatting, and every
-   emitted result is re-parsed by `full_moon` as a validity gate. Decision + evidence:
+   builder adapter — never by string concatenation. The completed AST is passed directly to
+   `stylua` after token positions are materialized, avoiding a redundant stringify/reparse
+   boundary. Every formatted result is still re-parsed by `full_moon` as a validity gate. Decision + evidence:
    `docs/AST_DECISION.md`. The heavy tree manipulation (inlining, De Morgan, control-flow
    structuring) happens on the **SSA / region** layer; the Lua AST is only the final
    materialization target, built once, fully-formed.
@@ -56,8 +64,11 @@ String  (--dec)
 3. **Idiomatic Rust**: owned trees (`Vec<Proto>` not raw pointers), `enum` with data for
    sum types (SSA ops, AST nodes), `Result<_, LuaError>` (thiserror) not sentinels,
    iterators, `&[u8]`/`bstr` for Lua's byte-strings (Lua strings are **not** UTF-8).
-4. **Version-aware, 5.1-first.** Everything routes through `LuaVersion` + `OpcodeTable`.
-   Do not hardcode 5.1 field widths; read them from the active `OpcodeTable`.
+4. **Complete targets, not partial versions.** Input detection produces a
+   `LuaVersion`; the single boundary conversion to `LuaTarget` rejects releases
+   without a complete parse-to-source pipeline. Everything afterward routes
+   through `LuaTarget` + `OpcodeTable`. Do not hardcode instruction field widths;
+   read them from the active table.
 5. **Clippy-clean** under the workspace lints (correctness/suspicious = deny).
 6. **Small, single-responsibility files — no monoliths.** Strive for small, focused files
    (a few hundred lines); **hard cap ~1000 lines** — split before you hit it, don't sit at it.
@@ -97,7 +108,7 @@ crates/nw-lua/
   src/
     lib.rs                   public API: parse / disassemble / decompile / build_ssa
     error.rs                 LuaError (thiserror)
-    version.rs               LuaVersion { V51, V52, V53, V54, V55 } + detection
+    version.rs               recognized LuaVersion + complete LuaTarget capability
     chunk/                   [LuaChunk.pas]
       mod.rs                 Chunk, Proto, Constant, LocVar, UpvalDesc, Header
       reader.rs              ByteReader: endian, sizes, varints, per-version string formats
@@ -107,7 +118,7 @@ crates/nw-lua/
       mod.rs
       semantic.rs            SemanticOp enum (~90, version-independent) + names + parse
       table.rs               OpcodeTable (field widths + raw→SemanticOp map),
-                             builtin tables 5.1–5.5, custom-table text loader
+                             exhaustive target selection + custom-table loader
       instruction.rs         Instruction (decoded A/B/C/Bx/sBx/Ax/sJ/k, RK helpers)
     disasm/
       mod.rs                 disassemble(proto/chunk) -> String   [LuaDis.pas]
@@ -117,19 +128,33 @@ crates/nw-lua/
       dom.rs                 dominators (petgraph simple_fast) + dominance frontiers
       ssa.rs                 φ placement (Cytron) + rename
       lift.rs                Instruction (SemanticOp) → SsaNode lifting
-      passes.rs              SSA simplification/cleanup passes  [LuaSSAPasses.pas]
+      operands.rs            authoritative use/def roles, effect facts, loop-control operands
+      table.rs               typed NEWTABLE floating-byte allocation/source-count hints
+      passes.rs              typed pass pipeline, schedules, reports, analysis cache
+      passes/simplify.rs     conservative SSA cleanup transforms [LuaSSAPasses.pas]
       dump.rs                DumpSSA equivalent (--ssa-dump)
     decompile/               [LuaDecomp*.inc] — SSA → decompiler IR (never strings)
       mod.rs                 Decompiler driver, DecompOptions, per-proto
       ast/                   compact decompiler IR (the working tree passes build + rewrite).
         mod.rs               re-exports; Block, Name, BinOp, UnOp, TableField, FuncBody
+        bindings.rs          one identity-aware usage/collision/rename traversal
         stmt.rs              Stmt
         expr.rs              Expr
-      region.rs              control-flow region detection (linear/if/while/repeat/for)
-      control_flow.rs        [LuaDecompCF.inc]  (split into a dir if it grows)
-      boolean.rs             [LuaDecompBoolean.inc] short-circuit / De Morgan
-      expr_build.rs          [LuaDecompExpr.inc]  SSA value → ast::Expr, inlining, use-counts
-      multi.rs               [LuaDecompMulti.inc] multi-assign / multi-return
+      control_flow/          typed region detection and lowering (linear/if/while/repeat/for)
+        regions/assembly.rs  CFG + control components → RegionTree
+        conditionals.rs      branch polarity, reachability, merge, and PHI facts
+        loops.rs             numeric, generic, and natural loop facts
+      boolean/               one indexed ControlComponent set for conditions and values
+        short_circuit/       typed condition/value plans and guarded composition
+      expr_build/            planned SSA value → ast::Expr lowering
+      reconstruction.rs      immutable value, declaration, constructor, and node ownership plan
+      reconstruction/regions.rs  region projections used by reconstruction planning
+      stmt_build/            monotonic RegionTree + ReconstructionPlan → ast::Stmt lowering
+      multi/                 [LuaDecompMulti.inc] multi-value and constructor recovery
+        plan.rs              typed omitted/standalone/owner/member node-emission schedule
+        assign.rs            planned tuple declaration, swap, and call-result transfer lowering
+        table_constructor.rs one reusable nested constructor plan from SSA + NEWTABLE hints
+        table_list.rs        constructor fields and SETLIST multi-result semantics
       closure.rs             [LuaDecompClosure.inc] nested funcs / upvalues
       naming.rs              [LuaDecompNaming.inc] local/arg/global naming heuristics
     emit/                    the ONLY module that produces Lua text / touches full_moon
@@ -138,12 +163,14 @@ crates/nw-lua/
       lower.rs               decompile::ast → full_moon::ast::Block (precedence/parens),
                              then stylua_lib::format_code + full_moon reparse gate
     bin/
-      main.rs                CLI: --dis --dec --ssa-dump --annotate --lua-version --opcode-table
+      nw-lua.rs              CLI: --dis --dec --ssa-dump --annotate --lua-version --opcode-table
   tests/                     integration tests + fixtures
 ```
 
-Reference-file → module mapping is authoritative: when implementing a module, read the
-mapped `.pas`/`.inc` file(s) in `E:\Projects\LuaDecompiler` for the exact algorithm.
+Reference-file → module mapping is authoritative for algorithm recovery: read
+the mapped `.pas`/`.inc` file in the fixed Coldzer0 clone, then express its facts
+through the Rust boundaries above rather than porting its string-oriented object
+shape.
 
 ---
 
@@ -155,6 +182,7 @@ Byte-strings: Lua constants/names are raw bytes. Use `bstr::BString` for owned,
 ```rust
 // version.rs
 pub enum LuaVersion { V51, V52, V53, V54, V55 }
+pub enum LuaTarget { V51 }
 
 // chunk/mod.rs
 pub enum Constant { Nil, Boolean(bool), Number(f64), Integer(i64), Str(BString) }
@@ -170,7 +198,7 @@ pub struct Proto {
     pub protos: Vec<Proto>,            // owned nested functions (no raw pointers)
     pub loc_vars: Vec<LocVar>,
     pub max_stack: u8, pub num_params: u8, pub is_vararg: u8,
-    pub version: LuaVersion,
+    pub version: LuaTarget,
 }
 
 // bytecode/semantic.rs  — one variant per abstract op across all versions
@@ -180,7 +208,7 @@ pub enum SemanticOp { Move, LoadK, LoadBool, LoadNil, GetUpval, GetGlobal, GetTa
 
 // bytecode/table.rs
 pub struct OpcodeTable {
-    pub version: LuaVersion,
+    pub version: LuaTarget,
     pub op_bits: u8, pub a_bits: u8, pub b_bits: u8, pub c_bits: u8,
     // + Bx/sBx/Ax/sJ/K derivation; RK bit position
     pub map: Vec<SemanticOp>,          // raw opcode ordinal → SemanticOp
@@ -195,11 +223,29 @@ pub enum BinOp { Add, Sub, Mul, Div, Mod, Pow, IDiv, BAnd, BOr, BXor, Shl, Shr }
 pub enum UnOp  { Neg, Not, Len, BNot }
 pub enum RelOp { Eq, Lt, Le, Test, TestSet }
 // SSA node: common fields + an op enum carrying variant data (idiomatic; replaces the
-// reference's flat TSSANode record with kind tag). Keep generic operand access ergonomic.
+// reference's flat TSSANode record with kind tag). Multi-register instructions own their
+// versioned secondary definitions; no function-global implicit-def side table or pseudo nodes.
 pub struct SsaNode { pub pc: i32, pub line: i32, pub dest: SsaRef, pub op: SsaOp, … }
 pub enum SsaOp { Nop, Phi { operands: Vec<SsaRef>, blocks: Vec<usize> }, Move(SsaRef),
-    LoadK(u32), /* … */ Branch { rel: RelOp, a: SsaRef, b: SsaRef, invert: bool,
+    LoadK(u32), NewTable { array_hint: TableSizeHint, hash_hint: TableSizeHint },
+    /* … */ Branch { rel: RelOp, a: SsaRef, b: SsaRef, invert: bool,
     t_true: i32, t_false: i32 }, Call { … }, /* … */ }
+
+// Every analysis and transform uses these capabilities rather than matching SsaOp again:
+// SsaOp::visit_uses / rewrite_uses (with UseRole), SsaNode::visit_defs,
+// SsaOp::effects, and SsaOp::control_flow_role. Numeric/generic loop control windows are
+// LoopControl values containing three versioned SsaRefs, not unversioned base arithmetic.
+
+// SSA construction owns a typed PassPipeline. PassChange declares preserved analyses;
+// PassContext lazily caches value facts and invalidates them centrally. Each pass runs once
+// or to a bounded fixpoint and produces a deterministic report. SSA construction runs no
+// simplifying transform: even safe folds can erase provenance needed for source/debug bindings.
+// The cleanup pipeline is explicit and opt-in.
+
+// Preserve NEWTABLE's encoded floating-byte operand. It is an exact source
+// field count only where Lua 5.1's int2fb mapping is injective; larger values
+// are allocation capacities and must not be treated as constructor boundaries.
+pub struct TableSizeHint(u16);
 
 // decompile/ast — the decompiler's COMPACT WORKING IR. This is NOT "a second Lua AST":
 // full_moon remains the sole spec-compliant AST and the output. This IR is the medium the
@@ -266,7 +312,12 @@ Vertical, tracer-bullet slices. Each phase must `cargo build -p nw-lua`,
 - **P6 — Boolean / short-circuit** (`boolean.rs`): and/or, De Morgan, comparison chains.
 - **P7 — Multi-assign / multi-return** (`multi.rs`).
 - **P8 — Closures / upvalues** (`closure.rs`), recursive proto decompile.
-- **P9 — Naming heuristics** (`naming.rs`).
+- **P9 — Naming heuristics** (`naming.rs`). Debug identifiers are authoritative.
+  Anonymous bindings use deterministic role prefixes (`aN` parameter, `lN` local,
+  `uN` upvalue), while receiver proof may rename a synthetic first parameter to
+  `self`. Physical register reuse is not binding identity: initializer ownership
+  follows the SSA value entering the debug-local lifetime, so a call initializer
+  emits `local x = f(...)` instead of naming the pre-call function temporary `x`.
 - **P9b — Idiomatic clean-code emitter.** A **semantics-preserving** AST→AST cleanup applied by the
   driver *before* `emit`. Built as ONE clean abstraction, **not a bloated rulebook**:
   - a single generic **bottom-up AST rewriter** (fold/visitor over `Block`/`Stmt`/`Expr`) that
@@ -291,7 +342,7 @@ Vertical, tracer-bullet slices. Each phase must `cargo build -p nw-lua`,
   Rules: casing uses the **`heck`** crate (`ToUpperCamelCase`=PascalCase, `ToLowerCamelCase`,
   `ToShoutySnakeCase`=UPPER_SNAKE) — never hand-rolled. All renames are **binding-aware** (rewrite a
   binding's chosen name + every use, never text replacement) and apply to **synthetic names only**.
-  Aggressiveness = **conservative** (keep opaque `vN` unless a role is provable); **do** rename a
+  Aggressiveness = **conservative** (keep opaque `lN` unless a stronger role is provable); **do** rename a
   recognized synthetic module table to PascalCase from the chunk source/file stem when reliable.
 - **P9c — Corpus hardening** (done): real NW corpus 80%→99%, 0 crashes; residual ~1% are honest `Err`.
 - **P10 — CLI + validation harness** parity with the reference; wire options; fixtures.
@@ -317,7 +368,9 @@ Vertical, tracer-bullet slices. Each phase must `cargo build -p nw-lua`,
   types + number formats, chunk-format edge cases, arg modes, language constructs, string escapes)
   vs the 5.1.5 manual + `lundump.c`/`lopcodes.h`/`lvm.c`. Report in `docs/LUA51_COVERAGE.md`; finish
   any gaps cleanly before P11.
-- **P11+ — Extend to 5.2–5.5**: chunk formats, opcode tables, semantics, per-version tests.
+- **P11+ — Extend one complete target at a time**: for each later release, land
+  its chunk format, opcode table, semantics, source AST/emitter support, runtime
+  tests, and corpus gate before adding its `LuaTarget` variant.
 
 New World specifics to keep in mind: NW bytecode is standard PUC 5.1 `lundump`, but may
 use a **custom/shuffled opcode table** — the `--opcode-table` loader (P1/P10) is important

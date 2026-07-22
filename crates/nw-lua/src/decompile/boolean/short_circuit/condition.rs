@@ -1,13 +1,9 @@
 use super::helpers::condition_segments;
 use super::*;
 
-pub fn condition_chain(
-    function: &SsaFunction,
-    expr_analysis: &DecompileAnalysis,
-    start: usize,
-    pc_map: &[Option<usize>],
-    loop_headers: &BlockSet,
-) -> Option<ConditionChain> {
+pub fn condition_chain(context: &ConditionContext<'_>, start: usize) -> Option<ConditionChain> {
+    let function = context.function;
+    let pc_map = context.pc_map;
     let first = branch_info(function, start, pc_map)?;
     if branch_rel(function, first.node)? == RelOp::TestSet {
         return None;
@@ -17,7 +13,7 @@ pub fn condition_chain(
     let mut current = start;
     let mut steps = 0;
     loop {
-        if steps >= 32 || (current != start && loop_headers.contains(current)) {
+        if steps >= 32 || (current != start && context.loop_headers.contains(current)) {
             return None;
         }
         steps += 1;
@@ -27,38 +23,10 @@ pub fn condition_chain(
         }
         blocks.push(current);
 
-        let true_is_cond = is_condition_block(
-            function,
-            expr_analysis,
-            info.true_block,
-            pc_map,
-            loop_headers,
-        ) && is_chain_continuation(
-            function,
-            expr_analysis,
-            info,
-            info.true_block,
-            info.false_block,
-            &blocks,
-            pc_map,
-            loop_headers,
-        );
-        let false_is_cond = is_condition_block(
-            function,
-            expr_analysis,
-            info.false_block,
-            pc_map,
-            loop_headers,
-        ) && is_chain_continuation(
-            function,
-            expr_analysis,
-            info,
-            info.false_block,
-            info.true_block,
-            &blocks,
-            pc_map,
-            loop_headers,
-        );
+        let true_is_cond = context.is_condition_block(info.true_block)
+            && is_chain_continuation(context, info, info.true_block, info.false_block, &blocks);
+        let false_is_cond = context.is_condition_block(info.false_block)
+            && is_chain_continuation(context, info, info.false_block, info.true_block, &blocks);
         match (true_is_cond, false_is_cond) {
             (true, _) => current = info.true_block,
             (false, true) => current = info.false_block,
@@ -124,17 +92,14 @@ pub(super) fn condition_chain_targets_are_closed(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn is_chain_continuation(
-    function: &SsaFunction,
-    expr_analysis: &DecompileAnalysis,
+    context: &ConditionContext<'_>,
     info: conditionals::BranchInfo,
     target: usize,
     sibling: usize,
     chain_blocks: &[usize],
-    pc_map: &[Option<usize>],
-    loop_headers: &BlockSet,
 ) -> bool {
+    let function = context.function;
     let Some(block) = function.blocks.get(target) else {
         return false;
     };
@@ -147,34 +112,15 @@ pub(super) fn is_chain_continuation(
         let sibling = conditionals::follow_jmp_only(function, sibling, None);
         return shares_sibling_successor(function, target, sibling)
             || (!conditionals::is_terminal_block(function, sibling)
-                && condition_only_reaches(
-                    function,
-                    expr_analysis,
-                    target,
-                    sibling,
-                    pc_map,
-                    loop_headers,
-                )
+                && condition_only_reaches(context, target, sibling)
                 && sibling_preds_are_owned(
-                    function,
-                    expr_analysis,
+                    context,
                     info.node.block,
                     target,
                     sibling,
                     chain_blocks,
-                    pc_map,
-                    loop_headers,
                 ))
-            || reaches_sibling_terminal(
-                function,
-                expr_analysis,
-                info.node.block,
-                target,
-                sibling,
-                chain_blocks,
-                pc_map,
-                loop_headers,
-            );
+            || reaches_sibling_terminal(context, info.node.block, target, sibling, chain_blocks);
     }
     let sibling = conditionals::follow_jmp_only(function, sibling, None);
     conditionals::is_terminal_block(function, sibling)
@@ -215,47 +161,26 @@ pub(super) fn shares_sibling_successor(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn reaches_sibling_terminal(
-    function: &SsaFunction,
-    expr_analysis: &DecompileAnalysis,
+    context: &ConditionContext<'_>,
     current: usize,
     target: usize,
     sibling: usize,
     chain_blocks: &[usize],
-    pc_map: &[Option<usize>],
-    loop_headers: &BlockSet,
 ) -> bool {
+    let function = context.function;
     let sibling = conditionals::follow_jmp_only(function, sibling, None);
     conditionals::is_terminal_block(function, sibling)
-        && condition_only_reaches(
-            function,
-            expr_analysis,
-            target,
-            sibling,
-            pc_map,
-            loop_headers,
-        )
-        && sibling_preds_are_owned(
-            function,
-            expr_analysis,
-            current,
-            target,
-            sibling,
-            chain_blocks,
-            pc_map,
-            loop_headers,
-        )
+        && condition_only_reaches(context, target, sibling)
+        && sibling_preds_are_owned(context, current, target, sibling, chain_blocks)
 }
 
 pub(super) fn condition_only_reaches(
-    function: &SsaFunction,
-    expr_analysis: &DecompileAnalysis,
+    context: &ConditionContext<'_>,
     start: usize,
     target: usize,
-    pc_map: &[Option<usize>],
-    loop_headers: &BlockSet,
 ) -> bool {
+    let function = context.function;
     if start >= function.blocks.len() || target >= function.blocks.len() {
         return false;
     }
@@ -271,9 +196,7 @@ pub(super) fn condition_only_reaches(
         }
         seen[block] = true;
 
-        if !is_condition_block(function, expr_analysis, block, pc_map, loop_headers)
-            && !conditionals::is_jmp_only(function, block)
-        {
+        if !context.is_condition_block(block) && !conditionals::is_jmp_only(function, block) {
             continue;
         }
         stack.extend(function.blocks[block].succs.iter().copied());
@@ -282,35 +205,25 @@ pub(super) fn condition_only_reaches(
     false
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn sibling_preds_are_owned(
-    function: &SsaFunction,
-    expr_analysis: &DecompileAnalysis,
+    context: &ConditionContext<'_>,
     current: usize,
     target: usize,
     sibling: usize,
     chain_blocks: &[usize],
-    pc_map: &[Option<usize>],
-    loop_headers: &BlockSet,
 ) -> bool {
+    let function = context.function;
     let Some(block) = function.blocks.get(sibling) else {
         return false;
     };
     block.preds.iter().copied().all(|pred| {
-        condition_only_reaches(function, expr_analysis, target, pred, pc_map, loop_headers)
+        condition_only_reaches(context, target, pred)
             || function.blocks.get(pred).is_some_and(|pred_block| {
                 conditionals::is_jmp_only(function, pred)
                     && pred_block.preds.iter().copied().all(|jump_pred| {
                         jump_pred == current
                             || chain_blocks.contains(&jump_pred)
-                            || condition_only_reaches(
-                                function,
-                                expr_analysis,
-                                target,
-                                jump_pred,
-                                pc_map,
-                                loop_headers,
-                            )
+                            || condition_only_reaches(context, target, jump_pred)
                     })
             })
     })

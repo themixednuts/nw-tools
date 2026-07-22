@@ -179,7 +179,7 @@ impl<'a> Engine<'a> {
                 var,
                 start: self.fold_expr(start, ctx, &mut changed),
                 stop: self.fold_expr(stop, ctx, &mut changed),
-                step: step.map(|step| self.fold_expr(step, ctx, &mut changed)),
+                step: step.map(|step| Box::new(self.fold_expr(*step, ctx, &mut changed))),
                 body: self.fold_child_block(body, &ctx.control_block(), &mut changed),
             },
             Stmt::GenericFor { names, exprs, body } => Stmt::GenericFor {

@@ -481,6 +481,39 @@ return M
 }
 
 #[test]
+fn guarded_value_component_preserves_entire_condition_prefix() {
+    let bytecode = match compile_source_bytes(
+        "guarded_value_component_shape",
+        r#"
+local NaNStringSet = {}
+local infinity = 1 / 0
+local negativeInfinity = -1 / 0
+local function usable(number)
+    return type(number) == "number" and number > negativeInfinity and number < infinity and (number ~= 0 or not NaNStringSet[tostring(number)])
+end
+return usable
+"#,
+        false,
+    ) {
+        Some(bytecode) => bytecode,
+        None => return,
+    };
+    let decompiled = nw_lua::decompile(&bytecode).expect("guarded value component decompiles");
+
+    for operand in [
+        "return type(number) == \"number\"",
+        "and negativeInfinity < number",
+        "and number < infinity",
+        "and (number ~= 0 or not NaNStringSet[tostring(number)])",
+    ] {
+        assert!(
+            decompiled.contains(operand),
+            "guarded value component dropped `{operand}`:\n{decompiled}"
+        );
+    }
+}
+
+#[test]
 fn convert_seconds_short_circuit_reconstruction_is_faithful() {
     let source = Path::new(r"E:\Projects\DEMOJSON\lyshineui\_common\timehelperfunctions.lua");
     let bytecode = match compile_file_bytes("r2_timehelper", source, false) {

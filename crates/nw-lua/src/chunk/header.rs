@@ -1,6 +1,9 @@
 //! Lua binary chunk header parsing.
 
-use crate::{LuaError, version::LuaVersion};
+use crate::{
+    LuaError,
+    version::{LuaTarget, LuaVersion},
+};
 
 use super::{Header, reader::ByteReader};
 
@@ -24,11 +27,9 @@ pub fn parse_header(reader: &mut ByteReader<'_>) -> Result<Header, LuaError> {
     let Some(version) = LuaVersion::from_byte(version_byte) else {
         return Err(LuaError::UnsupportedVersion(version_byte));
     };
-    if version != LuaVersion::V51 {
-        return Err(LuaError::UnsupportedVersion(version_byte));
+    match LuaTarget::for_version(version)? {
+        LuaTarget::V51 => parse_header_51(reader),
     }
-
-    parse_header_51(reader)
 }
 
 fn parse_header_51(reader: &mut ByteReader<'_>) -> Result<Header, LuaError> {
@@ -72,7 +73,7 @@ fn parse_header_51(reader: &mut ByteReader<'_>) -> Result<Header, LuaError> {
     };
 
     Ok(Header {
-        version: LuaVersion::V51,
+        version: LuaTarget::V51,
         format,
         little_endian,
         int_size,

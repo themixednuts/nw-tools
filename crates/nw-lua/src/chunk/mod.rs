@@ -2,7 +2,7 @@
 
 use bstr::BString;
 
-use crate::{LuaError, version::LuaVersion};
+use crate::{LuaError, version::LuaTarget};
 
 pub mod header;
 pub mod proto;
@@ -21,7 +21,7 @@ pub struct Chunk {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     /// Lua bytecode version.
-    pub version: LuaVersion,
+    pub version: LuaTarget,
     /// Binary chunk format byte. Official Lua 5.1 chunks use `0`.
     pub format: u8,
     /// Whether numeric fields are little-endian.
@@ -72,7 +72,7 @@ pub struct Proto {
     /// Lua 5.1 vararg flag byte.
     pub is_vararg: u8,
     /// Version that produced this proto.
-    pub version: LuaVersion,
+    pub version: LuaTarget,
 }
 
 /// Constant pool entry.

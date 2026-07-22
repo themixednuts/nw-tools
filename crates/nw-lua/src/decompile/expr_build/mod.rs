@@ -1,5 +1,10 @@
 //! SSA value to compact expression reconstruction for Phase 4.
 
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
+
 use bstr::BString;
 
 use crate::{
@@ -12,10 +17,11 @@ use crate::{
 };
 
 use super::{
-    analysis::{DecompileAnalysis, NodeId, ValueId, for_each_use, node_has_observable_side_effect},
+    analysis::{DecompileAnalysis, NodeId, ValueId},
     boolean::{BooleanAnalysis, ValuePlan, ValuePlanKind, ValueTerm, normalize},
     closure, multi,
     naming::{NameResolver, is_valid_identifier},
+    reconstruction::ReconstructionPlan,
 };
 
 mod boolean;
@@ -29,15 +35,13 @@ mod inline;
 mod tests;
 
 use helpers::{
-    constructor_mutation_table, direct_eval_order_refs, is_parent_constructor_mutation,
-    is_pure_def, map_bin_op, map_un_op, op_uses_ref,
+    constructor_mutation_table, direct_eval_order_refs, is_pure_def, map_bin_op, map_un_op,
 };
 pub(crate) use helpers::{
     global_expr_from_name, ident_from_string_expr, index_expr, is_inlineable_def,
 };
 
-/// Builds expressions while remembering values materialized by statement
-/// reconstruction.
+/// Builds expressions from the immutable reconstruction plan.
 #[derive(Debug)]
 pub struct ExprBuilder<'a> {
     proto: &'a Proto,
@@ -46,9 +50,13 @@ pub struct ExprBuilder<'a> {
     analysis: &'a DecompileAnalysis,
     names: &'a NameResolver<'a>,
     booleans: &'a BooleanAnalysis,
-    materialized: Vec<Vec<Option<Name>>>,
+    plan: &'a ReconstructionPlan,
+    activated: Vec<Vec<bool>>,
     visiting: Vec<Vec<bool>>,
     chain_inline_blocks: Vec<usize>,
+    inline_cache: RefCell<HashMap<(SsaRef, i32), bool>>,
+    inline_visiting: RefCell<HashSet<(SsaRef, i32)>>,
+    evaluation_index_cache: RefCell<HashMap<(SsaRef, NodeId), Option<usize>>>,
 }
 
 impl<'a> ExprBuilder<'a> {
@@ -60,6 +68,7 @@ impl<'a> ExprBuilder<'a> {
         analysis: &'a DecompileAnalysis,
         names: &'a NameResolver<'a>,
         booleans: &'a BooleanAnalysis,
+        plan: &'a ReconstructionPlan,
     ) -> Self {
         Self {
             proto,
@@ -68,15 +77,18 @@ impl<'a> ExprBuilder<'a> {
             analysis,
             names,
             booleans,
-            materialized: vec![Vec::new(); function.num_regs],
+            plan,
+            activated: vec![Vec::new(); function.num_regs],
             visiting: vec![Vec::new(); function.num_regs],
             chain_inline_blocks: Vec::new(),
+            inline_cache: RefCell::new(HashMap::new()),
+            inline_visiting: RefCell::new(HashSet::new()),
+            evaluation_index_cache: RefCell::new(HashMap::new()),
         }
     }
 
-    /// Remember that a value was emitted as a statement and must be referenced
-    /// by name afterward.
-    pub fn mark_materialized(&mut self, reference: SsaRef, name: Name) {
+    /// Activate a materialization decision after its declaration is emitted.
+    pub fn activate(&mut self, reference: SsaRef) {
         let Some(value) = ValueId::from_ref(reference) else {
             return;
         };
@@ -84,17 +96,13 @@ impl<'a> ExprBuilder<'a> {
         let Ok(version) = usize::try_from(value.ver) else {
             return;
         };
-        if reg >= self.materialized.len() {
-            self.materialized.resize_with(reg + 1, Vec::new);
+        if reg >= self.activated.len() {
+            self.activated.resize_with(reg + 1, Vec::new);
         }
-        if version >= self.materialized[reg].len() {
-            self.materialized[reg].resize(version + 1, None);
+        if version >= self.activated[reg].len() {
+            self.activated[reg].resize(version + 1, false);
         }
-        self.materialized[reg][version] = Some(name);
-    }
-
-    pub(crate) fn is_materialized(&self, reference: SsaRef) -> bool {
-        self.materialized_name(reference).is_some()
+        self.activated[reg][version] = true;
     }
 
     pub(crate) fn with_chain_inline_blocks<T>(

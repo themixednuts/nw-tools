@@ -3,7 +3,7 @@ use nw_lua::{
     chunk::Proto,
     disasm::{disassemble_chunk, disassemble_proto},
     parse_chunk,
-    version::LuaVersion,
+    version::LuaTarget,
 };
 
 const SHOPCOMMON: &[u8] = include_bytes!("fixtures/shopcommon.luac");
@@ -117,7 +117,7 @@ fn disassembles_shopcommon_and_nested_proto_stably() {
 fn parses_custom_opcode_table_text() {
     let table = OpcodeTable::from_custom_text(IDLE_HEROES_TABLE).expect("custom table parses");
 
-    assert_eq!(table.version, LuaVersion::V51);
+    assert_eq!(table.version, LuaTarget::V51);
     assert_eq!(table.op_bits, 6);
     assert_eq!(table.a_bits, 8);
     assert_eq!(table.b_bits, 9);
@@ -142,7 +142,7 @@ fn semantic_names_round_trip() {
 }
 
 fn lua51_table() -> OpcodeTable {
-    OpcodeTable::builtin(LuaVersion::V51).expect("Lua 5.1 table exists")
+    OpcodeTable::builtin(LuaTarget::V51)
 }
 
 fn abc(op: u32, a: u32, b: u32, c: u32) -> u32 {

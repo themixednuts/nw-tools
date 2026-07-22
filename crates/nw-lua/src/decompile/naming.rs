@@ -6,9 +6,11 @@ use bstr::BString;
 
 use crate::{
     chunk::{LocVar, Proto},
-    decompile::{analysis, ast::Name},
+    decompile::ast::{BindingId, FunctionId, Name},
     ir::{SsaFunction, SsaOp, SsaRef},
 };
+
+pub use super::identifier::is_valid_identifier;
 
 /// Debug-local binding selected for a register at a program counter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,44 +22,81 @@ pub struct LocalBinding {
     pub end_pc: i32,
 }
 
+#[derive(Debug)]
+struct NamingResult {
+    names: Vec<Vec<Option<Name>>>,
+    bindings: Vec<Vec<Option<BindingId>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnonymousNameRole {
+    Parameter,
+    Local,
+    Upvalue,
+}
+
+impl AnonymousNameRole {
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::Parameter => "a",
+            Self::Local => "l",
+            Self::Upvalue => "u",
+        }
+    }
+
+    fn base(self, index: impl std::fmt::Display) -> String {
+        format!("{}{index}", self.prefix())
+    }
+
+    fn name(self, index: impl std::fmt::Display) -> Name {
+        Name::from(self.base(index))
+    }
+}
+
 /// Name resolver backed by one precomputed `reg/version -> name` map.
 #[derive(Debug)]
 pub struct NameResolver<'a> {
     proto: &'a Proto,
+    function_id: FunctionId,
     upvalue_overrides: Vec<Name>,
     parameter_names: Vec<Name>,
     local_bindings: Vec<LocalBinding>,
     value_names: Vec<Vec<Option<Name>>>,
+    value_bindings: Vec<Vec<Option<BindingId>>>,
 }
 
 impl<'a> NameResolver<'a> {
     #[must_use]
     pub fn new(proto: &'a Proto, function: &SsaFunction) -> Self {
-        Self::with_overrides(proto, function, Vec::new(), Vec::new())
+        Self::with_overrides(proto, function, FunctionId::root(), Vec::new(), Vec::new())
     }
 
     #[must_use]
     pub fn with_overrides(
         proto: &'a Proto,
         function: &SsaFunction,
+        function_id: FunctionId,
         upvalue_overrides: Vec<Name>,
         param_overrides: Vec<Option<Name>>,
     ) -> Self {
         let parameter_names = parameter_names(proto, &param_overrides);
         let local_bindings = local_bindings(proto, &parameter_names);
-        let value_names = build_value_names(
+        let naming = build_value_names(
             proto,
             function,
             &local_bindings,
             &parameter_names,
             &upvalue_overrides,
+            &function_id,
         );
         Self {
             proto,
+            function_id,
             upvalue_overrides,
             parameter_names,
             local_bindings,
-            value_names,
+            value_names: naming.names,
+            value_bindings: naming.bindings,
         }
     }
 
@@ -73,9 +112,10 @@ impl<'a> NameResolver<'a> {
     /// this checks the definition boundary first and then a small lookahead.
     #[must_use]
     pub fn binding_for_def(&self, reg: u16, pc: i32) -> Option<LocalBinding> {
-        self.binding_at(reg, pc + 1)
-            .or_else(|| self.binding_at(reg, pc))
-            .or_else(|| self.binding_starting_soon(reg, pc, 4))
+        self.binding_at(reg, pc + 1).or_else(|| {
+            self.binding_at(reg, pc)
+                .filter(|binding| binding.end_pc > pc + 1)
+        })
     }
 
     /// Return whether this SSA destination is a named debug local.
@@ -87,14 +127,52 @@ impl<'a> NameResolver<'a> {
         self.binding_for_def(reg, pc).is_some()
     }
 
+    /// Return the naming-group identity for a versioned register.
+    #[must_use]
+    pub fn binding_id_for_ref(&self, reference: SsaRef) -> Option<BindingId> {
+        let SsaRef::Reg { reg, ver } = reference else {
+            return None;
+        };
+        let version = usize::try_from(ver).ok()?;
+        self.value_bindings
+            .get(usize::from(reg))?
+            .get(version)
+            .cloned()
+            .flatten()
+    }
+
+    /// Return whether lifetime analysis associated this SSA value with a
+    /// source/debug local, including values defined at an end-PC boundary.
+    #[must_use]
+    pub fn has_debug_binding(&self, reference: SsaRef) -> bool {
+        self.binding_id_for_ref(reference)
+            .is_some_and(|binding| binding.is_debug_local())
+    }
+
+    /// Return the debug-local lifetime associated with an SSA value.
+    #[must_use]
+    pub fn debug_binding_for_ref(&self, reference: SsaRef) -> Option<LocalBinding> {
+        let identity = self.binding_id_for_ref(reference)?;
+        self.local_bindings
+            .iter()
+            .enumerate()
+            .find(|(index, _)| self.debug_binding(*index) == identity)
+            .map(|(_, binding)| binding.clone())
+    }
+
     /// Return the local name for a use site or a deterministic fallback.
     #[must_use]
     pub fn name_for_ref(&self, reference: SsaRef, pc: i32) -> Name {
         if let SsaRef::Reg { reg, .. } = reference
             && let Some(binding) = self.binding_for_use(reg, pc)
-            && !binding.name.is_synthetic()
         {
-            return binding.name;
+            let name = if binding.name.is_synthetic() {
+                self.value_name(reference)
+                    .unwrap_or_else(|| self.synthetic_value_name(reference))
+            } else {
+                binding.name
+            };
+            return name.with_binding(self.debug_binding(binding.index));
         }
         if let Some(name) = self.value_name(reference) {
             return name;
@@ -105,28 +183,36 @@ impl<'a> NameResolver<'a> {
     /// Return a deterministic temporary name for a value.
     #[must_use]
     pub fn synthetic_value_name(&self, reference: SsaRef) -> Name {
-        match reference {
+        let name = match reference {
             SsaRef::Reg { reg, .. } => self.synthetic_reg_name(reg),
             SsaRef::Const(idx) => Name::from(format!("k{idx}")),
             SsaRef::None => Name::from("nil"),
-        }
+        };
+        self.binding_id_for_ref(reference)
+            .map_or(name.clone(), |binding| name.with_binding(binding))
     }
 
     /// Return the canonical emitted name for a debug binding at a definition.
     #[must_use]
     pub fn name_for_binding_def(&self, binding: &LocalBinding, reference: SsaRef) -> Name {
-        if binding.name.is_synthetic() {
-            return self
-                .value_name(reference)
-                .unwrap_or_else(|| self.synthetic_value_name(reference));
-        }
-        binding.name.clone()
+        let name = if binding.name.is_synthetic() {
+            self.value_name(reference)
+                .unwrap_or_else(|| self.synthetic_value_name(reference))
+        } else {
+            binding.name.clone()
+        };
+        name.with_binding(self.debug_binding(binding.index))
     }
 
     /// Return a deterministic register fallback name.
     #[must_use]
     pub fn synthetic_reg_name(&self, reg: u16) -> Name {
-        Name::from(format!("v{reg}"))
+        let role = if reg < u16::from(self.proto.num_params) {
+            AnonymousNameRole::Parameter
+        } else {
+            AnonymousNameRole::Local
+        };
+        role.name(reg)
     }
 
     /// Return the single source-level name for a register SSA value.
@@ -142,14 +228,20 @@ impl<'a> NameResolver<'a> {
         if let Some(name) = self.upvalue_overrides.get(idx_usize)
             && is_valid_identifier(&name.0)
         {
-            return name.clone();
+            return name.binding().map_or_else(
+                || name.clone().with_binding(self.upvalue_binding(idx_usize)),
+                |_| name.clone(),
+            );
         }
         if let Some(upvalue) = self.proto.upvalues.get(idx_usize)
             && is_valid_identifier(&upvalue.name)
         {
-            return name_from_debug_identifier(upvalue.name.clone());
+            return name_from_debug_identifier(upvalue.name.clone())
+                .with_binding(self.upvalue_binding(idx_usize));
         }
-        Name::from(format!("up{idx}"))
+        AnonymousNameRole::Upvalue
+            .name(idx)
+            .with_binding(self.upvalue_binding(idx_usize))
     }
 
     /// Return the emitted parameter name for a register index.
@@ -158,7 +250,24 @@ impl<'a> NameResolver<'a> {
         self.parameter_names
             .get(usize::from(reg))
             .cloned()
-            .unwrap_or_else(|| Name::from(format!("arg{}", u16::from(reg) + 1)))
+            .unwrap_or_else(|| AnonymousNameRole::Parameter.name(reg))
+            .with_binding(self.debug_binding(usize::from(reg)))
+    }
+
+    /// Binding identity for one debug-local slot in this lexical function.
+    #[must_use]
+    pub fn debug_binding(&self, index: usize) -> BindingId {
+        BindingId::debug_local(&self.function_id, index)
+    }
+
+    /// Lexical identity for a child prototype.
+    #[must_use]
+    pub fn child_function_id(&self, index: usize) -> FunctionId {
+        self.function_id.child(index)
+    }
+
+    fn upvalue_binding(&self, index: usize) -> BindingId {
+        BindingId::upvalue(&self.function_id, index)
     }
 
     /// Return initial local declarations that are already in scope as params or
@@ -179,6 +288,56 @@ impl<'a> NameResolver<'a> {
         declared.sort_unstable();
         declared.dedup();
         declared
+    }
+
+    /// Return whether a debug binding is in scope before SSA statements lower.
+    #[must_use]
+    pub fn is_declared_at_entry(&self, index: usize) -> bool {
+        self.initially_declared_locals().contains(&index)
+            || self
+                .local_bindings
+                .get(index)
+                .is_some_and(|binding| binding.start_pc == 0)
+    }
+
+    /// Return leading locals whose explicit `nil` initializer has no VM instruction.
+    #[must_use]
+    pub fn implicit_nil_prefix(&self, first: &LocalBinding) -> Vec<(SsaRef, Name)> {
+        self.local_bindings
+            .iter()
+            .filter(|binding| {
+                binding.start_pc == first.start_pc
+                    && binding.reg < first.reg
+                    && !self.is_declared_at_entry(binding.index)
+            })
+            .map(|binding| {
+                let reference = SsaRef::Reg {
+                    reg: binding.reg,
+                    ver: 0,
+                };
+                (reference, self.name_for_binding_def(binding, reference))
+            })
+            .collect()
+    }
+
+    /// Return named locals whose lexical lifetime begins at function entry but
+    /// which are not parameters. Lua 5.1 represents an uninitialized local in
+    /// this position only through debug lifetime metadata; there is no
+    /// `LOADNIL` instruction to reconstruct.
+    #[must_use]
+    pub fn implicit_entry_declarations(&self) -> Vec<Name> {
+        self.local_bindings
+            .iter()
+            .filter(|binding| {
+                binding.index >= usize::from(self.proto.num_params) && binding.start_pc == 0
+            })
+            .map(|binding| {
+                binding
+                    .name
+                    .clone()
+                    .with_binding(self.debug_binding(binding.index))
+            })
+            .collect()
     }
 
     fn value_name(&self, reference: SsaRef) -> Option<Name> {
@@ -208,16 +367,6 @@ impl<'a> NameResolver<'a> {
                 })
             })
     }
-
-    fn binding_starting_soon(&self, reg: u16, pc: i32, window: i32) -> Option<LocalBinding> {
-        self.local_bindings
-            .iter()
-            .rev()
-            .find(|binding| {
-                binding.reg == reg && binding.start_pc > pc && binding.start_pc <= pc + window
-            })
-            .cloned()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -230,6 +379,7 @@ struct ValueId {
 struct ValueSlot {
     value: ValueId,
     def_pc: Option<i32>,
+    use_pcs: Vec<i32>,
 }
 
 #[derive(Debug)]
@@ -239,6 +389,7 @@ struct NamingPass<'a> {
     local_bindings: &'a [LocalBinding],
     parameter_names: &'a [Name],
     upvalue_overrides: &'a [Name],
+    function_id: &'a FunctionId,
     slots: Vec<Vec<Option<usize>>>,
     values: Vec<ValueSlot>,
     parents: Vec<usize>,
@@ -251,6 +402,7 @@ impl<'a> NamingPass<'a> {
         local_bindings: &'a [LocalBinding],
         parameter_names: &'a [Name],
         upvalue_overrides: &'a [Name],
+        function_id: &'a FunctionId,
     ) -> Self {
         Self {
             proto,
@@ -258,16 +410,16 @@ impl<'a> NamingPass<'a> {
             local_bindings,
             parameter_names,
             upvalue_overrides,
+            function_id,
             slots: vec![Vec::new(); function.num_regs],
             values: Vec::new(),
             parents: Vec::new(),
         }
     }
 
-    fn run(mut self) -> Vec<Vec<Option<Name>>> {
+    fn run(mut self) -> NamingResult {
         self.collect_values();
         self.union_phi_values();
-        self.union_self_updates();
         self.union_debug_locals();
         self.assign_names()
     }
@@ -285,33 +437,16 @@ impl<'a> NamingPass<'a> {
 
         for block in &self.function.blocks {
             for node in &block.nodes {
-                if let Some(id) = self.ensure_ref(node.dest) {
-                    self.set_def_pc(id, node.pc);
-                }
-                if let SsaOp::Phi { operands, .. } = &node.op {
-                    for operand in operands {
-                        self.ensure_ref(*operand);
+                node.visit_defs(|reference| {
+                    if let Some(id) = self.ensure_ref(reference) {
+                        self.set_def_pc(id, node.pc);
                     }
-                }
-                analysis::for_each_use(&node.op, |reference| {
-                    self.ensure_ref(reference);
                 });
-            }
-        }
-
-        for implicit in &self.function.implicit_defs {
-            let reference = SsaRef::Reg {
-                reg: implicit.reg,
-                ver: implicit.version,
-            };
-            if let Some(id) = self.ensure_ref(reference)
-                && let Some(node) = self
-                    .function
-                    .blocks
-                    .get(implicit.block)
-                    .and_then(|block| block.nodes.get(implicit.node))
-            {
-                self.set_def_pc(id, node.pc);
+                node.op.visit_uses(|reference, _| {
+                    if let Some(id) = self.ensure_ref(reference) {
+                        self.record_use(id, node.pc);
+                    }
+                });
             }
         }
     }
@@ -330,26 +465,6 @@ impl<'a> NamingPass<'a> {
                         self.union(dest, operand);
                     }
                 }
-            }
-        }
-    }
-
-    fn union_self_updates(&mut self) {
-        for block in &self.function.blocks {
-            for node in &block.nodes {
-                let Some(dest_reg) = node.dest.reg_index() else {
-                    continue;
-                };
-                let Some(dest) = self.ensure_ref(node.dest) else {
-                    continue;
-                };
-                analysis::for_each_use(&node.op, |reference| {
-                    if reference.reg_index() == Some(dest_reg)
-                        && let Some(use_id) = self.ensure_ref(reference)
-                    {
-                        self.union(dest, use_id);
-                    }
-                });
             }
         }
     }
@@ -374,8 +489,8 @@ impl<'a> NamingPass<'a> {
         }
     }
 
-    fn assign_names(mut self) -> Vec<Vec<Option<Name>>> {
-        let debug_names = self.debug_names_by_root();
+    fn assign_names(mut self) -> NamingResult {
+        let debug_bindings = self.debug_bindings_by_root();
         let mut groups = BTreeMap::<usize, GroupInfo>::new();
         for id in 0..self.values.len() {
             let root = self.find(id);
@@ -385,7 +500,7 @@ impl<'a> NamingPass<'a> {
                 first_pc: slot.def_pc.unwrap_or(i32::MAX),
                 first_reg: slot.value.reg,
                 has_param: false,
-                debug_name: debug_names.get(&root).cloned(),
+                debug_binding: debug_bindings.get(&root).cloned(),
             });
             let pc = slot.def_pc.unwrap_or(i32::MAX);
             if (pc, slot.value.reg) < (info.first_pc, info.first_reg) {
@@ -407,33 +522,38 @@ impl<'a> NamingPass<'a> {
             self.local_bindings,
             self.upvalue_overrides,
         );
-        let mut per_reg_counts = BTreeMap::<u16, usize>::new();
-        let mut names_by_root = BTreeMap::<usize, Name>::new();
+        let mut anonymous_locals = BTreeMap::<u16, Name>::new();
+        let mut names_by_root = BTreeMap::<usize, (Name, BindingId)>::new();
         for group in groups {
-            let name = if let Some(name) = group.debug_name {
-                name
+            let (name, binding) = if let Some((index, name)) = group.debug_binding {
+                (name, BindingId::debug_local(self.function_id, index))
             } else if group.has_param {
-                self.parameter_names
-                    .get(usize::from(group.first_reg))
-                    .cloned()
-                    .unwrap_or_else(|| Name::from(format!("arg{}", group.first_reg + 1)))
+                (
+                    self.parameter_names
+                        .get(usize::from(group.first_reg))
+                        .cloned()
+                        .unwrap_or_else(|| AnonymousNameRole::Parameter.name(group.first_reg)),
+                    BindingId::debug_local(self.function_id, usize::from(group.first_reg)),
+                )
             } else {
-                let count = per_reg_counts.entry(group.first_reg).or_default();
-                let base = if *count == 0 {
-                    format!("v{}", group.first_reg)
+                let name = if let Some(name) = anonymous_locals.get(&group.first_reg) {
+                    name.clone()
                 } else {
-                    format!("v{}_{}", group.first_reg, *count + 1)
+                    let name =
+                        unique_name(AnonymousNameRole::Local.base(group.first_reg), &mut used);
+                    anonymous_locals.insert(group.first_reg, name.clone());
+                    name
                 };
-                *count += 1;
-                unique_name(base, &mut used)
+                (name, BindingId::synthetic(self.function_id, group.root))
             };
-            names_by_root.insert(group.root, name);
+            names_by_root.insert(group.root, (name, binding));
         }
 
         let mut value_names = vec![Vec::new(); self.function.num_regs];
+        let mut value_bindings = vec![Vec::new(); self.function.num_regs];
         for id in 0..self.values.len() {
             let root = self.find(id);
-            let Some(name) = names_by_root.get(&root).cloned() else {
+            let Some((name, binding)) = names_by_root.get(&root).cloned() else {
                 continue;
             };
             let value = self.values[id].value;
@@ -443,16 +563,22 @@ impl<'a> NamingPass<'a> {
             };
             if reg >= value_names.len() {
                 value_names.resize_with(reg + 1, Vec::new);
+                value_bindings.resize_with(reg + 1, Vec::new);
             }
             if version >= value_names[reg].len() {
                 value_names[reg].resize(version + 1, None);
+                value_bindings[reg].resize(version + 1, None);
             }
-            value_names[reg][version] = Some(name);
+            value_names[reg][version] = Some(name.with_binding(binding.clone()));
+            value_bindings[reg][version] = Some(binding);
         }
-        value_names
+        NamingResult {
+            names: value_names,
+            bindings: value_bindings,
+        }
     }
 
-    fn debug_names_by_root(&mut self) -> BTreeMap<usize, Name> {
+    fn debug_bindings_by_root(&mut self) -> BTreeMap<usize, (usize, Name)> {
         let mut names = BTreeMap::new();
         for binding in self.local_bindings {
             if binding.name.is_synthetic() {
@@ -467,7 +593,9 @@ impl<'a> NamingPass<'a> {
             }
             if let Some(id) = matching_id {
                 let root = self.find(id);
-                names.entry(root).or_insert_with(|| binding.name.clone());
+                names
+                    .entry(root)
+                    .or_insert_with(|| (binding.index, binding.name.clone()));
             }
         }
         names
@@ -477,11 +605,18 @@ impl<'a> NamingPass<'a> {
         if usize::from(binding.reg) < usize::from(self.proto.num_params) && slot.value.ver == 0 {
             return true;
         }
+        if slot
+            .use_pcs
+            .iter()
+            .copied()
+            .any(|use_pc| binding_in_scope(binding, use_pc))
+        {
+            return true;
+        }
         let Some(pc) = slot.def_pc else {
             return false;
         };
-        let start = binding.start_pc.saturating_sub(4);
-        start <= pc && pc <= binding.end_pc
+        binding_in_scope(binding, pc) || pc.checked_add(1) == Some(binding.start_pc)
     }
 
     fn ensure_ref(&mut self, reference: SsaRef) -> Option<usize> {
@@ -503,6 +638,7 @@ impl<'a> NamingPass<'a> {
         self.values.push(ValueSlot {
             value: ValueId { reg, ver },
             def_pc: None,
+            use_pcs: Vec::new(),
         });
         self.parents.push(id);
         self.slots[reg_index][version] = Some(id);
@@ -514,6 +650,14 @@ impl<'a> NamingPass<'a> {
             && slot.def_pc.is_none_or(|current| pc < current)
         {
             slot.def_pc = Some(pc);
+        }
+    }
+
+    fn record_use(&mut self, id: usize, pc: i32) {
+        if let Some(slot) = self.values.get_mut(id)
+            && !slot.use_pcs.contains(&pc)
+        {
+            slot.use_pcs.push(pc);
         }
     }
 
@@ -542,7 +686,7 @@ struct GroupInfo {
     first_pc: i32,
     first_reg: u16,
     has_param: bool,
-    debug_name: Option<Name>,
+    debug_binding: Option<(usize, Name)>,
 }
 
 fn build_value_names(
@@ -551,13 +695,15 @@ fn build_value_names(
     local_bindings: &[LocalBinding],
     parameter_names: &[Name],
     upvalue_overrides: &[Name],
-) -> Vec<Vec<Option<Name>>> {
+    function_id: &FunctionId,
+) -> NamingResult {
     NamingPass::new(
         proto,
         function,
         local_bindings,
         parameter_names,
         upvalue_overrides,
+        function_id,
     )
     .run()
 }
@@ -580,7 +726,7 @@ fn parameter_name_for(proto: &Proto, overrides: &[Option<Name>], reg: u8) -> Nam
     {
         return name_from_debug_identifier(loc.name.clone());
     }
-    Name::from(format!("arg{}", u16::from(reg) + 1))
+    AnonymousNameRole::Parameter.name(reg)
 }
 
 fn local_bindings(proto: &Proto, parameter_names: &[Name]) -> Vec<LocalBinding> {
@@ -597,7 +743,7 @@ fn local_bindings(proto: &Proto, parameter_names: &[Name]) -> Vec<LocalBinding> 
                 parameter_names
                     .get(index)
                     .cloned()
-                    .unwrap_or_else(|| Name::from(format!("arg{}", index + 1)))
+                    .unwrap_or_else(|| AnonymousNameRole::Parameter.name(index))
             } else {
                 name_from_debug_identifier(loc.name.clone())
             };
@@ -622,7 +768,7 @@ fn locvar_reg(proto: &Proto, index: usize) -> Option<u16> {
 }
 
 fn binding_in_scope(binding: &LocalBinding, pc: i32) -> bool {
-    (binding.start_pc <= pc && pc <= binding.end_pc)
+    (binding.start_pc <= pc && pc < binding.end_pc)
         || (binding.start_pc == binding.end_pc
             && binding.start_pc > 0
             && pc == binding.start_pc - 1)
@@ -643,7 +789,7 @@ fn reserved_names(
         }
     }
     for name in upvalue_overrides {
-        if is_valid_identifier(&name.0) && !name.is_synthetic() {
+        if is_valid_identifier(&name.0) {
             used.insert(name.0.to_string());
         }
     }
@@ -674,9 +820,12 @@ fn name_from_debug_identifier(bytes: BString) -> Name {
 }
 
 fn is_synthetic_identifier(bytes: &[u8]) -> bool {
-    has_prefixed_number(bytes, b"v", true)
-        || has_prefixed_number(bytes, b"arg", false)
-        || has_prefixed_number(bytes, b"up", false)
+    has_prefixed_number(bytes, b"a", true)
+        || has_prefixed_number(bytes, b"l", true)
+        || has_prefixed_number(bytes, b"u", true)
+        || has_prefixed_number(bytes, b"v", true)
+        || has_prefixed_number(bytes, b"arg", true)
+        || has_prefixed_number(bytes, b"up", true)
         || has_prefixed_number(bytes, b"k", false)
         || has_prefixed_number(bytes, b"__nw_lua_pack_", false)
         || has_prefixed_number(bytes, b"__nw_lua_values_", false)
@@ -713,52 +862,4 @@ fn has_prefixed_number(bytes: &[u8], prefix: &[u8], allow_number_suffixes: bool)
 
 fn is_internal_local(loc: &LocVar) -> bool {
     loc.name.is_empty() || loc.name.as_slice().first().copied() == Some(b'(')
-}
-
-/// Return whether raw bytes can be emitted as a simple Lua identifier.
-#[must_use]
-pub fn is_valid_identifier(bytes: &BString) -> bool {
-    let bytes = bytes.as_slice();
-    let Some((&first, rest)) = bytes.split_first() else {
-        return false;
-    };
-    if !is_ident_start(first) || !rest.iter().copied().all(is_ident_continue) {
-        return false;
-    }
-    !is_keyword(bytes)
-}
-
-fn is_ident_start(byte: u8) -> bool {
-    byte == b'_' || byte.is_ascii_alphabetic()
-}
-
-fn is_ident_continue(byte: u8) -> bool {
-    is_ident_start(byte) || byte.is_ascii_digit()
-}
-
-fn is_keyword(bytes: &[u8]) -> bool {
-    matches!(
-        bytes,
-        b"and"
-            | b"break"
-            | b"do"
-            | b"else"
-            | b"elseif"
-            | b"end"
-            | b"false"
-            | b"for"
-            | b"function"
-            | b"if"
-            | b"in"
-            | b"local"
-            | b"nil"
-            | b"not"
-            | b"or"
-            | b"repeat"
-            | b"return"
-            | b"then"
-            | b"true"
-            | b"until"
-            | b"while"
-    )
 }

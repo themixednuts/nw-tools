@@ -2,7 +2,7 @@
 
 use bstr::BString;
 
-use crate::{LuaError, version::LuaVersion};
+use crate::{LuaError, version::LuaTarget};
 
 use super::{Constant, Header, LocVar, Proto, UpvalDesc, reader::ByteReader};
 
@@ -18,8 +18,7 @@ const LUA_TSTRING: u8 = 4;
 /// Returns [`LuaError`] when the prototype tree is truncated or malformed.
 pub fn parse_root(reader: &mut ByteReader<'_>, header: &Header) -> Result<Proto, LuaError> {
     match header.version {
-        LuaVersion::V51 => parse_proto_51(reader, None),
-        version => Err(LuaError::UnsupportedVersion(version.to_byte())),
+        LuaTarget::V51 => parse_proto_51(reader, None),
     }
 }
 
@@ -59,7 +58,7 @@ fn parse_proto_51(
         max_stack,
         num_params,
         is_vararg,
-        version: LuaVersion::V51,
+        version: LuaTarget::V51,
     })
 }
 

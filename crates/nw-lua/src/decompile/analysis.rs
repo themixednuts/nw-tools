@@ -1,6 +1,6 @@
 //! One-time SSA facts used by Phase 4 reconstruction.
 
-use crate::ir::{SsaFunction, SsaNode, SsaOp, SsaRef, UpvalueCapture};
+use crate::ir::{SsaFunction, SsaNode, SsaRef, UseRole};
 
 /// Stable identifier for a node inside an [`SsaFunction`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -288,27 +288,12 @@ pub fn analyze(function: &SsaFunction) -> DecompileAnalysis {
                 block: block.index,
                 node: node_index,
             };
-            analysis.set_def(node.dest, id);
-            if let Some(reg) = node.dest.reg_index() {
-                analysis.add_def_pc(reg, node.pc);
-            }
-        }
-    }
-
-    for implicit in &function.implicit_defs {
-        let id = NodeId {
-            block: implicit.block,
-            node: implicit.node,
-        };
-        analysis.set_def(
-            SsaRef::Reg {
-                reg: implicit.reg,
-                ver: implicit.version,
-            },
-            id,
-        );
-        if let Some(node) = analysis.node(function, id) {
-            analysis.add_def_pc(implicit.reg, node.pc);
+            node.visit_defs(|reference| {
+                analysis.set_def(reference, id);
+                if let Some(reg) = reference.reg_index() {
+                    analysis.add_def_pc(reg, node.pc);
+                }
+            });
         }
     }
 
@@ -323,29 +308,14 @@ pub fn analyze(function: &SsaFunction) -> DecompileAnalysis {
                 block: block.index,
                 node: node_index,
             };
-            if let SsaOp::Phi { operands, .. } = &node.op {
-                for operand in operands {
-                    analysis.add_use(*operand, true, id);
+            node.op.visit_uses(|reference, role| {
+                analysis.add_use(reference, role == UseRole::Phi, id);
+                match role {
+                    UseRole::MutatingTable => analysis.add_mutating_table_use(reference),
+                    UseRole::UpvalueCapture => analysis.add_upvalue_capture(reference),
+                    UseRole::Value | UseRole::Phi | UseRole::LoopControl => {}
                 }
-                continue;
-            }
-
-            for_each_use(&node.op, |reference| {
-                analysis.add_use(reference, false, id);
             });
-            if let SsaOp::SetTable { table, .. } = &node.op {
-                analysis.add_mutating_table_use(*table);
-            }
-            if let SsaOp::SetList { table, .. } = &node.op {
-                analysis.add_mutating_table_use(*table);
-            }
-            if let SsaOp::Closure { upvalues, .. } = &node.op {
-                for capture in upvalues {
-                    if let UpvalueCapture::ParentLocal(reference) = capture {
-                        analysis.add_upvalue_capture(*reference);
-                    }
-                }
-            }
         }
     }
 
@@ -361,96 +331,10 @@ fn side_effect_prefix_by_block(function: &SsaFunction) -> Vec<Vec<usize>> {
             prefix.push(0);
             for node in &block.nodes {
                 let next = prefix.last().copied().unwrap_or(0)
-                    + usize::from(node_has_observable_side_effect(&node.op));
+                    + usize::from(node.op.effects().blocks_reordering());
                 prefix.push(next);
             }
             prefix
         })
         .collect()
-}
-
-pub(crate) fn node_has_observable_side_effect(op: &SsaOp) -> bool {
-    matches!(
-        op,
-        SsaOp::SetGlobal { .. }
-            | SsaOp::SetUpval { .. }
-            | SsaOp::SetTable { .. }
-            | SsaOp::Call { .. }
-            | SsaOp::TailCall { .. }
-            | SsaOp::Return { .. }
-            | SsaOp::SetList { .. }
-            | SsaOp::Close { .. }
-    )
-}
-
-pub(crate) fn for_each_use(op: &SsaOp, mut f: impl FnMut(SsaRef)) {
-    match op {
-        SsaOp::Move { src } => f(*src),
-        SsaOp::GetTable { table, key } => {
-            f(*table);
-            f(*key);
-        }
-        SsaOp::SetGlobal { src, .. } | SsaOp::SetUpval { src, .. } => f(*src),
-        SsaOp::SetTable { table, key, value } => {
-            f(*table);
-            f(*key);
-            f(*value);
-        }
-        SsaOp::SelfOp { table, key, .. } => {
-            f(*table);
-            f(*key);
-        }
-        SsaOp::BinOp { left, right, .. } => {
-            f(*left);
-            f(*right);
-        }
-        SsaOp::UnOp { value, .. } => f(*value),
-        SsaOp::Concat { operands } => {
-            for operand in operands {
-                f(*operand);
-            }
-        }
-        SsaOp::Branch { a, b, .. } => {
-            f(*a);
-            f(*b);
-        }
-        SsaOp::Call { func, args, .. } | SsaOp::TailCall { func, args, .. } => {
-            f(*func);
-            for arg in args {
-                f(*arg);
-            }
-        }
-        SsaOp::Return { values, .. } => {
-            for value in values {
-                f(*value);
-            }
-        }
-        SsaOp::SetList { table, values, .. } => {
-            f(*table);
-            for value in values {
-                f(*value);
-            }
-        }
-        SsaOp::Phi { .. }
-        | SsaOp::Nop
-        | SsaOp::LoadK { .. }
-        | SsaOp::LoadBool { .. }
-        | SsaOp::LoadNil { .. }
-        | SsaOp::GetUpval { .. }
-        | SsaOp::GetGlobal { .. }
-        | SsaOp::NewTable { .. }
-        | SsaOp::Jump { .. }
-        | SsaOp::ForPrep { .. }
-        | SsaOp::ForLoop { .. }
-        | SsaOp::TForLoop { .. }
-        | SsaOp::Close { .. }
-        | SsaOp::VarArg { .. } => {}
-        SsaOp::Closure { upvalues, .. } => {
-            for capture in upvalues {
-                if let UpvalueCapture::ParentLocal(reference) = capture {
-                    f(*reference);
-                }
-            }
-        }
-    }
 }

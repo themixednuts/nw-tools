@@ -124,6 +124,38 @@ fn assert_elseif_chain(source: &str) {
 }
 
 #[test]
+fn exact_newtable_hints_recover_nested_module_constructor_boundary() {
+    let Some(source) = run_equivalence(
+        "nested_module_constructor",
+        r#"
+local Module = {
+    config = {
+        width = 10,
+        height = 20,
+    },
+    enabled = true,
+}
+function Module:getWidth()
+    return self.config.width
+end
+print(Module:getWidth(), Module.enabled)
+return Module
+"#,
+    ) else {
+        return;
+    };
+
+    assert!(source.contains("local Module = {"), "{source}");
+    assert!(source.contains("config = {"), "{source}");
+    assert!(source.contains("width = 10"), "{source}");
+    assert!(source.contains("height = 20"), "{source}");
+    assert!(source.contains("enabled = true"), "{source}");
+    assert!(source.contains("function Module:getWidth()"), "{source}");
+    assert!(!source.contains("Module.config ="), "{source}");
+    assert!(!source.contains("getWidth = function"), "{source}");
+}
+
+#[test]
 fn stripped_variants_style_synthetic_module_and_receiver_names() {
     let Some(module_source) = run_stripped_equivalence(
         "stripped_module_table",
@@ -139,11 +171,15 @@ return M
         return;
     };
     assert!(
-        module_source.contains("function v0.add("),
+        module_source.contains("function l0.add("),
         "{module_source}"
     );
     assert!(
-        !module_source.contains("function v0:add("),
+        module_source.contains("function l0.add(a0, a1)"),
+        "{module_source}"
+    );
+    assert!(
+        !module_source.contains("function l0:add("),
         "{module_source}"
     );
 
@@ -163,7 +199,7 @@ return M
         return;
     };
     assert!(
-        method_source.contains("function v0:inc("),
+        method_source.contains("function l0:inc("),
         "{method_source}"
     );
     assert!(
@@ -202,9 +238,28 @@ return M
         "{source_preserved}"
     );
     assert!(
-        !source_preserved.contains("local v0 ="),
+        !source_preserved.contains("local l0 ="),
         "{source_preserved}"
     );
+}
+
+#[test]
+fn local_function_sugar_distinguishes_shadowed_binding_identity() {
+    let Some(source) = run_equivalence(
+        "local_function_shadow_identity",
+        r#"
+local f = function()
+    local f = 3
+    return f
+end
+print(f())
+"#,
+    ) else {
+        return;
+    };
+
+    assert!(source.contains("local function f()"), "{source}");
+    assert!(source.contains("local f = 3"), "{source}");
 }
 
 #[test]
@@ -346,8 +401,7 @@ fn run_without_debug_locals(name: &str, source: &str) -> Option<String> {
     let bytecode = fs::read(&paths.bytecode).expect("read bytecode");
     let mut chunk = nw_lua::parse_chunk(&bytecode).expect("parse bytecode");
     clear_debug_names(&mut chunk.root);
-    let table =
-        nw_lua::bytecode::OpcodeTable::builtin(chunk.header.version).expect("Lua opcode table");
+    let table = nw_lua::bytecode::OpcodeTable::builtin(chunk.header.version);
     let ssa = nw_lua::ir::build_ssa(&chunk.root, &table);
     let block = nw_lua::decompile::decompile_proto(&chunk.root, &ssa, &table)
         .expect("decompile with synthetic names");

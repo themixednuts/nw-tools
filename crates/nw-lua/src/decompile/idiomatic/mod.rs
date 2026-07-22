@@ -29,8 +29,9 @@ pub fn context_for_proto_with_fallback(
 
 /// Applies the idiomatic cleanup pass to a decompiled block.
 pub fn clean(block: Block, ctx: CleanContext) -> Block {
-    let rules: [&dyn Rule; 10] = [
+    let rules: [&dyn Rule; 11] = [
         &naming_style::ModuleTableName,
+        &naming_style::ConsumerFieldTableName,
         &sugar::AssignmentFunctionSugar,
         &sugar::LocalFunctionSugar,
         &sugar::RecursiveLocalFunctionSugar,

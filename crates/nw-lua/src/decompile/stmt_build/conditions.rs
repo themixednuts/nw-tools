@@ -1,6 +1,16 @@
 use super::*;
 
 impl<'a> StatementBuilder<'a> {
+    pub(crate) fn emit_value_region(&mut self, plan: &ValuePlan) -> Result<Vec<Stmt>, LuaError> {
+        if !self.should_materialize_ref(plan.dest) {
+            return Ok(Vec::new());
+        }
+        if !self.will_declare(plan.dest) {
+            self.activate(plan.dest);
+        }
+        let value = self.value_plan_expr(plan)?;
+        Ok(vec![self.materialize_value(plan.dest, plan.pc, value)])
+    }
     pub(crate) fn condition_for_branch(
         &mut self,
         node: &SsaNode,
@@ -40,47 +50,11 @@ impl<'a> StatementBuilder<'a> {
         invert: bool,
         inline_blocks: &[usize],
     ) -> Result<Expr, LuaError> {
-        let Some(first) = chain.segments.first() else {
-            return Ok(Expr::True);
-        };
-        let mut and_expr = self.condition_segment_expr(first, inline_blocks)?;
-        let mut or_terms = Vec::new();
-
-        for pair in chain.segments.windows(2) {
-            let [left, right] = pair else {
-                continue;
-            };
-            let Some(connector) = left.connector else {
-                continue;
-            };
-            let rhs = self.condition_segment_expr(right, inline_blocks)?;
-            match connector {
-                crate::decompile::boolean::BoolConnector::And => {
-                    and_expr = Expr::Binary {
-                        op: connector.ast_op(),
-                        lhs: Box::new(and_expr),
-                        rhs: Box::new(rhs),
-                    };
-                }
-                crate::decompile::boolean::BoolConnector::Or => {
-                    or_terms.push(and_expr);
-                    and_expr = rhs;
-                }
-            }
-        }
-        or_terms.push(and_expr);
-
-        let mut terms = or_terms.into_iter();
-        let mut expr = terms.next().unwrap_or(Expr::True);
-        for rhs in terms {
-            expr = Expr::Binary {
-                op: crate::decompile::ast::BinOp::Or,
-                lhs: Box::new(expr),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        expr = normalize::normalize(expr);
+        let expr = self
+            .exprs
+            .with_chain_inline_blocks(inline_blocks, |exprs| {
+                exprs.expr_for_condition_segments(&chain.segments)
+            })?;
         Ok(if invert {
             normalize::invert(expr)
         } else {
@@ -88,43 +62,20 @@ impl<'a> StatementBuilder<'a> {
         })
     }
 
-    pub(super) fn condition_segment_expr(
-        &mut self,
-        segment: &crate::decompile::boolean::ConditionSegment,
-        inline_blocks: &[usize],
-    ) -> Result<Expr, LuaError> {
-        let Some(node) = self.analysis.node(self.function, segment.node) else {
-            return Ok(Expr::True);
-        };
-        self.condition_for_branch_with_inline_blocks(node, segment.inverted, inline_blocks)
-    }
-
     pub(crate) fn declare_phi_local(&mut self, reference: SsaRef, pc: i32) -> Option<Stmt> {
-        let name = self.names.collapsed_name_for_ref(reference, pc);
-        self.exprs.mark_materialized(reference, name.clone());
-
-        let reg = reference.reg_index()?;
-        if let Some(binding) = self.names.binding_for_def(reg, pc) {
-            if self.declared_locals.insert(binding.index) {
-                let name = self.names.name_for_binding_def(&binding, reference);
-                return Some(Stmt::Local {
-                    names: vec![name],
-                    attribs: Vec::new(),
-                    values: Vec::new(),
-                });
-            }
+        if !self.claim_declaration(reference) {
             return None;
         }
-
-        if self.declared_phi_regs.insert(reg) {
-            self.declared_synthetic_names.insert(name.clone());
-            return Some(Stmt::Local {
-                names: vec![name],
-                attribs: Vec::new(),
-                values: Vec::new(),
-            });
-        }
-        None
+        let name = self
+            .plan
+            .name(reference)
+            .unwrap_or_else(|| self.names.collapsed_name_for_ref(reference, pc));
+        self.exprs.activate(reference);
+        Some(Stmt::Local {
+            names: vec![name],
+            attribs: Vec::new(),
+            values: Vec::new(),
+        })
     }
 
     pub(crate) fn phi_assignment(
@@ -134,7 +85,7 @@ impl<'a> StatementBuilder<'a> {
         pc: i32,
     ) -> Result<Option<Stmt>, LuaError> {
         let name = self.names.collapsed_name_for_ref(dest, pc);
-        self.exprs.mark_materialized(dest, name.clone());
+        self.exprs.activate(dest);
         let value = self.exprs.expr_for_ref(operand, pc)?;
         if value == Expr::Name(name.clone()) {
             return Ok(None);
@@ -155,7 +106,7 @@ impl<'a> StatementBuilder<'a> {
             return Ok(None);
         }
         let name = self.names.collapsed_name_for_ref(dest, pc);
-        self.exprs.mark_materialized(dest, name.clone());
+        self.exprs.activate(dest);
         let value = self.value_plan_expr(plan)?;
         if value == Expr::Name(name.clone()) {
             return Ok(None);

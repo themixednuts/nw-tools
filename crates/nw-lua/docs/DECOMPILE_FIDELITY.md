@@ -28,7 +28,7 @@ Validation run:
 cargo test -p nw-lua --test fidelity_gate
 ```
 
-Result: default 80-file gate passed; test body time was 7.88s.
+Result: default 80-file gate passed in the final full-suite audit.
 
 ## Current 300-file sweep
 
@@ -42,33 +42,76 @@ cargo run -p nw-lua --bin nw-lua-fidelity -- \
   --limit 300 --examples 12
 ```
 
-Result after R1 + R2 + R3:
+Result after typed reconstruction ownership, unified control dependence,
+binding-aware idiom passes, and source-shape ranking:
 
 - Files seen: 1296
 - Files processed: 300
 - Source compile errors: 0
 - Decompile errors: 0
 - Parse errors: 0
-- Divergent files: 279 / 300 (93.00%)
-- Divergent functions: 1772 / 4236 (41.83%)
+- Divergent files: 275 / 300 (91.67%)
+- Divergent functions: 1390 / 4236 (32.81%)
 
 | Category | File hits | File pct | Function hits | Function pct |
 | --- | ---: | ---: | ---: | ---: |
-| `function_count` | 17 | 5.67% | 145 | 3.42% |
+| `function_count` | 20 | 6.67% | 74 | 1.75% |
 | `dropped_return` | 0 | 0.00% | 0 | 0.00% |
-| `statement_count` | 0 | 0.00% | 1482 | 34.99% |
-| `assignment_count` | 0 | 0.00% | 1155 | 27.27% |
-| `assignment_target_mismatch` | 0 | 0.00% | 1155 | 27.27% |
-| `control_flow_count` | 0 | 0.00% | 266 | 6.28% |
+| `statement_count` | 266 | 88.67% | 1091 | 25.76% |
+| `assignment_count` | 259 | 86.33% | 758 | 17.89% |
+| `assignment_target_mismatch` | 260 | 86.67% | 779 | 18.39% |
+| `control_flow_count` | 105 | 35.00% | 221 | 5.22% |
 | `empty_decompiled_branch` | 0 | 0.00% | 0 | 0.00% |
-| `short_circuit_loss` | 22 | 7.33% | 81 | 1.91% |
-| `short_circuit_gain` | 128 | 42.67% | 285 | 6.73% |
+| `unnecessary_control_flow` | 44 | 14.67% | 59 | 1.39% |
+| `constructor_shape` | 103 | 34.33% | 220 | 5.19% |
+| `declaration_sugar` | 21 | 7.00% | 28 | 0.66% |
+| `exposed_temporary` | 75 | 25.00% | 140 | 3.31% |
+| `short_circuit_loss` | 66 | 22.00% | 88 | 2.08% |
+| `short_circuit_gain` | 142 | 47.33% | 271 | 6.40% |
 | `bogus_not_number` | 0 | 0.00% | 0 | 0.00% |
 | `number_short_circuit` | 146 | 48.67% | 0 | 0.00% |
 | `undefined_synthetic_read` | 0 | 0.00% | 0 | 0.00% |
 
 The high-severity classes are all zero on the 300-file sweep and are enforced by
 the default gate.
+
+File hits now include files containing a function-level difference. Earlier
+reports counted only lexical/file-level categories in that column, so the old
+zero file counts for statement, assignment, and control-flow categories were
+not meaningful. The expanded source-shape categories also make the aggregate
+divergent-file count deliberately stricter; the comparable function-level total
+fell from 1,769 to 1,390 while all correctness gates remained zero.
+
+## Source-shape ranking
+
+The analyzer now ranks four directly actionable output-quality signals in
+addition to broad statement and assignment drift:
+
+- `unnecessary_control_flow`: the decompile has more structured control nodes
+  than the source;
+- `constructor_shape`: table-constructor or constructor-field counts differ;
+- `declaration_sugar`: local functions, named function declarations, and
+  function-value assignments use a different declaration form;
+- `exposed_temporary`: the decompile introduces more synthetic local bindings.
+
+These metrics are collected by the existing recursive AST signature traversal;
+there is no second child scanner or text-pattern reconstruction path. They are
+ranking signals, not proof of incorrect behavior, and direct work toward the
+owning reconstruction or binding fact.
+
+## Typed constructor-boundary recovery
+
+Lua 5.1's compiler records table-constructor list and record counts in the B/C
+operands of `NEWTABLE` using its floating-byte encoding. `TableSizeHint` now
+retains that encoding and reports an exact source field count only across the
+injective range. A shared, stack-based `TableConstructorPlan` uses those exact
+counts for nested constructors and falls back to the semantic `SETLIST`
+boundary for larger/open list constructors.
+
+This replaces separate expression/statement scans and prevents later table
+mutations—especially method closure assignments—from being absorbed into an
+earlier literal. On `abilitiescommon.lua`, output now reconstructs the original
+five-field nested module constructor followed by a separate colon method.
 
 ## R3 fixes from residual sampling
 
@@ -122,8 +165,8 @@ The analyzer:
 3. Parses original and decompiled source with `full_moon`.
 4. Builds approximate per-function signatures.
 5. Compares function/proto counts, statement counts, return counts, assignment
-   counts and targets, if/elseif/else/loop counts, empty branch counts, and
-   lexical smells.
+   counts and targets, control shape, constructor shape, declaration form,
+   synthetic temporary exposure, and lexical smells.
 
 Function alignment is best effort: exact function name first, then
 source/decompile order. The analyzer is a deterministic divergence signal, not a

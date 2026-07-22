@@ -2,7 +2,7 @@ mod support;
 
 use std::collections::BTreeSet;
 
-use support::run_stripped_equivalence;
+use support::{run_equivalence, run_stripped_equivalence};
 
 const SHOPCOMMON: &[u8] = include_bytes!("fixtures/shopcommon.luac");
 
@@ -122,6 +122,51 @@ print(sum)
         !decompiled.contains(&format!("[{loop_var}_")),
         "loop body used an SSA-versioned sibling of {loop_var:?}:\n{decompiled}"
     );
+}
+
+#[test]
+fn call_result_owns_the_debug_local_initializer() {
+    let Some(decompiled) = run_equivalence(
+        "call_result_local_initializer",
+        r#"
+local function RequireScript(path)
+    return { path = path }
+end
+local PopupWrapper = RequireScript("LyShineUI.Popup.PopupRequestWrapper")
+print(PopupWrapper.path)
+"#,
+    ) else {
+        return;
+    };
+
+    assert!(
+        decompiled.contains(
+            "local PopupWrapper = RequireScript(\"LyShineUI.Popup.PopupRequestWrapper\")"
+        ),
+        "call result should own the local declaration:\n{decompiled}"
+    );
+}
+
+#[test]
+fn stripped_anonymous_names_reflect_binding_roles() {
+    let Some(decompiled) = run_stripped_equivalence(
+        "anonymous_binding_roles",
+        r#"
+local function accumulate(value, increment)
+    local total = value + increment
+    print(total)
+    return total
+end
+print(accumulate(2, 3))
+"#,
+    ) else {
+        return;
+    };
+
+    assert!(decompiled.contains("function(a0, a1)"), "{decompiled}");
+    assert!(decompiled.contains("local l2 = a0 + a1"), "{decompiled}");
+    assert!(!decompiled.contains("arg1"), "{decompiled}");
+    assert!(!decompiled.contains("local v"), "{decompiled}");
 }
 
 #[test]
@@ -261,16 +306,18 @@ fn statement_boundary(token: &str) -> bool {
 }
 
 fn is_synthetic_name(token: &str) -> bool {
-    let Some(rest) = token.strip_prefix('v') else {
-        return false;
-    };
-    let Some((head, tail)) = rest.split_once('_') else {
-        return !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit());
-    };
-    !head.is_empty()
-        && !tail.is_empty()
-        && head.bytes().all(|byte| byte.is_ascii_digit())
-        && tail.bytes().all(|byte| byte.is_ascii_digit())
+    ["arg", "up", "a", "l", "u", "v"]
+        .iter()
+        .any(|prefix| has_numeric_components(token, prefix))
+}
+
+fn has_numeric_components(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .split('_')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    })
 }
 
 fn is_identifier(token: &str) -> bool {

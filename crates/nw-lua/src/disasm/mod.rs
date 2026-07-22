@@ -7,26 +7,16 @@ use crate::{
         Instruction, InstructionFormat, OpArgMode, OpcodeTable, OperandSlot, SemanticOp, opinfo,
     },
     chunk::{Chunk, Constant, LocVar, Proto, UpvalDesc},
-    version::LuaVersion,
 };
 
 /// Disassemble a parsed chunk using its built-in opcode table.
 #[must_use]
 pub fn disassemble_chunk(chunk: &Chunk) -> String {
-    let Ok(table) = OpcodeTable::builtin(chunk.header.version) else {
-        return format!(
-            "-- unsupported Lua {} disassembly --\n",
-            version_label(chunk.header.version)
-        );
-    };
+    let table = OpcodeTable::builtin(chunk.header.version);
 
     let mut out = String::new();
-    writeln!(
-        out,
-        "-- Lua {} Disassembly --",
-        version_label(chunk.header.version)
-    )
-    .expect("writing to String cannot fail");
+    writeln!(out, "-- Lua {} Disassembly --", chunk.header.version)
+        .expect("writing to String cannot fail");
     writeln!(out).expect("writing to String cannot fail");
     write_proto_recursive(&mut out, &chunk.root, &table, 0);
     out
@@ -585,14 +575,4 @@ fn comparison_symbol(op: SemanticOp) -> &'static str {
 
 fn jump_target(pc: usize, offset: i32) -> i32 {
     i32::try_from(pc).map_or(offset + 2, |pc| pc + offset + 2)
-}
-
-fn version_label(version: LuaVersion) -> &'static str {
-    match version {
-        LuaVersion::V51 => "5.1",
-        LuaVersion::V52 => "5.2",
-        LuaVersion::V53 => "5.3",
-        LuaVersion::V54 => "5.4",
-        LuaVersion::V55 => "5.5",
-    }
 }

@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, VecDeque};
 
 use crate::{
     decompile::analysis::NodeId,
-    ir::{SsaFunction, SsaOp},
+    ir::{SsaFunction, SsaOp, SsaRef},
 };
 
 use super::conditionals::{branch_info, follow_jmp_only, is_pure_condition_block, pc_to_block};
@@ -43,6 +43,7 @@ pub struct NumericForLoop {
     pub start_node: Option<NodeId>,
     pub stop_node: Option<NodeId>,
     pub step_node: Option<NodeId>,
+    pub var: SsaRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,7 @@ pub struct GenericForLoop {
     pub count: i32,
     pub tfor_node: NodeId,
     pub call_node: Option<NodeId>,
+    pub vars: Vec<SsaRef>,
 }
 
 #[must_use]
@@ -119,10 +121,10 @@ fn numeric_for_loops(function: &SsaFunction, pc_map: &[Option<usize>]) -> Vec<Nu
                 .iter()
                 .enumerate()
                 .find_map(|(node_index, node)| {
-                    let SsaOp::ForPrep { base, target } = node.op else {
+                    let SsaOp::ForPrep { control, target } = node.op else {
                         return None;
                     };
-                    Some((node_index, base, target))
+                    Some((node_index, control.base(), target))
                 })
         else {
             continue;
@@ -130,15 +132,9 @@ fn numeric_for_loops(function: &SsaFunction, pc_map: &[Option<usize>]) -> Vec<Nu
         let Some(loop_block) = pc_to_block(pc_map, target) else {
             continue;
         };
-        let Some((loop_index, _)) =
-            function.blocks[loop_block]
-                .nodes
-                .iter()
-                .enumerate()
-                .find(|(_, node)| {
-                    matches!(node.op, SsaOp::ForLoop { base: loop_base, .. } if loop_base == base)
-                })
-        else {
+        let Some((loop_index, loop_node)) = function.blocks[loop_block].nodes.iter().enumerate().find(
+            |(_, node)| matches!(node.op, SsaOp::ForLoop { control, .. } if control.base() == base),
+        ) else {
             continue;
         };
 
@@ -184,6 +180,7 @@ fn numeric_for_loops(function: &SsaFunction, pc_map: &[Option<usize>]) -> Vec<Nu
                 base.saturating_add(2),
                 Some(prep_index),
             ),
+            var: loop_node.dest,
         });
     }
 
@@ -200,10 +197,10 @@ fn generic_for_loops(function: &SsaFunction) -> Vec<GenericForLoop> {
                 .iter()
                 .enumerate()
                 .find_map(|(node_index, node)| {
-                    let SsaOp::TForLoop { base, count } = node.op else {
+                    let SsaOp::TForLoop { control, count } = node.op else {
                         return None;
                     };
-                    Some((node_index, base, count))
+                    Some((node_index, control.base(), count))
                 })
         else {
             continue;
@@ -241,6 +238,18 @@ fn generic_for_loops(function: &SsaFunction) -> Vec<GenericForLoop> {
             .min()
             .unwrap_or(block.index);
 
+        let mut vars = Vec::new();
+        function.blocks[block.index].nodes[node_index].visit_defs(|reference| {
+            if reference.reg_index().is_some_and(|reg| {
+                reg >= base.saturating_add(3)
+                    && reg
+                        < base.saturating_add(3 + u16::try_from(count.max(0)).unwrap_or(u16::MAX))
+            }) {
+                vars.push(reference);
+            }
+        });
+        vars.sort_by_key(|reference| reference.reg_index());
+
         loops.push(GenericForLoop {
             entry,
             tfor_block: block.index,
@@ -254,6 +263,7 @@ fn generic_for_loops(function: &SsaFunction) -> Vec<GenericForLoop> {
                 node: node_index,
             },
             call_node: find_iterator_call(function, entry, block.index, base),
+            vars,
         });
     }
 
@@ -272,7 +282,7 @@ fn natural_loops(function: &SsaFunction, pc_map: &[Option<usize>]) -> Vec<Natura
         for &succ in &block.succs {
             if block_has_for_loop(function, block.index)
                 || block_is_generic_latch(function, block.index)
-                || !dominates(function, succ, block.index)
+                || !function.dom.dominates(succ, block.index)
             {
                 continue;
             }
@@ -292,26 +302,6 @@ fn natural_loops(function: &SsaFunction, pc_map: &[Option<usize>]) -> Vec<Natura
     loops.sort_by_key(|info| (info.header, info.latch));
     loops.dedup_by_key(|info| (info.header, info.latch));
     loops
-}
-
-#[must_use]
-pub fn dominates(function: &SsaFunction, dominator: usize, block: usize) -> bool {
-    if dominator == block {
-        return true;
-    }
-    let mut current = Some(block);
-    let mut steps = 0;
-    while let Some(block) = current {
-        if block == dominator {
-            return true;
-        }
-        if steps >= function.blocks.len() {
-            return false;
-        }
-        steps += 1;
-        current = function.blocks.get(block).and_then(|block| block.idom);
-    }
-    false
 }
 
 fn natural_loop_blocks(function: &SsaFunction, header: usize, latch: usize) -> BTreeSet<usize> {
@@ -450,7 +440,7 @@ fn has_repeat_tail_update_before_branch(function: &SsaFunction, block: usize) ->
         .nodes
         .iter()
         .take(branch_index)
-        .filter(|node| !node.is_meta_only && !matches!(node.op, SsaOp::Phi { .. }))
+        .filter(|node| !matches!(node.op, SsaOp::Phi { .. }))
         .filter_map(|node| node.dest.reg_index())
         .any(|dest| branch_regs.contains(&dest) && phi_regs.contains(&dest))
 }

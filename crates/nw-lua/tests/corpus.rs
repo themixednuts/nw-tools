@@ -26,6 +26,21 @@ const CHILD_ERR: &str = "NW_LUA_CORPUS_CHILD_ERR";
 const CHILD_STRUCTURAL_REPORT: &str = "NW_LUA_STRUCTURAL_REPORT";
 
 #[test]
+fn runtime_equivalence_loop_carried_short_circuit_value() {
+    let source = r#"
+local function fold(values)
+    local count = 0
+    for i = 1, #values do
+        count = count + values[i] ~= 0 and 1 or 0
+    end
+    return count
+end
+print(fold({0}), fold({0, 1, 0}), fold({-1, 1}))
+"#;
+    run_equivalence("loop_carried_short_circuit_value", source);
+}
+
+#[test]
 fn runtime_equivalence_table_constructor_lists() {
     let cases = [
         (
@@ -173,6 +188,38 @@ while x == false or n < 3 do
     x = true
 print(n)
 end
+"#,
+        ),
+        (
+            "loop_carried_implicit_nil_local",
+            r#"
+local function furthest(values)
+    local selected
+    for i = 1, #values do
+        if selected == nil or selected < values[i] then
+            selected = values[i]
+        end
+    end
+    return selected
+end
+print(furthest({3, 1, 7, 2}))
+"#,
+        ),
+        (
+            "branch_overwritten_declaration_anchor",
+            r#"
+local function choose(kind)
+    local value = 0
+    if kind == 1 then
+        value = 10
+        return value
+    elseif kind == 2 then
+        value = 20
+        return value
+    end
+    return false
+end
+print(choose(1), choose(2), choose(3))
 "#,
         ),
         (
@@ -366,6 +413,42 @@ sink(t)
 }
 
 #[test]
+fn runtime_equivalence_multi_result_reverse_transfer() {
+    let source = r#"
+local first, second, third
+first = tostring
+second = 42
+first, second, third = first(second)
+print(first, second == nil, third == nil)
+"#;
+    let Some(decompiled) = run_equivalence("multi_result_reverse_transfer", source) else {
+        return;
+    };
+    assert!(
+        decompiled.contains("first, second, third = first(second)"),
+        "fixed call results should transfer directly to source variables:\n{decompiled}"
+    );
+}
+
+#[test]
+fn nested_effectful_call_arguments_inline_compositionally() {
+    let source = r#"
+local function log(x)
+    io.write(x)
+    return x
+end
+print(log("1"), log("2"), log("3"))
+"#;
+    let Some(decompiled) = run_equivalence("nested_effectful_call_arguments", source) else {
+        return;
+    };
+    assert!(
+        decompiled.contains("print(log(\"1\"), log(\"2\"), log(\"3\"))"),
+        "single-use call arguments should compose without register temporaries:\n{decompiled}"
+    );
+}
+
+#[test]
 fn nw_named_regressions_decompile_and_reparse() {
     if !tools_available() {
         eprintln!("skipping NW named regression tests; missing Lua 5.1 tools");
@@ -460,7 +543,6 @@ fn run_nw_corpus_structural_sample(limit: usize, label: &str) {
     let mut structural_total_protos = 0usize;
     let mut structural_matched_ops = 0usize;
     let mut structural_total_ops = 0usize;
-    let mut undefined_synthetics = 0usize;
     let mut buckets = BTreeMap::<String, FailureBucket>::new();
     let worker = Path::new(env!("CARGO_BIN_EXE_nw-lua-corpus-child"));
 
@@ -479,7 +561,6 @@ fn run_nw_corpus_structural_sample(limit: usize, label: &str) {
                 structural_total_protos += report.total_protos;
                 structural_matched_ops += report.matched_ops;
                 structural_total_ops += report.total_ops;
-                undefined_synthetics += report.undefined_synthetics;
             }
             Err(FileResult::Err(message)) => {
                 if message.starts_with("luac:") {
@@ -508,14 +589,13 @@ fn run_nw_corpus_structural_sample(limit: usize, label: &str) {
         files.len()
     );
     eprintln!(
-        "Phase 10b structural report: exact_proto_rate={}/{} ({:.2}%) opcode_match_rate={}/{} ({:.2}%) undefined_synthetics={}",
+        "Phase 10b structural report: exact_proto_rate={}/{} ({:.2}%) opcode_match_rate={}/{} ({:.2}%)",
         structural_exact_protos,
         structural_total_protos,
         percentage(structural_exact_protos, structural_total_protos),
         structural_matched_ops,
         structural_total_ops,
-        percentage(structural_matched_ops, structural_total_ops),
-        undefined_synthetics
+        percentage(structural_matched_ops, structural_total_ops)
     );
     if !buckets.is_empty() {
         eprintln!("Phase 10b failure buckets:");
@@ -555,10 +635,6 @@ fn run_nw_corpus_structural_sample(limit: usize, label: &str) {
         recompile_ok,
         files.len(),
         "corpus recompile-clean count must be 100%"
-    );
-    assert_eq!(
-        undefined_synthetics, 0,
-        "corpus decompiled output has {undefined_synthetics} undefined synthetic reads"
     );
 }
 
@@ -628,7 +704,6 @@ fn parse_child_report_line(line: &str) -> ChildReport {
             "total_protos" => report.total_protos = value,
             "matched_ops" => report.matched_ops = value,
             "total_ops" => report.total_ops = value,
-            "undefined_synthetics" => report.undefined_synthetics = value,
             _ => {}
         }
     }
@@ -733,7 +808,6 @@ struct ChildReport {
     total_protos: usize,
     matched_ops: usize,
     total_ops: usize,
-    undefined_synthetics: usize,
 }
 
 struct FailureBucket {

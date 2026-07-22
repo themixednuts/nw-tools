@@ -13,6 +13,10 @@ pub enum Category {
     AssignmentTargetMismatch,
     ControlFlowCount,
     EmptyDecompiledBranch,
+    UnnecessaryControlFlow,
+    ConstructorShape,
+    DeclarationSugar,
+    ExposedTemporary,
     ShortCircuitLoss,
     ShortCircuitGain,
     BogusNotNumber,
@@ -30,6 +34,10 @@ impl Category {
             Category::AssignmentTargetMismatch => "assignment_target_mismatch",
             Category::ControlFlowCount => "control_flow_count",
             Category::EmptyDecompiledBranch => "empty_decompiled_branch",
+            Category::UnnecessaryControlFlow => "unnecessary_control_flow",
+            Category::ConstructorShape => "constructor_shape",
+            Category::DeclarationSugar => "declaration_sugar",
+            Category::ExposedTemporary => "exposed_temporary",
             Category::ShortCircuitLoss => "short_circuit_loss",
             Category::ShortCircuitGain => "short_circuit_gain",
             Category::BogusNotNumber => "bogus_not_number",
@@ -252,6 +260,26 @@ fn compare_metrics(original: &Metrics, decompiled: &Metrics) -> BTreeSet<Categor
     }
     if decompiled.empty_branches > original.empty_branches {
         categories.insert(Category::EmptyDecompiledBranch);
+    }
+    let original_control = original.ifs + original.elseifs + original.elses + original.loops;
+    let decompiled_control =
+        decompiled.ifs + decompiled.elseifs + decompiled.elses + decompiled.loops;
+    if decompiled_control > original_control {
+        categories.insert(Category::UnnecessaryControlFlow);
+    }
+    if original.table_constructors != decompiled.table_constructors
+        || original.table_fields != decompiled.table_fields
+    {
+        categories.insert(Category::ConstructorShape);
+    }
+    if original.local_functions != decompiled.local_functions
+        || original.function_declarations != decompiled.function_declarations
+        || original.function_value_assignments != decompiled.function_value_assignments
+    {
+        categories.insert(Category::DeclarationSugar);
+    }
+    if decompiled.synthetic_locals > original.synthetic_locals {
+        categories.insert(Category::ExposedTemporary);
     }
     if decompiled.and_ops + decompiled.or_ops < original.and_ops + original.or_ops {
         categories.insert(Category::ShortCircuitLoss);

@@ -11,6 +11,7 @@ impl<'a> StatementBuilder<'a> {
             SsaOp::Phi { .. } => self.emit_boolean_phi(node),
             SsaOp::Move { .. }
             | SsaOp::LoadK { .. }
+            | SsaOp::LoadLiteral { .. }
             | SsaOp::LoadBool { .. }
             | SsaOp::LoadNil { .. }
             | SsaOp::GetUpval { .. }

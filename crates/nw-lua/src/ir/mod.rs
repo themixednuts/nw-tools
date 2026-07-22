@@ -5,15 +5,20 @@ use bstr::BString;
 use crate::{
     bytecode::{Instruction, OpcodeTable},
     chunk::Proto,
-    version::LuaVersion,
+    version::LuaTarget,
 };
 
 pub mod cfg;
 pub mod dom;
 pub mod dump;
 pub mod lift;
+pub mod operands;
 pub mod passes;
 pub mod ssa;
+pub mod table;
+
+pub use operands::{ControlFlowRole, LoopControl, OpEffects, UseRole};
+pub use table::TableSizeHint;
 
 /// SSA value reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,6 +34,31 @@ pub enum SsaRef {
     },
     /// Constant table index.
     Const(u32),
+}
+
+/// Constant value introduced by an SSA transform without mutating the chunk's pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SsaLiteral {
+    Nil,
+    Boolean(bool),
+    Number(u64),
+    Integer(i64),
+    Str(BString),
+}
+
+impl SsaLiteral {
+    #[must_use]
+    pub const fn number(value: f64) -> Self {
+        Self::Number(value.to_bits())
+    }
+
+    #[must_use]
+    pub const fn as_number(&self) -> Option<f64> {
+        match self {
+            Self::Number(bits) => Some(f64::from_bits(*bits)),
+            Self::Nil | Self::Boolean(_) | Self::Integer(_) | Self::Str(_) => None,
+        }
+    }
 }
 
 impl SsaRef {
@@ -128,6 +158,9 @@ pub enum SsaOp {
     LoadK {
         idx: u32,
     },
+    LoadLiteral {
+        value: SsaLiteral,
+    },
     LoadBool {
         value: bool,
         skip_next: bool,
@@ -160,8 +193,8 @@ pub enum SsaOp {
         value: SsaRef,
     },
     NewTable {
-        array_size: i32,
-        hash_size: i32,
+        array_hint: TableSizeHint,
+        hash_hint: TableSizeHint,
     },
     SelfOp {
         table: SsaRef,
@@ -211,15 +244,15 @@ pub enum SsaOp {
         count: i32,
     },
     ForPrep {
-        base: u16,
+        control: LoopControl,
         target: i32,
     },
     ForLoop {
-        base: u16,
+        control: LoopControl,
         target: i32,
     },
     TForLoop {
-        base: u16,
+        control: LoopControl,
         count: i32,
     },
     SetList {
@@ -253,32 +286,34 @@ pub struct SsaNode {
     pub dest: SsaRef,
     /// Operation payload.
     pub op: SsaOp,
-    /// Metadata-only pseudo node inserted during rename.
-    pub is_meta_only: bool,
+    /// Versioned definitions produced by the same instruction after `dest`.
+    secondary_defs: Vec<SsaRef>,
 }
 
 impl SsaNode {
     /// Create a node with no destination.
     #[must_use]
-    pub const fn new(pc: i32, line: i32, op: SsaOp) -> Self {
+    pub fn new(pc: i32, line: i32, op: SsaOp) -> Self {
+        let secondary_defs = operands::secondary_defs(&op, SsaRef::None);
         Self {
             pc,
             line,
             dest: SsaRef::None,
             op,
-            is_meta_only: false,
+            secondary_defs,
         }
     }
 
     /// Create a node with a destination.
     #[must_use]
-    pub const fn with_dest(pc: i32, line: i32, dest: SsaRef, op: SsaOp) -> Self {
+    pub fn with_dest(pc: i32, line: i32, dest: SsaRef, op: SsaOp) -> Self {
+        let secondary_defs = operands::secondary_defs(&op, dest);
         Self {
             pc,
             line,
             dest,
             op,
-            is_meta_only: false,
+            secondary_defs,
         }
     }
 
@@ -351,7 +386,7 @@ pub struct SsaFunction {
     pub source: BString,
     pub line_defined: i32,
     pub last_line_defined: i32,
-    pub version: LuaVersion,
+    pub version: LuaTarget,
     pub num_params: u8,
     pub is_vararg: u8,
     pub max_stack: u8,
@@ -360,7 +395,6 @@ pub struct SsaFunction {
     pub blocks: Vec<BasicBlock>,
     pub dom: dom::DomInfo,
     pub def_sites: ssa::DefSites,
-    pub implicit_defs: Vec<ssa::ImplicitDef>,
 }
 
 /// Build SSA for one prototype.
@@ -377,13 +411,11 @@ pub fn build_ssa(proto: &Proto, table: &OpcodeTable) -> SsaFunction {
     lift::lift_all(proto, table, &instructions, &mut blocks);
     let def_sites = ssa::collect_def_sites(&blocks, usize::from(proto.max_stack));
     ssa::insert_phi_functions(&mut blocks, usize::from(proto.max_stack), &dom, &def_sites);
-    let mut implicit_defs = Vec::new();
     ssa::rename(
         &mut blocks,
         usize::from(proto.max_stack),
         usize::from(proto.num_params),
         &dom,
-        &mut implicit_defs,
     );
 
     SsaFunction {
@@ -399,6 +431,5 @@ pub fn build_ssa(proto: &Proto, table: &OpcodeTable) -> SsaFunction {
         blocks,
         dom,
         def_sites,
-        implicit_defs,
     }
 }

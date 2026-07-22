@@ -213,8 +213,7 @@ fn parsed_samples() -> Vec<ParsedSample> {
         .map(|sample| {
             let chunk = nw_lua::parse_chunk(sample.bytes)
                 .unwrap_or_else(|err| panic!("{} parse: {err}", sample.name));
-            let table = OpcodeTable::builtin(chunk.header.version)
-                .unwrap_or_else(|err| panic!("{} opcode table: {err}", sample.name));
+            let table = OpcodeTable::builtin(chunk.header.version);
             ParsedSample {
                 name: sample.name,
                 chunk,

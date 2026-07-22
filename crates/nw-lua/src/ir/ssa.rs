@@ -1,6 +1,6 @@
 //! Phi placement and SSA renaming.
 
-use super::{BasicBlock, SsaNode, SsaOp, SsaRef, UpvalueCapture};
+use super::{BasicBlock, SsaNode, SsaOp, SsaRef};
 use crate::ir::dom::DomInfo;
 
 /// Def-site and liveness facts computed once for phi placement.
@@ -10,15 +10,6 @@ pub struct DefSites {
     pub defines: Vec<Vec<bool>>,
     pub use_before_def: Vec<Vec<bool>>,
     pub live_in: Vec<Vec<bool>>,
-}
-
-/// Extra register definition with no primary node destination.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImplicitDef {
-    pub reg: u16,
-    pub version: u32,
-    pub block: usize,
-    pub node: usize,
 }
 
 /// Compute def-sites and live-in sets once.
@@ -31,17 +22,16 @@ pub fn collect_def_sites(blocks: &[BasicBlock], num_regs: usize) -> DefSites {
     for block in blocks {
         let mut block_defs = vec![false; num_regs];
         for node in &block.nodes {
-            for_each_use(node, |reference| {
-                if let Some(reg) = reg_usize(*reference, num_regs)
+            node.op.visit_uses(|reference, _| {
+                if let Some(reg) = reg_usize(reference, num_regs)
                     && !block_defs[reg]
                 {
                     use_before_def[block.index][reg] = true;
                 }
             });
 
-            for_each_defined_reg(node, |reg| {
-                let reg = usize::from(reg);
-                if reg < num_regs {
+            node.visit_defs(|reference| {
+                if let Some(reg) = reg_usize(reference, num_regs) {
                     block_defs[reg] = true;
                     defines[block.index][reg] = true;
                 }
@@ -99,16 +89,10 @@ pub fn insert_phi_functions(
 }
 
 /// Rename all register references in dominator-tree order.
-pub fn rename(
-    blocks: &mut [BasicBlock],
-    num_regs: usize,
-    num_params: usize,
-    dom: &DomInfo,
-    implicit_defs: &mut Vec<ImplicitDef>,
-) {
+pub fn rename(blocks: &mut [BasicBlock], num_regs: usize, num_params: usize, dom: &DomInfo) {
     let mut state = RenameState::new(num_regs, num_params);
     if !blocks.is_empty() {
-        rename_block(blocks, 0, dom, &mut state, implicit_defs);
+        rename_block(blocks, 0, dom, &mut state);
     }
 }
 
@@ -166,10 +150,8 @@ fn rename_block(
     block_index: usize,
     dom: &DomInfo,
     state: &mut RenameState,
-    implicit_defs: &mut Vec<ImplicitDef>,
 ) {
     let mut defs = Vec::new();
-    let mut pseudo_nodes = Vec::new();
     let node_count = blocks[block_index].nodes.len();
 
     for node_index in 0..node_count {
@@ -182,55 +164,27 @@ fn rename_block(
                 }
                 continue_after_phi = true;
             } else {
-                rename_uses(&mut node.op, state);
+                node.op
+                    .rewrite_uses(|reference, _| rename_use(state, reference));
                 if let Some(reg) = rename_def(state, &mut node.dest) {
                     defs.push(reg);
                 }
+                node.rewrite_secondary_defs(|reference| {
+                    if let Some(reg) = rename_def(state, reference) {
+                        defs.push(reg);
+                    }
+                });
             }
         }
         if continue_after_phi {
             continue;
         }
-
-        let node = &blocks[block_index].nodes[node_index];
-        let pc = node.pc;
-        let line = node.line;
-        for_each_implicit_def(node, |reg| {
-            let mut reference = SsaRef::reg(reg);
-            if let Some(def_reg) = rename_def(state, &mut reference) {
-                defs.push(def_reg);
-                implicit_defs.push(ImplicitDef {
-                    reg,
-                    version: reference.version().unwrap_or(0),
-                    block: block_index,
-                    node: node_index,
-                });
-            }
-        });
-        for_each_loadnil_extra_def(node, |reg| {
-            let mut reference = SsaRef::reg(reg);
-            if let Some(def_reg) = rename_def(state, &mut reference) {
-                defs.push(def_reg);
-                let mut pseudo = SsaNode::with_dest(
-                    pc,
-                    line,
-                    reference,
-                    SsaOp::LoadNil {
-                        start: reg,
-                        end: reg,
-                    },
-                );
-                pseudo.is_meta_only = true;
-                pseudo_nodes.push(pseudo);
-            }
-        });
     }
 
-    blocks[block_index].nodes.extend(pseudo_nodes);
     fill_successor_phi_uses(blocks, block_index, state);
 
     for &child in &dom.dom_children[block_index] {
-        rename_block(blocks, child, dom, state, implicit_defs);
+        rename_block(blocks, child, dom, state);
     }
 
     for reg in defs.into_iter().rev() {
@@ -260,250 +214,6 @@ fn fill_successor_phi_uses(blocks: &mut [BasicBlock], block_index: usize, state:
                     ver: state.peek(reg),
                 };
             }
-        }
-    }
-}
-
-fn rename_uses(op: &mut SsaOp, state: &RenameState) {
-    match op {
-        SsaOp::Phi { .. }
-        | SsaOp::Nop
-        | SsaOp::LoadK { .. }
-        | SsaOp::LoadBool { .. }
-        | SsaOp::LoadNil { .. }
-        | SsaOp::GetUpval { .. }
-        | SsaOp::GetGlobal { .. }
-        | SsaOp::NewTable { .. }
-        | SsaOp::Jump { .. }
-        | SsaOp::ForPrep { .. }
-        | SsaOp::ForLoop { .. }
-        | SsaOp::TForLoop { .. }
-        | SsaOp::Close { .. }
-        | SsaOp::VarArg { .. } => {}
-        SsaOp::Closure { upvalues, .. } => {
-            for capture in upvalues {
-                if let UpvalueCapture::ParentLocal(reference) = capture {
-                    rename_use(state, reference);
-                }
-            }
-        }
-        SsaOp::SetList { table, values, .. } => {
-            rename_use(state, table);
-            for value in values {
-                rename_use(state, value);
-            }
-        }
-        SsaOp::Move { src } => rename_use(state, src),
-        SsaOp::GetTable { table, key } => {
-            rename_use(state, table);
-            rename_use(state, key);
-        }
-        SsaOp::SetGlobal { src, .. } | SsaOp::SetUpval { src, .. } => rename_use(state, src),
-        SsaOp::SetTable { table, key, value } => {
-            rename_use(state, table);
-            rename_use(state, key);
-            rename_use(state, value);
-        }
-        SsaOp::SelfOp { table, key, .. } => {
-            rename_use(state, table);
-            rename_use(state, key);
-        }
-        SsaOp::BinOp { left, right, .. } => {
-            rename_use(state, left);
-            rename_use(state, right);
-        }
-        SsaOp::UnOp { value, .. } => rename_use(state, value),
-        SsaOp::Concat { operands } => {
-            for operand in operands {
-                rename_use(state, operand);
-            }
-        }
-        SsaOp::Branch { a, b, .. } => {
-            rename_use(state, a);
-            rename_use(state, b);
-        }
-        SsaOp::Call { func, args, .. } | SsaOp::TailCall { func, args, .. } => {
-            rename_use(state, func);
-            for arg in args {
-                rename_use(state, arg);
-            }
-        }
-        SsaOp::Return { values, .. } => {
-            for value in values {
-                rename_use(state, value);
-            }
-        }
-    }
-}
-
-fn for_each_use(node: &SsaNode, mut f: impl FnMut(&SsaRef)) {
-    match &node.op {
-        SsaOp::Move { src } => f(src),
-        SsaOp::GetTable { table, key } => {
-            f(table);
-            f(key);
-        }
-        SsaOp::SetGlobal { src, .. } | SsaOp::SetUpval { src, .. } => f(src),
-        SsaOp::SetTable { table, key, value } => {
-            f(table);
-            f(key);
-            f(value);
-        }
-        SsaOp::SelfOp { table, key, .. } => {
-            f(table);
-            f(key);
-        }
-        SsaOp::BinOp { left, right, .. } => {
-            f(left);
-            f(right);
-        }
-        SsaOp::UnOp { value, .. } => f(value),
-        SsaOp::Concat { operands } => {
-            for operand in operands {
-                f(operand);
-            }
-        }
-        SsaOp::Branch { a, b, .. } => {
-            f(a);
-            f(b);
-        }
-        SsaOp::Call { func, args, .. } | SsaOp::TailCall { func, args, .. } => {
-            f(func);
-            for arg in args {
-                f(arg);
-            }
-        }
-        SsaOp::Return { values, .. } => {
-            for value in values {
-                f(value);
-            }
-        }
-        SsaOp::SetList { table, values, .. } => {
-            f(table);
-            for value in values {
-                f(value);
-            }
-        }
-        SsaOp::ForPrep { base, .. } | SsaOp::ForLoop { base, .. } => {
-            for_each_numeric_for_control_ref(*base, &mut f);
-        }
-        SsaOp::TForLoop { base, .. } => {
-            for_each_numeric_for_control_ref(*base, &mut f);
-        }
-        SsaOp::Phi { .. }
-        | SsaOp::Nop
-        | SsaOp::LoadK { .. }
-        | SsaOp::LoadBool { .. }
-        | SsaOp::LoadNil { .. }
-        | SsaOp::GetUpval { .. }
-        | SsaOp::GetGlobal { .. }
-        | SsaOp::NewTable { .. }
-        | SsaOp::Jump { .. }
-        | SsaOp::Close { .. }
-        | SsaOp::VarArg { .. } => {}
-        SsaOp::Closure { upvalues, .. } => {
-            for capture in upvalues {
-                if let UpvalueCapture::ParentLocal(reference) = capture {
-                    f(reference);
-                }
-            }
-        }
-    }
-}
-
-fn for_each_defined_reg(node: &SsaNode, mut f: impl FnMut(u16)) {
-    let dest = node.dest.reg_index();
-    if let Some(reg) = dest {
-        f(reg);
-    }
-    match &node.op {
-        SsaOp::LoadNil { start, end } => emit_range_except(&mut f, *start, *end, dest),
-        SsaOp::ForLoop { base, .. } => {
-            emit_range_except(&mut f, *base, base.saturating_add(3), dest);
-        }
-        SsaOp::TForLoop { base, count } => {
-            let start = base.saturating_add(3);
-            let end = start.saturating_add(u16::try_from(count.saturating_sub(1)).unwrap_or(0));
-            emit_range_except(&mut f, start, end, dest);
-        }
-        SsaOp::SelfOp { self_reg, .. } if Some(*self_reg) != dest => f(*self_reg),
-        SsaOp::Call {
-            base, return_count, ..
-        } if *return_count >= 3 => {
-            let end = base.saturating_add(u16::try_from(*return_count - 2).unwrap_or(0));
-            emit_range_except(&mut f, base.saturating_add(1), end, dest);
-        }
-        SsaOp::VarArg { base, count } if *count >= 3 => {
-            let end = base.saturating_add(u16::try_from(*count - 2).unwrap_or(0));
-            emit_range_except(&mut f, base.saturating_add(1), end, dest);
-        }
-        _ => {}
-    }
-}
-
-fn for_each_numeric_for_control_ref(base: u16, mut f: impl FnMut(&SsaRef)) {
-    let refs = [
-        SsaRef::reg(base),
-        SsaRef::reg(base.saturating_add(1)),
-        SsaRef::reg(base.saturating_add(2)),
-    ];
-    for reference in &refs {
-        f(reference);
-    }
-}
-
-fn for_each_implicit_def(node: &SsaNode, mut f: impl FnMut(u16)) {
-    match &node.op {
-        SsaOp::ForLoop { base, .. } => {
-            let end = base.saturating_add(2);
-            emit_range(&mut f, *base, end);
-        }
-        SsaOp::TForLoop { base, count } => {
-            let start = base.saturating_add(3);
-            let end = start.saturating_add(u16::try_from(count.saturating_sub(1)).unwrap_or(0));
-            emit_range(&mut f, start, end);
-        }
-        SsaOp::SelfOp { self_reg, .. } => f(*self_reg),
-        SsaOp::Call {
-            base, return_count, ..
-        } if *return_count >= 3 => {
-            let end = base.saturating_add(u16::try_from(*return_count - 2).unwrap_or(0));
-            emit_range(&mut f, base.saturating_add(1), end);
-        }
-        SsaOp::VarArg { base, count } if *count >= 3 => {
-            let end = base.saturating_add(u16::try_from(*count - 2).unwrap_or(0));
-            emit_range(&mut f, base.saturating_add(1), end);
-        }
-        _ => {}
-    }
-}
-
-fn for_each_loadnil_extra_def(node: &SsaNode, mut f: impl FnMut(u16)) {
-    let SsaOp::LoadNil { start, end } = node.op else {
-        return;
-    };
-    if end <= start {
-        return;
-    }
-    emit_range(&mut f, start + 1, end);
-}
-
-fn emit_range(mut f: impl FnMut(u16), start: u16, end: u16) {
-    if end < start {
-        return;
-    }
-    for reg in start..=end {
-        f(reg);
-    }
-}
-
-fn emit_range_except(mut f: impl FnMut(u16), start: u16, end: u16, except: Option<u16>) {
-    if end < start {
-        return;
-    }
-    for reg in start..=end {
-        if Some(reg) != except {
-            f(reg);
         }
     }
 }

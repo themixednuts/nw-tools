@@ -167,9 +167,39 @@ New World's observed convention is closer to Roblox/Lumberyard C++ API style:
 | Returned script table / component table / class-like table | PascalCase, often matching the file/module concept: `Logger`, `UIStyle`, `CrestTab`, `TimeHelperFunctions`, `ActivateEntity` | PascalCase only when P9b has a recognized returned module table and a reliable chunk/file/module name. Otherwise keep deterministic fallback. |
 | Methods on those tables | PascalCase after `:`: `OnInit`, `SetVisualElements`, `ConvertSecondsToHrsMinSecString` | PascalCase for synthetic table member names only. Do not recase recovered field names. |
 | Global helper functions in NW scripts | PascalCase: `RequireScript`, `IsAttackRelatedToLocalPlayer`, `FindLocalPlayerEntityId` | Do not create new globals for style. Do not rename recovered globals. |
-| Local variables and fields | lowerCamel: `channelName`, `sendToConsole`, `effectGroupName`, `frameLineAlpha`, `localPlayerEntityId` | lowerCamel for synthetic locals when there is a semantic role. Keep opaque register names (`v0`, `v1_2`) when no role is known. |
+| Local variables and fields | lowerCamel: `channelName`, `sendToConsole`, `effectGroupName`, `frameLineAlpha`, `localPlayerEntityId` | lowerCamel for synthetic locals when there is a semantic role. Otherwise use role-explicit fallbacks: `aN` parameters, `lN` locals, and `uN` upvalues. |
 | Constants / enum-like fields | `UPPER_SNAKE_CASE` or engine enum names: `SEND_ALL`, `TEXT_CASING_NORMAL`, `eUiTextCaseSetting_Normal` | `UPPER_SNAKE_CASE` only for synthetic constant fields when proven constant-like. Do not infer constant-ness from uppercase recovered names. |
 | RequireScript imports | Mixed. PascalCase for class/data handlers, lowerCamel for helpers: `BaseElement`, `EntitlementsDataHandler`, `styleHelpers`, `crestTabCommon` | Do not style imports in P9b v1 unless a later name pass has a reliable target-specific rule. |
+
+### Consumer-derived table local names
+
+A synthetic table local may take its lower-camel name from a named field that
+uniquely consumes it:
+
+```lua
+local properties = {}
+properties.Width = 10
+Options.Properties = properties
+```
+
+This is a generic data-flow rule, not a `Properties` special case. It applies
+only when the same binding is initialized by a table constructor, is used as a
+receiver, and has exactly one ordinary value read: the right-hand side of a
+single named-field store. The derived spelling must be a valid, non-keyword Lua
+identifier and must not collide with another binding or global lookup. Recovered
+debug names are never changed.
+
+Numeric and dynamic consumers do not supply a semantic name, so these remain on
+the deterministic `lN` fallback:
+
+```lua
+Options[1] = l4
+Options[key] = l4
+```
+
+The rule renames one proven binding and all of its uses. It does not fold the
+table into its consumer, reorder statements, or infer names from New World
+paths or APIs.
 
 ## New World Observed Conventions
 
@@ -389,9 +419,9 @@ let has_assignment_form = decompiled.contains("o.get = function(self)");
 fallback names:
 
 ```rust
-Name::from(format!("v{reg}"))
-Name::from(format!("arg{}", u16::from(reg) + 1))
-Name::from(format!("up{idx}"))
+AnonymousNameRole::Parameter.name(reg) // aN
+AnonymousNameRole::Local.name(reg)     // lN
+AnonymousNameRole::Upvalue.name(idx)   // uN
 ```
 
 Those are synthetic and eligible for P9b styling only under the rules below.
@@ -404,16 +434,17 @@ decisions, but should not itself rewrite executable structure in v1.
 | Order | Transform | Status | Preconditions | Output policy |
 | --- | --- | --- | --- | --- |
 | 1 | Recognize module/component table pattern | SAFE | Pattern is one local or global table binding assigned a table value, followed by functions/fields on that same table, with a final `return SameTable`. Recognition must be metadata-only unless a later listed transform applies. | Tag the table as `module_like`/`component_like`. Do not reorder statements, localize globals, or create a table binding from a `return { ... }` literal. |
-| 2 | Style synthetic returned module table name | SAFE-WITH-PRECONDITION | The table name is synthetic (`vN`, `vN_M`, or equivalent internal marker), the module pattern from order 1 is recognized, a reliable chunk/file/module basename exists, the generated PascalCase name is a valid Lua identifier, and no collision occurs in scope. | Rename the binding and all local uses to PascalCase, e.g. `shopcommon` -> `ShopCommon`, `timehelperfunctions` -> `TimeHelperFunctions`. If any condition fails, keep `vN`. |
-| 3 | Standalone table function assignment sugar | SAFE-WITH-PRECONDITION | Statement is a single-target assignment whose RHS is exactly one function expression: `T.f = function(...) ... end`. Target must be representable as a Lua function name (`Name(.Name)*.Name`), or `["field"]` only when the string key is a valid non-keyword identifier. The assignment must not be part of multi-assignment. | Emit `function T.f(...) ... end`. Preserve the recovered table/member names exactly. |
-| 4 | Standalone global function assignment sugar | SAFE-WITH-PRECONDITION | Same as order 3, but target is a global name: `F = function(...) ... end`. Do not apply when `F` is a recovered local binding or when assignment order is part of a multi-assignment. | Emit `function F(...) ... end`. This matches NW globals like `RequireScript` and `FindLocalPlayerEntityId`, but P9b must not invent new globals. |
-| 5 | Local function sugar from `local f = function` | SAFE-WITH-PRECONDITION | Statement is `local f = function(...) ... end`, `f` is a single local binding, and binding analysis proves the function body has no free reference to `f` that would change from an outer/global binding to this new local. Simpler v1 rule: require no reference to `f` inside the function body. | Emit `local function f(...) ... end`. If the function is recursive, prefer order 6's `local f; f = function` pattern instead. |
-| 6 | Local recursive function sugar from declaration plus assignment | SAFE-WITH-PRECONDITION | Adjacent statements are exactly `local f` followed by `f = function(...) ... end`; both refer to the same local binding; there is no intervening read/write; the assignment RHS is only the function expression. | Emit `local function f(...) ... end`. This is the Lua 5.1-defined recursive local-function shape. |
-| 7 | Method declaration sugar | SAFE-WITH-PRECONDITION | Input after orders 3/4 is `function T.method(self, ...) ... end` or equivalent assignment form. The first parameter binding is named `self`, or it is synthetic and P9b can rename that parameter binding and all uses to `self` without collision. | Emit `function T:method(...) ... end`. For recovered method names, preserve case. For synthetic table member names only, prefer PascalCase in NW-targeted mode. |
-| 8 | Style synthetic receiver parameter to `self` | SAFE-WITH-PRECONDITION | Only inside a function selected for method sugar. First parameter is synthetic (`arg1` or equivalent), all reads resolve to that parameter binding, and no nested local named `self` collision would be introduced in the same scope. | Rename that binding to `self` and then apply order 7. Do not rename a recovered non-`self` first parameter. |
-| 9 | Style synthetic local variables with semantic roles | SAFE-WITH-PRECONDITION | The name is synthetic and role evidence is strong: receiver `self`, numeric loop index `i`/`j`, generic unused slot `_`, recognized module table name, or a future semantic role assigned by P9. All uses must be binding-aware rewrites. | Use NW case: lowerCamel for locals/parameters, PascalCase for returned module/class tables, upper snake only for proven constant-like fields. Keep opaque `vN` names when no role is known. |
-| 10 | Convert `T["field"] = function` to declaration sugar | SAFE-WITH-PRECONDITION | Same as order 3, plus the string key is a valid Lua identifier and not a keyword. | Emit `function T.field(...) ... end`; if first parameter qualifies, order 7 may emit `function T:field(...)`. |
-| 11 | Reparse gate after P9b and after StyLua | SAFE | Always. | P9b output must parse before formatting, and formatted output must parse again. This catches invalid sugaring even when the transform was locally plausible. |
+| 2 | Style synthetic returned module table name | SAFE-WITH-PRECONDITION | The table name is synthetic (`lN` or equivalent internal marker), the module pattern from order 1 is recognized, a reliable chunk/file/module basename exists, the generated PascalCase name is a valid Lua identifier, and no collision occurs in scope. | Rename the binding and all local uses to PascalCase, e.g. `shopcommon` -> `ShopCommon`, `timehelperfunctions` -> `TimeHelperFunctions`. If any condition fails, keep `lN`. |
+| 3 | Name a synthetic table from its unique named-field consumer | SAFE-WITH-PRECONDITION | One synthetic binding is initialized by a table constructor, has receiver mutations, and has exactly one value read in `T.Field = binding`. `Field` converts to a valid collision-free lower-camel identifier. Numeric/dynamic index stores are excluded. | Rename that binding and all binding-identified uses, such as `l4` to `properties`. Do not fold or move the table. |
+| 4 | Standalone table function assignment sugar | SAFE-WITH-PRECONDITION | Statement is a single-target assignment whose RHS is exactly one function expression: `T.f = function(...) ... end`. Target must be representable as a Lua function name (`Name(.Name)*.Name`), or `["field"]` only when the string key is a valid non-keyword identifier. The assignment must not be part of multi-assignment. | Emit `function T.f(...) ... end`. Preserve the recovered table/member names exactly. |
+| 5 | Standalone global function assignment sugar | SAFE-WITH-PRECONDITION | Same as order 4, but target is a global name: `F = function(...) ... end`. Do not apply when `F` is a recovered local binding or when assignment order is part of a multi-assignment. | Emit `function F(...) ... end`. This matches NW globals like `RequireScript` and `FindLocalPlayerEntityId`, but P9b must not invent new globals. |
+| 6 | Local function sugar from `local f = function` | SAFE-WITH-PRECONDITION | Statement is `local f = function(...) ... end`, `f` is a single local binding, and binding analysis proves the function body has no free reference to `f` that would change from an outer/global binding to this new local. Simpler v1 rule: require no reference to `f` inside the function body. | Emit `local function f(...) ... end`. If the function is recursive, prefer order 7's `local f; f = function` pattern instead. |
+| 7 | Local recursive function sugar from declaration plus assignment | SAFE-WITH-PRECONDITION | Adjacent statements are exactly `local f` followed by `f = function(...) ... end`; both refer to the same local binding; there is no intervening read/write; the assignment RHS is only the function expression. | Emit `local function f(...) ... end`. This is the Lua 5.1-defined recursive local-function shape. |
+| 8 | Method declaration sugar | SAFE-WITH-PRECONDITION | Input after orders 4/5 is `function T.method(self, ...) ... end` or equivalent assignment form. The first parameter binding is named `self`, or it is synthetic and P9b can rename that parameter binding and all uses to `self` without collision. | Emit `function T:method(...) ... end`. For recovered method names, preserve case. For synthetic table member names only, prefer PascalCase in NW-targeted mode. |
+| 9 | Style synthetic receiver parameter to `self` | SAFE-WITH-PRECONDITION | Only inside a function selected for method sugar. First parameter is synthetic (`a0` or equivalent), all reads resolve to that parameter binding, and no nested local named `self` collision would be introduced in the same scope. | Rename that binding to `self` and then apply order 8. Do not rename a recovered non-`self` first parameter. |
+| 10 | Style synthetic local variables with semantic roles | SAFE-WITH-PRECONDITION | The name is synthetic and role evidence is strong: receiver `self`, numeric loop index `i`/`j`, generic unused slot `_`, recognized module table name, or a unique named-field table consumer. All uses must be binding-aware rewrites. | Use NW case: lowerCamel for locals/parameters, PascalCase for returned module/class tables, upper snake only for proven constant-like fields. Keep the role fallback (`aN`, `lN`, or `uN`) when no stronger role is known. |
+| 11 | Convert `T["field"] = function` to declaration sugar | SAFE-WITH-PRECONDITION | Same as order 4, plus the string key is a valid Lua identifier and not a keyword. | Emit `function T.field(...) ... end`; if first parameter qualifies, order 8 may emit `function T:field(...)`. |
+| 12 | Reparse gate after P9b and after StyLua | SAFE | Always. | P9b output must parse before formatting, and formatted output must parse again. This catches invalid sugaring even when the transform was locally plausible. |
 
 ## Explicit Unsafe Skips
 
@@ -425,7 +456,7 @@ decisions, but should not itself rewrite executable structure in v1.
 | Reshape `return { f = function(...) ... end }` into `local M = {}; function M:f(...) ...; return M` | UNSAFE-SKIP for v1 | Broadly changes structure, evaluation order around mixed table fields, duplicate-key behavior risk, closure upvalue shape, and debug behavior. It may be possible later under a much stricter proof, but not for P9b v1. |
 | Move functions out of arbitrary table constructors | UNSAFE-SKIP for v1 | Table constructor field evaluation order and duplicate fields can matter. Metatable literals are often clearer with inline functions. |
 | Convert `local f = function() ... f ... end` to `local function f` without binding proof | UNSAFE-SKIP | Lua 5.1 scoping differs; the function body may currently capture an outer/global `f`. |
-| Convert non-`self` first parameters to method sugar | UNSAFE-SKIP unless synthetic and binding-renamed | `function T.method(this, x)` -> `function T:method(x)` would make the body's `this` unresolved unless all binding uses are rewritten. Never do this for recovered `this`, `a0`, etc. |
+| Convert non-`self` first parameters to method sugar | UNSAFE-SKIP unless synthetic and binding-renamed | `function T.method(this, x)` -> `function T:method(x)` would make the body's `this` unresolved unless all binding uses are rewritten. Never do this for a recovered named parameter such as `this`; synthetic `a0` is eligible only through binding-aware receiver proof. |
 | Convert call sites `obj.method(obj, x)` to `obj:method(x)` | UNSAFE-SKIP for v1 | It is safe only under strict receiver identity/evaluation rules and preferably opcode evidence. P9b v1 focuses on declarations, not calls. |
 | Sort or regroup statements for style | UNSAFE-SKIP | Statement order is executable in Lua. Do not move `RequireScript`, `BaseElement:CreateNewElement`, table initialization, bus connects, or field assignments. |
 | Synthesize imports or rename `RequireScript` locals from path heuristics | UNSAFE-SKIP for v1 | NW import local case is mixed and context-dependent (`BaseElement` vs `styleHelpers` vs `crestTabCommon`). |
@@ -445,9 +476,9 @@ Never rename recovered identifiers:
 
 P9b may style only synthetic names:
 
-- Register fallbacks currently shaped like `v0`, `v1`, `v1_2`.
-- Synthetic parameter fallbacks currently shaped like `arg1`, `arg2`.
-- Synthetic upvalue fallbacks currently shaped like `up0`.
+- Synthetic local fallbacks shaped like `l0`, `l1`.
+- Synthetic parameter fallbacks shaped like `a0`, `a1`.
+- Synthetic upvalue fallbacks shaped like `u0`.
 - Synthetic constant fallbacks currently shaped like `k0`, if ever emitted as
   identifiers.
 - New names P9b itself introduces for a recognized module table or receiver
@@ -464,18 +495,19 @@ For NW-targeted clean-code emission:
 1. Preserve every recovered identifier exactly.
 2. For recognized returned module/component tables with synthetic names, use
    PascalCase from the chunk/file stem when reliable.
-3. For synthetic methods on recognized module/component tables, use PascalCase
+3. For a synthetic table with one named-field consumer, use the field's
+   lower-camel spelling only under the binding and use-count proof above.
+4. For synthetic methods on recognized module/component tables, use PascalCase
    only if the member name itself is synthetic. Most member names are recovered
    from constants and must not be recased.
-4. For method receiver parameters, use `self` when the binding is synthetic or
+5. For method receiver parameters, use `self` when the binding is synthetic or
    already recovered as `self`.
-5. For ordinary synthetic locals and parameters, prefer lowerCamel only when P9
-   or P9b has semantic role evidence. Otherwise keep deterministic fallback
-   names (`vN`, `argN`) rather than inventing misleading names.
-6. For constants, use upper snake only when the field/local is synthetic and
+6. For ordinary synthetic locals and parameters, prefer lowerCamel only when P9
+   or P9b has semantic role evidence. Otherwise keep deterministic role
+   fallbacks (`lN`, `aN`, `uN`) rather than inventing misleading names.
+7. For constants, use upper snake only when the field/local is synthetic and
    proven constant-like. Do not infer constness from value alone in v1.
 
 Verdict: New World Lua is not snake_case. It is PascalCase for exported
 component/module/class tables and methods, lowerCamel for ordinary locals and
 fields, and UPPER_SNAKE_CASE for constant-like fields.
-

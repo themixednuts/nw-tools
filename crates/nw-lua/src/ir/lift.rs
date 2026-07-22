@@ -5,7 +5,7 @@ use crate::{
     chunk::Proto,
 };
 
-use super::{BasicBlock, BinOp, RelOp, SsaNode, SsaOp, SsaRef, UnOp, UpvalueCapture};
+use super::{BasicBlock, BinOp, LoopControl, RelOp, SsaNode, SsaOp, SsaRef, UnOp, UpvalueCapture};
 
 /// Lift all basic blocks in-place.
 pub fn lift_all(
@@ -121,8 +121,12 @@ fn lift_block(
                 line,
                 reg_ref(inst.a),
                 SsaOp::NewTable {
-                    array_size: inst.b,
-                    hash_size: inst.c,
+                    array_hint: super::TableSizeHint::from_encoded(
+                        u16::try_from(inst.b).expect("decoded B operand fits in u16"),
+                    ),
+                    hash_hint: super::TableSizeHint::from_encoded(
+                        u16::try_from(inst.c).expect("decoded C operand fits in u16"),
+                    ),
                 },
             )),
             SemanticOp::SelfOp => nodes.push(SsaNode::with_dest(
@@ -227,7 +231,7 @@ fn lift_block(
                 line,
                 reg_ref(inst.a + 3),
                 SsaOp::ForLoop {
-                    base: reg_index(inst.a),
+                    control: LoopControl::from_base(reg_index(inst.a)),
                     target: jump_target(pc, inst.sbx),
                 },
             )),
@@ -236,7 +240,7 @@ fn lift_block(
                 line,
                 reg_ref(inst.a),
                 SsaOp::ForPrep {
-                    base: reg_index(inst.a),
+                    control: LoopControl::from_base(reg_index(inst.a)),
                     target: jump_target(pc, inst.sbx),
                 },
             )),
@@ -244,7 +248,7 @@ fn lift_block(
                 pc_i32,
                 line,
                 SsaOp::TForLoop {
-                    base: reg_index(inst.a),
+                    control: LoopControl::from_base(reg_index(inst.a)),
                     count: inst.c,
                 },
             )),
