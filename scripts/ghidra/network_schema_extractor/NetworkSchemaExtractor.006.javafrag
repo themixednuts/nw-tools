@@ -502,10 +502,14 @@
         if (shapeWire == null) {
             shapeWire = wireShapeFromNestedTypeShape(shape);
         }
-        if (shapeWire == null) {
-            return;
+        String shapeLayout = wireLayoutFromNestedTypeShape(shape);
+        if (shapeLayout != null &&
+            (field.wireLayout == null || field.wireLayout.equals(shapeLayout))) {
+            field.wireLayout = shapeLayout;
+            field.wireLayoutSource = wireShapeSource;
         }
-        if (field.wireShape == null || field.wireShape.equals(shapeWire)) {
+        if (shapeWire != null &&
+            (field.wireShape == null || field.wireShape.equals(shapeWire))) {
             field.wireShape = shapeWire;
             field.wireShapeSource = wireShapeSource;
         }
@@ -551,6 +555,31 @@
             memberShapes.add(member.wireShape);
         }
         return compositeWireShape(memberShapes);
+    }
+
+    private String wireLayoutFromNestedTypeShape(NestedTypeShape shape) {
+        if (shape == null || !Boolean.TRUE.equals(shape.memberCoverageProven) ||
+            !Boolean.TRUE.equals(shape.wireOrderProven)) {
+            return null;
+        }
+        List<NestedTypeMember> members = provenWireOrderedMembers(shape.members);
+        if (members == null || members.isEmpty()) {
+            return null;
+        }
+        ArrayList<String> layouts = new ArrayList<>(members.size());
+        for (NestedTypeMember member : members) {
+            WireShape evidence = nestedMemberWireEvidence(member);
+            String layout = evidence == null
+                ? null
+                : firstNonEmpty(evidence.layout, evidence.shape);
+            if (layout == null || canonicalLayoutWireShape(layout) == null) {
+                return null;
+            }
+            layouts.add(layout);
+        }
+        return layouts.size() == 1
+            ? canonicalLayoutWireShape(layouts.get(0))
+            : compositeWireShape(layouts);
     }
 
     private NestedTypeShape recoverNestedDirectTypeShape(

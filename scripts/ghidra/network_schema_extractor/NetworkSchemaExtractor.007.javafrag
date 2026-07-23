@@ -207,6 +207,7 @@
             ? uniqueSerializeTypeForObservedNativeLayout(shape)
             : serializeTypesById.get(evidence.getKey());
         if (reflected == null) {
+            proveDirectSymbolicTypeIdentity(shape, target);
             return;
         }
         String identitySource = evidence == null
@@ -227,6 +228,37 @@
         shape.typeNameFull = reflected.name;
         shape.typeNameSource = identitySource;
         enrichKnownSerializeIdentity(shape);
+    }
+
+    private void proveDirectSymbolicTypeIdentity(
+        NestedTypeShape shape,
+        Function target) {
+
+        if (shape == null || target == null || shape.members.isEmpty() ||
+            !Boolean.TRUE.equals(shape.layoutProven) ||
+            !Boolean.TRUE.equals(shape.memberCoverageProven) ||
+            !Boolean.TRUE.equals(shape.wireOrderProven)) {
+            return;
+        }
+        String typeName = directUnmarshalValueTypeName(target);
+        if (typeName == null || wireShapeFromNativeType(typeName) != null) {
+            return;
+        }
+        String observed = firstNonEmpty(shape.typeNameFull, shape.typeName);
+        if (observed != null &&
+            !normalizeNativeType(observed).equals(normalizeNativeType(typeName))) {
+            return;
+        }
+        String source =
+            "ghidra-direct-unmarshal-value-type+complete-output-storage+cfg-complete-wire-product";
+        shape.identityProven = true;
+        shape.identitySource = source;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(typeName);
+        shape.typeNameFull = typeName;
+        shape.typeNameSource = "ghidra-symbol";
+        shape.validation = appendValidation(
+            shape.validation,
+            "symbolic-direct-type-identity");
     }
 
     private SerializeTypeInfo uniqueSerializeTypeForObservedNativeLayout(

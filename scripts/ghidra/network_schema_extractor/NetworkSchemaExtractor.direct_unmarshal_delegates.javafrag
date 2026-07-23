@@ -8,7 +8,15 @@
         }
 
         List<PcodeOpAST> operations = orderedPcodeOps(wrapperHigh);
-        PcodeStorage wrapperValue = new PcodeStorage("param_1", 0L);
+        Integer wrapperValueSlot = unmarshalOutputParameterSlot(wrapper);
+        if (wrapperValueSlot == null) {
+            recordNestedTypeShapeReject(
+                "direct-delegate-wrapper-output-unproven");
+            return null;
+        }
+        PcodeStorage wrapperValue = new PcodeStorage(
+            "param_" + wrapperValueSlot,
+            0L);
         PcodeStorage wrapperReadBuffer = null;
         PcodeOpAST delegatedCall = null;
         Function delegatedTarget = null;
@@ -44,13 +52,14 @@
                 operation,
                 target,
                 wrapperValue);
+            Integer targetValueSlot = unmarshalOutputParameterSlot(target);
             if (callerReadBuffer == null || callerReadBuffer.offset != 0L ||
                 pcodeParameterIndex(callerReadBuffer.base) == null) {
                 recordNestedTypeShapeReject(
                     "direct-delegate-caller-read-buffer-unproven");
                 continue;
             }
-            if (!Integer.valueOf(1).equals(valueSlot)) {
+            if (targetValueSlot == null || !targetValueSlot.equals(valueSlot)) {
                 recordNestedTypeShapeReject(
                     "direct-delegate-value-receiver-unproven");
                 continue;
@@ -135,7 +144,7 @@
         }
 
         NestedTypeShape delegated = copyNestedTypeShape(child);
-        delegated.memberBase = "param_1";
+        delegated.memberBase = wrapperValue.base;
         long nativeExtent = 0L;
         for (NestedTypeMember member : delegated.members) {
             if (member.nativeOffset == null) {
