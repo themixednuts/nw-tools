@@ -378,7 +378,8 @@
             for (FieldCall field : function.fields) {
                 String detail = "registration=" +
                     formatAddress(function.function.getEntryPoint()) +
-                    ", field=" + field.index;
+                    ", field=" + field.index +
+                    ", handler=" + formatAddress(field.handlerVtable);
                 heartbeat = updateAnalysisWorklist(
                     "field-handler-enrichment",
                     completed,

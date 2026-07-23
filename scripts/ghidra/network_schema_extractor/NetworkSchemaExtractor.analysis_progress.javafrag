@@ -1,5 +1,18 @@
     private static final long ANALYSIS_HEARTBEAT_NANOS = 15_000_000_000L;
 
+    private static final class AnalysisCancelledException extends RuntimeException {
+        @Override
+        public synchronized Throwable fillInStackTrace() {
+            return this;
+        }
+    }
+
+    private void checkAnalysisCancelled() {
+        if (monitor.isCancelled()) {
+            throw new AnalysisCancelledException();
+        }
+    }
+
     private void startAnalysisWorklist(String phase, long total) {
         monitor.setCancelEnabled(true);
         monitor.setShowProgressValue(true);

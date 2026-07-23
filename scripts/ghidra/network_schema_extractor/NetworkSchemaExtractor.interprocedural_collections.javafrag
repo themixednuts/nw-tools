@@ -81,6 +81,7 @@
         Integer selected = null;
         int argumentCount = provenCallArgumentCount(call, helper);
         for (int slot = 1; slot <= argumentCount; slot++) {
+            codecWireTraceCheckpoint();
             LinkedHashSet<PcodeStorage> candidates = new LinkedHashSet<>();
             PcodeStorage argument = provenCallArgumentStorage(
                 caller,
@@ -109,6 +110,7 @@
             }
             boolean produced = false;
             for (PcodeStorage candidate : candidates) {
+                codecWireTraceCheckpoint();
                 PcodeOpAST producer = uniqueUnmarshalCountProducer(
                     high,
                     operations,

@@ -60,13 +60,22 @@
     }
 
     private Set<PcodeStorage> scalarCallOutputStorages(PcodeOp call) {
+        return scalarCallOutputStorages(call, null);
+    }
+
+    private Set<PcodeStorage> scalarCallOutputStorages(
+        PcodeOp call,
+        WireShape knownEvidence) {
+
         Function target = pcodeCallTarget(call);
         String nativeType = firstNonEmpty(
             unmarshalNativeTypeFromTarget(target),
             scalarOutputStoreNativeType(target));
         Integer nativeWidth = nativeTypeByteWidth(nativeType);
         if (nativeWidth == null) {
-            WireShape evidence = directCallWireEvidence((PcodeOpAST)call);
+            WireShape evidence = knownEvidence == null
+                ? directCallWireEvidence((PcodeOpAST)call)
+                : knownEvidence;
             nativeWidth = evidence == null ? null : wireShapeByteWidth(evidence.shape);
         }
         PcodeStorage storage = pcodeScalarUnmarshalOutputStorage(call, nativeWidth);

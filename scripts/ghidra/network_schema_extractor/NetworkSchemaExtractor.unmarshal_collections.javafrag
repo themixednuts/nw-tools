@@ -9,6 +9,7 @@
         Map<Address, CollectionOutputShape> localCollections =
             containerCollectionOutputs(function);
         for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            codecWireTraceCheckpoint();
             PcodeOpAST count = nearestCountCallForLoop(function, high, loop, operations);
             CollectionOutputShape shape = count == null
                 ? null
@@ -40,6 +41,7 @@
         HashMap<String, String> tempNativeTypes = new HashMap<>();
         HashMap<String, String> tempWireShapes = new HashMap<>();
         for (PcodeOpAST operation : operations) {
+            codecWireTraceCheckpoint();
             if (operation.getOpcode() != PcodeOp.CALL) {
                 continue;
             }
@@ -103,13 +105,13 @@
 
         PcodeOpAST selected = null;
         for (PcodeOpAST candidate : operations) {
+            codecWireTraceCheckpoint();
             if (candidate.getOpcode() != PcodeOp.CALL ||
                 !NetworkSchemaControlFlow.precedes(high, candidate, consumer)) {
                 continue;
             }
-            Function target = pcodeCallTarget(candidate);
             WireShape evidence = directCallWireEvidence(candidate);
-            Set<PcodeStorage> outputs = scalarCallOutputStorages(candidate);
+            Set<PcodeStorage> outputs = scalarCallOutputStorages(candidate, evidence);
             boolean matchingOutput = outputs.stream()
                 .anyMatch(countStorage::sameLocation);
             if (evidence == null || !"vlq-u32".equals(evidence.shape) ||

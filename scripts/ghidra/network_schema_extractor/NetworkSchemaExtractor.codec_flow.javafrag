@@ -2,6 +2,12 @@
     private final Set<String> codecWireTraceActiveContexts = new LinkedHashSet<>();
     private final Map<String, CodecWireTrace> codecWireTraceCompletedContexts =
         lruCache(CODEC_CLASSIFICATION_CACHE_LIMIT);
+    private final Map<String, Boolean> codecWireTraceRejectedContexts =
+        lruCache(CODEC_CLASSIFICATION_CACHE_LIMIT);
+    private final Set<Address> codecWireTraceActiveFunctions = new HashSet<>();
+    private final ArrayDeque<String> codecWireTraceStack = new ArrayDeque<>();
+    private long codecWireTraceOperations;
+    private long codecWireTraceHeartbeatNanos;
 
     private NestedTypeShape directWireSequenceShape(
         Function target,
@@ -134,15 +140,33 @@
         if (function == null || readBuffer == null) {
             return null;
         }
+        checkAnalysisCancelled();
         String context = function.getEntryPoint() + "|" + readBuffer.expression();
         CodecWireTrace completed = completedContexts.get(context);
         if (completed != null) {
             return new CodecWireTrace(completed.events);
         }
+        if (codecWireTraceRejectedContexts.containsKey(context)) {
+            runMetrics.increment("codecWireTraceNegativeCacheHits");
+            return null;
+        }
         if (!activeContexts.add(context)) {
             recordNestedTypeShapeReject("codec-wire-call-cycle");
+            runMetrics.increment("codecWireTraceContextCycleRejects");
             return unresolvedCodecWireTrace(context, "call-cycle");
         }
+        Address functionEntry = function.getEntryPoint();
+        if (!codecWireTraceActiveFunctions.add(functionEntry)) {
+            activeContexts.remove(context);
+            recordNestedTypeShapeReject("codec-wire-function-call-cycle");
+            runMetrics.increment("codecWireTraceFunctionCycleRejects");
+            return unresolvedCodecWireTrace(context, "function-call-cycle");
+        }
+        if (codecWireTraceStack.isEmpty()) {
+            codecWireTraceOperations = 0L;
+            codecWireTraceHeartbeatNanos = System.nanoTime();
+        }
+        codecWireTraceStack.addLast(context);
 
         try {
             HighFunction high = highFunction(function);
@@ -192,6 +216,7 @@
                     "ambiguous-collection-actions");
             }
             for (PcodeOpAST op : operations) {
+                codecWireTraceCheckpoint();
                 UnmarshalSequenceAction sequence = sequenceActions.get(op);
                 UnmarshalCollectionAction collection = collectionActions.get(op);
                 if (collection != null) {
@@ -362,6 +387,8 @@
             return result;
         }
         finally {
+            codecWireTraceStack.removeLast();
+            codecWireTraceActiveFunctions.remove(functionEntry);
             activeContexts.remove(context);
         }
     }
@@ -371,7 +398,31 @@
         String diagnostic) {
 
         codecWireTraceDiagnostics.put(context, diagnostic);
+        if (diagnostic == null || !diagnostic.contains("call-cycle")) {
+            codecWireTraceRejectedContexts.put(context, Boolean.TRUE);
+        }
         return null;
+    }
+
+    private void codecWireTraceCheckpoint() {
+        checkAnalysisCancelled();
+        if (codecWireTraceStack.isEmpty()) {
+            return;
+        }
+        codecWireTraceOperations++;
+        long now = System.nanoTime();
+        if (codecWireTraceHeartbeatNanos == 0L) {
+            codecWireTraceHeartbeatNanos = now;
+            return;
+        }
+        if (now - codecWireTraceHeartbeatNanos < ANALYSIS_HEARTBEAT_NANOS) {
+            return;
+        }
+        println(
+            "Codec trace progress: operations=" + codecWireTraceOperations +
+            ", depth=" + codecWireTraceStack.size() +
+            ", context=" + codecWireTraceStack.peekLast());
+        codecWireTraceHeartbeatNanos = now;
     }
 
     private String codecWireTraceDiagnostic(
@@ -515,6 +566,7 @@
                 continue;
             }
             for (PcodeOpAST operation : operations) {
+                codecWireTraceCheckpoint();
                 PcodeStorageWrite write = storageWrite(operation);
                 if (write == null || !(call instanceof PcodeOpAST callAst) ||
                     !NetworkSchemaControlFlow.precedes(high, operation, callAst) ||
