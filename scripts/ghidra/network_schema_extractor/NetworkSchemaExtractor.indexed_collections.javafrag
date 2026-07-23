@@ -15,7 +15,6 @@
             ? inserted
             : countedCollectionIndexedOutput(owner, codecs);
     }
-
     private String countedCollectionIndexedOutput(
         Function owner,
         List<PcodeCodecCall> codecs) {
@@ -44,4 +43,3 @@
         }
         return selected;
     }
-
