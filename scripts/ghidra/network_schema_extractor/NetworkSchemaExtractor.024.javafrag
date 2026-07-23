@@ -619,6 +619,11 @@
             return value;
         }
 
+        value = trackedBaseLoadValue(instruction, operandIndex, state);
+        if (value != null) {
+            return value;
+        }
+
         value = trackedFormattedFieldNamePointerLoadValue(instruction, operandIndex, state);
         if (value != null) {
             return value;

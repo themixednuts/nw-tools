@@ -40,6 +40,41 @@ fn emits_presence_prefixed_composite_state_field() {
 }
 
 #[test]
+fn rejects_replicated_state_with_partially_unknown_field_groups() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "8CA7C6C0-2244-4E78-A55E-E7A8752A5984",
+            "typeIndex": 7001,
+            "typeName": "MB::GroupedReplicatedState",
+            "capabilities": ["replicated-state"],
+            "fields": [{
+                "index": 0,
+                "name": "first",
+                "group": 0,
+                "wireShape": "u64",
+                "confidence": "register-field-call"
+            }, {
+                "index": 1,
+                "name": "second",
+                "wireShape": "u64",
+                "confidence": "register-field-call"
+            }]
+        }],
+        "fieldRegistrationFunctions": [],
+        "fieldHandlerVtables": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [7001])
+        .expect("replicated state report");
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(!plan.can_generate);
+    assert_eq!(plan.blocked_reasons, ["missing-field-group:1"]);
+    assert!(!output.source.contains("pub struct GroupedReplicatedState"));
+}
+
+#[test]
 fn emits_single_generated_state_module_with_registration_allowlist() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
@@ -160,6 +195,7 @@ fn replicated_state_attributes_are_not_emitted_as_normal_fields() {
             "fields": [{
                 "index": 0,
                 "name": "AssetId",
+                "group": 0,
                 "registrationKind": "field",
                 "handlerVtable": "NewWorld+0x8041098",
                 "confidence": "fixed-field-table-append"
@@ -212,16 +248,19 @@ fn disambiguates_repeated_replicated_state_field_labels_by_field_index() {
             "fields": [{
                 "index": 0,
                 "name": "Value",
+                "group": 0,
                 "wireShape": "u8",
                 "confidence": "fixed-field-table-append"
             }, {
                 "index": 1,
                 "name": "Value",
+                "group": 0,
                 "wireShape": "u8",
                 "confidence": "fixed-field-table-append"
             }, {
                 "index": 2,
                 "name": "Value",
+                "group": 0,
                 "wireShape": "u8",
                 "confidence": "fixed-field-table-append"
             }]

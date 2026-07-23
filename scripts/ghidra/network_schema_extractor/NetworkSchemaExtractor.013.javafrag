@@ -166,6 +166,7 @@
                 ? trackedOperandValue(instruction, 1, state)
                 : null;
             observeThisValueWrite(instruction, state, offset, source);
+            observeBaseValueWrite(instruction, state, baseOffset, source);
             observeStackValueWrite(instruction, state, source);
             if (offset != null && source != null &&
                 source.address != null && isVtableLike(source.address)) {
@@ -237,6 +238,20 @@
                 state.valuesByStackSlot.put(entry.getKey(), promoted);
             }
         }
+        for (Map.Entry<ObjectOffset, TrackedValue> entry :
+                new ArrayList<>(state.valuesByBaseOffset.entrySet())) {
+            ObjectOffset key = entry.getKey();
+            if (!key.base().equals(baseKey)) {
+                continue;
+            }
+            Integer promotedOffset = NetworkSchemaX86.addOffsets(
+                key.offset(),
+                -(long)baseOffset);
+            if (promotedOffset != null) {
+                state.valuesByThisOffset.put(promotedOffset, entry.getValue().copy());
+            }
+            state.valuesByBaseOffset.remove(key);
+        }
     }
 
     private TrackedValue promoteValueBaseToThis(
@@ -263,7 +278,11 @@
         }
 
         TrackedValue receiver = state.registers.get("RCX");
-        return receiver != null && receiver.thisOffset != null && receiver.thisOffset == 0;
+        return receiver != null &&
+            (receiver.thisOffset != null && receiver.thisOffset == 0 ||
+                "param_1".equals(receiver.baseKey) &&
+                    receiver.baseOffset != null &&
+                    receiver.baseOffset == 0);
     }
 
     private boolean isStackProbeCall(Instruction instruction) {
@@ -450,6 +469,25 @@
         return value == null ? null : value.copy();
     }
 
+    private TrackedValue trackedBaseLoadValue(
+        Instruction instruction,
+        int operandIndex,
+        ForwardArgState state) {
+
+        TrackedValue baseOffset = trackedBaseOffsetForMemoryOperand(
+            instruction,
+            operandIndex,
+            state.registers);
+        if (baseOffset == null ||
+            baseOffset.baseKey == null ||
+            baseOffset.baseOffset == null) {
+            return null;
+        }
+        TrackedValue value = state.valuesByBaseOffset.get(
+            baseOffsetKey(baseOffset.baseKey, baseOffset.baseOffset));
+        return value == null ? null : value.copy();
+    }
+
     private TrackedValue trackedFormattedFieldNamePointerLoadValue(
         Instruction instruction,
         int operandIndex,
@@ -490,6 +528,27 @@
         }
         else {
             state.valuesByThisOffset.put(offset, source.copy());
+        }
+    }
+
+    private void observeBaseValueWrite(
+        Instruction instruction,
+        ForwardArgState state,
+        TrackedValue baseOffset,
+        TrackedValue source) {
+
+        if (baseOffset == null ||
+            baseOffset.baseKey == null ||
+            baseOffset.baseOffset == null) {
+            return;
+        }
+        ObjectOffset key = baseOffsetKey(baseOffset.baseKey, baseOffset.baseOffset);
+        Integer widthBits = memoryWriteWidthBits(instruction);
+        if (widthBits == null || widthBits > 64 || source == null) {
+            state.valuesByBaseOffset.remove(key);
+        }
+        else {
+            state.valuesByBaseOffset.put(key, source.copy());
         }
     }
 

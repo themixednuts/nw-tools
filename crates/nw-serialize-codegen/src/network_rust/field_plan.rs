@@ -683,6 +683,9 @@ pub(super) fn state_field_blocked_reason(
     if field.name.is_none() {
         return Some("missing-field-name".to_owned());
     }
+    if field.group.is_none() {
+        return Some("missing-field-group".to_owned());
+    }
     if !field.confidence.is_high_or_exact() {
         return Some("low-confidence-field".to_owned());
     }

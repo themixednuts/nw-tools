@@ -742,8 +742,14 @@
             }
 
             if (!observeConstructors) {
+                boolean addFilterGroupCall = isAddFilterGroupCall(instruction, state);
                 clearVolatileRegisters(state.registers);
                 clearVolatileAllocatorDispatchRegisters(state);
+                if (addFilterGroupCall) {
+                    state.registers.put(
+                        "RAX",
+                        TrackedValue.immediate(state.nextFilterGroupIndex++));
+                }
                 return;
             }
 

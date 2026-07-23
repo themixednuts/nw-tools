@@ -118,6 +118,7 @@ final class ForwardArgState {
             new HashMap<>();
     final Set<String> allocatorDispatchRegisters = new LinkedHashSet<>();
     final Map<Integer, TrackedValue> valuesByThisOffset = new HashMap<>();
+    final Map<ObjectOffset, TrackedValue> valuesByBaseOffset = new HashMap<>();
     final Map<Integer, TrackedValue> valuesByStackSlot = new HashMap<>();
     int nextFilterGroupIndex = 1;
     Boolean zeroFlag;
@@ -156,6 +157,9 @@ final class ForwardArgState {
         }
         for (Map.Entry<Integer, TrackedValue> entry : other.valuesByThisOffset.entrySet()) {
             valuesByThisOffset.put(entry.getKey(), entry.getValue().copy());
+        }
+        for (Map.Entry<ObjectOffset, TrackedValue> entry : other.valuesByBaseOffset.entrySet()) {
+            valuesByBaseOffset.put(entry.getKey(), entry.getValue().copy());
         }
     }
 
@@ -213,6 +217,13 @@ final class ForwardArgState {
             }
             valuesByThisOffset.putIfAbsent(entry.getKey(), entry.getValue().copy());
         }
+        for (Map.Entry<ObjectOffset, TrackedValue> entry : other.valuesByBaseOffset.entrySet()) {
+            TrackedValue existing = valuesByBaseOffset.get(entry.getKey());
+            if (existing != null && !existing.sameValue(entry.getValue())) {
+                return false;
+            }
+            valuesByBaseOffset.putIfAbsent(entry.getKey(), entry.getValue().copy());
+        }
         return true;
     }
 
@@ -220,6 +231,7 @@ final class ForwardArgState {
         boolean changed = retainCommonValues(registers, other.registers);
         changed |= retainCommonValues(valuesByStackSlot, other.valuesByStackSlot);
         changed |= retainCommonValues(valuesByThisOffset, other.valuesByThisOffset);
+        changed |= retainCommonValues(valuesByBaseOffset, other.valuesByBaseOffset);
         changed |= retainCommonSet(allocatorDispatchRegisters, other.allocatorDispatchRegisters);
         if (!Objects.equals(zeroFlag, other.zeroFlag) && zeroFlag != null) {
             zeroFlag = null;
