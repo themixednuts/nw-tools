@@ -37,24 +37,38 @@ pub struct NetworkEvidenceIssue {
 }
 
 pub(super) fn state_evidence_issues(network_type: &NetworkType) -> Vec<NetworkEvidenceIssue> {
-    field_evidence_issues(network_type)
+    field_evidence_issues(&network_type.fields)
 }
 
 pub(super) fn message_evidence_issues(network_type: &NetworkType) -> Vec<NetworkEvidenceIssue> {
-    let mut issues = field_evidence_issues(network_type);
+    let marshal_only = network_type
+        .instance
+        .as_ref()
+        .and_then(|instance| instance.supports_unmarshal)
+        == Some(false)
+        && !network_type.marshal_fields.is_empty();
+    let fields = if marshal_only {
+        &network_type.marshal_fields
+    } else {
+        &network_type.fields
+    };
+    let mut issues = field_evidence_issues(fields);
     if network_type.signature_field_count_conflict {
         issues.push(NetworkEvidenceIssue {
             kind: NetworkEvidenceIssueKind::FieldCountConflict,
             field_ordinals: Vec::new(),
             field_indices: Vec::new(),
             storage_offset: None,
-            evidence: Some(network_type.fields.len().to_string()),
+            evidence: Some(fields.len().to_string()),
         });
     }
     let mut storage = BTreeMap::<(&str, u32), usize>::new();
 
-    for (ordinal, field) in network_type.fields.iter().enumerate() {
-        if is_pcode_stack_field(field) && field.storage_base.as_deref() != Some("param_3") {
+    for (ordinal, field) in fields.iter().enumerate() {
+        if is_pcode_stack_field(field)
+            && field.storage_base.as_deref() != Some("param_3")
+            && !has_matching_marshal_field(field, &network_type.marshal_fields)
+        {
             issues.push(field_issue(
                 NetworkEvidenceIssueKind::NonRootStorage,
                 ordinal,
@@ -79,7 +93,7 @@ pub(super) fn message_evidence_issues(network_type: &NetworkType) -> Vec<Network
         {
             issues.push(pair_issue(
                 NetworkEvidenceIssueKind::DuplicateStorage,
-                network_type,
+                fields,
                 previous,
                 ordinal,
                 offset,
@@ -87,11 +101,11 @@ pub(super) fn message_evidence_issues(network_type: &NetworkType) -> Vec<Network
         }
     }
 
-    for (parent_ordinal, parent) in network_type.fields.iter().enumerate() {
+    for (parent_ordinal, parent) in fields.iter().enumerate() {
         let Some((start, end)) = exact_nested_storage_range(parent) else {
             continue;
         };
-        for (child_ordinal, child) in network_type.fields.iter().enumerate() {
+        for (child_ordinal, child) in fields.iter().enumerate() {
             if parent_ordinal == child_ordinal || child.storage_base != parent.storage_base {
                 continue;
             }
@@ -101,7 +115,7 @@ pub(super) fn message_evidence_issues(network_type: &NetworkType) -> Vec<Network
             if offset > start && offset < end {
                 issues.push(pair_issue(
                     NetworkEvidenceIssueKind::NestedStorageOverlap,
-                    network_type,
+                    fields,
                     parent_ordinal,
                     child_ordinal,
                     offset,
@@ -113,9 +127,9 @@ pub(super) fn message_evidence_issues(network_type: &NetworkType) -> Vec<Network
     issues
 }
 
-fn field_evidence_issues(network_type: &NetworkType) -> Vec<NetworkEvidenceIssue> {
+fn field_evidence_issues(fields: &[NetworkField]) -> Vec<NetworkEvidenceIssue> {
     let mut issues = Vec::new();
-    for (ordinal, field) in network_type.fields.iter().enumerate() {
+    for (ordinal, field) in fields.iter().enumerate() {
         if field.type_conflict || field.signature_type_conflict {
             issues.push(field_issue(
                 NetworkEvidenceIssueKind::FieldTypeConflict,
@@ -193,6 +207,22 @@ fn field_evidence_issues(network_type: &NetworkType) -> Vec<NetworkEvidenceIssue
     issues
 }
 
+fn has_matching_marshal_field(field: &NetworkField, marshal_fields: &[NetworkField]) -> bool {
+    field.confidence.is_high_or_exact()
+        && field.evidence.iter().any(|evidence| {
+            evidence.kind == crate::network_schema::NetworkEvidenceKind::MessageSource
+        })
+        && marshal_fields.iter().any(|marshal| {
+            marshal.index == field.index
+                && marshal.confidence.is_high_or_exact()
+                && marshal.evidence.iter().any(|evidence| {
+                    evidence.kind == crate::network_schema::NetworkEvidenceKind::MessageSource
+                })
+                && marshal.wire_shape == field.wire_shape
+                && marshal.wire_layout == field.wire_layout
+        })
+}
+
 fn is_pcode_stack_field(field: &NetworkField) -> bool {
     field
         .evidence
@@ -237,7 +267,7 @@ fn field_issue(
 
 fn pair_issue(
     kind: NetworkEvidenceIssueKind,
-    network_type: &NetworkType,
+    fields: &[NetworkField],
     left: usize,
     right: usize,
     storage_offset: u32,
@@ -247,7 +277,7 @@ fn pair_issue(
         field_ordinals: vec![left, right],
         field_indices: [left, right]
             .into_iter()
-            .filter_map(|ordinal| network_type.fields[ordinal].index)
+            .filter_map(|ordinal| fields[ordinal].index)
             .collect(),
         storage_offset: Some(storage_offset),
         evidence: None,

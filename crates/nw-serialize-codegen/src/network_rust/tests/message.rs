@@ -181,7 +181,7 @@ fn emits_native_marshal_only_messages_without_a_decoder() {
             "fields": [{
                 "index": 0,
                 "name": "ActorId",
-                "storageOffset": "0x8",
+                "storageExpression": "local_20",
                 "wireLayout": "fixed-bytes-16",
                 "confidence": "message-unmarshal-pcode-stack-readraw"
             }],
@@ -228,6 +228,56 @@ fn emits_native_marshal_only_messages_without_a_decoder() {
             .iter()
             .any(|reason| reason == "marshal-unmarshal-field-mismatch")
     );
+}
+
+#[test]
+fn accepts_source_matched_bidirectional_fields_recovered_through_temporaries() {
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "0552ED14-3F76-47CC-844C-E1C1150766C0",
+            "typeIndex": 1956,
+            "typeName": "MB::ServerContext::PulseMsg",
+            "fields": [{
+                "index": 0,
+                "storageExpression": "local_20",
+                "wireShape": "u64",
+                "confidence": "message-unmarshal-pcode-stack-call"
+            }],
+            "messageMarshal": {
+                "fields": [{
+                    "index": 0,
+                    "wireShape": "u64",
+                    "confidence": "message-marshal-pcode-stack"
+                }]
+            }
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+    schema.merge_message_signatures(
+        &[NetworkMessageSignature {
+            type_id: Some(uuid!("0552ed14-3f76-47cc-844c-e1c1150766c0")),
+            type_index: Some(1956),
+            name: Some("MB::ServerContext::PulseMsg".to_owned()),
+            rust_name: Some("PulseMsg".to_owned()),
+            source: Some("source-signature".to_owned()),
+            fields: vec![NetworkMessageFieldSignature {
+                index: Some(0),
+                name: "CurrentTimePoint".to_owned(),
+                rust_type: Some("::nw_network::TimePoint".to_owned()),
+                native_type: Some("TimePoint".to_owned()),
+                wire_shape: Some(crate::NetworkWireShape::U64),
+            }],
+        }],
+        None,
+    );
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert!(plan.evidence_issues.is_empty());
+    assert!(output.source.contains("pub struct PulseMsg"));
 }
 
 #[test]

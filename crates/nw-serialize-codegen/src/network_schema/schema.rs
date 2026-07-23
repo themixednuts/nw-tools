@@ -634,6 +634,12 @@ fn merge_message_signature_direction(
             report.wire_shape_conflict_count += 1;
         }
 
+        if !field.signature_type_conflict
+            && !field.signature_wire_conflict
+            && !field.confidence.is_high_or_exact()
+        {
+            field.confidence = NetworkConfidence::High;
+        }
         field.evidence.push(NetworkEvidence {
             kind: NetworkEvidenceKind::MessageSource,
             source: source.to_owned(),

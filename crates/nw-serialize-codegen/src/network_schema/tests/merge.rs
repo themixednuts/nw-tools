@@ -733,6 +733,12 @@ fn message_signatures_group_unknown_scalar_lanes_inside_exact_products() {
         schema.types[0].marshal_fields[2].name.as_deref(),
         Some("MovementInteractionId")
     );
+    assert!(
+        schema.types[0]
+            .marshal_fields
+            .iter()
+            .all(|field| field.confidence == NetworkConfidence::High)
+    );
 }
 
 #[test]
