@@ -312,7 +312,8 @@ pub(super) fn replicated_state_shape_support_tokens(
             let binding = &member.binding;
             quote!(#field_ident: #binding,)
         });
-        if uses_source_type {
+        if uses_source_type && !source_shape_direct_initializer_is_complete(shape, serialize_types)
+        {
             quote! {
                 #value_type {
                     #(#init_fields)*
@@ -430,6 +431,36 @@ pub(super) fn replicated_state_shape_support_tokens(
 
         #marshaler_impl
     })
+}
+
+fn source_shape_direct_initializer_is_complete(
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> bool {
+    let Some(source_type) = shape
+        .type_id
+        .and_then(|type_id| serialize_types.get(&type_id))
+    else {
+        return false;
+    };
+    if source_type.kind != NetworkSerializeKind::Struct
+        || shape.members.len() != source_type.fields.len()
+    {
+        return false;
+    }
+
+    let initialized_fields = shape
+        .members
+        .iter()
+        .filter_map(|member| member.name.as_deref())
+        .map(rust_field_ident)
+        .collect::<BTreeSet<_>>();
+    let source_fields = source_type
+        .fields
+        .iter()
+        .map(|field| rust_field_ident(&field.name))
+        .collect::<BTreeSet<_>>();
+    initialized_fields.len() == shape.members.len() && initialized_fields == source_fields
 }
 
 fn support_member_needs_explicit_default(rust_type: &syn::Type) -> bool {
