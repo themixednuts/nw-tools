@@ -3,6 +3,7 @@
             Address unmarshalFull,
             Long expectedElementStride) {
 
+        checkAnalysisCancelled();
         LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> candidates =
             new LinkedHashMap<>();
         if (expectedElementStride == null || expectedElementStride <= 0L) {
@@ -21,6 +22,7 @@
         }
         LinkedHashMap<Long, NestedTypeMember> decodedMembers = new LinkedHashMap<>();
         for (Map.Entry<Long, NestedTypeMember> entry : element.entrySet()) {
+            checkAnalysisCancelled();
             NestedTypeMember member = entry.getValue();
             if (member != null && (member.wireShape != null || member.wireLayout != null)) {
                 decodedMembers.put(entry.getKey(), member);
@@ -43,6 +45,7 @@
         Map<String, LinkedHashMap<Long, NestedTypeMember>> candidates,
         int depth) {
 
+        checkAnalysisCancelled();
         if (function == null || bufferParameter == null || depth > 8) {
             return;
         }
@@ -58,8 +61,10 @@
             boolean foundElementLoop = false;
             List<PcodeOpAST> operations = orderedPcodeOps(high);
             for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+                checkAnalysisCancelled();
                 for (PcodeOpAST induction :
                         affinePointerInductions(loop, expectedElementStride)) {
+                    checkAnalysisCancelled();
                     foundElementLoop = true;
                     collectRootedContainerLoopMembers(
                         function,
@@ -77,6 +82,7 @@
 
             PcodeStorage readBuffer = new PcodeStorage(bufferParameter, 0L);
             for (PcodeOpAST operation : operations) {
+                checkAnalysisCancelled();
                 if (operation.getOpcode() != PcodeOp.CALL) {
                     continue;
                 }
@@ -114,6 +120,7 @@
         Map<String, LinkedHashMap<Long, NestedTypeMember>> candidates) {
 
         for (PcodeOpAST operation : operations) {
+            checkAnalysisCancelled();
             if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
                 continue;
             }
@@ -214,6 +221,7 @@
         }
         LinkedHashMap<String, PcodeStorage> result = new LinkedHashMap<>();
         for (int slot = 1; slot < operation.getNumInputs(); slot++) {
+            checkAnalysisCancelled();
             Long offset = elementRelativeOffset(
                 operation.getInput(slot),
                 elementRoot,
@@ -234,6 +242,7 @@
         LinkedHashMap<Long, NestedTypeMember> members =
             candidates.computeIfAbsent("element", ignored -> new LinkedHashMap<>());
         for (PcodeStorage storage : rootedArguments.values()) {
+            checkAnalysisCancelled();
             if (!"element".equals(storage.base) || members.containsKey(storage.offset) ||
                 members.size() >= NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
                 continue;

@@ -32,12 +32,28 @@ final class NetworkSchemaControlFlow {
                 return size() > ANALYSIS_CACHE_LIMIT;
             }
         };
+    private static final ThreadLocal<Runnable> CANCELLATION_CHECKPOINT = new ThreadLocal<>();
 
     private NetworkSchemaControlFlow() {}
 
     static void clearCaches() {
         synchronized (ANALYSIS_CACHE) {
             ANALYSIS_CACHE.clear();
+        }
+    }
+
+    static void setCancellationCheckpoint(Runnable checkpoint) {
+        CANCELLATION_CHECKPOINT.set(checkpoint);
+    }
+
+    static void clearCancellationCheckpoint() {
+        CANCELLATION_CHECKPOINT.remove();
+    }
+
+    private static void checkCancelled() {
+        Runnable checkpoint = CANCELLATION_CHECKPOINT.get();
+        if (checkpoint != null) {
+            checkpoint.run();
         }
     }
 
@@ -61,6 +77,7 @@ final class NetworkSchemaControlFlow {
 
         ArrayList<PcodeBlockBasic> entries = new ArrayList<>();
         for (PcodeBlockBasic block : blocks) {
+            checkCancelled();
             if (block.getInSize() == 0) {
                 entries.add(block);
             }
@@ -73,20 +90,24 @@ final class NetworkSchemaControlFlow {
         HashSet<PcodeBlockBasic> visited = new HashSet<>();
         ArrayList<PcodeBlockBasic> postorder = new ArrayList<>(blocks.size());
         for (PcodeBlockBasic entry : entries) {
+            checkCancelled();
             appendPostorder(entry, visited, postorder);
         }
         ArrayList<PcodeBlockBasic> remaining = new ArrayList<>(blocks);
         remaining.removeAll(visited);
         remaining.sort(BLOCK_ORDER);
         for (PcodeBlockBasic block : remaining) {
+            checkCancelled();
             appendPostorder(block, visited, postorder);
         }
         Collections.reverse(postorder);
 
         ArrayList<PcodeOpAST> operations = new ArrayList<>();
         for (PcodeBlockBasic block : postorder) {
+            checkCancelled();
             Iterator<PcodeOp> iterator = block.getIterator();
             while (iterator.hasNext()) {
+                checkCancelled();
                 PcodeOp operation = iterator.next();
                 if (operation instanceof PcodeOpAST ast) {
                     operations.add(ast);
@@ -107,11 +128,13 @@ final class NetworkSchemaControlFlow {
         HashSet<PcodeBlockBasic> visited = new HashSet<>();
         pending.add(source);
         while (!pending.isEmpty()) {
+            checkCancelled();
             PcodeBlockBasic block = pending.remove(pending.size() - 1);
             if (!visited.add(block)) {
                 continue;
             }
             for (PcodeBlockBasic successor : successors(block)) {
+                checkCancelled();
                 if (successor == target) {
                     return true;
                 }
@@ -173,7 +196,9 @@ final class NetworkSchemaControlFlow {
         LinkedHashMap<PcodeBlockBasic, LinkedHashSet<PcodeBlockBasic>> bodies =
             new LinkedHashMap<>();
         for (PcodeBlockBasic tail : blocks) {
+            checkCancelled();
             for (PcodeBlockBasic header : successors(tail)) {
+                checkCancelled();
                 Set<PcodeBlockBasic> tailDominators = dominators.get(tail);
                 if (tailDominators == null || !tailDominators.contains(header)) {
                     continue;
@@ -186,6 +211,7 @@ final class NetworkSchemaControlFlow {
         headers.sort(BLOCK_ORDER);
         ArrayList<NetworkSchemaNaturalLoop> result = new ArrayList<>(headers.size());
         for (PcodeBlockBasic header : headers) {
+            checkCancelled();
             result.add(new NetworkSchemaNaturalLoop(header, bodies.get(header)));
         }
         return analysis.cacheNaturalLoops(result);
@@ -202,6 +228,7 @@ final class NetworkSchemaControlFlow {
         }
         int entries = 0;
         for (PcodeBlockBasic block : blocks) {
+            checkCancelled();
             if (block.getInSize() == 0) {
                 entries++;
             }
@@ -235,6 +262,7 @@ final class NetworkSchemaControlFlow {
         if (block == null || !visited.add(block)) {
             return;
         }
+        checkCancelled();
         for (PcodeBlockBasic successor : successors(block)) {
             appendPostorder(successor, visited, postorder);
         }
@@ -253,8 +281,10 @@ final class NetworkSchemaControlFlow {
             pending.add(tail);
         }
         while (!pending.isEmpty()) {
+            checkCancelled();
             PcodeBlockBasic block = pending.remove(pending.size() - 1);
             for (PcodeBlockBasic predecessor : predecessors(block)) {
+                checkCancelled();
                 if (body.add(predecessor) && predecessor != header) {
                     pending.add(predecessor);
                 }
@@ -269,6 +299,7 @@ final class NetworkSchemaControlFlow {
         HashSet<PcodeBlockBasic> all = new HashSet<>(blocks);
         Map<PcodeBlockBasic, Set<PcodeBlockBasic>> dominators = new HashMap<>();
         for (PcodeBlockBasic block : blocks) {
+            checkCancelled();
             dominators.put(
                 block,
                 block.getInSize() == 0
@@ -277,13 +308,16 @@ final class NetworkSchemaControlFlow {
         }
         boolean changed;
         do {
+            checkCancelled();
             changed = false;
             for (PcodeBlockBasic block : blocks) {
+                checkCancelled();
                 if (block.getInSize() == 0) {
                     continue;
                 }
                 Set<PcodeBlockBasic> next = null;
                 for (PcodeBlockBasic predecessor : predecessors(block)) {
+                    checkCancelled();
                     Set<PcodeBlockBasic> predecessorDominators = dominators.get(predecessor);
                     if (predecessorDominators == null) {
                         continue;
@@ -311,6 +345,7 @@ final class NetworkSchemaControlFlow {
     static List<PcodeBlockBasic> successors(PcodeBlockBasic block) {
         ArrayList<PcodeBlockBasic> result = new ArrayList<>(block.getOutSize());
         for (int index = 0; index < block.getOutSize(); index++) {
+            checkCancelled();
             PcodeBlock successor = block.getOut(index);
             PcodeBlock leaf = successor == null ? null : successor.getFrontLeaf();
             if (leaf instanceof PcodeBlockBasic basic) {
@@ -324,6 +359,7 @@ final class NetworkSchemaControlFlow {
     static List<PcodeBlockBasic> predecessors(PcodeBlockBasic block) {
         ArrayList<PcodeBlockBasic> result = new ArrayList<>(block.getInSize());
         for (int index = 0; index < block.getInSize(); index++) {
+            checkCancelled();
             PcodeBlock predecessor = block.getIn(index);
             PcodeBlock leaf = predecessor == null ? null : predecessor.getFrontLeaf();
             if (leaf instanceof PcodeBlockBasic basic) {
@@ -347,6 +383,7 @@ final class NetworkSchemaControlFlow {
         ArrayList<PcodeOpAST> result = new ArrayList<>();
         Iterator<PcodeOpAST> iterator = high.getPcodeOps();
         while (iterator.hasNext()) {
+            checkCancelled();
             result.add(iterator.next());
         }
         result.sort((left, right) -> left.getSeqnum().compareTo(right.getSeqnum()));

@@ -73,6 +73,7 @@ import java.util.Collection;
         Address vtable,
         FullContainerPlan fullContainerPlan) {
 
+        checkAnalysisCancelled();
         if (!isExecutableAddress(unmarshalFull)) {
             return null;
         }
@@ -102,6 +103,7 @@ import java.util.Collection;
                     candidates == null
                         ? Collections.<NativeTypeInfoEvidence>emptyList()
                         : candidates) {
+                checkAnalysisCancelled();
                 if (isExactContainerValueTypeEvidence(candidate)) {
                     recordContainerValueShapeRejectSample(
                         "no-output-storage",
@@ -133,6 +135,7 @@ import java.util.Collection;
         NestedTypeShape selected = null;
         for (NativeTypeInfoEvidence candidate :
                 candidates == null ? Collections.<NativeTypeInfoEvidence>emptyList() : candidates) {
+            checkAnalysisCancelled();
             if (candidate == null || !isExactContainerValueTypeEvidence(candidate)) {
                 continue;
             }
@@ -228,6 +231,7 @@ import java.util.Collection;
         NestedTypeShape selected = null;
         String selectedBase = null;
         for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry : byBase.entrySet()) {
+            checkAnalysisCancelled();
             ArrayList<NestedTypeMember> members = new ArrayList<>(entry.getValue().values());
             members.sort((left, right) -> Long.compare(left.offset, right.offset));
             String observedLayout = relativeObservedNativeWireLayoutKey(members);
@@ -280,6 +284,7 @@ import java.util.Collection;
         selected.identityProven = true;
         selected.identitySource = candidate.source + "+exact-output-root";
         for (NestedTypeMember member : selected.members) {
+            checkAnalysisCancelled();
             if (Boolean.TRUE.equals(member.typeIdentityProven)) {
                 member.typeIdentitySource = selected.identitySource;
             }
@@ -304,6 +309,7 @@ import java.util.Collection;
         NestedTypeShape selected = null;
         String selectedBase = null;
         for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry : byBase.entrySet()) {
+            checkAnalysisCancelled();
             NestedTypeShape shape = constructionBackedContainerValueShapeForBase(
                 candidate,
                 reflected,
@@ -354,6 +360,7 @@ import java.util.Collection;
         ArrayList<NestedTypeMember> members = new ArrayList<>();
         int index = 0;
         for (NestedTypeMember source : observedMembers) {
+            checkAnalysisCancelled();
             if (source == null || source.offset < 0L ||
                 source.offset >= candidate.nativeSize) {
                 return null;

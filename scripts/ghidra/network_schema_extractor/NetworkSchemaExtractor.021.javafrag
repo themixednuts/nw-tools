@@ -38,6 +38,7 @@
         }
         Long end = null;
         for (SerializeFieldInfo field : info.layoutFields) {
+            checkAnalysisCancelled();
             if (field == null || field.offset == null) {
                 continue;
             }
@@ -82,6 +83,7 @@
         Set<String> completedContexts,
         Map<String, PcodeStorage> callerParamStorage) {
 
+        checkAnalysisCancelled();
         if (byBase == null || target == null) {
             return;
         }
@@ -110,6 +112,7 @@
             ArrayList<CollectionStorageSpan> collectionSpans = new ArrayList<>();
             List<PcodeOpAST> operations = orderedPcodeOps(high);
             for (PcodeOpAST op : operations) {
+                checkAnalysisCancelled();
                 if (op.getOpcode() == PcodeOp.CALL) {
                 CollectionOutputShape collection = countedCollections.get(
                     op.getSeqnum().getTarget());
