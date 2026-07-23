@@ -157,38 +157,42 @@ impl NetworkSchema {
             match network_type.type_index {
                 Some(existing) if existing == type_index => {
                     report.matching_type_index_count += 1;
-                    network_type.evidence.push(typeindex_evidence(
-                        type_index,
-                        NetworkConfidence::Exact,
-                        None,
-                    ));
+                    push_unique(
+                        &mut network_type.evidence,
+                        typeindex_evidence(type_index, NetworkConfidence::Exact, None),
+                    );
                 }
                 Some(existing) => {
                     report.conflicting_type_index_count += 1;
-                    network_type.evidence.push(typeindex_evidence(
-                        type_index,
-                        NetworkConfidence::Weak,
-                        Some(format!("typeindex.json={type_index}, existing={existing}")),
-                    ));
+                    push_unique(
+                        &mut network_type.evidence,
+                        typeindex_evidence(
+                            type_index,
+                            NetworkConfidence::Weak,
+                            Some(format!("typeindex.json={type_index}, existing={existing}")),
+                        ),
+                    );
                 }
                 None => {
                     report.filled_type_index_count += 1;
                     network_type.type_index = Some(type_index);
-                    network_type.evidence.push(typeindex_evidence(
-                        type_index,
-                        NetworkConfidence::Exact,
-                        None,
-                    ));
+                    push_unique(
+                        &mut network_type.evidence,
+                        typeindex_evidence(type_index, NetworkConfidence::Exact, None),
+                    );
                 }
             }
         }
-        self.sources.push(NetworkSchemaSource {
-            kind: NetworkSchemaSourceKind::TypeIndex,
-            path: source_path,
-            schema: None,
-            program: None,
-            image_base: None,
-        });
+        push_unique(
+            &mut self.sources,
+            NetworkSchemaSource {
+                kind: NetworkSchemaSourceKind::TypeIndex,
+                path: source_path,
+                schema: None,
+                program: None,
+                image_base: None,
+            },
+        );
         self.summary = self.build_summary();
         Ok(report)
     }
@@ -227,23 +231,29 @@ impl NetworkSchema {
                 report.filled_name_count += 1;
             }
             network_type.serialize = Some(network_serialize_type(item, &index));
-            network_type.evidence.push(NetworkEvidence {
-                kind: NetworkEvidenceKind::SerializeContext,
-                source,
-                address: None,
-                detail: Some(item.source_name.clone()),
-                confidence,
-            });
+            push_unique(
+                &mut network_type.evidence,
+                NetworkEvidence {
+                    kind: NetworkEvidenceKind::SerializeContext,
+                    source,
+                    address: None,
+                    detail: Some(item.source_name.clone()),
+                    confidence,
+                },
+            );
             merge_field_serialize_types(network_type, &index, &selected_value_types, &mut report);
         }
 
-        self.sources.push(NetworkSchemaSource {
-            kind: NetworkSchemaSourceKind::SerializeContext,
-            path: source_path,
-            schema: None,
-            program: None,
-            image_base: None,
-        });
+        push_unique(
+            &mut self.sources,
+            NetworkSchemaSource {
+                kind: NetworkSchemaSourceKind::SerializeContext,
+                path: source_path,
+                schema: None,
+                program: None,
+                image_base: None,
+            },
+        );
         self.summary = self.build_summary();
         report
     }
@@ -372,13 +382,16 @@ impl NetworkSchema {
             }
         }
 
-        self.sources.push(NetworkSchemaSource {
-            kind: NetworkSchemaSourceKind::MessageSignatures,
-            path: source_path,
-            schema: None,
-            program: None,
-            image_base: None,
-        });
+        push_unique(
+            &mut self.sources,
+            NetworkSchemaSource {
+                kind: NetworkSchemaSourceKind::MessageSignatures,
+                path: source_path,
+                schema: None,
+                program: None,
+                image_base: None,
+            },
+        );
         self.summary = self.build_summary();
         report
     }
@@ -455,23 +468,29 @@ impl NetworkSchema {
                 field.confidence = confidence;
                 report.confidence_updated_count += 1;
             }
-            field.evidence.push(NetworkEvidence {
-                kind: NetworkEvidenceKind::FieldOverride,
-                source: source.clone(),
-                address: None,
-                detail: Some(field_override_detail(field_override)),
-                confidence: field_override.confidence.unwrap_or(NetworkConfidence::High),
-            });
+            push_unique(
+                &mut field.evidence,
+                NetworkEvidence {
+                    kind: NetworkEvidenceKind::FieldOverride,
+                    source: source.clone(),
+                    address: None,
+                    detail: Some(field_override_detail(field_override)),
+                    confidence: field_override.confidence.unwrap_or(NetworkConfidence::High),
+                },
+            );
             report.matched_field_count += 1;
         }
 
-        self.sources.push(NetworkSchemaSource {
-            kind: NetworkSchemaSourceKind::FieldOverrides,
-            path: source_path,
-            schema: None,
-            program: None,
-            image_base: None,
-        });
+        push_unique(
+            &mut self.sources,
+            NetworkSchemaSource {
+                kind: NetworkSchemaSourceKind::FieldOverrides,
+                path: source_path,
+                schema: None,
+                program: None,
+                image_base: None,
+            },
+        );
         self.summary = self.build_summary();
         report
     }
@@ -642,13 +661,16 @@ fn merge_message_signature_direction(
         {
             field.confidence = NetworkConfidence::High;
         }
-        field.evidence.push(NetworkEvidence {
-            kind: NetworkEvidenceKind::MessageSource,
-            source: source.to_owned(),
-            address: None,
-            detail: Some(signature.name.clone()),
-            confidence: NetworkConfidence::High,
-        });
+        push_unique(
+            &mut field.evidence,
+            NetworkEvidence {
+                kind: NetworkEvidenceKind::MessageSource,
+                source: source.to_owned(),
+                address: None,
+                detail: Some(signature.name.clone()),
+                confidence: NetworkConfidence::High,
+            },
+        );
     }
     true
 }

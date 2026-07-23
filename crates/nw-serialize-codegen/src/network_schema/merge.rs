@@ -645,13 +645,16 @@ fn grouped_message_field(
         field.wire_layout = Some(wire_layout.clone());
         field.wire_shape_source = Some(projection.source.to_owned());
         field.wire_layout_source = Some(projection.source.to_owned());
-        field.evidence.push(NetworkEvidence {
-            kind: NetworkEvidenceKind::MessageSource,
-            source: "message-signature+ghidra-field-sequence".to_owned(),
-            address: None,
-            detail: Some(wire_layout),
-            confidence: NetworkConfidence::Exact,
-        });
+        push_unique(
+            &mut field.evidence,
+            NetworkEvidence {
+                kind: NetworkEvidenceKind::MessageSource,
+                source: "message-signature+ghidra-field-sequence".to_owned(),
+                address: None,
+                detail: Some(wire_layout),
+                confidence: NetworkConfidence::Exact,
+            },
+        );
     }
     field
 }
@@ -895,13 +898,16 @@ pub(super) fn merge_field_serialize_types(
             source.clone(),
             confidence,
         ));
-        field.evidence.push(NetworkEvidence {
-            kind: NetworkEvidenceKind::SerializeContext,
-            source,
-            address,
-            detail: Some(item.source_name.clone()),
-            confidence,
-        });
+        push_unique(
+            &mut field.evidence,
+            NetworkEvidence {
+                kind: NetworkEvidenceKind::SerializeContext,
+                source,
+                address,
+                detail: Some(item.source_name.clone()),
+                confidence,
+            },
+        );
     }
 }
 

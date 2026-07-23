@@ -52,5 +52,11 @@ use replicated_state::{
     replicated_state_abi_evidence,
 };
 
+fn push_unique<T: PartialEq>(values: &mut Vec<T>, value: T) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
 #[cfg(test)]
 mod tests;
