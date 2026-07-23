@@ -39,9 +39,14 @@
             return UnmarshalTerminalFlow.unresolved(
                 sawReturn ? "no-scalar-success-terminal" : "no-return-operation");
         }
+        Set<PcodeBlockBasic> mandatory = high.getBasicBlocks().stream()
+            .filter(block -> successful.stream().allMatch(terminal ->
+                NetworkSchemaControlFlow.dominates(high, block, terminal)))
+            .collect(Collectors.toUnmodifiableSet());
         return new UnmarshalTerminalFlow(
             Set.copyOf(successful),
             Map.of(),
+            mandatory,
             "scalar-return-complete");
     }
 
@@ -64,11 +69,12 @@
             }
             return switch (definition.getOpcode()) {
                 case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT,
-                    PcodeOp.INT_SEXT, PcodeOp.INDIRECT ->
+                    PcodeOp.INT_SEXT ->
                     scalarReturnStatus(
                         definition.getInput(0),
                         active,
                         depth + 1);
+                case PcodeOp.INDIRECT -> UnmarshalStatusByte.UNKNOWN;
                 case PcodeOp.SUBPIECE -> {
                     Long offset = definition.getNumInputs() < 2
                         ? null

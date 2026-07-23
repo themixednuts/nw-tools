@@ -1,0 +1,449 @@
+    private record MessageConstructorSpan(
+        long offset,
+        long nativeSize,
+        Address constructor,
+        Address callsite,
+        String evidenceSource) {}
+
+    private void applyMessageConstructorSpans(
+        MessageUnmarshalPlan plan,
+        Function wrapper) {
+
+        if (plan == null || wrapper == null || plan.rootStorageBase == null ||
+            !isCompleteMessageWireCoverage(plan, wrapper)) {
+            return;
+        }
+        for (MessageConstructorSpan span : messageConstructorSpans(plan, wrapper)) {
+            NestedTypeShape shape = anonymousMessageConstructorSpanShape(
+                plan,
+                wrapper,
+                span);
+            if (shape == null) {
+                continue;
+            }
+            FieldCall first = firstMessageFieldInRange(
+                plan,
+                span.offset(),
+                span.nativeSize());
+            if (first == null) {
+                continue;
+            }
+            FieldCall field = addPcodeMessageField(
+                plan,
+                first.callsite,
+                new PcodeStorage(plan.rootStorageBase, span.offset()),
+                null,
+                "message-unmarshal-constructor-subobject-boundary",
+                first.recoveryOrder);
+            field.nativeType = null;
+            field.sourceTypeName = null;
+            field.sourceTypeId = null;
+            field.sourceTypeIdSource = null;
+            field.sourceTypeIdentityProven = null;
+            field.typeEvidence = null;
+            field.typeConflict = null;
+            field.nestedTypeShape = shape;
+            field.callFrameBoundaryProven = null;
+            field.rawByteLength = null;
+            field.fixedSequenceShape = null;
+            field.confidence = "message-unmarshal-constructor-subobject-boundary";
+            String wireShape = wireShapeFromNestedTypeShape(shape);
+            field.wireShape = wireShape;
+            field.wireShapeSource = wireShape == null ? null : span.evidenceSource();
+            ArrayList<String> layouts = new ArrayList<>();
+            for (NestedTypeMember member : shape.members) {
+                String layout = firstNonEmpty(member.wireLayout, member.wireShape);
+                if (layout == null) {
+                    layouts.clear();
+                    break;
+                }
+                layouts.add(layout);
+            }
+            if (!layouts.isEmpty()) {
+                field.wireLayout = compositeWireShape(layouts);
+                field.wireLayoutSource = span.evidenceSource();
+            }
+        }
+    }
+
+    private List<MessageConstructorSpan> messageConstructorSpans(
+        MessageUnmarshalPlan plan,
+        Function wrapper) {
+
+        HighFunction high = highFunction(wrapper);
+        if (high == null) {
+            return List.of();
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        LinkedHashMap<String, PcodeOpAST> constructors = new LinkedHashMap<>();
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            PcodeStorage receiver = provenCallArgumentStorage(
+                wrapper,
+                operation,
+                target,
+                1);
+            if (target == null || receiver == null || receiver.offset <= 0L ||
+                !plan.rootStorageBase.equals(receiver.base) ||
+                isMemsetFunction(target) ||
+                !readBufferParameters(target).isEmpty()) {
+                continue;
+            }
+            constructors.putIfAbsent(storageKey(receiver), operation);
+        }
+
+        LinkedHashMap<String, MessageConstructorSpan> spans = new LinkedHashMap<>();
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (!isMemsetFunction(target)) {
+                continue;
+            }
+            PcodeStorage destination = provenCallArgumentStorage(
+                wrapper,
+                operation,
+                target,
+                1);
+            Long length = provenCallArgumentImmediate(
+                wrapper,
+                operation,
+                target,
+                3);
+            Long end = destination == null || length == null
+                ? null
+                : addExactOrNull(destination.offset, length);
+            if (destination == null || destination.offset <= 0L ||
+                !plan.rootStorageBase.equals(destination.base) ||
+                length == null || length <= 0L ||
+                end == null ||
+                plan.instanceSize != null && end > plan.instanceSize) {
+                continue;
+            }
+            PcodeOpAST constructor = constructors.get(storageKey(destination));
+            if (constructor == null ||
+                !NetworkSchemaControlFlow.precedes(high, operation, constructor)) {
+                continue;
+            }
+            Function constructorTarget = pcodeCallTarget(constructor);
+            String source =
+                "dominating-constructor-memset+same-storage-constructor-call";
+            spans.putIfAbsent(
+                storageKey(destination),
+                new MessageConstructorSpan(
+                    destination.offset,
+                    length,
+                    constructorTarget == null
+                        ? null
+                        : constructorTarget.getEntryPoint(),
+                    constructor.getSeqnum().getTarget(),
+                    source));
+        }
+        return List.copyOf(spans.values());
+    }
+
+    private boolean isMemsetFunction(Function function) {
+        return function != null && "memset".equalsIgnoreCase(function.getName());
+    }
+
+    private NestedTypeShape anonymousMessageConstructorSpanShape(
+        MessageUnmarshalPlan plan,
+        Function wrapper,
+        MessageConstructorSpan span) {
+
+        Long end = addExactOrNull(span.offset(), span.nativeSize());
+        if (end == null) {
+            return null;
+        }
+        ArrayList<FieldCall> fields = new ArrayList<>();
+        for (FieldCall field : logicalMessageFields(plan)) {
+            if (field.storageOffset != null &&
+                field.storageOffset >= span.offset() && field.storageOffset < end) {
+                fields.add(field);
+            }
+        }
+        fields.sort(Comparator
+            .comparingInt((FieldCall field) -> field.recoveryOrder)
+            .thenComparingLong(field -> field.storageOffset));
+        if (fields.size() < 2 ||
+            fields.stream().anyMatch(field ->
+                preferredLogicalMessageWireShape(field) == null)) {
+            return null;
+        }
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeNameSource = "synthetic-constructor-subobject";
+        shape.function = wrapper.getEntryPoint();
+        shape.functionName = fullFunctionName(wrapper);
+        shape.constructor = span.constructor();
+        shape.memberBase = plan.rootStorageBase;
+        shape.memberNameSource = "synthetic-offset";
+        shape.memberNamesProven = false;
+        shape.layoutProven = true;
+        shape.memberCoverageProven = true;
+        shape.wireOrderProven = true;
+        shape.wireOrderSource = "message-cfg-complete-wire-coverage";
+        shape.validation = span.evidenceSource() +
+            "+complete-message-unmarshal-wire-sequence";
+        shape.nativeSize = span.nativeSize();
+        shape.nativeSizeSource = "constructor-memset-length";
+
+        int index = 0;
+        for (FieldCall field : fields) {
+            long fieldOffset = field.storageOffset - span.offset();
+            if (isProvenAggregateField(field)) {
+                NestedTypeMember semantic = provenSemanticAggregateMember(
+                    field,
+                    fieldOffset,
+                    index,
+                    shape.wireOrderSource);
+                if (semantic != null) {
+                    shape.members.add(semantic);
+                    index++;
+                    continue;
+                }
+                List<NestedTypeMember> children =
+                    provenWireOrderedMembers(field.nestedTypeShape.members);
+                if (children == null) {
+                    return null;
+                }
+                for (NestedTypeMember child : children) {
+                    long childOffset = child.nativeOffset == null
+                        ? child.offset
+                        : child.nativeOffset;
+                    Long translatedOffset = addExactOrNull(fieldOffset, childOffset);
+                    if (translatedOffset == null || translatedOffset < 0L ||
+                        translatedOffset >= span.nativeSize()) {
+                        return null;
+                    }
+                    NestedTypeMember member = copyNestedTypeMember(child);
+                    member.index = index;
+                    member.offset = translatedOffset;
+                    member.nativeOffset = translatedOffset;
+                    member.name = "_" + index;
+                    member.nameSource = "synthetic-offset";
+                    member.nameProven = false;
+                    member.nameEvidence = null;
+                    member.wireOrdinal = index;
+                    member.wireOrderSource = shape.wireOrderSource;
+                    shape.members.add(member);
+                    index++;
+                }
+                continue;
+            }
+            NestedTypeMember member = new NestedTypeMember();
+            member.index = index;
+            member.offset = fieldOffset;
+            member.nativeOffset = member.offset;
+            member.name = "_" + index;
+            member.nameSource = "synthetic-offset";
+            member.nameProven = false;
+            member.nativeType = field.nativeType;
+            member.typeId = normalizeUuid(field.sourceTypeId);
+            member.typeIdSource = field.sourceTypeIdSource;
+            member.typeIdentityProven = field.sourceTypeIdentityProven;
+            member.typeIdentitySource = field.sourceTypeIdSource;
+            member.wireShape = preferredLogicalMessageWireShape(field);
+            member.wireShapeSource = firstNonEmpty(
+                field.wireShapeSource,
+                "message-cfg-wire-coverage");
+            member.wireLayout = firstNonEmpty(field.wireLayout, field.wireShape);
+            member.wireLayoutSource = firstNonEmpty(
+                field.wireLayoutSource,
+                field.wireShapeSource);
+            member.byteWidth = wireShapeByteWidth(member.wireLayout);
+            member.wireOrdinal = index;
+            member.wireOrderSource = shape.wireOrderSource;
+            member.callsite = field.callsite;
+            shape.members.add(member);
+            index++;
+        }
+        return shape;
+    }
+
+    private NestedTypeMember provenSemanticAggregateMember(
+        FieldCall field,
+        long fieldOffset,
+        int index,
+        String wireOrderSource) {
+
+        NestedTypeShape nested = field == null ? null : field.nestedTypeShape;
+        String semanticWireShape = provenNestedTypeIdentityWireShape(nested);
+        if (nested == null || semanticWireShape == null) {
+            return null;
+        }
+        String wireLayout = firstNonEmpty(
+            field.wireLayout,
+            wireShapeFromNestedTypeShape(nested),
+            field.wireShape,
+            semanticWireShape);
+        if (wireLayout == null) {
+            return null;
+        }
+
+        NestedTypeMember member = new NestedTypeMember();
+        member.index = index;
+        member.offset = fieldOffset;
+        member.nativeOffset = fieldOffset;
+        member.name = "_" + index;
+        member.nameSource = "synthetic-offset";
+        member.nameProven = false;
+        member.nativeType = firstNonEmpty(
+            field.nativeType,
+            nested.typeNameFull,
+            nested.typeName);
+        member.typeId = normalizeUuid(firstNonEmpty(
+            nested.typeId,
+            field.sourceTypeId));
+        member.typeIdSource = firstNonEmpty(
+            nested.typeIdSource,
+            field.sourceTypeIdSource);
+        member.typeIdentityProven = true;
+        member.typeIdentitySource = firstNonEmpty(
+            nested.identitySource,
+            member.typeIdSource);
+        member.wireShape = semanticWireShape;
+        member.wireShapeSource = firstNonEmpty(
+            nested.identitySource,
+            field.wireShapeSource);
+        member.wireLayout = wireLayout;
+        member.wireLayoutSource = firstNonEmpty(
+            field.wireLayoutSource,
+            field.wireShapeSource,
+            nested.identitySource);
+        member.byteWidth = wireShapeByteWidth(wireLayout);
+        member.wireOrdinal = index;
+        member.wireOrderSource = wireOrderSource;
+        member.callsite = field.callsite;
+        member.target = firstAddress(nested.function, field.unmarshalTarget);
+        member.targetName = firstNonEmpty(
+            nested.functionName,
+            field.unmarshalTargetName);
+        return member;
+    }
+
+    private boolean isCompleteMessageWireCoverage(
+        MessageUnmarshalPlan plan,
+        Function wrapper) {
+
+        NestedTypeShape direct = directWireSequenceShape(
+            wrapper,
+            fullFunctionName(wrapper),
+            fullFunctionName(wrapper));
+        if (direct == null || !Boolean.TRUE.equals(direct.memberCoverageProven) ||
+            !Boolean.TRUE.equals(direct.wireOrderProven)) {
+            return false;
+        }
+        ArrayList<String> recovered = new ArrayList<>();
+        for (FieldCall field : logicalMessageFields(plan)) {
+            if (!appendLogicalMessageWireLayouts(field, recovered)) {
+                return false;
+            }
+        }
+        List<String> expected = flattenedCanonicalWireLayouts(direct.members);
+        if (!sameOrderedWireLayoutProjection(recovered, expected)) {
+            return false;
+        }
+        return true;
+    }
+
+    private boolean sameOrderedWireLayoutProjection(
+        List<String> observed,
+        List<String> expected) {
+
+        if (observed == null || expected == null || observed.size() != expected.size() ||
+            observed.isEmpty()) {
+            return false;
+        }
+        for (int index = 0; index < observed.size(); index++) {
+            String left = observed.get(index);
+            String right = expected.get(index);
+            if (Objects.equals(left, right)) {
+                continue;
+            }
+            Integer leftWidth = wireShapeByteWidth(left);
+            Integer rightWidth = wireShapeByteWidth(right);
+            if (leftWidth == null || !leftWidth.equals(rightWidth)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean appendLogicalMessageWireLayouts(
+        FieldCall field,
+        List<String> result) {
+
+        if (field == null || result == null) {
+            return false;
+        }
+        String layout = field.wireLayout;
+        if (layout == null && field.nestedTypeShape != null &&
+            Boolean.TRUE.equals(field.nestedTypeShape.memberCoverageProven) &&
+            Boolean.TRUE.equals(field.nestedTypeShape.wireOrderProven)) {
+            List<NestedTypeMember> members = provenWireOrderedMembers(
+                field.nestedTypeShape.members);
+            List<String> nested = flattenedCanonicalWireLayouts(members);
+            if (nested == null) {
+                return false;
+            }
+            result.addAll(nested);
+            return true;
+        }
+        layout = firstNonEmpty(layout, field.wireShape);
+        List<String> flattened = flattenedLayoutMembers(layout);
+        if (flattened == null || flattened.isEmpty()) {
+            return false;
+        }
+        for (String member : flattened) {
+            String canonical = canonicalLayoutWireShape(member);
+            if (canonical == null) {
+                return false;
+            }
+            result.add(canonical);
+        }
+        return true;
+    }
+
+    private List<FieldCall> logicalMessageFields(MessageUnmarshalPlan plan) {
+        ArrayList<FieldCall> fields = new ArrayList<>(plan.fields);
+        ArrayList<FieldCall> aggregates = new ArrayList<>();
+        for (FieldCall field : fields) {
+            if (isProvenAggregateField(field)) {
+                aggregates.add(field);
+            }
+        }
+        fields.removeIf(field -> aggregates.stream().anyMatch(aggregate ->
+            field != aggregate && isInteriorAggregateLeaf(aggregate, field)));
+        fields.sort(Comparator
+            .comparingInt((FieldCall field) -> field.recoveryOrder)
+            .thenComparingLong(field ->
+                field.storageOffset == null ? Long.MAX_VALUE : field.storageOffset));
+        return fields;
+    }
+
+    private String preferredLogicalMessageWireShape(FieldCall field) {
+        if (field == null) {
+            return null;
+        }
+        String nativeShape = wireShapeFromNativeType(field.nativeType);
+        if (nativeShape != null && !nativeShape.startsWith("composite<")) {
+            return nativeShape;
+        }
+        if (field.wireShape != null && !field.wireShape.startsWith("composite<")) {
+            return field.wireShape;
+        }
+        if (field.nestedTypeShape != null &&
+            Boolean.TRUE.equals(field.nestedTypeShape.memberCoverageProven) &&
+            Boolean.TRUE.equals(field.nestedTypeShape.wireOrderProven)) {
+            String nested = wireShapeFromNestedTypeShape(field.nestedTypeShape);
+            if (nested != null) {
+                return nested;
+            }
+        }
+        return firstNonEmpty(field.wireShape, field.wireLayout);
+    }

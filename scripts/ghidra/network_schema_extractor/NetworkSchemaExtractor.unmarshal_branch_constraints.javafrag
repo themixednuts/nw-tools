@@ -1,0 +1,248 @@
+    private record SuccessfulUnmarshalSubgraph(
+        Set<UnmarshalFlowNode> nodes,
+        Set<UnmarshalFlowEdge> edges) {
+    }
+
+    private record ConditionalSuccessor(
+        PcodeOpAST branch,
+        boolean condition) {
+    }
+
+    private SuccessfulUnmarshalSubgraph constrainedSuccessfulUnmarshalSubgraph(
+        Set<UnmarshalFlowEdge> edges,
+        Set<UnmarshalFlowNode> terminals) {
+
+        LinkedHashSet<UnmarshalFlowEdge> remaining = new LinkedHashSet<>(edges);
+        SuccessfulUnmarshalSubgraph subgraph = successfulUnmarshalSubgraph(
+            remaining,
+            terminals);
+        while (!subgraph.nodes().isEmpty()) {
+            LinkedHashSet<UnmarshalFlowEdge> rejected = new LinkedHashSet<>();
+            for (UnmarshalFlowNode node : subgraph.nodes()) {
+                Set<PcodeBlockBasic> successors = subgraph.edges().stream()
+                    .filter(edge -> edge.source().equals(node))
+                    .map(edge -> edge.target().block())
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+                if (successors.size() != 1) {
+                    continue;
+                }
+                ConditionalSuccessor required = conditionalSuccessor(
+                    node.block(),
+                    successors.iterator().next());
+                if (required == null) {
+                    continue;
+                }
+                for (UnmarshalFlowEdge incoming : subgraph.edges()) {
+                    if (!incoming.target().equals(node)) {
+                        continue;
+                    }
+                    Boolean value = incomingBooleanValue(
+                        required.branch().getInput(1),
+                        node.block(),
+                        incoming.source().block(),
+                        new LinkedHashSet<>(),
+                        0);
+                    if (value != null && value != required.condition()) {
+                        rejected.add(incoming);
+                    }
+                }
+            }
+            if (rejected.isEmpty()) {
+                return subgraph;
+            }
+            remaining.removeAll(rejected);
+            subgraph = successfulUnmarshalSubgraph(remaining, terminals);
+        }
+        return subgraph;
+    }
+
+    private SuccessfulUnmarshalSubgraph successfulUnmarshalSubgraph(
+        Set<UnmarshalFlowEdge> edges,
+        Set<UnmarshalFlowNode> terminals) {
+
+        HashMap<UnmarshalFlowNode, List<UnmarshalFlowEdge>> predecessors =
+            new HashMap<>();
+        for (UnmarshalFlowEdge edge : edges) {
+            predecessors.computeIfAbsent(
+                edge.target(),
+                ignored -> new ArrayList<>()).add(edge);
+        }
+        LinkedHashSet<UnmarshalFlowNode> nodes = new LinkedHashSet<>(terminals);
+        LinkedHashSet<UnmarshalFlowEdge> selectedEdges = new LinkedHashSet<>();
+        ArrayDeque<UnmarshalFlowNode> pending = new ArrayDeque<>(terminals);
+        while (!pending.isEmpty()) {
+            UnmarshalFlowNode target = pending.removeFirst();
+            for (UnmarshalFlowEdge edge :
+                    predecessors.getOrDefault(target, List.of())) {
+                selectedEdges.add(edge);
+                if (nodes.add(edge.source())) {
+                    pending.addLast(edge.source());
+                }
+            }
+        }
+        return new SuccessfulUnmarshalSubgraph(
+            Set.copyOf(nodes),
+            Set.copyOf(selectedEdges));
+    }
+
+    private ConditionalSuccessor conditionalSuccessor(
+        PcodeBlockBasic block,
+        PcodeBlockBasic successor) {
+
+        if (block == null || successor == null) {
+            return null;
+        }
+        PcodeOpAST branch = null;
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (operation instanceof PcodeOpAST ast &&
+                operation.getOpcode() == PcodeOp.CBRANCH) {
+                if (branch != null) {
+                    return null;
+                }
+                branch = ast;
+            }
+        }
+        if (branch == null || branch.getNumInputs() < 2) {
+            return null;
+        }
+        PcodeBlockBasic conditionTrue = branchConditionTrueSuccessor(branch, block);
+        PcodeBlockBasic conditionFalse = branchConditionFalseSuccessor(branch, block);
+        List<PcodeBlockBasic> successors = NetworkSchemaControlFlow.successors(block);
+        if (conditionTrue == null || conditionFalse == null ||
+            conditionTrue == conditionFalse || successors.size() != 2 ||
+            !successors.contains(successor)) {
+            return null;
+        }
+        if (successor == conditionTrue) {
+            return new ConditionalSuccessor(branch, true);
+        }
+        return successor == conditionFalse
+            ? new ConditionalSuccessor(branch, false)
+            : null;
+    }
+
+    private Boolean incomingBooleanValue(
+        Varnode value,
+        PcodeBlockBasic block,
+        PcodeBlockBasic predecessor,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || block == null || predecessor == null ||
+            depth > 48 || !active.add(pcodeSsaNodeKey(value))) {
+            return null;
+        }
+        try {
+            Long constant = NetworkSchemaIntegerEvaluator.evaluate(value);
+            if (constant != null) {
+                return constant != 0L;
+            }
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                return null;
+            }
+            return switch (definition.getOpcode()) {
+                case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT,
+                    PcodeOp.INT_SEXT -> incomingBooleanValue(
+                        definition.getInput(0),
+                        block,
+                        predecessor,
+                        active,
+                        depth + 1);
+                // INDIRECT is a call/store clobber in decompiler SSA. Its input is
+                // the value before the side effect, not the value produced by it.
+                case PcodeOp.INDIRECT -> null;
+                case PcodeOp.SUBPIECE ->
+                    definition.getNumInputs() == 2 &&
+                        NetworkSchemaIntegerEvaluator.equals(
+                            definition.getInput(1), 0L)
+                    ? incomingBooleanValue(
+                        definition.getInput(0),
+                        block,
+                        predecessor,
+                        active,
+                        depth + 1)
+                    : null;
+                case PcodeOp.BOOL_NEGATE -> invertBoolean(incomingBooleanValue(
+                    definition.getInput(0),
+                    block,
+                    predecessor,
+                    active,
+                    depth + 1));
+                case PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL ->
+                    incomingZeroComparisonValue(
+                        definition,
+                        block,
+                        predecessor,
+                        active,
+                        depth + 1);
+                case PcodeOp.MULTIEQUAL -> incomingPhiBooleanValue(
+                    definition,
+                    block,
+                    predecessor,
+                    active,
+                    depth + 1);
+                default -> null;
+            };
+        }
+        finally {
+            active.remove(pcodeSsaNodeKey(value));
+        }
+    }
+
+    private Boolean incomingZeroComparisonValue(
+        PcodeOp comparison,
+        PcodeBlockBasic block,
+        PcodeBlockBasic predecessor,
+        Set<String> active,
+        int depth) {
+
+        if (comparison.getNumInputs() != 2) {
+            return null;
+        }
+        int zeroSlot = NetworkSchemaIntegerEvaluator.equals(
+            comparison.getInput(0), 0L)
+            ? 0
+            : NetworkSchemaIntegerEvaluator.equals(comparison.getInput(1), 0L)
+                ? 1
+                : -1;
+        if (zeroSlot < 0) {
+            return null;
+        }
+        Boolean input = incomingBooleanValue(
+            comparison.getInput(1 - zeroSlot),
+            block,
+            predecessor,
+            active,
+            depth);
+        return comparison.getOpcode() == PcodeOp.INT_EQUAL
+            ? invertBoolean(input)
+            : input;
+    }
+
+    private Boolean incomingPhiBooleanValue(
+        PcodeOp phi,
+        PcodeBlockBasic block,
+        PcodeBlockBasic predecessor,
+        Set<String> active,
+        int depth) {
+
+        if (phi.getNumInputs() != block.getInSize()) {
+            return null;
+        }
+        for (int index = 0; index < block.getInSize(); index++) {
+            if (!(block.getIn(index) instanceof PcodeBlockBasic incoming) ||
+                incoming.getIndex() != predecessor.getIndex()) {
+                continue;
+            }
+            return incomingBooleanValue(
+                phi.getInput(index),
+                incoming,
+                predecessor,
+                active,
+                depth);
+        }
+        return null;
+    }

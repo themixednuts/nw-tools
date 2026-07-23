@@ -1,0 +1,50 @@
+    private record CodecSuccessCoverageAnalysis(
+        boolean complete,
+        String diagnostic) {
+    }
+
+    private CodecSuccessCoverageAnalysis codecSuccessCoverage(
+        Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock,
+        UnmarshalTerminalFlow terminalFlow,
+        int expectedEventCount) {
+
+        if (eventsByBlock == null || terminalFlow == null ||
+            expectedEventCount <= 0) {
+            return new CodecSuccessCoverageAnalysis(false, "missing-input");
+        }
+        ArrayList<Map.Entry<PcodeBlockBasic, List<CodecWireEvent>>> entries =
+            eventsByBlock.entrySet().stream()
+                .filter(entry -> entry.getValue() != null && !entry.getValue().isEmpty())
+                .sorted(Comparator
+                    .comparing(
+                        (Map.Entry<PcodeBlockBasic, List<CodecWireEvent>> entry) ->
+                            entry.getKey() == null
+                            ? null
+                            : entry.getKey().getStart(),
+                        Comparator.nullsLast(Address::compareTo))
+                    .thenComparingInt(entry -> entry.getKey() == null
+                        ? Integer.MAX_VALUE
+                        : entry.getKey().getIndex()))
+                .collect(Collectors.toCollection(ArrayList::new));
+        int observedEventCount = 0;
+        boolean allMandatory = !terminalFlow.mandatoryBlocks().isEmpty();
+        ArrayList<String> blocks = new ArrayList<>();
+        for (Map.Entry<PcodeBlockBasic, List<CodecWireEvent>> entry : entries) {
+            PcodeBlockBasic block = entry.getKey();
+            int eventCount = entry.getValue().size();
+            boolean mandatory = block != null &&
+                terminalFlow.mandatoryBlocks().contains(block);
+            observedEventCount += eventCount;
+            allMandatory &= mandatory;
+            blocks.add(
+                (block == null ? "missing" : formatAddress(block.getStart())) +
+                    "x" + eventCount + (mandatory ? "+" : "-"));
+        }
+        boolean complete = allMandatory && observedEventCount == expectedEventCount;
+        return new CodecSuccessCoverageAnalysis(
+            complete,
+            "expected=" + expectedEventCount +
+                ",observed=" + observedEventCount +
+                ",mandatory=" + terminalFlow.mandatoryBlocks().size() +
+                ",blocks=" + blocks);
+    }

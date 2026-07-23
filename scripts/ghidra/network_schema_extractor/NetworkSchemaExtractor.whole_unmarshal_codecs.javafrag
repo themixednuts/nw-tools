@@ -1,0 +1,68 @@
+    private WireShape wholeUnmarshalCodecEvidence(
+        Function function,
+        String readBufferParameter) {
+
+        if (function == null || readBufferParameter == null) {
+            return null;
+        }
+        CodecWireTrace trace = traceUnmarshalCodec(
+            function,
+            readBufferParameter,
+            codecWireTraceActiveContexts,
+            codecWireTraceCompletedContexts);
+        if (trace == null || trace.events.isEmpty()) {
+            return null;
+        }
+        WireShape composite = exactDeclaredCompositeUnmarshalEvidence(
+            function,
+            trace.events);
+        if (composite != null) {
+            return composite;
+        }
+        if (trace.events.size() != 1) {
+            return null;
+        }
+        CodecWireEvent event = trace.events.get(0);
+        WireShape evidence = event.wireEvidence();
+        return evidence != null && evidence.hasProvenSemantics() &&
+            function.getEntryPoint().equals(event.target())
+                ? evidence
+                : null;
+    }
+
+    private WireShape exactDeclaredCompositeUnmarshalEvidence(
+        Function function,
+        List<CodecWireEvent> events) {
+
+        DeclaredCodecShape declared = declaredCodecShape(function);
+        List<String> expectedMembers = declared == null
+            ? null
+            : flattenedSemanticMembers(declared.shape());
+        Integer expectedWidth = declared == null
+            ? null
+            : wireShapeByteWidth(declared.shape());
+        if (expectedMembers == null || expectedMembers.size() < 2 ||
+            expectedWidth == null ||
+            !codecSemanticBodyMatches(
+                declared.shape(),
+                events.stream().map(CodecWireEvent::wireEvidence).toList())) {
+            return null;
+        }
+
+        long observedWidth = 0L;
+        for (CodecWireEvent event : events) {
+            Integer width = event == null
+                ? null
+                : wireShapeByteWidth(event.wireEvidence().layout);
+            if (width == null) {
+                return null;
+            }
+            observedWidth += width;
+        }
+        return observedWidth == expectedWidth
+            ? WireShape.semantic(
+                declared.shape(),
+                fixedByteLayout(expectedWidth),
+                "unmarshal-codec-specialization+cfg-semantic-decomposition")
+            : null;
+    }

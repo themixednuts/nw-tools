@@ -27,13 +27,23 @@
             return false;
         }
         if (Boolean.TRUE.equals(shape.identityProven) && shape.typeId != null) {
-            return addProvenNestedTypeMemberCandidate(
+            boolean added = addProvenNestedTypeMemberCandidate(
                 byBase,
                 storage,
                 shape,
                 op,
                 target,
                 source);
+            if (added) {
+                markNestedTypeMemberWireOrder(
+                    byBase,
+                    storage,
+                    "cfg-call-order+proven-nested-type");
+            }
+            return added;
+        }
+        if (!Boolean.TRUE.equals(shape.layoutProven)) {
+            return false;
         }
 
         boolean added = false;
@@ -54,9 +64,71 @@
                 source == null ? "pcode-nested-direct-type-call" : source);
             members = byBase.get(storage.base);
             int after = members == null ? 0 : members.size();
+            NestedTypeMember expanded = members == null
+                ? null
+                : members.get(storage.offset + member.offset);
+            copyExpandedNestedMemberEvidence(expanded, member);
             added = added || after > before;
         }
+        if (added && Boolean.TRUE.equals(shape.wireOrderProven)) {
+            applyExpandedNestedMemberWireOrder(byBase, storage, shape, source);
+        }
         return added;
+    }
+
+    private void copyExpandedNestedMemberEvidence(
+        NestedTypeMember target,
+        NestedTypeMember source) {
+
+        if (target == null || source == null) {
+            return;
+        }
+        target.callsite = source.callsite == null ? target.callsite : source.callsite;
+        target.target = source.target == null ? target.target : source.target;
+        target.targetName = source.targetName == null
+            ? target.targetName
+            : source.targetName;
+        if (source.typeId != null && Boolean.TRUE.equals(source.typeIdentityProven)) {
+            target.typeId = source.typeId;
+            target.typeIdSource = source.typeIdSource;
+            target.typeIdentityProven = true;
+            target.typeIdentitySource = source.typeIdentitySource;
+        }
+    }
+
+    private void applyExpandedNestedMemberWireOrder(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        PcodeStorage storage,
+        NestedTypeShape shape,
+        String source) {
+
+        List<NestedTypeMember> ordered = provenWireOrderedMembers(shape.members);
+        Map<Long, NestedTypeMember> members = byBase.get(storage.base);
+        if (ordered == null || members == null) {
+            return;
+        }
+        int nextOrdinal = members.values().stream()
+            .map(member -> member.wireOrdinal)
+            .filter(Objects::nonNull)
+            .max(Integer::compareTo)
+            .map(ordinal -> ordinal + 1)
+            .orElse(0);
+        ArrayList<NestedTypeMember> expanded = new ArrayList<>(ordered.size());
+        for (NestedTypeMember child : ordered) {
+            NestedTypeMember member = members.get(storage.offset + child.offset);
+            if (member == null || Boolean.TRUE.equals(member.typeConflict) ||
+                member.wireOrdinal != null) {
+                return;
+            }
+            expanded.add(member);
+        }
+        for (int index = 0; index < expanded.size(); index++) {
+            NestedTypeMember member = expanded.get(index);
+            member.wireOrdinal = nextOrdinal + index;
+            member.wireOrderSource = firstNonEmpty(
+                source,
+                "pcode-nested-direct-type-call") + "+nested-wire-order";
+        }
     }
     private boolean addProvenNestedTypeMemberCandidate(
         Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
@@ -75,7 +147,9 @@
             layouts.add(evidence.layout);
         }
         String layout = compositeWireShape(layouts);
-        String semantic = wireShapeFromNestedTypeShape(shape);
+        String semantic = firstNonEmpty(
+            provenNestedTypeIdentityWireShape(shape),
+            wireShapeFromNestedTypeShape(shape));
         String evidenceSource = source == null
             ? "pcode-proven-nested-direct-type"
             : source + "+proven-direct-type";
@@ -357,6 +431,7 @@
             shape.memberBase = entry.getKey();
             shape.memberNameSource = "synthetic-offset";
             shape.memberNamesProven = false;
+            shape.layoutProven = true;
             shape.validation = "layout-consistent-direct-type";
             shape.members.addAll(members);
             applyNestedTypeMemberNames(shape);
@@ -765,7 +840,7 @@
             return 24;
         }
         return switch (shape) {
-            case "bool", "u8" -> 1;
+            case "bool", "byte", "u8" -> 1;
             case "u16", "half-f32" -> 2;
             case "u32", "f32", "vec2-comp" -> 4;
             case "vec3-comp", "vec3-comp-norm" -> 6;

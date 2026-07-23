@@ -641,6 +641,7 @@ pub struct ManaComponent;
             ),
             repr: None,
             raw_conversion: None,
+            prefab: None,
             derives: vec![
                 "Component".to_owned(),
                 "AzRtti".to_owned(),

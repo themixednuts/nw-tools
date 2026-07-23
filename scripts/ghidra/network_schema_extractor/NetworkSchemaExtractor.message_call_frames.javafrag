@@ -2,52 +2,199 @@
         String parameterBase,
         NestedTypeShape shape,
         Address firstCallsite,
-        int firstOperationOrder) {}
+        int firstOperationOrder,
+        int lastOperationOrder) {}
 
-    private void applyMessageCallFrameBoundaries(
+    private int applyMessageCallFrameOutputs(
         MessageUnmarshalPlan plan,
         Function owner,
         PcodeOp operation,
         Function target,
-        Map<String, PcodeStorage> arguments) {
+        Map<String, PcodeStorage> arguments,
+        int[] operationOrder) {
 
         if (plan == null || owner == null || operation == null || target == null ||
-            arguments == null || arguments.isEmpty()) {
-            return;
+            arguments == null || arguments.isEmpty() || operationOrder == null) {
+            return 0;
         }
         List<MessageCallFrameOutput> outputs = messageCallFrameOutputs(target);
         if (outputs.isEmpty()) {
-            return;
+            return 0;
         }
 
         HashMap<String, Integer> bindingCounts = new HashMap<>();
+        int rootOutputCount = 0;
         for (MessageCallFrameOutput output : outputs) {
             PcodeStorage binding = arguments.get(output.parameterBase());
-            if (!isRootMessageStorage(plan, binding) || binding.offset == 0L) {
+            if (!isRootMessageStorage(plan, binding)) {
+                continue;
+            }
+            rootOutputCount++;
+            if (!isProvenMessageCallFrameOutput(output)) {
                 continue;
             }
             bindingCounts.merge(storageKey(binding), 1, Integer::sum);
         }
 
+        int promotedOutputCount = 0;
+        int promotedMemberCount = 0;
         for (MessageCallFrameOutput output : outputs) {
             PcodeStorage binding = arguments.get(output.parameterBase());
-            if (!isRootMessageStorage(plan, binding) || binding.offset == 0L ||
+            if (!isRootMessageStorage(plan, binding) ||
                 bindingCounts.getOrDefault(storageKey(binding), 0) != 1) {
                 continue;
             }
+            appendMessageCallFrameOutputMembers(
+                plan,
+                operation,
+                binding,
+                output,
+                operationOrder);
+            applyMessageCallFrameBoundary(
+                plan,
+                operation,
+                binding,
+                output,
+                operationOrder);
+            promotedOutputCount++;
+            promotedMemberCount += output.shape().members.size();
+        }
+        if (promotedOutputCount != rootOutputCount) {
+            recordPcodeMessageGraphReject(
+                plan,
+                "message-call-frame-not-promoted:root=" + rootOutputCount +
+                    ",promoted=" + promotedOutputCount +
+                    ",outputs=" + outputs.size() +
+                    ",proof=" + messageCallFrameProofSummary(target, outputs),
+                target);
+        }
+        return promotedMemberCount;
+    }
+
+    private String messageCallFrameProofSummary(
+        Function target,
+        List<MessageCallFrameOutput> outputs) {
+
+        NestedTypeShape wireSequence = directWireSequenceShape(
+            target,
+            fullFunctionName(target),
+            fullFunctionName(target));
+        List<String> direct = wireSequence == null
+            ? null
+            : flattenedCanonicalWireLayouts(wireSequence.members);
+        ArrayList<String> outputProofs = new ArrayList<>();
+        for (MessageCallFrameOutput output : outputs) {
+            NestedTypeShape shape = output == null ? null : output.shape();
+            List<String> layouts = shape == null
+                ? null
+                : flattenedCanonicalWireLayouts(shape.members);
+            outputProofs.add(output == null
+                ? "missing"
+                : output.parameterBase() + "{members=" +
+                    (shape == null ? 0 : shape.members.size()) +
+                    ",coverage=" +
+                    (shape == null ? null : shape.memberCoverageProven) +
+                    ",order=" +
+                    (shape == null ? null : shape.wireOrderProven) +
+                    ",ops=" + output.firstOperationOrder() + "-" +
+                    output.lastOperationOrder() +
+                    ",layouts=" + layouts + "}");
+        }
+        return "direct=" + direct + ",outputs=" + outputProofs;
+    }
+
+    private boolean isProvenMessageCallFrameOutput(MessageCallFrameOutput output) {
+        if (output == null || output.shape() == null ||
+            output.shape().members.isEmpty() ||
+            !Boolean.TRUE.equals(output.shape().memberCoverageProven) ||
+            !Boolean.TRUE.equals(output.shape().wireOrderProven)) {
+            return false;
+        }
+        return output.shape().members.stream().allMatch(member ->
+            member != null && member.offset >= 0L &&
+                nestedMemberWireEvidence(member) != null);
+    }
+
+    private void appendMessageCallFrameOutputMembers(
+        MessageUnmarshalPlan plan,
+        PcodeOp operation,
+        PcodeStorage binding,
+        MessageCallFrameOutput output,
+        int[] operationOrder) {
+
+        for (NestedTypeMember member : output.shape().members) {
+            WireShape wireEvidence = nestedMemberWireEvidence(member);
+            PcodeStorage storage = binding.plus(member.offset);
             FieldCall field = addPcodeMessageField(
                 plan,
-                operation.getSeqnum().getTarget(),
-                binding,
-                null,
-                "message-unmarshal-call-frame-boundary",
-                Integer.MAX_VALUE);
-            field.callFrameBoundaryProven = true;
-            applyNestedTypeShapeToField(
-                field,
-                output.shape(),
-                "message-unmarshal-call-frame-output-shape");
+                member.callsite == null
+                    ? operation.getSeqnum().getTarget()
+                    : member.callsite,
+                storage,
+                member.nativeType,
+                "message-unmarshal-call-frame-output-member",
+                operationOrder[0]++);
+            applyWireEvidence(field, wireEvidence);
+            if (member.typeId != null &&
+                Boolean.TRUE.equals(member.typeIdentityProven)) {
+                field.sourceTypeName = member.nativeType;
+                field.sourceTypeId = normalizeUuid(member.typeId);
+                field.sourceTypeIdSource = member.typeIdentitySource;
+                field.sourceTypeIdentityProven = true;
+            }
         }
+    }
+
+    private void applyMessageCallFrameBoundary(
+        MessageUnmarshalPlan plan,
+        PcodeOp operation,
+        PcodeStorage binding,
+        MessageCallFrameOutput output,
+        int[] operationOrder) {
+
+        NestedTypeShape shape = output == null ? null : output.shape();
+        if (plan == null || operation == null || binding == null || shape == null ||
+            shape.members.size() < 2 ||
+            !Boolean.TRUE.equals(shape.memberCoverageProven) ||
+            !Boolean.TRUE.equals(shape.wireOrderProven)) {
+            return;
+        }
+        ArrayList<String> layouts = new ArrayList<>();
+        for (NestedTypeMember member : shape.members) {
+            WireShape evidence = nestedMemberWireEvidence(member);
+            if (evidence == null || evidence.layout == null) {
+                return;
+            }
+            layouts.add(evidence.layout);
+        }
+        String wireShape = wireShapeFromNestedTypeShape(shape);
+        String wireLayout = compositeWireShape(layouts);
+        if (wireLayout == null) {
+            return;
+        }
+        FieldCall field = addPcodeMessageField(
+            plan,
+            operation.getSeqnum().getTarget(),
+            binding,
+            null,
+            "message-unmarshal-call-frame-boundary",
+            operationOrder[0]++);
+        field.nativeType = null;
+        field.sourceTypeName = null;
+        field.sourceTypeId = null;
+        field.sourceTypeIdSource = null;
+        field.sourceTypeIdentityProven = null;
+        field.typeEvidence = null;
+        field.typeConflict = null;
+        field.nestedTypeShape = shape;
+        field.callFrameBoundaryProven = true;
+        field.rawByteLength = null;
+        field.fixedSequenceShape = null;
+        field.wireShape = wireShape;
+        field.wireShapeSource = wireShape == null ? null : shape.wireOrderSource;
+        field.wireLayout = wireLayout;
+        field.wireLayoutSource = shape.wireOrderSource;
+        field.confidence = "message-unmarshal-call-frame-boundary";
     }
 
     private List<MessageCallFrameOutput> messageCallFrameOutputs(Function function) {
@@ -92,7 +239,7 @@
                 continue;
             }
             Function target = pcodeCallTarget(operation);
-            if (!isAnonymousMessageHelperCall(function, operation, target)) {
+            if (!isMessageOutputHelperCall(function, operation, target)) {
                 continue;
             }
             Map<String, PcodeStorage> arguments = callArgumentStorageMap(
@@ -109,10 +256,66 @@
                     target);
             }
         }
+        appendCountedMessageCallFrameMembers(function, operations, byBase);
         return buildMessageCallFrameOutputs(function, operations, byBase);
     }
 
-    private boolean isAnonymousMessageHelperCall(
+    private void appendCountedMessageCallFrameMembers(
+        Function function,
+        List<PcodeOpAST> operations,
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase) {
+
+        for (CollectionOutputShape collection :
+                collectionOutputShapesByParameterFromPcode(function).values()) {
+            PcodeOpAST countOperation = operationAt(
+                operations,
+                collection.countCallsite);
+            if (countOperation == null) {
+                continue;
+            }
+            String nativeType = collection.nativeType;
+            WireShape wireEvidence = collection.wireEvidence;
+            ReflectedSetIdentity setIdentity = countedSetIdentity(function, collection);
+            if (setIdentity != null) {
+                String source =
+                    "message-bidirectional-reflected-azstd-unordered-set-helper";
+                nativeType = setIdentity.nativeType();
+                wireEvidence = WireShape.semantic(
+                    setIdentity.wireShape(),
+                    wireEvidence.layout,
+                    source);
+            }
+            addNestedTypeMemberCandidate(
+                byBase,
+                collection.storage,
+                nativeType,
+                wireEvidence,
+                countOperation,
+                pcodeCallTarget(countOperation),
+                "message-call-frame-counted-collection");
+            markNestedTypeMemberWireOrder(
+                byBase,
+                collection.storage,
+                "cfg-counted-loop-order");
+        }
+    }
+
+    private PcodeOpAST operationAt(
+        List<PcodeOpAST> operations,
+        Address address) {
+
+        if (operations == null || address == null) {
+            return null;
+        }
+        for (PcodeOpAST operation : operations) {
+            if (address.equals(operation.getSeqnum().getTarget())) {
+                return operation;
+            }
+        }
+        return null;
+    }
+
+    private boolean isMessageOutputHelperCall(
         Function owner,
         PcodeOp operation,
         Function target) {
@@ -125,7 +328,8 @@
             return false;
         }
         String nativeType = unmarshalNativeTypeFromTarget(target);
-        return wireShapeEvidenceFromUnmarshalTarget(target, nativeType) == null;
+        return wireShapeEvidenceFromUnmarshalTarget(target, nativeType) == null ||
+            !collectionOutputShapesByParameterFromPcode(target).isEmpty();
     }
 
     private void appendTranslatedMessageCallFrameMembers(
@@ -137,6 +341,20 @@
 
         if (byBase == null || binding == null || nested == null ||
             nested.members.isEmpty()) {
+            return;
+        }
+        if (Boolean.TRUE.equals(nested.identityProven) && nested.typeId != null &&
+            addProvenNestedTypeMemberCandidate(
+                byBase,
+                binding,
+                nested,
+                operation,
+                target,
+                "message-call-frame-callee-output")) {
+            markNestedTypeMemberWireOrder(
+                byBase,
+                binding,
+                "cfg-call-order+proven-callee-output");
             return;
         }
         for (NestedTypeMember member : nested.members) {
@@ -188,18 +406,19 @@
         ArrayList<MessageCallFrameOutput> result = new ArrayList<>();
         for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry :
             byBase.entrySet()) {
-            if (!isLikelyOutputParameterBase(entry.getKey())) {
+            if (!isProvenOutputParameterBase(function, entry.getKey())) {
                 continue;
             }
             ArrayList<NestedTypeMember> members =
                 new ArrayList<>(entry.getValue().values());
-            if (!isCompleteMessageCallFrameOutput(members)) {
-                continue;
-            }
             members.sort((left, right) -> compareMessageCallFrameMembers(
                 left,
                 right,
                 operationOrder));
+            members = collapseProvenTypedCallFrameMembers(members);
+            if (!isCompleteMessageCallFrameOutput(members)) {
+                continue;
+            }
             for (int index = 0; index < members.size(); index++) {
                 NestedTypeMember member = members.get(index);
                 member.index = index;
@@ -222,16 +441,411 @@
 
             NestedTypeMember first = members.get(0);
             int firstOrder = messageCallFrameOperationOrder(first, operationOrder);
+            int lastOrder = members.stream()
+                .mapToInt(member ->
+                    messageCallFrameOperationOrder(member, operationOrder))
+                .max()
+                .orElse(Integer.MAX_VALUE);
             result.add(new MessageCallFrameOutput(
                 entry.getKey(),
                 shape,
                 first.callsite,
-                firstOrder));
+                firstOrder,
+                lastOrder));
         }
         result.sort(Comparator
             .comparingInt(MessageCallFrameOutput::firstOperationOrder)
             .thenComparing(MessageCallFrameOutput::parameterBase));
+        proveMessageCallFrameOutputCoverage(function, result);
+        if (result.size() == 1) {
+            proveDirectTypeIdentity(result.get(0).shape(), function);
+        }
         return result;
+    }
+
+    private ArrayList<NestedTypeMember> collapseProvenTypedCallFrameMembers(
+        List<NestedTypeMember> members) {
+
+        ArrayList<NestedTypeMember> collapsed = new ArrayList<>();
+        for (int start = 0; start < members.size();) {
+            NestedTypeMember first = members.get(start);
+            int end = start + 1;
+            while (end < members.size() && sameCallFrameCodecInvocation(
+                    first,
+                    members.get(end))) {
+                end++;
+            }
+            List<NestedTypeMember> group = members.subList(start, end);
+            NestedTypeMember semantic = group.size() < 2
+                ? null
+                : provenTypedCallFrameProduct(group);
+            if (semantic != null) {
+                collapsed.add(semantic);
+            }
+            else {
+                collapsed.addAll(group);
+            }
+            start = end;
+        }
+        return collapsed;
+    }
+
+    private boolean sameCallFrameCodecInvocation(
+        NestedTypeMember left,
+        NestedTypeMember right) {
+
+        return left != null && right != null &&
+            left.callsite != null && left.callsite.equals(right.callsite) &&
+            left.target != null && left.target.equals(right.target);
+    }
+
+    private NestedTypeMember provenTypedCallFrameProduct(
+        List<NestedTypeMember> products) {
+
+        NestedTypeMember first = products == null || products.isEmpty()
+            ? null
+            : products.get(0);
+        Function target = first == null || first.target == null
+            ? null
+            : functionContaining(first.target);
+        String nativeType = directUnmarshalValueTypeName(target);
+        NestedTypeShape exact = target == null || nativeType == null
+            ? null
+            : recoverNestedDirectTypeShape(target, nativeType);
+        String semanticWireShape = provenNestedTypeIdentityWireShape(exact);
+        if (exact == null || semanticWireShape == null ||
+            !sameFlattenedCodecProducts(products, exact.members)) {
+            return null;
+        }
+
+        ArrayList<String> layouts = new ArrayList<>(products.size());
+        long physicalEnd = first.offset;
+        for (NestedTypeMember product : products) {
+            String layout = firstNonEmpty(product.wireLayout, product.wireShape);
+            Integer width = product.byteWidth == null
+                ? wireShapeByteWidth(layout)
+                : product.byteWidth;
+            Long end = width == null || width <= 0
+                ? null
+                : addExactOrNull(product.offset, width.longValue());
+            if (layout == null || end == null) {
+                return null;
+            }
+            layouts.add(layout);
+            physicalEnd = Math.max(physicalEnd, end);
+        }
+        long physicalWidth = physicalEnd - first.offset;
+        if (physicalWidth <= 0L || physicalWidth > Integer.MAX_VALUE) {
+            return null;
+        }
+
+        NestedTypeMember member = copyNestedTypeMember(first);
+        member.nativeType = firstNonEmpty(exact.typeNameFull, exact.typeName);
+        member.typeId = normalizeUuid(exact.typeId);
+        member.typeIdSource = exact.typeIdSource;
+        member.typeIdentityProven = true;
+        member.typeIdentitySource = exact.identitySource;
+        member.wireShape = semanticWireShape;
+        member.wireShapeSource = exact.identitySource;
+        member.wireLayout = compositeWireShape(layouts);
+        member.wireLayoutSource =
+            "message-call-frame-exact-codec-product";
+        member.byteWidth = (int) physicalWidth;
+        member.target = exact.function;
+        member.targetName = exact.functionName;
+        member.typeConflict = null;
+        return member;
+    }
+
+    private void proveMessageCallFrameOutputCoverage(
+        Function function,
+        List<MessageCallFrameOutput> outputs) {
+
+        if (function == null || outputs == null || outputs.isEmpty()) {
+            return;
+        }
+        NestedTypeShape recovered = new NestedTypeShape();
+        for (MessageCallFrameOutput output : outputs) {
+            if (output == null || output.shape() == null) {
+                return;
+            }
+            for (NestedTypeMember member : output.shape().members) {
+                recovered.members.add(copyNestedTypeMember(member));
+            }
+        }
+        NestedTypeShape wireSequence = directWireSequenceShape(
+            function,
+            fullFunctionName(function),
+            fullFunctionName(function));
+        boolean orderedOutputs = hasNonInterleavedMessageCallFrameOrder(outputs);
+        boolean coverageProven = orderedOutputs
+            ? sameNestedWireSequenceInProvenOrder(
+                recovered,
+                outputs,
+                wireSequence)
+            : sameNestedWireSequence(recovered, wireSequence);
+        if (!coverageProven) {
+            coverageProven = hasCompleteCountedCollectionCallFrameCoverage(
+                function,
+                outputs);
+        }
+        if (!coverageProven) {
+            return;
+        }
+        for (MessageCallFrameOutput output : outputs) {
+            NestedTypeShape shape = output.shape();
+            shape.memberCoverageProven = true;
+            shape.wireOrderProven = true;
+            shape.wireOrderSource =
+                wireSequence == null
+                    ? "cfg-counted-collection-complete-buffer-coverage"
+                    : "cfg-success-flow+complete-helper-wire-sequence";
+        }
+    }
+
+    private boolean hasCompleteCountedCollectionCallFrameCoverage(
+        Function function,
+        List<MessageCallFrameOutput> outputs) {
+
+        if (function == null || outputs == null || outputs.isEmpty()) {
+            return false;
+        }
+        Map<String, CollectionOutputShape> collections =
+            collectionOutputShapesByParameterFromPcode(function);
+        if (collections.size() != outputs.size()) {
+            return false;
+        }
+
+        LinkedHashSet<Address> coveredCalls = new LinkedHashSet<>();
+        for (MessageCallFrameOutput output : outputs) {
+            CollectionOutputShape collection = collections.get(
+                storageKey(new PcodeStorage(output.parameterBase(), 0L)));
+            NestedTypeShape shape = output.shape();
+            if (collection == null || collection.storage.offset != 0L ||
+                shape == null || shape.members.size() != 1 ||
+                !sameCountedCollectionMember(
+                    shape.members.get(0),
+                    collection.wireEvidence)) {
+                return false;
+            }
+            coveredCalls.add(collection.countCallsite);
+            coveredCalls.addAll(collection.codecCallsites);
+        }
+
+        String readBufferParameter = uniqueReadBufferParameter(function);
+        HighFunction high = highFunction(function);
+        if (readBufferParameter == null || high == null || coveredCalls.isEmpty()) {
+            return false;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        PcodeStorage readBuffer = new PcodeStorage(readBufferParameter, 0L);
+        LinkedHashSet<Address> observedCoveredCalls = new LinkedHashSet<>();
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() == PcodeOp.CALL) {
+                Function target = pcodeCallTarget(operation);
+                PcodeStorage targetBuffer = target == null
+                    ? null
+                    : callTargetReadBufferStorage(
+                        high,
+                        operations,
+                        operation,
+                        target,
+                        readBuffer,
+                        new LinkedHashSet<>());
+                boolean receivesBuffer = targetBuffer != null ||
+                    uniqueCallArgumentSlot(operation, readBuffer) != null;
+                if (!receivesBuffer) {
+                    continue;
+                }
+                Address callsite = operation.getSeqnum().getTarget();
+                if (!coveredCalls.contains(callsite)) {
+                    return false;
+                }
+                observedCoveredCalls.add(callsite);
+                continue;
+            }
+            CodecWireEvent directRead = directCursorReadEvent(
+                high,
+                operation,
+                operations,
+                readBufferParameter);
+            if (directRead != null) {
+                return false;
+            }
+        }
+        return observedCoveredCalls.equals(coveredCalls);
+    }
+
+    private boolean sameCountedCollectionMember(
+        NestedTypeMember member,
+        WireShape collectionEvidence) {
+
+        WireShape memberEvidence = nestedMemberWireEvidence(member);
+        if (memberEvidence == null || collectionEvidence == null) {
+            return false;
+        }
+        String memberLayout = canonicalLayoutWireShape(
+            firstNonEmpty(memberEvidence.layout, memberEvidence.shape));
+        String collectionLayout = canonicalLayoutWireShape(
+            firstNonEmpty(collectionEvidence.layout, collectionEvidence.shape));
+        return member.offset == 0L && memberLayout != null &&
+            memberLayout.equals(collectionLayout);
+    }
+
+    private boolean sameNestedWireSequenceInProvenOrder(
+        NestedTypeShape recovered,
+        List<MessageCallFrameOutput> outputs,
+        NestedTypeShape wireSequence) {
+
+        if (recovered == null || outputs == null || outputs.isEmpty() ||
+            wireSequence == null ||
+            recovered.members.isEmpty()) {
+            return false;
+        }
+        int globalIndex = 0;
+        for (MessageCallFrameOutput output : outputs) {
+            HashSet<Integer> ordinals = new HashSet<>();
+            for (int localIndex = 0;
+                    localIndex < output.shape().members.size();
+                    localIndex++, globalIndex++) {
+                NestedTypeMember storage = recovered.members.get(globalIndex);
+                if (storage == null || storage.wireOrdinal == null ||
+                    storage.wireOrderSource == null ||
+                    !ordinals.add(storage.wireOrdinal)) {
+                    return false;
+                }
+            }
+        }
+        List<NestedTypeMember> storageMembers = recovered.members;
+        List<NestedTypeMember> wireMembers = wireSequence.members;
+        if (!sameFlattenedCodecProducts(storageMembers, wireMembers)) {
+            return false;
+        }
+        for (MessageCallFrameOutput output : outputs) {
+            for (int index = 0; index < output.shape().members.size(); index++) {
+                NestedTypeMember member = output.shape().members.get(index);
+                member.wireOrdinal = index;
+                member.wireOrderSource =
+                    "cfg-success-flow+ordered-helper-wire-sequence";
+            }
+        }
+        for (int index = 0; index < recovered.members.size(); index++) {
+            NestedTypeMember member = recovered.members.get(index);
+            member.wireOrdinal = index;
+            member.wireOrderSource =
+                "cfg-success-flow+ordered-helper-wire-sequence";
+        }
+        recovered.memberCoverageProven = true;
+        recovered.wireOrderProven = true;
+        recovered.wireOrderSource =
+            "cfg-success-flow+ordered-helper-wire-sequence";
+        return true;
+    }
+
+    private boolean sameFlattenedCodecProducts(
+        List<NestedTypeMember> observed,
+        List<NestedTypeMember> expected) {
+
+        List<String> observedLayouts = flattenedWireLayouts(observed);
+        List<String> expectedLayouts = flattenedWireLayouts(expected);
+        if (observedLayouts == null || expectedLayouts == null ||
+            observedLayouts.size() != expectedLayouts.size()) {
+            return false;
+        }
+        for (int index = 0; index < observedLayouts.size(); index++) {
+            if (!sameCodecProduct(
+                    observedLayouts.get(index),
+                    expectedLayouts.get(index))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean sameCodecProduct(String observed, String expected) {
+        if (Objects.equals(
+                canonicalLayoutWireShape(observed),
+                canonicalLayoutWireShape(expected))) {
+            return true;
+        }
+        Integer observedRawWidth = fixedBytesLayoutWidth(observed);
+        Integer expectedRawWidth = fixedBytesLayoutWidth(expected);
+        if ((observedRawWidth == null) == (expectedRawWidth == null)) {
+            return false;
+        }
+        Integer rawWidth = observedRawWidth == null
+            ? expectedRawWidth
+            : observedRawWidth;
+        String semantic = observedRawWidth == null ? observed : expected;
+        return rawWidth.equals(wireShapeByteWidth(semantic));
+    }
+
+    private Integer fixedBytesLayoutWidth(String layout) {
+        return layout != null && layout.startsWith("fixed-bytes-")
+            ? wireShapeByteWidth(layout)
+            : null;
+    }
+
+    private List<String> flattenedWireLayouts(List<NestedTypeMember> members) {
+        if (members == null || members.isEmpty()) {
+            return null;
+        }
+        ArrayList<String> result = new ArrayList<>();
+        for (NestedTypeMember member : members) {
+            if (member == null || member.wireLayout == null) {
+                return null;
+            }
+            List<String> flattened = flattenedLayoutMembers(member.wireLayout);
+            if (flattened == null || flattened.isEmpty()) {
+                return null;
+            }
+            result.addAll(flattened);
+        }
+        return List.copyOf(result);
+    }
+
+    private List<String> flattenedCanonicalWireLayouts(
+        List<NestedTypeMember> members) {
+
+        if (members == null || members.isEmpty()) {
+            return null;
+        }
+        ArrayList<String> result = new ArrayList<>();
+        for (NestedTypeMember member : members) {
+            if (member == null || member.wireLayout == null) {
+                return null;
+            }
+            List<String> flattened = flattenedLayoutMembers(member.wireLayout);
+            if (flattened == null || flattened.isEmpty()) {
+                return null;
+            }
+            for (String layout : flattened) {
+                String canonical = canonicalLayoutWireShape(layout);
+                if (canonical == null) {
+                    return null;
+                }
+                result.add(canonical);
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private boolean hasNonInterleavedMessageCallFrameOrder(
+        List<MessageCallFrameOutput> outputs) {
+
+        int previousLast = -1;
+        for (MessageCallFrameOutput output : outputs) {
+            if (output == null || output.shape() == null ||
+                !Boolean.TRUE.equals(output.shape().wireOrderProven) ||
+                output.firstOperationOrder() == Integer.MAX_VALUE ||
+                output.lastOperationOrder() == Integer.MAX_VALUE ||
+                output.firstOperationOrder() > output.lastOperationOrder() ||
+                output.firstOperationOrder() <= previousLast) {
+                return false;
+            }
+            previousLast = output.lastOperationOrder();
+        }
+        return true;
     }
 
     private boolean isCompleteMessageCallFrameOutput(

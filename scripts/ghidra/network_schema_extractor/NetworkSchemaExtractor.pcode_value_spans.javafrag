@@ -1,0 +1,141 @@
+    private PcodeByteSpan pcodeByteSpan(
+        Varnode value,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || value.getSize() <= 0 || depth > 48 ||
+            !active.add(pcodeSsaNodeKey(value))) {
+            return null;
+        }
+        try {
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                PcodeStorage storage = pcodeStorageExpression(value);
+                return storage == null ? null : new PcodeByteSpan(storage, value.getSize());
+            }
+            return switch (definition.getOpcode()) {
+                case PcodeOp.LOAD -> {
+                    PcodeStorage storage = definition.getNumInputs() < 2
+                        ? null
+                        : pcodeStorageExpression(definition.getInput(1));
+                    yield storage == null
+                        ? null
+                        : new PcodeByteSpan(storage, value.getSize());
+                }
+                case PcodeOp.COPY, PcodeOp.CAST -> pcodeByteSpan(
+                    definition.getInput(0), active, depth + 1);
+                case PcodeOp.INDIRECT -> {
+                    PcodeStorage storage = pcodeStorageExpression(value);
+                    yield storage == null
+                        ? null
+                        : new PcodeByteSpan(storage, value.getSize());
+                }
+                case PcodeOp.SUBPIECE -> subpieceByteSpan(definition, active, depth + 1);
+                case PcodeOp.PIECE -> pieceByteSpan(definition, active, depth + 1);
+                case PcodeOp.MULTIEQUAL -> phiByteSpan(definition, active, depth + 1);
+                default -> null;
+            };
+        }
+        finally {
+            active.remove(pcodeSsaNodeKey(value));
+        }
+    }
+
+    private PcodeByteSpan subpieceByteSpan(
+        PcodeOp definition,
+        Set<String> active,
+        int depth) {
+
+        if (definition.getNumInputs() < 2 || !definition.getInput(1).isConstant()) {
+            return null;
+        }
+        PcodeByteSpan source = pcodeByteSpan(
+            definition.getInput(0),
+            new LinkedHashSet<>(active),
+            depth);
+        long dropped = definition.getInput(1).getOffset();
+        int outputSize = definition.getOutput() == null
+            ? 0
+            : definition.getOutput().getSize();
+        if (source == null || dropped > source.byteLength() || outputSize <= 0 ||
+            outputSize > source.byteLength() - dropped) {
+            return null;
+        }
+        return new PcodeByteSpan(source.storage().plus(dropped), outputSize);
+    }
+
+    private PcodeByteSpan pieceByteSpan(
+        PcodeOp definition,
+        Set<String> active,
+        int depth) {
+
+        if (definition.getNumInputs() != 2) {
+            return null;
+        }
+        PcodeByteSpan high = pcodeByteSpan(
+            definition.getInput(0),
+            new LinkedHashSet<>(active),
+            depth);
+        PcodeByteSpan low = pcodeByteSpan(
+            definition.getInput(1),
+            new LinkedHashSet<>(active),
+            depth);
+        if (high == null || low == null ||
+            !high.storage().base.equals(low.storage().base) ||
+            high.storage().offset != low.storage().offset + low.byteLength()) {
+            return null;
+        }
+        return new PcodeByteSpan(
+            low.storage(),
+            Math.addExact(low.byteLength(), high.byteLength()));
+    }
+
+    private PcodeByteSpan phiByteSpan(
+        PcodeOp definition,
+        Set<String> active,
+        int depth) {
+
+        PcodeByteSpan selected = null;
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            PcodeByteSpan candidate = pcodeByteSpan(
+                definition.getInput(slot),
+                new LinkedHashSet<>(active),
+                depth);
+            if (candidate == null || selected != null && !selected.same(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private String pcodeTempRangeEvidence(
+        Varnode value,
+        Map<String, String> evidenceByStorageByte) {
+
+        if (value == null || evidenceByStorageByte == null ||
+            evidenceByStorageByte.isEmpty()) {
+            return null;
+        }
+        PcodeByteSpan span = pcodeByteSpan(value, new LinkedHashSet<>(), 0);
+        if (span == null || !isPcodeLocalTempStorage(span.storage())) {
+            return null;
+        }
+        String selected = null;
+        for (int byteOffset = 0; byteOffset < span.byteLength(); byteOffset++) {
+            String evidence = evidenceByStorageByte.get(
+                storageKey(span.storage().plus(byteOffset)));
+            if (evidence == null || selected != null && !selected.equals(evidence)) {
+                return null;
+            }
+            selected = evidence;
+        }
+        return selected;
+    }
+
+    private record PcodeByteSpan(PcodeStorage storage, int byteLength) {
+        boolean same(PcodeByteSpan other) {
+            return other != null && byteLength == other.byteLength &&
+                storage.sameLocation(other.storage);
+        }
+    }

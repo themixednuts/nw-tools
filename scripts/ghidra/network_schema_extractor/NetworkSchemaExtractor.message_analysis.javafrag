@@ -1,0 +1,68 @@
+    private void classifyMessageAnalysis(
+        MessageUnmarshalPlan unmarshal,
+        MessageMarshalPlan marshal) {
+
+        if (unmarshal == null) {
+            return;
+        }
+        if (unmarshal.delegatedCodec != null) {
+            unmarshal.analysisStatus = "delegated-codec";
+            return;
+        }
+        if (Boolean.FALSE.equals(unmarshal.supportsUnmarshal) &&
+            marshal != null && !marshal.fields.isEmpty()) {
+            unmarshal.analysisStatus = "marshal-only";
+            return;
+        }
+        if (!unmarshal.fields.isEmpty()) {
+            unmarshal.analysisStatus = "recovered-fields";
+            return;
+        }
+        if (proveEmptyMessageWire(unmarshal, marshal)) {
+            unmarshal.analysisStatus = "proven-empty";
+            unmarshal.emptyWireProven = true;
+            unmarshal.emptyWireEvidenceSource =
+                "vptr-only-instance+empty-marshal-cfg+successful-no-read-unmarshal-cfg";
+            while (unmarshal.rejectedPcodeFields.size() > 0) {
+                unmarshal.rejectedPcodeFields.remove(
+                    unmarshal.rejectedPcodeFields.size() - 1);
+            }
+            return;
+        }
+        unmarshal.analysisStatus = "unresolved";
+    }
+
+    private boolean proveEmptyMessageWire(
+        MessageUnmarshalPlan unmarshal,
+        MessageMarshalPlan marshal) {
+
+        if (unmarshal.instanceSize == null ||
+            unmarshal.instanceSize.longValue() != Long.BYTES ||
+            marshal == null ||
+            !"complete-empty-cfg-stack-flow".equals(marshal.analysisStatus) ||
+            !marshal.events.isEmpty() ||
+            !marshal.fields.isEmpty()) {
+            return false;
+        }
+        Function wrapper = functionAtOrContaining(unmarshal.wrapper);
+        HighFunction high = highFunction(wrapper);
+        if (high == null) {
+            unmarshal.terminalStatus = "missing-high-function";
+            return false;
+        }
+        UnmarshalTerminalFlow terminalFlow = successfulUnmarshalTerminalFlow(high);
+        unmarshal.terminalStatus = terminalFlow.status();
+        if (terminalFlow.terminals().isEmpty()) {
+            return false;
+        }
+        for (int slot = 1; slot <= 4; slot++) {
+            if (hasReadBufferFlow(
+                    wrapper,
+                    "param_" + slot,
+                    new LinkedHashSet<>())) {
+                return false;
+            }
+        }
+        unmarshal.supportsUnmarshal = true;
+        return true;
+    }

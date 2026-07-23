@@ -1,0 +1,281 @@
+    private record UnmarshalFlowNode(
+        PcodeBlockBasic block,
+        UnmarshalStatusByte status) {
+    }
+
+    private record UnmarshalFlowEdge(
+        UnmarshalFlowNode source,
+        UnmarshalFlowNode target) {
+    }
+
+    private UnmarshalTerminalFlow successfulUnmarshalStateFlow(
+        HighFunction high,
+        String expectedResultBase,
+        Set<String> active,
+        int depth) {
+
+        LinkedHashSet<String> resultBases = new LinkedHashSet<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            StatusByteWrite write = unmarshalStatusByteWrite(operation);
+            if (write != null) {
+                resultBases.add(write.base());
+            }
+        }
+        String resultBase = expectedResultBase;
+        if (resultBase == null) {
+            resultBase = resultBases.size() == 1
+                ? resultBases.iterator().next()
+                : returnedUnmarshalResultBase(high, resultBases);
+        }
+        if (resultBase == null) {
+            return resultBases.isEmpty()
+                ? scalarReturnUnmarshalTerminalFlow(high)
+                : UnmarshalTerminalFlow.unresolved(
+                    "result-base-count:" + resultBases.size());
+        }
+
+        Set<PcodeOpAST> delegatedSuccess = delegatedUnmarshalSuccessCalls(
+            high,
+            resultBase,
+            active,
+            depth);
+        List<PcodeBlockBasic> entries = high.getBasicBlocks().stream()
+            .filter(block -> NetworkSchemaControlFlow.predecessors(block).isEmpty())
+            .sorted(Comparator
+                .comparing(PcodeBlockBasic::getStart)
+                .thenComparingInt(PcodeBlock::getIndex))
+            .toList();
+        if (entries.isEmpty()) {
+            return UnmarshalTerminalFlow.unresolved("missing-entry-block");
+        }
+
+        Map<PcodeBlockBasic, Map<PcodeBlockBasic, UnmarshalStatusByte>>
+            terminalIncoming = new HashMap<>();
+        LinkedHashSet<UnmarshalFlowNode> nodes = new LinkedHashSet<>();
+        LinkedHashSet<UnmarshalFlowEdge> edges = new LinkedHashSet<>();
+        LinkedHashSet<UnmarshalFlowNode> entryNodes = new LinkedHashSet<>();
+        ArrayDeque<UnmarshalFlowNode> pending = new ArrayDeque<>();
+        for (PcodeBlockBasic entry : entries) {
+            UnmarshalFlowNode node = new UnmarshalFlowNode(
+                entry,
+                transferUnmarshalStatus(
+                    high,
+                    entry,
+                    UnmarshalStatusByte.UNSET,
+                    null,
+                    resultBase,
+                    delegatedSuccess,
+                    active,
+                    depth));
+            entryNodes.add(node);
+            if (nodes.add(node)) {
+                pending.addLast(node);
+            }
+        }
+
+        while (!pending.isEmpty()) {
+            UnmarshalFlowNode source = pending.removeFirst();
+            for (PcodeBlockBasic successor :
+                    NetworkSchemaControlFlow.successors(source.block())) {
+                UnmarshalStatusByte edgeStatus = terminalIncomingStatusForEdge(
+                    high,
+                    source.block(),
+                    successor,
+                    resultBase,
+                    terminalIncoming);
+                UnmarshalFlowNode target = new UnmarshalFlowNode(
+                    successor,
+                    transferUnmarshalStatus(
+                        high,
+                        successor,
+                        source.status(),
+                        edgeStatus,
+                        resultBase,
+                        delegatedSuccess,
+                        active,
+                        depth));
+                edges.add(new UnmarshalFlowEdge(source, target));
+                if (nodes.add(target)) {
+                    pending.addLast(target);
+                }
+            }
+        }
+
+        LinkedHashSet<UnmarshalFlowNode> successfulTerminals = nodes.stream()
+            .filter(node -> isTerminatingPcodeBlock(node.block()))
+            .filter(node -> node.status() == UnmarshalStatusByte.SUCCESS)
+            .collect(Collectors.toCollection(LinkedHashSet::new));
+        if (successfulTerminals.isEmpty()) {
+            return UnmarshalTerminalFlow.unresolved("no-success-terminal");
+        }
+
+        SuccessfulUnmarshalSubgraph successful =
+            constrainedSuccessfulUnmarshalSubgraph(edges, successfulTerminals);
+        Set<UnmarshalFlowNode> successfulNodes = successful.nodes();
+
+        LinkedHashSet<String> successfulPhysicalEdges = new LinkedHashSet<>();
+        for (UnmarshalFlowEdge edge : successful.edges()) {
+            successfulPhysicalEdges.add(unmarshalPhysicalEdgeKey(
+                edge.source().block(),
+                edge.target().block()));
+        }
+        HashMap<PcodeBlockBasic, LinkedHashSet<PcodeBlockBasic>> excluded =
+            new HashMap<>();
+        for (PcodeBlockBasic block : high.getBasicBlocks()) {
+            for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(block)) {
+                if (!successfulPhysicalEdges.contains(
+                        unmarshalPhysicalEdgeKey(block, successor))) {
+                    excluded.computeIfAbsent(block, ignored -> new LinkedHashSet<>())
+                        .add(successor);
+                }
+            }
+        }
+
+        HashMap<PcodeBlockBasic, Set<PcodeBlockBasic>> immutableExcluded = new HashMap<>();
+        excluded.forEach((block, successors) ->
+            immutableExcluded.put(block, Set.copyOf(successors)));
+        Set<PcodeBlockBasic> mandatoryBlocks = mandatorySuccessfulPhysicalBlocks(
+            successfulNodes,
+            successful.edges(),
+            entryNodes,
+            successfulTerminals);
+        return new UnmarshalTerminalFlow(
+            successfulTerminals.stream()
+                .map(UnmarshalFlowNode::block)
+                .collect(Collectors.toUnmodifiableSet()),
+            Map.copyOf(immutableExcluded),
+            mandatoryBlocks,
+            "complete-status-product-graph");
+    }
+
+    private Set<PcodeBlockBasic> mandatorySuccessfulPhysicalBlocks(
+        Set<UnmarshalFlowNode> successfulNodes,
+        Set<UnmarshalFlowEdge> edges,
+        Set<UnmarshalFlowNode> entries,
+        Set<UnmarshalFlowNode> terminals) {
+
+        if (successfulNodes == null || successfulNodes.isEmpty() ||
+            edges == null || entries == null || terminals == null ||
+            terminals.isEmpty()) {
+            return Set.of();
+        }
+        HashMap<UnmarshalFlowNode, List<UnmarshalFlowNode>> successors =
+            new HashMap<>();
+        for (UnmarshalFlowEdge edge : edges) {
+            if (successfulNodes.contains(edge.source()) &&
+                successfulNodes.contains(edge.target())) {
+                successors.computeIfAbsent(
+                    edge.source(),
+                    ignored -> new ArrayList<>()).add(edge.target());
+            }
+        }
+        Set<UnmarshalFlowNode> successfulEntries = entries.stream()
+            .filter(successfulNodes::contains)
+            .collect(Collectors.toUnmodifiableSet());
+        if (successfulEntries.isEmpty()) {
+            return Set.of();
+        }
+
+        LinkedHashSet<PcodeBlockBasic> candidates = successfulNodes.stream()
+            .map(UnmarshalFlowNode::block)
+            .collect(Collectors.toCollection(LinkedHashSet::new));
+        candidates.removeIf(block -> successfulTerminalReachableWithoutBlock(
+            block,
+            successfulEntries,
+            terminals,
+            successors));
+        return Set.copyOf(candidates);
+    }
+
+    private boolean successfulTerminalReachableWithoutBlock(
+        PcodeBlockBasic excludedBlock,
+        Set<UnmarshalFlowNode> entries,
+        Set<UnmarshalFlowNode> terminals,
+        Map<UnmarshalFlowNode, List<UnmarshalFlowNode>> successors) {
+
+        ArrayDeque<UnmarshalFlowNode> pending = new ArrayDeque<>();
+        HashSet<UnmarshalFlowNode> visited = new HashSet<>();
+        for (UnmarshalFlowNode entry : entries) {
+            if (entry.block() != excludedBlock && visited.add(entry)) {
+                pending.addLast(entry);
+            }
+        }
+        while (!pending.isEmpty()) {
+            UnmarshalFlowNode node = pending.removeFirst();
+            if (terminals.contains(node)) {
+                return true;
+            }
+            for (UnmarshalFlowNode successor :
+                    successors.getOrDefault(node, List.of())) {
+                if (successor.block() != excludedBlock &&
+                    visited.add(successor)) {
+                    pending.addLast(successor);
+                }
+            }
+        }
+        return false;
+    }
+
+    private UnmarshalStatusByte transferUnmarshalStatus(
+        HighFunction high,
+        PcodeBlockBasic block,
+        UnmarshalStatusByte input,
+        UnmarshalStatusByte terminalEdgeStatus,
+        String resultBase,
+        Set<PcodeOpAST> delegatedSuccess,
+        Set<String> active,
+        int depth) {
+
+        UnmarshalStatusByte status = input;
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (!(operation instanceof PcodeOpAST ast)) {
+                continue;
+            }
+            StatusByteWrite write = unmarshalStatusByteWrite(ast);
+            if (write != null && resultBase.equals(write.base())) {
+                UnmarshalStatusByte written = effectiveUnmarshalStatusByte(
+                    high,
+                    ast,
+                    write,
+                    active,
+                    depth);
+                status = written == UnmarshalStatusByte.UNKNOWN &&
+                    terminalEdgeStatus != null
+                    ? terminalEdgeStatus
+                    : written;
+            }
+            else if (delegatedSuccess.contains(ast)) {
+                status = UnmarshalStatusByte.SUCCESS;
+            }
+        }
+        return status;
+    }
+
+    private UnmarshalStatusByte terminalIncomingStatusForEdge(
+        HighFunction high,
+        PcodeBlockBasic predecessor,
+        PcodeBlockBasic target,
+        String resultBase,
+        Map<PcodeBlockBasic, Map<PcodeBlockBasic, UnmarshalStatusByte>> cache) {
+
+        if (!isTerminatingPcodeBlock(target)) {
+            return null;
+        }
+        Map<PcodeBlockBasic, UnmarshalStatusByte> incoming = cache.computeIfAbsent(
+            target,
+            block -> {
+                Map<PcodeBlockBasic, UnmarshalStatusByte> recovered =
+                    terminalIncomingStatus(high, block, resultBase);
+                return recovered == null ? Map.of() : recovered;
+            });
+        return incoming.get(predecessor);
+    }
+
+    private String unmarshalPhysicalEdgeKey(
+        PcodeBlockBasic source,
+        PcodeBlockBasic target) {
+
+        return source.getIndex() + "->" + target.getIndex();
+    }

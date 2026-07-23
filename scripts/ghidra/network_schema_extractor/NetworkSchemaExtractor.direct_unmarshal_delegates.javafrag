@@ -1,0 +1,326 @@
+    private NestedTypeShape directDelegatedUnmarshalShape(
+        Function wrapper,
+        HighFunction wrapperHigh) {
+
+        String wrapperType = directUnmarshalValueTypeName(wrapper);
+        if (wrapperType == null || wrapperHigh == null) {
+            return null;
+        }
+
+        List<PcodeOpAST> operations = orderedPcodeOps(wrapperHigh);
+        PcodeStorage wrapperValue = new PcodeStorage("param_1", 0L);
+        PcodeStorage wrapperReadBuffer = null;
+        PcodeOpAST delegatedCall = null;
+        Function delegatedTarget = null;
+        String delegatedType = null;
+        int directTargetCalls = 0;
+
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            String targetType = directUnmarshalValueTypeName(target);
+            if (targetType == null || wireShapeFromNativeType(targetType) != null) {
+                continue;
+            }
+            directTargetCalls++;
+            String targetReadBuffer = uniqueReadBufferParameter(target);
+            Integer targetReadBufferSlot = pcodeParameterIndex(targetReadBuffer);
+            if (targetReadBufferSlot == null) {
+                recordNestedTypeShapeReject(
+                    "direct-delegate-target-read-buffer-unproven");
+                continue;
+            }
+            PcodeStorage callerReadBuffer = targetReadBufferSlot == null
+                ? null
+                : provenCallArgumentStorage(
+                    wrapper,
+                    operation,
+                    target,
+                    targetReadBufferSlot);
+            Integer valueSlot = provenCallArgumentSlot(
+                wrapper,
+                operation,
+                target,
+                wrapperValue);
+            if (callerReadBuffer == null || callerReadBuffer.offset != 0L ||
+                pcodeParameterIndex(callerReadBuffer.base) == null) {
+                recordNestedTypeShapeReject(
+                    "direct-delegate-caller-read-buffer-unproven");
+                continue;
+            }
+            if (!Integer.valueOf(1).equals(valueSlot)) {
+                recordNestedTypeShapeReject(
+                    "direct-delegate-value-receiver-unproven");
+                continue;
+            }
+            if (!hasReadBufferFlow(
+                    target,
+                    targetReadBuffer,
+                    new LinkedHashSet<>())) {
+                recordNestedTypeShapeReject(
+                    "direct-delegate-target-read-flow-unproven");
+                return null;
+            }
+            if (delegatedCall != null) {
+                recordNestedTypeShapeReject(
+                    "direct-delegate-ambiguous-call-frame");
+                return null;
+            }
+            delegatedCall = operation;
+            delegatedTarget = target;
+            delegatedType = targetType;
+            wrapperReadBuffer = callerReadBuffer;
+        }
+
+        if (delegatedCall == null || delegatedTarget == null ||
+            delegatedType == null || wrapperReadBuffer == null) {
+            if (directTargetCalls > 0) {
+                recordNestedTypeShapeReject(
+                    "direct-delegate-call-frame-unresolved");
+            }
+            return null;
+        }
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                if (directCursorReadEvent(
+                        wrapperHigh,
+                        operation,
+                        operations,
+                        wrapperReadBuffer.base) != null) {
+                    recordNestedTypeShapeReject(
+                        "direct-delegate-independent-cursor-read");
+                    return null;
+                }
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Integer readBufferSlot = provenCallArgumentSlot(
+                wrapper,
+                operation,
+                target,
+                wrapperReadBuffer);
+            if (operation != delegatedCall && target != null &&
+                readBufferSlot != null && hasReadBufferFlow(
+                    target,
+                    "param_" + readBufferSlot,
+                    new LinkedHashSet<>())) {
+                recordNestedTypeShapeReject(
+                    "direct-delegate-additional-read-consumer");
+                return null;
+            }
+        }
+
+        NestedTypeShape child = recoverNestedDirectTypeShape(
+            delegatedTarget,
+            delegatedType);
+        if (!isCompleteDirectDelegateChildShape(child)) {
+            recordNestedTypeShapeReject(directDelegateChildRejectReason(child));
+            return null;
+        }
+        UnmarshalTerminalFlow wrapperTerminals =
+            successfulUnmarshalTerminalFlow(wrapperHigh);
+        UnmarshalTerminalFlow childTerminals =
+            successfulUnmarshalTerminalFlow(highFunction(delegatedTarget));
+        if (!isCompleteUnmarshalTerminalFlow(wrapperTerminals) ||
+            !isCompleteUnmarshalTerminalFlow(childTerminals) ||
+            wrapperTerminals.terminals().isEmpty() ||
+            childTerminals.terminals().isEmpty()) {
+            recordNestedTypeShapeReject(
+                !isCompleteUnmarshalTerminalFlow(wrapperTerminals)
+                    ? "direct-delegate-wrapper-terminal-flow-incomplete"
+                    : "direct-delegate-child-terminal-flow-incomplete");
+            return null;
+        }
+
+        NestedTypeShape delegated = copyNestedTypeShape(child);
+        delegated.memberBase = "param_1";
+        long nativeExtent = 0L;
+        for (NestedTypeMember member : delegated.members) {
+            if (member.nativeOffset == null) {
+                member.nativeOffset = member.offset;
+            }
+            nativeExtent = Math.max(
+                nativeExtent,
+                member.nativeOffset + member.byteWidth);
+        }
+        if (delegated.nativeSize == null) {
+            delegated.nativeSize = nativeExtent;
+            delegated.nativeSizeSource =
+                "ghidra-pcode-direct-delegate-native-storage-extent";
+        }
+        delegated.validation = appendValidation(
+            delegated.validation,
+            "single-direct-unmarshal-delegate+same-value-storage+same-read-buffer+complete-success-flow");
+        return delegated;
+    }
+
+    private String directDelegateChildRejectReason(NestedTypeShape shape) {
+        if (shape == null || shape.members.isEmpty()) {
+            return "direct-delegate-child-shape-missing";
+        }
+        if (!Boolean.TRUE.equals(shape.layoutProven)) {
+            return "direct-delegate-child-layout-unproven";
+        }
+        if (!Boolean.TRUE.equals(shape.memberCoverageProven)) {
+            return "direct-delegate-child-coverage-unproven";
+        }
+        if (!Boolean.TRUE.equals(shape.wireOrderProven)) {
+            return "direct-delegate-child-wire-order-unproven";
+        }
+        if (!("param_1".equals(shape.memberBase) ||
+            "this".equals(shape.memberBase))) {
+            return "direct-delegate-child-value-base-unproven";
+        }
+        return "direct-delegate-child-member-incomplete";
+    }
+
+    private boolean isCompleteDirectDelegateChildShape(NestedTypeShape shape) {
+        if (shape == null || shape.members.isEmpty() ||
+            !Boolean.TRUE.equals(shape.layoutProven) ||
+            !Boolean.TRUE.equals(shape.memberCoverageProven) ||
+            !Boolean.TRUE.equals(shape.wireOrderProven) ||
+            !("param_1".equals(shape.memberBase) || "this".equals(shape.memberBase))) {
+            return false;
+        }
+        for (NestedTypeMember member : shape.members) {
+            if (member == null || member.offset < 0L ||
+                member.byteWidth == null || member.byteWidth <= 0 ||
+                member.wireLayout == null ||
+                Boolean.TRUE.equals(member.typeConflict)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean sameNestedWireSequenceInProvenStorageOrder(
+        NestedTypeShape storage,
+        NestedTypeShape wire,
+        HighFunction high) {
+
+        if (storage == null || wire == null || high == null ||
+            storage.members.size() != wire.members.size() ||
+            storage.members.isEmpty()) {
+            return false;
+        }
+        UnmarshalTerminalFlow terminalFlow = successfulUnmarshalTerminalFlow(high);
+        if (!isCompleteUnmarshalTerminalFlow(terminalFlow)) {
+            return false;
+        }
+
+        ArrayList<NestedTypeMember> ordered =
+            new ArrayList<>(Collections.nCopies(storage.members.size(), null));
+        ArrayList<PcodeOpAST> evidence =
+            new ArrayList<>(Collections.nCopies(storage.members.size(), null));
+        for (NestedTypeMember member : storage.members) {
+            if (member == null || member.wireOrdinal == null ||
+                member.wireOrdinal < 0 || member.wireOrdinal >= ordered.size() ||
+                ordered.get(member.wireOrdinal) != null) {
+                return false;
+            }
+            PcodeOpAST operation = nestedMemberEvidenceOperation(high, member);
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+            if (operation == null || block == null ||
+                !terminalFlow.mandatoryBlocks().contains(block)) {
+                return false;
+            }
+            ordered.set(member.wireOrdinal, member);
+            evidence.set(member.wireOrdinal, operation);
+        }
+        for (int index = 0; index < evidence.size() - 1; index++) {
+            if (!NetworkSchemaControlFlow.precedes(
+                    high,
+                    evidence.get(index),
+                    evidence.get(index + 1))) {
+                return false;
+            }
+        }
+        if (!sameFlattenedCodecProducts(ordered, wire.members)) {
+            return false;
+        }
+
+        for (int index = 0; index < ordered.size(); index++) {
+            NestedTypeMember member = ordered.get(index);
+            member.nativeOffset = member.offset;
+            member.wireOrdinal = index;
+            member.wireOrderSource =
+                "cfg-dominating-output-storage-order+recursive-unmarshal-order";
+        }
+        storage.members.clear();
+        storage.members.addAll(ordered);
+        storage.memberCoverageProven = true;
+        storage.wireOrderProven = true;
+        storage.wireOrderSource =
+            "cfg-dominating-output-storage-order+recursive-unmarshal-order";
+        return true;
+    }
+
+    private PcodeOpAST nestedMemberEvidenceOperation(
+        HighFunction high,
+        NestedTypeMember member) {
+
+        if (high == null || member == null || member.callsite == null) {
+            return null;
+        }
+        PcodeOpAST store = null;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getSeqnum() == null ||
+                !member.callsite.equals(operation.getSeqnum().getTarget())) {
+                continue;
+            }
+            if (operation.getOpcode() == PcodeOp.CALL) {
+                Function target = pcodeCallTarget(operation);
+                if (target != null && member.target != null &&
+                    member.target.equals(target.getEntryPoint())) {
+                    return operation;
+                }
+            }
+            else if (operation.getOpcode() == PcodeOp.STORE) {
+                if (store != null) {
+                    return null;
+                }
+                store = operation;
+            }
+        }
+        return store;
+    }
+
+    private boolean isCompleteUnmarshalTerminalFlow(UnmarshalTerminalFlow flow) {
+        return flow != null && flow.status() != null &&
+            flow.status().startsWith("complete") &&
+            !flow.terminals().isEmpty();
+    }
+
+    private NestedTypeShape copyNestedTypeShape(NestedTypeShape source) {
+        NestedTypeShape copy = new NestedTypeShape();
+        copy.typeId = source.typeId;
+        copy.typeIdSource = source.typeIdSource;
+        copy.identityProven = source.identityProven;
+        copy.identitySource = source.identitySource;
+        copy.typeName = source.typeName;
+        copy.typeNameFull = source.typeNameFull;
+        copy.typeNameSource = source.typeNameSource;
+        copy.function = source.function;
+        copy.functionName = source.functionName;
+        copy.factory = source.factory;
+        copy.azRttiAddress = source.azRttiAddress;
+        copy.constructor = source.constructor;
+        copy.vtable = source.vtable;
+        copy.memberBase = source.memberBase;
+        copy.memberNameSource = source.memberNameSource;
+        copy.memberNamesProven = source.memberNamesProven;
+        copy.layoutProven = source.layoutProven;
+        copy.memberCoverageProven = source.memberCoverageProven;
+        copy.wireOrderProven = source.wireOrderProven;
+        copy.wireOrderSource = source.wireOrderSource;
+        copy.datatypePath = source.datatypePath;
+        copy.validation = source.validation;
+        copy.nativeSize = source.nativeSize;
+        copy.nativeSizeSource = source.nativeSizeSource;
+        for (NestedTypeMember member : source.members) {
+            copy.members.add(copyNestedTypeMember(member));
+        }
+        return copy;
+    }

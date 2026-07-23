@@ -121,6 +121,7 @@
             }
             CollectionOutputShape output = new CollectionOutputShape(
                 recovery.storage().data(),
+                null,
                 recovery.shape().wireEvidence,
                 recovery.shape().countCallsite,
                 loop.header().getStart(),

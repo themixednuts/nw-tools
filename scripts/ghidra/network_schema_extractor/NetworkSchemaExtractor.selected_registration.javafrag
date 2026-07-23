@@ -1,0 +1,76 @@
+    private Map<String, RegistrationFunction> collectSelectedRegistrationFunctions(
+        List<RegistryEntry> registry) throws CancelledException {
+
+        LinkedHashMap<String, RegistrationFunction> result = new LinkedHashMap<>();
+        int constructorCount = 0;
+        startAnalysisWorklist("selected-field-registration", registry.size());
+        long heartbeat = System.nanoTime();
+        int completed = 0;
+        for (RegistryEntry entry : registry) {
+            heartbeat = updateAnalysisWorklist(
+                "selected-field-registration",
+                completed,
+                registry.size(),
+                registryProgressDetail(entry),
+                heartbeat);
+            completed++;
+            String typeId = canonicalUuidFromString(entry.uuid);
+            AzRttiEvidence rtti = decodeAzRttiFromRegistryHandler(entry, typeId, true);
+            if (rtti == null || rtti.constructorVptrWrites == null) {
+                continue;
+            }
+            for (JsonElement element : rtti.constructorVptrWrites) {
+                if (!element.isJsonObject()) {
+                    continue;
+                }
+                JsonObject write = element.getAsJsonObject();
+                if (!uuidEquals(typeId, string(write, "typeId")) ||
+                    !"concrete".equals(string(write, "constructorRole"))) {
+                    continue;
+                }
+                Address address = parseCapturedAddress(string(write, "constructorFunction"));
+                Function constructor = functionAtOrContaining(address);
+                if (constructor == null) {
+                    continue;
+                }
+                String key = constructor.getEntryPoint().toString();
+                if (result.containsKey(key)) {
+                    continue;
+                }
+                constructorCount++;
+                RegistrationFunction registration = recoverRegistrationFunction(constructor);
+                if (!registration.fields.isEmpty()) {
+                    result.put(key, registration);
+                }
+            }
+        }
+        updateAnalysisWorklist(
+            "selected-field-registration",
+            completed,
+            registry.size(),
+            "registrations=" + result.size(),
+            heartbeat);
+        finishAnalysisWorklist("selected-field-registration", registry.size());
+        println(
+            "Selected registration constructors: candidates=" + constructorCount +
+            ", registrations=" + result.size());
+        return result;
+    }
+
+    private RegistrationFunction recoverRegistrationFunction(Function owner) {
+        RegistrationFunction function = new RegistrationFunction(owner);
+        function.instanceVtable = findInstanceVtable(function.function);
+        function.azRtti = decodeAzRttiFromVtable(function.instanceVtable);
+        function.fields.addAll(recoverRegisterFieldCallsFromPcode(function.function));
+
+        List<FieldCall> executedFields = hasBackwardPcodeBranch(function.function)
+            ? recoverExecutedRegisterFieldCalls(function.function)
+            : Collections.emptyList();
+        if (executedFields.size() > function.fields.size()) {
+            registerFieldLoopRecoveredFunctionCount++;
+            registerFieldLoopRecoveredCallCount += executedFields.size() - function.fields.size();
+            function.fields.clear();
+            function.fields.addAll(executedFields);
+        }
+        return function;
+    }

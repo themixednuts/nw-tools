@@ -727,8 +727,9 @@
             plan.readBufferParameter = plan.delegatedCodec.readBufferStorage.base;
             plan.rootEvidenceSource = plan.delegatedCodec.evidenceSource;
         }
-        if (plan.fields.isEmpty() && plan.delegatedCodec == null) {
-            return null;
+        if (plan.delegatedCodec == null) {
+            applyMessageConstructorTypeBoundaries(plan, wrapper);
+            applyMessageConstructorSpans(plan, wrapper);
         }
         normalizeMessageFields(plan);
         return plan;

@@ -11,10 +11,15 @@
     private record UnmarshalTerminalFlow(
         Set<PcodeBlockBasic> terminals,
         Map<PcodeBlockBasic, Set<PcodeBlockBasic>> excludedEdges,
+        Set<PcodeBlockBasic> mandatoryBlocks,
         String status) {
 
         static UnmarshalTerminalFlow unresolved(String status) {
-            return new UnmarshalTerminalFlow(Set.of(), Map.of(), status);
+            return new UnmarshalTerminalFlow(
+                Set.of(),
+                Map.of(),
+                Set.of(),
+                status);
         }
     }
 

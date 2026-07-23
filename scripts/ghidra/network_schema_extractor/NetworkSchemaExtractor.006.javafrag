@@ -21,6 +21,9 @@
         }
         if (hasNativeType && wireShapeFromNativeType(nativeType) != null) {
             PcodeStorage scalarOutput = pcodeScalarUnmarshalOutputStorage(op, nativeType);
+            if (scalarOutput == null) {
+                scalarOutput = provenUnmarshalOutputStorage(op);
+            }
             putPcodeTempUnmarshalRange(
                 tempNativeTypes,
                 tempWireShapes,
@@ -109,7 +112,9 @@
         Map<String, PcodeStorage> callerParamStorage) {
 
         if (op == null || shape == null || shape.memberBase == null) {
-            return provenUnmarshalOutputStorage(op);
+            return translatedAbsoluteHelperStorage(
+                provenUnmarshalOutputStorage(op),
+                callerParamStorage);
         }
 
         Map<String, PcodeStorage> arguments =
@@ -178,9 +183,25 @@
             return null;
         }
 
+        NestedTypeShape semanticShape = recoverNestedDirectTypeShape(
+            target,
+            typeName);
+        if (semanticShape != null && !semanticShape.members.isEmpty()) {
+            PcodeStorage semanticStorage = nestedDirectTypeCallOutputStorage(
+                owner,
+                op,
+                semanticShape,
+                callerParamStorage);
+            if (semanticStorage != null) {
+                return new NestedDirectTypeCallShape(
+                    semanticStorage,
+                    copyNestedTypeShape(semanticShape));
+            }
+        }
+
         LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> byBase =
             nestedDirectTypeMemberCandidates(target, high);
-        if (byBase.size() < 2) {
+        if (byBase.isEmpty()) {
             return null;
         }
 
@@ -242,10 +263,6 @@
                         op,
                         callTarget,
                         "pcode-multi-output-nested-direct-type-call")) {
-                    markNestedTypeMemberWireOrder(
-                        byBase,
-                        storage,
-                        "cfg-call-order");
                     continue;
                 }
 
@@ -305,7 +322,7 @@
         Map<String, PcodeStorage> arguments) {
 
         if (typeName == null || target == null || byBase == null ||
-            byBase.size() < 2 || arguments == null || arguments.isEmpty()) {
+            byBase.isEmpty() || arguments == null || arguments.isEmpty()) {
             return null;
         }
 
@@ -313,7 +330,7 @@
             new LinkedHashMap<>();
         for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry :
             byBase.entrySet()) {
-            if (!isLikelyOutputParameterBase(entry.getKey())) {
+            if (!isProvenOutputParameterBase(target, entry.getKey())) {
                 continue;
             }
             PcodeStorage argumentStorage = arguments.get(entry.getKey());
@@ -347,8 +364,8 @@
                 NestedTypeMember member = members.get(i);
                 member.index = i;
                 member.name = "_" + i;
-                member.nativeOffset = member.offset;
                 member.offset -= baseOffset;
+                member.nativeOffset = member.offset;
             }
 
             NestedTypeShape shape = new NestedTypeShape();
@@ -360,8 +377,14 @@
             shape.memberBase = entry.getKey();
             shape.memberNameSource = "synthetic-offset";
             shape.memberNamesProven = false;
+            shape.layoutProven = true;
             shape.validation = "layout-consistent-parameter-direct-type";
             shape.members.addAll(members);
+            NestedTypeShape wireSequence = directWireSequenceShape(
+                target,
+                typeName,
+                targetName);
+            sameNestedWireSequence(shape, wireSequence);
             applyNestedTypeMemberNames(shape);
             selected = new NestedDirectTypeCallShape(
                 new PcodeStorage(entry.getKey(), baseOffset),
@@ -469,7 +492,16 @@
         if (field.nestedTypeShape == null) {
             field.nestedTypeShape = shape;
         }
-        String shapeWire = wireShapeFromNestedTypeShape(shape);
+        field.sourceTypeName = appendDistinctType(
+            field.sourceTypeName,
+            field.nativeType);
+        field.sourceTypeName = appendDistinctType(
+            field.sourceTypeName,
+            shape.typeNameFull);
+        String shapeWire = provenNestedTypeIdentityWireShape(shape);
+        if (shapeWire == null) {
+            shapeWire = wireShapeFromNestedTypeShape(shape);
+        }
         if (shapeWire == null) {
             return;
         }
@@ -477,6 +509,17 @@
             field.wireShape = shapeWire;
             field.wireShapeSource = wireShapeSource;
         }
+    }
+
+    private String provenNestedTypeIdentityWireShape(NestedTypeShape shape) {
+        if (shape == null || !Boolean.TRUE.equals(shape.identityProven) ||
+            !Boolean.TRUE.equals(shape.memberCoverageProven) ||
+            !Boolean.TRUE.equals(shape.wireOrderProven)) {
+            return null;
+        }
+        return wireShapeFromNativeType(firstNonEmpty(
+            shape.typeNameFull,
+            shape.typeName));
     }
 
     private void applyMessageFieldWireShape(
@@ -578,13 +621,16 @@
             return null;
         }
 
+        NestedTypeShape delegated = directDelegatedUnmarshalShape(target, high);
+        if (delegated != null) {
+            return delegated;
+        }
+
         LinkedHashMap<String, LinkedHashMap<Long, NestedTypeMember>> byBase =
             new LinkedHashMap<>();
         HashMap<String, String> tempNativeTypes = new HashMap<>();
         HashMap<String, String> tempWireShapes = new HashMap<>();
-        Iterator<PcodeOpAST> ops = high.getPcodeOps();
-        while (ops.hasNext()) {
-            PcodeOpAST op = ops.next();
+        for (PcodeOpAST op : orderedPcodeOps(high)) {
             if (op.getOpcode() == PcodeOp.CALL) {
                 Function callTarget = pcodeCallTarget(op);
                 RawPcodeWrite rawWrite = pcodeReadRawWrite(op, callTarget);
@@ -597,6 +643,10 @@
                         op,
                         callTarget,
                         "pcode-readraw-fixed-bytes");
+                    markNestedTypeMemberWireOrder(
+                        byBase,
+                        rawWrite.storage,
+                        "cfg-call-order");
                     continue;
                 }
                 NestedTypeShape nestedMemberShape = recoverNestedDirectMemberShape(
@@ -617,10 +667,6 @@
                         op,
                         callTarget,
                         "pcode-nested-direct-type-call")) {
-                    markNestedTypeMemberWireOrder(
-                        byBase,
-                        storage,
-                        "cfg-call-order");
                     continue;
                 }
                 String memberType = unmarshalNativeTypeFromTarget(callTarget);
@@ -643,6 +689,7 @@
                     op,
                     callTarget,
                     "pcode-call");
+                markNestedTypeMemberWireOrder(byBase, storage, "cfg-call-order");
                 continue;
             }
             if (op.getOpcode() != PcodeOp.STORE || op.getNumInputs() < 3) {
@@ -665,6 +712,7 @@
                 op,
                 valueTarget == null ? null : valueTarget.target,
                 "pcode-store");
+            markNestedTypeMemberWireOrder(byBase, storage, "cfg-store-order");
         }
 
         NestedTypeShape storageShape = directTypeShapeFromCandidates(
@@ -685,7 +733,11 @@
             proveDirectTypeIdentity(wireSequenceShape, target);
             return wireSequenceShape;
         }
-        if (sameNestedWireSequence(storageShape, wireSequenceShape)) {
+        if (sameNestedWireSequenceInProvenStorageOrder(
+                storageShape,
+                wireSequenceShape,
+                high) ||
+            sameNestedWireSequence(storageShape, wireSequenceShape)) {
             proveDirectTypeIdentity(storageShape, target);
             return storageShape;
         }

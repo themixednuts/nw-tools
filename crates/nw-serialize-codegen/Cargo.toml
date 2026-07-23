@@ -7,31 +7,54 @@ description = "Compiler-style SerializeContext parser, linter, semantic catalog,
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "nw-serialize-codegen"
+path = "src/bin/nw-serialize-codegen.rs"
+required-features = ["full"]
+
+[features]
+default = ["full"]
+rust-serialize-context = []
+full = [
+    "rust-serialize-context",
+    "dep:clap",
+    "dep:oxc_allocator",
+    "dep:oxc_codegen",
+    "dep:oxc_parser",
+    "dep:oxc_span",
+    "dep:rust-embed",
+    "dep:tracing-subscriber",
+    "dep:treesitter-types-go",
+]
+
 [dependencies]
 anyhow = { workspace = true }
 blake3 = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive"], optional = true }
 heck = { workspace = true }
 nw-jobs = { workspace = true }
 nw-objectstream.workspace = true
-oxc_allocator = { workspace = true }
-oxc_codegen = { workspace = true }
-oxc_parser = { workspace = true }
-oxc_span = { workspace = true }
+oxc_allocator = { workspace = true, optional = true }
+oxc_codegen = { workspace = true, optional = true }
+oxc_parser = { workspace = true, optional = true }
+oxc_span = { workspace = true, optional = true }
 prettyplease = { workspace = true }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
-rust-embed = { workspace = true }
+rust-embed = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 syn = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-treesitter-types-go = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+treesitter-types-go = { workspace = true, optional = true }
 treesitter-types-cpp = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 blake3 = { workspace = true }
 tempfile = { workspace = true }
+
+[build-dependencies]
+blake3 = { workspace = true }

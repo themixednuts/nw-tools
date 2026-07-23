@@ -21,6 +21,20 @@ import java.util.Collection;
         String nativeType,
         String readBufferParameter) {
 
+        WireShape direct = directWireShapeEvidenceFromUnmarshalTarget(
+            target,
+            nativeType,
+            readBufferParameter);
+        return direct != null
+            ? direct
+            : wholeUnmarshalCodecEvidence(target, readBufferParameter);
+    }
+
+    private WireShape directWireShapeEvidenceFromUnmarshalTarget(
+        Function target,
+        String nativeType,
+        String readBufferParameter) {
+
         if (target == null || readBufferParameter == null) {
             return null;
         }
@@ -896,44 +910,21 @@ import java.util.Collection;
             field.nestedTypeShape.members.isEmpty()) {
             return false;
         }
-        if (Boolean.TRUE.equals(field.callFrameBoundaryProven)) {
-            return true;
-        }
-        return field.nestedTypeShape.nativeSize != null &&
-            field.nestedTypeShape.nativeSize > 0 &&
+        return Boolean.TRUE.equals(field.nestedTypeShape.layoutProven) &&
+            Boolean.TRUE.equals(field.nestedTypeShape.memberCoverageProven) &&
+            Boolean.TRUE.equals(field.nestedTypeShape.wireOrderProven) &&
+            (Boolean.TRUE.equals(field.callFrameBoundaryProven) ||
+                field.nestedTypeShape.nativeSize != null &&
+                field.nestedTypeShape.nativeSize > 0) &&
             field.nestedTypeShape.members.size() >= 2;
     }
 
-    private boolean isInteriorAggregateLeaf(FieldCall aggregate, FieldCall field) {
-        if (field == null || field.storageOffset == null ||
-            !Objects.equals(messageFieldStorageBase(aggregate), messageFieldStorageBase(field))) {
-            return false;
+    private String messageFieldWireLayout(FieldCall field) {
+        if (field == null) {
+            return null;
         }
-        long start = aggregate.storageOffset;
-        long offset = field.storageOffset;
-        if (offset < start || field.wireShape == null) {
-            return false;
-        }
-        Long size = aggregate.nestedTypeShape.nativeSize;
-        if (!Boolean.TRUE.equals(aggregate.callFrameBoundaryProven) &&
-            (size == null || size <= 0 || start > Long.MAX_VALUE - size ||
-                offset >= start + size)) {
-            return false;
-        }
-        long relativeOffset = offset - start;
-        for (NestedTypeMember member : aggregate.nestedTypeShape.members) {
-            if (member == null || member.wireShape == null) {
-                continue;
-            }
-            boolean offsetMatches = member.offset == relativeOffset ||
-                member.nativeOffset != null && member.nativeOffset == relativeOffset;
-            if (offsetMatches &&
-                canonicalLayoutWireShape(member.wireShape).equals(
-                    canonicalLayoutWireShape(field.wireShape))) {
-                return true;
-            }
-        }
-        return false;
+        String evidence = field.wireLayout == null ? field.wireShape : field.wireLayout;
+        return evidence == null ? null : canonicalLayoutWireShape(evidence);
     }
 
     private String messageFieldStorageBase(FieldCall field) {

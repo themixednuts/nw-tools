@@ -365,7 +365,7 @@ pub(super) fn replicated_state_shape_support_tokens(
         quote! {}
     } else {
         quote! {
-            impl ::nw_network::serialize::Marshaler for #value_type {
+            impl ::nw_network::serialize::Marshal for #value_type {
                 const MARSHAL_SIZE: usize =
                     <#codec_ident as ::nw_network::serialize::Codec<#value_type>>::MARSHAL_SIZE;
 
@@ -373,6 +373,9 @@ pub(super) fn replicated_state_shape_support_tokens(
                     <#codec_ident as ::nw_network::serialize::Codec<#value_type>>::marshal(self, wb);
                 }
 
+            }
+
+            impl ::nw_network::serialize::Unmarshal for #value_type {
                 fn unmarshal(
                     rb: &mut ::nw_network::serialize::ReadBuffer,
                 ) -> Result<Self, ::nw_network::serialize::MarshalerError> {
@@ -558,6 +561,58 @@ fn member_wire_shape_projection(
                     .map(|codec| format!("::nw_network::serialize::OptionalCodec<{codec}>")),
             })
         }
+        NetworkMemberWireShape::DefaultOmitted(members) => {
+            let members = members
+                .iter()
+                .map(|member| {
+                    member_wire_shape_projection(field, member, embedded_shapes, serialize_types)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let rust_type = tuple_projection(
+                &members
+                    .iter()
+                    .map(|member| (member.rust_type.clone(), None))
+                    .collect::<Vec<_>>(),
+            )
+            .0;
+            let codecs = members
+                .iter()
+                .map(member_projection_codec_type)
+                .collect::<Vec<_>>();
+            Some(MemberWireProjection {
+                rust_type,
+                codec_type: Some(format!(
+                    "::nw_network::serialize::DefaultOmittedTupleCodec<{}>",
+                    tuple_projection(
+                        &codecs
+                            .into_iter()
+                            .map(|codec| (codec, None))
+                            .collect::<Vec<_>>()
+                    )
+                    .0
+                )),
+            })
+        }
+        NetworkMemberWireShape::BooleanChoice {
+            false_value,
+            true_value,
+        } => {
+            let false_value =
+                member_wire_shape_projection(field, false_value, embedded_shapes, serialize_types)?;
+            let true_value =
+                member_wire_shape_projection(field, true_value, embedded_shapes, serialize_types)?;
+            let false_codec = member_projection_codec_type(&false_value);
+            let true_codec = member_projection_codec_type(&true_value);
+            Some(MemberWireProjection {
+                rust_type: format!(
+                    "::nw_network::serialize::BooleanChoice<{}, {}>",
+                    false_value.rust_type, true_value.rust_type
+                ),
+                codec_type: Some(format!(
+                    "::nw_network::serialize::BooleanChoiceCodec<{false_codec}, {true_codec}>"
+                )),
+            })
+        }
         NetworkMemberWireShape::Vector(element) => {
             let element =
                 member_wire_shape_projection(field, element, embedded_shapes, serialize_types)?;
@@ -566,6 +621,38 @@ fn member_wire_shape_projection(
                 codec_type: element
                     .codec_type
                     .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>")),
+            })
+        }
+        NetworkMemberWireShape::Set(element) => {
+            let element =
+                member_wire_shape_projection(field, element, embedded_shapes, serialize_types)?;
+            Some(MemberWireProjection {
+                rust_type: format!("::nw_network::serialize::IndexSet<{}>", element.rust_type),
+                codec_type: element.codec_type.map(|codec| {
+                    format!(
+                        "::nw_network::serialize::ContainerMarshaler<{}, {codec}>",
+                        element.rust_type
+                    )
+                }),
+            })
+        }
+        NetworkMemberWireShape::Map { key, value } => {
+            let key = member_wire_shape_projection(field, key, embedded_shapes, serialize_types)?;
+            let value =
+                member_wire_shape_projection(field, value, embedded_shapes, serialize_types)?;
+            let codec_type = (key.codec_type.is_some() || value.codec_type.is_some()).then(|| {
+                format!(
+                    "::nw_network::serialize::MapSequenceCodec<{}, {}>",
+                    member_projection_codec_type(&key),
+                    member_projection_codec_type(&value)
+                )
+            });
+            Some(MemberWireProjection {
+                rust_type: format!(
+                    "::nw_network::serialize::IndexMap<{}, {}>",
+                    key.rust_type, value.rust_type
+                ),
+                codec_type,
             })
         }
         NetworkMemberWireShape::FixedVector { element, capacity } => {
@@ -599,6 +686,15 @@ fn member_wire_shape_projection(
             })
         }
     }
+}
+
+fn member_projection_codec_type(projection: &MemberWireProjection) -> String {
+    projection.codec_type.clone().unwrap_or_else(|| {
+        format!(
+            "::nw_network::serialize::DefaultMarshaler<{}>",
+            projection.rust_type
+        )
+    })
 }
 
 fn composite_member_projection(members: &[MemberWireProjection]) -> Option<MemberWireProjection> {
@@ -977,7 +1073,13 @@ pub(super) fn replicated_state_field_type_tokens(
         SchemaWireShape::String => {
             quote!(::nw_network::serialize::ReplicatedFieldHandler<String>)
         }
-        SchemaWireShape::Composite(_) | SchemaWireShape::Optional(_) => {
+        SchemaWireShape::Composite(_)
+        | SchemaWireShape::Optional(_)
+        | SchemaWireShape::DefaultOmitted(_)
+        | SchemaWireShape::BooleanChoice(_)
+        | SchemaWireShape::Sequence(_)
+        | SchemaWireShape::Map { .. }
+        | SchemaWireShape::Set(_) => {
             let field_type = rust_field_shape(shape).field_type;
             let field_type = syn::parse_str::<syn::Type>(&field_type)
                 .expect("recursive wire shape produces a valid Rust field type");

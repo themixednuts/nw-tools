@@ -1,4 +1,7 @@
     private final Map<String, String> codecWireTraceDiagnostics = new HashMap<>();
+    private final Set<String> codecWireTraceActiveContexts = new LinkedHashSet<>();
+    private final Map<String, CodecWireTrace> codecWireTraceCompletedContexts =
+        lruCache(CODEC_CLASSIFICATION_CACHE_LIMIT);
 
     private NestedTypeShape directWireSequenceShape(
         Function target,
@@ -8,12 +11,15 @@
         if (target == null) {
             return null;
         }
+        String readBufferParameter = uniqueReadBufferParameter(target);
         CodecWireTrace trace = traceUnmarshalCodec(
             target,
-            "param_4",
-            new LinkedHashSet<>(),
-            new HashMap<>());
-        if (trace == null || trace.events.size() < 2) {
+            readBufferParameter,
+            codecWireTraceActiveContexts,
+            codecWireTraceCompletedContexts);
+        if (trace == null || trace.events.isEmpty() ||
+            trace.events.size() == 1 &&
+                !isAggregateWireEvidence(trace.events.get(0).wireEvidence())) {
             return null;
         }
 
@@ -56,6 +62,22 @@
         return shape;
     }
 
+    private boolean isAggregateWireEvidence(WireShape evidence) {
+        if (evidence == null) {
+            return false;
+        }
+        String observed = firstNonEmpty(evidence.shape, evidence.layout);
+        return vectorElementWireShape(observed) != null ||
+            observed != null && (
+                observed.startsWith("set<") ||
+                observed.startsWith("composite<") ||
+                observed.startsWith("optional<") ||
+                observed.startsWith("default-omitted<") ||
+                observed.startsWith("boolean-choice<") ||
+                observed.startsWith("fixed-sequence<") ||
+                observed.startsWith("replicated-container<"));
+    }
+
     private boolean sameNestedWireSequence(
         NestedTypeShape left,
         NestedTypeShape right) {
@@ -63,22 +85,28 @@
         if (left == null || right == null) {
             return false;
         }
-        List<NestedTypeMember> leftWireOrder = provenWireOrderedMembers(left.members);
-        if (leftWireOrder == null || leftWireOrder.size() != right.members.size()) {
+        List<NestedTypeMember> leftWireOrder = uniquelyMatchedNestedWireSequence(
+            left.members,
+            right.members);
+        if (leftWireOrder == null) {
             return false;
         }
         for (int index = 0; index < leftWireOrder.size(); index++) {
-            String leftShape = canonicalLayoutWireShape(leftWireOrder.get(index).wireLayout);
+            NestedTypeMember member = leftWireOrder.get(index);
+            String leftShape = canonicalLayoutWireShape(member.wireLayout);
             String rightShape = canonicalLayoutWireShape(right.members.get(index).wireLayout);
             if (leftShape == null || !leftShape.equals(rightShape)) {
                 return false;
             }
+            member.wireOrdinal = index;
+            member.wireOrderSource = "cfg-recursive-unmarshal-order+unique-storage-match";
         }
         left.members.clear();
         left.members.addAll(leftWireOrder);
         left.memberCoverageProven = true;
         left.wireOrderProven = true;
-        left.wireOrderSource = "cfg-recursive-unmarshal-order";
+        left.wireOrderSource =
+            "cfg-recursive-unmarshal-order+unique-storage-match";
         return true;
     }
 
@@ -250,6 +278,24 @@
             }
 
             UnmarshalTerminalFlow terminalFlow = successfulUnmarshalTerminalFlow(high);
+            BooleanChoiceAnalysis booleanChoice = booleanChoiceUnmarshalShape(
+                function,
+                high,
+                eventsByBlock,
+                terminalFlow);
+            if (booleanChoice.shape() != null) {
+                CodecWireEvent first = body.events.get(0);
+                CodecWireTrace result = new CodecWireTrace(List.of(
+                    new CodecWireEvent(
+                        unmarshalNativeTypeFromTarget(function),
+                        booleanChoice.shape(),
+                        first.callsite(),
+                        function.getEntryPoint(),
+                        fullFunctionName(function))));
+                completedContexts.put(context, new CodecWireTrace(result.events));
+                codecWireTraceDiagnostics.put(context, "complete-boolean-choice");
+                return result;
+            }
             NetworkSchemaFlowSequence.Result<CodecWireEvent> sequence =
                 terminalFlow.terminals().isEmpty()
                 ? NetworkSchemaFlowSequence.analyze(
@@ -269,6 +315,16 @@
                     (left, right) -> sameWireEvidence(
                         left.wireEvidence(),
                         right.wireEvidence()));
+            CodecSuccessCoverageAnalysis successCoverage =
+                codecSuccessCoverage(
+                    eventsByBlock,
+                    terminalFlow,
+                    body.events.size());
+            if (!sequence.complete() && successCoverage.complete()) {
+                sequence = new NetworkSchemaFlowSequence.Result<>(
+                    NetworkSchemaFlowSequence.Status.COMPLETE,
+                    List.copyOf(body.events));
+            }
             if (!sequence.complete()) {
                 CodecWireTrace optional = optionalUnmarshalCodecTrace(
                     function,
@@ -284,7 +340,9 @@
                         context,
                         "flow-" + sequence.status().name().toLowerCase(Locale.ROOT) +
                             ":terminal=" + terminalFlow.status() +
-                            ":events=" + body.events.size());
+                            ":events=" + body.events.size() +
+                            ":boolean-choice=" + booleanChoice.diagnostic() +
+                            ":success-coverage=" + successCoverage.diagnostic());
                 }
                 CodecWireTrace result = directParameter == null
                     ? optional
@@ -388,7 +446,8 @@
                 evidence == null ? rawEvidence : evidence,
                 op.getSeqnum().getTarget(),
                 target.getEntryPoint(),
-                fullFunctionName(target)));
+                fullFunctionName(target),
+                rawRead == null ? null : rawRead.storage));
             return null;
         }
 
@@ -491,7 +550,7 @@
             return body;
         }
         String nativeType = unmarshalNativeTypeFromTarget(function);
-        WireShape candidate = wireShapeEvidenceFromUnmarshalTarget(
+        WireShape candidate = directWireShapeEvidenceFromUnmarshalTarget(
             function,
             nativeType,
             readBufferParameter);

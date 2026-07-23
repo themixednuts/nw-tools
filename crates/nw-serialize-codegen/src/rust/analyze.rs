@@ -657,6 +657,7 @@ mod tests {
             ),
             repr: None,
             raw_conversion: None,
+            prefab: None,
             derives: vec![
                 "Component".to_owned(),
                 "AzRtti".to_owned(),
@@ -751,6 +752,7 @@ pub struct HealthComponent {
             raw_conversion: Some(RustEnumRawConversionPlan {
                 raw_type: "i32".to_owned(),
             }),
+            prefab: None,
             derives: vec!["AzTypeInfo".to_owned(), "Debug".to_owned()],
             rtti_bases: Vec::new(),
             fields: Vec::new(),

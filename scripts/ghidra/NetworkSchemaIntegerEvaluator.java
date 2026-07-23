@@ -1,5 +1,10 @@
 import java.util.HashSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.atomic.LongAdder;
 
 import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.Varnode;
@@ -8,11 +13,17 @@ import ghidra.program.model.pcode.VarnodeAST;
 /** Exact integer constant propagation over p-code SSA values up to 64 bits. */
 final class NetworkSchemaIntegerEvaluator {
     private static final int MAX_DEPTH = 128;
+    private static final int MAX_UNIQUE_STATES = 8_192;
+    private static final LongAdder QUERY_COUNT = new LongAdder();
+    private static final LongAdder EXACT_CACHE_HIT_COUNT = new LongAdder();
+    private static final LongAdder BIT_CACHE_HIT_COUNT = new LongAdder();
+    private static final LongAdder BUDGET_EXHAUSTION_COUNT = new LongAdder();
 
     private NetworkSchemaIntegerEvaluator() {}
 
     static Long evaluate(Varnode node) {
-        return evaluate(node, new HashSet<>(), 0);
+        QUERY_COUNT.increment();
+        return evaluate(node, new EvaluationContext(), 0);
     }
 
     static boolean equals(Varnode node, long expected) {
@@ -24,7 +35,8 @@ final class NetworkSchemaIntegerEvaluator {
         if (node == null || byteOffset < 0 || byteOffset >= node.getSize()) {
             return null;
         }
-        return knownByte(knownBits(node, new HashSet<>(), 0), byteOffset);
+        QUERY_COUNT.increment();
+        return knownByte(knownBits(node, new EvaluationContext(), 0), byteOffset);
     }
 
     static Long evaluateOutputByte(PcodeOp operation, int byteOffset) {
@@ -32,13 +44,11 @@ final class NetworkSchemaIntegerEvaluator {
         if (output == null || byteOffset < 0 || byteOffset >= output.getSize()) {
             return null;
         }
-        Long exact = evaluateDefinition(
-            output,
-            operation,
-            new HashSet<>(),
-            0);
+        QUERY_COUNT.increment();
+        EvaluationContext context = new EvaluationContext();
+        Long exact = evaluateDefinition(output, operation, context, 0);
         BitKnowledge knowledge = exact == null
-            ? knownBitsDefinition(output, operation, new HashSet<>(), 0)
+            ? knownBitsDefinition(output, operation, context, 0)
             : BitKnowledge.full(output.getSize(), exact);
         return knownByte(knowledge, byteOffset);
     }
@@ -51,7 +61,7 @@ final class NetworkSchemaIntegerEvaluator {
             : (knowledge.value() >>> shift) & 0xffL;
     }
 
-    private static Long evaluate(Varnode node, Set<String> active, int depth) {
+    private static Long evaluate(Varnode node, EvaluationContext context, int depth) {
         if (node == null || node.getSize() <= 0 || node.getSize() > Long.BYTES ||
             depth > MAX_DEPTH) {
             return null;
@@ -60,84 +70,104 @@ final class NetworkSchemaIntegerEvaluator {
             return truncate(node.getOffset(), node.getSize());
         }
         String key = key(node);
-        if (!active.add(key)) {
+        OptionalLong cached = context.exact.get(key);
+        if (cached != null) {
+            EXACT_CACHE_HIT_COUNT.increment();
+            return cached.isPresent() ? cached.getAsLong() : null;
+        }
+        if (!context.exactActive.add(key)) {
             return null;
         }
+        if (!context.consume("exact:" + key)) {
+            context.exactActive.remove(key);
+            return null;
+        }
+        Long result;
         try {
             PcodeOp definition = node.getDef();
             if (definition == null) {
-                return null;
+                result = null;
             }
-            return evaluateDefinition(node, definition, active, depth + 1);
-        } finally {
-            active.remove(key);
+            else {
+                result = evaluateDefinition(node, definition, context, depth + 1);
+            }
         }
+        finally {
+            context.exactActive.remove(key);
+        }
+        context.exact.put(
+            key,
+            result == null ? OptionalLong.empty() : OptionalLong.of(result));
+        return result;
     }
 
     private static Long evaluateDefinition(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth) {
 
         return switch (definition.getOpcode()) {
-            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INDIRECT ->
-                unary(output, definition, active, depth, value -> value);
+            case PcodeOp.COPY, PcodeOp.CAST ->
+                unary(output, definition, context, depth, value -> value);
+            // INDIRECT is the value after an opaque call or memory effect. Its
+            // first input is the pre-effect value, not an identity operand.
+            case PcodeOp.INDIRECT -> null;
             case PcodeOp.INT_ZEXT -> unary(
                 output,
                 definition,
-                active,
+                context,
                 depth,
                 value -> truncate(value, definition.getInput(0).getSize()));
             case PcodeOp.INT_SEXT -> unary(
                 output,
                 definition,
-                active,
+                context,
                 depth,
                 value -> signed(value, definition.getInput(0).getSize()));
             case PcodeOp.INT_NEGATE ->
-                unary(output, definition, active, depth, value -> ~value);
+                unary(output, definition, context, depth, value -> ~value);
             case PcodeOp.INT_2COMP ->
-                unary(output, definition, active, depth, value -> -value);
+                unary(output, definition, context, depth, value -> -value);
             case PcodeOp.BOOL_NEGATE ->
-                unary(output, definition, active, depth, value -> value == 0 ? 1L : 0L);
+                unary(output, definition, context, depth, value -> value == 0 ? 1L : 0L);
             case PcodeOp.INT_ADD, PcodeOp.PTRSUB -> binary(
-                output, definition, active, depth, (left, right) -> left + right);
+                output, definition, context, depth, (left, right) -> left + right);
             case PcodeOp.INT_SUB -> binary(
-                output, definition, active, depth, (left, right) -> left - right);
+                output, definition, context, depth, (left, right) -> left - right);
             case PcodeOp.INT_MULT -> binary(
-                output, definition, active, depth, (left, right) -> left * right);
+                output, definition, context, depth, (left, right) -> left * right);
             case PcodeOp.INT_AND -> binary(
-                output, definition, active, depth, (left, right) -> left & right);
+                output, definition, context, depth, (left, right) -> left & right);
             case PcodeOp.INT_OR -> binary(
-                output, definition, active, depth, (left, right) -> left | right);
+                output, definition, context, depth, (left, right) -> left | right);
             case PcodeOp.INT_XOR -> binary(
-                output, definition, active, depth, (left, right) -> left ^ right);
-            case PcodeOp.INT_LEFT -> shift(output, definition, active, depth, Shift.LEFT);
-            case PcodeOp.INT_RIGHT -> shift(output, definition, active, depth, Shift.RIGHT);
-            case PcodeOp.INT_SRIGHT -> shift(output, definition, active, depth, Shift.SIGNED_RIGHT);
-            case PcodeOp.INT_DIV -> divide(output, definition, active, depth, false, false);
-            case PcodeOp.INT_SDIV -> divide(output, definition, active, depth, true, false);
-            case PcodeOp.INT_REM -> divide(output, definition, active, depth, false, true);
-            case PcodeOp.INT_SREM -> divide(output, definition, active, depth, true, true);
-            case PcodeOp.PTRADD -> pointerAdd(output, definition, active, depth);
-            case PcodeOp.SUBPIECE -> subpiece(output, definition, active, depth);
-            case PcodeOp.PIECE -> piece(output, definition, active, depth);
-            case PcodeOp.MULTIEQUAL -> phi(output, definition, active, depth);
+                output, definition, context, depth, (left, right) -> left ^ right);
+            case PcodeOp.INT_LEFT -> shift(output, definition, context, depth, Shift.LEFT);
+            case PcodeOp.INT_RIGHT -> shift(output, definition, context, depth, Shift.RIGHT);
+            case PcodeOp.INT_SRIGHT -> shift(output, definition, context, depth, Shift.SIGNED_RIGHT);
+            case PcodeOp.INT_DIV -> divide(output, definition, context, depth, false, false);
+            case PcodeOp.INT_SDIV -> divide(output, definition, context, depth, true, false);
+            case PcodeOp.INT_REM -> divide(output, definition, context, depth, false, true);
+            case PcodeOp.INT_SREM -> divide(output, definition, context, depth, true, true);
+            case PcodeOp.PTRADD -> pointerAdd(output, definition, context, depth);
+            case PcodeOp.SUBPIECE -> subpiece(output, definition, context, depth);
+            case PcodeOp.PIECE -> piece(output, definition, context, depth);
+            case PcodeOp.MULTIEQUAL -> phi(output, definition, context, depth);
             case PcodeOp.INT_EQUAL -> comparison(
-                output, definition, active, depth, (left, right) -> left == right);
+                output, definition, context, depth, (left, right) -> left == right);
             case PcodeOp.INT_NOTEQUAL -> comparison(
-                output, definition, active, depth, (left, right) -> left != right);
+                output, definition, context, depth, (left, right) -> left != right);
             case PcodeOp.INT_LESS -> comparison(
-                output, definition, active, depth,
+                output, definition, context, depth,
                 (left, right) -> Long.compareUnsigned(left, right) < 0);
             case PcodeOp.INT_LESSEQUAL -> comparison(
-                output, definition, active, depth,
+                output, definition, context, depth,
                 (left, right) -> Long.compareUnsigned(left, right) <= 0);
             case PcodeOp.INT_SLESS -> signedComparison(
-                output, definition, active, depth, (left, right) -> left < right);
+                output, definition, context, depth, (left, right) -> left < right);
             case PcodeOp.INT_SLESSEQUAL -> signedComparison(
-                output, definition, active, depth, (left, right) -> left <= right);
+                output, definition, context, depth, (left, right) -> left <= right);
             default -> null;
         };
     }
@@ -145,25 +175,25 @@ final class NetworkSchemaIntegerEvaluator {
     private static Long unary(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth,
         Unary operation) {
 
         if (definition.getNumInputs() < 1) {
             return null;
         }
-        Long value = evaluate(definition.getInput(0), active, depth);
+        Long value = evaluate(definition.getInput(0), context, depth);
         return value == null ? null : truncate(operation.apply(value), output.getSize());
     }
 
     private static Long binary(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth,
         Binary operation) {
 
-        Long[] values = binaryInputs(definition, active, depth);
+        Long[] values = binaryInputs(definition, context, depth);
         return values == null
             ? null
             : truncate(operation.apply(values[0], values[1]), output.getSize());
@@ -172,11 +202,11 @@ final class NetworkSchemaIntegerEvaluator {
     private static Long shift(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth,
         Shift kind) {
 
-        Long[] values = binaryInputs(definition, active, depth);
+        Long[] values = binaryInputs(definition, context, depth);
         if (values == null) {
             return null;
         }
@@ -197,12 +227,12 @@ final class NetworkSchemaIntegerEvaluator {
     private static Long divide(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth,
         boolean signed,
         boolean remainder) {
 
-        Long[] values = binaryInputs(definition, active, depth);
+        Long[] values = binaryInputs(definition, context, depth);
         if (values == null || values[1] == 0) {
             return null;
         }
@@ -222,15 +252,15 @@ final class NetworkSchemaIntegerEvaluator {
     private static Long pointerAdd(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth) {
 
         if (definition.getNumInputs() != 3) {
             return null;
         }
-        Long base = evaluate(definition.getInput(0), active, depth);
-        Long index = evaluate(definition.getInput(1), active, depth);
-        Long scale = evaluate(definition.getInput(2), active, depth);
+        Long base = evaluate(definition.getInput(0), context, depth);
+        Long index = evaluate(definition.getInput(1), context, depth);
+        Long scale = evaluate(definition.getInput(2), context, depth);
         return base == null || index == null || scale == null
             ? null
             : truncate(base + index * scale, output.getSize());
@@ -239,10 +269,10 @@ final class NetworkSchemaIntegerEvaluator {
     private static Long subpiece(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth) {
 
-        Long[] values = binaryInputs(definition, active, depth);
+        Long[] values = binaryInputs(definition, context, depth);
         if (values == null || values[1] < 0 || values[1] >= Long.BYTES) {
             return null;
         }
@@ -253,10 +283,10 @@ final class NetworkSchemaIntegerEvaluator {
     private static Long piece(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth) {
 
-        Long[] values = binaryInputs(definition, active, depth);
+        Long[] values = binaryInputs(definition, context, depth);
         if (values == null || output.getSize() > Long.BYTES) {
             return null;
         }
@@ -270,12 +300,12 @@ final class NetworkSchemaIntegerEvaluator {
     private static Long phi(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth) {
 
         Long selected = null;
         for (int index = 0; index < definition.getNumInputs(); index++) {
-            Long value = evaluate(definition.getInput(index), new HashSet<>(active), depth);
+            Long value = evaluate(definition.getInput(index), context, depth);
             if (value == null || selected != null && !selected.equals(value)) {
                 return null;
             }
@@ -287,11 +317,11 @@ final class NetworkSchemaIntegerEvaluator {
     private static Long comparison(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth,
         Comparison comparison) {
 
-        Long[] values = binaryInputs(definition, active, depth);
+        Long[] values = binaryInputs(definition, context, depth);
         return values == null
             ? null
             : truncate(comparison.test(values[0], values[1]) ? 1L : 0L, output.getSize());
@@ -300,11 +330,11 @@ final class NetworkSchemaIntegerEvaluator {
     private static Long signedComparison(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth,
         Comparison comparison) {
 
-        Long[] values = binaryInputs(definition, active, depth);
+        Long[] values = binaryInputs(definition, context, depth);
         if (values == null) {
             return null;
         }
@@ -313,16 +343,23 @@ final class NetworkSchemaIntegerEvaluator {
         return truncate(comparison.test(left, right) ? 1L : 0L, output.getSize());
     }
 
-    private static Long[] binaryInputs(PcodeOp definition, Set<String> active, int depth) {
+    private static Long[] binaryInputs(
+        PcodeOp definition,
+        EvaluationContext context,
+        int depth) {
         if (definition.getNumInputs() < 2) {
             return null;
         }
-        Long left = evaluate(definition.getInput(0), new HashSet<>(active), depth);
-        Long right = evaluate(definition.getInput(1), new HashSet<>(active), depth);
+        Long left = evaluate(definition.getInput(0), context, depth);
+        Long right = evaluate(definition.getInput(1), context, depth);
         return left == null || right == null ? null : new Long[] { left, right };
     }
 
-    private static BitKnowledge knownBits(Varnode node, Set<String> active, int depth) {
+    private static BitKnowledge knownBits(
+        Varnode node,
+        EvaluationContext context,
+        int depth) {
+
         if (node == null || node.getSize() <= 0 || node.getSize() > Long.BYTES ||
             depth > MAX_DEPTH) {
             return null;
@@ -331,69 +368,90 @@ final class NetworkSchemaIntegerEvaluator {
             return BitKnowledge.full(node.getSize(), node.getOffset());
         }
         String key = key(node);
-        if (!active.add(key)) {
+        BitKnowledge cached = context.bits.get(key);
+        if (cached != null) {
+            BIT_CACHE_HIT_COUNT.increment();
+            return cached;
+        }
+        if (!context.bitsActive.add(key)) {
             return null;
         }
+        if (!context.consume("bits:" + key)) {
+            context.bitsActive.remove(key);
+            return BitKnowledge.unknown();
+        }
+        BitKnowledge result;
         try {
             PcodeOp definition = node.getDef();
             if (definition == null) {
-                return BitKnowledge.unknown();
+                result = BitKnowledge.unknown();
             }
-            BitKnowledge exact = exactKnowledge(node);
-            if (exact != null) {
-                return exact;
+            else {
+                BitKnowledge exact = exactKnowledge(node, context, depth);
+                result = exact != null
+                    ? exact
+                    : knownBitsDefinition(node, definition, context, depth + 1);
             }
-            return knownBitsDefinition(node, definition, active, depth + 1);
         }
         finally {
-            active.remove(key);
+            context.bitsActive.remove(key);
         }
+        if (result == null) {
+            result = BitKnowledge.unknown();
+        }
+        context.bits.put(key, result);
+        return result;
     }
 
     private static BitKnowledge knownBitsDefinition(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth) {
 
         return switch (definition.getOpcode()) {
-            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INDIRECT ->
+            case PcodeOp.COPY, PcodeOp.CAST ->
                 resizedKnowledge(
-                    knownBits(definition.getInput(0), active, depth),
+                    knownBits(definition.getInput(0), context, depth),
                     output.getSize());
+            case PcodeOp.INDIRECT -> BitKnowledge.unknown();
             case PcodeOp.INT_ZEXT -> zeroExtendedKnowledge(
-                knownBits(definition.getInput(0), active, depth),
+                knownBits(definition.getInput(0), context, depth),
                 definition.getInput(0).getSize(),
                 output.getSize());
             case PcodeOp.INT_SEXT -> signExtendedKnowledge(
-                knownBits(definition.getInput(0), active, depth),
+                knownBits(definition.getInput(0), context, depth),
                 definition.getInput(0).getSize(),
                 output.getSize());
             case PcodeOp.INT_AND, PcodeOp.INT_OR, PcodeOp.INT_XOR ->
-                bitwiseKnowledge(output, definition, active, depth);
+                bitwiseKnowledge(output, definition, context, depth);
             case PcodeOp.INT_NEGATE -> complementedKnowledge(
-                knownBits(definition.getInput(0), active, depth),
+                knownBits(definition.getInput(0), context, depth),
                 output.getSize());
             case PcodeOp.SUBPIECE -> subpieceKnowledge(
                 output,
                 definition,
-                active,
+                context,
                 depth);
-            case PcodeOp.PIECE -> pieceKnowledge(output, definition, active, depth);
-            case PcodeOp.MULTIEQUAL -> mergedKnowledge(output, definition, active, depth);
+            case PcodeOp.PIECE -> pieceKnowledge(output, definition, context, depth);
+            case PcodeOp.MULTIEQUAL -> mergedKnowledge(output, definition, context, depth);
             default -> BitKnowledge.unknown();
         };
     }
 
-    private static BitKnowledge exactKnowledge(Varnode node) {
-        Long value = evaluate(node);
+    private static BitKnowledge exactKnowledge(
+        Varnode node,
+        EvaluationContext context,
+        int depth) {
+
+        Long value = evaluate(node, context, depth);
         return value == null ? null : BitKnowledge.full(node.getSize(), value);
     }
 
     private static BitKnowledge bitwiseKnowledge(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth) {
 
         if (definition.getNumInputs() != 2) {
@@ -404,10 +462,10 @@ final class NetworkSchemaIntegerEvaluator {
             return BitKnowledge.full(output.getSize(), 0L);
         }
         BitKnowledge left = resizedKnowledge(
-            knownBits(definition.getInput(0), new HashSet<>(active), depth),
+            knownBits(definition.getInput(0), context, depth),
             output.getSize());
         BitKnowledge right = resizedKnowledge(
-            knownBits(definition.getInput(1), new HashSet<>(active), depth),
+            knownBits(definition.getInput(1), context, depth),
             output.getSize());
         long widthMask = widthMask(output.getSize());
         long leftOne = left.mask() & left.value();
@@ -471,7 +529,7 @@ final class NetworkSchemaIntegerEvaluator {
     private static BitKnowledge subpieceKnowledge(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth) {
 
         Long byteOffset = definition.getNumInputs() == 2
@@ -480,7 +538,7 @@ final class NetworkSchemaIntegerEvaluator {
         if (byteOffset == null || byteOffset < 0 || byteOffset >= Long.BYTES) {
             return BitKnowledge.unknown();
         }
-        BitKnowledge input = knownBits(definition.getInput(0), active, depth);
+        BitKnowledge input = knownBits(definition.getInput(0), context, depth);
         int shift = Math.toIntExact(byteOffset * Byte.SIZE);
         long outputMask = widthMask(output.getSize());
         return new BitKnowledge(
@@ -491,14 +549,14 @@ final class NetworkSchemaIntegerEvaluator {
     private static BitKnowledge pieceKnowledge(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth) {
 
         if (definition.getNumInputs() != 2) {
             return BitKnowledge.unknown();
         }
-        BitKnowledge high = knownBits(definition.getInput(0), new HashSet<>(active), depth);
-        BitKnowledge low = knownBits(definition.getInput(1), new HashSet<>(active), depth);
+        BitKnowledge high = knownBits(definition.getInput(0), context, depth);
+        BitKnowledge low = knownBits(definition.getInput(1), context, depth);
         int shift = Math.multiplyExact(definition.getInput(1).getSize(), Byte.SIZE);
         long outputMask = widthMask(output.getSize());
         return new BitKnowledge(
@@ -509,13 +567,13 @@ final class NetworkSchemaIntegerEvaluator {
     private static BitKnowledge mergedKnowledge(
         Varnode output,
         PcodeOp definition,
-        Set<String> active,
+        EvaluationContext context,
         int depth) {
 
         BitKnowledge merged = null;
         for (int index = 0; index < definition.getNumInputs(); index++) {
             BitKnowledge candidate = resizedKnowledge(
-                knownBits(definition.getInput(index), new HashSet<>(active), depth),
+                knownBits(definition.getInput(index), context, depth),
                 output.getSize());
             merged = merged == null ? candidate : merged.intersection(candidate);
         }
@@ -552,6 +610,53 @@ final class NetworkSchemaIntegerEvaluator {
         return node instanceof VarnodeAST ast
             ? "ssa:" + ast.getUniqueId()
             : node.getAddress() + ":" + node.getOffset() + ":" + node.getSize();
+    }
+
+    static void resetMetrics() {
+        QUERY_COUNT.reset();
+        EXACT_CACHE_HIT_COUNT.reset();
+        BIT_CACHE_HIT_COUNT.reset();
+        BUDGET_EXHAUSTION_COUNT.reset();
+    }
+
+    static long queryCount() {
+        return QUERY_COUNT.sum();
+    }
+
+    static long exactCacheHitCount() {
+        return EXACT_CACHE_HIT_COUNT.sum();
+    }
+
+    static long bitCacheHitCount() {
+        return BIT_CACHE_HIT_COUNT.sum();
+    }
+
+    static long budgetExhaustionCount() {
+        return BUDGET_EXHAUSTION_COUNT.sum();
+    }
+
+    private static final class EvaluationContext {
+        final Map<String, OptionalLong> exact = new HashMap<>();
+        final Map<String, BitKnowledge> bits = new HashMap<>();
+        final Set<String> exactActive = new HashSet<>();
+        final Set<String> bitsActive = new HashSet<>();
+        final Set<String> visitedStates = new HashSet<>();
+        boolean budgetExhausted;
+
+        boolean consume(String state) {
+            if (visitedStates.contains(state)) {
+                return true;
+            }
+            if (visitedStates.size() >= MAX_UNIQUE_STATES) {
+                if (!budgetExhausted) {
+                    budgetExhausted = true;
+                    BUDGET_EXHAUSTION_COUNT.increment();
+                }
+                return false;
+            }
+            visitedStates.add(state);
+            return true;
+        }
     }
 
     private enum Shift {

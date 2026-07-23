@@ -835,7 +835,9 @@
             return false;
         }
         PcodeOp definition = value.getDef();
-        if (definition == null || definition.getOpcode() != PcodeOp.INT_NOTEQUAL ||
+        if (definition == null ||
+            (definition.getOpcode() != PcodeOp.INT_NOTEQUAL &&
+                definition.getOpcode() != PcodeOp.INT_EQUAL) ||
             definition.getNumInputs() != 2) {
             return false;
         }

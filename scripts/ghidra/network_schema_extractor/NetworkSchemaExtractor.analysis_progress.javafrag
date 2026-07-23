@@ -1,0 +1,61 @@
+    private static final long ANALYSIS_HEARTBEAT_NANOS = 15_000_000_000L;
+
+    private void startAnalysisWorklist(String phase, long total) {
+        monitor.setCancelEnabled(true);
+        monitor.setShowProgressValue(true);
+        monitor.setIndeterminate(total <= 0);
+        if (total > 0) {
+            monitor.initialize(total, phase);
+        }
+        else {
+            monitor.setMessage(phase);
+        }
+        println("Phase " + phase + " worklist: total=" + total);
+    }
+
+    private long updateAnalysisWorklist(
+        String phase,
+        long completed,
+        long total,
+        String detail,
+        long lastHeartbeatNanos) throws CancelledException {
+
+        monitor.checkCancelled();
+        if (total > 0) {
+            monitor.setProgress(Math.min(completed, total));
+        }
+        String status = phase + ": " + completed + "/" + total;
+        if (detail != null && !detail.isBlank()) {
+            status += " " + detail;
+        }
+        monitor.setMessage(status);
+
+        long now = System.nanoTime();
+        if (completed == 0 || completed >= total ||
+            now - lastHeartbeatNanos >= ANALYSIS_HEARTBEAT_NANOS) {
+            println("Phase " + phase + " progress: " + completed + "/" + total +
+                (detail == null || detail.isBlank() ? "" : ", " + detail));
+            return now;
+        }
+        return lastHeartbeatNanos;
+    }
+
+    private void finishAnalysisWorklist(String phase, long total) {
+        if (total > 0) {
+            monitor.setProgress(total);
+        }
+        monitor.setMessage(phase + ": complete");
+    }
+
+    private String registryProgressDetail(RegistryEntry entry) {
+        if (entry == null) {
+            return null;
+        }
+        String detail = entry.typeIndex == null
+            ? "typeIndex=<missing>"
+            : "typeIndex=" + entry.typeIndex;
+        if (entry.name != null && !entry.name.isBlank()) {
+            detail += ", type=" + entry.name;
+        }
+        return detail;
+    }

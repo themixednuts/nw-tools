@@ -5,26 +5,52 @@ pub(super) fn message_field_shape_report(
     wire_shapes: &BTreeMap<&str, &SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
     value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
     message_type_name: Option<&str>,
 ) -> NetworkStateFieldShapeReport {
     let handler_vtables = BTreeMap::new();
-    let serialize_types = BTreeMap::new();
     let mut report = state_field_shape_report(
         field,
         wire_shapes,
         wire_shape_sources,
         &handler_vtables,
         value_type_candidates,
-        &serialize_types,
+        serialize_types,
     );
+    if report.wire_shape.is_none()
+        && let Some(shape) = anonymous_message_wire_layout_shape(field)
+    {
+        report.wire_shape_source = field
+            .wire_layout_source
+            .clone()
+            .or_else(|| Some("message-wire-layout".to_owned()));
+        report.wire_shape = Some(shape);
+    }
     let source_type = serialize_field_scalar_source_type(field, report.wire_shape.as_ref());
     let rust_type = field
         .rust_type
         .as_deref()
         .map(normalize_generated_rust_type)
-        .or_else(|| message_serialize_source_rust_type(field))
+        .or_else(|| {
+            report.wire_shape.as_ref()?;
+            field
+                .native_type
+                .as_deref()
+                .and_then(|native_type| {
+                    network_native_type_rust_type(native_type, &BTreeMap::new())
+                })
+                .map(|rust_type| normalize_generated_rust_type(&rust_type))
+        })
         .or_else(|| message_nested_shape_rust_type(field, message_type_name))
+        .or_else(|| message_serialize_source_rust_type(field))
         .or(source_type)
+        .or_else(|| {
+            report
+                .wire_shape
+                .as_ref()
+                .map(rust_field_shape)
+                .map(|shape| shape.value_type)
+        })
         .or_else(|| report.rust_value_type.clone());
     report.rust_value_type = rust_type.clone();
     report.rust_field_type = rust_type.clone();
@@ -32,6 +58,30 @@ pub(super) fn message_field_shape_report(
         message_field_blocked_reason(field, report.wire_shape.as_ref(), rust_type.as_deref());
     report.supported = report.blocked_reason.is_none();
     report
+}
+
+fn anonymous_message_wire_layout_shape(field: &NetworkField) -> Option<SchemaWireShape> {
+    if field.rust_type.is_some()
+        || field.native_type.is_some()
+        || field.source_type_name.is_some()
+        || field.source_type_id.is_some()
+        || field.serialize.is_some()
+        || field.nested_type_shape.is_some()
+    {
+        return None;
+    }
+
+    let shape = parse_network_wire_scalar_shape(field.wire_layout.as_deref()?)?;
+    let SchemaWireScalarShape::FixedBytes(width) = shape else {
+        return None;
+    };
+    if field
+        .raw_byte_length
+        .is_some_and(|raw_byte_length| raw_byte_length != u32::from(width))
+    {
+        return None;
+    }
+    Some(SchemaWireShape::FixedBytes(width))
 }
 
 pub(super) fn state_field_shape_report(
@@ -326,6 +376,9 @@ pub(super) fn message_nested_shape_rust_type(
     if !message_nested_shape_matches_field(field, shape) {
         return None;
     }
+    if let Some(shared_type) = shared_network_nested_shape_rust_type(shape) {
+        return Some(shared_type.to_owned());
+    }
     if message_nested_shape_uses_source_type(shape) {
         return shape
             .type_name_full
@@ -333,7 +386,27 @@ pub(super) fn message_nested_shape_rust_type(
             .or(shape.type_name.as_deref())
             .and_then(serialize_source_rust_type_name);
     }
-    message_nested_shape_support_type_name(shape, message_type_name)
+    if !shape.has_proven_anonymous_layout() {
+        return None;
+    }
+    message_nested_shape_support_type_name(field, shape, message_type_name)
+}
+
+fn shared_network_nested_shape_rust_type(
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+) -> Option<&'static str> {
+    if !shape.has_proven_layout() {
+        return None;
+    }
+    let wire_product = crate::network_schema::parse::nested_type_shape_wire_shapes(shape, &[])?;
+    match shape.type_name_full.as_deref()? {
+        "Javelin::ClientMessages::ActorRequestId"
+            if wire_product == [SchemaWireScalarShape::U64, SchemaWireScalarShape::U64] =>
+        {
+            Some("::nw_network::ActorRequestId")
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn message_nested_shape_matches_field(
@@ -341,6 +414,15 @@ pub(super) fn message_nested_shape_matches_field(
     shape: &crate::network_schema::NetworkNestedTypeShape,
 ) -> bool {
     if shape.has_exact_identity() {
+        return true;
+    }
+    if shape.has_proven_anonymous_layout()
+        && shape
+            .type_name
+            .as_deref()
+            .or(shape.type_name_full.as_deref())
+            .is_none()
+    {
         return true;
     }
     let Some(shape_name) = shape
@@ -354,16 +436,16 @@ pub(super) fn message_nested_shape_matches_field(
         .source_type_name
         .as_deref()
         .or(field.native_type.as_deref())
-        .and_then(first_source_type_leaf)
-        .is_some_and(|source_name| source_name == shape_name)
+        .is_some_and(|source_names| source_type_contains_leaf(source_names, shape_name))
 }
 
-pub(super) fn first_source_type_leaf(value: &str) -> Option<&str> {
+fn source_type_contains_leaf(value: &str, expected: &str) -> bool {
     value
         .split(',')
         .map(str::trim)
-        .find(|part| !part.is_empty())
+        .filter(|part| !part.is_empty())
         .map(type_name_leaf)
+        .any(|part| part == expected)
 }
 
 pub(super) fn message_nested_shape_uses_source_type(
@@ -373,10 +455,20 @@ pub(super) fn message_nested_shape_uses_source_type(
 }
 
 pub(super) fn message_nested_shape_support_type_name(
+    field: &NetworkField,
     shape: &crate::network_schema::NetworkNestedTypeShape,
     message_type_name: Option<&str>,
 ) -> Option<String> {
-    let mut name = rust_type_ident(shape.type_name.as_deref()?);
+    let mut name = shape
+        .type_name
+        .as_deref()
+        .or(shape.type_name_full.as_deref())
+        .map(rust_type_ident)
+        .or_else(|| {
+            let message = rust_type_ident(message_type_name?);
+            let field = rust_type_ident(&rust_field_ident(field.name.as_deref()?));
+            Some(format!("{message}{field}Value"))
+        })?;
     if message_type_name
         .map(rust_type_ident)
         .is_some_and(|message_name| message_name == name)
@@ -397,6 +489,8 @@ pub(super) fn resolved_field_descriptor_rust_type(field: &NetworkField) -> Optio
 
 pub(super) fn normalize_generated_rust_type(rust_type: &str) -> String {
     rust_type
+        .replace("::std::string::String", "String")
+        .replace("::std::vec::Vec<", "Vec<")
         .replace(
             "::std::collections::HashMap<",
             "::nw_network::serialize::IndexMap<",
@@ -504,8 +598,59 @@ pub(super) fn message_blocked_reasons(
     if network_type.name.is_none() {
         reasons.push("missing-type-name".to_owned());
     }
+    if network_type.fields.is_empty()
+        && network_type.marshal_fields.is_empty()
+        && !network_type.instance.as_ref().is_some_and(|instance| {
+            instance.empty_wire_proven
+                && instance.analysis_status
+                    == Some(crate::network_schema::NetworkMessageAnalysisStatus::ProvenEmpty)
+        })
+    {
+        reasons.push("message-layout-unresolved".to_owned());
+    }
+    let supports_unmarshal = network_type
+        .instance
+        .as_ref()
+        .and_then(|instance| instance.supports_unmarshal);
+    if supports_unmarshal != Some(false) && !message_directional_fields_agree(network_type) {
+        reasons.push("marshal-unmarshal-field-mismatch".to_owned());
+    }
     reasons.extend(counted_field_blocked_reasons(fields));
     reasons
+}
+
+fn message_directional_fields_agree(network_type: &NetworkType) -> bool {
+    network_type.marshal_fields.is_empty()
+        || (network_type.fields.len() == network_type.marshal_fields.len()
+            && network_type
+                .fields
+                .iter()
+                .zip(&network_type.marshal_fields)
+                .all(|(unmarshal, marshal)| {
+                    directional_field_offset(unmarshal) == directional_field_offset(marshal)
+                        && directional_wire_evidence_agrees(unmarshal, marshal)
+                }))
+}
+
+fn directional_field_offset(field: &NetworkField) -> Option<u32> {
+    field.storage_offset.or(field.storage_base_offset)
+}
+
+fn directional_wire_evidence_agrees(left: &NetworkField, right: &NetworkField) -> bool {
+    let shape_agrees = left
+        .wire_shape
+        .as_ref()
+        .zip(right.wire_shape.as_ref())
+        .is_none_or(|(left, right)| left == right);
+    let layout_agrees = left
+        .wire_layout
+        .as_ref()
+        .zip(right.wire_layout.as_ref())
+        .is_none_or(|(left, right)| left == right);
+    shape_agrees
+        && layout_agrees
+        && (left.wire_shape.is_some() && right.wire_shape.is_some()
+            || left.wire_layout.is_some() && right.wire_layout.is_some())
 }
 
 pub(super) fn counted_field_blocked_reasons(

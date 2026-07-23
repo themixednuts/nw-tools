@@ -118,10 +118,11 @@
             case PcodeOp.INT_ZEXT:
             case PcodeOp.INT_SEXT:
             case PcodeOp.SUBPIECE:
-            case PcodeOp.INDIRECT:
                 return def.getNumInputs() == 0
                     ? null
                     : pcodeValueCallTargetInfo(def.getInput(0), seen, depth + 1);
+            case PcodeOp.INDIRECT:
+                return null;
             case PcodeOp.MULTIEQUAL:
                 PcodeCallTargetInfo merged = null;
                 for (int i = 0; i < def.getNumInputs(); i++) {
@@ -416,7 +417,6 @@
             case PcodeOp.INT_ZEXT:
             case PcodeOp.INT_SEXT:
             case PcodeOp.SUBPIECE:
-            case PcodeOp.INDIRECT:
                 return def.getNumInputs() == 0
                     ? null
                     : pcodeMemoryPath(
@@ -424,6 +424,8 @@
                         remainingDereferences,
                         active,
                         memo);
+            case PcodeOp.INDIRECT:
+                return null;
             case PcodeOp.LOAD:
                 if (remainingDereferences == 0 || def.getNumInputs() < 2) {
                     return null;
@@ -794,7 +796,6 @@
             case PcodeOp.COPY:
             case PcodeOp.CAST:
             case PcodeOp.SUBPIECE:
-            case PcodeOp.INDIRECT:
                 return def.getNumInputs() == 0
                     ? null
                     : pcodeValueWireShape(
@@ -872,22 +873,10 @@
         if (def.getNumInputs() != 2 || def.getOutput() == null) {
             return null;
         }
-        String high = pcodeValueWireShape(
-            def.getInput(0),
-            tempWireShapes,
-            tempNativeTypes,
-            new LinkedHashSet<>(seen),
-            depth);
-        String low = pcodeValueWireShape(
-            def.getInput(1),
-            tempWireShapes,
-            tempNativeTypes,
-            new LinkedHashSet<>(seen),
-            depth);
-        Integer width = high == null ? null : wireShapeByteWidth(high);
-        return high != null && high.equals(low) && width != null &&
-            width == def.getOutput().getSize()
-                ? high
+        String wireShape = pcodeTempRangeEvidence(def.getOutput(), tempWireShapes);
+        Integer width = wireShape == null ? null : wireShapeByteWidth(wireShape);
+        return width != null && width == def.getOutput().getSize()
+                ? wireShape
                 : null;
     }
 
@@ -919,8 +908,7 @@
                 return unmarshalNativeTypeFromTarget(pcodeCallTarget(def));
             case PcodeOp.COPY:
             case PcodeOp.CAST:
-            case PcodeOp.SUBPIECE:
-            case PcodeOp.INDIRECT: {
+            case PcodeOp.SUBPIECE: {
                 String sourceType = def.getNumInputs() == 0
                     ? null
                     : pcodeValueNativeType(
@@ -930,6 +918,8 @@
                         depth + 1);
                 return pcodeNativeTypeAtValueWidth(sourceType, node.getSize());
             }
+            case PcodeOp.INDIRECT:
+                return null;
             case PcodeOp.INT_EQUAL:
             case PcodeOp.INT_NOTEQUAL:
             case PcodeOp.INT_LESS:

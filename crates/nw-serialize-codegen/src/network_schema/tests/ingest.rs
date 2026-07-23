@@ -645,6 +645,91 @@ fn imports_message_unmarshal_fields_without_registered_fields_capability() {
 }
 
 #[test]
+fn keeps_message_marshal_fields_separate_from_unmarshal_fields() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "44BA4CBA-AFAD-4EC5-A9DA-500838B28A57",
+            "typeIndex": 747,
+            "typeName": "ActorMover::CheckMovementStatusMsg",
+            "messageUnmarshal": {
+                "wrapper": "NewWorld+0x6a59b30",
+                "terminalStatus": "no-success-terminal",
+                "supportsUnmarshal": false,
+                "fields": [{
+                    "index": 0,
+                    "callsite": "NewWorld+0x6a59b9e",
+                    "storageExpression": "param_3 + 0x8",
+                    "storageBase": "param_3",
+                    "storageBaseOffset": "0x8",
+                    "wireLayout": "fixed-bytes-16",
+                    "confidence": "message-unmarshal-pcode-stack-readraw"
+                }]
+            },
+            "messageMarshal": {
+                "wrapper": "NewWorld+0x6a59a40",
+                "writeBufferParameter": "param_3",
+                "rootStorageBase": "param_2",
+                "analysisStatus": "complete-cfg-stack-flow",
+                "fields": [{
+                    "index": 0,
+                    "callsite": "NewWorld+0x6a59a4c",
+                    "storageExpression": "param_2 + 0x8",
+                    "storageBase": "param_2",
+                    "storageOffset": "0x8",
+                    "wireLayout": "fixed-bytes-16",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 1,
+                    "callsite": "NewWorld+0x6a59a65",
+                    "storageExpression": "param_2 + 0x20",
+                    "storageBase": "param_2",
+                    "storageOffset": "0x20",
+                    "wireShape": "composite<u32,fixed-bytes-16,fixed-bytes-16>",
+                    "confidence": "message-marshal-pcode-stack"
+                }]
+            },
+            "fields": [{
+                "index": 0,
+                "callsite": "NewWorld+0x6a59b9e",
+                "storageExpression": "param_3 + 0x8",
+                "storageBase": "param_3",
+                "storageBaseOffset": "0x8",
+                "wireLayout": "fixed-bytes-16",
+                "confidence": "message-unmarshal-pcode-stack-readraw"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+
+    let schema =
+        NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+    let network_type = &schema.types[0];
+
+    assert_eq!(network_type.fields.len(), 1);
+    assert_eq!(network_type.marshal_fields.len(), 2);
+    let instance = network_type.instance.as_ref().expect("instance layout");
+    assert_eq!(instance.supports_unmarshal, Some(false));
+    assert_eq!(
+        instance.terminal_status.as_deref(),
+        Some("no-success-terminal")
+    );
+    assert_eq!(schema.summary.message_unmarshal_field_count, 1);
+    assert_eq!(schema.summary.message_marshal_field_count, 2);
+    assert_eq!(
+        network_type.marshal_fields[0].evidence[0].kind,
+        NetworkEvidenceKind::MessageMarshal
+    );
+    assert_eq!(
+        network_type.marshal_fields[1].wire_shape,
+        Some(NetworkWireShape::Composite(vec![
+            NetworkWireShape::U32,
+            NetworkWireShape::FixedBytes(16),
+            NetworkWireShape::FixedBytes(16),
+        ]))
+    );
+}
+
+#[test]
 fn imports_delegated_fragment_codec_evidence() {
     let report = json!({
         "registryEntries": [{

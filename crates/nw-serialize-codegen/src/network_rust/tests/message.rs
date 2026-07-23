@@ -68,6 +68,13 @@ fn reports_message_blocker_summary_with_examples() {
             "typeIndex": 1,
             "typeName": "Example::EmptyMsg",
             "capabilities": ["direct-message"],
+            "messageUnmarshal": {
+                "analysisStatus": "proven-empty",
+                "emptyWireProven": true,
+                "emptyWireEvidenceSource": "vptr-only-instance+empty-marshal-cfg+successful-no-read-unmarshal-cfg",
+                "supportsUnmarshal": true,
+                "instanceSize": "0x8"
+            },
             "fields": []
         }, {
             "uuid": "22222222-2222-2222-2222-222222222222",
@@ -93,6 +100,12 @@ fn reports_message_blocker_summary_with_examples() {
                 "wireShape": "u32",
                 "confidence": "message-unmarshal-call"
             }]
+        }, {
+            "uuid": "44444444-4444-4444-4444-444444444444",
+            "typeIndex": 4,
+            "typeName": "Example::UnresolvedMsg",
+            "capabilities": ["direct-message"],
+            "fields": []
         }],
         "fieldRegistrationFunctions": []
     }))
@@ -101,12 +114,15 @@ fn reports_message_blocker_summary_with_examples() {
     let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
     let summary = &output.report.message_blocker_summary;
 
-    assert_eq!(summary.total_plan_count, 3);
+    assert_eq!(summary.total_plan_count, 4);
     assert_eq!(summary.generatable_count, 3);
-    assert_eq!(summary.blocked_count, 0);
-    assert!(summary.reason_buckets.is_empty());
-    assert!(summary.combination_buckets.is_empty());
+    assert_eq!(summary.blocked_count, 1);
+    assert_eq!(
+        summary.reason_buckets[0].reason,
+        "message-layout-unresolved"
+    );
     assert!(output.source.contains("pub struct EmptyMsg"));
+    assert!(!output.source.contains("pub struct UnresolvedMsg"));
     let placeholder_plan = output
         .report
         .message_generation_plans
@@ -118,6 +134,140 @@ fn reports_message_blocker_summary_with_examples() {
     assert_eq!(
         placeholder_plan.fields[0].field_name.as_deref(),
         Some("ActorRef")
+    );
+}
+
+#[test]
+fn emits_vlq_counted_ordered_map_messages() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "4CF9D4AE-3BE1-4E9E-A8F1-A313AB114D00",
+            "typeIndex": 191,
+            "typeName": "Amazon::Hub::HubIdDebugTrait::ReceiveAllHubNamesMsg",
+            "fields": [{
+                "index": 0,
+                "name": "HubNames",
+                "storageOffset": "0x8",
+                "wireShape": "map<u32,composite<entity-ref,u32,bool>>",
+                "wireLayout": "vec<composite<u32,entity-ref,u32,fixed-bytes-1>>",
+                "confidence": "message-unmarshal-pcode-interprocedural-collection"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_field_type.as_deref(),
+        Some("::nw_network::serialize::IndexMap<u32, (::nw_network::EntityRef, u32, bool)>")
+    );
+}
+
+#[test]
+fn emits_native_marshal_only_messages_without_a_decoder() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "44BA8334-C3AA-476E-855C-27364BF8A964",
+            "typeIndex": 747,
+            "typeName": "ActorMover::CheckMovementStatusMsg",
+            "messageUnmarshal": {
+                "terminalStatus": "no-success-terminal",
+                "supportsUnmarshal": false
+            },
+            "fields": [{
+                "index": 0,
+                "name": "ActorId",
+                "storageOffset": "0x8",
+                "wireLayout": "fixed-bytes-16",
+                "confidence": "message-unmarshal-pcode-stack-readraw"
+            }],
+            "messageMarshal": {
+                "fields": [{
+                    "index": 0,
+                    "name": "ActorId",
+                    "storageOffset": "0x8",
+                    "rustType": "::nw_network::ActorId",
+                    "wireLayout": "fixed-bytes-16",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 1,
+                    "name": "OriginatingMoveCoordinator",
+                    "storageOffset": "0x20",
+                    "wireShape": "composite<u32,fixed-bytes-16,fixed-bytes-16>",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 2,
+                    "name": "MovementInteractionId",
+                    "storageOffset": "0x48",
+                    "wireShape": "composite<u32,u32,u64,u64>",
+                    "confidence": "message-marshal-pcode-stack"
+                }]
+            }
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(plan.supports_unmarshal, Some(false));
+    assert!(
+        output
+            .source
+            .contains("#[derive(Debug, Clone, PartialEq, Marshal)]")
+    );
+    assert!(
+        !plan
+            .blocked_reasons
+            .iter()
+            .any(|reason| reason == "marshal-unmarshal-field-mismatch")
+    );
+}
+
+#[test]
+fn blocks_messages_with_proven_directional_field_mismatches() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "44BA4CBA-AFAD-4EC5-A9DA-500838B28A58",
+            "typeIndex": 748,
+            "typeName": "Example::SymmetricMsg",
+            "fields": [{
+                "index": 0,
+                "name": "ActorId",
+                "storageOffset": "0x8",
+                "wireLayout": "fixed-bytes-16",
+                "confidence": "message-unmarshal-pcode-stack-readraw"
+            }],
+            "messageMarshal": {
+                "fields": [{
+                    "index": 0,
+                    "storageOffset": "0x8",
+                    "wireLayout": "fixed-bytes-16",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 1,
+                    "storageOffset": "0x18",
+                    "wireShape": "u32",
+                    "confidence": "message-marshal-pcode-stack"
+                }]
+            }
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert_eq!(
+        plan.blocked_reasons,
+        vec!["marshal-unmarshal-field-mismatch"]
     );
 }
 
@@ -284,6 +434,50 @@ fn emits_message_structs_with_placeholder_field_names() {
 }
 
 #[test]
+fn emits_anonymous_fixed_width_message_fields_as_byte_arrays() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A5E12A88-7B5C-40EA-A2B0-95A636E90549",
+            "typeIndex": 1756,
+            "typeName": "Aoi::BaseQueryTrait::QueryAabbMsg",
+            "capabilities": ["direct-message"],
+            "messageUnmarshal": {
+                "supportsUnmarshal": true
+            },
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "storageExpression": "param_3 + 8",
+                "storageBase": "param_3",
+                "storageBaseOffset": 8,
+                "storageOffset": 8,
+                "rawByteLength": 8,
+                "wireLayout": "fixed-bytes-8",
+                "wireLayoutSource": "message-unmarshal-read-raw",
+                "confidence": "message-unmarshal-pcode-stack-readraw"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = output
+        .report
+        .message_generation_plans
+        .first()
+        .unwrap_or_else(|| panic!("missing message plan: {:#?}", output.report));
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].wire_shape,
+        Some(SchemaWireShape::FixedBytes(8))
+    );
+    assert_eq!(plan.fields[0].rust_value_type.as_deref(), Some("[u8; 8]"));
+    assert!(output.source.contains("pub field_0: [u8; 8]"));
+}
+
+#[test]
 fn emits_message_fields_from_explicit_rust_types_without_wire_shapes() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
@@ -319,7 +513,7 @@ fn emits_message_fields_from_explicit_rust_types_without_wire_shapes() {
 }
 
 #[test]
-fn unmarshal_type_names_do_not_resolve_external_support_types() {
+fn proven_actor_request_id_shapes_use_the_shared_network_type() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
             "registryEntries": [{
                 "uuid": "57735773-5773-4773-9773-577357735773",
@@ -346,6 +540,10 @@ fn unmarshal_type_names_do_not_resolve_external_support_types() {
                         "memberBase": "param_1",
                         "memberNameSource": "synthetic-offset",
                         "memberNamesProven": false,
+                        "layoutProven": true,
+                        "memberCoverageProven": true,
+                        "wireOrderProven": true,
+                        "wireOrderSource": "cfg-recursive-unmarshal-order+unique-storage-match",
                         "validation": "layout-consistent-two-u64",
                         "members": [{
                             "index": 0,
@@ -355,6 +553,8 @@ fn unmarshal_type_names_do_not_resolve_external_support_types() {
                             "nameProven": false,
                             "nativeType": "u64",
                             "wireShape": "u64",
+                            "wireLayout": "fixed-bytes-8",
+                            "wireOrdinal": 0,
                             "byteWidth": 8,
                             "evidenceSource": "pcode-call"
                         }, {
@@ -365,6 +565,8 @@ fn unmarshal_type_names_do_not_resolve_external_support_types() {
                             "nameProven": false,
                             "nativeType": "u64",
                             "wireShape": "u64",
+                            "wireLayout": "fixed-bytes-8",
+                            "wireOrdinal": 1,
                             "byteWidth": 8,
                             "evidenceSource": "pcode-call"
                         }]
@@ -404,8 +606,13 @@ fn unmarshal_type_names_do_not_resolve_external_support_types() {
                         "typeNameFull": "Javelin::ClientMessages::ActorRequestId",
                         "typeNameSource": "ghidra-symbol",
                         "functionName": "Javelin::ClientMessages::ActorRequestId::Unmarshal",
+                        "memberBase": "param_1",
                         "memberNamesProven": false,
-                        "validation": "layout-consistent-two-u64",
+                        "layoutProven": true,
+                        "memberCoverageProven": true,
+                        "wireOrderProven": true,
+                        "wireOrderSource": "cfg-dominating-output-storage-order+recursive-unmarshal-order",
+                        "validation": "layout-consistent-two-u64+single-direct-unmarshal-delegate",
                         "members": [{
                             "index": 0,
                             "offset": "0x0",
@@ -450,8 +657,8 @@ fn unmarshal_type_names_do_not_resolve_external_support_types() {
     let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
     assert_eq!(output.report.message_generation_plan_count, 4);
-    assert_eq!(output.report.generatable_message_count, 1);
-    assert_eq!(output.report.blocked_message_count, 3);
+    assert_eq!(output.report.generatable_message_count, 2);
+    assert_eq!(output.report.blocked_message_count, 2);
 
     let resolved_plan = output
         .report
@@ -463,13 +670,13 @@ fn unmarshal_type_names_do_not_resolve_external_support_types() {
     assert!(resolved_plan.blocked_reasons.is_empty());
     assert_eq!(
         resolved_plan.fields[0].rust_value_type.as_deref(),
-        Some("ActorRequestId")
+        Some("::nw_network::ActorRequestId")
     );
     assert_eq!(resolved_plan.fields[0].blocked_reason, None);
     assert!(
         output
             .source
-            .contains("pub actor_request_id: ActorRequestId")
+            .contains("pub actor_request_id: ::nw_network::ActorRequestId")
     );
 
     let unresolved_plan = output
@@ -500,20 +707,18 @@ fn unmarshal_type_names_do_not_resolve_external_support_types() {
         .find(|plan| plan.type_index == Some(3477))
         .expect("composite type plan");
     assert_eq!(composite_plan.missing_support_type_count, 0);
-    assert_eq!(composite_plan.missing_composite_support_type_count, 1);
-    assert_eq!(
-        composite_plan.blocked_reasons,
-        vec!["missing-composite-support-type:1"]
-    );
+    assert_eq!(composite_plan.missing_composite_support_type_count, 0);
+    assert!(composite_plan.blocked_reasons.is_empty());
     assert_eq!(
         composite_plan.fields[0].source_type_name.as_deref(),
         Some("ActorRequestIdPayload,ActorRequestId")
     );
-    assert_eq!(composite_plan.fields[0].rust_value_type, None);
     assert_eq!(
-        composite_plan.fields[0].blocked_reason.as_deref(),
-        Some("missing-composite-support-type")
+        composite_plan.fields[0].rust_value_type.as_deref(),
+        Some("::nw_network::ActorRequestId")
     );
+    assert_eq!(composite_plan.fields[0].blocked_reason, None);
+    assert!(!output.source.contains("pub struct ActorRequestId"));
 
     let direct_payload_plan = output
         .report
@@ -578,6 +783,10 @@ fn emits_message_support_structs_from_proven_nested_shapes() {
                         "memberBase": "param_1",
                         "memberNameSource": "synthetic-offset",
                         "memberNamesProven": false,
+                        "layoutProven": true,
+                        "memberCoverageProven": true,
+                        "wireOrderProven": true,
+                        "wireOrderSource": "cfg-recursive-unmarshal-order+unique-storage-match",
                         "validation": "layout-consistent-direct-type",
                         "members": [{
                             "index": 0,
@@ -587,6 +796,8 @@ fn emits_message_support_structs_from_proven_nested_shapes() {
                             "nameProven": false,
                             "nativeType": "u64",
                             "wireShape": "u64",
+                            "wireLayout": "fixed-bytes-8",
+                            "wireOrdinal": 0,
                             "byteWidth": 8
                         }, {
                             "index": 1,
@@ -596,6 +807,8 @@ fn emits_message_support_structs_from_proven_nested_shapes() {
                             "nameProven": false,
                             "nativeType": "u64",
                             "wireShape": "u64",
+                            "wireLayout": "fixed-bytes-8",
+                            "wireOrdinal": 1,
                             "byteWidth": 8
                         }, {
                             "index": 2,
@@ -605,6 +818,8 @@ fn emits_message_support_structs_from_proven_nested_shapes() {
                             "nameProven": false,
                             "nativeType": "bool",
                             "wireShape": "bool",
+                            "wireLayout": "fixed-bytes-1",
+                            "wireOrdinal": 2,
                             "byteWidth": 1
                         }]
                     },
@@ -638,7 +853,71 @@ fn emits_message_support_structs_from_proven_nested_shapes() {
     assert!(
         output
             .source
-            .contains("impl ::nw_network::serialize::Marshaler for ActorRequestIdBoolPayload")
+            .contains("impl ::nw_network::serialize::Marshal for ActorRequestIdBoolPayload")
+    );
+    assert!(
+        output
+            .source
+            .contains("impl ::nw_network::serialize::Unmarshal for ActorRequestIdBoolPayload")
+    );
+}
+
+#[test]
+fn names_constructor_proven_anonymous_message_values_from_their_owner() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "49334933-4933-4933-8933-493349334935",
+            "typeIndex": 6178,
+            "typeName": "Aoi::AnonymousConstructorMsg",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "wireShape": "composite<u32,u8>",
+                "wireLayout": "composite<fixed-bytes-4,fixed-bytes-1>",
+                "nestedTypeShape": {
+                    "typeNameSource": "synthetic-constructor-subobject",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "wireOrderSource": "message-cfg-complete-wire-coverage",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "name": "_0",
+                        "wireShape": "u32",
+                        "wireLayout": "fixed-bytes-4",
+                        "wireOrdinal": 0,
+                        "byteWidth": 4
+                    }, {
+                        "index": 1,
+                        "offset": "0x4",
+                        "name": "_1",
+                        "wireShape": "u8",
+                        "wireLayout": "fixed-bytes-1",
+                        "wireOrdinal": 1,
+                        "byteWidth": 1
+                    }]
+                },
+                "confidence": "message-unmarshal-constructor-subobject-boundary"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("AnonymousConstructorMsgField0Value")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub struct AnonymousConstructorMsgField0Value")
     );
 }
 
@@ -747,6 +1026,43 @@ fn native_fixed_vector_names_do_not_select_arrayvec() {
         Some("missing-support-type")
     );
     assert_eq!(plan.fields[0].rust_value_type, None);
+}
+
+#[test]
+fn emits_native_unordered_set_with_semantic_element_type() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "C0B051D8-C059-499E-A5E5-597954F2AA5C",
+            "typeIndex": 985,
+            "typeName": "Amazon::Hub::ResubscribeMsg",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "name": "registryIndex",
+                "nativeType": "AZ::u32",
+                "wireShape": "u32",
+                "confidence": "message-unmarshal-pcode-call"
+            }, {
+                "index": 1,
+                "name": "listeners",
+                "nativeType": "AZStd::unordered_set<Amazon::Pervasives::CrcID>",
+                "wireShape": "set<fixed-bytes-16>",
+                "confidence": "message-unmarshal-cfg-azstd-unordered-set"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+    assert_eq!(output.report.generatable_message_count, 1);
+    assert_eq!(output.report.blocked_message_count, 0);
+    assert!(
+        output
+            .source
+            .contains("pub listeners: ::nw_network::serialize::IndexSet<::nw_network::CrcId>")
+    );
 }
 
 #[test]

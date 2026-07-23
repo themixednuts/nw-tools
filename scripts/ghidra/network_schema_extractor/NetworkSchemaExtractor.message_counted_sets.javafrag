@@ -1,0 +1,793 @@
+    private static final long AZSTD_UNORDERED_SET_NODE_VALUE_OFFSET = 0x10L;
+    private static final Set<Long> AZSTD_UNORDERED_SET_RECEIVER_OFFSETS = Set.of(
+        0x08L,
+        0x18L,
+        0x58L,
+        0x60L,
+        0x68L,
+        0x70L);
+
+    private ReflectedSetIdentity countedSetIdentity(
+        Function helper,
+        CollectionOutputShape output) {
+
+        if (helper == null || output == null || output.wireEvidence == null) {
+            return null;
+        }
+        String observed = firstNonEmpty(
+            output.wireEvidence.shape,
+            output.wireEvidence.layout);
+        String elementShape = vectorElementWireShape(observed);
+        Integer elementWidth = wireShapeByteWidth(elementShape);
+        if (elementShape == null || elementWidth == null || elementWidth <= 0) {
+            recordReflectedSetReject(
+                "wire-element-width-unresolved",
+                helper,
+                null,
+                null,
+                output.storage == null ? null : output.storage.offset,
+                elementWidth,
+                null);
+            return null;
+        }
+
+        Function insertion = countedCollectionInsertionTarget(helper, output);
+        if (insertion == null) {
+            recordReflectedSetReject(
+                "set-insertion-target-unresolved",
+                helper,
+                null,
+                null,
+                output.storage == null ? null : output.storage.offset,
+                elementWidth,
+                null);
+            return null;
+        }
+        if (!hasAzStdUnorderedSetInsertionLayout(insertion, elementWidth)) {
+            recordReflectedSetReject(
+                "set-insertion-layout-mismatch",
+                insertion,
+                helper,
+                null,
+                output.storage == null ? null : output.storage.offset,
+                elementWidth,
+                null);
+            return null;
+        }
+        return reflectedSetIdentityForUnmarshalHelper(helper, output, elementWidth);
+    }
+
+    private Function countedCollectionInsertionTarget(
+        Function helper,
+        CollectionOutputShape output) {
+
+        HighFunction high = highFunction(helper);
+        if (high == null || output == null || output.loopHeader == null) {
+            return null;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        Function selected = null;
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            if (loop.header() == null ||
+                !output.loopHeader.equals(loop.header().getStart())) {
+                continue;
+            }
+            CollectionElementSequence elements = loopElementCodecs(
+                helper,
+                high,
+                loop,
+                operations);
+            if (elements == null || elements.codecs().isEmpty()) {
+                return null;
+            }
+            PcodeOpAST insertion = countedCollectionInsertionCall(
+                helper,
+                high,
+                loop,
+                operations,
+                elements.codecs());
+            Function candidate = pcodeCallTarget(insertion);
+            if (candidate == null) {
+                return null;
+            }
+            if (selected != null &&
+                !selected.getEntryPoint().equals(candidate.getEntryPoint())) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private boolean hasAzStdUnorderedSetInsertionLayout(
+        Function insertion,
+        int elementWidth) {
+
+        HighFunction high = highFunction(insertion);
+        if (high == null || elementWidth <= 0 || elementWidth > 0x1000) {
+            return false;
+        }
+        long nodeSize = AZSTD_UNORDERED_SET_NODE_VALUE_OFFSET + elementWidth;
+        boolean allocationLayout = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL ||
+                operation.getOutput() == null ||
+                operation.getOutput().getSize() != currentProgram.getDefaultPointerSize() ||
+                !callHasConstants(operation, nodeSize, 8L, 0L)) {
+                continue;
+            }
+            if (allocationPayloadIsFullyStored(
+                    high,
+                    operation,
+                    AZSTD_UNORDERED_SET_NODE_VALUE_OFFSET,
+                    elementWidth)) {
+                allocationLayout = true;
+                break;
+            }
+        }
+        return allocationLayout &&
+            directReceiverOffsets(high, "param_1")
+                .containsAll(AZSTD_UNORDERED_SET_RECEIVER_OFFSETS);
+    }
+
+    private boolean callHasConstants(PcodeOpAST call, long... expected) {
+        if (call == null) {
+            return false;
+        }
+        LinkedHashSet<Long> constants = new LinkedHashSet<>();
+        for (int index = 1; index < call.getNumInputs(); index++) {
+            Long value = NetworkSchemaIntegerEvaluator.evaluate(call.getInput(index));
+            if (value != null) {
+                constants.add(value);
+            }
+        }
+        for (long value : expected) {
+            if (!constants.contains(value)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean allocationPayloadIsFullyStored(
+        HighFunction high,
+        PcodeOpAST allocation,
+        long valueOffset,
+        int valueWidth) {
+
+        Varnode root = allocation.getOutput();
+        boolean[] covered = new boolean[valueWidth];
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3 ||
+                !NetworkSchemaControlFlow.precedes(high, allocation, operation)) {
+                continue;
+            }
+            Long offset = pcodeConstantOffsetFromRoot(
+                operation.getInput(1),
+                root,
+                new LinkedHashSet<>(),
+                0);
+            Varnode value = operation.getInput(2);
+            if (offset == null || value == null || value.getSize() <= 0) {
+                continue;
+            }
+            long start = Math.max(offset, valueOffset);
+            long end = Math.min(offset + value.getSize(), valueOffset + valueWidth);
+            for (long position = start; position < end; position++) {
+                covered[(int)(position - valueOffset)] = true;
+            }
+        }
+        for (boolean value : covered) {
+            if (!value) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Set<Long> directReceiverOffsets(HighFunction high, String receiver) {
+        LinkedHashSet<Long> offsets = new LinkedHashSet<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            Varnode address = switch (operation.getOpcode()) {
+                case PcodeOp.LOAD, PcodeOp.STORE -> operation.getNumInputs() >= 2
+                    ? operation.getInput(1)
+                    : null;
+                default -> null;
+            };
+            PcodeMemoryPath path = pcodeMemoryPath(address, 0);
+            if (path != null && path.root().isStorage(receiver) &&
+                path.dereferenceOffsets().isEmpty()) {
+                offsets.add(path.offset());
+            }
+        }
+        return offsets;
+    }
+
+    private ReflectedSetIdentity reflectedSetIdentityForUnmarshalHelper(
+        Function helper,
+        CollectionOutputShape output,
+        int elementWidth) {
+
+        if (helper == null || output == null || output.storage == null) {
+            recordReflectedSetReject(
+                "unmarshal-output-storage-missing",
+                helper,
+                null,
+                null,
+                null,
+                elementWidth,
+                null);
+            return null;
+        }
+        Address helperTarget = resolvedCodeTarget(helper.getEntryPoint());
+        LinkedHashMap<String, ReflectedSetIdentity> identities = new LinkedHashMap<>();
+        boolean sawCallReference = false;
+        boolean sawRegistryOwner = false;
+        boolean sawHelperCall = false;
+        boolean sawTranslatedField = false;
+        ReferenceIterator references = currentProgram.getReferenceManager()
+            .getReferencesTo(helperTarget);
+        while (references.hasNext() && !monitor.isCancelled()) {
+            Reference reference = references.next();
+            if (!reference.getReferenceType().isCall()) {
+                continue;
+            }
+            sawCallReference = true;
+            Function caller = functionContaining(reference.getFromAddress());
+            List<RegistryEntry> entries = caller == null
+                ? null
+                : registryEntriesByUnmarshal.get(caller.getEntryPoint().toString());
+            sawRegistryOwner |= entries != null && !entries.isEmpty();
+            HighFunction high = entries == null ? null : highFunction(caller);
+            if (high == null) {
+                continue;
+            }
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                Function target = pcodeCallTarget(operation);
+                if (target == null || !helperTarget.equals(
+                        resolvedCodeTarget(target.getEntryPoint()))) {
+                    continue;
+                }
+                sawHelperCall = true;
+                PcodeStorage field = callArgumentStorageMap(
+                    caller,
+                    operation,
+                    Collections.emptyMap()).get(output.storage.base);
+                if (field == null || !"param_3".equals(field.base) ||
+                    field.offset < 0L) {
+                    continue;
+                }
+                sawTranslatedField = true;
+                for (RegistryEntry entry : entries) {
+                    collectPairedMarshalSetIdentities(
+                        entry,
+                        field.offset,
+                        elementWidth,
+                        identities);
+                }
+            }
+        }
+        if (!sawCallReference) {
+            recordReflectedSetReject(
+                "unmarshal-helper-call-reference-missing",
+                helper,
+                null,
+                null,
+                null,
+                elementWidth,
+                null);
+        }
+        else if (!sawRegistryOwner) {
+            recordReflectedSetReject(
+                "unmarshal-helper-registry-owner-missing",
+                helper,
+                null,
+                null,
+                null,
+                elementWidth,
+                null);
+        }
+        else if (!sawHelperCall) {
+            recordReflectedSetReject(
+                "unmarshal-helper-pcode-call-missing",
+                helper,
+                null,
+                null,
+                null,
+                elementWidth,
+                null);
+        }
+        else if (!sawTranslatedField) {
+            recordReflectedSetReject(
+                "unmarshal-field-root-translation-failed",
+                helper,
+                null,
+                null,
+                output.storage.offset,
+                elementWidth,
+                null);
+        }
+        else if (identities.isEmpty()) {
+            recordReflectedSetReject(
+                "paired-marshal-identity-missing",
+                helper,
+                null,
+                null,
+                output.storage.offset,
+                elementWidth,
+                null);
+        }
+        else if (identities.size() > 1) {
+            recordReflectedSetReject(
+                "paired-marshal-identity-ambiguous",
+                helper,
+                null,
+                null,
+                output.storage.offset,
+                elementWidth,
+                null);
+        }
+        return identities.size() == 1
+            ? identities.values().iterator().next()
+            : null;
+    }
+
+    private void collectPairedMarshalSetIdentities(
+        RegistryEntry entry,
+        long fieldOffset,
+        int elementWidth,
+        Map<String, ReflectedSetIdentity> identities) {
+
+        Function marshal = functionAtOrContaining(parseCapturedAddress(entry.marshal));
+        HighFunction high = highFunction(marshal);
+        if (high == null) {
+            recordReflectedSetReject(
+                "paired-marshal-decompile-failed",
+                marshal,
+                null,
+                entry,
+                fieldOffset,
+                elementWidth,
+                null);
+            return;
+        }
+        PcodeStorage expectedField = new PcodeStorage("param_2", fieldOffset);
+        PcodeStorage expectedBuffer = new PcodeStorage("param_3", 0L);
+        boolean sawFieldBufferPair = false;
+        boolean resolvedIdentity = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function helper = pcodeCallTarget(operation);
+            if (helper == null) {
+                continue;
+            }
+            Collection<PcodeStorage> arguments = callArgumentStorageMap(
+                marshal,
+                operation,
+                Collections.emptyMap()).values();
+            if (arguments.stream().noneMatch(expectedField::sameLocation) ||
+                arguments.stream().noneMatch(expectedBuffer::sameLocation)) {
+                continue;
+            }
+            sawFieldBufferPair = true;
+            ReflectedSetIdentity identity = reflectedMarshalSetIdentity(
+                helper,
+                elementWidth);
+            if (identity != null) {
+                resolvedIdentity = true;
+                identities.putIfAbsent(identity.identityKey(), identity);
+            }
+        }
+        if (!sawFieldBufferPair) {
+            recordReflectedSetReject(
+                "paired-marshal-field-buffer-call-missing",
+                marshal,
+                null,
+                entry,
+                fieldOffset,
+                elementWidth,
+                null);
+        }
+        else if (!resolvedIdentity) {
+            recordReflectedSetReject(
+                "paired-marshal-reflection-unresolved",
+                marshal,
+                null,
+                entry,
+                fieldOffset,
+                elementWidth,
+                null);
+        }
+    }
+
+    private ReflectedSetIdentity reflectedMarshalSetIdentity(
+        Function helper,
+        int elementWidth) {
+
+        Address helperTarget = helper == null
+            ? null
+            : resolvedCodeTarget(helper.getEntryPoint());
+        if (!isExecutableAddress(helperTarget) || elementWidth <= 0) {
+            recordReflectedSetReject(
+                "marshal-helper-invalid",
+                helper,
+                null,
+                null,
+                null,
+                elementWidth,
+                null);
+            return null;
+        }
+        String key = helperTarget + "|" + elementWidth;
+        Optional<ReflectedSetIdentity> cached = reflectedMarshalSetIdentityCache.get(key);
+        if (cached != null) {
+            return cached.orElse(null);
+        }
+
+        LinkedHashMap<String, ReflectedSetIdentity> identities = new LinkedHashMap<>();
+        boolean sawCallReference = false;
+        boolean sawRegistryOwner = false;
+        boolean sawHelperCall = false;
+        boolean sawSingleFieldArgument = false;
+        ReferenceIterator references = currentProgram.getReferenceManager()
+            .getReferencesTo(helperTarget);
+        while (references.hasNext() && !monitor.isCancelled()) {
+            Reference reference = references.next();
+            if (!reference.getReferenceType().isCall()) {
+                continue;
+            }
+            sawCallReference = true;
+            Function caller = functionContaining(reference.getFromAddress());
+            List<RegistryEntry> entries = caller == null
+                ? null
+                : registryEntriesByMarshal.get(caller.getEntryPoint().toString());
+            sawRegistryOwner |= entries != null && !entries.isEmpty();
+            HighFunction high = entries == null ? null : highFunction(caller);
+            if (high == null) {
+                continue;
+            }
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                Function target = pcodeCallTarget(operation);
+                if (target == null || !helperTarget.equals(
+                        resolvedCodeTarget(target.getEntryPoint()))) {
+                    continue;
+                }
+                sawHelperCall = true;
+                List<PcodeStorage> fieldArguments = callArgumentStorageMap(
+                    caller,
+                    operation,
+                    Collections.emptyMap()).values().stream()
+                    .filter(storage -> "param_2".equals(storage.base) && storage.offset >= 0L)
+                    .toList();
+                if (fieldArguments.size() != 1) {
+                    continue;
+                }
+                sawSingleFieldArgument = true;
+                for (RegistryEntry entry : entries) {
+                    SerializeTypeInfo owner = exactSerializeTypeForRegistryEntry(entry);
+                    SerializeFieldInfo field = owner == null
+                        ? null
+                        : exactSerializeField(owner, fieldArguments.get(0).offset);
+                    if (owner != null && field == null) {
+                        recordReflectedSetReject(
+                            "reflected-field-offset-missing-or-ambiguous",
+                            helper,
+                            caller,
+                            entry,
+                            fieldArguments.get(0).offset,
+                            elementWidth,
+                            null);
+                    }
+                    ReflectedSetIdentity identity = reflectedSetFieldIdentity(
+                        helperTarget,
+                        owner,
+                        field,
+                        elementWidth);
+                    if (identity != null) {
+                        identities.putIfAbsent(identity.identityKey(), identity);
+                    }
+                }
+            }
+        }
+
+        if (!sawCallReference) {
+            recordReflectedSetReject(
+                "marshal-helper-call-reference-missing",
+                helper,
+                null,
+                null,
+                null,
+                elementWidth,
+                null);
+        }
+        else if (!sawRegistryOwner) {
+            recordReflectedSetReject(
+                "marshal-helper-registry-owner-missing",
+                helper,
+                null,
+                null,
+                null,
+                elementWidth,
+                null);
+        }
+        else if (!sawHelperCall) {
+            recordReflectedSetReject(
+                "marshal-helper-pcode-call-missing",
+                helper,
+                null,
+                null,
+                null,
+                elementWidth,
+                null);
+        }
+        else if (!sawSingleFieldArgument) {
+            recordReflectedSetReject(
+                "marshal-field-root-translation-failed",
+                helper,
+                null,
+                null,
+                null,
+                elementWidth,
+                null);
+        }
+        else if (identities.isEmpty()) {
+            recordReflectedSetReject(
+                "marshal-reflected-identity-missing",
+                helper,
+                null,
+                null,
+                null,
+                elementWidth,
+                null);
+        }
+        else if (identities.size() > 1) {
+            recordReflectedSetReject(
+                "marshal-reflected-identity-ambiguous",
+                helper,
+                null,
+                null,
+                null,
+                elementWidth,
+                null);
+        }
+
+        ReflectedSetIdentity result = identities.size() == 1
+            ? identities.values().iterator().next()
+            : null;
+        reflectedMarshalSetIdentityCache.put(key, Optional.ofNullable(result));
+        return result;
+    }
+
+    private SerializeTypeInfo exactSerializeTypeForRegistryEntry(RegistryEntry entry) {
+        Address createInstance = entry == null
+            ? null
+            : parseCapturedAddress(entry.createInstance);
+        String typeName = recoverCreateInstanceTypeName(createInstance);
+        Long nativeSize = recoverCreateInstanceSize(createInstance);
+        if (!isPlausibleTypeName(typeName)) {
+            recordReflectedSetReject(
+                "registry-owner-factory-type-name-unresolved",
+                null,
+                null,
+                entry,
+                null,
+                null,
+                null);
+            return null;
+        }
+        if (nativeSize == null || nativeSize <= 0L) {
+            recordReflectedSetReject(
+                "registry-owner-create-size-unresolved",
+                null,
+                null,
+                entry,
+                null,
+                null,
+                null);
+            return null;
+        }
+
+        LinkedHashMap<String, SerializeTypeInfo> candidates = new LinkedHashMap<>();
+        for (SerializeTypeInfo candidate : serializeTypesByName.getOrDefault(
+                typeName,
+                Collections.emptyList())) {
+            candidates.putIfAbsent(normalizeUuid(candidate.typeId), candidate);
+        }
+        String leaf = NetworkSchemaText.sourceTypeLeaf(typeName);
+        for (SerializeTypeInfo candidate : serializeTypesByLeafName.getOrDefault(
+                leaf,
+                Collections.emptyList())) {
+            candidates.putIfAbsent(normalizeUuid(candidate.typeId), candidate);
+        }
+        candidates.values().removeIf(candidate ->
+            !nativeSize.equals(exactSerializeNativeSize(candidate)));
+        if (candidates.isEmpty()) {
+            recordReflectedSetReject(
+                "registry-owner-reflected-layout-missing",
+                null,
+                null,
+                entry,
+                null,
+                null,
+                null);
+        }
+        else if (candidates.size() > 1) {
+            recordReflectedSetReject(
+                "registry-owner-reflected-layout-ambiguous",
+                null,
+                null,
+                entry,
+                null,
+                null,
+                null);
+        }
+        return candidates.size() == 1
+            ? candidates.values().iterator().next()
+            : null;
+    }
+
+    private SerializeFieldInfo exactSerializeField(
+        SerializeTypeInfo owner,
+        long fieldOffset) {
+
+        SerializeFieldInfo selected = null;
+        for (SerializeFieldInfo field : owner.fields) {
+            if (field.baseClass || field.offset == null || field.offset != fieldOffset) {
+                continue;
+            }
+            if (selected != null &&
+                (!Objects.equals(selected.typeId, field.typeId) ||
+                    !Objects.equals(selected.name, field.name))) {
+                return null;
+            }
+            selected = field;
+        }
+        return selected;
+    }
+
+    private ReflectedSetIdentity reflectedSetFieldIdentity(
+        Address marshalHelper,
+        SerializeTypeInfo owner,
+        SerializeFieldInfo field,
+        int elementWidth) {
+
+        if (owner == null || field == null) {
+            return null;
+        }
+        if (!"AZStd::unordered_set".equals(field.genericClassName)) {
+            recordReflectedSetReject(
+                "reflected-field-generic-class-mismatch",
+                functionAtOrContaining(marshalHelper),
+                null,
+                null,
+                field.offset,
+                elementWidth,
+                null);
+            return null;
+        }
+        if (field.templatedTypeIds.size() != 1) {
+            recordReflectedSetReject(
+                "reflected-field-template-arity-mismatch",
+                functionAtOrContaining(marshalHelper),
+                null,
+                null,
+                field.offset,
+                elementWidth,
+                null);
+            return null;
+        }
+        String elementTypeId = canonicalUuidFromString(field.templatedTypeIds.get(0));
+        String elementShape = wireShapeFromSerializeTypeId(elementTypeId);
+        Integer reflectedWidth = wireShapeByteWidth(elementShape);
+        SerializeTypeInfo elementType = elementTypeId == null
+            ? null
+            : serializeTypesById.get(normalizeUuid(elementTypeId));
+        if (elementTypeId == null) {
+            recordReflectedSetReject(
+                "reflected-element-type-id-invalid",
+                functionAtOrContaining(marshalHelper),
+                null,
+                null,
+                field.offset,
+                elementWidth,
+                reflectedWidth);
+            return null;
+        }
+        if (elementType == null || !isPlausibleTypeName(elementType.name)) {
+            recordReflectedSetReject(
+                "reflected-element-type-unresolved",
+                functionAtOrContaining(marshalHelper),
+                null,
+                null,
+                field.offset,
+                elementWidth,
+                reflectedWidth);
+            return null;
+        }
+        if (reflectedWidth == null) {
+            recordReflectedSetReject(
+                "reflected-element-wire-width-unresolved",
+                functionAtOrContaining(marshalHelper),
+                null,
+                null,
+                field.offset,
+                elementWidth,
+                null);
+            return null;
+        }
+        if (reflectedWidth != elementWidth) {
+            recordReflectedSetReject(
+                "reflected-element-width-mismatch",
+                functionAtOrContaining(marshalHelper),
+                null,
+                null,
+                field.offset,
+                elementWidth,
+                reflectedWidth);
+            return null;
+        }
+        String nativeType = field.genericClassName + "<" + elementType.name + ">";
+        return new ReflectedSetIdentity(
+            nativeType,
+            elementType.name,
+            elementTypeId,
+            "set<" + elementShape + ">",
+            marshalHelper,
+            owner.name,
+            owner.typeId,
+            field.name,
+            field.offset);
+    }
+
+    private void recordReflectedSetReject(
+        String reason,
+        Function helper,
+        Function caller,
+        RegistryEntry entry,
+        Long fieldOffset,
+        Integer observedWidth,
+        Integer reflectedWidth) {
+
+        reflectedSetRejectCounts.merge(reason, 1, Integer::sum);
+        if (reflectedSetRejectSamples.size() >= 64) {
+            return;
+        }
+        JsonObject sample = new JsonObject();
+        sample.addProperty("reason", reason);
+        NetworkSchemaJson.addAddress(
+            sample,
+            "helper",
+            helper == null ? null : helper.getEntryPoint(),
+            addressFormatter);
+        NetworkSchemaJson.add(sample, "helperName", fullFunctionName(helper));
+        NetworkSchemaJson.addAddress(
+            sample,
+            "caller",
+            caller == null ? null : caller.getEntryPoint(),
+            addressFormatter);
+        NetworkSchemaJson.add(sample, "callerName", fullFunctionName(caller));
+        NetworkSchemaJson.add(sample, "typeIndex", entry == null ? null : entry.typeIndex);
+        NetworkSchemaJson.add(sample, "typeName", entry == null ? null : entry.name);
+        NetworkSchemaJson.add(sample, "typeId", entry == null ? null : entry.uuid);
+        Address createInstance = entry == null
+            ? null
+            : parseCapturedAddress(entry.createInstance);
+        NetworkSchemaJson.add(
+            sample,
+            "factoryTypeName",
+            recoverCreateInstanceTypeName(createInstance));
+        Long factorySize = recoverCreateInstanceSize(createInstance);
+        NetworkSchemaJson.add(
+            sample,
+            "factoryInstanceSize",
+            factorySize == null ? null : String.format("0x%x", factorySize));
+        if (fieldOffset != null) {
+            sample.addProperty("fieldOffset", fieldOffset);
+        }
+        NetworkSchemaJson.add(sample, "observedWidth", observedWidth);
+        NetworkSchemaJson.add(sample, "reflectedWidth", reflectedWidth);
+        reflectedSetRejectSamples.add(sample);
+    }

@@ -2,13 +2,15 @@
         int ownerParameter,
         int countParameter,
         int readBufferParameter,
-        long elementStride,
+        ContainerStorageKind storageKind,
+        Long elementStride,
         WireShape wireEvidence) {
     }
 
     private record InterproceduralCollectionCall(
         PcodeStorage owner,
         PcodeStorage count,
+        ContainerStorageKind storageKind,
         WireShape wireEvidence) {
     }
 
@@ -16,18 +18,16 @@
         Function caller,
         PcodeOpAST call,
         Function helper,
-        Map<String, String> tempNativeTypes,
-        Map<String, String> tempWireShapes,
         Map<String, PcodeStorage> callerParamStorage) {
 
         if (helper == null || call == null) {
             return null;
         }
-        Integer callerCountParameter = uniqueCallArgumentWithWireShape(
+        Integer callerCountParameter = uniqueCallArgumentProducedByCodec(
+            caller,
             call,
-            "vlq-u32",
-            tempNativeTypes,
-            tempWireShapes);
+            helper,
+            "vlq-u32");
         if (callerCountParameter == null) {
             return null;
         }
@@ -60,30 +60,215 @@
         count = translatedAbsoluteHelperStorage(count, callerParamStorage);
         return owner == null || count == null
             ? null
-            : new InterproceduralCollectionCall(owner, count, shape.wireEvidence());
+            : new InterproceduralCollectionCall(
+                owner,
+                count,
+                shape.storageKind(),
+                shape.wireEvidence());
     }
 
-    private Integer uniqueCallArgumentWithWireShape(
-        PcodeOp call,
-        String expectedShape,
-        Map<String, String> tempNativeTypes,
-        Map<String, String> tempWireShapes) {
+    private Integer uniqueCallArgumentProducedByCodec(
+        Function caller,
+        PcodeOpAST call,
+        Function helper,
+        String expectedShape) {
 
+        HighFunction high = highFunction(caller);
+        if (high == null || call == null || expectedShape == null) {
+            return null;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
         Integer selected = null;
-        for (int slot = 1; slot < call.getNumInputs(); slot++) {
-            String shape = pcodeValueWireShape(
-                call.getInput(slot),
-                tempWireShapes,
-                tempNativeTypes);
-            if (!Objects.equals(expectedShape, shape)) {
+        int argumentCount = provenCallArgumentCount(call, helper);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            LinkedHashSet<PcodeStorage> candidates = new LinkedHashSet<>();
+            PcodeStorage argument = provenCallArgumentStorage(
+                caller,
+                call,
+                helper,
+                slot);
+            if (argument != null) {
+                candidates.add(argument);
+            }
+            if (slot < call.getNumInputs()) {
+                PcodeStorage direct = pcodeStorageExpression(call.getInput(slot));
+                PcodeStorage loaded = pcodeLoadedStorageExpression(call.getInput(slot));
+                PcodeByteSpan value = pcodeByteSpan(
+                    call.getInput(slot),
+                    new LinkedHashSet<>(),
+                    0);
+                if (direct != null) {
+                    candidates.add(direct);
+                }
+                if (loaded != null) {
+                    candidates.add(loaded);
+                }
+                if (value != null) {
+                    candidates.add(value.storage());
+                }
+            }
+            boolean produced = false;
+            for (PcodeStorage candidate : candidates) {
+                PcodeOpAST producer = uniqueUnmarshalCountProducer(
+                    high,
+                    operations,
+                    call,
+                    candidate);
+                WireShape evidence = producer == null
+                    ? null
+                    : directCallWireEvidence(producer);
+                if (evidence != null && Objects.equals(expectedShape, evidence.shape)) {
+                    produced = true;
+                    break;
+                }
+            }
+            if (!produced) {
                 continue;
             }
             if (selected != null) {
+                recordNestedTypeShapeReject(
+                    "interprocedural-collection-count-argument-ambiguous");
                 return null;
             }
             selected = slot;
         }
+        if (selected == null) {
+            recordNestedTypeShapeReject(
+                "interprocedural-collection-count-producer-unproven");
+            recordInterproceduralCollectionCountSample(
+                caller,
+                call,
+                helper,
+                high,
+                operations,
+                expectedShape);
+        }
         return selected;
+    }
+
+    private void recordInterproceduralCollectionCountSample(
+        Function caller,
+        PcodeOpAST call,
+        Function helper,
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        String expectedShape) {
+
+        if (interproceduralCollectionCountSamples.size() >= 32 || call == null) {
+            return;
+        }
+        JsonObject sample = new JsonObject();
+        NetworkSchemaJson.addAddress(
+            sample,
+            "caller",
+            caller == null ? null : caller.getEntryPoint(),
+            addressFormatter);
+        NetworkSchemaJson.addAddress(
+            sample,
+            "callsite",
+            call.getSeqnum().getTarget(),
+            addressFormatter);
+        NetworkSchemaJson.addAddress(
+            sample,
+            "target",
+            helper == null ? null : helper.getEntryPoint(),
+            addressFormatter);
+        NetworkSchemaJson.add(
+            sample,
+            "targetName",
+            helper == null ? null : fullFunctionName(helper));
+        sample.addProperty("expectedShape", expectedShape);
+
+        JsonArray arguments = new JsonArray();
+        int argumentCount = provenCallArgumentCount(call, helper);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            JsonObject argument = new JsonObject();
+            argument.addProperty("slot", slot);
+            JsonArray storages = new JsonArray();
+            addPcodeStorageDiagnostic(
+                storages,
+                "proven-abi",
+                provenCallArgumentStorage(caller, call, helper, slot));
+            if (slot < call.getNumInputs()) {
+                Varnode input = call.getInput(slot);
+                argument.addProperty("inputSize", input.getSize());
+                argument.addProperty("input", input.toString());
+                addPcodeStorageDiagnostic(
+                    storages,
+                    "direct",
+                    pcodeStorageExpression(input));
+                addPcodeStorageDiagnostic(
+                    storages,
+                    "loaded",
+                    pcodeLoadedStorageExpression(input));
+                PcodeByteSpan span = pcodeByteSpan(
+                    input,
+                    new LinkedHashSet<>(),
+                    0);
+                if (span != null) {
+                    JsonObject value = pcodeStorageDiagnostic(
+                        "ssa-byte-span",
+                        span.storage());
+                    value.addProperty("byteLength", span.byteLength());
+                    storages.add(value);
+                }
+            }
+            argument.add("storages", storages);
+            arguments.add(argument);
+        }
+        sample.add("arguments", arguments);
+
+        JsonArray producers = new JsonArray();
+        for (PcodeOpAST candidate : operations) {
+            if (candidate.getOpcode() != PcodeOp.CALL ||
+                !NetworkSchemaControlFlow.precedes(high, candidate, call)) {
+                continue;
+            }
+            WireShape evidence = directCallWireEvidence(candidate);
+            if (evidence == null || !Objects.equals(expectedShape, evidence.shape)) {
+                continue;
+            }
+            JsonObject producer = new JsonObject();
+            NetworkSchemaJson.addAddress(
+                producer,
+                "callsite",
+                candidate.getSeqnum().getTarget(),
+                addressFormatter);
+            Function target = pcodeCallTarget(candidate);
+            NetworkSchemaJson.addAddress(
+                producer,
+                "target",
+                target == null ? null : target.getEntryPoint(),
+                addressFormatter);
+            producer.addProperty("wireShape", evidence.shape);
+            JsonArray outputs = new JsonArray();
+            for (PcodeStorage output : scalarCallOutputStorages(candidate)) {
+                addPcodeStorageDiagnostic(outputs, "scalar-output", output);
+            }
+            producer.add("outputs", outputs);
+            producers.add(producer);
+        }
+        sample.add("producers", producers);
+        interproceduralCollectionCountSamples.add(sample);
+    }
+
+    private void addPcodeStorageDiagnostic(
+        JsonArray result,
+        String source,
+        PcodeStorage storage) {
+
+        if (result != null && storage != null) {
+            result.add(pcodeStorageDiagnostic(source, storage));
+        }
+    }
+
+    private JsonObject pcodeStorageDiagnostic(String source, PcodeStorage storage) {
+        JsonObject result = new JsonObject();
+        result.addProperty("source", source);
+        result.addProperty("base", storage.base);
+        result.addProperty("offset", storage.offset);
+        result.addProperty("expression", storage.expression());
+        return result;
     }
 
     private InterproceduralCollectionHelper interproceduralCollectionHelper(
@@ -101,10 +286,20 @@
         if (cached != null) {
             return cached.orElse(null);
         }
-        InterproceduralCollectionHelper recovered =
-            recoverInterproceduralCollectionHelper(helper, expectedCountParameter);
-        interproceduralCollectionHelperCache.put(key, Optional.ofNullable(recovered));
-        return recovered;
+        if (!interproceduralCollectionHelperActive.add(key)) {
+            recordNestedTypeShapeReject(
+                "interprocedural-collection-helper-call-cycle");
+            return null;
+        }
+        try {
+            InterproceduralCollectionHelper recovered =
+                recoverInterproceduralCollectionHelper(helper, expectedCountParameter);
+            interproceduralCollectionHelperCache.put(key, Optional.ofNullable(recovered));
+            return recovered;
+        }
+        finally {
+            interproceduralCollectionHelperActive.remove(key);
+        }
     }
 
     private InterproceduralCollectionHelper recoverInterproceduralCollectionHelper(
@@ -177,19 +372,24 @@
             }
             return null;
         }
-        ContainerLoopInduction induction = containerLoopInduction(loop);
-        if (induction == null) {
-            recordNestedTypeShapeReject(
-                "interprocedural-collection-buffer-loop-induction-unproven");
-            return null;
+        DynamicSequenceExtent extent = dynamicSequenceExtent(loop, operations);
+        if (extent == null) {
+            return interproceduralInsertedCollectionHelperFromLoop(
+                helper,
+                high,
+                loop,
+                operations,
+                bufferParameter,
+                parameterCount,
+                expectedCountParameter);
         }
-        if (induction.storageKind() != ContainerStorageKind.VECTOR ||
+        ContainerLoopInduction induction = containerLoopInduction(loop);
+        if (induction == null || induction.storageKind() != ContainerStorageKind.VECTOR ||
             induction.stride() == null || induction.stride() <= 0L) {
             recordNestedTypeShapeReject(
                 "interprocedural-collection-buffer-loop-not-affine-vector");
             return null;
         }
-        DynamicSequenceExtent extent = dynamicSequenceExtent(loop, operations);
         String ownerParameter = extent == null
             ? null
             : formalParameterBaseFromStorage(helper, extent.data());
@@ -238,8 +438,133 @@
                 ownerSlot,
                 countParameter,
                 bufferParameter,
+                ContainerStorageKind.VECTOR,
                 induction.stride(),
                 iteration.wireEvidence());
+    }
+
+    private InterproceduralCollectionHelper interproceduralInsertedCollectionHelperFromLoop(
+        Function helper,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        int bufferParameter,
+        int parameterCount,
+        int expectedCountParameter) {
+
+        if (expectedCountParameter < 1 || expectedCountParameter > parameterCount ||
+            expectedCountParameter == bufferParameter ||
+            !countParameterControlsLoop(high, loop, expectedCountParameter)) {
+            recordNestedTypeShapeReject(
+                "interprocedural-inserted-collection-count-bound-unproven");
+            return null;
+        }
+        CollectionElementSequence elementSequence = loopElementCodecs(
+            helper,
+            high,
+            loop,
+            operations);
+        if (elementSequence == null || elementSequence.codecs().isEmpty() ||
+            !strictlyOrderedCodecCalls(high, elementSequence.codecs())) {
+            recordNestedTypeShapeReject(
+                "interprocedural-inserted-collection-codec-order-unproven");
+            return null;
+        }
+        String ownerParameter = countedCollectionInsertionOutput(
+            helper,
+            high,
+            loop,
+            operations,
+            elementSequence.codecs());
+        if (ownerParameter == null || !ownerParameter.matches("param_\\d+")) {
+            recordNestedTypeShapeReject(
+                "interprocedural-inserted-collection-owner-unproven");
+            return null;
+        }
+        int ownerSlot = Integer.parseInt(ownerParameter.substring("param_".length()));
+        if (ownerSlot == expectedCountParameter || ownerSlot == bufferParameter) {
+            recordNestedTypeShapeReject(
+                "interprocedural-inserted-collection-parameter-alias");
+            return null;
+        }
+        WireShape wireEvidence = countedSequenceWireEvidence(elementSequence.codecs());
+        if (wireEvidence == null) {
+            recordNestedTypeShapeReject(
+                "interprocedural-inserted-collection-wire-shape-unproven");
+            return null;
+        }
+        return new InterproceduralCollectionHelper(
+            ownerSlot,
+            expectedCountParameter,
+            bufferParameter,
+            ContainerStorageKind.INDEX_MAP,
+            null,
+            wireEvidence);
+    }
+
+    private boolean countParameterControlsLoop(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        int countParameter) {
+
+        if (high == null || loop == null || countParameter < 1) {
+            return false;
+        }
+        PcodeStorage count = new PcodeStorage("param_" + countParameter, 0L);
+        var headerOperations = loop.header().getIterator();
+        while (headerOperations.hasNext()) {
+            PcodeOp operation = headerOperations.next();
+            if (!(operation instanceof PcodeOpAST induction) ||
+                induction.getOpcode() != PcodeOp.MULTIEQUAL ||
+                induction.getOutput() == null ||
+                !Objects.equals(inductionInitialConstant(induction), 0L) ||
+                !Objects.equals(affinePointerInductionStride(induction), 1L)) {
+                continue;
+            }
+            for (PcodeOpAST comparison : orderedPcodeOps(high)) {
+                if (!loop.contains(comparison) || !isOrderedIntegerComparison(comparison) ||
+                    comparison.getNumInputs() != 2) {
+                    continue;
+                }
+                int counterSlot = affineOffsetFromPhi(
+                    comparison.getInput(0),
+                    induction.getOutput(),
+                    new LinkedHashSet<>(),
+                    0) != null ? 0 :
+                    affineOffsetFromPhi(
+                        comparison.getInput(1),
+                        induction.getOutput(),
+                        new LinkedHashSet<>(),
+                        0) != null ? 1 : -1;
+                if (counterSlot < 0 || !pcodeNodeReferencesStorage(
+                        comparison.getInput(1 - counterSlot),
+                        count,
+                        new LinkedHashSet<>(),
+                        0)) {
+                    continue;
+                }
+                Long counterOffset = affineOffsetFromPhi(
+                    comparison.getInput(counterSlot),
+                    induction.getOutput(),
+                    new LinkedHashSet<>(),
+                    0);
+                PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(comparison);
+                PcodeOpAST branch = branchUsingComparison(block, comparison);
+                Boolean trueContinues = branchTrueContinuesLoop(branch, loop);
+                long expectedOffset = block == loop.header() ? 0L : 1L;
+                if (counterOffset == null || counterOffset != expectedOffset ||
+                    trueContinues == null) {
+                    continue;
+                }
+                if (comparison.getOpcode() == PcodeOp.INT_LESS && counterSlot == 0 &&
+                    trueContinues ||
+                    comparison.getOpcode() == PcodeOp.INT_NOTEQUAL && trueContinues ||
+                    comparison.getOpcode() == PcodeOp.INT_EQUAL && !trueContinues) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private boolean unmarshalCodecWritesSequenceElement(
@@ -312,7 +637,8 @@
         return left.ownerParameter() == right.ownerParameter() &&
             left.countParameter() == right.countParameter() &&
             left.readBufferParameter() == right.readBufferParameter() &&
-            left.elementStride() == right.elementStride() &&
+            left.storageKind() == right.storageKind() &&
+            Objects.equals(left.elementStride(), right.elementStride()) &&
             sameWireEvidence(left.wireEvidence(), right.wireEvidence());
     }
 

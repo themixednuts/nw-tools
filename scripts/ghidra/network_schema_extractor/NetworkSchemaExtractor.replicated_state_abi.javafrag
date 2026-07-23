@@ -8,7 +8,7 @@ import java.util.Comparator;
     private JsonObject replicatedStateAbiDiagnostics = new JsonObject();
 
     private void classifyReplicatedStateAbis(
-        Collection<RegistrationFunction> registrations) {
+        Collection<RegistrationFunction> registrations) throws CancelledException {
 
         LinkedHashMap<String, ReplicatedStateAbiSignature> signatures =
             new LinkedHashMap<>();
@@ -16,8 +16,18 @@ import java.util.Comparator;
         LinkedHashMap<RegistrationFunction, String> keysByRegistration =
             new LinkedHashMap<>();
         int candidateCount = 0;
+        startAnalysisWorklist("replicated-state-abi", registrations.size());
+        long heartbeat = System.nanoTime();
+        int completed = 0;
         for (RegistrationFunction registration : registrations) {
+            heartbeat = updateAnalysisWorklist(
+                "replicated-state-abi",
+                completed,
+                registrations.size(),
+                "registration=" + formatAddress(registration.function.getEntryPoint()),
+                heartbeat);
             ReplicatedStateAbiSignature signature = replicatedStateAbiSignature(registration);
+            completed++;
             if (signature == null) {
                 continue;
             }
@@ -41,6 +51,7 @@ import java.util.Comparator;
         int matchCount = 0;
         for (Map.Entry<RegistrationFunction, String> entry :
                 keysByRegistration.entrySet()) {
+            monitor.checkCancelled();
             String key = entry.getValue();
             ReplicatedStateAbiSignature signature = signatures.get(key);
             int cohortCount = counts.get(key);
@@ -55,6 +66,13 @@ import java.util.Comparator;
                     : "register-field-receiver+specialized-fragment-vtable-signature");
             matchCount++;
         }
+        updateAnalysisWorklist(
+            "replicated-state-abi",
+            completed,
+            registrations.size(),
+            "candidates=" + candidateCount,
+            heartbeat);
+        finishAnalysisWorklist("replicated-state-abi", registrations.size());
 
         JsonObject diagnostics = new JsonObject();
         diagnostics.addProperty("candidateCount", candidateCount);

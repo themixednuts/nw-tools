@@ -44,6 +44,7 @@ pub(super) fn message_generation_plans(
     context: &CodegenContext,
 ) -> Result<Vec<NetworkMessageGenerationPlanReport>, NetworkRustEmitError> {
     let wire_shape_sources = wire_shape_sources_by_handler_vtable(schema);
+    let serialize_types = serialize_types_by_type_id(schema);
     let message_types = schema
         .types
         .iter()
@@ -62,6 +63,7 @@ pub(super) fn message_generation_plans(
                     wire_shapes,
                     &wire_shape_sources,
                     value_type_candidates,
+                    &serialize_types,
                 )
             });
     if plans.was_cancelled() {
@@ -160,9 +162,19 @@ pub(super) fn message_generation_plan(
     wire_shapes: &BTreeMap<&str, &SchemaWireShape>,
     wire_shape_sources: &BTreeMap<&str, &str>,
     value_type_candidates: &BTreeMap<&str, Vec<NetworkNativeTypeInfoEvidence>>,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> NetworkMessageGenerationPlanReport {
-    let mut fields = network_type
-        .fields
+    let supports_unmarshal = network_type
+        .instance
+        .as_ref()
+        .and_then(|instance| instance.supports_unmarshal);
+    let native_fields =
+        if supports_unmarshal == Some(false) && !network_type.marshal_fields.is_empty() {
+            &network_type.marshal_fields
+        } else {
+            &network_type.fields
+        };
+    let mut fields = native_fields
         .iter()
         .map(|field| {
             message_field_shape_report(
@@ -170,6 +182,7 @@ pub(super) fn message_generation_plan(
                 wire_shapes,
                 wire_shape_sources,
                 value_type_candidates,
+                serialize_types,
                 network_type.name.as_deref(),
             )
         })
@@ -218,6 +231,15 @@ pub(super) fn message_generation_plan(
     NetworkMessageGenerationPlanReport {
         type_index: network_type.type_index,
         type_name: network_type.name.clone(),
+        analysis_status: network_type
+            .instance
+            .as_ref()
+            .and_then(|instance| instance.analysis_status),
+        empty_wire_proven: network_type
+            .instance
+            .as_ref()
+            .is_some_and(|instance| instance.empty_wire_proven),
+        supports_unmarshal,
         field_count,
         shaped_field_count,
         supported_field_count,

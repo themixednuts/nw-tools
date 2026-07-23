@@ -44,6 +44,8 @@ pub struct NetworkSchemaSummary {
     pub high_confidence_field_count: usize,
     #[serde(default)]
     pub message_unmarshal_field_count: usize,
+    #[serde(default)]
+    pub message_marshal_field_count: usize,
     pub type_index_evidence_count: usize,
     #[serde(default)]
     pub serialize_source_type_count: usize,
@@ -103,6 +105,8 @@ pub struct NetworkMessageSignatureMergeReport {
     pub ambiguous_message_count: usize,
     pub unmatched_message_count: usize,
     pub field_count_mismatch_count: usize,
+    #[serde(default)]
+    pub field_grouped_count: usize,
     pub field_index_mismatch_count: usize,
     pub field_name_filled_count: usize,
     pub field_name_conflict_count: usize,
@@ -215,8 +219,10 @@ pub struct NetworkType {
     pub registration_type_name: Option<String>,
     pub registration_hook: Option<NetworkRegistrationHook>,
     pub fields: Vec<NetworkField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marshal_fields: Vec<NetworkField>,
     #[serde(default, skip_serializing_if = "is_false")]
-    pub field_count_conflict: bool,
+    pub signature_field_count_conflict: bool,
     pub evidence: Vec<NetworkEvidence>,
 }
 
@@ -364,7 +370,9 @@ pub struct NetworkField {
     #[serde(default, skip_serializing_if = "is_false")]
     pub type_conflict: bool,
     #[serde(default, skip_serializing_if = "is_false")]
-    pub wire_conflict: bool,
+    pub signature_type_conflict: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub signature_wire_conflict: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wire_shape_source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -452,13 +460,7 @@ impl NetworkNestedTypeShape {
     }
 
     pub(crate) fn has_proven_anonymous_layout(&self) -> bool {
-        self.type_id.is_none()
-            && self.identity_proven != Some(true)
-            && self
-                .type_name
-                .as_deref()
-                .is_some_and(|name| !name.trim().is_empty())
-            && self.has_proven_layout()
+        self.type_id.is_none() && self.identity_proven != Some(true) && self.has_proven_layout()
     }
 }
 

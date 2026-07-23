@@ -48,8 +48,6 @@
                 function,
                 operation,
                 target,
-                tempNativeTypes,
-                tempWireShapes,
                 Collections.emptyMap());
             if (collection != null) {
                 PcodeOpAST count = uniqueUnmarshalCountProducer(
@@ -111,12 +109,11 @@
             }
             Function target = pcodeCallTarget(candidate);
             WireShape evidence = directCallWireEvidence(candidate);
-            String nativeType = unmarshalNativeTypeFromTarget(target);
-            PcodeStorage output = pcodeScalarUnmarshalOutputStorage(
-                candidate,
-                nativeType);
+            Set<PcodeStorage> outputs = scalarCallOutputStorages(candidate);
+            boolean matchingOutput = outputs.stream()
+                .anyMatch(countStorage::sameLocation);
             if (evidence == null || !"vlq-u32".equals(evidence.shape) ||
-                output == null || !countStorage.sameLocation(output)) {
+                !matchingOutput) {
                 continue;
             }
             if (selected != null) {

@@ -211,7 +211,8 @@ pub(super) fn network_field_from_message_signature(
             .map(NetworkWireShape::wire_string),
         wire_layout_source: signature.wire_shape.as_ref().map(|_| source.clone()),
         type_conflict: false,
-        wire_conflict: false,
+        signature_type_conflict: false,
+        signature_wire_conflict: false,
         wire_shape_source: signature.wire_shape.as_ref().map(|_| source),
         constructor_writes: Vec::new(),
         unmarshal_evidence: None,
@@ -221,6 +222,470 @@ pub(super) fn network_field_from_message_signature(
         confidence: NetworkConfidence::High,
         evidence,
     }
+}
+
+pub(super) fn merge_message_field_native_type(
+    field: &mut NetworkField,
+    signature: &NetworkMessageFieldSignature,
+    report: &mut NetworkMessageSignatureMergeReport,
+) {
+    let Some(expected) = signature.native_type.as_deref() else {
+        return;
+    };
+    let Some(existing) = field.native_type.as_deref() else {
+        field.native_type = Some(expected.to_owned());
+        report.native_type_filled_count += 1;
+        return;
+    };
+
+    if equivalent_native_type(existing, expected) {
+        field.native_type = Some(expected.to_owned());
+        return;
+    }
+
+    if is_wire_projection_native_type(field)
+        && signature.wire_shape.as_ref() == field.wire_shape.as_ref()
+    {
+        field.native_type = Some(expected.to_owned());
+        report.native_type_filled_count += 1;
+        return;
+    }
+
+    field.signature_type_conflict = true;
+    report.native_type_conflict_count += 1;
+}
+
+#[derive(Clone)]
+struct MessageFieldProjection {
+    shapes: Vec<NetworkWireShape>,
+    wire_shape: NetworkWireShape,
+    source: &'static str,
+}
+
+#[derive(Clone)]
+struct MessageFieldGroup {
+    start: usize,
+    end: usize,
+    projection: Option<MessageFieldProjection>,
+}
+
+#[derive(Clone)]
+enum MachineWireToken {
+    Shape {
+        field_index: usize,
+        shape: NetworkWireShape,
+    },
+    Opaque {
+        field_index: usize,
+    },
+}
+
+impl MachineWireToken {
+    fn field_index(&self) -> usize {
+        match self {
+            Self::Shape { field_index, .. } | Self::Opaque { field_index } => *field_index,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MachineFieldSpan {
+    start: usize,
+    end: usize,
+}
+
+pub(super) fn group_message_fields_by_signature(
+    fields: &[NetworkField],
+    signatures: &[NetworkMessageFieldSignature],
+    serialize_types: &[NetworkSerializeType],
+) -> Option<(Vec<NetworkField>, usize)> {
+    if fields.is_empty() || signatures.is_empty() {
+        return None;
+    }
+
+    let projections = signatures
+        .iter()
+        .map(|signature| message_field_projection(signature, serialize_types))
+        .collect::<Vec<_>>();
+    let (machine_tokens, field_spans) = machine_wire_tokens(fields)?;
+    let groups = match_message_field_sequence(&machine_tokens, &field_spans, &projections)?;
+    let projected_count = groups
+        .iter()
+        .zip(signatures)
+        .filter(|(group, signature)| {
+            message_field_requires_projection(
+                fields,
+                &machine_tokens,
+                &field_spans,
+                group,
+                signature,
+            )
+        })
+        .count();
+    if fields.len() == signatures.len() && projected_count == 0 {
+        return None;
+    }
+
+    let grouped_fields = groups
+        .iter()
+        .zip(signatures)
+        .enumerate()
+        .map(|(index, (group, signature))| {
+            grouped_message_field(
+                fields,
+                &machine_tokens,
+                &field_spans,
+                group,
+                signature,
+                index,
+            )
+        })
+        .collect();
+    let grouped_count = groups
+        .iter()
+        .filter(|group| {
+            let source_fields = group_source_fields(&machine_tokens, group);
+            let [source_field_index] = source_fields.as_slice() else {
+                return true;
+            };
+            let span = field_spans[*source_field_index];
+            span.start != group.start || span.end != group.end
+        })
+        .count();
+    Some((grouped_fields, grouped_count))
+}
+
+fn message_field_projection(
+    signature: &NetworkMessageFieldSignature,
+    serialize_types: &[NetworkSerializeType],
+) -> Option<MessageFieldProjection> {
+    if let Some(wire_shape) = signature.wire_shape.as_ref() {
+        return Some(MessageFieldProjection {
+            shapes: canonical_wire_atoms(wire_shape),
+            wire_shape: wire_shape.clone(),
+            source: "message-signature-wire-layout",
+        });
+    }
+
+    let native_type = signature.native_type.as_deref()?;
+    let exact = serialize_types
+        .iter()
+        .filter(|serialize| serialize.name == native_type)
+        .collect::<Vec<_>>();
+    let serialize = match exact.as_slice() {
+        [serialize] => *serialize,
+        [] => {
+            let leaf = type_leaf_name(native_type);
+            let matches = serialize_types
+                .iter()
+                .filter(|serialize| type_leaf_name(&serialize.name) == leaf)
+                .collect::<Vec<_>>();
+            let [serialize] = matches.as_slice() else {
+                return None;
+            };
+            *serialize
+        }
+        _ => return None,
+    };
+    (!serialize.wire_shapes.is_empty()).then(|| {
+        let shapes = serialize
+            .wire_shapes
+            .iter()
+            .copied()
+            .map(NetworkWireShape::from)
+            .collect::<Vec<_>>();
+        MessageFieldProjection {
+            wire_shape: composite_wire_shape(&shapes),
+            shapes: shapes.iter().flat_map(canonical_wire_atoms).collect(),
+            source: "serialize-wire-layout",
+        }
+    })
+}
+
+fn machine_wire_tokens(
+    fields: &[NetworkField],
+) -> Option<(Vec<MachineWireToken>, Vec<MachineFieldSpan>)> {
+    let mut tokens = Vec::new();
+    let mut spans = Vec::with_capacity(fields.len());
+    for (field_index, field) in fields.iter().enumerate() {
+        let start = tokens.len();
+        if let Some(shapes) = message_machine_field_shapes(field) {
+            tokens.extend(
+                shapes
+                    .into_iter()
+                    .map(|shape| MachineWireToken::Shape { field_index, shape }),
+            );
+        } else {
+            tokens.push(MachineWireToken::Opaque { field_index });
+        }
+        spans.push(MachineFieldSpan {
+            start,
+            end: tokens.len(),
+        });
+    }
+    (!tokens.is_empty()).then_some((tokens, spans))
+}
+
+fn message_machine_field_shapes(field: &NetworkField) -> Option<Vec<NetworkWireShape>> {
+    let direct = field.wire_shape.clone().or_else(|| {
+        field
+            .wire_layout
+            .as_deref()
+            .and_then(parse_network_wire_shape)
+    });
+    if let Some(shape) = direct {
+        return Some(canonical_wire_atoms(&shape));
+    }
+
+    let nested = field.nested_type_shape.as_ref()?;
+    if !nested.has_proven_layout() {
+        return None;
+    }
+    let mut members = nested.members.iter().collect::<Vec<_>>();
+    members.sort_by_key(|member| member.wire_ordinal);
+    let ordered = members
+        .iter()
+        .enumerate()
+        .all(|(index, member)| member.wire_ordinal == u32::try_from(index).ok());
+    if !ordered {
+        return None;
+    }
+
+    let shapes = members
+        .into_iter()
+        .map(|member| {
+            member
+                .wire_shape
+                .as_deref()
+                .and_then(parse_network_wire_shape)
+                .or_else(|| {
+                    member
+                        .wire_layout
+                        .as_deref()
+                        .and_then(parse_network_wire_shape)
+                })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(shapes.iter().flat_map(canonical_wire_atoms).collect())
+}
+
+fn canonical_wire_atoms(shape: &NetworkWireShape) -> Vec<NetworkWireShape> {
+    match shape {
+        NetworkWireShape::Composite(members) => {
+            members.iter().flat_map(canonical_wire_atoms).collect()
+        }
+        NetworkWireShape::DefaultOmitted(_) | NetworkWireShape::BooleanChoice(_) => {
+            vec![shape.clone()]
+        }
+        NetworkWireShape::ActorRef => vec![
+            NetworkWireShape::U32,
+            NetworkWireShape::FixedBytes(16),
+            NetworkWireShape::FixedBytes(16),
+        ],
+        shape => vec![shape.clone()],
+    }
+}
+
+fn composite_wire_shape(shapes: &[NetworkWireShape]) -> NetworkWireShape {
+    match shapes {
+        [shape] => shape.clone(),
+        shapes => NetworkWireShape::Composite(shapes.to_vec()),
+    }
+}
+
+fn match_message_field_sequence(
+    machine_tokens: &[MachineWireToken],
+    field_spans: &[MachineFieldSpan],
+    projections: &[Option<MessageFieldProjection>],
+) -> Option<Vec<MessageFieldGroup>> {
+    let mut groups = Vec::with_capacity(projections.len());
+    let mut token_index = 0usize;
+    for projection in projections {
+        let start = token_index;
+        if let Some(projection) = projection {
+            let end = start.checked_add(projection.shapes.len())?;
+            let tokens = machine_tokens.get(start..end)?;
+            let matches = tokens.iter().zip(&projection.shapes).all(|(token, expected)| {
+                matches!(token, MachineWireToken::Shape { shape, .. } if shape == expected)
+            });
+            if !matches {
+                return None;
+            }
+            token_index = end;
+            groups.push(MessageFieldGroup {
+                start,
+                end,
+                projection: Some(projection.clone()),
+            });
+            continue;
+        }
+
+        let field_index = machine_tokens.get(start)?.field_index();
+        let span = *field_spans.get(field_index)?;
+        if span.start != start {
+            return None;
+        }
+        token_index = span.end;
+        groups.push(MessageFieldGroup {
+            start,
+            end: span.end,
+            projection: None,
+        });
+    }
+    (token_index == machine_tokens.len()).then_some(groups)
+}
+
+fn message_field_requires_projection(
+    fields: &[NetworkField],
+    machine_tokens: &[MachineWireToken],
+    field_spans: &[MachineFieldSpan],
+    group: &MessageFieldGroup,
+    signature: &NetworkMessageFieldSignature,
+) -> bool {
+    let source_fields = group_source_fields(machine_tokens, group);
+    let [source_field_index] = source_fields.as_slice() else {
+        return true;
+    };
+    let Some(span) = field_spans.get(*source_field_index) else {
+        return true;
+    };
+    if span.start != group.start || span.end != group.end {
+        return true;
+    }
+    let Some(projection) = group.projection.as_ref() else {
+        return false;
+    };
+    let field = &fields[*source_field_index];
+    field.wire_shape.as_ref() != Some(&projection.wire_shape)
+        || matches!(
+            (field.native_type.as_deref(), signature.native_type.as_deref()),
+            (Some(existing), Some(expected)) if !equivalent_native_type(existing, expected)
+        )
+}
+
+fn grouped_message_field(
+    fields: &[NetworkField],
+    machine_tokens: &[MachineWireToken],
+    field_spans: &[MachineFieldSpan],
+    group: &MessageFieldGroup,
+    signature: &NetworkMessageFieldSignature,
+    fallback_index: usize,
+) -> NetworkField {
+    let source_fields = group_source_fields(machine_tokens, group);
+    let mut field = fields[source_fields[0]].clone();
+    field.index = signature
+        .index
+        .or_else(|| u32::try_from(fallback_index).ok());
+    if !message_field_requires_projection(fields, machine_tokens, field_spans, group, signature) {
+        return field;
+    }
+
+    for source_field in source_fields.iter().skip(1).map(|index| &fields[*index]) {
+        field
+            .constructor_writes
+            .extend(source_field.constructor_writes.iter().cloned());
+        field.evidence.extend(source_field.evidence.iter().cloned());
+    }
+    field.name_address = None;
+    field.native_type = None;
+    field.source_type_name = None;
+    field.source_type_id = None;
+    field.source_type_id_source = None;
+    field.source_type_identity_proven = false;
+    field.rust_type = None;
+    field.storage_expression = None;
+    field.storage_base = None;
+    field.storage_base_offset = None;
+    field.storage_offset = None;
+    field.raw_byte_length = None;
+    field.wire_shape_raw = None;
+    field.nested_type_shape = None;
+    field.serialize = None;
+    field.unmarshal_evidence = None;
+    field.type_conflict = false;
+    field.signature_type_conflict = false;
+    field.signature_wire_conflict = false;
+
+    if let Some(projection) = group.projection.as_ref() {
+        let wire_shape = projection.wire_shape.clone();
+        let wire_layout = wire_shape.wire_string();
+        field.wire_shape = Some(wire_shape);
+        field.wire_layout = Some(wire_layout.clone());
+        field.wire_shape_source = Some(projection.source.to_owned());
+        field.wire_layout_source = Some(projection.source.to_owned());
+        field.evidence.push(NetworkEvidence {
+            kind: NetworkEvidenceKind::MessageSource,
+            source: "message-signature+ghidra-field-sequence".to_owned(),
+            address: None,
+            detail: Some(wire_layout),
+            confidence: NetworkConfidence::Exact,
+        });
+    }
+    field
+}
+
+fn group_source_fields(
+    machine_tokens: &[MachineWireToken],
+    group: &MessageFieldGroup,
+) -> Vec<usize> {
+    let mut fields = Vec::new();
+    for field_index in machine_tokens[group.start..group.end]
+        .iter()
+        .map(MachineWireToken::field_index)
+    {
+        if fields.last() != Some(&field_index) {
+            fields.push(field_index);
+        }
+    }
+    fields
+}
+
+fn equivalent_native_type(left: &str, right: &str) -> bool {
+    canonical_native_type(left) == canonical_native_type(right)
+}
+
+fn canonical_native_type(value: &str) -> &str {
+    match value.trim() {
+        "AZ::u8" | "uint8_t" | "unsigned char" => "u8",
+        "AZ::u16" | "uint16_t" | "unsigned short" => "u16",
+        "AZ::u32" | "uint32_t" | "unsigned int" => "u32",
+        "AZ::u64" | "uint64_t" | "unsigned long long" => "u64",
+        "AZ::s8" | "int8_t" | "signed char" => "i8",
+        "AZ::s16" | "int16_t" | "short" => "i16",
+        "AZ::s32" | "int32_t" | "int" => "i32",
+        "AZ::s64" | "int64_t" | "long long" => "i64",
+        other => other,
+    }
+}
+
+fn is_wire_projection_native_type(field: &NetworkField) -> bool {
+    if field.source_type_name.is_some()
+        || field.source_type_id.is_some()
+        || field.nested_type_shape.is_some()
+        || field.serialize.is_some()
+    {
+        return false;
+    }
+    let Some(native_type) = field.native_type.as_deref() else {
+        return false;
+    };
+    let Some(wire_shape) = field.wire_shape.as_ref() else {
+        return false;
+    };
+    let projected_shape = match canonical_native_type(native_type) {
+        "bool" => NetworkWireShape::Bool,
+        "u8" | "i8" => NetworkWireShape::U8,
+        "u16" | "i16" => NetworkWireShape::U16,
+        "u32" | "i32" => NetworkWireShape::U32,
+        "u64" | "i64" => NetworkWireShape::U64,
+        "f32" | "float" => NetworkWireShape::F32,
+        "f64" | "double" => NetworkWireShape::F64,
+        _ => return false,
+    };
+    projected_shape == *wire_shape
+        && field.wire_shape_source.as_deref().is_some_and(|source| {
+            source.starts_with("message-unmarshal-") || source.starts_with("unmarshal-codec-")
+        })
 }
 
 pub(super) fn field_override_type_candidates(

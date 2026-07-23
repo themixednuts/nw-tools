@@ -25,7 +25,8 @@
         }
         PcodeOpAST selected = null;
         for (PcodeOpAST operation : operations) {
-            if (operation.getOpcode() != PcodeOp.INT_NOTEQUAL ||
+            if ((operation.getOpcode() != PcodeOp.INT_NOTEQUAL &&
+                    operation.getOpcode() != PcodeOp.INT_EQUAL) ||
                 operation.getOutput() == null ||
                 operation.getOutput().getSize() != Byte.BYTES ||
                 !NetworkSchemaControlFlow.precedes(high, guard, operation) ||

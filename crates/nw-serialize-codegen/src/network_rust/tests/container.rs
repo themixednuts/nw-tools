@@ -162,7 +162,12 @@ fn unreflected_rtti_map_value_emits_named_support_struct() {
     assert!(
         output
             .source
-            .contains("impl ::nw_network::serialize::Marshaler for GlobalMapData")
+            .contains("impl ::nw_network::serialize::Marshal for GlobalMapData")
+    );
+    assert!(
+        output
+            .source
+            .contains("impl ::nw_network::serialize::Unmarshal for GlobalMapData")
     );
 }
 

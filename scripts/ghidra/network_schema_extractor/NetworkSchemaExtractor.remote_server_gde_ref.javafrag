@@ -232,117 +232,6 @@
         return true;
     }
 
-    private PcodeByteSpan pcodeByteSpan(
-        Varnode value,
-        Set<String> active,
-        int depth) {
-
-        if (value == null || value.getSize() <= 0 || depth > 48 ||
-            !active.add(pcodeSsaNodeKey(value))) {
-            return null;
-        }
-        try {
-            PcodeOp definition = value.getDef();
-            if (definition == null) {
-                PcodeStorage storage = pcodeStorageExpression(value);
-                return storage == null ? null : new PcodeByteSpan(storage, value.getSize());
-            }
-            return switch (definition.getOpcode()) {
-                case PcodeOp.LOAD -> {
-                    PcodeStorage storage = definition.getNumInputs() < 2
-                        ? null
-                        : pcodeStorageExpression(definition.getInput(1));
-                    yield storage == null
-                        ? null
-                        : new PcodeByteSpan(storage, value.getSize());
-                }
-                case PcodeOp.COPY, PcodeOp.CAST -> pcodeByteSpan(
-                    definition.getInput(0), active, depth + 1);
-                case PcodeOp.INDIRECT -> {
-                    PcodeStorage storage = pcodeStorageExpression(value);
-                    yield storage == null
-                        ? null
-                        : new PcodeByteSpan(storage, value.getSize());
-                }
-                case PcodeOp.SUBPIECE -> subpieceByteSpan(definition, active, depth + 1);
-                case PcodeOp.PIECE -> pieceByteSpan(definition, active, depth + 1);
-                case PcodeOp.MULTIEQUAL -> phiByteSpan(definition, active, depth + 1);
-                default -> null;
-            };
-        }
-        finally {
-            active.remove(pcodeSsaNodeKey(value));
-        }
-    }
-
-    private PcodeByteSpan subpieceByteSpan(
-        PcodeOp definition,
-        Set<String> active,
-        int depth) {
-
-        if (definition.getNumInputs() < 2 || !definition.getInput(1).isConstant()) {
-            return null;
-        }
-        PcodeByteSpan source = pcodeByteSpan(
-            definition.getInput(0),
-            new LinkedHashSet<>(active),
-            depth);
-        long dropped = definition.getInput(1).getOffset();
-        int outputSize = definition.getOutput() == null
-            ? 0
-            : definition.getOutput().getSize();
-        if (source == null || dropped > source.byteLength() || outputSize <= 0 ||
-            outputSize > source.byteLength() - dropped) {
-            return null;
-        }
-        return new PcodeByteSpan(source.storage().plus(dropped), outputSize);
-    }
-
-    private PcodeByteSpan pieceByteSpan(
-        PcodeOp definition,
-        Set<String> active,
-        int depth) {
-
-        if (definition.getNumInputs() != 2) {
-            return null;
-        }
-        PcodeByteSpan high = pcodeByteSpan(
-            definition.getInput(0),
-            new LinkedHashSet<>(active),
-            depth);
-        PcodeByteSpan low = pcodeByteSpan(
-            definition.getInput(1),
-            new LinkedHashSet<>(active),
-            depth);
-        if (high == null || low == null ||
-            !high.storage().base.equals(low.storage().base) ||
-            high.storage().offset != low.storage().offset + low.byteLength()) {
-            return null;
-        }
-        return new PcodeByteSpan(
-            low.storage(),
-            Math.addExact(low.byteLength(), high.byteLength()));
-    }
-
-    private PcodeByteSpan phiByteSpan(
-        PcodeOp definition,
-        Set<String> active,
-        int depth) {
-
-        PcodeByteSpan selected = null;
-        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
-            PcodeByteSpan candidate = pcodeByteSpan(
-                definition.getInput(slot),
-                new LinkedHashSet<>(active),
-                depth);
-            if (candidate == null || selected != null && !selected.same(candidate)) {
-                return null;
-            }
-            selected = candidate;
-        }
-        return selected;
-    }
-
     private boolean pcodeStorageIs(Varnode value, String base, long offset) {
         PcodeStorage storage = pcodeStorageExpression(value);
         return storage != null && storage.base.equals(base) && storage.offset == offset;
@@ -353,11 +242,5 @@
         return actual != null && actual == expected;
     }
 
-    private record PcodeByteSpan(PcodeStorage storage, int byteLength) {
-        boolean same(PcodeByteSpan other) {
-            return other != null && byteLength == other.byteLength &&
-                storage.sameLocation(other.storage);
-        }
-    }
     private static final String REMOTE_SERVER_GDE_REF_TYPE_ID =
         "17207DAC-730B-4793-B975-23591A950260";

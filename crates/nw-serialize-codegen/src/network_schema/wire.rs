@@ -119,6 +119,12 @@ pub struct NetworkReplicatedContainerWireShape {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkBooleanChoiceWireShape {
+    pub false_value: Box<NetworkWireShape>,
+    pub true_value: Box<NetworkWireShape>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkWireShape {
     Bool,
     U8,
@@ -159,6 +165,11 @@ pub enum NetworkWireShape {
     String,
     Composite(Vec<Self>),
     Optional(Box<Self>),
+    DefaultOmitted(Vec<Self>),
+    BooleanChoice(NetworkBooleanChoiceWireShape),
+    Sequence(Box<Self>),
+    Set(Box<Self>),
+    Map { key: Box<Self>, value: Box<Self> },
     ReplicatedContainer(NetworkReplicatedContainerWireShape),
     FixedSequence(NetworkFixedSequenceWireShape),
 }
@@ -316,6 +327,11 @@ impl NetworkWireShape {
             | Self::PackedPosition(_)
             | Self::Composite(_)
             | Self::Optional(_)
+            | Self::DefaultOmitted(_)
+            | Self::BooleanChoice(_)
+            | Self::Sequence(_)
+            | Self::Set(_)
+            | Self::Map { .. }
             | Self::ReplicatedContainer(_)
             | Self::FixedSequence(_) => None,
             Self::String => Some("string"),
@@ -337,6 +353,24 @@ impl NetworkWireShape {
                         .join(",")
                 ),
                 Self::Optional(value) => format!("optional<{}>", value.wire_string()),
+                Self::DefaultOmitted(members) => format!(
+                    "default-omitted<{}>",
+                    members
+                        .iter()
+                        .map(Self::wire_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                Self::BooleanChoice(choice) => format!(
+                    "boolean-choice<{},{}>",
+                    choice.false_value.wire_string(),
+                    choice.true_value.wire_string()
+                ),
+                Self::Sequence(value) => format!("vec<{}>", value.wire_string()),
+                Self::Set(value) => format!("set<{}>", value.wire_string()),
+                Self::Map { key, value } => {
+                    format!("map<{},{}>", key.wire_string(), value.wire_string())
+                }
                 Self::ReplicatedContainer(container) => format!(
                     "replicated-container<{},{}>",
                     container.key.wire_string(),
@@ -377,6 +411,28 @@ impl Serialize for NetworkWireShape {
             Self::Optional(value) => {
                 serializer.serialize_str(&format!("optional<{}>", value.wire_string()))
             }
+            Self::DefaultOmitted(members) => serializer.serialize_str(&format!(
+                "default-omitted<{}>",
+                members
+                    .iter()
+                    .map(Self::wire_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            Self::BooleanChoice(choice) => serializer.serialize_str(&format!(
+                "boolean-choice<{},{}>",
+                choice.false_value.wire_string(),
+                choice.true_value.wire_string()
+            )),
+            Self::Sequence(value) => {
+                serializer.serialize_str(&format!("vec<{}>", value.wire_string()))
+            }
+            Self::Set(value) => serializer.serialize_str(&format!("set<{}>", value.wire_string())),
+            Self::Map { key, value } => serializer.serialize_str(&format!(
+                "map<{},{}>",
+                key.wire_string(),
+                value.wire_string()
+            )),
             Self::ReplicatedContainer(container) => serializer.serialize_str(&format!(
                 "replicated-container<{},{}>",
                 container.key.wire_string(),

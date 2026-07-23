@@ -1,0 +1,632 @@
+    private record BooleanBranch(
+        PcodeOpAST operation,
+        PcodeBlockBasic block,
+        PcodeBlockBasic falseSuccessor,
+        PcodeBlockBasic trueSuccessor) {
+    }
+
+    private record BooleanChoiceAnalysis(WireShape shape, String diagnostic) {
+    }
+
+    private BooleanChoiceAnalysis booleanChoiceUnmarshalShape(
+        Function function,
+        HighFunction high,
+        Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock,
+        UnmarshalTerminalFlow terminalFlow) {
+
+        if (function == null || high == null || terminalFlow.terminals().isEmpty()) {
+            return new BooleanChoiceAnalysis(null, "no-success-terminals");
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        CodecWireEvent tag = uniqueDominatingBooleanChoiceTag(
+            high,
+            operations,
+            eventsByBlock,
+            terminalFlow);
+        if (tag == null || tag.outputStorage() == null) {
+            return new BooleanChoiceAnalysis(null, "dominating-boolean-tag-not-unique");
+        }
+        BooleanBranch branch = normalizedBooleanBranch(
+            high,
+            operations,
+            tag);
+        if (branch == null) {
+            return new BooleanChoiceAnalysis(null, "tag-ssa-branch-not-unique");
+        }
+
+        NetworkSchemaBranchFlow.Result<CodecWireEvent> falsePaths =
+            NetworkSchemaBranchFlow.analyzeFrom(
+                branch.falseSuccessor(),
+                eventsByBlock,
+                terminalFlow.terminals(),
+                terminalFlow.excludedEdges(),
+                64);
+        NetworkSchemaBranchFlow.Result<CodecWireEvent> truePaths =
+            NetworkSchemaBranchFlow.analyzeFrom(
+                branch.trueSuccessor(),
+                eventsByBlock,
+                terminalFlow.terminals(),
+                terminalFlow.excludedEdges(),
+                64);
+        if (!falsePaths.complete() || !truePaths.complete()) {
+            return new BooleanChoiceAnalysis(
+                null,
+                "branch-flow:false=" + falsePaths.status() +
+                    ",true=" + truePaths.status());
+        }
+
+        String falseShape = branchPayloadShape(
+            high,
+            operations,
+            falsePaths.paths());
+        String trueShape = branchPayloadShape(
+            high,
+            operations,
+            truePaths.paths());
+        if (falseShape == null || trueShape == null) {
+            return new BooleanChoiceAnalysis(
+                null,
+                "branch-payload:false=" + Objects.toString(falseShape, "unresolved") +
+                    ",true=" + Objects.toString(trueShape, "unresolved") +
+                    ",false-paths=" + branchPathWireSummary(falsePaths.paths()) +
+                    ",true-paths=" + branchPathWireSummary(truePaths.paths()));
+        }
+        return new BooleanChoiceAnalysis(
+            WireShape.semantic(
+                "boolean-choice<" + falseShape + "," + trueShape + ">",
+                "unmarshal-pcode-boolean-branch+guarded-payloads"),
+            "complete");
+    }
+
+    private String branchPathWireSummary(
+        List<NetworkSchemaBranchFlow.Path<CodecWireEvent>> paths) {
+
+        if (paths == null) {
+            return "missing";
+        }
+        return paths.stream()
+            .limit(8)
+            .map(path -> path.events().stream()
+                .map(event -> event == null || event.wireEvidence() == null
+                    ? "missing"
+                    : firstNonEmpty(
+                        event.wireEvidence().shape,
+                        event.wireEvidence().layout))
+                .collect(Collectors.joining("+", "[", "]")))
+            .collect(Collectors.joining("|", "{", "}"));
+    }
+
+    private BooleanBranch normalizedBooleanBranch(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        CodecWireEvent event) {
+
+        if (high == null || operations == null || event == null ||
+            event.callsite() == null || event.outputStorage() == null) {
+            return null;
+        }
+        PcodeOpAST readCall = pcodeCallAt(high, event.callsite());
+        RawPcodeWrite rawRead = readCall == null
+            ? null
+            : pcodeReadRawWrite(readCall, pcodeCallTarget(readCall));
+        PcodeOpAST normalization = boundedNormalizedBooleanOperation(
+            high,
+            operations,
+            readCall,
+            rawRead);
+        PcodeOpAST branch = normalization == null
+            ? null
+            : conditionalBranchForNormalizedBoolean(
+                high,
+                normalization,
+                operations);
+        if (branch == null || branch.getNumInputs() < 2) {
+            return null;
+        }
+        Boolean polarity = booleanValuePolarity(
+            branch.getInput(1),
+            normalization.getOutput(),
+            new HashSet<>());
+        if (normalization.getOpcode() == PcodeOp.INT_EQUAL) {
+            polarity = invertBoolean(polarity);
+        }
+        return polarity == null ? null : booleanBranch(branch, polarity);
+    }
+
+    private PcodeOpAST conditionalBranchForNormalizedBoolean(
+        HighFunction high,
+        PcodeOpAST normalization,
+        List<PcodeOpAST> operations) {
+
+        if (high == null || normalization == null ||
+            normalization.getOutput() == null || operations == null) {
+            return null;
+        }
+        ArrayList<PcodeOpAST> candidates = new ArrayList<>();
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CBRANCH ||
+                operation.getNumInputs() < 2 ||
+                !NetworkSchemaControlFlow.precedes(
+                    high,
+                    normalization,
+                    operation) ||
+                !pcodeNodeDependsOn(
+                    operation.getInput(1),
+                    normalization.getOutput(),
+                    new LinkedHashSet<>(),
+                    0)) {
+                continue;
+            }
+            candidates.add(operation);
+        }
+        if (candidates.size() == 1) {
+            return candidates.get(0);
+        }
+        PcodeOpAST selected = null;
+        for (PcodeOpAST candidate : candidates) {
+            PcodeBlockBasic candidateBlock =
+                NetworkSchemaControlFlow.parentBlock(candidate);
+            if (candidateBlock == null || candidates.stream().anyMatch(other -> {
+                    PcodeBlockBasic otherBlock =
+                        NetworkSchemaControlFlow.parentBlock(other);
+                    return other != candidate &&
+                        (otherBlock == null || candidateBlock == otherBlock ||
+                            !NetworkSchemaControlFlow.dominates(
+                                high,
+                                candidateBlock,
+                                otherBlock));
+                })) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Boolean booleanValuePolarity(
+        Varnode value,
+        Varnode expected,
+        Set<Varnode> visited) {
+
+        if (value == null || expected == null || !visited.add(value)) {
+            return null;
+        }
+        if (sameVarnodeIdentity(value, expected)) {
+            return true;
+        }
+        PcodeOp definition = value.getDef();
+        if (definition == null) {
+            return null;
+        }
+        return switch (definition.getOpcode()) {
+            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.SUBPIECE ->
+                definition.getNumInputs() == 0
+                    ? null
+                    : booleanValuePolarity(
+                        definition.getInput(0),
+                        expected,
+                        visited);
+            case PcodeOp.INDIRECT -> null;
+            case PcodeOp.BOOL_NEGATE -> invertBoolean(
+                definition.getNumInputs() == 0
+                    ? null
+                    : booleanValuePolarity(
+                        definition.getInput(0),
+                        expected,
+                        visited));
+            case PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL ->
+                zeroComparisonValuePolarity(definition, expected, visited);
+            case PcodeOp.MULTIEQUAL ->
+                mergedBooleanValuePolarity(definition, expected, visited);
+            default -> null;
+        };
+    }
+
+    private Boolean zeroComparisonValuePolarity(
+        PcodeOp comparison,
+        Varnode expected,
+        Set<Varnode> visited) {
+
+        if (comparison.getNumInputs() != 2) {
+            return null;
+        }
+        Long first = NetworkSchemaIntegerEvaluator.evaluate(comparison.getInput(0));
+        Long second = NetworkSchemaIntegerEvaluator.evaluate(comparison.getInput(1));
+        int valueSlot = first != null && first == 0L
+            ? 1
+            : second != null && second == 0L ? 0 : -1;
+        if (valueSlot < 0) {
+            return null;
+        }
+        Boolean input = booleanValuePolarity(
+            comparison.getInput(valueSlot),
+            expected,
+            visited);
+        return comparison.getOpcode() == PcodeOp.INT_EQUAL
+            ? invertBoolean(input)
+            : input;
+    }
+
+    private Boolean mergedBooleanValuePolarity(
+        PcodeOp phi,
+        Varnode expected,
+        Set<Varnode> visited) {
+
+        Boolean selected = null;
+        for (int index = 0; index < phi.getNumInputs(); index++) {
+            Boolean candidate = booleanValuePolarity(
+                phi.getInput(index),
+                expected,
+                new HashSet<>(visited));
+            if (candidate == null ||
+                selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private CodecWireEvent uniqueDominatingBooleanChoiceTag(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock,
+        UnmarshalTerminalFlow terminalFlow) {
+
+        if (high == null || operations == null || eventsByBlock == null || terminalFlow == null ||
+            terminalFlow.mandatoryBlocks().isEmpty()) {
+            return null;
+        }
+        CodecWireEvent selected = null;
+        for (Map.Entry<PcodeBlockBasic, List<CodecWireEvent>> entry : eventsByBlock.entrySet()) {
+            for (CodecWireEvent event : entry.getValue()) {
+                if (event == null || event.wireEvidence() == null ||
+                    event.outputStorage() == null ||
+                    !terminalFlow.mandatoryBlocks().contains(entry.getKey()) ||
+                    !Integer.valueOf(1).equals(
+                        wireShapeByteWidth(event.wireEvidence().layout)) ||
+                    normalizedBooleanBranch(high, operations, event) == null) {
+                    continue;
+                }
+                if (selected != null && !selected.callsite().equals(event.callsite())) {
+                    return null;
+                }
+                selected = event;
+            }
+        }
+        return selected;
+    }
+
+    private BooleanBranch uniqueBooleanBranch(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeStorage conditionStorage,
+        Address after) {
+
+        BooleanBranch selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CBRANCH || operation.getNumInputs() < 2 ||
+                after != null && operation.getSeqnum().getTarget().compareTo(after) <= 0) {
+                continue;
+            }
+            Boolean polarity = booleanConditionPolarity(
+                operation.getInput(1),
+                conditionStorage,
+                new HashSet<>());
+            if (polarity == null) {
+                continue;
+            }
+            BooleanBranch candidate = booleanBranch(operation, polarity);
+            if (candidate == null) {
+                return null;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private BooleanBranch booleanBranch(
+        PcodeOpAST operation,
+        boolean polarity) {
+
+        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+        PcodeBlockBasic conditionTrue = branchConditionTrueSuccessor(operation, block);
+        PcodeBlockBasic conditionFalse = branchConditionFalseSuccessor(operation, block);
+        if (conditionTrue == null || conditionFalse == null ||
+            conditionTrue == conditionFalse) {
+            return null;
+        }
+        return polarity
+            ? new BooleanBranch(operation, block, conditionFalse, conditionTrue)
+            : new BooleanBranch(operation, block, conditionTrue, conditionFalse);
+    }
+
+    private PcodeBlockBasic branchConditionTrueSuccessor(
+        PcodeOpAST branch,
+        PcodeBlockBasic block) {
+
+        if (branch == null || branch.getOpcode() != PcodeOp.CBRANCH || block == null ||
+            block.getOutSize() != 2 ||
+            !(block.getTrueOut() instanceof PcodeBlockBasic successor)) {
+            return null;
+        }
+        return successor;
+    }
+
+    private PcodeBlockBasic branchConditionFalseSuccessor(
+        PcodeOpAST branch,
+        PcodeBlockBasic block) {
+
+        if (branch == null || branch.getOpcode() != PcodeOp.CBRANCH || block == null ||
+            block.getOutSize() != 2 ||
+            !(block.getFalseOut() instanceof PcodeBlockBasic successor)) {
+            return null;
+        }
+        return successor;
+    }
+
+    private Boolean booleanConditionPolarity(
+        Varnode value,
+        PcodeStorage expected,
+        Set<Varnode> visited) {
+
+        if (value == null || expected == null || !visited.add(value)) {
+            return null;
+        }
+        PcodeStorage direct = pcodeStorageExpression(value);
+        PcodeStorage loaded = pcodeLoadedStorageExpression(value);
+        if (expected.sameLocation(direct) || expected.sameLocation(loaded)) {
+            return true;
+        }
+        PcodeOp definition = value.getDef();
+        if (definition == null) {
+            return null;
+        }
+        return switch (definition.getOpcode()) {
+            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.SUBPIECE ->
+                booleanConditionPolarity(definition.getInput(0), expected, visited);
+            case PcodeOp.INDIRECT -> null;
+            case PcodeOp.BOOL_NEGATE -> invertBoolean(
+                booleanConditionPolarity(definition.getInput(0), expected, visited));
+            case PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL ->
+                zeroComparisonPolarity(definition, expected, visited);
+            case PcodeOp.MULTIEQUAL -> mergedBooleanPolarity(definition, expected, visited);
+            default -> null;
+        };
+    }
+
+    private Boolean zeroComparisonPolarity(
+        PcodeOp comparison,
+        PcodeStorage expected,
+        Set<Varnode> visited) {
+
+        if (comparison.getNumInputs() != 2) {
+            return null;
+        }
+        int valueSlot;
+        if (NetworkSchemaIntegerEvaluator.evaluate(comparison.getInput(0)) != null &&
+            NetworkSchemaIntegerEvaluator.evaluate(comparison.getInput(0)) == 0L) {
+            valueSlot = 1;
+        }
+        else if (NetworkSchemaIntegerEvaluator.evaluate(comparison.getInput(1)) != null &&
+            NetworkSchemaIntegerEvaluator.evaluate(comparison.getInput(1)) == 0L) {
+            valueSlot = 0;
+        }
+        else {
+            return null;
+        }
+        Boolean input = booleanConditionPolarity(
+            comparison.getInput(valueSlot), expected, visited);
+        return comparison.getOpcode() == PcodeOp.INT_EQUAL ? invertBoolean(input) : input;
+    }
+
+    private Boolean mergedBooleanPolarity(
+        PcodeOp phi,
+        PcodeStorage expected,
+        Set<Varnode> visited) {
+
+        Boolean selected = null;
+        for (int index = 0; index < phi.getNumInputs(); index++) {
+            Boolean candidate = booleanConditionPolarity(
+                phi.getInput(index), expected, new HashSet<>(visited));
+            if (candidate == null || selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Boolean invertBoolean(Boolean value) {
+        return value == null ? null : !value;
+    }
+
+    private String uniqueBranchPayloadShape(
+        List<NetworkSchemaBranchFlow.Path<CodecWireEvent>> paths) {
+
+        String selected = null;
+        for (NetworkSchemaBranchFlow.Path<CodecWireEvent> path : paths) {
+            if (path.events().size() != 1) {
+                return null;
+            }
+            String shape = branchPayloadWireShape(path.events().get(0));
+            if (shape == null || selected != null && !selected.equals(shape)) {
+                return null;
+            }
+            selected = shape;
+        }
+        return selected;
+    }
+
+    private String branchPayloadShape(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        List<NetworkSchemaBranchFlow.Path<CodecWireEvent>> paths) {
+
+        String direct = uniqueBranchPayloadShape(paths);
+        return direct != null
+            ? direct
+            : defaultOmittedTupleShape(high, operations, paths);
+    }
+
+    private String branchPayloadWireShape(CodecWireEvent event) {
+        if (event == null || event.wireEvidence() == null) {
+            return null;
+        }
+        return firstNonEmpty(
+            event.wireEvidence().shape,
+            event.wireEvidence().layout);
+    }
+
+    private String defaultOmittedTupleShape(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        List<NetworkSchemaBranchFlow.Path<CodecWireEvent>> paths) {
+
+        if (paths.isEmpty()) {
+            return null;
+        }
+        List<CodecWireEvent> shortest = paths.stream()
+            .map(NetworkSchemaBranchFlow.Path::events)
+            .min(Comparator.comparingInt(List::size))
+            .orElse(List.of());
+        if (shortest.size() < 1 ||
+            shortest.stream().anyMatch(event ->
+                event.outputStorage() == null ||
+                    normalizedBooleanBranch(high, operations, event) == null)) {
+            return null;
+        }
+        int memberCount = shortest.size();
+        ArrayList<CodecWireEvent> payloads = distinctPayloadEvents(paths, memberCount);
+        if (payloads.size() != memberCount) {
+            return null;
+        }
+        payloads.sort(Comparator.comparing(CodecWireEvent::callsite));
+
+        for (NetworkSchemaBranchFlow.Path<CodecWireEvent> path : paths) {
+            if (path.events().size() < memberCount ||
+                !sameEventPrefix(shortest, path.events(), memberCount)) {
+                return null;
+            }
+            List<CodecWireEvent> suffix = path.events().subList(memberCount, path.events().size());
+            if (!isOrderedSubset(suffix, payloads)) {
+                return null;
+            }
+        }
+        if (!allPresenceCombinationsObserved(paths, memberCount, payloads)) {
+            return null;
+        }
+        for (int index = 0; index < memberCount; index++) {
+            if (!presenceGuardMatchesPayload(
+                    high,
+                    operations,
+                    shortest.get(index),
+                    payloads.get(index),
+                    paths)) {
+                return null;
+            }
+        }
+        return "default-omitted<" + payloads.stream()
+            .map(this::branchPayloadWireShape)
+            .collect(Collectors.joining(",")) + ">";
+    }
+
+    private ArrayList<CodecWireEvent> distinctPayloadEvents(
+        List<NetworkSchemaBranchFlow.Path<CodecWireEvent>> paths,
+        int prefixLength) {
+
+        LinkedHashMap<Address, CodecWireEvent> events = new LinkedHashMap<>();
+        for (NetworkSchemaBranchFlow.Path<CodecWireEvent> path : paths) {
+            for (CodecWireEvent event : path.events().subList(prefixLength, path.events().size())) {
+                if (event.callsite() == null || branchPayloadWireShape(event) == null) {
+                    return new ArrayList<>();
+                }
+                events.putIfAbsent(event.callsite(), event);
+            }
+        }
+        return new ArrayList<>(events.values());
+    }
+
+    private boolean sameEventPrefix(
+        List<CodecWireEvent> expected,
+        List<CodecWireEvent> actual,
+        int length) {
+
+        for (int index = 0; index < length; index++) {
+            if (!expected.get(index).callsite().equals(actual.get(index).callsite())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isOrderedSubset(
+        List<CodecWireEvent> values,
+        List<CodecWireEvent> order) {
+
+        int previous = -1;
+        for (CodecWireEvent value : values) {
+            int index = order.indexOf(value);
+            if (index <= previous) {
+                return false;
+            }
+            previous = index;
+        }
+        return true;
+    }
+
+    private boolean allPresenceCombinationsObserved(
+        List<NetworkSchemaBranchFlow.Path<CodecWireEvent>> paths,
+        int prefixLength,
+        List<CodecWireEvent> payloads) {
+
+        if (payloads.size() >= Integer.SIZE - 1) {
+            return false;
+        }
+        HashSet<Integer> combinations = new HashSet<>();
+        for (NetworkSchemaBranchFlow.Path<CodecWireEvent> path : paths) {
+            int bits = 0;
+            List<CodecWireEvent> suffix = path.events().subList(prefixLength, path.events().size());
+            for (int index = 0; index < payloads.size(); index++) {
+                if (suffix.contains(payloads.get(index))) {
+                    bits |= 1 << index;
+                }
+            }
+            combinations.add(bits);
+        }
+        return combinations.size() == 1 << payloads.size();
+    }
+
+    private boolean presenceGuardMatchesPayload(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        CodecWireEvent presence,
+        CodecWireEvent payload,
+        List<NetworkSchemaBranchFlow.Path<CodecWireEvent>> paths) {
+
+        BooleanBranch guard = normalizedBooleanBranch(
+            high,
+            operations,
+            presence);
+        if (guard == null) {
+            return false;
+        }
+        for (NetworkSchemaBranchFlow.Path<CodecWireEvent> path : paths) {
+            PcodeBlockBasic successor = path.successorOf(guard.block());
+            if (successor == null) {
+                continue;
+            }
+            boolean present = path.events().contains(payload);
+            if (successor == guard.trueSuccessor() != present ||
+                successor == guard.falseSuccessor() == present) {
+                return false;
+            }
+        }
+        return true;
+    }

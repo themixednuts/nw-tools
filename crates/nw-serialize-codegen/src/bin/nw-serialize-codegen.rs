@@ -483,7 +483,9 @@ fn network_schema(args: &NetworkSchemaArgs, status: CodegenStatus) -> Result<()>
             .merge_ghidra_static_network_overlay(&overlay)
             .with_context(|| format!("merge Ghidra overlay from {}", overlay_path.display()))?;
         println!(
-            "ghidra overlay: {} handler vtable(s) replaced, {} added; {} dependent field(s) rebound; {} field registration function(s) replaced, {} added",
+            "ghidra overlay: {} registry type(s) replaced, {} added; {} handler vtable(s) replaced, {} added; {} dependent field(s) rebound; {} field registration function(s) replaced, {} added",
+            merge.replaced_registry_type_count,
+            merge.added_registry_type_count,
             merge.replaced_field_handler_vtable_count,
             merge.added_field_handler_vtable_count,
             merge.rebound_dependent_field_count,
@@ -553,12 +555,13 @@ fn network_schema(args: &NetworkSchemaArgs, status: CodegenStatus) -> Result<()>
             .unwrap_or_else(|| signatures_path.display().to_string());
         let merge = schema.merge_message_signatures(&signatures, Some(source));
         println!(
-            "message signatures: {} source message(s), {} matched, {} field name(s) filled, {} native type(s) filled, {} wire shape(s) filled, {} field-count mismatch, {} ambiguous, {} unmatched",
+            "message signatures: {} source message(s), {} matched, {} field name(s) filled, {} native type(s) filled, {} wire shape(s) filled, {} composite field(s) grouped, {} field-count mismatch, {} ambiguous, {} unmatched",
             merge.source_message_count,
             merge.matched_message_count,
             merge.field_name_filled_count,
             merge.native_type_filled_count,
             merge.wire_shape_filled_count,
+            merge.field_grouped_count,
             merge.field_count_mismatch_count,
             merge.ambiguous_message_count,
             merge.unmatched_message_count
@@ -575,12 +578,13 @@ fn network_schema(args: &NetworkSchemaArgs, status: CodegenStatus) -> Result<()>
             .unwrap_or_else(|| root.display().to_string());
         let merge = schema.merge_message_signatures(&signatures, Some(source));
         println!(
-            "message source: {} source message(s), {} matched, {} field name(s) filled, {} native type(s) filled, {} wire shape(s) filled, {} field-count mismatch, {} ambiguous, {} unmatched",
+            "message source: {} source message(s), {} matched, {} field name(s) filled, {} native type(s) filled, {} wire shape(s) filled, {} composite field(s) grouped, {} field-count mismatch, {} ambiguous, {} unmatched",
             merge.source_message_count,
             merge.matched_message_count,
             merge.field_name_filled_count,
             merge.native_type_filled_count,
             merge.wire_shape_filled_count,
+            merge.field_grouped_count,
             merge.field_count_mismatch_count,
             merge.ambiguous_message_count,
             merge.unmatched_message_count

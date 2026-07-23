@@ -1,0 +1,80 @@
+    private boolean isInteriorAggregateLeaf(FieldCall aggregate, FieldCall field) {
+        if (field == null || field.storageOffset == null ||
+            !Objects.equals(messageFieldStorageBase(aggregate), messageFieldStorageBase(field))) {
+            return false;
+        }
+        long start = aggregate.storageOffset;
+        long offset = field.storageOffset;
+        String fieldLayout = messageFieldWireLayout(field);
+        if (offset < start || fieldLayout == null) {
+            return false;
+        }
+        Long size = aggregate.nestedTypeShape.nativeSize;
+        if (!Boolean.TRUE.equals(aggregate.callFrameBoundaryProven) &&
+            (size == null || size <= 0 || start > Long.MAX_VALUE - size ||
+                offset >= start + size)) {
+            return false;
+        }
+        long relativeOffset = offset - start;
+        if (isProvenAggregateField(field) &&
+            containsOrderedAggregateProduct(aggregate, field, relativeOffset)) {
+            return true;
+        }
+        for (NestedTypeMember member : aggregate.nestedTypeShape.members) {
+            WireShape memberEvidence = nestedMemberWireEvidence(member);
+            if (memberEvidence == null || memberEvidence.layout == null) {
+                continue;
+            }
+            boolean offsetMatches = member.offset == relativeOffset ||
+                member.nativeOffset != null && member.nativeOffset == relativeOffset;
+            if (offsetMatches &&
+                canonicalLayoutWireShape(memberEvidence.layout).equals(fieldLayout)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean containsOrderedAggregateProduct(
+        FieldCall parent,
+        FieldCall child,
+        long childOffset) {
+
+        List<NestedTypeMember> childMembers =
+            provenWireOrderedMembers(child.nestedTypeShape.members);
+        List<NestedTypeMember> parentMembers = parent.nestedTypeShape.members;
+        if (childMembers == null || parentMembers.isEmpty()) {
+            return false;
+        }
+        int parentIndex = 0;
+        for (NestedTypeMember childMember : childMembers) {
+            WireShape childEvidence = nestedMemberWireEvidence(childMember);
+            long nativeOffset = childMember.nativeOffset == null
+                ? childMember.offset
+                : childMember.nativeOffset;
+            Long translatedOffset = addExactOrNull(childOffset, nativeOffset);
+            if (childEvidence == null || childEvidence.layout == null ||
+                translatedOffset == null) {
+                return false;
+            }
+            boolean matched = false;
+            while (parentIndex < parentMembers.size()) {
+                NestedTypeMember parentMember = parentMembers.get(parentIndex++);
+                WireShape parentEvidence = nestedMemberWireEvidence(parentMember);
+                long parentOffset = parentMember.nativeOffset == null
+                    ? parentMember.offset
+                    : parentMember.nativeOffset;
+                if (parentOffset == translatedOffset && parentEvidence != null &&
+                    parentEvidence.layout != null && sameCodecProduct(
+                        parentEvidence.layout,
+                        childEvidence.layout)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                return false;
+            }
+        }
+        return true;
+    }

@@ -3,7 +3,6 @@ use crate::go::layout::GoStandaloneLayoutReport;
 use crate::go::source::{GoSourceEmitError, GoSourceOptions, GoStandaloneProject};
 use crate::ir::{SerializeCodegenSelection, SerializeCodegenUnit};
 use crate::layout::LayoutAnalysisReport;
-use crate::lint::Severity;
 use crate::rust::integrate::{
     RustIntegrationError, RustIntegrationPlan, RustIntegrationPlanner, RustItemPathResolver,
     RustSourceInventory, source_index::RustSourceTypeIndex,
@@ -309,13 +308,6 @@ impl CompileUnit {
     ) -> Result<GoStandaloneProject, GoSourceEmitError> {
         self.codegen_view(selection)
             .emit_standalone_go_project(module_path, package_name, context)
-    }
-
-    #[must_use]
-    pub fn has_errors(&self) -> bool {
-        self.diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity == Severity::Error)
     }
 
     pub fn plan_rust_integration(

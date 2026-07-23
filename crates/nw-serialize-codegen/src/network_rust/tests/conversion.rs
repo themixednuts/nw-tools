@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn resolves_native_math_types_to_bevy_and_glam() {
+    let expected = [
+        ("AZ::Matrix3x3", "::glam::Mat3"),
+        ("AZ::Transform", "::glam::Affine3A"),
+        ("AZ::Bounds", "::bevy_math::bounding::Aabb2d"),
+        ("AZ::Aabb", "::bevy_math::bounding::Aabb3d"),
+    ];
+
+    for (native, rust) in expected {
+        assert_eq!(
+            network_native_scalar_type(native).map(|scalar| scalar.rust_type),
+            Some(rust)
+        );
+    }
+}
+
+#[test]
 fn emits_conversion_marshaler_for_explicit_message_scalar_types() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
@@ -382,7 +399,10 @@ fn emits_struct_marshaler_for_signed_enum_fields() {
         .expect("conversion source");
 
     assert!(output.source.contains(
-        "impl ::nw_network::serialize::Marshaler for ::nw_network::source::TerritoryUpgradeData"
+        "impl ::nw_network::serialize::Marshal for ::nw_network::source::TerritoryUpgradeData"
+    ));
+    assert!(output.source.contains(
+        "impl ::nw_network::serialize::Unmarshal for ::nw_network::source::TerritoryUpgradeData"
     ));
     assert!(
         output

@@ -177,6 +177,7 @@ fn emit_integrated_type_files(
     let exports_by_module = standalone_type_exports_by_module(&symbol_surface);
     let known_type_names = standalone_known_type_names(unit, &exports_by_module);
     let register_children_by_module = integrated_register_children_by_module(&layout, &module_tree);
+    let prefab_type_paths = integrated_prefab_type_paths(&layout);
     let tasks = integrated_type_tasks(&layout, &module_tree, &register_children_by_module);
 
     let emitted = context
@@ -194,6 +195,11 @@ fn emit_integrated_type_files(
                 task.leaf_modules.iter().map(String::as_str),
                 &task.register_child_modules,
                 &task.items,
+                if task.module_path.is_empty() {
+                    &prefab_type_paths
+                } else {
+                    &[]
+                },
             )
             .map(|source| RustStandaloneProjectFile {
                 path: task.path.clone(),
@@ -358,6 +364,7 @@ fn emit_integrated_type_module<'a>(
     leaf_modules: impl Iterator<Item = &'a str>,
     register_child_modules: &[String],
     items: &[&RustItemPlan],
+    prefab_type_paths: &[String],
 ) -> Result<String, RustSourceEmitError> {
     let child_modules = child_dirs
         .map(parse_module_ident)
@@ -421,8 +428,44 @@ fn emit_integrated_type_module<'a>(
     if has_register {
         source.push_str(&render_integrated_register(items, register_child_modules)?);
     }
+    if !prefab_type_paths.is_empty() {
+        source.push_str(&render_integrated_prefab_type_registry(prefab_type_paths)?);
+    }
 
     rustfmt_source(&source)
+}
+
+fn integrated_prefab_type_paths(
+    layout: &crate::rust::layout::RustStandaloneTypeLayout<'_>,
+) -> Vec<String> {
+    let module_items = layout
+        .module_groups
+        .iter()
+        .flat_map(|(module_path, items)| {
+            items.iter().map(move |item| (module_path.clone(), *item))
+        });
+    let file_items = layout
+        .file_groups
+        .iter()
+        .flat_map(|((scope_path, file_stem), items)| {
+            let mut module_path = scope_path.clone();
+            module_path.push(file_stem.clone());
+            items.iter().map(move |item| (module_path.clone(), *item))
+        });
+    let mut paths = module_items
+        .chain(file_items)
+        .filter(|(_, item)| item.prefab.is_some())
+        .map(|(module_path, item)| {
+            let qualified = format!("self::{}::{}", module_path.join("::"), item.rust_name);
+            (qualified, item)
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|(left_path, left_item), (right_path, right_item)| {
+        left_path
+            .cmp(right_path)
+            .then_with(|| left_item.source_type_id.cmp(&right_item.source_type_id))
+    });
+    paths.into_iter().map(|(path, _)| path).collect()
 }
 
 fn render_module_item_source(
@@ -737,6 +780,9 @@ fn append_integrated_type_imports(
         append_import_items(source, &reflect_serde_imports);
         source.push_str(";\n");
     }
+    if items.iter().any(|item| item.prefab.is_some()) {
+        source.push_str("use bevy::reflect::std_traits::ReflectDefault;\n");
+    }
 
     let needs_bevy_component = items.iter().any(|item| has_derive(item, "Component"));
     let needs_reflect = items.iter().any(|item| has_derive(item, "Reflect"));
@@ -746,6 +792,9 @@ fn append_integrated_type_imports(
     let needs_marshaler = items.iter().any(|item| has_derive(item, "Marshaler"));
     if needs_marshaler {
         source.push_str("use gridmate::Marshaler;\n");
+    }
+    if items.iter().any(|item| item.prefab.is_some()) {
+        source.push_str("use az_prefab::{Prefab, ReflectPrefab};\n");
     }
     if has_register {
         source.push_str("use bevy::prelude::App;\n");
@@ -783,6 +832,28 @@ fn render_integrated_register(
             #(app.register_type::<#type_names>();)*
             #(app.register_type_data::<#az_type_info_names, ::az_core::ReflectAzTypeInfo>();)*
             #(app.register_type_data::<#az_rtti_names, ::az_core::ReflectAzRtti>();)*
+        }
+    })
+    .map_err(RustSourceEmitError::File)?;
+    Ok(prettyplease::unparse(&file))
+}
+
+fn render_integrated_prefab_type_registry(
+    prefab_type_paths: &[String],
+) -> Result<String, RustSourceEmitError> {
+    let prefab_type_paths = prefab_type_paths
+        .iter()
+        .map(|path| {
+            syn::parse_str::<syn::Path>(path).map_err(|source| RustSourceEmitError::ItemIdent {
+                source_name: format!("prefab:{path}"),
+                identifier: path.clone(),
+                source,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let file = syn::parse2::<syn::File>(quote! {
+        pub fn register_prefab_types(registry: &mut ::bevy::reflect::TypeRegistry) {
+            #(registry.register::<#prefab_type_paths>();)*
         }
     })
     .map_err(RustSourceEmitError::File)?;
@@ -862,6 +933,9 @@ fn append_standalone_type_imports(
         append_import_items(source, &reflect_serde_imports);
         source.push_str(";\n");
         source.push('\n');
+    }
+    if items.iter().any(|item| item.prefab.is_some()) {
+        source.push_str("use bevy_reflect::std_traits::ReflectDefault;\n\n");
     }
 
     let needs_bevy_component = items.iter().any(|item| has_derive(item, "Component"));
@@ -1317,6 +1391,37 @@ mod tests {
     }
 
     #[test]
+    fn integrated_prefab_type_paths_are_sorted_and_plan_driven() {
+        use crate::rust::item_plan::{RustCodegenUnit, RustPrefabPlan};
+
+        let mut zeta = rtti_leaf_with_base("ZetaComponent", "Component");
+        zeta.scope_path = vec!["zeta".to_owned()];
+        zeta.prefab = Some(RustPrefabPlan {
+            tag: "Zeta".to_owned(),
+            source_version: 1,
+        });
+        let mut alpha = rtti_leaf_with_base("AlphaComponent", "Component");
+        alpha.scope_path = vec!["alpha".to_owned()];
+        alpha.prefab = Some(RustPrefabPlan {
+            tag: "Alpha".to_owned(),
+            source_version: 1,
+        });
+        let mut runtime_only = rtti_leaf_with_base("RuntimeOnlyComponent", "Component");
+        runtime_only.scope_path = vec!["runtime".to_owned()];
+        let unit = RustCodegenUnit {
+            items: vec![zeta, runtime_only, alpha],
+        };
+
+        assert_eq!(
+            integrated_prefab_type_paths(&crate::rust::layout::standalone_type_layout(&unit)),
+            vec![
+                "self::alpha::alpha_component::AlphaComponent".to_owned(),
+                "self::zeta::zeta_component::ZetaComponent".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn standalone_imports_reflect_serde_type_data_for_reflected_serde_items() {
         let known_type_names = BTreeSet::new();
         let reexported_type_names = BTreeSet::new();
@@ -1382,6 +1487,7 @@ mod tests {
             identity: RustTypeIdentityPlan::az_rtti(type_id, Some(rust_name.to_owned())),
             repr: None,
             raw_conversion: None,
+            prefab: None,
             derives: Vec::new(),
             rtti_bases: vec![RustRttiBasePlan {
                 source_type_id: uuid!("22222222-2222-2222-2222-222222222222"),

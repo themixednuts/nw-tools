@@ -1,0 +1,804 @@
+    private MessageMarshalPlan recoverMessageMarshalPlan(RegistryEntry entry) {
+        Function wrapper = functionAtOrContaining(parseCapturedAddress(entry.marshal));
+        if (wrapper == null) {
+            return null;
+        }
+
+        String writeBufferParameter = "param_3";
+        NetworkSchemaFlowSequence.Result<MessageMarshalEvent> sequence =
+            messageMarshalEventSequence(
+                wrapper,
+                writeBufferParameter,
+                Collections.emptyMap(),
+                new LinkedHashSet<>());
+        if (!sequence.complete()) {
+            return null;
+        }
+
+        MessageMarshalPlan plan = new MessageMarshalPlan();
+        plan.wrapper = wrapper.getEntryPoint();
+        plan.wrapperName = fullFunctionName(wrapper);
+        plan.writeBufferParameter = writeBufferParameter;
+        plan.analysisStatus = sequence.events().isEmpty()
+            ? "complete-empty-cfg-stack-flow"
+            : "complete-cfg-stack-flow";
+        plan.events.addAll(sequence.events());
+        plan.rootStorageBase = uniqueMessageMarshalRoot(plan.events);
+        plan.fields.addAll(messageMarshalFields(plan.events));
+        return plan;
+    }
+
+    private void reconcileMessageCollectionShapes(
+        RegistryEntry entry,
+        MessageUnmarshalPlan unmarshal) {
+
+        if (entry == null || unmarshal == null) {
+            return;
+        }
+        List<FieldCall> collections = unmarshal.fields.stream()
+            .filter(field -> field.collectionStorageKind != null)
+            .toList();
+        if (collections.size() != 1) {
+            return;
+        }
+        Function wrapper = functionAtOrContaining(parseCapturedAddress(entry.marshal));
+        if (wrapper == null) {
+            return;
+        }
+        ArrayList<ContainerPlanDiagnostic> diagnostics = new ArrayList<>();
+        FullContainerPlan plan = recoverFullContainerPlanNode(
+            wrapper,
+            "param_3",
+            new LinkedHashSet<>(),
+            0,
+            diagnostics);
+        FieldCall field = collections.get(0);
+        if (plan == null || plan.storageKind != field.collectionStorageKind) {
+            recordNestedTypeShapeReject(
+                "message-collection-marshal-plan-unproven");
+            return;
+        }
+        WireShape sequence = messageCollectionSequenceWireEvidence(plan);
+        WireShape decoded = fieldWireEvidence(field);
+        if (!NetworkSchemaWireShape.equivalentBySemanticOrLayout(
+                sequence.shape,
+                sequence.layout,
+                decoded.shape,
+                decoded.layout)) {
+            recordNestedTypeShapeReject(
+                "message-collection-directional-codec-mismatch");
+            return;
+        }
+        WireShape collection = messageCollectionWireEvidence(plan, sequence);
+        if (collection == null) {
+            recordNestedTypeShapeReject(
+                "message-collection-key-value-boundary-unproven");
+            return;
+        }
+        field.wireShape = collection.shape;
+        field.wireShapeSource = collection.source;
+    }
+
+    private WireShape messageCollectionSequenceWireEvidence(FullContainerPlan plan) {
+        if (plan == null) {
+            return null;
+        }
+        ArrayList<ContainerCodecCall> codecs = new ArrayList<>();
+        if (plan.storageKind == ContainerStorageKind.INDEX_MAP) {
+            codecs.addAll(plan.keyCodecs);
+        }
+        codecs.addAll(plan.valueCodecs);
+        List<ContainerCodecCall> leaves = logicalContainerCodecLeaves(codecs);
+        WireShape element = sequenceElementWireEvidence(leaves);
+        if (element == null) {
+            return null;
+        }
+        String source = "message-marshal-linked-container-codec-sequence";
+        return WireShape.semantic(
+            "vec<" + element.shape + ">",
+            "vec<" + element.layout + ">",
+            source);
+    }
+
+    private WireShape messageCollectionWireEvidence(
+        FullContainerPlan plan,
+        WireShape sequence) {
+
+        if (plan == null || sequence == null ||
+            plan.storageKind != ContainerStorageKind.INDEX_MAP) {
+            return null;
+        }
+        WireShape key = sequenceElementWireEvidence(
+            logicalContainerCodecLeaves(plan.keyCodecs));
+        WireShape value = sequenceElementWireEvidence(
+            logicalContainerCodecLeaves(plan.valueCodecs));
+        if (key == null || value == null) {
+            return null;
+        }
+        return WireShape.semantic(
+            "map<" + key.shape + "," + value.shape + ">",
+            sequence.layout,
+            "message-bidirectional-index-map-codec-agreement");
+    }
+
+    private WireShape fieldWireEvidence(FieldCall field) {
+        if (field == null || field.wireLayout == null) {
+            return null;
+        }
+        return field.wireShape == null
+            ? WireShape.layout(field.wireLayout, field.wireLayoutSource)
+            : WireShape.semantic(
+                field.wireShape,
+                field.wireLayout,
+                field.wireShapeSource);
+    }
+
+    private void refineMessageUnmarshalCapability(
+        MessageUnmarshalPlan unmarshal,
+        MessageMarshalPlan marshal) {
+
+        if (!directionalMessagePlansDisagree(unmarshal, marshal)) {
+            return;
+        }
+        Function wrapper = functionAtOrContaining(unmarshal.wrapper);
+        HighFunction high = highFunction(wrapper);
+        if (high == null) {
+            unmarshal.terminalStatus = "missing-high-function";
+            return;
+        }
+        UnmarshalTerminalFlow terminalFlow = successfulUnmarshalTerminalFlow(high);
+        unmarshal.terminalStatus = terminalFlow.status();
+        unmarshal.supportsUnmarshal = switch (terminalFlow.status()) {
+            case "complete" -> true;
+            case "no-success-terminal" -> false;
+            default -> null;
+        };
+    }
+
+    private boolean directionalMessagePlansDisagree(
+        MessageUnmarshalPlan unmarshal,
+        MessageMarshalPlan marshal) {
+
+        if (unmarshal == null || marshal == null) {
+            return false;
+        }
+        if (unmarshal.fields.size() != marshal.fields.size()) {
+            return true;
+        }
+        for (int index = 0; index < unmarshal.fields.size(); index++) {
+            FieldCall decoded = unmarshal.fields.get(index);
+            MessageMarshalField encoded = marshal.fields.get(index);
+            Long decodedOffset = decoded.storageOffset != null
+                ? decoded.storageOffset
+                : decoded.storageBaseOffset;
+            Long encodedOffset = encoded.storage == null
+                ? null
+                : encoded.storage.offset;
+            if (decodedOffset != null && encodedOffset != null &&
+                !decodedOffset.equals(encodedOffset)) {
+                return true;
+            }
+            if (provenDirectionalWireConflict(decoded, encoded)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean provenDirectionalWireConflict(
+        FieldCall decoded,
+        MessageMarshalField encoded) {
+
+        if (encoded.wireEvidence == null) {
+            return false;
+        }
+        if (decoded.wireShape != null && encoded.wireEvidence.shape != null &&
+            !decoded.wireShape.equals(encoded.wireEvidence.shape)) {
+            return true;
+        }
+        return decoded.wireLayout != null && encoded.wireEvidence.layout != null &&
+            !decoded.wireLayout.equals(encoded.wireEvidence.layout);
+    }
+
+    private NetworkSchemaFlowSequence.Result<MessageMarshalEvent>
+            messageMarshalEventSequence(
+                Function function,
+                String writeBufferParameter,
+                Map<String, PcodeStorage> callerParamStorage,
+                Set<String> activeContexts) {
+
+        if (function == null || writeBufferParameter == null) {
+            return messageMarshalFailure(
+                NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+        }
+        String context = function.getEntryPoint() + "|" + writeBufferParameter;
+        if (!activeContexts.add(context)) {
+            return messageMarshalFailure(NetworkSchemaFlowSequence.Status.CYCLIC_EVENTS);
+        }
+        try {
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                return messageMarshalFailure(
+                    NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+            }
+            Map<PcodeBlockBasic, List<MessageMarshalEvent>> eventsByBlock =
+                new HashMap<>();
+            Map<String, List<PcodeOpAST>> indirectWrites =
+                containerHelperIndirectWrites(high);
+            PcodeStorage writeBuffer = new PcodeStorage(writeBufferParameter, 0L);
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                List<MessageMarshalEvent> events = List.of();
+                if (operation.getOpcode() == PcodeOp.CALL) {
+                    Function target = pcodeCallTarget(operation);
+                    Integer bufferSlot = provenCallArgumentSlot(
+                        function,
+                        operation,
+                        target,
+                        writeBuffer);
+                    if (bufferSlot == null) {
+                        continue;
+                    }
+                    if (target == null) {
+                        return messageMarshalFailure(
+                            NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                    }
+                    events = messageMarshalCallEvents(
+                        function,
+                        high,
+                        operation,
+                        target,
+                        bufferSlot,
+                        writeBufferParameter,
+                        callerParamStorage,
+                        indirectWrites,
+                        activeContexts);
+                    if (events.isEmpty()) {
+                        return messageMarshalFailure(
+                            NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                    }
+                }
+                else if (operation.getOpcode() == PcodeOp.CALLIND) {
+                    Integer byteLength = provenVirtualRawWriteLength(
+                        function,
+                        operation,
+                        writeBufferParameter);
+                    if (byteLength == null) {
+                        if (provenCallArgumentSlot(
+                                function,
+                                operation,
+                                null,
+                                writeBuffer) != null) {
+                            return messageMarshalFailure(
+                                NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                        }
+                        continue;
+                    }
+                    events = messageMarshalRawEvent(
+                        function,
+                        operation,
+                        writeBufferParameter,
+                        callerParamStorage,
+                        byteLength);
+                    if (events.isEmpty()) {
+                        return messageMarshalFailure(
+                            NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                    }
+                }
+                if (!addMessageMarshalEvents(eventsByBlock, operation, events)) {
+                    return messageMarshalFailure(
+                        NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                }
+            }
+            return NetworkSchemaFlowSequence.analyze(
+                high,
+                eventsByBlock,
+                this::sameMessageMarshalEvent);
+        }
+        finally {
+            activeContexts.remove(context);
+        }
+    }
+
+    private List<MessageMarshalEvent> messageMarshalCallEvents(
+        Function owner,
+        HighFunction high,
+        PcodeOpAST operation,
+        Function target,
+        int bufferSlot,
+        String writeBufferParameter,
+        Map<String, PcodeStorage> callerParamStorage,
+        Map<String, List<PcodeOpAST>> indirectWrites,
+        Set<String> activeContexts) {
+
+        String targetBufferParameter = "param_" + bufferSlot;
+        String targetName = fullFunctionName(target);
+        String nativeType = marshalFunctionTemplateType(targetName);
+        WireShape leaf = validatedMarshalLeaf(target, targetBufferParameter);
+        if (leaf != null) {
+            MessageMarshalSource source = messageMarshalCodecSource(
+                owner,
+                high,
+                operation,
+                target,
+                nativeType,
+                leaf,
+                writeBufferParameter,
+                callerParamStorage,
+                indirectWrites);
+            if (source == null) {
+                return List.of();
+            }
+            MessageMarshalEvent event = new MessageMarshalEvent();
+            event.callsite = operation.getSeqnum().getTarget();
+            event.target = target.getEntryPoint();
+            event.targetName = targetName;
+            event.nativeType = nativeType == null
+                ? nativeTypeFromWireShape(leaf.shape)
+                : nativeType;
+            event.wireEvidence = leaf;
+            event.localSource = source.local();
+            event.source = source.absolute();
+            event.evidenceSource = "message-marshal-pcode-stack-leaf";
+            return List.of(event);
+        }
+
+        Map<String, PcodeStorage> localArguments = callArgumentStorageMap(
+            owner,
+            operation,
+            Collections.emptyMap());
+        Map<String, PcodeStorage> arguments = callArgumentStorageMap(
+            owner,
+            operation,
+            callerParamStorage);
+        NetworkSchemaFlowSequence.Result<MessageMarshalEvent> nested =
+            messageMarshalEventSequence(
+                target,
+                targetBufferParameter,
+                arguments,
+                activeContexts);
+        if (!nested.complete()) {
+            return List.of();
+        }
+        ArrayList<MessageMarshalEvent> events = new ArrayList<>();
+        for (MessageMarshalEvent nestedEvent : nested.events()) {
+            MessageMarshalEvent event = nestedEvent.copy();
+            MessageMarshalFrame frame = messageMarshalFrame(
+                operation,
+                target,
+                targetBufferParameter,
+                localArguments,
+                arguments,
+                callerParamStorage,
+                event.localSource);
+            if (frame != null) {
+                event.frames.add(frame);
+            }
+            event.localSource = translatedMessageMarshalLocalSource(
+                event.localSource,
+                localArguments);
+            events.add(event);
+        }
+        return List.copyOf(events);
+    }
+
+    private MessageMarshalSource messageMarshalCodecSource(
+        Function owner,
+        HighFunction high,
+        PcodeOpAST operation,
+        Function target,
+        String nativeType,
+        WireShape wireEvidence,
+        String writeBufferParameter,
+        Map<String, PcodeStorage> callerParamStorage,
+        Map<String, List<PcodeOpAST>> indirectWrites) {
+
+        ContainerCodecCall codec = new ContainerCodecCall();
+        codec.operation = operation;
+        codec.target = target.getEntryPoint();
+        codec.nativeType = nativeType;
+        codec.wireEvidence = wireEvidence;
+        PcodeStorage local = containerHelperCodecSourceStorage(
+            high,
+            codec,
+            writeBufferParameter,
+            indirectWrites);
+        if (local != null) {
+            return messageMarshalSource(local, callerParamStorage);
+        }
+
+        Integer bufferSlot = provenCallArgumentSlot(
+            owner,
+            operation,
+            target,
+            new PcodeStorage(writeBufferParameter, 0L));
+        PcodeStorage selected = null;
+        int argumentCount = provenCallArgumentCount(operation, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            if (Integer.valueOf(slot).equals(bufferSlot)) {
+                continue;
+            }
+            PcodeStorage candidate = provenCallArgumentStorage(
+                owner,
+                operation,
+                target,
+                slot);
+            if (!isParameterStorage(candidate)) {
+                continue;
+            }
+            if (selected != null && !selected.sameLocation(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return messageMarshalSource(selected, callerParamStorage);
+    }
+
+    private List<MessageMarshalEvent> messageMarshalRawEvent(
+        Function owner,
+        PcodeOpAST operation,
+        String writeBufferParameter,
+        Map<String, PcodeStorage> callerParamStorage,
+        int byteLength) {
+        HighFunction high = highFunction(owner);
+        Map<String, List<PcodeOpAST>> indirectWrites = high == null
+            ? Collections.emptyMap()
+            : containerHelperIndirectWrites(high);
+        PcodeStorage local = provenCallArgumentStorage(
+            owner,
+            operation,
+            null,
+            2);
+        if (!isParameterStorage(local) && operation.getNumInputs() > 2) {
+            local = indirectParameterSourceStorage(
+                operation,
+                operation.getInput(2),
+                byteLength,
+                indirectWrites);
+        }
+        MessageMarshalSource source = messageMarshalSource(
+            local,
+            callerParamStorage);
+        if (source == null) {
+            return List.of();
+        }
+        boolean normalizedBoolean = byteLength == Byte.BYTES &&
+            rawWriteArgumentIsNormalizedBoolean(owner, operation);
+        MessageMarshalEvent event = new MessageMarshalEvent();
+        event.callsite = operation.getSeqnum().getTarget();
+        event.wireEvidence = normalizedBoolean
+            ? WireShape.semantic(
+                "bool",
+                fixedByteLayout(byteLength),
+                "message-marshal-pcode-normalized-boolean-write")
+            : WireShape.layout(
+                fixedByteLayout(byteLength),
+                "message-marshal-pcode-raw-write");
+        event.nativeType = normalizedBoolean ? "bool" : null;
+        event.localSource = source.local();
+        event.source = source.absolute();
+        event.evidenceSource = normalizedBoolean
+            ? "message-marshal-pcode-stack-normalized-boolean"
+            : "message-marshal-pcode-stack-write-raw";
+        return List.of(event);
+    }
+
+    private MessageMarshalFrame messageMarshalFrame(
+        PcodeOpAST operation,
+        Function target,
+        String writeBufferParameter,
+        Map<String, PcodeStorage> localArguments,
+        Map<String, PcodeStorage> arguments,
+        Map<String, PcodeStorage> callerParamStorage,
+        PcodeStorage eventLocalSource) {
+
+        if (eventLocalSource == null ||
+            writeBufferParameter.equals(eventLocalSource.base)) {
+            return null;
+        }
+        PcodeStorage localBinding = localArguments.get(eventLocalSource.base);
+        PcodeStorage absoluteBinding = arguments.get(eventLocalSource.base);
+        if (localBinding == null || absoluteBinding == null) {
+            return null;
+        }
+        PcodeStorage translatedBinding = translatedAbsoluteHelperStorage(
+            localBinding,
+            callerParamStorage);
+        if (translatedBinding == null ||
+            !translatedBinding.sameLocation(absoluteBinding)) {
+            return null;
+        }
+        return new MessageMarshalFrame(
+            operation.getSeqnum().getTarget(),
+            target.getEntryPoint(),
+            fullFunctionName(target),
+            eventLocalSource.base,
+            absoluteBinding);
+    }
+
+    private MessageMarshalSource messageMarshalSource(
+        PcodeStorage local,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        if (local == null || !isParameterStorage(local)) {
+            return null;
+        }
+        PcodeStorage absolute = translatedAbsoluteHelperStorage(
+            local,
+            callerParamStorage);
+        return absolute == null
+            ? null
+            : new MessageMarshalSource(local, absolute);
+    }
+
+    private PcodeStorage translatedMessageMarshalLocalSource(
+        PcodeStorage childLocalSource,
+        Map<String, PcodeStorage> localArguments) {
+
+        if (childLocalSource == null || localArguments == null) {
+            return null;
+        }
+        PcodeStorage binding = localArguments.get(childLocalSource.base);
+        return binding == null ? null : binding.plus(childLocalSource.offset);
+    }
+
+    private boolean addMessageMarshalEvents(
+        Map<PcodeBlockBasic, List<MessageMarshalEvent>> eventsByBlock,
+        PcodeOpAST operation,
+        List<MessageMarshalEvent> events) {
+
+        if (events.isEmpty()) {
+            return true;
+        }
+        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+        if (block == null) {
+            return false;
+        }
+        eventsByBlock.computeIfAbsent(block, ignored -> new ArrayList<>()).addAll(events);
+        return true;
+    }
+
+    private boolean sameMessageMarshalEvent(
+        MessageMarshalEvent left,
+        MessageMarshalEvent right) {
+
+        return left != null && right != null &&
+            left.source != null && left.source.sameLocation(right.source) &&
+            sameWireEvidence(left.wireEvidence, right.wireEvidence);
+    }
+
+    private NetworkSchemaFlowSequence.Result<MessageMarshalEvent> messageMarshalFailure(
+        NetworkSchemaFlowSequence.Status status) {
+
+        return new NetworkSchemaFlowSequence.Result<>(status, List.of());
+    }
+
+    private String uniqueMessageMarshalRoot(List<MessageMarshalEvent> events) {
+        String selected = null;
+        for (MessageMarshalEvent event : events) {
+            if (event.source == null) {
+                return null;
+            }
+            if (selected != null && !selected.equals(event.source.base)) {
+                return null;
+            }
+            selected = event.source.base;
+        }
+        return selected;
+    }
+
+    private List<MessageMarshalField> messageMarshalFields(
+        List<MessageMarshalEvent> events) {
+
+        ArrayList<MessageMarshalField> fields = new ArrayList<>();
+        for (MessageMarshalEvent event : events) {
+            PcodeStorage storage = event.source;
+            MessageMarshalField field = fields.isEmpty()
+                ? null
+                : fields.get(fields.size() - 1);
+            if (field == null || field.storage == null || storage == null ||
+                !field.storage.sameLocation(storage)) {
+                field = new MessageMarshalField();
+                field.index = fields.size();
+                field.storage = storage;
+                field.callsite = outerMessageMarshalCallsite(event);
+                fields.add(field);
+            }
+            field.events.add(event);
+        }
+        for (MessageMarshalField field : fields) {
+            field.wireEvidence = messageMarshalFieldWireEvidence(field.events);
+            field.nativeType = messageMarshalFieldNativeType(field.events);
+        }
+        return List.copyOf(fields);
+    }
+
+    private void alignMessageMarshalFieldsToUnmarshal(
+        MessageMarshalPlan marshal,
+        MessageUnmarshalPlan unmarshal) {
+
+        if (marshal == null || unmarshal == null || marshal.rootStorageBase == null ||
+            marshal.fields.isEmpty()) {
+            return;
+        }
+        ArrayList<FieldCall> boundaries = new ArrayList<>();
+        for (FieldCall field : logicalMessageFields(unmarshal)) {
+            if (isProvenAggregateField(field)) {
+                boundaries.add(field);
+            }
+        }
+        boundaries.sort(Comparator.comparingInt(field -> field.recoveryOrder));
+        if (boundaries.isEmpty()) {
+            return;
+        }
+
+        HashMap<Integer, MessageMarshalField> replacements = new HashMap<>();
+        HashSet<Integer> consumed = new HashSet<>();
+        for (FieldCall boundary : boundaries) {
+            List<Integer> indices = exactMarshalBoundaryFieldIndices(
+                marshal,
+                boundary);
+            if (indices.isEmpty() || indices.stream().anyMatch(consumed::contains)) {
+                continue;
+            }
+            int first = indices.get(0);
+            replacements.put(first, marshalBoundaryField(marshal, boundary, indices));
+            consumed.addAll(indices);
+        }
+        if (replacements.isEmpty()) {
+            return;
+        }
+
+        ArrayList<MessageMarshalField> aligned = new ArrayList<>();
+        for (int index = 0; index < marshal.fields.size(); index++) {
+            MessageMarshalField replacement = replacements.get(index);
+            if (replacement != null) {
+                aligned.add(replacement);
+            }
+            else if (!consumed.contains(index)) {
+                aligned.add(marshal.fields.get(index));
+            }
+        }
+        marshal.fields.clear();
+        marshal.fields.addAll(aligned);
+        for (int index = 0; index < marshal.fields.size(); index++) {
+            marshal.fields.get(index).index = index;
+        }
+    }
+
+    private List<Integer> exactMarshalBoundaryFieldIndices(
+        MessageMarshalPlan marshal,
+        FieldCall boundary) {
+
+        if (boundary == null || boundary.storageOffset == null ||
+            boundary.nestedTypeShape == null) {
+            return List.of();
+        }
+        List<NestedTypeMember> members = provenWireOrderedMembers(
+            boundary.nestedTypeShape.members);
+        if (members == null || members.size() < 2) {
+            return List.of();
+        }
+
+        ArrayList<Integer> indices = new ArrayList<>();
+        for (NestedTypeMember member : members) {
+            long relativeOffset = member.nativeOffset == null
+                ? member.offset
+                : member.nativeOffset;
+            Long absoluteOffset = addExactOrNull(boundary.storageOffset, relativeOffset);
+            if (absoluteOffset == null) {
+                return List.of();
+            }
+            int selected = -1;
+            for (int index = 0; index < marshal.fields.size(); index++) {
+                MessageMarshalField candidate = marshal.fields.get(index);
+                if (candidate.storage == null ||
+                    !marshal.rootStorageBase.equals(candidate.storage.base) ||
+                    candidate.storage.offset != absoluteOffset ||
+                    !marshalBoundaryMemberMatches(member, candidate)) {
+                    continue;
+                }
+                if (selected >= 0) {
+                    return List.of();
+                }
+                selected = index;
+            }
+            if (selected < 0 || !indices.isEmpty() &&
+                selected != indices.get(indices.size() - 1) + 1) {
+                return List.of();
+            }
+            indices.add(selected);
+        }
+        return List.copyOf(indices);
+    }
+
+    private boolean marshalBoundaryMemberMatches(
+        NestedTypeMember member,
+        MessageMarshalField field) {
+
+        WireShape expected = nestedMemberWireEvidence(member);
+        WireShape actual = field == null ? null : field.wireEvidence;
+        if (expected == null || actual == null) {
+            return false;
+        }
+        if (expected.shape != null && actual.shape != null &&
+            !expected.shape.equals(actual.shape)) {
+            return false;
+        }
+        String expectedLayout = firstNonEmpty(expected.layout, expected.shape);
+        String actualLayout = firstNonEmpty(actual.layout, actual.shape);
+        return expectedLayout != null && actualLayout != null &&
+            canonicalLayoutWireShape(expectedLayout).equals(
+                canonicalLayoutWireShape(actualLayout));
+    }
+
+    private MessageMarshalField marshalBoundaryField(
+        MessageMarshalPlan marshal,
+        FieldCall boundary,
+        List<Integer> indices) {
+
+        MessageMarshalField result = new MessageMarshalField();
+        result.storage = new PcodeStorage(
+            marshal.rootStorageBase,
+            boundary.storageOffset);
+        result.nativeType = firstNonEmpty(
+            boundary.nativeType,
+            boundary.sourceTypeName);
+        for (int index : indices) {
+            MessageMarshalField field = marshal.fields.get(index);
+            if (result.callsite == null) {
+                result.callsite = field.callsite;
+            }
+            result.events.addAll(field.events);
+        }
+        String source = "message-marshal-exact-unmarshal-constructor-boundary";
+        result.wireEvidence = boundary.wireShape == null
+            ? WireShape.layout(boundary.wireLayout, source)
+            : WireShape.semantic(
+                boundary.wireShape,
+                boundary.wireLayout,
+                source);
+        return result;
+    }
+
+    private Address outerMessageMarshalCallsite(MessageMarshalEvent event) {
+        return event.frames.isEmpty()
+            ? event.callsite
+            : event.frames.get(event.frames.size() - 1).callsite();
+    }
+
+    private WireShape messageMarshalFieldWireEvidence(
+        List<MessageMarshalEvent> events) {
+
+        if (events.size() == 1) {
+            return events.get(0).wireEvidence;
+        }
+        ArrayList<String> tokens = new ArrayList<>();
+        boolean semantic = true;
+        for (MessageMarshalEvent event : events) {
+            WireShape evidence = event.wireEvidence;
+            String token = evidence == null
+                ? null
+                : evidence.shape == null ? evidence.layout : evidence.shape;
+            if (token == null) {
+                return null;
+            }
+            semantic &= evidence.hasProvenSemantics();
+            tokens.add(token);
+        }
+        String composite = "composite<" + String.join(",", tokens) + ">";
+        return semantic
+            ? WireShape.semantic(composite, "message-marshal-call-frame-sequence")
+            : WireShape.layout(composite, "message-marshal-call-frame-sequence");
+    }
+
+    private String messageMarshalFieldNativeType(List<MessageMarshalEvent> events) {
+        if (events.size() == 1) {
+            return events.get(0).nativeType;
+        }
+        MessageMarshalEvent first = events.get(0);
+        if (first.frames.isEmpty()) {
+            return null;
+        }
+        MessageMarshalFrame frame = first.frames.get(first.frames.size() - 1);
+        return marshalFunctionTemplateType(frame.targetName());
+    }

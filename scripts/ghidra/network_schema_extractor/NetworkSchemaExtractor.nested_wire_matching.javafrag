@@ -1,0 +1,125 @@
+    private List<NestedTypeMember> uniquelyMatchedNestedWireSequence(
+        List<NestedTypeMember> storageMembers,
+        List<NestedTypeMember> wireMembers) {
+
+        if (storageMembers == null || wireMembers == null ||
+            storageMembers.size() != wireMembers.size() || storageMembers.isEmpty()) {
+            return null;
+        }
+
+        ArrayList<List<Integer>> candidates = new ArrayList<>(wireMembers.size());
+        for (NestedTypeMember wire : wireMembers) {
+            ArrayList<Integer> compatible = compatibleNestedStorageMembers(
+                storageMembers,
+                wire);
+            if (compatible.isEmpty()) {
+                return null;
+            }
+            candidates.add(compatible);
+        }
+
+        ArrayList<int[]> assignments = new ArrayList<>(2);
+        collectNestedWireAssignments(
+            candidates,
+            0,
+            new boolean[storageMembers.size()],
+            new int[wireMembers.size()],
+            assignments);
+        if (assignments.size() != 1) {
+            return null;
+        }
+
+        ArrayList<NestedTypeMember> ordered = new ArrayList<>(wireMembers.size());
+        for (int storageIndex : assignments.get(0)) {
+            ordered.add(storageMembers.get(storageIndex));
+        }
+        return ordered;
+    }
+
+    private ArrayList<Integer> compatibleNestedStorageMembers(
+        List<NestedTypeMember> storageMembers,
+        NestedTypeMember wire) {
+
+        ArrayList<Integer> compatible = new ArrayList<>();
+        String wireLayout = wire == null
+            ? null
+            : canonicalLayoutWireShape(wire.wireLayout);
+        if (wireLayout == null) {
+            return compatible;
+        }
+        for (int index = 0; index < storageMembers.size(); index++) {
+            NestedTypeMember storage = storageMembers.get(index);
+            if (storage != null && !Boolean.TRUE.equals(storage.typeConflict) &&
+                wireLayout.equals(canonicalLayoutWireShape(storage.wireLayout))) {
+                compatible.add(index);
+            }
+        }
+
+        ArrayList<Integer> exactCallsites = new ArrayList<>();
+        if (wire.callsite != null) {
+            for (int index : compatible) {
+                if (wire.callsite.equals(storageMembers.get(index).callsite)) {
+                    exactCallsites.add(index);
+                }
+            }
+        }
+        if (!exactCallsites.isEmpty()) {
+            return exactCallsites;
+        }
+
+        ArrayList<Integer> exactTargets = new ArrayList<>();
+        if (wire.target != null) {
+            for (int index : compatible) {
+                if (wire.target.equals(storageMembers.get(index).target)) {
+                    exactTargets.add(index);
+                }
+            }
+        }
+        if (!exactTargets.isEmpty()) {
+            compatible = exactTargets;
+        }
+
+        ArrayList<Integer> exactNativeTypes = new ArrayList<>();
+        if (wire.nativeType != null) {
+            for (int index : compatible) {
+                if (wire.nativeType.equals(storageMembers.get(index).nativeType)) {
+                    exactNativeTypes.add(index);
+                }
+            }
+        }
+        return exactNativeTypes.isEmpty() ? compatible : exactNativeTypes;
+    }
+
+    private void collectNestedWireAssignments(
+        List<List<Integer>> candidates,
+        int wireIndex,
+        boolean[] usedStorage,
+        int[] current,
+        List<int[]> assignments) {
+
+        if (assignments.size() > 1) {
+            return;
+        }
+        if (wireIndex == candidates.size()) {
+            assignments.add(current.clone());
+            return;
+        }
+        for (int storageIndex : candidates.get(wireIndex)) {
+            if (storageIndex < 0 || storageIndex >= usedStorage.length ||
+                usedStorage[storageIndex]) {
+                continue;
+            }
+            usedStorage[storageIndex] = true;
+            current[wireIndex] = storageIndex;
+            collectNestedWireAssignments(
+                candidates,
+                wireIndex + 1,
+                usedStorage,
+                current,
+                assignments);
+            usedStorage[storageIndex] = false;
+            if (assignments.size() > 1) {
+                return;
+            }
+        }
+    }

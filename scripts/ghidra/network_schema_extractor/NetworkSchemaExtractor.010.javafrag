@@ -284,16 +284,11 @@
 
         LinkedHashSet<Long> sizes = new LinkedHashSet<>();
         for (PcodeOpAST operation : orderedPcodeOps(high)) {
-            if (operation.getOpcode() != PcodeOp.CALL || operation.getNumInputs() < 2) {
+            Integer sizeSlot = createInstanceAllocationSizeSlot(operation);
+            if (sizeSlot == null) {
                 continue;
             }
-            Function target = pcodeCallTarget(operation);
-            if (target == null ||
-                !isNamedAllocatorFunction(fullFunctionName(target)) &&
-                    !isAllocatorReturnFunction(target)) {
-                continue;
-            }
-            Long size = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(1));
+            Long size = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(sizeSlot));
             if (size != null && size > 0L) {
                 sizes.add(size);
             }
@@ -303,6 +298,112 @@
             createInstanceSizeCache.put(key, size);
         }
         return size;
+    }
+
+    private String recoverCreateInstanceTypeName(Address createInstance) {
+        String key = createInstance == null
+            ? null
+            : addressCacheKey("create-instance-type-name", createInstance);
+        if (key != null && createInstanceTypeNameCache.containsKey(key)) {
+            return createInstanceTypeNameCache.get(key);
+        }
+        Function function = functionAtOrContaining(createInstance);
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            if (key != null) {
+                createInstanceTypeNameCache.put(key, null);
+            }
+            return null;
+        }
+
+        LinkedHashMap<String, Address> names = new LinkedHashMap<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            Integer sizeSlot = createInstanceAllocationSizeSlot(operation);
+            if (sizeSlot == null) {
+                continue;
+            }
+            Long size = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(sizeSlot));
+            if (size == null || size <= 0L) {
+                continue;
+            }
+            int firstNameSlot = operation.getOpcode() == PcodeOp.CALLIND ? 5 : 2;
+            int nameSlotLimit = operation.getOpcode() == PcodeOp.CALLIND
+                ? Math.min(operation.getNumInputs(), firstNameSlot + 1)
+                : operation.getNumInputs();
+            for (int slot = firstNameSlot; slot < nameSlotLimit; slot++) {
+                LinkedHashSet<Address> origins = new LinkedHashSet<>();
+                collectPcodeAddressOrigins(
+                    operation.getInput(slot),
+                    origins,
+                    new LinkedHashSet<>());
+                for (Address origin : origins) {
+                    String name = readPrintableString(origin);
+                    if (isLikelyRuntimeTypeName(name)) {
+                        names.putIfAbsent(name, origin);
+                    }
+                }
+            }
+        }
+        String name = names.size() == 1 ? names.keySet().iterator().next() : null;
+        if (key != null) {
+            createInstanceTypeNameCache.put(key, name);
+        }
+        return name;
+    }
+
+    private Integer createInstanceAllocationSizeSlot(PcodeOpAST operation) {
+        if (operation == null) {
+            return null;
+        }
+        if (operation.getOpcode() == PcodeOp.CALL) {
+            if (operation.getNumInputs() < 2) {
+                return null;
+            }
+            Function target = pcodeCallTarget(operation);
+            return target != null &&
+                (isNamedAllocatorFunction(fullFunctionName(target)) ||
+                    isAllocatorReturnFunction(target))
+                ? 1
+                : null;
+        }
+        if (operation.getOpcode() != PcodeOp.CALLIND ||
+            operation.getNumInputs() < 6) {
+            return null;
+        }
+        Long virtualSlot = virtualDispatchSlotForReceiver(
+            operation.getInput(0),
+            operation.getInput(1));
+        Long alignment = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(3));
+        Long flags = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(4));
+        if (virtualSlot == null || virtualSlot != 0x8L ||
+            alignment == null || alignment <= 0L || alignment > 0x1000L ||
+            (alignment & (alignment - 1L)) != 0L ||
+            flags == null || flags != 0L) {
+            return null;
+        }
+        return 2;
+    }
+
+    private Long virtualDispatchSlotForReceiver(
+        Varnode target,
+        Varnode receiver) {
+
+        PcodeMemoryPath receiverPath = pcodeMemoryPath(receiver, 0);
+        PcodeMemoryPath targetPath = pcodeMemoryPath(target, 2);
+        if (receiverPath == null || targetPath == null ||
+            targetPath.offset() != 0L ||
+            !Objects.equals(receiverPath.root(), targetPath.root())) {
+            return null;
+        }
+        List<Long> receiverDereferences = receiverPath.dereferenceOffsets();
+        List<Long> targetDereferences = targetPath.dereferenceOffsets();
+        if (targetDereferences.size() != receiverDereferences.size() + 2 ||
+            !targetDereferences.subList(0, receiverDereferences.size())
+                .equals(receiverDereferences) ||
+            targetDereferences.get(receiverDereferences.size()) != receiverPath.offset()) {
+            return null;
+        }
+        return targetDereferences.get(targetDereferences.size() - 1);
     }
 
     private Long storageByteOffsetFromExpression(String expression) {

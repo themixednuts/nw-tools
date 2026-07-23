@@ -673,7 +673,7 @@
     }
 
     private Map<String, HookTypeEvidence> collectRegistrationHookTypeNames(
-        List<RegistryEntry> registry) {
+        List<RegistryEntry> registry) throws CancelledException {
 
         LinkedHashMap<String, HookTypeEvidence> result = new LinkedHashMap<>();
         seedRegistryTypeIds(registry);
@@ -682,9 +682,7 @@
 
         SymbolIterator symbols = currentProgram.getSymbolTable().getAllSymbols(true);
         while (symbols.hasNext()) {
-            if (monitor.isCancelled()) {
-                break;
-            }
+            monitor.checkCancelled();
             Symbol symbol = symbols.next();
             String typeName = registrationHookTypeName(symbol);
             if (!isPlausibleTypeName(typeName)) {

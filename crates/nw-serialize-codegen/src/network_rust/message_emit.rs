@@ -31,6 +31,11 @@ pub(super) fn message_module_tokens(
         .iter()
         .map(message_field_tokens)
         .collect::<Vec<_>>();
+    let codec_derive = if plan.supports_unmarshal == Some(false) {
+        quote!(Marshal)
+    } else {
+        quote!(Marshaler)
+    };
     let mut support_names = BTreeSet::new();
     let support_items = plan
         .fields
@@ -42,13 +47,13 @@ pub(super) fn message_module_tokens(
 
     quote! {
         pub mod #module_ident {
-            use ::nw_network::{Marshaler, az_rtti, type_registry};
+            use ::nw_network::{#codec_derive, az_rtti, type_registry};
 
             #(#support_items)*
 
             #[az_rtti(#type_id)]
             #[type_registry(#type_index)]
-            #[derive(Debug, Clone, PartialEq, Marshaler)]
+            #[derive(Debug, Clone, PartialEq, #codec_derive)]
             pub struct #message_ident {
                 #(#fields)*
             }
@@ -65,6 +70,9 @@ pub(super) fn message_field_support_tokens(
 ) -> Option<proc_macro2::TokenStream> {
     let shape = field.nested_type_shape.as_ref()?;
     if message_nested_shape_uses_source_type(shape) {
+        return None;
+    }
+    if !shape.has_proven_anonymous_layout() {
         return None;
     }
     let value_type_string = field.rust_value_type.as_deref()?;
@@ -154,7 +162,7 @@ pub(super) fn message_field_support_tokens(
             }
         }
 
-        impl ::nw_network::serialize::Marshaler for #value_type {
+        impl ::nw_network::serialize::Marshal for #value_type {
             const MARSHAL_SIZE: usize =
                 <#codec_ident as ::nw_network::serialize::Codec<#value_type>>::MARSHAL_SIZE;
 
@@ -162,6 +170,9 @@ pub(super) fn message_field_support_tokens(
                 <#codec_ident as ::nw_network::serialize::Codec<#value_type>>::marshal(self, wb);
             }
 
+        }
+
+        impl ::nw_network::serialize::Unmarshal for #value_type {
             fn unmarshal(
                 rb: &mut ::nw_network::serialize::ReadBuffer,
             ) -> Result<Self, ::nw_network::serialize::MarshalerError> {
@@ -290,6 +301,25 @@ pub(super) fn message_field_type_tokens(shape: &SchemaWireShape) -> proc_macro2:
             let inner = message_field_type_tokens(inner);
             quote!(::core::option::Option<#inner>)
         }
+        SchemaWireShape::DefaultOmitted(_) | SchemaWireShape::BooleanChoice(_) => {
+            let value_type = rust_field_shape(shape).value_type;
+            syn::parse_str::<syn::Type>(&value_type)
+                .map(|value_type| quote!(#value_type))
+                .expect("recursive wire shape produces a valid Rust value type")
+        }
+        SchemaWireShape::Sequence(element) => {
+            let element = message_field_type_tokens(element);
+            quote!(::std::vec::Vec<#element>)
+        }
+        SchemaWireShape::Set(element) => {
+            let element = message_field_type_tokens(element);
+            quote!(::nw_network::serialize::IndexSet<#element>)
+        }
+        SchemaWireShape::Map { key, value } => {
+            let key = message_field_type_tokens(key);
+            let value = message_field_type_tokens(value);
+            quote!(::nw_network::serialize::IndexMap<#key, #value>)
+        }
         SchemaWireShape::ReplicatedContainer(_) => {
             unreachable!("container message fields require an explicit semantic type")
         }
@@ -365,7 +395,13 @@ pub(super) fn message_wire_shape_marshal_attr_tokens(
         SchemaWireShape::TransformCompressor => {
             quote!(#[marshal(codec = "::nw_network::serialize::TransformCompressor")])
         }
-        SchemaWireShape::Composite(_) | SchemaWireShape::Optional(_) => {
+        SchemaWireShape::Composite(_)
+        | SchemaWireShape::Optional(_)
+        | SchemaWireShape::DefaultOmitted(_)
+        | SchemaWireShape::BooleanChoice(_)
+        | SchemaWireShape::Sequence(_)
+        | SchemaWireShape::Map { .. }
+        | SchemaWireShape::Set(_) => {
             let Some(codec) = wire_shape_codec_type(shape) else {
                 return quote! {};
             };

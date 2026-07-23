@@ -35,6 +35,54 @@ fn parses_nested_collection_member_wire_shapes() {
     );
 }
 
+#[test]
+fn parses_conditional_wire_shapes_without_flattening_branch_structure() {
+    use crate::network_schema::parse::{nested_member_wire_shapes, parse_network_wire_shape};
+
+    let text = "boolean-choice<default-omitted<vec3,vec3>,u32>";
+    let shape = parse_network_wire_shape(text).expect("conditional wire shape");
+
+    assert_eq!(shape.wire_string(), text);
+    assert_eq!(nested_member_wire_shapes(text, &[]), None);
+}
+
+#[test]
+fn parses_counted_set_wire_shapes() {
+    use crate::network_schema::parse::{nested_member_wire_shapes, parse_network_wire_shape};
+
+    let text = "set<fixed-bytes-16>";
+    let shape = parse_network_wire_shape(text).expect("counted set wire shape");
+
+    assert_eq!(shape.wire_string(), text);
+    assert_eq!(
+        nested_member_wire_shapes(text, &[]),
+        Some(vec![
+            NetworkWireScalarShape::VlqU32,
+            NetworkWireScalarShape::FixedBytes(16),
+        ])
+    );
+}
+
+#[test]
+fn parses_counted_map_wire_shapes() {
+    use crate::network_schema::parse::{nested_member_wire_shapes, parse_network_wire_shape};
+
+    let text = "map<u32,composite<entity-ref,u32,bool>>";
+    let shape = parse_network_wire_shape(text).expect("counted map wire shape");
+
+    assert_eq!(shape.wire_string(), text);
+    assert_eq!(
+        nested_member_wire_shapes(text, &[]),
+        Some(vec![
+            NetworkWireScalarShape::VlqU32,
+            NetworkWireScalarShape::U32,
+            NetworkWireScalarShape::EntityRef,
+            NetworkWireScalarShape::U32,
+            NetworkWireScalarShape::Bool,
+        ])
+    );
+}
+
 fn fragment_access_message_signatures() -> Vec<NetworkMessageSignature> {
     vec![
         NetworkMessageSignature {

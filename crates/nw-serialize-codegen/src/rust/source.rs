@@ -178,6 +178,7 @@ fn imports_for_unit(unit: &RustCodegenUnit, options: RustSourceOptions) -> Vec<T
             .iter()
             .any(|derive_name| derive_name == "Marshaler")
     });
+    let needs_prefab = unit.items.iter().any(|item| item.prefab.is_some());
 
     let mut imports = Vec::new();
     let mut az_derives = Vec::new();
@@ -202,6 +203,14 @@ fn imports_for_unit(unit: &RustCodegenUnit, options: RustSourceOptions) -> Vec<T
     if needs_marshaler {
         imports.push(quote!(
             use gridmate::Marshaler;
+        ));
+    }
+    if needs_prefab {
+        imports.push(quote!(
+            use az_prefab::{Prefab, ReflectPrefab};
+        ));
+        imports.push(quote!(
+            use bevy::reflect::std_traits::ReflectDefault;
         ));
     }
     imports
@@ -365,7 +374,7 @@ fn render_item(
             source,
         }
     })?;
-    let derives = item
+    let mut derives = item
         .derives
         .iter()
         .filter(|derive_name| render_derive_for_item_kind(item.kind, derive_name))
@@ -378,10 +387,18 @@ fn render_item(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if item.prefab.is_some() {
+        derives.push(syn::parse_quote!(Prefab));
+    }
     let identity_attr = render_identity_attr(item, options)?;
     let reflect_attr = reflect_attr_for_item(item);
     let serde_attr = render_serde_container_attr(item);
     let standalone_identity = render_standalone_identity_impls(item, &ident, options);
+    let prefab_attr = item.prefab.as_ref().map(|prefab| {
+        let tag = LitStr::new(&prefab.tag, Span::call_site());
+        let version = prefab.source_version;
+        quote!(#[prefab(tag = #tag, version = #version)])
+    });
 
     match item.kind {
         RustItemKind::Struct => {
@@ -405,6 +422,7 @@ fn render_item(
                 #identity_attr
                 #serde_attr
                 #reflect_attr
+                #prefab_attr
                 pub struct #ident #body
 
                 #range_impl
@@ -1110,6 +1128,16 @@ fn reflect_attr_for_item(item: &RustItemPlan) -> TokenStream {
         .derives
         .iter()
         .any(|derive| is_serde_derive(derive, "Deserialize"));
+    if item.prefab.is_some() {
+        return match (has_serialize, has_deserialize) {
+            (true, true) => {
+                quote!(#[reflect(Component, Default, Prefab, Serialize, Deserialize)])
+            }
+            (true, false) => quote!(#[reflect(Component, Default, Prefab, Serialize)]),
+            (false, true) => quote!(#[reflect(Component, Default, Prefab, Deserialize)]),
+            (false, false) => quote!(#[reflect(Component, Default, Prefab)]),
+        };
+    }
     match (has_component, has_serialize, has_deserialize) {
         (true, true, true) => quote!(#[reflect(Component, Serialize, Deserialize)]),
         (true, true, false) => quote!(#[reflect(Component, Serialize)]),
@@ -1582,7 +1610,7 @@ mod tests {
     use crate::rust::identity::{RustTypeIdentityKind, RustTypeIdentityPlan};
     use crate::rust::item_plan::{
         RustCodegenUnit, RustFieldPlan, RustIntegerRangePlan, RustItemKind, RustItemPlan,
-        RustUnresolvedTypePlan,
+        RustPrefabPlan, RustUnresolvedTypePlan,
     };
     use crate::rust::plan::RustCodegenPlanner;
     use crate::types::{MapKind, ResolvedType, ScalarType, SequenceKind};
@@ -1611,6 +1639,7 @@ mod tests {
                 ),
                 repr: None,
                 raw_conversion: None,
+                prefab: None,
                 derives: vec![
                     "AzTypeInfo".to_owned(),
                     "Debug".to_owned(),
@@ -1856,6 +1885,7 @@ mod tests {
                 ),
                 repr: None,
                 raw_conversion: None,
+                prefab: None,
                 derives: vec![
                     "Debug".to_owned(),
                     "Default".to_owned(),
@@ -1923,6 +1953,7 @@ mod tests {
                 raw_conversion: Some(RustEnumRawConversionPlan {
                     raw_type: "u8".to_owned(),
                 }),
+                prefab: None,
                 derives: vec![
                     "Debug".to_owned(),
                     "Default".to_owned(),
@@ -2602,6 +2633,7 @@ mod tests {
                 ),
                 repr: None,
                 raw_conversion: None,
+                prefab: None,
                 derives: vec![
                     "Debug".to_owned(),
                     "Default".to_owned(),
@@ -2840,6 +2872,87 @@ mod tests {
     }
 
     #[test]
+    fn emits_native_prefab_metadata_and_root_registry_for_integrated_components() {
+        let model = SerializeContextModel::from_root(&json!({
+            "$id": 1,
+            "uuidMap": {
+                "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA": {
+                    "$id": 10,
+                    "name": "AZ::Component",
+                    "typeId": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+                    "elements": [],
+                    "attributes": []
+                },
+                "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB": {
+                    "$id": 20,
+                    "name": "GameTransformComponent",
+                    "typeId": "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+                    "version": 0,
+                    "elements": [{
+                        "$id": 21,
+                        "name": "AZ::Component",
+                        "typeId": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+                        "is_base_class": true
+                    }],
+                    "attributes": []
+                }
+            },
+            "classNameToUuid": [],
+            "uuidGenericMap": [],
+            "uuidAnyCreationMap": {},
+            "editContext": {"$id": 2, "classData": [], "enumData": []},
+            "enumTypeIdToUnderlyingTypeIdMap": {}
+        }));
+        let mut unit = RustCodegenPlanner::plan_model(&model, &crate::CodegenContext::inline());
+        let component = unit
+            .items
+            .iter_mut()
+            .find(|item| item.source_name == "GameTransformComponent")
+            .expect("component plan");
+        component.prefab = Some(RustPrefabPlan {
+            tag: component.source_name.clone(),
+            source_version: 0,
+        });
+
+        let project =
+            RustSourceEmitter::emit_integrated_project(&unit, &crate::CodegenContext::inline())
+                .expect("integrated project");
+        let component_file = project
+            .files
+            .iter()
+            .find(|file| file.source.contains("pub struct GameTransformComponent"))
+            .expect("generated component file");
+        let source = &component_file.source;
+        let root = &project
+            .files
+            .iter()
+            .find(|file| file.path == "mod.rs")
+            .expect("generated root module")
+            .source;
+
+        assert!(source.contains("use az_prefab::{Prefab, ReflectPrefab};"));
+        assert!(source.contains("Prefab,"));
+        assert!(source.contains("#[reflect(Component, Default, Prefab, Serialize, Deserialize)]"));
+        assert!(source.contains("#[prefab(tag = \"GameTransformComponent\", version = 0u32)]"));
+        assert!(root.contains(
+            "pub fn register_prefab_types(registry: &mut ::bevy::reflect::TypeRegistry)"
+        ));
+        let component_module = component_file
+            .path
+            .strip_suffix(".rs")
+            .expect("component is emitted as a leaf module")
+            .replace('/', "::");
+        assert!(
+            root.contains(&format!("self::{component_module}::GameTransformComponent")),
+            "unexpected root module:\n{root}"
+        );
+        assert_eq!(root.matches(".register::<").count(), 1);
+        assert!(!root.contains("App"));
+        syn::parse_file(source).expect("source should be parseable Rust");
+        syn::parse_file(root).expect("root source should be parseable Rust");
+    }
+
+    #[test]
     fn integrated_unit_does_not_emit_root_registration_plugin() {
         let reflected_id = uuid!("11111111-1111-1111-1111-111111111111");
         let opaque_id = uuid!("22222222-2222-2222-2222-222222222222");
@@ -2863,6 +2976,7 @@ mod tests {
                     ),
                     repr: None,
                     raw_conversion: None,
+                    prefab: None,
                     derives: vec![
                         "Component".to_owned(),
                         "AzRtti".to_owned(),
@@ -2892,6 +3006,7 @@ mod tests {
                     ),
                     repr: None,
                     raw_conversion: None,
+                    prefab: None,
                     derives: vec![
                         "Component".to_owned(),
                         "AzRtti".to_owned(),
@@ -3481,6 +3596,7 @@ mod tests {
                     ),
                     repr: None,
                     raw_conversion: None,
+                    prefab: None,
                     derives: vec![
                         "Component".to_owned(),
                         "AzRtti".to_owned(),
@@ -3521,6 +3637,7 @@ mod tests {
                     ),
                     repr: None,
                     raw_conversion: None,
+                    prefab: None,
                     derives: vec![
                         "AzRtti".to_owned(),
                         "Debug".to_owned(),
@@ -3813,6 +3930,7 @@ mod tests {
             identity: RustTypeIdentityPlan::az_rtti(source_type_id, Some(source_name.to_owned())),
             repr: None,
             raw_conversion: None,
+            prefab: None,
             derives: vec!["Debug".to_owned(), "Default".to_owned(), "Clone".to_owned()],
             rtti_bases: Vec::new(),
             fields: Vec::new(),
@@ -3840,6 +3958,7 @@ mod tests {
                 ),
                 repr: None,
                 raw_conversion: None,
+                prefab: None,
                 derives: vec!["AzTypeInfo".to_owned(), "Debug".to_owned()],
                 rtti_bases: Vec::new(),
                 fields: vec![RustFieldPlan {

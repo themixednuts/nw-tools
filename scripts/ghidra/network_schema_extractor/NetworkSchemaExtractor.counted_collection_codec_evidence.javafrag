@@ -1,0 +1,17 @@
+    private WireShape directCallWireEvidence(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST operation) {
+
+        Function target = pcodeCallTarget(operation);
+        RawPcodeWrite rawRead = pcodeReadRawWrite(operation, target);
+        if (rawRead != null) {
+            WireShape normalized = boundedNormalizedBooleanReadEvidence(
+                high,
+                operations,
+                operation,
+                rawRead);
+            return normalized == null ? rawRead.wireEvidence : normalized;
+        }
+        return directCallWireEvidence(operation);
+    }

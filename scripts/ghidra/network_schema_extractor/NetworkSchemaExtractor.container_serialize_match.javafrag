@@ -313,11 +313,15 @@
         if (typeId == null) {
             return null;
         }
+        Long reflectedExtent = serializeTypeByteWidth(type);
+        if (reflectedExtent != null && reflectedExtent > 0L) {
+            return reflectedExtent;
+        }
         LinkedHashSet<Long> declared = serializeDeclaredSizesByTypeId.get(typeId);
         if (declared != null && !declared.isEmpty()) {
             return declared.size() == 1 ? declared.iterator().next() : null;
         }
-        return serializeTypeByteWidth(type);
+        return null;
     }
 
     private void recordUniqueSerializeContainerMatch(

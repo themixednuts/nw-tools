@@ -1,6 +1,6 @@
 use super::*;
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v50";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v56";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -129,6 +129,12 @@ pub struct NetworkStateFieldShapeReport {
 pub struct NetworkMessageGenerationPlanReport {
     pub type_index: Option<u32>,
     pub type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_status: Option<crate::network_schema::NetworkMessageAnalysisStatus>,
+    #[serde(default)]
+    pub empty_wire_proven: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_unmarshal: Option<bool>,
     pub field_count: usize,
     pub shaped_field_count: usize,
     pub supported_field_count: usize,

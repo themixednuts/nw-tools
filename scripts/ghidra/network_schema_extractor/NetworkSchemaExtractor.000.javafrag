@@ -34,6 +34,7 @@ import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.util.exception.CancelledException;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
@@ -72,7 +73,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final NetworkSchemaAddressFormatter addressFormatter = this::formatAddress;
 
     private static final String EXTRACTOR_VERSION =
-        "network-schema-extractor-20260716-focused-type-worklist-pass";
+        "network-schema-extractor-20260722-semantic-direct-call-shape-pass";
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;
@@ -230,6 +231,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final Map<String, Boolean> vectorConstructorIteratorCache = new HashMap<>();
     private final Map<String, ForwardArgState> inheritedForwardStateCache = new HashMap<>();
     private final Map<String, Long> createInstanceSizeCache = new HashMap<>();
+    private final Map<String, String> createInstanceTypeNameCache = new HashMap<>();
     private final Map<String, HighFunction> highFunctionCache =
         lruCache(HIGH_FUNCTION_CACHE_LIMIT);
     private final Map<String, HighFunction> smallHighFunctionCache =
@@ -253,6 +255,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
         lruCache(FUNCTION_INSTRUCTION_CACHE_LIMIT);
     private final Set<String> messageCallFrameOutputActive = new HashSet<>();
     private final Map<String, Optional<PcodeMemoryPath>> pcodeMemoryPathCache =
+        lruCache(PCODE_MEMORY_PATH_CACHE_LIMIT);
+    private final Map<String, Optional<Integer>> formalPointerRootSlotCache =
         lruCache(PCODE_MEMORY_PATH_CACHE_LIMIT);
     private final Map<String, Optional<ConstructorFieldTypeIdentity>>
         constructorFieldTypeIdentityCache = new HashMap<>();
@@ -279,6 +283,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         lruCache(FUNCTION_INSTRUCTION_CACHE_LIMIT);
     private final Map<String, Optional<InterproceduralCollectionHelper>>
         interproceduralCollectionHelperCache = lruCache(FUNCTION_INSTRUCTION_CACHE_LIMIT);
+    private final Set<String> interproceduralCollectionHelperActive = new HashSet<>();
     private final Map<String, List<Structure>> nestedTypeStructureCache = new HashMap<>();
     private final Map<String, List<SerializeTypeInfo>> serializeTypesByName = new HashMap<>();
     private final Map<String, List<SerializeTypeInfo>> serializeTypesByLeafName = new HashMap<>();
@@ -295,6 +300,11 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final Map<String, JsonObject> serializeObjectsByRef = new HashMap<>();
     private final Map<String, HookTypeEvidence> registrationHooksByTypeId = new HashMap<>();
     private final Map<String, List<RegistryEntry>> registryEntriesByUnmarshal = new HashMap<>();
+    private final Map<String, List<RegistryEntry>> registryEntriesByMarshal = new HashMap<>();
+    private final Map<String, Optional<ReflectedSetIdentity>> reflectedMarshalSetIdentityCache =
+        new HashMap<>();
+    private final Map<String, Integer> reflectedSetRejectCounts = new LinkedHashMap<>();
+    private JsonArray reflectedSetRejectSamples = new JsonArray();
     private final LinkedHashSet<String> registryTypeIds = new LinkedHashSet<>();
     private final Map<String, Integer> typeIdSourceCounts = new LinkedHashMap<>();
     private final Map<String, Integer> nativeUuidRejectCounts = new LinkedHashMap<>();
@@ -309,6 +319,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private int nestedTypeShapeFailures;
     private final Map<String, Integer> nestedTypeShapeRejectCounts = new LinkedHashMap<>();
     private JsonArray containerValueShapeRejectSamples = new JsonArray();
+    private JsonArray interproceduralCollectionCountSamples = new JsonArray();
     private final Map<String, Integer> countedCollectionRejectCounts = new LinkedHashMap<>();
     private JsonArray countedCollectionRejectSamples = new JsonArray();
     private int countedCollectionsRecovered;
@@ -374,7 +385,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
         phaseStarted = runMetrics.startPhase();
         List<RegistryEntry> registry = parseRegistry(root);
-        indexRegistryUnmarshalEntries(registry);
+        indexRegistryHandlerEntries(registry);
         println("Phase registry-parse: " +
             runMetrics.finishPhase("registry-parse", phaseStarted) + " ms");
         initializeDecompiler();
@@ -392,19 +403,22 @@ public class NetworkSchemaExtractor extends GhidraScript {
             println("Selected TypeRegistry entries: " + selectedTypeIndices);
         }
         phaseStarted = runMetrics.startPhase();
-        Map<String, HookTypeEvidence> hookTypeNamesById =
-            analyzeHandlersOnly || focusedTypes
+        startAnalysisWorklist("registration-identities", 0);
+        Map<String, HookTypeEvidence> hookTypeNamesById = analyzeHandlersOnly
             ? Collections.emptyMap()
-            : collectRegistrationHookTypeNames(analysisRegistry);
+            : focusedTypes
+                ? collectSelectedRegistrationHookTypeNames(analysisRegistry)
+                : collectRegistrationHookTypeNames(analysisRegistry);
         monitor.checkCancelled();
         registrationHooksByTypeId.clear();
         registrationHooksByTypeId.putAll(hookTypeNamesById);
+        finishAnalysisWorklist("registration-identities", 0);
         println("Phase registration-identities: " +
             runMetrics.finishPhase("registration-identities", phaseStarted) + " ms");
 
         phaseStarted = runMetrics.startPhase();
         Map<String, RegistrationFunction> registrationFunctions = focusedTypes
-            ? new LinkedHashMap<>()
+            ? collectSelectedRegistrationFunctions(analysisRegistry)
             : collectRegistrationFunctions(registerField);
         monitor.checkCancelled();
         println("Phase dynamic-field-registration: " +
@@ -444,18 +458,18 @@ public class NetworkSchemaExtractor extends GhidraScript {
         LinkedHashMap<String, Integer> identityBlockerCounts = new LinkedHashMap<>();
         phaseStarted = runMetrics.startPhase();
         int registryEntriesAnalyzed = 0;
+        startAnalysisWorklist("registry-analysis", analysisRegistry.size());
+        long registryHeartbeat = System.nanoTime();
         for (RegistryEntry entry : analyzeHandlersOnly
                 ? Collections.<RegistryEntry>emptyList()
                 : analysisRegistry) {
-            monitor.checkCancelled();
+            registryHeartbeat = updateAnalysisWorklist(
+                "registry-analysis",
+                registryEntriesAnalyzed,
+                analysisRegistry.size(),
+                registryProgressDetail(entry),
+                registryHeartbeat);
             registryEntriesAnalyzed++;
-            if ((registryEntriesAnalyzed & 0x7f) == 0) {
-                println(
-                    "Registry analysis progress: entries=" + registryEntriesAnalyzed +
-                    "/" + analysisRegistry.size() +
-                    ", high-function misses=" + runMetrics.counter("highFunctionMisses") +
-                    ", recompilations=" + runMetrics.counter("highFunctionRecompilations"));
-            }
             List<RegistrationFunction> matches =
                 constructorMatches(entry, registrationFunctions);
             if (!matches.isEmpty() && !analyzeStates || matches.isEmpty() && !analyzeMessages) {
@@ -537,7 +551,15 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 row.add("constructorMatches", constructorJson);
             }
             else {
+                MessageMarshalPlan marshalPlan = recoverMessageMarshalPlan(entry);
                 MessageUnmarshalPlan messagePlan = recoverMessageUnmarshalPlan(entry);
+                reconcileMessageCollectionShapes(entry, messagePlan);
+                alignMessageMarshalFieldsToUnmarshal(marshalPlan, messagePlan);
+                refineMessageUnmarshalCapability(messagePlan, marshalPlan);
+                classifyMessageAnalysis(messagePlan, marshalPlan);
+                if (marshalPlan != null) {
+                    row.add("messageMarshal", marshalPlan.toJson(addressFormatter));
+                }
                 if (messagePlan != null) {
                     row.add("messageUnmarshal", messagePlan.toJson());
                     if (!messagePlan.fields.isEmpty()) {
@@ -548,6 +570,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
                             fieldJson.add(field.toJson());
                         }
                         row.add("fields", fieldJson);
+                    }
+                    else if (messagePlan.emptyWireProven) {
+                        mappedMessageEntries++;
                     }
                 }
             }
@@ -560,6 +585,14 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 pcodeMissesBefore);
             registryJson.add(row);
         }
+        updateAnalysisWorklist(
+            "registry-analysis",
+            registryEntriesAnalyzed,
+            analysisRegistry.size(),
+            "high-function-misses=" + runMetrics.counter("highFunctionMisses") +
+                ", recompilations=" + runMetrics.counter("highFunctionRecompilations"),
+            registryHeartbeat);
+        finishAnalysisWorklist("registry-analysis", analysisRegistry.size());
         println("Phase registry-analysis: " +
             runMetrics.finishPhase("registry-analysis", phaseStarted) + " ms");
 
@@ -705,6 +738,18 @@ public class NetworkSchemaExtractor extends GhidraScript {
         report.add("fieldRegistrationFunctions", functionJson);
         report.add("fieldHandlerVtables", fieldHandlerVtableJson);
         JsonObject performance = runMetrics.toJson();
+        performance.addProperty(
+            "integerEvaluatorQueries",
+            NetworkSchemaIntegerEvaluator.queryCount());
+        performance.addProperty(
+            "integerEvaluatorExactCacheHits",
+            NetworkSchemaIntegerEvaluator.exactCacheHitCount());
+        performance.addProperty(
+            "integerEvaluatorBitCacheHits",
+            NetworkSchemaIntegerEvaluator.bitCacheHitCount());
+        performance.addProperty(
+            "integerEvaluatorBudgetExhaustions",
+            NetworkSchemaIntegerEvaluator.budgetExhaustionCount());
         performance.add(
             "highFunctionRecompileHotspots",
             highFunctionRecompileHotspotsJson());
@@ -744,6 +789,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
                 CODEC_CLASSIFICATION_CACHE_LIMIT) +
             ", unmarshalLeaves=" + cacheSizeWithLimit(
                 unmarshalLeafCache.size(),
-                CODEC_CLASSIFICATION_CACHE_LIMIT));
+                CODEC_CLASSIFICATION_CACHE_LIMIT) +
+            ", integerEvaluatorBudgetExhaustions=" +
+                NetworkSchemaIntegerEvaluator.budgetExhaustionCount());
         println("Extractor performance: " + performance);
     }

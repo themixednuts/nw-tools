@@ -16,6 +16,16 @@ pub struct NetworkHandler {
 pub struct NetworkInstanceLayout {
     pub create_instance: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_status: Option<NetworkMessageAnalysisStatus>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub empty_wire_proven: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub empty_wire_evidence_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_unmarshal: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_source: Option<String>,
@@ -28,6 +38,16 @@ pub struct NetworkInstanceLayout {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegated_codec: Option<NetworkDelegatedCodec>,
     pub evidence: Vec<NetworkEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkMessageAnalysisStatus {
+    RecoveredFields,
+    MarshalOnly,
+    DelegatedCodec,
+    ProvenEmpty,
+    Unresolved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +124,7 @@ pub enum NetworkEvidenceKind {
     RegisterField,
     FieldRegistrationFunction,
     MessageUnmarshal,
+    MessageMarshal,
     MessageSource,
     FieldOverride,
     FragmentMetadata,

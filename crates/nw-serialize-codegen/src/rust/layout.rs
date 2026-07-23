@@ -662,6 +662,7 @@ mod tests {
             },
             repr: None,
             raw_conversion: None,
+            prefab: None,
             derives: Vec::new(),
             rtti_bases: Vec::new(),
             fields: Vec::new(),

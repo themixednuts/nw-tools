@@ -1,14 +1,23 @@
-    private void indexRegistryUnmarshalEntries(List<RegistryEntry> registry) {
+    private void indexRegistryHandlerEntries(List<RegistryEntry> registry) {
         registryEntriesByUnmarshal.clear();
+        registryEntriesByMarshal.clear();
         for (RegistryEntry entry : registry) {
-            Address address = parseCapturedAddress(entry.unmarshal);
-            Function function = functionAtOrContaining(address);
-            if (function == null) {
-                continue;
+            Function unmarshal = functionAtOrContaining(parseCapturedAddress(entry.unmarshal));
+            if (unmarshal != null) {
+                registryEntriesByUnmarshal
+                    .computeIfAbsent(
+                        unmarshal.getEntryPoint().toString(),
+                        ignored -> new ArrayList<>())
+                    .add(entry);
             }
-            registryEntriesByUnmarshal
-                .computeIfAbsent(function.getEntryPoint().toString(), ignored -> new ArrayList<>())
-                .add(entry);
+            Function marshal = functionAtOrContaining(parseCapturedAddress(entry.marshal));
+            if (marshal != null) {
+                registryEntriesByMarshal
+                    .computeIfAbsent(
+                        marshal.getEntryPoint().toString(),
+                        ignored -> new ArrayList<>())
+                    .add(entry);
+            }
         }
     }
 

@@ -69,20 +69,10 @@
         if (def.getNumInputs() != 2 || def.getOutput() == null) {
             return null;
         }
-        String high = pcodeValueNativeType(
-            def.getInput(0),
-            tempNativeTypes,
-            new LinkedHashSet<>(seen),
-            depth);
-        String low = pcodeValueNativeType(
-            def.getInput(1),
-            tempNativeTypes,
-            new LinkedHashSet<>(seen),
-            depth);
-        Integer width = high == null ? null : nativeTypeByteWidth(high);
-        return high != null && high.equals(low) && width != null &&
-            width == def.getOutput().getSize()
-                ? high
+        String nativeType = pcodeTempRangeEvidence(def.getOutput(), tempNativeTypes);
+        Integer width = nativeType == null ? null : nativeTypeByteWidth(nativeType);
+        return width != null && width == def.getOutput().getSize()
+                ? nativeType
                 : null;
     }
 
@@ -243,9 +233,16 @@
         if ("AZ::Uuid".equals(normalized) ||
             "AZ::TypeId".equals(normalized) ||
             "Uuid".equals(normalized) ||
+            "Amazon::Pervasives::CrcID".equals(normalized) ||
             "Amazon::Pervasives::UID".equals(normalized) ||
             normalized.startsWith("Amazon::Pervasives::UID<")) {
             return "fixed-bytes-16";
+        }
+        GenericType generic = parseGenericTemplateType(normalized);
+        if (generic != null && "unordered_set".equals(generic.simpleName) &&
+            !generic.args.isEmpty()) {
+            String element = wireShapeFromNativeType(generic.args.get(0));
+            return element == null ? null : "set<" + element + ">";
         }
         if (normalized.matches("fixed-bytes-[1-9][0-9]*")) {
             return normalized;
@@ -366,21 +363,44 @@
     }
 
     private void enrichRegistrationFieldHandlers(
-        Map<String, RegistrationFunction> registrationFunctions) {
+        Map<String, RegistrationFunction> registrationFunctions) throws CancelledException {
 
         if (registrationFunctions == null) {
             return;
         }
+        int total = registrationFunctions.values().stream()
+            .mapToInt(function -> function.fields.size())
+            .sum();
+        startAnalysisWorklist("field-handler-enrichment", total);
+        long heartbeat = System.nanoTime();
+        int completed = 0;
         for (RegistrationFunction function : registrationFunctions.values()) {
             for (FieldCall field : function.fields) {
+                String detail = "registration=" +
+                    formatAddress(function.function.getEntryPoint()) +
+                    ", field=" + field.index;
+                heartbeat = updateAnalysisWorklist(
+                    "field-handler-enrichment",
+                    completed,
+                    total,
+                    detail,
+                    heartbeat);
                 field.handlerConstruction = handlerConstructionOwnedBy(
                     function.function,
                     field.handlerConstruction);
                 applyFieldHandlerShape(field, fieldHandlerShape(field.handlerVtable));
                 field.handlerTypeName =
                     fieldHandlerTypeName(field.handlerConstruction, field.handlerVtable);
+                completed++;
             }
         }
+        updateAnalysisWorklist(
+            "field-handler-enrichment",
+            completed,
+            total,
+            "unique-vtables=" + fieldHandlerShapeCache.size(),
+            heartbeat);
+        finishAnalysisWorklist("field-handler-enrichment", total);
     }
 
     private void applyFieldHandlerShape(FieldCall field, FieldHandlerShape shape) {

@@ -176,6 +176,17 @@ impl NetworkRustEmitter {
                 String,
                 Composite(&'static [NetworkWireShape]),
                 Optional(&'static NetworkWireShape),
+                DefaultOmitted(&'static [NetworkWireShape]),
+                BooleanChoice {
+                    false_value: &'static NetworkWireShape,
+                    true_value: &'static NetworkWireShape,
+                },
+                Sequence(&'static NetworkWireShape),
+                Set(&'static NetworkWireShape),
+                Map {
+                    key: &'static NetworkWireShape,
+                    value: &'static NetworkWireShape,
+                },
                 ReplicatedContainer(NetworkReplicatedContainerWireShape),
                 FixedSequence(NetworkFixedSequenceWireShape),
             }
@@ -539,6 +550,7 @@ impl NetworkRustEmitter {
                     &wire_shapes,
                     &wire_shape_sources,
                     &value_type_candidates,
+                    &serialize_types,
                 )
             },
         );

@@ -53,16 +53,6 @@
                 NetworkSchemaJson.add(object, "typeName", name);
                 NetworkSchemaJson.add(object, "typeNameSource", "typeregistry-entry");
             }
-            else if (isConcreteNetworkTypeName(concreteValueProviderTypeName)) {
-                NetworkSchemaJson.add(object, "typeName", concreteValueProviderTypeName);
-                NetworkSchemaJson.add(object, "typeNameSource", "valueAzRtti-provider");
-            }
-            else if (valueAzRttiEvidence != null &&
-                isConcreteNetworkTypeName(valueAzRttiEvidence.typeName)) {
-                NetworkSchemaJson.add(object, "typeName", valueAzRttiEvidence.typeName);
-                NetworkSchemaJson.add(object, "typeNameSource", "valueAzRtti-observed-type-name");
-            }
-
             JsonObject handler = new JsonObject();
             NetworkSchemaJson.add(handler, "Destructor", destructor);
             NetworkSchemaJson.add(handler, "GetEmptyValue", getEmptyValue);
@@ -232,6 +222,7 @@
         String wireShapeSource;
         String wireLayout;
         String wireLayoutSource;
+        ContainerStorageKind collectionStorageKind;
         FixedSequenceShape fixedSequenceShape;
         List<HandlerConstructorWrite> constructorWrites;
         String confidence;
@@ -336,6 +327,11 @@
             NetworkSchemaJson.add(object, "wireShapeSource", resolvedWireShapeSource);
             NetworkSchemaJson.add(object, "wireLayout", wireLayout);
             NetworkSchemaJson.add(object, "wireLayoutSource", wireLayoutSource);
+            if (collectionStorageKind != null) {
+                object.addProperty(
+                    "collectionStorageKind",
+                    collectionStorageKind.jsonName);
+            }
             if (fixedSequenceShape != null) {
                 object.add("fixedSequenceShape", fixedSequenceShape.toJson(addressFormatter));
             }
@@ -530,6 +526,11 @@
         String rootStorageBase;
         String readBufferParameter;
         String rootEvidenceSource;
+        String analysisStatus;
+        boolean emptyWireProven;
+        String emptyWireEvidenceSource;
+        String terminalStatus;
+        Boolean supportsUnmarshal;
         DelegatedCodecEvidence delegatedCodec;
         final ArrayList<FieldCall> fields = new ArrayList<>();
         final JsonArray rejectedPcodeFields = new JsonArray();
@@ -554,6 +555,18 @@
             NetworkSchemaJson.add(object, "rootStorageBase", rootStorageBase);
             NetworkSchemaJson.add(object, "readBufferParameter", readBufferParameter);
             NetworkSchemaJson.add(object, "rootEvidenceSource", rootEvidenceSource);
+            NetworkSchemaJson.add(object, "analysisStatus", analysisStatus);
+            if (emptyWireProven) {
+                object.addProperty("emptyWireProven", true);
+                NetworkSchemaJson.add(
+                    object,
+                    "emptyWireEvidenceSource",
+                    emptyWireEvidenceSource);
+            }
+            NetworkSchemaJson.add(object, "terminalStatus", terminalStatus);
+            if (supportsUnmarshal != null) {
+                object.addProperty("supportsUnmarshal", supportsUnmarshal);
+            }
             if (delegatedCodec != null) {
                 object.add("delegatedCodec", delegatedCodec.toJson());
             }

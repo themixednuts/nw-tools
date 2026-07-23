@@ -8,6 +8,7 @@
     }
 
     private record CollectionIteration(
+        String nativeType,
         WireShape wireEvidence,
         Set<Address> codecCallsites) {
 
@@ -41,8 +42,6 @@
         HashMap<PcodeBlockBasic, List<CollectionElementCodec>> codecsByBlock =
             new HashMap<>();
         LinkedHashSet<Address> callsites = new LinkedHashSet<>();
-        Map<String, CodecWireTrace> completed = new HashMap<>();
-        Set<String> active = new LinkedHashSet<>();
         for (PcodeOpAST operation : operations) {
             if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
                 continue;
@@ -57,7 +56,7 @@
                 operation,
                 target,
                 readBuffer,
-                active);
+                codecWireTraceActiveContexts);
             if (targetReadBuffer == null) {
                 continue;
             }
@@ -76,8 +75,8 @@
             CodecWireTrace nested = traceUnmarshalCodec(
                 target,
                 targetReadBuffer,
-                active,
-                completed);
+                codecWireTraceActiveContexts,
+                codecWireTraceCompletedContexts);
             if (nested == null || nested.events.isEmpty()) {
                 recordNestedTypeShapeReject(
                     "dynamic-collection-element-codec-unproven");
@@ -110,7 +109,22 @@
         WireShape evidence = dynamicSequenceWireEvidence(events);
         return evidence == null
             ? null
-            : new CollectionIteration(evidence, callsites);
+            : new CollectionIteration(
+                dynamicSequenceNativeType(events),
+                evidence,
+                callsites);
+    }
+
+    private String dynamicSequenceNativeType(List<CodecWireEvent> events) {
+        if (events == null || events.size() != 1) {
+            return null;
+        }
+        String elementType = events.get(0).nativeType();
+        if (elementType == null || elementType.isBlank() ||
+            "unknown".equals(elementType)) {
+            return null;
+        }
+        return "AZStd::vector<" + elementType + ">";
     }
 
     private boolean sameCollectionElementCodec(
@@ -143,7 +157,7 @@
                 continue;
             }
             Function target = pcodeCallTarget(operation);
-            WireShape evidence = directCallWireEvidence(operation);
+            WireShape evidence = directCallWireEvidence(high, operations, operation);
             observePcodeTempUnmarshal(
                 tempNativeTypes,
                 tempWireShapes,
@@ -163,8 +177,6 @@
                 owner,
                 operation,
                 pcodeCallTarget(operation),
-                tempNativeTypes,
-                tempWireShapes,
                 Collections.emptyMap());
             if (collection == null) {
                 continue;
@@ -197,7 +209,7 @@
             if (nestedHelpers.contains(operation)) {
                 continue;
             }
-            WireShape evidence = directCallWireEvidence(operation);
+            WireShape evidence = directCallWireEvidence(high, operations, operation);
             if (evidence != null && evidence.layout != null) {
                 result.add(new PcodeCodecCall(operation, evidence));
                 consumedCallsites.add(operation.getSeqnum().getTarget());

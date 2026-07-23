@@ -1,18 +1,22 @@
-use std::{borrow::Cow, path::Path};
+#[cfg(feature = "full")]
+use std::borrow::Cow;
+use std::path::Path;
 
 use crate::catalog::ReflectedTypeCatalog;
 use crate::document::SerializeContextDocument;
 use crate::field_evidence::FieldOwnerEvidenceIndex;
 use crate::graph::SchemaGraph;
 use crate::ir::{SerializeCodegenPlanner, SerializeCodegenUnit};
-use crate::lint::{Diagnostic, lint_codegen_unit, lint_document};
+use crate::lint::{Diagnostic, Severity, lint_codegen_unit, lint_document};
 use crate::model::SerializeContextModel;
 use crate::native::NativeSymbolIndex;
 
+#[cfg(feature = "full")]
 mod compile_unit;
 mod diagnostics;
 mod error;
 mod input;
+#[cfg(feature = "full")]
 mod view;
 
 pub use error::SerializeContextCompileError;
@@ -36,6 +40,7 @@ pub struct CompileUnit {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[cfg(feature = "full")]
 #[derive(Debug, Clone)]
 pub struct SerializeCodegenView<'a> {
     emitted_unit: Cow<'a, SerializeCodegenUnit>,
@@ -204,7 +209,16 @@ impl SerializeContextCompiler {
     }
 }
 
-#[cfg(test)]
+impl CompileUnit {
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error)
+    }
+}
+
+#[cfg(all(test, feature = "full"))]
 mod tests {
     use std::fs;
 

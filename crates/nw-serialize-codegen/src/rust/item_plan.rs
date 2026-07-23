@@ -24,10 +24,21 @@ pub struct RustItemPlan {
     pub identity: RustTypeIdentityPlan,
     pub repr: Option<String>,
     pub raw_conversion: Option<RustEnumRawConversionPlan>,
+    /// Canonical Prefab source identity for authorable Bevy components.
+    ///
+    /// This stays opt-in at the plan boundary so protocol-only and standalone
+    /// codegen do not acquire an `az-prefab` dependency.
+    pub prefab: Option<RustPrefabPlan>,
     pub derives: Vec<String>,
     pub rtti_bases: Vec<RustRttiBasePlan>,
     pub fields: Vec<RustFieldPlan>,
     pub variants: Vec<RustVariantPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustPrefabPlan {
+    pub tag: String,
+    pub source_version: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -97,11 +97,20 @@
         JsonObject diagnostics = new JsonObject();
         diagnostics.add("rejectSamples", containerValueShapeRejectSamples.deepCopy());
         diagnostics.add(
+            "interproceduralCollectionCountSamples",
+            interproceduralCollectionCountSamples.deepCopy());
+        diagnostics.add(
             "countedCollectionRejectSummary",
             countMapJson(countedCollectionRejectCounts));
         diagnostics.add(
             "countedCollectionRejectSamples",
             countedCollectionRejectSamples.deepCopy());
+        diagnostics.add(
+            "reflectedSetRejectSummary",
+            countMapJson(reflectedSetRejectCounts));
+        diagnostics.add(
+            "reflectedSetRejectSamples",
+            reflectedSetRejectSamples.deepCopy());
         diagnostics.addProperty("countedCollectionsRecovered", countedCollectionsRecovered);
         diagnostics.addProperty("countedCollectionsApplied", countedCollectionsApplied);
         diagnostics.add(

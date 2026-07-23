@@ -145,8 +145,6 @@
                         target,
                         op,
                         callTarget,
-                        tempNativeTypes,
-                        tempWireShapes,
                         callerParamStorage);
                 if (collectionCall != null) {
                     countedCollectionsApplied++;
@@ -236,10 +234,6 @@
                             op,
                             callTarget,
                             "container-value-pcode-nested-direct-type-call")) {
-                        markNestedTypeMemberWireOrder(
-                            byBase,
-                            storage,
-                            "cfg-call-order");
                         continue;
                     }
                 }
@@ -398,16 +392,11 @@
         return key.toString();
     }
 
-    private boolean isLikelyOutputParameterBase(String base) {
+    private boolean isProvenOutputParameterBase(Function function, String base) {
         if (base == null || !base.matches("param_\\d+")) {
             return false;
         }
-        try {
-            return Integer.parseInt(base.substring("param_".length())) >= 3;
-        }
-        catch (NumberFormatException ignored) {
-            return false;
-        }
+        return function != null && !readBufferParameters(function).contains(base);
     }
 
     private PcodeStorage sequenceOwnerStorageForElementUnmarshal(

@@ -262,6 +262,7 @@
             decompiler.dispose();
             decompiler = null;
         }
+        NetworkSchemaIntegerEvaluator.resetMetrics();
         clearAnalysisCaches();
         cacheProgramKey = currentProgramCacheKey();
     }
@@ -280,6 +281,7 @@
         vectorConstructorIteratorCache.clear();
         inheritedForwardStateCache.clear();
         createInstanceSizeCache.clear();
+        createInstanceTypeNameCache.clear();
         highFunctionCache.clear();
         smallHighFunctionCache.clear();
         failedHighFunctions.clear();
@@ -301,12 +303,18 @@
         scalarOutputParameterSlotCache.clear();
         unmarshalOutputParameterSlotCache.clear();
         unmarshalOutputParameterSlotActive.clear();
+        formalPointerRootSlotCache.clear();
         readBufferFlowCache.clear();
         readRawFunctionCache.clear();
         marshalLeafCache.clear();
         unmarshalLeafCache.clear();
+        codecWireTraceDiagnostics.clear();
+        codecWireTraceActiveContexts.clear();
+        codecWireTraceCompletedContexts.clear();
         nestedTypeShapeActive.clear();
         collectionOutputShapeCache.clear();
+        interproceduralCollectionHelperCache.clear();
+        interproceduralCollectionHelperActive.clear();
         fieldHandlerShapeCache.clear();
         nestedTypeShapeCache.clear();
         serializeTypesByName.clear();
@@ -321,6 +329,10 @@
         serializeObjectsByRef.clear();
         registrationHooksByTypeId.clear();
         registryEntriesByUnmarshal.clear();
+        registryEntriesByMarshal.clear();
+        reflectedMarshalSetIdentityCache.clear();
+        reflectedSetRejectCounts.clear();
+        reflectedSetRejectSamples = new JsonArray();
         registryTypeIds.clear();
         typeIdSourceCounts.clear();
         nativeUuidRejectCounts.clear();
@@ -333,6 +345,7 @@
         nestedTypeShapeFailures = 0;
         nestedTypeShapeRejectCounts.clear();
         containerValueShapeRejectSamples = new JsonArray();
+        interproceduralCollectionCountSamples = new JsonArray();
         countedCollectionRejectCounts.clear();
         countedCollectionRejectSamples = new JsonArray();
         countedCollectionsRecovered = 0;
@@ -423,6 +436,8 @@
             try (Writer writer = Files.newBufferedWriter(temp, StandardCharsets.UTF_8)) {
                 gson.toJson(report, writer);
             }
+            long expectedSize = Files.size(temp);
+            Path actualOutput;
 
             try {
                 Files.move(
@@ -430,12 +445,12 @@
                     absoluteOutput,
                     StandardCopyOption.REPLACE_EXISTING,
                     StandardCopyOption.ATOMIC_MOVE);
-                return absoluteOutput.toFile();
+                actualOutput = absoluteOutput;
             }
             catch (IOException atomicFailure) {
                 try {
                     Files.move(temp, absoluteOutput, StandardCopyOption.REPLACE_EXISTING);
-                    return absoluteOutput.toFile();
+                    actualOutput = absoluteOutput;
                 }
                 catch (IOException replaceFailure) {
                     Path fallback = lockedFallbackOutputPath(absoluteOutput);
@@ -443,12 +458,40 @@
                     println(
                         "Primary report path is locked; wrote fallback report: " +
                         fallback.toFile().getAbsolutePath());
-                    return fallback.toFile();
+                    actualOutput = fallback;
                 }
             }
+            verifyWrittenReport(actualOutput, expectedSize, report);
+            return actualOutput.toFile();
         }
         finally {
             Files.deleteIfExists(temp);
+        }
+    }
+
+    private void verifyWrittenReport(
+        Path output,
+        long expectedSize,
+        JsonObject report) throws IOException {
+
+        long actualSize = Files.size(output);
+        if (actualSize != expectedSize) {
+            throw new IOException(
+                "Report write verification failed for " + output +
+                ": expected " + expectedSize + " bytes, found " + actualSize);
+        }
+        String expectedVersion = report.get("extractorVersion").getAsString();
+        char[] header = new char[16 * 1024];
+        int length;
+        try (Reader reader = Files.newBufferedReader(output, StandardCharsets.UTF_8)) {
+            length = reader.read(header);
+        }
+        String prefix = length <= 0 ? "" : new String(header, 0, length);
+        String compactVersion = "\"extractorVersion\":\"" + expectedVersion + "\"";
+        String prettyVersion = "\"extractorVersion\": \"" + expectedVersion + "\"";
+        if (!prefix.contains(compactVersion) && !prefix.contains(prettyVersion)) {
+            throw new IOException(
+                "Report write verification found stale extractor metadata at " + output);
         }
     }
 
@@ -622,7 +665,8 @@
         JsonObject object = element.getAsJsonObject();
         String typeId = canonicalUuidFromString(string(object, "typeId"));
         Long dataSize = longValue(object, "dataSize");
-        if (typeId != null && dataSize != null && dataSize > 0L) {
+        boolean pointerStorage = Boolean.TRUE.equals(bool(object, "is_pointer"));
+        if (typeId != null && dataSize != null && dataSize > 0L && !pointerStorage) {
             serializeDeclaredSizesByTypeId
                 .computeIfAbsent(normalizeUuid(typeId), ignored -> new LinkedHashSet<>())
                 .add(dataSize);

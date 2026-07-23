@@ -13,10 +13,12 @@ $sourceNames = @(
     'NetworkSchemaModels.java',
     'NetworkSchemaTypeModels.java',
     'NetworkSchemaContainerModels.java',
+    'NetworkSchemaMessageModels.java',
     'NetworkSchemaStack.java',
     'NetworkSchemaPcode.java'
     'NetworkSchemaControlFlow.java'
     'NetworkSchemaFlowSequence.java'
+    'NetworkSchemaBranchFlow.java'
     'NetworkSchemaNaturalLoop.java'
     'NetworkSchemaCodecClassifier.java'
     'NetworkSchemaIntegerEvaluator.java'

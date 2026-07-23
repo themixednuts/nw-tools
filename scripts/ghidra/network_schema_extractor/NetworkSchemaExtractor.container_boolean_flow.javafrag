@@ -32,7 +32,7 @@
                         pcodeStorageExpression(candidate.getOutput()))) {
                     continue;
                 }
-                if (normalizedBooleanExpression(
+                if (normalizedBooleanLowByteExpression(
                         candidate.getInput(0),
                         new LinkedHashSet<>(),
                         0)) {
@@ -41,6 +41,59 @@
             }
         }
         return false;
+    }
+
+    private boolean normalizedBooleanLowByteExpression(
+        Varnode value,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || depth > 32) {
+            return false;
+        }
+        if (value.getSize() == Byte.BYTES) {
+            return normalizedBooleanExpression(value, active, depth);
+        }
+        if (!active.add(pcodeNodeKey(value))) {
+            return false;
+        }
+        PcodeOp definition = value.getDef();
+        if (definition == null) {
+            return false;
+        }
+        return switch (definition.getOpcode()) {
+            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INDIRECT,
+                 PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT ->
+                definition.getNumInputs() == 1 &&
+                    normalizedBooleanLowByteExpression(
+                        definition.getInput(0),
+                        active,
+                        depth + 1);
+            case PcodeOp.PIECE -> definition.getNumInputs() == 2 &&
+                normalizedBooleanLowByteExpression(
+                    definition.getInput(1),
+                    active,
+                    depth + 1);
+            case PcodeOp.SUBPIECE -> definition.getNumInputs() == 2 &&
+                Objects.equals(
+                    NetworkSchemaIntegerEvaluator.evaluate(definition.getInput(1)),
+                    0L) &&
+                normalizedBooleanLowByteExpression(
+                    definition.getInput(0),
+                    active,
+                    depth + 1);
+            case PcodeOp.MULTIEQUAL -> {
+                boolean allNormalized = definition.getNumInputs() > 0;
+                for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+                    allNormalized &= normalizedBooleanLowByteExpression(
+                        definition.getInput(slot),
+                        new LinkedHashSet<>(active),
+                        depth + 1);
+                }
+                yield allNormalized;
+            }
+            default -> false;
+        };
     }
 
     private boolean normalizedBooleanExpression(

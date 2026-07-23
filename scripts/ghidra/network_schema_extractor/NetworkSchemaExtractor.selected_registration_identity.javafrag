@@ -1,0 +1,143 @@
+    private Map<String, HookTypeEvidence> collectSelectedRegistrationHookTypeNames(
+        List<RegistryEntry> registry) throws CancelledException {
+
+        LinkedHashMap<String, HookTypeEvidence> result = new LinkedHashMap<>();
+        seedRegistryTypeIds(registry);
+        startAnalysisWorklist("selected-registration-identities", registry.size());
+        long heartbeat = System.nanoTime();
+        int completed = 0;
+        for (RegistryEntry entry : registry) {
+            heartbeat = updateAnalysisWorklist(
+                "selected-registration-identities",
+                completed,
+                registry.size(),
+                registryProgressDetail(entry),
+                heartbeat);
+            completed++;
+            String typeId = canonicalUuidFromString(entry.uuid);
+            if (typeId == null || isZeroUuid(typeId)) {
+                continue;
+            }
+            if (isPlausibleTypeName(entry.name)) {
+                continue;
+            }
+
+            HookTypeEvidence hook = selectedRegistrationHook(entry, typeId);
+            if (hook != null && uuidEquals(typeId, hook.typeId)) {
+                hook.source = "selected-registration-helper-table";
+                result.put(normalizeUuid(typeId), hook);
+            }
+        }
+        updateAnalysisWorklist(
+            "selected-registration-identities",
+            completed,
+            registry.size(),
+            "recovered=" + result.size(),
+            heartbeat);
+        finishAnalysisWorklist("selected-registration-identities", registry.size());
+        int recovered = result.size();
+        seedRegistryTypeIdentities(result, registry);
+        println(
+            "Recovered selected registration type names: " + recovered +
+            " (registry names: " + (result.size() - recovered) + ")");
+        return result;
+    }
+
+    private HookTypeEvidence selectedRegistrationHook(
+        RegistryEntry entry,
+        String typeId) {
+
+        AzRttiEvidence identity = resolvedAzRtti(entry, List.of());
+        for (Address provider : rttiProvidersForTypeId(identity, typeId)) {
+            for (Function registerThunk : directRegisterTypeCallers(provider)) {
+                HookTypeEvidence hook = registrationHookForThunk(registerThunk);
+                if (hook != null && uuidEquals(typeId, hook.typeId)) {
+                    return hook;
+                }
+            }
+        }
+        return null;
+    }
+
+    private List<Address> rttiProvidersForTypeId(
+        AzRttiEvidence evidence,
+        String typeId) {
+
+        if (evidence == null || typeId == null) {
+            return List.of();
+        }
+        LinkedHashSet<Address> providers = new LinkedHashSet<>();
+        for (JsonElement element : evidence.providers) {
+            if (!element.isJsonObject()) {
+                continue;
+            }
+            JsonObject provider = element.getAsJsonObject();
+            if (!uuidEquals(typeId, string(provider, "typeId"))) {
+                continue;
+            }
+            Address address = parseCapturedAddress(string(provider, "provider"));
+            if (isExecutableAddress(address)) {
+                providers.add(resolvedCodeTarget(address));
+            }
+        }
+        return List.copyOf(providers);
+    }
+
+    private List<Function> directRegisterTypeCallers(Address provider) {
+        if (!isExecutableAddress(provider)) {
+            return List.of();
+        }
+        Address registerType = currentProgram.getImageBase().add(TYPE_REGISTRY_REGISTER_TYPE_RVA);
+        LinkedHashMap<Address, Function> callers = new LinkedHashMap<>();
+        ReferenceIterator references =
+            currentProgram.getReferenceManager().getReferencesTo(provider);
+        while (references.hasNext()) {
+            Reference reference = references.next();
+            Function owner = functionContaining(reference.getFromAddress());
+            if (owner != null && functionCalls(owner, registerType)) {
+                callers.putIfAbsent(owner.getEntryPoint(), owner);
+            }
+        }
+        return List.copyOf(callers.values());
+    }
+
+    private boolean functionCalls(Function function, Address target) {
+        if (function == null || !isExecutableAddress(target)) {
+            return false;
+        }
+        Address resolvedTarget = resolvedCodeTarget(target);
+        for (Instruction instruction : functionInstructions(function)) {
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+            Address called = resolvedCodeTarget(callTarget(instruction));
+            if (resolvedTarget.equals(called)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private HookTypeEvidence registrationHookForThunk(Function registerThunk) {
+        ReferenceIterator references = currentProgram.getReferenceManager()
+            .getReferencesTo(registerThunk.getEntryPoint());
+        while (references.hasNext()) {
+            Address helperTable = subtract(references.next().getFromAddress(), 0x10L);
+            if (!isRegistrationHelperTable(helperTable)) {
+                continue;
+            }
+            Address tableThunk = registrationCodePointer(helperTable.add(0x10L));
+            if (!registerThunk.getEntryPoint().equals(resolvedCodeTarget(tableThunk))) {
+                continue;
+            }
+            String typeName = registrationHookTypeNameFromSlot(helperTable, 3);
+            if (!isPlausibleTypeName(typeName)) {
+                continue;
+            }
+            return decodeRegistrationHelperTable(
+                registerThunk.getEntryPoint(),
+                helperTable,
+                typeName);
+        }
+        return null;
+    }

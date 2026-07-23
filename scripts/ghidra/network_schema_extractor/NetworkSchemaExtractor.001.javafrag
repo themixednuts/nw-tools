@@ -41,6 +41,20 @@
             field.dataSize = longValue(value, "dataSize");
             field.typeName = typeName;
             field.wireShape = wireShapeFromSerializeField(value, typeId, field.typeName);
+            JsonObject generic = resolveSerializeObject(object(value, "genericClassInfo"));
+            JsonObject genericClassData = resolveSerializeObject(object(generic, "classData"));
+            field.genericClassName = genericClassData == null
+                ? null
+                : string(genericClassData, "name");
+            JsonArray templatedTypeIds = array(generic, "templatedTypeIds");
+            if (templatedTypeIds != null) {
+                for (JsonElement templatedTypeId : templatedTypeIds) {
+                    String canonical = canonicalUuidFromString(stringValue(templatedTypeId));
+                    if (canonical != null) {
+                        field.templatedTypeIds.add(canonical);
+                    }
+                }
+            }
             field.baseClass = baseClass;
             fields.add(field);
         }
@@ -263,7 +277,8 @@
         return slots - registered;
     }
 
-    private Map<String, RegistrationFunction> collectRegistrationFunctions(Address registerField) {
+    private Map<String, RegistrationFunction> collectRegistrationFunctions(
+        Address registerField) throws CancelledException {
         LinkedHashMap<String, Function> owners = new LinkedHashMap<>();
         ReferenceIterator references =
             currentProgram.getReferenceManager().getReferencesTo(registerField);
@@ -281,24 +296,27 @@
         }
 
         LinkedHashMap<String, RegistrationFunction> result = new LinkedHashMap<>();
+        startAnalysisWorklist("dynamic-field-registration", owners.size());
+        long heartbeat = System.nanoTime();
+        int completed = 0;
         for (Map.Entry<String, Function> owner : owners.entrySet()) {
-            RegistrationFunction function = new RegistrationFunction(owner.getValue());
-            function.instanceVtable = findInstanceVtable(function.function);
-            function.azRtti = decodeAzRttiFromVtable(function.instanceVtable);
-            List<FieldCall> pcodeFields = recoverRegisterFieldCallsFromPcode(function.function);
-            function.fields.addAll(pcodeFields);
-
-            List<FieldCall> executedFields = hasBackwardPcodeBranch(function.function)
-                ? recoverExecutedRegisterFieldCalls(function.function)
-                : Collections.emptyList();
-            if (executedFields.size() > function.fields.size()) {
-                registerFieldLoopRecoveredFunctionCount++;
-                registerFieldLoopRecoveredCallCount += executedFields.size() - function.fields.size();
-                function.fields.clear();
-                function.fields.addAll(executedFields);
-            }
+            heartbeat = updateAnalysisWorklist(
+                "dynamic-field-registration",
+                completed,
+                owners.size(),
+                "function=" + formatAddress(owner.getValue().getEntryPoint()),
+                heartbeat);
+            RegistrationFunction function = recoverRegistrationFunction(owner.getValue());
             result.put(owner.getKey(), function);
+            completed++;
         }
+        updateAnalysisWorklist(
+            "dynamic-field-registration",
+            completed,
+            owners.size(),
+            "registrations=" + result.size(),
+            heartbeat);
+        finishAnalysisWorklist("dynamic-field-registration", owners.size());
         return result;
     }
 
@@ -518,15 +536,21 @@
 
     private void collectDirectFieldTableRegistrationFunctions(
         List<RegistryEntry> registry,
-        Map<String, RegistrationFunction> registrationFunctions) {
+        Map<String, RegistrationFunction> registrationFunctions) throws CancelledException {
 
         LinkedHashSet<String> visitedFunctions = new LinkedHashSet<>();
         int seedCount = 0;
         int matchedFunctionCount = 0;
+        startAnalysisWorklist("direct-field-registration", registry.size());
+        long heartbeat = System.nanoTime();
+        int completed = 0;
         for (RegistryEntry entry : registry) {
-            if (monitor.isCancelled()) {
-                break;
-            }
+            heartbeat = updateAnalysisWorklist(
+                "direct-field-registration",
+                completed,
+                registry.size(),
+                registryProgressDetail(entry),
+                heartbeat);
             matchedFunctionCount += collectDirectFieldTableRegistrationSeed(
                 parseCapturedAddress(entry.createInstance),
                 visitedFunctions,
@@ -537,7 +561,15 @@
                 visitedFunctions,
                 registrationFunctions);
             seedCount++;
+            completed++;
         }
+        updateAnalysisWorklist(
+            "direct-field-registration",
+            completed,
+            registry.size(),
+            "functions=" + visitedFunctions.size(),
+            heartbeat);
+        finishAnalysisWorklist("direct-field-registration", registry.size());
 
         println(
             "Direct field registration scan: seeds=" + seedCount +
@@ -548,7 +580,7 @@
     private int collectDirectFieldTableRegistrationSeed(
         Address seed,
         Set<String> visitedFunctions,
-        Map<String, RegistrationFunction> registrationFunctions) {
+        Map<String, RegistrationFunction> registrationFunctions) throws CancelledException {
 
         Address target = resolvedCodeTarget(seed);
         if (!isExecutableAddress(target)) {
@@ -565,9 +597,7 @@
             visitedFunctions,
             registrationFunctions);
         for (Instruction instruction : functionInstructions(function)) {
-            if (monitor.isCancelled()) {
-                break;
-            }
+            monitor.checkCancelled();
             if (!instruction.getFlowType().isCall()) {
                 continue;
             }

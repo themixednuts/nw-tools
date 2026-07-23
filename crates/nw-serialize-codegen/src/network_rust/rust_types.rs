@@ -23,11 +23,15 @@ pub(super) fn network_native_type_rust_type(
                 "::std::vec::Vec<{}>",
                 network_native_type_rust_type(element, serialize_types)?
             )),
+            ("AZStd::unordered_set" | "std::unordered_set", [element, ..]) => Some(format!(
+                "::nw_network::serialize::IndexSet<{}>",
+                network_native_type_rust_type(element, serialize_types)?
+            )),
             (
                 "AZStd::unordered_map" | "AZStd::unordered_flat_map" | "std::unordered_map",
                 [key, value, ..],
             ) => Some(format!(
-                "::std::collections::HashMap<{}, {}>",
+                "::nw_network::serialize::IndexMap<{}, {}>",
                 network_native_type_rust_type(key, serialize_types)?,
                 network_native_type_rust_type(value, serialize_types)?,
             )),
@@ -95,12 +99,36 @@ pub(super) fn network_native_scalar_type(native_type: &str) -> Option<NetworkNat
             ("::std::string::String", SchemaWireScalarShape::String)
         }
         "AZ::Uuid" => ("::uuid::Uuid", SchemaWireScalarShape::FixedBytes(16)),
+        "ActorRef" | "Amazon::Hub::ActorRef" | "HubAddress" | "ProxyAddress" => {
+            ("::nw_network::ActorRef", SchemaWireScalarShape::ActorRef)
+        }
+        "EntityRef" => ("::nw_network::EntityRef", SchemaWireScalarShape::EntityRef),
+        "FragmentKey" | "Amazon::Hub::FragmentKey" => {
+            ("::nw_network::hub::FragmentKey", SchemaWireScalarShape::U32)
+        }
+        "SequenceNumber" | "Amazon::Hub::SequenceNumber" => (
+            "::nw_network::SequenceNumber",
+            SchemaWireScalarShape::SequenceNumber,
+        ),
+        "Amazon::Pervasives::CrcID" => {
+            ("::nw_network::CrcId", SchemaWireScalarShape::FixedBytes(16))
+        }
         "AZ::Crc32" => ("::nw_network::Crc32", SchemaWireScalarShape::U32),
         "AZ::EntityId" => ("::nw_network::EntityId", SchemaWireScalarShape::U64),
         "AZ::Vector2" => ("::glam::Vec2", SchemaWireScalarShape::Vec2),
         "AZ::Vector3" => ("::glam::Vec3", SchemaWireScalarShape::Vec3),
         "AZ::Vector4" => ("::glam::Vec4", SchemaWireScalarShape::Vec4),
         "AZ::Quaternion" => ("::glam::Quat", SchemaWireScalarShape::Quat),
+        "AZ::Matrix3x3" => ("::glam::Mat3", SchemaWireScalarShape::Mat3),
+        "AZ::Transform" => ("::glam::Affine3A", SchemaWireScalarShape::Affine3),
+        "AZ::Bounds" => (
+            "::bevy_math::bounding::Aabb2d",
+            SchemaWireScalarShape::Aabb2d,
+        ),
+        "AZ::Aabb" => (
+            "::bevy_math::bounding::Aabb3d",
+            SchemaWireScalarShape::Aabb3d,
+        ),
         _ => return None,
     };
     Some(NetworkNativeScalarType {

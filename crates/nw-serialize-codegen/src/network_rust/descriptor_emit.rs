@@ -108,6 +108,34 @@ pub(super) fn wire_shape_tokens(shape: &SchemaWireShape) -> proc_macro2::TokenSt
             let value = wire_shape_tokens(value);
             quote!(NetworkWireShape::Optional(&#value))
         }
+        SchemaWireShape::DefaultOmitted(members) => {
+            let members = members.iter().map(wire_shape_tokens);
+            quote!(NetworkWireShape::DefaultOmitted(&[#(#members),*]))
+        }
+        SchemaWireShape::BooleanChoice(choice) => {
+            let false_value = wire_shape_tokens(&choice.false_value);
+            let true_value = wire_shape_tokens(&choice.true_value);
+            quote!(NetworkWireShape::BooleanChoice {
+                false_value: &#false_value,
+                true_value: &#true_value,
+            })
+        }
+        SchemaWireShape::Sequence(value) => {
+            let value = wire_shape_tokens(value);
+            quote!(NetworkWireShape::Sequence(&#value))
+        }
+        SchemaWireShape::Set(value) => {
+            let value = wire_shape_tokens(value);
+            quote!(NetworkWireShape::Set(&#value))
+        }
+        SchemaWireShape::Map { key, value } => {
+            let key = wire_shape_tokens(key);
+            let value = wire_shape_tokens(value);
+            quote!(NetworkWireShape::Map {
+                key: &#key,
+                value: &#value,
+            })
+        }
         SchemaWireShape::ReplicatedContainer(container) => {
             let container = replicated_container_wire_shape_tokens(*container);
             quote!(NetworkWireShape::ReplicatedContainer(#container))

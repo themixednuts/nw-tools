@@ -174,6 +174,95 @@ pub(super) fn rust_field_shape(shape: &SchemaWireShape) -> RustFieldShape {
                 container_embedded_value_type_shapes: inner.container_embedded_value_type_shapes,
             }
         }
+        SchemaWireShape::DefaultOmitted(members) => {
+            let (value_type, codec) = default_omitted_projection(members);
+            let field_type = replicated_field_type(&value_type, Some(&codec));
+            RustFieldShape {
+                value_type,
+                field_type,
+                container_key_type_shape: None,
+                container_embedded_key_type_shapes: Vec::new(),
+                container_value_type_shape: None,
+                container_embedded_value_type_shapes: Vec::new(),
+            }
+        }
+        SchemaWireShape::BooleanChoice(choice) => {
+            let false_value = rust_field_shape(&choice.false_value);
+            let true_value = rust_field_shape(&choice.true_value);
+            let value_type = format!(
+                "::nw_network::serialize::BooleanChoice<{}, {}>",
+                false_value.value_type, true_value.value_type
+            );
+            let codec = format!(
+                "::nw_network::serialize::BooleanChoiceCodec<{}, {}>",
+                codec_type_or_default(&choice.false_value, &false_value.value_type),
+                codec_type_or_default(&choice.true_value, &true_value.value_type)
+            );
+            let field_type = replicated_field_type(&value_type, Some(&codec));
+            RustFieldShape {
+                value_type,
+                field_type,
+                container_key_type_shape: None,
+                container_embedded_key_type_shapes: Vec::new(),
+                container_value_type_shape: None,
+                container_embedded_value_type_shapes: Vec::new(),
+            }
+        }
+        SchemaWireShape::Sequence(inner) => {
+            let inner_shape = rust_field_shape(inner);
+            let value_type = format!("::std::vec::Vec<{}>", inner_shape.value_type);
+            let codec = wire_shape_codec_type(inner)
+                .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>"));
+            let field_type = replicated_field_type(&value_type, codec.as_deref());
+            RustFieldShape {
+                value_type,
+                field_type,
+                container_key_type_shape: None,
+                container_embedded_key_type_shapes: Vec::new(),
+                container_value_type_shape: None,
+                container_embedded_value_type_shapes: Vec::new(),
+            }
+        }
+        SchemaWireShape::Set(inner) => {
+            let inner_shape = rust_field_shape(inner);
+            let value_type = format!(
+                "::nw_network::serialize::IndexSet<{}>",
+                inner_shape.value_type
+            );
+            let codec = wire_shape_codec_type(inner).map(|codec| {
+                format!(
+                    "::nw_network::serialize::ContainerMarshaler<{}, {codec}>",
+                    inner_shape.value_type
+                )
+            });
+            let field_type = replicated_field_type(&value_type, codec.as_deref());
+            RustFieldShape {
+                value_type,
+                field_type,
+                container_key_type_shape: None,
+                container_embedded_key_type_shapes: Vec::new(),
+                container_value_type_shape: None,
+                container_embedded_value_type_shapes: Vec::new(),
+            }
+        }
+        SchemaWireShape::Map { key, value } => {
+            let key_shape = rust_field_shape(key);
+            let value_shape = rust_field_shape(value);
+            let value_type = format!(
+                "::nw_network::serialize::IndexMap<{}, {}>",
+                key_shape.value_type, value_shape.value_type
+            );
+            let codec = map_sequence_codec_type(key, value, &key_shape, &value_shape);
+            let field_type = replicated_field_type(&value_type, codec.as_deref());
+            RustFieldShape {
+                value_type,
+                field_type,
+                container_key_type_shape: None,
+                container_embedded_key_type_shapes: Vec::new(),
+                container_value_type_shape: None,
+                container_embedded_value_type_shapes: Vec::new(),
+            }
+        }
         SchemaWireShape::ReplicatedContainer(container) => {
             replicated_container_field_shape(*container)
         }
@@ -219,8 +308,86 @@ pub(super) fn wire_shape_codec_type(shape: &SchemaWireShape) -> Option<String> {
         SchemaWireShape::Composite(members) => composite_projection(members).1,
         SchemaWireShape::Optional(inner) => wire_shape_codec_type(inner)
             .map(|codec| format!("::nw_network::serialize::OptionalCodec<{codec}>")),
+        SchemaWireShape::DefaultOmitted(members) => Some(default_omitted_projection(members).1),
+        SchemaWireShape::BooleanChoice(choice) => {
+            let false_value = rust_field_shape(&choice.false_value).value_type;
+            let true_value = rust_field_shape(&choice.true_value).value_type;
+            Some(format!(
+                "::nw_network::serialize::BooleanChoiceCodec<{}, {}>",
+                codec_type_or_default(&choice.false_value, &false_value),
+                codec_type_or_default(&choice.true_value, &true_value)
+            ))
+        }
+        SchemaWireShape::Sequence(inner) => wire_shape_codec_type(inner)
+            .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>")),
+        SchemaWireShape::Set(inner) => {
+            let inner_shape = rust_field_shape(inner);
+            wire_shape_codec_type(inner).map(|codec| {
+                format!(
+                    "::nw_network::serialize::ContainerMarshaler<{}, {codec}>",
+                    inner_shape.value_type
+                )
+            })
+        }
+        SchemaWireShape::Map { key, value } => {
+            let key_shape = rust_field_shape(key);
+            let value_shape = rust_field_shape(value);
+            map_sequence_codec_type(key, value, &key_shape, &value_shape)
+        }
         _ => None,
     }
+}
+
+fn map_sequence_codec_type(
+    key: &SchemaWireShape,
+    value: &SchemaWireShape,
+    key_shape: &RustFieldShape,
+    value_shape: &RustFieldShape,
+) -> Option<String> {
+    let key_codec = wire_shape_codec_type(key);
+    let value_codec = wire_shape_codec_type(value);
+    (key_codec.is_some() || value_codec.is_some()).then(|| {
+        format!(
+            "::nw_network::serialize::MapSequenceCodec<{}, {}>",
+            key_codec.unwrap_or_else(|| format!(
+                "::nw_network::serialize::DefaultMarshaler<{}>",
+                key_shape.value_type
+            )),
+            value_codec.unwrap_or_else(|| format!(
+                "::nw_network::serialize::DefaultMarshaler<{}>",
+                value_shape.value_type
+            ))
+        )
+    })
+}
+
+fn default_omitted_projection(members: &[SchemaWireShape]) -> (String, String) {
+    assert!(
+        (2..=12).contains(&members.len()),
+        "a default-omitted tuple contains between two and twelve members"
+    );
+    let fields = members.iter().map(rust_field_shape).collect::<Vec<_>>();
+    let value_type = tuple_rust_type(
+        &fields
+            .iter()
+            .map(|field| field.value_type.clone())
+            .collect::<Vec<_>>(),
+    );
+    let codecs = members
+        .iter()
+        .zip(&fields)
+        .map(|(shape, field)| codec_type_or_default(shape, &field.value_type))
+        .collect::<Vec<_>>();
+    let codec = format!(
+        "::nw_network::serialize::DefaultOmittedTupleCodec<{}>",
+        tuple_rust_type(&codecs)
+    );
+    (value_type, codec)
+}
+
+fn codec_type_or_default(shape: &SchemaWireShape, value_type: &str) -> String {
+    wire_shape_codec_type(shape)
+        .unwrap_or_else(|| format!("::nw_network::serialize::DefaultMarshaler<{value_type}>"))
 }
 
 fn composite_projection(members: &[SchemaWireShape]) -> (String, Option<String>) {

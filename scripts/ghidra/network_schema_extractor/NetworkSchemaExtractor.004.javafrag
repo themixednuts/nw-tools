@@ -4,7 +4,8 @@
         return NIL_TYPE_ID.equals(normalized);
     }
 
-    private void collectQueuedRegistrationHooks(Map<String, HookTypeEvidence> result) {
+    private void collectQueuedRegistrationHooks(
+        Map<String, HookTypeEvidence> result) throws CancelledException {
         queuedRegistrationReferenceCount = 0;
         queuedRegistrationDecodedCount = 0;
         queuedRegistrationNoFunctionCount = 0;
@@ -16,9 +17,7 @@
         ReferenceIterator references =
             currentProgram.getReferenceManager().getReferencesTo(queueRegistrationHook);
         while (references.hasNext()) {
-            if (monitor.isCancelled()) {
-                break;
-            }
+            monitor.checkCancelled();
             Reference reference = references.next();
             queuedRegistrationReferenceCount++;
             if (queuedRegistrationReferenceCount % 512 == 0) {
@@ -76,7 +75,8 @@
         }
     }
 
-    private void collectDirectRegisterTypeProviders(Map<String, HookTypeEvidence> result) {
+    private void collectDirectRegisterTypeProviders(
+        Map<String, HookTypeEvidence> result) throws CancelledException {
         directRegisterTypeReferenceCount = 0;
         directRegisterTypeDecodedCount = 0;
         directRegisterTypeCoveredCount = 0;
@@ -95,9 +95,7 @@
         ReferenceIterator references =
             currentProgram.getReferenceManager().getReferencesTo(registerType);
         while (references.hasNext()) {
-            if (monitor.isCancelled()) {
-                break;
-            }
+            monitor.checkCancelled();
             Reference reference = references.next();
             directRegisterTypeReferenceCount++;
             if (directRegisterTypeReferenceCount % 512 == 0) {

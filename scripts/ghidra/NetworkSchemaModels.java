@@ -17,9 +17,27 @@ final class SerializeFieldInfo {
     String typeId;
     String typeName;
     String wireShape;
+    String genericClassName;
+    final ArrayList<String> templatedTypeIds = new ArrayList<>();
     Long offset;
     Long dataSize;
     boolean baseClass;
+}
+
+record ReflectedSetIdentity(
+    String nativeType,
+    String elementTypeName,
+    String elementTypeId,
+    String wireShape,
+    Address marshalHelper,
+    String ownerTypeName,
+    String ownerTypeId,
+    String fieldName,
+    long fieldOffset) {
+
+    String identityKey() {
+        return nativeType + "|" + elementTypeId + "|" + wireShape;
+    }
 }
 
 final class SerializeWireSlot {
@@ -170,6 +188,7 @@ final class PcodeStorage {
 
 final class CollectionOutputShape {
     final PcodeStorage storage;
+    final String nativeType;
     final WireShape wireEvidence;
     final Address countCallsite;
     final Address loopHeader;
@@ -178,12 +197,14 @@ final class CollectionOutputShape {
 
     CollectionOutputShape(
             PcodeStorage storage,
+            String nativeType,
             WireShape wireEvidence,
             Address countCallsite,
             Address loopHeader,
             Set<Address> codecCallsites,
             Long interiorSpan) {
         this.storage = storage;
+        this.nativeType = nativeType;
         this.wireEvidence = wireEvidence;
         this.countCallsite = countCallsite;
         this.loopHeader = loopHeader;

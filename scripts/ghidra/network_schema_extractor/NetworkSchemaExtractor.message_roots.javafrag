@@ -189,6 +189,14 @@
                 .preReadReturnAliases++;
         }
 
+        String initializedRoot = initializedMessageRootParameter(
+            operations,
+            firstReadCall,
+            readBufferParameter);
+        if (initializedRoot != null) {
+            return initializedRoot;
+        }
+
         String selected = null;
         int selectedScore = Integer.MIN_VALUE;
         boolean ambiguous = false;
@@ -208,6 +216,28 @@
             }
         }
         return ambiguous ? null : selected;
+    }
+
+    private String initializedMessageRootParameter(
+        List<PcodeOpAST> operations,
+        int beforeOperation,
+        String readBufferParameter) {
+
+        LinkedHashSet<String> roots = new LinkedHashSet<>();
+        for (int index = 0; index < beforeOperation; index++) {
+            PcodeOpAST operation = operations.get(index);
+            if (operation.getOpcode() != PcodeOp.STORE || operation.getNumInputs() < 3 ||
+                uniquePcodeVtableAddress(operation.getInput(2)) == null) {
+                continue;
+            }
+            PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+            if (destination == null || destination.offset != 0L ||
+                !isMessageRootCandidate(destination, readBufferParameter)) {
+                continue;
+            }
+            roots.add(destination.base);
+        }
+        return roots.size() == 1 ? roots.iterator().next() : null;
     }
 
     private boolean isMessageRootCandidate(

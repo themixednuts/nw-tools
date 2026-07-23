@@ -11,6 +11,7 @@ pub(super) fn confidence_from_raw(raw: Option<&str>) -> NetworkConfidence {
             | "message-signature-source",
         ) => NetworkConfidence::High,
         Some(value) if value.starts_with("message-unmarshal-") => NetworkConfidence::High,
+        Some(value) if value.starts_with("message-marshal-") => NetworkConfidence::High,
         Some(value) if value.starts_with("message-signature-") => NetworkConfidence::High,
         Some(value) if value.starts_with("fixed-field-table-append") => NetworkConfidence::High,
         Some(value) if value.starts_with("fixed-attribute-table-append") => NetworkConfidence::High,
@@ -86,6 +87,50 @@ pub(super) fn parse_network_wire_shape(value: &str) -> Option<NetworkWireShape> 
             .collect::<Option<Vec<_>>>()
             .filter(|members| !members.is_empty())
             .map(NetworkWireShape::Composite);
+    }
+    if let Some(arguments) = generic_arguments(value, "default-omitted") {
+        return arguments
+            .into_iter()
+            .map(parse_network_wire_shape)
+            .collect::<Option<Vec<_>>>()
+            .filter(|members| (2..=12).contains(&members.len()))
+            .map(NetworkWireShape::DefaultOmitted);
+    }
+    if let Some(arguments) = generic_arguments(value, "boolean-choice") {
+        let [false_value, true_value] = arguments.as_slice() else {
+            return None;
+        };
+        return Some(NetworkWireShape::BooleanChoice(
+            NetworkBooleanChoiceWireShape {
+                false_value: Box::new(parse_network_wire_shape(false_value)?),
+                true_value: Box::new(parse_network_wire_shape(true_value)?),
+            },
+        ));
+    }
+    if let Some(arguments) = generic_arguments(value, "set") {
+        let [inner] = arguments.as_slice() else {
+            return None;
+        };
+        return parse_network_wire_shape(inner)
+            .map(Box::new)
+            .map(NetworkWireShape::Set);
+    }
+    if let Some(arguments) = generic_arguments(value, "vec") {
+        let [inner] = arguments.as_slice() else {
+            return None;
+        };
+        return parse_network_wire_shape(inner)
+            .map(Box::new)
+            .map(NetworkWireShape::Sequence);
+    }
+    if let Some(arguments) = generic_arguments(value, "map") {
+        let [key, value] = arguments.as_slice() else {
+            return None;
+        };
+        return Some(NetworkWireShape::Map {
+            key: Box::new(parse_network_wire_shape(key)?),
+            value: Box::new(parse_network_wire_shape(value)?),
+        });
     }
     if let Some(container) = parse_replicated_container_wire_shape(value) {
         return Some(NetworkWireShape::ReplicatedContainer(container));
@@ -199,9 +244,25 @@ pub(crate) enum NetworkMemberWireShape<'a> {
     Scalar(NetworkWireScalarShape),
     Composite(Vec<Self>),
     Optional(Box<Self>),
+    DefaultOmitted(Vec<Self>),
+    BooleanChoice {
+        false_value: Box<Self>,
+        true_value: Box<Self>,
+    },
     Vector(Box<Self>),
-    FixedVector { element: Box<Self>, capacity: u16 },
-    FixedArray { element: Box<Self>, capacity: u16 },
+    Set(Box<Self>),
+    Map {
+        key: Box<Self>,
+        value: Box<Self>,
+    },
+    FixedVector {
+        element: Box<Self>,
+        capacity: u16,
+    },
+    FixedArray {
+        element: Box<Self>,
+        capacity: u16,
+    },
     Named(&'a str),
 }
 
@@ -226,11 +287,41 @@ pub(crate) fn parse_network_member_wire_shape(value: &str) -> Option<NetworkMemb
             .map(Box::new)
             .map(NetworkMemberWireShape::Optional);
     }
+    if let Some(arguments) = generic_arguments(value, "default-omitted") {
+        return arguments
+            .into_iter()
+            .map(parse_network_member_wire_shape)
+            .collect::<Option<Vec<_>>>()
+            .filter(|members| (2..=12).contains(&members.len()))
+            .map(NetworkMemberWireShape::DefaultOmitted);
+    }
+    if let Some(arguments) = generic_arguments(value, "boolean-choice") {
+        let [false_value, true_value] = arguments.as_slice() else {
+            return None;
+        };
+        return Some(NetworkMemberWireShape::BooleanChoice {
+            false_value: Box::new(parse_network_member_wire_shape(false_value)?),
+            true_value: Box::new(parse_network_member_wire_shape(true_value)?),
+        });
+    }
     if let Some(arguments) = generic_arguments(value, "vec") {
         let [element] = arguments.as_slice().try_into().ok()?;
         return Some(NetworkMemberWireShape::Vector(Box::new(
             parse_network_member_wire_shape(element)?,
         )));
+    }
+    if let Some(arguments) = generic_arguments(value, "set") {
+        let [element] = arguments.as_slice().try_into().ok()?;
+        return Some(NetworkMemberWireShape::Set(Box::new(
+            parse_network_member_wire_shape(element)?,
+        )));
+    }
+    if let Some(arguments) = generic_arguments(value, "map") {
+        let [key, value] = arguments.as_slice().try_into().ok()?;
+        return Some(NetworkMemberWireShape::Map {
+            key: Box::new(parse_network_member_wire_shape(key)?),
+            value: Box::new(parse_network_member_wire_shape(value)?),
+        });
     }
     if let Some(arguments) = generic_arguments(value, "fixed-vector") {
         let [element, capacity] = arguments.as_slice().try_into().ok()?;
@@ -328,11 +419,20 @@ fn flatten_member_wire_shape(
             }
             Some(shapes)
         }
-        NetworkMemberWireShape::Optional(_) => None,
+        NetworkMemberWireShape::Optional(_)
+        | NetworkMemberWireShape::DefaultOmitted(_)
+        | NetworkMemberWireShape::BooleanChoice { .. } => None,
         NetworkMemberWireShape::Vector(element)
+        | NetworkMemberWireShape::Set(element)
         | NetworkMemberWireShape::FixedVector { element, .. } => {
             let mut shapes = vec![NetworkWireScalarShape::VlqU32];
             shapes.extend(flatten_member_wire_shape(element, embedded_shapes)?);
+            Some(shapes)
+        }
+        NetworkMemberWireShape::Map { key, value } => {
+            let mut shapes = vec![NetworkWireScalarShape::VlqU32];
+            shapes.extend(flatten_member_wire_shape(key, embedded_shapes)?);
+            shapes.extend(flatten_member_wire_shape(value, embedded_shapes)?);
             Some(shapes)
         }
         NetworkMemberWireShape::FixedArray { element, capacity } => Some(

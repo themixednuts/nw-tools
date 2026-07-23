@@ -320,90 +320,55 @@ impl NetworkSchema {
             };
 
             let network_type = &mut self.types[*network_type_index];
+            network_type.signature_field_count_conflict = false;
+            for field in network_type
+                .fields
+                .iter_mut()
+                .chain(&mut network_type.marshal_fields)
+            {
+                field.signature_type_conflict = false;
+                field.signature_wire_conflict = false;
+            }
             let source = signature
                 .source
                 .clone()
                 .or_else(|| source_path.clone())
                 .unwrap_or_else(|| "messageSignatures".to_owned());
             report.matched_message_count += 1;
-            if network_type.fields.is_empty() && !signature.fields.is_empty() {
-                network_type.fields =
-                    network_fields_from_message_signature(&signature.fields, source.clone());
-                report.field_name_filled_count += signature.fields.len();
-                report.native_type_filled_count += signature
-                    .fields
-                    .iter()
-                    .filter(|field| field.native_type.is_some())
-                    .count();
-                report.wire_shape_filled_count += signature
-                    .fields
-                    .iter()
-                    .filter(|field| field.wire_shape.is_some())
-                    .count();
-                continue;
-            }
-
-            if network_type.fields.len() != signature.fields.len() {
-                network_type.field_count_conflict = true;
+            let supports_unmarshal = network_type
+                .instance
+                .as_ref()
+                .and_then(|instance| instance.supports_unmarshal);
+            let mut secondary_report = NetworkMessageSignatureMergeReport::default();
+            let (unmarshal_report, marshal_report) = if supports_unmarshal == Some(false) {
+                (&mut secondary_report, &mut report)
+            } else {
+                (&mut report, &mut secondary_report)
+            };
+            let unmarshal_aligned = merge_message_signature_direction(
+                &mut network_type.fields,
+                &signature.fields,
+                &self.serialize_types,
+                &source,
+                true,
+                unmarshal_report,
+            );
+            let marshal_aligned = merge_message_signature_direction(
+                &mut network_type.marshal_fields,
+                &signature.fields,
+                &self.serialize_types,
+                &source,
+                false,
+                marshal_report,
+            );
+            let active_directions_aligned = if supports_unmarshal == Some(false) {
+                marshal_aligned
+            } else {
+                unmarshal_aligned && marshal_aligned
+            };
+            network_type.signature_field_count_conflict = !active_directions_aligned;
+            if !active_directions_aligned {
                 report.field_count_mismatch_count += 1;
-                continue;
-            }
-
-            for (field, field_signature) in
-                network_type.fields.iter_mut().zip(signature.fields.iter())
-            {
-                if let (Some(existing), Some(expected)) = (field.index, field_signature.index)
-                    && existing != expected
-                {
-                    report.field_index_mismatch_count += 1;
-                    continue;
-                }
-
-                if field.name.as_deref().is_none_or(is_placeholder_field_name)
-                    || field_has_native_type_name(field)
-                {
-                    field.name = Some(field_signature.name.clone());
-                    report.field_name_filled_count += 1;
-                } else if field.name.as_deref() != Some(field_signature.name.as_str()) {
-                    report.field_name_conflict_count += 1;
-                }
-
-                if field.native_type.is_none() {
-                    field.native_type = field_signature.native_type.clone();
-                    if field.native_type.is_some() {
-                        report.native_type_filled_count += 1;
-                    }
-                } else if let Some(expected) = field_signature.native_type.as_deref()
-                    && field.native_type.as_deref() != Some(expected)
-                {
-                    field.type_conflict = true;
-                    report.native_type_conflict_count += 1;
-                }
-
-                if field.rust_type.is_none() {
-                    field.rust_type = field_signature.rust_type.clone();
-                }
-
-                if field.wire_shape.is_none()
-                    && let Some(wire_shape) = field_signature.wire_shape.as_ref()
-                {
-                    field.wire_shape = Some(wire_shape.clone());
-                    field.wire_shape_source = Some(source.clone());
-                    report.wire_shape_filled_count += 1;
-                } else if let Some(expected) = field_signature.wire_shape.as_ref()
-                    && field.wire_shape.as_ref() != Some(expected)
-                {
-                    field.wire_conflict = true;
-                    report.wire_shape_conflict_count += 1;
-                }
-
-                field.evidence.push(NetworkEvidence {
-                    kind: NetworkEvidenceKind::MessageSource,
-                    source: source.clone(),
-                    address: None,
-                    detail: Some(field_signature.name.clone()),
-                    confidence: NetworkConfidence::High,
-                });
             }
         }
 
@@ -555,6 +520,11 @@ impl NetworkSchema {
                         .any(|evidence| evidence.kind == NetworkEvidenceKind::MessageUnmarshal)
                 })
                 .count(),
+            message_marshal_field_count: self
+                .types
+                .iter()
+                .flat_map(|network_type| &network_type.marshal_fields)
+                .count(),
             type_index_evidence_count: self
                 .types
                 .iter()
@@ -593,4 +563,84 @@ impl NetworkSchema {
                 .count(),
         }
     }
+}
+
+fn merge_message_signature_direction(
+    fields: &mut Vec<NetworkField>,
+    signatures: &[NetworkMessageFieldSignature],
+    serialize_types: &[NetworkSerializeType],
+    source: &str,
+    fill_empty: bool,
+    report: &mut NetworkMessageSignatureMergeReport,
+) -> bool {
+    if fields.is_empty() {
+        if !fill_empty || signatures.is_empty() {
+            return true;
+        }
+        *fields = network_fields_from_message_signature(signatures, source.to_owned());
+        report.field_name_filled_count += signatures.len();
+        report.native_type_filled_count += signatures
+            .iter()
+            .filter(|field| field.native_type.is_some())
+            .count();
+        report.wire_shape_filled_count += signatures
+            .iter()
+            .filter(|field| field.wire_shape.is_some())
+            .count();
+        return true;
+    }
+
+    if let Some((grouped, grouped_count)) =
+        group_message_fields_by_signature(fields, signatures, serialize_types)
+    {
+        *fields = grouped;
+        report.field_grouped_count += grouped_count;
+    } else if fields.len() != signatures.len() {
+        return false;
+    }
+
+    for (field, signature) in fields.iter_mut().zip(signatures) {
+        if let (Some(existing), Some(expected)) = (field.index, signature.index)
+            && existing != expected
+        {
+            report.field_index_mismatch_count += 1;
+            continue;
+        }
+
+        if field.name.as_deref().is_none_or(is_placeholder_field_name)
+            || field_has_native_type_name(field)
+        {
+            field.name = Some(signature.name.clone());
+            report.field_name_filled_count += 1;
+        } else if field.name.as_deref() != Some(signature.name.as_str()) {
+            report.field_name_conflict_count += 1;
+        }
+
+        merge_message_field_native_type(field, signature, report);
+        if field.rust_type.is_none() {
+            field.rust_type = signature.rust_type.clone();
+        }
+
+        if field.wire_shape.is_none()
+            && let Some(wire_shape) = signature.wire_shape.as_ref()
+        {
+            field.wire_shape = Some(wire_shape.clone());
+            field.wire_shape_source = Some(source.to_owned());
+            report.wire_shape_filled_count += 1;
+        } else if let Some(expected) = signature.wire_shape.as_ref()
+            && field.wire_shape.as_ref() != Some(expected)
+        {
+            field.signature_wire_conflict = true;
+            report.wire_shape_conflict_count += 1;
+        }
+
+        field.evidence.push(NetworkEvidence {
+            kind: NetworkEvidenceKind::MessageSource,
+            source: source.to_owned(),
+            address: None,
+            detail: Some(signature.name.clone()),
+            confidence: NetworkConfidence::High,
+        });
+    }
+    true
 }

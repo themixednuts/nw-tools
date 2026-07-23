@@ -451,7 +451,10 @@
             }
             HashMap<String, String> tempNativeTypes = new HashMap<>();
             HashMap<String, String> tempWireShapes = new HashMap<>();
-            for (PcodeOpAST op : orderedPcodeOps(high)) {
+            List<PcodeOpAST> operations = orderedPcodeOps(high);
+            Map<String, WireShape> boundedBooleanOutputs = new HashMap<>();
+            boolean[] boundedBooleanOutputsRecovered = {false};
+            for (PcodeOpAST op : operations) {
                 int order = operationOrder[0]++;
                 plan.pcodeOrderByCallsite.putIfAbsent(
                     op.getSeqnum().getTarget().toString(),
@@ -473,11 +476,15 @@
                 if (op.getOpcode() == PcodeOp.STORE) {
                     recoverPcodeMessageGraphStore(
                         plan,
+                        high,
+                        operations,
                         op,
                         callerParamStorage,
                         order,
                         tempNativeTypes,
-                        tempWireShapes);
+                        tempWireShapes,
+                        boundedBooleanOutputs,
+                        boundedBooleanOutputsRecovered);
                 }
             }
         }
@@ -489,7 +496,7 @@
     private void recoverPcodeMessageGraphCall(
         MessageUnmarshalPlan plan,
         Function owner,
-        PcodeOp op,
+        PcodeOpAST op,
         String readBufferParameter,
         Map<String, PcodeStorage> callerParamStorage,
         Set<String> activeContexts,
@@ -557,6 +564,23 @@
             }
             return;
         }
+        InterproceduralCollectionCall collection = interproceduralCollectionCall(
+            owner,
+            op,
+            target,
+            callerParamStorage);
+        if (collection != null && isRootMessageStorage(plan, collection.owner())) {
+            FieldCall field = addPcodeMessageField(
+                plan,
+                op.getSeqnum().getTarget(),
+                collection.owner(),
+                null,
+                "message-unmarshal-pcode-interprocedural-collection",
+                order);
+            field.collectionStorageKind = collection.storageKind();
+            applyWireEvidence(field, collection.wireEvidence());
+            return;
+        }
         String nativeType = unmarshalNativeTypeFromTarget(target);
         WireShape wireEvidence = wireShapeEvidenceFromUnmarshalTarget(target, nativeType);
         String wireShape = wireEvidence == null ? null : wireEvidence.shape;
@@ -587,15 +611,34 @@
                 nestedShape,
                 callerParamStorage)
             : translatedShape.storage;
-        if (wireEvidence != null && isRootMessageStorage(plan, output)) {
+        if (wireEvidence == null && isRootMessageStorage(plan, output)) {
+            String targetReadBuffer = uniqueReadBufferParameter(target);
+            String diagnostic = targetReadBuffer == null
+                ? "read-buffer-parameter-unresolved"
+                : Objects.toString(
+                    codecWireTraceDiagnostic(
+                        target,
+                        new PcodeStorage(targetReadBuffer, 0L)),
+                    "codec-trace-not-run");
+            recordPcodeMessageGraphReject(
+                plan,
+                "semantic-codec-unresolved:" + diagnostic,
+                target);
+        }
+        if ((nativeType != null || wireEvidence != null && wireEvidence.hasProvenSemantics()) &&
+            isRootMessageStorage(plan, output)) {
             FieldCall field = addPcodeMessageField(
                 plan,
                 op.getSeqnum().getTarget(),
                 output,
-                nativeType,
-                "message-unmarshal-pcode-stack",
+                nativeType == null ? nativeTypeFromWireShape(wireShape) : nativeType,
+                wireEvidence == null
+                    ? "message-unmarshal-pcode-stack-direct-type"
+                    : "message-unmarshal-pcode-stack",
                 order);
-            applyWireEvidence(field, wireEvidence);
+            if (wireEvidence != null) {
+                applyWireEvidence(field, wireEvidence);
+            }
             applyNestedTypeShapeToField(
                 field,
                 nestedShape,
@@ -612,7 +655,13 @@
         if (!hasRootMessageArgument(plan, arguments)) {
             return;
         }
-        applyMessageCallFrameBoundaries(plan, owner, op, target, arguments);
+        applyMessageCallFrameOutputs(
+            plan,
+            owner,
+            op,
+            target,
+            arguments,
+            operationOrder);
         if (plan.helper == null) {
             plan.helperCallsite = op.getSeqnum().getTarget();
             plan.helper = target.getEntryPoint();
@@ -629,11 +678,15 @@
 
     private void recoverPcodeMessageGraphStore(
         MessageUnmarshalPlan plan,
-        PcodeOp op,
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST op,
         Map<String, PcodeStorage> callerParamStorage,
         int order,
         Map<String, String> tempNativeTypes,
-        Map<String, String> tempWireShapes) {
+        Map<String, String> tempWireShapes,
+        Map<String, WireShape> boundedBooleanOutputs,
+        boolean[] boundedBooleanOutputsRecovered) {
 
         if (op.getNumInputs() < 3) {
             return;
@@ -648,6 +701,18 @@
             op.getInput(2),
             tempWireShapes,
             new LinkedHashSet<>());
+        WireShape booleanEvidence = null;
+        if (wireShape == null) {
+            if (!boundedBooleanOutputsRecovered[0]) {
+                boundedBooleanOutputs.putAll(
+                    boundedBooleanOutputEvidence(high, operations));
+                boundedBooleanOutputsRecovered[0] = true;
+            }
+            booleanEvidence = boundedBooleanOutputs.get(pcodeNodeKey(op.getInput(2)));
+        }
+        if (booleanEvidence != null) {
+            wireShape = booleanEvidence.shape;
+        }
         if (wireShape == null) {
             return;
         }
@@ -662,10 +727,48 @@
             nativeType,
             "message-unmarshal-pcode-stack-store",
             order);
-        applyMessageFieldWireShape(
-            field,
-            wireShape,
-            "message-unmarshal-pcode-stack-store");
+        if (booleanEvidence != null) {
+            applyWireEvidence(field, booleanEvidence);
+        }
+        else {
+            applyMessageFieldWireShape(
+                field,
+                wireShape,
+                "message-unmarshal-pcode-stack-store");
+        }
+    }
+
+    private Map<String, WireShape> boundedBooleanOutputEvidence(
+        HighFunction high,
+        List<PcodeOpAST> operations) {
+
+        LinkedHashMap<String, WireShape> result = new LinkedHashMap<>();
+        if (high == null || operations == null) {
+            return result;
+        }
+        for (PcodeOpAST readCall : operations) {
+            if (readCall.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            RawPcodeWrite rawRead = pcodeReadRawWrite(
+                readCall,
+                pcodeCallTarget(readCall));
+            PcodeOpAST normalization = boundedNormalizedBooleanOperation(
+                high,
+                operations,
+                readCall,
+                rawRead);
+            if (normalization == null || rawRead == null) {
+                continue;
+            }
+            result.put(
+                pcodeNodeKey(normalization.getOutput()),
+                WireShape.semantic(
+                    "bool",
+                    rawRead.wireEvidence.layout,
+                    "message-unmarshal-bounded-boolean-store"));
+        }
+        return result;
     }
 
     private String pcodeNetworkValueWireShape(

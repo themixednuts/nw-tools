@@ -64,6 +64,13 @@
             addFormalOutputCandidate(
                 candidates,
                 pcodeStorageExpression(operation.getInput(1)));
+            addFormalOutputCandidate(
+                candidates,
+                pcodeLoadedStorageExpression(operation.getInput(1)));
+            Integer ownerSlot = formalPointerRootSlot(operation.getInput(1));
+            if (ownerSlot != null) {
+                candidates.add(ownerSlot);
+            }
             return;
         }
         if (operation.getOpcode() != PcodeOp.CALL) {
@@ -104,4 +111,318 @@
         if (slot != null) {
             candidates.add(slot);
         }
+    }
+
+    private Integer formalPointerRootSlot(Varnode node) {
+        if (node == null) {
+            return null;
+        }
+        String key = "formal-pointer-root:" + pcodeMemoryPathCacheKey(node, 0);
+        Optional<Integer> cached = formalPointerRootSlotCache.get(key);
+        if (cached != null) {
+            return cached.orElse(null);
+        }
+        Integer result = formalPointerRootSlot(
+            node,
+            new HashSet<>(),
+            new HashMap<>());
+        formalPointerRootSlotCache.put(key, Optional.ofNullable(result));
+        return result;
+    }
+
+    private Integer formalPointerRootSlot(
+        Varnode node,
+        Set<String> active,
+        Map<String, Optional<Integer>> memo) {
+
+        if (node == null) {
+            return null;
+        }
+        String key = pcodeSsaNodeKey(node);
+        Optional<Integer> cached = memo.get(key);
+        if (cached != null) {
+            return cached.orElse(null);
+        }
+        if (!active.add(key)) {
+            return null;
+        }
+
+        Integer result;
+        try {
+            result = formalParameterSlot(node);
+            if (result == null) {
+                result = formalPointerRootSlotFromDef(
+                    node.getDef(),
+                    active,
+                    memo);
+            }
+        }
+        finally {
+            active.remove(key);
+        }
+        memo.put(key, Optional.ofNullable(result));
+        return result;
+    }
+
+    private Integer formalPointerRootSlotFromDef(
+        PcodeOp operation,
+        Set<String> active,
+        Map<String, Optional<Integer>> memo) {
+
+        if (operation == null) {
+            return null;
+        }
+        return switch (operation.getOpcode()) {
+            case PcodeOp.COPY,
+                 PcodeOp.CAST,
+                 PcodeOp.INT_ZEXT,
+                 PcodeOp.INT_SEXT,
+                 PcodeOp.SUBPIECE -> operation.getNumInputs() == 0
+                    ? null
+                    : formalPointerRootSlot(operation.getInput(0), active, memo);
+            case PcodeOp.LOAD -> operation.getNumInputs() < 2
+                ? null
+                : formalPointerRootSlot(operation.getInput(1), active, memo);
+            case PcodeOp.PTRADD,
+                 PcodeOp.PTRSUB -> operation.getNumInputs() == 0
+                    ? null
+                    : formalPointerRootSlot(operation.getInput(0), active, memo);
+            case PcodeOp.INT_ADD,
+                 PcodeOp.INT_SUB -> uniqueFormalPointerOperand(
+                    operation,
+                    active,
+                    memo);
+            case PcodeOp.MULTIEQUAL -> commonFormalPointerRoot(
+                operation,
+                active,
+                memo);
+            case PcodeOp.CALL -> returnedFormalPointerRoot(
+                operation,
+                active,
+                memo);
+            // INDIRECT marks a value invalidated by a call or memory effect. Its
+            // pre-effect input is not proof of the post-effect pointer value.
+            case PcodeOp.INDIRECT -> null;
+            default -> null;
+        };
+    }
+
+    private Integer uniqueFormalPointerOperand(
+        PcodeOp operation,
+        Set<String> active,
+        Map<String, Optional<Integer>> memo) {
+
+        Integer selected = null;
+        for (int index = 0; index < operation.getNumInputs(); index++) {
+            Integer candidate = formalPointerRootSlot(
+                operation.getInput(index),
+                active,
+                memo);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Integer commonFormalPointerRoot(
+        PcodeOp operation,
+        Set<String> active,
+        Map<String, Optional<Integer>> memo) {
+
+        Integer selected = null;
+        Varnode phiOutput = operation.getOutput();
+        for (int index = 0; index < operation.getNumInputs(); index++) {
+            Boolean recurrence = affinePointerRecurrence(
+                operation.getInput(index),
+                phiOutput,
+                new HashSet<>(),
+                0);
+            if (Boolean.TRUE.equals(recurrence)) {
+                continue;
+            }
+            Integer candidate = formalPointerRootSlot(
+                operation.getInput(index),
+                active,
+                memo);
+            if (candidate == null || selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Boolean affinePointerRecurrence(
+        Varnode node,
+        Varnode phiOutput,
+        Set<String> active,
+        int depth) {
+
+        if (node == null || phiOutput == null || depth > 48) {
+            return null;
+        }
+        if (sameVarnodeIdentity(node, phiOutput)) {
+            return true;
+        }
+        if (node.isConstant() || node.getDef() == null) {
+            return false;
+        }
+        String key = pcodeSsaNodeKey(node);
+        if (!active.add(key)) {
+            return null;
+        }
+        try {
+            PcodeOp definition = node.getDef();
+            return switch (definition.getOpcode()) {
+                case PcodeOp.COPY,
+                     PcodeOp.CAST,
+                     PcodeOp.INT_ZEXT,
+                     PcodeOp.INT_SEXT -> definition.getNumInputs() == 1
+                        ? affinePointerRecurrence(
+                            definition.getInput(0),
+                            phiOutput,
+                            active,
+                            depth + 1)
+                        : null;
+                case PcodeOp.SUBPIECE -> isZeroSubpiece(definition)
+                    ? affinePointerRecurrence(
+                        definition.getInput(0),
+                        phiOutput,
+                        active,
+                        depth + 1)
+                    : null;
+                case PcodeOp.PTRADD,
+                     PcodeOp.PTRSUB -> affinePointerBaseRecurrence(
+                        definition,
+                        phiOutput,
+                        active,
+                        depth + 1);
+                case PcodeOp.INT_ADD -> affineAddRecurrence(
+                    definition,
+                    phiOutput,
+                    active,
+                    depth + 1);
+                case PcodeOp.INT_SUB -> affineSubtractRecurrence(
+                    definition,
+                    phiOutput,
+                    active,
+                    depth + 1);
+                default -> null;
+            };
+        }
+        finally {
+            active.remove(key);
+        }
+    }
+
+    private boolean isZeroSubpiece(PcodeOp operation) {
+        return operation.getNumInputs() == 2 &&
+            operation.getInput(1).isConstant() &&
+            operation.getInput(1).getOffset() == 0L;
+    }
+
+    private Boolean affinePointerBaseRecurrence(
+        PcodeOp operation,
+        Varnode phiOutput,
+        Set<String> active,
+        int depth) {
+
+        if (operation.getNumInputs() < 2) {
+            return null;
+        }
+        Boolean base = affinePointerRecurrence(
+            operation.getInput(0),
+            phiOutput,
+            active,
+            depth);
+        if (base == null) {
+            return null;
+        }
+        for (int index = 1; index < operation.getNumInputs(); index++) {
+            Boolean offset = affinePointerRecurrence(
+                operation.getInput(index),
+                phiOutput,
+                active,
+                depth);
+            if (!Boolean.FALSE.equals(offset)) {
+                return null;
+            }
+        }
+        return base;
+    }
+
+    private Boolean affineAddRecurrence(
+        PcodeOp operation,
+        Varnode phiOutput,
+        Set<String> active,
+        int depth) {
+
+        if (operation.getNumInputs() != 2) {
+            return null;
+        }
+        Boolean left = affinePointerRecurrence(
+            operation.getInput(0),
+            phiOutput,
+            active,
+            depth);
+        Boolean right = affinePointerRecurrence(
+            operation.getInput(1),
+            phiOutput,
+            active,
+            depth);
+        if (left == null || right == null) {
+            return null;
+        }
+        if (!left && !right) {
+            return false;
+        }
+        return left != right ? true : null;
+    }
+
+    private Boolean affineSubtractRecurrence(
+        PcodeOp operation,
+        Varnode phiOutput,
+        Set<String> active,
+        int depth) {
+
+        if (operation.getNumInputs() != 2) {
+            return null;
+        }
+        Boolean left = affinePointerRecurrence(
+            operation.getInput(0),
+            phiOutput,
+            active,
+            depth);
+        Boolean right = affinePointerRecurrence(
+            operation.getInput(1),
+            phiOutput,
+            active,
+            depth);
+        if (left == null || right == null) {
+            return null;
+        }
+        if (!left && !right) {
+            return false;
+        }
+        return left && !right ? true : null;
+    }
+
+    private Integer returnedFormalPointerRoot(
+        PcodeOp operation,
+        Set<String> active,
+        Map<String, Optional<Integer>> memo) {
+
+        Function target = pcodeCallTarget(operation);
+        Integer returnedSlot = returnedParameterSlot(target);
+        return returnedSlot == null || returnedSlot >= operation.getNumInputs()
+            ? null
+            : formalPointerRootSlot(
+                operation.getInput(returnedSlot),
+                active,
+                memo);
     }

@@ -56,8 +56,8 @@
                 CodecWireTrace wireTrace = traceUnmarshalCodec(
                     function,
                     parameter,
-                    new LinkedHashSet<>(),
-                    new HashMap<>());
+                    codecWireTraceActiveContexts,
+                    codecWireTraceCompletedContexts);
                 JsonArray events = new JsonArray();
                 if (wireTrace != null) {
                     for (CodecWireEvent event : wireTrace.events) {
@@ -491,6 +491,7 @@
 
         DynamicSequenceExtent extent = dynamicSequenceExtent(loop, operations);
         PcodeStorage outputStorage;
+        String nativeType;
         WireShape sequence;
         Set<Address> codecCallsites;
         if (extent != null) {
@@ -509,6 +510,7 @@
                 return null;
             }
             outputStorage = directFormalParameterStorage(extent.data());
+            nativeType = iteration.nativeType();
             sequence = iteration.wireEvidence();
             codecCallsites = iteration.codecCallsites();
         }
@@ -536,6 +538,7 @@
             outputStorage = outputParameter == null
                 ? null
                 : new PcodeStorage(outputParameter, 0L);
+            nativeType = null;
             sequence = countedSequenceWireEvidence(elementCodecs);
             codecCallsites = elementSequence.consumedCallsites();
         }
@@ -560,6 +563,7 @@
             sequence);
         return new CollectionOutputShape(
                 outputStorage,
+                nativeType,
                 sequence,
                 countCall.getSeqnum().getTarget(),
                 loop.header().getStart(),
@@ -755,7 +759,7 @@
                 target,
                 slot);
             String parameter = formalParameterBaseFromStorage(owner, storage);
-            if (isLikelyOutputParameterBase(parameter)) {
+            if (isProvenOutputParameterBase(owner, parameter)) {
                 parameters.add(parameter);
             }
         }

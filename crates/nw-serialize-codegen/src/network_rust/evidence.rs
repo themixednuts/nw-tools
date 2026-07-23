@@ -42,7 +42,7 @@ pub(super) fn state_evidence_issues(network_type: &NetworkType) -> Vec<NetworkEv
 
 pub(super) fn message_evidence_issues(network_type: &NetworkType) -> Vec<NetworkEvidenceIssue> {
     let mut issues = field_evidence_issues(network_type);
-    if network_type.field_count_conflict {
+    if network_type.signature_field_count_conflict {
         issues.push(NetworkEvidenceIssue {
             kind: NetworkEvidenceIssueKind::FieldCountConflict,
             field_ordinals: Vec::new(),
@@ -116,7 +116,7 @@ pub(super) fn message_evidence_issues(network_type: &NetworkType) -> Vec<Network
 fn field_evidence_issues(network_type: &NetworkType) -> Vec<NetworkEvidenceIssue> {
     let mut issues = Vec::new();
     for (ordinal, field) in network_type.fields.iter().enumerate() {
-        if field.type_conflict {
+        if field.type_conflict || field.signature_type_conflict {
             issues.push(field_issue(
                 NetworkEvidenceIssueKind::FieldTypeConflict,
                 ordinal,
@@ -124,7 +124,7 @@ fn field_evidence_issues(network_type: &NetworkType) -> Vec<NetworkEvidenceIssue
                 field.native_type.clone(),
             ));
         }
-        if field.wire_conflict {
+        if field.signature_wire_conflict {
             issues.push(field_issue(
                 NetworkEvidenceIssueKind::FieldWireConflict,
                 ordinal,

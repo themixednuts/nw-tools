@@ -14,8 +14,8 @@
         CodecWireTrace trace = traceUnmarshalCodec(
             function,
             readBuffer,
-            new LinkedHashSet<>(),
-            new HashMap<>());
+            codecWireTraceActiveContexts,
+            codecWireTraceCompletedContexts);
         if (trace == null || trace.events.size() != 1) {
             return null;
         }

@@ -263,11 +263,13 @@ pub(super) fn struct_native_marshaler_tokens(
     let unmarshal_fields = fields.iter().map(|field| &field.unmarshal);
 
     Some(quote! {
-        impl ::nw_network::serialize::Marshaler for ::nw_network::source::#struct_ident {
+        impl ::nw_network::serialize::Marshal for ::nw_network::source::#struct_ident {
             fn marshal(&self, wb: &mut ::nw_network::serialize::WriteBuffer) {
                 #(#marshal_fields)*
             }
+        }
 
+        impl ::nw_network::serialize::Unmarshal for ::nw_network::source::#struct_ident {
             fn unmarshal(
                 rb: &mut ::nw_network::serialize::ReadBuffer,
             ) -> Result<Self, ::nw_network::serialize::MarshalerError> {
@@ -298,10 +300,10 @@ pub(super) fn struct_marshaler_field_tokens(
 
     Some(StructMarshalerFieldTokens {
         marshal: quote! {
-            ::nw_network::serialize::Marshaler::marshal(&self.#field_ident, wb);
+            ::nw_network::serialize::Marshal::marshal(&self.#field_ident, wb);
         },
         unmarshal: quote! {
-            #field_ident: ::nw_network::serialize::Marshaler::unmarshal(rb)?,
+            #field_ident: ::nw_network::serialize::Unmarshal::unmarshal(rb)?,
         },
     })
 }
@@ -321,11 +323,11 @@ pub(super) fn struct_enum_field_marshaler_tokens(
     Some(StructMarshalerFieldTokens {
         marshal: quote! {
             let raw = #underlying_ty::from(self.#field_ident);
-            ::nw_network::serialize::Marshaler::marshal(&raw, wb);
+            ::nw_network::serialize::Marshal::marshal(&raw, wb);
         },
         unmarshal: quote! {
             #field_ident: {
-                let raw = <#underlying_ty as ::nw_network::serialize::Marshaler>::unmarshal(rb)?;
+                let raw = <#underlying_ty as ::nw_network::serialize::Unmarshal>::unmarshal(rb)?;
                 <#enum_type as ::core::convert::TryFrom<#underlying_ty>>::try_from(raw).map_err(|_| {
                     ::nw_network::serialize::MarshalerError::InvalidRange {
                         value: raw as u64,

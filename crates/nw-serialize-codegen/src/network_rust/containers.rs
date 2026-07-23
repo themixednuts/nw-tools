@@ -610,16 +610,29 @@ fn member_wire_shape_is_emittable(
 ) -> bool {
     match shape {
         NetworkMemberWireShape::Scalar(_) => true,
-        NetworkMemberWireShape::Composite(members) => members
+        NetworkMemberWireShape::Composite(members)
+        | NetworkMemberWireShape::DefaultOmitted(members) => members
             .iter()
             .all(|member| member_wire_shape_is_emittable(member, embedded_shapes, serialize_types)),
         NetworkMemberWireShape::Optional(inner) => {
             member_wire_shape_is_emittable(inner, embedded_shapes, serialize_types)
         }
+        NetworkMemberWireShape::BooleanChoice {
+            false_value,
+            true_value,
+        } => {
+            member_wire_shape_is_emittable(false_value, embedded_shapes, serialize_types)
+                && member_wire_shape_is_emittable(true_value, embedded_shapes, serialize_types)
+        }
         NetworkMemberWireShape::Vector(element)
+        | NetworkMemberWireShape::Set(element)
         | NetworkMemberWireShape::FixedVector { element, .. }
         | NetworkMemberWireShape::FixedArray { element, .. } => {
             member_wire_shape_is_emittable(element, embedded_shapes, serialize_types)
+        }
+        NetworkMemberWireShape::Map { key, value } => {
+            member_wire_shape_is_emittable(key, embedded_shapes, serialize_types)
+                && member_wire_shape_is_emittable(value, embedded_shapes, serialize_types)
         }
         NetworkMemberWireShape::Named(name) => nested_shape_by_wire_name(name, embedded_shapes)
             .is_some_and(|shape| {

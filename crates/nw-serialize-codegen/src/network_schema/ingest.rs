@@ -44,6 +44,16 @@ pub(super) fn network_type_from_registry_entry(entry: &Map<String, Value>) -> Ne
         .map(network_field)
         .collect::<Vec<_>>();
     reindex_message_fields(&mut fields);
+    let mut marshal_fields = entry
+        .get("messageMarshal")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|plan| array_values(plan, "fields"))
+        .filter_map(Value::as_object)
+        .filter(|field| is_plausible_network_field(field))
+        .map(network_field)
+        .collect::<Vec<_>>();
+    reindex_directional_message_fields(&mut marshal_fields, NetworkEvidenceKind::MessageMarshal);
     let has_registered_fields = fields.iter().any(|field| {
         field
             .evidence
@@ -145,7 +155,8 @@ pub(super) fn network_type_from_registry_entry(entry: &Map<String, Value>) -> Ne
         registration_type_name: string(entry, "registrationTypeName"),
         registration_hook,
         fields,
-        field_count_conflict: bool_value(entry, "fieldCountConflict").unwrap_or(false),
+        marshal_fields,
+        signature_field_count_conflict: false,
         evidence,
     }
 }
@@ -171,11 +182,18 @@ pub(super) fn is_plausible_network_field(field: &Map<String, Value>) -> bool {
 }
 
 pub(super) fn reindex_message_fields(fields: &mut [NetworkField]) {
+    reindex_directional_message_fields(fields, NetworkEvidenceKind::MessageUnmarshal);
+}
+
+fn reindex_directional_message_fields(
+    fields: &mut [NetworkField],
+    evidence_kind: NetworkEvidenceKind,
+) {
     if fields.iter().all(|field| {
         field
             .evidence
             .iter()
-            .any(|evidence| evidence.kind == NetworkEvidenceKind::MessageUnmarshal)
+            .any(|evidence| evidence.kind == evidence_kind)
     }) {
         for (index, field) in fields.iter_mut().enumerate() {
             field.index = Some(index as u32);
@@ -303,6 +321,7 @@ pub(super) fn network_field(field: &Map<String, Value>) -> NetworkField {
         Some(value) if value.starts_with("message-unmarshal") => {
             NetworkEvidenceKind::MessageUnmarshal
         }
+        Some(value) if value.starts_with("message-marshal") => NetworkEvidenceKind::MessageMarshal,
         Some(value) if value.starts_with("message-signature") => NetworkEvidenceKind::MessageSource,
         _ => NetworkEvidenceKind::RegisterField,
     };
@@ -368,7 +387,8 @@ pub(super) fn network_field(field: &Map<String, Value>) -> NetworkField {
         wire_layout: string(field, "wireLayout"),
         wire_layout_source: string(field, "wireLayoutSource"),
         type_conflict: bool_value(field, "typeConflict").unwrap_or(false),
-        wire_conflict: bool_value(field, "wireConflict").unwrap_or(false),
+        signature_type_conflict: false,
+        signature_wire_conflict: false,
         wire_shape_source,
         constructor_writes: network_field_constructor_writes(field),
         unmarshal_evidence: network_field_unmarshal_evidence(field),
@@ -721,6 +741,25 @@ pub(super) fn network_instance_layout(
     };
     NetworkInstanceLayout {
         create_instance: string(message_unmarshal, "createInstance"),
+        analysis_status: string(message_unmarshal, "analysisStatus").and_then(
+            |status| match status.as_str() {
+                "recovered-fields" => Some(NetworkMessageAnalysisStatus::RecoveredFields),
+                "marshal-only" => Some(NetworkMessageAnalysisStatus::MarshalOnly),
+                "delegated-codec" => Some(NetworkMessageAnalysisStatus::DelegatedCodec),
+                "proven-empty" => Some(NetworkMessageAnalysisStatus::ProvenEmpty),
+                "unresolved" => Some(NetworkMessageAnalysisStatus::Unresolved),
+                _ => None,
+            },
+        ),
+        empty_wire_proven: message_unmarshal
+            .get("emptyWireProven")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        empty_wire_evidence_source: string(message_unmarshal, "emptyWireEvidenceSource"),
+        supports_unmarshal: message_unmarshal
+            .get("supportsUnmarshal")
+            .and_then(Value::as_bool),
+        terminal_status: string(message_unmarshal, "terminalStatus"),
         size: hex_or_decimal_u32(message_unmarshal, "instanceSize"),
         size_source: string(message_unmarshal, "instanceSizeSource"),
         constructor: string(message_unmarshal, "instanceConstructor"),

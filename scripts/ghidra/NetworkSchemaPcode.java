@@ -139,7 +139,18 @@ record CodecWireEvent(
     WireShape wireEvidence,
     Address callsite,
     Address target,
-    String targetName) {
+    String targetName,
+    PcodeStorage outputStorage) {
+
+    CodecWireEvent(
+        String nativeType,
+        WireShape wireEvidence,
+        Address callsite,
+        Address target,
+        String targetName) {
+
+        this(nativeType, wireEvidence, callsite, target, targetName, null);
+    }
 }
 
 final class CodecWireTrace {
