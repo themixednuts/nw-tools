@@ -379,6 +379,9 @@ pub(super) fn message_nested_shape_rust_type(
     if let Some(shared_type) = shared_network_nested_shape_rust_type(shape) {
         return Some(shared_type.to_owned());
     }
+    if let Some(runtime_type) = shape.type_id.and_then(exact_type_id_rust_type) {
+        return Some(runtime_type.to_owned());
+    }
     if message_nested_shape_uses_source_type(shape) {
         return shape
             .type_name_full

@@ -863,6 +863,66 @@ fn emits_message_support_structs_from_proven_nested_shapes() {
 }
 
 #[test]
+fn exact_nested_client_ref_uses_the_runtime_wire_type() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "49334933-4933-4933-8933-493349334936",
+            "typeIndex": 6180,
+            "typeName": "Aoi::ClientRefMsg",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "name": "clientRef",
+                "nativeType": "ClientRef",
+                "sourceTypeName": "ClientRef",
+                "sourceTypeId": "c148c555-3264-41f7-a335-e48b65f91728",
+                "sourceTypeIdentityProven": true,
+                "wireShape": "actor-ref",
+                "nestedTypeShape": {
+                    "typeId": "c148c555-3264-41f7-a335-e48b65f91728",
+                    "identityProven": true,
+                    "typeName": "ClientRef",
+                    "typeNameFull": "ClientRef",
+                    "memberNamesProven": true,
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x8",
+                        "name": "m_clientRef",
+                        "nameProven": true,
+                        "nativeType": "Amazon::Hub::ActorRef",
+                        "typeId": "0638e28c-ab7b-4ba4-84ac-0353038e6fdc",
+                        "typeIdentityProven": true,
+                        "wireShape": "actor-ref",
+                        "wireOrdinal": 0
+                    }]
+                },
+                "confidence": "message-unmarshal-constructor-typed-boundary"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::nw_network::ClientRef")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub client_ref: ::nw_network::ClientRef")
+    );
+    assert!(!output.source.contains("::nw_network::source::ClientRef"));
+}
+
+#[test]
 fn names_constructor_proven_anonymous_message_values_from_their_owner() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
