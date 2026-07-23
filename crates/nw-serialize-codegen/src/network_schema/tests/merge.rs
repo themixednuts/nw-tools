@@ -602,6 +602,140 @@ fn message_signatures_group_exact_serialized_field_sequences() {
 }
 
 #[test]
+fn message_signatures_group_unknown_scalar_lanes_inside_exact_products() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "4604A3CC-2CAC-4A93-A0E2-D330041777E6",
+            "typeIndex": 736,
+            "typeName": "ActorMover::MovementTimeoutMsg",
+            "messageUnmarshal": {
+                "terminalStatus": "no-success-terminal",
+                "supportsUnmarshal": false,
+                "fields": []
+            },
+            "messageMarshal": {
+                "fields": [{
+                    "index": 0,
+                    "storageExpression": "param_2 + 0x8",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 1,
+                    "storageExpression": "param_2 + 0x18",
+                    "wireShape": "u32",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 2,
+                    "storageExpression": "param_2 + 0x1c",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 3,
+                    "storageExpression": "param_2 + 0x2c",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 4,
+                    "storageExpression": "param_2 + 0x40",
+                    "wireShape": "u32",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 5,
+                    "storageExpression": "param_2 + 0x44",
+                    "wireShape": "u32",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 6,
+                    "storageExpression": "param_2 + 0x48",
+                    "wireShape": "u64",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 7,
+                    "storageExpression": "param_2 + 0x50",
+                    "wireShape": "u64",
+                    "confidence": "message-marshal-pcode-stack"
+                }]
+            }
+        }],
+        "fieldRegistrationFunctions": []
+    });
+    let mut schema =
+        NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+    schema.serialize_types = serde_json::from_value(json!([{
+        "typeId": "0638E28C-AB7B-4BA4-84AC-0353038E6FDC",
+        "kind": "struct",
+        "name": "Amazon::Hub::ActorRef",
+        "role": "support-type",
+        "fieldCount": 0,
+        "variantCount": 0,
+        "directDependencyTypeIds": [],
+        "wireShapes": ["u32", "fixed-bytes-16", "fixed-bytes-16"],
+        "isAbstract": null,
+        "isReflectionMarker": true
+    }, {
+        "typeId": "AABF0B66-00C9-478D-BF17-25BF39F9D894",
+        "kind": "struct",
+        "name": "MovementInteractionId",
+        "role": "support-type",
+        "fieldCount": 4,
+        "variantCount": 0,
+        "directDependencyTypeIds": [],
+        "wireShapes": ["u32", "u32", "u64", "u64"],
+        "isAbstract": null,
+        "isReflectionMarker": true
+    }]))
+    .expect("serialize types");
+
+    let merge = schema.merge_message_signatures(
+        &[NetworkMessageSignature {
+            type_id: Some(uuid!("4604a3cc-2cac-4a93-a0e2-d330041777e6")),
+            type_index: Some(736),
+            name: Some("ActorMover::MovementTimeoutMsg".to_owned()),
+            rust_name: Some("MovementTimeoutMsg".to_owned()),
+            source: None,
+            fields: vec![
+                NetworkMessageFieldSignature {
+                    index: Some(0),
+                    name: "ActorId".to_owned(),
+                    rust_type: Some("::nw_network::ActorId".to_owned()),
+                    native_type: Some("Amazon::Hub::ActorID".to_owned()),
+                    wire_shape: Some(NetworkWireShape::FixedBytes(16)),
+                },
+                NetworkMessageFieldSignature {
+                    index: Some(1),
+                    name: "RemoteMoveCoordinator".to_owned(),
+                    rust_type: Some("::nw_network::ActorRef".to_owned()),
+                    native_type: Some("Amazon::Hub::ActorRef".to_owned()),
+                    wire_shape: None,
+                },
+                NetworkMessageFieldSignature {
+                    index: Some(2),
+                    name: "MovementInteractionId".to_owned(),
+                    rust_type: Some("::nw_network::MovementInteractionId".to_owned()),
+                    native_type: Some("MovementInteractionId".to_owned()),
+                    wire_shape: None,
+                },
+            ],
+        }],
+        Some("message-signatures.json".to_owned()),
+    );
+
+    assert_eq!(merge.field_count_mismatch_count, 0);
+    assert_eq!(merge.field_grouped_count, 2);
+    assert_eq!(schema.types[0].marshal_fields.len(), 3);
+    assert!(!schema.types[0].signature_field_count_conflict);
+    assert_eq!(
+        schema.types[0].marshal_fields[0].wire_shape,
+        Some(NetworkWireShape::FixedBytes(16))
+    );
+    assert_eq!(
+        schema.types[0].marshal_fields[1].name.as_deref(),
+        Some("RemoteMoveCoordinator")
+    );
+    assert_eq!(
+        schema.types[0].marshal_fields[2].name.as_deref(),
+        Some("MovementInteractionId")
+    );
+}
+
+#[test]
 fn message_signatures_project_proven_nested_storage_into_semantic_fields() {
     let report = json!({
         "registryEntries": [{

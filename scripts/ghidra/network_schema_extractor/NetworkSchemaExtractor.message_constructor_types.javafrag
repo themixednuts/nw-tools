@@ -253,6 +253,30 @@
         MessageUnmarshalPlan plan,
         MessageConstructorTypeBoundary boundary) {
 
+        String wireShape = wireShapeFromNestedTypeShape(boundary.shape());
+        ArrayList<String> layouts = new ArrayList<>();
+        for (NestedTypeMember member : boundary.shape().members) {
+            layouts.add(firstNonEmpty(member.wireLayout, member.wireShape));
+        }
+        String wireLayout = compositeWireShape(layouts);
+        for (FieldCall existing : plan.fields) {
+            if (!Boolean.TRUE.equals(existing.callFrameBoundaryProven) ||
+                existing.storageOffset == null ||
+                existing.storageOffset != boundary.offset() ||
+                !Objects.equals(
+                    messageFieldStorageBase(existing),
+                    plan.rootStorageBase)) {
+                continue;
+            }
+            String existingLayout = firstNonEmpty(
+                existing.wireLayout,
+                existing.wireShape);
+            if (existingLayout != null && wireLayout != null &&
+                !sameCodecProduct(existingLayout, wireLayout)) {
+                return;
+            }
+        }
+
         FieldCall field = addPcodeMessageField(
             plan,
             boundary.firstCallsite(),
@@ -272,16 +296,11 @@
         field.rawByteLength = null;
         field.fixedSequenceShape = null;
         field.confidence = "message-unmarshal-constructor-typed-boundary";
-        String wireShape = wireShapeFromNestedTypeShape(boundary.shape());
         if (wireShape != null) {
             field.wireShape = wireShape;
             field.wireShapeSource = boundary.shape().identitySource;
         }
-        ArrayList<String> layouts = new ArrayList<>();
-        for (NestedTypeMember member : boundary.shape().members) {
-            layouts.add(firstNonEmpty(member.wireLayout, member.wireShape));
-        }
-        field.wireLayout = compositeWireShape(layouts);
+        field.wireLayout = wireLayout;
         field.wireLayoutSource = boundary.shape().identitySource;
         addMessageFieldTypeEvidence(
             field,

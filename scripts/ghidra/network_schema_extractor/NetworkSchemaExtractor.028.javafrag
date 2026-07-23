@@ -923,7 +923,8 @@ import java.util.Collection;
             (Boolean.TRUE.equals(field.callFrameBoundaryProven) ||
                 field.nestedTypeShape.nativeSize != null &&
                 field.nestedTypeShape.nativeSize > 0) &&
-            field.nestedTypeShape.members.size() >= 2;
+            (field.nestedTypeShape.members.size() >= 2 ||
+                Boolean.TRUE.equals(field.nestedTypeShape.identityProven));
     }
 
     private String messageFieldWireLayout(FieldCall field) {

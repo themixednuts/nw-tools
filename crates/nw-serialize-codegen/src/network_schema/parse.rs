@@ -3,6 +3,10 @@ use super::*;
 pub(super) fn confidence_from_raw(raw: Option<&str>) -> NetworkConfidence {
     match raw {
         Some("exact") => NetworkConfidence::Exact,
+        Some("high") => NetworkConfidence::High,
+        Some("inferred") => NetworkConfidence::Inferred,
+        Some("weak") => NetworkConfidence::Weak,
+        Some("unknown") => NetworkConfidence::Unknown,
         Some(
             "register-field-call"
             | "registration-hook"

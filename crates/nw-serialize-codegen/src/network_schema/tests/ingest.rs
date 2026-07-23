@@ -275,6 +275,33 @@ fn rejects_private_source_derived_ghidra_reports() {
 }
 
 #[test]
+fn preserves_normalized_confidence_labels() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "44BA4CBA-AFAD-4EC5-A9DA-500838B28A57",
+            "typeIndex": 747,
+            "typeName": "ActorMover::CheckMovementStatusMsg",
+            "fields": [{
+                "index": 0,
+                "name": "ActorId",
+                "wireShape": "fixed-bytes-16",
+                "confidence": "high"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+
+    let schema =
+        NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+
+    assert_eq!(
+        schema.types[0].fields[0].confidence,
+        NetworkConfidence::High
+    );
+    assert_eq!(schema.summary.high_confidence_field_count, 1);
+}
+
+#[test]
 fn parses_fixed_byte_wire_shapes() {
     let report = json!({
         "registryEntries": [],

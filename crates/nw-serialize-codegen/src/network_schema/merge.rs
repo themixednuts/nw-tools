@@ -506,7 +506,8 @@ fn match_message_field_sequence(
             let end = start.checked_add(projection.shapes.len())?;
             let tokens = machine_tokens.get(start..end)?;
             let matches = tokens.iter().zip(&projection.shapes).all(|(token, expected)| {
-                matches!(token, MachineWireToken::Shape { shape, .. } if shape == expected)
+                matches!(token, MachineWireToken::Opaque { .. })
+                    || matches!(token, MachineWireToken::Shape { shape, .. } if shape == expected)
             });
             if !matches {
                 return None;
