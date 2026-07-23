@@ -357,6 +357,7 @@ pub(super) const fn exact_type_id_rust_type(type_id: Uuid) -> Option<&'static st
         0x9f4e_062e_06a0_46d4_85df_e0da_9646_7d3a => Some("::nw_network::Crc32"),
         0x652e_d536_3402_439b_aebe_4a5d_bc55_4085 => Some("::nw_network::AssetId"),
         0x0638_e28c_ab7b_4ba4_84ac_0353_038e_6fdc => Some("::nw_network::ActorRef"),
+        0xc148_c555_3264_41f7_a335_e48b_65f9_1728 => Some("::nw_network::ClientRef"),
         0xa54c_2b36_d5b8_46a1_a529_4ebd_bd24_50e7 => Some("::bevy_math::bounding::Aabb3d"),
         _ => None,
     }

@@ -417,8 +417,9 @@ fn proven_uid_container_key_uses_the_resolved_generic_type() {
 }
 
 #[test]
-fn canonical_actor_ref_identity_uses_the_runtime_wire_type() {
+fn canonical_reference_identities_use_the_runtime_wire_types() {
     let actor_ref_type_id = uuid!("0638e28c-ab7b-4ba4-84ac-0353038e6fdc");
+    let client_ref_type_id = uuid!("c148c555-3264-41f7-a335-e48b65f91728");
     let actor_ref = NetworkSerializeType {
         type_id: actor_ref_type_id,
         kind: NetworkSerializeKind::Struct,
@@ -435,11 +436,34 @@ fn canonical_actor_ref_identity_uses_the_runtime_wire_type() {
         is_abstract: Some(false),
         is_reflection_marker: false,
     };
-    let serialize_types = BTreeMap::from([(actor_ref_type_id, &actor_ref)]);
+    let client_ref = NetworkSerializeType {
+        type_id: client_ref_type_id,
+        kind: NetworkSerializeKind::Struct,
+        name: "ClientRef".to_owned(),
+        role: NetworkSerializeRole::SupportType,
+        resolved_type: None,
+        emits_source: true,
+        factory: None,
+        field_count: 1,
+        fields: Vec::new(),
+        variant_count: 0,
+        direct_dependency_type_ids: vec![actor_ref_type_id],
+        wire_shapes: Vec::new(),
+        is_abstract: Some(false),
+        is_reflection_marker: false,
+    };
+    let serialize_types = BTreeMap::from([
+        (actor_ref_type_id, &actor_ref),
+        (client_ref_type_id, &client_ref),
+    ]);
 
     assert_eq!(
         network_serialize_type_rust_type(&actor_ref, &serialize_types).as_deref(),
         Some("::nw_network::ActorRef")
+    );
+    assert_eq!(
+        network_serialize_type_rust_type(&client_ref, &serialize_types).as_deref(),
+        Some("::nw_network::ClientRef")
     );
 }
 
