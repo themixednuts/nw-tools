@@ -48,3 +48,66 @@
                 ",mandatory=" + terminalFlow.mandatoryBlocks().size() +
                 ",blocks=" + blocks);
     }
+
+    private Map<PcodeBlockBasic, Set<PcodeBlockBasic>>
+        unsuccessfulCodecEventEdges(
+            HighFunction high,
+            Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock,
+            Set<PcodeBlockBasic> successfulTerminals) {
+
+        if (high == null || eventsByBlock == null || eventsByBlock.isEmpty() ||
+            successfulTerminals == null || successfulTerminals.isEmpty()) {
+            return Map.of();
+        }
+        HashMap<PcodeBlockBasic, List<ContainerCodecCall>> codecsByBlock =
+            new HashMap<>();
+        for (Map.Entry<PcodeBlockBasic, List<CodecWireEvent>> entry :
+                eventsByBlock.entrySet()) {
+            ArrayList<ContainerCodecCall> codecs = new ArrayList<>();
+            LinkedHashSet<PcodeOpAST> operations = new LinkedHashSet<>();
+            for (CodecWireEvent event : entry.getValue()) {
+                PcodeOpAST operation = event == null || event.callsite() == null
+                    ? null
+                    : pcodeCallAt(high, event.callsite());
+                if (operation == null ||
+                    NetworkSchemaControlFlow.parentBlock(operation) != entry.getKey() ||
+                    !operations.add(operation)) {
+                    continue;
+                }
+                ContainerCodecCall codec = new ContainerCodecCall();
+                codec.operation = operation;
+                codec.callsite = event.callsite();
+                codec.target = event.target();
+                codec.targetName = event.targetName();
+                codec.nativeType = event.nativeType();
+                codec.wireEvidence = event.wireEvidence();
+                codec.evidenceSource =
+                    "GridMate::ReadBuffer::ReadRaw".equals(event.targetName())
+                        ? "container-helper-unmarshal-read-raw"
+                        : "codec-wire-event";
+                codecs.add(codec);
+            }
+            if (!codecs.isEmpty()) {
+                codecsByBlock.put(entry.getKey(), List.copyOf(codecs));
+            }
+        }
+        if (codecsByBlock.isEmpty()) {
+            return Map.of();
+        }
+
+        HashMap<PcodeBlockBasic, Set<PcodeBlockBasic>> failedEdges =
+            new HashMap<>();
+        for (Map.Entry<PcodeBlockBasic, List<ContainerCodecCall>> entry :
+                codecsByBlock.entrySet()) {
+            List<ContainerCodecCall> codecs = entry.getValue();
+            PcodeBlockBasic failed = failedCodecSuccessor(
+                entry.getKey(),
+                codecs.get(codecs.size() - 1),
+                codecsByBlock,
+                successfulTerminals);
+            if (failed != null) {
+                failedEdges.put(entry.getKey(), Set.of(failed));
+            }
+        }
+        return Map.copyOf(failedEdges);
+    }

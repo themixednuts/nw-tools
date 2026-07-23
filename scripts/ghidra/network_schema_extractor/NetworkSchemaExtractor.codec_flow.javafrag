@@ -200,11 +200,27 @@
             }
 
             UnmarshalTerminalFlow terminalFlow = successfulUnmarshalTerminalFlow(high);
+            Map<PcodeBlockBasic, Set<PcodeBlockBasic>> codecFailureEdges =
+                unsuccessfulCodecEventEdges(
+                    high,
+                    eventsByBlock,
+                    terminalFlow.terminals());
+            Map<PcodeBlockBasic, Set<PcodeBlockBasic>> flowExcludedEdges =
+                mergeExcludedEdges(
+                    terminalFlow.excludedEdges(),
+                    codecFailureEdges);
+            UnmarshalTerminalFlow sequenceTerminalFlow = new UnmarshalTerminalFlow(
+                terminalFlow.terminals(),
+                flowExcludedEdges,
+                terminalFlow.mandatoryBlocks(),
+                codecFailureEdges.isEmpty()
+                    ? terminalFlow.status()
+                    : terminalFlow.status() + "+codec-failure-edges");
             BooleanChoiceAnalysis booleanChoice = booleanChoiceUnmarshalShape(
                 function,
                 high,
                 eventsByBlock,
-                terminalFlow);
+                sequenceTerminalFlow);
             if (booleanChoice.shape() != null) {
                 CodecWireEvent first = body.events.get(0);
                 CodecWireTrace result = new CodecWireTrace(List.of(
@@ -221,7 +237,7 @@
                 return result;
             }
             NetworkSchemaFlowSequence.Result<CodecWireEvent> sequence =
-                terminalFlow.terminals().isEmpty()
+                sequenceTerminalFlow.terminals().isEmpty()
                 ? NetworkSchemaFlowSequence.analyze(
                     high,
                     eventsByBlock,
@@ -233,9 +249,9 @@
                     high,
                     eventsByBlock,
                     collapsedEventBlocks,
-                    terminalFlow.terminals(),
+                    sequenceTerminalFlow.terminals(),
                     Set.of(),
-                    terminalFlow.excludedEdges(),
+                    sequenceTerminalFlow.excludedEdges(),
                     (left, right) -> sameWireEvidence(
                         left.wireEvidence(),
                         right.wireEvidence()));
@@ -256,14 +272,14 @@
                     operations,
                     eventsByBlock,
                     collapsedEventBlocks,
-                    terminalFlow);
+                    sequenceTerminalFlow);
                 if (optional == null) {
                     recordNestedTypeShapeReject(
                         "codec-wire-" + sequence.status().name().toLowerCase(Locale.ROOT));
                     return unresolvedCodecWireTrace(
                         context,
                         "flow-" + sequence.status().name().toLowerCase(Locale.ROOT) +
-                            ":terminal=" + terminalFlow.status() +
+                            ":terminal=" + sequenceTerminalFlow.status() +
                             ":events=" + body.events.size() +
                             ":boolean-choice=" + booleanChoice.diagnostic() +
                             ":success-coverage=" + successCoverage.diagnostic());

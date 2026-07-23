@@ -18,6 +18,7 @@ $sourceNames = @(
     'NetworkSchemaPcode.java'
     'NetworkSchemaControlFlow.java'
     'NetworkSchemaFlowSequence.java'
+    'NetworkSchemaLoopSequence.java'
     'NetworkSchemaBranchFlow.java'
     'NetworkSchemaNaturalLoop.java'
     'NetworkSchemaCodecClassifier.java'

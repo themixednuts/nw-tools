@@ -66,6 +66,7 @@ pub(super) fn message_evidence_issues(network_type: &NetworkType) -> Vec<Network
 
     for (ordinal, field) in fields.iter().enumerate() {
         if is_pcode_stack_field(field)
+            && field.storage_base.is_some()
             && field.storage_base.as_deref() != Some("param_3")
             && !has_matching_marshal_field(field, &network_type.marshal_fields)
         {

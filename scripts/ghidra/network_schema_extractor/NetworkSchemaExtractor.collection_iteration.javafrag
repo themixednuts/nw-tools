@@ -99,13 +99,24 @@
                 loop,
                 codecsByBlock,
                 this::sameCollectionElementCodec);
-        if (!sequence.complete() || sequence.events().isEmpty()) {
-            recordNestedTypeShapeReject(
-                "dynamic-collection-iteration-" + sequence.status());
-            return null;
-        }
         ArrayList<CodecWireEvent> events = new ArrayList<>();
-        sequence.events().forEach(codec -> events.addAll(codec.events()));
+        if (sequence.complete() && !sequence.events().isEmpty()) {
+            sequence.events().forEach(codec -> events.addAll(codec.events()));
+        }
+        else {
+            CodecWireEvent optional = optionalCollectionElementEvent(
+                function,
+                high,
+                loop,
+                operations,
+                codecsByBlock);
+            if (optional == null) {
+                recordNestedTypeShapeReject(
+                    "dynamic-collection-iteration-" + sequence.status());
+                return null;
+            }
+            events.add(optional);
+        }
         WireShape evidence = dynamicSequenceWireEvidence(events);
         return evidence == null
             ? null
@@ -113,6 +124,81 @@
                 dynamicSequenceNativeType(events),
                 evidence,
                 callsites);
+    }
+
+    private CodecWireEvent optionalCollectionElementEvent(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        Map<PcodeBlockBasic, List<CollectionElementCodec>> codecsByBlock) {
+
+        NetworkSchemaLoopSequence.OptionalSuffixResult<CollectionElementCodec> optional =
+            NetworkSchemaLoopSequence.analyzeOptionalSuffix(
+                loop,
+                codecsByBlock,
+                this::sameCollectionElementCodec);
+        if (!optional.hasOptionalSuffix() ||
+            optional.distinctSequenceCount() != 2) {
+            return null;
+        }
+        ArrayList<CodecWireEvent> requiredEvents = new ArrayList<>();
+        optional.requiredEvents().forEach(codec ->
+            requiredEvents.addAll(codec.events()));
+        ArrayList<CodecWireEvent> optionalEvents = new ArrayList<>();
+        optional.optionalEvents().forEach(codec ->
+            optionalEvents.addAll(codec.events()));
+        if (requiredEvents.size() != 1 || optionalEvents.isEmpty()) {
+            return null;
+        }
+
+        CodecWireEvent presence = requiredEvents.get(0);
+        WireShape presenceShape = presence.wireEvidence();
+        HashMap<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock =
+            new HashMap<>();
+        codecsByBlock.forEach((block, codecs) -> {
+            ArrayList<CodecWireEvent> events = new ArrayList<>();
+            codecs.forEach(codec -> events.addAll(codec.events()));
+            eventsByBlock.put(block, List.copyOf(events));
+        });
+        if (presenceShape == null ||
+            !"bool".equals(presenceShape.shape) ||
+            !presenceShape.hasProvenSemantics() ||
+            !presenceBooleanControlsOptionalEvents(
+                high,
+                operations,
+                eventsByBlock,
+                presence,
+                optionalEvents)) {
+            return null;
+        }
+        WireShape inner = orderedCodecWireEvidence(
+            optionalEvents,
+            "unmarshal-cfg-loop-optional-body");
+        if (inner == null || inner.layout == null) {
+            return null;
+        }
+        String layout = "optional<" + inner.layout + ">";
+        WireShape shape = inner.hasProvenSemantics()
+            ? WireShape.semantic(
+                "optional<" + inner.shape + ">",
+                layout,
+                "unmarshal-cfg-loop-presence-prefixed-optional")
+            : WireShape.layout(
+                layout,
+                "unmarshal-cfg-loop-presence-prefixed-optional");
+        String nativeType = optionalEvents.size() == 1 &&
+            optionalEvents.get(0).nativeType() != null
+            ? "AZStd::optional<" + optionalEvents.get(0).nativeType() + ">"
+            : null;
+        return new CodecWireEvent(
+            nativeType,
+            shape,
+            presence.callsite(),
+            function.getEntryPoint(),
+            fullFunctionName(function),
+            null,
+            null);
     }
 
     private String dynamicSequenceNativeType(List<CodecWireEvent> events) {
