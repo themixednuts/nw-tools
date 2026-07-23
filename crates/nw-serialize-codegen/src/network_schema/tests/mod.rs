@@ -9,6 +9,7 @@ use super::*;
 
 mod ingest;
 mod merge;
+mod message_alignment;
 
 #[test]
 fn parses_nested_collection_member_wire_shapes() {

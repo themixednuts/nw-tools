@@ -17,6 +17,7 @@ mod container_plan;
 mod fixed_sequence;
 mod ingest;
 mod merge;
+mod message_alignment;
 mod model;
 mod overlay;
 pub(crate) mod parse;
@@ -44,6 +45,7 @@ pub use wire::*;
 use fixed_sequence::{parse_fixed_sequence_shape, parse_fixed_sequence_wire_shape};
 use ingest::*;
 use merge::*;
+use message_alignment::*;
 use parse::*;
 use replicated_state::{
     network_type_replicated_state_abi, promote_replicated_state_capabilities,

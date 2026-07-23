@@ -107,6 +107,8 @@ pub struct NetworkMessageSignatureMergeReport {
     pub field_count_mismatch_count: usize,
     #[serde(default)]
     pub field_grouped_count: usize,
+    #[serde(default)]
+    pub field_reordered_count: usize,
     pub field_index_mismatch_count: usize,
     pub field_name_filled_count: usize,
     pub field_name_conflict_count: usize,

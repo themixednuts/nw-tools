@@ -590,6 +590,8 @@ fn merge_message_signature_direction(
         return true;
     }
 
+    report.field_reordered_count +=
+        reorder_message_fields_by_signature(fields, signatures, serialize_types);
     if let Some((grouped, grouped_count)) =
         group_message_fields_by_signature(fields, signatures, serialize_types)
     {
