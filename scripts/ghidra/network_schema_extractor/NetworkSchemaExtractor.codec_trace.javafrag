@@ -816,6 +816,8 @@
                     : null;
             case PcodeOp.MULTIEQUAL:
                 return mergedNetworkValueWireShape(def, tempWireShapes, seen);
+            case PcodeOp.PIECE:
+                return pcodePieceValueWireShape(def, tempWireShapes);
             default:
                 return null;
         }

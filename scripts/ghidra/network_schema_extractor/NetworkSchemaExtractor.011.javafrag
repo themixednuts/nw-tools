@@ -825,10 +825,7 @@
             case PcodeOp.PIECE:
                 return pcodePieceValueWireShape(
                     def,
-                    tempWireShapes,
-                    tempNativeTypes,
-                    seen,
-                    depth + 1);
+                    tempWireShapes);
             default:
                 return wireShapeFromNativeType(pcodeValueNativeType(node, tempNativeTypes));
         }
@@ -865,10 +862,7 @@
 
     private String pcodePieceValueWireShape(
         PcodeOp def,
-        Map<String, String> tempWireShapes,
-        Map<String, String> tempNativeTypes,
-        Set<String> seen,
-        int depth) {
+        Map<String, String> tempWireShapes) {
 
         if (def.getNumInputs() != 2 || def.getOutput() == null) {
             return null;
