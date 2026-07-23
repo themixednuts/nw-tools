@@ -147,13 +147,6 @@ fn merge_registry_types(
             *added_count += 1;
         }
     }
-    destination.sort_by_key(|entry| {
-        (
-            entry.registry_index.unwrap_or(u32::MAX),
-            entry.type_index.unwrap_or(u32::MAX),
-            entry.type_id,
-        )
-    });
     Ok(source_ids)
 }
 
