@@ -54,6 +54,7 @@ pub(super) fn message_module_tokens(
             #[az_rtti(#type_id)]
             #[type_registry(#type_index)]
             #[derive(Debug, Clone, PartialEq, #codec_derive)]
+            #[allow(clippy::type_complexity)]
             pub struct #message_ident {
                 #(#fields)*
             }
