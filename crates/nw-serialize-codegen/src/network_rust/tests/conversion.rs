@@ -413,6 +413,70 @@ fn emits_struct_marshaler_for_signed_enum_fields() {
     assert!(output.source.contains("max: 0u64"));
 }
 
+#[test]
+fn struct_marshaler_matches_the_materialized_source_field_projection() {
+    let interface_type_id = uuid!("2e6af6b7-6901-45eb-a02b-ebfb0accb1f1");
+    let interface = SerializeCodegenItem {
+        source_type_id: interface_type_id,
+        source_name: "IRMIDispatcher".to_owned(),
+        role: crate::role::ReflectedTypeRole::SupportType,
+        is_reflection_marker: false,
+        is_abstract: Some(true),
+        factory: None,
+        rtti_base_chain: Vec::new(),
+        kind: SerializeCodegenItemKind::Struct,
+        enum_underlying_type: None,
+        fields: Vec::new(),
+        variants: Vec::new(),
+    };
+    let client_ref = SerializeCodegenItem {
+        source_type_id: uuid!("c148c555-3264-41f7-a335-e48b65f91728"),
+        source_name: "ClientRef".to_owned(),
+        role: crate::role::ReflectedTypeRole::SupportType,
+        is_reflection_marker: false,
+        is_abstract: Some(false),
+        factory: None,
+        rtti_base_chain: Vec::new(),
+        kind: SerializeCodegenItemKind::Struct,
+        enum_underlying_type: None,
+        fields: vec![
+            SerializeCodegenField {
+                source_name: "BaseClass1".to_owned(),
+                source_type_id: interface_type_id,
+                resolved_type: ResolvedType::Named {
+                    type_id: interface_type_id,
+                    source_name: "IRMIDispatcher".to_owned(),
+                },
+                data_size: None,
+                offset: Some(0),
+                flags: None,
+                is_base_class: true,
+                is_pointer: false,
+                is_dynamic_field: false,
+            },
+            SerializeCodegenField {
+                source_name: "m_clientRef".to_owned(),
+                source_type_id: uuid!("43da906b-7def-4ca8-9790-854106d3f983"),
+                resolved_type: ResolvedType::Scalar(ScalarType::U32),
+                data_size: Some(4),
+                offset: Some(8),
+                flags: None,
+                is_base_class: false,
+                is_pointer: false,
+                is_dynamic_field: false,
+            },
+        ],
+        variants: Vec::new(),
+    };
+
+    let output = NetworkRustEmitter::emit_marshaler_conversions([&interface, &client_ref])
+        .expect("conversion source");
+
+    assert!(output.source.contains("self.client_ref"));
+    assert!(!output.source.contains("base_class_1"));
+    syn::parse_file(&output.source).expect("generated conversion source parses");
+}
+
 fn grid_sides_enum_item(type_id: Uuid) -> SerializeCodegenItem {
     SerializeCodegenItem {
         source_type_id: type_id,

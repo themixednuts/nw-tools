@@ -379,6 +379,73 @@ fn emits_anonymous_value_from_proven_subobjects_and_scalar_slots() {
 }
 
 #[test]
+fn state_support_value_constructs_non_default_aabb_members() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "89C55D6C-722A-4646-B8F9-FD71184059DE",
+            "typeIndex": 1881,
+            "typeName": "MB::ForbiddenBoundsReplicatedState",
+            "fields": [{
+                "index": 0,
+                "name": "forbiddenBounds",
+                "group": 0,
+                "handlerVtable": "NewWorld+0x8383280",
+                "confidence": "register-field-call"
+            }]
+        }],
+        "fieldRegistrationFunctions": [],
+        "fieldHandlerVtables": [{
+            "address": "NewWorld+0x8383280",
+            "fieldCount": 1,
+            "valueTypeShape": {
+                "identityProven": false,
+                "layoutProven": true,
+                "typeName": "Value",
+                "typeNameSource": "synthetic-anonymous-composite",
+                "memberNameSource": "synthetic-layout-member",
+                "memberNamesProven": false,
+                "memberCoverageProven": true,
+                "wireOrderProven": true,
+                "members": [{
+                    "index": 0,
+                    "offset": "0x0",
+                    "name": "field_0",
+                    "wireShape": "bool",
+                    "wireOrdinal": 0
+                }, {
+                    "index": 1,
+                    "offset": "0x4",
+                    "name": "field_1",
+                    "wireShape": "aabb2d",
+                    "wireOrdinal": 1
+                }, {
+                    "index": 2,
+                    "offset": "0x14",
+                    "name": "field_2",
+                    "wireShape": "u8",
+                    "wireOrdinal": 2
+                }]
+            },
+            "slots": []
+        }]
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [1881])
+        .expect("generated state source");
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert!(
+        output
+            .source
+            .contains("impl ::core::default::Default for ForbiddenBoundsValue")
+    );
+    assert!(output.source.contains("min: ::glam::Vec2::ZERO"));
+    syn::parse_file(&output.source).expect("generated state source parses");
+}
+
+#[test]
 fn emits_anonymous_value_from_proven_scalar_storage_window() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{

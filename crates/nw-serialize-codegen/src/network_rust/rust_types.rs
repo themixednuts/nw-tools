@@ -74,9 +74,7 @@ pub(super) fn network_native_type_rust_type(
     if candidates.any(|candidate| candidate.type_id != selected.type_id) {
         return None;
     }
-    exact_type_id_rust_type(selected.type_id)
-        .map(ToOwned::to_owned)
-        .or_else(|| serialize_source_rust_type_name(&selected.name))
+    network_serialize_type_rust_type(selected, serialize_types)
 }
 
 pub(super) fn network_native_scalar_type(native_type: &str) -> Option<NetworkNativeScalarType> {
@@ -198,9 +196,9 @@ pub(super) fn exact_member_rust_type(
         return exact_type_id_rust_type(type_id)
             .map(ToOwned::to_owned)
             .or_else(|| {
-                serialize_types
-                    .get(&type_id)
-                    .and_then(|serialize| serialize_source_rust_type_name(&serialize.name))
+                serialize_types.get(&type_id).and_then(|serialize| {
+                    network_serialize_type_rust_type(serialize, serialize_types)
+                })
             });
     }
 
@@ -255,6 +253,35 @@ pub(super) fn network_resolved_type_rust_type(
     resolved: &ResolvedType,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<String> {
+    network_resolved_type_rust_type_inner(resolved, serialize_types, &mut BTreeSet::new())
+}
+
+pub(super) fn network_serialize_type_rust_type(
+    serialize: &NetworkSerializeType,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<String> {
+    if let Some(rust_type) = exact_type_id_rust_type(serialize.type_id) {
+        return Some(rust_type.to_owned());
+    }
+    if let Some(resolved) = &serialize.resolved_type {
+        let mut resolving = BTreeSet::from([serialize.type_id]);
+        if let Some(rust_type) =
+            network_resolved_type_rust_type_inner(resolved, serialize_types, &mut resolving)
+        {
+            return Some(rust_type);
+        }
+    }
+    serialize
+        .emits_source
+        .then(|| serialize_source_rust_type_name(&serialize.name))
+        .flatten()
+}
+
+fn network_resolved_type_rust_type_inner(
+    resolved: &ResolvedType,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+    resolving: &mut BTreeSet<Uuid>,
+) -> Option<String> {
     resolved.unresolved().is_none().then_some(())?;
     let mut type_ids = BTreeSet::new();
     collect_resolved_named_type_ids(resolved, &mut type_ids);
@@ -262,7 +289,23 @@ pub(super) fn network_resolved_type_rust_type(
         .into_iter()
         .map(|type_id| {
             let serialize = serialize_types.get(&type_id)?;
-            Some((type_id, serialize_source_rust_type_name(&serialize.name)?))
+            let rust_type = exact_type_id_rust_type(type_id)
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    serialize
+                        .emits_source
+                        .then(|| serialize_source_rust_type_name(&serialize.name))
+                        .flatten()
+                })
+                .or_else(|| {
+                    resolving.insert(type_id).then_some(())?;
+                    let rust_type = serialize.resolved_type.as_ref().and_then(|resolved| {
+                        network_resolved_type_rust_type_inner(resolved, serialize_types, resolving)
+                    });
+                    resolving.remove(&type_id);
+                    rust_type
+                })?;
+            Some((type_id, rust_type))
         })
         .collect::<Option<BTreeMap<_, _>>>()?;
     let renderer = RustTypeRenderer::new(RustTypeOptions {
@@ -313,6 +356,7 @@ pub(super) const fn exact_type_id_rust_type(type_id: Uuid) -> Option<&'static st
         0x6383_f1d3_bb27_4e6b_a49a_6409_b205_9eaa => Some("::nw_network::EntityId"),
         0x9f4e_062e_06a0_46d4_85df_e0da_9646_7d3a => Some("::nw_network::Crc32"),
         0x652e_d536_3402_439b_aebe_4a5d_bc55_4085 => Some("::nw_network::AssetId"),
+        0x0638_e28c_ab7b_4ba4_84ac_0353_038e_6fdc => Some("::nw_network::ActorRef"),
         0xa54c_2b36_d5b8_46a1_a529_4ebd_bd24_50e7 => Some("::bevy_math::bounding::Aabb3d"),
         _ => None,
     }

@@ -257,6 +257,10 @@ pub(super) fn struct_native_marshaler_tokens(
     let fields = item
         .fields
         .iter()
+        .filter(|field| {
+            crate::field_projection::classify_codegen_field(field, items_by_type_id)
+                .is_materialized()
+        })
         .map(|field| struct_marshaler_field_tokens(field, items_by_type_id))
         .collect::<Option<Vec<_>>>()?;
     let marshal_fields = fields.iter().map(|field| &field.marshal);

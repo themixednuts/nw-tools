@@ -137,7 +137,7 @@ pub(super) fn message_field_support_tokens(
     });
 
     Some(quote! {
-        #[derive(Debug, Clone, Default, PartialEq)]
+        #[derive(Debug, Clone, PartialEq)]
         pub struct #value_type_ident {
             #(#struct_fields)*
         }

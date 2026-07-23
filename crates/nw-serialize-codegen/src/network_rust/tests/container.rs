@@ -417,6 +417,33 @@ fn proven_uid_container_key_uses_the_resolved_generic_type() {
 }
 
 #[test]
+fn canonical_actor_ref_identity_uses_the_runtime_wire_type() {
+    let actor_ref_type_id = uuid!("0638e28c-ab7b-4ba4-84ac-0353038e6fdc");
+    let actor_ref = NetworkSerializeType {
+        type_id: actor_ref_type_id,
+        kind: NetworkSerializeKind::Struct,
+        name: "Amazon::Hub::ActorRef".to_owned(),
+        role: NetworkSerializeRole::SupportType,
+        resolved_type: None,
+        emits_source: true,
+        factory: None,
+        field_count: 0,
+        fields: Vec::new(),
+        variant_count: 0,
+        direct_dependency_type_ids: Vec::new(),
+        wire_shapes: Vec::new(),
+        is_abstract: Some(false),
+        is_reflection_marker: false,
+    };
+    let serialize_types = BTreeMap::from([(actor_ref_type_id, &actor_ref)]);
+
+    assert_eq!(
+        network_serialize_type_rust_type(&actor_ref, &serialize_types).as_deref(),
+        Some("::nw_network::ActorRef")
+    );
+}
+
+#[test]
 fn reflected_identity_without_struct_fields_uses_the_network_projection() {
     let type_id = uuid!("1be36174-fd4f-4a1c-8e52-7c28d50eec5a");
     let shape = serde_json::from_value::<crate::network_schema::NetworkNestedTypeShape>(json!({

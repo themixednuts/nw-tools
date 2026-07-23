@@ -354,11 +354,33 @@ pub(super) fn replicated_state_shape_support_tokens(
                 pub #field_ident: #rust_type,
             }
         });
+        let needs_explicit_default = members
+            .iter()
+            .any(|member| support_member_needs_explicit_default(&member.rust_type));
+        let default_derive = (!needs_explicit_default).then(|| quote!(, Default));
+        let default_impl = needs_explicit_default.then(|| {
+            let default_fields = members.iter().map(|member| {
+                let field_ident = &member.field_ident;
+                let value = support_member_default_value(&member.rust_type);
+                quote!(#field_ident: #value,)
+            });
+            quote! {
+                impl ::core::default::Default for #value_type_ident {
+                    fn default() -> Self {
+                        Self {
+                            #(#default_fields)*
+                        }
+                    }
+                }
+            }
+        });
         quote! {
-            #[derive(Debug, Clone, Default, PartialEq #key_derives)]
+            #[derive(Debug, Clone #default_derive, PartialEq #key_derives)]
             pub struct #value_type_ident {
                 #(#struct_fields)*
             }
+
+            #default_impl
         }
     };
     let marshaler_impl = if uses_source_type {
@@ -408,6 +430,42 @@ pub(super) fn replicated_state_shape_support_tokens(
 
         #marshaler_impl
     })
+}
+
+fn support_member_needs_explicit_default(rust_type: &syn::Type) -> bool {
+    matches!(
+        rust_type,
+        syn::Type::Path(path)
+            if path.path.segments.last().is_some_and(|segment| {
+                matches!(segment.ident.to_string().as_str(), "Aabb2d" | "Aabb3d")
+            })
+    )
+}
+
+fn support_member_default_value(rust_type: &syn::Type) -> proc_macro2::TokenStream {
+    let type_name = match rust_type {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        _ => None,
+    };
+    match type_name.as_deref() {
+        Some("Aabb2d") => quote! {
+            ::bevy_math::bounding::Aabb2d {
+                min: ::glam::Vec2::ZERO,
+                max: ::glam::Vec2::ZERO,
+            }
+        },
+        Some("Aabb3d") => quote! {
+            ::bevy_math::bounding::Aabb3d {
+                min: ::glam::Vec3A::ZERO,
+                max: ::glam::Vec3A::ZERO,
+            }
+        },
+        _ => quote!(::core::default::Default::default()),
+    }
 }
 
 pub(super) struct ContainerValueMemberTokens {

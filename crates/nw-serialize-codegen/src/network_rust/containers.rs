@@ -521,10 +521,15 @@ pub(super) fn serialize_container_value_type(
 ) -> Option<ContainerValueType> {
     let rust_type = serialize_types
         .get(&type_id)
-        .and_then(|serialize| serialize.resolved_type.as_ref())
-        .and_then(|resolved| network_resolved_type_rust_type(resolved, serialize_types))
+        .and_then(|serialize| network_serialize_type_rust_type(serialize, serialize_types))
         .or_else(|| exact_type_id_rust_type(type_id).map(ToOwned::to_owned))
-        .or_else(|| serialize_source_rust_type_name(name))?;
+        .or_else(|| {
+            serialize_types
+                .get(&type_id)
+                .is_none()
+                .then(|| serialize_source_rust_type_name(name))
+                .flatten()
+        })?;
     let marshaler_type = if kind == NetworkSerializeKind::Enum && wire_shapes.len() == 1 {
         let wire_shape = wire_shapes[0].into();
         conversion_marshal_type_string_for(&wire_shape, &rust_type)
