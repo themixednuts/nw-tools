@@ -116,7 +116,10 @@ struct GenerateArgs {
 struct NetworkSchemaArgs {
     #[command(flatten)]
     catalog: CatalogArgs,
-    /// Ghidra static reports in overlay order. Pass the full report first, then focused reports.
+    /// Existing normalized schema to update with focused Ghidra reports.
+    #[arg(long = "base-schema", value_name = "PATH")]
+    base_schema: Option<PathBuf>,
+    /// Ghidra static reports in overlay order. Without --base-schema, pass the full report first.
     #[arg(long = "ghidra-report", required = true, value_name = "PATH")]
     ghidra_reports: Vec<PathBuf>,
     /// Public label to store for the TypeRegistry source instead of the report's raw path.
@@ -457,27 +460,50 @@ fn network_schema(args: &NetworkSchemaArgs, status: CodegenStatus) -> Result<()>
     let context = codegen_context(args.catalog.jobs, status)?;
     let step_count = 3
         + args.ghidra_reports.len() as u64
+        + enabled_step(args.base_schema.is_some())
         + enabled_step(args.typeindex.is_some())
         + args.message_signatures.len() as u64
         + enabled_step(args.message_rust_source_root.is_some())
         + args.field_overrides.len() as u64;
     let progress = context.status().phase("network schema", Some(step_count));
-    let primary_report_path = args
-        .ghidra_reports
-        .first()
-        .context("at least one --ghidra-report is required")?;
-    let (report, compile_unit) = context.runner().join(
-        || load_json_root(primary_report_path, "Ghidra static network report"),
+    let primary_report_path = args.ghidra_reports.first();
+    let primary_input_path = args
+        .base_schema
+        .as_ref()
+        .or(primary_report_path)
+        .context("at least one schema input is required")?;
+    let (primary_input, compile_unit) = context.runner().join(
+        || {
+            load_json_root(
+                primary_input_path,
+                if args.base_schema.is_some() {
+                    "normalized network schema"
+                } else {
+                    "Ghidra static network report"
+                },
+            )
+        },
         || compile_catalog(&args.catalog, &context),
     );
-    let report = report?;
+    let primary_input = primary_input?;
     let compile_unit = compile_unit?;
     progress.advance_with_message(1, Some("loaded inputs".to_owned()));
-    let mut schema =
-        NetworkSchema::from_ghidra_static_network_report_with_context(&report, &context)
-            .context("normalize Ghidra static report into network schema")?;
-    progress.advance_with_message(1, Some("normalized Ghidra report".to_owned()));
-    for overlay_path in args.ghidra_reports.iter().skip(1) {
+    let mut schema = if args.base_schema.is_some() {
+        parse_network_schema(primary_input, primary_input_path)?
+    } else {
+        NetworkSchema::from_ghidra_static_network_report_with_context(&primary_input, &context)
+            .context("normalize Ghidra static report into network schema")?
+    };
+    progress.advance_with_message(
+        1,
+        Some(if args.base_schema.is_some() {
+            "loaded normalized base schema".to_owned()
+        } else {
+            "normalized Ghidra report".to_owned()
+        }),
+    );
+    let overlay_start = usize::from(args.base_schema.is_none());
+    for overlay_path in args.ghidra_reports.iter().skip(overlay_start) {
         let overlay = load_json_root(overlay_path, "Ghidra static network overlay")?;
         let merge = schema
             .merge_ghidra_static_network_overlay(&overlay)
@@ -648,9 +674,7 @@ fn network_rust(args: &NetworkRustArgs, status: CodegenStatus) -> Result<()> {
     let step_count = 4 + enabled_step(args.rust_source_root.is_some());
     let progress = context.status().phase("network rust", Some(step_count));
     let root = load_json_root(&args.schema, "network schema JSON")?;
-    let mut schema = serde_json::from_value::<NetworkSchema>(root)
-        .with_context(|| format!("parse network schema from {}", args.schema.display()))?;
-    schema.normalize_derived_shapes();
+    let schema = parse_network_schema(root, &args.schema)?;
     progress.advance_with_message(1, Some("loaded schema".to_owned()));
     if args.kind != NetworkRustKind::Descriptors
         && (args.rust_source_root.is_some() || args.rust_source_audit.is_some())
@@ -736,6 +760,20 @@ fn network_rust(args: &NetworkRustArgs, status: CodegenStatus) -> Result<()> {
     );
     progress.finish_with_message(Some("network rust complete".to_owned()));
     Ok(())
+}
+
+fn parse_network_schema(root: Value, path: &Path) -> Result<NetworkSchema> {
+    let mut schema = serde_json::from_value::<NetworkSchema>(root)
+        .with_context(|| format!("parse network schema from {}", path.display()))?;
+    if schema.schema != NETWORK_SCHEMA_VERSION {
+        bail!(
+            "network schema {} has unsupported version `{}`",
+            path.display(),
+            schema.schema
+        );
+    }
+    schema.normalize_derived_shapes();
+    Ok(schema)
 }
 
 fn load_message_signatures(path: &Path) -> Result<Vec<NetworkMessageSignature>> {
