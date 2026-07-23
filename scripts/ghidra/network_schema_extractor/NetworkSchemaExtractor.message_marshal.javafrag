@@ -59,7 +59,17 @@
             return;
         }
         WireShape sequence = messageCollectionSequenceWireEvidence(plan);
+        if (sequence == null) {
+            recordNestedTypeShapeReject(
+                "message-collection-marshal-sequence-unproven");
+            return;
+        }
         WireShape decoded = fieldWireEvidence(field);
+        if (decoded == null) {
+            recordNestedTypeShapeReject(
+                "message-collection-unmarshal-sequence-unproven");
+            return;
+        }
         if (!NetworkSchemaWireShape.equivalentBySemanticOrLayout(
                 sequence.shape,
                 sequence.layout,

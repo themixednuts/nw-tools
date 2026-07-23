@@ -73,7 +73,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final NetworkSchemaAddressFormatter addressFormatter = this::formatAddress;
 
     private static final String EXTRACTOR_VERSION =
-        "network-schema-extractor-20260722-cancellable-codec-cfg-pass";
+        "network-schema-extractor-20260722-proven-message-collection-reconciliation-pass";
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;
