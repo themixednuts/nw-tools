@@ -12,6 +12,7 @@ mod conditional;
 mod container;
 mod conversion;
 mod descriptor;
+mod direct_value_products;
 mod identity;
 mod message;
 mod state;

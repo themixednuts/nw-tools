@@ -26,14 +26,19 @@
             shape.members.isEmpty()) {
             return false;
         }
-        if (Boolean.TRUE.equals(shape.identityProven) && shape.typeId != null) {
+        String typeIdentitySource = Boolean.TRUE.equals(shape.identityProven) &&
+            shape.typeId != null
+            ? shape.identitySource
+            : null;
+        if (typeIdentitySource != null) {
             boolean added = addProvenNestedTypeMemberCandidate(
                 byBase,
                 storage,
                 shape,
                 op,
                 target,
-                source);
+                source,
+                typeIdentitySource);
             if (added) {
                 markNestedTypeMemberWireOrder(
                     byBase,
@@ -136,7 +141,8 @@
         NestedTypeShape shape,
         PcodeOp op,
         Function target,
-        String source) {
+        String source,
+        String typeIdentitySource) {
 
         ArrayList<String> layouts = new ArrayList<>();
         for (NestedTypeMember nested : shape.members) {
@@ -173,7 +179,7 @@
         member.typeId = shape.typeId;
         member.typeIdSource = shape.typeIdSource;
         member.typeIdentityProven = true;
-        member.typeIdentitySource = shape.identitySource;
+        member.typeIdentitySource = typeIdentitySource;
         if (shape.nativeSize != null && shape.nativeSize > 0 &&
             shape.nativeSize <= Integer.MAX_VALUE) {
             member.byteWidth = shape.nativeSize.intValue();

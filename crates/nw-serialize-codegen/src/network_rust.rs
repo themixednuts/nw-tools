@@ -11,7 +11,7 @@ use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind, collect_resolved
 use crate::naming::{rust_field_ident, rust_module_ident, rust_type_ident};
 use crate::network_schema::parse::{
     NetworkMemberWireShape, collection_element_wire_shape, nested_member_wire_shapes,
-    nested_shape_by_wire_name, parse_network_member_wire_shape, parse_network_wire_scalar_shape,
+    nested_shape_by_wire_name, parse_network_member_wire_shape, parse_network_wire_shape,
     type_name_leaf,
 };
 use crate::network_schema::{

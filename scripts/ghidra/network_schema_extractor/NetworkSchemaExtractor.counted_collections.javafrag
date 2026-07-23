@@ -529,7 +529,7 @@
                 recordCountedCollectionReject(owner, loop, "unordered-element-codecs");
                 return null;
             }
-            String outputParameter = countedCollectionInsertionOutput(
+            String outputParameter = countedCollectionOutputParameter(
                 owner,
                 high,
                 loop,

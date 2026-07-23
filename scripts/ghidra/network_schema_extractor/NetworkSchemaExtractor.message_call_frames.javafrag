@@ -350,7 +350,8 @@
                 nested,
                 operation,
                 target,
-                "message-call-frame-callee-output")) {
+                "message-call-frame-callee-output",
+                nested.identitySource)) {
             markNestedTypeMemberWireOrder(
                 byBase,
                 binding,

@@ -409,6 +409,7 @@
         if (op == null) {
             return null;
         }
+        PcodeStorage selected = null;
         for (int i = 1; i < op.getNumInputs(); i++) {
             PcodeStorage direct = pcodeStorageExpression(op.getInput(i));
             PcodeStorage loaded = pcodeLoadedStorageExpression(op.getInput(i));
@@ -421,10 +422,13 @@
                 new LinkedHashSet<>(),
                 0);
             if (storage != null) {
-                return storage;
+                if (selected != null && !selected.sameLocation(storage)) {
+                    return null;
+                }
+                selected = storage;
             }
         }
-        return null;
+        return selected;
     }
 
     private Varnode storageVarnodeForCallOutput(PcodeOp op, PcodeStorage storage) {

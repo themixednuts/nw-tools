@@ -112,7 +112,9 @@
             shape,
             presence.callsite(),
             function.getEntryPoint(),
-            fullFunctionName(function)));
+            fullFunctionName(function),
+            null,
+            null));
         return result;
     }
 

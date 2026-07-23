@@ -461,6 +461,17 @@ impl NetworkNestedTypeShape {
             && !self.members.is_empty()
     }
 
+    pub(crate) fn has_proven_symbolic_identity(&self) -> bool {
+        self.type_id.is_none()
+            && self
+                .type_name_full
+                .as_deref()
+                .or(self.type_name.as_deref())
+                .is_some_and(|name| !name.trim().is_empty())
+            && self.identity_proven == Some(true)
+            && self.has_proven_layout()
+    }
+
     pub(crate) fn has_proven_anonymous_layout(&self) -> bool {
         self.type_id.is_none() && self.identity_proven != Some(true) && self.has_proven_layout()
     }

@@ -76,7 +76,7 @@ pub(super) fn wire_shape(object: &Map<String, Value>, key: &str) -> Option<Netwo
     string_ref(object, key).and_then(parse_network_wire_shape)
 }
 
-pub(super) fn parse_network_wire_shape(value: &str) -> Option<NetworkWireShape> {
+pub(crate) fn parse_network_wire_shape(value: &str) -> Option<NetworkWireShape> {
     if let Some(arguments) = generic_arguments(value, "optional") {
         let [inner] = arguments.as_slice() else {
             return None;
@@ -397,10 +397,19 @@ pub(crate) fn nested_type_shape_wire_shapes(
 
     let mut shapes = Vec::new();
     for member in &shape.members {
-        let wire_shape = member.wire_shape.as_deref()?;
+        let wire_shape = member
+            .wire_shape
+            .as_deref()
+            .or(member.wire_layout.as_deref())?;
         shapes.extend(nested_member_wire_shapes(wire_shape, embedded_shapes)?);
     }
     (!shapes.is_empty()).then_some(shapes)
+}
+
+pub(crate) fn wire_shape_scalar_product(
+    shape: &NetworkWireShape,
+) -> Option<Vec<NetworkWireScalarShape>> {
+    nested_member_wire_shapes(&shape.wire_string(), &[])
 }
 
 pub(crate) fn nested_member_wire_shapes(

@@ -1,0 +1,47 @@
+    private String countedCollectionOutputParameter(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        List<PcodeCodecCall> codecs) {
+
+        String inserted = countedCollectionInsertionOutput(
+            owner,
+            high,
+            loop,
+            operations,
+            codecs);
+        return inserted != null
+            ? inserted
+            : countedCollectionIndexedOutput(owner, codecs);
+    }
+
+    private String countedCollectionIndexedOutput(
+        Function owner,
+        List<PcodeCodecCall> codecs) {
+
+        String readBufferParameter = uniqueReadBufferParameter(owner);
+        if (readBufferParameter == null || codecs == null || codecs.isEmpty()) {
+            return null;
+        }
+        PcodeStorage readBuffer = new PcodeStorage(readBufferParameter, 0L);
+        String selected = null;
+        for (PcodeCodecCall codec : codecs) {
+            if (codec == null || codec.operation() == null) {
+                return null;
+            }
+            PcodeStorage ownerStorage = sequenceOwnerStorageForElementUnmarshal(
+                codec.operation(),
+                readBuffer);
+            String parameter = formalParameterBaseFromStorage(owner, ownerStorage);
+            if (!isProvenOutputParameterBase(owner, parameter)) {
+                return null;
+            }
+            if (selected != null && !selected.equals(parameter)) {
+                return null;
+            }
+            selected = parameter;
+        }
+        return selected;
+    }
+

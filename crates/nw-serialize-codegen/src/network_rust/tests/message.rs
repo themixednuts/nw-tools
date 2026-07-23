@@ -528,7 +528,50 @@ fn emits_anonymous_fixed_width_message_fields_as_byte_arrays() {
 }
 
 #[test]
-fn emits_message_fields_from_explicit_rust_types_without_wire_shapes() {
+fn emits_complete_anonymous_counted_products_as_wire_tuples() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "78DD8FA7-4C22-43EA-8B4C-9C8E84AE0FF5",
+            "typeIndex": 531,
+            "typeName": "Aoi::PlayerReceiverTrait::ReceivePlayerRefsMsg",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "storageExpression": "param_3 + 8",
+                "storageBase": "param_3",
+                "storageBaseOffset": 8,
+                "storageOffset": 8,
+                "wireLayout": "vec<composite<entity-ref,fixed-bytes-16,fixed-bytes-8>>",
+                "wireLayoutSource": "cfg-counted-loop+ordered-element-codecs",
+                "confidence": "high"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = output
+        .report
+        .message_generation_plans
+        .first()
+        .unwrap_or_else(|| panic!("missing message plan: {:#?}", output.report));
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::std::vec::Vec<(::nw_network::EntityRef, [u8; 16], [u8; 8])>")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub field_0: ::std::vec::Vec<(::nw_network::EntityRef, [u8; 16], [u8; 8])>")
+    );
+}
+
+#[test]
+fn emits_source_backed_login_tokens_without_wire_shapes() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
             "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
@@ -538,7 +581,6 @@ fn emits_message_fields_from_explicit_rust_types_without_wire_shapes() {
                 "index": 0,
                 "name": "LoginToken",
                 "nativeType": "LoginToken",
-                "rustType": "::nw_network::LoginToken",
                 "confidence": "message-unmarshal-call"
             }]
         }],
@@ -1233,7 +1275,7 @@ fn emits_actor_ref_for_proven_actor_ref_message_fields() {
 }
 
 #[test]
-fn baselineable_fragment_names_do_not_select_protocol_types() {
+fn emits_source_backed_baselineable_fragments_without_wire_shapes() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
             "uuid": "951EF3ED-C9A0-4E3D-A6FD-7FE0673D28D2",
@@ -1252,13 +1294,52 @@ fn baselineable_fragment_names_do_not_select_protocol_types() {
 
     let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
-    assert_eq!(output.report.generatable_message_count, 0);
-    assert_eq!(output.report.blocked_message_count, 1);
+    assert_eq!(output.report.generatable_message_count, 1);
+    assert_eq!(output.report.blocked_message_count, 0);
     assert_eq!(
         output.report.message_generation_plans[0].fields[0]
-            .blocked_reason
+            .rust_value_type
             .as_deref(),
-        Some("missing-support-type")
+        Some("::nw_network::hub::BaselineableFragment")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub fragment: ::nw_network::hub::BaselineableFragment")
+    );
+}
+
+#[test]
+fn emits_actor_instantiation_parameter_runtime_type() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "F24987B3-0136-4BCF-9D27-08BDE18B0266",
+            "typeIndex": 751,
+            "typeName": "Amazon::Hub::CreateActorMsg",
+            "fields": [{
+                "index": 0,
+                "name": "Parameters",
+                "nativeType": "Amazon::Hub::ActorInstantiationParameters",
+                "confidence": "message-unmarshal-pcode-direct-type-call"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+    assert_eq!(output.report.generatable_message_count, 1);
+    assert_eq!(
+        output.report.message_generation_plans[0].fields[0]
+            .rust_value_type
+            .as_deref(),
+        Some("::nw_network::hub::ActorInstantiationParameters")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub parameters: ::nw_network::hub::ActorInstantiationParameters")
     );
 }
 

@@ -32,6 +32,13 @@ pub(super) fn message_field_shape_report(
         .as_deref()
         .map(normalize_generated_rust_type)
         .or_else(|| {
+            field
+                .native_type
+                .as_deref()
+                .and_then(exact_native_runtime_rust_type)
+                .map(normalize_generated_rust_type)
+        })
+        .or_else(|| {
             report.wire_shape.as_ref()?;
             field
                 .native_type
@@ -71,17 +78,25 @@ fn anonymous_message_wire_layout_shape(field: &NetworkField) -> Option<SchemaWir
         return None;
     }
 
-    let shape = parse_network_wire_scalar_shape(field.wire_layout.as_deref()?)?;
-    let SchemaWireScalarShape::FixedBytes(width) = shape else {
-        return None;
-    };
-    if field
-        .raw_byte_length
-        .is_some_and(|raw_byte_length| raw_byte_length != u32::from(width))
-    {
-        return None;
+    let shape = parse_network_wire_shape(field.wire_layout.as_deref()?)?;
+    if let SchemaWireShape::FixedBytes(width) = shape {
+        if field
+            .raw_byte_length
+            .is_some_and(|raw_byte_length| raw_byte_length != u32::from(width))
+        {
+            return None;
+        }
+        return Some(SchemaWireShape::FixedBytes(width));
     }
-    Some(SchemaWireShape::FixedBytes(width))
+
+    let source = field.wire_layout_source.as_deref()?;
+    matches!(
+        source,
+        "cfg-counted-loop+ordered-element-codecs"
+            | "cfg-complete-direct-call-wire-product"
+            | "cfg-success-flow+complete-helper-wire-sequence"
+    )
+    .then_some(shape)
 }
 
 pub(super) fn state_field_shape_report(
@@ -389,6 +404,9 @@ pub(super) fn message_nested_shape_rust_type(
             .or(shape.type_name.as_deref())
             .and_then(serialize_source_rust_type_name);
     }
+    if shape.has_proven_symbolic_identity() {
+        return message_nested_shape_support_type_name(field, shape, message_type_name);
+    }
     if !shape.has_proven_anonymous_layout() {
         return None;
     }
@@ -402,14 +420,11 @@ fn shared_network_nested_shape_rust_type(
         return None;
     }
     let wire_product = crate::network_schema::parse::nested_type_shape_wire_shapes(shape, &[])?;
-    match shape.type_name_full.as_deref()? {
-        "Javelin::ClientMessages::ActorRequestId"
-            if wire_product == [SchemaWireScalarShape::U64, SchemaWireScalarShape::U64] =>
-        {
-            Some("::nw_network::ActorRequestId")
-        }
-        _ => None,
-    }
+    let native_type = shape
+        .type_name_full
+        .as_deref()
+        .or(shape.type_name.as_deref())?;
+    exact_symbolic_wire_product_rust_type(native_type, &wire_product)
 }
 
 pub(super) fn message_nested_shape_matches_field(
@@ -418,6 +433,26 @@ pub(super) fn message_nested_shape_matches_field(
 ) -> bool {
     if shape.has_exact_identity() {
         return true;
+    }
+    if shape.has_proven_symbolic_identity() {
+        let Some(shape_name) = shape
+            .type_name_full
+            .as_deref()
+            .or(shape.type_name.as_deref())
+        else {
+            return false;
+        };
+        if !field
+            .source_type_name
+            .as_deref()
+            .or(field.native_type.as_deref())
+            .is_some_and(|source_names| {
+                source_type_contains_leaf(source_names, type_name_leaf(shape_name))
+            })
+        {
+            return false;
+        }
+        return message_nested_shape_wire_product_matches_field(field, shape).unwrap_or(true);
     }
     if shape.has_proven_anonymous_layout()
         && shape
@@ -440,6 +475,26 @@ pub(super) fn message_nested_shape_matches_field(
         .as_deref()
         .or(field.native_type.as_deref())
         .is_some_and(|source_names| source_type_contains_leaf(source_names, shape_name))
+}
+
+fn message_nested_shape_wire_product_matches_field(
+    field: &NetworkField,
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+) -> Option<bool> {
+    let Some(observed) = crate::network_schema::parse::nested_type_shape_wire_shapes(shape, &[])
+    else {
+        return Some(false);
+    };
+    field
+        .wire_shape
+        .as_ref()
+        .and_then(crate::network_schema::parse::wire_shape_scalar_product)
+        .or_else(|| {
+            field.wire_layout.as_deref().and_then(|expected| {
+                crate::network_schema::parse::nested_member_wire_shapes(expected, &[])
+            })
+        })
+        .map(|expected| expected == observed)
 }
 
 fn source_type_contains_leaf(value: &str, expected: &str) -> bool {

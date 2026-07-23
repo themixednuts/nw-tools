@@ -36,6 +36,11 @@ pub(super) fn message_module_tokens(
     } else {
         quote!(Marshaler)
     };
+    let type_registry_attr = if plan.supports_unmarshal == Some(false) {
+        quote!(#[type_registry(#type_index)])
+    } else {
+        quote!(#[type_registry(#type_index, class)])
+    };
     let mut support_names = BTreeSet::new();
     let support_items = plan
         .fields
@@ -52,7 +57,7 @@ pub(super) fn message_module_tokens(
             #(#support_items)*
 
             #[az_rtti(#type_id)]
-            #[type_registry(#type_index)]
+            #type_registry_attr
             #[derive(Debug, Clone, PartialEq, #codec_derive)]
             #[allow(clippy::type_complexity)]
             pub struct #message_ident {
@@ -73,7 +78,7 @@ pub(super) fn message_field_support_tokens(
     if message_nested_shape_uses_source_type(shape) {
         return None;
     }
-    if !shape.has_proven_anonymous_layout() {
+    if !shape.has_proven_anonymous_layout() && !shape.has_proven_symbolic_identity() {
         return None;
     }
     let value_type_string = field.rust_value_type.as_deref()?;

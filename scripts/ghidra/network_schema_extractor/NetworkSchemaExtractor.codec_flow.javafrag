@@ -9,113 +9,6 @@
     private long codecWireTraceOperations;
     private long codecWireTraceHeartbeatNanos;
 
-    private NestedTypeShape directWireSequenceShape(
-        Function target,
-        String owner,
-        String targetName) {
-
-        if (target == null) {
-            return null;
-        }
-        String readBufferParameter = uniqueReadBufferParameter(target);
-        CodecWireTrace trace = traceUnmarshalCodec(
-            target,
-            readBufferParameter,
-            codecWireTraceActiveContexts,
-            codecWireTraceCompletedContexts);
-        if (trace == null || trace.events.isEmpty() ||
-            trace.events.size() == 1 &&
-                !isAggregateWireEvidence(trace.events.get(0).wireEvidence())) {
-            return null;
-        }
-
-        NestedTypeShape shape = new NestedTypeShape();
-        shape.typeName = NetworkSchemaText.sourceTypeLeaf(owner);
-        shape.typeNameFull = owner;
-        shape.typeNameSource = owner == null ? "pcode-wire-sequence" : "ghidra-symbol";
-        shape.function = target.getEntryPoint();
-        shape.functionName = targetName;
-        shape.memberBase = "wire-sequence";
-        shape.memberNameSource = "synthetic-wire-order";
-        shape.memberNamesProven = false;
-        shape.validation = "pcode-read-buffer-call-stack-wire-sequence";
-
-        for (int index = 0; index < trace.events.size(); index++) {
-            CodecWireEvent event = trace.events.get(index);
-            NestedTypeMember member = new NestedTypeMember();
-            member.index = index;
-            member.offset = index;
-            member.name = "_" + index;
-            member.nameSource = "synthetic-wire-order";
-            member.nameProven = false;
-            member.nativeType = event.nativeType();
-            WireShape wireEvidence = event.wireEvidence();
-            member.wireShape = wireEvidence.shape;
-            member.wireShapeSource = wireEvidence.source;
-            member.wireLayout = wireEvidence.layout;
-            member.wireLayoutSource = wireEvidence.layoutSource;
-            member.byteWidth = wireShapeByteWidth(wireEvidence.layout);
-            member.wireOrdinal = index;
-            member.wireOrderSource = "cfg-recursive-unmarshal-order";
-            member.callsite = event.callsite();
-            member.target = event.target();
-            member.targetName = event.targetName();
-            shape.members.add(member);
-        }
-        shape.memberCoverageProven = true;
-        shape.wireOrderProven = true;
-        shape.wireOrderSource = "cfg-recursive-unmarshal-order";
-        return shape;
-    }
-
-    private boolean isAggregateWireEvidence(WireShape evidence) {
-        if (evidence == null) {
-            return false;
-        }
-        String observed = firstNonEmpty(evidence.shape, evidence.layout);
-        return vectorElementWireShape(observed) != null ||
-            observed != null && (
-                observed.startsWith("set<") ||
-                observed.startsWith("composite<") ||
-                observed.startsWith("optional<") ||
-                observed.startsWith("default-omitted<") ||
-                observed.startsWith("boolean-choice<") ||
-                observed.startsWith("fixed-sequence<") ||
-                observed.startsWith("replicated-container<"));
-    }
-
-    private boolean sameNestedWireSequence(
-        NestedTypeShape left,
-        NestedTypeShape right) {
-
-        if (left == null || right == null) {
-            return false;
-        }
-        List<NestedTypeMember> leftWireOrder = uniquelyMatchedNestedWireSequence(
-            left.members,
-            right.members);
-        if (leftWireOrder == null) {
-            return false;
-        }
-        for (int index = 0; index < leftWireOrder.size(); index++) {
-            NestedTypeMember member = leftWireOrder.get(index);
-            String leftShape = canonicalLayoutWireShape(member.wireLayout);
-            String rightShape = canonicalLayoutWireShape(right.members.get(index).wireLayout);
-            if (leftShape == null || !leftShape.equals(rightShape)) {
-                return false;
-            }
-            member.wireOrdinal = index;
-            member.wireOrderSource = "cfg-recursive-unmarshal-order+unique-storage-match";
-        }
-        left.members.clear();
-        left.members.addAll(leftWireOrder);
-        left.memberCoverageProven = true;
-        left.wireOrderProven = true;
-        left.wireOrderSource =
-            "cfg-recursive-unmarshal-order+unique-storage-match";
-        return true;
-    }
-
     private CodecWireTrace traceUnmarshalCodec(
         Function function,
         String readBufferParameter,
@@ -183,7 +76,9 @@
                             leaf,
                             function.getEntryPoint(),
                             function.getEntryPoint(),
-                            fullFunctionName(function))));
+                            fullFunctionName(function),
+                            null,
+                            null)));
                     completedContexts.put(context, new CodecWireTrace(result.events));
                     return result;
                 }
@@ -227,7 +122,9 @@
                             codec.wireEvidence,
                             codec.callsite,
                             codec.target,
-                            codec.targetName);
+                            codec.targetName,
+                            null,
+                            null);
                         body.events.add(event);
                         if (!addUnmarshalEventsForOperation(
                                 eventsByBlock,
@@ -316,7 +213,9 @@
                         booleanChoice.shape(),
                         first.callsite(),
                         function.getEntryPoint(),
-                        fullFunctionName(function))));
+                        fullFunctionName(function),
+                        null,
+                        null)));
                 completedContexts.put(context, new CodecWireTrace(result.events));
                 codecWireTraceDiagnostics.put(context, "complete-boolean-choice");
                 return result;
@@ -498,7 +397,8 @@
                 op.getSeqnum().getTarget(),
                 target.getEntryPoint(),
                 fullFunctionName(target),
-                rawRead == null ? null : rawRead.storage));
+                rawRead == null ? null : rawRead.storage,
+                null));
             return null;
         }
 
@@ -508,7 +408,14 @@
             activeContexts,
             completedContexts);
         if (nested != null) {
-            events.addAll(nested.events);
+            CodecWireEvent directProduct =
+                directValueCallProductEvent(owner, op, target, nested);
+            if (directProduct == null) {
+                events.addAll(nested.events);
+            }
+            else {
+                events.add(directProduct);
+            }
             return null;
         }
         String nestedDiagnostic = codecWireTraceDiagnostic(target, targetReadBuffer);
@@ -642,7 +549,9 @@
             candidate,
             first.callsite(),
             function.getEntryPoint(),
-            fullFunctionName(function)));
+            fullFunctionName(function),
+            null,
+            null));
         return result;
     }
 
@@ -971,6 +880,8 @@
                 fixedByteLayout(Math.toIntExact(advance.byteCount())),
                 "pcode-read-buffer-cursor-advance"),
             op.getSeqnum().getTarget(),
+            null,
+            null,
             null,
             null);
     }

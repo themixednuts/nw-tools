@@ -1,0 +1,178 @@
+    private NestedTypeShape directWireSequenceShape(
+        Function target,
+        String owner,
+        String targetName) {
+
+        if (target == null) {
+            return null;
+        }
+        String readBufferParameter = uniqueReadBufferParameter(target);
+        CodecWireTrace trace = traceUnmarshalCodec(
+            target,
+            readBufferParameter,
+            codecWireTraceActiveContexts,
+            codecWireTraceCompletedContexts);
+        if (trace == null || trace.events.isEmpty() ||
+            trace.events.size() == 1 &&
+                !isAggregateWireEvidence(trace.events.get(0).wireEvidence())) {
+            return null;
+        }
+
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(owner);
+        shape.typeNameFull = owner;
+        shape.typeNameSource = owner == null ? "pcode-wire-sequence" : "ghidra-symbol";
+        shape.function = target.getEntryPoint();
+        shape.functionName = targetName;
+        shape.memberBase = "wire-sequence";
+        shape.memberNameSource = "synthetic-wire-order";
+        shape.memberNamesProven = false;
+        shape.layoutProven = true;
+        shape.validation = "pcode-read-buffer-call-stack-wire-sequence";
+
+        for (int index = 0; index < trace.events.size(); index++) {
+            CodecWireEvent event = trace.events.get(index);
+            NestedTypeMember member = new NestedTypeMember();
+            member.index = index;
+            member.offset = index;
+            member.name = "_" + index;
+            member.nameSource = "synthetic-wire-order";
+            member.nameProven = false;
+            member.nativeType = event.nativeType();
+            member.typeIdentityProven =
+                event.typeIdentitySource() == null ? null : true;
+            member.typeIdentitySource = event.typeIdentitySource();
+            WireShape wireEvidence = event.wireEvidence();
+            member.wireShape = wireEvidence.shape;
+            member.wireShapeSource = wireEvidence.source;
+            member.wireLayout = wireEvidence.layout;
+            member.wireLayoutSource = wireEvidence.layoutSource;
+            member.byteWidth = wireShapeByteWidth(wireEvidence.layout);
+            member.wireOrdinal = index;
+            member.wireOrderSource = "cfg-recursive-unmarshal-order";
+            member.callsite = event.callsite();
+            member.target = event.target();
+            member.targetName = event.targetName();
+            shape.members.add(member);
+        }
+        shape.memberCoverageProven = true;
+        shape.wireOrderProven = true;
+        shape.wireOrderSource = "cfg-recursive-unmarshal-order";
+        shape.typeName = null;
+        shape.typeNameFull = null;
+        shape.typeNameSource = "pcode-wire-sequence";
+        return shape;
+    }
+
+    private boolean isAggregateWireEvidence(WireShape evidence) {
+        if (evidence == null) {
+            return false;
+        }
+        String observed = firstNonEmpty(evidence.shape, evidence.layout);
+        return vectorElementWireShape(observed) != null ||
+            observed != null && (
+                observed.startsWith("set<") ||
+                observed.startsWith("composite<") ||
+                observed.startsWith("optional<") ||
+                observed.startsWith("default-omitted<") ||
+                observed.startsWith("boolean-choice<") ||
+                observed.startsWith("fixed-sequence<") ||
+                observed.startsWith("replicated-container<"));
+    }
+
+    private boolean sameNestedWireSequence(
+        NestedTypeShape left,
+        NestedTypeShape right) {
+
+        if (left == null || right == null) {
+            return false;
+        }
+        List<NestedTypeMember> leftWireOrder = uniquelyMatchedNestedWireSequence(
+            left.members,
+            right.members);
+        if (leftWireOrder == null) {
+            return false;
+        }
+        for (int index = 0; index < leftWireOrder.size(); index++) {
+            NestedTypeMember member = leftWireOrder.get(index);
+            String leftShape = member.wireLayout;
+            String rightShape = right.members.get(index).wireLayout;
+            if (!sameCodecProduct(leftShape, rightShape)) {
+                return false;
+            }
+            member.wireOrdinal = index;
+            member.wireOrderSource = "cfg-recursive-unmarshal-order+unique-storage-match";
+        }
+        left.members.clear();
+        left.members.addAll(leftWireOrder);
+        left.layoutProven = true;
+        left.memberCoverageProven = true;
+        left.wireOrderProven = true;
+        left.wireOrderSource =
+            "cfg-recursive-unmarshal-order+unique-storage-match";
+        return true;
+    }
+
+    private CodecWireEvent directValueCallProductEvent(
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        CodecWireTrace nested) {
+
+        if (owner == null || operation == null || target == null || nested == null ||
+            nested.events.isEmpty()) {
+            return null;
+        }
+        String nativeType = directUnmarshalValueTypeName(target);
+        if (nativeType == null) {
+            return null;
+        }
+        String ownerType = directUnmarshalValueTypeName(owner);
+        if (ownerType != null &&
+            normalizeNativeType(ownerType).equals(normalizeNativeType(nativeType))) {
+            return null;
+        }
+        WireShape product = codecWireProduct(
+            nativeType,
+            nested.events,
+            "cfg-complete-direct-call-wire-product");
+        if (product == null) {
+            return null;
+        }
+        return new CodecWireEvent(
+            nativeType,
+            product,
+            operation.getSeqnum().getTarget(),
+            target.getEntryPoint(),
+            fullFunctionName(target),
+            provenUnmarshalOutputStorage(operation),
+            null);
+    }
+
+    private WireShape codecWireProduct(
+        String nativeType,
+        List<CodecWireEvent> events,
+        String source) {
+
+        ArrayList<String> layouts = new ArrayList<>(events.size());
+        for (CodecWireEvent event : events) {
+            if (event == null || event.wireEvidence() == null) {
+                return null;
+            }
+            String layout = firstNonEmpty(
+                event.wireEvidence().layout,
+                event.wireEvidence().shape);
+            if (layout == null || canonicalLayoutWireShape(layout) == null) {
+                return null;
+            }
+            layouts.add(layout);
+        }
+        String layout = compositeWireShape(layouts);
+        if (layout == null) {
+            return null;
+        }
+        String semantic = wireShapeFromNativeType(nativeType);
+        return semantic != null && sameCodecProduct(semantic, layout)
+            ? WireShape.semantic(semantic, layout, source)
+            : WireShape.layout(layout, source);
+    }

@@ -17,6 +17,9 @@ pub(super) fn network_native_type_rust_type(
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<String> {
     let native_type = normalized_cpp_value_type(native_type)?;
+    if let Some(rust_type) = exact_native_runtime_rust_type(&native_type) {
+        return Some(rust_type.to_owned());
+    }
     if let Some((template, arguments)) = cpp_template(&native_type) {
         return match (template, arguments.as_slice()) {
             ("AZStd::vector" | "std::vector", [element, ..]) => Some(format!(
@@ -75,6 +78,19 @@ pub(super) fn network_native_type_rust_type(
         return None;
     }
     network_serialize_type_rust_type(selected, serialize_types)
+}
+
+pub(super) fn exact_native_runtime_rust_type(native_type: &str) -> Option<&'static str> {
+    match normalized_cpp_value_type(native_type)?.as_str() {
+        "LoginToken" | "Amazon::REP::LoginToken" => Some("::nw_network::LoginToken"),
+        "BaselineableFragment" | "Amazon::Hub::BaselineableFragment" => {
+            Some("::nw_network::hub::BaselineableFragment")
+        }
+        "ActorInstantiationParameters" | "Amazon::Hub::ActorInstantiationParameters" => {
+            Some("::nw_network::hub::ActorInstantiationParameters")
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn network_native_scalar_type(native_type: &str) -> Option<NetworkNativeScalarType> {
@@ -192,14 +208,21 @@ pub(super) fn exact_member_rust_type(
         .type_id
         .is_some_and(|type_id| serialize_types.contains_key(&type_id));
     if member.type_identity_proven && !parent_is_serialize_backed {
-        let type_id = member.type_id?;
-        return exact_type_id_rust_type(type_id)
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                serialize_types.get(&type_id).and_then(|serialize| {
-                    network_serialize_type_rust_type(serialize, serialize_types)
-                })
-            });
+        if let Some(type_id) = member.type_id {
+            return exact_type_id_rust_type(type_id)
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    serialize_types.get(&type_id).and_then(|serialize| {
+                        network_serialize_type_rust_type(serialize, serialize_types)
+                    })
+                });
+        }
+        let native_type = member.native_type.as_deref()?;
+        let wire_shape = nested_member_wire_shape(member)?;
+        let wire_product =
+            crate::network_schema::parse::nested_member_wire_shapes(wire_shape, &[])?;
+        return exact_symbolic_wire_product_rust_type(native_type, &wire_product)
+            .map(ToOwned::to_owned);
     }
 
     let identity_proven = member.type_identity_proven
@@ -239,6 +262,20 @@ pub(super) fn exact_member_rust_type(
         current_type_id = field.type_id;
     }
     None
+}
+
+pub(super) fn exact_symbolic_wire_product_rust_type(
+    native_type: &str,
+    wire_product: &[SchemaWireScalarShape],
+) -> Option<&'static str> {
+    match normalized_cpp_value_type(native_type)?.as_str() {
+        "ActorRequestId" | "Javelin::ClientMessages::ActorRequestId"
+            if wire_product == [SchemaWireScalarShape::U64, SchemaWireScalarShape::U64] =>
+        {
+            Some("::nw_network::ActorRequestId")
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn parse_native_member_offset(value: &str) -> Option<u32> {
