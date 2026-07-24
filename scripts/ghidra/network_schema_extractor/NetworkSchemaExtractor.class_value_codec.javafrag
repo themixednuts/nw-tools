@@ -1,0 +1,343 @@
+    private WireShape descriptorDispatchedClassValueUnmarshalShape(
+        Function function,
+        String readBufferParameter) {
+
+        if (function == null || readBufferParameter == null) {
+            return null;
+        }
+        Integer readBufferSlot = pcodeParameterIndex(readBufferParameter);
+        if (readBufferSlot == null) {
+            return null;
+        }
+
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return null;
+        }
+        runMetrics.increment("descriptorClassValueCandidates");
+        PcodeStorage readBuffer = new PcodeStorage(readBufferParameter, 0L);
+
+        ArrayList<DescriptorVirtualCall> factoryCalls = new ArrayList<>();
+        ArrayList<DescriptorVirtualCall> bodyCalls = new ArrayList<>();
+        collectInstructionDescriptorVirtualCalls(
+            function,
+            high,
+            readBuffer,
+            factoryCalls,
+            bodyCalls);
+        if (factoryCalls.isEmpty()) {
+            runMetrics.increment("descriptorClassValueFactoryEmpty");
+            return null;
+        }
+        runMetrics.add(
+            "descriptorClassValueFactoryCandidates",
+            factoryCalls.size());
+        if (bodyCalls.isEmpty()) {
+            runMetrics.increment("descriptorClassValueBodyEmpty");
+            return null;
+        }
+        runMetrics.add(
+            "descriptorClassValueBodyCandidates",
+            bodyCalls.size());
+
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        ArrayList<PcodeOpAST> descriptorReads = new ArrayList<>();
+        for (PcodeOpAST operation : operations) {
+            checkAnalysisCancelled();
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (target != null && provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    readBuffer) != null) {
+                descriptorReads.add(operation);
+            }
+        }
+        if (descriptorReads.size() == 1) {
+            runMetrics.increment("descriptorClassValueDescriptorReads");
+        }
+
+        Address descriptorCallsite = descriptorReads.size() == 1
+            ? descriptorReads.get(0).getSeqnum().getTarget()
+            : null;
+        ArrayList<DescriptorDispatchPair> dispatchPairs = new ArrayList<>();
+        int receiverMismatches = 0;
+        int resultMismatches = 0;
+        int orderMismatches = 0;
+        for (DescriptorVirtualCall factory : factoryCalls) {
+            if (descriptorCallsite != null &&
+                factory.callsite().compareTo(descriptorCallsite) <= 0) {
+                orderMismatches++;
+                continue;
+            }
+            PcodeStorage factoryResult = callResultStorageAt(factory.callsite());
+            if (factoryResult == null) {
+                continue;
+            }
+            for (DescriptorVirtualCall body : bodyCalls) {
+                if (body.callsite().compareTo(factory.callsite()) <= 0) {
+                    orderMismatches++;
+                    continue;
+                }
+                if (!factory.receiver().sameLocation(body.receiver())) {
+                    receiverMismatches++;
+                    continue;
+                }
+                PcodeStorage bodyValue = instructionCallArgumentStorageAt(
+                    function,
+                    body.callsite(),
+                    3);
+                if (bodyValue == null || !factoryResult.sameLocation(bodyValue)) {
+                    resultMismatches++;
+                    continue;
+                }
+                dispatchPairs.add(new DescriptorDispatchPair(factory, body));
+            }
+        }
+        if (receiverMismatches != 0) {
+            runMetrics.add(
+                "descriptorClassValueReceiverMismatches",
+                receiverMismatches);
+        }
+        if (resultMismatches != 0) {
+            runMetrics.add(
+                "descriptorClassValueResultMismatches",
+                resultMismatches);
+        }
+        if (orderMismatches != 0) {
+            runMetrics.add(
+                "descriptorClassValueOrderMismatches",
+                orderMismatches);
+        }
+        if (dispatchPairs.size() != 1) {
+            runMetrics.increment("descriptorClassValueDispatchRejects");
+            return null;
+        }
+
+        runMetrics.increment("descriptorClassValueFactories");
+        runMetrics.increment("descriptorClassValueBodies");
+        runMetrics.increment("descriptorClassValueDispatchTriples");
+        runMetrics.increment("descriptorClassValueAbiMatches");
+        runMetrics.increment("descriptorDispatchedClassValues");
+        return WireShape.semantic(
+            "class-value",
+            "unmarshal-instruction-descriptor-factory-dispatch+win64-call-result-flow");
+    }
+
+    private void collectInstructionDescriptorVirtualCalls(
+        Function function,
+        HighFunction high,
+        PcodeStorage readBuffer,
+        List<DescriptorVirtualCall> factoryCalls,
+        List<DescriptorVirtualCall> bodyCalls) {
+
+        Map<Long, ForwardArgState> callsites = abiCallsiteStates(function);
+        HashMap<String, Long> registerVtableSlots = new HashMap<>();
+        for (Instruction instruction : functionInstructions(function)) {
+            checkAnalysisCancelled();
+            // Resolve CALL targets before invalidating register slots. CALL R10
+            // does not write R10, but its operand 0 would otherwise clear the
+            // MOV R10,[desc+0x28] binding that identifies the body dispatch.
+            if (instruction.getFlowType().isCall()) {
+                runMetrics.increment("descriptorClassValueInstructionCalls");
+                Address callsite = instruction.getMinAddress();
+                ForwardArgState state = callsites.get(callsite.getOffset());
+                if (state == null) {
+                    runMetrics.increment("descriptorClassValueCallsiteStateMisses");
+                }
+                else {
+                    PcodeStorage receiver = pcodeStorageFromTrackedValue(
+                        state.registers.get("RCX"));
+                    if (receiver == null) {
+                        runMetrics.increment("descriptorClassValueReceiverMisses");
+                    }
+                    else {
+                        Long slot = instructionVirtualSlotOffset(
+                            instruction,
+                            registerVtableSlots);
+                        if (slot == null) {
+                            runMetrics.increment("descriptorClassValueSlotMisses");
+                        }
+                        else {
+                            runMetrics.increment("descriptorClassValueInstructionSlots");
+                            if (slot == 0x28L &&
+                                NetworkSchemaX86.registerOperand(instruction, 0) != null) {
+                                runMetrics.increment(
+                                    "descriptorClassValueRegisterIndirectBodies");
+                            }
+                            DescriptorVirtualCall virtualCall = new DescriptorVirtualCall(
+                                callsite,
+                                pcodeCallAt(high, callsite),
+                                receiver,
+                                slot);
+                            if (slot == 0x10L) {
+                                factoryCalls.add(virtualCall);
+                            }
+                            else if (slot == 0x28L) {
+                                PcodeStorage bufferArgument = pcodeStorageFromTrackedValue(
+                                    win64CallArgumentValue(state, 4));
+                                if (bufferArgument != null &&
+                                    bufferArgument.sameLocation(readBuffer)) {
+                                    bodyCalls.add(virtualCall);
+                                }
+                                else {
+                                    runMetrics.increment(
+                                        "descriptorClassValueBodyBufferRejects");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            observeInstructionVtableSlotLoad(instruction, registerVtableSlots);
+        }
+    }
+
+    private void observeInstructionVtableSlotLoad(
+        Instruction instruction,
+        Map<String, Long> registerVtableSlots) {
+
+        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+        if (instruction.getFlowType().isCall() ||
+            instruction.getFlowType().isJump() ||
+            instruction.getFlowType().isTerminal()) {
+            return;
+        }
+        if (!"MOV".equals(mnemonic)) {
+            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+            if (destination != null) {
+                registerVtableSlots.remove(destination);
+            }
+            return;
+        }
+        String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+        if (destination == null) {
+            return;
+        }
+        Long slot = memoryOperandVtableSlot(instruction, 1);
+        if (slot != null) {
+            registerVtableSlots.put(destination, slot);
+            return;
+        }
+        registerVtableSlots.remove(destination);
+    }
+
+    private Long instructionVirtualSlotOffset(
+        Instruction instruction,
+        Map<String, Long> registerVtableSlots) {
+
+        Long memorySlot = memoryOperandVtableSlot(instruction, 0);
+        if (memorySlot != null) {
+            return memorySlot;
+        }
+        Long encodedSlot = encodedCallMemoryVtableSlot(instruction);
+        if (encodedSlot != null) {
+            return encodedSlot;
+        }
+        String targetRegister = NetworkSchemaX86.registerOperand(instruction, 0);
+        return targetRegister == null ? null : registerVtableSlots.get(targetRegister);
+    }
+
+    private Long memoryOperandVtableSlot(Instruction instruction, int operandIndex) {
+        MemoryReference memory = NetworkSchemaX86.memoryReference(
+            instruction,
+            operandIndex);
+        if (memory != null &&
+            (memory.displacement == 0x10 || memory.displacement == 0x28)) {
+            return (long) memory.displacement;
+        }
+        MemoryAddress address = NetworkSchemaX86.memoryAddress(instruction, operandIndex);
+        if (address != null &&
+            (address.displacement == 0x10 || address.displacement == 0x28) &&
+            !address.terms.isEmpty()) {
+            return (long) address.displacement;
+        }
+        return null;
+    }
+
+    private Long encodedCallMemoryVtableSlot(Instruction instruction) {
+        if (instruction == null) {
+            return null;
+        }
+        try {
+            byte[] bytes = instruction.getBytes();
+            if (bytes == null || bytes.length < 3) {
+                return null;
+            }
+            int index = 0;
+            // Optional REX prefix.
+            if ((bytes[0] & 0xf0) == 0x40) {
+                index++;
+            }
+            if (index >= bytes.length || (bytes[index] & 0xff) != 0xff) {
+                return null;
+            }
+            index++;
+            if (index >= bytes.length) {
+                return null;
+            }
+            int modrm = bytes[index] & 0xff;
+            int mod = modrm >>> 6;
+            int reg = (modrm >>> 3) & 0x7;
+            if (reg != 2) {
+                // FF /2 = CALL r/m64
+                return null;
+            }
+            index++;
+            if (mod == 1 && index < bytes.length) {
+                int displacement = bytes[index];
+                if (displacement == 0x10 || displacement == 0x28) {
+                    return (long) displacement;
+                }
+            }
+            if (mod == 2 && index + 3 < bytes.length) {
+                int displacement = (bytes[index] & 0xff)
+                    | ((bytes[index + 1] & 0xff) << 8)
+                    | ((bytes[index + 2] & 0xff) << 16)
+                    | ((bytes[index + 3] & 0xff) << 24);
+                if (displacement == 0x10 || displacement == 0x28) {
+                    return (long) displacement;
+                }
+            }
+        }
+        catch (Exception ignored) {
+            return null;
+        }
+        return null;
+    }
+
+    private PcodeStorage instructionCallArgumentStorageAt(
+        Function owner,
+        Address callsite,
+        int argumentSlot) {
+
+        if (owner == null || callsite == null || argumentSlot < 1) {
+            return null;
+        }
+        ForwardArgState state = abiCallsiteStates(owner).get(callsite.getOffset());
+        return state == null
+            ? null
+            : pcodeStorageFromTrackedValue(
+                win64CallArgumentValue(state, argumentSlot));
+    }
+
+    private PcodeStorage callResultStorageAt(Address callsite) {
+        return callsite == null
+            ? null
+            : new PcodeStorage(callResultBaseKey(callsite), 0L);
+    }
+
+    private record DescriptorVirtualCall(
+        Address callsite,
+        PcodeOpAST operation,
+        PcodeStorage receiver,
+        long slotOffset) {
+    }
+
+    private record DescriptorDispatchPair(
+        DescriptorVirtualCall factory,
+        DescriptorVirtualCall body) {
+    }

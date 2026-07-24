@@ -107,7 +107,14 @@
                     target,
                     storage);
                 if (target != null && slot != null) {
-                    if (pcodeReadRawWireEvidence(operation, target) != null ||
+                    // A raw-read callsite proves buffer flow only for the storage
+                    // occupying the callee's cursor parameter. isReadRawFunction's
+                    // body pattern proves that is always param_1 (cursor load/store
+                    // on param_1+0x8/+0x10); the write destination (param_2) is an
+                    // output, not a buffer. A slot-blind check misclassified ReadRaw
+                    // destinations as buffers (NewWorld+0x5b4fef0 param_4).
+                    if ((pcodeReadRawWireEvidence(operation, target) != null &&
+                            slot.intValue() == 1) ||
                         hasReadBufferFlow(
                             target,
                             "param_" + slot,

@@ -124,8 +124,11 @@
         NestedTypeShape child = recoverNestedDirectTypeShape(
             delegatedTarget,
             delegatedType);
-        if (!isCompleteDirectDelegateChildShape(child)) {
-            recordNestedTypeShapeReject(directDelegateChildRejectReason(child));
+        Integer delegatedValueSlot =
+            unmarshalOutputParameterSlot(delegatedTarget);
+        if (!isCompleteDirectDelegateChildShape(child, delegatedValueSlot)) {
+            recordNestedTypeShapeReject(
+                directDelegateChildRejectReason(child, delegatedValueSlot));
             return null;
         }
         UnmarshalTerminalFlow wrapperTerminals =
@@ -165,7 +168,10 @@
         return delegated;
     }
 
-    private String directDelegateChildRejectReason(NestedTypeShape shape) {
+    private String directDelegateChildRejectReason(
+        NestedTypeShape shape,
+        Integer valueSlot) {
+
         if (shape == null || shape.members.isEmpty()) {
             return "direct-delegate-child-shape-missing";
         }
@@ -178,19 +184,21 @@
         if (!Boolean.TRUE.equals(shape.wireOrderProven)) {
             return "direct-delegate-child-wire-order-unproven";
         }
-        if (!("param_1".equals(shape.memberBase) ||
-            "this".equals(shape.memberBase))) {
+        if (!isDirectDelegateValueBase(shape.memberBase, valueSlot)) {
             return "direct-delegate-child-value-base-unproven";
         }
         return "direct-delegate-child-member-incomplete";
     }
 
-    private boolean isCompleteDirectDelegateChildShape(NestedTypeShape shape) {
+    private boolean isCompleteDirectDelegateChildShape(
+        NestedTypeShape shape,
+        Integer valueSlot) {
+
         if (shape == null || shape.members.isEmpty() ||
             !Boolean.TRUE.equals(shape.layoutProven) ||
             !Boolean.TRUE.equals(shape.memberCoverageProven) ||
             !Boolean.TRUE.equals(shape.wireOrderProven) ||
-            !("param_1".equals(shape.memberBase) || "this".equals(shape.memberBase))) {
+            !isDirectDelegateValueBase(shape.memberBase, valueSlot)) {
             return false;
         }
         for (NestedTypeMember member : shape.members) {
@@ -204,14 +212,21 @@
         return true;
     }
 
+    private boolean isDirectDelegateValueBase(
+        String memberBase,
+        Integer valueSlot) {
+
+        return "this".equals(memberBase) ||
+            valueSlot != null && ("param_" + valueSlot).equals(memberBase);
+    }
+
     private boolean sameNestedWireSequenceInProvenStorageOrder(
         NestedTypeShape storage,
         NestedTypeShape wire,
         HighFunction high) {
 
         if (storage == null || wire == null || high == null ||
-            storage.members.size() != wire.members.size() ||
-            storage.members.isEmpty()) {
+            storage.members.isEmpty() || wire.members.isEmpty()) {
             return false;
         }
         UnmarshalTerminalFlow terminalFlow = successfulUnmarshalTerminalFlow(high);
@@ -239,7 +254,8 @@
             evidence.set(member.wireOrdinal, operation);
         }
         for (int index = 0; index < evidence.size() - 1; index++) {
-            if (!NetworkSchemaControlFlow.precedes(
+            if (evidence.get(index) != evidence.get(index + 1) &&
+                !NetworkSchemaControlFlow.precedes(
                     high,
                     evidence.get(index),
                     evidence.get(index + 1))) {

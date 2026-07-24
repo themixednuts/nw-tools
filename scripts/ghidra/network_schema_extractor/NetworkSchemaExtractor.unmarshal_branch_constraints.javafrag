@@ -47,6 +47,57 @@
                     }
                 }
             }
+            // Status-product aggregates fold the ok byte into MULTIEQUAL phis of
+            // the store constants (ContractsComponentClientFacet_OnSearchContracts
+            // at NewWorld+0x2da5a20 gates later codecs on CMP [result+1],0 where the
+            // decompiler proved the value is 1 on the ok path and 0 on the cleared
+            // path). okByteStorage cannot resolve such folded phis, so the JZ-to-
+            // cleanup edge was kept as a SUCCESS continuation and the epilogue
+            // became reachable without the gated codec blocks. For any node with
+            // more than one successful successor, reject an outgoing edge whose
+            // required branch outcome is contradicted by every incoming-edge
+            // resolution of the condition: such an edge is infeasible on every
+            // success path that can enter this node.
+            for (UnmarshalFlowNode node : subgraph.nodes()) {
+                List<UnmarshalFlowEdge> incoming = subgraph.edges().stream()
+                    .filter(edge -> edge.target().equals(node))
+                    .toList();
+                if (incoming.isEmpty()) {
+                    continue;
+                }
+                List<UnmarshalFlowEdge> outgoing = subgraph.edges().stream()
+                    .filter(edge -> edge.source().equals(node))
+                    .toList();
+                if (outgoing.size() < 2) {
+                    continue;
+                }
+                for (UnmarshalFlowEdge candidate : outgoing) {
+                    ConditionalSuccessor required = conditionalSuccessor(
+                        node.block(),
+                        candidate.target().block());
+                    if (required == null) {
+                        continue;
+                    }
+                    boolean feasible = false;
+                    boolean proven = true;
+                    for (UnmarshalFlowEdge source : incoming) {
+                        Boolean value = incomingBooleanValue(
+                            required.branch().getInput(1),
+                            node.block(),
+                            source.source().block(),
+                            new LinkedHashSet<>(),
+                            0);
+                        if (value == null) {
+                            proven = false;
+                            break;
+                        }
+                        feasible |= value.booleanValue() == required.condition();
+                    }
+                    if (proven && !feasible) {
+                        rejected.add(candidate);
+                    }
+                }
+            }
             if (rejected.isEmpty()) {
                 return subgraph;
             }

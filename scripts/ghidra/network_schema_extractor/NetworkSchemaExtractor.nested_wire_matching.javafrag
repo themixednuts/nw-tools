@@ -67,6 +67,19 @@
             return exactCallsites;
         }
 
+        ArrayList<Integer> exactWireOrdinals = new ArrayList<>();
+        if (wire.wireOrdinal != null) {
+            for (int index : compatible) {
+                if (wire.wireOrdinal.equals(
+                        storageMembers.get(index).wireOrdinal)) {
+                    exactWireOrdinals.add(index);
+                }
+            }
+        }
+        if (!exactWireOrdinals.isEmpty()) {
+            return exactWireOrdinals;
+        }
+
         ArrayList<Integer> exactTargets = new ArrayList<>();
         if (wire.target != null) {
             for (int index : compatible) {

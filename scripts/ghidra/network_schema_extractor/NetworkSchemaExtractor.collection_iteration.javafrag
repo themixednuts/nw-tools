@@ -1,6 +1,7 @@
     private record CollectionElementCodec(
         PcodeOpAST operation,
-        List<CodecWireEvent> events) {
+        List<CodecWireEvent> events,
+        boolean writesElement) {
 
         CollectionElementCodec {
             events = List.copyOf(events);
@@ -50,44 +51,116 @@
             if (target == null) {
                 continue;
             }
-            PcodeStorage targetReadBuffer = callTargetReadBufferStorage(
-                high,
-                operations,
-                operation,
-                target,
-                readBuffer,
-                codecWireTraceActiveContexts);
-            if (targetReadBuffer == null) {
-                continue;
-            }
-            if (!unmarshalCodecWritesSequenceElement(
-                    function,
+            // Presence tags are often GridMate::ReadBuffer::ReadRaw(1) with a
+            // void Ghidra signature (e.g. NewWorld+0x15c29b0). Recover those from
+            // the callsite rather than requiring ReadRaw body buffer flow.
+            RawPcodeWrite rawWrite = pcodeReadRawWrite(operation, target);
+            WireShape rawEvidence = rawWrite == null
+                ? null
+                : boundedNormalizedBooleanReadEvidence(
                     high,
-                    loop,
                     operations,
                     operation,
-                    extent,
-                    readBuffer)) {
-                recordNestedTypeShapeReject(
-                    "dynamic-collection-element-store-unproven");
-                return null;
+                    rawWrite);
+            if (rawEvidence == null && rawWrite != null) {
+                rawEvidence = rawWrite.wireEvidence;
             }
-            CodecWireTrace nested = traceUnmarshalCodec(
-                target,
-                targetReadBuffer,
-                codecWireTraceActiveContexts,
-                codecWireTraceCompletedContexts);
-            if (nested == null || nested.events.isEmpty()) {
-                recordNestedTypeShapeReject(
-                    "dynamic-collection-element-codec-unproven");
-                return null;
+            List<CodecWireEvent> nestedEvents = null;
+            boolean writesElement;
+            if (rawEvidence != null) {
+                writesElement = false;
+                nestedEvents = List.of(new CodecWireEvent(
+                    rawWrite.nativeType,
+                    rawEvidence,
+                    operation.getSeqnum().getTarget(),
+                    target.getEntryPoint(),
+                    fullFunctionName(target),
+                    rawWrite.storage,
+                    null));
+            }
+            else {
+                PcodeStorage targetReadBuffer = callTargetReadBufferStorage(
+                    high,
+                    operations,
+                    operation,
+                    target,
+                    readBuffer,
+                    codecWireTraceActiveContexts);
+                String preferredBuffer = targetReadBuffer == null
+                    ? null
+                    : formalParameterBaseFromStorage(target, targetReadBuffer);
+                // Descriptor class-value helpers (NewWorld+0x15ac710) are proven
+                // as instruction leaves; their CFG body is not a standard codec
+                // event sequence. Emit the leaf directly so optional-suffix
+                // recovery can see writesElement=true.
+                WireShape classValueLeaf = classValueUnmarshalLeaf(
+                    target,
+                    preferredBuffer);
+                if (classValueLeaf != null) {
+                    writesElement = true;
+                    nestedEvents = List.of(new CodecWireEvent(
+                        null,
+                        classValueLeaf,
+                        operation.getSeqnum().getTarget(),
+                        target.getEntryPoint(),
+                        fullFunctionName(target),
+                        null,
+                        null));
+                }
+                else {
+                    if (targetReadBuffer == null) {
+                        continue;
+                    }
+                    if (!hasReadBufferFlow(
+                            target,
+                            targetReadBuffer,
+                            codecWireTraceActiveContexts)) {
+                        continue;
+                    }
+                    writesElement = unmarshalCodecWritesSequenceElement(
+                        function,
+                        high,
+                        loop,
+                        operations,
+                        operation,
+                        extent,
+                        readBuffer);
+                    CodecWireTrace nested = traceUnmarshalCodec(
+                        target,
+                        targetReadBuffer,
+                        codecWireTraceActiveContexts,
+                        codecWireTraceCompletedContexts);
+                    if (nested == null || nested.events.isEmpty()) {
+                        // Cursor/telemetry helpers often take the ReadBuffer (e.g.
+                        // NewWorld+0x873230 size delta in 0x15c29b0) but are not
+                        // element codecs. Only fail the iteration when the call
+                        // actually stores into the sequence element.
+                        if (writesElement) {
+                            recordNestedTypeShapeReject(
+                                "dynamic-collection-element-codec-unproven");
+                            return null;
+                        }
+                        continue;
+                    }
+                    nestedEvents = nested.events;
+                    boolean presence = nestedEvents.size() == 1 &&
+                        nestedEvents.get(0).wireEvidence() != null &&
+                        "bool".equals(nestedEvents.get(0).wireEvidence().shape) &&
+                        nestedEvents.get(0).wireEvidence().hasProvenSemantics();
+                    if (!writesElement && !presence) {
+                        continue;
+                    }
+                }
             }
             PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
             if (block == null) {
                 return null;
             }
             codecsByBlock.computeIfAbsent(block, ignored -> new ArrayList<>()).add(
-                new CollectionElementCodec(operation, nested.events));
+                new CollectionElementCodec(
+                    operation,
+                    nestedEvents,
+                    writesElement));
             callsites.add(operation.getSeqnum().getTarget());
         }
         if (codecsByBlock.isEmpty()) {
@@ -101,6 +174,12 @@
                 this::sameCollectionElementCodec);
         ArrayList<CodecWireEvent> events = new ArrayList<>();
         if (sequence.complete() && !sequence.events().isEmpty()) {
+            if (sequence.events().stream().anyMatch(
+                    codec -> !codec.writesElement())) {
+                recordNestedTypeShapeReject(
+                    "dynamic-collection-element-store-unproven");
+                return null;
+            }
             sequence.events().forEach(codec -> events.addAll(codec.events()));
         }
         else {
@@ -139,7 +218,12 @@
                 codecsByBlock,
                 this::sameCollectionElementCodec);
         if (!optional.hasOptionalSuffix() ||
-            optional.distinctSequenceCount() != 2) {
+            optional.distinctSequenceCount() != 2 ||
+            optional.requiredEvents().size() != 1 ||
+            optional.requiredEvents().get(0).writesElement() ||
+            optional.optionalEvents().isEmpty() ||
+            optional.optionalEvents().stream().anyMatch(
+                codec -> !codec.writesElement())) {
             return null;
         }
         ArrayList<CodecWireEvent> requiredEvents = new ArrayList<>();
@@ -161,15 +245,31 @@
             codecs.forEach(codec -> events.addAll(codec.events()));
             eventsByBlock.put(block, List.copyOf(events));
         });
-        if (presenceShape == null ||
-            !"bool".equals(presenceShape.shape) ||
-            !presenceShape.hasProvenSemantics() ||
-            !presenceBooleanControlsOptionalEvents(
-                high,
-                operations,
-                eventsByBlock,
-                presence,
-                optionalEvents)) {
+        boolean classValueBody = optionalEvents.size() == 1 &&
+            optionalEvents.get(0).wireEvidence() != null &&
+            "class-value".equals(optionalEvents.get(0).wireEvidence().shape);
+        // Presence is normally a proven bool. 0x15c29b0 sometimes only surfaces
+        // the ReadRaw(1) layout when normalization is split across ok/range
+        // checks; accept fixed-bytes-1 when the optional body is class-value.
+        boolean presenceOk = presenceShape != null && (
+            "bool".equals(presenceShape.shape) &&
+                presenceShape.hasProvenSemantics() ||
+            classValueBody &&
+                "fixed-bytes-1".equals(presenceShape.layout));
+        if (!presenceOk) {
+            return null;
+        }
+        boolean guarded = presenceBooleanControlsOptionalEvents(
+            high,
+            operations,
+            eventsByBlock,
+            presence,
+            optionalEvents,
+            loop);
+        // 0x15c29b0 gates class-value with (ok && presence) rather than a single
+        // normalized-boolean CBRANCH; accept when the optional body is exactly
+        // one class-value store under the loop.
+        if (!guarded && !classValueBody) {
             return null;
         }
         WireShape inner = orderedCodecWireEvidence(
@@ -218,6 +318,9 @@
         CollectionElementCodec right) {
 
         if (left.events().size() != right.events().size()) {
+            return false;
+        }
+        if (left.writesElement() != right.writesElement()) {
             return false;
         }
         for (int index = 0; index < left.events().size(); index++) {

@@ -72,8 +72,90 @@ import java.util.stream.Collectors;
 public class NetworkSchemaExtractor extends GhidraScript {
     private final NetworkSchemaAddressFormatter addressFormatter = this::formatAddress;
 
+    private JsonObject codecTraceDiagnosticsJson() {
+
+        JsonObject object = new JsonObject();
+        JsonArray frames = new JsonArray();
+        List<String> frameKeys = new ArrayList<>(messageCallFrameOutputCache.keySet());
+        Collections.sort(frameKeys);
+        for (String key : frameKeys) {
+            List<MessageCallFrameOutput> outputs = messageCallFrameOutputCache.get(key);
+            if (outputs == null || outputs.isEmpty()) {
+                continue;
+            }
+            JsonObject frame = new JsonObject();
+            frame.addProperty("function", key);
+            JsonArray outputJson = new JsonArray();
+            for (MessageCallFrameOutput output : outputs) {
+                JsonObject item = new JsonObject();
+                item.addProperty("base", output.parameterBase());
+                item.addProperty("coverage", Objects.toString(
+                    output.shape() == null ? null : output.shape().memberCoverageProven));
+                JsonArray members = new JsonArray();
+                if (output.shape() != null) {
+                    for (NestedTypeMember member : output.shape().members) {
+                        JsonObject entry = new JsonObject();
+                        entry.addProperty("offset", "0x" + Long.toHexString(member.offset));
+                        entry.addProperty("layout", member.wireLayout);
+                        entry.addProperty("shape", member.wireShape);
+                        entry.addProperty("ordinal", member.wireOrdinal);
+                        entry.addProperty("conflict", Objects.toString(member.typeConflict));
+                        entry.addProperty("callsite", formatAddress(member.callsite));
+                        members.add(entry);
+                    }
+                }
+                item.add("members", members);
+                outputJson.add(item);
+            }
+            frame.add("outputs", outputJson);
+            frames.add(frame);
+        }
+        object.add("messageCallFrameOutputs", frames);
+
+        JsonObject traces = new JsonObject();
+        List<String> contexts = new ArrayList<>(codecWireTraceDiagnostics.keySet());
+        Collections.sort(contexts);
+        for (String context : contexts) {
+            String diagnostic = codecWireTraceDiagnostics.get(context);
+            if (diagnostic == null ||
+                diagnostic.startsWith("complete:") && !diagnostic.contains("cyclic")) {
+                continue;
+            }
+            NetworkSchemaJson.add(traces, context, diagnostic);
+        }
+        object.add("codecWireTraceOutcomes", traces);
+
+        JsonObject traceEvents = new JsonObject();
+        List<String> completedContexts = new ArrayList<>(codecWireTraceCompletedContexts.keySet());
+        Collections.sort(completedContexts);
+        for (String context : completedContexts) {
+            CodecWireTrace trace = codecWireTraceCompletedContexts.get(context);
+            if (trace == null || trace.events == null || trace.events.size() < 2) {
+                continue;
+            }
+            JsonArray events = new JsonArray();
+            for (CodecWireEvent event : trace.events) {
+                JsonObject item = new JsonObject();
+                NetworkSchemaJson.add(
+                    item,
+                    "layout",
+                    event.wireEvidence() == null ? null : event.wireEvidence().layout);
+                NetworkSchemaJson.add(
+                    item,
+                    "shape",
+                    event.wireEvidence() == null ? null : event.wireEvidence().shape);
+                NetworkSchemaJson.add(item, "callsite", formatAddress(event.callsite()));
+                events.add(item);
+            }
+            traceEvents.add(context, events);
+        }
+        object.add("codecWireTraceEvents", traceEvents);
+        return object;
+    }
+
     private static final String EXTRACTOR_VERSION =
-        "network-schema-extractor-20260723-loop-optional-and-codec-failure-pass";
+        "network-schema-extractor-20260724-skip-unresolved-nonbuffer-calls";
+
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;
@@ -738,6 +820,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
         JsonObject registrationInvariants =
             registrationInvariants(hookTypeNamesById, registry);
         report.add("registrationInvariants", registrationInvariants);
+
+        report.add("codecTraceDiagnostics", codecTraceDiagnosticsJson());
 
         report.add("registryEntries", registryJson);
         report.add("installRegistrationHooks", hookTypeNamesJson(hookTypeNamesById));

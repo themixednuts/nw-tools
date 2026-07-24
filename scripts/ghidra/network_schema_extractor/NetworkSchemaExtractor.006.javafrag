@@ -245,6 +245,13 @@
                         "cfg-call-order");
                     continue;
                 }
+                if (callTarget != null && isReadRawFunction(callTarget)) {
+                    recordNestedTypeShapeReject(
+                        "readraw-output-storage-unresolved:" +
+                            formatAddress(target.getEntryPoint()) + ":" +
+                            formatAddress(op.getSeqnum().getTarget()));
+                }
+
 
                 NestedTypeShape nestedMemberShape =
                     recoverNestedDirectMemberShape(target, callTarget);

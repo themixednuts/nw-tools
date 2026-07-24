@@ -145,6 +145,10 @@ pub(super) fn rust_field_shape(shape: &SchemaWireShape) -> RustFieldShape {
         SchemaWireShape::String => {
             rust_field_shape_static("String", "ReplicatedFieldHandler<String>")
         }
+        SchemaWireShape::ClassValue => rust_field_shape_static(
+            "::nw_network::serialize::ClassValue",
+            "ReplicatedFieldHandler<::nw_network::serialize::ClassValue>",
+        ),
         SchemaWireShape::Composite(members) => {
             let (value_type, codec) = composite_projection(members);
             let field_type = replicated_field_type(&value_type, codec.as_deref());

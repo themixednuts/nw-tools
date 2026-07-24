@@ -10,6 +10,10 @@
             : pcodeStorageFromTrackedValue(state.registers.get(register));
     }
 
+    private String callResultBaseKey(Address callsite) {
+        return "call-result:" + formatAddress(callsite);
+    }
+
     private PcodeStorage instructionCallArgumentStorage(
         Function owner,
         PcodeOp operation,
@@ -305,11 +309,14 @@
             operation,
             target,
             argumentSlot);
-        if (pcode != null && instruction != null &&
-            !pcode.sameLocation(instruction)) {
-            return null;
+        // Win64 call-frame storage wins when Ghidra SSA reuses registers across
+        // CALL/CALLIND boundaries. Preferring null on disagreement dropped every
+        // descriptor factory/body pair at NewWorld+0x15ac710 and also lost stack
+        // status out-params used by codec failure-edge recovery.
+        if (instruction != null) {
+            return instruction;
         }
-        return pcode != null ? pcode : instruction;
+        return pcode;
     }
 
     private Long provenCallArgumentImmediate(
@@ -332,10 +339,10 @@
         ForwardArgState state = instructionStateBeforeCall(owner, operation, target);
         TrackedValue value = win64CallArgumentValue(state, argumentSlot);
         Long instruction = value == null ? null : value.immediate;
-        if (pcode != null && instruction != null && !pcode.equals(instruction)) {
-            return null;
+        if (instruction != null) {
+            return instruction;
         }
-        return pcode != null ? pcode : instruction;
+        return pcode;
     }
 
     private String win64ArgumentRegister(int argumentSlot) {
@@ -357,6 +364,11 @@
 
     private int provenCallArgumentCount(PcodeOp operation, Function target) {
         int encoded = encodedCallArgumentCount(operation);
+        if (operation != null && operation.getOpcode() == PcodeOp.CALLIND) {
+            // Indirect calls frequently omit register args from CALLIND p-code.
+            // Win64 frame tracking still recovers RCX/RDX/R8/R9 at the callsite.
+            return Math.max(encoded, 4);
+        }
         if (operation == null || operation.getOpcode() != PcodeOp.CALL || target == null ||
             !Objects.equals(target, pcodeCallTarget(operation))) {
             return encoded;

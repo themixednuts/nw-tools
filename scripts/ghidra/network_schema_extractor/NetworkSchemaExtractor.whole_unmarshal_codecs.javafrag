@@ -19,6 +19,17 @@
         if (composite != null) {
             return composite;
         }
+        // Completed multi-event CFG traces (e.g. status-gated aggregates with
+        // complete:N) are already success-covered; collapse them into ordered
+        // wire evidence instead of rejecting as semantic-codec-unresolved.
+        if (trace.events.size() > 1) {
+            WireShape ordered = orderedCodecWireEvidence(
+                trace.events,
+                "unmarshal-cfg-complete-codec-body");
+            if (ordered != null && ordered.layout != null) {
+                return ordered;
+            }
+        }
         if (trace.events.size() != 1) {
             return null;
         }

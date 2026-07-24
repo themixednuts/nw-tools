@@ -299,6 +299,7 @@ pub(super) fn message_field_type_tokens(shape: &SchemaWireShape) -> proc_macro2:
         }
         SchemaWireShape::Bytes => quote!(Vec<u8>),
         SchemaWireShape::String => quote!(String),
+        SchemaWireShape::ClassValue => quote!(::nw_network::serialize::ClassValue),
         SchemaWireShape::Composite(members) => {
             let members = members.iter().map(message_field_type_tokens);
             quote!((#(#members,)*))

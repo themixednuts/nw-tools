@@ -248,6 +248,13 @@
                 Collections.emptyMap());
             for (MessageCallFrameOutput nested : messageCallFrameOutputs(target)) {
                 PcodeStorage binding = arguments.get(nested.parameterBase());
+                if (binding == null) {
+                    recordNestedTypeShapeReject(
+                        "message-call-frame-binding-missing:" +
+                            formatAddress(function.getEntryPoint()) + "->" +
+                            formatAddress(target.getEntryPoint()) + ":" +
+                            nested.parameterBase());
+                }
                 appendTranslatedMessageCallFrameMembers(
                     byBase,
                     binding,
@@ -328,8 +335,24 @@
             return false;
         }
         String nativeType = unmarshalNativeTypeFromTarget(target);
-        return wireShapeEvidenceFromUnmarshalTarget(target, nativeType) == null ||
-            !collectionOutputShapesByParameterFromPcode(target).isEmpty();
+        if (wireShapeEvidenceFromUnmarshalTarget(target, nativeType) == null ||
+            !collectionOutputShapesByParameterFromPcode(target).isEmpty()) {
+            return true;
+        }
+        // A callee that provably writes several distinct output parameter bases is
+        // a multi-output helper even when its whole-function codec trace succeeds:
+        // the leaf evidence cannot express the per-output decomposition the call
+        // frame needs (NewWorld+0x5b4f020 / NewWorld+0x5b4fef0 write 8/7 bases).
+        return hasMultipleMessageCallFrameOutputBases(target);
+    }
+
+    private boolean hasMultipleMessageCallFrameOutputBases(Function target) {
+
+        return target != null &&
+            messageCallFrameOutputs(target).stream()
+                .map(MessageCallFrameOutput::parameterBase)
+                .distinct()
+                .count() > 1;
     }
 
     private void appendTranslatedMessageCallFrameMembers(
@@ -361,6 +384,10 @@
         for (NestedTypeMember member : nested.members) {
             WireShape wireEvidence = nestedMemberWireEvidence(member);
             if (wireEvidence == null) {
+                recordNestedTypeShapeReject(
+                    "message-call-frame-member-evidence-missing:" +
+                        (target == null ? "unknown" : formatAddress(target.getEntryPoint())) +
+                        ":" + binding.base + ":" + member.offset);
                 continue;
             }
             PcodeStorage storage = binding.plus(member.offset);
@@ -408,6 +435,9 @@
         for (Map.Entry<String, LinkedHashMap<Long, NestedTypeMember>> entry :
             byBase.entrySet()) {
             if (!isProvenOutputParameterBase(function, entry.getKey())) {
+                recordNestedTypeShapeReject(
+                    "message-call-frame-base-not-proven:" +
+                        formatAddress(function.getEntryPoint()) + ":" + entry.getKey());
                 continue;
             }
             ArrayList<NestedTypeMember> members =
@@ -418,6 +448,10 @@
                 operationOrder));
             members = collapseProvenTypedCallFrameMembers(members);
             if (!isCompleteMessageCallFrameOutput(members)) {
+                recordNestedTypeShapeReject(
+                    "message-call-frame-output-incomplete:" +
+                        formatAddress(function.getEntryPoint()) + ":" + entry.getKey() +
+                        ":" + messageCallFrameIncompleteReason(members));
                 continue;
             }
             for (int index = 0; index < members.size(); index++) {
@@ -456,6 +490,7 @@
         }
         result.sort(Comparator
             .comparingInt(MessageCallFrameOutput::firstOperationOrder)
+            .thenComparingInt(output -> messageCallFrameParameterIndex(output.parameterBase()))
             .thenComparing(MessageCallFrameOutput::parameterBase));
         proveMessageCallFrameOutputCoverage(function, result);
         if (result.size() == 1) {
@@ -579,12 +614,21 @@
             fullFunctionName(function),
             fullFunctionName(function));
         boolean orderedOutputs = hasNonInterleavedMessageCallFrameOrder(outputs);
+        // The unordered path must still accept composite members: recovered
+        // members are already in proven callsite order (operation order, then
+        // numeric parameter index), so a flattened layout comparison against
+        // the whole-function wire sequence is a sound coverage proof even when
+        // storage outputs (possibly composite) do not match wire events 1:1.
         boolean coverageProven = orderedOutputs
             ? sameNestedWireSequenceInProvenOrder(
                 recovered,
                 outputs,
                 wireSequence)
-            : sameNestedWireSequence(recovered, wireSequence);
+            : sameNestedWireSequenceInRecoveredOrder(
+                recovered,
+                outputs,
+                wireSequence) ||
+                sameNestedWireSequence(recovered, wireSequence);
         if (!coverageProven) {
             coverageProven = hasCompleteCountedCollectionCallFrameCoverage(
                 function,
@@ -691,6 +735,39 @@
             firstNonEmpty(collectionEvidence.layout, collectionEvidence.shape));
         return member.offset == 0L && memberLayout != null &&
             memberLayout.equals(collectionLayout);
+    }
+
+    private boolean sameNestedWireSequenceInRecoveredOrder(
+        NestedTypeShape recovered,
+        List<MessageCallFrameOutput> outputs,
+        NestedTypeShape wireSequence) {
+
+        if (recovered == null || outputs == null || outputs.isEmpty() ||
+            wireSequence == null || recovered.members.isEmpty()) {
+            return false;
+        }
+        if (!sameFlattenedCodecProducts(recovered.members, wireSequence.members)) {
+            return false;
+        }
+        for (MessageCallFrameOutput output : outputs) {
+            for (int index = 0; index < output.shape().members.size(); index++) {
+                NestedTypeMember member = output.shape().members.get(index);
+                member.wireOrdinal = index;
+                member.wireOrderSource =
+                    "cfg-success-flow+complete-helper-wire-sequence";
+            }
+        }
+        for (int index = 0; index < recovered.members.size(); index++) {
+            NestedTypeMember member = recovered.members.get(index);
+            member.wireOrdinal = index;
+            member.wireOrderSource =
+                "cfg-success-flow+complete-helper-wire-sequence";
+        }
+        recovered.memberCoverageProven = true;
+        recovered.wireOrderProven = true;
+        recovered.wireOrderSource =
+            "cfg-success-flow+complete-helper-wire-sequence";
+        return true;
     }
 
     private boolean sameNestedWireSequenceInProvenOrder(
@@ -847,6 +924,41 @@
             previousLast = output.lastOperationOrder();
         }
         return true;
+    }
+
+    private int messageCallFrameParameterIndex(String base) {
+
+        return base != null && base.matches("param_\\d+")
+            ? Integer.parseInt(base.substring("param_".length()))
+            : Integer.MAX_VALUE;
+    }
+
+    private String messageCallFrameIncompleteReason(List<NestedTypeMember> members) {
+
+        if (members == null || members.isEmpty()) {
+            return "empty";
+        }
+        if (members.size() > NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
+            return "member-limit";
+        }
+        for (NestedTypeMember member : members) {
+            if (member == null) {
+                return "null-member";
+            }
+            if (Boolean.TRUE.equals(member.typeConflict)) {
+                return "type-conflict:0x" + Long.toHexString(member.offset);
+            }
+            if (member.offset < 0L) {
+                return "negative-offset";
+            }
+            if (member.wireLayout == null) {
+                return "no-wire-layout:0x" + Long.toHexString(member.offset);
+            }
+            if (member.wireOrdinal == null) {
+                return "no-wire-ordinal:0x" + Long.toHexString(member.offset);
+            }
+        }
+        return "unknown";
     }
 
     private boolean isCompleteMessageCallFrameOutput(

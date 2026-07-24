@@ -1,4 +1,5 @@
     private final Map<String, String> codecWireTraceDiagnostics = new HashMap<>();
+    private final Map<String, String> statusFlowGraphDebugByFunction = new HashMap<>();
     private final Set<String> codecWireTraceActiveContexts = new LinkedHashSet<>();
     private final Map<String, CodecWireTrace> codecWireTraceCompletedContexts =
         lruCache(CODEC_CLASSIFICATION_CACHE_LIMIT);
@@ -86,6 +87,7 @@
 
             CodecWireTrace body = new CodecWireTrace();
             Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock = new HashMap<>();
+            Map<PcodeBlockBasic, PcodeOpAST> eventOriginsByBlock = new HashMap<>();
             Set<PcodeBlockBasic> collapsedEventBlocks = new HashSet<>();
             List<PcodeOpAST> operations = orderedPcodeOps(high);
             Map<PcodeOpAST, UnmarshalSequenceAction> sequenceActions =
@@ -135,6 +137,10 @@
                                 context,
                                 "collection-event-block-missing");
                         }
+                        recordUnmarshalEventOrigin(
+                            eventOriginsByBlock,
+                            op,
+                            List.of(event));
                     }
                     continue;
                 }
@@ -150,6 +156,10 @@
                                 context,
                                 "sequence-event-block-missing");
                         }
+                        recordUnmarshalEventOrigin(
+                            eventOriginsByBlock,
+                            op,
+                            sequence.events());
                     }
                     continue;
                 }
@@ -176,6 +186,10 @@
                             context,
                             "call-event-block-missing");
                     }
+                    recordUnmarshalEventOrigin(
+                        eventOriginsByBlock,
+                        op,
+                        body.events.subList(eventStart, body.events.size()));
                     continue;
                 }
                 CodecWireEvent directRead = directParameter == null
@@ -196,6 +210,10 @@
                             context,
                             "direct-read-event-block-missing");
                     }
+                    recordUnmarshalEventOrigin(
+                        eventOriginsByBlock,
+                        op,
+                        List.of(directRead));
                 }
             }
 
@@ -204,18 +222,20 @@
                 unsuccessfulCodecEventEdges(
                     high,
                     eventsByBlock,
+                    eventOriginsByBlock,
                     terminalFlow.terminals());
             Map<PcodeBlockBasic, Set<PcodeBlockBasic>> flowExcludedEdges =
                 mergeExcludedEdges(
                     terminalFlow.excludedEdges(),
                     codecFailureEdges);
-            UnmarshalTerminalFlow sequenceTerminalFlow = new UnmarshalTerminalFlow(
-                terminalFlow.terminals(),
-                flowExcludedEdges,
-                terminalFlow.mandatoryBlocks(),
-                codecFailureEdges.isEmpty()
-                    ? terminalFlow.status()
-                    : terminalFlow.status() + "+codec-failure-edges");
+            UnmarshalTerminalFlow sequenceTerminalFlow =
+                unmarshalFlowWithExcludedEdges(
+                    high,
+                    terminalFlow,
+                    flowExcludedEdges,
+                    codecFailureEdges.isEmpty()
+                        ? terminalFlow.status()
+                        : terminalFlow.status() + "+codec-failure-edges");
             BooleanChoiceAnalysis booleanChoice = booleanChoiceUnmarshalShape(
                 function,
                 high,
@@ -258,7 +278,7 @@
             CodecSuccessCoverageAnalysis successCoverage =
                 codecSuccessCoverage(
                     eventsByBlock,
-                    terminalFlow,
+                    sequenceTerminalFlow,
                     body.events.size());
             if (!sequence.complete() && successCoverage.complete()) {
                 sequence = new NetworkSchemaFlowSequence.Result<>(
@@ -282,7 +302,11 @@
                             ":terminal=" + sequenceTerminalFlow.status() +
                             ":events=" + body.events.size() +
                             ":boolean-choice=" + booleanChoice.diagnostic() +
-                            ":success-coverage=" + successCoverage.diagnostic());
+                            ":success-coverage=" + successCoverage.diagnostic() +
+                            ":status-flow=" +
+                                statusFlowGraphDebugByFunction.getOrDefault(
+                                    function.getEntryPoint().toString(),
+                                    "missing"));
                 }
                 CodecWireTrace result = directParameter == null
                     ? optional
@@ -596,7 +620,8 @@
         }
         if ("vec3-smallest-three".equals(candidate.shape) ||
             "quat-smallest-three".equals(candidate.shape) ||
-            "entity-ref".equals(candidate.shape)) {
+            "entity-ref".equals(candidate.shape) ||
+            "class-value".equals(candidate.shape)) {
             WireShape validated = validatedUnmarshalLeaf(
                 function,
                 readBufferParameter);

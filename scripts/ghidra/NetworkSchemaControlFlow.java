@@ -144,6 +144,44 @@ final class NetworkSchemaControlFlow {
         return false;
     }
 
+    /**
+     * Returns whether {@code target} is reachable during the current loop iteration.
+     * Back edges to the loop header begin the next iteration and are not traversed.
+     */
+    static boolean reachesWithinIteration(
+        PcodeBlockBasic source,
+        PcodeBlockBasic target,
+        NetworkSchemaNaturalLoop loop) {
+
+        if (source == null || target == null || loop == null ||
+            !loop.contains(source) || !loop.contains(target)) {
+            return false;
+        }
+        if (source == target) {
+            return true;
+        }
+        ArrayList<PcodeBlockBasic> pending = new ArrayList<>();
+        HashSet<PcodeBlockBasic> visited = new HashSet<>();
+        pending.add(source);
+        while (!pending.isEmpty()) {
+            checkCancelled();
+            PcodeBlockBasic block = pending.remove(pending.size() - 1);
+            if (!visited.add(block)) {
+                continue;
+            }
+            for (PcodeBlockBasic successor : successors(block)) {
+                checkCancelled();
+                if (successor == target) {
+                    return true;
+                }
+                if (successor != loop.header() && loop.contains(successor)) {
+                    pending.add(successor);
+                }
+            }
+        }
+        return false;
+    }
+
     /** Returns true when every entry-to-target path passes through {@code source}. */
     static boolean dominates(HighFunction high, PcodeBlockBasic source, PcodeBlockBasic target) {
         if (high == null || source == null || target == null) {

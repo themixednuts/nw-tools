@@ -17,6 +17,25 @@
             if (shape == null || !Objects.equals(
                     shape.loopHeader,
                     loop.header().getStart())) {
+                // Fixed-sequence-recovered shapes are keyed by the count
+                // callsite their own recovery proved; the counted-path finder
+                // can miss resize-linked extents where the loop branch is a
+                // plain pointer-vs-end compare (e.g. NewWorld+0x5b51330).
+                // Match the recovered shape by loop identity instead.
+                shape = null;
+                for (CollectionOutputShape candidate : localCollections.values()) {
+                    if (Objects.equals(candidate.loopHeader, loop.header().getStart())) {
+                        shape = candidate;
+                        break;
+                    }
+                }
+                count = shape == null
+                    ? null
+                    : callOperationByCallsite(operations, shape.countCallsite);
+            }
+            if (shape == null || count == null || !Objects.equals(
+                    shape.loopHeader,
+                    loop.header().getStart())) {
                 continue;
             }
             ContainerCodecCall boundary = unmarshalCollectionBoundary(
@@ -124,6 +143,22 @@
             selected = candidate;
         }
         return selected;
+    }
+
+    private PcodeOpAST callOperationByCallsite(
+        List<PcodeOpAST> operations,
+        Address callsite) {
+
+        if (callsite == null) {
+            return null;
+        }
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() == PcodeOp.CALL && callsite.equals(
+                    operation.getSeqnum().getTarget())) {
+                return operation;
+            }
+        }
+        return null;
     }
 
     private ContainerCodecCall unmarshalCollectionBoundary(

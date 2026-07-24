@@ -124,6 +124,7 @@
             case "vec2" -> "AZ::Vector2";
             case "vec3" -> "AZ::Vector3";
             case "vec4" -> "AZ::Vector4";
+            case "class-value" -> "ClassValue";
             default -> shape;
         };
     }

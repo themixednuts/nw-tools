@@ -639,10 +639,12 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
             operation,
             target,
             expected);
-        if (pcodeSlot != null && abiSlot != null && !pcodeSlot.equals(abiSlot)) {
-            return null;
+        // Prefer the Win64 frame when SSA call args disagree or are absent —
+        // CALLIND especially often omits register arguments from p-code.
+        if (abiSlot != null) {
+            return abiSlot;
         }
-        return pcodeSlot != null ? pcodeSlot : abiSlot;
+        return pcodeSlot;
     }
 
     private Integer instructionAbiCallArgumentSlot(

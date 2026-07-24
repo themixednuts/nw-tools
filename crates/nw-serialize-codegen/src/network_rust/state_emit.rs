@@ -1162,6 +1162,13 @@ pub(super) fn replicated_state_field_type_tokens(
         SchemaWireShape::String => {
             quote!(::nw_network::serialize::ReplicatedFieldHandler<String>)
         }
+        SchemaWireShape::ClassValue => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::nw_network::serialize::ClassValue,
+                >
+            )
+        }
         SchemaWireShape::Composite(_)
         | SchemaWireShape::Optional(_)
         | SchemaWireShape::DefaultOmitted(_)

@@ -125,6 +125,23 @@
         CodecWireEvent presence,
         List<CodecWireEvent> optionalEvents) {
 
+        return presenceBooleanControlsOptionalEvents(
+            high,
+            operations,
+            eventsByBlock,
+            presence,
+            optionalEvents,
+            null);
+    }
+
+    private boolean presenceBooleanControlsOptionalEvents(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock,
+        CodecWireEvent presence,
+        List<CodecWireEvent> optionalEvents,
+        NetworkSchemaNaturalLoop loop) {
+
         PcodeOpAST readCall = pcodeCallAt(high, presence.callsite());
         if (readCall == null) {
             return false;
@@ -160,9 +177,9 @@
         int bodyEdges = 0;
         for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(branchBlock)) {
             boolean reachesAll = optionalBlocks.stream().allMatch(block ->
-                successor == block || NetworkSchemaControlFlow.reaches(successor, block));
+                optionalEventReachable(successor, block, loop));
             boolean reachesAny = optionalBlocks.stream().anyMatch(block ->
-                successor == block || NetworkSchemaControlFlow.reaches(successor, block));
+                optionalEventReachable(successor, block, loop));
             if (reachesAll) {
                 bodyEdges++;
             }
@@ -171,6 +188,16 @@
             }
         }
         return bodyEdges == 1;
+    }
+
+    private boolean optionalEventReachable(
+        PcodeBlockBasic source,
+        PcodeBlockBasic target,
+        NetworkSchemaNaturalLoop loop) {
+
+        return source == target || (loop == null
+            ? NetworkSchemaControlFlow.reaches(source, target)
+            : NetworkSchemaControlFlow.reachesWithinIteration(source, target, loop));
     }
 
     private Varnode rawReadOutputValue(

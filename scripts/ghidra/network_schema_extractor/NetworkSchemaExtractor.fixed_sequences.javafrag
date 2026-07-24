@@ -99,9 +99,18 @@
         ArrayList<FixedSequenceStorage> candidates = new ArrayList<>();
         for (PcodeOpAST phi : affineSequenceInductions(loop)) {
             Long stride = affinePointerInductionStride(phi);
-            PcodeStorage data = fixedSequenceInitialStorage(phi);
-            if (stride == null || data == null ||
-                !data.base.matches("param_\\d+") ||
+            PcodeStorage anchor = fixedSequenceInitialStorage(phi);
+            Long baseAdjustment = stride == null
+                ? null
+                : fixedSequenceElementBaseAdjustment(
+                    loop,
+                    operations,
+                    phi,
+                    stride);
+            PcodeStorage data = anchor == null || baseAdjustment == null
+                ? null
+                : anchor.plus(baseAdjustment);
+            if (stride == null || data == null || !data.base.matches("param_\\d+") ||
                 !loopConditionDependsOn(high, loop, phi.getOutput())) {
                 continue;
             }
@@ -134,6 +143,42 @@
             return null;
         }
         return candidates.get(0);
+    }
+
+    private Long fixedSequenceElementBaseAdjustment(
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeOpAST induction,
+        long stride) {
+
+        Long lowest = 0L;
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation == induction) {
+                continue;
+            }
+            int firstSlot = operation.getOpcode() == PcodeOp.CALL ||
+                operation.getOpcode() == PcodeOp.CALLIND
+                    ? 1
+                    : operation.getOpcode() == PcodeOp.LOAD ||
+                        operation.getOpcode() == PcodeOp.STORE
+                            ? 1
+                            : operation.getNumInputs();
+            int lastSlot = operation.getOpcode() == PcodeOp.LOAD ||
+                operation.getOpcode() == PcodeOp.STORE
+                    ? Math.min(2, operation.getNumInputs())
+                    : operation.getNumInputs();
+            for (int slot = firstSlot; slot < lastSlot; slot++) {
+                Long offset = pcodeConstantOffsetFromRoot(
+                    operation.getInput(slot),
+                    induction.getOutput(),
+                    new LinkedHashSet<>(),
+                    0);
+                if (offset != null && offset > -stride && offset < stride) {
+                    lowest = Math.min(lowest, offset);
+                }
+            }
+        }
+        return lowest;
     }
 
     private List<PcodeOpAST> affineSequenceInductions(NetworkSchemaNaturalLoop loop) {
@@ -322,6 +367,7 @@
                     ? fixedSequenceElementStoreWireEvidence(
                         operation,
                         storage,
+                        inductions,
                         tempNativeTypes,
                         tempWireShapes)
                     : null;
@@ -362,6 +408,7 @@
     private WireShape fixedSequenceElementStoreWireEvidence(
         PcodeOp operation,
         FixedSequenceStorage storage,
+        List<PcodeOpAST> inductions,
         Map<String, String> tempNativeTypes,
         Map<String, String> tempWireShapes) {
 
@@ -370,9 +417,19 @@
             return null;
         }
         PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
-        if (destination == null || !destination.base.equals(storage.data().base) ||
-            destination.offset < storage.data().offset ||
-            destination.offset >= storage.data().offset + storage.stride()) {
+        boolean directElement = destination != null &&
+            destination.base.equals(storage.data().base) &&
+            destination.offset >= storage.data().offset &&
+            destination.offset < storage.data().offset + storage.stride();
+        boolean inducedElement = !directElement && inductions.stream().anyMatch(induction -> {
+            Long offset = pcodeConstantOffsetFromRoot(
+                operation.getInput(1),
+                induction.getOutput(),
+                new LinkedHashSet<>(),
+                0);
+            return offset != null && offset >= 0L && offset < storage.stride();
+        });
+        if (!directElement && !inducedElement) {
             return null;
         }
         String shape = pcodeValueWireShape(
@@ -885,114 +942,4 @@
             }
         }
         return false;
-    }
-
-    private interface SequenceExtent {
-        PcodeStorage data();
-        PcodeStorage end();
-        long stride();
-    }
-
-    private record DynamicSequenceExtent(
-        PcodeStorage data,
-        PcodeStorage end,
-        long stride) implements SequenceExtent {
-    }
-
-    private record FixedSequenceStorage(
-        PcodeOpAST induction,
-        PcodeStorage data,
-        PcodeStorage end,
-        long stride,
-        int capacity) implements SequenceExtent {
-    }
-
-    private record FixedSequenceResizeEvidence(
-        int countOutputCount,
-        int currentSizeValueCount,
-        PcodeOpAST growComparison,
-        PcodeOpAST shrinkComparison,
-        PcodeOpAST growAction,
-        PcodeOpAST shrinkAction,
-        PcodeOpAST ownerCall,
-        PcodeOpAST deltaCall,
-        PcodeOpAST scaledOwnerCall,
-        PcodeOpAST endStore,
-        PcodeOpAST scaledEndStore,
-        boolean growControlled,
-        boolean shrinkControlled,
-        boolean growExtentControlled,
-        boolean shrinkExtentControlled,
-        boolean ambiguousComparison,
-        boolean ambiguousAction) {
-
-        boolean proven() {
-            boolean directActions = growAction != null && shrinkAction != null &&
-                growControlled && shrinkControlled;
-            boolean extentActions = scaledEndStore != null && scaledOwnerCall != null &&
-                growExtentControlled && shrinkExtentControlled;
-            return countOutputCount > 0 && currentSizeValueCount > 0 &&
-                growComparison != null && shrinkComparison != null &&
-                (directActions || extentActions) &&
-                !ambiguousComparison && !ambiguousAction;
-        }
-
-        JsonObject toJson(NetworkSchemaAddressFormatter addresses) {
-            JsonObject object = new JsonObject();
-            object.addProperty("countOutputCount", countOutputCount);
-            object.addProperty("currentSizeValueCount", currentSizeValueCount);
-            NetworkSchemaJson.addAddress(
-                object,
-                "growComparison",
-                growComparison == null ? null : growComparison.getSeqnum().getTarget(),
-                addresses);
-            NetworkSchemaJson.addAddress(
-                object,
-                "shrinkComparison",
-                shrinkComparison == null ? null : shrinkComparison.getSeqnum().getTarget(),
-                addresses);
-            NetworkSchemaJson.addAddress(
-                object,
-                "growAction",
-                growAction == null ? null : growAction.getSeqnum().getTarget(),
-                addresses);
-            NetworkSchemaJson.addAddress(
-                object,
-                "shrinkAction",
-                shrinkAction == null ? null : shrinkAction.getSeqnum().getTarget(),
-                addresses);
-            NetworkSchemaJson.addAddress(
-                object,
-                "ownerCallCandidate",
-                ownerCall == null ? null : ownerCall.getSeqnum().getTarget(),
-                addresses);
-            NetworkSchemaJson.addAddress(
-                object,
-                "deltaCallCandidate",
-                deltaCall == null ? null : deltaCall.getSeqnum().getTarget(),
-                addresses);
-            NetworkSchemaJson.addAddress(
-                object,
-                "scaledOwnerCallCandidate",
-                scaledOwnerCall == null ? null : scaledOwnerCall.getSeqnum().getTarget(),
-                addresses);
-            NetworkSchemaJson.addAddress(
-                object,
-                "endStoreCandidate",
-                endStore == null ? null : endStore.getSeqnum().getTarget(),
-                addresses);
-            NetworkSchemaJson.addAddress(
-                object,
-                "scaledEndStoreCandidate",
-                scaledEndStore == null ? null : scaledEndStore.getSeqnum().getTarget(),
-                addresses);
-            object.addProperty("growControlled", growControlled);
-            object.addProperty("shrinkControlled", shrinkControlled);
-            object.addProperty("growExtentControlled", growExtentControlled);
-            object.addProperty("shrinkExtentControlled", shrinkExtentControlled);
-            object.addProperty("ambiguousComparison", ambiguousComparison);
-            object.addProperty("ambiguousAction", ambiguousAction);
-            object.addProperty("proven", proven());
-            return object;
-        }
     }

@@ -221,7 +221,7 @@
     private record NormalizedStatusSource(Varnode value, boolean trueMeansSuccess) {
     }
 
-    private Map<PcodeBlockBasic, UnmarshalStatusByte> terminalIncomingStatus(
+    private Map<PcodeBlockBasic, UnmarshalStatusByte> incomingUnmarshalStatus(
         HighFunction high,
         PcodeBlockBasic block,
         String resultBase) {
@@ -248,7 +248,7 @@
             new LinkedHashSet<>(),
             0);
         if (phi == null || phi.getNumInputs() != block.getInSize()) {
-            return terminalIncomingInstructionStatus(high, block, selected);
+            return incomingUnmarshalInstructionStatus(high, block, selected);
         }
         LinkedHashMap<PcodeBlockBasic, UnmarshalStatusByte> result =
             new LinkedHashMap<>();
@@ -272,7 +272,7 @@
         return Map.copyOf(result);
     }
 
-    private Map<PcodeBlockBasic, UnmarshalStatusByte> terminalIncomingInstructionStatus(
+    private Map<PcodeBlockBasic, UnmarshalStatusByte> incomingUnmarshalInstructionStatus(
         HighFunction high,
         PcodeBlockBasic block,
         PcodeOpAST store) {

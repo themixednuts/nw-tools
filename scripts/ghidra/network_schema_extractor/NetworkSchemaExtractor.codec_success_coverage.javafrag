@@ -3,6 +3,90 @@
         String diagnostic) {
     }
 
+    private UnmarshalTerminalFlow unmarshalFlowWithExcludedEdges(
+        HighFunction high,
+        UnmarshalTerminalFlow source,
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> excludedEdges,
+        String status) {
+
+        if (high == null || source == null) {
+            return UnmarshalTerminalFlow.unresolved("missing-flow");
+        }
+        LinkedHashSet<PcodeBlockBasic> mandatory = new LinkedHashSet<>(
+            source.mandatoryBlocks());
+        mandatory.addAll(mandatoryPhysicalBlocks(
+            high,
+            source.terminals(),
+            excludedEdges));
+        return new UnmarshalTerminalFlow(
+            source.terminals(),
+            excludedEdges,
+            Set.copyOf(mandatory),
+            status);
+    }
+
+    private Set<PcodeBlockBasic> mandatoryPhysicalBlocks(
+        HighFunction high,
+        Set<PcodeBlockBasic> terminals,
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> excludedEdges) {
+
+        if (high == null || terminals == null || terminals.isEmpty()) {
+            return Set.of();
+        }
+        List<PcodeBlockBasic> entries = high.getBasicBlocks().stream()
+            .filter(block -> NetworkSchemaControlFlow.predecessors(block).isEmpty())
+            .toList();
+        if (entries.isEmpty()) {
+            return Set.of();
+        }
+        Set<PcodeBlockBasic> reachable = reachablePhysicalBlocks(
+            entries,
+            terminals,
+            excludedEdges,
+            null);
+        LinkedHashSet<PcodeBlockBasic> mandatory =
+            new LinkedHashSet<>(reachable);
+        mandatory.removeIf(block -> !reachablePhysicalBlocks(
+            entries,
+            terminals,
+            excludedEdges,
+            block).isEmpty());
+        return Set.copyOf(mandatory);
+    }
+
+    private Set<PcodeBlockBasic> reachablePhysicalBlocks(
+        List<PcodeBlockBasic> entries,
+        Set<PcodeBlockBasic> terminals,
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> excludedEdges,
+        PcodeBlockBasic removed) {
+
+        ArrayDeque<PcodeBlockBasic> pending = new ArrayDeque<>();
+        LinkedHashSet<PcodeBlockBasic> visited = new LinkedHashSet<>();
+        for (PcodeBlockBasic entry : entries) {
+            if (entry != removed && visited.add(entry)) {
+                pending.addLast(entry);
+            }
+        }
+        boolean reachedTerminal = false;
+        while (!pending.isEmpty()) {
+            checkAnalysisCancelled();
+            PcodeBlockBasic block = pending.removeFirst();
+            if (terminals.contains(block)) {
+                reachedTerminal = true;
+            }
+            for (PcodeBlockBasic successor :
+                    NetworkSchemaControlFlow.successors(block)) {
+                if (successor == removed ||
+                    excludedEdges.getOrDefault(block, Set.of()).contains(successor) ||
+                    !visited.add(successor)) {
+                    continue;
+                }
+                pending.addLast(successor);
+            }
+        }
+        return reachedTerminal ? Set.copyOf(visited) : Set.of();
+    }
+
     private CodecSuccessCoverageAnalysis codecSuccessCoverage(
         Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock,
         UnmarshalTerminalFlow terminalFlow,
@@ -53,6 +137,7 @@
         unsuccessfulCodecEventEdges(
             HighFunction high,
             Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock,
+            Map<PcodeBlockBasic, PcodeOpAST> eventOriginsByBlock,
             Set<PcodeBlockBasic> successfulTerminals) {
 
         if (high == null || eventsByBlock == null || eventsByBlock.isEmpty() ||
@@ -63,33 +148,34 @@
             new HashMap<>();
         for (Map.Entry<PcodeBlockBasic, List<CodecWireEvent>> entry :
                 eventsByBlock.entrySet()) {
-            ArrayList<ContainerCodecCall> codecs = new ArrayList<>();
-            LinkedHashSet<PcodeOpAST> operations = new LinkedHashSet<>();
-            for (CodecWireEvent event : entry.getValue()) {
-                PcodeOpAST operation = event == null || event.callsite() == null
-                    ? null
-                    : pcodeCallAt(high, event.callsite());
-                if (operation == null ||
-                    NetworkSchemaControlFlow.parentBlock(operation) != entry.getKey() ||
-                    !operations.add(operation)) {
-                    continue;
-                }
-                ContainerCodecCall codec = new ContainerCodecCall();
-                codec.operation = operation;
-                codec.callsite = event.callsite();
-                codec.target = event.target();
-                codec.targetName = event.targetName();
-                codec.nativeType = event.nativeType();
-                codec.wireEvidence = event.wireEvidence();
-                codec.evidenceSource =
-                    "GridMate::ReadBuffer::ReadRaw".equals(event.targetName())
-                        ? "container-helper-unmarshal-read-raw"
-                        : "codec-wire-event";
-                codecs.add(codec);
+            List<CodecWireEvent> events = entry.getValue();
+            if (events == null || events.isEmpty()) {
+                continue;
             }
-            if (!codecs.isEmpty()) {
-                codecsByBlock.put(entry.getKey(), List.copyOf(codecs));
+            CodecWireEvent event = events.get(events.size() - 1);
+            PcodeOpAST operation = eventOriginsByBlock == null
+                ? null
+                : eventOriginsByBlock.get(entry.getKey());
+            if (operation == null && event.callsite() != null) {
+                operation = pcodeCallAt(high, event.callsite());
             }
+            if (operation == null ||
+                NetworkSchemaControlFlow.parentBlock(operation) != entry.getKey()) {
+                continue;
+            }
+            ContainerCodecCall codec = new ContainerCodecCall();
+            codec.operation = operation;
+            codec.callsite = operation.getSeqnum().getTarget();
+            Function target = pcodeCallTarget(operation);
+            codec.target = target == null ? event.target() : target.getEntryPoint();
+            codec.targetName = target == null ? event.targetName() : fullFunctionName(target);
+            codec.nativeType = event.nativeType();
+            codec.wireEvidence = event.wireEvidence();
+            codec.evidenceSource = target != null &&
+                pcodeReadRawWireEvidence(operation, target) != null
+                    ? "container-helper-unmarshal-read-raw"
+                    : "codec-wire-event";
+            codecsByBlock.put(entry.getKey(), List.of(codec));
         }
         if (codecsByBlock.isEmpty()) {
             return Map.of();
@@ -100,14 +186,29 @@
         for (Map.Entry<PcodeBlockBasic, List<ContainerCodecCall>> entry :
                 codecsByBlock.entrySet()) {
             List<ContainerCodecCall> codecs = entry.getValue();
-            PcodeBlockBasic failed = failedCodecSuccessor(
+            CodecFailureEdge failed = failedCodecEdge(
                 entry.getKey(),
                 codecs.get(codecs.size() - 1),
                 codecsByBlock,
                 successfulTerminals);
             if (failed != null) {
-                failedEdges.put(entry.getKey(), Set.of(failed));
+                failedEdges.put(failed.source(), Set.of(failed.target()));
             }
         }
         return Map.copyOf(failedEdges);
+    }
+
+    private void recordUnmarshalEventOrigin(
+        Map<PcodeBlockBasic, PcodeOpAST> originsByBlock,
+        PcodeOpAST operation,
+        List<CodecWireEvent> events) {
+
+        if (originsByBlock == null || operation == null ||
+            events == null || events.isEmpty()) {
+            return;
+        }
+        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+        if (block != null) {
+            originsByBlock.put(block, operation);
+        }
     }

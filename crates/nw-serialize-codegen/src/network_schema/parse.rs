@@ -142,6 +142,9 @@ pub(crate) fn parse_network_wire_shape(value: &str) -> Option<NetworkWireShape> 
     if let Some(sequence) = parse_fixed_sequence_wire_shape(value) {
         return Some(NetworkWireShape::FixedSequence(sequence));
     }
+    if value == "class-value" {
+        return Some(NetworkWireShape::ClassValue);
+    }
     parse_network_wire_scalar_shape(value).map(Into::into)
 }
 

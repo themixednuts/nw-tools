@@ -891,6 +891,7 @@ fn rust_source_field_wire_shape(field: &RustSourceField) -> Option<NetworkWireSh
         "SequenceNumber" => Some(NetworkWireShape::SequenceNumber),
         "Bytes" => Some(NetworkWireShape::Bytes),
         "String" => Some(NetworkWireShape::String),
+        "ClassValue" => Some(NetworkWireShape::ClassValue),
         "QuatCompNorm" => Some(NetworkWireShape::QuatCompNorm),
         _ => None,
     }

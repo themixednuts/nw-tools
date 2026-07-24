@@ -466,7 +466,7 @@ pub struct UuidGenericMap {
     #[serde(skip_serializing_if = "Option::is_none")]
     generic_type_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    legacy_specialized_type_id: Option<LegacySpecializedTypeId>,
+    legacy_specialized_type_id: Option<String>,
     non_type_template_arguments: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     class_data: Option<UuidMap>,
@@ -683,10 +683,3 @@ pub struct UuidMapAzRtti {
     is_abstract: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum LegacySpecializedTypeId {
-    #[serde(rename = "00EB73A2-F67F-0000-3DD0-F4A9F67F0000")]
-    The00Eb73A2F67F00003Dd0F4A9F67F0000,
-    #[serde(rename = "3DD0F4A9-F67F-0000-3DD0-F4A9F67F0000")]
-    The3Dd0F4A9F67F00003Dd0F4A9F67F0000,
-}

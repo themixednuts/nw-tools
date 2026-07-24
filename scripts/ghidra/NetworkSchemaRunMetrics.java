@@ -34,6 +34,12 @@ final class NetworkSchemaRunMetrics {
         counters.merge(name, 1L, Long::sum);
     }
 
+    void add(String name, long amount) {
+        if (amount != 0L) {
+            counters.merge(name, amount, Long::sum);
+        }
+    }
+
     long counter(String name) {
         return counters.getOrDefault(name, 0L);
     }

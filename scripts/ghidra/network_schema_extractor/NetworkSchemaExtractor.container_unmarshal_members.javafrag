@@ -345,19 +345,29 @@
             ContainerCodecCall lastCodec = entry.getValue().isEmpty()
                 ? null
                 : entry.getValue().get(entry.getValue().size() - 1);
-            PcodeBlockBasic failed = failedCodecSuccessor(
+            CodecFailureEdge failed = failedCodecEdge(
                 entry.getKey(),
                 lastCodec,
                 membersByBlock,
                 successfulTerminals);
             if (failed != null) {
-                failedSuccessors.put(entry.getKey(), Set.of(failed));
+                failedSuccessors.put(failed.source(), Set.of(failed.target()));
             }
         }
         return Map.copyOf(failedSuccessors);
     }
 
-    private PcodeBlockBasic failedCodecSuccessor(
+    private record CodecFailureEdge(
+        PcodeBlockBasic source,
+        PcodeBlockBasic target) {
+    }
+
+    private record CodecGuardBranch(
+        PcodeBlockBasic block,
+        PcodeOpAST branch) {
+    }
+
+    private CodecFailureEdge failedCodecEdge(
         PcodeBlockBasic block,
         ContainerCodecCall codec,
         Map<PcodeBlockBasic, List<ContainerCodecCall>> membersByBlock,
@@ -368,20 +378,46 @@
             codecCall.getOpcode() != PcodeOp.CALL) {
             return null;
         }
-        PcodeOpAST branch = null;
-        var operations = block.getIterator();
-        while (operations.hasNext()) {
-            PcodeOp operation = operations.next();
-            if (operation instanceof PcodeOpAST ast &&
-                ast.getOpcode() == PcodeOp.CBRANCH &&
-                ast.getSeqnum().getTarget().compareTo(
-                    codecCall.getSeqnum().getTarget()) > 0) {
-                branch = ast;
-            }
-        }
-        if (branch == null || branch.getNumInputs() < 2) {
+        CodecGuardBranch guard = codecGuardBranch(
+            block,
+            codecCall,
+            membersByBlock);
+        if (guard == null || guard.branch().getNumInputs() < 2) {
             return null;
         }
+        PcodeOpAST branch = guard.branch();
+        List<PcodeBlockBasic> successors =
+            NetworkSchemaControlFlow.successors(guard.block());
+        if (successors.size() != 2) {
+            return null;
+        }
+        Address trueDestination = pcodeAddress(branch.getInput(0));
+        PcodeBlockBasic trueSuccessor = branchTargetSuccessor(
+            successors,
+            trueDestination);
+        if (trueSuccessor == null) {
+            return null;
+        }
+        PcodeBlockBasic falseSuccessor = successors.get(0) == trueSuccessor
+            ? successors.get(1)
+            : successors.get(0);
+        PcodeBlockBasic structuralSuccessor = structuralCodecSuccessor(
+            trueSuccessor,
+            falseSuccessor,
+            membersByBlock,
+            successfulTerminals);
+        // Prefer CFG asymmetry before status-byte provenance. Aggregate helpers
+        // like ReceivePlayerPositionWithCameraClientMsg gate later ReadRaw calls
+        // behind Marshaler<u32> success; the continuing codec block is enough.
+        // Shared cleanup after ok-clear is not a success continuation.
+        if (structuralSuccessor != null) {
+            return new CodecFailureEdge(
+                guard.block(),
+                structuralSuccessor == trueSuccessor
+                    ? falseSuccessor
+                    : trueSuccessor);
+        }
+
         PcodeOp condition = branch.getInput(1).getDef();
         if (condition == null ||
             condition.getOpcode() != PcodeOp.INT_EQUAL &&
@@ -401,33 +437,6 @@
         if (statusValue.getSize() != Byte.BYTES) {
             return null;
         }
-        List<PcodeBlockBasic> successors = NetworkSchemaControlFlow.successors(block);
-        if (successors.size() != 2) {
-            return null;
-        }
-        Address trueDestination = pcodeAddress(branch.getInput(0));
-        PcodeBlockBasic trueSuccessor = successors.stream()
-            .filter(successor -> Objects.equals(successor.getStart(), trueDestination))
-            .findFirst()
-            .orElse(null);
-        if (trueSuccessor == null) {
-            return null;
-        }
-        PcodeBlockBasic falseSuccessor = successors.get(0) == trueSuccessor
-            ? successors.get(1)
-            : successors.get(0);
-        PcodeBlockBasic structuralSuccessor = structuralCodecSuccessor(
-            trueSuccessor,
-            falseSuccessor,
-            membersByBlock,
-            successfulTerminals);
-        if (structuralSuccessor != null &&
-            "container-helper-unmarshal-read-raw".equals(codec.evidenceSource)) {
-            return structuralSuccessor == trueSuccessor
-                ? falseSuccessor
-                : trueSuccessor;
-        }
-
         PcodeStorage status = pcodeStorageExpression(statusValue);
         boolean argumentResult = status != null &&
             callCarriesResultStorage(codecCall, status);
@@ -440,13 +449,80 @@
         if (!argumentResult && !returnedResult && !callDefinedResult) {
             return null;
         }
-        if (structuralSuccessor != null) {
-            return structuralSuccessor == trueSuccessor
-                ? falseSuccessor
-                : trueSuccessor;
-        }
         boolean trueMeansSuccess = condition.getOpcode() == PcodeOp.INT_NOTEQUAL;
-        return trueMeansSuccess ? falseSuccessor : trueSuccessor;
+        return new CodecFailureEdge(
+            guard.block(),
+            trueMeansSuccess ? falseSuccessor : trueSuccessor);
+    }
+
+    private CodecGuardBranch codecGuardBranch(
+        PcodeBlockBasic codecBlock,
+        PcodeOpAST codecCall,
+        Map<PcodeBlockBasic, List<ContainerCodecCall>> membersByBlock) {
+
+        PcodeBlockBasic current = codecBlock;
+        LinkedHashSet<PcodeBlockBasic> visited = new LinkedHashSet<>();
+        for (int depth = 0; depth < 8 && current != null && visited.add(current); depth++) {
+            checkAnalysisCancelled();
+            PcodeOpAST branch = null;
+            var operations = current.getIterator();
+            while (operations.hasNext()) {
+                PcodeOp operation = operations.next();
+                if (!(operation instanceof PcodeOpAST ast) ||
+                    ast.getOpcode() != PcodeOp.CBRANCH ||
+                    current == codecBlock &&
+                        ast.getSeqnum().getTarget().compareTo(
+                            codecCall.getSeqnum().getTarget()) <= 0) {
+                    continue;
+                }
+                if (branch != null) {
+                    return null;
+                }
+                branch = ast;
+            }
+            if (branch != null) {
+                return new CodecGuardBranch(current, branch);
+            }
+
+            List<PcodeBlockBasic> successors =
+                NetworkSchemaControlFlow.successors(current);
+            if (successors.size() != 1) {
+                return null;
+            }
+            PcodeBlockBasic next = successors.get(0);
+            if (next != codecBlock &&
+                !membersByBlock.getOrDefault(next, List.of()).isEmpty()) {
+                return null;
+            }
+            current = next;
+        }
+        return null;
+    }
+
+    private PcodeBlockBasic branchTargetSuccessor(
+        List<PcodeBlockBasic> successors,
+        Address destination) {
+
+        if (successors == null || destination == null) {
+            return null;
+        }
+        PcodeBlockBasic exact = successors.stream()
+            .filter(successor -> Objects.equals(successor.getStart(), destination))
+            .findFirst()
+            .orElse(null);
+        if (exact != null) {
+            return exact;
+        }
+        return successors.stream()
+            .filter(successor -> {
+                Address start = successor.getStart();
+                Address end = successor.getStop();
+                return start != null && end != null &&
+                    start.compareTo(destination) <= 0 &&
+                    end.compareTo(destination) >= 0;
+            })
+            .findFirst()
+            .orElse(null);
     }
 
     private PcodeBlockBasic structuralCodecSuccessor(
@@ -460,8 +536,13 @@
         if (firstHasCodec != secondHasCodec) {
             return firstHasCodec ? first : second;
         }
-        boolean firstSuccess = successfulTerminals.contains(first);
-        boolean secondSuccess = successfulTerminals.contains(second);
+        boolean firstClearsOk = failJoinClearsUnmarshalOk(first, 2);
+        boolean secondClearsOk = failJoinClearsUnmarshalOk(second, 2);
+        if (firstClearsOk != secondClearsOk) {
+            return firstClearsOk ? second : first;
+        }
+        boolean firstSuccess = successfulTerminals.contains(first) && !firstClearsOk;
+        boolean secondSuccess = successfulTerminals.contains(second) && !secondClearsOk;
         if (firstSuccess != secondSuccess) {
             return firstSuccess ? first : second;
         }
@@ -471,6 +552,57 @@
             return firstRejectedTerminal ? second : first;
         }
         return null;
+    }
+
+    private boolean failJoinClearsUnmarshalOk(PcodeBlockBasic block, int depth) {
+        if (block == null || depth < 0) {
+            return false;
+        }
+        if (blockClearsUnmarshalOkByte(block)) {
+            return true;
+        }
+        // Fail joins after gated codecs are straight-line (MOV status; JMP clear).
+        // Do not walk through further callsites.
+        if (blockContainsCall(block)) {
+            return false;
+        }
+        List<PcodeBlockBasic> successors = NetworkSchemaControlFlow.successors(block);
+        return successors.size() == 1 &&
+            failJoinClearsUnmarshalOk(successors.get(0), depth - 1);
+    }
+
+    private boolean blockContainsCall(PcodeBlockBasic block) {
+        if (block == null) {
+            return false;
+        }
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            int opcode = operations.next().getOpcode();
+            if (opcode == PcodeOp.CALL || opcode == PcodeOp.CALLIND) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean blockClearsUnmarshalOkByte(PcodeBlockBasic block) {
+        if (block == null) {
+            return false;
+        }
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (!(operation instanceof PcodeOpAST ast) ||
+                ast.getOpcode() != PcodeOp.STORE ||
+                ast.getNumInputs() < 3) {
+                continue;
+            }
+            StatusByteWrite write = unmarshalStatusByteWrite(ast);
+            if (write != null && write.value() == UnmarshalStatusByte.FAILURE) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean callCarriesResultStorage(PcodeOpAST call, PcodeStorage status) {
@@ -522,9 +654,11 @@
         PcodeOpAST call,
         PcodeBlockBasic block) {
 
-        PcodeOp definition = statusValue == null ? null : statusValue.getDef();
-        if (definition != null && definition.getOpcode() == PcodeOp.INDIRECT &&
-            definition.getSeqnum().getTarget().equals(call.getSeqnum().getTarget())) {
+        if (codecStatusProvenance(
+                statusValue,
+                call,
+                new LinkedHashSet<>(),
+                0) == CodecStatusProvenance.CALL_OR_ZERO) {
             return true;
         }
         if (status == null || block == null) {
@@ -543,6 +677,89 @@
             }
         }
         return false;
+    }
+
+    private enum CodecStatusProvenance {
+        INVALID,
+        ZERO,
+        CALL_OR_ZERO
+    }
+
+    private CodecStatusProvenance codecStatusProvenance(
+        Varnode value,
+        PcodeOpAST call,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || call == null || depth > 32) {
+            return CodecStatusProvenance.INVALID;
+        }
+        Long constant = NetworkSchemaIntegerEvaluator.evaluate(value);
+        if (constant != null) {
+            return constant == 0L
+                ? CodecStatusProvenance.ZERO
+                : CodecStatusProvenance.INVALID;
+        }
+        String key = pcodeSsaNodeKey(value);
+        if (!active.add(key)) {
+            return CodecStatusProvenance.INVALID;
+        }
+        try {
+            PcodeOp definition = value.getDef();
+            if (definition == null) {
+                return CodecStatusProvenance.INVALID;
+            }
+            if (definition.getOpcode() == PcodeOp.INDIRECT) {
+                return definition.getSeqnum().getTarget().equals(
+                    call.getSeqnum().getTarget())
+                    ? CodecStatusProvenance.CALL_OR_ZERO
+                    : CodecStatusProvenance.INVALID;
+            }
+            if ((definition.getOpcode() == PcodeOp.COPY ||
+                definition.getOpcode() == PcodeOp.CAST ||
+                definition.getOpcode() == PcodeOp.INT_ZEXT ||
+                definition.getOpcode() == PcodeOp.INT_SEXT) &&
+                definition.getNumInputs() > 0) {
+                return codecStatusProvenance(
+                    definition.getInput(0),
+                    call,
+                    active,
+                    depth + 1);
+            }
+            if (definition.getOpcode() == PcodeOp.SUBPIECE &&
+                definition.getNumInputs() == 2 &&
+                NetworkSchemaIntegerEvaluator.equals(
+                    definition.getInput(1),
+                    0L)) {
+                return codecStatusProvenance(
+                    definition.getInput(0),
+                    call,
+                    active,
+                    depth + 1);
+            }
+            if (definition.getOpcode() != PcodeOp.MULTIEQUAL ||
+                definition.getNumInputs() == 0) {
+                return CodecStatusProvenance.INVALID;
+            }
+            boolean sawCall = false;
+            for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+                CodecStatusProvenance input = codecStatusProvenance(
+                    definition.getInput(slot),
+                    call,
+                    new LinkedHashSet<>(active),
+                    depth + 1);
+                if (input == CodecStatusProvenance.INVALID) {
+                    return CodecStatusProvenance.INVALID;
+                }
+                sawCall |= input == CodecStatusProvenance.CALL_OR_ZERO;
+            }
+            return sawCall
+                ? CodecStatusProvenance.CALL_OR_ZERO
+                : CodecStatusProvenance.ZERO;
+        }
+        finally {
+            active.remove(key);
+        }
     }
 
     private Long ssaAffineOffset(

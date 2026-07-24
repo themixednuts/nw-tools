@@ -1,0 +1,109 @@
+    private interface SequenceExtent {
+        PcodeStorage data();
+        PcodeStorage end();
+        long stride();
+    }
+
+    private record DynamicSequenceExtent(
+        PcodeStorage data,
+        PcodeStorage end,
+        long stride) implements SequenceExtent {
+    }
+
+    private record FixedSequenceStorage(
+        PcodeOpAST induction,
+        PcodeStorage data,
+        PcodeStorage end,
+        long stride,
+        int capacity) implements SequenceExtent {
+    }
+
+    private record FixedSequenceResizeEvidence(
+        int countOutputCount,
+        int currentSizeValueCount,
+        PcodeOpAST growComparison,
+        PcodeOpAST shrinkComparison,
+        PcodeOpAST growAction,
+        PcodeOpAST shrinkAction,
+        PcodeOpAST ownerCall,
+        PcodeOpAST deltaCall,
+        PcodeOpAST scaledOwnerCall,
+        PcodeOpAST endStore,
+        PcodeOpAST scaledEndStore,
+        boolean growControlled,
+        boolean shrinkControlled,
+        boolean growExtentControlled,
+        boolean shrinkExtentControlled,
+        boolean ambiguousComparison,
+        boolean ambiguousAction) {
+
+        boolean proven() {
+            boolean directActions = growAction != null && shrinkAction != null &&
+                growControlled && shrinkControlled;
+            boolean extentActions = scaledEndStore != null && scaledOwnerCall != null &&
+                growExtentControlled && shrinkExtentControlled;
+            return countOutputCount > 0 && currentSizeValueCount > 0 &&
+                growComparison != null && shrinkComparison != null &&
+                (directActions || extentActions) &&
+                !ambiguousComparison && !ambiguousAction;
+        }
+
+        JsonObject toJson(NetworkSchemaAddressFormatter addresses) {
+            JsonObject object = new JsonObject();
+            object.addProperty("countOutputCount", countOutputCount);
+            object.addProperty("currentSizeValueCount", currentSizeValueCount);
+            NetworkSchemaJson.addAddress(
+                object,
+                "growComparison",
+                growComparison == null ? null : growComparison.getSeqnum().getTarget(),
+                addresses);
+            NetworkSchemaJson.addAddress(
+                object,
+                "shrinkComparison",
+                shrinkComparison == null ? null : shrinkComparison.getSeqnum().getTarget(),
+                addresses);
+            NetworkSchemaJson.addAddress(
+                object,
+                "growAction",
+                growAction == null ? null : growAction.getSeqnum().getTarget(),
+                addresses);
+            NetworkSchemaJson.addAddress(
+                object,
+                "shrinkAction",
+                shrinkAction == null ? null : shrinkAction.getSeqnum().getTarget(),
+                addresses);
+            NetworkSchemaJson.addAddress(
+                object,
+                "ownerCallCandidate",
+                ownerCall == null ? null : ownerCall.getSeqnum().getTarget(),
+                addresses);
+            NetworkSchemaJson.addAddress(
+                object,
+                "deltaCallCandidate",
+                deltaCall == null ? null : deltaCall.getSeqnum().getTarget(),
+                addresses);
+            NetworkSchemaJson.addAddress(
+                object,
+                "scaledOwnerCallCandidate",
+                scaledOwnerCall == null ? null : scaledOwnerCall.getSeqnum().getTarget(),
+                addresses);
+            NetworkSchemaJson.addAddress(
+                object,
+                "endStoreCandidate",
+                endStore == null ? null : endStore.getSeqnum().getTarget(),
+                addresses);
+            NetworkSchemaJson.addAddress(
+                object,
+                "scaledEndStoreCandidate",
+                scaledEndStore == null ? null : scaledEndStore.getSeqnum().getTarget(),
+                addresses);
+            object.addProperty("growControlled", growControlled);
+            object.addProperty("shrinkControlled", shrinkControlled);
+            object.addProperty("growExtentControlled", growExtentControlled);
+            object.addProperty("shrinkExtentControlled", shrinkExtentControlled);
+            object.addProperty("ambiguousComparison", ambiguousComparison);
+            object.addProperty("ambiguousAction", ambiguousAction);
+            object.addProperty("proven", proven());
+            return object;
+        }
+    }

@@ -113,9 +113,21 @@
                 operations,
                 new PcodeStorage(readBufferParameter, 0L),
                 recovery.storage());
-            if (iteration == null || iteration.wireEvidence().layout == null ||
-                !iteration.wireEvidence().layout.equals(
-                    recovery.shape().wireEvidence.layout)) {
+            if (iteration == null) {
+                recordCountedCollectionReject(
+                    function,
+                    loop,
+                    "fixed-sequence-element-iteration-unproven");
+                recordNestedTypeShapeReject("fixed-sequence-codec-callsites-unproven");
+                continue;
+            }
+            if (!compatibleFixedSequenceElementEvidence(
+                    iteration.wireEvidence(),
+                    recovery.shape().wireEvidence)) {
+                recordCountedCollectionReject(
+                    function,
+                    loop,
+                    "fixed-sequence-element-layout-mismatch");
                 recordNestedTypeShapeReject("fixed-sequence-codec-callsites-unproven");
                 continue;
             }
@@ -196,4 +208,32 @@
         catch (ArithmeticException ignored) {
             return null;
         }
+    }
+
+    private boolean compatibleFixedSequenceElementEvidence(
+        WireShape left,
+        WireShape right) {
+
+        if (sameWireEvidence(left, right)) {
+            return true;
+        }
+        String leftLayout = normalizedFixedSequenceElementLayout(left);
+        String rightLayout = normalizedFixedSequenceElementLayout(right);
+        return leftLayout != null && leftLayout.equals(rightLayout);
+    }
+
+    private String normalizedFixedSequenceElementLayout(WireShape evidence) {
+        if (evidence == null) {
+            return null;
+        }
+        String layout = firstNonEmpty(evidence.layout, evidence.shape);
+        String element = vectorElementWireShape(layout);
+        if (element == null) {
+            element = layout;
+        }
+        if (element != null && element.startsWith("fixed-bytes-")) {
+            return element;
+        }
+        Integer width = element == null ? null : wireShapeByteWidth(element);
+        return width == null ? element : fixedByteLayout(width);
     }

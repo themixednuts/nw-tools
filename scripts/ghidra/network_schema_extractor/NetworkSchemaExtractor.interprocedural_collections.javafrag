@@ -586,6 +586,12 @@
             directOwner.offset == extent.data().offset) {
             return true;
         }
+        // Descriptor class-value helpers (NewWorld+0x15ac710) take the element
+        // slot in Win64 arg3/R8 and store inside the callee. P-code CALL inputs
+        // are often truncated to the target only, so recover via ABI state.
+        if (abiCallWritesSequenceElement(helper, call, extent, readBuffer)) {
+            return true;
+        }
 
         Set<PcodeStorage> outputs = scalarCallOutputStorages(call);
         if (outputs.size() != 1) {
@@ -606,6 +612,113 @@
             selected = operation;
         }
         return selected != null;
+    }
+
+    private boolean abiCallWritesSequenceElement(
+        Function helper,
+        PcodeOpAST call,
+        SequenceExtent extent,
+        PcodeStorage readBuffer) {
+
+        if (helper == null || call == null || extent == null) {
+            return false;
+        }
+        Function target = pcodeCallTarget(call);
+        if (target == null) {
+            return false;
+        }
+        // Class-value ABI from NewWorld+0x15ac710 / use at 0x15c29b0:
+        // RCX=result, RDX=status, R8=element slot, R9=buffer. Element store is
+        // inside the callee, so loop-local STORE matching never sees it.
+        // Ghidra may type the helper as void; recover the leaf via preferred
+        // buffer slots instead of requiring a unique readBufferParameters hit.
+        WireShape leaf = classValueUnmarshalLeaf(
+            target,
+            readBuffer == null
+                ? null
+                : formalParameterBaseFromStorage(target, readBuffer));
+        if (leaf == null) {
+            return false;
+        }
+        PcodeStorage element = provenCallArgumentStorage(helper, call, target, 3);
+        PcodeStorage bufferArgument = provenCallArgumentStorage(
+            helper,
+            call,
+            target,
+            4);
+        if (element != null) {
+            if (readBuffer != null && element.sameLocation(readBuffer)) {
+                return false;
+            }
+            if (bufferArgument != null && element.sameLocation(bufferArgument)) {
+                return false;
+            }
+            if (element.sameLocation(extent.data())) {
+                return true;
+            }
+            NetworkSchemaNaturalLoop loop = loopContaining(call);
+            if (loop != null) {
+                for (PcodeOpAST induction : affineSequenceInductions(loop)) {
+                    Long stride = affinePointerInductionStride(induction);
+                    PcodeStorage initial = fixedSequenceInitialStorage(induction);
+                    if (stride == null || stride != extent.stride() ||
+                        initial == null ||
+                        !initial.sameLocation(extent.data())) {
+                        continue;
+                    }
+                    PcodeStorage inductionStorage = pcodeStorageExpression(
+                        induction.getOutput());
+                    if (inductionStorage != null &&
+                        inductionStorage.sameLocation(element)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        // Win64 R8 holding the live loop cursor is enough when stride matches the
+        // 16-byte class-value slot used by 0x15c29b0. Element storage may be
+        // missing from truncated CALL p-code when the callee is typed void.
+        return extent.stride() == 0x10L;
+    }
+
+    private WireShape classValueUnmarshalLeaf(
+        Function target,
+        String preferredBuffer) {
+
+        if (target == null) {
+            return null;
+        }
+        LinkedHashSet<String> candidates = new LinkedHashSet<>();
+        if (preferredBuffer != null) {
+            candidates.add(preferredBuffer);
+        }
+        candidates.addAll(readBufferParameters(target));
+        candidates.add("param_4");
+        candidates.add("param_3");
+        candidates.add("param_2");
+        candidates.add("param_1");
+        for (String parameter : candidates) {
+            WireShape leaf = validatedUnmarshalLeaf(target, parameter);
+            if (leaf != null && "class-value".equals(leaf.shape)) {
+                return leaf;
+            }
+        }
+        return null;
+    }
+
+    private NetworkSchemaNaturalLoop loopContaining(PcodeOpAST call) {
+        HighFunction high = call == null || call.getSeqnum() == null
+            ? null
+            : highFunction(functionContaining(call.getSeqnum().getTarget()));
+        if (high == null) {
+            return null;
+        }
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            if (loop.contains(call)) {
+                return loop;
+            }
+        }
+        return null;
     }
 
     private boolean storeTargetsSequenceElement(

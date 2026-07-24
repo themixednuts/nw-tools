@@ -163,6 +163,7 @@ pub enum NetworkWireShape {
     FixedBytes(u16),
     Bytes,
     String,
+    ClassValue,
     Composite(Vec<Self>),
     Optional(Box<Self>),
     DefaultOmitted(Vec<Self>),
@@ -322,6 +323,7 @@ impl NetworkWireShape {
             Self::ActorRef => Some("actor-ref"),
             Self::EntityRef => Some("entity-ref"),
             Self::Bytes => Some("length-prefixed-bytes"),
+            Self::ClassValue => Some("class-value"),
             Self::FixedBytes(_)
             | Self::DeltaVec3(_)
             | Self::PackedPosition(_)

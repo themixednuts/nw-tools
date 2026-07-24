@@ -15,23 +15,36 @@
         int depth) {
 
         LinkedHashSet<String> resultBases = new LinkedHashSet<>();
+        LinkedHashSet<String> provenResultBases = new LinkedHashSet<>();
         for (PcodeOpAST operation : orderedPcodeOps(high)) {
             StatusByteWrite write = unmarshalStatusByteWrite(operation);
             if (write != null) {
                 resultBases.add(write.base());
+                if (write.value() == UnmarshalStatusByte.SUCCESS ||
+                    write.value() == UnmarshalStatusByte.FAILURE) {
+                    provenResultBases.add(write.base());
+                }
             }
         }
+        // Output-parameter stores of computed values (e.g. *param_4 = count in
+        // FilterChatResponseMsg at NewWorld+0x7d9070) look like wide status
+        // writes whose ok byte is not a compile-time constant. A genuine
+        // status-result base always has a constant 0/1 write on some path, so
+        // prefer bases with a proven status transition when any exist.
+        Set<String> candidateBases = provenResultBases.isEmpty()
+            ? resultBases
+            : provenResultBases;
         String resultBase = expectedResultBase;
         if (resultBase == null) {
-            resultBase = resultBases.size() == 1
-                ? resultBases.iterator().next()
-                : returnedUnmarshalResultBase(high, resultBases);
+            resultBase = candidateBases.size() == 1
+                ? candidateBases.iterator().next()
+                : returnedUnmarshalResultBase(high, candidateBases);
         }
         if (resultBase == null) {
-            return resultBases.isEmpty()
+            return candidateBases.isEmpty()
                 ? scalarReturnUnmarshalTerminalFlow(high)
                 : UnmarshalTerminalFlow.unresolved(
-                    "result-base-count:" + resultBases.size());
+                    "result-base-count:" + candidateBases.size());
         }
 
         Set<PcodeOpAST> delegatedSuccess = delegatedUnmarshalSuccessCalls(
@@ -77,18 +90,29 @@
             UnmarshalFlowNode source = pending.removeFirst();
             for (PcodeBlockBasic successor :
                     NetworkSchemaControlFlow.successors(source.block())) {
-                UnmarshalStatusByte edgeStatus = terminalIncomingStatusForEdge(
+                UnmarshalStatusByte edgeStatus = incomingUnmarshalStatusForEdge(
                     high,
                     source.block(),
                     successor,
                     resultBase,
                     terminalIncoming);
+                // Shared-cleanup aggregates (ReceivePlayerPositionWithCameraClientMsg
+                // at NewWorld+0x3f99b30) do CMP [result+1],0 / JZ cleanup to skip the
+                // explicit ok-clear store when ok is already 0. That edge is still a
+                // failure join; treating it as SUCCESS lets paths skip later ReadRaws.
+                UnmarshalStatusByte inputStatus =
+                    isOkByteZeroBranch(source.block(), successor, resultBase)
+                        ? UnmarshalStatusByte.FAILURE
+                        : source.status();
+                if (inputStatus == UnmarshalStatusByte.FAILURE) {
+                    edgeStatus = UnmarshalStatusByte.FAILURE;
+                }
                 UnmarshalFlowNode target = new UnmarshalFlowNode(
                     successor,
                     transferUnmarshalStatus(
                         high,
                         successor,
-                        source.status(),
+                        inputStatus,
                         edgeStatus,
                         resultBase,
                         delegatedSuccess,
@@ -139,6 +163,14 @@
             successful.edges(),
             entryNodes,
             successfulTerminals);
+        statusFlowGraphDebugByFunction.put(
+            high.getFunction().getEntryPoint().toString(),
+            statusFlowGraphDebug(
+                nodes,
+                edges,
+                successful,
+                successfulTerminals,
+                mandatoryBlocks));
         return new UnmarshalTerminalFlow(
             successfulTerminals.stream()
                 .map(UnmarshalFlowNode::block)
@@ -253,24 +285,362 @@
         return status;
     }
 
-    private UnmarshalStatusByte terminalIncomingStatusForEdge(
+    private UnmarshalStatusByte incomingUnmarshalStatusForEdge(
         HighFunction high,
         PcodeBlockBasic predecessor,
         PcodeBlockBasic target,
         String resultBase,
         Map<PcodeBlockBasic, Map<PcodeBlockBasic, UnmarshalStatusByte>> cache) {
 
-        if (!isTerminatingPcodeBlock(target)) {
-            return null;
-        }
         Map<PcodeBlockBasic, UnmarshalStatusByte> incoming = cache.computeIfAbsent(
             target,
             block -> {
                 Map<PcodeBlockBasic, UnmarshalStatusByte> recovered =
-                    terminalIncomingStatus(high, block, resultBase);
+                    incomingUnmarshalStatus(high, block, resultBase);
                 return recovered == null ? Map.of() : recovered;
             });
         return incoming.get(predecessor);
+    }
+
+    private boolean isOkByteZeroBranch(
+        PcodeBlockBasic source,
+        PcodeBlockBasic successor,
+        String resultBase) {
+
+        if (source == null || successor == null || resultBase == null) {
+            return false;
+        }
+        if (isOkByteZeroBranchPcode(source, successor, resultBase)) {
+            return true;
+        }
+        // Listing fallback for NewWorld+0x3f99c12: CMP byte ptr [RDI+0x1],0 / JZ
+        // when RDI holds the unmarshal result (param_2).
+        return isOkByteZeroBranchInstruction(source, successor, resultBase);
+    }
+
+    private boolean isOkByteZeroBranchPcode(
+        PcodeBlockBasic source,
+        PcodeBlockBasic successor,
+        String resultBase) {
+
+        PcodeOpAST branch = null;
+        var operations = source.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (!(operation instanceof PcodeOpAST ast) ||
+                ast.getOpcode() != PcodeOp.CBRANCH ||
+                ast.getNumInputs() < 2) {
+                continue;
+            }
+            if (branch != null) {
+                return false;
+            }
+            branch = ast;
+        }
+        if (branch == null) {
+            return false;
+        }
+        Address destination = pcodeAddress(branch.getInput(0));
+        if (!blockContainsAddress(successor, destination)) {
+            return false;
+        }
+        PcodeOp condition = branch.getInput(1).getDef();
+        if (condition == null ||
+            condition.getOpcode() != PcodeOp.INT_EQUAL ||
+            condition.getNumInputs() != 2) {
+            return false;
+        }
+        int zeroSlot = NetworkSchemaIntegerEvaluator.equals(condition.getInput(0), 0L)
+            ? 0
+            : NetworkSchemaIntegerEvaluator.equals(condition.getInput(1), 0L)
+                ? 1
+                : -1;
+        if (zeroSlot < 0) {
+            return false;
+        }
+        PcodeStorage ok = okByteStorage(condition.getInput(1 - zeroSlot));
+        return ok != null &&
+            resultBase.equals(ok.base) &&
+            ok.offset == 1L;
+    }
+
+    private boolean isOkByteZeroBranchInstruction(
+        PcodeBlockBasic source,
+        PcodeBlockBasic successor,
+        String resultBase) {
+
+        Function owner = functionContaining(source.getStart());
+        if (owner == null) {
+            return false;
+        }
+        Instruction compare = null;
+        String okRegister = null;
+        Instruction jump = null;
+        Boolean jumpOnZero = null;
+        for (Instruction instruction : functionInstructions(owner)) {
+            Address address = instruction.getMinAddress();
+            if (source.getStart() != null && address.compareTo(source.getStart()) < 0) {
+                continue;
+            }
+            if (source.getStop() != null && address.compareTo(source.getStop()) > 0) {
+                break;
+            }
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if ("CMP".equals(mnemonic)) {
+                MemoryReference memory = NetworkSchemaX86.memoryReference(instruction, 0);
+                Long immediate = NetworkSchemaX86.immediateValue(instruction, 1);
+                if (memory != null &&
+                    memory.displacement == 1 &&
+                    Long.valueOf(0L).equals(immediate)) {
+                    compare = instruction;
+                    okRegister = memory.baseRegister;
+                }
+            }
+            else if (compare != null && okRegister != null &&
+                ("JZ".equals(mnemonic) || "JE".equals(mnemonic) ||
+                    "JNZ".equals(mnemonic) || "JNE".equals(mnemonic))) {
+                jump = instruction;
+                jumpOnZero = "JZ".equals(mnemonic) || "JE".equals(mnemonic);
+            }
+        }
+        if (compare == null || jump == null || okRegister == null || jumpOnZero == null ||
+            jump.getNumOperands() < 1) {
+            return false;
+        }
+        Address destination = null;
+        try {
+            for (Object object : jump.getOpObjects(0)) {
+                if (object instanceof Address address) {
+                    destination = address;
+                    break;
+                }
+            }
+        }
+        catch (Exception ignored) {
+            return false;
+        }
+        if (destination == null) {
+            return false;
+        }
+        // The edge carries ok==0 iff it is the taken edge of a JZ/JE or the
+        // fallthrough edge of a JNZ/JNE. Anything else is a success continuation.
+        boolean zeroOutcome = blockContainsAddress(successor, destination)
+            ? jumpOnZero.booleanValue()
+            : !jumpOnZero.booleanValue();
+        if (!zeroOutcome) {
+            return false;
+        }
+        // Provenance proof: the compared register holds the unmarshal result
+        // pointer, so [reg+1] is the ok byte by construction. Pure re-test gates
+        // (ContractsComponentClientFacet_OnSearchContracts at NewWorld+0x2da5aa0)
+        // re-check a previously stored ok byte with no nearby ok-clear; the
+        // forward ABI tracker proves the register is a copy of the result param.
+        if (okByteRegisterHoldsResultPointer(owner, source, compare, okRegister, resultBase)) {
+            return true;
+        }
+        // Listing fallback for NewWorld+0x3f99c12: CMP [reg+1],0 / JZ cleanup
+        // with a nearby MOV [reg+1],0 ok-clear sibling.
+        boolean sawOkClear = blockClearsOkRegisterAfter(
+            owner,
+            jump.getMinAddress(),
+            okRegister);
+        if (!sawOkClear) {
+            for (PcodeBlockBasic sibling : NetworkSchemaControlFlow.successors(source)) {
+                if (sibling == successor) {
+                    continue;
+                }
+                if (blockClearsOkRegister(owner, sibling, okRegister)) {
+                    sawOkClear = true;
+                    break;
+                }
+            }
+        }
+        return sawOkClear;
+    }
+
+    private final Map<String, Map<Integer, ForwardArgState>> abiBlockEntryStateCache =
+        lruCache(FUNCTION_INSTRUCTION_CACHE_LIMIT);
+
+    private Map<Integer, ForwardArgState> abiBlockEntryStatesCached(
+        Function owner,
+        HighFunction high,
+        PcodeBlockBasic entryBlock) {
+
+        String key = functionCacheKey("abi-block-entry-states", owner);
+        Map<Integer, ForwardArgState> cached = abiBlockEntryStateCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        Map<Integer, ForwardArgState> result = abiBlockEntryStates(owner, high, entryBlock);
+        abiBlockEntryStateCache.put(key, result);
+        return result;
+    }
+
+    private boolean okByteRegisterHoldsResultPointer(
+        Function owner,
+        PcodeBlockBasic source,
+        Instruction compare,
+        String okRegister,
+        String resultBase) {
+
+        if (owner == null || source == null || compare == null || okRegister == null ||
+            resultBase == null || !resultBase.matches("param_[0-9]+")) {
+            return false;
+        }
+        HighFunction high = highFunction(owner);
+        PcodeBlockBasic entryBlock = functionEntryBlock(high, owner);
+        if (high == null || entryBlock == null) {
+            return false;
+        }
+        ForwardArgState input = abiBlockEntryStatesCached(owner, high, entryBlock)
+            .get(source.getIndex());
+        if (input == null) {
+            return false;
+        }
+        ForwardArgState state = input.copy();
+        for (Instruction instruction : blockInstructions(owner, source)) {
+            if (instruction.getMinAddress().equals(compare.getMinAddress())) {
+                TrackedValue value = state.registers.get(okRegister);
+                return value != null &&
+                    resultBase.equals(value.baseKey) &&
+                    value.baseOffset != null &&
+                    value.baseOffset.intValue() == 0;
+            }
+            observeForwardInstruction(instruction, state, false);
+        }
+        return false;
+    }
+
+    private boolean blockContainsAddress(PcodeBlockBasic block, Address address) {
+        if (block == null || address == null) {
+            return false;
+        }
+        Address start = block.getStart();
+        Address stop = block.getStop();
+        return Objects.equals(start, address) ||
+            start != null && stop != null &&
+                start.compareTo(address) <= 0 &&
+                stop.compareTo(address) >= 0;
+    }
+
+    private boolean blockClearsOkRegister(
+        Function owner,
+        PcodeBlockBasic block,
+        String okRegister) {
+
+        return block != null &&
+            blockClearsOkRegisterAfter(owner, block.getStart(), okRegister);
+    }
+
+    private boolean blockClearsOkRegisterAfter(
+        Function owner,
+        Address after,
+        String okRegister) {
+
+        if (owner == null || after == null || okRegister == null) {
+            return false;
+        }
+        int seen = 0;
+        for (Instruction instruction : functionInstructions(owner)) {
+            Address address = instruction.getMinAddress();
+            if (address.compareTo(after) <= 0) {
+                continue;
+            }
+            if (++seen > 8) {
+                return false;
+            }
+            if (!"MOV".equals(NetworkSchemaX86.upperMnemonic(instruction))) {
+                continue;
+            }
+            MemoryReference memory = NetworkSchemaX86.memoryReference(instruction, 0);
+            Long immediate = NetworkSchemaX86.immediateValue(instruction, 1);
+            if (memory != null &&
+                okRegister.equals(memory.baseRegister) &&
+                memory.displacement == 1 &&
+                Long.valueOf(0L).equals(immediate)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private PcodeStorage okByteStorage(Varnode node) {
+        if (node == null) {
+            return null;
+        }
+        PcodeStorage direct = pcodeStorageExpression(node);
+        if (direct != null) {
+            return direct;
+        }
+        PcodeStorage loaded = pcodeLoadedStorageExpression(node);
+        if (loaded != null) {
+            return loaded;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return null;
+        }
+        return switch (definition.getOpcode()) {
+            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT ->
+                okByteStorage(definition.getInput(0));
+            case PcodeOp.LOAD -> definition.getNumInputs() >= 2
+                ? pcodeStorageExpression(definition.getInput(1))
+                : null;
+            case PcodeOp.SUBPIECE -> definition.getNumInputs() >= 2 &&
+                NetworkSchemaIntegerEvaluator.equals(definition.getInput(1), 0L)
+                ? okByteStorage(definition.getInput(0))
+                : null;
+            default -> null;
+        };
+    }
+
+    private String statusFlowGraphDebug(
+        Set<UnmarshalFlowNode> nodes,
+        Set<UnmarshalFlowEdge> edges,
+        SuccessfulUnmarshalSubgraph successful,
+        Set<UnmarshalFlowNode> terminals,
+        Set<PcodeBlockBasic> mandatory) {
+
+        StringBuilder builder = new StringBuilder();
+        builder.append("nodes=[");
+        boolean first = true;
+        for (UnmarshalFlowNode node : nodes) {
+            if (!first) {
+                builder.append(',');
+            }
+            first = false;
+            builder.append(formatAddress(node.block().getStart()))
+                .append(':')
+                .append(node.status().name().charAt(0));
+            if (terminals.contains(node)) {
+                builder.append('T');
+            }
+            if (successful.nodes().contains(node)) {
+                builder.append('G');
+            }
+            if (mandatory.contains(node.block())) {
+                builder.append('M');
+            }
+        }
+        builder.append("],edges=[");
+        first = true;
+        for (UnmarshalFlowEdge edge : edges) {
+            if (!first) {
+                builder.append(',');
+            }
+            first = false;
+            if (successful.edges().contains(edge)) {
+                builder.append('*');
+            }
+            builder.append(formatAddress(edge.source().block().getStart()))
+                .append(':')
+                .append(edge.source().status().name().charAt(0))
+                .append('>')
+                .append(formatAddress(edge.target().block().getStart()))
+                .append(':')
+                .append(edge.target().status().name().charAt(0));
+        }
+        return builder.append(']').toString();
     }
 
     private String unmarshalPhysicalEdgeKey(

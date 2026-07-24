@@ -174,6 +174,7 @@ impl NetworkRustEmitter {
                 FixedBytes(u16),
                 Bytes,
                 String,
+                ClassValue,
                 Composite(&'static [NetworkWireShape]),
                 Optional(&'static NetworkWireShape),
                 DefaultOmitted(&'static [NetworkWireShape]),

@@ -371,8 +371,8 @@ impl<'a> SchemaGenericClassInfo<'a> {
         match self {
             Self::UuidGenericMap(generic) => generic
                 .legacy_specialized_type_id
-                .as_ref()
-                .map(legacy_specialized_type_id_str)
+                .as_deref()
+                .filter(|value| !value.is_empty())
                 .map(Cow::Borrowed),
             Self::Sticky(generic) => generic
                 .legacy_specialized_type_id
@@ -964,17 +964,6 @@ fn i64_to_u32(value: i64) -> Option<u32> {
 
 fn str_to_u32(value: &str) -> Option<u32> {
     value.parse().ok()
-}
-
-fn legacy_specialized_type_id_str(value: &LegacySpecializedTypeId) -> &'static str {
-    match value {
-        LegacySpecializedTypeId::The00Eb73A2F67F00003Dd0F4A9F67F0000 => {
-            "00EB73A2-F67F-0000-3DD0-F4A9F67F0000"
-        }
-        LegacySpecializedTypeId::The3Dd0F4A9F67F00003Dd0F4A9F67F0000 => {
-            "3DD0F4A9-F67F-0000-3DD0-F4A9F67F0000"
-        }
-    }
 }
 
 fn schema_name(value: &Name) -> &'static str {

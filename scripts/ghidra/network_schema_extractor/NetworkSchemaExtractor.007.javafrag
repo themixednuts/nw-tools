@@ -88,11 +88,6 @@
         if (target == null || source == null) {
             return;
         }
-        target.callsite = source.callsite == null ? target.callsite : source.callsite;
-        target.target = source.target == null ? target.target : source.target;
-        target.targetName = source.targetName == null
-            ? target.targetName
-            : source.targetName;
         if (source.typeId != null && Boolean.TRUE.equals(source.typeIdentityProven)) {
             target.typeId = source.typeId;
             target.typeIdSource = source.typeIdSource;

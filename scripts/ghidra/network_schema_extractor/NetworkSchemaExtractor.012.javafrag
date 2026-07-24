@@ -751,6 +751,13 @@
                         "RAX",
                         TrackedValue.immediate(state.nextFilterGroupIndex++));
                 }
+                else {
+                    state.registers.put(
+                        "RAX",
+                        TrackedValue.baseOffset(
+                            callResultBaseKey(instruction.getMinAddress()),
+                            0));
+                }
                 return;
             }
 

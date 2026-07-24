@@ -506,10 +506,6 @@
         Map<String, String> tempWireShapes) {
 
         Function target = pcodeCallTarget(op);
-        if (target == null) {
-            recordPcodeMessageGraphReject(plan, "message-call-target-unresolved", null);
-            return;
-        }
         PcodeStorage callerReadBuffer = translatedAbsoluteHelperStorage(
             new PcodeStorage(readBufferParameter, 0L),
             callerParamStorage);
@@ -518,6 +514,19 @@
             op,
             target,
             callerReadBuffer);
+        if (target == null) {
+            // Unresolved CALL targets include failure-path vtable cleanup
+            // (e.g. NewWorld+0x7c2db3 CALL [RAX+0x38]). Those are not wire
+            // codecs; only reject when the callsite still consumes the
+            // message read buffer — same gate as resolved non-buffer calls.
+            if (readBufferSlot != null) {
+                recordPcodeMessageGraphReject(
+                    plan,
+                    "message-call-target-unresolved",
+                    null);
+            }
+            return;
+        }
         if (readBufferSlot == null) {
             return;
         }

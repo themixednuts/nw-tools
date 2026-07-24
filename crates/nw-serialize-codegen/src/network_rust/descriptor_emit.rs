@@ -100,6 +100,7 @@ pub(super) fn wire_shape_tokens(shape: &SchemaWireShape) -> proc_macro2::TokenSt
         SchemaWireShape::FixedBytes(len) => quote!(NetworkWireShape::FixedBytes(#len)),
         SchemaWireShape::Bytes => quote!(NetworkWireShape::Bytes),
         SchemaWireShape::String => quote!(NetworkWireShape::String),
+        SchemaWireShape::ClassValue => quote!(NetworkWireShape::ClassValue),
         SchemaWireShape::Composite(members) => {
             let members = members.iter().map(wire_shape_tokens);
             quote!(NetworkWireShape::Composite(&[#(#members),*]))

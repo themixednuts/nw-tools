@@ -134,6 +134,19 @@
         if (high == null) {
             return null;
         }
+        WireShape classValue = descriptorDispatchedClassValueUnmarshalShape(
+            function,
+            readBufferParameter);
+        if (classValue != null) {
+            return classValue;
+        }
+        FixedSequenceShape fixedSequence = fixedSequenceShape(
+            function,
+            readBufferParameter,
+            NetworkSchemaCodecClassifier.CodecDirection.DECODE);
+        if (fixedSequence != null && fixedSequence.wireEvidence != null) {
+            return fixedSequence.wireEvidence;
+        }
         NetworkSchemaCodecClassifier.VariableIntegerCodec structural =
             NetworkSchemaCodecClassifier.variableIntegerCodec(high);
         if (structural != null &&
