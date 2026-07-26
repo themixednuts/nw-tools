@@ -11,3 +11,7 @@ target/
 
 # scratch/probe/audit outputs
 /tmp/
+
+# local developer state and generated probe output
+/.claude/settings.local.json
+/luac.out
