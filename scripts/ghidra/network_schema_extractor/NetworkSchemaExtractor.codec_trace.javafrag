@@ -454,6 +454,10 @@
             List<PcodeOpAST> operations = orderedPcodeOps(high);
             Map<String, WireShape> boundedBooleanOutputs = new HashMap<>();
             boolean[] boundedBooleanOutputsRecovered = {false};
+            // MOVUPS/SIMD packing lowers to multiple STORE pcode ops that reuse a
+            // lane value (ReceiveHeartbeatResponseMsg writes 3 f32s as xmmword and
+            // duplicates the middle lane into +0x4c). Deduplicate by callsite+value.
+            LinkedHashSet<String> seenCallsiteStoreValues = new LinkedHashSet<>();
             for (PcodeOpAST op : operations) {
                 int order = operationOrder[0]++;
                 plan.pcodeOrderByCallsite.putIfAbsent(
@@ -484,7 +488,8 @@
                         tempNativeTypes,
                         tempWireShapes,
                         boundedBooleanOutputs,
-                        boundedBooleanOutputsRecovered);
+                        boundedBooleanOutputsRecovered,
+                        seenCallsiteStoreValues);
                 }
             }
         }
@@ -695,7 +700,8 @@
         Map<String, String> tempNativeTypes,
         Map<String, String> tempWireShapes,
         Map<String, WireShape> boundedBooleanOutputs,
-        boolean[] boundedBooleanOutputsRecovered) {
+        boolean[] boundedBooleanOutputsRecovered,
+        Set<String> seenCallsiteStoreValues) {
 
         if (op.getNumInputs() < 3) {
             return;
@@ -704,6 +710,14 @@
             pcodeStorageExpression(op.getInput(1)),
             callerParamStorage);
         if (!isRootMessageStorage(plan, storage)) {
+            return;
+        }
+        Address callsite = op.getSeqnum().getTarget();
+        String storeValueKey = callsite + "|" + pcodeNodeKey(op.getInput(2));
+        if (seenCallsiteStoreValues != null &&
+            !seenCallsiteStoreValues.add(storeValueKey)) {
+            // Same instruction already stored this SSA value (SIMD lane padding).
+            runMetrics.increment("message-unmarshal-store-duplicate-ssa-lane");
             return;
         }
         String wireShape = pcodeNetworkValueWireShape(
@@ -731,7 +745,7 @@
         }
         FieldCall field = addPcodeMessageField(
             plan,
-            op.getSeqnum().getTarget(),
+            callsite,
             storage,
             nativeType,
             "message-unmarshal-pcode-stack-store",

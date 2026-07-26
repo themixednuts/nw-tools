@@ -26,6 +26,12 @@ pub(super) fn message_field_shape_report(
             .or_else(|| Some("message-wire-layout".to_owned()));
         report.wire_shape = Some(shape);
     }
+    if report.wire_shape.is_none()
+        && let Some(shape) = message_native_wire_shape(field)
+    {
+        report.wire_shape_source = Some("message-native-type+layout".to_owned());
+        report.wire_shape = Some(shape);
+    }
     let source_type = serialize_field_scalar_source_type(field, report.wire_shape.as_ref());
     let rust_type = field
         .rust_type
@@ -67,13 +73,38 @@ pub(super) fn message_field_shape_report(
     report
 }
 
+fn message_native_wire_shape(field: &NetworkField) -> Option<SchemaWireShape> {
+    let native = field.native_type.as_deref()?;
+    let layout = field.wire_layout.as_deref()?;
+    let scalar = network_native_scalar_type(native)?.wire_shape;
+    let shape = SchemaWireShape::from(scalar);
+    let expected = nested_member_wire_shapes(layout, &[])?;
+    let observed = crate::network_schema::parse::wire_shape_scalar_product(&shape)?;
+    wire_scalar_shapes_match(
+        &expand_directional_wire_scalars(observed),
+        &expand_directional_wire_scalars(expected),
+    )
+    .then_some(shape)
+}
+
 fn anonymous_message_wire_layout_shape(field: &NetworkField) -> Option<SchemaWireShape> {
     if field.rust_type.is_some()
-        || field.native_type.is_some()
-        || field.source_type_name.is_some()
         || field.source_type_id.is_some()
         || field.serialize.is_some()
         || field.nested_type_shape.is_some()
+    {
+        return None;
+    }
+    // Real C++ type names must not invent wire shapes. Extractor sometimes
+    // parks proven wire products in nativeType/sourceTypeName instead.
+    if field
+        .native_type
+        .as_deref()
+        .is_some_and(|native| !is_wire_product_spelling(native))
+        || field
+            .source_type_name
+            .as_deref()
+            .is_some_and(|source| !source_type_is_wire_product_spelling(source))
     {
         return None;
     }
@@ -89,14 +120,53 @@ fn anonymous_message_wire_layout_shape(field: &NetworkField) -> Option<SchemaWir
         return Some(SchemaWireShape::FixedBytes(width));
     }
 
+    if matches!(
+        &shape,
+        SchemaWireShape::Composite(_)
+            | SchemaWireShape::Sequence(_)
+            | SchemaWireShape::Set(_)
+            | SchemaWireShape::Map { .. }
+            | SchemaWireShape::Optional(_)
+            | SchemaWireShape::DefaultOmitted(_)
+            | SchemaWireShape::BooleanChoice(_)
+            | SchemaWireShape::FixedSequence(_)
+            | SchemaWireShape::ClassValue
+    ) {
+        return Some(shape);
+    }
+
     let source = field.wire_layout_source.as_deref()?;
     matches!(
         source,
         "cfg-counted-loop+ordered-element-codecs"
             | "cfg-complete-direct-call-wire-product"
             | "cfg-success-flow+complete-helper-wire-sequence"
+            | "unmarshal-cfg-complete-codec-body"
+            | "message-unmarshal-pcode-stack-nested-shape"
     )
     .then_some(shape)
+}
+
+fn is_wire_product_spelling(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("fixed-vector<")
+        || value.starts_with("fixed-array<")
+        || value.starts_with("vec<")
+        || value.starts_with("set<")
+        || value.starts_with("map<")
+        || value.starts_with("composite<")
+        || value.starts_with("optional<")
+        || value.starts_with("boolean-choice<")
+        || value.starts_with("default-omitted<")
+        || value == "class-value"
+}
+
+fn source_type_is_wire_product_spelling(value: &str) -> bool {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .all(is_wire_product_spelling)
 }
 
 pub(super) fn state_field_shape_report(
@@ -398,11 +468,19 @@ pub(super) fn message_nested_shape_rust_type(
         return Some(runtime_type.to_owned());
     }
     if message_nested_shape_uses_source_type(shape) {
-        return shape
+        if let Some(source_type) = shape
             .type_name_full
             .as_deref()
             .or(shape.type_name.as_deref())
-            .and_then(serialize_source_rust_type_name);
+            .and_then(serialize_source_rust_type_name)
+        {
+            return Some(source_type);
+        }
+        // Exact Ghidra identity without a SerializeContext match: still emit a
+        // local support type from the proven nested wire layout.
+        if shape.has_proven_layout() {
+            return message_nested_shape_support_type_name(field, shape, message_type_name);
+        }
     }
     if shape.has_proven_symbolic_identity() {
         return message_nested_shape_support_type_name(field, shape, message_type_name);
@@ -481,11 +559,10 @@ fn message_nested_shape_wire_product_matches_field(
     field: &NetworkField,
     shape: &crate::network_schema::NetworkNestedTypeShape,
 ) -> Option<bool> {
-    let Some(observed) = crate::network_schema::parse::nested_type_shape_wire_shapes(shape, &[])
-    else {
-        return Some(false);
-    };
-    field
+    // Optional / boolean-choice / class-value limbs may not flatten. Leave the
+    // product comparison undecided so proven symbolic identity can still bind.
+    let observed = crate::network_schema::parse::nested_type_shape_wire_shapes(shape, &[])?;
+    let expected = field
         .wire_shape
         .as_ref()
         .and_then(crate::network_schema::parse::wire_shape_scalar_product)
@@ -493,8 +570,8 @@ fn message_nested_shape_wire_product_matches_field(
             field.wire_layout.as_deref().and_then(|expected| {
                 crate::network_schema::parse::nested_member_wire_shapes(expected, &[])
             })
-        })
-        .map(|expected| expected == observed)
+        })?;
+    Some(wire_scalar_shapes_match(&observed, &expected))
 }
 
 fn source_type_contains_leaf(value: &str, expected: &str) -> bool {
@@ -678,16 +755,115 @@ pub(super) fn message_blocked_reasons(
 }
 
 fn message_directional_fields_agree(network_type: &NetworkType) -> bool {
-    network_type.marshal_fields.is_empty()
-        || (network_type.fields.len() == network_type.marshal_fields.len()
-            && network_type
-                .fields
-                .iter()
-                .zip(&network_type.marshal_fields)
-                .all(|(unmarshal, marshal)| {
-                    directional_field_offset(unmarshal) == directional_field_offset(marshal)
-                        && directional_wire_evidence_agrees(unmarshal, marshal)
-                }))
+    if network_type.marshal_fields.is_empty() {
+        return true;
+    }
+    if let (Some(unmarshal), Some(marshal)) = (
+        directional_fields_wire_product(&network_type.fields),
+        directional_fields_wire_product(&network_type.marshal_fields),
+    ) {
+        if wire_scalar_products_directionally_agree(&unmarshal, &marshal) {
+            return true;
+        }
+    }
+    network_type.fields.len() == network_type.marshal_fields.len()
+        && network_type
+            .fields
+            .iter()
+            .zip(&network_type.marshal_fields)
+            .all(|(unmarshal, marshal)| {
+                directional_field_offset(unmarshal) == directional_field_offset(marshal)
+                    && directional_wire_evidence_agrees(unmarshal, marshal)
+            })
+}
+
+fn wire_scalar_products_directionally_agree(
+    unmarshal: &[SchemaWireScalarShape],
+    marshal: &[SchemaWireScalarShape],
+) -> bool {
+    // Both directions must recover the same product. A partial recovery that is
+    // merely a prefix or suffix of the other direction is not agreement: it means
+    // one side's CFG walk stopped early, and accepting it emits a struct whose
+    // wire length is unproven. Fix the recovery in the extractor instead.
+    let unmarshal = expand_directional_wire_scalars(unmarshal.to_vec());
+    let marshal = expand_directional_wire_scalars(marshal.to_vec());
+    wire_scalar_shapes_match(&unmarshal, &marshal)
+}
+
+fn directional_fields_wire_product(
+    fields: &[NetworkField],
+) -> Option<Vec<SchemaWireScalarShape>> {
+    let mut product = Vec::new();
+    for field in fields {
+        product.extend(directional_field_wire_product(field)?);
+    }
+    Some(product)
+}
+
+fn directional_field_wire_product(field: &NetworkField) -> Option<Vec<SchemaWireScalarShape>> {
+    // Prefer semantic wireShape (vec3/quat/actor-ref) so marshal limb splits can
+    // agree with unmarshal aggregates; fall back to layout/nested products.
+    let product = field
+        .wire_shape
+        .as_ref()
+        .and_then(crate::network_schema::parse::wire_shape_scalar_product)
+        .or_else(|| {
+            field
+                .wire_layout
+                .as_deref()
+                .and_then(|layout| nested_member_wire_shapes(layout, &[]))
+        })
+        .or_else(|| {
+            field.nested_type_shape.as_ref().and_then(|shape| {
+                crate::network_schema::parse::nested_type_shape_wire_shapes(shape, &[])
+            })
+        })?;
+    Some(expand_directional_wire_scalars(product))
+}
+
+fn expand_directional_wire_scalars(
+    shapes: Vec<SchemaWireScalarShape>,
+) -> Vec<SchemaWireScalarShape> {
+    shapes
+        .into_iter()
+        .flat_map(|shape| match shape {
+            // Marshal paths often split ActorRef into peer/id/crc fixed limbs while
+            // unmarshal keeps the semantic actor-ref product.
+            SchemaWireScalarShape::ActorRef => vec![
+                SchemaWireScalarShape::U32,
+                SchemaWireScalarShape::FixedBytes(16),
+                SchemaWireScalarShape::FixedBytes(16),
+            ],
+            SchemaWireScalarShape::Vec2 | SchemaWireScalarShape::Vec2Comp => {
+                vec![SchemaWireScalarShape::F32, SchemaWireScalarShape::F32]
+            }
+            SchemaWireScalarShape::Vec3
+            | SchemaWireScalarShape::Vec3Comp
+            | SchemaWireScalarShape::Vec3CompNorm
+            | SchemaWireScalarShape::Vec3SmallestThree
+            | SchemaWireScalarShape::NonUniformScaleComp => vec![
+                SchemaWireScalarShape::F32,
+                SchemaWireScalarShape::F32,
+                SchemaWireScalarShape::F32,
+            ],
+            SchemaWireScalarShape::Vec4 => vec![
+                SchemaWireScalarShape::F32,
+                SchemaWireScalarShape::F32,
+                SchemaWireScalarShape::F32,
+                SchemaWireScalarShape::F32,
+            ],
+            SchemaWireScalarShape::Quat
+            | SchemaWireScalarShape::QuatComp
+            | SchemaWireScalarShape::QuatCompNorm
+            | SchemaWireScalarShape::QuatSmallestThree => vec![
+                SchemaWireScalarShape::F32,
+                SchemaWireScalarShape::F32,
+                SchemaWireScalarShape::F32,
+                SchemaWireScalarShape::F32,
+            ],
+            other => vec![other],
+        })
+        .collect()
 }
 
 fn directional_field_offset(field: &NetworkField) -> Option<u32> {
@@ -801,9 +977,9 @@ pub(super) fn message_field_blocked_reason(
     if shape.is_some_and(SchemaWireShape::is_replicated_container) {
         return Some("missing-semantic-type".to_owned());
     }
-    if matches!(shape, Some(SchemaWireShape::FixedSequence(_))) {
-        return Some("missing-semantic-type".to_owned());
-    }
+    // Nested/top-level fixed-vector wire proofs emit ArrayVec from the shape
+    // alone (see rust_field_shape). RegisterField-backed sequences still use
+    // the handler-plan path in state_field_shape_report.
     None
 }
 

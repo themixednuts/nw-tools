@@ -684,6 +684,7 @@ mod tests {
                 is_base_class: false,
             }],
             variants: Vec::new(),
+            reflect_opaque_leaf: false,
         };
         let source = r#"
 use bevy::prelude::Component;
@@ -763,6 +764,7 @@ pub struct HealthComponent {
                     discriminant: Some(7),
                     payload_type: None,
                     payload_has_materialized_fields: false,
+                    payload_key: None,
                 },
                 RustVariantPlan {
                     source_name: "Disabled".to_owned(),
@@ -770,8 +772,10 @@ pub struct HealthComponent {
                     discriminant: Some(8),
                     payload_type: None,
                     payload_has_materialized_fields: false,
+                    payload_key: None,
                 },
             ],
+            reflect_opaque_leaf: false,
         };
         let source = r#"
 #[derive(AzTypeInfo, Debug)]

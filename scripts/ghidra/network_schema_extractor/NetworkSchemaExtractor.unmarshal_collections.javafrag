@@ -70,7 +70,7 @@
                 operation,
                 target,
                 Collections.emptyMap());
-            if (collection != null) {
+            if (collection != null && collection.count() != null) {
                 PcodeOpAST count = uniqueUnmarshalCountProducer(
                     high,
                     operations,

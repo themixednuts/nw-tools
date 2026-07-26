@@ -16,47 +16,70 @@
             return;
         }
         ArrayList<MessageConstructorTypeBoundary> candidates = new ArrayList<>();
-        for (VtableWrite write : handlerVtableWrites(wrapper.getEntryPoint())) {
-            if (write.baseOffset == null || write.baseOffset <= 0 ||
-                !plan.rootStorageBase.equals(write.baseKey)) {
+        LinkedHashSet<Address> scanned = new LinkedHashSet<>();
+        ArrayList<Address> roots = new ArrayList<>();
+        roots.add(wrapper.getEntryPoint());
+        if (plan.createInstance != null) {
+            roots.add(plan.createInstance);
+        }
+        for (Address root : roots) {
+            if (root == null || !scanned.add(root)) {
                 continue;
             }
-            AzRttiEvidence rtti = decodeAzRttiFromVtable(write.vtable);
-            SerializeTypeInfo reflected = serializeTypeForMessageConstructorRtti(rtti);
-            if (reflected == null) {
-                continue;
+            for (VtableWrite write : handlerVtableWrites(root)) {
+                if (write.baseOffset == null || write.baseOffset <= 0 ||
+                    !plan.rootStorageBase.equals(write.baseKey)) {
+                    continue;
+                }
+                AzRttiEvidence rtti = decodeAzRttiFromVtable(write.vtable);
+                SerializeTypeInfo reflected = serializeTypeForMessageConstructorRtti(rtti);
+                NestedTypeShape shape = null;
+                if (reflected != null) {
+                    Long nativeSize = exactSerializeNativeSize(reflected);
+                    if (nativeSize != null && nativeSize > 0L) {
+                        shape = messageConstructorTypeShape(
+                            plan,
+                            wrapper,
+                            write.vtable,
+                            write.baseOffset,
+                            nativeSize,
+                            reflected,
+                            rtti);
+                    }
+                }
+                if (shape == null) {
+                    shape = messageConstructorRegistryTypeShape(
+                        plan,
+                        wrapper,
+                        write,
+                        rtti);
+                }
+                if (shape == null) {
+                    continue;
+                }
+                FieldCall first = firstMessageFieldInRange(
+                    plan,
+                    write.baseOffset,
+                    shape.nativeSize == null ? 1L : shape.nativeSize);
+                if (first == null && shape.nativeSize == null) {
+                    first = firstMessageFieldAtOffset(plan, write.baseOffset);
+                }
+                if (first == null) {
+                    continue;
+                }
+                long nativeSize = shape.nativeSize == null
+                    ? 1L
+                    : shape.nativeSize;
+                candidates.add(new MessageConstructorTypeBoundary(
+                    write.baseOffset,
+                    nativeSize,
+                    write.vtable,
+                    rtti,
+                    reflected,
+                    shape,
+                    first.callsite,
+                    first.recoveryOrder));
             }
-            Long nativeSize = exactSerializeNativeSize(reflected);
-            if (nativeSize == null || nativeSize <= 0L) {
-                continue;
-            }
-            NestedTypeShape shape = messageConstructorTypeShape(
-                plan,
-                wrapper,
-                write.vtable,
-                write.baseOffset,
-                nativeSize,
-                reflected,
-                rtti);
-            if (shape == null) {
-                continue;
-            }
-            FieldCall first = firstMessageFieldInRange(
-                plan,
-                write.baseOffset,
-                nativeSize);
-            if (first == null) {
-                continue;
-            }
-            candidates.add(new MessageConstructorTypeBoundary(
-                write.baseOffset,
-                nativeSize,
-                write.vtable,
-                rtti,
-                reflected,
-                shape,
-                first.callsite,
-                first.recoveryOrder));
         }
         candidates.sort(Comparator
             .comparingLong(MessageConstructorTypeBoundary::offset)
@@ -76,6 +99,98 @@
         for (MessageConstructorTypeBoundary boundary : selected) {
             applyMessageConstructorTypeBoundary(plan, boundary);
         }
+    }
+
+    private NestedTypeShape messageConstructorRegistryTypeShape(
+        MessageUnmarshalPlan plan,
+        Function wrapper,
+        VtableWrite write,
+        AzRttiEvidence rtti) {
+
+        if (plan == null || wrapper == null || write == null || rtti == null) {
+            return null;
+        }
+        String typeName = firstNonEmpty(
+            rtti.selectedProviderTypeName(),
+            rtti.typeName);
+        RegistryEntry entry = uniqueRegistryEntryForTypeNameLeaf(typeName);
+        if (entry == null) {
+            return null;
+        }
+        FieldCall field = firstMessageFieldAtOffset(plan, write.baseOffset);
+        if (field == null) {
+            return null;
+        }
+        String wireProduct = composedMessageFieldWireProduct(field);
+        if (wireProduct == null || canonicalLayoutWireShape(wireProduct) == null) {
+            return null;
+        }
+        String source =
+            "message-unmarshal-constructor-vptr+az-rtti+typeregistry-type-name";
+        NestedTypeShape shape = new NestedTypeShape();
+        shape.typeId = normalizeUuid(firstNonEmpty(entry.uuid, rtti.typeId));
+        shape.typeIdSource = source;
+        shape.identityProven = true;
+        shape.identitySource = source;
+        shape.typeName = NetworkSchemaText.sourceTypeLeaf(
+            firstNonEmpty(entry.name, typeName));
+        shape.typeNameFull = firstNonEmpty(entry.name, typeName);
+        shape.typeNameSource = "az-rtti-vtable+typeregistry";
+        shape.function = wrapper.getEntryPoint();
+        shape.functionName = fullFunctionName(wrapper);
+        shape.vtable = write.vtable;
+        shape.memberBase = plan.rootStorageBase;
+        shape.memberNameSource = "synthetic-offset";
+        shape.memberNamesProven = false;
+        shape.layoutProven = true;
+        shape.memberCoverageProven = true;
+        shape.wireOrderProven = true;
+        shape.wireOrderSource = "cfg-ordered-multi-helper-wire-product";
+        shape.validation = source;
+
+        List<String> members = compositeWireShapeMembers(wireProduct);
+        if (members == null || members.isEmpty()) {
+            members = new ArrayList<>();
+            members.add(wireProduct);
+        }
+        int index = 0;
+        for (String memberShape : members) {
+            NestedTypeMember member = new NestedTypeMember();
+            member.index = index;
+            member.offset = (long) index;
+            member.name = "_" + index;
+            member.nameSource = "synthetic-offset";
+            member.nameProven = false;
+            member.wireShape = memberShape;
+            member.wireShapeSource = field.wireShapeSource;
+            member.wireLayout = firstNonEmpty(
+                canonicalLayoutWireShape(memberShape),
+                memberShape);
+            member.wireLayoutSource = firstNonEmpty(
+                field.wireLayoutSource,
+                field.wireShapeSource);
+            member.wireOrdinal = index;
+            member.wireOrderSource = shape.wireOrderSource;
+            member.callsite = field.callsite;
+            shape.members.add(member);
+            index++;
+        }
+        return shape;
+    }
+
+    private FieldCall firstMessageFieldAtOffset(
+        MessageUnmarshalPlan plan,
+        long offset) {
+
+        if (plan == null) {
+            return null;
+        }
+        return plan.fields.stream()
+            .filter(field -> field.storageOffset != null &&
+                field.storageOffset == offset &&
+                Objects.equals(messageFieldStorageBase(field), plan.rootStorageBase))
+            .min(Comparator.comparingInt((FieldCall field) -> field.recoveryOrder))
+            .orElse(null);
     }
 
     private SerializeTypeInfo serializeTypeForMessageConstructorRtti(
@@ -277,16 +392,27 @@
             }
         }
 
+        String typeName = boundary.reflected() == null
+            ? firstNonEmpty(
+                boundary.shape().typeNameFull,
+                boundary.shape().typeName)
+            : boundary.reflected().name;
+        String typeId = boundary.reflected() == null
+            ? boundary.shape().typeId
+            : normalizeUuid(boundary.reflected().typeId);
+        if (typeName == null) {
+            return;
+        }
         FieldCall field = addPcodeMessageField(
             plan,
             boundary.firstCallsite(),
             new PcodeStorage(plan.rootStorageBase, boundary.offset()),
-            boundary.reflected().name,
+            typeName,
             "message-unmarshal-constructor-typed-boundary",
             boundary.firstRecoveryOrder());
-        field.nativeType = boundary.reflected().name;
-        field.sourceTypeName = boundary.reflected().name;
-        field.sourceTypeId = normalizeUuid(boundary.reflected().typeId);
+        field.nativeType = typeName;
+        field.sourceTypeName = typeName;
+        field.sourceTypeId = typeId;
         field.sourceTypeIdSource = boundary.shape().identitySource;
         field.sourceTypeIdentityProven = true;
         field.typeEvidence = null;
@@ -300,11 +426,13 @@
             field.wireShape = wireShape;
             field.wireShapeSource = boundary.shape().identitySource;
         }
-        field.wireLayout = wireLayout;
-        field.wireLayoutSource = boundary.shape().identitySource;
+        if (wireLayout != null) {
+            field.wireLayout = wireLayout;
+            field.wireLayoutSource = boundary.shape().identitySource;
+        }
         addMessageFieldTypeEvidence(
             field,
-            boundary.reflected().name,
+            typeName,
             boundary.shape().identitySource,
             formatAddress(boundary.vtable()),
             "message-constructor-az-rtti");

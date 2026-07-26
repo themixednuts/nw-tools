@@ -12,7 +12,7 @@ use crate::layout::{LayoutIndex, dependency_ordered_codegen_items, reflected_bas
 use crate::model::SerializeContextModel;
 use crate::naming::{rust_type_ident, rust_variant_ident};
 use crate::role::ReflectedTypeRole;
-use crate::rust::derive_plan::{RustDeriveCaches, RustDerivePlanner};
+use crate::rust::derive_plan::{RustDeriveCaches, RustDerivePlanner, field_supports_reflect};
 use crate::rust::enum_plan::{RustEnumPlanner, RustVariantPlan, enum_has_duplicate_discriminants};
 use crate::rust::field_plan::{RustFieldPlanner, integrated_custom_field_type};
 use crate::rust::identity::RustTypeIdentityPlan;
@@ -24,6 +24,48 @@ use crate::rust::scope_plan::{
     rust_symbol_scope_key, standalone_family_symbol_module_paths_by_candidate,
 };
 use crate::rust::types::{RustTypeOptions, RustTypeRenderer};
+use crate::types::{MapKind, ResolvedType, SequenceKind};
+
+/// `AZStd::any`. Mirrors `AZSTD_ANY` in
+/// `az-rs .../formats/legacy/object-stream/src/types.rs`.
+const AZSTD_ANY_TYPE_ID: Uuid = Uuid::from_u128(0x03924488_C7F4_4D6D_948B_ABC2D1AE2FD3);
+
+/// JSON key `AZStd::any` writes its payload under.
+///
+/// Native's `IDataContainer::EnumElements` for `any` fabricates exactly one
+/// dynamic ClassElement named `m_data` (CRC `0x335CC942`), which is why an
+/// `any` serializes as the same `{TypeId, m_data}` shape as
+/// `DynamicSerializableField`.
+const AZSTD_ANY_PAYLOAD_KEY: &str = "m_data";
+
+/// Concrete payload types `AZStd::any` is observed to carry, as
+/// `(variant name, Rust payload type)`.
+///
+/// Closed set, measured over the full 650,542-file ObjectStream corpus by
+/// grouping on the payload element's own name+UUID without filtering to an
+/// expected set: `float` 74,739 + `s32` 10,677 = 85,416, reconciling exactly to
+/// the populated-`any` count with no residue. The structural reason there are
+/// only two is that the sole populated owner, `BehaviorParameter`, is a
+/// blackboard-bindable wrapper around a scalar.
+///
+/// The type ids are not repeated here: the emitter recovers each from
+/// `AzTypeInfo`/`AzRtti`, whose `f32`/`i32` impls already carry exactly the two
+/// observed UUIDs. A payload outside this set therefore lands on the sum
+/// deserializer's existing `unknown … concrete type {}` hard error, named by
+/// type id.
+const AZSTD_ANY_PAYLOAD_VARIANTS: [(&str, &str); 2] = [("Float", "f32"), ("S32", "i32")];
+
+/// Variant an empty `AZStd::any` decodes to. An `any` holding nothing has no
+/// children and no data, so it lowers to JSON `null` rather than an object.
+const AZSTD_ANY_EMPTY_VARIANT: &str = "Empty";
+
+/// `DynamicSerializableField`. Its reflected schema declares only `TypeId`;
+/// native fabricates the concrete `m_data` field from that id at runtime.
+const DYNAMIC_SERIALIZABLE_FIELD_TYPE_ID: Uuid =
+    Uuid::from_u128(0xD761E0C2_A098_497C_B8EB_EA62F5ED896B);
+
+const DYNAMIC_PAYLOAD_KEY: &str = "m_data";
+const EVENT_DATA_TYPE_ID: Uuid = Uuid::from_u128(0x46F1804A_234D_4511_A5A0_70851CF1096F);
 
 #[derive(Debug)]
 pub struct RustCodegenPlanner {
@@ -246,6 +288,12 @@ impl RustCodegenPlanner {
         ));
         prune_derives_for_planned_dependencies(&mut items, &name_plan);
         prune_integrated_hash_derives(&mut items, self.options.mode, &name_plan);
+        apply_reflect_opaque_hash_leaves(
+            &mut items,
+            context_unit,
+            context_items_by_type_id,
+            self.options.mode,
+        );
         RustCodegenUnit { items }
     }
 
@@ -370,6 +418,16 @@ impl RustCodegenPlanner {
         item: &SerializeCodegenItem,
         plan_context: &mut RustSerializePlanContext<'_>,
     ) -> RustItemPlan {
+        if let Some(dynamic_field) =
+            self.plan_dynamic_serializable_field_sum_enum(item, plan_context)
+        {
+            return dynamic_field;
+        }
+
+        if let Some(any_enum) = self.plan_azstd_any_sum_enum(item, plan_context) {
+            return any_enum;
+        }
+
         if let Some(sum_enum) = self.plan_abstract_sum_enum(item, plan_context) {
             return sum_enum;
         }
@@ -442,6 +500,199 @@ impl RustCodegenPlanner {
             rtti_bases,
             fields,
             variants: Vec::new(),
+            reflect_opaque_leaf: false,
+        }
+    }
+
+    /// Plan `AZStd::any` as a sum over the concrete payload types it carries.
+    ///
+    /// `any` reaches codegen as a *fieldless* struct: `serialize.json` records
+    /// it as a container with no usable elements, because native reflects the
+    /// payload through an `IDataContainer` whose `EnumElements` fabricates an
+    /// `m_data` ClassElement at enumeration time instead of declaring one. The
+    /// resulting `struct Any {}` carries no `deny_unknown_fields`, so serde
+    /// accepts the payload map and discards it — a silent drop, invisible to
+    /// any error count — while an empty `any` lowers to `null` and fails
+    /// outright.
+    ///
+    /// This deliberately does not route through [`Self::plan_abstract_sum_enum`].
+    /// That path discriminates over an RTTI inheritance family, and `any` has
+    /// neither `is_abstract` nor a derived-type map; its variants come from the
+    /// corpus-measured payload set in [`AZSTD_ANY_PAYLOAD_VARIANTS`] instead.
+    /// Everything downstream — `$type` dispatch, the `unknown … concrete type`
+    /// hard error — is the shared sum-enum idiom.
+    fn plan_azstd_any_sum_enum(
+        &self,
+        item: &SerializeCodegenItem,
+        plan_context: &mut RustSerializePlanContext<'_>,
+    ) -> Option<RustItemPlan> {
+        // Members would mean the frozen SerializeContext started declaring a
+        // shape this variant set does not describe. Leave such an item on the
+        // struct path rather than silently overriding it.
+        if item.source_type_id != AZSTD_ANY_TYPE_ID || !item.fields.is_empty() {
+            return None;
+        }
+
+        let mut variants = vec![RustVariantPlan {
+            source_name: item.source_name.clone(),
+            rust_name: AZSTD_ANY_EMPTY_VARIANT.to_owned(),
+            discriminant: None,
+            payload_type: None,
+            payload_has_materialized_fields: false,
+            payload_key: None,
+        }];
+        variants.extend(
+            AZSTD_ANY_PAYLOAD_VARIANTS
+                .iter()
+                .map(|(rust_name, payload)| RustVariantPlan {
+                    source_name: (*payload).to_owned(),
+                    rust_name: (*rust_name).to_owned(),
+                    discriminant: None,
+                    payload_type: Some((*payload).to_owned()),
+                    payload_has_materialized_fields: false,
+                    payload_key: Some(AZSTD_ANY_PAYLOAD_KEY.to_owned()),
+                }),
+        );
+
+        Some(self.plan_dynamic_value_sum_enum(item, variants, plan_context))
+    }
+
+    /// Plan `DynamicSerializableField` as the same keyed dynamic-value sum used
+    /// by `AZStd::any`.
+    ///
+    /// The key is a property of the wire shape, not the Rust payload shape:
+    /// `EntityId`, vectors, and colors are scalar-like serializers while
+    /// `EventData` is a reflected struct, but all five are nested under the
+    /// fabricated `m_data` child. Keeping that fact in [`RustVariantPlan`]
+    /// avoids a separate, structurally identical decoder for struct payloads.
+    fn plan_dynamic_serializable_field_sum_enum(
+        &self,
+        item: &SerializeCodegenItem,
+        plan_context: &mut RustSerializePlanContext<'_>,
+    ) -> Option<RustItemPlan> {
+        if item.source_type_id != DYNAMIC_SERIALIZABLE_FIELD_TYPE_ID
+            || item.fields.len() != 1
+            || item.fields[0].source_name != "TypeId"
+        {
+            return None;
+        }
+
+        let entity_id_type = match self.options.mode {
+            RustCodegenMode::Integrated => "::az_core::EntityId",
+            RustCodegenMode::Standalone => "crate::az::rtti::EntityId",
+        };
+        let (vector2_type, vector3_type, color_type) = match self.options.mode {
+            RustCodegenMode::Integrated => (
+                "::bevy::math::Vec2",
+                "::bevy::math::Vec3",
+                "::bevy::color::LinearRgba",
+            ),
+            RustCodegenMode::Standalone => (
+                "bevy_math::Vec2",
+                "bevy_math::Vec3",
+                "bevy_color::LinearRgba",
+            ),
+        };
+        let event_data_type = plan_context
+            .name_plan
+            .reference_name(EVENT_DATA_TYPE_ID, "EventData");
+        let payloads = [
+            ("EntityId", entity_id_type, false),
+            ("EventData", event_data_type.as_str(), true),
+            ("Vector2", vector2_type, false),
+            ("Vector3", vector3_type, false),
+            ("Color", color_type, false),
+        ];
+
+        let mut variants = vec![RustVariantPlan {
+            source_name: item.source_name.clone(),
+            rust_name: "Empty".to_owned(),
+            discriminant: None,
+            payload_type: None,
+            payload_has_materialized_fields: false,
+            payload_key: None,
+        }];
+        variants.extend(payloads.map(
+            |(rust_name, payload_type, payload_has_materialized_fields)| RustVariantPlan {
+                source_name: rust_name.to_owned(),
+                rust_name: rust_name.to_owned(),
+                discriminant: None,
+                payload_type: Some(payload_type.to_owned()),
+                payload_has_materialized_fields,
+                payload_key: Some(DYNAMIC_PAYLOAD_KEY.to_owned()),
+            },
+        ));
+
+        Some(self.plan_dynamic_value_sum_enum(item, variants, plan_context))
+    }
+
+    fn plan_dynamic_value_sum_enum(
+        &self,
+        item: &SerializeCodegenItem,
+        variants: Vec<RustVariantPlan>,
+        plan_context: &mut RustSerializePlanContext<'_>,
+    ) -> RustItemPlan {
+        let is_bevy_component = is_bevy_component_role(item);
+        let identity = self.rust_identity_for_struct(item, is_bevy_component);
+        let type_path = plan_context
+            .layout_index
+            .type_path(item, plan_context.items_by_type_id);
+
+        // Take the derive set the struct path would have granted rather than
+        // `plan_sum_enum_derives`, which is tuned for RTTI value enums and drops
+        // `Marshaler` and the identity derive. `BehaviorParameter` derives
+        // `Marshaler` over a `storage: Any` field, so losing it here is a
+        // compile break, not a narrowing. Then remove what the payloads cannot
+        // support; the referrer cascade is handled for us afterwards by
+        // `prune_derives_for_planned_dependencies`, which reads variant payload
+        // types as dependencies.
+        let mut derives = self.derive_planner.plan_struct_derives(
+            is_bevy_component,
+            identity.kind,
+            item,
+            plan_context.items_by_type_id,
+            &mut plan_context.derive_caches,
+        );
+        prune_custom_field_identity_derives(self.options.mode, &mut derives, item);
+        if self.manual_default_type_ids.contains(&item.source_type_id) {
+            remove_default_derive(&mut derives);
+        }
+        if !variants
+            .iter()
+            .filter_map(|variant| variant.payload_type.as_deref())
+            .all(dynamic_payload_is_totally_ordered)
+        {
+            derives
+                .retain(|derive| !matches!(derive.as_str(), "Eq" | "PartialOrd" | "Ord" | "Hash"));
+        }
+
+        RustItemPlan {
+            source_type_id: item.source_type_id,
+            source_name: item.source_name.clone(),
+            is_reflected_base: plan_context
+                .reflected_base_type_ids
+                .contains(&item.source_type_id),
+            is_slot_owner: false,
+            has_layout_family_descendants: plan_context
+                .layout_index
+                .has_layout_family_descendants(item),
+            is_bevy_component,
+            file_stem_override: Some(type_path.file_stem),
+            scope_path: type_path.scope_segments,
+            family_scope_path: plan_context
+                .layout_index
+                .inheritance_family_scope_segments(item, plan_context.items_by_type_id),
+            rust_name: plan_context.name_plan.definition_name(item),
+            kind: RustItemKind::SumEnum,
+            identity,
+            repr: None,
+            raw_conversion: None,
+            prefab: None,
+            derives,
+            rtti_bases: Vec::new(),
+            fields: Vec::new(),
+            variants,
+            reflect_opaque_leaf: false,
         }
     }
 
@@ -498,6 +749,7 @@ impl RustCodegenPlanner {
                             .reference_name(child.source_type_id, &child.source_name),
                     ),
                     payload_has_materialized_fields: has_materialized_fields,
+                    payload_key: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -532,6 +784,7 @@ impl RustCodegenPlanner {
             rtti_bases: Vec::new(),
             fields: Vec::new(),
             variants,
+            reflect_opaque_leaf: false,
         })
     }
 
@@ -601,6 +854,7 @@ impl RustCodegenPlanner {
             discriminant: None,
             payload_type: Some(name_plan.reference_name(base.source_type_id, &base.source_name)),
             payload_has_materialized_fields: item_has_materialized_payload(base, items_by_type_id),
+            payload_key: None,
         }];
         variants.extend(children.iter().map(|child| RustVariantPlan {
             source_name: child.source_name.clone(),
@@ -608,6 +862,7 @@ impl RustCodegenPlanner {
             discriminant: None,
             payload_type: Some(name_plan.reference_name(child.source_type_id, &child.source_name)),
             payload_has_materialized_fields: item_has_materialized_payload(child, items_by_type_id),
+            payload_key: None,
         }));
 
         let mut derives = self.plan_sum_enum_derives(&variants);
@@ -638,6 +893,7 @@ impl RustCodegenPlanner {
             rtti_bases: Vec::new(),
             fields: Vec::new(),
             variants,
+            reflect_opaque_leaf: false,
         })
     }
 
@@ -692,6 +948,7 @@ impl RustCodegenPlanner {
             rtti_bases: Vec::new(),
             fields: Vec::new(),
             variants: self.enum_planner.plan_variants(item),
+            reflect_opaque_leaf: false,
         }
     }
 
@@ -890,6 +1147,24 @@ fn remove_default_derive(derives: &mut Vec<String>) {
     derives.retain(|derive| derive != "Default");
 }
 
+/// Whether a scalar sum-enum payload supports the total-ordering and hashing
+/// derives.
+///
+/// Rust's floating-point types are `PartialEq`/`PartialOrd` but not `Eq`, `Ord`,
+/// or `Hash`, so a sum that can hold a `float` cannot keep them. Dropping `Eq`
+/// takes `PartialOrd`/`Ord` with it, matching the cascade
+/// [`prune_derive_if_dependency_missing`] already applies to struct fields.
+/// `prune_derives_for_planned_dependencies` cannot decide this itself: it
+/// resolves derive sets by looking type names up among the *planned* items, and
+/// a primitive is not one, so an unknown name is treated as supporting
+/// everything.
+fn dynamic_payload_is_totally_ordered(rust_type: &str) -> bool {
+    !matches!(rust_type, "f32" | "f64")
+        && !rust_type.ends_with("::Vec2")
+        && !rust_type.ends_with("::Vec3")
+        && !rust_type.ends_with("::LinearRgba")
+}
+
 fn prune_derives_for_planned_dependencies(items: &mut [RustItemPlan], name_plan: &RustNamePlan) {
     let mut changed = true;
     while changed {
@@ -1065,6 +1340,127 @@ fn prune_integrated_hash_derives(
                 changed = true;
             }
         }
+    }
+}
+
+/// Marks every planned item whose generated type appears in a hashing
+/// collection position (`HashSet` element / `HashMap` key) anywhere in the
+/// context so the emitter reflects it **opaque** with `#[reflect(Hash,
+/// PartialEq)]`. See [`RustItemPlan::reflect_opaque_leaf`] for why structural
+/// reflection of such a type panics `bevy_reflect`'s `DynamicSet`/`DynamicMap`
+/// hashing.
+///
+/// The position survey walks the full `context_unit` type graph (not just the
+/// emitted subset) so a type is flagged whenever *any* reachable **reflected**
+/// field uses it as a set element or map key; the flag is then applied only to
+/// items actually emitted here.
+fn apply_reflect_opaque_hash_leaves(
+    items: &mut [RustItemPlan],
+    context_unit: &SerializeCodegenUnit,
+    items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+    mode: RustCodegenMode,
+) {
+    let leaf_type_ids =
+        collect_reflect_opaque_hash_leaf_type_ids(context_unit, items_by_type_id, mode);
+    if leaf_type_ids.is_empty() {
+        return;
+    }
+    for item in items.iter_mut() {
+        if leaf_type_ids.contains(&item.source_type_id) {
+            item.reflect_opaque_leaf = true;
+        }
+    }
+}
+
+/// Collects the `source_type_id` of every generated (`Named`) type used in a
+/// hashing collection position — a `HashSet` (`UnorderedSet`) element or a
+/// `HashMap` (`UnorderedMap` / `UnorderedFlatMap`) key — across every
+/// **reflected** field and enum discriminant type in `unit`.
+///
+/// A field that will be `#[reflect(ignore, clone)]` never enters bevy
+/// reflection, so its collections can never become a `DynamicSet`/`DynamicMap`
+/// and are not in the panic class — such fields are skipped. The skip uses the
+/// exact same determination (`field_supports_reflect`) that `plan_serialize_field`
+/// uses to set `RustFieldPlan::reflect_ignore`, so the survey and the emitted
+/// `#[reflect(ignore)]` attribute never disagree. (In integrated mode that gate
+/// already requires a hashing element/key to support a native hash key — i.e.
+/// derive `Hash` + `Eq` — so every surveyed leaf is both reflected and hashable
+/// by construction.)
+fn collect_reflect_opaque_hash_leaf_type_ids(
+    unit: &SerializeCodegenUnit,
+    items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+    mode: RustCodegenMode,
+) -> BTreeSet<Uuid> {
+    let mut out = BTreeSet::new();
+    let mut reflect_cache = BTreeMap::new();
+    for item in &unit.items {
+        for field in &item.fields {
+            if !field_supports_reflect(
+                field,
+                items_by_type_id,
+                &mut reflect_cache,
+                &mut BTreeSet::new(),
+                mode,
+            ) {
+                continue;
+            }
+            collect_hash_leaf_positions(&field.resolved_type, &mut out);
+        }
+        if let Some(resolved) = &item.enum_underlying_type {
+            collect_hash_leaf_positions(resolved, &mut out);
+        }
+    }
+    out
+}
+
+/// Recursive helper for [`collect_reflect_opaque_hash_leaf_type_ids`]: descends
+/// through every container layer of `resolved` and, at each hashing position
+/// (`UnorderedSet` element / `UnorderedMap`|`UnorderedFlatMap` key), records the
+/// immediately-nested `Named` `type_id`. Only an immediate `Named` element/key
+/// is a leaf — a nested container at that position reflects as its own dynamic
+/// collection and is surveyed on its own recursion.
+fn collect_hash_leaf_positions(resolved: &ResolvedType, out: &mut BTreeSet<Uuid>) {
+    match resolved {
+        ResolvedType::Sequence { kind, element, .. } => {
+            if matches!(kind, SequenceKind::UnorderedSet)
+                && let ResolvedType::Named { type_id, .. } = element.as_ref()
+            {
+                out.insert(*type_id);
+            }
+            collect_hash_leaf_positions(element, out);
+        }
+        ResolvedType::Map { kind, key, value } => {
+            if matches!(kind, MapKind::UnorderedMap | MapKind::UnorderedFlatMap)
+                && let ResolvedType::Named { type_id, .. } = key.as_ref()
+            {
+                out.insert(*type_id);
+            }
+            collect_hash_leaf_positions(key, out);
+            collect_hash_leaf_positions(value, out);
+        }
+        ResolvedType::Pair { first, second } => {
+            collect_hash_leaf_positions(first, out);
+            collect_hash_leaf_positions(second, out);
+        }
+        ResolvedType::RangedInteger { value, .. }
+        | ResolvedType::Optional { value }
+        | ResolvedType::ReplicatedField { value } => {
+            collect_hash_leaf_positions(value, out);
+        }
+        ResolvedType::Pointer { target, .. } => {
+            collect_hash_leaf_positions(target, out);
+        }
+        ResolvedType::Tuple { elements } => {
+            for element in elements {
+                collect_hash_leaf_positions(element, out);
+            }
+        }
+        ResolvedType::Named { .. }
+        | ResolvedType::Scalar(_)
+        | ResolvedType::Asset { .. }
+        | ResolvedType::Uid { .. }
+        | ResolvedType::ByteStream
+        | ResolvedType::Unknown { .. } => {}
     }
 }
 
@@ -2488,6 +2884,127 @@ pub struct ExternalPayload;
         }
     }
 
+    fn unordered_set_field(
+        source_name: &str,
+        source_type_id: uuid::Uuid,
+        element_type_id: uuid::Uuid,
+        element_type_name: &str,
+    ) -> SerializeCodegenField {
+        SerializeCodegenField {
+            source_name: source_name.to_owned(),
+            source_type_id,
+            resolved_type: ResolvedType::Sequence {
+                kind: SequenceKind::UnorderedSet,
+                element: Box::new(ResolvedType::Named {
+                    type_id: element_type_id,
+                    source_name: element_type_name.to_owned(),
+                }),
+                capacity: None,
+            },
+            data_size: None,
+            offset: None,
+            flags: None,
+            is_base_class: false,
+            is_pointer: false,
+            is_dynamic_field: false,
+        }
+    }
+
+    // A generated type used as a *reflected* `HashSet` element must be flagged
+    // reflect-opaque, but a generated type whose only set usage sits in a
+    // `#[reflect(ignore, clone)]` field must NOT be flagged — a reflect-ignored
+    // field never becomes a `DynamicSet`, so it is not in the panic class and the
+    // element (which may not derive `Hash`/`Eq`) must not trip the opaque guard.
+    #[test]
+    fn survey_skips_reflect_ignored_hash_set_fields() {
+        let hashable_id = uuid!("a1000000-0000-0000-0000-000000000001");
+        let non_hashable_id = uuid!("a1000000-0000-0000-0000-000000000002");
+        let reflected_container_id = uuid!("a1000000-0000-0000-0000-000000000003");
+        let ignored_container_id = uuid!("a1000000-0000-0000-0000-000000000004");
+
+        // Only an integer field: derives `Hash` + `Eq`, so `HashSet<Hashable>` is
+        // reflected in integrated mode and the element reflects opaque.
+        let hashable = facet_item(
+            hashable_id,
+            "HashableLeaf",
+            ReflectedTypeRole::SupportType,
+            vec![scalar_member_field(
+                "m_id",
+                uuid!("a1000000-0000-0000-0000-0000000000a1"),
+                ScalarType::U32,
+            )],
+        );
+        // A float field breaks `Eq`/`Hash`, so `HashSet<NonHashable>` cannot be a
+        // native hash key: the field is reflect-ignored and its element is not in
+        // the panic class.
+        let non_hashable = facet_item(
+            non_hashable_id,
+            "NonHashableLeaf",
+            ReflectedTypeRole::SupportType,
+            vec![scalar_member_field(
+                "m_weight",
+                uuid!("a1000000-0000-0000-0000-0000000000a2"),
+                ScalarType::F32,
+            )],
+        );
+        let reflected_container = facet_item(
+            reflected_container_id,
+            "ReflectedSetContainer",
+            ReflectedTypeRole::SupportType,
+            vec![unordered_set_field(
+                "m_hashables",
+                uuid!("a1000000-0000-0000-0000-0000000000b1"),
+                hashable_id,
+                "HashableLeaf",
+            )],
+        );
+        let ignored_container = facet_item(
+            ignored_container_id,
+            "IgnoredSetContainer",
+            ReflectedTypeRole::SupportType,
+            vec![unordered_set_field(
+                "m_non_hashables",
+                uuid!("a1000000-0000-0000-0000-0000000000b2"),
+                non_hashable_id,
+                "NonHashableLeaf",
+            )],
+        );
+
+        let unit = SerializeCodegenUnit {
+            items: vec![
+                hashable,
+                non_hashable,
+                reflected_container,
+                ignored_container,
+            ],
+        };
+
+        // Plans in integrated mode (the default), where the reflect-ignore gate is
+        // active. Planning does not emit source, so an errant flag would surface as
+        // the assertion below rather than a guard panic.
+        let rust_unit =
+            RustCodegenPlanner::plan_codegen_unit(&unit, &crate::CodegenContext::inline());
+        let hashable_item = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == hashable_id)
+            .expect("hashable leaf item");
+        let non_hashable_item = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == non_hashable_id)
+            .expect("non-hashable leaf item");
+
+        assert!(
+            hashable_item.reflect_opaque_leaf,
+            "a generated type used as a reflected HashSet element must be flagged reflect-opaque"
+        );
+        assert!(
+            !non_hashable_item.reflect_opaque_leaf,
+            "a generated type used only in a reflect-ignored HashSet must not be flagged reflect-opaque"
+        );
+    }
+
     #[test]
     fn plans_ranged_integer_metadata_with_core_range_type() {
         let model = SerializeContextModel::from_root(&json!({
@@ -2918,6 +3435,185 @@ pub struct ExternalPayload;
             Some("GatherableCondition")
         );
         assert!(condition.variants[1].payload_has_materialized_fields);
+    }
+
+    #[test]
+    fn plans_azstd_any_as_scalar_payload_sum_enum() {
+        let owner_id = uuid!("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA");
+        let any_id = AZSTD_ANY_TYPE_ID;
+
+        // `serialize.json:330877` records `any` with **no** `isAbstract` key at
+        // all, so the real item carries `is_abstract: None`. That is load
+        // bearing: `rust_identity_for_struct` selects `AzRtti` whenever
+        // `is_abstract.is_some()`, and `facet_item`'s `Some(false)` would flip
+        // the identity -- and therefore the identity derive -- to a kind the
+        // real type does not have. The emitted `any.rs` is
+        // `#[az_type_info(name = "any", ...)]`, which is only reachable from
+        // `None`.
+        let mut any_item = facet_item(any_id, "any", ReflectedTypeRole::SupportType, Vec::new());
+        any_item.is_abstract = None;
+
+        let unit = SerializeCodegenUnit {
+            items: vec![
+                facet_item(
+                    owner_id,
+                    "BehaviorParameter",
+                    ReflectedTypeRole::SupportType,
+                    vec![member_field("Storage", any_id, "any")],
+                ),
+                any_item,
+            ],
+        };
+
+        let rust_unit = RustCodegenPlanner::default()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
+        let any = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == any_id)
+            .expect("any plan");
+
+        assert_eq!(any.kind, RustItemKind::SumEnum);
+
+        // The empty case has to be payload-less: it is what a JSON `null`
+        // decodes to, and `null` is what 132,104 corpus sites emit.
+        assert_eq!(any.variants[0].rust_name, AZSTD_ANY_EMPTY_VARIANT);
+        assert!(any.variants[0].payload_type.is_none());
+
+        // The wire key is what separates these from spread struct-payload arms.
+        // Without it the materialized arm runs `from_value::<f32>` over an
+        // object and always fails, and the non-materialized arm drains the map
+        // and returns a default -- the silent drop this change exists to fix.
+        let payloads = any.variants[1..]
+            .iter()
+            .map(|variant| {
+                (
+                    variant.rust_name.as_str(),
+                    variant.payload_type.as_deref(),
+                    variant.payload_key.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            payloads,
+            vec![
+                ("Float", Some("f32"), Some("m_data")),
+                ("S32", Some("i32"), Some("m_data")),
+            ]
+        );
+
+        // Losing either of these is a compile break at the referrer, not a
+        // derive narrowing: `BehaviorParameter` derives `Marshaler` over a
+        // `storage: Any` field. `plan_sum_enum_derives` drops both, which is
+        // why this path does not use it.
+        assert!(any.derives.contains(&"Marshaler".to_owned()));
+        assert!(any.derives.contains(&"Default".to_owned()));
+        // The identity derive must survive whatever the identity kind is, and
+        // for `any` that kind is `AzTypeInfo` -- asserting both means a future
+        // change to `rust_identity_for_struct` fails here loudly instead of
+        // silently emitting an item whose derive and attribute disagree.
+        assert_eq!(any.identity.kind, RustTypeIdentityKind::AzTypeInfo);
+        assert!(
+            any.derives
+                .contains(&any.identity.kind.integrated_derive_name().to_owned())
+        );
+
+        // `f32` is not `Eq`/`Ord`/`Hash`, so `Any` cannot keep them...
+        for derive in ["Eq", "PartialOrd", "Ord", "Hash"] {
+            assert!(
+                !any.derives.contains(&derive.to_owned()),
+                "Any should not derive {derive} over an f32 payload"
+            );
+        }
+        // ...and the referrer cascade has to follow, or the emitted tree does
+        // not compile. `PartialEq` survives, because `f32` has it.
+        let owner = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == owner_id)
+            .expect("owner plan");
+        assert!(owner.derives.contains(&"PartialEq".to_owned()));
+        for derive in ["Eq", "PartialOrd", "Ord", "Hash"] {
+            assert!(
+                !owner.derives.contains(&derive.to_owned()),
+                "BehaviorParameter should not derive {derive} through Any"
+            );
+        }
+    }
+
+    #[test]
+    fn plans_dynamic_serializable_field_as_keyed_payload_sum() {
+        let dynamic_id = DYNAMIC_SERIALIZABLE_FIELD_TYPE_ID;
+        let mut dynamic_item = facet_item(
+            dynamic_id,
+            "DynamicSerializableField",
+            ReflectedTypeRole::SupportType,
+            vec![scalar_member_field(
+                "TypeId",
+                type_ids::AZ_UUID,
+                ScalarType::Uuid,
+            )],
+        );
+        dynamic_item.is_abstract = None;
+        let event_data = facet_item(
+            EVENT_DATA_TYPE_ID,
+            "EventData",
+            ReflectedTypeRole::SupportType,
+            vec![scalar_member_field(
+                "m_applyRecursively",
+                type_ids::BOOL,
+                ScalarType::Bool,
+            )],
+        );
+        let unit = SerializeCodegenUnit {
+            items: vec![dynamic_item, event_data],
+        };
+
+        let rust_unit = RustCodegenPlanner::default()
+            .plan_serialize_codegen_unit(&unit, &crate::CodegenContext::inline());
+        let dynamic = rust_unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == dynamic_id)
+            .expect("DynamicSerializableField plan");
+
+        assert_eq!(dynamic.kind, RustItemKind::SumEnum);
+        assert_eq!(dynamic.variants[0].rust_name, "Empty");
+        assert!(dynamic.variants[0].payload_type.is_none());
+        assert_eq!(
+            dynamic.variants[1..]
+                .iter()
+                .map(|variant| (
+                    variant.rust_name.as_str(),
+                    variant.payload_type.as_deref(),
+                    variant.payload_has_materialized_fields,
+                    variant.payload_key.as_deref(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "EntityId",
+                    Some("::az_core::EntityId"),
+                    false,
+                    Some("m_data")
+                ),
+                ("EventData", Some("EventData"), true, Some("m_data")),
+                ("Vector2", Some("::bevy::math::Vec2"), false, Some("m_data")),
+                ("Vector3", Some("::bevy::math::Vec3"), false, Some("m_data")),
+                (
+                    "Color",
+                    Some("::bevy::color::LinearRgba"),
+                    false,
+                    Some("m_data"),
+                ),
+            ]
+        );
+        for derive in ["Eq", "PartialOrd", "Ord", "Hash"] {
+            assert!(
+                !dynamic.derives.contains(&derive.to_owned()),
+                "dynamic payload floats prevent deriving {derive}"
+            );
+        }
     }
 
     #[test]

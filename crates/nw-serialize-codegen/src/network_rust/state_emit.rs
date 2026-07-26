@@ -1185,7 +1185,10 @@ pub(super) fn replicated_state_field_type_tokens(
             unreachable!("container fields require an explicit ReplicatedContainer type")
         }
         SchemaWireShape::FixedSequence(_) => {
-            unreachable!("fixed-sequence fields require an explicit ArrayVec type")
+            let field_type = rust_field_shape(shape).field_type;
+            let field_type = syn::parse_str::<syn::Type>(&field_type)
+                .expect("fixed-sequence wire shape produces a valid Rust field type");
+            quote!(#field_type)
         }
     }
 }

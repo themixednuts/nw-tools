@@ -336,6 +336,8 @@
         registrationHooksByTypeId.clear();
         registryEntriesByUnmarshal.clear();
         registryEntriesByMarshal.clear();
+        registryEntriesByTypeNameLeaf.clear();
+        indexedRegistryEntries = List.of();
         reflectedMarshalSetIdentityCache.clear();
         reflectedSetRejectCounts.clear();
         reflectedSetRejectSamples = new JsonArray();

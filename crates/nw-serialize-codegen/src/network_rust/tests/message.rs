@@ -322,6 +322,583 @@ fn blocks_messages_with_proven_directional_field_mismatches() {
 }
 
 #[test]
+fn blocks_incomplete_marshal_recovery_as_field_mismatch() {
+    // A marshal walk that stops early recovers a strict prefix of the unmarshal
+    // product. That is incomplete recovery, not agreement: the emitted struct's
+    // wire length would be unproven, so it must block and be fixed upstream in
+    // the extractor's CFG follow-through.
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000001744",
+            "typeIndex": 1744,
+            "typeName": "Aoi::BaseQueryResponseTrait::DebugReceiveGridPhysicsStatsMsg",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "storageOffset": "0x8",
+                "wireShape": "f32",
+                "wireLayout": "fixed-bytes-4",
+                "confidence": "message-unmarshal-pcode-stack"
+            }, {
+                "index": 1,
+                "name": "field_1",
+                "storageOffset": "0xc",
+                "wireShape": "u32",
+                "wireLayout": "fixed-bytes-4",
+                "confidence": "message-unmarshal-pcode-stack"
+            }, {
+                "index": 2,
+                "name": "field_2",
+                "storageOffset": "0x10",
+                "nativeType": "Amazon::Hub::ActorRef",
+                "wireShape": "actor-ref",
+                "confidence": "message-unmarshal-pcode-stack"
+            }],
+            "messageMarshal": {
+                "fields": [{
+                    "index": 0,
+                    "storageOffset": "0x8",
+                    "wireShape": "f32",
+                    "wireLayout": "fixed-bytes-4",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 1,
+                    "storageOffset": "0xc",
+                    "wireShape": "u32",
+                    "wireLayout": "fixed-bytes-4",
+                    "confidence": "message-marshal-pcode-stack"
+                }]
+            }
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+    assert!(!plan.can_generate, "{plan:#?}");
+    assert!(
+        plan.blocked_reasons
+            .iter()
+            .any(|reason| reason == "marshal-unmarshal-field-mismatch"),
+        "{plan:#?}"
+    );
+}
+
+#[test]
+fn blocks_duplicate_unmarshal_stack_store_absent_from_marshal() {
+    // A duplicated SIMD lane store surfacing as a fourth f32 makes the unmarshal
+    // product one scalar longer than marshal. Codegen must not silently drop it:
+    // the extractor dedupes the lane by SSA value identity, so a schema that
+    // still carries the duplicate is stale evidence and has to block.
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000003115",
+            "typeIndex": 3115,
+            "typeName": "BotBrokerTrait::ReceiveHeartbeatResponseMsg",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "storageOffset": "0x8",
+                "wireLayout": "composite<fixed-bytes-16,u64,fixed-bytes-8>",
+                "confidence": "message-unmarshal-call-frame-boundary"
+            }, {
+                "index": 1,
+                "name": "field_1",
+                "storageOffset": "0x40",
+                "wireShape": "f32",
+                "wireShapeSource": "message-unmarshal-pcode-stack-store",
+                "confidence": "message-unmarshal-pcode-stack-store"
+            }, {
+                "index": 2,
+                "name": "field_2",
+                "storageOffset": "0x44",
+                "wireShape": "f32",
+                "wireShapeSource": "message-unmarshal-pcode-stack-store",
+                "confidence": "message-unmarshal-pcode-stack-store"
+            }, {
+                "index": 3,
+                "name": "field_3",
+                "storageOffset": "0x48",
+                "wireShape": "f32",
+                "wireShapeSource": "message-unmarshal-pcode-stack-store",
+                "confidence": "message-unmarshal-pcode-stack-store"
+            }, {
+                "index": 4,
+                "name": "field_4",
+                "storageOffset": "0x4c",
+                "wireShape": "f32",
+                "wireShapeSource": "message-unmarshal-pcode-stack-store",
+                "confidence": "message-unmarshal-pcode-stack-store"
+            }, {
+                "index": 5,
+                "name": "field_5",
+                "storageOffset": "0x50",
+                "wireShape": "string",
+                "confidence": "message-unmarshal-pcode-stack"
+            }],
+            "messageMarshal": {
+                "fields": [{
+                    "index": 0,
+                    "storageOffset": "0x18",
+                    "wireLayout": "fixed-bytes-16",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 1,
+                    "storageOffset": "0x28",
+                    "wireShape": "u64",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 2,
+                    "storageOffset": "0x30",
+                    "wireShape": "u64",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 3,
+                    "storageOffset": "0x40",
+                    "wireShape": "f32",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 4,
+                    "storageOffset": "0x44",
+                    "wireShape": "f32",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 5,
+                    "storageOffset": "0x48",
+                    "wireShape": "f32",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 6,
+                    "storageOffset": "0x50",
+                    "wireShape": "string",
+                    "confidence": "message-marshal-pcode-stack"
+                }]
+            }
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    // Codegen keeps every recovered field; nothing is silently retained or dropped.
+    assert_eq!(schema.types[0].fields.len(), 6);
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+    assert!(!plan.can_generate, "{plan:#?}");
+    assert!(
+        plan.blocked_reasons
+            .iter()
+            .any(|reason| reason == "marshal-unmarshal-field-mismatch"),
+        "{plan:#?}"
+    );
+}
+
+#[test]
+fn generates_heartbeat_response_from_deduped_simd_lane_evidence() {
+    // The same message once the extractor's SSA-identity lane dedupe has run:
+    // three f32 limbs, so both directions expand to the same seven scalars.
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000003115",
+            "typeIndex": 3115,
+            "typeName": "BotBrokerTrait::ReceiveHeartbeatResponseMsg",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "storageOffset": "0x8",
+                "wireLayout": "composite<fixed-bytes-16,u64,fixed-bytes-8>",
+                "confidence": "message-unmarshal-call-frame-boundary"
+            }, {
+                "index": 1,
+                "name": "field_1",
+                "storageOffset": "0x40",
+                "wireShape": "f32",
+                "wireShapeSource": "message-unmarshal-pcode-stack-store",
+                "confidence": "message-unmarshal-pcode-stack-store"
+            }, {
+                "index": 2,
+                "name": "field_2",
+                "storageOffset": "0x44",
+                "wireShape": "f32",
+                "wireShapeSource": "message-unmarshal-pcode-stack-store",
+                "confidence": "message-unmarshal-pcode-stack-store"
+            }, {
+                "index": 3,
+                "name": "field_3",
+                "storageOffset": "0x48",
+                "wireShape": "f32",
+                "wireShapeSource": "message-unmarshal-pcode-stack-store",
+                "confidence": "message-unmarshal-pcode-stack-store"
+            }, {
+                "index": 4,
+                "name": "field_4",
+                "storageOffset": "0x50",
+                "wireShape": "string",
+                "confidence": "message-unmarshal-pcode-stack"
+            }],
+            "messageMarshal": {
+                "fields": [{
+                    "index": 0,
+                    "storageOffset": "0x18",
+                    "wireLayout": "fixed-bytes-16",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 1,
+                    "storageOffset": "0x28",
+                    "wireShape": "u64",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 2,
+                    "storageOffset": "0x30",
+                    "wireShape": "u64",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 3,
+                    "storageOffset": "0x40",
+                    "wireShape": "f32",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 4,
+                    "storageOffset": "0x44",
+                    "wireShape": "f32",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 5,
+                    "storageOffset": "0x48",
+                    "wireShape": "f32",
+                    "confidence": "message-marshal-pcode-stack"
+                }, {
+                    "index": 6,
+                    "storageOffset": "0x50",
+                    "wireShape": "string",
+                    "confidence": "message-marshal-pcode-stack"
+                }]
+            }
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(plan.field_count, 5);
+}
+
+#[test]
+fn accepts_actor_ref_split_across_marshal_limbs() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000000155",
+            "typeIndex": 155,
+            "typeName": "Aoi::PhysicsTrait::UnregisterTerrainChunkMsg",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "storageOffset": "0x8",
+                "nativeType": "Amazon::Hub::ActorRef",
+                "wireShape": "actor-ref",
+                "wireLayout": "composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>",
+                "confidence": "message-unmarshal-pcode-stack-nested-shape"
+            }],
+            "marshalFields": [{
+                "index": 0,
+                "storageOffset": "0x8",
+                "wireShape": "u32",
+                "wireLayout": "fixed-bytes-4",
+                "confidence": "message-marshal-pcode-stack"
+            }, {
+                "index": 1,
+                "storageOffset": "0xc",
+                "wireLayout": "fixed-bytes-16",
+                "confidence": "message-marshal-pcode-stack"
+            }, {
+                "index": 2,
+                "storageOffset": "0x1c",
+                "wireLayout": "fixed-bytes-16",
+                "confidence": "message-marshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert!(
+        !plan
+            .blocked_reasons
+            .iter()
+            .any(|reason| reason == "marshal-unmarshal-field-mismatch")
+    );
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::nw_network::ActorRef")
+    );
+}
+
+#[test]
+fn accepts_vec3_split_across_marshal_limbs() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000001638",
+            "typeIndex": 1638,
+            "typeName": "Aoi::GhostBaseTrait::MovePositionMsg",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "storageOffset": "0x10",
+                "wireShape": "vec3",
+                "wireLayout": "fixed-bytes-12",
+                "confidence": "message-unmarshal-pcode-stack"
+            }, {
+                "index": 1,
+                "name": "field_1",
+                "storageOffset": "0x20",
+                "wireShape": "u64",
+                "wireLayout": "fixed-bytes-8",
+                "confidence": "message-unmarshal-pcode-stack"
+            }],
+            "marshalFields": [{
+                "index": 0,
+                "storageOffset": "0x10",
+                "wireShape": "f32",
+                "wireLayout": "fixed-bytes-4",
+                "confidence": "message-marshal-pcode-stack"
+            }, {
+                "index": 1,
+                "storageOffset": "0x14",
+                "wireShape": "f32",
+                "wireLayout": "fixed-bytes-4",
+                "confidence": "message-marshal-pcode-stack"
+            }, {
+                "index": 2,
+                "storageOffset": "0x18",
+                "wireShape": "f32",
+                "wireLayout": "fixed-bytes-4",
+                "confidence": "message-marshal-pcode-stack"
+            }, {
+                "index": 3,
+                "storageOffset": "0x28",
+                "wireShape": "u64",
+                "wireLayout": "fixed-bytes-8",
+                "confidence": "message-marshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+    assert!(plan.can_generate, "{plan:#?}");
+}
+
+#[test]
+fn accepts_incomplete_unmarshal_as_marshal_product_suffix() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000000250",
+            "typeIndex": 250,
+            "typeName": "Aoi::PhysicsTrait::UnregisterRigidBodyMsg",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "storageOffset": "0x38",
+                "wireShape": "u32",
+                "wireLayout": "fixed-bytes-4",
+                "confidence": "message-unmarshal-pcode-stack"
+            }],
+            "marshalFields": [{
+                "index": 0,
+                "storageOffset": "0x18",
+                "wireLayout": "fixed-bytes-16",
+                "confidence": "message-marshal-pcode-stack"
+            }, {
+                "index": 1,
+                "storageOffset": "0x28",
+                "wireShape": "u64",
+                "wireLayout": "fixed-bytes-8",
+                "confidence": "message-marshal-pcode-stack"
+            }, {
+                "index": 2,
+                "storageOffset": "0x30",
+                "wireShape": "u64",
+                "wireLayout": "fixed-bytes-8",
+                "confidence": "message-marshal-pcode-stack"
+            }, {
+                "index": 3,
+                "storageOffset": "0x38",
+                "wireShape": "u32",
+                "wireLayout": "fixed-bytes-4",
+                "confidence": "message-marshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+    assert!(plan.can_generate, "{plan:#?}");
+}
+
+#[test]
+fn accepts_wire_product_native_with_matching_layout() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000004800",
+            "typeIndex": 4800,
+            "typeName": "Javelin::AI::ClientMessages::HubLocalCacheComponentClientFacet_Receive",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "nativeType": "fixed-vector<composite<u32,u32>,10>",
+                "wireLayout": "vec<composite<fixed-bytes-4,fixed-bytes-4>>",
+                "wireLayoutSource": "cfg-counted-loop+ordered-element-codecs",
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+    assert!(plan.can_generate, "{plan:#?}");
+    assert!(
+        plan.fields[0]
+            .rust_value_type
+            .as_deref()
+            .is_some_and(|value| value.contains("Vec<")),
+        "{plan:#?}"
+    );
+}
+
+#[test]
+fn accepts_boolean_choice_layout_without_native_type() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000000128",
+            "typeIndex": 128,
+            "typeName": "Aoi::PhysicsTrait::QueryWorldRayCastMsg",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "storageExpression": "param_3 + 0x8",
+                "nativeType": "Amazon::Hub::ActorRef",
+                "wireShape": "actor-ref",
+                "wireLayout": "composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>",
+                "confidence": "message-unmarshal-pcode-stack"
+            }, {
+                "index": 1,
+                "name": "field_1",
+                "storageExpression": "param_3 + 0x30",
+                "wireShape": "u32",
+                "confidence": "message-unmarshal-pcode-stack"
+            }, {
+                "index": 2,
+                "name": "field_2",
+                "storageExpression": "param_3 + 0x70",
+                "wireLayout": "composite<fixed-bytes-12,fixed-bytes-12,boolean-choice<default-omitted<fixed-bytes-12,fixed-bytes-12>,u32>,fixed-bytes-4,fixed-bytes-8>",
+                "wireLayoutSource": "unmarshal-cfg-complete-codec-body",
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+    assert!(plan.can_generate, "{plan:#?}");
+    assert!(
+        plan.fields[2]
+            .rust_value_type
+            .as_deref()
+            .is_some_and(|value| value.contains("BooleanChoice")),
+        "{plan:#?}"
+    );
+}
+
+#[test]
+fn accepts_nested_shape_when_layout_uses_fixed_byte_limbs() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "B55B0001-0000-4000-8000-000000001334",
+            "typeIndex": 1334,
+            "typeName": "Javelin::ClientMessages::JavSpectatorCameraComponentServerFacet_OnRequestClientStateInformation",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "nativeType": "ReceivePlayerPositionWithCameraClientMsg",
+                "sourceTypeName": "ReceivePlayerPositionWithCameraClientMsg,Javelin::IPositionReceiver::ReceivePlayerPositionWithCameraClientMsg",
+                "wireLayout": "composite<composite<fixed-bytes-8,fixed-bytes-8>,fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>",
+                "identityProven": true,
+                "nestedTypeShape": {
+                    "typeName": "ReceivePlayerPositionWithCameraClientMsg",
+                    "typeNameFull": "Javelin::IPositionReceiver::ReceivePlayerPositionWithCameraClientMsg",
+                    "identityProven": true,
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "members": [{
+                        "index": 0,
+                        "name": "_0",
+                        "wireShape": "u64",
+                        "wireLayout": "fixed-bytes-8",
+                        "wireOrdinal": 0
+                    }, {
+                        "index": 1,
+                        "name": "_1",
+                        "wireShape": "u64",
+                        "wireLayout": "u64",
+                        "wireOrdinal": 1
+                    }, {
+                        "index": 2,
+                        "name": "_2",
+                        "wireShape": "u32",
+                        "wireLayout": "u32",
+                        "wireOrdinal": 2
+                    }, {
+                        "index": 3,
+                        "name": "_3",
+                        "wireLayout": "fixed-bytes-16",
+                        "wireOrdinal": 3
+                    }, {
+                        "index": 4,
+                        "name": "_4",
+                        "wireLayout": "fixed-bytes-16",
+                        "wireOrdinal": 4
+                    }]
+                },
+                "confidence": "message-unmarshal-pcode-call"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert!(
+        !plan.blocked_reasons.iter().any(|reason| {
+            reason.starts_with("known-layout-missing-semantic-type")
+        }),
+        "{plan:#?}"
+    );
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("ReceivePlayerPositionWithCameraClientMsg")
+    );
+}
+
+#[test]
 fn native_type_names_do_not_infer_message_wire_shapes() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{

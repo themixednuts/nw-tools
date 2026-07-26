@@ -19,6 +19,52 @@
         return result;
     }
 
+    private static final int MARSHAL_LEAF_REACH_MAX_DEPTH = 4;
+
+    /**
+     * Whether this function, or anything it transitively calls, validates as a
+     * marshal leaf on some Win64 argument slot.
+     *
+     * A marshal walk skips calls whose write-buffer slot it cannot prove. That
+     * is correct for calls with nothing to do with the buffer (string size,
+     * allocators, logging) and wrong for a marshal continuation, where it
+     * silently truncates the field list while the walk still reports complete.
+     * This predicate separates the two without naming any function or type.
+     */
+    private boolean functionReachesMarshalLeaf(Function function) {
+        return functionReachesMarshalLeaf(function, new LinkedHashSet<>(), 0);
+    }
+
+    private boolean functionReachesMarshalLeaf(
+        Function function,
+        Set<String> visited,
+        int depth) {
+
+        if (function == null || depth > MARSHAL_LEAF_REACH_MAX_DEPTH ||
+            !visited.add(functionCacheKey("marshal-leaf-reach", function))) {
+            return false;
+        }
+        for (int slot = 1; slot <= 4; slot++) {
+            if (validatedMarshalLeaf(function, "param_" + slot) != null) {
+                return true;
+            }
+        }
+        HighFunction high = highFunction(function);
+        if (high == null) {
+            return false;
+        }
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() == PcodeOp.CALL &&
+                functionReachesMarshalLeaf(
+                    pcodeCallTarget(operation),
+                    visited,
+                    depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private WireShape validatedMarshalLeafUncached(
         Function function,
         String writeBufferParameter) {
@@ -83,7 +129,7 @@
 
         Integer expectedWidth = wireShapeByteWidth(declared.shape());
         if (expectedWidth != null &&
-            hasOnlyFixedRawWrite(function, writeBufferParameter, expectedWidth)) {
+            hasFixedRawWriteCoverage(function, writeBufferParameter, expectedWidth)) {
             return WireShape.semantic(
                 declared.shape(),
                 fixedByteLayout(expectedWidth),
@@ -545,7 +591,16 @@
         return true;
     }
 
-    private boolean hasOnlyFixedRawWrite(
+    /**
+     * Whether the function's fixed raw writes to the buffer cover exactly
+     * {@code expectedWidth} bytes.
+     *
+     * A declared shape is not required to reach the wire in a single write:
+     * component codecs emit one write per component after converting each
+     * (vec2 as 2x4, vec3 as 3x4, quat as 4x4), so the coverage test is the sum
+     * of the widths rather than each write matching the whole shape.
+     */
+    private boolean hasFixedRawWriteCoverage(
         Function function,
         String writeBufferParameter,
         int expectedWidth) {
@@ -554,6 +609,7 @@
         if (high == null) {
             return false;
         }
+        long total = 0;
         boolean found = false;
         for (PcodeOpAST operation : orderedPcodeOps(high)) {
             Integer width = provenVirtualRawWriteLength(
@@ -563,12 +619,13 @@
             if (width == null) {
                 continue;
             }
-            if (width != expectedWidth) {
+            total += width;
+            if (total > expectedWidth) {
                 return false;
             }
             found = true;
         }
-        return found;
+        return found && total == expectedWidth;
     }
 
     private boolean hasVirtualBufferCall(

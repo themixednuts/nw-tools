@@ -13,14 +13,24 @@
             codecs);
         return inserted != null
             ? inserted
-            : countedCollectionIndexedOutput(owner, codecs);
+            : countedCollectionIndexedOutput(
+                owner,
+                high,
+                loop,
+                operations,
+                codecs);
     }
+
     private String countedCollectionIndexedOutput(
         Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
         List<PcodeCodecCall> codecs) {
 
         String readBufferParameter = uniqueReadBufferParameter(owner);
-        if (readBufferParameter == null || codecs == null || codecs.isEmpty()) {
+        if (high == null || loop == null || operations == null ||
+            readBufferParameter == null || codecs == null || codecs.isEmpty()) {
             return null;
         }
         PcodeStorage readBuffer = new PcodeStorage(readBufferParameter, 0L);
@@ -29,8 +39,12 @@
             if (codec == null || codec.operation() == null) {
                 return null;
             }
-            PcodeStorage ownerStorage = sequenceOwnerStorageForElementUnmarshal(
-                codec.operation(),
+            PcodeStorage ownerStorage = countedCollectionCodecOwnerStorage(
+                owner,
+                high,
+                loop,
+                operations,
+                codec,
                 readBuffer);
             String parameter = formalParameterBaseFromStorage(owner, ownerStorage);
             if (!isProvenOutputParameterBase(owner, parameter)) {
@@ -40,6 +54,58 @@
                 return null;
             }
             selected = parameter;
+        }
+        return selected;
+    }
+
+    private PcodeStorage countedCollectionCodecOwnerStorage(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeCodecCall codec,
+        PcodeStorage readBuffer) {
+
+        PcodeOpAST call = codec.operation();
+        PcodeStorage direct = sequenceOwnerStorageForElementUnmarshal(
+            call,
+            readBuffer);
+        if (direct != null) {
+            return direct;
+        }
+
+        Set<PcodeStorage> outputs = scalarCallOutputStorages(
+            call,
+            codec.evidence());
+        if (outputs.size() != 1) {
+            return null;
+        }
+        Integer expectedWidth = codec.evidence() == null
+            ? null
+            : wireShapeByteWidth(codec.evidence().shape);
+        PcodeStorage selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) ||
+                operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3 ||
+                !NetworkSchemaControlFlow.precedes(high, call, operation) ||
+                (expectedWidth != null &&
+                    operation.getInput(2).getSize() != expectedWidth) ||
+                !referencesAnyStorage(operation.getInput(2), outputs)) {
+                continue;
+            }
+            PcodeStorage candidate = vectorOwnerStorageForElementPointer(
+                operation.getInput(1),
+                new LinkedHashSet<>(),
+                0);
+            String parameter = formalParameterBaseFromStorage(owner, candidate);
+            if (!isProvenOutputParameterBase(owner, parameter)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = candidate;
         }
         return selected;
     }

@@ -728,6 +728,7 @@
             plan.rootEvidenceSource = plan.delegatedCodec.evidenceSource;
         }
         if (plan.delegatedCodec == null) {
+            reconcileComposableMessageFieldWireProducts(plan);
             applyMessageConstructorTypeBoundaries(plan, wrapper);
             applyMessageConstructorSpans(plan, wrapper);
         }

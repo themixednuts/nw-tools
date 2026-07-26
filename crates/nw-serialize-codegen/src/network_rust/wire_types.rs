@@ -270,8 +270,25 @@ pub(super) fn rust_field_shape(shape: &SchemaWireShape) -> RustFieldShape {
         SchemaWireShape::ReplicatedContainer(container) => {
             replicated_container_field_shape(*container)
         }
-        SchemaWireShape::FixedSequence(_) => {
-            unreachable!("fixed sequences require their proven handler plan")
+        SchemaWireShape::FixedSequence(sequence) => {
+            // Nested fixed-vector proofs (no handler vtable) emit ArrayVec from
+            // the scalar element + capacity. Top-level RegisterField fixed
+            // sequences still prefer the handler-plan path in field_plan.
+            let element = scalar_rust_type(sequence.element);
+            let value_type =
+                format!("::arrayvec::ArrayVec<{element}, {}>", sequence.capacity);
+            let element_shape = SchemaWireShape::from(sequence.element);
+            let codec = wire_shape_codec_type(&element_shape)
+                .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>"));
+            let field_type = replicated_field_type(&value_type, codec.as_deref());
+            RustFieldShape {
+                value_type,
+                field_type,
+                container_key_type_shape: None,
+                container_embedded_key_type_shapes: Vec::new(),
+                container_value_type_shape: None,
+                container_embedded_value_type_shapes: Vec::new(),
+            }
         }
     }
 }
@@ -337,6 +354,11 @@ pub(super) fn wire_shape_codec_type(shape: &SchemaWireShape) -> Option<String> {
             let key_shape = rust_field_shape(key);
             let value_shape = rust_field_shape(value);
             map_sequence_codec_type(key, value, &key_shape, &value_shape)
+        }
+        SchemaWireShape::FixedSequence(sequence) => {
+            let element_shape = SchemaWireShape::from(sequence.element);
+            wire_shape_codec_type(&element_shape)
+                .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>"))
         }
         _ => None,
     }

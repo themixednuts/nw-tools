@@ -596,14 +596,28 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
             operation.getNumInputs() < 2 || writeBufferParameter == null) {
             return null;
         }
+        PcodeStorage expected = new PcodeStorage(writeBufferParameter, 0L);
         PcodeVirtualDispatch dispatch = pcodeVirtualDispatch(operation.getInput(0));
-        if (dispatch == null || dispatch.objectOffset() != 0L ||
-            dispatch.slotOffset() != 0x40L) {
+        boolean pcodeDispatch = dispatch != null &&
+            dispatch.objectOffset() == 0L &&
+            dispatch.slotOffset() == RAW_WRITE_VTABLE_SLOT;
+        // A p-code dispatch that resolves to some other shape is not evidence
+        // against a raw write: when the receiver is staged through the stack the
+        // path roots at "stack" with a non-zero object offset, which is a
+        // failure to see through the staging rather than a different method.
+        // The instruction proof is independent and discriminates on the same
+        // two facts, including the object offset — a vtable loaded from
+        // receiver+N records a dependency on receiver+N, not receiver+0.
+        if (!pcodeDispatch && !instructionVirtualDispatchOnReceiver(
+                owner,
+                operation,
+                expected,
+                RAW_WRITE_VTABLE_SLOT)) {
             return null;
         }
 
-        PcodeStorage expected = new PcodeStorage(writeBufferParameter, 0L);
-        boolean pcodeReceiver = dispatch.root().isStorage(writeBufferParameter);
+        boolean pcodeReceiver = pcodeDispatch &&
+            dispatch.root().isStorage(writeBufferParameter);
         Integer abiSlot = instructionAbiCallArgumentSlot(
             owner,
             operation,
@@ -940,48 +954,4 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
             phi,
             seen,
             depth + 1);
-    }
-
-    private boolean pcodeNodeDependsOn(
-        Varnode node,
-        Varnode expected,
-        Set<String> seen,
-        int depth) {
-
-        if (node == null || expected == null || depth > 48) {
-            return false;
-        }
-        if (sameVarnodeIdentity(node, expected)) {
-            return true;
-        }
-        if (!seen.add(pcodeNodeKey(node))) {
-            return false;
-        }
-        PcodeOp definition = node.getDef();
-        if (definition == null || definition.getOpcode() == PcodeOp.CALL ||
-            definition.getOpcode() == PcodeOp.CALLIND) {
-            return false;
-        }
-        int inputs = definition.getOpcode() == PcodeOp.INDIRECT
-            ? Math.min(1, definition.getNumInputs())
-            : definition.getNumInputs();
-        for (int slot = 0; slot < inputs; slot++) {
-            Varnode input = definition.getInput(slot);
-            if (input != null && !input.isConstant() && pcodeNodeDependsOn(
-                input,
-                expected,
-                seen,
-                depth + 1)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean transparentPcodeDefinition(PcodeOp definition) {
-        return definition != null && definition.getNumInputs() > 0 && switch (definition.getOpcode()) {
-            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INDIRECT,
-                PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT, PcodeOp.SUBPIECE -> true;
-            default -> false;
-        };
     }

@@ -80,10 +80,30 @@
             addMessageFieldTypeEvidence(field, nativeType, source, targetName, targetKind);
             field.sourceTypeName = appendDistinctType(field.sourceTypeName, field.nativeType);
             field.sourceTypeName = appendDistinctType(field.sourceTypeName, nativeType);
+            // Successive helpers writing the same message storage compose into
+            // one nested value. Keep prior wire evidence so applyWireEvidence
+            // can build an ordered product instead of wiping to the later helper.
+            if (isComposableMessageWireNativeType(field.nativeType) &&
+                isComposableMessageWireNativeType(nativeType)) {
+                field.nativeType = "composite";
+                field.confidence = source;
+                return;
+            }
             field.nativeType = "composite";
             field.typeConflict = true;
             restoreNestedTypeWireShape(field, source);
         }
+    }
+
+    private boolean isComposableMessageWireNativeType(String nativeType) {
+        if (nativeType == null || nativeType.isEmpty() ||
+            "composite".equals(nativeType)) {
+            return false;
+        }
+        String shape = firstNonEmpty(
+            wireShapeFromNativeType(nativeType),
+            canonicalLayoutWireShape(nativeType));
+        return shape != null && !shape.isEmpty();
     }
 
     private void restoreNestedTypeWireShape(FieldCall field, String source) {

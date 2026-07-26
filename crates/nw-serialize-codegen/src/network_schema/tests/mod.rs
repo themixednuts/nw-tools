@@ -12,6 +12,118 @@ mod merge;
 mod message_alignment;
 
 #[test]
+fn collapses_alternate_spelling_multi_helper_wire_products() {
+    use crate::network_schema::parse::collapse_alternate_spelling_wire_product;
+
+    assert_eq!(
+        collapse_alternate_spelling_wire_product(
+            "composite<composite<fixed-bytes-8,u64,u8>,composite<u64,u64,u8>>",
+            None,
+        ),
+        Some("composite<u64,u64,u8>")
+    );
+    assert_eq!(
+        collapse_alternate_spelling_wire_product(
+            "composite<composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>,actor-ref>",
+            None,
+        ),
+        Some("actor-ref")
+    );
+    // Distinct successive helpers must stay composed (FilterChat GameChatMessage).
+    assert_eq!(
+        collapse_alternate_spelling_wire_product(
+            "composite<vec<composite<fixed-bytes-4,fixed-bytes-2>>,composite<fixed-bytes-4,string>>",
+            None,
+        ),
+        None
+    );
+    // Trailing limb already present as the leading limb of the inner product.
+    // Requires nested-shape agreement so unrelated composite<field,same-type>
+    // products stay intact.
+    let nested = nested_shape_from_layouts(&[
+        "fixed-bytes-8",
+        "composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>",
+        "entity-ref",
+        "composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>",
+        "string",
+    ]);
+    assert_eq!(
+        collapse_alternate_spelling_wire_product(
+            "composite<composite<fixed-bytes-8,composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>,entity-ref,composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>,string>,fixed-bytes-8>",
+            Some(&nested),
+        ),
+        Some(
+            "composite<fixed-bytes-8,composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>,entity-ref,composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>,string>"
+        )
+    );
+    assert_eq!(
+        collapse_alternate_spelling_wire_product(
+            "composite<composite<fixed-bytes-8,string>,fixed-bytes-8>",
+            None,
+        ),
+        None
+    );
+}
+
+fn nested_shape_from_layouts(layouts: &[&str]) -> crate::network_schema::NetworkNestedTypeShape {
+    crate::network_schema::NetworkNestedTypeShape {
+        type_id: None,
+        type_id_source: None,
+        identity_proven: None,
+        identity_source: None,
+        type_name: None,
+        type_name_full: None,
+        type_name_source: None,
+        function: None,
+        function_name: None,
+        factory: None,
+        az_rtti_address: None,
+        constructor: None,
+        vtable: None,
+        member_base: None,
+        member_name_source: None,
+        member_names_proven: None,
+        layout_proven: None,
+        member_coverage_proven: None,
+        wire_order_proven: None,
+        wire_order_source: None,
+        datatype_path: None,
+        validation: None,
+        native_size: None,
+        native_size_source: None,
+        members: layouts
+            .iter()
+            .enumerate()
+            .map(|(index, layout)| crate::network_schema::NetworkNestedTypeMember {
+                index: Some(index as u32),
+                offset: None,
+                native_offset: None,
+                name: None,
+                name_source: None,
+                name_proven: None,
+                name_evidence: None,
+                native_type: None,
+                type_id: None,
+                type_id_source: None,
+                type_identity_proven: false,
+                type_identity_source: None,
+                wire_shape: None,
+                wire_shape_source: None,
+                wire_layout: Some((*layout).to_owned()),
+                wire_layout_source: None,
+                byte_width: None,
+                wire_ordinal: None,
+                wire_order_source: None,
+                callsite: None,
+                target: None,
+                target_name: None,
+                type_conflict: false,
+            })
+            .collect(),
+    }
+}
+
+#[test]
 fn parses_nested_collection_member_wire_shapes() {
     use crate::network_schema::parse::nested_member_wire_shapes;
 

@@ -1,7 +1,11 @@
     private void indexRegistryHandlerEntries(List<RegistryEntry> registry) {
         registryEntriesByUnmarshal.clear();
         registryEntriesByMarshal.clear();
-        for (RegistryEntry entry : registry) {
+        registryEntriesByTypeNameLeaf.clear();
+        indexedRegistryEntries = registry == null
+            ? List.of()
+            : Collections.unmodifiableList(new ArrayList<>(registry));
+        for (RegistryEntry entry : indexedRegistryEntries) {
             Function unmarshal = functionAtOrContaining(parseCapturedAddress(entry.unmarshal));
             if (unmarshal != null) {
                 registryEntriesByUnmarshal
@@ -18,7 +22,33 @@
                         ignored -> new ArrayList<>())
                     .add(entry);
             }
+            for (String leaf : registryEntryTypeNameLeaves(entry)) {
+                registryEntriesByTypeNameLeaf
+                    .computeIfAbsent(leaf, ignored -> new ArrayList<>())
+                    .add(entry);
+            }
         }
+    }
+
+    private List<String> registryEntryTypeNameLeaves(RegistryEntry entry) {
+        if (entry == null) {
+            return List.of();
+        }
+        LinkedHashSet<String> leaves = new LinkedHashSet<>();
+        String leaf = NetworkSchemaText.sourceTypeLeaf(entry.name);
+        if (isPlausibleTypeName(leaf)) {
+            leaves.add(leaf);
+        }
+        return new ArrayList<>(leaves);
+    }
+
+    private RegistryEntry uniqueRegistryEntryForTypeNameLeaf(String typeName) {
+        String leaf = NetworkSchemaText.sourceTypeLeaf(typeName);
+        if (!isPlausibleTypeName(leaf)) {
+            return null;
+        }
+        List<RegistryEntry> entries = registryEntriesByTypeNameLeaf.get(leaf);
+        return entries != null && entries.size() == 1 ? entries.get(0) : null;
     }
 
     private NestedTypeShape registeredHandlerValueShape(

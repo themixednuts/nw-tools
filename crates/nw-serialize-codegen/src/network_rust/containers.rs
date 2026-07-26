@@ -417,7 +417,30 @@ pub(super) fn scalar_shapes_match(
         || matches!(
             (observed, expected),
             (SchemaWireScalarShape::Bool, SchemaWireScalarShape::U8)
+                | (SchemaWireScalarShape::U8, SchemaWireScalarShape::Bool)
         )
+        || fixed_width_scalar_shapes_match(observed, expected)
+}
+
+fn fixed_width_scalar_shapes_match(
+    observed: SchemaWireScalarShape,
+    expected: SchemaWireScalarShape,
+) -> bool {
+    match (fixed_width_scalar_bytes(observed), fixed_width_scalar_bytes(expected)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn fixed_width_scalar_bytes(shape: SchemaWireScalarShape) -> Option<u16> {
+    match shape {
+        SchemaWireScalarShape::Bool | SchemaWireScalarShape::U8 => Some(1),
+        SchemaWireScalarShape::U16 | SchemaWireScalarShape::HalfF32 => Some(2),
+        SchemaWireScalarShape::U32 | SchemaWireScalarShape::F32 => Some(4),
+        SchemaWireScalarShape::U64 | SchemaWireScalarShape::F64 => Some(8),
+        SchemaWireScalarShape::FixedBytes(width) => Some(width),
+        _ => None,
+    }
 }
 
 pub(super) fn container_value_member_shape_span(

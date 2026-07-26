@@ -30,6 +30,36 @@
             return;
         }
 
+        // MSVC spills a register parameter to its home slot (`MOV [RSP+8], RCX`)
+        // and later hands the spilled copy to a continuation helper. The MOV
+        // case below only fires for register destinations, so without this the
+        // store is never recorded — and the matching reload, which
+        // `trackedStackLoadValue` already resolves, finds nothing. Recording it
+        // keeps a parameter's identity across the spill/reload round trip, so a
+        // callee argument still resolves to `param_N` rather than a bare stack
+        // location.
+        // The base register is deliberately not required to be RSP/RBP: MSVC
+        // copies RSP into a scratch register first (`MOV RAX,RSP`) so the home
+        // slots stay addressable after the frame is allocated, then spills via
+        // `MOV [RAX+8],RCX`. stackSlotOffset already resolves any register
+        // holding a tracked stack offset, so deferring to it covers both
+        // spellings and keeps the slot arithmetic in one place.
+        if ("MOV".equals(mnemonic) &&
+            NetworkSchemaX86.registerOperand(instruction, 0) == null) {
+            MemoryReference spillTarget = NetworkSchemaX86.memoryReference(instruction, 0);
+            Integer spillSlot = spillTarget == null
+                ? null
+                : stackSlotOffset(spillTarget, state);
+            if (spillSlot != null) {
+                writeStackValue(
+                    state,
+                    spillSlot,
+                    memoryWriteWidthBits(instruction),
+                    trackedOperandValue(instruction, 1, state));
+                return;
+            }
+        }
+
         String destination = NetworkSchemaX86.registerOperand(instruction, 0);
         if (destination != null) {
             if (("XOR".equals(mnemonic) || "SUB".equals(mnemonic)) &&
@@ -459,12 +489,12 @@
         int operandIndex,
         ForwardArgState state) {
 
+        // Mirrors the spill side: the base register need not literally be
+        // RSP/RBP, since MSVC reloads home slots through a scratch register
+        // holding a copy of the frame pointer. stackSlotOffset resolves any
+        // register carrying a tracked stack offset.
         MemoryReference memory = NetworkSchemaX86.memoryReference(instruction, operandIndex);
-        if (memory == null || !isStackRegister(memory.baseRegister)) {
-            return null;
-        }
-
-        Integer stackSlot = stackSlotOffset(memory, state);
+        Integer stackSlot = memory == null ? null : stackSlotOffset(memory, state);
         TrackedValue value = stackSlot == null ? null : state.valuesByStackSlot.get(stackSlot);
         return value == null ? null : value.copy();
     }
@@ -578,9 +608,23 @@
 
         int byteWidth = byteWidth(widthBits);
         invalidateStackRange(state, stackSlot, byteWidth);
-        if (byteWidth == 8 && source != null) {
+        if (source == null) {
+            return;
+        }
+        // Full-width stores are the pointer spills the Win64 argument reader
+        // consumes. Narrower stores are kept only when the value carries a
+        // provable origin: a scalar staged into a stack temporary ahead of a
+        // by-pointer codec call still has to resolve back to the storage it was
+        // loaded from. Untracked narrow stores stay dropped, so argument slots
+        // are never populated with values that prove nothing.
+        if (byteWidth == 8 || hasProvableOrigin(source)) {
             state.valuesByStackSlot.put(stackSlot, source.copy());
         }
+    }
+
+    private boolean hasProvableOrigin(TrackedValue value) {
+        return value != null &&
+            (value.baseKey != null || !value.storageDependencies.isEmpty());
     }
 
     private int byteWidth(Integer widthBits) {

@@ -1,0 +1,98 @@
+    private void observeForwardInstruction(
+        Instruction instruction,
+        ForwardArgState state,
+        boolean observeConstructors) {
+
+        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+        if (mnemonic == null) {
+            return;
+        }
+
+        if ("PUSH".equals(mnemonic)) {
+            TrackedValue source = trackedOperandValue(instruction, 0, state);
+            adjustTrackedRegister(state, "RSP", -8);
+            Integer stackSlot = stackRegisterOffset(state, "RSP");
+            if (stackSlot != null) {
+                writeStackValue(state, stackSlot, 64, source);
+            }
+            return;
+        }
+
+        if ("POP".equals(mnemonic)) {
+            Integer stackSlot = stackRegisterOffset(state, "RSP");
+            TrackedValue value = stackSlot == null ? null : state.valuesByStackSlot.get(stackSlot);
+            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+            if (destination != null) {
+                putOrRemove(state.registers, destination, value == null ? null : value.copy());
+            }
+            if (stackSlot != null) {
+                invalidateStackRange(state, stackSlot, 8);
+            }
+            adjustTrackedRegister(state, "RSP", 8);
+            return;
+        }
+
+        if (instruction.getFlowType().isCall()) {
+            clearConditionFlags(state);
+            if (isStackProbeCall(instruction)) {
+                state.registers.remove("R10");
+                state.registers.remove("R11");
+                return;
+            }
+
+            if (!observeConstructors) {
+                boolean addFilterGroupCall = isAddFilterGroupCall(instruction, state);
+                // Read the pass-through argument before the call clobbers it.
+                TrackedValue passthrough = callReturnedParameterValue(instruction, state);
+                clearVolatileRegisters(state.registers);
+                clearVolatileAllocatorDispatchRegisters(state);
+                if (addFilterGroupCall) {
+                    state.registers.put(
+                        "RAX",
+                        TrackedValue.immediate(state.nextFilterGroupIndex++));
+                }
+                else if (passthrough != null) {
+                    state.registers.put("RAX", passthrough);
+                }
+                else {
+                    state.registers.put(
+                        "RAX",
+                        TrackedValue.baseOffset(
+                            callResultBaseKey(instruction.getMinAddress()),
+                            0));
+                }
+                return;
+            }
+
+            TrackedValue formattedFieldName = formattedFieldNameCallValue(instruction, state);
+
+            if (isAllocatorCall(instruction, state)) {
+                clearVolatileRegisters(state.registers);
+                clearVolatileAllocatorDispatchRegisters(state);
+                state.registers.put(
+                    "RAX",
+                    TrackedValue.baseOffset(
+                        allocationBaseKey(instruction.getMinAddress()),
+                        0));
+                return;
+            }
+
+            boolean addFilterGroupCall = isAddFilterGroupCall(instruction, state);
+            promoteReplicatedStateConstructorReceiver(instruction, state);
+            observeHandlerConstructorMemsetCall(instruction, state);
+            observeVectorFieldHandlerConstructorCall(instruction, state);
+            observeFieldHandlerConstructorCall(instruction, state);
+            clearVolatileRegisters(state.registers);
+            clearVolatileAllocatorDispatchRegisters(state);
+            if (formattedFieldName != null) {
+                state.registers.put("RAX", formattedFieldName);
+            }
+            if (addFilterGroupCall) {
+                state.registers.put(
+                    "RAX",
+                    TrackedValue.immediate(state.nextFilterGroupIndex++));
+            }
+            return;
+        }
+
+        if ("MUL".equals(mnemonic) || "DIV".equals(mnemonic) || "IDIV".equals(mnemonic) ||

@@ -634,6 +634,19 @@
                 function,
                 outputs);
         }
+        // Whole-helper codec traces are often a coarse prefix of the storage
+        // writes (ActorRequestId as 2x fixed-bytes-8 vs expanded u64/u32 limbs).
+        // Ordered call-frame members with per-member wire evidence are still
+        // enough to promote unique root bindings.
+        String coverageSource = wireSequence == null
+            ? "cfg-counted-collection-complete-buffer-coverage"
+            : "cfg-success-flow+complete-helper-wire-sequence";
+        if (!coverageProven &&
+            hasFullyEvidencedOrderedCallFrameMembers(outputs)) {
+            coverageProven = true;
+            coverageSource =
+                "cfg-call-frame-ordered-members-with-wire-evidence";
+        }
         if (!coverageProven) {
             return;
         }
@@ -641,11 +654,33 @@
             NestedTypeShape shape = output.shape();
             shape.memberCoverageProven = true;
             shape.wireOrderProven = true;
-            shape.wireOrderSource =
-                wireSequence == null
-                    ? "cfg-counted-collection-complete-buffer-coverage"
-                    : "cfg-success-flow+complete-helper-wire-sequence";
+            shape.wireOrderSource = coverageSource;
         }
+    }
+
+    private boolean hasFullyEvidencedOrderedCallFrameMembers(
+        List<MessageCallFrameOutput> outputs) {
+
+        if (outputs == null || outputs.isEmpty()) {
+            return false;
+        }
+        for (MessageCallFrameOutput output : outputs) {
+            NestedTypeShape shape = output == null ? null : output.shape();
+            if (shape == null ||
+                shape.members.isEmpty() ||
+                !Boolean.TRUE.equals(shape.layoutProven) ||
+                !Boolean.TRUE.equals(shape.wireOrderProven)) {
+                return false;
+            }
+            for (NestedTypeMember member : shape.members) {
+                if (member == null ||
+                    member.offset < 0L ||
+                    nestedMemberWireEvidence(member) == null) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     private boolean hasCompleteCountedCollectionCallFrameCoverage(
@@ -959,48 +994,4 @@
             }
         }
         return "unknown";
-    }
-
-    private boolean isCompleteMessageCallFrameOutput(
-        List<NestedTypeMember> members) {
-
-        if (members == null || members.isEmpty() ||
-            members.size() > NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
-            return false;
-        }
-        for (NestedTypeMember member : members) {
-            if (member == null || Boolean.TRUE.equals(member.typeConflict) ||
-                member.offset < 0L || member.wireLayout == null ||
-                member.wireOrdinal == null) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private int compareMessageCallFrameMembers(
-        NestedTypeMember left,
-        NestedTypeMember right,
-        Map<Long, Integer> operationOrder) {
-
-        int order = Integer.compare(
-            messageCallFrameOperationOrder(left, operationOrder),
-            messageCallFrameOperationOrder(right, operationOrder));
-        if (order != 0) {
-            return order;
-        }
-        order = Integer.compare(left.wireOrdinal, right.wireOrdinal);
-        return order != 0 ? order : Long.compare(left.offset, right.offset);
-    }
-
-    private int messageCallFrameOperationOrder(
-        NestedTypeMember member,
-        Map<Long, Integer> operationOrder) {
-
-        if (member == null || member.callsite == null) {
-            return Integer.MAX_VALUE;
-        }
-        return operationOrder.getOrDefault(
-            member.callsite.getOffset(),
-            Integer.MAX_VALUE);
     }

@@ -668,6 +668,7 @@ pub struct ManaComponent;
                 is_base_class: false,
             }],
             variants: Vec::<RustVariantPlan>::new(),
+            reflect_opaque_leaf: false,
         }
     }
 }

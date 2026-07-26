@@ -178,6 +178,12 @@ fn emit_integrated_type_files(
     let known_type_names = standalone_known_type_names(unit, &exports_by_module);
     let register_children_by_module = integrated_register_children_by_module(&layout, &module_tree);
     let prefab_type_paths = integrated_prefab_type_paths(&layout);
+    // Both of these are rendered strings, not parsed syn nodes, because the map
+    // below is parallel and `syn` types are `!Sync` (they hold `proc_macro2`
+    // tokens over `Rc` and the compiler's `proc_macro` bridge). They are parsed
+    // at emit time inside `render_integrated_prefab_type_registry`. Turning
+    // either back into `Vec<syn::Type>` here does not compile.
+    let prefab_arc_types = integrated_prefab_arc_types(&layout)?;
     let tasks = integrated_type_tasks(&layout, &module_tree, &register_children_by_module);
 
     let emitted = context
@@ -197,6 +203,11 @@ fn emit_integrated_type_files(
                 &task.items,
                 if task.module_path.is_empty() {
                     &prefab_type_paths
+                } else {
+                    &[]
+                },
+                if task.module_path.is_empty() {
+                    &prefab_arc_types
                 } else {
                     &[]
                 },
@@ -365,6 +376,7 @@ fn emit_integrated_type_module<'a>(
     register_child_modules: &[String],
     items: &[&RustItemPlan],
     prefab_type_paths: &[String],
+    prefab_arc_types: &[String],
 ) -> Result<String, RustSourceEmitError> {
     let child_modules = child_dirs
         .map(parse_module_ident)
@@ -428,8 +440,11 @@ fn emit_integrated_type_module<'a>(
     if has_register {
         source.push_str(&render_integrated_register(items, register_child_modules)?);
     }
-    if !prefab_type_paths.is_empty() {
-        source.push_str(&render_integrated_prefab_type_registry(prefab_type_paths)?);
+    if !prefab_type_paths.is_empty() || !prefab_arc_types.is_empty() {
+        source.push_str(&render_integrated_prefab_type_registry(
+            prefab_type_paths,
+            prefab_arc_types,
+        )?);
     }
 
     rustfmt_source(&source)
@@ -466,6 +481,54 @@ fn integrated_prefab_type_paths(
             .then_with(|| left_item.source_type_id.cmp(&right_item.source_type_id))
     });
     paths.into_iter().map(|(path, _)| path).collect()
+}
+
+/// The `Arc<T>` registrations `register_prefab_types` owes the offline cook
+/// registry, collected across the whole unit.
+///
+/// Deliberately whole-unit, not per-module, because the two registration
+/// functions have different shapes. `register(app)` is recursive — each module
+/// registers its own items and calls its children — so the per-module Arc list
+/// in [`render_integrated_register`] reaches everything. `register_prefab_types`
+/// is emitted once, at the crate root, and is flat. The root module owns no
+/// items of its own, so a per-module list there would register nothing at all.
+///
+/// Runs the same [`smart_pointer_types_needing_serde_reflect`] predicate the App
+/// path uses rather than reimplementing the collection, so the cook registry and
+/// the runtime registry cannot drift apart — which is the exact defect this
+/// exists to close: the generated code registered these on the App path only,
+/// and the importer never builds an `App`.
+///
+/// The collected types keep the inner name exactly as the field wrote it
+/// (`::bevy::platform::sync::Arc<SlayerScriptDataValue>`), so the emitted
+/// registration only compiles if that name resolves at the crate root. It does:
+/// every generated leaf imports its cross-module types as `crate::<root>::X`, so
+/// the root's re-export surface is global and unambiguous by construction or the
+/// crate would not compile today. If a future name collision ever breaks that,
+/// it breaks as a compile error in generated source, not as a silent skip.
+///
+/// Returns rendered strings rather than `syn::Type`, matching
+/// [`integrated_prefab_type_paths`] — and that is required, not stylistic.
+/// The result is captured by the parallel closure in [`emit_integrated_type_files`],
+/// whose runner demands `Send + Sync`, and `syn::Type` is neither: it can hold a
+/// `proc_macro2::TokenStream`, which wraps the compiler's `!Sync`
+/// `proc_macro::TokenStream`. Parsing happens inside
+/// [`render_integrated_prefab_type_registry`], on the far side of that boundary.
+/// The per-module App path in [`render_integrated_register`] can keep `syn::Type`
+/// precisely because it never crosses it — it is built and consumed inside one task.
+fn integrated_prefab_arc_types(
+    layout: &crate::rust::layout::RustStandaloneTypeLayout<'_>,
+) -> Result<Vec<String>, RustSourceEmitError> {
+    let items = layout
+        .module_groups
+        .values()
+        .chain(layout.file_groups.values())
+        .flat_map(|items| items.iter().copied())
+        .collect::<Vec<_>>();
+    Ok(smart_pointer_types_needing_serde_reflect(&items)?
+        .iter()
+        .map(|ty| quote!(#ty).to_string())
+        .collect())
 }
 
 fn render_module_item_source(
@@ -826,20 +889,135 @@ fn render_integrated_register(
         .filter(|item| can_register_az_rtti(item))
         .map(|item| parse_register_item_ident(item))
         .collect::<Result<Vec<_>, _>>()?;
+    let arc_types = smart_pointer_types_needing_serde_reflect(&items)?;
     let file = syn::parse2::<syn::File>(quote! {
         pub fn register(app: &mut App) {
             #(#child_modules::register(app);)*
             #(app.register_type::<#type_names>();)*
             #(app.register_type_data::<#az_type_info_names, ::az_core::ReflectAzTypeInfo>();)*
             #(app.register_type_data::<#az_rtti_names, ::az_core::ReflectAzRtti>();)*
+            #(app.register_type::<#arc_types>();)*
+            #(app.register_type_data::<#arc_types, ::bevy::reflect::ReflectSerialize>();)*
+            #(app.register_type_data::<#arc_types, ::bevy::reflect::ReflectDeserialize>();)*
         }
     })
     .map_err(RustSourceEmitError::File)?;
     Ok(prettyplease::unparse(&file))
 }
 
+/// Concrete `Arc<T>` types that need their own serde reflect registration.
+///
+/// When a type's `#[reflect(...)]` loses `Serialize`/`Deserialize` to the
+/// vocabulary rule, the az-prefab sparse codec can no longer route through its
+/// serde impl and falls back to reflecting the fields structurally. `Arc<T>` is
+/// reflected **opaque** by bevy — `impl_reflect_opaque!(Arc<T: Send + Sync + ?Sized>(Clone))`
+/// in `bevy_reflect\src\impls\bevy_platform\sync.rs` — so it is neither Struct
+/// nor Enum, the codec declines it, and nothing is registered to encode it.
+/// Reflection exposes no inner value to unwrap, so registering the concrete
+/// `Arc<T>` is the only route.
+///
+/// Both directions are registered deliberately: the decode path has the same
+/// hole, and registering only `Serialize` yields a fix that imports cleanly and
+/// fails on the first read.
+///
+/// This depends on serde's `rc` feature for `impl Serialize for Arc<T>`; the
+/// consuming crate enables it (`newworld-runtime`'s `serde = { …, features = ["rc"] }`).
+/// If that feature is ever dropped these registrations stop compiling.
+///
+/// Keyed on the *shape* — any suppressed item with an `Arc` field — rather than
+/// on the handful of types observed failing, because the rest are latent and
+/// would otherwise surface one import at a time.
+fn smart_pointer_types_needing_serde_reflect(
+    items: &[&RustItemPlan],
+) -> Result<Vec<Type>, RustSourceEmitError> {
+    // Keyed by rendered form so duplicates across fields and items collapse and
+    // the emitted order is deterministic.
+    let mut seen: BTreeMap<String, Type> = BTreeMap::new();
+    for item in items {
+        if super::emits_serde_reflect_data(item) {
+            continue;
+        }
+        for field in &item.fields {
+            if field.reflect_ignore {
+                continue;
+            }
+            // A field type that will not parse would produce broken generated
+            // source anyway, so a parse failure is real signal — error rather
+            // than skipping the field and silently dropping its registrations.
+            let parsed = syn::parse_str::<Type>(&field.rust_type).map_err(|source| {
+                RustSourceEmitError::ItemIdent {
+                    source_name: format!("{}::{}", item.source_name, field.source_name),
+                    identifier: field.rust_type.clone(),
+                    source,
+                }
+            })?;
+            collect_arc_types(&parsed, &mut seen);
+        }
+    }
+    Ok(seen.into_values().collect())
+}
+
+/// Collect every `Arc<...>` appearing anywhere in `ty`.
+///
+/// Walks the parsed type rather than scanning the rendered string, which matters
+/// twice:
+///
+/// * **Exact ident match.** A substring search for `Arc<` also matches a type
+///   named `MyArc<T>`, which is not an `Arc` at all.
+/// * **Every occurrence.** A field typed `HashMap<Arc<A>, Arc<B>>` contributes
+///   *both*; stopping at the first defeats the shape-keying this exists for and
+///   would leave the second latent, surfacing one import at a time.
+///
+/// The matched type is cloned verbatim from the field, so it stays qualified
+/// exactly as written and resolves in the module the field already resolves in.
+fn collect_arc_types(ty: &Type, out: &mut BTreeMap<String, Type>) {
+    match ty {
+        Type::Path(type_path) => {
+            if let Some(last) = type_path.path.segments.last()
+                && last.ident == "Arc"
+                && matches!(last.arguments, PathArguments::AngleBracketed(_))
+            {
+                out.insert(quote!(#ty).to_string(), ty.clone());
+            }
+            if let Some(qself) = &type_path.qself {
+                collect_arc_types(&qself.ty, out);
+            }
+            for segment in &type_path.path.segments {
+                if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                    for arg in &args.args {
+                        if let GenericArgument::Type(inner) = arg {
+                            collect_arc_types(inner, out);
+                        }
+                    }
+                }
+            }
+        }
+        Type::Tuple(tuple) => {
+            for element in &tuple.elems {
+                collect_arc_types(element, out);
+            }
+        }
+        Type::Reference(reference) => collect_arc_types(&reference.elem, out),
+        Type::Slice(slice) => collect_arc_types(&slice.elem, out),
+        Type::Array(array) => collect_arc_types(&array.elem, out),
+        Type::Paren(paren) => collect_arc_types(&paren.elem, out),
+        Type::Group(group) => collect_arc_types(&group.elem, out),
+        _ => {}
+    }
+}
+
+/// Emit the cook-path registry initializer.
+///
+/// The `Arc<T>` block mirrors the tail of [`render_integrated_register`] on
+/// purpose. Both registries need it and neither can be derived from the other:
+/// the runtime reaches these types through an `App`, the importer through a bare
+/// `TypeRegistry`, and registering on only one side is what let 1,066 files fail
+/// at import with the generated code looking correct. `register::<T>()` must
+/// precede the `register_type_data` calls — `TypeRegistry` panics on type data
+/// for an unregistered type.
 fn render_integrated_prefab_type_registry(
     prefab_type_paths: &[String],
+    prefab_arc_types: &[String],
 ) -> Result<String, RustSourceEmitError> {
     let prefab_type_paths = prefab_type_paths
         .iter()
@@ -851,9 +1029,25 @@ fn render_integrated_prefab_type_registry(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // Parsed here rather than by the caller: these cross a `Send + Sync` closure
+    // boundary as strings because `syn::Type` is `!Sync`. See
+    // `integrated_prefab_arc_types`.
+    let prefab_arc_types = prefab_arc_types
+        .iter()
+        .map(|rendered| {
+            syn::parse_str::<Type>(rendered).map_err(|source| RustSourceEmitError::ItemIdent {
+                source_name: format!("prefab-arc:{rendered}"),
+                identifier: rendered.clone(),
+                source,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let file = syn::parse2::<syn::File>(quote! {
         pub fn register_prefab_types(registry: &mut ::bevy::reflect::TypeRegistry) {
             #(registry.register::<#prefab_type_paths>();)*
+            #(registry.register::<#prefab_arc_types>();)*
+            #(registry.register_type_data::<#prefab_arc_types, ::bevy::reflect::ReflectSerialize>();)*
+            #(registry.register_type_data::<#prefab_arc_types, ::bevy::reflect::ReflectDeserialize>();)*
         }
     })
     .map_err(RustSourceEmitError::File)?;
@@ -948,16 +1142,22 @@ fn append_standalone_type_imports(
 
 fn reflected_serde_imports_for_items(items: &[&RustItemPlan]) -> BTreeSet<String> {
     let mut imports = BTreeSet::new();
-    if items
-        .iter()
-        .any(|item| has_derive(item, "Reflect") && has_derive(item, "Serialize"))
-    {
+    // Gated on whether the reflect attribute is actually emitted, not merely on
+    // the serde derive being present. The derive deliberately survives
+    // vocabulary suppression (it still drives the legacy ObjectStream import
+    // path), so keying on the derive alone imports names nothing uses.
+    if items.iter().any(|item| {
+        has_derive(item, "Reflect")
+            && has_derive(item, "Serialize")
+            && super::emits_serde_reflect_data(item)
+    }) {
         imports.insert("ReflectSerialize".to_owned());
     }
-    if items
-        .iter()
-        .any(|item| has_derive(item, "Reflect") && has_derive(item, "Deserialize"))
-    {
+    if items.iter().any(|item| {
+        has_derive(item, "Reflect")
+            && has_derive(item, "Deserialize")
+            && super::emits_serde_reflect_data(item)
+    }) {
         imports.insert("ReflectDeserialize".to_owned());
     }
     imports
@@ -1367,6 +1567,49 @@ mod tests {
     }
 
     #[test]
+    fn collect_arc_types_matches_by_ident_and_finds_every_occurrence() {
+        fn collected(rendered: &str) -> Vec<String> {
+            let ty = syn::parse_str::<Type>(rendered).expect("parses as a type");
+            let mut out = BTreeMap::new();
+            collect_arc_types(&ty, &mut out);
+            out.into_keys().collect()
+        }
+
+        // Every occurrence, not just the first: a map keyed AND valued by Arc
+        // contributes both. Finding only one leaves the other latent.
+        assert_eq!(
+            collected("HashMap<Arc<A>, Arc<B>>"),
+            vec!["Arc < A >".to_owned(), "Arc < B >".to_owned()]
+        );
+        assert_eq!(
+            collected("(Arc<A>, Arc<B>)"),
+            vec!["Arc < A >".to_owned(), "Arc < B >".to_owned()]
+        );
+
+        // Exact ident match: a substring scan for `Arc<` also hits these.
+        assert!(collected("MyArc<Foo>").is_empty());
+        assert!(collected("Arcanum<Foo>").is_empty());
+        // An `Arc` with no generic args is not the smart pointer we register.
+        assert!(collected("Arc").is_empty());
+
+        // Qualification is preserved verbatim so the emitted registration
+        // resolves in the same scope the field does.
+        assert_eq!(
+            collected("Option<::bevy::platform::sync::Arc<Foo>>"),
+            vec![":: bevy :: platform :: sync :: Arc < Foo >".to_owned()]
+        );
+        assert_eq!(collected("Vec<Arc<T>>"), vec!["Arc < T >".to_owned()]);
+        // Nested inside another Arc.
+        assert_eq!(
+            collected("Arc<Vec<Arc<Inner>>>"),
+            vec![
+                "Arc < Inner >".to_owned(),
+                "Arc < Vec < Arc < Inner > > >".to_owned()
+            ]
+        );
+    }
+
+    #[test]
     fn integrated_imports_reflect_serde_type_data_for_reflected_serde_items() {
         let known_type_names = BTreeSet::new();
         let reexported_type_names = BTreeSet::new();
@@ -1419,6 +1662,117 @@ mod tests {
                 "self::zeta::zeta_component::ZetaComponent".to_owned(),
             ]
         );
+    }
+
+    /// An item carrying an `Arc` field the sparse codec cannot reflect through.
+    ///
+    /// The renamed field is load-bearing, not decoration: it is what makes
+    /// `speaks_legacy_serde_vocabulary` true, which drops the item's
+    /// `#[reflect(Serialize, Deserialize)]` and is the whole reason the concrete
+    /// `Arc<T>` needs registering on its own.
+    fn arc_field_item(rust_name: &str, module: &str, arc_field_type: &str) -> RustItemPlan {
+        use crate::rust::item_plan::RustFieldPlan;
+        use uuid::uuid;
+
+        let mut item = rtti_leaf_with_base(rust_name, "SerializeContext::ClassData");
+        item.scope_path = vec![module.to_owned()];
+        // `can_register_type` gates the whole `register(app)` body on this, so
+        // without it the fixture could not observe the App path at all.
+        item.derives = vec!["Reflect".to_owned()];
+        item.fields = vec![RustFieldPlan {
+            source_name: "m_scriptData".to_owned(),
+            rust_name: "script_data".to_owned(),
+            source_type_id: uuid!("33333333-3333-3333-3333-333333333333"),
+            rust_type: arc_field_type.to_owned(),
+            reflect_ignore: false,
+            unresolved_type: None,
+            integer_range: None,
+            data_size: None,
+            offset: None,
+            flags: None,
+            is_base_class: false,
+        }];
+        item
+    }
+
+    #[test]
+    fn integrated_prefab_type_registry_registers_arc_types_from_every_module() {
+        use crate::rust::item_plan::RustCodegenUnit;
+
+        // Both items live in non-root modules, which is the point. The root
+        // module owns no items of its own, so a per-module Arc list — the
+        // shape `register(app)` uses — would emit nothing here at all.
+        let unit = RustCodegenUnit {
+            items: vec![
+                arc_field_item(
+                    "SlayerScriptDataContainer",
+                    "components",
+                    "Option<::bevy::platform::sync::Arc<SlayerScriptDataValue>>",
+                ),
+                arc_field_item(
+                    "ConditionalTutorialStep",
+                    "tutorial_steps",
+                    "::bevy::platform::sync::Arc<TutorialStep>",
+                ),
+            ],
+        };
+
+        let project = emit_integrated_project(&unit, &crate::CodegenContext::inline())
+            .expect("integrated project");
+        let root = &project
+            .files
+            .iter()
+            .find(|file| file.path == "mod.rs")
+            .expect("generated root module")
+            .source;
+        // Compare against emitted text with the formatter's choices normalised
+        // away: prettyplease wraps long turbofish arguments across lines, and
+        // when it wraps it also adds a trailing comma before the closing `>`.
+        // Neither is part of the registration, so fold both out rather than
+        // pinning the assertions to prettyplease's current line-breaking.
+        let normalize = |source: &str| {
+            source
+                .split_whitespace()
+                .collect::<String>()
+                .replace(",>", ">")
+        };
+        let root_compact = normalize(root);
+
+        for rendered in [
+            "::bevy::platform::sync::Arc<SlayerScriptDataValue>",
+            "::bevy::platform::sync::Arc<TutorialStep>",
+        ] {
+            for expected in [
+                format!("registry.register::<{rendered}>()"),
+                format!(
+                    "registry.register_type_data::<{rendered},::bevy::reflect::ReflectSerialize>()"
+                ),
+                format!(
+                    "registry.register_type_data::<{rendered},::bevy::reflect::ReflectDeserialize>()"
+                ),
+            ] {
+                assert!(
+                    root_compact.contains(&expected),
+                    "cook registry is missing `{expected}`:\n{root}"
+                );
+            }
+        }
+
+        // The App path keeps its own copy — this is an addition, not a move.
+        let arc_module = project
+            .files
+            .iter()
+            .find(|file| file.source.contains("pub struct SlayerScriptDataContainer"))
+            .expect("generated arc module");
+        assert!(
+            normalize(&arc_module.source).contains(
+                "app.register_type::<::bevy::platform::sync::Arc<SlayerScriptDataValue>>()"
+            ),
+            "runtime registration was moved instead of duplicated:\n{}",
+            arc_module.source
+        );
+
+        syn::parse_file(root).expect("root source should be parseable Rust");
     }
 
     #[test]
@@ -1496,6 +1850,7 @@ mod tests {
             }],
             fields: Vec::new(),
             variants: Vec::new(),
+            reflect_opaque_leaf: false,
         }
     }
 }

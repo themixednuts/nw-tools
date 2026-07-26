@@ -76,9 +76,21 @@ pub(super) fn message_field_support_tokens(
 ) -> Option<proc_macro2::TokenStream> {
     let shape = field.nested_type_shape.as_ref()?;
     if message_nested_shape_uses_source_type(shape) {
-        return None;
+        // Source-backed nested shapes resolve to `::nw_network::source::…` and
+        // must not emit a duplicate local support type. Exact identities that
+        // fell back to a local support name still need emission below.
+        if field
+            .rust_value_type
+            .as_deref()
+            .is_some_and(|value| value.contains("::"))
+        {
+            return None;
+        }
     }
-    if !shape.has_proven_anonymous_layout() && !shape.has_proven_symbolic_identity() {
+    if !shape.has_proven_anonymous_layout()
+        && !shape.has_proven_symbolic_identity()
+        && !(shape.has_exact_identity() && shape.has_proven_layout())
+    {
         return None;
     }
     let value_type_string = field.rust_value_type.as_deref()?;
@@ -330,8 +342,13 @@ pub(super) fn message_field_type_tokens(shape: &SchemaWireShape) -> proc_macro2:
         SchemaWireShape::ReplicatedContainer(_) => {
             unreachable!("container message fields require an explicit semantic type")
         }
-        SchemaWireShape::FixedSequence(_) => {
-            unreachable!("fixed-sequence message fields require an explicit semantic type")
+        SchemaWireShape::FixedSequence(sequence) => {
+            let element = scalar_rust_type(sequence.element);
+            let element = syn::parse_str::<syn::Type>(&element)
+                .expect("fixed-sequence element produces a valid Rust type");
+            let capacity =
+                syn::LitInt::new(&sequence.capacity.to_string(), proc_macro2::Span::call_site());
+            quote!(::arrayvec::ArrayVec<#element, #capacity>)
         }
     }
 }
@@ -408,7 +425,8 @@ pub(super) fn message_wire_shape_marshal_attr_tokens(
         | SchemaWireShape::BooleanChoice(_)
         | SchemaWireShape::Sequence(_)
         | SchemaWireShape::Map { .. }
-        | SchemaWireShape::Set(_) => {
+        | SchemaWireShape::Set(_)
+        | SchemaWireShape::FixedSequence(_) => {
             let Some(codec) = wire_shape_codec_type(shape) else {
                 return quote! {};
             };

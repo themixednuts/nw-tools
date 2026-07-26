@@ -367,7 +367,9 @@
                 operation,
                 pcodeCallTarget(operation),
                 Collections.emptyMap());
-            if (collection == null) {
+            if (collection == null || collection.count() == null) {
+                // A self-counted helper has no caller-side count to bind a
+                // nested-loop boundary to.
                 continue;
             }
             PcodeOpAST count = uniqueUnmarshalCountProducer(

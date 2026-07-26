@@ -451,14 +451,259 @@
         if (field == null || evidence == null) {
             return;
         }
-        if (evidence.shape != null && field.wireShape == null) {
-            field.wireShape = evidence.shape;
-            field.wireShapeSource = evidence.source;
+        String incoming = firstNonEmpty(evidence.layout, evidence.shape);
+        if (incoming == null) {
+            return;
         }
-        if (evidence.layout != null && field.wireLayout == null) {
-            field.wireLayout = evidence.layout;
-            field.wireLayoutSource = evidence.layoutSource;
+        String existing = firstNonEmpty(field.wireLayout, field.wireShape);
+        if (existing == null) {
+            if (evidence.shape != null) {
+                field.wireShape = evidence.shape;
+                field.wireShapeSource = evidence.source;
+            }
+            if (evidence.layout != null) {
+                field.wireLayout = evidence.layout;
+                field.wireLayoutSource = evidence.layoutSource;
+            }
+            else if (field.wireLayout == null && evidence.shape != null) {
+                field.wireLayout = evidence.shape;
+                field.wireLayoutSource = evidence.source;
+            }
+            return;
         }
+        if (sameCodecProduct(existing, incoming) ||
+            compatibleCodecProducts(existing, incoming)) {
+            // Alternate spellings of the same payload (ActorRequestId as
+            // fixed-bytes-8/u64 limbs vs typed u64s, ActorRef limbs vs actor-ref).
+            // Prefer the richer product; do not concatenate into a false product.
+            if (preferIncomingCodecProduct(existing, incoming)) {
+                if (evidence.shape != null) {
+                    field.wireShape = evidence.shape;
+                    field.wireShapeSource = evidence.source;
+                }
+                else if (evidence.layout != null) {
+                    field.wireShape = evidence.layout;
+                    field.wireShapeSource = evidence.layoutSource;
+                }
+                if (evidence.layout != null) {
+                    field.wireLayout = evidence.layout;
+                    field.wireLayoutSource = evidence.layoutSource;
+                }
+                else if (evidence.shape != null) {
+                    field.wireLayout = evidence.shape;
+                    field.wireLayoutSource = evidence.source;
+                }
+            }
+            else {
+                if (field.wireShape == null && evidence.shape != null) {
+                    field.wireShape = evidence.shape;
+                    field.wireShapeSource = evidence.source;
+                }
+                if (field.wireLayout == null && evidence.layout != null) {
+                    field.wireLayout = evidence.layout;
+                    field.wireLayoutSource = evidence.layoutSource;
+                }
+            }
+            return;
+        }
+        // Same storage, successive helpers: compose an ordered product instead of
+        // first-winning a partial helper body (FilterChat GameChatMessage pattern).
+        String composed = compositeWireShape(List.of(existing, incoming));
+        field.wireLayout = composed;
+        field.wireLayoutSource = "cfg-ordered-multi-helper-wire-product";
+        field.wireShape = composed;
+        field.wireShapeSource = field.wireLayoutSource;
+        field.typeConflict = null;
+        collapseAlternateSpellingWireProduct(field);
+    }
+
+    private void reconcileComposableMessageFieldWireProducts(
+        MessageUnmarshalPlan plan) {
+
+        if (plan == null) {
+            return;
+        }
+        for (FieldCall field : plan.fields) {
+            reconcileComposableMessageFieldWireProduct(field);
+        }
+    }
+
+    private void reconcileComposableMessageFieldWireProduct(FieldCall field) {
+        if (field == null) {
+            return;
+        }
+        collapseAlternateSpellingWireProduct(field);
+        String layout = field.wireLayout;
+        String shape = field.wireShape;
+        if (layout == null || shape == null ||
+            sameCodecProduct(layout, shape) ||
+            compatibleCodecProducts(layout, shape) ||
+            compatibleWireSemantics(layout, shape)) {
+            return;
+        }
+        if (canonicalLayoutWireShape(layout) == null ||
+            canonicalLayoutWireShape(shape) == null) {
+            return;
+        }
+        String composed = compositeWireShape(List.of(layout, shape));
+        field.wireLayout = composed;
+        field.wireLayoutSource = "cfg-ordered-multi-helper-wire-product";
+        field.wireShape = composed;
+        field.wireShapeSource = field.wireLayoutSource;
+        field.typeConflict = null;
+        collapseAlternateSpellingWireProduct(field);
+    }
+
+    private void collapseAlternateSpellingWireProduct(FieldCall field) {
+        if (field == null) {
+            return;
+        }
+        String product = firstNonEmpty(field.wireLayout, field.wireShape);
+        List<String> members = compositeWireShapeMembers(product);
+        if (members == null || members.size() != 2) {
+            return;
+        }
+        String left = members.get(0);
+        String right = members.get(1);
+        String preferred = null;
+        if (compatibleCodecProducts(left, right)) {
+            preferred = preferIncomingCodecProduct(left, right) ? right : left;
+        }
+        else {
+            preferred = collapseRedundantCompositeBoundaryLimb(
+                left,
+                right,
+                field.nestedTypeShape);
+        }
+        if (preferred == null) {
+            return;
+        }
+        field.wireLayout = preferred;
+        field.wireShape = preferred;
+        field.wireLayoutSource = "cfg-multi-helper-alternate-spelling-collapse";
+        field.wireShapeSource = field.wireLayoutSource;
+        field.typeConflict = null;
+    }
+
+    private String collapseRedundantCompositeBoundaryLimb(
+        String left,
+        String right,
+        NestedTypeShape nested) {
+
+        // Nested shape must prove which side is the real product so we do not
+        // collapse legitimate composite<field, same-scalar-type> payloads.
+        List<String> nestedProducts = provenNestedTypeProducts(nested);
+        if (nestedProducts.isEmpty()) {
+            return null;
+        }
+        boolean leftMatches = matchesAnyCodecProduct(left, nestedProducts);
+        boolean rightMatches = matchesAnyCodecProduct(right, nestedProducts);
+        if (leftMatches && !rightMatches && boundaryLimbIsRedundant(left, right)) {
+            return left;
+        }
+        if (rightMatches && !leftMatches && boundaryLimbIsRedundant(right, left)) {
+            return right;
+        }
+        if (leftMatches && rightMatches) {
+            return preferIncomingCodecProduct(left, right) ? right : left;
+        }
+        return null;
+    }
+
+    private boolean boundaryLimbIsRedundant(String product, String limb) {
+        List<String> members = compositeWireShapeMembers(product);
+        if (members == null || members.isEmpty()) {
+            return false;
+        }
+        return compatibleCodecProducts(members.get(0), limb) ||
+            compatibleCodecProducts(members.get(members.size() - 1), limb);
+    }
+
+    private boolean compatibleCodecProducts(String left, String right) {
+        if (left == null || right == null) {
+            return false;
+        }
+        if (sameCodecProduct(left, right) || compatibleWireSemantics(left, right)) {
+            return true;
+        }
+        List<String> leftMembers = compositeWireShapeMembers(left);
+        List<String> rightMembers = compositeWireShapeMembers(right);
+        if (leftMembers != null && rightMembers != null) {
+            if (leftMembers.size() != rightMembers.size()) {
+                return false;
+            }
+            for (int index = 0; index < leftMembers.size(); index++) {
+                if (!compatibleCodecProducts(
+                        leftMembers.get(index),
+                        rightMembers.get(index))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (leftMembers != null) {
+            List<String> expected = semanticMembers(right);
+            return expected != null &&
+                leftMembers.size() == expected.size() &&
+                compatibleCodecProductLists(leftMembers, expected);
+        }
+        if (rightMembers != null) {
+            List<String> expected = semanticMembers(left);
+            return expected != null &&
+                rightMembers.size() == expected.size() &&
+                compatibleCodecProductLists(expected, rightMembers);
+        }
+        return false;
+    }
+
+    private boolean compatibleCodecProductLists(
+        List<String> left,
+        List<String> right) {
+
+        for (int index = 0; index < left.size(); index++) {
+            if (!compatibleCodecProducts(left.get(index), right.get(index))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean preferIncomingCodecProduct(String existing, String incoming) {
+        if (existing == null) {
+            return incoming != null;
+        }
+        if (incoming == null) {
+            return false;
+        }
+        int existingScore = codecProductSemanticScore(existing);
+        int incomingScore = codecProductSemanticScore(incoming);
+        return incomingScore > existingScore;
+    }
+
+    private int codecProductSemanticScore(String product) {
+        if (product == null) {
+            return Integer.MIN_VALUE;
+        }
+        if ("actor-ref".equals(product) || "entity-ref".equals(product)) {
+            return 1_000;
+        }
+        List<String> members = compositeWireShapeMembers(product);
+        if (members == null) {
+            return product.startsWith("fixed-bytes-") ? 0 : 10;
+        }
+        int score = 0;
+        for (String member : members) {
+            score += codecProductSemanticScore(member);
+        }
+        return score;
+    }
+
+    private String composedMessageFieldWireProduct(FieldCall field) {
+        if (field == null) {
+            return null;
+        }
+        reconcileComposableMessageFieldWireProduct(field);
+        return firstNonEmpty(field.wireShape, field.wireLayout);
     }
 
     private String wireShapeFromMarshallerType(String marshallerType) {
@@ -699,97 +944,3 @@
     private void observeForwardInstruction(Instruction instruction, ForwardArgState state) {
         observeForwardInstruction(instruction, state, true);
     }
-
-    private void observeForwardInstruction(
-        Instruction instruction,
-        ForwardArgState state,
-        boolean observeConstructors) {
-
-        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
-        if (mnemonic == null) {
-            return;
-        }
-
-        if ("PUSH".equals(mnemonic)) {
-            TrackedValue source = trackedOperandValue(instruction, 0, state);
-            adjustTrackedRegister(state, "RSP", -8);
-            Integer stackSlot = stackRegisterOffset(state, "RSP");
-            if (stackSlot != null) {
-                writeStackValue(state, stackSlot, 64, source);
-            }
-            return;
-        }
-
-        if ("POP".equals(mnemonic)) {
-            Integer stackSlot = stackRegisterOffset(state, "RSP");
-            TrackedValue value = stackSlot == null ? null : state.valuesByStackSlot.get(stackSlot);
-            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
-            if (destination != null) {
-                putOrRemove(state.registers, destination, value == null ? null : value.copy());
-            }
-            if (stackSlot != null) {
-                invalidateStackRange(state, stackSlot, 8);
-            }
-            adjustTrackedRegister(state, "RSP", 8);
-            return;
-        }
-
-        if (instruction.getFlowType().isCall()) {
-            clearConditionFlags(state);
-            if (isStackProbeCall(instruction)) {
-                state.registers.remove("R10");
-                state.registers.remove("R11");
-                return;
-            }
-
-            if (!observeConstructors) {
-                boolean addFilterGroupCall = isAddFilterGroupCall(instruction, state);
-                clearVolatileRegisters(state.registers);
-                clearVolatileAllocatorDispatchRegisters(state);
-                if (addFilterGroupCall) {
-                    state.registers.put(
-                        "RAX",
-                        TrackedValue.immediate(state.nextFilterGroupIndex++));
-                }
-                else {
-                    state.registers.put(
-                        "RAX",
-                        TrackedValue.baseOffset(
-                            callResultBaseKey(instruction.getMinAddress()),
-                            0));
-                }
-                return;
-            }
-
-            TrackedValue formattedFieldName = formattedFieldNameCallValue(instruction, state);
-
-            if (isAllocatorCall(instruction, state)) {
-                clearVolatileRegisters(state.registers);
-                clearVolatileAllocatorDispatchRegisters(state);
-                state.registers.put(
-                    "RAX",
-                    TrackedValue.baseOffset(
-                        allocationBaseKey(instruction.getMinAddress()),
-                        0));
-                return;
-            }
-
-            boolean addFilterGroupCall = isAddFilterGroupCall(instruction, state);
-            promoteReplicatedStateConstructorReceiver(instruction, state);
-            observeHandlerConstructorMemsetCall(instruction, state);
-            observeVectorFieldHandlerConstructorCall(instruction, state);
-            observeFieldHandlerConstructorCall(instruction, state);
-            clearVolatileRegisters(state.registers);
-            clearVolatileAllocatorDispatchRegisters(state);
-            if (formattedFieldName != null) {
-                state.registers.put("RAX", formattedFieldName);
-            }
-            if (addFilterGroupCall) {
-                state.registers.put(
-                    "RAX",
-                    TrackedValue.immediate(state.nextFilterGroupIndex++));
-            }
-            return;
-        }
-
-        if ("MUL".equals(mnemonic) || "DIV".equals(mnemonic) || "IDIV".equals(mnemonic) ||

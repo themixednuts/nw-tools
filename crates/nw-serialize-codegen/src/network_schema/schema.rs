@@ -82,6 +82,12 @@ impl NetworkSchema {
         let projections = field_handler_projections(&self.field_handler_vtables);
         for network_type in &mut self.types {
             enrich_fields_from_handler_projections(&mut network_type.fields, &projections);
+            for field in &mut network_type.fields {
+                collapse_field_alternate_spelling_wire_products(field);
+            }
+            for field in &mut network_type.marshal_fields {
+                collapse_field_alternate_spelling_wire_products(field);
+            }
         }
         for function in &mut self.field_registration_functions {
             enrich_fields_from_handler_projections(&mut function.fields, &projections);

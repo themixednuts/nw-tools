@@ -589,6 +589,39 @@
             : compositeWireShape(layouts);
     }
 
+    /**
+     * Every proven spelling of a nested shape's product. The semantic variant
+     * demands a wire shape on every member; the layout variant instead demands
+     * proven member coverage and wire order, so a shape whose members only
+     * carry layouts (raw ReadRaw limbs, call-frame callee outputs) still yields
+     * a product. Callers that only need to know which of two candidate products
+     * the nested shape actually proves should match against all spellings.
+     */
+    private List<String> provenNestedTypeProducts(NestedTypeShape shape) {
+        LinkedHashSet<String> products = new LinkedHashSet<>();
+        String semantic = wireShapeFromNestedTypeShape(shape);
+        if (semantic != null) {
+            products.add(semantic);
+        }
+        String layout = wireLayoutFromNestedTypeShape(shape);
+        if (layout != null) {
+            products.add(layout);
+        }
+        return new ArrayList<>(products);
+    }
+
+    private boolean matchesAnyCodecProduct(String product, List<String> candidates) {
+        if (product == null || candidates == null) {
+            return false;
+        }
+        for (String candidate : candidates) {
+            if (compatibleCodecProducts(product, candidate)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private NestedTypeShape recoverNestedDirectTypeShape(
         Function target,
         String nativeType) {

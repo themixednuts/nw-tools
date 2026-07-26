@@ -337,6 +337,8 @@
             case "aabb3d" -> List.of("vec3", "vec3");
             case "mat3" -> List.of("vec3", "vec3", "vec3");
             case "affine3", "transform" -> List.of("vec3", "vec3", "vec3", "vec3");
+            case "actor-ref" ->
+                List.of("fixed-bytes-4", "fixed-bytes-16", "fixed-bytes-16");
             default -> null;
         };
     }
@@ -347,7 +349,17 @@
         }
         List<String> expected = semanticMembers(semantic);
         List<String> observed = compositeWireShapeMembers(decomposition);
-        return expected != null && expected.equals(observed);
+        if (expected == null || observed == null ||
+            expected.size() != observed.size()) {
+            return false;
+        }
+        for (int index = 0; index < expected.size(); index++) {
+            if (!sameCodecProduct(expected.get(index), observed.get(index)) &&
+                !Objects.equals(expected.get(index), observed.get(index))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private boolean reconcileFixedSequenceShape(HandlerWireShapeEvidence evidence) {

@@ -75,14 +75,141 @@
             : (int)slot;
     }
 
+    /**
+     * First Win64 argument slot carrying {@code expected}, searched past the
+     * proven argument count up to {@code maxSlot}. Diagnostic only: it reports
+     * where a value actually sits when slot resolution failed, separating "the
+     * value is beyond the proven arity ceiling" from "it is not an argument at
+     * all". Returns 0 when no slot matches.
+     */
+    private int win64ArgumentSlotHolding(
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        PcodeStorage expected,
+        int maxSlot,
+        boolean matchBaseOnly) {
+
+        if (expected == null) {
+            return 0;
+        }
+        ForwardArgState state = instructionStateBeforeCall(owner, operation, target);
+        if (state == null) {
+            return 0;
+        }
+        for (int argumentSlot = 1; argumentSlot <= maxSlot; argumentSlot++) {
+            PcodeStorage actual = pcodeStorageFromTrackedValue(
+                win64CallArgumentValue(state, argumentSlot));
+            if (actual == null) {
+                continue;
+            }
+            if (matchBaseOnly
+                ? Objects.equals(expected.base, actual.base)
+                : expected.sameLocation(actual)) {
+                return argumentSlot;
+            }
+        }
+        return 0;
+    }
+
+    private boolean hasWin64CallFrameState(
+        Function owner,
+        PcodeOp operation,
+        Function target) {
+
+        return instructionStateBeforeCall(owner, operation, target) != null;
+    }
+
+    /**
+     * Value a direct call hands back when the callee returns one of its own
+     * arguments, read from the caller state before the call clobbers it.
+     *
+     * In-place constructors and `return *this` helpers hand back the very
+     * pointer they were given, so a message instance can reach its codec as a
+     * call result even though it is really a parameter. Recording an opaque
+     * `call-result:` root instead loses that identity, and every field rooted
+     * on it stops resolving.
+     */
+    private TrackedValue callReturnedParameterValue(
+        Instruction instruction,
+        ForwardArgState state) {
+
+        if (instruction == null || state == null) {
+            return null;
+        }
+        Function target = functionAtOrContaining(
+            resolvedCodeTarget(callTarget(instruction)));
+        Integer slot = returnedParameterSlot(target);
+        if (slot == null) {
+            return null;
+        }
+        TrackedValue value = win64CallArgumentValue(state, slot);
+        return value == null ? null : value.copy();
+    }
+
+    /**
+     * Instruction-level proof of `receiver->vtable[slotOffset](...)`, for use
+     * when p-code cannot supply it.
+     *
+     * pcodeVirtualDispatch walks a bounded number of dereferences from an SSA
+     * root, so a receiver reaching the callsite through a spill/reload costs an
+     * extra level and roots at "stack" rather than a parameter. The Win64 frame
+     * still proves the same two facts the p-code path checks: the call goes
+     * indirect through [reg + slotOffset], and reg was loaded from the receiver
+     * itself (offset 0), which is what makes it that object's vtable.
+     */
+    private boolean instructionVirtualDispatchOnReceiver(
+        Function owner,
+        PcodeOp operation,
+        PcodeStorage receiver,
+        int slotOffset) {
+
+        if (owner == null || operation == null || receiver == null ||
+            operation.getSeqnum() == null) {
+            return false;
+        }
+        Instruction instruction = currentProgram.getListing()
+            .getInstructionAt(operation.getSeqnum().getTarget());
+        if (instruction == null) {
+            return false;
+        }
+        MemoryReference slot = NetworkSchemaX86.memoryReference(instruction, 0);
+        if (slot == null || slot.baseRegister == null ||
+            slot.displacement != slotOffset) {
+            return false;
+        }
+        ForwardArgState state = instructionStateBeforeCall(owner, operation, null);
+        TrackedValue vtable = state == null
+            ? null
+            : state.registers.get(slot.baseRegister);
+        if (vtable == null) {
+            return false;
+        }
+        // PcodeStorage does not override equals; compare by location.
+        for (PcodeStorage dependency : vtable.storageDependencies) {
+            if (receiver.sameLocation(dependency)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isArgumentPassingOperation(PcodeOp operation) {
+        if (operation == null) {
+            return false;
+        }
+        int opcode = operation.getOpcode();
+        return opcode == PcodeOp.CALL ||
+            opcode == PcodeOp.CALLIND;
+    }
+
     private ForwardArgState instructionStateBeforeCall(
         Function owner,
         PcodeOp operation,
         Function expectedTarget) {
 
         if (owner == null || operation == null ||
-            (operation.getOpcode() != PcodeOp.CALL &&
-                operation.getOpcode() != PcodeOp.CALLIND) ||
+            !isArgumentPassingOperation(operation) ||
             operation.getSeqnum() == null) {
             return null;
         }
@@ -294,8 +421,7 @@
         int argumentSlot) {
 
         if (owner == null || operation == null ||
-            (operation.getOpcode() != PcodeOp.CALL &&
-                operation.getOpcode() != PcodeOp.CALLIND) ||
+            !isArgumentPassingOperation(operation) ||
             argumentSlot < 1 ||
             argumentSlot > provenCallArgumentCount(operation, target)) {
             return null;
@@ -326,8 +452,7 @@
         int argumentSlot) {
 
         if (owner == null || operation == null ||
-            (operation.getOpcode() != PcodeOp.CALL &&
-                operation.getOpcode() != PcodeOp.CALLIND) ||
+            !isArgumentPassingOperation(operation) ||
             argumentSlot < 1 ||
             argumentSlot > provenCallArgumentCount(operation, target)) {
             return null;
@@ -377,9 +502,18 @@
         int declared = callee == null || callee.getLocalSymbolMap() == null
             ? 0
             : Math.max(0, callee.getLocalSymbolMap().getNumParams());
-        return Math.max(
+        int count = Math.max(
             Math.max(encoded, declared),
             machineRegisterArgumentCount(target));
+        // Callees imported/analyzed as `void`/`unknown` often declare 0 formals
+        // while CALL p-code only encodes the target (or a subset of register
+        // args). Stack-heavy GridMate marshal continuations still pass the write
+        // buffer in RCX — keep the Win64 register frame visible so follow-through
+        // does not skip those helpers (DebugReceiveGridPhysicsStatsMsg pattern).
+        if (declared == 0 && count < 4) {
+            return 4;
+        }
+        return count;
     }
 
     private int machineRegisterArgumentCount(Function function) {

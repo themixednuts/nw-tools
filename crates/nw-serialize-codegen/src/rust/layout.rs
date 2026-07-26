@@ -667,6 +667,7 @@ mod tests {
             rtti_bases: Vec::new(),
             fields: Vec::new(),
             variants: Vec::new(),
+            reflect_opaque_leaf: false,
         }
     }
 

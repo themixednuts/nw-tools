@@ -154,7 +154,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private static final String EXTRACTOR_VERSION =
-        "network-schema-extractor-20260724-skip-unresolved-nonbuffer-calls";
+        "network-schema-extractor-20260726-staged-counted-element-stores";
 
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
@@ -167,6 +167,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private static final int REPLICATED_STATE_ATTRIBUTE_VECTOR_OFFSET = 0x680;
     private static final int VECTOR_CURRENT_POINTER_OFFSET = 0x8;
     private static final int AZ_RTTI_VTABLE_SCAN_SLOTS = 24;
+    /** GridMate WriteBuffer/ReadBuffer vtable slot for the raw byte-range copy. */
+    private static final int RAW_WRITE_VTABLE_SLOT = 0x40;
     private static final int FIELD_HANDLER_SCALAR_VTABLE_SLOTS = 14;
     private static final int FIELD_HANDLER_CONTAINER_VTABLE_SLOTS = 20;
     private static final int FIELD_HANDLER_CONSTRUCTOR_WRITE_SPAN = 0x200;
@@ -383,6 +385,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final Map<String, HookTypeEvidence> registrationHooksByTypeId = new HashMap<>();
     private final Map<String, List<RegistryEntry>> registryEntriesByUnmarshal = new HashMap<>();
     private final Map<String, List<RegistryEntry>> registryEntriesByMarshal = new HashMap<>();
+    private final Map<String, List<RegistryEntry>> registryEntriesByTypeNameLeaf = new HashMap<>();
+    private List<RegistryEntry> indexedRegistryEntries = List.of();
     private final Map<String, Optional<ReflectedSetIdentity>> reflectedMarshalSetIdentityCache =
         new HashMap<>();
     private final Map<String, Integer> reflectedSetRejectCounts = new LinkedHashMap<>();

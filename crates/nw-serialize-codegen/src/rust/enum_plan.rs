@@ -16,6 +16,15 @@ pub struct RustVariantPlan {
     pub discriminant: Option<i32>,
     pub payload_type: Option<String>,
     pub payload_has_materialized_fields: bool,
+    /// JSON key carrying this variant's payload when the wire nests it rather
+    /// than spreading a reflected struct's fields into the tagged object.
+    ///
+    /// Most struct payloads are recovered from the map entries that remain
+    /// after `$type`, because their own fields *are* those entries. Dynamic
+    /// containers such as `AZStd::any` and `DynamicSerializableField` instead
+    /// fabricate an `m_data` child. That key applies equally to scalar and
+    /// structured payloads. `None` means the ordinary spread-struct shape.
+    pub payload_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +50,7 @@ impl RustEnumPlanner {
                     discriminant: variant.value_i32,
                     payload_type: None,
                     payload_has_materialized_fields: false,
+                    payload_key: None,
                 }
             })
             .collect()

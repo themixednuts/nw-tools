@@ -22,7 +22,7 @@
             unmarshal.analysisStatus = "proven-empty";
             unmarshal.emptyWireProven = true;
             unmarshal.emptyWireEvidenceSource =
-                "vptr-only-instance+empty-marshal-cfg+successful-no-read-unmarshal-cfg";
+                "empty-marshal-cfg+successful-no-read-unmarshal-cfg";
             while (unmarshal.rejectedPcodeFields.size() > 0) {
                 unmarshal.rejectedPcodeFields.remove(
                     unmarshal.rejectedPcodeFields.size() - 1);
@@ -36,9 +36,14 @@
         MessageUnmarshalPlan unmarshal,
         MessageMarshalPlan marshal) {
 
-        if (unmarshal.instanceSize == null ||
-            unmarshal.instanceSize.longValue() != Long.BYTES ||
-            marshal == null ||
+        // Instance size is deliberately not required to be vptr-only. It
+        // describes memory layout, not the wire: a message may default-
+        // initialise many members and still marshal none of them, which is
+        // exactly what a constructor-only codec does. The three conditions
+        // below already prove the wire is empty in both directions — marshal
+        // writes nothing, unmarshal reads nothing, and unmarshal still reaches
+        // a success terminal — so the size check only suppressed real proofs.
+        if (marshal == null ||
             !"complete-empty-cfg-stack-flow".equals(marshal.analysisStatus) ||
             !marshal.events.isEmpty() ||
             !marshal.fields.isEmpty()) {

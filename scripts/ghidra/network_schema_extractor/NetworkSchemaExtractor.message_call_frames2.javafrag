@@ -1,0 +1,52 @@
+    private boolean isCompleteMessageCallFrameOutput(
+        List<NestedTypeMember> members) {
+
+        if (members == null || members.isEmpty() ||
+            members.size() > NESTED_DIRECT_TYPE_MEMBER_LIMIT) {
+            return false;
+        }
+        for (NestedTypeMember member : members) {
+            if (member == null || Boolean.TRUE.equals(member.typeConflict) ||
+                member.offset < 0L || member.wireLayout == null ||
+                member.wireOrdinal == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private int compareMessageCallFrameMembers(
+        NestedTypeMember left,
+        NestedTypeMember right,
+        Map<Long, Integer> operationOrder) {
+
+        int order = Integer.compare(
+            messageCallFrameOperationOrder(left, operationOrder),
+            messageCallFrameOperationOrder(right, operationOrder));
+        if (order != 0) {
+            return order;
+        }
+        // Members may arrive before ordinal assignment; nulls sort last so the
+        // incomplete-output gate can reject them without NPE during TimSort.
+        order = Comparator.nullsLast(Integer::compare).compare(
+            left == null ? null : left.wireOrdinal,
+            right == null ? null : right.wireOrdinal);
+        if (order != 0) {
+            return order;
+        }
+        long leftOffset = left == null ? Long.MAX_VALUE : left.offset;
+        long rightOffset = right == null ? Long.MAX_VALUE : right.offset;
+        return Long.compare(leftOffset, rightOffset);
+    }
+
+    private int messageCallFrameOperationOrder(
+        NestedTypeMember member,
+        Map<Long, Integer> operationOrder) {
+
+        if (member == null || member.callsite == null) {
+            return Integer.MAX_VALUE;
+        }
+        return operationOrder.getOrDefault(
+            member.callsite.getOffset(),
+            Integer.MAX_VALUE);
+    }

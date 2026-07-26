@@ -699,12 +699,17 @@ fn render_sum_default_impl(
         return Ok(TokenStream::new());
     };
     let variant_ident = parse_variant_ident(item, variant)?;
-    let payload_ty = parse_variant_payload_type(item, variant)?;
+    let construct = if variant.payload_type.is_some() {
+        let payload_ty = parse_variant_payload_type(item, variant)?;
+        quote!(Self::#variant_ident(<#payload_ty as ::core::default::Default>::default()))
+    } else {
+        quote!(Self::#variant_ident)
+    };
 
     Ok(quote! {
         impl ::core::default::Default for #ident {
             fn default() -> Self {
-                Self::#variant_ident(<#payload_ty as ::core::default::Default>::default())
+                #construct
             }
         }
     })
@@ -745,7 +750,43 @@ fn render_sum_serialize_impl(
         .iter()
         .map(|variant| {
             let variant_ident = parse_variant_ident(item, variant)?;
+            // A payload-less variant is the JSON `null` case: an AZ dynamic
+            // value holding nothing serializes as a bare null, not as a tagged
+            // object, because there is no concrete type to name in `$type`.
+            if variant.payload_type.is_none() {
+                return Ok(quote! {
+                    Self::#variant_ident => {
+                        ::serde::Serializer::serialize_unit(serializer)
+                    }
+                });
+            }
             let payload_ty = parse_variant_payload_type(item, variant)?;
+            // Dynamic containers may nest either a scalar or a reflected
+            // struct under the single fabricated key native reflection
+            // enumerates. The wire plan, not the Rust payload kind, decides.
+            if let Some(payload_key) = &variant.payload_key {
+                let payload_key = LitStr::new(payload_key, Span::call_site());
+                return Ok(quote! {
+                    Self::#variant_ident(payload) => {
+                        let mut fields = ::serde_json::Map::new();
+                        fields.insert(
+                            "$type".to_owned(),
+                            ::serde_json::Value::String(
+                                <#payload_ty as #type_info>::TYPE_ID.to_string(),
+                            ),
+                        );
+                        fields.insert(
+                            #payload_key.to_owned(),
+                            ::serde_json::to_value(payload)
+                                .map_err(::serde::ser::Error::custom)?,
+                        );
+                        ::serde::Serialize::serialize(
+                            &::serde_json::Value::Object(fields),
+                            serializer,
+                        )
+                    }
+                });
+            }
             let (pattern, body) = if variant.payload_has_materialized_fields {
                 (
                     quote! {
@@ -861,9 +902,61 @@ fn render_sum_deserialize_impl(
     let variant_checks = item
         .variants
         .iter()
+        // A payload-less variant carries no concrete type to match `$type`
+        // against; it is reached from `visit_unit` below, not from here.
+        .filter(|variant| variant.payload_type.is_some())
         .map(|variant| {
             let variant_ident = parse_variant_ident(item, variant)?;
             let payload_ty = parse_variant_payload_type(item, variant)?;
+            // A keyed payload is not spread across the remaining map entries.
+            // Read it back from the single fabricated child regardless of
+            // whether the concrete Rust payload is scalar or structured.
+            if let Some(payload_key) = &variant.payload_key {
+                let payload_key = LitStr::new(payload_key, Span::call_site());
+                if variant.payload_has_materialized_fields {
+                    return Ok(quote! {
+                        if type_id == <#payload_ty as #type_info>::TYPE_ID {
+                            let mut payload: ::core::option::Option<::serde_json::Value> = None;
+                            while let Some(key) = map.next_key::<String>()? {
+                                if key == #payload_key {
+                                    payload = Some(map.next_value::<::serde_json::Value>()?);
+                                } else {
+                                    let _ = map.next_value::<::serde::de::IgnoredAny>()?;
+                                }
+                            }
+                            let Some(source) = payload else {
+                                return Err(::serde::de::Error::missing_field(#payload_key));
+                            };
+                            let mut value = ::serde_json::to_value(
+                                <#payload_ty as ::core::default::Default>::default(),
+                            )
+                            .map_err(::serde::de::Error::custom)?;
+                            merge_sum_payload_defaults(&mut value, source);
+                            return ::serde_json::from_value::<#payload_ty>(value)
+                                .map(#ident::#variant_ident)
+                                .map_err(::serde::de::Error::custom);
+                        }
+                    });
+                }
+                return Ok(quote! {
+                    if type_id == <#payload_ty as #type_info>::TYPE_ID {
+                        let mut payload: ::core::option::Option<#payload_ty> = None;
+                        while let Some(key) = map.next_key::<String>()? {
+                            if key == #payload_key {
+                                payload = Some(map.next_value::<#payload_ty>()?);
+                            } else {
+                                let _ = map.next_value::<::serde::de::IgnoredAny>()?;
+                            }
+                        }
+                        match payload {
+                            Some(payload) => return Ok(#ident::#variant_ident(payload)),
+                            None => {
+                                return Err(::serde::de::Error::missing_field(#payload_key));
+                            }
+                        }
+                    }
+                });
+            }
             let decode = if variant.payload_has_materialized_fields {
                 quote! {
                     let source_fields = <::serde_json::Map<String, ::serde_json::Value> as ::serde::Deserialize>::deserialize(
@@ -899,6 +992,41 @@ fn render_sum_deserialize_impl(
         })
         .collect::<Result<Vec<_>, RustSourceEmitError>>()?;
 
+    // An AZ dynamic value holding nothing serializes as `null`, so a sum with a
+    // payload-less variant has to accept a unit as well as a map. `serde_json`
+    // routes `Value::Null` to `visit_unit`, and its `Value` deserializer
+    // forwards `deserialize_map` to `deserialize_any` -- but asking for `any`
+    // is the honest declaration that either shape is valid, and it keeps the
+    // behaviour from depending on that forwarding.
+    let empty_variant = item
+        .variants
+        .iter()
+        .find(|variant| variant.payload_type.is_none());
+    let visit_unit = empty_variant
+        .map(|variant| {
+            let variant_ident = parse_variant_ident(item, variant)?;
+            Ok::<_, RustSourceEmitError>(quote! {
+                fn visit_unit<E>(self) -> ::core::result::Result<Self::Value, E>
+                where
+                    E: ::serde::de::Error,
+                {
+                    Ok(#ident::#variant_ident)
+                }
+            })
+        })
+        .transpose()?;
+    let expecting = if empty_variant.is_some() {
+        "null, or an AZ polymorphic object with a `$type` field"
+    } else {
+        "AZ polymorphic object with a `$type` field"
+    };
+    let expecting = LitStr::new(expecting, Span::call_site());
+    let entry_point = if empty_variant.is_some() {
+        quote!(deserializer.deserialize_any(Visitor))
+    } else {
+        quote!(deserializer.deserialize_map(Visitor))
+    };
+
     Ok(quote! {
         impl<'de> ::serde::Deserialize<'de> for #ident {
             fn deserialize<D>(deserializer: D) -> ::core::result::Result<Self, D::Error>
@@ -914,8 +1042,10 @@ fn render_sum_deserialize_impl(
                         &self,
                         formatter: &mut ::core::fmt::Formatter<'_>,
                     ) -> ::core::fmt::Result {
-                        formatter.write_str("AZ polymorphic object with a `$type` field")
+                        formatter.write_str(#expecting)
                     }
+
+                    #visit_unit
 
                     fn visit_map<A>(self, mut map: A) -> ::core::result::Result<Self::Value, A::Error>
                     where
@@ -947,7 +1077,7 @@ fn render_sum_deserialize_impl(
                     }
                 }
 
-                deserializer.deserialize_map(Visitor)
+                #entry_point
             }
         }
     })
@@ -1107,6 +1237,27 @@ fn uuid_u128_literal(type_id: uuid::Uuid) -> LitInt {
     )
 }
 
+/// A type whose serde impl speaks legacy ObjectStream vocabulary — i.e. any
+/// field emitted with `#[serde(rename = ...)]`. See the vocabulary-ownership
+/// rule documented in [`reflect_attr_for_item`].
+pub(crate) fn speaks_legacy_serde_vocabulary(item: &RustItemPlan) -> bool {
+    item.fields
+        .iter()
+        .any(|field| field.source_name != field.rust_name)
+}
+
+/// Whether this item's emitted `#[reflect(...)]` will actually register serde
+/// reflect type data.
+///
+/// Mirrors the branch structure of [`reflect_attr_for_item`]: opaque hash leaves
+/// and Prefab components register unconditionally, everything else is gated on
+/// vocabulary ownership. These two must agree — when they drifted, 1,598
+/// generated files kept importing `ReflectSerialize`/`ReflectDeserialize` while
+/// no longer emitting the attribute that used them.
+pub(crate) fn emits_serde_reflect_data(item: &RustItemPlan) -> bool {
+    item.reflect_opaque_leaf || item.prefab.is_some() || !speaks_legacy_serde_vocabulary(item)
+}
+
 fn reflect_attr_for_item(item: &RustItemPlan) -> TokenStream {
     let has_component = item
         .derives
@@ -1128,6 +1279,39 @@ fn reflect_attr_for_item(item: &RustItemPlan) -> TokenStream {
         .derives
         .iter()
         .any(|derive| is_serde_derive(derive, "Deserialize"));
+    if item.reflect_opaque_leaf {
+        // This type appears as a `HashSet` element / `HashMap` key, so it must
+        // reflect **opaque** with concrete `Hash`/`PartialEq` — structural
+        // reflection of a hash leaf yields a dynamic aggregate whose
+        // `reflect_hash()` is `None`, panicking `bevy_reflect`'s
+        // `DynamicSet`/`DynamicMap` hashing. See
+        // `RustItemPlan::reflect_opaque_leaf`. The two invariants below make the
+        // opaque routing sound; a violation is a type-graph modeling bug and is a
+        // hard codegen error.
+        assert!(
+            item.derives.iter().any(|derive| derive == "Hash")
+                && item.derives.iter().any(|derive| derive == "Eq"),
+            "type `{}` is used in a HashSet/HashMap hashing position and must \
+             reflect opaque, but it does not derive both `Hash` and `Eq`; opaque \
+             `#[reflect(Hash, PartialEq)]` routes hashing/equality through the \
+             concrete impls and requires them",
+            item.source_name,
+        );
+        assert!(
+            item.prefab.is_none(),
+            "type `{}` is used in a HashSet/HashMap hashing position (opaque \
+             reflection) but is also registered as a Prefab component; a prefab \
+             component reflects structurally and cannot be an opaque hash leaf",
+            item.source_name,
+        );
+        let component = has_component.then(|| quote!(Component,));
+        let serialize = has_serialize.then(|| quote!(, Serialize));
+        let deserialize = has_deserialize.then(|| quote!(, Deserialize));
+        return quote! {
+            #[reflect(opaque)]
+            #[reflect(#component Hash, PartialEq #serialize #deserialize)]
+        };
+    }
     if item.prefab.is_some() {
         return match (has_serialize, has_deserialize) {
             (true, true) => {
@@ -1138,6 +1322,32 @@ fn reflect_attr_for_item(item: &RustItemPlan) -> TokenStream {
             (false, false) => quote!(#[reflect(Component, Default, Prefab)]),
         };
     }
+    // `Serialize`/`Deserialize` reflect registrations are reserved for types
+    // whose serde impl IS the canonical Azoth wire (opaque leaves handled
+    // above). A non-prefab type whose serde impl speaks legacy ObjectStream
+    // vocabulary — any field emitted with `#[serde(rename = ...)]`, see
+    // `render_field_serde_attr` — must not register serde reflect type data:
+    // its canonical reflected encoding is structural (Rust field idents), and
+    // registering `ReflectSerialize` would route the az-prefab sparse codec
+    // through the legacy-named serde wire instead. The serde derive itself
+    // stays for the legacy ObjectStream import path.
+    //
+    // The rule is VOCABULARY OWNERSHIP, not identifier validity. It fires on
+    // *any* rename, including legacy names like `m_scriptName` that would be
+    // perfectly valid RON identifiers, because Azoth RON must read `script_name`
+    // everywhere rather than a mix determined by whether a legacy name happened
+    // to be identifier-safe. Measured on the New World corpus: 1,598 generated
+    // types are suppressed here, of which only ~112 have a legacy name that is
+    // not a valid identifier — so the collateral is deliberate and large.
+    //
+    // Do not "narrow" this to `!is_valid_ron_identifier(source_name)`. That
+    // reintroduces legacy vocabulary for exactly the types it exempts. An
+    // earlier revision of this comment justified the rule on identifier validity
+    // alone, which described roughly 7% of what the code does and read as an
+    // invitation to narrow it.
+    let legacy_serde_vocabulary = speaks_legacy_serde_vocabulary(item);
+    let has_serialize = has_serialize && !legacy_serde_vocabulary;
+    let has_deserialize = has_deserialize && !legacy_serde_vocabulary;
     match (has_component, has_serialize, has_deserialize) {
         (true, true, true) => quote!(#[reflect(Component, Serialize, Deserialize)]),
         (true, true, false) => quote!(#[reflect(Component, Serialize)]),
@@ -1663,6 +1873,7 @@ mod tests {
                     is_base_class: false,
                 }],
                 variants: Vec::new(),
+                reflect_opaque_leaf: false,
             }],
         };
 
@@ -1910,6 +2121,7 @@ mod tests {
                     is_base_class: false,
                 }],
                 variants: Vec::new(),
+                reflect_opaque_leaf: false,
             }],
         };
 
@@ -1977,6 +2189,7 @@ mod tests {
                         discriminant: Some(0),
                         payload_type: None,
                         payload_has_materialized_fields: false,
+                        payload_key: None,
                     },
                     RustVariantPlan {
                         source_name: "Faction1".to_owned(),
@@ -1984,8 +2197,10 @@ mod tests {
                         discriminant: Some(1),
                         payload_type: None,
                         payload_has_materialized_fields: false,
+                        payload_key: None,
                     },
                 ],
+                reflect_opaque_leaf: false,
             }],
         };
 
@@ -2652,6 +2867,7 @@ mod tests {
                         discriminant: None,
                         payload_type: Some("DefaultCondition".to_owned()),
                         payload_has_materialized_fields: false,
+                        payload_key: None,
                     },
                     RustVariantPlan {
                         source_name: "GatherableCondition".to_owned(),
@@ -2659,8 +2875,10 @@ mod tests {
                         discriminant: None,
                         payload_type: Some("GatherableCondition".to_owned()),
                         payload_has_materialized_fields: true,
+                        payload_key: None,
                     },
                 ],
+                reflect_opaque_leaf: false,
             }],
         };
 
@@ -2679,6 +2897,150 @@ mod tests {
         assert!(source.contains("while let Some(_extra)"));
         assert!(!source.contains("unknown_field(&extra"));
         assert!(!source.contains("#[default]"));
+        syn::parse_file(&source).expect("source should be parseable Rust");
+    }
+
+    #[test]
+    fn emits_scalar_payload_sum_enum_with_null_variant_and_keyed_payload() {
+        let any_id = uuid!("03924488-C7F4-4D6D-948B-ABC2D1AE2FD3");
+        let unit = RustCodegenUnit {
+            items: vec![RustItemPlan {
+                source_type_id: any_id,
+                source_name: "any".to_owned(),
+                is_reflected_base: false,
+                is_slot_owner: false,
+                has_layout_family_descendants: false,
+                is_bevy_component: false,
+                file_stem_override: Some("any".to_owned()),
+                scope_path: Vec::new(),
+                family_scope_path: Vec::new(),
+                rust_name: "Any".to_owned(),
+                kind: RustItemKind::SumEnum,
+                identity: RustTypeIdentityPlan::az_type_info(any_id, Some("any".to_owned())),
+                repr: None,
+                raw_conversion: None,
+                prefab: None,
+                derives: vec![
+                    "Debug".to_owned(),
+                    "Default".to_owned(),
+                    "Clone".to_owned(),
+                    "Copy".to_owned(),
+                    "PartialEq".to_owned(),
+                    "Serialize".to_owned(),
+                    "Deserialize".to_owned(),
+                    "Reflect".to_owned(),
+                ],
+                rtti_bases: Vec::new(),
+                fields: Vec::new(),
+                variants: vec![
+                    RustVariantPlan {
+                        source_name: "any".to_owned(),
+                        rust_name: "Empty".to_owned(),
+                        discriminant: None,
+                        payload_type: None,
+                        payload_has_materialized_fields: false,
+                        payload_key: None,
+                    },
+                    RustVariantPlan {
+                        source_name: "f32".to_owned(),
+                        rust_name: "Float".to_owned(),
+                        discriminant: None,
+                        payload_type: Some("f32".to_owned()),
+                        payload_has_materialized_fields: false,
+                        payload_key: Some("m_data".to_owned()),
+                    },
+                ],
+                reflect_opaque_leaf: false,
+            }],
+        };
+
+        let source =
+            RustSourceEmitter::emit_standalone_unit(&unit, &crate::CodegenContext::inline())
+                .expect("scalar payload sum enum source");
+
+        assert!(source.contains("Empty,"));
+        assert!(source.contains("Float(f32),"));
+        // `null` has to reach the empty variant, and the entry point has to ask
+        // for a shape that permits it.
+        assert!(source.contains("fn visit_unit"));
+        assert!(source.contains("deserializer.deserialize_any(Visitor)"));
+        assert!(!source.contains("deserializer.deserialize_map(Visitor)"));
+        // The payload is read back by key, not from the leftover map entries.
+        assert!(source.contains("\"m_data\""));
+        // The struct-payload arms must NOT be used for a scalar: both drop it.
+        assert!(!source.contains("MapAccessDeserializer::new(map)"));
+        assert!(!source.contains("merge_sum_payload_defaults"));
+        // Loud-on-unknown must survive -- an unrecognised payload type id is an
+        // error, never a default.
+        assert!(source.contains("unknown {} concrete type {}"));
+        syn::parse_file(&source).expect("source should be parseable Rust");
+    }
+
+    #[test]
+    fn emits_keyed_struct_payload_with_native_default_merge() {
+        let dynamic_id = uuid!("D761E0C2-A098-497C-B8EB-EA62F5ED896B");
+        let unit = RustCodegenUnit {
+            items: vec![RustItemPlan {
+                source_type_id: dynamic_id,
+                source_name: "DynamicSerializableField".to_owned(),
+                is_reflected_base: false,
+                is_slot_owner: false,
+                has_layout_family_descendants: false,
+                is_bevy_component: false,
+                file_stem_override: Some("dynamic_serializable_field".to_owned()),
+                scope_path: Vec::new(),
+                family_scope_path: Vec::new(),
+                rust_name: "DynamicSerializableField".to_owned(),
+                kind: RustItemKind::SumEnum,
+                identity: RustTypeIdentityPlan::az_type_info(
+                    dynamic_id,
+                    Some("DynamicSerializableField".to_owned()),
+                ),
+                repr: None,
+                raw_conversion: None,
+                prefab: None,
+                derives: vec![
+                    "Debug".to_owned(),
+                    "Default".to_owned(),
+                    "Clone".to_owned(),
+                    "PartialEq".to_owned(),
+                    "Serialize".to_owned(),
+                    "Deserialize".to_owned(),
+                ],
+                rtti_bases: Vec::new(),
+                fields: Vec::new(),
+                variants: vec![
+                    RustVariantPlan {
+                        source_name: "DynamicSerializableField".to_owned(),
+                        rust_name: "Empty".to_owned(),
+                        discriminant: None,
+                        payload_type: None,
+                        payload_has_materialized_fields: false,
+                        payload_key: None,
+                    },
+                    RustVariantPlan {
+                        source_name: "EventData".to_owned(),
+                        rust_name: "EventData".to_owned(),
+                        discriminant: None,
+                        payload_type: Some("EventData".to_owned()),
+                        payload_has_materialized_fields: true,
+                        payload_key: Some("m_data".to_owned()),
+                    },
+                ],
+                reflect_opaque_leaf: false,
+            }],
+        };
+
+        let source =
+            RustSourceEmitter::emit_standalone_unit(&unit, &crate::CodegenContext::inline())
+                .expect("keyed struct payload sum enum source");
+
+        assert!(source.contains("EventData(EventData),"));
+        assert!(source.contains("\"m_data\""));
+        assert!(source.contains("Option<::serde_json::Value>"));
+        assert!(source.contains("merge_sum_payload_defaults(&mut value, source)"));
+        assert!(!source.contains("MapAccessDeserializer::new(map)"));
+        assert!(source.contains("unknown {} concrete type {}"));
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
 
@@ -2865,7 +3227,12 @@ mod tests {
         assert!(!source.contains("base ="));
         assert!(!source.contains("AzTypeRegistration"));
         assert!(source.contains("HealthComponent"));
-        assert!(source.contains("#[reflect(Component, Serialize, Deserialize)]"));
+        // `m_value` renames to `value`, so the item speaks legacy serde
+        // vocabulary and must not register serde reflect type data.
+        let component_reflect_attr = reflect_attr_for_item(component).to_string();
+        assert!(component_reflect_attr.contains("reflect (Component)"));
+        assert!(!component_reflect_attr.contains("Serialize"));
+        assert!(!component_reflect_attr.contains("Deserialize"));
         assert!(source.contains("pub struct HealthComponent"));
         assert!(source.contains("pub value: u32"));
         syn::parse_file(&source).expect("source should be parseable Rust");
@@ -2987,6 +3354,7 @@ mod tests {
                     rtti_bases: Vec::new(),
                     fields: Vec::new(),
                     variants: Vec::new(),
+                    reflect_opaque_leaf: false,
                 },
                 RustItemPlan {
                     source_type_id: opaque_id,
@@ -3016,6 +3384,7 @@ mod tests {
                     rtti_bases: Vec::new(),
                     fields: Vec::new(),
                     variants: Vec::new(),
+                    reflect_opaque_leaf: false,
                 },
             ],
         };
@@ -3091,6 +3460,11 @@ mod tests {
         }));
         let unit =
             RustCodegenPlanner::plan_standalone_model(&model, &crate::CodegenContext::inline());
+        let component = unit
+            .items
+            .iter()
+            .find(|item| item.source_type_id == uuid!("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"))
+            .expect("target component plan");
 
         let source =
             RustSourceEmitter::emit_standalone_unit(&unit, &crate::CodegenContext::inline())
@@ -3114,7 +3488,13 @@ mod tests {
         assert!(source.contains("pub struct AssetId"));
         assert!(source.contains("bevy_ecs::component::Component"));
         assert!(source.contains("bevy_reflect::Reflect"));
-        assert!(source.contains("#[reflect(Component, Serialize, Deserialize)]"));
+        // `m_entity`/`m_asset`/`m_tag`/`m_owner` rename to Rust idents, so the
+        // item speaks legacy serde vocabulary and must not register serde
+        // reflect type data.
+        let component_reflect_attr = reflect_attr_for_item(component).to_string();
+        assert!(component_reflect_attr.contains("reflect (Component)"));
+        assert!(!component_reflect_attr.contains("Serialize"));
+        assert!(!component_reflect_attr.contains("Deserialize"));
         assert!(source.contains("pub entity: u64"));
         assert!(source.contains("pub asset: AzAssetId"));
         assert!(source.contains("pub tag: AzCrc32"));
@@ -3608,6 +3988,7 @@ mod tests {
                     rtti_bases: Vec::new(),
                     fields: Vec::new(),
                     variants: Vec::new(),
+                    reflect_opaque_leaf: false,
                 },
                 RustItemPlan {
                     source_type_id: ref_id,
@@ -3648,6 +4029,7 @@ mod tests {
                     rtti_bases: Vec::new(),
                     fields: Vec::new(),
                     variants: Vec::new(),
+                    reflect_opaque_leaf: false,
                 },
             ],
         };
@@ -3935,6 +4317,7 @@ mod tests {
             rtti_bases: Vec::new(),
             fields: Vec::new(),
             variants: Vec::new(),
+            reflect_opaque_leaf: false,
         }
     }
 
@@ -3978,6 +4361,7 @@ mod tests {
                     is_base_class: false,
                 }],
                 variants: Vec::new(),
+                reflect_opaque_leaf: false,
             }],
         }
     }

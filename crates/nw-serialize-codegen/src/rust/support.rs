@@ -49,6 +49,62 @@ pub trait AzRtti {
 	const TYPE_ID: Uuid;
 	const BASE_TYPE_IDS: &'static [Uuid] = &[];
 }
+
+macro_rules! az_rtti_scalar {
+	($ty:ty, $name:literal, $uuid:literal) => {
+		impl AzRtti for $ty {
+			const NAME: &'static str = $name;
+			const TYPE_ID: Uuid = Uuid::from_u128($uuid);
+		}
+	};
+}
+
+/// Standalone reflected `AZ::EntityId`.
+///
+/// Ordinary generated entity-id fields remain `u64` for compatibility. A
+/// dynamic payload needs its distinct AZ type identity, however, so it uses
+/// this transparent wrapper rather than incorrectly inheriting `u64`'s UUID.
+#[derive(
+	Debug,
+	Clone,
+	Copy,
+	Default,
+	Eq,
+	Hash,
+	Ord,
+	PartialEq,
+	PartialOrd,
+	serde::Serialize,
+	serde::Deserialize,
+	bevy_reflect::Reflect,
+)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct EntityId(pub u64);
+
+// Reflected identities of the primitives, mirroring the `az_type_info!` block in
+// `az-core/src/type_info.rs`. A dynamic sum resolves its payload's `$type`
+// through this trait, so every observed keyed payload needs its identity here
+// just as it does in the integrated backend.
+az_rtti_scalar!(bool, "bool", 0xA0CA880C_AFE4_43CB_926C_59AC48496112);
+az_rtti_scalar!(i8, "s8", 0x58422C0E_1E47_4854_98E6_34098F6FE12D);
+az_rtti_scalar!(i16, "s16", 0xB8A56D56_A10D_4DCE_9F63_405EE243DD3C);
+az_rtti_scalar!(i32, "s32", 0x72039442_EB38_4D42_A1AD_CB68F7E0EEF6);
+az_rtti_scalar!(i64, "s64", 0x70D8A282_A1EA_462D_9D04_51EDE81FAC2F);
+az_rtti_scalar!(u8, "u8", 0x72B9409A_7D1A_4831_9CFE_FCB3FADD3426);
+az_rtti_scalar!(u16, "u16", 0xECA0B403_C4F8_4B86_95FC_81688D046E40);
+az_rtti_scalar!(u32, "u32", 0x43DA906B_7DEF_4CA8_9790_854106D3F983);
+az_rtti_scalar!(u64, "u64", 0xD6597933_47CD_4FC8_B911_63F3E2B0993A);
+az_rtti_scalar!(f32, "float", 0xEA2C3E90_AFBE_44D4_A90D_FAAF79BAF93D);
+az_rtti_scalar!(f64, "double", 0x110C4B14_11A8_4E9D_8638_5051013A56AC);
+az_rtti_scalar!(EntityId, "AZ::EntityId", 0x6383F1D3_BB27_4E6B_A49A_6409B2059EAA);
+az_rtti_scalar!(bevy_math::Vec2, "AZ::Vector2", 0x3D80F623_C85C_4741_90D0_E4E66164E6BF);
+az_rtti_scalar!(bevy_math::Vec3, "AZ::Vector3", 0x8379EB7D_01FA_4538_B64B_A6543B4BE73D);
+az_rtti_scalar!(
+	bevy_color::LinearRgba,
+	"AZ::Color",
+	0x7894072A_9050_4F0F_901B_34B1A0D29417
+);
 "#;
 
 const RUST_UUID_MODULE: &str = r#"
@@ -554,6 +610,21 @@ mod tests {
         assert!(crc.contains("pub struct Crc32(pub u32);"));
         assert!(crc.contains("pub const fn from_str_lower"));
         assert!(crc.contains("0xEDB8_8320"));
+    }
+
+    #[test]
+    fn standalone_rtti_covers_dynamic_payload_identities() {
+        let rtti = rtti_module_source();
+
+        assert!(rtti.contains("pub struct EntityId(pub u64);"));
+        for type_id in [
+            "0x6383F1D3_BB27_4E6B_A49A_6409B2059EAA",
+            "0x3D80F623_C85C_4741_90D0_E4E66164E6BF",
+            "0x8379EB7D_01FA_4538_B64B_A6543B4BE73D",
+            "0x7894072A_9050_4F0F_901B_34B1A0D29417",
+        ] {
+            assert!(rtti.contains(type_id), "missing dynamic identity {type_id}");
+        }
     }
 
     #[test]

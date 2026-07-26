@@ -123,6 +123,14 @@ final class MessageMarshalField {
     JsonObject toJson(NetworkSchemaAddressFormatter addresses) {
         JsonObject object = new JsonObject();
         object.addProperty("index", index);
+        // Marshal fields are recovered positionally, exactly like unmarshal
+        // fields, and neither direction carries a source-level name. Emitting
+        // the same positional name and per-field confidence the unmarshal side
+        // emits is what makes a marshal-only message plannable; without them it
+        // reads as an unnamed, unknown-confidence field even though every
+        // constituent event is structurally proven.
+        NetworkSchemaJson.add(object, "name", "field_" + index);
+        NetworkSchemaJson.add(object, "confidence", "message-marshal-pcode-stack");
         NetworkSchemaJson.addAddress(object, "callsite", callsite, addresses);
         if (storage != null) {
             NetworkSchemaJson.add(object, "storageBase", storage.base);

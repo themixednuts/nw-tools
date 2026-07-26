@@ -29,7 +29,8 @@
             helper,
             "vlq-u32");
         if (callerCountParameter == null) {
-            return null;
+            // The helper may count itself instead of being handed a count.
+            return selfCountedCollectionCall(call, helper, callerParamStorage);
         }
         InterproceduralCollectionHelper shape = interproceduralCollectionHelper(
             helper,
@@ -65,6 +66,62 @@
                 count,
                 shape.storageKind(),
                 shape.wireEvidence());
+    }
+
+    /**
+     * A collection helper that unmarshals its own count.
+     *
+     * The interprocedural path above assumes the caller reads the count and
+     * passes it in, so it looks for a caller-side vlq-u32 producer bound to an
+     * argument. Many helpers instead read the count themselves and bound the
+     * element loop with it, leaving no caller-side producer to find. The
+     * count-bounded loop form those helpers use is already recovered
+     * intra-procedurally by collectionOutputShapesByParameterFromPcode, which
+     * yields the output parameter and the vec<> evidence; all that is missing is
+     * mapping that parameter back onto this call's argument.
+     *
+     * The returned call has no count storage: there is no caller-side count to
+     * point at. Callers that need one must treat null as "not a counted call
+     * they can reason about" rather than dereferencing it.
+     */
+    private InterproceduralCollectionCall selfCountedCollectionCall(
+        PcodeOpAST call,
+        Function helper,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        Map<String, CollectionOutputShape> shapes =
+            collectionOutputShapesByParameterFromPcode(helper);
+        if (shapes.size() != 1) {
+            if (shapes.size() > 1) {
+                recordNestedTypeShapeReject(
+                    "self-counted-collection-output-ambiguous");
+            }
+            return null;
+        }
+        CollectionOutputShape shape = shapes.values().iterator().next();
+        if (shape.wireEvidence == null || shape.storage == null ||
+            shape.storage.offset != 0L) {
+            return null;
+        }
+        Integer slot = formalParameterSlot(shape.storage);
+        if (slot == null || slot >= call.getNumInputs()) {
+            recordNestedTypeShapeReject(
+                "self-counted-collection-owner-parameter-unproven");
+            return null;
+        }
+        PcodeStorage owner = translatedAbsoluteHelperStorage(
+            pcodeStorageExpression(call.getInput(slot)),
+            callerParamStorage);
+        if (owner == null) {
+            recordNestedTypeShapeReject(
+                "self-counted-collection-owner-argument-unresolved");
+            return null;
+        }
+        return new InterproceduralCollectionCall(
+            owner,
+            null,
+            ContainerStorageKind.VECTOR,
+            shape.wireEvidence);
     }
 
     private Integer uniqueCallArgumentProducedByCodec(

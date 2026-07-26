@@ -862,6 +862,18 @@ fn rust_storage_override_for_field(
         return Some("Vec<u8>");
     }
 
+    // New World persists NaN in this Vector3 as the native "no override"
+    // sentinel. Model that semantic state explicitly so generated runtime
+    // types never need to contain or serialize non-finite coordinates.
+    if item.source_name == "MarkerComponentClientFacet"
+        && field.source_name == "m_diegeticPositionOverride"
+    {
+        return Some(match mode {
+            RustCodegenMode::Integrated => "Option<::bevy::math::Vec3>",
+            RustCodegenMode::Standalone => "Option<glam::Vec3>",
+        });
+    }
+
     None
 }
 
@@ -920,6 +932,46 @@ mod tests {
         assert_eq!(
             rust_storage_override_for_field(RustCodegenMode::Integrated, &item, &field),
             Some("Vec<u8>")
+        );
+    }
+
+    #[test]
+    fn marker_diegetic_position_uses_optional_vector_storage() {
+        let item = SerializeCodegenItem {
+            source_type_id: uuid!("68B753AD-51F7-4980-A020-ABF8DB7B4BE7"),
+            source_name: "MarkerComponentClientFacet".to_owned(),
+            role: ReflectedTypeRole::SupportType,
+            is_reflection_marker: false,
+            is_abstract: Some(false),
+            factory: None,
+            rtti_base_chain: Vec::new(),
+            kind: SerializeCodegenItemKind::Struct,
+            enum_underlying_type: None,
+            fields: Vec::new(),
+            variants: Vec::new(),
+        };
+        let field = SerializeCodegenField {
+            source_name: "m_diegeticPositionOverride".to_owned(),
+            source_type_id: uuid!("8379EB7D-01FA-4538-B64B-A6543B4BE73D"),
+            resolved_type: ResolvedType::Named {
+                type_id: uuid!("8379EB7D-01FA-4538-B64B-A6543B4BE73D"),
+                source_name: "Vector3".to_owned(),
+            },
+            data_size: Some(16),
+            offset: Some(2272),
+            flags: None,
+            is_base_class: false,
+            is_pointer: false,
+            is_dynamic_field: false,
+        };
+
+        assert_eq!(
+            rust_storage_override_for_field(RustCodegenMode::Integrated, &item, &field),
+            Some("Option<::bevy::math::Vec3>")
+        );
+        assert_eq!(
+            rust_storage_override_for_field(RustCodegenMode::Standalone, &item, &field),
+            Some("Option<glam::Vec3>")
         );
     }
 

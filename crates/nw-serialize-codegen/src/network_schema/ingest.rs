@@ -170,6 +170,7 @@ pub(super) fn is_plausible_network_field(field: &Map<String, Value>) -> bool {
     }
 
     let has_known_field_type = string_ref(field, "wireShape").is_some()
+        || string_ref(field, "wireLayout").is_some()
         || string_ref(field, "rustType").is_some()
         || string_ref(field, "nativeType").is_some();
     let Some(storage) = string_ref(field, "storageExpression") else {

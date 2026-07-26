@@ -33,6 +33,14 @@ pub struct RustItemPlan {
     pub rtti_bases: Vec<RustRttiBasePlan>,
     pub fields: Vec<RustFieldPlan>,
     pub variants: Vec<RustVariantPlan>,
+    /// This type appears in a hashing collection position — a `HashSet`
+    /// (`unordered_set`) element or `HashMap` (`unordered_map` /
+    /// `unordered_flat_map`) key — so it must reflect **opaque** with
+    /// `#[reflect(Hash, PartialEq)]`. Structural reflection of such a type
+    /// yields a `DynamicStruct`/`DynamicTupleStruct` whose `reflect_hash()` is
+    /// `None`, which panics `bevy_reflect`'s `DynamicSet`/`DynamicMap` hashing.
+    /// Set during planning by position; consumed by the source emitter.
+    pub reflect_opaque_leaf: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

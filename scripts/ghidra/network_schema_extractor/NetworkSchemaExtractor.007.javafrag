@@ -881,7 +881,7 @@
             case "uuid", "vec4", "quat", "aabb2d" -> 16;
             case "vec3" -> 12;
             case "aabb3d" -> 24;
-            case "mat3" -> 36;
+            case "actor-ref", "mat3" -> 36;
             case "transform", "affine3" -> 48;
             default -> null;
         };

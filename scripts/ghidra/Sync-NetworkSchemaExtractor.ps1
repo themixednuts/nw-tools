@@ -45,7 +45,7 @@ $checkedSources = @()
 $checkedSources += $sourceNames | ForEach-Object { Join-Path $SourceDir $_ }
 $checkedSources += $extractorFragments | ForEach-Object { $_.FullName }
 foreach ($path in $checkedSources) {
-    $lineCount = (Get-Content -LiteralPath $path | Measure-Object -Line).Lines
+    $lineCount = (Get-Content -LiteralPath $path).Count
     if ($lineCount -gt $maxSourceLines) {
         throw "Source file exceeds $maxSourceLines lines: $path ($lineCount lines)"
     }

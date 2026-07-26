@@ -12,6 +12,10 @@
                 Collections.emptyMap(),
                 new LinkedHashSet<>());
         if (!sequence.complete()) {
+            // Status is a bounded enum, so this stays safe to leave on for full
+            // runs and says why a marshal wrapper produced no plan at all.
+            recordNestedTypeShapeReject(
+                "message-marshal-sequence-incomplete:" + sequence.status());
             return null;
         }
 
@@ -246,6 +250,49 @@
                         target,
                         writeBuffer);
                     if (bufferSlot == null) {
+                        // Most calls here genuinely do not touch the write buffer
+                        // (string size, allocators, logging) and skipping them is
+                        // correct. But a callee that itself reaches a marshal leaf
+                        // is a continuation whose buffer slot we failed to prove:
+                        // skipping it silently is what lets a partial walk report
+                        // `complete-cfg-stack-flow` with a truncated field list.
+                        if (functionReachesMarshalLeaf(target)) {
+                            recordNestedTypeShapeReject(
+                                "message-marshal-unresolved-buffer-call");
+                            recordNestedTypeShapeReject(
+                                "message-marshal-unresolved-buffer-call:" +
+                                    fullFunctionName(target));
+                            int arity = Math.min(
+                                provenCallArgumentCount(operation, target),
+                                24);
+                            recordNestedTypeShapeReject(
+                                "message-marshal-unresolved-buffer-call-arity:" + arity);
+                            recordNestedTypeShapeReject(
+                                "message-marshal-unresolved-buffer-call-frame-state:" +
+                                    (hasWin64CallFrameState(function, operation, target)
+                                        ? "present"
+                                        : "absent"));
+                            recordNestedTypeShapeReject(
+                                "message-marshal-unresolved-buffer-call-holding-slot:" +
+                                    win64ArgumentSlotHolding(
+                                        function,
+                                        operation,
+                                        target,
+                                        writeBuffer,
+                                        arity,
+                                        false));
+                            recordNestedTypeShapeReject(
+                                "message-marshal-unresolved-buffer-call-base-slot:" +
+                                    win64ArgumentSlotHolding(
+                                        function,
+                                        operation,
+                                        target,
+                                        writeBuffer,
+                                        arity,
+                                        true));
+                            return messageMarshalFailure(
+                                NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                        }
                         continue;
                     }
                     if (target == null) {
@@ -278,6 +325,10 @@
                                 operation,
                                 null,
                                 writeBuffer) != null) {
+                            // Buffer is the receiver but the write itself is
+                            // unproven: dispatch shape, receiver slot, or length.
+                            recordNestedTypeShapeReject(
+                                "message-marshal-raw-write-length-unproven");
                             return messageMarshalFailure(
                                 NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
                         }
@@ -290,6 +341,36 @@
                         callerParamStorage,
                         byteLength);
                     if (events.isEmpty()) {
+                        // Length proven, but the copied byte range could not be
+                        // tied back to message storage.
+                        recordNestedTypeShapeReject(
+                            "message-marshal-raw-write-source-unresolved");
+                        return messageMarshalFailure(
+                            NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                    }
+                }
+                else if (operation.getOpcode() == PcodeOp.BRANCHIND) {
+                    // Tail-call raw write. Unlike CALLIND this cannot fail the
+                    // walk when unproven: most BRANCHINDs are jump tables, and
+                    // provenVirtualRawWriteLength is the gate that tells the two
+                    // apart — it demands a vtable slot loaded from the write
+                    // buffer itself.
+                    Integer byteLength = provenVirtualRawWriteLength(
+                        function,
+                        operation,
+                        writeBufferParameter);
+                    if (byteLength == null) {
+                        continue;
+                    }
+                    events = messageMarshalRawEvent(
+                        function,
+                        operation,
+                        writeBufferParameter,
+                        callerParamStorage,
+                        byteLength);
+                    if (events.isEmpty()) {
+                        recordNestedTypeShapeReject(
+                            "message-marshal-tail-raw-write-source-unresolved");
                         return messageMarshalFailure(
                             NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
                     }
@@ -367,6 +448,13 @@
                 arguments,
                 activeContexts);
         if (!nested.complete()) {
+            // Names the exact helper whose body could not be proven, so a failed
+            // continuation is attributable instead of surfacing only as a null
+            // plan on the outermost wrapper.
+            recordNestedTypeShapeReject(
+                "message-marshal-nested-incomplete:" + nested.status());
+            recordNestedTypeShapeReject(
+                "message-marshal-nested-incomplete-target:" + targetName);
             return List.of();
         }
         ArrayList<MessageMarshalEvent> events = new ArrayList<>();
@@ -433,6 +521,13 @@
                 target,
                 slot);
             if (!isParameterStorage(candidate)) {
+                candidate = stagedStackSourceStorage(
+                    owner,
+                    operation,
+                    target,
+                    candidate);
+            }
+            if (!isParameterStorage(candidate)) {
                 continue;
             }
             if (selected != null && !selected.sameLocation(candidate)) {
@@ -441,6 +536,50 @@
             selected = candidate;
         }
         return messageMarshalSource(selected, callerParamStorage);
+    }
+
+    /**
+     * Storage a scalar was loaded from before being staged into a stack
+     * temporary.
+     *
+     * `Marshaler<T>::Marshal(status, &temp, buffer)` takes its value by pointer,
+     * so the argument names a stack slot rather than message storage. The
+     * tracked store into that slot still carries the origin, which is what ties
+     * the field back to the message.
+     */
+    private PcodeStorage stagedStackSourceStorage(
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        PcodeStorage candidate) {
+
+        if (candidate == null || !"stack".equals(candidate.base) ||
+            candidate.offset < Integer.MIN_VALUE ||
+            candidate.offset > Integer.MAX_VALUE) {
+            return null;
+        }
+        ForwardArgState state = instructionStateBeforeCall(owner, operation, target);
+        TrackedValue staged = state == null
+            ? null
+            : state.valuesByStackSlot.get((int)candidate.offset);
+        if (staged == null) {
+            return null;
+        }
+        PcodeStorage direct = pcodeStorageFromTrackedValue(staged);
+        if (isParameterStorage(direct)) {
+            return direct;
+        }
+        PcodeStorage resolved = null;
+        for (PcodeStorage dependency : staged.storageDependencies) {
+            if (!isParameterStorage(dependency)) {
+                continue;
+            }
+            if (resolved != null && !resolved.sameLocation(dependency)) {
+                return null;
+            }
+            resolved = dependency;
+        }
+        return resolved;
     }
 
     private List<MessageMarshalEvent> messageMarshalRawEvent(
