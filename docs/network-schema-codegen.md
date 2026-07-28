@@ -146,8 +146,9 @@ Useful resolver diagnostics:
 1. Preserve richer wire shapes in `nw-tools` (`vlq-u64`,
    `sequence-number`, and `replicated-container<key,value>`) while keeping Rust
    generation conservative.
-2. Move field overrides into the `nw-tools` pipeline as an override ingestor and
-   report stale overrides.
+2. Keep the optional override ingestor available for external migrations and
+   report stale overrides, but fold project-owned metadata into canonical
+   message signatures or handwritten replicated-state definitions.
 3. Resolve scalar fields from `WireShape` plus native/source evidence.
 4. Resolve replicated containers from native source wrapper/storage/key/value
    evidence plus Ghidra wire-codec evidence, then emit full
@@ -163,7 +164,6 @@ cargo run -p nw-serialize-codegen -- network-schema `
   --ghidra-report E:\Projects\new-world\resources\network-schema.static.json `
   --typeindex "E:\Games\steamapps\common\New World\typeindex.json" `
   --message-signatures E:\Projects\nw-network\crates\nw-network-types\codegen\message-signatures.json `
-  --field-overrides E:\Projects\nw-network\codegen\network-field-overrides.json `
   --out tmp\network-schema.v1.json
 
 cargo run -p nw-serialize-codegen -- network-rust `
@@ -172,9 +172,15 @@ cargo run -p nw-serialize-codegen -- network-rust `
   --report tmp\network-schema.rust-report.json
 ```
 
-Field overrides identify a type with `typeId`, `typeIndex`, or `typeName`, and
-identify one of its fields with `fieldIndex` and/or `field`. The optional
-`name` property replaces the matched field's generated name:
+The `nw-network` build does not consume a field-override file. Stable message
+field names belong in `message-signatures.json`; domain-specific replicated
+state types belong in the owning handwritten state module and generated-state
+denylist.
+
+The CLI still accepts optional field overrides for external migration work.
+They identify a type with `typeId`, `typeIndex`, or `typeName`, and identify one
+of its fields with `fieldIndex` and/or `field`. The optional `name` property
+replaces the matched field's generated name:
 
 ```json
 {
