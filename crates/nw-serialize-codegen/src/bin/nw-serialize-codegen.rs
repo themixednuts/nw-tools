@@ -629,13 +629,14 @@ fn network_schema(args: &NetworkSchemaArgs, status: CodegenStatus) -> Result<()>
             .unwrap_or_else(|| overrides_path.display().to_string());
         let merge = schema.merge_field_overrides(&overrides, Some(source));
         println!(
-            "field overrides: {} source field(s), {} matched, {} unmatched type(s), {} ambiguous type(s), {} unmatched field(s), {} ambiguous field(s), {} native type update(s), {} Rust type update(s), {} wire shape update(s), {} confidence update(s)",
+            "field overrides: {} source field(s), {} matched, {} unmatched type(s), {} ambiguous type(s), {} unmatched field(s), {} ambiguous field(s), {} field name update(s), {} native type update(s), {} Rust type update(s), {} wire shape update(s), {} confidence update(s)",
             merge.source_field_count,
             merge.matched_field_count,
             merge.unmatched_type_count,
             merge.ambiguous_type_count,
             merge.unmatched_field_count,
             merge.ambiguous_field_count,
+            merge.field_name_updated_count,
             merge.native_type_updated_count,
             merge.rust_type_updated_count,
             merge.wire_shape_updated_count,

@@ -492,6 +492,12 @@
                         seenCallsiteStoreValues);
                 }
             }
+            appendDirectCountedMessageFields(
+                plan,
+                function,
+                operations,
+                callerParamStorage,
+                operationOrder);
         }
         finally {
             activeContexts.remove(context);
@@ -511,14 +517,13 @@
         Map<String, String> tempWireShapes) {
 
         Function target = pcodeCallTarget(op);
-        PcodeStorage callerReadBuffer = translatedAbsoluteHelperStorage(
-            new PcodeStorage(readBufferParameter, 0L),
-            callerParamStorage);
+        // Slot matching stays in the current owner's frame. Translate the
+        // selected argument only when propagating storage into the caller.
         Integer readBufferSlot = provenCallArgumentSlot(
             owner,
             op,
             target,
-            callerReadBuffer);
+            new PcodeStorage(readBufferParameter, 0L));
         if (target == null) {
             // Unresolved CALL targets include failure-path vtable cleanup
             // (e.g. NewWorld+0x7c2db3 CALL [RAX+0x38]). Those are not wire

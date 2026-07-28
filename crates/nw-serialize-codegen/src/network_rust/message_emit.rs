@@ -104,9 +104,8 @@ pub(super) fn message_field_support_tokens(
     let value_type = syn::parse_str::<syn::Type>(value_type_string).ok()?;
     let codec_name = format!("{}Marshaler", rust_type_ident(value_type_string));
     let codec_ident = format_ident!("{codec_name}");
-    let members = shape
-        .members
-        .iter()
+    let members = nested_type_shape_members_in_wire_order(shape)?
+        .into_iter()
         .map(|member| container_value_member_tokens(field, shape, member, &[], serialize_types))
         .collect::<Option<Vec<_>>>()?;
     if members.is_empty() {
@@ -346,8 +345,10 @@ pub(super) fn message_field_type_tokens(shape: &SchemaWireShape) -> proc_macro2:
             let element = scalar_rust_type(sequence.element);
             let element = syn::parse_str::<syn::Type>(&element)
                 .expect("fixed-sequence element produces a valid Rust type");
-            let capacity =
-                syn::LitInt::new(&sequence.capacity.to_string(), proc_macro2::Span::call_site());
+            let capacity = syn::LitInt::new(
+                &sequence.capacity.to_string(),
+                proc_macro2::Span::call_site(),
+            );
             quote!(::arrayvec::ArrayVec<#element, #capacity>)
         }
     }
@@ -359,6 +360,13 @@ pub(super) fn message_field_marshal_attr_tokens(
     if let Some(conversion) = field_conversion_marshal_type_string(field) {
         let conversion = LitStr::new(&conversion, proc_macro2::Span::call_site());
         return quote!(#[marshal(codec = #conversion)]);
+    }
+    if field.nested_type_shape.is_some()
+        && field.rust_value_type.as_deref().is_some_and(|rust_type| {
+            is_generated_source_type(rust_type) || message_support_type_ident(rust_type).is_some()
+        })
+    {
+        return quote! {};
     }
 
     match field.wire_shape.as_ref() {
@@ -454,9 +462,14 @@ pub(super) fn field_conversion_marshal_type_string(
 pub(super) fn serialize_field_scalar_source_type(
     field: &NetworkField,
     shape: Option<&SchemaWireShape>,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<String> {
     let serialize = field.serialize.as_ref()?;
-    if serialize.kind != NetworkSerializeKind::Enum {
+    if serialize.kind != NetworkSerializeKind::Enum
+        || !serialize_types
+            .get(&serialize.type_id)
+            .is_some_and(|serialize| serialize.emits_source)
+    {
         return None;
     }
     scalar_conversion_serialized_type(shape?)?;

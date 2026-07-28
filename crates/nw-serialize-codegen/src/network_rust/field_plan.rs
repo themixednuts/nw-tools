@@ -32,11 +32,13 @@ pub(super) fn message_field_shape_report(
         report.wire_shape_source = Some("message-native-type+layout".to_owned());
         report.wire_shape = Some(shape);
     }
-    let source_type = serialize_field_scalar_source_type(field, report.wire_shape.as_ref());
+    let source_type =
+        serialize_field_scalar_source_type(field, report.wire_shape.as_ref(), serialize_types);
     let rust_type = field
         .rust_type
         .as_deref()
         .map(normalize_generated_rust_type)
+        .or_else(|| message_nested_shape_rust_type(field, message_type_name, serialize_types))
         .or_else(|| {
             field
                 .native_type
@@ -54,8 +56,7 @@ pub(super) fn message_field_shape_report(
                 })
                 .map(|rust_type| normalize_generated_rust_type(&rust_type))
         })
-        .or_else(|| message_nested_shape_rust_type(field, message_type_name))
-        .or_else(|| message_serialize_source_rust_type(field))
+        .or_else(|| message_selected_serialize_rust_type(field, serialize_types))
         .or(source_type)
         .or_else(|| {
             report
@@ -67,8 +68,15 @@ pub(super) fn message_field_shape_report(
         .or_else(|| report.rust_value_type.clone());
     report.rust_value_type = rust_type.clone();
     report.rust_field_type = rust_type.clone();
-    report.blocked_reason =
-        message_field_blocked_reason(field, report.wire_shape.as_ref(), rust_type.as_deref());
+    report.blocked_reason = rust_type
+        .as_deref()
+        .and_then(message_support_type_ident)
+        .and(field.nested_type_shape.as_ref())
+        .filter(|shape| !container_value_shape_members_are_emittable(shape, &[], serialize_types))
+        .map(|_| "unsupported-support-type-layout".to_owned())
+        .or_else(|| {
+            message_field_blocked_reason(field, report.wire_shape.as_ref(), rust_type.as_deref())
+        });
     report.supported = report.blocked_reason.is_none();
     report
 }
@@ -192,7 +200,7 @@ pub(super) fn state_field_shape_report(
     } else {
         field_wire_shape(field, wire_shapes)
     };
-    let source_type = serialize_field_scalar_source_type(field, shape);
+    let source_type = serialize_field_scalar_source_type(field, shape, serialize_types);
     let rust_shape = shape
         .filter(|shape| {
             !shape.is_replicated_container() && !matches!(shape, SchemaWireShape::FixedSequence(_))
@@ -453,9 +461,24 @@ pub(super) fn message_serialize_source_rust_type(field: &NetworkField) -> Option
         .or_else(|| serialize_source_rust_type_name(&serialize.name))
 }
 
+pub(super) fn message_selected_serialize_rust_type(
+    field: &NetworkField,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<String> {
+    let serialize = field.serialize.as_ref()?;
+    exact_type_id_rust_type(serialize.type_id)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            serialize_types
+                .get(&serialize.type_id)
+                .and_then(|serialize| network_serialize_type_rust_type(serialize, serialize_types))
+        })
+}
+
 pub(super) fn message_nested_shape_rust_type(
     field: &NetworkField,
     message_type_name: Option<&str>,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<String> {
     let shape = field.nested_type_shape.as_ref()?;
     if !message_nested_shape_matches_field(field, shape) {
@@ -468,12 +491,11 @@ pub(super) fn message_nested_shape_rust_type(
         return Some(runtime_type.to_owned());
     }
     if message_nested_shape_uses_source_type(shape) {
-        if let Some(source_type) = shape
-            .type_name_full
-            .as_deref()
-            .or(shape.type_name.as_deref())
-            .and_then(serialize_source_rust_type_name)
-        {
+        if let Some(source_type) = shape.type_id.and_then(|type_id| {
+            serialize_types
+                .get(&type_id)
+                .and_then(|serialize| network_serialize_type_rust_type(serialize, serialize_types))
+        }) {
             return Some(source_type);
         }
         // Exact Ghidra identity without a SerializeContext match: still emit a
@@ -790,9 +812,7 @@ fn wire_scalar_products_directionally_agree(
     wire_scalar_shapes_match(&unmarshal, &marshal)
 }
 
-fn directional_fields_wire_product(
-    fields: &[NetworkField],
-) -> Option<Vec<SchemaWireScalarShape>> {
+fn directional_fields_wire_product(fields: &[NetworkField]) -> Option<Vec<SchemaWireScalarShape>> {
     let mut product = Vec::new();
     for field in fields {
         product.extend(directional_field_wire_product(field)?);

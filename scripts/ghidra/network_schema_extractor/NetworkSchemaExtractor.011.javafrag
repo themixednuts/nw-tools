@@ -194,7 +194,11 @@
                 }
                 PcodeStorage storage = pcodeStorageExpression(value);
                 Integer slot = formalParameterSlot(storage);
-                if (slot == null || storage.offset != 0L) {
+                if (slot == null) {
+                    slot = transportedFormalParameterSlot(value);
+                }
+                if (slot == null ||
+                    formalParameterSlot(storage) != null && storage.offset != 0L) {
                     valid = false;
                     return null;
                 }

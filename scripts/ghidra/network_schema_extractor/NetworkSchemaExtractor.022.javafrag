@@ -84,11 +84,10 @@
     }
 
     private String formalParameterBaseFromStorage(Function function, PcodeStorage storage) {
-        if (storage == null || storage.offset != 0L && !"stack".equals(storage.base)) {
+        if (storage == null || storage.offset < 0L && !"stack".equals(storage.base)) {
             return null;
         }
-        if (storage.base != null && storage.base.matches("param_\\d+") &&
-            storage.offset == 0L) {
+        if (storage.base != null && storage.base.matches("param_\\d+")) {
             return storage.base;
         }
         if (!"stack".equals(storage.base)) {

@@ -1,0 +1,439 @@
+    private record DirectFlatHashSet(
+        PcodeStorage storage,
+        Address countCallsite,
+        WireShape wireEvidence) {
+    }
+
+    private void appendDirectCountedMessageFields(
+        MessageUnmarshalPlan plan,
+        Function function,
+        List<PcodeOpAST> operations,
+        Map<String, PcodeStorage> callerParamStorage,
+        int[] operationOrder) {
+
+        for (CollectionOutputShape collection :
+                collectionOutputShapesByParameterFromPcode(function).values()) {
+            if (monitor.isCancelled()) {
+                return;
+            }
+            PcodeStorage storage = translatedAbsoluteHelperStorage(
+                collection.storage,
+                callerParamStorage);
+            if (!isRootMessageStorage(plan, storage) ||
+                operationAt(operations, collection.countCallsite) == null) {
+                continue;
+            }
+
+            String nativeType = collection.nativeType;
+            WireShape wireEvidence = collection.wireEvidence;
+            ReflectedSetIdentity setIdentity = countedSetIdentity(function, collection);
+            if (setIdentity != null) {
+                String source =
+                    "message-bidirectional-reflected-azstd-unordered-set";
+                nativeType = setIdentity.nativeType();
+                wireEvidence = WireShape.semantic(
+                    setIdentity.wireShape(),
+                    setIdentity.wireShape(),
+                    source);
+            }
+            else {
+                WireShape setLayout = countedSetLayoutEvidence(function, collection);
+                if (setLayout != null) {
+                    wireEvidence = setLayout;
+                }
+            }
+
+            FieldCall field = addPcodeMessageField(
+                plan,
+                collection.countCallsite,
+                storage,
+                nativeType,
+                "message-unmarshal-pcode-direct-counted-collection",
+                operationOrder[0]++);
+            if (wireEvidence != null && wireEvidence.layout != null &&
+                wireEvidence.layout.startsWith("vec<")) {
+                field.collectionStorageKind = ContainerStorageKind.VECTOR;
+            }
+            applyWireEvidence(field, wireEvidence);
+        }
+
+        DirectFlatHashSet flatSet = directFlatHashSet(function, operations);
+        if (flatSet == null) {
+            return;
+        }
+        PcodeStorage storage = translatedAbsoluteHelperStorage(
+            flatSet.storage(),
+            callerParamStorage);
+        if (!isRootMessageStorage(plan, storage)) {
+            return;
+        }
+        FieldCall field = addPcodeMessageField(
+            plan,
+            flatSet.countCallsite(),
+            storage,
+            null,
+            "message-unmarshal-pcode-direct-flat-hash-set",
+            operationOrder[0]++);
+        applyWireEvidence(field, flatSet.wireEvidence());
+    }
+
+    private DirectFlatHashSet directFlatHashSet(
+        Function helper,
+        List<PcodeOpAST> operations) {
+
+        HighFunction high = highFunction(helper);
+        if (high == null || operations == null) {
+            return null;
+        }
+        DirectFlatHashSet selected = null;
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            PcodeOpAST count = nearestCountCallForLoop(
+                helper,
+                high,
+                loop,
+                operations);
+            PcodeCodecCall raw = uniqueLoopRawCodec(loop, operations);
+            if (count == null || raw == null) {
+                continue;
+            }
+            RawPcodeWrite rawWrite = pcodeReadRawWrite(
+                raw.operation(),
+                pcodeCallTarget(raw.operation()));
+            Integer elementWidth = rawWrite == null
+                ? null
+                : wireShapeByteWidth(raw.evidence().layout);
+            if (rawWrite == null || rawWrite.storage == null ||
+                elementWidth == null || elementWidth <= 0) {
+                continue;
+            }
+            DirectFlatHashSet candidate = directFlatHashSetFromLoop(
+                helper,
+                high,
+                loop,
+                operations,
+                count,
+                raw,
+                rawWrite,
+                elementWidth);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null &&
+                (!selected.storage().sameLocation(candidate.storage()) ||
+                    !sameWireEvidence(
+                        selected.wireEvidence(),
+                        candidate.wireEvidence()))) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private PcodeCodecCall uniqueLoopRawCodec(
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        PcodeCodecCall selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            RawPcodeWrite raw = pcodeReadRawWrite(
+                operation,
+                pcodeCallTarget(operation));
+            if (raw == null || raw.wireEvidence == null) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = new PcodeCodecCall(operation, raw.wireEvidence);
+        }
+        return selected;
+    }
+
+    private DirectFlatHashSet directFlatHashSetFromLoop(
+        Function helper,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeOpAST count,
+        PcodeCodecCall raw,
+        RawPcodeWrite rawWrite,
+        int elementWidth) {
+
+        DirectFlatHashSet selected = null;
+        boolean keyBound = false;
+        boolean ownerBound = false;
+        boolean probeProven = false;
+        for (PcodeOpAST operation : operations) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL ||
+                !NetworkSchemaControlFlow.precedes(
+                    high,
+                    raw.operation(),
+                    operation)) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (target == null) {
+                continue;
+            }
+            PcodeStorage owner = provenCallArgumentStorage(
+                helper,
+                operation,
+                target,
+                1);
+            PcodeStorage result = provenCallArgumentStorage(
+                helper,
+                operation,
+                target,
+                2);
+            PcodeStorage element = provenCallArgumentStorage(
+                helper,
+                operation,
+                target,
+                3);
+            String output = formalParameterBaseFromStorage(helper, owner);
+            if (!rawWrite.storage.sameLocation(element)) {
+                continue;
+            }
+            keyBound = true;
+            if (!isProvenOutputParameterBase(helper, output) || result == null) {
+                continue;
+            }
+            ownerBound = true;
+            if (!hasFlatHashProbeLayout(highFunction(target), elementWidth)) {
+                continue;
+            }
+            probeProven = true;
+            if (!insertedFlatHashKeyIsFullyStored(
+                    high,
+                    loop,
+                    operations,
+                    operation,
+                    owner,
+                    result,
+                    element,
+                    elementWidth)) {
+                continue;
+            }
+            DirectFlatHashSet candidate = new DirectFlatHashSet(
+                owner,
+                count.getSeqnum().getTarget(),
+                WireShape.layout(
+                    "set<" + raw.evidence().layout + ">",
+                    "message-unmarshal-flat-hash-set-layout"));
+            if (selected != null &&
+                !selected.storage().sameLocation(candidate.storage())) {
+                return null;
+            }
+            selected = candidate;
+        }
+        if (selected == null) {
+            String reason = !keyBound
+                ? "direct-flat-set-key-argument-unproven"
+                : !ownerBound
+                    ? "direct-flat-set-output-owner-unproven"
+                    : !probeProven
+                        ? "direct-flat-set-probe-layout-unproven"
+                        : "direct-flat-set-key-store-unproven";
+            recordCountedCollectionReject(helper, loop, reason);
+        }
+        return selected;
+    }
+
+    private WireShape countedSetLayoutEvidence(
+        Function helper,
+        CollectionOutputShape output) {
+
+        if (helper == null || output == null || output.wireEvidence == null) {
+            return null;
+        }
+        String observed = firstNonEmpty(
+            output.wireEvidence.shape,
+            output.wireEvidence.layout);
+        String elementShape = vectorElementWireShape(observed);
+        Integer elementWidth = wireShapeByteWidth(elementShape);
+        if (elementShape == null || elementWidth == null || elementWidth <= 0) {
+            return null;
+        }
+        Function insertion = countedCollectionInsertionTarget(helper, output);
+        if (!hasFlatHashSetInsertionLayout(
+                helper,
+                output,
+                insertion,
+                elementWidth)) {
+            return null;
+        }
+        return WireShape.layout(
+            "set<" + elementShape + ">",
+            "message-unmarshal-flat-hash-set-layout");
+    }
+
+    private boolean hasFlatHashSetInsertionLayout(
+        Function helper,
+        CollectionOutputShape output,
+        Function insertion,
+        int elementWidth) {
+
+        HighFunction insertionHigh = highFunction(insertion);
+        if (helper == null || output == null || output.storage == null ||
+            insertionHigh == null || elementWidth <= 0 || elementWidth > 0x1000 ||
+            !hasFlatHashProbeLayout(insertionHigh, elementWidth)) {
+            return false;
+        }
+
+        HighFunction high = highFunction(helper);
+        if (high == null || output.loopHeader == null) {
+            return false;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            if (monitor.isCancelled()) {
+                return false;
+            }
+            if (loop.header() == null ||
+                !output.loopHeader.equals(loop.header().getStart())) {
+                continue;
+            }
+            CollectionElementSequence elements = loopElementCodecs(
+                helper,
+                high,
+                loop,
+                operations);
+            if (elements == null || elements.codecs().size() != 1) {
+                return false;
+            }
+            PcodeCodecCall codec = elements.codecs().get(0);
+            RawPcodeWrite raw = pcodeReadRawWrite(
+                codec.operation(),
+                pcodeCallTarget(codec.operation()));
+            if (raw == null || raw.storage == null ||
+                !Objects.equals(
+                    wireShapeByteWidth(codec.evidence().layout),
+                    elementWidth)) {
+                return false;
+            }
+
+            PcodeOpAST insertionCall = countedCollectionInsertionCall(
+                helper,
+                high,
+                loop,
+                operations,
+                elements.codecs());
+            Function target = pcodeCallTarget(insertionCall);
+            if (target == null || !Objects.equals(
+                    resolvedCodeTarget(target.getEntryPoint()),
+                    resolvedCodeTarget(insertion.getEntryPoint()))) {
+                return false;
+            }
+            PcodeStorage owner = provenCallArgumentStorage(
+                helper,
+                insertionCall,
+                target,
+                1);
+            PcodeStorage result = provenCallArgumentStorage(
+                helper,
+                insertionCall,
+                target,
+                2);
+            PcodeStorage element = provenCallArgumentStorage(
+                helper,
+                insertionCall,
+                target,
+                3);
+            if (!output.storage.sameLocation(owner) ||
+                !raw.storage.sameLocation(element) ||
+                result == null) {
+                return false;
+            }
+            return insertedFlatHashKeyIsFullyStored(
+                high,
+                loop,
+                operations,
+                insertionCall,
+                owner,
+                result,
+                element,
+                elementWidth);
+        }
+        return false;
+    }
+
+    private boolean hasFlatHashProbeLayout(
+        HighFunction high,
+        int elementWidth) {
+
+        if (high == null || elementWidth <= 0) {
+            return false;
+        }
+        Set<Long> receiverOffsets = directReceiverOffsets(high, "param_1");
+        Set<Long> resultOffsets = directReceiverOffsets(high, "param_2");
+        Set<Long> keyOffsets = directReceiverOffsets(high, "param_3");
+        if (!receiverOffsets.containsAll(Set.of(0L, 8L, 24L)) ||
+            !resultOffsets.containsAll(Set.of(0L, 8L))) {
+            return false;
+        }
+        for (long offset = 0L; offset < elementWidth; offset += 8L) {
+            if (!keyOffsets.contains(offset)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean insertedFlatHashKeyIsFullyStored(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeOpAST insertion,
+        PcodeStorage owner,
+        PcodeStorage result,
+        PcodeStorage element,
+        int elementWidth) {
+
+        boolean[] covered = new boolean[elementWidth];
+        PcodeStorage data = owner.plus(currentProgram.getDefaultPointerSize());
+        for (PcodeOpAST operation : operations) {
+            if (monitor.isCancelled()) {
+                return false;
+            }
+            if (!loop.contains(operation) ||
+                operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3 ||
+                !NetworkSchemaControlFlow.precedes(high, insertion, operation) ||
+                !referencesStorage(operation.getInput(1), data) ||
+                !referencesStorage(operation.getInput(1), result)) {
+                continue;
+            }
+            Varnode value = operation.getInput(2);
+            PcodeStorage source = pcodeLoadedStorageExpression(value);
+            if (source == null || !Objects.equals(source.base, element.base)) {
+                continue;
+            }
+            long start = source.offset - element.offset;
+            long end = Math.min(start + value.getSize(), elementWidth);
+            if (start < 0L || start >= elementWidth) {
+                continue;
+            }
+            for (long offset = start; offset < end; offset++) {
+                covered[(int)offset] = true;
+            }
+        }
+        for (boolean byteCovered : covered) {
+            if (!byteCovered) {
+                return false;
+            }
+        }
+        return true;
+    }

@@ -230,6 +230,15 @@
         }
     }
 
+    private void invalidateStackArgumentsPassedByAddress(ForwardArgState state) {
+        for (String register : List.of("RCX", "RDX", "R8", "R9")) {
+            TrackedValue argument = state.registers.get(register);
+            if (argument != null && argument.stackOffset != null) {
+                invalidateStackRange(state, argument.stackOffset, 8);
+            }
+        }
+    }
+
     private void promoteReplicatedStateConstructorReceiver(
         Instruction instruction,
         ForwardArgState state) {
@@ -496,7 +505,13 @@
         MemoryReference memory = NetworkSchemaX86.memoryReference(instruction, operandIndex);
         Integer stackSlot = memory == null ? null : stackSlotOffset(memory, state);
         TrackedValue value = stackSlot == null ? null : state.valuesByStackSlot.get(stackSlot);
-        return value == null ? null : value.copy();
+        if (value != null) {
+            return value.copy();
+        }
+        return stackSlot == null
+            ? null
+            : TrackedValue.storageDependency(
+                new PcodeStorage("stack", stackSlot));
     }
 
     private TrackedValue trackedBaseLoadValue(
@@ -798,7 +813,7 @@
 
     private TrackedValue addTrackedValues(TrackedValue left, TrackedValue right) {
         if (left == null || right == null) {
-            return null;
+            return dependencyOnlyTrackedValue(left == null ? right : left);
         }
         if (left.immediate != null && right.immediate != null) {
             try {
@@ -819,7 +834,7 @@
 
     private TrackedValue subtractTrackedValues(TrackedValue left, TrackedValue right) {
         if (left == null || right == null) {
-            return null;
+            return dependencyOnlyTrackedValue(left == null ? right : left);
         }
         if (right.immediate == null) {
             return mergedTrackedDependencies(left, right);
@@ -929,12 +944,30 @@
 
     private TrackedValue mergedTrackedDependencies(TrackedValue left, TrackedValue right) {
         if (left == null || right == null) {
-            return null;
+            return dependencyOnlyTrackedValue(left == null ? right : left);
         }
-        LinkedHashSet<PcodeStorage> dependencies = new LinkedHashSet<>(
-            left.storageDependencies);
-        dependencies.addAll(right.storageDependencies);
+        LinkedHashSet<PcodeStorage> dependencies = trackedDependencies(left);
+        dependencies.addAll(trackedDependencies(right));
         return TrackedValue.storageDependencies(dependencies);
+    }
+
+    private TrackedValue dependencyOnlyTrackedValue(TrackedValue value) {
+        return value == null
+            ? null
+            : TrackedValue.storageDependencies(trackedDependencies(value));
+    }
+
+    private LinkedHashSet<PcodeStorage> trackedDependencies(TrackedValue value) {
+        LinkedHashSet<PcodeStorage> dependencies = new LinkedHashSet<>();
+        if (value == null) {
+            return dependencies;
+        }
+        PcodeStorage direct = pcodeStorageFromTrackedValue(value);
+        if (direct != null) {
+            dependencies.add(direct);
+        }
+        dependencies.addAll(value.storageDependencies);
+        return dependencies;
     }
 
     private int operandCount(Instruction instruction) {
@@ -945,4 +978,3 @@
             return 0;
         }
     }
-

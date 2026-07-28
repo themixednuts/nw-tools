@@ -374,8 +374,8 @@ pub(crate) fn collapse_alternate_spelling_wire_product<'a>(
     if compatible_alternate_wire_products(left, right) {
         return Some(prefer_alternate_wire_product(left, right, nested));
     }
-    // Successive helpers sometimes re-append a leading/trailing limb already
-    // present inside the other product (ReceiveSpawnRequestMsg pattern).
+    // Successive helpers sometimes re-append a leading/trailing sub-product
+    // already present inside the other product (ActorRequestId pattern).
     // Require nested-shape agreement so legitimate composite<field, same-type>
     // products are not collapsed.
     collapse_redundant_composite_boundary_limb(left, right, nested)
@@ -391,24 +391,35 @@ fn collapse_redundant_composite_boundary_limb<'a>(
         .is_some_and(|product| wire_scalar_products_width_compatible(&product, &observed));
     let right_matches = nested_member_wire_shapes(right, &[])
         .is_some_and(|product| wire_scalar_products_width_compatible(&product, &observed));
+    let complete_nested_product = nested.is_some_and(|shape| {
+        shape.layout_proven == Some(true)
+            && shape.member_coverage_proven == Some(true)
+            && shape.wire_order_proven == Some(true)
+    });
     match (left_matches, right_matches) {
-        (true, false) => boundary_limb_is_redundant(left, right).then_some(left),
-        (false, true) => boundary_limb_is_redundant(right, left).then_some(right),
+        (true, false) => {
+            (complete_nested_product || boundary_limb_is_redundant(left, right)).then_some(left)
+        }
+        (false, true) => {
+            (complete_nested_product || boundary_limb_is_redundant(right, left)).then_some(right)
+        }
         (true, true) => Some(prefer_alternate_wire_product(left, right, nested)),
         (false, false) => None,
     }
 }
 
 fn boundary_limb_is_redundant(product: &str, limb: &str) -> bool {
-    let Some(members) = top_level_composite_members(product) else {
+    let Some(product) = nested_member_wire_shapes(product, &[]) else {
         return false;
     };
-    members
-        .first()
-        .is_some_and(|first| compatible_alternate_wire_products(first, limb))
-        || members
-            .last()
-            .is_some_and(|last| compatible_alternate_wire_products(last, limb))
+    let Some(limb) = nested_member_wire_shapes(limb, &[]) else {
+        return false;
+    };
+    if limb.is_empty() || limb.len() >= product.len() {
+        return false;
+    }
+    wire_scalar_products_width_compatible(&product[..limb.len()], &limb)
+        || wire_scalar_products_width_compatible(&product[product.len() - limb.len()..], &limb)
 }
 
 fn compatible_alternate_wire_products(left: &str, right: &str) -> bool {
@@ -457,7 +468,10 @@ fn codec_product_semantic_score(product: &str) -> i32 {
         return 1_000;
     }
     if let Some(members) = top_level_composite_members(product) {
-        return members.iter().map(|member| codec_product_semantic_score(member)).sum();
+        return members
+            .iter()
+            .map(|member| codec_product_semantic_score(member))
+            .sum();
     }
     if product.starts_with("fixed-bytes-") {
         0
@@ -466,85 +480,64 @@ fn codec_product_semantic_score(product: &str) -> i32 {
     }
 }
 
-fn wire_scalar_products_width_compatible(
+pub(crate) fn wire_scalar_products_width_compatible(
     left: &[NetworkWireScalarShape],
     right: &[NetworkWireScalarShape],
 ) -> bool {
-    let left = expand_width_comparable_scalars(left);
-    let right = expand_width_comparable_scalars(right);
-    if left.len() != right.len() {
-        return wire_scalar_product_total_width(&left)
-            .zip(wire_scalar_product_total_width(&right))
-            .is_some_and(|(left_width, right_width)| left_width == right_width);
-    }
-    left.iter()
-        .zip(&right)
-        .all(|(left, right)| wire_scalars_width_compatible(*left, *right))
-}
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let mut left_width = 0u32;
+    let mut right_width = 0u32;
 
-fn expand_width_comparable_scalars(
-    shapes: &[NetworkWireScalarShape],
-) -> Vec<NetworkWireScalarShape> {
-    shapes
-        .iter()
-        .copied()
-        .flat_map(|shape| match shape {
-            NetworkWireScalarShape::ActorRef => vec![
-                NetworkWireScalarShape::U32,
-                NetworkWireScalarShape::FixedBytes(16),
-                NetworkWireScalarShape::FixedBytes(16),
-            ],
-            NetworkWireScalarShape::Vec2 | NetworkWireScalarShape::Vec2Comp => {
-                vec![NetworkWireScalarShape::F32, NetworkWireScalarShape::F32]
+    loop {
+        if left_width == right_width {
+            left_width = 0;
+            right_width = 0;
+            match (left.get(left_index), right.get(right_index)) {
+                (None, None) => return true,
+                (Some(left), Some(right)) => {
+                    match (scalar_wire_width(*left), scalar_wire_width(*right)) {
+                        (Some(next_left), Some(next_right)) => {
+                            left_width = u32::from(next_left);
+                            right_width = u32::from(next_right);
+                            left_index += 1;
+                            right_index += 1;
+                        }
+                        (None, None) if left == right => {
+                            left_index += 1;
+                            right_index += 1;
+                        }
+                        _ => return false,
+                    }
+                }
+                _ => return false,
             }
-            NetworkWireScalarShape::Vec3
-            | NetworkWireScalarShape::Vec3Comp
-            | NetworkWireScalarShape::Vec3CompNorm
-            | NetworkWireScalarShape::Vec3SmallestThree
-            | NetworkWireScalarShape::NonUniformScaleComp => vec![
-                NetworkWireScalarShape::F32,
-                NetworkWireScalarShape::F32,
-                NetworkWireScalarShape::F32,
-            ],
-            NetworkWireScalarShape::Vec4 => vec![
-                NetworkWireScalarShape::F32,
-                NetworkWireScalarShape::F32,
-                NetworkWireScalarShape::F32,
-                NetworkWireScalarShape::F32,
-            ],
-            NetworkWireScalarShape::Quat
-            | NetworkWireScalarShape::QuatComp
-            | NetworkWireScalarShape::QuatCompNorm
-            | NetworkWireScalarShape::QuatSmallestThree => vec![
-                NetworkWireScalarShape::F32,
-                NetworkWireScalarShape::F32,
-                NetworkWireScalarShape::F32,
-                NetworkWireScalarShape::F32,
-            ],
-            other => vec![other],
-        })
-        .collect()
-}
-
-fn wire_scalars_width_compatible(
-    left: NetworkWireScalarShape,
-    right: NetworkWireScalarShape,
-) -> bool {
-    left == right
-        || matches!(
-            (left, right),
-            (NetworkWireScalarShape::Bool, NetworkWireScalarShape::U8)
-                | (NetworkWireScalarShape::U8, NetworkWireScalarShape::Bool)
-        )
-        || scalar_wire_width(left)
-            .zip(scalar_wire_width(right))
-            .is_some_and(|(left_width, right_width)| left_width == right_width)
-}
-
-fn wire_scalar_product_total_width(shapes: &[NetworkWireScalarShape]) -> Option<u32> {
-    shapes.iter().try_fold(0u32, |total, shape| {
-        total.checked_add(u32::from(scalar_wire_width(*shape)?))
-    })
+        } else if left_width < right_width {
+            let Some(next) = left
+                .get(left_index)
+                .and_then(|shape| scalar_wire_width(*shape))
+            else {
+                return false;
+            };
+            let Some(total) = left_width.checked_add(u32::from(next)) else {
+                return false;
+            };
+            left_width = total;
+            left_index += 1;
+        } else {
+            let Some(next) = right
+                .get(right_index)
+                .and_then(|shape| scalar_wire_width(*shape))
+            else {
+                return false;
+            };
+            let Some(total) = right_width.checked_add(u32::from(next)) else {
+                return false;
+            };
+            right_width = total;
+            right_index += 1;
+        }
+    }
 }
 
 fn scalar_wire_width(shape: NetworkWireScalarShape) -> Option<u16> {
@@ -565,6 +558,10 @@ fn scalar_wire_width(shape: NetworkWireScalarShape) -> Option<u16> {
         | NetworkWireScalarShape::QuatComp
         | NetworkWireScalarShape::QuatCompNorm
         | NetworkWireScalarShape::QuatSmallestThree => Some(16),
+        NetworkWireScalarShape::Aabb2d => Some(16),
+        NetworkWireScalarShape::Aabb3d => Some(24),
+        NetworkWireScalarShape::Mat3 => Some(36),
+        NetworkWireScalarShape::Affine3 => Some(48),
         NetworkWireScalarShape::ActorRef => Some(36),
         _ => None,
     }
@@ -644,6 +641,25 @@ pub(crate) fn nested_type_shape_wire_shapes(
         shapes.extend(nested_member_wire_shapes(wire_shape, embedded_shapes)?);
     }
     (!shapes.is_empty()).then_some(shapes)
+}
+
+pub(crate) fn nested_type_shape_members_in_wire_order(
+    shape: &NetworkNestedTypeShape,
+) -> Option<Vec<&crate::network_schema::NetworkNestedTypeMember>> {
+    if shape.wire_order_proven != Some(true) {
+        return None;
+    }
+
+    let mut members = shape.members.iter().collect::<Vec<_>>();
+    if members.iter().all(|member| member.wire_ordinal.is_none()) {
+        return Some(members);
+    }
+    members.sort_by_key(|member| member.wire_ordinal);
+    members
+        .iter()
+        .enumerate()
+        .all(|(index, member)| member.wire_ordinal == u32::try_from(index).ok())
+        .then_some(members)
 }
 
 pub(crate) fn wire_shape_scalar_product(

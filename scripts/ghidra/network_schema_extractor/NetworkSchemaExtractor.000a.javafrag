@@ -319,6 +319,7 @@
         codecWireTraceHeartbeatNanos = 0L;
         nestedTypeShapeActive.clear();
         collectionOutputShapeCache.clear();
+        collectionOutputShapeActive.clear();
         interproceduralCollectionHelperCache.clear();
         interproceduralCollectionHelperActive.clear();
         fieldHandlerShapeCache.clear();
@@ -356,6 +357,10 @@
         interproceduralCollectionCountSamples = new JsonArray();
         countedCollectionRejectCounts.clear();
         countedCollectionRejectSamples = new JsonArray();
+        localVectorOwnerDiagnostics = new JsonArray();
+        localVectorOwnerDiagnosticKeys.clear();
+        nestedParentConsumptionDiagnostics = new JsonArray();
+        nestedParentConsumptionDiagnosticKeys.clear();
         countedCollectionsRecovered = 0;
         countedCollectionsApplied = 0;
         countedCollectionRecoveredSamples = new JsonArray();

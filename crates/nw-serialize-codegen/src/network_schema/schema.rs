@@ -438,6 +438,12 @@ impl NetworkSchema {
                 .clone()
                 .unwrap_or_else(|| "fieldOverrides".to_owned());
             let field = &mut network_type.fields[*field_index];
+            if let Some(name) = field_override.name.as_ref()
+                && field.name.as_deref() != Some(name.as_str())
+            {
+                field.name = Some(name.clone());
+                report.field_name_updated_count += 1;
+            }
             if let Some(native_type) = field_override.native_type.as_ref()
                 && field.native_type.as_deref() != Some(native_type.as_str())
             {

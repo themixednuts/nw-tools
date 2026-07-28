@@ -106,6 +106,12 @@
             "countedCollectionRejectSamples",
             countedCollectionRejectSamples.deepCopy());
         diagnostics.add(
+            "localVectorOwnerDiagnostics",
+            localVectorOwnerDiagnostics.deepCopy());
+        diagnostics.add(
+            "nestedParentConsumptionDiagnostics",
+            nestedParentConsumptionDiagnostics.deepCopy());
+        diagnostics.add(
             "reflectedSetRejectSummary",
             countMapJson(reflectedSetRejectCounts));
         diagnostics.add(

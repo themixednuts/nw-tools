@@ -171,3 +171,16 @@ cargo run -p nw-serialize-codegen -- network-rust `
   --out tmp\network-schema.rs `
   --report tmp\network-schema.rust-report.json
 ```
+
+Field overrides identify a type with `typeId`, `typeIndex`, or `typeName`, and
+identify one of its fields with `fieldIndex` and/or `field`. The optional
+`name` property replaces the matched field's generated name:
+
+```json
+{
+  "typeIndex": 226,
+  "fieldIndex": 0,
+  "name": "sections",
+  "confidence": "high"
+}
+```

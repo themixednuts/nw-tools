@@ -471,38 +471,29 @@
             }
             return;
         }
-        if (sameCodecProduct(existing, incoming) ||
-            compatibleCodecProducts(existing, incoming)) {
+        if (compatibleCodecProducts(existing, incoming) &&
+            (evidence.shape == null ||
+                compatibleCodecProducts(existing, evidence.shape)) &&
+            (evidence.layout == null ||
+                compatibleCodecProducts(existing, evidence.layout))) {
             // Alternate spellings of the same payload (ActorRequestId as
             // fixed-bytes-8/u64 limbs vs typed u64s, ActorRef limbs vs actor-ref).
             // Prefer the richer product; do not concatenate into a false product.
-            if (preferIncomingCodecProduct(existing, incoming)) {
-                if (evidence.shape != null) {
-                    field.wireShape = evidence.shape;
-                    field.wireShapeSource = evidence.source;
-                }
-                else if (evidence.layout != null) {
-                    field.wireShape = evidence.layout;
-                    field.wireShapeSource = evidence.layoutSource;
-                }
-                if (evidence.layout != null) {
-                    field.wireLayout = evidence.layout;
-                    field.wireLayoutSource = evidence.layoutSource;
-                }
-                else if (evidence.shape != null) {
-                    field.wireLayout = evidence.shape;
-                    field.wireLayoutSource = evidence.source;
-                }
+            String incomingShape = firstNonEmpty(evidence.shape, evidence.layout);
+            if (field.wireShape == null ||
+                preferIncomingCodecProduct(field.wireShape, incomingShape)) {
+                field.wireShape = incomingShape;
+                field.wireShapeSource = evidence.shape != null
+                    ? evidence.source
+                    : evidence.layoutSource;
             }
-            else {
-                if (field.wireShape == null && evidence.shape != null) {
-                    field.wireShape = evidence.shape;
-                    field.wireShapeSource = evidence.source;
-                }
-                if (field.wireLayout == null && evidence.layout != null) {
-                    field.wireLayout = evidence.layout;
-                    field.wireLayoutSource = evidence.layoutSource;
-                }
+            boolean explicitLayout = evidence.layout != null &&
+                !Objects.equals(evidence.layout, evidence.shape);
+            if (field.wireLayout == null || explicitLayout) {
+                field.wireLayout = firstNonEmpty(evidence.layout, evidence.shape);
+                field.wireLayoutSource = evidence.layout != null
+                    ? evidence.layoutSource
+                    : evidence.source;
             }
             return;
         }
@@ -565,16 +556,21 @@
         }
         String left = members.get(0);
         String right = members.get(1);
-        String preferred = null;
         if (compatibleCodecProducts(left, right)) {
-            preferred = preferIncomingCodecProduct(left, right) ? right : left;
+            boolean preferRight = preferIncomingCodecProduct(left, right);
+            field.wireShape = preferRight ? right : left;
+            field.wireLayout = sameCodecProduct(left, right)
+                ? field.wireShape
+                : preferRight ? left : right;
+            field.wireLayoutSource = "cfg-multi-helper-alternate-spelling-collapse";
+            field.wireShapeSource = field.wireLayoutSource;
+            field.typeConflict = null;
+            return;
         }
-        else {
-            preferred = collapseRedundantCompositeBoundaryLimb(
-                left,
-                right,
-                field.nestedTypeShape);
-        }
+        String preferred = collapseRedundantCompositeBoundaryLimb(
+            left,
+            right,
+            field.nestedTypeShape);
         if (preferred == null) {
             return;
         }
@@ -626,6 +622,14 @@
         if (sameCodecProduct(left, right) || compatibleWireSemantics(left, right)) {
             return true;
         }
+        String leftContainer = wireCodecContainerName(left);
+        String rightContainer = wireCodecContainerName(right);
+        if (leftContainer != null && leftContainer.equals(rightContainer)) {
+            List<String> leftArgs = wireCodecContainerArguments(left);
+            List<String> rightArgs = wireCodecContainerArguments(right);
+            return leftArgs.size() == rightArgs.size() &&
+                compatibleCodecProductLists(leftArgs, rightArgs);
+        }
         List<String> leftMembers = compositeWireShapeMembers(left);
         List<String> rightMembers = compositeWireShapeMembers(right);
         if (leftMembers != null && rightMembers != null) {
@@ -654,6 +658,27 @@
                 compatibleCodecProductLists(expected, rightMembers);
         }
         return false;
+    }
+
+    private String wireCodecContainerName(String product) {
+        if (product == null || !product.endsWith(">")) {
+            return null;
+        }
+        int open = product.indexOf('<');
+        if (open <= 0) {
+            return null;
+        }
+        String name = product.substring(0, open);
+        return switch (name) {
+            case "vec", "set", "map", "optional", "fixed-vector", "array" -> name;
+            default -> null;
+        };
+    }
+
+    private List<String> wireCodecContainerArguments(String product) {
+        int open = product.indexOf('<');
+        return NetworkSchemaText.splitTopLevel(
+            product.substring(open + 1, product.length() - 1));
     }
 
     private boolean compatibleCodecProductLists(
@@ -689,7 +714,17 @@
         }
         List<String> members = compositeWireShapeMembers(product);
         if (members == null) {
-            return product.startsWith("fixed-bytes-") ? 0 : 10;
+            List<String> containerArgs = wireCodecContainerName(product) == null
+                ? null
+                : wireCodecContainerArguments(product);
+            if (containerArgs == null) {
+                return product.startsWith("fixed-bytes-") ? 0 : 10;
+            }
+            int score = 0;
+            for (String argument : containerArgs) {
+                score += codecProductSemanticScore(argument);
+            }
+            return score;
         }
         int score = 0;
         for (String member : members) {

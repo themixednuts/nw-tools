@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::network_schema::parse::{composite_member_wire_shapes, nested_type_shape_wire_shapes};
+use crate::network_schema::parse::{
+    composite_member_wire_shapes, nested_type_shape_wire_shapes,
+    wire_scalar_products_width_compatible,
+};
 use crate::network_schema::{NetworkField, NetworkNestedTypeShape, NetworkType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,7 +241,8 @@ fn nested_wire_shape_matches(field: &NetworkField, shape: &NetworkNestedTypeShap
     let Some(expected) = composite_member_wire_shapes(raw) else {
         return true;
     };
-    nested_type_shape_wire_shapes(shape, &[]).is_some_and(|observed| observed == expected)
+    nested_type_shape_wire_shapes(shape, &[])
+        .is_some_and(|observed| wire_scalar_products_width_compatible(&observed, &expected))
 }
 
 fn exact_nested_storage_range(field: &NetworkField) -> Option<(u32, u32)> {

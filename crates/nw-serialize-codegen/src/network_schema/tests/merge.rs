@@ -1062,6 +1062,7 @@ fn merges_field_overrides_with_source_style_container_types() {
                 type_name: None,
                 field_index: Some(3),
                 field: Some("spawnedEntityIdsBySpawnerId".to_owned()),
+                name: None,
                 native_type: Some("MB::ReplicatedMapFieldHandler<AZ::Crc32, AZ::EntityId>".to_owned()),
                 rust_type: Some("::nw_network::serialize::ReplicatedContainer<::nw_network::serialize::IndexMap<::nw_network::Crc32, ::nw_network::EntityId>, { ::nw_network::serialize::WIRE_VEC_CAP }, ::nw_network::serialize::DefaultMarshaler<::nw_network::Crc32>, ::nw_network::serialize::DefaultMarshaler<::nw_network::EntityId>>".to_owned()),
                 wire_shape: Some(NetworkWireShape::ReplicatedContainer(
@@ -1105,6 +1106,48 @@ fn merges_field_overrides_with_source_style_container_types() {
         field.evidence.last().map(|evidence| evidence.kind),
         Some(NetworkEvidenceKind::FieldOverride)
     );
+}
+
+#[test]
+fn renames_a_field_override_selected_by_index() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+            "typeIndex": 226,
+            "typeName": "ReceiveConfigOverridesKeyValuePairsMsg",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "wireShape": "vec<composite<string,vec<composite<string,string>>>>",
+                "confidence": "message-unmarshal-pcode-interprocedural-collection"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&report).expect("schema");
+    let overrides = NetworkFieldOverrideFile {
+        fields: vec![NetworkFieldOverride {
+            type_id: None,
+            type_index: Some(226),
+            type_name: None,
+            field_index: Some(0),
+            field: None,
+            name: Some("sections".to_owned()),
+            native_type: None,
+            rust_type: None,
+            wire_shape: None,
+            wire_shape_source: None,
+            confidence: Some(NetworkConfidence::High),
+        }],
+    };
+
+    let merge =
+        schema.merge_field_overrides(&overrides, Some("network-field-overrides.json".to_owned()));
+
+    assert_eq!(merge.matched_field_count, 1);
+    assert_eq!(merge.unmatched_field_count, 0);
+    assert_eq!(merge.field_name_updated_count, 1);
+    assert_eq!(schema.types[0].fields[0].name.as_deref(), Some("sections"));
 }
 
 #[test]

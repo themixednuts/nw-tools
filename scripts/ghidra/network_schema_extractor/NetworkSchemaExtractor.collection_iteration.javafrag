@@ -28,6 +28,18 @@
         }
     }
 
+    private record InlineNestedCollection(
+        NetworkSchemaNaturalLoop loop,
+        PcodeOpAST count,
+        PcodeStorage storage,
+        WireShape wireEvidence,
+        Set<Address> codecCallsites) {
+
+        InlineNestedCollection {
+            codecCallsites = Set.copyOf(codecCallsites);
+        }
+    }
+
     private CollectionIteration collectionIteration(
         Function function,
         HighFunction high,
@@ -79,44 +91,8 @@
                     null));
             }
             else {
-                PcodeStorage targetReadBuffer = callTargetReadBufferStorage(
-                    high,
-                    operations,
-                    operation,
-                    target,
-                    readBuffer,
-                    codecWireTraceActiveContexts);
-                String preferredBuffer = targetReadBuffer == null
-                    ? null
-                    : formalParameterBaseFromStorage(target, targetReadBuffer);
-                // Descriptor class-value helpers (NewWorld+0x15ac710) are proven
-                // as instruction leaves; their CFG body is not a standard codec
-                // event sequence. Emit the leaf directly so optional-suffix
-                // recovery can see writesElement=true.
-                WireShape classValueLeaf = classValueUnmarshalLeaf(
-                    target,
-                    preferredBuffer);
-                if (classValueLeaf != null) {
-                    writesElement = true;
-                    nestedEvents = List.of(new CodecWireEvent(
-                        null,
-                        classValueLeaf,
-                        operation.getSeqnum().getTarget(),
-                        target.getEntryPoint(),
-                        fullFunctionName(target),
-                        null,
-                        null));
-                }
-                else {
-                    if (targetReadBuffer == null) {
-                        continue;
-                    }
-                    if (!hasReadBufferFlow(
-                            target,
-                            targetReadBuffer,
-                            codecWireTraceActiveContexts)) {
-                        continue;
-                    }
+                WireShape directEvidence = directCallWireEvidence(operation);
+                if (directEvidence != null && directEvidence.hasProvenSemantics()) {
                     writesElement = unmarshalCodecWritesSequenceElement(
                         function,
                         high,
@@ -125,30 +101,105 @@
                         operation,
                         extent,
                         readBuffer);
-                    CodecWireTrace nested = traceUnmarshalCodec(
-                        target,
-                        targetReadBuffer,
-                        codecWireTraceActiveContexts,
-                        codecWireTraceCompletedContexts);
-                    if (nested == null || nested.events.isEmpty()) {
-                        // Cursor/telemetry helpers often take the ReadBuffer (e.g.
-                        // NewWorld+0x873230 size delta in 0x15c29b0) but are not
-                        // element codecs. Only fail the iteration when the call
-                        // actually stores into the sequence element.
-                        if (writesElement) {
-                            recordNestedTypeShapeReject(
-                                "dynamic-collection-element-codec-unproven");
-                            return null;
-                        }
+                    if (!writesElement) {
                         continue;
                     }
-                    nestedEvents = nested.events;
-                    boolean presence = nestedEvents.size() == 1 &&
-                        nestedEvents.get(0).wireEvidence() != null &&
-                        "bool".equals(nestedEvents.get(0).wireEvidence().shape) &&
-                        nestedEvents.get(0).wireEvidence().hasProvenSemantics();
-                    if (!writesElement && !presence) {
-                        continue;
+                    nestedEvents = List.of(new CodecWireEvent(
+                        unmarshalNativeTypeFromTarget(target),
+                        directEvidence,
+                        operation.getSeqnum().getTarget(),
+                        target.getEntryPoint(),
+                        fullFunctionName(target),
+                        provenUnmarshalOutputStorage(operation),
+                        null));
+                }
+                else {
+                    PcodeStorage targetReadBuffer = callTargetReadBufferStorage(
+                        high,
+                        operations,
+                        operation,
+                        target,
+                        readBuffer,
+                        codecWireTraceActiveContexts);
+                    String preferredBuffer = targetReadBuffer == null
+                        ? null
+                        : formalParameterBaseFromStorage(target, targetReadBuffer);
+                    // Descriptor class-value helpers (NewWorld+0x15ac710) are proven
+                    // as instruction leaves; their CFG body is not a standard codec
+                    // event sequence. Emit the leaf directly so optional-suffix
+                    // recovery can see writesElement=true.
+                    WireShape classValueLeaf = classValueUnmarshalLeaf(
+                        target,
+                        preferredBuffer);
+                    if (classValueLeaf != null) {
+                        writesElement = true;
+                        nestedEvents = List.of(new CodecWireEvent(
+                            null,
+                            classValueLeaf,
+                            operation.getSeqnum().getTarget(),
+                            target.getEntryPoint(),
+                            fullFunctionName(target),
+                            null,
+                            null));
+                    }
+                    else {
+                        if (targetReadBuffer == null) {
+                            continue;
+                        }
+                        if (!hasReadBufferFlow(
+                                target,
+                                targetReadBuffer,
+                                codecWireTraceActiveContexts)) {
+                            continue;
+                        }
+                        writesElement = unmarshalCodecWritesSequenceElement(
+                            function,
+                            high,
+                            loop,
+                            operations,
+                            operation,
+                            extent,
+                            readBuffer);
+                        CodecWireTrace nested = traceUnmarshalCodec(
+                            target,
+                            targetReadBuffer,
+                            codecWireTraceActiveContexts,
+                            codecWireTraceCompletedContexts);
+                        if (nested == null || nested.events.isEmpty()) {
+                            if (writesElement && directEvidence != null &&
+                                directEvidence.layout != null) {
+                                nestedEvents = List.of(new CodecWireEvent(
+                                    unmarshalNativeTypeFromTarget(target),
+                                    directEvidence,
+                                    operation.getSeqnum().getTarget(),
+                                    target.getEntryPoint(),
+                                    fullFunctionName(target),
+                                    provenUnmarshalOutputStorage(operation),
+                                    null));
+                            }
+                            // Cursor/telemetry helpers often take the ReadBuffer (e.g.
+                            // NewWorld+0x873230 size delta in 0x15c29b0) but are not
+                            // element codecs. Only fail the iteration when the call
+                            // actually stores into the sequence element.
+                            else if (writesElement) {
+                                recordNestedTypeShapeReject(
+                                    "dynamic-collection-element-codec-unproven");
+                                return null;
+                            }
+                            else {
+                                continue;
+                            }
+                        }
+                        else {
+                            nestedEvents = nested.events;
+                        }
+                        boolean presence = nestedEvents.size() == 1 &&
+                            nestedEvents.get(0).wireEvidence() != null &&
+                            "bool".equals(nestedEvents.get(0).wireEvidence().shape) &&
+                            nestedEvents.get(0).wireEvidence().hasProvenSemantics();
+                        if (!writesElement && !presence) {
+                            continue;
+                        }
                     }
                 }
             }
@@ -339,6 +390,16 @@
         NetworkSchemaNaturalLoop loop,
         List<PcodeOpAST> operations) {
 
+        return loopElementCodecs(owner, high, loop, operations, true);
+    }
+
+    private CollectionElementSequence loopElementCodecs(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        boolean includeInlineNestedCollections) {
+
         HashMap<String, String> tempNativeTypes = new HashMap<>();
         HashMap<String, String> tempWireShapes = new HashMap<>();
         for (PcodeOpAST operation : operations) {
@@ -354,6 +415,15 @@
                 unmarshalNativeTypeFromTarget(target),
                 evidence == null ? null : firstNonEmpty(evidence.shape, evidence.layout));
         }
+
+        List<InlineNestedCollection> inlineNestedCollections =
+            includeInlineNestedCollections
+                ? inlineNestedCollections(owner, high, loop, operations)
+                : List.of();
+        IdentityHashMap<PcodeOpAST, InlineNestedCollection> inlineNestedByCount =
+            new IdentityHashMap<>();
+        inlineNestedCollections.forEach(collection ->
+            inlineNestedByCount.put(collection.count(), collection));
 
         IdentityHashMap<PcodeOpAST, WireShape> nestedCollections = new IdentityHashMap<>();
         Set<PcodeOpAST> nestedHelpers = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -392,6 +462,17 @@
             if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
                 continue;
             }
+            InlineNestedCollection inlineNested = inlineNestedByCount.get(operation);
+            if (inlineNested != null) {
+                result.add(new PcodeCodecCall(operation, inlineNested.wireEvidence()));
+                consumedCallsites.add(operation.getSeqnum().getTarget());
+                consumedCallsites.addAll(inlineNested.codecCallsites());
+                continue;
+            }
+            if (inlineNestedCollections.stream().anyMatch(
+                    collection -> collection.loop().contains(operation))) {
+                continue;
+            }
             WireShape nested = nestedCollections.get(operation);
             if (nested != null) {
                 result.add(new PcodeCodecCall(operation, nested));
@@ -407,4 +488,337 @@
             }
         }
         return new CollectionElementSequence(result, consumedCallsites);
+    }
+
+    private List<InlineNestedCollection> inlineNestedCollections(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop parent,
+        List<PcodeOpAST> operations) {
+
+        ArrayList<InlineNestedCollection> result = new ArrayList<>();
+        List<NetworkSchemaNaturalLoop> loops = NetworkSchemaControlFlow.naturalLoops(high);
+        for (NetworkSchemaNaturalLoop child : loops) {
+            if (monitor.isCancelled()) {
+                break;
+            }
+            if (!isStrictNestedLoop(parent, child)) {
+                continue;
+            }
+            PcodeOpAST count = nearestCountCallForLoop(
+                owner,
+                high,
+                child,
+                operations);
+            if (count == null) {
+                continue;
+            }
+            InlineNestedCollection collection = inlineNestedCollection(
+                owner,
+                high,
+                child,
+                operations,
+                count);
+            if (collection == null) {
+                continue;
+            }
+            if (!nestedCollectionFeedsParentOutput(
+                    owner,
+                    high,
+                    parent,
+                    operations,
+                    collection)) {
+                recordCountedCollectionReject(
+                    owner,
+                    child,
+                    "inline-nested-parent-consumption-unproven");
+                continue;
+            }
+            result.add(collection);
+        }
+        return List.copyOf(result);
+    }
+
+    private InlineNestedCollection inlineNestedCollection(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeOpAST count) {
+
+        DynamicSequenceExtent extent = dynamicSequenceExtent(loop, operations);
+        String readBufferParameter = uniqueReadBufferParameter(owner);
+        CollectionIteration iteration =
+            extent == null || readBufferParameter == null
+                ? null
+                : collectionIteration(
+                    owner,
+                    high,
+                    loop,
+                    operations,
+                    new PcodeStorage(readBufferParameter, 0L),
+                    extent);
+        if (iteration != null &&
+            isStableCollectionStorage(
+                extent.data(),
+                new PcodeStorage(readBufferParameter, 0L))) {
+            return new InlineNestedCollection(
+                loop,
+                count,
+                extent.data(),
+                iteration.wireEvidence(),
+                iteration.codecCallsites());
+        }
+
+        CollectionElementSequence elements = loopElementCodecs(
+            owner,
+            high,
+            loop,
+            operations,
+            false);
+        if (elements == null || elements.codecs().isEmpty() ||
+            !strictlyOrderedCodecCalls(high, elements.codecs())) {
+            recordCountedCollectionReject(
+                owner,
+                loop,
+                "inline-nested-element-codecs-unproven");
+            return null;
+        }
+        PcodeStorage storage = countedCollectionIndexedOutputStorage(
+            owner,
+            high,
+            loop,
+            operations,
+            elements.codecs(),
+            false);
+        WireShape evidence = countedSequenceWireEvidence(elements.codecs());
+        if (storage == null) {
+            recordCountedCollectionReject(
+                owner,
+                loop,
+                "inline-nested-local-storage-unproven");
+            return null;
+        }
+        if (evidence == null) {
+            recordCountedCollectionReject(
+                owner,
+                loop,
+                "inline-nested-wire-evidence-unproven");
+            return null;
+        }
+        return new InlineNestedCollection(
+            loop,
+            count,
+            storage,
+            evidence,
+            elements.consumedCallsites());
+    }
+
+    private boolean isStrictNestedLoop(
+        NetworkSchemaNaturalLoop parent,
+        NetworkSchemaNaturalLoop child) {
+
+        return parent != null && child != null && parent != child &&
+            parent.body().containsAll(child.body()) &&
+            !parent.body().equals(child.body());
+    }
+
+    private boolean nestedCollectionFeedsParentOutput(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop parent,
+        List<PcodeOpAST> operations,
+        InlineNestedCollection nested) {
+
+        for (PcodeOpAST operation : operations) {
+            if (monitor.isCancelled()) {
+                return false;
+            }
+            if (!parent.contains(operation) || nested.loop().contains(operation) ||
+                operation.getOpcode() != PcodeOp.CALL ||
+                directCallWireEvidence(operation) != null) {
+                continue;
+            }
+            boolean countPrecedes =
+                NetworkSchemaControlFlow.precedes(high, nested.count(), operation);
+            String output = uniqueLikelyOutputParameter(owner, operation);
+            boolean outputProven = isProvenOutputParameterBase(owner, output);
+            boolean consumes = callConsumesNestedCollectionStorage(
+                owner,
+                operation,
+                nested.storage());
+            boolean successfulLoopExitReachesCall =
+                nestedLoopExitReachesConsumingCall(
+                    nested.loop(),
+                    nested.codecCallsites(),
+                    operations,
+                    operation);
+            recordNestedParentConsumptionDiagnostic(
+                owner,
+                operation,
+                nested.storage(),
+                countPrecedes,
+                output,
+                outputProven,
+                consumes,
+                successfulLoopExitReachesCall);
+            if (countPrecedes && outputProven && consumes &&
+                successfulLoopExitReachesCall) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean nestedLoopExitReachesConsumingCall(
+        NetworkSchemaNaturalLoop loop,
+        Set<Address> codecCallsites,
+        List<PcodeOpAST> operations,
+        PcodeOpAST call) {
+
+        PcodeBlockBasic target = NetworkSchemaControlFlow.parentBlock(call);
+        if (loop == null || target == null || loop.contains(target) ||
+            codecCallsites == null || codecCallsites.isEmpty()) {
+            return false;
+        }
+        boolean codecsBelongToLoop = codecCallsites.stream()
+            .map(callsite -> operationAt(operations, callsite))
+            .allMatch(codec -> codec != null && loop.contains(codec));
+        if (!codecsBelongToLoop) {
+            return false;
+        }
+        for (PcodeBlockBasic block : loop.body()) {
+            for (PcodeBlockBasic successor :
+                    NetworkSchemaControlFlow.successors(block)) {
+                if (loop.contains(successor)) {
+                    continue;
+                }
+                if (successor == target ||
+                    NetworkSchemaControlFlow.reaches(successor, target)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void recordNestedParentConsumptionDiagnostic(
+        Function owner,
+        PcodeOpAST call,
+        PcodeStorage nestedStorage,
+        boolean countPrecedes,
+        String output,
+        boolean outputProven,
+        boolean consumes,
+        boolean successfulLoopExitReachesCall) {
+
+        if (call == null || call.getSeqnum() == null ||
+            nestedParentConsumptionDiagnostics.size() >= 32) {
+            return;
+        }
+        Address callsite = call.getSeqnum().getTarget();
+        String key = formatAddress(callsite) + ':' + storageKey(nestedStorage);
+        if (!nestedParentConsumptionDiagnosticKeys.add(key)) {
+            return;
+        }
+
+        Function target = pcodeCallTarget(call);
+        HighFunction targetHigh = highFunction(target);
+        JsonObject diagnostic = new JsonObject();
+        NetworkSchemaJson.addAddress(
+            diagnostic,
+            "function",
+            owner == null ? null : owner.getEntryPoint(),
+            addressFormatter);
+        NetworkSchemaJson.addAddress(
+            diagnostic,
+            "callsite",
+            callsite,
+            addressFormatter);
+        NetworkSchemaJson.addAddress(
+            diagnostic,
+            "target",
+            target == null ? null : target.getEntryPoint(),
+            addressFormatter);
+        NetworkSchemaJson.add(diagnostic, "output", output);
+        diagnostic.addProperty("countPrecedes", countPrecedes);
+        diagnostic.addProperty("outputProven", outputProven);
+        diagnostic.addProperty("consumes", consumes);
+        diagnostic.addProperty(
+            "successfulLoopExitReachesCall",
+            successfulLoopExitReachesCall);
+        addStorageDiagnostic(diagnostic, "nestedStorage", nestedStorage);
+
+        JsonArray arguments = new JsonArray();
+        int argumentCount = provenCallArgumentCount(call, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            PcodeStorage argument = provenCallArgumentStorage(
+                owner,
+                call,
+                target,
+                slot);
+            JsonObject entry = new JsonObject();
+            entry.addProperty("slot", slot);
+            addStorageDiagnostic(entry, "storage", argument);
+            if (argument != null && nestedStorage != null &&
+                Objects.equals(argument.base, nestedStorage.base)) {
+                long relative = nestedStorage.offset - argument.offset;
+                entry.addProperty("relativeMemberOffset", relative);
+                JsonArray offsets = new JsonArray();
+                if (targetHigh != null) {
+                    for (Long offset : directReceiverOffsets(
+                            targetHigh,
+                            "param_" + slot)) {
+                        offsets.add(offset);
+                    }
+                }
+                entry.add("calleeOffsets", offsets);
+            }
+            arguments.add(entry);
+        }
+        diagnostic.add("arguments", arguments);
+        nestedParentConsumptionDiagnostics.add(diagnostic);
+    }
+
+    private boolean callConsumesNestedCollectionStorage(
+        Function owner,
+        PcodeOpAST call,
+        PcodeStorage nestedStorage) {
+
+        Function target = pcodeCallTarget(call);
+        HighFunction targetHigh = highFunction(target);
+        int argumentCount = provenCallArgumentCount(call, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            if (monitor.isCancelled()) {
+                return false;
+            }
+            PcodeStorage argument = provenCallArgumentStorage(
+                owner,
+                call,
+                target,
+                slot);
+            if (argument == null && slot < call.getNumInputs()) {
+                argument = pcodeStorageExpression(call.getInput(slot));
+            }
+            if (argument == null || nestedStorage == null ||
+                !Objects.equals(argument.base, nestedStorage.base)) {
+                continue;
+            }
+            if (argument.sameLocation(nestedStorage)) {
+                return true;
+            }
+            long relative = nestedStorage.offset - argument.offset;
+            if (relative < 0L || relative > 0x1000L || targetHigh == null) {
+                continue;
+            }
+            Set<Long> offsets = directReceiverOffsets(
+                targetHigh,
+                "param_" + slot);
+            if (offsets.contains(relative) &&
+                offsets.contains(relative + 8L) &&
+                offsets.contains(relative + 16L)) {
+                return true;
+            }
+        }
+        return false;
     }

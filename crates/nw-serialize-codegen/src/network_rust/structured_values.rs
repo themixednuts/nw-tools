@@ -123,13 +123,7 @@ fn build_structured_value_field_plan(
     if shape.member_coverage_proven != Some(true) {
         return Err(StructuredValuePlanError::UnprovenMemberCoverage);
     }
-    if shape.wire_order_proven != Some(true)
-        || shape
-            .members
-            .iter()
-            .enumerate()
-            .any(|(index, member)| member.wire_ordinal != u32::try_from(index).ok())
-    {
+    if nested_type_shape_members_in_wire_order(shape).is_none() {
         return Err(StructuredValuePlanError::UnprovenWireOrder);
     }
     if shape.members.is_empty() {

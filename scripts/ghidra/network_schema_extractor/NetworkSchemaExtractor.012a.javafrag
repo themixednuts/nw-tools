@@ -39,6 +39,7 @@
                 state.registers.remove("R11");
                 return;
             }
+            invalidateStackArgumentsPassedByAddress(state);
 
             if (!observeConstructors) {
                 boolean addFilterGroupCall = isAddFilterGroupCall(instruction, state);

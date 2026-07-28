@@ -643,9 +643,9 @@
             directOwner.offset == extent.data().offset) {
             return true;
         }
-        // Descriptor class-value helpers (NewWorld+0x15ac710) take the element
-        // slot in Win64 arg3/R8 and store inside the callee. P-code CALL inputs
-        // are often truncated to the target only, so recover via ABI state.
+        // Element helpers may store the complete aggregate inside the callee.
+        // P-code CALL inputs are often truncated, so bind a proven callee output
+        // to the caller's affine element cursor through the Win64 call frame.
         if (abiCallWritesSequenceElement(helper, call, extent, readBuffer)) {
             return true;
         }
@@ -684,58 +684,140 @@
         if (target == null) {
             return false;
         }
-        // Class-value ABI from NewWorld+0x15ac710 / use at 0x15c29b0:
-        // RCX=result, RDX=status, R8=element slot, R9=buffer. Element store is
-        // inside the callee, so loop-local STORE matching never sees it.
-        // Ghidra may type the helper as void; recover the leaf via preferred
-        // buffer slots instead of requiring a unique readBufferParameters hit.
-        WireShape leaf = classValueUnmarshalLeaf(
-            target,
-            readBuffer == null
-                ? null
-                : formalParameterBaseFromStorage(target, readBuffer));
-        if (leaf == null) {
+        Integer outputSlot = provenSequenceElementOutputSlot(target, extent);
+        if (outputSlot == null) {
+            if (!messageCallFrameOutputs(target).isEmpty()) {
+                recordNestedTypeShapeReject(
+                    "sequence-element-value-output-unproven");
+            }
             return false;
         }
-        PcodeStorage element = provenCallArgumentStorage(helper, call, target, 3);
-        PcodeStorage bufferArgument = provenCallArgumentStorage(
+        NetworkSchemaNaturalLoop loop = loopContaining(call);
+        PcodeOpAST cursor = uniqueAffineSequenceCursor(loop, extent);
+        if (cursor == null) {
+            recordNestedTypeShapeReject(
+                "sequence-element-affine-cursor-unproven");
+            return false;
+        }
+        if (outputSlot > provenCallArgumentCount(call, target)) {
+            recordNestedTypeShapeReject(
+                "sequence-element-output-slot-outside-arity");
+            return false;
+        }
+
+        PcodeStorage element = provenCallArgumentStorage(
             helper,
             call,
             target,
-            4);
-        if (element != null) {
-            if (readBuffer != null && element.sameLocation(readBuffer)) {
-                return false;
-            }
-            if (bufferArgument != null && element.sameLocation(bufferArgument)) {
-                return false;
-            }
-            if (element.sameLocation(extent.data())) {
-                return true;
-            }
-            NetworkSchemaNaturalLoop loop = loopContaining(call);
-            if (loop != null) {
-                for (PcodeOpAST induction : affineSequenceInductions(loop)) {
-                    Long stride = affinePointerInductionStride(induction);
-                    PcodeStorage initial = fixedSequenceInitialStorage(induction);
-                    if (stride == null || stride != extent.stride() ||
-                        initial == null ||
-                        !initial.sameLocation(extent.data())) {
-                        continue;
-                    }
-                    PcodeStorage inductionStorage = pcodeStorageExpression(
-                        induction.getOutput());
-                    if (inductionStorage != null &&
-                        inductionStorage.sameLocation(element)) {
-                        return true;
-                    }
-                }
-            }
+            outputSlot);
+        if (element != null &&
+            (element.sameLocation(extent.end()) ||
+                readBuffer != null && element.sameLocation(readBuffer))) {
+            recordNestedTypeShapeReject(
+                "sequence-element-output-aliases-non-element");
+            return false;
         }
-        // Win64 R8 holding the live loop cursor is enough when stride matches the
-        // 16-byte class-value slot used by 0x15c29b0. Element storage may be
-        // missing from truncated CALL p-code when the callee is typed void.
-        return extent.stride() == 0x10L;
+
+        if (outputSlot < call.getNumInputs() &&
+            pcodeNodeDependsOn(
+                call.getInput(outputSlot),
+                cursor.getOutput(),
+                new LinkedHashSet<>(),
+                0)) {
+            return true;
+        }
+
+        Set<PcodeStorage> dependencies =
+            instructionCallArgumentStorageDependencies(
+                helper,
+                call,
+                target,
+                outputSlot);
+        boolean dataRooted = dependencies.stream()
+            .anyMatch(extent.data()::sameLocation);
+        boolean endRooted = dependencies.stream()
+            .anyMatch(extent.end()::sameLocation);
+        boolean bufferRooted = readBuffer != null && dependencies.stream()
+            .anyMatch(readBuffer::sameLocation);
+        boolean proven = dataRooted && !endRooted && !bufferRooted;
+        if (!proven) {
+            recordNestedTypeShapeReject(
+                "sequence-element-abi-cursor-unproven");
+        }
+        return proven;
+    }
+
+    private Integer provenSequenceElementOutputSlot(
+        Function target,
+        SequenceExtent extent) {
+
+        Integer valueSlot = unmarshalOutputParameterSlot(target);
+        if (valueSlot == null) {
+            return null;
+        }
+        List<MessageCallFrameOutput> outputs = messageCallFrameOutputs(target);
+        MessageCallFrameOutput valueOutput = null;
+        for (MessageCallFrameOutput output : outputs) {
+            if (messageCallFrameParameterIndex(output.parameterBase()) != valueSlot) {
+                continue;
+            }
+            if (valueOutput != null) {
+                return null;
+            }
+            valueOutput = output;
+        }
+        if (valueOutput != null) {
+            int span = nestedTypeRequiredLength(valueOutput.shape());
+            return isProvenSequenceElementStorageOutput(valueOutput) &&
+                span > 0 && span <= extent.stride()
+                    ? valueSlot
+                    : null;
+        }
+        if (!outputs.isEmpty()) {
+            return null;
+        }
+
+        Integer span = contiguousFormalOutputSpan(target, valueSlot);
+        return validatedUnmarshalLeaf(target) != null &&
+            span != null && span > 0 && span <= extent.stride()
+                ? valueSlot
+                : null;
+    }
+
+    private boolean isProvenSequenceElementStorageOutput(
+        MessageCallFrameOutput output) {
+
+        if (output == null || output.shape() == null ||
+            output.shape().members.isEmpty() ||
+            !Boolean.TRUE.equals(output.shape().memberCoverageProven)) {
+            return false;
+        }
+        return output.shape().members.stream().allMatch(member ->
+            member != null && member.offset >= 0L &&
+                nestedMemberWireEvidence(member) != null);
+    }
+
+    private PcodeOpAST uniqueAffineSequenceCursor(
+        NetworkSchemaNaturalLoop loop,
+        SequenceExtent extent) {
+
+        if (loop == null || extent == null) {
+            return null;
+        }
+        PcodeOpAST selected = null;
+        for (PcodeOpAST induction : affineSequenceInductions(loop)) {
+            Long stride = affinePointerInductionStride(induction);
+            PcodeStorage initial = fixedSequenceInitialStorage(induction);
+            if (stride == null || stride != extent.stride() || initial == null ||
+                !initial.sameLocation(extent.data())) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = induction;
+        }
+        return selected;
     }
 
     private WireShape classValueUnmarshalLeaf(
@@ -877,17 +959,20 @@
     }
 
     private WireShape dynamicSequenceWireEvidence(List<CodecWireEvent> events) {
-        if (events == null || events.isEmpty() || events.stream().anyMatch(event ->
-                event == null || event.wireEvidence() == null ||
-                    !event.wireEvidence().hasProvenSemantics() ||
-                    event.wireEvidence().layout == null)) {
+        if (events == null || events.isEmpty()) {
             return null;
         }
         ArrayList<String> shapes = new ArrayList<>(events.size());
         ArrayList<String> layouts = new ArrayList<>(events.size());
+        boolean projected = false;
         for (CodecWireEvent event : events) {
-            shapes.add(event.wireEvidence().shape);
-            layouts.add(event.wireEvidence().layout);
+            WireShape evidence = event == null ? null : event.wireEvidence();
+            if (evidence == null || evidence.layout == null) {
+                return null;
+            }
+            shapes.add(evidence.hasProvenSemantics() ? evidence.shape : evidence.layout);
+            layouts.add(evidence.layout);
+            projected |= !evidence.hasProvenSemantics();
         }
         String elementShape = compositeWireShape(shapes);
         String elementLayout = compositeWireShape(layouts);
@@ -896,5 +981,7 @@
             : WireShape.semantic(
                 "vec<" + elementShape + ">",
                 "vec<" + elementLayout + ">",
-                "cfg-interprocedural-counted-sequence");
+                projected
+                    ? "cfg-interprocedural-counted-sequence-partial-semantic-projection"
+                    : "cfg-interprocedural-counted-sequence");
     }

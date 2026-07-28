@@ -154,7 +154,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private static final String EXTRACTOR_VERSION =
-        "network-schema-extractor-20260726-staged-counted-element-stores";
+        "network-schema-extractor-20260727-container-evidence-reconciliation-pass";
 
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
@@ -365,6 +365,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final Set<String> nestedTypeShapeActive = new HashSet<>();
     private final Map<String, Map<String, CollectionOutputShape>> collectionOutputShapeCache =
         lruCache(FUNCTION_INSTRUCTION_CACHE_LIMIT);
+    private final Set<String> collectionOutputShapeActive = new HashSet<>();
     private final Map<String, Optional<InterproceduralCollectionHelper>>
         interproceduralCollectionHelperCache = lruCache(FUNCTION_INSTRUCTION_CACHE_LIMIT);
     private final Set<String> interproceduralCollectionHelperActive = new HashSet<>();
@@ -408,6 +409,11 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private JsonArray interproceduralCollectionCountSamples = new JsonArray();
     private final Map<String, Integer> countedCollectionRejectCounts = new LinkedHashMap<>();
     private JsonArray countedCollectionRejectSamples = new JsonArray();
+    private JsonArray localVectorOwnerDiagnostics = new JsonArray();
+    private final Set<String> localVectorOwnerDiagnosticKeys = new LinkedHashSet<>();
+    private JsonArray nestedParentConsumptionDiagnostics = new JsonArray();
+    private final Set<String> nestedParentConsumptionDiagnosticKeys =
+        new LinkedHashSet<>();
     private int countedCollectionsRecovered;
     private int countedCollectionsApplied;
     private JsonArray countedCollectionRecoveredSamples = new JsonArray();

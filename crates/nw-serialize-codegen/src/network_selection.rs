@@ -171,17 +171,16 @@ fn collect_exact_codec_type_ids(codec: &NetworkContainerCodec, type_ids: &mut BT
 }
 
 fn collect_exact_shape_type_ids(shape: &NetworkNestedTypeShape, type_ids: &mut BTreeSet<Uuid>) {
-    if !shape.has_exact_identity() {
-        return;
+    if shape.has_exact_identity() {
+        type_ids.extend(shape.type_id);
     }
-    type_ids.extend(shape.type_id);
     for member in &shape.members {
         collect_exact_member_type_id(member, type_ids);
     }
 }
 
 fn collect_exact_member_type_id(member: &NetworkNestedTypeMember, type_ids: &mut BTreeSet<Uuid>) {
-    if member.type_id_source.as_deref() == Some("serialize-field-for-proven-type") {
+    if member.type_identity_proven {
         type_ids.extend(member.type_id);
     }
 }
@@ -229,6 +228,51 @@ mod tests {
         assert_eq!(
             planner.plan([] as [&str; 0]).root_specs,
             [emitted_type_id.to_string()]
+        );
+    }
+
+    #[test]
+    fn exact_nested_member_identity_is_a_required_serialize_root() {
+        let member_type_id = Uuid::parse_str("16b90ef8-dc71-4b3d-b113-e1b2e231a535").unwrap();
+        let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+            "registryEntries": [{
+                "uuid": "A55A0001-0000-4000-8000-000000006181",
+                "typeIndex": 6181,
+                "typeName": "Javelin::ClientMessages::NestedMemberMsg",
+                "fields": [{
+                    "index": 0,
+                    "name": "field_0",
+                    "wireShape": "composite<u64,composite<u32,bool>>",
+                    "nestedTypeShape": {
+                        "layoutProven": true,
+                        "memberCoverageProven": true,
+                        "wireOrderProven": true,
+                        "members": [{
+                            "index": 0,
+                            "name": "_0",
+                            "wireShape": "u64",
+                            "wireOrdinal": 0
+                        }, {
+                            "index": 1,
+                            "name": "_1",
+                            "nativeType": "AbilityInstanceLimit",
+                            "typeId": member_type_id.to_string(),
+                            "typeIdSource": "ghidra-pcode-output-layout+unique-serialize-native-layout",
+                            "typeIdentityProven": true,
+                            "wireShape": "composite<u32,bool>",
+                            "wireOrdinal": 1
+                        }]
+                    },
+                    "confidence": "message-unmarshal-pcode-stack"
+                }]
+            }],
+            "fieldRegistrationFunctions": []
+        }))
+        .unwrap();
+
+        assert_eq!(
+            required_serialize_type_ids(&schema),
+            BTreeSet::from([member_type_id])
         );
     }
 }

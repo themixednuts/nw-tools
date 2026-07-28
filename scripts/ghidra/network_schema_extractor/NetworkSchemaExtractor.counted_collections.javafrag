@@ -432,49 +432,6 @@
         return result;
     }
 
-    private Map<String, CollectionOutputShape> collectionOutputShapesByParameterFromPcode(
-        Function target) {
-
-        if (target == null || target.getEntryPoint() == null) {
-            return Collections.emptyMap();
-        }
-        String context = functionCacheKey("collection-output-shape", target);
-        Map<String, CollectionOutputShape> cached = collectionOutputShapeCache.get(context);
-        if (cached != null) {
-            return cached;
-        }
-        HighFunction high = highFunction(target);
-        if (high == null) {
-            return Collections.emptyMap();
-        }
-
-        List<PcodeOpAST> operations = orderedPcodeOps(high);
-        LinkedHashMap<String, CollectionOutputShape> result = new LinkedHashMap<>();
-        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
-            CollectionOutputShape shape = countedCollectionOutputFromLoop(
-                target,
-                high,
-                loop,
-                operations);
-            if (shape == null) {
-                continue;
-            }
-            CollectionOutputShape previous = result.putIfAbsent(
-                storageKey(shape.storage),
-                shape);
-            if (previous != null &&
-                (!Objects.equals(previous.countCallsite, shape.countCallsite) ||
-                 !sameWireEvidence(previous.wireEvidence, shape.wireEvidence))) {
-                recordNestedTypeShapeReject("ambiguous-counted-collection-output");
-                result.clear();
-                break;
-            }
-        }
-        Map<String, CollectionOutputShape> immutable = Map.copyOf(result);
-        collectionOutputShapeCache.put(context, immutable);
-        return immutable;
-    }
-
     private CollectionOutputShape countedCollectionOutputFromLoop(
         Function owner,
         HighFunction high,
@@ -529,15 +486,12 @@
                 recordCountedCollectionReject(owner, loop, "unordered-element-codecs");
                 return null;
             }
-            String outputParameter = countedCollectionOutputParameter(
+            outputStorage = countedCollectionOutputStorage(
                 owner,
                 high,
                 loop,
                 operations,
                 elementCodecs);
-            outputStorage = outputParameter == null
-                ? null
-                : new PcodeStorage(outputParameter, 0L);
             nativeType = null;
             sequence = countedSequenceWireEvidence(elementCodecs);
             codecCallsites = elementSequence.consumedCallsites();

@@ -267,9 +267,8 @@ pub(super) fn replicated_state_shape_support_tokens(
     };
     let value_type = syn::parse_str::<syn::Type>(&value_type_string).ok()?;
 
-    let members = shape
-        .members
-        .iter()
+    let members = nested_type_shape_members_in_wire_order(shape)?
+        .into_iter()
         .map(|member| {
             container_value_member_tokens(field, shape, member, embedded_shapes, serialize_types)
         })
@@ -764,6 +763,10 @@ fn member_wire_shape_projection(
                     .map(|codec| format!("::nw_network::serialize::ArrayCodec<{codec}>")),
             })
         }
+        NetworkMemberWireShape::Named("class-value") => Some(MemberWireProjection {
+            rust_type: "::nw_network::serialize::ClassValue".to_owned(),
+            codec_type: None,
+        }),
         NetworkMemberWireShape::Named(name) => {
             let shape = nested_shape_by_wire_name(name, embedded_shapes)?;
             Some(MemberWireProjection {

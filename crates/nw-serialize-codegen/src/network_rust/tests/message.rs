@@ -887,9 +887,10 @@ fn accepts_nested_shape_when_layout_uses_fixed_byte_limbs() {
 
     assert!(plan.can_generate, "{plan:#?}");
     assert!(
-        !plan.blocked_reasons.iter().any(|reason| {
-            reason.starts_with("known-layout-missing-semantic-type")
-        }),
+        !plan
+            .blocked_reasons
+            .iter()
+            .any(|reason| { reason.starts_with("known-layout-missing-semantic-type") }),
         "{plan:#?}"
     );
     assert_eq!(
@@ -1589,6 +1590,277 @@ fn exact_nested_client_ref_uses_the_runtime_wire_type() {
             .contains("pub client_ref: ::nw_network::ClientRef")
     );
     assert!(!output.source.contains("::nw_network::source::ClientRef"));
+}
+
+#[test]
+fn exact_unreflected_nested_identity_emits_local_support_type() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "49334933-4933-4933-8933-493349334937",
+            "typeIndex": 6181,
+            "typeName": "ProfanityFilterClientTrait::FilterChatResponseMsg",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "nativeType": "GameChatMessage",
+                "sourceTypeName": "GameChatMessage",
+                "sourceTypeId": "088CAA4E-5FCF-4965-A64C-8C1A3272B1E7",
+                "sourceTypeIdentityProven": true,
+                "wireShape": "composite<u32,u8>",
+                "wireLayout": "composite<fixed-bytes-4,fixed-bytes-1>",
+                "nestedTypeShape": {
+                    "typeId": "088CAA4E-5FCF-4965-A64C-8C1A3272B1E7",
+                    "identityProven": true,
+                    "typeName": "GameChatMessage",
+                    "typeNameFull": "GameChatMessage",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "members": [{
+                        "index": 0,
+                        "name": "_0",
+                        "wireShape": "u32",
+                        "wireLayout": "fixed-bytes-4",
+                        "wireOrdinal": 0
+                    }, {
+                        "index": 1,
+                        "name": "_1",
+                        "wireShape": "u8",
+                        "wireLayout": "fixed-bytes-1",
+                        "wireOrdinal": 1
+                    }]
+                },
+                "confidence": "message-unmarshal-constructor-vptr"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("GameChatMessage")
+    );
+    assert!(output.source.contains("pub struct GameChatMessage"));
+    assert!(
+        !output
+            .source
+            .contains("::nw_network::source::GameChatMessage")
+    );
+}
+
+#[test]
+fn proven_nested_layout_overrides_partial_native_scalar_label() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "49334933-4933-4933-8933-493349334938",
+            "typeIndex": 6182,
+            "typeName": "Aoi::PhysicsTrait::QueryWorldRayCastMsg",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "nativeType": "AZ::Vector3",
+                "wireShape": "composite<vec3,u32>",
+                "wireLayout": "composite<fixed-bytes-12,fixed-bytes-4>",
+                "nestedTypeShape": {
+                    "typeNameSource": "ghidra-call-frame",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "members": [{
+                        "index": 0,
+                        "name": "second",
+                        "nativeType": "u32",
+                        "wireShape": "u32",
+                        "wireLayout": "fixed-bytes-4",
+                        "wireOrdinal": 1
+                    }, {
+                        "index": 1,
+                        "name": "first",
+                        "nativeType": "AZ::Vector3",
+                        "wireShape": "vec3",
+                        "wireLayout": "fixed-bytes-12",
+                        "wireOrdinal": 0
+                    }]
+                },
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("QueryWorldRayCastMsgField0Value")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub struct QueryWorldRayCastMsgField0Value")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub field_0: QueryWorldRayCastMsgField0Value")
+    );
+    let wire_first = output
+        .source
+        .find("first")
+        .expect("wire-ordinal zero member");
+    let wire_second = output
+        .source
+        .find("second")
+        .expect("wire-ordinal one member");
+    assert!(wire_first < wire_second, "{}", output.source);
+    assert!(!output.source.contains("#[marshal("));
+}
+
+#[test]
+fn class_value_members_emit_local_support_types() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "49334933-4933-4933-8933-493349334939",
+            "typeIndex": 6183,
+            "typeName": "Javelin::ClientMessages::ContractsComponentClientFacet_OnAcceptContract",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "wireShape": "composite<composite<bool,class-value>,u32>",
+                "wireLayout": "composite<composite<fixed-bytes-1,class-value>,fixed-bytes-4>",
+                "nestedTypeShape": {
+                    "typeNameSource": "ghidra-call-frame",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "members": [{
+                        "index": 0,
+                        "name": "_0",
+                        "wireShape": "composite<bool,class-value>",
+                        "wireLayout": "composite<fixed-bytes-1,class-value>",
+                        "wireOrdinal": 0
+                    }, {
+                        "index": 1,
+                        "name": "_1",
+                        "wireShape": "u32",
+                        "wireLayout": "fixed-bytes-4",
+                        "wireOrdinal": 1
+                    }]
+                },
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert!(
+        output
+            .source
+            .contains("pub struct ContractsComponentClientFacetOnAcceptContractField0Value")
+    );
+    assert!(
+        output
+            .source
+            .contains("::nw_network::serialize::ClassValue")
+    );
+    assert!(!output.source.contains("#[marshal("));
+}
+
+#[test]
+fn class_value_aggregate_with_conditional_member_emits_local_support_type() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "49334933-4933-4933-8933-493349334940",
+            "typeIndex": 6184,
+            "typeName": "Aoi::BaseQueryTrait::QueryLinearShapeCastMsg",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 1,
+                "name": "field_1",
+                "wireShape": "composite<composite<bool,class-value>,vec3,vec3,quat,boolean-choice<default-omitted<fixed-bytes-12,fixed-bytes-12>,u32>,u32,fixed-bytes-8>",
+                "wireLayout": "composite<composite<fixed-bytes-1,class-value>,fixed-bytes-12,fixed-bytes-12,fixed-bytes-16,boolean-choice<default-omitted<fixed-bytes-12,fixed-bytes-12>,u32>,u32,fixed-bytes-8>",
+                "nestedTypeShape": {
+                    "typeNameSource": "ghidra-call-frame",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "members": [{
+                        "index": 0,
+                        "name": "_0",
+                        "wireShape": "composite<bool,class-value>",
+                        "wireLayout": "composite<fixed-bytes-1,class-value>",
+                        "wireOrdinal": 0
+                    }, {
+                        "index": 1,
+                        "name": "_1",
+                        "wireShape": "vec3",
+                        "wireLayout": "fixed-bytes-12",
+                        "wireOrdinal": 1
+                    }, {
+                        "index": 2,
+                        "name": "_2",
+                        "wireShape": "vec3",
+                        "wireLayout": "fixed-bytes-12",
+                        "wireOrdinal": 2
+                    }, {
+                        "index": 3,
+                        "name": "_3",
+                        "wireShape": "quat",
+                        "wireLayout": "fixed-bytes-16",
+                        "wireOrdinal": 3
+                    }, {
+                        "index": 4,
+                        "name": "_4",
+                        "wireShape": "boolean-choice<default-omitted<fixed-bytes-12,fixed-bytes-12>,u32>",
+                        "wireLayout": "boolean-choice<default-omitted<fixed-bytes-12,fixed-bytes-12>,u32>",
+                        "wireOrdinal": 4
+                    }, {
+                        "index": 5,
+                        "name": "_5",
+                        "wireShape": "u32",
+                        "wireLayout": "u32",
+                        "wireOrdinal": 5
+                    }, {
+                        "index": 6,
+                        "name": "_6",
+                        "wireLayout": "fixed-bytes-8",
+                        "wireOrdinal": 6
+                    }]
+                },
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert!(
+        output
+            .source
+            .contains("pub struct QueryLinearShapeCastMsgField1Value"),
+        "{}",
+        output.source
+    );
 }
 
 #[test]

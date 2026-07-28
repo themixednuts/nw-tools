@@ -63,6 +63,88 @@ fn collapses_alternate_spelling_multi_helper_wire_products() {
         ),
         None
     );
+    let nested = nested_shape_from_layouts(&["u64", "u64", "u32", "bool"]);
+    assert_eq!(
+        collapse_alternate_spelling_wire_product(
+            "composite<composite<fixed-bytes-8,u64,u32,bool>,composite<fixed-bytes-8,fixed-bytes-8>>",
+            Some(&nested),
+        ),
+        Some("composite<fixed-bytes-8,u64,u32,bool>")
+    );
+    let nested = nested_shape_from_layouts(&[
+        "fixed-bytes-8",
+        "u64",
+        "u8",
+        "fixed-bytes-12",
+        "fixed-bytes-12",
+        "fixed-bytes-4",
+        "fixed-bytes-4",
+        "fixed-bytes-4",
+        "composite<fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4>",
+        "bool",
+        "string",
+        "fixed-bytes-4",
+        "composite<fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4>",
+        "bool",
+        "string",
+    ]);
+    assert_eq!(
+        collapse_alternate_spelling_wire_product(
+            "composite<composite<fixed-bytes-8,u64,u8,fixed-bytes-12,fixed-bytes-12,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,composite<fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4>,bool,string,fixed-bytes-4,composite<fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4>,bool,string>,composite<fixed-bytes-8,fixed-bytes-8>>",
+            Some(&nested),
+        ),
+        Some(
+            "composite<fixed-bytes-8,u64,u8,fixed-bytes-12,fixed-bytes-12,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,composite<fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4>,bool,string,fixed-bytes-4,composite<fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4>,bool,string>"
+        )
+    );
+    let nested = nested_shape_from_layouts(&[
+        "u64",
+        "u64",
+        "u8",
+        "vec3",
+        "vec3",
+        "f32",
+        "f32",
+        "f32",
+        "composite<f32,f32,f32,f32>",
+        "bool",
+        "string",
+        "f32",
+        "composite<f32,f32,f32,f32>",
+        "bool",
+        "string",
+    ]);
+    assert_eq!(
+        collapse_alternate_spelling_wire_product(
+            "composite<composite<fixed-bytes-8,u64,u8,fixed-bytes-12,fixed-bytes-12,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,composite<fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4>,bool,string,fixed-bytes-4,composite<fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4>,bool,string>,composite<fixed-bytes-8,fixed-bytes-8>>",
+            Some(&nested),
+        ),
+        Some(
+            "composite<fixed-bytes-8,u64,u8,fixed-bytes-12,fixed-bytes-12,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,composite<fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4>,bool,string,fixed-bytes-4,composite<fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4>,bool,string>"
+        )
+    );
+    let mut nested = nested_shape_from_layouts(&["u32", "fixed-bytes-16", "fixed-bytes-16", "u64"]);
+    nested.layout_proven = Some(true);
+    nested.member_coverage_proven = Some(true);
+    nested.wire_order_proven = Some(true);
+    assert_eq!(
+        collapse_alternate_spelling_wire_product(
+            "composite<composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16,fixed-bytes-8>,fixed-bytes-16>",
+            Some(&nested),
+        ),
+        Some("composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16,fixed-bytes-8>")
+    );
+    let mut nested = nested_shape_from_layouts(&["u64", "u64", "u32", "aabb3d"]);
+    nested.layout_proven = Some(true);
+    nested.member_coverage_proven = Some(true);
+    nested.wire_order_proven = Some(true);
+    assert_eq!(
+        collapse_alternate_spelling_wire_product(
+            "composite<composite<fixed-bytes-8,u64,fixed-bytes-4,fixed-bytes-24>,composite<fixed-bytes-8,fixed-bytes-8>>",
+            Some(&nested),
+        ),
+        Some("composite<fixed-bytes-8,u64,fixed-bytes-4,fixed-bytes-24>")
+    );
 }
 
 fn nested_shape_from_layouts(layouts: &[&str]) -> crate::network_schema::NetworkNestedTypeShape {
@@ -94,31 +176,33 @@ fn nested_shape_from_layouts(layouts: &[&str]) -> crate::network_schema::Network
         members: layouts
             .iter()
             .enumerate()
-            .map(|(index, layout)| crate::network_schema::NetworkNestedTypeMember {
-                index: Some(index as u32),
-                offset: None,
-                native_offset: None,
-                name: None,
-                name_source: None,
-                name_proven: None,
-                name_evidence: None,
-                native_type: None,
-                type_id: None,
-                type_id_source: None,
-                type_identity_proven: false,
-                type_identity_source: None,
-                wire_shape: None,
-                wire_shape_source: None,
-                wire_layout: Some((*layout).to_owned()),
-                wire_layout_source: None,
-                byte_width: None,
-                wire_ordinal: None,
-                wire_order_source: None,
-                callsite: None,
-                target: None,
-                target_name: None,
-                type_conflict: false,
-            })
+            .map(
+                |(index, layout)| crate::network_schema::NetworkNestedTypeMember {
+                    index: Some(index as u32),
+                    offset: None,
+                    native_offset: None,
+                    name: None,
+                    name_source: None,
+                    name_proven: None,
+                    name_evidence: None,
+                    native_type: None,
+                    type_id: None,
+                    type_id_source: None,
+                    type_identity_proven: false,
+                    type_identity_source: None,
+                    wire_shape: None,
+                    wire_shape_source: None,
+                    wire_layout: Some((*layout).to_owned()),
+                    wire_layout_source: None,
+                    byte_width: None,
+                    wire_ordinal: None,
+                    wire_order_source: None,
+                    callsite: None,
+                    target: None,
+                    target_name: None,
+                    type_conflict: false,
+                },
+            )
             .collect(),
     }
 }

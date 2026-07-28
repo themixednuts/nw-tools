@@ -275,8 +275,7 @@ pub(super) fn rust_field_shape(shape: &SchemaWireShape) -> RustFieldShape {
             // the scalar element + capacity. Top-level RegisterField fixed
             // sequences still prefer the handler-plan path in field_plan.
             let element = scalar_rust_type(sequence.element);
-            let value_type =
-                format!("::arrayvec::ArrayVec<{element}, {}>", sequence.capacity);
+            let value_type = format!("::arrayvec::ArrayVec<{element}, {}>", sequence.capacity);
             let element_shape = SchemaWireShape::from(sequence.element);
             let codec = wire_shape_codec_type(&element_shape)
                 .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>"));

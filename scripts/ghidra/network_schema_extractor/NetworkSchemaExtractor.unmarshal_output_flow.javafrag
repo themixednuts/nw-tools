@@ -40,6 +40,23 @@
                     candidates.remove(readBufferSlot);
                 }
             }
+            if (candidates.isEmpty()) {
+                for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                    collectMutatingHelperOutputCandidates(
+                        candidates,
+                        function,
+                        operation);
+                }
+                if (returnedSlot != null) {
+                    candidates.remove(returnedSlot);
+                }
+                for (String readBuffer : readBuffers) {
+                    Integer readBufferSlot = pcodeParameterIndex(readBuffer);
+                    if (readBufferSlot != null) {
+                        candidates.remove(readBufferSlot);
+                    }
+                }
+            }
             selected = candidates.size() == 1
                 ? candidates.iterator().next()
                 : null;
@@ -51,6 +68,76 @@
                 key,
                 selected == null ? -1 : selected);
         }
+    }
+
+    private Integer transportedFormalParameterSlot(Varnode node) {
+        return transportedFormalParameterSlot(
+            node,
+            new LinkedHashSet<>(),
+            0);
+    }
+
+    private Integer transportedFormalParameterSlot(
+        Varnode node,
+        Set<String> active,
+        int depth) {
+
+        if (node == null || depth > 32 ||
+            !active.add("transported-parameter:" + pcodeSsaNodeKey(node))) {
+            return null;
+        }
+        Integer direct = formalParameterSlot(node);
+        if (direct != null) {
+            return direct;
+        }
+        PcodeStorage storage = pcodeStorageExpression(node);
+        Integer storageSlot = formalParameterSlot(storage);
+        if (storageSlot != null && storage.offset == 0L) {
+            return storageSlot;
+        }
+
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return null;
+        }
+        return switch (definition.getOpcode()) {
+            case PcodeOp.COPY,
+                 PcodeOp.CAST -> definition.getNumInputs() == 0
+                ? null
+                : transportedFormalParameterSlot(
+                    definition.getInput(0),
+                    active,
+                    depth + 1);
+            case PcodeOp.MULTIEQUAL -> commonTransportedFormalParameterSlot(
+                definition,
+                active,
+                depth + 1);
+            default -> null;
+        };
+    }
+
+    private Integer commonTransportedFormalParameterSlot(
+        PcodeOp operation,
+        Set<String> active,
+        int depth) {
+
+        Integer selected = null;
+        for (int index = 0; index < operation.getNumInputs(); index++) {
+            Integer candidate = transportedFormalParameterSlot(
+                operation.getInput(index),
+                new LinkedHashSet<>(active),
+                depth);
+            if (candidate == null) {
+                return null;
+            }
+            if (selected == null) {
+                selected = candidate;
+            }
+            else if (!selected.equals(candidate)) {
+                return null;
+            }
+        }
+        return selected;
     }
 
     private void collectDirectUnmarshalOutputCandidate(
@@ -101,6 +188,47 @@
         addFormalOutputCandidate(
             candidates,
             provenCallArgumentStorage(owner, operation, target, outputSlot));
+    }
+
+    private void collectMutatingHelperOutputCandidates(
+        Set<Integer> candidates,
+        Function owner,
+        PcodeOpAST operation) {
+
+        if (candidates == null || owner == null || operation == null ||
+            operation.getOpcode() != PcodeOp.CALL) {
+            return;
+        }
+        Function target = pcodeCallTarget(operation);
+        HighFunction targetHigh = highFunction(target);
+        if (targetHigh == null) {
+            return;
+        }
+
+        LinkedHashSet<Integer> mutatedSlots = new LinkedHashSet<>();
+        for (PcodeOpAST targetOperation : orderedPcodeOps(targetHigh)) {
+            if (targetOperation.getOpcode() != PcodeOp.STORE ||
+                targetOperation.getNumInputs() < 3) {
+                continue;
+            }
+            Integer slot = formalPointerRootSlot(targetOperation.getInput(1));
+            if (slot != null) {
+                mutatedSlots.add(slot);
+            }
+        }
+        int argumentCount = provenCallArgumentCount(operation, target);
+        for (Integer slot : mutatedSlots) {
+            if (slot == null || slot <= 0 || slot > argumentCount) {
+                continue;
+            }
+            addFormalOutputCandidate(
+                candidates,
+                provenCallArgumentStorage(
+                    owner,
+                    operation,
+                    target,
+                    slot));
+        }
     }
 
     private void addFormalOutputCandidate(

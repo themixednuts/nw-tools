@@ -391,8 +391,11 @@ pub(super) fn container_value_shape_matches_with_embedded(
     if shape.members.is_empty() || value_wire_shapes.is_empty() {
         return false;
     }
+    let Some(members) = nested_type_shape_members_in_wire_order(shape) else {
+        return false;
+    };
     let mut index = 0;
-    for member in &shape.members {
+    for member in members {
         let Some(wire_shape) = nested_member_wire_shape(member) else {
             return false;
         };
@@ -426,7 +429,10 @@ fn fixed_width_scalar_shapes_match(
     observed: SchemaWireScalarShape,
     expected: SchemaWireScalarShape,
 ) -> bool {
-    match (fixed_width_scalar_bytes(observed), fixed_width_scalar_bytes(expected)) {
+    match (
+        fixed_width_scalar_bytes(observed),
+        fixed_width_scalar_bytes(expected),
+    ) {
         (Some(left), Some(right)) => left == right,
         _ => false,
     }
@@ -574,13 +580,13 @@ pub(super) fn container_value_shape_members_are_emittable(
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> bool {
     let uses_source_type = container_value_shape_uses_source_type(shape, serialize_types);
+    let Some(members) = nested_type_shape_members_in_wire_order(shape) else {
+        return false;
+    };
     container_value_shape_member_names_are_emittable(shape, serialize_types)
         && shape.member_coverage_proven == Some(true)
-        && shape.wire_order_proven == Some(true)
-        && shape.members.iter().enumerate().all(|(index, member)| {
-            member.wire_ordinal == u32::try_from(index).ok()
-                && (!uses_source_type
-                    || exact_member_rust_type(shape, member, serialize_types).is_some())
+        && members.into_iter().all(|member| {
+            (!uses_source_type || exact_member_rust_type(shape, member, serialize_types).is_some())
                 && container_value_member_wire_shape_is_emittable(
                     shape,
                     member,
@@ -662,6 +668,7 @@ fn member_wire_shape_is_emittable(
             member_wire_shape_is_emittable(key, embedded_shapes, serialize_types)
                 && member_wire_shape_is_emittable(value, embedded_shapes, serialize_types)
         }
+        NetworkMemberWireShape::Named("class-value") => true,
         NetworkMemberWireShape::Named(name) => nested_shape_by_wire_name(name, embedded_shapes)
             .is_some_and(|shape| {
                 container_value_shape_members_are_emittable(shape, embedded_shapes, serialize_types)
