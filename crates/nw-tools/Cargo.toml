@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 az-physics-assets.workspace = true
+az-turso.workspace = true
 clap.workspace = true
 cry-animation.workspace = true
 cry-audio.workspace = true
@@ -61,14 +62,19 @@ arboard = { version = "3.6.1", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["png", "qoi", "tiff", "exr", "gif"] }
 base64 = "0.22.1"
 uuid.workspace = true
-drizzle = { version = "0.1.9", features = ["rusqlite"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+drizzle = { git = "https://github.com/themixednuts/drizzle-rs", rev = "78688095e29643709213dc3d23a95bcf374d22e2", features = [
+  "turso",
+] }
+futures-lite = "2"
 tempfile.workspace = true
 toml = "0.9"
 walkdir = "2"
 
 [build-dependencies]
-drizzle-migrations = "0.1.9"
-drizzle-types = "0.1.9"
+drizzle-migrations = { git = "https://github.com/themixednuts/drizzle-rs", rev = "78688095e29643709213dc3d23a95bcf374d22e2" }
+drizzle-types = { git = "https://github.com/themixednuts/drizzle-rs", rev = "78688095e29643709213dc3d23a95bcf374d22e2" }
 
 [dev-dependencies]
+turso = { version = "=0.7.2", default-features = false, features = [
+  "pure-rust-crypto",
+] }

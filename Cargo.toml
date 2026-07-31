@@ -45,6 +45,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 arcstr = { version = "1.2.0", features = ["serde"] }
 arrayvec = "0.7"
 az-animation = { version = "0.1.0", path = "../az-rs/crates/az/animation" }
+az-turso = { version = "0.1.0", path = "../az-rs/crates/az/turso" }
 az-physics-assets = { version = "0.1.0", path = "crates/az-physics-assets" }
 glam = { version = "0.32", features = ["serde"] }
 bevy_math = { version = "0.19", default-features = false, features = ["std"] }

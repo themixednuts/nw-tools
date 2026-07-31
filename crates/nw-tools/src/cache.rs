@@ -1,4 +1,4 @@
-//! On-disk cache (SQLite via `drizzle`) for the resolved asset catalog.
+//! On-disk cache (Turso MVCC via `drizzle`) for the resolved asset catalog.
 //!
 //! Parsing New World's 365 MB asset catalog out of `Engine.pak` costs ~12 s per
 //! run. The catalog only changes when the game updates, so we parse RASC and
@@ -11,13 +11,16 @@
 //! `drizzle-migrations`) and embedded at compile time via
 //! `drizzle::include_migrations!`, so the on-disk schema always matches.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use drizzle::migrations::Tracking;
 use drizzle::sqlite::connection::SQLiteTransactionType;
+use drizzle::sqlite::pragma::{Pragma, Synchronous, TempStore};
 use drizzle::sqlite::prelude::*;
-use drizzle::sqlite::rusqlite::Drizzle;
+use drizzle::sqlite::turso::Drizzle;
 
 /// Full RASC catalog index, keyed by `AssetId` string.
 #[SQLiteTable]
@@ -46,22 +49,24 @@ pub struct Schema {
 const FINGERPRINT_KEY: &str = "engine_pak_fingerprint";
 const RASC_VERSION_KEY: &str = "rasc_version";
 
-/// Connection pragmas. This database is a disposable cache — it is rebuilt from
-/// the catalog whenever `Engine.pak` changes — so we trade durability for speed:
-/// WAL with relaxed `synchronous` for fast concurrent reads and cheap bulk writes,
-/// memory temp store, and a memory-mapped read window over the file.
-const PRAGMAS: &str = "\
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA temp_store = MEMORY;
-PRAGMA mmap_size = 268435456;";
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// SQLite is capped at 999 bound parameters per statement. [`Catalog`] binds
-/// four columns per row, so this stays below the limit.
-const CATALOG_CHUNK: usize = 240;
+trait CacheFutureExt: Future + Sized {
+    fn wait(self) -> Self::Output {
+        futures_lite::future::block_on(self)
+    }
+}
 
-/// The parsed catalog cache, backed by a migrated SQLite database.
+impl<F> CacheFutureExt for F where F: Future + Sized {}
+
+/// Turso follows SQLite's modern 32,766-parameter ceiling. [`Catalog`] binds
+/// four columns per row, so this leaves broad headroom while avoiding hundreds
+/// of tiny insert statements for the shipped catalog.
+const CATALOG_CHUNK: usize = 4_000;
+
+/// The parsed catalog cache, backed by a migrated Turso MVCC database.
 pub struct Cache {
+    local_database: az_turso::LocalDatabase,
     db: Drizzle<Schema>,
 }
 
@@ -77,7 +82,10 @@ impl Cache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(Self::migrated(rusqlite::Connection::open(path)?)?)
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("cache path is not valid UTF-8: {}", path.display()))?;
+        Self::migrated(path)
     }
 
     /// Open an in-memory cache — for tests and ephemeral runs.
@@ -87,21 +95,31 @@ impl Cache {
     /// Returns an error if the database cannot be created or a migration fails.
     #[cfg(test)]
     pub fn open_in_memory() -> anyhow::Result<Self> {
-        Ok(Self::migrated(rusqlite::Connection::open_in_memory()?)?)
+        Self::migrated(":memory:")
     }
 
-    fn migrated(conn: rusqlite::Connection) -> drizzle::Result<Self> {
-        conn.execute_batch(PRAGMAS)?;
-        let (db, _) = Drizzle::new(conn, Schema::new());
-        db.migrate(&drizzle::include_migrations!("./drizzle"), Tracking::SQLITE)?;
-        Ok(Self { db })
+    fn migrated(path: &str) -> anyhow::Result<Self> {
+        async {
+            let local_database = az_turso::open_local_mvcc(path, BUSY_TIMEOUT).await?;
+            let conn = local_database.connection().clone();
+
+            let (mut db, _) = Drizzle::new(conn, Schema::new());
+            configure_cache_connection(&db).await?;
+            db.migrate(&drizzle::include_migrations!("./drizzle"), Tracking::SQLITE)
+                .await?;
+            let runtime_connection = local_database.new_connection(BUSY_TIMEOUT)?;
+            let (db, _) = Drizzle::new(runtime_connection, Schema::new());
+            configure_cache_connection(&db).await?;
+            Ok(Self { local_database, db })
+        }
+        .wait()
     }
 
     /// The stored `Engine.pak` fingerprint, if the cache has been populated.
     #[must_use]
     pub fn fingerprint(&self) -> Option<String> {
         let Schema { meta, .. } = Schema::new();
-        let rows: Vec<SelectMeta> = self.db.select(()).from(meta).all().ok()?;
+        let rows: Vec<SelectMeta> = self.db.select(()).from(meta).all().wait().ok()?;
         rows.into_iter()
             .find(|row| row.key == FINGERPRINT_KEY)
             .map(|row| row.value)
@@ -115,14 +133,14 @@ impl Cache {
     /// types, sizes, or version metadata.
     pub fn catalog(&self) -> anyhow::Result<nw_asset::AssetCatalog> {
         let Schema { catalog, meta } = Schema::new();
-        let meta: Vec<SelectMeta> = self.db.select(()).from(meta).all()?;
+        let meta: Vec<SelectMeta> = self.db.select(()).from(meta).all().wait()?;
         let version = meta
             .into_iter()
             .find(|row| row.key == RASC_VERSION_KEY)
             .ok_or_else(|| anyhow::anyhow!("catalog cache is missing RASC version"))?
             .value
             .parse::<u32>()?;
-        let catalog_rows: Vec<SelectCatalog> = self.db.select(()).from(catalog).all()?;
+        let catalog_rows: Vec<SelectCatalog> = self.db.select(()).from(catalog).all().wait()?;
         let entries = catalog_rows
             .into_iter()
             .map(|row| {
@@ -152,40 +170,59 @@ impl Cache {
         asset_catalog: &nw_asset::AssetCatalog,
     ) -> drizzle::Result<()> {
         let Schema { catalog, meta } = Schema::new();
-        self.db.transaction(SQLiteTransactionType::Deferred, |tx| {
-            // Rebuild in place instead of replacing the database file. SQLite may
-            // still have the WAL open, and replacing only the main file can leave
-            // a partially stale cache behind. Clearing and repopulating in one
-            // transaction also preserves the last complete cache on failure.
-            tx.delete(catalog).execute()?;
-            tx.delete(meta).execute()?;
+        self.db
+            .transaction(SQLiteTransactionType::Deferred, async |tx| {
+                // Rebuild in place instead of replacing the database file. SQLite may
+                // still have the WAL open, and replacing only the main file can leave
+                // a partially stale cache behind. Clearing and repopulating in one
+                // transaction also preserves the last complete cache on failure.
+                tx.delete(catalog).execute().await?;
+                tx.delete(meta).execute().await?;
 
-            for chunk in asset_catalog.entries().chunks(CATALOG_CHUNK) {
-                let rows = chunk
-                    .iter()
-                    .map(|entry| {
-                        InsertCatalog::new(
-                            entry.asset_id().to_string(),
-                            entry.path(),
-                            entry.asset_type().to_string(),
-                            i64::from(entry.size_bytes()),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                tx.insert(catalog).values(rows).execute()?;
-            }
-            tx.insert(meta)
-                .value(InsertMeta::new(FINGERPRINT_KEY, fingerprint))
-                .execute()?;
-            tx.insert(meta)
-                .value(InsertMeta::new(
-                    RASC_VERSION_KEY,
-                    asset_catalog.rasc().version().to_string(),
-                ))
-                .execute()?;
-            Ok(())
-        })
+                for chunk in asset_catalog.entries().chunks(CATALOG_CHUNK) {
+                    let rows = chunk
+                        .iter()
+                        .map(|entry| {
+                            InsertCatalog::new(
+                                entry.asset_id().to_string(),
+                                entry.path(),
+                                entry.asset_type().to_string(),
+                                i64::from(entry.size_bytes()),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    tx.insert(catalog).values(rows).execute().await?;
+                }
+                tx.insert(meta)
+                    .value(InsertMeta::new(FINGERPRINT_KEY, fingerprint))
+                    .execute()
+                    .await?;
+                tx.insert(meta)
+                    .value(InsertMeta::new(
+                        RASC_VERSION_KEY,
+                        asset_catalog.rasc().version().to_string(),
+                    ))
+                    .execute()
+                    .await?;
+                Ok(())
+            })
+            .wait()?;
+        self.local_database.checkpoint().wait().map_err(|source| {
+            drizzle::error::DrizzleError::TransactionError(
+                format!("checkpoint catalog cache after rebuild: {source}").into(),
+            )
+        })?;
+        Ok(())
     }
+}
+
+async fn configure_cache_connection(db: &Drizzle<Schema>) -> anyhow::Result<()> {
+    // This is a disposable cache, so retain the existing NORMAL synchronous
+    // policy while using MVCC for concurrent in-process IO.
+    db.execute(Pragma::Synchronous(Synchronous::Normal)).await?;
+    db.execute(Pragma::TempStore(TempStore::Memory)).await?;
+    db.execute(Pragma::MmapSize(268_435_456)).await?;
+    Ok(())
 }
 
 /// Magic + format version for the persisted authored-dependency index blob.
@@ -354,6 +391,10 @@ mod tests {
     #[test]
     fn store_round_trips_and_replaces_catalog() {
         let mut cache = Cache::open_in_memory().unwrap();
+        assert_eq!(
+            cache.local_database.journal_mode().wait().unwrap(),
+            az_turso::MVCC_JOURNAL_MODE
+        );
         assert!(cache.fingerprint().is_none());
         let material_id = nw_asset::AssetId::new(uuid::Uuid::from_u128(1), 0);
         let mesh_id = nw_asset::AssetId::new(uuid::Uuid::from_u128(2), 7);
@@ -402,6 +443,55 @@ mod tests {
         let restored = cache.catalog().unwrap();
         assert_eq!(restored.rasc().version(), 6);
         assert_eq!(restored.entries(), replacement.entries());
+    }
+
+    #[test]
+    fn open_checkpoints_and_migrates_an_existing_wal_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("legacy.sqlite");
+        let path_text = path.to_string_lossy();
+        async {
+            let legacy = turso::Builder::new_local(&path_text)
+                .experimental_index_method(true)
+                .build()
+                .await
+                .expect("open legacy database");
+            let connection = legacy.connect().expect("connect legacy database");
+            connection
+                .pragma_update("journal_mode", "'wal'")
+                .await
+                .expect("enable WAL");
+            connection
+                .execute("CREATE TABLE legacy_marker(value TEXT NOT NULL)", ())
+                .await
+                .expect("create legacy marker");
+            connection
+                .execute("INSERT INTO legacy_marker VALUES ('preserved')", ())
+                .await
+                .expect("insert legacy marker");
+        }
+        .wait();
+
+        let cache = Cache::open(&path).expect("migrate cache to MVCC");
+        assert_eq!(
+            cache.local_database.journal_mode().wait().unwrap(),
+            az_turso::MVCC_JOURNAL_MODE
+        );
+        let mut rows = cache
+            .db
+            .conn()
+            .query("SELECT value FROM legacy_marker", ())
+            .wait()
+            .expect("query legacy marker");
+        assert_eq!(
+            rows.next()
+                .wait()
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            "preserved"
+        );
     }
 
     #[test]
