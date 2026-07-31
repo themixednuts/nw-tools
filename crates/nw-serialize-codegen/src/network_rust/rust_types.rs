@@ -376,6 +376,9 @@ pub(super) const fn exact_type_id_rust_type(type_id: Uuid) -> Option<&'static st
         0xea2c_3e90_afbe_44d4_a90d_faaf_79ba_f93d => Some("f32"),
         0x110c_4b14_11a8_4e9d_8638_5051_013a_56ac => Some("f64"),
         0xa0ca_880c_afe4_43cb_926c_59ac_4849_6112 => Some("bool"),
+        0x03aa_ab3f_5c47_5a66_9ebc_d5fa_4db3_53c9
+        | 0xc263_97ed_8f60_4df6_8320_0d0c_592d_a3cd
+        | 0xef8f_f807_ddee_4eb0_b678_4ca3_a2c4_90a4 => Some("String"),
         0xe152_c105_a133_4d03_bbf8_3d4b_2fba_3e2a | 0xdfe5_0973_ea0b_4616_833a_b60b_5e2e_71df => {
             Some("::uuid::Uuid")
         }

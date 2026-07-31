@@ -569,6 +569,51 @@ fn mismatched_unproven_nested_scalar_identity_remains_a_blocker() {
 }
 
 #[test]
+fn matching_unproven_nested_string_identity_is_wire_equivalent() {
+    let schema = replicated_container_schema_with_named_shape(
+        "values",
+        json!({
+            "storageKind": "vector",
+            "valueCodecs": [{ "wireShape": "string" }]
+        }),
+        Some(json!({
+            "typeId": "11111111-1111-4111-8111-111111111111",
+            "typeIdSource": "unmarshal-full-element-vptr",
+            "identityProven": true,
+            "identitySource": "unmarshal-full-element-vptr",
+            "typeName": "Value",
+            "typeNameFull": "Value",
+            "typeNameSource": "az-rtti-vtable-provider",
+            "memberNameSource": "synthetic-wire-ordinal",
+            "memberNamesProven": false,
+            "layoutProven": true,
+            "memberCoverageProven": true,
+            "wireOrderProven": true,
+            "wireOrderSource": "marshal+unmarshal-custom-codec-order",
+            "members": [{
+                "index": 0,
+                "offset": 0,
+                "name": "field_0",
+                "nameSource": "synthetic-wire-ordinal",
+                "nameProven": false,
+                "typeId": "03AAAB3F-5C47-5A66-9EBC-D5FA4DB353C9",
+                "typeIdSource": "az-type-info-fold",
+                "typeIdentityProven": false,
+                "wireShape": "string",
+                "wireOrdinal": 0
+            }]
+        })),
+    );
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert!(plan.evidence_issues.is_empty(), "{plan:#?}");
+    assert!(output.source.contains("pub field_0: String"));
+}
+
+#[test]
 fn unreflected_rtti_map_value_emits_named_support_struct() {
     let schema = replicated_container_schema_with_named_shape(
         "globalMapData",
