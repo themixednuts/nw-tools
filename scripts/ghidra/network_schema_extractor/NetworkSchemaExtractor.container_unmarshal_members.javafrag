@@ -273,6 +273,14 @@
             boolean linear = nestedExact && allMembersMapped && flow.complete();
             boolean optionalExact = optional != null && optional.hasOptionalSuffix();
             boolean exact = linear || optionalExact;
+            if (!exact) {
+                ContainerCodecMembers traced = exactContainerUnmarshalSuccessTrace(
+                    function,
+                    readBuffer);
+                if (traced != null) {
+                    return traced;
+                }
+            }
             String analysisStatus = linear
                 ? "complete"
                 : optionalExact

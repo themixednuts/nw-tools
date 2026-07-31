@@ -1,0 +1,28 @@
+    private ContainerCodecMembers exactContainerUnmarshalSuccessTrace(
+        Function function,
+        PcodeStorage readBuffer) {
+
+        CodecWireTrace trace = traceUnmarshalCodec(
+            function,
+            readBuffer,
+            codecWireTraceActiveContexts,
+            codecWireTraceCompletedContexts);
+        if (trace == null || trace.events.isEmpty()) {
+            return null;
+        }
+        ArrayList<ContainerCodecCall> members = new ArrayList<>(trace.events.size());
+        for (CodecWireEvent event : trace.events) {
+            if (event == null || event.wireEvidence() == null) {
+                return null;
+            }
+            members.add(containerCodecFromWireEvent(
+                event,
+                "container-helper-unmarshal-success-trace"));
+        }
+        return new ContainerCodecMembers(
+            members,
+            List.of(),
+            true,
+            true,
+            "complete-success-trace");
+    }
