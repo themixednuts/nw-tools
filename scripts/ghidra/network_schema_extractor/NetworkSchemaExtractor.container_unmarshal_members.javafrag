@@ -136,6 +136,11 @@
                             raw == null ? null : raw.nativeType,
                             booleanEvidence == null ? rawEvidence : booleanEvidence);
                         codec.evidenceSource = "container-helper-unmarshal-read-raw";
+                        applyUnmarshalContainerCodecOutputStorage(
+                            codec,
+                            high,
+                            operation,
+                            raw == null ? null : raw.storage);
                         applyConstructorFieldTypeIdentity(
                             codec,
                             rawConstructorFieldIdentity(
@@ -161,6 +166,11 @@
                             unmarshalNativeTypeFromTarget(target),
                             leaf);
                         codec.evidenceSource = "container-helper-unmarshal-leaf";
+                        applyUnmarshalContainerCodecOutputStorage(
+                            codec,
+                            high,
+                            operation,
+                            provenUnmarshalOutputStorage(operation));
                         discovered.add(codec);
                         allMembersMapped &= addContainerCodecMembersForOperation(
                             membersByBlock,
@@ -185,6 +195,16 @@
                     if (nested.members().isEmpty() && nested.optionalMembers().isEmpty()) {
                         continue;
                     }
+                    translateContainerHelperMemberStorage(
+                        function,
+                        operation,
+                        target,
+                        nested.members());
+                    translateContainerHelperMemberStorage(
+                        function,
+                        operation,
+                        target,
+                        nested.optionalMembers());
                     ContainerCodecCall boundary = new ContainerCodecCall();
                     boundary.operation = operation;
                     boundary.callsite = operation.getSeqnum().getTarget();
@@ -320,6 +340,7 @@
         codec.nativeType = event.nativeType();
         codec.wireEvidence = event.wireEvidence();
         codec.evidenceSource = evidenceSource;
+        applyUnmarshalContainerCodecOutputStorage(codec, event.outputStorage());
         if (codec.nativeType != null) {
             applyContainerCodecTypeIdentity(codec, codec.nativeType);
         }

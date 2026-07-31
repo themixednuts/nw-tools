@@ -1,6 +1,72 @@
 use super::*;
 
 #[test]
+fn exact_scalar_rtti_shape_uses_the_scalar_without_a_support_struct() {
+    let u64_id = uuid!("d6597933-47cd-4fc8-b911-63f3e2b0993a");
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "4F70C3BB-8F7D-48C2-A0B6-95431F88F356",
+            "typeIndex": 2768,
+            "typeName": "MB::PlayerHousingReplicatedState",
+            "fields": [{
+                "index": 5,
+                "name": "m_phasedHousingPlotEntityId",
+                "group": 0,
+                "sourceTypeId": u64_id.to_string(),
+                "sourceTypeIdSource": "ghidra-direct-unmarshal-value-type",
+                "sourceTypeIdentityProven": true,
+                "handlerVtable": "NewWorld+0x80b8678",
+                "confidence": "register-field-call"
+            }]
+        }],
+        "fieldRegistrationFunctions": [],
+        "fieldHandlerVtables": [{
+            "address": "NewWorld+0x80b8678",
+            "fieldCount": 1,
+            "wireShape": "u64",
+            "wireShapeSource": "marshal+unmarshal-pcode-agreement",
+            "valueTypeShape": {
+                "typeId": u64_id.to_string(),
+                "typeIdSource": "ghidra-direct-unmarshal-value-type",
+                "identityProven": true,
+                "identitySource": "ghidra-direct-unmarshal-value-type",
+                "typeName": "u64",
+                "typeNameFull": "AZ::u64",
+                "memberNameSource": "synthetic-layout-member",
+                "memberNamesProven": false,
+                "memberCoverageProven": true,
+                "wireOrderProven": true,
+                "members": [{
+                    "index": 0,
+                    "offset": "0x0",
+                    "nativeOffset": "0x0",
+                    "name": "field_0",
+                    "nameSource": "synthetic-wire-ordinal",
+                    "nameProven": false,
+                    "nativeType": "u64",
+                    "wireLayout": "u64",
+                    "wireOrdinal": 0
+                }]
+            },
+            "slots": []
+        }]
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [2768])
+        .expect("generated state source");
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_field_type.as_deref(),
+        Some("ReplicatedFieldHandler<u64>")
+    );
+    assert!(!output.source.contains("pub struct U64"));
+    assert!(!output.source.contains("U64Marshaler"));
+}
+
+#[test]
 fn emits_proven_remote_server_gde_ref_field_codec() {
     let remote_ref_id = uuid!("17207dac-730b-4793-b975-23591a950260");
     let context_id = uuid!("5bedcb9d-f3be-4300-80af-b4e17a7f4646");

@@ -331,6 +331,8 @@
         serializeTypeWireShapeCache.clear();
         serializeTypeByteWidthCache.clear();
         serializeTypeNativeWireLayoutCache.clear();
+        serializeTypesByDirectFirstFieldTypeId.clear();
+        serializeTypesByDirectFirstFieldTypeIdLoaded = false;
         serializeTypesByExactNativeSize.clear();
         serializeTypesByExactNativeSizeLoaded = false;
         serializeObjectsByRef.clear();

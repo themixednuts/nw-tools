@@ -741,6 +741,26 @@ import java.util.Collection;
         return immutable;
     }
 
+    private List<SerializeWireSlot> serializeTypeReflectedMemberWireLayout(String typeId) {
+        String normalized = normalizeUuid(typeId);
+        SerializeTypeInfo type = normalized == null ? null : serializeTypesById.get(normalized);
+        if (type == null || type.layoutFields.isEmpty()) {
+            return Collections.emptyList();
+        }
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        seen.add(normalized);
+        List<SerializeWireSlot> layout = serializeTypeNativeWireLayoutFields(
+            type,
+            0L,
+            "",
+            seen);
+        layout.sort((left, right) -> {
+            int offset = Long.compare(left.offset, right.offset);
+            return offset != 0 ? offset : left.wireShape.compareTo(right.wireShape);
+        });
+        return List.copyOf(layout);
+    }
+
     private List<SerializeWireSlot> serializeTypeNativeWireLayout(
         String typeId,
         long baseOffset,
@@ -766,6 +786,14 @@ import java.util.Collection;
         if (type == null || type.layoutFields.isEmpty()) {
             return Collections.emptyList();
         }
+        return serializeTypeNativeWireLayoutFields(type, baseOffset, path, seen);
+    }
+
+    private List<SerializeWireSlot> serializeTypeNativeWireLayoutFields(
+        SerializeTypeInfo type,
+        long baseOffset,
+        String path,
+        Set<String> seen) {
 
         ArrayList<SerializeWireSlot> result = new ArrayList<>();
         for (SerializeFieldInfo field : type.layoutFields) {

@@ -106,6 +106,469 @@ fn anonymous_container_value_layout_emits_support_struct() {
 }
 
 #[test]
+fn rtti_container_value_with_nested_sequence_emits_support_struct() {
+    let members = json!([
+        { "wireLayout": "fixed-bytes-16" },
+        { "wireShape": "u64" },
+        { "wireShape": "u64" },
+        { "wireLayout": "fixed-bytes-16" },
+        { "wireShape": "u64" },
+        { "wireShape": "f32" },
+        { "wireShape": "f32" },
+        { "wireShape": "f32" },
+        { "wireShape": "u64" },
+        { "wireShape": "u64" },
+        { "wireShape": "u16" },
+        { "wireShape": "bool" },
+        {
+            "wireShape": "vec<u32>",
+            "wireLayout": "vec<u32>",
+            "memberSemantics": "counted-sequence",
+            "members": [
+                { "wireShape": "vlq-u32" },
+                { "wireShape": "u32" }
+            ]
+        },
+        { "wireShape": "f32" },
+        { "wireShape": "bool" },
+        { "wireShape": "bool" },
+        { "wireShape": "u64" },
+        { "wireShape": "u32" }
+    ]);
+    let shape_members = [
+        "fixed-bytes-16",
+        "u64",
+        "u64",
+        "fixed-bytes-16",
+        "u64",
+        "vec3",
+        "u64",
+        "u64",
+        "u16",
+        "bool",
+        "vec<u32>",
+        "f32",
+        "bool",
+        "bool",
+        "u64",
+        "u32",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, wire_shape)| {
+        let mut member = json!({
+            "index": index,
+            "offset": index,
+            "name": format!("field_{index}"),
+            "nameSource": "synthetic-wire-ordinal",
+            "nameProven": false,
+            "wireShape": wire_shape,
+            "wireOrdinal": index
+        });
+        let scalar_type_id = match wire_shape {
+            "u16" => Some(("ECA0B403-C4F8-4B86-95FC-81688D046E40", "az-type-info-fold")),
+            "u32" => Some(("43DA906B-7DEF-4CA8-9790-854106D3F983", "az-type-info-fold")),
+            "u64" => Some((
+                "D6597933-47CD-4FC8-B911-63F3E2B0993A",
+                "serialize-unique-leaf-name",
+            )),
+            "f32" => Some(("EA2C3E90-AFBE-44D4-A90D-FAAF79BAF93D", "az-type-info-fold")),
+            _ => None,
+        };
+        if let Some((type_id, type_id_source)) = scalar_type_id {
+            member["typeId"] = json!(type_id);
+            member["typeIdSource"] = json!(type_id_source);
+            member["typeIdentityProven"] = json!(false);
+        }
+        member
+    })
+    .collect::<Vec<_>>();
+    let schema = replicated_container_schema_with_named_shape(
+        "ownedHouses",
+        json!({
+            "storageKind": "vector",
+            "elementStride": 240,
+            "keyCodecs": [],
+            "valueCodecs": [{
+                "memberSemantics": "linear-sequence",
+                "members": members
+            }]
+        }),
+        Some(json!({
+            "typeId": "CA00FC6D-8593-431B-B4BA-3F235F1BDFC1",
+            "typeIdSource": "unmarshal-full-element-vptr",
+            "identityProven": true,
+            "identitySource": "unmarshal-full-element-vptr+affine-element-stride",
+            "typeName": "ReplicatedOwnedHouseData",
+            "typeNameFull": "ReplicatedOwnedHouseData",
+            "typeNameSource": "az-rtti-vtable-provider",
+            "memberNameSource": "synthetic-wire-ordinal",
+            "memberNamesProven": false,
+            "layoutProven": true,
+            "memberCoverageProven": true,
+            "wireOrderProven": true,
+            "wireOrderSource": "marshal+unmarshal-custom-codec-order",
+            "nativeSize": 240,
+            "members": shape_members
+        })),
+    );
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::std::vec::Vec<ReplicatedOwnedHouseData>")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub struct ReplicatedOwnedHouseData")
+    );
+    assert!(output.source.contains("pub field_5: ::glam::Vec3"));
+    assert!(output.source.contains("pub field_10: ::std::vec::Vec<u32>"));
+    assert!(
+        output
+            .source
+            .contains("impl ::nw_network::serialize::Marshal for ReplicatedOwnedHouseData")
+    );
+}
+
+#[test]
+fn constructor_grouped_owned_house_data_emits_semantic_members() {
+    let typeless_ref_id = uuid!("6328304a-b754-4ad3-bf78-87236958b55b");
+    let gde_ref_id = uuid!("17207dac-730b-4793-b975-23591a950260");
+    let time_point_id = uuid!("24fbf222-8cf9-4539-b313-34726b8fc675");
+    let members = json!([
+        { "wireLayout": "fixed-bytes-16" },
+        { "wireShape": "u64" },
+        { "wireShape": "u64" },
+        { "wireLayout": "fixed-bytes-16" },
+        { "wireShape": "u64" },
+        { "wireShape": "f32" },
+        { "wireShape": "f32" },
+        { "wireShape": "f32" },
+        { "wireShape": "u64" },
+        { "wireShape": "u64" },
+        { "wireShape": "u16" },
+        { "wireShape": "bool" },
+        {
+            "wireShape": "vec<u32>",
+            "wireLayout": "vec<u32>",
+            "memberSemantics": "counted-sequence",
+            "members": [
+                { "wireShape": "vlq-u32" },
+                { "wireShape": "u32" }
+            ]
+        },
+        { "wireShape": "f32" },
+        { "wireShape": "bool" },
+        { "wireShape": "bool" },
+        { "wireShape": "u64" },
+        { "wireShape": "u32" }
+    ]);
+    let semantic_members = json!([
+        {
+            "index": 0,
+            "offset": "0x10",
+            "nativeOffset": "0x10",
+            "name": "remote_typeless_server_facet_ref",
+            "nameSource": "synthetic-provider-type",
+            "nameProven": false,
+            "nativeType": "RemoteTypelessServerFacetRef",
+            "typeId": typeless_ref_id.to_string(),
+            "typeIdSource": "constructor-stored-az-rtti-provider",
+            "typeIdentityProven": true,
+            "wireShape": "composite<fixed-bytes-16,u64,u64>",
+            "wireLayout": "composite<fixed-bytes-16,u64,u64>",
+            "wireOrdinal": 0
+        },
+        {
+            "index": 1,
+            "offset": "0x40",
+            "nativeOffset": "0x40",
+            "name": "remote_server_gde_ref",
+            "nameSource": "synthetic-provider-type",
+            "nameProven": false,
+            "nativeType": "RemoteServerGDERef",
+            "typeId": gde_ref_id.to_string(),
+            "typeIdSource": "constructor-stored-az-rtti-provider",
+            "typeIdentityProven": true,
+            "wireShape": "composite<fixed-bytes-16,u64>",
+            "wireLayout": "composite<fixed-bytes-16,u64>",
+            "wireOrdinal": 1
+        },
+        {
+            "index": 2,
+            "offset": "0x70",
+            "nativeOffset": "0x70",
+            "name": "field_5",
+            "nameSource": "synthetic-wire-ordinal",
+            "nameProven": false,
+            "nativeType": "AZ::Vector3",
+            "wireShape": "vec3",
+            "wireLayout": "vec3",
+            "wireOrdinal": 2
+        },
+        {
+            "index": 3,
+            "offset": "0x80",
+            "nativeOffset": "0x80",
+            "name": "wall_clock_time_point",
+            "nameSource": "synthetic-provider-type",
+            "nameProven": false,
+            "nativeType": "WallClockTimePoint",
+            "typeId": time_point_id.to_string(),
+            "typeIdSource": "constructor-stored-az-rtti-provider",
+            "typeIdentityProven": true,
+            "wireShape": "u64",
+            "wireLayout": "u64",
+            "wireOrdinal": 3
+        },
+        {
+            "index": 4,
+            "offset": "0x90",
+            "nativeOffset": "0x90",
+            "name": "wall_clock_time_point_2",
+            "nameSource": "synthetic-provider-type",
+            "nameProven": false,
+            "nativeType": "WallClockTimePoint",
+            "typeId": time_point_id.to_string(),
+            "typeIdSource": "constructor-stored-az-rtti-provider",
+            "typeIdentityProven": true,
+            "wireShape": "u64",
+            "wireLayout": "u64",
+            "wireOrdinal": 4
+        },
+        {
+            "index": 5,
+            "offset": "0xa0",
+            "nativeOffset": "0xa0",
+            "name": "field_8",
+            "nameSource": "synthetic-wire-ordinal",
+            "nameProven": false,
+            "nativeType": "u16",
+            "wireShape": "u16",
+            "wireLayout": "u16",
+            "wireOrdinal": 5
+        },
+        {
+            "index": 6,
+            "offset": "0xa2",
+            "nativeOffset": "0xa2",
+            "name": "field_9",
+            "nameSource": "synthetic-wire-ordinal",
+            "nameProven": false,
+            "nativeType": "bool",
+            "wireShape": "bool",
+            "wireLayout": "bool",
+            "wireOrdinal": 6
+        },
+        {
+            "index": 7,
+            "offset": "0xa8",
+            "nativeOffset": "0xa8",
+            "name": "field_10",
+            "nameSource": "synthetic-wire-ordinal",
+            "nameProven": false,
+            "nativeType": "AZStd::vector<AZ::u32>",
+            "wireShape": "vec<u32>",
+            "wireLayout": "vec<u32>",
+            "wireOrdinal": 7
+        },
+        {
+            "index": 8,
+            "offset": "0xc8",
+            "nativeOffset": "0xc8",
+            "name": "field_11",
+            "nameSource": "synthetic-wire-ordinal",
+            "nameProven": false,
+            "nativeType": "float",
+            "wireShape": "f32",
+            "wireLayout": "f32",
+            "wireOrdinal": 8
+        },
+        {
+            "index": 9,
+            "offset": "0xe5",
+            "nativeOffset": "0xe5",
+            "name": "field_12",
+            "nameSource": "synthetic-wire-ordinal",
+            "nameProven": false,
+            "nativeType": "bool",
+            "wireShape": "bool",
+            "wireLayout": "bool",
+            "wireOrdinal": 9
+        },
+        {
+            "index": 10,
+            "offset": "0xe6",
+            "nativeOffset": "0xe6",
+            "name": "field_13",
+            "nameSource": "synthetic-wire-ordinal",
+            "nameProven": false,
+            "nativeType": "bool",
+            "wireShape": "bool",
+            "wireLayout": "bool",
+            "wireOrdinal": 10
+        },
+        {
+            "index": 11,
+            "offset": "0xd0",
+            "nativeOffset": "0xd0",
+            "name": "wall_clock_time_point_3",
+            "nameSource": "synthetic-provider-type",
+            "nameProven": false,
+            "nativeType": "WallClockTimePoint",
+            "typeId": time_point_id.to_string(),
+            "typeIdSource": "constructor-stored-az-rtti-provider",
+            "typeIdentityProven": true,
+            "wireShape": "u64",
+            "wireLayout": "u64",
+            "wireOrdinal": 11
+        },
+        {
+            "index": 12,
+            "offset": "0xe0",
+            "nativeOffset": "0xe0",
+            "name": "field_15",
+            "nameSource": "synthetic-wire-ordinal",
+            "nameProven": false,
+            "nativeType": "u32",
+            "wireShape": "u32",
+            "wireLayout": "u32",
+            "wireOrdinal": 12
+        }
+    ]);
+    let mut schema = replicated_container_schema_with_named_shape(
+        "ownedHouses",
+        json!({
+            "storageKind": "vector",
+            "elementStride": 240,
+            "keyCodecs": [],
+            "valueCodecs": [{
+                "memberSemantics": "linear-sequence",
+                "members": members
+            }]
+        }),
+        Some(json!({
+            "typeId": "CA00FC6D-8593-431B-B4BA-3F235F1BDFC1",
+            "typeIdSource": "unmarshal-full-element-vptr",
+            "identityProven": true,
+            "identitySource": "unmarshal-full-element-vptr+exact-custom-codec-helper",
+            "typeName": "ReplicatedOwnedHouseData",
+            "typeNameFull": "ReplicatedOwnedHouseData",
+            "typeNameSource": "az-rtti-vtable-provider",
+            "memberBase": "element",
+            "memberNameSource": "synthetic-constructor-type",
+            "memberNamesProven": false,
+            "layoutProven": true,
+            "memberCoverageProven": true,
+            "wireOrderProven": true,
+            "wireOrderSource": "marshal+unmarshal-custom-codec-order+constructor-layout",
+            "validation": "exact-custom-codec-wire-projection+constructor-provider-layout-cover",
+            "nativeSize": 240,
+            "members": semantic_members
+        })),
+    );
+    schema.merge_serialize_codegen_unit(
+        &SerializeCodegenUnit {
+            items: vec![
+                named_value_item(typeless_ref_id, "RemoteTypelessServerFacetRef", []),
+                named_value_item(gde_ref_id, "RemoteServerGDERef", []),
+                named_value_item(time_point_id, "WallClockTimePoint", []),
+            ],
+        },
+        Some("serialize.json".to_owned()),
+    );
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::std::vec::Vec<ReplicatedOwnedHouseData>")
+    );
+    assert!(output.source.contains(
+        "pub remote_typeless_server_facet_ref: ::nw_network::source::RemoteTypelessServerFacetRef"
+    ));
+    assert!(
+        output
+            .source
+            .contains("pub remote_server_gde_ref: ::nw_network::source::RemoteServerGDERef")
+    );
+    for field_name in [
+        "wall_clock_time_point",
+        "wall_clock_time_point_2",
+        "wall_clock_time_point_3",
+    ] {
+        assert!(output.source.contains(&format!(
+            "pub {field_name}: ::nw_network::source::WallClockTimePoint"
+        )));
+    }
+    assert!(output.source.contains("pub field_5: ::glam::Vec3"));
+    assert!(output.source.contains("pub field_10: ::std::vec::Vec<u32>"));
+    for old_scalar_field in ["field_6", "field_7", "field_14"] {
+        assert!(
+            !output
+                .source
+                .contains(&format!("pub {old_scalar_field}: u64"))
+        );
+    }
+    assert!(!output.source.contains("pub field_0: [u8; 16]"));
+}
+
+#[test]
+fn mismatched_unproven_nested_scalar_identity_remains_a_blocker() {
+    let schema = replicated_container_schema_with_named_shape(
+        "values",
+        json!({
+            "storageKind": "vector",
+            "valueCodecs": [{ "wireShape": "u64" }]
+        }),
+        Some(json!({
+            "typeId": "11111111-1111-4111-8111-111111111111",
+            "typeIdSource": "unmarshal-full-element-vptr",
+            "identityProven": true,
+            "identitySource": "unmarshal-full-element-vptr",
+            "typeName": "Value",
+            "typeNameFull": "Value",
+            "typeNameSource": "az-rtti-vtable-provider",
+            "memberNameSource": "synthetic-wire-ordinal",
+            "memberNamesProven": false,
+            "layoutProven": true,
+            "memberCoverageProven": true,
+            "wireOrderProven": true,
+            "wireOrderSource": "marshal+unmarshal-custom-codec-order",
+            "members": [{
+                "index": 0,
+                "offset": 0,
+                "name": "field_0",
+                "nameSource": "synthetic-wire-ordinal",
+                "nameProven": false,
+                "typeId": "6383F1D3-BB27-4E6B-A49A-6409B2059EAA",
+                "typeIdSource": "layout-only-correlation",
+                "typeIdentityProven": false,
+                "wireShape": "u64",
+                "wireOrdinal": 0
+            }]
+        })),
+    );
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(!plan.can_generate, "{plan:#?}");
+    assert_eq!(plan.blocked_reasons, ["invalid-evidence:1"]);
+    assert_eq!(
+        plan.evidence_issues[0].kind,
+        NetworkEvidenceIssueKind::UnprovenNestedMemberTypeIdentity
+    );
+}
+
+#[test]
 fn unreflected_rtti_map_value_emits_named_support_struct() {
     let schema = replicated_container_schema_with_named_shape(
         "globalMapData",

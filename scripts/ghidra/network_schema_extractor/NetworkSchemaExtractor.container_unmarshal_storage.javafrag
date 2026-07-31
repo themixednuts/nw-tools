@@ -1,0 +1,418 @@
+    private PcodeStorage normalizedBooleanUnmarshalOutputStorage(
+        ContainerCodecCall codec,
+        HighFunction high,
+        PcodeOpAST call,
+        PcodeStorage output) {
+
+        if (codec == null || codec.wireEvidence == null ||
+            !"bool".equals(codec.wireEvidence.shape) ||
+            high == null || call == null || output == null) {
+            return null;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        PcodeOpAST normalization = boundedNormalizedBooleanOperation(
+            high,
+            operations,
+            call,
+            new RawPcodeWrite(output, null, codec.wireEvidence));
+        if (normalization == null || normalization.getOutput() == null) {
+            return null;
+        }
+
+        PcodeStorage selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3 ||
+                !NetworkSchemaControlFlow.precedes(high, normalization, operation) ||
+                !pcodeNodeDependsOn(
+                    operation.getInput(2),
+                    normalization.getOutput(),
+                    new LinkedHashSet<>(),
+                    0)) {
+                continue;
+            }
+            PcodeStorage destination =
+                pcodeStorageExpression(operation.getInput(1));
+            if (!isParameterStorage(destination) ||
+                destination.offset < 0L || destination.offset > 0x100000L) {
+                continue;
+            }
+            if (selected != null && !selected.sameLocation(destination)) {
+                return null;
+            }
+            selected = destination;
+        }
+        if (selected != null) {
+            runMetrics.increment("normalizedBooleanOutputStorageResolved");
+        }
+        return selected;
+    }
+
+    private PcodeStorage typedAggregateUnmarshalOutputStorage(
+        ContainerCodecCall codec,
+        PcodeOpAST call) {
+
+        Integer width = codec == null || codec.nativeType == null
+            ? null
+            : nativeTypeByteWidth(codec.nativeType);
+        Function target = call == null ? null : pcodeCallTarget(call);
+        Function owner = call == null || call.getSeqnum() == null
+            ? null
+            : functionContaining(call.getSeqnum().getTarget());
+        if (width == null || width <= Long.BYTES || target == null || owner == null) {
+            return null;
+        }
+        runMetrics.increment("typedAggregateOutputAttempts");
+        Integer outputSlot = typedAggregateUnmarshalOutputParameterSlot(
+            target,
+            width);
+        PcodeStorage result = outputSlot == null
+            ? null
+            : provenCallArgumentStorage(owner, call, target, outputSlot);
+        if (result != null) {
+            runMetrics.increment("typedAggregateOutputStorageResolved");
+        }
+        return result;
+    }
+
+    private Integer typedAggregateUnmarshalOutputParameterSlot(
+        Function function,
+        int expectedWidth) {
+
+        HighFunction high = highFunction(function);
+        if (high == null || expectedWidth <= Long.BYTES) {
+            return null;
+        }
+        Map<Integer, List<long[]>> rangesBySlot = new LinkedHashMap<>();
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3) {
+                continue;
+            }
+            runMetrics.increment("typedAggregateOutputStores");
+            Varnode destinationNode = operation.getInput(1);
+            Integer slot = formalPointerRootSlot(destinationNode);
+            if (slot != null) {
+                runMetrics.increment("typedAggregateOutputRootSlots");
+            }
+            Long offset = slot == null
+                ? null
+                : formalPointerRelativeOffset(destinationNode, slot);
+            if (offset != null) {
+                runMetrics.increment("typedAggregateOutputRelativeOffsets");
+            }
+            if (slot == null || offset == null) {
+                PcodeStorage destination =
+                    pcodeStorageExpression(destinationNode);
+                slot = formalParameterSlot(destination);
+                offset = destination == null ? null : destination.offset;
+            }
+            int byteWidth = operation.getInput(2).getSize();
+            Long end = offset == null
+                ? null
+                : addExactOrNull(offset, (long)byteWidth);
+            if (slot == null || offset == null || offset < 0L || end == null ||
+                byteWidth <= 0 || end > 0x100000L) {
+                continue;
+            }
+            rangesBySlot.computeIfAbsent(slot, ignored -> new ArrayList<>())
+                .add(new long[] { offset, end });
+        }
+
+        Integer selected = null;
+        for (Map.Entry<Integer, List<long[]>> entry : rangesBySlot.entrySet()) {
+            Integer slot = entry.getKey();
+            if (!storageRangesCoverPrefix(entry.getValue(), expectedWidth)) {
+                continue;
+            }
+            runMetrics.increment("typedAggregateOutputSlotCandidates");
+            if (selected != null && !selected.equals(slot)) {
+                runMetrics.increment("typedAggregateOutputSlotAmbiguous");
+                return null;
+            }
+            selected = slot;
+        }
+        if (selected != null) {
+            runMetrics.increment("typedAggregateOutputSlotResolved");
+        }
+        return selected;
+    }
+
+    private Long formalPointerRelativeOffset(
+        Varnode node,
+        int expectedSlot) {
+
+        return formalPointerRelativeOffset(
+            node,
+            expectedSlot,
+            new LinkedHashSet<>(),
+            new HashMap<>(),
+            0);
+    }
+
+    private Long formalPointerRelativeOffset(
+        Varnode node,
+        int expectedSlot,
+        Set<String> active,
+        Map<String, Optional<Long>> memo,
+        int depth) {
+
+        if (node == null || expectedSlot <= 0 || depth > 48) {
+            return null;
+        }
+        String key = expectedSlot + ":" + pcodeSsaNodeKey(node);
+        Optional<Long> cached = memo.get(key);
+        if (cached != null) {
+            return cached.orElse(null);
+        }
+        if (!active.add(key)) {
+            return null;
+        }
+
+        Long result;
+        try {
+            Integer directSlot = formalParameterSlot(node);
+            if (expectedSlot == (directSlot == null ? -1 : directSlot) &&
+                (node.getDef() == null || node.getHigh() instanceof HighParam)) {
+                result = 0L;
+            }
+            else {
+                result = formalPointerRelativeOffsetFromDef(
+                    node.getDef(),
+                    expectedSlot,
+                    active,
+                    memo,
+                    depth + 1);
+            }
+        }
+        finally {
+            active.remove(key);
+        }
+        memo.put(key, Optional.ofNullable(result));
+        return result;
+    }
+
+    private Long formalPointerRelativeOffsetFromDef(
+        PcodeOp operation,
+        int expectedSlot,
+        Set<String> active,
+        Map<String, Optional<Long>> memo,
+        int depth) {
+
+        if (operation == null) {
+            return null;
+        }
+        return switch (operation.getOpcode()) {
+            case PcodeOp.COPY,
+                 PcodeOp.CAST,
+                 PcodeOp.INT_ZEXT,
+                 PcodeOp.INT_SEXT,
+                 PcodeOp.SUBPIECE -> operation.getNumInputs() == 0
+                    ? null
+                    : formalPointerRelativeOffset(
+                        operation.getInput(0),
+                        expectedSlot,
+                        active,
+                        memo,
+                        depth);
+            case PcodeOp.INT_ADD -> formalPointerAddOffset(
+                operation,
+                expectedSlot,
+                active,
+                memo,
+                depth);
+            case PcodeOp.INT_SUB -> formalPointerSubtractOffset(
+                operation,
+                expectedSlot,
+                active,
+                memo,
+                depth);
+            case PcodeOp.PTRADD -> formalPointerIndexedOffset(
+                operation,
+                expectedSlot,
+                active,
+                memo,
+                depth);
+            case PcodeOp.PTRSUB -> formalPointerFieldOffset(
+                operation,
+                expectedSlot,
+                active,
+                memo,
+                depth);
+            case PcodeOp.MULTIEQUAL -> commonFormalPointerRelativeOffset(
+                operation,
+                expectedSlot,
+                active,
+                memo,
+                depth);
+            default -> null;
+        };
+    }
+
+    private Long formalPointerAddOffset(
+        PcodeOp operation,
+        int expectedSlot,
+        Set<String> active,
+        Map<String, Optional<Long>> memo,
+        int depth) {
+
+        if (operation.getNumInputs() != 2) {
+            return null;
+        }
+        for (int baseSlot = 0; baseSlot < 2; baseSlot++) {
+            Long base = formalPointerRelativeOffset(
+                operation.getInput(baseSlot),
+                expectedSlot,
+                active,
+                memo,
+                depth);
+            Long constant = NetworkSchemaIntegerEvaluator.evaluate(
+                operation.getInput(1 - baseSlot));
+            if (base == null || constant == null) {
+                continue;
+            }
+            long delta = signedPcodeConstant(
+                constant,
+                operation.getInput(1 - baseSlot).getSize());
+            Long result = addExactOrNull(base, delta);
+            if (result != null) {
+                return result;
+            }
+        }
+        return null;
+    }
+
+    private Long formalPointerSubtractOffset(
+        PcodeOp operation,
+        int expectedSlot,
+        Set<String> active,
+        Map<String, Optional<Long>> memo,
+        int depth) {
+
+        if (operation.getNumInputs() != 2) {
+            return null;
+        }
+        Long base = formalPointerRelativeOffset(
+            operation.getInput(0),
+            expectedSlot,
+            active,
+            memo,
+            depth);
+        Long constant = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(1));
+        if (base == null || constant == null) {
+            return null;
+        }
+        long delta = signedPcodeConstant(
+            constant,
+            operation.getInput(1).getSize());
+        return subtractExactOrNull(base, delta);
+    }
+
+    private Long formalPointerIndexedOffset(
+        PcodeOp operation,
+        int expectedSlot,
+        Set<String> active,
+        Map<String, Optional<Long>> memo,
+        int depth) {
+
+        if (operation.getNumInputs() != 3) {
+            return null;
+        }
+        Long base = formalPointerRelativeOffset(
+            operation.getInput(0),
+            expectedSlot,
+            active,
+            memo,
+            depth);
+        Long index = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(1));
+        Long scale = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(2));
+        if (base == null || index == null || scale == null) {
+            return null;
+        }
+        try {
+            long signedIndex = signedPcodeConstant(
+                index,
+                operation.getInput(1).getSize());
+            return Math.addExact(base, Math.multiplyExact(signedIndex, scale));
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private Long formalPointerFieldOffset(
+        PcodeOp operation,
+        int expectedSlot,
+        Set<String> active,
+        Map<String, Optional<Long>> memo,
+        int depth) {
+
+        if (operation.getNumInputs() != 2) {
+            return null;
+        }
+        Long base = formalPointerRelativeOffset(
+            operation.getInput(0),
+            expectedSlot,
+            active,
+            memo,
+            depth);
+        Long constant = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(1));
+        if (base == null || constant == null) {
+            return null;
+        }
+        long delta = signedPcodeConstant(
+            constant,
+            operation.getInput(1).getSize());
+        return addExactOrNull(base, delta);
+    }
+
+    private Long commonFormalPointerRelativeOffset(
+        PcodeOp operation,
+        int expectedSlot,
+        Set<String> active,
+        Map<String, Optional<Long>> memo,
+        int depth) {
+
+        Long selected = null;
+        for (int index = 0; index < operation.getNumInputs(); index++) {
+            Long candidate = formalPointerRelativeOffset(
+                operation.getInput(index),
+                expectedSlot,
+                active,
+                memo,
+                depth);
+            if (candidate == null) {
+                return null;
+            }
+            if (selected == null) {
+                selected = candidate;
+            }
+            else if (!selected.equals(candidate)) {
+                return null;
+            }
+        }
+        return selected;
+    }
+
+    private boolean storageRangesCoverPrefix(
+        List<long[]> ranges,
+        int expectedWidth) {
+
+        if (ranges == null || ranges.isEmpty() || expectedWidth <= 0) {
+            return false;
+        }
+        ArrayList<long[]> ordered = new ArrayList<>(ranges);
+        ordered.sort((left, right) -> Long.compare(left[0], right[0]));
+        long covered = 0L;
+        for (long[] range : ordered) {
+            if (range == null || range.length < 2 ||
+                range[0] > covered || range[1] <= range[0]) {
+                return false;
+            }
+            covered = Math.max(covered, range[1]);
+            if (covered >= expectedWidth) {
+                return true;
+            }
+        }
+        return false;
+    }

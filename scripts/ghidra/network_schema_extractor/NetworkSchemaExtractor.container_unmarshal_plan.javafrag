@@ -55,8 +55,8 @@
         plan.unmarshalCodecs.clear();
         plan.unmarshalCodecs.addAll(decoded);
         ContainerCodecAgreement agreement = reconcileLogicalContainerCodecSequence(
-            keyLeaves,
-            valueLeaves,
+            plan.keyCodecs,
+            plan.valueCodecs,
             decoded);
         if (agreement != ContainerCodecAgreement.NONE) {
             plan.unmarshalReconciliation = agreement == ContainerCodecAgreement.SEMANTIC
@@ -148,6 +148,10 @@
 
         ArrayList<ContainerCodecCall> leaves = new ArrayList<>();
         for (ContainerCodecCall codec : codecs) {
+            if (promoteSemanticContainerCodecBoundary(codec)) {
+                leaves.add(codec);
+                continue;
+            }
             if (codec.members.isEmpty() || "counted-sequence".equals(codec.memberSemantics) ||
                 "fixed-sequence".equals(codec.memberSemantics) ||
                 "structured-value".equals(codec.memberSemantics)) {
@@ -177,6 +181,43 @@
             leaves.addAll(nested);
         }
         return List.copyOf(leaves);
+    }
+
+    private boolean promoteSemanticContainerCodecBoundary(ContainerCodecCall codec) {
+        if (codec == null || codec.members.isEmpty() ||
+            !"linear-sequence".equals(codec.memberSemantics)) {
+            return false;
+        }
+        String nativeType = firstNonEmpty(
+            codec.nativeType,
+            marshalFunctionTemplateType(codec.targetName));
+        WireShape semantic = semanticWireEvidenceForNativeType(nativeType);
+        List<String> observed = containerPhysicalLayouts(codec);
+        List<String> expected = semantic == null
+            ? null
+            : containerAggregatePhysicalLayouts(semantic.layout);
+        if (observed == null || expected == null ||
+            observed.size() != expected.size()) {
+            return false;
+        }
+        for (int index = 0; index < observed.size(); index++) {
+            if (!containerPhysicalLayoutsMatch(
+                    observed.get(index),
+                    expected.get(index))) {
+                return false;
+            }
+        }
+        String source = "codec-template+complete-child-codec-coverage";
+        codec.nativeType = nativeType;
+        codec.wireEvidence = WireShape.semantic(
+            semantic.shape,
+            semantic.layout,
+            source);
+        codec.evidenceSource = source;
+        codec.memberSemantics = "fixed-sequence";
+        codec.analysisStatus = "complete";
+        applyContainerCodecTypeIdentity(codec, nativeType);
+        return true;
     }
 
     private List<ContainerCodecCall> recoverFullContainerUnmarshalCodecs(
@@ -542,6 +583,11 @@
                         plan);
                 ContainerCodecCall codec =
                     unmarshalContainerCodec(operation, target, null, evidence);
+                applyUnmarshalContainerCodecOutputStorage(
+                    codec,
+                    high,
+                    operation,
+                    raw == null ? null : raw.storage);
                 applyConstructorFieldTypeIdentity(
                     codec,
                     rawConstructorFieldIdentity(
@@ -555,11 +601,17 @@
             }
             WireShape leaf = validatedUnmarshalLeaf(target, "param_" + bufferSlot);
             if (leaf != null) {
-                result.add(unmarshalContainerCodec(
+                ContainerCodecCall codec = unmarshalContainerCodec(
                     operation,
                     target,
                     unmarshalNativeTypeFromTarget(target),
-                    leaf));
+                    leaf);
+                applyUnmarshalContainerCodecOutputStorage(
+                    codec,
+                    high,
+                    operation,
+                    provenUnmarshalOutputStorage(operation));
+                result.add(codec);
                 continue;
             }
             ContainerCodecMembers nested = collectContainerUnmarshalCodecMembers(
@@ -576,10 +628,16 @@
                     "helper:" + nested.analysisStatus());
                 continue;
             }
-            if (nested.linear() && nested.optionalMembers().isEmpty()) {
-                result.addAll(nested.members());
-                continue;
-            }
+            translateContainerHelperMemberStorage(
+                function,
+                operation,
+                target,
+                nested.members());
+            translateContainerHelperMemberStorage(
+                function,
+                operation,
+                target,
+                nested.optionalMembers());
             ContainerCodecCall boundary = new ContainerCodecCall();
             boundary.operation = operation;
             boundary.callsite = operation.getSeqnum().getTarget();
@@ -594,6 +652,7 @@
             boundary.optionalMembers.addAll(nested.optionalMembers());
             result.add(boundary);
         }
+        applyContainerCodecElementOffsets(loop, result);
         return List.copyOf(result);
     }
 
@@ -665,4 +724,231 @@
             applyContainerCodecTypeIdentity(codec, nativeType);
         }
         return codec;
+    }
+
+    private void applyUnmarshalContainerCodecOutputStorage(
+        ContainerCodecCall codec,
+        PcodeStorage output) {
+
+        if (codec == null || !isParameterStorage(output) ||
+            output.offset < 0L || output.offset > 0x100000L) {
+            return;
+        }
+        codec.elementBase = output.base;
+        codec.elementOffset = output.offset;
+    }
+
+    private void applyUnmarshalContainerCodecOutputStorage(
+        ContainerCodecCall codec,
+        HighFunction high,
+        PcodeOpAST call,
+        PcodeStorage output) {
+
+        PcodeStorage resolved = typedAggregateUnmarshalOutputStorage(codec, call);
+        if (resolved == null && isParameterStorage(output)) {
+            resolved = output;
+        }
+        if (resolved == null) {
+            resolved = postCallUnmarshalOutputStorage(codec, high, call, output);
+        }
+        if (resolved == null) {
+            resolved = normalizedBooleanUnmarshalOutputStorage(
+                codec,
+                high,
+                call,
+                output);
+        }
+        applyUnmarshalContainerCodecOutputStorage(codec, resolved);
+    }
+
+    private PcodeStorage postCallUnmarshalOutputStorage(
+        ContainerCodecCall codec,
+        HighFunction high,
+        PcodeOpAST call,
+        PcodeStorage output) {
+
+        Integer width = codec == null || codec.nativeType == null
+            ? null
+            : nativeTypeByteWidth(codec.nativeType);
+        if (width == null && codec != null && codec.wireEvidence != null) {
+            width = wireShapeByteWidth(codec.wireEvidence.layout);
+        }
+        Long outputEnd = output == null || width == null || width <= 0
+            ? null
+            : addExactOrNull(output.offset, width.longValue());
+        if (high == null || call == null || output == null || outputEnd == null ||
+            isParameterStorage(output)) {
+            return null;
+        }
+
+        PcodeStorage selected = null;
+        boolean afterCall = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (!afterCall) {
+                afterCall = operation == call;
+                continue;
+            }
+            if (operation.getOpcode() == PcodeOp.CALL) {
+                PcodeStorage nextOutput = provenUnmarshalOutputStorage(operation);
+                if (storageRangesOverlap(
+                        output,
+                        width,
+                        nextOutput,
+                        width)) {
+                    break;
+                }
+                continue;
+            }
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3) {
+                continue;
+            }
+            PcodeStorage destination =
+                pcodeStorageExpression(operation.getInput(1));
+            Long sourceOffset = pcodeValueStorageOffsetInRange(
+                operation.getInput(2),
+                output,
+                outputEnd,
+                new LinkedHashSet<>(),
+                0);
+            if (!isParameterStorage(destination) || sourceOffset == null) {
+                continue;
+            }
+            long relative = sourceOffset - output.offset;
+            PcodeStorage root;
+            try {
+                root = destination.plus(-relative);
+            }
+            catch (ArithmeticException ignored) {
+                return null;
+            }
+            if (root.offset < 0L || root.offset > 0x100000L ||
+                selected != null && !selected.sameLocation(root)) {
+                return null;
+            }
+            selected = root;
+        }
+        return selected;
+    }
+
+    private boolean storageRangesOverlap(
+        PcodeStorage left,
+        Integer leftWidth,
+        PcodeStorage right,
+        Integer rightWidth) {
+
+        if (left == null || right == null ||
+            leftWidth == null || leftWidth <= 0 ||
+            rightWidth == null || rightWidth <= 0 ||
+            !Objects.equals(left.base, right.base)) {
+            return false;
+        }
+        Long leftEnd = addExactOrNull(left.offset, leftWidth.longValue());
+        Long rightEnd = addExactOrNull(right.offset, rightWidth.longValue());
+        return leftEnd != null && rightEnd != null &&
+            left.offset < rightEnd && right.offset < leftEnd;
+    }
+
+    private Long pcodeValueStorageOffsetInRange(
+        Varnode value,
+        PcodeStorage expected,
+        long expectedEnd,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || expected == null || depth > 48 ||
+            !active.add(pcodeNodeKey(value))) {
+            return null;
+        }
+        PcodeStorage loaded = pcodeLoadedStorageExpression(value);
+        Long loadedEnd = loaded == null
+            ? null
+            : addExactOrNull(loaded.offset, (long)value.getSize());
+        if (loaded != null && loadedEnd != null &&
+            Objects.equals(loaded.base, expected.base) &&
+            loaded.offset >= expected.offset && loadedEnd <= expectedEnd) {
+            return loaded.offset;
+        }
+
+        PcodeOp definition = value.getDef();
+        if (definition == null ||
+            definition.getOpcode() == PcodeOp.CALL ||
+            definition.getOpcode() == PcodeOp.CALLIND) {
+            return null;
+        }
+        if (definition.getOpcode() == PcodeOp.SUBPIECE &&
+            definition.getNumInputs() == 2 &&
+            definition.getInput(1).isConstant()) {
+            Long source = pcodeValueStorageOffsetInRange(
+                definition.getInput(0),
+                expected,
+                expectedEnd,
+                new LinkedHashSet<>(active),
+                depth + 1);
+            long byteOffset = definition.getInput(1).getOffset();
+            Long shifted = source == null
+                ? null
+                : addExactOrNull(source, byteOffset);
+            Long shiftedEnd = shifted == null
+                ? null
+                : addExactOrNull(shifted, (long)value.getSize());
+            return shifted != null && shiftedEnd != null &&
+                shifted >= expected.offset && shiftedEnd <= expectedEnd
+                ? shifted
+                : null;
+        }
+        if (definition.getOpcode() == PcodeOp.PIECE) {
+            ArrayList<long[]> ranges = new ArrayList<>();
+            for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+                Varnode input = definition.getInput(slot);
+                Long source = pcodeValueStorageOffsetInRange(
+                    input,
+                    expected,
+                    expectedEnd,
+                    new LinkedHashSet<>(active),
+                    depth + 1);
+                Long end = source == null
+                    ? null
+                    : addExactOrNull(source, (long)input.getSize());
+                if (source == null || end == null) {
+                    return null;
+                }
+                ranges.add(new long[] { source, end });
+            }
+            ranges.sort((left, right) -> Long.compare(left[0], right[0]));
+            long start = ranges.get(0)[0];
+            long covered = start;
+            for (long[] range : ranges) {
+                if (range[0] != covered || range[1] <= range[0]) {
+                    return null;
+                }
+                covered = range[1];
+            }
+            Long expectedPieceEnd = addExactOrNull(start, (long)value.getSize());
+            return expectedPieceEnd != null && covered == expectedPieceEnd &&
+                start >= expected.offset && covered <= expectedEnd
+                ? start
+                : null;
+        }
+        Long selected = null;
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            Varnode input = definition.getInput(slot);
+            if (input == null || input.isConstant()) {
+                continue;
+            }
+            Long candidate = pcodeValueStorageOffsetInRange(
+                input,
+                expected,
+                expectedEnd,
+                new LinkedHashSet<>(active),
+                depth + 1);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
     }

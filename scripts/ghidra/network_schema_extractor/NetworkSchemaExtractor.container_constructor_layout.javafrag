@@ -1,0 +1,638 @@
+    private NestedTypeShape applyContainerConstructionLayout(
+        NestedTypeShape shape,
+        NativeTypeInfoEvidence candidate,
+        Function unmarshal,
+        FullContainerPlan plan) {
+
+        if (shape == null || candidate == null || unmarshal == null ||
+            plan == null || candidate.nativeSize == null ||
+            candidate.nativeSize <= 0L || shape.members.isEmpty()) {
+            return shape;
+        }
+        LinkedHashMap<Long, NestedTypeMember> observed = new LinkedHashMap<>();
+        for (NestedTypeMember source : shape.members) {
+            if (source == null || source.nativeOffset == null ||
+                source.nativeOffset < 0L ||
+                source.nativeOffset >= candidate.nativeSize) {
+                runMetrics.increment(
+                    "containerConstructorNativeProjectionIncomplete");
+                recordNestedTypeShapeReject(
+                    "container-constructor-native-offset-incomplete");
+                return shape;
+            }
+            NestedTypeMember member = copyNestedTypeMember(source);
+            member.offset = source.nativeOffset;
+            member.nativeOffset = source.nativeOffset;
+            if (observed.putIfAbsent(member.offset, member) != null) {
+                return shape;
+            }
+        }
+
+        List<HandlerValueMemberProvider> direct =
+            containerElementConstructionProviders(
+                unmarshal,
+                "param_2",
+                candidate,
+                observed);
+        if (direct.isEmpty()) {
+            runMetrics.increment("containerConstructorProvidersMissing");
+            recordNestedTypeShapeReject(
+                "container-constructor-provider-missing");
+            return shape;
+        }
+        runMetrics.add(
+            "containerConstructorDirectProviders",
+            direct.size());
+        ArrayList<HandlerValueMemberProvider> providers =
+            new ArrayList<>(direct);
+        List<HandlerValueMemberProvider> enclosing =
+            immediateContainerEnclosingProviders(
+            direct,
+            observed,
+            candidate.nativeSize);
+        runMetrics.add(
+            "containerConstructorEnclosingProviders",
+            enclosing.size());
+        providers.addAll(enclosing);
+        List<HandlerValueLayoutMember> layout = completeHandlerValueLayout(
+            providers,
+            observed,
+            0L,
+            candidate.nativeSize);
+        if (layout == null || layout.isEmpty()) {
+            runMetrics.increment("containerConstructorLayoutsIncomplete");
+            recordNestedTypeShapeReject(
+                "container-constructor-layout-cover-incomplete");
+            return shape;
+        }
+        runMetrics.increment("containerConstructorLayoutsCompleted");
+        runMetrics.add(
+            "containerConstructorLayoutMembers",
+            layout.size());
+
+        shape.memberBase = "element";
+        shape.memberNameSource = "synthetic-constructor-type";
+        shape.wireOrderSource =
+            "marshal+unmarshal-custom-codec-order+constructor-layout";
+        shape.validation =
+            "exact-custom-codec-wire-projection+constructor-provider-layout-cover";
+        shape.members.clear();
+        populateHandlerValueLayoutMembers(shape, layout, 0L);
+        return shape;
+    }
+
+    private List<HandlerValueMemberProvider>
+            containerElementConstructionProviders(
+        Function function,
+        String readBufferParameter,
+        NativeTypeInfoEvidence candidate,
+        Map<Long, NestedTypeMember> observed) {
+
+        LinkedHashMap<String, HandlerValueMemberProvider> providers =
+            new LinkedHashMap<>();
+        collectContainerElementConstructionProviders(
+            function,
+            readBufferParameter,
+            candidate,
+            observed,
+            new LinkedHashSet<>(),
+            providers,
+            0);
+        return List.copyOf(providers.values());
+    }
+
+    private void collectContainerElementConstructionProviders(
+        Function function,
+        String readBufferParameter,
+        NativeTypeInfoEvidence candidate,
+        Map<Long, NestedTypeMember> observed,
+        Set<String> active,
+        Map<String, HandlerValueMemberProvider> providers,
+        int depth) {
+
+        if (function == null || readBufferParameter == null ||
+            candidate == null || candidate.nativeSize == null ||
+            depth > 8 || monitor.isCancelled()) {
+            return;
+        }
+        String context = function.getEntryPoint() + "|" + readBufferParameter;
+        if (!active.add(context)) {
+            return;
+        }
+        try {
+            HighFunction high = highFunction(function);
+            if (high == null) {
+                return;
+            }
+            for (NetworkSchemaNaturalLoop loop :
+                    NetworkSchemaControlFlow.naturalLoops(high)) {
+                if (monitor.isCancelled()) {
+                    return;
+                }
+                List<PcodeOpAST> inductions =
+                    affinePointerInductions(loop, candidate.nativeSize);
+                for (PcodeOpAST induction : inductions) {
+                    ElementVptrStore root =
+                        mostDerivedElementVptrStore(high, loop, induction);
+                    NativeTypeInfoEvidence constructed = root == null
+                        ? null
+                        : elementTypeInfoFromVtable(
+                            root.vtable(),
+                            candidate.nativeSize);
+                    if (!sameNativeTypeInfo(candidate, constructed)) {
+                        continue;
+                    }
+                    runMetrics.increment(
+                        "containerConstructorMatchedLoops");
+                    List<ContainerConstructionPointerRoot> pointerRoots =
+                        containerConstructionPointerRoots(
+                            induction,
+                            inductions,
+                            candidate.nativeSize);
+                    runMetrics.add(
+                        "containerConstructorPointerRoots",
+                        pointerRoots.size());
+                    collectContainerLoopConstructionProviders(
+                        function,
+                        high,
+                        loop,
+                        root.operation(),
+                        pointerRoots,
+                        candidate.nativeSize,
+                        observed,
+                        providers);
+                }
+            }
+
+            PcodeStorage readBuffer =
+                new PcodeStorage(readBufferParameter, 0L);
+            for (PcodeOpAST operation : orderedPcodeOps(high)) {
+                if (monitor.isCancelled()) {
+                    return;
+                }
+                if (operation.getOpcode() != PcodeOp.CALL) {
+                    continue;
+                }
+                Function target = pcodeCallTarget(operation);
+                Integer bufferSlot = provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    readBuffer);
+                if (bufferSlot == null || target == null ||
+                    validatedUnmarshalLeaf(
+                        target,
+                        "param_" + bufferSlot) != null) {
+                    continue;
+                }
+                collectContainerElementConstructionProviders(
+                    target,
+                    "param_" + bufferSlot,
+                    candidate,
+                    observed,
+                    active,
+                    providers,
+                    depth + 1);
+            }
+        }
+        finally {
+            active.remove(context);
+        }
+    }
+
+    private boolean sameNativeTypeInfo(
+        NativeTypeInfoEvidence expected,
+        NativeTypeInfoEvidence actual) {
+
+        if (expected == null || actual == null ||
+            !Objects.equals(expected.nativeSize, actual.nativeSize)) {
+            return false;
+        }
+        String expectedTypeId = normalizeUuid(expected.typeId);
+        String actualTypeId = normalizeUuid(actual.typeId);
+        if (expectedTypeId != null || actualTypeId != null) {
+            return expectedTypeId != null && expectedTypeId.equals(actualTypeId);
+        }
+        return Objects.equals(expected.name, actual.name);
+    }
+
+    private void collectContainerLoopConstructionProviders(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        PcodeOpAST elementIdentityOperation,
+        List<ContainerConstructionPointerRoot> pointerRoots,
+        long nativeSize,
+        Map<Long, NestedTypeMember> observed,
+        Map<String, HandlerValueMemberProvider> providers) {
+
+        if (pointerRoots == null || pointerRoots.isEmpty()) {
+            return;
+        }
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (monitor.isCancelled()) {
+                return;
+            }
+            if (!loop.contains(operation)) {
+                continue;
+            }
+            if (operation == elementIdentityOperation) {
+                runMetrics.increment(
+                    "containerConstructorElementIdentityWritesSkipped");
+                continue;
+            }
+            HandlerValueMemberProvider provider = null;
+            if (operation.getOpcode() == PcodeOp.STORE &&
+                operation.getNumInputs() >= 3) {
+                Long offset = containerConstructionElementOffset(
+                    operation.getInput(1),
+                    pointerRoots,
+                    nativeSize);
+                if (offset != null && offset >= 0L && offset < nativeSize) {
+                    runMetrics.increment(
+                        "containerConstructorStoreOffsetsResolved");
+                    if (uniquePcodeVtableAddress(
+                            operation.getInput(2)) == null) {
+                        runMetrics.increment(
+                            "containerConstructorNonProviderStoresIgnored");
+                        continue;
+                    }
+                    provider = handlerValueMemberProvider(
+                        operation,
+                        offset,
+                        nativeSize,
+                        observed);
+                    runMetrics.increment(provider == null
+                        ? "containerConstructorStoreProvidersRejected"
+                        : "containerConstructorStoreProvidersResolved");
+                }
+            }
+            else if (operation.getOpcode() == PcodeOp.CALL &&
+                operation.getNumInputs() >= 2) {
+                Long offset = containerConstructionElementOffset(
+                    operation.getInput(1),
+                    pointerRoots,
+                    nativeSize);
+                Function target = pcodeCallTarget(operation);
+                if (offset != null && offset >= 0L && offset < nativeSize) {
+                    runMetrics.increment(
+                        "containerConstructorCallOffsetsResolved");
+                    LinkedHashMap<String, SerializeTypeInfo> candidates =
+                        serializeTypesNamedByConstructor(target);
+                    if (candidates.isEmpty()) {
+                        runMetrics.increment(
+                            "containerConstructorNonProviderCallsIgnored");
+                        continue;
+                    }
+                    provider = containerConstructorMemberProvider(
+                        target,
+                        candidates,
+                        operation.getSeqnum().getTarget(),
+                        offset,
+                        nativeSize,
+                        observed);
+                    runMetrics.increment(provider == null
+                        ? "containerConstructorCallProvidersRejected"
+                        : "containerConstructorCallProvidersResolved");
+                }
+            }
+            if (provider != null) {
+                providers.putIfAbsent(
+                    containerMemberProviderKey(provider),
+                    provider);
+            }
+        }
+    }
+
+    private List<ContainerConstructionPointerRoot>
+            containerConstructionPointerRoots(
+        PcodeOpAST elementInduction,
+        List<PcodeOpAST> inductions,
+        long nativeSize) {
+
+        if (elementInduction == null || inductions == null ||
+            inductions.isEmpty()) {
+            return List.of();
+        }
+        Varnode elementInitial =
+            affinePointerInductionInitial(elementInduction);
+        ArrayList<ContainerConstructionPointerRoot> roots =
+            new ArrayList<>();
+        roots.add(new ContainerConstructionPointerRoot(
+            elementInduction,
+            0L));
+        if (elementInitial == null) {
+            return List.copyOf(roots);
+        }
+
+        for (PcodeOpAST candidate : inductions) {
+            if (candidate == null || candidate == elementInduction ||
+                sameVarnodeIdentity(
+                    candidate.getOutput(),
+                    elementInduction.getOutput())) {
+                continue;
+            }
+            Varnode candidateInitial =
+                affinePointerInductionInitial(candidate);
+            Long offset = containerConstructorInitialOffset(
+                elementInitial,
+                candidateInitial);
+            if (offset == null || offset <= -nativeSize ||
+                offset >= nativeSize) {
+                continue;
+            }
+            roots.add(new ContainerConstructionPointerRoot(
+                candidate,
+                offset));
+            runMetrics.increment(
+                "containerConstructorAliasOffsetsResolved");
+        }
+        if (roots.size() > 1) {
+            runMetrics.add(
+                "containerConstructorAliasedInductions",
+                roots.size() - 1L);
+        }
+        return List.copyOf(roots);
+    }
+
+    private Long containerConstructorInitialOffset(
+        Varnode elementInitial,
+        Varnode candidateInitial) {
+
+        if (elementInitial == null || candidateInitial == null) {
+            return null;
+        }
+        Long offset = pcodeConstantOffsetFromRoot(
+            candidateInitial,
+            elementInitial,
+            new LinkedHashSet<>(),
+            0);
+        if (offset != null) {
+            return offset;
+        }
+        Long reverse = pcodeConstantOffsetFromRoot(
+            elementInitial,
+            candidateInitial,
+            new LinkedHashSet<>(),
+            0);
+        if (reverse != null) {
+            return subtractExactOrNull(0L, reverse);
+        }
+
+        PcodeStorage elementStorage =
+            pcodeStorageExpression(elementInitial);
+        PcodeStorage candidateStorage =
+            pcodeStorageExpression(candidateInitial);
+        return elementStorage != null && candidateStorage != null &&
+            Objects.equals(elementStorage.base, candidateStorage.base)
+                ? subtractExactOrNull(
+                    candidateStorage.offset,
+                    elementStorage.offset)
+                : null;
+    }
+
+    private Varnode affinePointerInductionInitial(
+        PcodeOpAST induction) {
+
+        if (induction == null || induction.getOutput() == null) {
+            return null;
+        }
+        Varnode selected = null;
+        for (int slot = 0; slot < induction.getNumInputs(); slot++) {
+            Varnode input = induction.getInput(slot);
+            Long step = affineStepFromPhi(
+                input,
+                induction.getOutput(),
+                new LinkedHashSet<>(),
+                0);
+            if (step != null) {
+                continue;
+            }
+            if (selected != null &&
+                !sameVarnodeIdentity(selected, input)) {
+                return null;
+            }
+            selected = input;
+        }
+        return selected;
+    }
+
+    private Long containerConstructionElementOffset(
+        Varnode node,
+        List<ContainerConstructionPointerRoot> roots,
+        long nativeSize) {
+
+        Long selected = null;
+        for (ContainerConstructionPointerRoot root : roots) {
+            Long relative = pcodeConstantOffsetFromRoot(
+                node,
+                root.induction().getOutput(),
+                new LinkedHashSet<>(),
+                0);
+            Long offset = relative == null
+                ? null
+                : addExactOrNull(root.elementOffset(), relative);
+            if (offset == null || offset < 0L || offset >= nativeSize) {
+                continue;
+            }
+            if (selected != null && !selected.equals(offset)) {
+                runMetrics.increment(
+                    "containerConstructorAliasOffsetConflicts");
+                return null;
+            }
+            selected = offset;
+        }
+        return selected;
+    }
+
+    private HandlerValueMemberProvider containerConstructorMemberProvider(
+        Function constructor,
+        Map<String, SerializeTypeInfo> candidates,
+        Address callsite,
+        long offset,
+        long windowEnd,
+        Map<Long, NestedTypeMember> observed) {
+
+        HandlerValueMemberProvider selected = null;
+        for (SerializeTypeInfo type : candidates.values()) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            HandlerValueMemberProvider provider = handlerValueMemberProvider(
+                type,
+                constructor.getEntryPoint(),
+                callsite,
+                offset,
+                windowEnd,
+                observed);
+            if (provider == null) {
+                continue;
+            }
+            if (selected != null &&
+                !uuidEquals(selected.type().typeId, provider.type().typeId)) {
+                return null;
+            }
+            selected = provider;
+        }
+        return selected;
+    }
+
+    private LinkedHashMap<String, SerializeTypeInfo>
+            serializeTypesNamedByConstructor(Function constructor) {
+
+        LinkedHashMap<String, SerializeTypeInfo> result =
+            new LinkedHashMap<>();
+        if (constructor == null) {
+            return result;
+        }
+        String functionName = fullFunctionName(constructor);
+        if (functionName == null ||
+            functionName.isBlank()) {
+            return result;
+        }
+        LinkedHashSet<String> candidates = new LinkedHashSet<>();
+        var namespace = constructor.getParentNamespace();
+        if (namespace != null) {
+            String fullNamespace = namespace.getName(true);
+            if (fullNamespace != null && !fullNamespace.isBlank() &&
+                !"Global".equals(fullNamespace)) {
+                candidates.add(fullNamespace);
+            }
+            String localNamespace = namespace.getName();
+            if (localNamespace != null && !localNamespace.isBlank() &&
+                !"Global".equals(localNamespace)) {
+                candidates.add(localNamespace);
+            }
+        }
+        int scope = functionName.lastIndexOf("::");
+        if (scope > 0) {
+            candidates.add(functionName.substring(0, scope));
+        }
+        int separator = functionName.lastIndexOf("__");
+        if (separator > 0) {
+            candidates.add(functionName.substring(0, separator));
+        }
+        for (String candidate : candidates) {
+            SerializeTypeInfo type = serializeTypeForTypeName(candidate);
+            if (type == null) {
+                type = serializeTypeForTypeName(
+                    NetworkSchemaText.sourceTypeLeaf(candidate));
+            }
+            String typeId = type == null
+                ? null
+                : normalizeUuid(type.typeId);
+            if (typeId != null) {
+                result.putIfAbsent(typeId, type);
+            }
+        }
+        return result;
+    }
+
+    private List<HandlerValueMemberProvider>
+            immediateContainerEnclosingProviders(
+        List<HandlerValueMemberProvider> direct,
+        Map<Long, NestedTypeMember> observed,
+        long windowEnd) {
+
+        ArrayList<HandlerValueMemberProvider> result = new ArrayList<>();
+        for (HandlerValueMemberProvider child : direct) {
+            if (monitor.isCancelled()) {
+                return List.copyOf(result);
+            }
+            LinkedHashMap<String, HandlerValueMemberProvider> matches =
+                new LinkedHashMap<>();
+            for (SerializeTypeInfo candidate :
+                    serializeTypesWithDirectFirstFieldTypeId(
+                        child.type().typeId)) {
+                if (monitor.isCancelled()) {
+                    return List.copyOf(result);
+                }
+                if (candidate == null ||
+                    uuidEquals(candidate.typeId, child.type().typeId) ||
+                    !hasDirectFirstSerializeField(
+                        candidate,
+                        child.type().typeId)) {
+                    continue;
+                }
+                HandlerValueMemberProvider provider =
+                    handlerValueMemberProvider(
+                        candidate,
+                        child.provider(),
+                        child.store(),
+                        child.offset(),
+                        windowEnd,
+                        observed);
+                if (provider != null &&
+                    provider.nativeSize() > child.nativeSize()) {
+                    matches.putIfAbsent(
+                        normalizeUuid(candidate.typeId),
+                        provider);
+                }
+            }
+            if (matches.size() == 1) {
+                result.add(matches.values().iterator().next());
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private List<SerializeTypeInfo> serializeTypesWithDirectFirstFieldTypeId(
+        String typeId) {
+
+        if (!serializeTypesByDirectFirstFieldTypeIdLoaded) {
+            indexSerializeTypesByDirectFirstFieldTypeId();
+        }
+        String key = normalizeUuid(typeId);
+        return key == null
+            ? List.of()
+            : serializeTypesByDirectFirstFieldTypeId.getOrDefault(
+                key,
+                Collections.emptyList());
+    }
+
+    private void indexSerializeTypesByDirectFirstFieldTypeId() {
+        serializeTypesByDirectFirstFieldTypeId.clear();
+        for (SerializeTypeInfo candidate : serializeTypesById.values()) {
+            if (monitor.isCancelled()) {
+                return;
+            }
+            for (SerializeFieldInfo field : candidate.layoutFields) {
+                if (field == null || !Long.valueOf(0L).equals(field.offset)) {
+                    continue;
+                }
+                String key = normalizeUuid(field.typeId);
+                if (key != null) {
+                    serializeTypesByDirectFirstFieldTypeId
+                        .computeIfAbsent(key, ignored -> new ArrayList<>())
+                        .add(candidate);
+                }
+            }
+        }
+        for (List<SerializeTypeInfo> candidates :
+                serializeTypesByDirectFirstFieldTypeId.values()) {
+            candidates.sort(Comparator.comparing(candidate ->
+                normalizeUuid(candidate.typeId)));
+        }
+        serializeTypesByDirectFirstFieldTypeIdLoaded = true;
+    }
+
+    private boolean hasDirectFirstSerializeField(
+        SerializeTypeInfo candidate,
+        String childTypeId) {
+
+        return candidate != null && childTypeId != null &&
+            candidate.layoutFields.stream().anyMatch(field ->
+                field != null && Long.valueOf(0L).equals(field.offset) &&
+                    uuidEquals(field.typeId, childTypeId));
+    }
+
+    private String containerMemberProviderKey(
+        HandlerValueMemberProvider provider) {
+
+        return provider.offset() + ":" + provider.nativeSize() + ":" +
+            normalizeUuid(provider.type().typeId);
+    }
+
+    private record ContainerConstructionPointerRoot(
+        PcodeOpAST induction,
+        long elementOffset) {}

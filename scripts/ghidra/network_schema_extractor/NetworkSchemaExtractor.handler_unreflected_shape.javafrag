@@ -131,32 +131,158 @@
         long windowEnd,
         Map<Long, NestedTypeMember> observed) {
 
+        if (store == null || store.getNumInputs() < 3) {
+            runMetrics.increment("handlerValueProviderStoreInvalid");
+            return null;
+        }
         LinkedHashSet<Address> origins = new LinkedHashSet<>();
         collectPcodeAddressOrigins(
             store.getInput(2),
             origins,
             new LinkedHashSet<>());
         LinkedHashMap<String, Address> providersByTypeId = new LinkedHashMap<>();
+        Address vtable = uniquePcodeVtableAddress(store.getInput(2));
+        if (vtable != null) {
+            AzRttiEvidence rtti = decodeAzRttiFromVtable(vtable);
+            String typeId = rtti == null ? null : normalizeUuid(rtti.typeId);
+            Address provider = azRttiTypeIdProvider(vtable, typeId);
+            if (typeId != null && provider != null) {
+                providersByTypeId.putIfAbsent(typeId, provider);
+                runMetrics.increment("handlerValueProviderVtableIdentityResolved");
+            }
+            else {
+                runMetrics.increment("handlerValueProviderVtableIdentityMissing");
+            }
+        }
         for (Address origin : origins) {
+            if (vtable != null && vtable.equals(origin)) {
+                continue;
+            }
             TypeIdDecode decoded = decodeDirectTypeIdProvider(origin);
             if (decoded != null && decoded.typeId != null) {
-                providersByTypeId.putIfAbsent(normalizeUuid(decoded.typeId), origin);
+                String typeId = normalizeUuid(decoded.typeId);
+                if (typeId != null) {
+                    providersByTypeId.putIfAbsent(typeId, origin);
+                    runMetrics.increment("handlerValueProviderDirectIdentityResolved");
+                }
             }
         }
         if (providersByTypeId.size() != 1) {
+            runMetrics.increment(providersByTypeId.isEmpty()
+                ? "handlerValueProviderIdentityMissing"
+                : "handlerValueProviderIdentityAmbiguous");
             return null;
         }
 
         Map.Entry<String, Address> identity = providersByTypeId.entrySet().iterator().next();
         SerializeTypeInfo type = serializeTypesById.get(identity.getKey());
+        return handlerValueMemberProvider(
+            type,
+            identity.getValue(),
+            store.getSeqnum().getTarget(),
+            offset,
+            windowEnd,
+            observed);
+    }
+
+    private Address azRttiTypeIdProvider(Address vtable, String typeId) {
+        if (vtable == null || typeId == null) {
+            return null;
+        }
+        for (int slot = 0; slot < AZ_RTTI_VTABLE_SCAN_SLOTS; slot++) {
+            if (monitor.isCancelled() || isVtableSlotBoundary(vtable, slot)) {
+                return null;
+            }
+            Address provider = readPointer(vtable.add(slot * 8L));
+            Address body = resolvedCodeTarget(provider);
+            if (!isExecutableAddress(body)) {
+                return null;
+            }
+            TypeIdDecode decoded = decodeAzRttiTypeIdProvider(provider);
+            if (decoded != null && uuidEquals(typeId, decoded.typeId)) {
+                return provider;
+            }
+        }
+        return null;
+    }
+
+    private HandlerValueMemberProvider handlerValueMemberProvider(
+        SerializeTypeInfo type,
+        Address provider,
+        Address evidence,
+        long offset,
+        long windowEnd,
+        Map<Long, NestedTypeMember> observed) {
+
+        if (type == null || provider == null || evidence == null ||
+            observed == null || observed.isEmpty()) {
+            runMetrics.increment("handlerValueProviderInputMissing");
+            return null;
+        }
         Long nativeSize = serializeTypeByteWidth(type);
-        List<SerializeWireSlot> expected = serializeTypeNativeWireLayout(identity.getKey());
         Long end = nativeSize == null ? null : addExactOrNull(offset, nativeSize);
-        if (type == null || nativeSize == null || nativeSize <= 0L ||
-            expected.isEmpty() || end == null || end > windowEnd) {
+        if (nativeSize == null || nativeSize <= 0L || end == null || end > windowEnd) {
+            runMetrics.increment("handlerValueProviderWindowRejected");
             return null;
         }
 
+        List<SerializeWireSlot> semanticLayout =
+            serializeTypeNativeWireLayout(type.typeId);
+        HandlerValueProviderLayoutResult result = matchHandlerValueProviderLayout(
+            type,
+            provider,
+            evidence,
+            offset,
+            nativeSize,
+            end,
+            observed,
+            semanticLayout);
+        if (result.provider() == null) {
+            List<SerializeWireSlot> reflectedLayout =
+                serializeTypeReflectedMemberWireLayout(type.typeId);
+            if (!reflectedLayout.isEmpty() &&
+                !nativeWireLayoutKey(nativeSize, reflectedLayout).equals(
+                    nativeWireLayoutKey(nativeSize, semanticLayout))) {
+                HandlerValueProviderLayoutResult reflectedResult =
+                    matchHandlerValueProviderLayout(
+                        type,
+                        provider,
+                        evidence,
+                        offset,
+                        nativeSize,
+                        end,
+                        observed,
+                        reflectedLayout);
+                if (reflectedResult.provider() != null) {
+                    runMetrics.increment(
+                        "handlerValueProviderReflectedMemberLayoutResolved");
+                }
+                result = reflectedResult;
+            }
+        }
+        if (result.provider() == null) {
+            runMetrics.increment(result.rejectionMetric());
+            return null;
+        }
+        runMetrics.increment("handlerValueProvidersResolved");
+        return result.provider();
+    }
+
+    private HandlerValueProviderLayoutResult matchHandlerValueProviderLayout(
+        SerializeTypeInfo type,
+        Address provider,
+        Address evidence,
+        long offset,
+        long nativeSize,
+        long end,
+        Map<Long, NestedTypeMember> observed,
+        List<SerializeWireSlot> expected) {
+
+        if (expected == null || expected.isEmpty()) {
+            return new HandlerValueProviderLayoutResult(
+                null,
+                "handlerValueProviderWireSlotRejected");
+        }
         LinkedHashSet<Long> coverage = new LinkedHashSet<>();
         ArrayList<String> shapes = new ArrayList<>(expected.size());
         ArrayList<String> layouts = new ArrayList<>(expected.size());
@@ -170,9 +296,10 @@
                 ? null
                 : member.wireLayout == null ? member.wireShape : member.wireLayout;
             if (slot.wireShape == null || member == null || member.wireOrdinal == null ||
-                !canonicalLayoutWireShape(slot.wireShape).equals(
-                    canonicalLayoutWireShape(layout))) {
-                return null;
+                !nestedMemberMatchesSerializeWireShape(member, slot.wireShape)) {
+                return new HandlerValueProviderLayoutResult(
+                    null,
+                    "handlerValueProviderWireSlotRejected");
             }
             coverage.add(observedOffset);
             shapes.add(slot.wireShape);
@@ -183,26 +310,60 @@
             long observedOffset = entry.getKey();
             if (observedOffset >= offset && observedOffset < end &&
                 !coverage.contains(observedOffset)) {
-                return null;
+                return new HandlerValueProviderLayoutResult(
+                    null,
+                    "handlerValueProviderCoverageRejected");
             }
         }
         ordered.sort(Comparator.comparingInt(member -> member.wireOrdinal));
         for (int index = 1; index < ordered.size(); index++) {
             if (ordered.get(index).wireOrdinal != ordered.get(index - 1).wireOrdinal + 1) {
-                return null;
+                return new HandlerValueProviderLayoutResult(
+                    null,
+                    "handlerValueProviderWireOrderRejected");
             }
         }
-        return new HandlerValueMemberProvider(
-            offset,
-            nativeSize,
-            type,
-            identity.getValue(),
-            store.getSeqnum().getTarget(),
-            Set.copyOf(coverage),
-            ordered.get(0).wireOrdinal,
-            ordered.get(ordered.size() - 1).wireOrdinal,
-            compositeWireShape(shapes),
-            compositeWireShape(layouts));
+        return new HandlerValueProviderLayoutResult(
+            new HandlerValueMemberProvider(
+                offset,
+                nativeSize,
+                type,
+                provider,
+                evidence,
+                Set.copyOf(coverage),
+                ordered.get(0).wireOrdinal,
+                ordered.get(ordered.size() - 1).wireOrdinal,
+                compositeWireShape(shapes),
+                compositeWireShape(layouts)),
+            null);
+    }
+
+    private record HandlerValueProviderLayoutResult(
+        HandlerValueMemberProvider provider,
+        String rejectionMetric) {
+    }
+
+    private boolean nestedMemberMatchesSerializeWireShape(
+        NestedTypeMember member,
+        String expectedWireShape) {
+
+        if (member == null || expectedWireShape == null ||
+            Boolean.TRUE.equals(member.typeConflict)) {
+            return false;
+        }
+        String expected = canonicalLayoutWireShape(expectedWireShape);
+        String semantic = member.wireShape == null
+            ? null
+            : canonicalLayoutWireShape(member.wireShape);
+        if (Objects.equals(expected, semantic)) {
+            return true;
+        }
+        String layout = member.wireLayout == null
+            ? null
+            : canonicalLayoutWireShape(member.wireLayout);
+        return Objects.equals(expected, layout) ||
+            "string".equals(expectedWireShape) &&
+                "length-prefixed-bytes".equals(member.wireLayout);
     }
 
     private String syntheticHandlerMemberName(String typeName) {

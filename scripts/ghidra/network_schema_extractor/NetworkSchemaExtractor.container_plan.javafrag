@@ -282,6 +282,16 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
         codec.evidenceSource = normalizedBoolean
             ? "full-container-loop-normalized-boolean-write"
             : "full-container-loop-write-raw";
+        PcodeStorage source = provenCallArgumentStorage(
+            owner,
+            operation,
+            null,
+            2);
+        if (isParameterStorage(source) &&
+            source.offset >= 0L && source.offset <= 0x100000L) {
+            codec.elementBase = source.base;
+            codec.elementOffset = source.offset;
+        }
         return codec;
     }
 

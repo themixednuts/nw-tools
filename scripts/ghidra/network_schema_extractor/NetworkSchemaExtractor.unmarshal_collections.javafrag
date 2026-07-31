@@ -43,6 +43,7 @@
                 pcodeCallTarget(count),
                 shape.wireEvidence,
                 "container-helper-unmarshal-local-collection");
+            applyUnmarshalContainerCodecOutputStorage(boundary, shape.storage);
             if (!putUnmarshalCollectionAction(actions, count, boundary, true)) {
                 return null;
             }
@@ -84,6 +85,9 @@
                     target,
                     collection.wireEvidence(),
                     "container-helper-unmarshal-interprocedural-collection");
+                applyUnmarshalContainerCodecOutputStorage(
+                    boundary,
+                    collection.owner());
                 if (!putUnmarshalCollectionAction(actions, count, boundary, true) ||
                     !putUnmarshalCollectionAction(actions, operation, boundary, false)) {
                     return null;

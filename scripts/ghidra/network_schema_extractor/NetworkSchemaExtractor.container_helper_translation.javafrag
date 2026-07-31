@@ -7,16 +7,17 @@
         if (owner == null || call == null || target == null || members == null) {
             return false;
         }
-        List<ContainerCodecCall> leaves = physicalContainerCodecLeaves(members);
+        List<ContainerCodecCall> leaves = logicalContainerCodecLeaves(members);
         if (leaves == null || leaves.isEmpty()) {
             return false;
         }
 
-        ArrayList<PcodeStorage> translated = new ArrayList<>(leaves.size());
+        boolean complete = true;
         for (ContainerCodecCall leaf : leaves) {
             Integer formalSlot = pcodeParameterIndex(leaf.elementBase);
             if (formalSlot == null || leaf.elementOffset == null) {
-                return false;
+                complete = false;
+                continue;
             }
             PcodeStorage callerStorage = helperCallArgumentStorage(
                 owner,
@@ -28,18 +29,13 @@
                 : addExactOrNull(callerStorage.offset, leaf.elementOffset);
             if (!isParameterStorage(callerStorage) || translatedOffset == null ||
                 translatedOffset < 0L || translatedOffset > 0x100000L) {
-                return false;
+                complete = false;
+                continue;
             }
-            translated.add(new PcodeStorage(callerStorage.base, translatedOffset));
+            leaf.elementBase = callerStorage.base;
+            leaf.elementOffset = translatedOffset;
         }
-
-        for (int index = 0; index < leaves.size(); index++) {
-            ContainerCodecCall leaf = leaves.get(index);
-            PcodeStorage storage = translated.get(index);
-            leaf.elementBase = storage.base;
-            leaf.elementOffset = storage.offset;
-        }
-        return true;
+        return complete;
     }
 
     private PcodeStorage helperCallArgumentStorage(

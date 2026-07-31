@@ -48,17 +48,16 @@
             codec.members.isEmpty()) {
             return;
         }
-        List<ContainerCodecCall> leaves = physicalContainerCodecLeaves(codec.members);
+        List<ContainerCodecCall> leaves = logicalContainerCodecLeaves(codec.members);
         if (leaves == null || leaves.isEmpty()) {
             return;
         }
 
-        ArrayList<Long> translated = new ArrayList<>(leaves.size());
         for (ContainerCodecCall leaf : leaves) {
             Integer formalSlot = pcodeParameterIndex(leaf.elementBase);
             if (formalSlot == null || leaf.elementOffset == null ||
                 formalSlot >= codec.operation.getNumInputs()) {
-                return;
+                continue;
             }
             Long argumentOffset = pcodeConstantOffsetFromRoot(
                 codec.operation.getInput(formalSlot),
@@ -70,14 +69,10 @@
                 : addExactOrNull(argumentOffset, leaf.elementOffset);
             if (absoluteOffset == null || absoluteOffset < 0L ||
                 absoluteOffset > 0x100000L) {
-                return;
+                continue;
             }
-            translated.add(absoluteOffset);
-        }
-        for (int index = 0; index < leaves.size(); index++) {
-            ContainerCodecCall leaf = leaves.get(index);
             leaf.elementBase = "element";
-            leaf.elementOffset = translated.get(index);
+            leaf.elementOffset = absoluteOffset;
         }
     }
 

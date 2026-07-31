@@ -456,12 +456,33 @@ pub(super) fn container_value_member_shape_span(
     embedded_shapes: &[crate::network_schema::NetworkNestedTypeShape],
 ) -> Option<usize> {
     let physical = nested_member_wire_shapes(observed, embedded_shapes)?;
+    if let [shape] = physical.as_slice()
+        && let Some(float_limbs) = uncompressed_float_limb_count(*shape)
+    {
+        let end = index.checked_add(float_limbs)?;
+        if expected.get(index..end).is_some_and(|expected| {
+            expected
+                .iter()
+                .all(|expected| scalar_shapes_match(*expected, SchemaWireScalarShape::F32))
+        }) {
+            return Some(float_limbs);
+        }
+    }
     let end = index.checked_add(physical.len())?;
     physical
         .iter()
         .zip(expected.get(index..end)?)
         .all(|(observed, expected)| scalar_shapes_match(*observed, *expected))
         .then_some(physical.len())
+}
+
+fn uncompressed_float_limb_count(shape: SchemaWireScalarShape) -> Option<usize> {
+    match shape {
+        SchemaWireScalarShape::Vec2 => Some(2),
+        SchemaWireScalarShape::Vec3 => Some(3),
+        SchemaWireScalarShape::Vec4 | SchemaWireScalarShape::Quat => Some(4),
+        _ => None,
+    }
 }
 
 pub(super) fn wire_scalar_shape_from_name(value: &str) -> Option<SchemaWireScalarShape> {

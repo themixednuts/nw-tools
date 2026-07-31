@@ -67,7 +67,7 @@ fn anonymous_scalar_passthrough(
     shape: &crate::network_schema::NetworkNestedTypeShape,
     wire_shape: Option<&SchemaWireShape>,
 ) -> bool {
-    if shape.has_exact_identity() || !shape.has_proven_anonymous_layout() {
+    if !shape.has_exact_identity() && !shape.has_proven_anonymous_layout() {
         return false;
     }
     let [member] = shape.members.as_slice() else {
@@ -81,7 +81,16 @@ fn anonymous_scalar_passthrough(
     else {
         return false;
     };
-    wire_shape == Some(&member_shape.into())
+    if wire_shape != Some(&member_shape.into()) {
+        return false;
+    }
+    if !shape.has_exact_identity() {
+        return true;
+    }
+    shape
+        .type_id
+        .and_then(exact_type_id_rust_type)
+        .is_some_and(|identity| identity == scalar_rust_type(member_shape))
 }
 
 fn build_structured_value_field_plan(

@@ -3,10 +3,14 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::network_schema::parse::{
-    composite_member_wire_shapes, nested_type_shape_wire_shapes,
+    composite_member_wire_shapes, nested_member_wire_shapes, nested_type_shape_wire_shapes,
     wire_scalar_products_width_compatible,
 };
-use crate::network_schema::{NetworkField, NetworkNestedTypeShape, NetworkType};
+use crate::network_schema::{
+    NetworkField, NetworkNestedTypeMember, NetworkNestedTypeShape, NetworkType,
+};
+
+use super::{exact_type_id_rust_type, scalar_rust_type};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -187,7 +191,10 @@ fn field_evidence_issues(fields: &[NetworkField]) -> Vec<NetworkEvidenceIssue> {
                     || shape.has_exact_identity()
                         && member.type_id_source.as_deref()
                             == Some("serialize-field-for-proven-type");
-                if member.type_id.is_some() && !identity_proven {
+                if member.type_id.is_some()
+                    && !identity_proven
+                    && !has_wire_equivalent_scalar_type_identity(member)
+                {
                     issues.push(field_issue(
                         NetworkEvidenceIssueKind::UnprovenNestedMemberTypeIdentity,
                         ordinal,
@@ -209,6 +216,29 @@ fn field_evidence_issues(fields: &[NetworkField]) -> Vec<NetworkEvidenceIssue> {
         }
     }
     issues
+}
+
+fn has_wire_equivalent_scalar_type_identity(member: &NetworkNestedTypeMember) -> bool {
+    let Some(type_id) = member.type_id else {
+        return false;
+    };
+    let Some(identity_rust_type) = exact_type_id_rust_type(type_id) else {
+        return false;
+    };
+    let Some(wire_shape) = member
+        .wire_shape
+        .as_deref()
+        .or(member.wire_layout.as_deref())
+    else {
+        return false;
+    };
+    let Some(wire_shapes) = nested_member_wire_shapes(wire_shape, &[]) else {
+        return false;
+    };
+    let [wire_scalar] = wire_shapes.as_slice() else {
+        return false;
+    };
+    scalar_rust_type(*wire_scalar) == identity_rust_type
 }
 
 fn has_matching_marshal_field(field: &NetworkField, marshal_fields: &[NetworkField]) -> bool {

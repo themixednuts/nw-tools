@@ -50,14 +50,38 @@
             !isPlausibleTypeName(candidate.name) ||
             candidate.nativeSize == null || plan == null ||
             !candidate.nativeSize.equals(plan.elementStride) ||
-            !"complete-conditional-physical-agreement".equals(
-                plan.unmarshalReconciliation)) {
+            plan.unmarshalReconciliation == null ||
+            !plan.unmarshalReconciliation.startsWith("complete-")) {
             return null;
         }
         List<ContainerCodecCall> encoded = logicalContainerCodecLeaves(plan.valueCodecs);
         List<ContainerCodecCall> decoded = logicalContainerCodecLeaves(plan.unmarshalCodecs);
-        if (!sameLogicalContainerCodecSequence(encoded, decoded)) {
+        List<ContainerCodecCall> projected;
+        List<Long> nativeProjection;
+        if (sameLogicalContainerCodecSequence(encoded, decoded)) {
+            projected = encoded;
+            nativeProjection = containerCodecNativeProjection(
+                encoded,
+                decoded,
+                candidate.nativeSize);
+        }
+        else if (plan.storageKind == ContainerStorageKind.VECTOR &&
+            decoded != null && !decoded.isEmpty() &&
+            samePhysicalContainerCodecSequence(plan.valueCodecs, decoded)) {
+            projected = decoded;
+            nativeProjection = containerCodecNativeProjection(
+                decoded,
+                encoded,
+                candidate.nativeSize);
+        }
+        else {
             recordNestedTypeShapeReject("custom-codec-wire-sequence-mismatch");
+            return null;
+        }
+        if (nativeProjection == null ||
+            nativeProjection.size() != projected.size()) {
+            recordNestedTypeShapeReject(
+                "custom-codec-native-projection-mismatch");
             return null;
         }
 
@@ -79,13 +103,288 @@
         shape.memberCoverageProven = true;
         shape.wireOrderProven = true;
         shape.wireOrderSource = "marshal+unmarshal-custom-codec-order";
-        shape.validation = "exact-custom-codec-wire-projection+partial-native-member-map";
+        shape.validation = completeContainerNativeProjection(
+                projected,
+                nativeProjection,
+                candidate.nativeSize)
+            ? "exact-custom-codec-wire-projection+complete-native-member-map"
+            : "exact-custom-codec-wire-projection+partial-native-member-map";
         shape.nativeSize = candidate.nativeSize;
         shape.nativeSizeSource = candidate.nativeSizeSource;
-        for (int index = 0; index < encoded.size(); index++) {
-            shape.members.add(customCodecWireMember(encoded.get(index), index));
+        for (int index = 0; index < projected.size(); index++) {
+            shape.members.add(customCodecWireMember(
+                projected.get(index),
+                nativeProjection.get(index),
+                index));
         }
-        return shape;
+        return applyContainerConstructionLayout(
+            shape,
+            candidate,
+            function,
+            plan);
+    }
+
+    private record ContainerCodecPhysicalSpan(
+        ContainerCodecCall codec,
+        int start,
+        int end,
+        List<String> layouts) {}
+
+    private List<Long> containerCodecNativeProjection(
+        List<ContainerCodecCall> primary,
+        List<ContainerCodecCall> fallback,
+        long nativeSize) {
+
+        List<ContainerCodecPhysicalSpan> primarySpans =
+            containerCodecPhysicalSpans(primary);
+        if (primarySpans == null) {
+            return null;
+        }
+        List<ContainerCodecPhysicalSpan> fallbackSpans =
+            fallback == null
+                ? List.of()
+                : containerCodecPhysicalSpans(fallback);
+        if (fallbackSpans == null ||
+            !sameContainerCodecPhysicalSpanSequence(
+                primarySpans,
+                fallbackSpans)) {
+            fallbackSpans = List.of();
+        }
+
+        ArrayList<Long> result = new ArrayList<>(primarySpans.size());
+        for (ContainerCodecPhysicalSpan span : primarySpans) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            Long offset = validContainerNativeProjection(
+                    span.codec(),
+                    nativeSize)
+                ? span.codec().elementOffset
+                : containerCodecNativeOffsetFromPhysicalSpan(
+                    span,
+                    fallbackSpans,
+                    nativeSize);
+            result.add(offset);
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    private List<ContainerCodecPhysicalSpan> containerCodecPhysicalSpans(
+        List<ContainerCodecCall> codecs) {
+
+        if (codecs == null) {
+            return null;
+        }
+        ArrayList<ContainerCodecPhysicalSpan> result = new ArrayList<>();
+        int cursor = 0;
+        for (ContainerCodecCall codec : codecs) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            List<String> layouts = containerPhysicalLayouts(codec);
+            if (layouts == null || layouts.isEmpty()) {
+                return null;
+            }
+            int end;
+            try {
+                end = Math.addExact(cursor, layouts.size());
+            }
+            catch (ArithmeticException ignored) {
+                return null;
+            }
+            result.add(new ContainerCodecPhysicalSpan(
+                codec,
+                cursor,
+                end,
+                layouts));
+            cursor = end;
+        }
+        return List.copyOf(result);
+    }
+
+    private boolean sameContainerCodecPhysicalSpanSequence(
+        List<ContainerCodecPhysicalSpan> primary,
+        List<ContainerCodecPhysicalSpan> fallback) {
+
+        if (primary.isEmpty() || fallback.isEmpty() ||
+            primary.get(primary.size() - 1).end() !=
+                fallback.get(fallback.size() - 1).end()) {
+            return false;
+        }
+        ArrayList<String> primaryLayouts = new ArrayList<>();
+        ArrayList<String> fallbackLayouts = new ArrayList<>();
+        for (ContainerCodecPhysicalSpan span : primary) {
+            primaryLayouts.addAll(span.layouts());
+        }
+        for (ContainerCodecPhysicalSpan span : fallback) {
+            fallbackLayouts.addAll(span.layouts());
+        }
+        if (primaryLayouts.size() != fallbackLayouts.size()) {
+            return false;
+        }
+        for (int index = 0; index < primaryLayouts.size(); index++) {
+            if (!containerPhysicalLayoutsMatch(
+                    primaryLayouts.get(index),
+                    fallbackLayouts.get(index))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Long containerCodecNativeOffsetFromPhysicalSpan(
+        ContainerCodecPhysicalSpan primary,
+        List<ContainerCodecPhysicalSpan> fallback,
+        long nativeSize) {
+
+        if (fallback.isEmpty()) {
+            return null;
+        }
+        ArrayList<ContainerCodecPhysicalSpan> tiles = new ArrayList<>();
+        int cursor = primary.start();
+        for (ContainerCodecPhysicalSpan candidate : fallback) {
+            if (candidate.end() <= cursor) {
+                continue;
+            }
+            if (candidate.start() != cursor ||
+                candidate.end() > primary.end()) {
+                return null;
+            }
+            tiles.add(candidate);
+            cursor = candidate.end();
+            if (cursor == primary.end()) {
+                break;
+            }
+        }
+        if (cursor != primary.end() || tiles.isEmpty()) {
+            return null;
+        }
+        if (tiles.size() == 1) {
+            ContainerCodecCall codec = tiles.get(0).codec();
+            return validContainerNativeProjection(codec, nativeSize)
+                ? codec.elementOffset
+                : null;
+        }
+
+        runMetrics.increment("customCodecAggregateNativeProjectionAttempts");
+        Long base = null;
+        long expected = -1L;
+        for (ContainerCodecPhysicalSpan tile : tiles) {
+            ContainerCodecCall codec = tile.codec();
+            Integer width = containerCodecNativeProjectionWidth(codec);
+            Integer physicalWidth =
+                containerCodecPhysicalProjectionWidth(tile.layouts());
+            if (!validContainerNativeProjection(codec, nativeSize) ||
+                width == null || physicalWidth == null ||
+                !width.equals(physicalWidth)) {
+                runMetrics.increment(
+                    "customCodecAggregateNativeProjectionRejected");
+                return null;
+            }
+            long offset = codec.elementOffset;
+            if (base == null) {
+                base = offset;
+                expected = offset;
+            }
+            if (offset != expected) {
+                runMetrics.increment(
+                    "customCodecAggregateNativeProjectionRejected");
+                return null;
+            }
+            try {
+                expected = Math.addExact(expected, width.longValue());
+            }
+            catch (ArithmeticException ignored) {
+                runMetrics.increment(
+                    "customCodecAggregateNativeProjectionRejected");
+                return null;
+            }
+            if (expected > nativeSize) {
+                runMetrics.increment(
+                    "customCodecAggregateNativeProjectionRejected");
+                return null;
+            }
+        }
+        runMetrics.increment("customCodecAggregateNativeProjectionResolved");
+        return base;
+    }
+
+    private Integer containerCodecNativeProjectionWidth(
+        ContainerCodecCall codec) {
+
+        if (codec == null) {
+            return null;
+        }
+        Integer width = nativeTypeByteWidth(codec.nativeType);
+        return width != null || codec.wireEvidence == null
+            ? width
+            : wireShapeByteWidth(codec.wireEvidence.layout);
+    }
+
+    private Integer containerCodecPhysicalProjectionWidth(
+        List<String> layouts) {
+
+        int width = 0;
+        for (String layout : layouts) {
+            Integer memberWidth = wireShapeByteWidth(layout);
+            if (memberWidth == null || memberWidth <= 0) {
+                return null;
+            }
+            try {
+                width = Math.addExact(width, memberWidth);
+            }
+            catch (ArithmeticException ignored) {
+                return null;
+            }
+        }
+        return width;
+    }
+
+    private boolean completeContainerNativeProjection(
+        List<ContainerCodecCall> codecs,
+        List<Long> offsets,
+        long nativeSize) {
+
+        if (codecs == null || offsets == null || codecs.isEmpty() ||
+            codecs.size() != offsets.size()) {
+            return false;
+        }
+        ArrayList<long[]> ranges = new ArrayList<>(codecs.size());
+        for (int index = 0; index < codecs.size(); index++) {
+            Long offset = offsets.get(index);
+            Integer width = containerCodecNativeProjectionWidth(
+                codecs.get(index));
+            if (offset == null || offset < 0L || offset >= nativeSize ||
+                width == null || width <= 0) {
+                return false;
+            }
+            long end;
+            try {
+                end = Math.addExact(offset, width.longValue());
+            }
+            catch (ArithmeticException ignored) {
+                return false;
+            }
+            if (end > nativeSize) {
+                return false;
+            }
+            ranges.add(new long[] { offset, end });
+        }
+        ranges.sort(Comparator.comparingLong(range -> range[0]));
+        for (int index = 1; index < ranges.size(); index++) {
+            if (ranges.get(index)[0] < ranges.get(index - 1)[1]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean validContainerNativeProjection(
+        ContainerCodecCall codec,
+        long nativeSize) {
+
+        return codec != null && codec.elementOffset != null &&
+            codec.elementOffset >= 0L && codec.elementOffset < nativeSize;
     }
 
     private boolean sameLogicalContainerCodecSequence(
@@ -105,7 +404,8 @@
                     left.wireEvidence.shape,
                     left.wireEvidence.layout,
                     right.wireEvidence.shape,
-                    right.wireEvidence.layout)) {
+                    right.wireEvidence.layout) &&
+                !samePhysicalContainerCodec(left, right)) {
                 return false;
             }
         }
@@ -114,12 +414,13 @@
 
     private NestedTypeMember customCodecWireMember(
         ContainerCodecCall codec,
+        Long nativeOffset,
         int index) {
 
         NestedTypeMember member = new NestedTypeMember();
         member.index = index;
         member.offset = index;
-        member.nativeOffset = codec.elementOffset;
+        member.nativeOffset = nativeOffset;
         member.name = "field_" + index;
         member.nameSource = "synthetic-wire-ordinal";
         member.nameProven = false;

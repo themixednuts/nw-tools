@@ -5,12 +5,18 @@
     }
 
     private ContainerCodecAgreement reconcileLogicalContainerCodecSequence(
-        List<ContainerCodecCall> encodedKeyLeaves,
-        List<ContainerCodecCall> encodedValueLeaves,
+        List<ContainerCodecCall> encodedKeyCodecs,
+        List<ContainerCodecCall> encodedValueCodecs,
         List<ContainerCodecCall> decoded) {
 
-        List<ContainerCodecCall> decodedLeaves = physicalContainerCodecLeaves(decoded);
-        if (decodedLeaves == null) {
+        List<ContainerCodecCall> encodedKeyLeaves =
+            physicalContainerCodecLeaves(encodedKeyCodecs);
+        List<ContainerCodecCall> encodedValueLeaves =
+            physicalContainerCodecLeaves(encodedValueCodecs);
+        List<ContainerCodecCall> decodedLeaves =
+            physicalContainerCodecLeaves(decoded);
+        if (encodedKeyLeaves == null || encodedValueLeaves == null ||
+            decodedLeaves == null) {
             return ContainerCodecAgreement.NONE;
         }
         ArrayList<ContainerCodecCall> encodedLeaves = new ArrayList<>(
@@ -22,15 +28,29 @@
             return ContainerCodecAgreement.NONE;
         }
 
-        if (encodedLeaves.size() != decodedLeaves.size()) {
+        List<ContainerCodecCall> encodedKeyLogical =
+            logicalContainerCodecLeaves(encodedKeyCodecs);
+        List<ContainerCodecCall> encodedValueLogical =
+            logicalContainerCodecLeaves(encodedValueCodecs);
+        List<ContainerCodecCall> decodedLogical =
+            logicalContainerCodecLeaves(decoded);
+        if (encodedKeyLogical == null || encodedValueLogical == null ||
+            decodedLogical == null) {
+            return ContainerCodecAgreement.PHYSICAL;
+        }
+        ArrayList<ContainerCodecCall> encodedLogical = new ArrayList<>(
+            encodedKeyLogical.size() + encodedValueLogical.size());
+        encodedLogical.addAll(encodedKeyLogical);
+        encodedLogical.addAll(encodedValueLogical);
+        if (!sameLogicalContainerCodecSequence(encodedLogical, decodedLogical)) {
             return ContainerCodecAgreement.PHYSICAL;
         }
 
         boolean completeSemantics = true;
-        for (int index = 0; index < encodedLeaves.size(); index++) {
+        for (int index = 0; index < encodedLogical.size(); index++) {
             completeSemantics &= applyUnmarshalCodecSemantics(
-                encodedLeaves.get(index),
-                decodedLeaves.get(index));
+                encodedLogical.get(index),
+                decodedLogical.get(index));
         }
         return completeSemantics
             ? ContainerCodecAgreement.SEMANTIC
@@ -230,14 +250,51 @@
         }
         String shape = codec.wireEvidence.shape;
         if (shape == null) {
-            return List.of(codec.wireEvidence.layout);
+            return containerAggregatePhysicalLayouts(codec.wireEvidence.layout);
         }
         return switch (shape) {
             case "vec2" -> fixedFloatPhysicalLayouts(codec.wireEvidence, 2);
             case "vec3" -> fixedFloatPhysicalLayouts(codec.wireEvidence, 3);
             case "quat" -> fixedFloatPhysicalLayouts(codec.wireEvidence, 4);
-            default -> List.of(codec.wireEvidence.layout);
+            default -> containerAggregatePhysicalLayouts(codec.wireEvidence.layout);
         };
+    }
+
+    private List<String> containerAggregatePhysicalLayouts(String layout) {
+        ArrayList<String> layouts = new ArrayList<>();
+        return appendContainerAggregatePhysicalLayout(layouts, layout)
+            ? List.copyOf(layouts)
+            : null;
+    }
+
+    private boolean appendContainerAggregatePhysicalLayout(
+        List<String> output,
+        String layout) {
+
+        if (layout == null) {
+            return false;
+        }
+        String element = vectorElementWireShape(layout);
+        if (element != null) {
+            output.add("vlq-u32");
+            return appendContainerAggregatePhysicalLayout(output, element);
+        }
+        List<String> members = compositeMemberWireShapes(layout);
+        if (members != null) {
+            for (String member : members) {
+                if (!appendContainerAggregatePhysicalLayout(output, member)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        switch (layout) {
+            case "vec2" -> output.addAll(Collections.nCopies(2, "f32"));
+            case "vec3" -> output.addAll(Collections.nCopies(3, "f32"));
+            case "vec4", "quat" -> output.addAll(Collections.nCopies(4, "f32"));
+            default -> output.add(layout);
+        }
+        return true;
     }
 
     private List<String> fixedFloatPhysicalLayouts(WireShape evidence, int count) {
