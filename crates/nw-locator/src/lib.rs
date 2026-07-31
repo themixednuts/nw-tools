@@ -526,23 +526,15 @@ mod tests {
 
     #[test]
     fn normalizes_install_related_paths() {
+        let root = PathBuf::from("SteamLibrary")
+            .join("steamapps")
+            .join("common")
+            .join("New World");
+        assert_eq!(normalize_root(root.join("Bin64")), root);
         assert_eq!(
-            normalize_root(PathBuf::from(
-                r"D:\SteamLibrary\steamapps\common\New World\Bin64"
-            )),
-            PathBuf::from(r"D:\SteamLibrary\steamapps\common\New World")
+            normalize_root(root.join("Bin64").join("NewWorld.exe")),
+            root
         );
-        assert_eq!(
-            normalize_root(PathBuf::from(
-                r"D:\SteamLibrary\steamapps\common\New World\Bin64\NewWorld.exe"
-            )),
-            PathBuf::from(r"D:\SteamLibrary\steamapps\common\New World")
-        );
-        assert_eq!(
-            normalize_root(PathBuf::from(
-                r"D:\SteamLibrary\steamapps\common\New World\assets"
-            )),
-            PathBuf::from(r"D:\SteamLibrary\steamapps\common\New World")
-        );
+        assert_eq!(normalize_root(root.join("assets")), root);
     }
 }

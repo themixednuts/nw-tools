@@ -7,15 +7,38 @@
         Address unmarshalAddress) {
 
         if (handlerVtable == null || physicalShape == null ||
-            !"fixed-bytes-16".equals(physicalShape.layout) ||
-            wireEvidence == null || wireEvidence.unmarshalEvents.size() != 1 ||
-            valueType == null || valueType.typeShape() == null ||
+            wireEvidence == null || valueType == null ||
+            valueType.typeShape() == null ||
             !Boolean.TRUE.equals(valueType.typeShape().identityProven) ||
             valueType.typeShape().typeId == null) {
             return null;
         }
 
         NestedTypeShape valueShape = valueType.typeShape();
+        if (uuidEquals(valueShape.typeId, REMOTE_SERVER_GDE_REF_TYPE_ID) &&
+            valueShape.nativeSize != null && valueShape.nativeSize == 24L &&
+            Boolean.TRUE.equals(valueShape.layoutProven) &&
+            Boolean.TRUE.equals(valueShape.memberCoverageProven) &&
+            Boolean.TRUE.equals(valueShape.wireOrderProven) &&
+            wireEvidence.conflict == null &&
+            wireEvidence.marshal != null && wireEvidence.unmarshal != null &&
+            "composite<fixed-bytes-16,fixed-bytes-8>".equals(
+                wireEvidence.marshal.layout) &&
+            Objects.equals(
+                wireEvidence.marshal.layout,
+                wireEvidence.unmarshal.layout) &&
+            Objects.equals(physicalShape.layout, wireEvidence.marshal.layout)) {
+            return WireShape.semantic(
+                "remote-server-gde-ref",
+                physicalShape.layout,
+                "exact-az-rtti+complete-native-layout+bidirectional-codec-product");
+        }
+
+        if (!"fixed-bytes-16".equals(physicalShape.layout) ||
+            wireEvidence.unmarshalEvents.size() != 1) {
+            return null;
+        }
+
         SerializeTypeInfo reflected = serializeTypesById.get(
             normalizeUuid(valueShape.typeId));
         Long nativeSize = reflected == null ? null : serializeTypeByteWidth(reflected);

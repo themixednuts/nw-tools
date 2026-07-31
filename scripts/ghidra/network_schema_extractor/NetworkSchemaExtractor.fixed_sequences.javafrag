@@ -16,12 +16,18 @@
             if (high == null) {
                 return null;
             }
-            LinkedHashMap<String, FixedSequenceShape> candidates = new LinkedHashMap<>();
-            putFixedSequenceCandidate(
-                candidates,
-                fixedSequenceShapeInFunction(function, high, bufferParameter, direction));
+            FixedSequenceShape local = fixedSequenceShapeInFunction(
+                function,
+                high,
+                bufferParameter,
+                direction);
+            if (local != null) {
+                return local;
+            }
 
+            LinkedHashMap<String, FixedSequenceShape> candidates = new LinkedHashMap<>();
             PcodeStorage buffer = new PcodeStorage(bufferParameter, 0L);
+            int bufferForwardingCalls = 0;
             for (PcodeOpAST operation : orderedPcodeOps(high)) {
                 if (operation.getOpcode() != PcodeOp.CALL) {
                     continue;
@@ -35,6 +41,7 @@
                 if (target == null || slot == null) {
                     continue;
                 }
+                bufferForwardingCalls++;
                 putFixedSequenceCandidate(
                     candidates,
                     fixedSequenceShape(
@@ -43,7 +50,12 @@
                         direction,
                         active));
             }
-            return candidates.size() == 1
+            // A wrapper may promote the one sequence codec to which it delegates
+            // its buffer. A composite helper also contains sequence codecs, but
+            // forwards that same buffer through other member codecs. Promoting a
+            // descendant from such a helper would mistake one nested member for
+            // the entire field value.
+            return bufferForwardingCalls == 1 && candidates.size() == 1
                 ? candidates.values().iterator().next()
                 : null;
         }

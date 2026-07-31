@@ -1008,7 +1008,9 @@ pub(super) fn message_field_blocked_reason(
     if !field.confidence.is_high_or_exact() {
         return Some("low-confidence-field".to_owned());
     }
-    if shape.is_some_and(message_wire_shape_contains_class_value) {
+    if shape.is_some_and(message_wire_shape_contains_class_value)
+        && !message_field_has_proven_class_value_aggregate(field, rust_type)
+    {
         return Some("unresolved-class-value".to_owned());
     }
     if let Some(rust_type) = rust_type
@@ -1038,6 +1040,17 @@ pub(super) fn message_field_blocked_reason(
     // alone (see rust_field_shape). RegisterField-backed sequences still use
     // the handler-plan path in state_field_shape_report.
     None
+}
+
+fn message_field_has_proven_class_value_aggregate(
+    field: &NetworkField,
+    rust_type: Option<&str>,
+) -> bool {
+    rust_type.and_then(message_support_type_ident).is_some()
+        && field
+            .nested_type_shape
+            .as_ref()
+            .is_some_and(|shape| shape.has_proven_layout())
 }
 
 fn message_wire_shape_contains_class_value(shape: &SchemaWireShape) -> bool {
