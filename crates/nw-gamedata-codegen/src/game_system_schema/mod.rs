@@ -95,8 +95,9 @@ pub fn infer_data_tables_schema(
         let mut columns = Vec::with_capacity(table.columns().len());
         for (column_index, column) in table.columns().iter().enumerate() {
             let mut analysis = analyze_column(table, column_index, column);
-            if let GameSystemColumnValueShape::String { foreign_keys, .. } =
-                &mut analysis.schema.value_shape
+            if analysis.schema.value_shape.supports_lossless_foreign_key()
+                && let GameSystemColumnValueShape::String { foreign_keys, .. } =
+                    &mut analysis.schema.value_shape
             {
                 *foreign_keys = infer_foreign_keys(
                     data_tables,
@@ -221,12 +222,14 @@ fn string_value_shape(
     let localized_key_like = string_shape.localized_key_like;
     let asset_path_like = string_shape.asset_path_like;
     let expression_like = string_shape.expression_like;
+    let qualified_reference_like = string_shape.qualified_reference_like;
     let list = string_shape.finish_list(row_type_name, column_name);
     GameSystemColumnValueShape::String {
         identifier_like,
         localized_key_like,
         asset_path_like,
         expression_like,
+        qualified_reference_like,
         list,
         foreign_keys: Vec::new(),
     }

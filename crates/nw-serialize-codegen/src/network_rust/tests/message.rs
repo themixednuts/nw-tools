@@ -2159,7 +2159,7 @@ fn emits_source_backed_baselineable_fragments_without_wire_shapes() {
 }
 
 #[test]
-fn emits_actor_instantiation_parameter_runtime_type() {
+fn blocks_unimplemented_actor_instantiation_parameter_runtime_type() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
             "uuid": "F24987B3-0136-4BCF-9D27-08BDE18B0266",
@@ -2178,18 +2178,82 @@ fn emits_actor_instantiation_parameter_runtime_type() {
 
     let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
-    assert_eq!(output.report.generatable_message_count, 1);
+    assert_eq!(output.report.generatable_message_count, 0);
+    assert_eq!(output.report.blocked_message_count, 1);
     assert_eq!(
         output.report.message_generation_plans[0].fields[0]
-            .rust_value_type
+            .blocked_reason
             .as_deref(),
-        Some("::nw_network::hub::ActorInstantiationParameters")
+        Some("missing-support-type")
     );
-    assert!(
-        output
-            .source
-            .contains("pub parameters: ::nw_network::hub::ActorInstantiationParameters")
+}
+
+#[test]
+fn wire_product_wins_over_conflicting_native_scalar_type() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000000007",
+            "typeIndex": 7,
+            "typeName": "ReplicateClient::FragmentUpdatesMsg",
+            "fields": [{
+                "index": 0,
+                "name": "Updates",
+                "nativeType": "u8",
+                "wireShape": "composite<vlq-u32,u32>",
+                "wireShapeSource": "unmarshal-cfg-complete-codec-body",
+                "wireLayout": "composite<vlq-u32,u32>",
+                "wireLayoutSource": "unmarshal-cfg-complete-codec-body",
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+    assert_eq!(
+        output.report.generatable_message_count, 1,
+        "{:#?}",
+        output.report.message_generation_plans[0]
     );
+    let field = &output.report.message_generation_plans[0].fields[0];
+    assert_eq!(field.rust_value_type.as_deref(), Some("(u32, u32)"));
+    assert_eq!(field.rust_field_type.as_deref(), Some("(u32, u32)"));
+    assert!(output.source.contains("TupleCodec"));
+    assert!(!output.source.contains("pub updates: u8"));
+}
+
+#[test]
+fn recursively_blocks_unresolved_class_value_wire_products() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000006167",
+            "typeIndex": 6167,
+            "typeName": "Amazon::Hub::RequestEnterSectorMsg",
+            "fields": [{
+                "index": 0,
+                "name": "Request",
+                "wireLayout": "optional<class-value>",
+                "wireLayoutSource": "unmarshal-cfg-complete-codec-body",
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+    assert_eq!(output.report.generatable_message_count, 0);
+    assert_eq!(output.report.blocked_message_count, 1);
+    assert_eq!(
+        output.report.message_generation_plans[0].fields[0]
+            .blocked_reason
+            .as_deref(),
+        Some("unresolved-class-value")
+    );
+    assert!(!output.source.contains("ClassValue"));
 }
 
 #[test]

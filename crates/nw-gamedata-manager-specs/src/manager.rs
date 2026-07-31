@@ -1705,6 +1705,8 @@ pub enum NativeProjectionTransform {
     OptionalCrc32ZeroAsNone,
     LowercaseCrcString,
     OptionalLowercaseCrcString,
+    OptionalQualifiedLowercaseCrcString,
+    OptionalQualifiedU16,
     CrcList,
     OptionalCrcListDefaultEmpty,
     LowercaseCrcStringList,

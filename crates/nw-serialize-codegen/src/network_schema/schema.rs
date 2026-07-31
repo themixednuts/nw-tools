@@ -264,6 +264,25 @@ impl NetworkSchema {
         report
     }
 
+    /// Restricts semantic source references to the reflected types that are
+    /// actually emitted into the consuming generated crate.
+    ///
+    /// A SerializeContext catalog describes every type that can be generated;
+    /// an explicit root selection emits only a closure of that catalog. Network
+    /// Rust generation must use the latter as its source-type availability
+    /// boundary or it can create references to types absent from the crate.
+    pub fn restrict_serialize_source_availability(&mut self, unit: &SerializeCodegenUnit) {
+        let available = unit
+            .items
+            .iter()
+            .map(|item| item.source_type_id)
+            .collect::<BTreeSet<_>>();
+        for serialize in &mut self.serialize_types {
+            serialize.emits_source = available.contains(&serialize.type_id);
+        }
+        self.summary = self.build_summary();
+    }
+
     pub fn merge_serialize_type_catalog(
         &mut self,
         catalog: &crate::catalog::ReflectedTypeCatalog,

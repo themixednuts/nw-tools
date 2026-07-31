@@ -373,6 +373,9 @@ pub(super) fn apply_foreign_key_family_affinity(
             if column.row_key {
                 continue;
             }
+            if !column.value_shape.supports_lossless_foreign_key() {
+                continue;
+            }
             let family_key = (table.row_type_name.clone(), column.name.clone());
             let Some(family_target) = family_targets.get(&family_key) else {
                 continue;
@@ -383,22 +386,11 @@ pub(super) fn apply_foreign_key_family_affinity(
             )) else {
                 continue;
             };
-            let Some(mut evidence) =
+            let Some(evidence) =
                 column_foreign_key_evidence(data_tables, table_index, column_index, target_index)
             else {
                 continue;
             };
-            if evidence.candidate.missing_values > 0 {
-                evidence.candidate.confidence =
-                    evidence
-                        .candidate
-                        .confidence
-                        .max(foreign_key_classification_confidence(
-                            &evidence.candidate,
-                            family_target,
-                        ));
-            }
-
             emit_missing_foreign_key_diagnostics_for_target(
                 data_tables,
                 table_index,
@@ -464,6 +456,9 @@ pub(super) fn foreign_key_family_targets(
 
     for table in tables {
         for column in &table.columns {
+            if !column.value_shape.supports_lossless_foreign_key() {
+                continue;
+            }
             let GameSystemColumnValueShape::String {
                 list, foreign_keys, ..
             } = &column.value_shape
@@ -584,24 +579,9 @@ pub(super) fn foreign_key_family_confidence(evidence: &ForeignKeyFamilyEvidence)
 }
 
 pub(super) fn is_column_foreign_key_candidate(candidate: &GameSystemForeignKeyCandidate) -> bool {
-    if candidate.checked_values == 0 {
-        return false;
-    }
-    if candidate.matched_values == candidate.checked_values && candidate.missing_values == 0 {
-        return true;
-    }
-    candidate.confidence >= FOREIGN_KEY_FAMILY_CONFIDENCE_THRESHOLD
-}
-
-pub(super) fn foreign_key_classification_confidence(
-    candidate: &GameSystemForeignKeyCandidate,
-    family_target: &ForeignKeyFamilyTarget,
-) -> f64 {
-    if candidate.matched_values == candidate.checked_values && candidate.missing_values == 0 {
-        candidate.confidence
-    } else {
-        family_target.confidence
-    }
+    candidate.checked_values > 0
+        && candidate.matched_values == candidate.checked_values
+        && candidate.missing_values == 0
 }
 
 pub(super) fn column_foreign_key_evidence(

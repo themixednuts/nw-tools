@@ -193,7 +193,7 @@ pub(in crate::game_system_schema) fn row_type_specific_list_affinity(
         if column_name == "EntitlementIds" {
             return Some(SemanticListAffinity {
                 separator: ",",
-                separators: SemanticListSeparators::Detected,
+                separators: SemanticListSeparators::Exact,
                 element_shape: Some(GameSystemListElementShape::Pair {
                     separator: ':',
                     first: GameSystemListAtomShape::Crc32,

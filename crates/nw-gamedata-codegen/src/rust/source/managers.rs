@@ -1704,6 +1704,7 @@ mod tests {
                 localized_key_like: false,
                 asset_path_like: false,
                 expression_like: false,
+                qualified_reference_like: false,
                 list: None,
                 foreign_keys: Vec::new(),
             },
@@ -3734,9 +3735,11 @@ fn rust_projection_type(field: &SemanticRecordField) -> String {
         SemanticProjectionTransform::OptionalCrc32
         | SemanticProjectionTransform::OptionalCrc32ZeroAsNone
         | SemanticProjectionTransform::OptionalLowercaseCrcString
+        | SemanticProjectionTransform::OptionalQualifiedLowercaseCrcString
         | SemanticProjectionTransform::OptionalTrimmedLowercaseCrcString => {
             "Option<Crc32>".to_owned()
         }
+        SemanticProjectionTransform::OptionalQualifiedU16 => "Option<u16>".to_owned(),
         SemanticProjectionTransform::I32 => "i32".to_owned(),
         SemanticProjectionTransform::F32
         | SemanticProjectionTransform::F32MinutesToSeconds
@@ -4574,6 +4577,16 @@ fn rust_projection_value(field: &SemanticRecordField) -> String {
         SemanticProjectionTransform::OptionalLowercaseCrcString => {
             format!(
                 "optional_lowercase_crc_string_cell(table, source_row, {column})?.map(Crc32::new)"
+            )
+        }
+        SemanticProjectionTransform::OptionalQualifiedLowercaseCrcString => {
+            format!(
+                "optional_qualified_crc_u16_cell(table, source_row, {column})?.map(|(id, _)| Crc32::new(id))"
+            )
+        }
+        SemanticProjectionTransform::OptionalQualifiedU16 => {
+            format!(
+                "optional_qualified_crc_u16_cell(table, source_row, {column})?.map(|(_, rank)| rank)"
             )
         }
         SemanticProjectionTransform::OptionalTrimmedLowercaseCrcString => {
@@ -6836,6 +6849,40 @@ fn optional_lowercase_crc_string_cell(
     column_name: &str,
 ) -> Result<Option<u32>> {
     Ok(optional_string_cell(table, row, column_name)?.map(crc32_lowercase))
+}
+
+fn optional_qualified_crc_u16_cell(
+    table: &DynamicTable,
+    row: &DynamicTableRow,
+    column_name: &str,
+) -> Result<Option<(u32, u16)>> {
+    let Some(value) = optional_string_cell(table, row, column_name)? else {
+        return Ok(None);
+    };
+    let (identifier, rank) = value.split_once(':').with_context(|| {
+        format!(
+            "row {}:{} column `{column_name}` value `{value}` must have `identifier:rank` syntax",
+            row.source_path,
+            row.row_index + 1,
+        )
+    })?;
+    let identifier = identifier.trim();
+    let rank = rank.trim();
+    if identifier.is_empty() || rank.is_empty() {
+        bail!(
+            "row {}:{} column `{column_name}` value `{value}` must have non-empty identifier and rank",
+            row.source_path,
+            row.row_index + 1,
+        );
+    }
+    let rank = rank.parse::<u16>().with_context(|| {
+        format!(
+            "row {}:{} column `{column_name}` value `{value}` has invalid u16 rank `{rank}`",
+            row.source_path,
+            row.row_index + 1,
+        )
+    })?;
+    Ok(Some((crc32_lowercase(identifier), rank)))
 }
 
 fn optional_trimmed_lowercase_crc_string_cell(

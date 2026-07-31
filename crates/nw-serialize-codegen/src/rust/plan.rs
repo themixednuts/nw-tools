@@ -433,7 +433,7 @@ impl RustCodegenPlanner {
         }
 
         let is_bevy_component = is_bevy_component_role(item);
-        let identity = self.rust_identity_for_struct(item, is_bevy_component);
+        let mut identity = self.rust_identity_for_struct(item, is_bevy_component);
         let is_slot_owner = plan_context.layout_index.has_concrete_slot_children(item);
         let has_layout_family_descendants = plan_context
             .layout_index
@@ -450,6 +450,11 @@ impl RustCodegenPlanner {
             &current_module,
             plan_context.polymorphic_value_type_names,
         );
+        if let Some(base_field) =
+            native_component_base_field(item, &fields, plan_context.items_by_type_id)
+        {
+            identity = identity.with_native_component_base_field(base_field);
+        }
         let rtti_bases = self.field_planner.plan_rtti_bases(
             item,
             plan_context.items_by_type_id,
@@ -1121,7 +1126,12 @@ fn abstract_sum_variant_name(
     name_plan: &RustNamePlan,
 ) -> String {
     let base_name = name_plan.definition_name(base);
-    let child_name = name_plan.reference_name(child.source_type_id, &child.source_name);
+    // Variant identifiers live inside the sum enum's own namespace. A
+    // payload type may need an absolute reference because another module has
+    // the same type name, but importing that path into the variant identifier
+    // produces names such as `CrateGenerated...TriggerEntity`. Use the local
+    // definition name here; the payload type remains fully qualified.
+    let child_name = name_plan.definition_name(child);
     let variant = child_name
         .strip_prefix(&base_name)
         .filter(|suffix| !suffix.is_empty())
@@ -1510,17 +1520,57 @@ fn current_module_path(scope_segments: &[String], file_stem: &str) -> String {
 }
 
 fn is_bevy_component_role(item: &SerializeCodegenItem) -> bool {
-    if item.is_abstract == Some(true) {
-        return false;
+    if is_native_component_role(item) {
+        return true;
     }
-    match item.role {
-        ReflectedTypeRole::FacetedComponent | ReflectedTypeRole::AzComponent => true,
-        ReflectedTypeRole::ClientFacet | ReflectedTypeRole::ServerFacet => !matches!(
-            source_leaf_name(&item.source_name),
-            "ClientFacet" | "ServerFacet"
-        ),
-        ReflectedTypeRole::AzEntity | ReflectedTypeRole::SupportType => false,
-    }
+    item.is_abstract != Some(true)
+        && match item.role {
+            ReflectedTypeRole::ClientFacet | ReflectedTypeRole::ServerFacet => !matches!(
+                source_leaf_name(&item.source_name),
+                "ClientFacet" | "ServerFacet"
+            ),
+            ReflectedTypeRole::FacetedComponent
+            | ReflectedTypeRole::AzComponent
+            | ReflectedTypeRole::AzEntity
+            | ReflectedTypeRole::SupportType => false,
+        }
+}
+
+fn is_native_component_role(item: &SerializeCodegenItem) -> bool {
+    item.is_abstract != Some(true)
+        && matches!(
+            item.role,
+            ReflectedTypeRole::FacetedComponent | ReflectedTypeRole::AzComponent
+        )
+}
+
+fn native_component_base_field(
+    item: &SerializeCodegenItem,
+    fields: &[crate::rust::item_plan::RustFieldPlan],
+    items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+) -> Option<String> {
+    is_native_component_role(item)
+        .then(|| {
+            fields.iter().find(|field| {
+                field.is_base_class
+                    && items_by_type_id
+                        .get(&field.source_type_id)
+                        .is_some_and(item_is_native_component_base)
+            })
+        })
+        .flatten()
+        .map(|field| field.rust_name.clone())
+}
+
+fn item_is_native_component_base(item: &&SerializeCodegenItem) -> bool {
+    matches!(
+        item.role,
+        ReflectedTypeRole::FacetedComponent | ReflectedTypeRole::AzComponent
+    ) || item.source_name == "AZ::Component"
+        || item
+            .rtti_base_chain
+            .iter()
+            .any(|base| base.source_name == "AZ::Component")
 }
 
 fn source_leaf_name(source_name: &str) -> &str {
@@ -2560,7 +2610,14 @@ pub struct ExternalPayload;
                     "$id": 10,
                     "name": "AZ::Component",
                     "typeId": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
-                    "elements": [],
+                    "elements": [
+                        {
+                            "$id": 11,
+                            "name": "Id",
+                            "typeId": type_ids::U64.hyphenated().to_string(),
+                            "is_base_class": false
+                        }
+                    ],
                     "attributes": []
                 },
                 "11111111-1111-1111-1111-111111111111": {
@@ -2601,6 +2658,11 @@ pub struct ExternalPayload;
         assert_eq!(component.identity.kind, RustTypeIdentityKind::AzRtti);
         assert!(component.is_bevy_component);
         assert_eq!(
+            component.identity.native_component_base_field.as_deref(),
+            Some("az_component"),
+            "{component:#?}"
+        );
+        assert_eq!(
             component.derives,
             vec![
                 "Component",
@@ -2620,7 +2682,14 @@ pub struct ExternalPayload;
                 "Reflect"
             ]
         );
-        assert_eq!(component.fields[0].rust_type, "u32");
+        assert_eq!(
+            component
+                .fields
+                .iter()
+                .find(|field| field.rust_name == "count")
+                .map(|field| field.rust_type.as_str()),
+            Some("u32")
+        );
     }
 
     #[test]
@@ -3435,6 +3504,60 @@ pub struct ExternalPayload;
             Some("GatherableCondition")
         );
         assert!(condition.variants[1].payload_has_materialized_fields);
+    }
+
+    #[test]
+    fn polymorphic_variant_name_is_local_when_payload_reference_is_qualified() {
+        let base_id = uuid!("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA");
+        let child_id = uuid!("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB");
+        let unrelated_id = uuid!("CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC");
+        let base = abstract_item(
+            base_id,
+            "TimelineClip",
+            ReflectedTypeRole::SupportType,
+            Vec::new(),
+        );
+        let child = facet_item(
+            child_id,
+            "TimelineClip::TriggerEntity",
+            ReflectedTypeRole::SupportType,
+            vec![base_field(base_id, "TimelineClip")],
+        );
+        let name_plan = RustNamePlan::scoped_candidates_with_root(
+            [
+                (
+                    base_id,
+                    vec!["timeline_clip".to_owned()],
+                    "TimelineClip".to_owned(),
+                ),
+                (
+                    child_id,
+                    vec!["timeline_clip".to_owned()],
+                    "TriggerEntity".to_owned(),
+                ),
+                (
+                    unrelated_id,
+                    vec!["node".to_owned()],
+                    "TriggerEntity".to_owned(),
+                ),
+            ],
+            std::collections::BTreeMap::from([
+                (base_id, vec!["timeline_clip".to_owned()]),
+                (child_id, vec!["timeline_clip".to_owned()]),
+                (unrelated_id, vec!["node".to_owned()]),
+            ]),
+            ["crate", "generated"],
+        );
+
+        assert!(
+            name_plan
+                .reference_name(child_id, &child.source_name)
+                .contains("crate::generated")
+        );
+        assert_eq!(
+            abstract_sum_variant_name(&base, &child, &name_plan),
+            "TriggerEntity"
+        );
     }
 
     #[test]

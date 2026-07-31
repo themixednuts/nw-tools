@@ -27,7 +27,7 @@ fn foreign_key_affinity_spreads_exact_family_targets_to_singleton_tables() {
 }
 
 #[test]
-fn foreign_key_affinity_reports_missing_singleton_values_and_keeps_family_type() {
+fn foreign_key_affinity_reports_missing_singleton_without_promoting_it() {
     let data_tables = foreign_key_family_data_tables("Achievement_Missing");
 
     let report = infer_data_tables_schema(&data_tables);
@@ -38,17 +38,8 @@ fn foreign_key_affinity_reports_missing_singleton_values_and_keeps_family_type()
     else {
         panic!("expected string column");
     };
-    assert_eq!(
-        list.as_ref().map(|list| &list.separators),
-        Some(&vec!["+".to_owned()])
-    );
-    assert_eq!(foreign_keys.len(), 1);
-    assert_eq!(foreign_keys[0].target_table, "AchievementData");
-    assert_eq!(foreign_keys[0].target_column, "AchievementID");
-    assert_eq!(foreign_keys[0].checked_values, 1);
-    assert_eq!(foreign_keys[0].matched_values, 0);
-    assert_eq!(foreign_keys[0].missing_values, 1);
-    assert_eq!(foreign_keys[0].confidence, 1.0);
+    assert!(list.is_none());
+    assert!(foreign_keys.is_empty());
 
     let diagnostic = report
         .diagnostics
@@ -70,15 +61,124 @@ fn foreign_key_affinity_reports_missing_singleton_values_and_keeps_family_type()
     assert_eq!(diagnostic.occurrences, 1);
 
     let affinity = report_table_affinity(&report, "Quest_Singleton", "RequiredAchievementId");
-    assert!(affinity.repairable);
-    assert!(affinity.repairs.iter().any(|repair| {
-        repair.kind == GameSystemColumnTypeRepairKind::ForeignKey && repair.row_index.is_none()
-    }));
-    assert!(affinity.repairs.iter().any(|repair| {
-        repair.kind == GameSystemColumnTypeRepairKind::ForeignKey
-            && repair.row_index == Some(0)
-            && repair.value.as_deref() == Some("Achievement_Missing")
-    }));
+    assert!(!affinity.repairable);
+    assert!(affinity.repairs.is_empty());
+}
+
+#[test]
+fn authored_achievement_expressions_block_foreign_key_promotion_for_the_whole_column() {
+    let mut data_tables = GameSystemDataTables::default();
+    data_tables
+        .insert(test_table(
+            "AchievementDataTable",
+            1,
+            "AchievementData",
+            vec![("AchievementID", ColumnType::String)],
+            ["debug_1", "ss2_quest_01_complete", "ss2_quest_01a_complete"]
+                .into_iter()
+                .map(|value| vec![OwnedCellValue::String(value.to_owned())])
+                .collect(),
+        ))
+        .expect("insert achievements");
+    data_tables
+        .insert(test_table(
+            "Objectives",
+            2,
+            "Objectives",
+            vec![
+                ("ObjectiveID", ColumnType::String),
+                ("RequiredAchievementId", ColumnType::String),
+            ],
+            vec![
+                vec![
+                    OwnedCellValue::String("objective_a".to_owned()),
+                    OwnedCellValue::String("debug_1".to_owned()),
+                ],
+                vec![
+                    OwnedCellValue::String("objective_b".to_owned()),
+                    OwnedCellValue::String("ss2_quest_01_complete".to_owned()),
+                ],
+                vec![
+                    OwnedCellValue::String("objective_expression".to_owned()),
+                    OwnedCellValue::String("debug_1 && !ss2_quest_01a_complete".to_owned()),
+                ],
+            ],
+        ))
+        .expect("insert objectives");
+
+    let report = infer_data_tables_schema(&data_tables);
+    let column = report_table_column(&report, "Objectives", "RequiredAchievementId");
+    let GameSystemColumnValueShape::String {
+        expression_like,
+        qualified_reference_like,
+        list,
+        foreign_keys,
+        ..
+    } = &column.value_shape
+    else {
+        panic!("expected authored string column");
+    };
+    assert!(*expression_like);
+    assert!(!qualified_reference_like);
+    assert!(list.is_none());
+    assert!(foreign_keys.is_empty());
+    assert!(column.value_shape.requires_authored_string());
+}
+
+#[test]
+fn rank_qualified_progression_references_are_not_plain_foreign_keys() {
+    let mut data_tables = GameSystemDataTables::default();
+    data_tables
+        .insert(test_table(
+            "CategoricalProgression",
+            1,
+            "CategoricalProgressionData",
+            vec![("CategoricalProgressionId", ColumnType::String)],
+            ["PvP_XP", "TerritoryStanding"]
+                .into_iter()
+                .map(|value| vec![OwnedCellValue::String(value.to_owned())])
+                .collect(),
+        ))
+        .expect("insert progression definitions");
+    data_tables
+        .insert(test_table(
+            "TutorialConditions",
+            2,
+            "TutorialConditionData",
+            vec![
+                ("ConditionId", ColumnType::String),
+                ("CategoricalProgression", ColumnType::String),
+            ],
+            vec![
+                vec![
+                    OwnedCellValue::String("condition_a".to_owned()),
+                    OwnedCellValue::String("PvP_XP:5".to_owned()),
+                ],
+                vec![
+                    OwnedCellValue::String("condition_b".to_owned()),
+                    OwnedCellValue::String("TerritoryStanding:2".to_owned()),
+                ],
+            ],
+        ))
+        .expect("insert tutorial conditions");
+
+    let report = infer_data_tables_schema(&data_tables);
+    let column = report_table_column(&report, "TutorialConditions", "CategoricalProgression");
+    let GameSystemColumnValueShape::String {
+        expression_like,
+        qualified_reference_like,
+        list,
+        foreign_keys,
+        ..
+    } = &column.value_shape
+    else {
+        panic!("expected authored string column");
+    };
+    assert!(!expression_like);
+    assert!(*qualified_reference_like);
+    assert!(list.is_none());
+    assert!(foreign_keys.is_empty());
+    assert!(column.value_shape.requires_authored_string());
 }
 
 #[test]

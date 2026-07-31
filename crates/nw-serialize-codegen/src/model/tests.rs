@@ -889,9 +889,89 @@ fn lowers_project_serialize_context_fixture() {
     assert!(model.generic_classes.len() > 700);
     assert!(model.enums.len() > 300);
     assert!(model.any_creators.len() > 5_000);
+    let data_flags = &model.generic_classes[&uuid!("CAB9E1F5-761E-54B8-916E-E7FB597E5EDE")];
+    assert_eq!(data_flags.elements_apply_to_class_data, Some(true));
+    assert_eq!(data_flags.class_data_element_count, Some(0));
+    assert_eq!(
+        data_flags.class_name.as_deref(),
+        Some("AZStd::unordered_map")
+    );
+    assert_eq!(
+        data_flags
+            .members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        ["element"]
+    );
     assert!(
         document.root()["editContext"]["classData"]
             .as_array()
             .is_some_and(Vec::is_empty)
+    );
+    // Ghidra `NewWorld 3-26`: the native registration at
+    // NewWorld+0x37b3da0 registers ConversationServices as 0..17. The
+    // reflected generic element below is the captured physical-width proof.
+    assert_eq!(
+        model
+            .enum_underlying_types
+            .get(&uuid!("B86C0ED6-D235-4937-9806-F3F16CCC6E7E")),
+        Some(&type_ids::U8),
+        "ConversationServices should recover its one-byte physical type from its EnumType member"
+    );
+}
+
+#[test]
+fn generic_element_ownership_signal_selects_class_data_members() {
+    let specialized = uuid!("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB");
+    let document = SerializeContextDocument::from_value_unchecked(json!({
+        "uuidMap": {},
+        "uuidGenericMap": [[
+            specialized,
+            {
+                "$id": 1,
+                "typeId": specialized,
+                "registeredTypeIds": [specialized],
+                "elementsApplyToClassData": false,
+                "classDataElementCount": 1,
+                "templatedArgumentCount": 1,
+                "templatedTypeIds": ["43DA906B-7DEF-4CA8-9790-854106D3F983"],
+                "typeIdFoldTypeIds": null,
+                "specializedTypeId": specialized,
+                "genericTypeId": "2BADE35A-6F1B-4698-B2BC-3373D010020C",
+                "legacySpecializedTypeId": null,
+                "nonTypeTemplateArguments": null,
+                "classData": {
+                    "$id": 2,
+                    "name": "AZStd::vector",
+                    "typeId": specialized,
+                    "elements": [{
+                        "name": "class_element",
+                        "nameCrc": 1,
+                        "typeId": "43DA906B-7DEF-4CA8-9790-854106D3F983"
+                    }]
+                },
+                "elements": [{
+                    "name": "generic_element",
+                    "nameCrc": 2,
+                    "typeId": "43DA906B-7DEF-4CA8-9790-854106D3F983"
+                }]
+            }
+        ]],
+        "enumTypeIdToUnderlyingTypeIdMap": {}
+    }));
+
+    let model = SerializeContextModel::from_document(&document);
+    let generic = &model.generic_classes[&specialized];
+
+    assert_eq!(generic.elements_apply_to_class_data, Some(false));
+    assert_eq!(generic.class_data_element_count, Some(1));
+    assert_eq!(
+        generic
+            .members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        ["class_element"]
     );
 }

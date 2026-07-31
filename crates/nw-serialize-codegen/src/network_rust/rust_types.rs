@@ -86,9 +86,6 @@ pub(super) fn exact_native_runtime_rust_type(native_type: &str) -> Option<&'stat
         "BaselineableFragment" | "Amazon::Hub::BaselineableFragment" => {
             Some("::nw_network::hub::BaselineableFragment")
         }
-        "ActorInstantiationParameters" | "Amazon::Hub::ActorInstantiationParameters" => {
-            Some("::nw_network::hub::ActorInstantiationParameters")
-        }
         _ => None,
     }
 }

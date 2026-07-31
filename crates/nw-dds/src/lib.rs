@@ -12,9 +12,10 @@ use std::path::Path;
 use thiserror::Error;
 
 pub use container::{
-    DecodedFloatImage, DecodedImage, DecodedImage16, Error as Ktx2Error, Ktx2, Sidecar,
-    decode_all_mips, decode_all_mips_until, decode_header_mip, decode_mip_max, decode_top_mip,
-    decode_top_mip_float, decode_top_mip_rgba16, decode_top_mip_with_attached_alpha,
+    DecodedFloatImage, DecodedImage, DecodedImage16, DecodedImageSet, Error as Ktx2Error, Ktx2,
+    Sidecar, decode_all_mips, decode_all_mips_until, decode_header_mip, decode_mip_max,
+    decode_top_mip, decode_top_mip_float, decode_top_mip_float_images, decode_top_mip_images,
+    decode_top_mip_rgba16, decode_top_mip_rgba16_images, decode_top_mip_with_attached_alpha,
 };
 
 pub const DDS_EXTENSION: &str = "dds";
@@ -26,13 +27,17 @@ const DDS_PIXEL_FORMAT_SIZE: u32 = 32;
 const DX10_HEADER_LEN: usize = 20;
 const FOUR_CC_DX10: [u8; 4] = *b"DX10";
 const FOUR_CC_FYRC: [u8; 4] = *b"FYRC";
+const DDS_CAPS2_CUBEMAP: u32 = 0x0000_0200;
+const DX10_RESOURCE_DIMENSION_TEXTURE_1D: u32 = 2;
+const DX10_RESOURCE_DIMENSION_TEXTURE_3D: u32 = 4;
+const DX10_RESOURCE_MISC_TEXTURE_CUBE: u32 = 0x4;
 
 const DDPF_ALPHA_PIXELS: u32 = 0x1;
 const DDPF_ALPHA: u32 = 0x2;
 const DDPF_FOUR_CC: u32 = 0x4;
 const DDPF_RGB: u32 = 0x40;
 const DDPF_LUMINANCE: u32 = 0x2_0000;
-const DDPF_BUMP_DUDV: u32 = 0x8_0000;
+pub const DDPF_BUMP_DUDV: u32 = 0x8_0000;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -120,6 +125,35 @@ pub enum DdsFormatCode {
         blue_mask: u32,
         alpha_mask: u32,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DdsDimension {
+    One,
+    Two,
+    Three,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DdsShape {
+    pub dimension: DdsDimension,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub array_layers: u32,
+    pub faces: u32,
+}
+
+impl DdsShape {
+    #[must_use]
+    pub const fn is_plain_2d(self) -> bool {
+        matches!(self.dimension, DdsDimension::Two) && self.array_layers == 1 && self.faces == 1
+    }
+
+    #[must_use]
+    pub fn image_count(self) -> u64 {
+        u64::from(self.depth) * u64::from(self.array_layers) * u64::from(self.faces)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +330,49 @@ impl Dds {
             green_mask: self.pixel_format.green_mask,
             blue_mask: self.pixel_format.blue_mask,
             alpha_mask: self.pixel_format.alpha_mask,
+        }
+    }
+
+    #[must_use]
+    pub fn shape(&self) -> DdsShape {
+        let dx10 = self.dx10();
+        let dimension = if self.depth() > 1
+            || self.header().cry_flags().contains(CryFlags::VOLUME_TEXTURE)
+            || dx10.is_some_and(|header| {
+                header.resource_dimension() == DX10_RESOURCE_DIMENSION_TEXTURE_3D
+            }) {
+            DdsDimension::Three
+        } else if dx10
+            .is_some_and(|header| header.resource_dimension() == DX10_RESOURCE_DIMENSION_TEXTURE_1D)
+        {
+            DdsDimension::One
+        } else {
+            DdsDimension::Two
+        };
+        let is_cube = self.header().caps2() & DDS_CAPS2_CUBEMAP != 0
+            || self.header().cry_flags().contains(CryFlags::CUBEMAP)
+            || dx10.is_some_and(|header| header.misc_flag() & DX10_RESOURCE_MISC_TEXTURE_CUBE != 0);
+        let array_layers = dx10.map_or(1, |header| {
+            let array_size = header.array_size().max(1);
+            if is_cube && self.is_cry_extended() {
+                // Lumberyard writes the total face count here (6 per cube),
+                // unlike the standard DX10 DDS cube-count interpretation.
+                (array_size / 6).max(1)
+            } else {
+                array_size
+            }
+        });
+        DdsShape {
+            dimension,
+            width: self.width(),
+            height: self.height().max(1),
+            depth: if dimension == DdsDimension::Three {
+                self.depth().max(1)
+            } else {
+                1
+            },
+            array_layers,
+            faces: if is_cube { 6 } else { 1 },
         }
     }
 

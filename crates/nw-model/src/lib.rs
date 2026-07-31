@@ -22,15 +22,15 @@ pub use animation_audio::{
     CryMannequinReceiverContext,
 };
 pub use geometry::{
-    AuxiliaryNode, AuxiliaryNodeRole, Bone, Mesh, MeshAttachment, MeshRole, Model, ModelBuildError,
-    Primitive, Skeleton, SkeletonPlacement,
+    AuxiliaryNode, AuxiliaryNodeRole, Bone, Mesh, MeshAttachment, MeshPhysicsData, MeshRole, Model,
+    ModelBuildError, Primitive, Skeleton, SkeletonPlacement,
 };
 pub use gltf::{
     AudioTriggerMediaRef, AudioTriggerPlayback, AudioTriggerResolution, AudioTriggerSurfaceMedia,
     AudioTriggerWwiseEvent, CryAssetExtras, CryEmbeddedResource, CryEmbeddedResourceKind,
-    CryNonRenderNode, CryNonRenderNodeRole, CryResourcePayload, CrySourceAsset, CrySourceAssetKind,
-    CryUnboundAnimation, Gltf, GltfAnimationError, GltfPackage, GltfPackageError, GltfResource,
-    ModelAnimation, NoMaterials, TextureData, WithMaterials,
+    CryMeshPhysicsData, CryNonRenderNode, CryNonRenderNodeRole, CryResourcePayload, CrySourceAsset,
+    CrySourceAssetKind, CryUnboundAnimation, Gltf, GltfAnimationError, GltfPackage,
+    GltfPackageError, GltfResource, ModelAnimation, NoMaterials, TextureData, WithMaterials,
 };
 pub use material::{MapSlot, MaterialSet, SubMaterial, TextureRef, TextureSourceKind};
 pub use particles::{
@@ -50,12 +50,66 @@ pub use physics::{
 pub enum Error {
     #[error(transparent)]
     Chunk(#[from] cry_chunk::CgfParseError),
+    #[error(
+        "chunk file references {data_ref_count} external data stream(s), but no heap sidecar bytes were supplied"
+    )]
+    MissingHeapSidecar { data_ref_count: usize },
     #[error(transparent)]
     Model(#[from] ModelBuildError),
     #[error("no drawable geometry, skeleton, or auxiliary nodes found in chunk file")]
     NoGeometry,
     #[error("no compiled skeleton found in chunk file")]
     NoSkeleton,
+}
+
+/// External stream requirements encoded by a Cry model source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshSourceLayout {
+    external_data_stream_count: usize,
+}
+
+impl MeshSourceLayout {
+    /// Inspect a Cry model source without assembling its geometry.
+    pub fn inspect(cgf: &[u8]) -> Result<Self, cry_chunk::CgfParseError> {
+        let file = cry_chunk::ChunkFile::parse(cgf)?;
+        let mut external_data_stream_count = 0;
+        for header in file.chunks() {
+            if header?.chunk_type() == Some(cry_chunk::ChunkType::DataRef) {
+                external_data_stream_count += 1;
+            }
+        }
+        Ok(Self {
+            external_data_stream_count,
+        })
+    }
+
+    fn from_file(file: &cry_chunk::CgfFile<'_>) -> Self {
+        Self {
+            external_data_stream_count: file.data_refs().len(),
+        }
+    }
+
+    /// Number of data streams stored in the same-basename heap sidecar.
+    pub const fn external_data_stream_count(self) -> usize {
+        self.external_data_stream_count
+    }
+
+    /// Whether lossless model assembly requires a heap sidecar.
+    pub const fn requires_heap_sidecar(self) -> bool {
+        self.external_data_stream_count != 0
+    }
+
+    /// Validate that required heap bytes were supplied.
+    ///
+    /// Empty heap bytes are treated as absent, matching [`model_from_bytes`].
+    pub fn validate_heap_sidecar(self, heap: &[u8]) -> Result<(), Error> {
+        if heap.is_empty() && self.requires_heap_sidecar() {
+            return Err(Error::MissingHeapSidecar {
+                data_ref_count: self.external_data_stream_count,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Parse a `.cgf` and its heap and assemble a [`Model`] in one step.
@@ -65,6 +119,7 @@ pub enum Error {
 /// Returns [`Error`] if the chunk file fails to parse or has no model graph.
 pub fn model_from_bytes(cgf: &[u8], heap: &[u8]) -> Result<Model, Error> {
     let file = cry_chunk::CgfFile::parse(cgf)?;
+    MeshSourceLayout::from_file(&file).validate_heap_sidecar(heap)?;
     let model = Model::try_from_cgf(&file, heap)?;
     if model.is_empty() && model.skeletons.is_empty() && model.auxiliary_nodes.is_empty() {
         return Err(Error::NoGeometry);
@@ -93,6 +148,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mesh_source_layout_requires_heap_only_for_external_streams() {
+        let embedded = MeshSourceLayout {
+            external_data_stream_count: 0,
+        };
+        assert!(!embedded.requires_heap_sidecar());
+        assert!(embedded.validate_heap_sidecar(&[]).is_ok());
+
+        let external = MeshSourceLayout {
+            external_data_stream_count: 3,
+        };
+        assert!(external.requires_heap_sidecar());
+        assert_eq!(external.external_data_stream_count(), 3);
+        assert!(matches!(
+            external.validate_heap_sidecar(&[]),
+            Err(Error::MissingHeapSidecar { data_ref_count: 3 })
+        ));
+        assert!(external.validate_heap_sidecar(&[1]).is_ok());
+    }
+
+    #[test]
+    fn mesh_source_layout_inspects_chunk_headers_without_decoding_payloads() {
+        let mut source = Vec::new();
+        source.extend_from_slice(b"CrCh");
+        source.extend_from_slice(&0x746_u32.to_le_bytes());
+        source.extend_from_slice(&1_u32.to_le_bytes());
+        source.extend_from_slice(&16_u32.to_le_bytes());
+        source.extend_from_slice(&0x300b_u16.to_le_bytes());
+        source.extend_from_slice(&0x0800_u16.to_le_bytes());
+        source.extend_from_slice(&7_i32.to_le_bytes());
+        source.extend_from_slice(&0_u32.to_le_bytes());
+        source.extend_from_slice(&32_u32.to_le_bytes());
+
+        let layout = MeshSourceLayout::inspect(&source).unwrap();
+        assert_eq!(layout.external_data_stream_count(), 1);
+        assert!(layout.requires_heap_sidecar());
+    }
+
+    #[test]
     fn glb_has_valid_header() {
         use glam::Vec3;
         // A model with one triangle.
@@ -101,6 +194,7 @@ mod tests {
             auxiliary_nodes: Vec::new(),
             meshes: vec![Mesh {
                 name: "tri".to_string(),
+                physics_data: Vec::new(),
                 role: MeshRole::Render,
                 skin: None,
                 lod: None,
@@ -129,6 +223,103 @@ mod tests {
     }
 
     #[test]
+    fn physics_proxy_payload_is_retained_once_in_buffer_views() {
+        let model = Model {
+            meshes: Vec::new(),
+            skeletons: Vec::new(),
+            auxiliary_nodes: vec![AuxiliaryNode {
+                name: "$physics_proxy_test".to_owned(),
+                role: AuxiliaryNodeRole::PhysicsProxy,
+                object_chunk_id: 73,
+                parent_chunk_id: 0,
+                material_chunk_id: 63,
+                transform: [0.0; 16],
+                properties: String::new(),
+                physics_data: vec![MeshPhysicsData {
+                    slot: 0,
+                    chunk_id: 72,
+                    flags: 7,
+                    tetrahedra_chunk_id: 91,
+                    physical_data: vec![1, 2, 3],
+                    tetrahedra_data: vec![4, 5],
+                }],
+            }],
+        };
+
+        let package = Gltf::new(&model).to_gltf_package();
+        assert_eq!(package.resources().len(), 1);
+        assert_eq!(package.resources()[0].bytes(), &[1, 2, 3, 0, 4, 5]);
+
+        let json: serde_json::Value = serde_json::from_str(
+            &package
+                .into_json(&["proxy-physics.bin".to_owned()])
+                .unwrap(),
+        )
+        .unwrap();
+        let physics = &json["extras"]["nonRenderNodes"][0]["physicsData"][0];
+        assert_eq!(physics["slot"], 0);
+        assert_eq!(physics["chunkId"], 72);
+        assert_eq!(physics["flags"], 7);
+        assert_eq!(physics["tetrahedraChunkId"], 91);
+        assert_eq!(physics["physicalDataBufferView"], 0);
+        assert_eq!(physics["tetrahedraDataBufferView"], 1);
+        assert_eq!(json["bufferViews"][0]["byteOffset"], 0);
+        assert_eq!(json["bufferViews"][0]["byteLength"], 3);
+        assert_eq!(json["bufferViews"][1]["byteOffset"], 4);
+        assert_eq!(json["bufferViews"][1]["byteLength"], 2);
+    }
+
+    #[test]
+    fn drawable_physicalized_mesh_uses_its_native_node_without_duplication() {
+        use glam::Vec3;
+
+        let model = Model {
+            skeletons: Vec::new(),
+            auxiliary_nodes: Vec::new(),
+            meshes: vec![Mesh {
+                name: "$physics_proxy_drawable".to_owned(),
+                role: MeshRole::PhysicsProxy,
+                skin: None,
+                lod: None,
+                shadow_proxy: false,
+                attachment: None,
+                physics_data: vec![MeshPhysicsData {
+                    slot: 0,
+                    chunk_id: 72,
+                    flags: 7,
+                    tetrahedra_chunk_id: 0,
+                    physical_data: vec![9, 8, 7],
+                    tetrahedra_data: Vec::new(),
+                }],
+                primitives: vec![Primitive {
+                    positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+                    normals: None,
+                    uvs: None,
+                    indices: vec![0, 1, 2],
+                    joints: None,
+                    weights: None,
+                    joints2: None,
+                    weights2: None,
+                    material_id: 0,
+                }],
+            }],
+        };
+
+        let package = Gltf::new(&model).to_gltf_package();
+        let json: serde_json::Value = serde_json::from_str(
+            &package
+                .into_json(&["drawable-proxy.bin".to_owned()])
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(json["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(json["nodes"][0]["extras"]["role"], "physicsProxy");
+        assert_eq!(json["nodes"][0]["extras"]["physicsData"][0]["chunkId"], 72);
+        assert!(json.get("extras").is_none());
+    }
+
+    #[test]
     fn structured_gltf_keeps_reusable_mesh_buffers_separate() {
         use glam::Vec3;
 
@@ -145,6 +336,7 @@ mod tests {
         };
         let mesh = |name: &str| Mesh {
             name: name.to_string(),
+            physics_data: Vec::new(),
             role: MeshRole::Render,
             skin: None,
             lod: None,
@@ -191,6 +383,7 @@ mod tests {
             auxiliary_nodes: Vec::new(),
             meshes: vec![Mesh {
                 name: "tree".to_owned(),
+                physics_data: Vec::new(),
                 role: MeshRole::Render,
                 skin: None,
                 lod: None,
@@ -308,6 +501,7 @@ mod tests {
             auxiliary_nodes: Vec::new(),
             meshes: vec![Mesh {
                 name: "m".to_string(),
+                physics_data: Vec::new(),
                 role: MeshRole::Render,
                 skin: None,
                 lod: None,
@@ -390,6 +584,7 @@ mod tests {
             meshes: vec![
                 Mesh {
                     name: "body".to_owned(),
+                    physics_data: Vec::new(),
                     primitives: vec![primitive()],
                     role: MeshRole::Render,
                     skin: None,
@@ -399,6 +594,7 @@ mod tests {
                 },
                 Mesh {
                     name: "body$lod1".to_owned(),
+                    physics_data: Vec::new(),
                     primitives: vec![primitive()],
                     role: MeshRole::Render,
                     skin: None,
@@ -443,6 +639,7 @@ mod tests {
         };
         let mesh = |name: &str, skin| Mesh {
             name: name.to_owned(),
+            physics_data: Vec::new(),
             primitives: vec![primitive()],
             role: MeshRole::Render,
             skin: Some(skin),
@@ -515,6 +712,7 @@ mod tests {
             .to_owned();
         ModelAnimation {
             skeleton: 0,
+            controller_binding: None,
             clip: AnimationClip {
                 source_path: source_path.to_owned(),
                 name,

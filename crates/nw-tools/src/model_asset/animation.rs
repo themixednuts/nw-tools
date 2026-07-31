@@ -163,9 +163,11 @@ fn evaluate_animation_asset(
         }
         clear_unbound_animation(&mut resolved.extras, &clip.source_path, skeleton);
         bound = true;
-        resolved
-            .animations
-            .push(nw_model::ModelAnimation { skeleton, clip });
+        resolved.animations.push(nw_model::ModelAnimation {
+            skeleton,
+            clip,
+            controller_binding: None,
+        });
     }
     let evaluation = AnimationAssetEvaluation::new(skeleton, &asset.path, policy);
     resolved
@@ -392,6 +394,9 @@ fn load_animation_list(
                 }
             }
             CharacterAnimationEntryKind::Include => {
+                if value.trim().is_empty() {
+                    continue;
+                }
                 let bytes = read_required(source, &value)?;
                 let xml = str::from_utf8(&bytes)
                     .with_context(|| format!("decode included CHRPARAMS {value}"))?;

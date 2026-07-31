@@ -642,6 +642,90 @@ fn scalar_field_ignores_matching_anonymous_handler_storage_shape() {
 }
 
 #[test]
+fn exact_serialize_value_uses_semantic_type_when_wire_products_match() {
+    let time_point_id = uuid!("0989a3e9-37e8-4381-8766-b208f460c1a3");
+    let u64_id = uuid!("d6597933-47cd-4fc8-b911-63f3e2b0993a");
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "63AD3B5A-3E2E-4923-ACCD-1DA221431EE0",
+            "typeIndex": 6951,
+            "typeName": "Javelin::PointsAccumulatorComponentReplicatedState",
+            "fields": [{
+                "index": 2,
+                "name": "timeWhenPointsZeroed0",
+                "group": 0,
+                "handlerVtable": "NewWorld+0x80b86e8",
+                "sourceTypeId": time_point_id.to_string(),
+                "sourceTypeIdSource": "handler-top-level-storage-window+constructor-vptr+az-rtti",
+                "sourceTypeIdentityProven": true,
+                "wireShape": "u64",
+                "confidence": "register-field-call"
+            }]
+        }],
+        "fieldRegistrationFunctions": [],
+        "fieldHandlerVtables": [{
+            "address": "NewWorld+0x80b86e8",
+            "fieldCount": 1,
+            "wireShape": "u64",
+            "valueTypeShape": {
+                "typeId": time_point_id.to_string(),
+                "typeIdSource": "handler-constructor-top-level-value-vptr",
+                "identityProven": true,
+                "identitySource": "handler-top-level-storage-window+constructor-vptr+az-rtti",
+                "typeName": "TimePoint",
+                "typeNameFull": "TimePoint",
+                "memberNameSource": "synthetic-layout-member",
+                "memberNamesProven": false,
+                "memberCoverageProven": true,
+                "wireOrderProven": true,
+                "members": [{
+                    "index": 0,
+                    "offset": "0x8",
+                    "name": "field_0",
+                    "nameSource": "synthetic-wire-ordinal",
+                    "nameProven": false,
+                    "wireShape": "u64",
+                    "wireOrdinal": 0
+                }]
+            },
+            "slots": []
+        }]
+    }))
+    .expect("schema");
+    schema.merge_serialize_codegen_unit(
+        &SerializeCodegenUnit {
+            items: vec![serialize_struct(
+                time_point_id,
+                "TimePoint",
+                vec![serialize_field(
+                    "m_nanosecondsSinceServerStart",
+                    u64_id,
+                    ResolvedType::Scalar(ScalarType::U64),
+                    8,
+                )],
+            )],
+        },
+        Some("selection.json".to_owned()),
+    );
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [6951])
+        .expect("generated state source");
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::nw_network::source::TimePoint")
+    );
+    assert_eq!(
+        plan.fields[0].rust_field_type.as_deref(),
+        Some("::nw_network::serialize::ReplicatedFieldHandler<::nw_network::source::TimePoint>")
+    );
+    assert!(!output.source.contains("TimePointMarshaler"));
+    syn::parse_file(&output.source).expect("generated state source parses");
+}
+
+#[test]
 fn emits_nested_collection_products_from_proven_wire_shape() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{

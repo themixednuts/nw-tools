@@ -44,6 +44,8 @@ pub struct Primitive {
 pub struct Mesh {
     pub name: String,
     pub primitives: Vec<Primitive>,
+    /// Physicalization payloads authored on this same drawable source node.
+    pub physics_data: Vec<MeshPhysicsData>,
     /// Semantic use of this geometry in the authored Cry graph.
     pub role: MeshRole,
     /// Skeleton index used by this mesh's JOINTS/WEIGHTS streams.
@@ -84,11 +86,27 @@ pub struct AuxiliaryNode {
     pub material_chunk_id: i32,
     pub transform: [f32; 16],
     pub properties: String,
+    /// Every physicalization slot referenced by the source mesh. Cry stores
+    /// each engine-specific physicalization blob separately from drawable mesh
+    /// streams, so the model retains those bytes and their decoded metadata.
+    pub physics_data: Vec<MeshPhysicsData>,
+}
+
+/// One `MeshPhysicsData` payload referenced by a Cry mesh physicalization slot.
+#[derive(Debug, Clone)]
+pub struct MeshPhysicsData {
+    pub slot: usize,
+    pub chunk_id: i32,
+    pub flags: i32,
+    pub tetrahedra_chunk_id: i32,
+    pub physical_data: Vec<u8>,
+    pub tetrahedra_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuxiliaryNodeRole {
     PhysicsProxy,
+    Physicalized,
 }
 
 /// Placement of a complete skeleton graph, used by nested CDF attachments.
@@ -164,6 +182,14 @@ pub struct Model {
 pub enum ModelBuildError {
     #[error("mesh node `{mesh}` references missing MeshSubsets chunk {chunk_id}")]
     MissingSubsets { mesh: String, chunk_id: i32 },
+    #[error(
+        "mesh node `{mesh}` physicalization slot {slot} references missing MeshPhysicsData chunk {chunk_id}"
+    )]
+    MissingPhysicsData {
+        mesh: String,
+        slot: usize,
+        chunk_id: i32,
+    },
     #[error("mesh node `{mesh}` subset {subset} has no readable position stream")]
     MissingPositions { mesh: String, subset: usize },
     #[error("mesh node `{mesh}` subset {subset} has no readable index stream")]
@@ -214,16 +240,47 @@ impl Model {
                 continue;
             };
             let is_physics_proxy = name.to_ascii_lowercase().starts_with("$physics_proxy");
-            if is_physics_proxy {
+            let physics_data = mesh
+                .physics_data_chunk_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, chunk_id)| *chunk_id > 0)
+                .map(|(slot, chunk_id)| {
+                    let payload = cgf.mesh_physics_data().get(&chunk_id).ok_or_else(|| {
+                        ModelBuildError::MissingPhysicsData {
+                            mesh: name.to_owned(),
+                            slot,
+                            chunk_id,
+                        }
+                    })?;
+                    Ok(MeshPhysicsData {
+                        slot,
+                        chunk_id,
+                        flags: payload.flags,
+                        tetrahedra_chunk_id: payload.tetrahedra_chunk_id,
+                        physical_data: payload.physical_data.to_vec(),
+                        tetrahedra_data: payload.tetrahedra_data.to_vec(),
+                    })
+                })
+                .collect::<Result<Vec<_>, ModelBuildError>>()?;
+            let has_drawable_subsets = cgf.mesh_subsets().contains_key(&mesh.subsets_chunk_id);
+            if !has_drawable_subsets && !physics_data.is_empty() {
                 auxiliary_nodes.push(AuxiliaryNode {
                     name: name.to_owned(),
-                    role: AuxiliaryNodeRole::PhysicsProxy,
+                    role: if is_physics_proxy {
+                        AuxiliaryNodeRole::PhysicsProxy
+                    } else {
+                        AuxiliaryNodeRole::Physicalized
+                    },
                     object_chunk_id: node.object_id,
                     parent_chunk_id: node.parent_id,
                     material_chunk_id: node.material_chunk_id,
                     transform: node.transform,
                     properties: node.properties.clone(),
+                    physics_data,
                 });
+                continue;
             }
             let skinned = stream_id(mesh, KIND_BONE_MAPPING).is_some();
             // Skinned vertices live in bind/model space — the skin handles placement,
@@ -242,6 +299,7 @@ impl Model {
                 skinned,
                 skeletons.first().map_or(0, |value| value.bones.len()),
             )? {
+                out.physics_data = physics_data;
                 if is_physics_proxy {
                     out.role = MeshRole::PhysicsProxy;
                 }
@@ -669,6 +727,7 @@ fn build_mesh(
     Ok(Some(Mesh {
         name: name.to_string(),
         primitives,
+        physics_data: Vec::new(),
         role: MeshRole::Render,
         skin: skinned.then_some(0),
         lod: node_lod(name),

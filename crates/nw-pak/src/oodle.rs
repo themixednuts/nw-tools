@@ -134,7 +134,7 @@ fn decompress_into_impl(compressed: &[u8], output: &mut [u8]) -> Result<usize, E
     platform::decompress_into(compressed, output)
 }
 
-#[cfg(all(windows, feature = "oodle"))]
+#[cfg(all(feature = "oodle", oodle_provider))]
 mod platform {
     use std::ffi::c_void;
     use std::os::raw::{c_int, c_uint};
@@ -319,7 +319,7 @@ mod platform {
     }
 }
 
-#[cfg(not(all(windows, feature = "oodle")))]
+#[cfg(not(all(feature = "oodle", oodle_provider)))]
 mod platform {
     use super::{Error, Options};
 
@@ -329,5 +329,24 @@ mod platform {
 
     pub(super) fn decompress_into(_compressed: &[u8], _output: &mut [u8]) -> Result<usize, Error> {
         Err(Error::Unavailable)
+    }
+}
+
+#[cfg(all(test, feature = "oodle", oodle_provider))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codec_round_trips_through_the_selected_platform_provider() {
+        let input = b"new world oodle provider cross-platform round trip";
+        let compressed = Codec::default().compress_to_vec(input).expect("compress");
+        let mut decoded = vec![0; input.len()];
+
+        let written = Codec::default()
+            .decompress_into(&compressed, &mut decoded)
+            .expect("decompress");
+
+        assert_eq!(written, input.len());
+        assert_eq!(decoded, input);
     }
 }

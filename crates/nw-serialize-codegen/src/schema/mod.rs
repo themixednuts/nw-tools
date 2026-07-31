@@ -302,6 +302,31 @@ impl<'a> SchemaGenericClassInfo<'a> {
     }
 
     #[must_use]
+    pub fn elements_apply_to_class_data(&self) -> Option<bool> {
+        match self {
+            Self::UuidGenericMap(generic) => generic.elements_apply_to_class_data,
+            Self::Sticky(generic) => generic.elements_apply_to_class_data,
+            Self::Tentacled(generic) => generic.elements_apply_to_class_data,
+            Self::Fluffy(generic) => generic.elements_apply_to_class_data,
+            Self::Purple(generic) => generic.elements_apply_to_class_data,
+            Self::IndigoRef(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn class_data_element_count(&self) -> Option<u32> {
+        match self {
+            Self::UuidGenericMap(generic) => generic.class_data_element_count,
+            Self::Sticky(generic) => generic.class_data_element_count,
+            Self::Tentacled(generic) => generic.class_data_element_count,
+            Self::Fluffy(generic) => generic.class_data_element_count,
+            Self::Purple(generic) => generic.class_data_element_count,
+            Self::IndigoRef(_) => None,
+        }
+        .and_then(i64_to_u32)
+    }
+
+    #[must_use]
     pub fn templated_argument_count(&self) -> Option<u32> {
         match self {
             Self::UuidGenericMap(generic) => generic.templated_argument_count,
@@ -1069,6 +1094,8 @@ mod tests {
                                 "$id": 30,
                                 "typeId": "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
                                 "registeredTypeIds": ["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"],
+                                "elementsApplyToClassData": true,
+                                "classDataElementCount": 0,
                                 "templatedArgumentCount": 1,
                                 "templatedTypeIds": ["43DA906B-7DEF-4CA8-9790-854106D3F983"],
                                 "typeIdFoldTypeIds": null,
@@ -1102,6 +1129,8 @@ mod tests {
                         "$id": 40,
                         "typeId": "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
                         "registeredTypeIds": ["BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"],
+                        "elementsApplyToClassData": true,
+                        "classDataElementCount": 0,
                         "templatedArgumentCount": 1,
                         "templatedTypeIds": ["43DA906B-7DEF-4CA8-9790-854106D3F983"],
                         "typeIdFoldTypeIds": null,
@@ -1136,6 +1165,8 @@ mod tests {
             .expect("top-level generic")
             .1;
         assert_eq!(top_level.id(), Some(40));
+        assert_eq!(top_level.elements_apply_to_class_data(), Some(true));
+        assert_eq!(top_level.class_data_element_count(), Some(0));
         assert_eq!(top_level.templated_argument_count(), Some(1));
         assert_eq!(top_level.non_type_template_arguments().capacity(), Some(8));
         assert_eq!(
@@ -1152,6 +1183,8 @@ mod tests {
             .generic_class_info()
             .expect("member generic");
         assert_eq!(member_generic.id(), Some(30));
+        assert_eq!(member_generic.elements_apply_to_class_data(), Some(true));
+        assert_eq!(member_generic.class_data_element_count(), Some(0));
         assert_eq!(
             member_generic.templated_type_ids(),
             ["43DA906B-7DEF-4CA8-9790-854106D3F983"]

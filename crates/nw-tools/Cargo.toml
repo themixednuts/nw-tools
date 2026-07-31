@@ -44,6 +44,7 @@ nw-resources.workspace = true
 nw-reflected-types.workspace = true
 nw-rnr.workspace = true
 nw-scene.workspace = true
+nw-source-meta = { path = "../nw-source-meta" }
 nw-terrain.workspace = true
 nw-vegetation.workspace = true
 nv-cloth-assets.workspace = true

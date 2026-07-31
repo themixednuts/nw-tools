@@ -7,6 +7,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 
+use az_animation::controller_target::{
+    AnimationControllerBindingExtras, AnimationControllerNodeExtras, CONTROLLER_TARGET_ROOT_NAME,
+};
 use bevy_math::Isometry3d;
 use bevy_math::bounding::Aabb3d;
 use cry_animation::{AnimationClip, AnimationEvent, CafRootMotion};
@@ -14,7 +17,9 @@ use glam::{Quat, Vec2, Vec3, Vec3A, Vec4};
 use serde::Serialize;
 
 use crate::animation_audio::{CryMannequinAnimationAudio, CryMannequinAudioClip};
-use crate::geometry::{AuxiliaryNode, AuxiliaryNodeRole, MeshRole, Model, Skeleton};
+use crate::geometry::{
+    AuxiliaryNode, AuxiliaryNodeRole, MeshPhysicsData, MeshRole, Model, Skeleton,
+};
 use crate::material::{MapSlot, MaterialSet, SubMaterial};
 use crate::particles::{CryParticleEmitter, CryUnboundParticleEmitter};
 use crate::physics::{PhysicsScene, PhysicsSceneError, PhysicsVisualRole};
@@ -70,9 +75,11 @@ struct MsftLod {
     ids: Vec<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct CryNodeExtras {
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    animation_controller: Option<AnimationControllerNodeExtras>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cry_lod: Option<u32>,
     shadow_proxy: bool,
@@ -82,6 +89,8 @@ struct CryNodeExtras {
     physics: Option<PhysicsVisualRole>,
     #[serde(skip_serializing_if = "Option::is_none")]
     particle_emitter: Option<CryParticleEmitter>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    physics_data: Vec<CryMeshPhysicsData>,
 }
 
 #[derive(Serialize)]
@@ -326,6 +335,8 @@ struct AnimationTarget {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CryAnimationExtras {
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    animation_controller_binding: Option<AnimationControllerBindingExtras>,
     cry_source_path: String,
     cry_duration: f32,
     cry_sample_rate: f32,
@@ -768,12 +779,29 @@ pub struct CryNonRenderNode {
     pub material_chunk_id: i32,
     pub transform: [f32; 16],
     pub properties: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub physics_data: Vec<CryMeshPhysicsData>,
+}
+
+/// Lossless Cry mesh physicalization payload stored in glTF buffer views.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryMeshPhysicsData {
+    pub slot: usize,
+    pub chunk_id: i32,
+    pub flags: i32,
+    pub tetrahedra_chunk_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_data_buffer_view: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tetrahedra_data_buffer_view: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CryNonRenderNodeRole {
     PhysicsProxy,
+    Physicalized,
 }
 
 /// A Cry animation clip bound to one skeleton graph in a multi-character model.
@@ -781,6 +809,7 @@ pub enum CryNonRenderNodeRole {
 pub struct ModelAnimation {
     pub skeleton: usize,
     pub clip: AnimationClip,
+    pub controller_binding: Option<AnimationControllerBindingExtras>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1435,6 +1464,12 @@ impl Builder {
                 rotation: (!rotation.abs_diff_eq(Quat::IDENTITY, 0.000_001))
                     .then_some(rotation.normalize().to_array()),
                 scale: (!scale.abs_diff_eq(Vec3::ONE, 0.000_001)).then_some(scale.to_array()),
+                extras: (bone.name != CONTROLLER_TARGET_ROOT_NAME).then(|| CryNodeExtras {
+                    animation_controller: Some(AnimationControllerNodeExtras::new(
+                        bone.controller_id,
+                    )),
+                    ..CryNodeExtras::default()
+                }),
                 ..Node::default()
             });
         }
@@ -1466,7 +1501,13 @@ impl Builder {
         }
     }
 
-    fn add_animation(&mut self, clip: &AnimationClip, skeleton: &Skeleton, joint_nodes: &[usize]) {
+    fn add_animation(
+        &mut self,
+        clip: &AnimationClip,
+        skeleton: &Skeleton,
+        joint_nodes: &[usize],
+        controller_binding: Option<&AnimationControllerBindingExtras>,
+    ) {
         let bone_by_controller = skeleton
             .bones
             .iter()
@@ -1559,6 +1600,7 @@ impl Builder {
             samplers,
             channels,
             extras: CryAnimationExtras {
+                animation_controller_binding: controller_binding.cloned(),
                 cry_source_path: clip.source_path.clone(),
                 cry_duration: clip.caf.header.total_duration,
                 cry_sample_rate: clip.caf.sample_rate,
@@ -1614,20 +1656,41 @@ impl From<&SubMaterial> for CryMaterialExtras {
     }
 }
 
-impl From<&AuxiliaryNode> for CryNonRenderNode {
-    fn from(node: &AuxiliaryNode) -> Self {
+impl CryNonRenderNode {
+    fn from_auxiliary(node: &AuxiliaryNode, builder: &mut Builder) -> Self {
         Self {
             name: node.name.clone(),
             role: match node.role {
                 AuxiliaryNodeRole::PhysicsProxy => CryNonRenderNodeRole::PhysicsProxy,
+                AuxiliaryNodeRole::Physicalized => CryNonRenderNodeRole::Physicalized,
             },
             object_chunk_id: node.object_chunk_id,
             parent_chunk_id: node.parent_chunk_id,
             material_chunk_id: node.material_chunk_id,
             transform: node.transform,
             properties: node.properties.clone(),
+            physics_data: emit_mesh_physics_data(builder, &node.physics_data),
         }
     }
+}
+
+fn emit_mesh_physics_data(
+    builder: &mut Builder,
+    payloads: &[MeshPhysicsData],
+) -> Vec<CryMeshPhysicsData> {
+    payloads
+        .iter()
+        .map(|payload| CryMeshPhysicsData {
+            slot: payload.slot,
+            chunk_id: payload.chunk_id,
+            flags: payload.flags,
+            tetrahedra_chunk_id: payload.tetrahedra_chunk_id,
+            physical_data_buffer_view: (!payload.physical_data.is_empty())
+                .then(|| builder.push_view(&payload.physical_data, None)),
+            tetrahedra_data_buffer_view: (!payload.tetrahedra_data.is_empty())
+                .then(|| builder.push_view(&payload.tetrahedra_data, None)),
+        })
+        .collect()
 }
 
 fn xml_element_json(element: &cry_xml::XmlElement) -> serde_json::Value {
@@ -1767,7 +1830,12 @@ fn build(
             let skeleton = model.skeletons.get(animation.skeleton)?;
             let emitted = emitted_skeletons.get(animation.skeleton)?;
             let mut local = Builder::new();
-            local.add_animation(&animation.clip, skeleton, &emitted.joints);
+            local.add_animation(
+                &animation.clip,
+                skeleton,
+                &emitted.joints,
+                animation.controller_binding.as_ref(),
+            );
             Some(BuiltAnimation {
                 buffer: local
                     .buffers
@@ -1892,6 +1960,7 @@ fn build(
                         (!scale.abs_diff_eq(Vec3::ONE, 0.000_001)).then_some(scale.to_array()),
                     )
                 });
+        let physics_data = emit_mesh_physics_data(&mut builder, &mesh.physics_data);
         let mesh_node = Node {
             name: Some(mesh.name.clone()),
             mesh: Some(mesh_index),
@@ -1902,14 +1971,19 @@ fn build(
             translation,
             rotation,
             scale,
-            extras: (mesh.lod.is_some() || mesh.shadow_proxy || mesh.role != MeshRole::Render)
-                .then_some(CryNodeExtras {
-                    cry_lod: mesh.lod,
-                    shadow_proxy: mesh.shadow_proxy,
-                    role: (mesh.role != MeshRole::Render).then_some(mesh.role),
-                    physics: None,
-                    particle_emitter: None,
-                }),
+            extras: (mesh.lod.is_some()
+                || mesh.shadow_proxy
+                || mesh.role != MeshRole::Render
+                || !physics_data.is_empty())
+            .then_some(CryNodeExtras {
+                animation_controller: None,
+                cry_lod: mesh.lod,
+                shadow_proxy: mesh.shadow_proxy,
+                role: (mesh.role != MeshRole::Render).then_some(mesh.role),
+                physics: None,
+                particle_emitter: None,
+                physics_data,
+            }),
             ..Node::default()
         };
         let node_index = builder.nodes.len();
@@ -2019,11 +2093,13 @@ fn build(
                     .then_some(rotation.normalize().to_array()),
                 scale: (!scale.abs_diff_eq(Vec3::ONE, 0.000_001)).then_some(scale.to_array()),
                 extras: Some(CryNodeExtras {
+                    animation_controller: None,
                     cry_lod: None,
                     shadow_proxy: false,
                     role: None,
                     physics: Some(visual.role),
                     particle_emitter: None,
+                    physics_data: Vec::new(),
                 }),
                 ..Node::default()
             });
@@ -2082,11 +2158,13 @@ fn build(
                     .then_some(rotation.normalize().to_array()),
                 scale: (!scale.abs_diff_eq(Vec3::ONE, 0.000_001)).then_some(scale.to_array()),
                 extras: Some(CryNodeExtras {
+                    animation_controller: None,
                     cry_lod: None,
                     shadow_proxy: false,
                     role: None,
                     physics: None,
                     particle_emitter: Some(emitter.clone()),
+                    physics_data: Vec::new(),
                 }),
                 ..Node::default()
             });
@@ -2117,9 +2195,19 @@ fn build(
         || physics.is_some_and(|physics| !physics.is_empty())
     {
         let mut value = extras.cloned().unwrap_or_default();
-        value
-            .non_render_nodes
-            .extend(model.auxiliary_nodes.iter().map(CryNonRenderNode::from));
+        if model
+            .auxiliary_nodes
+            .iter()
+            .any(|node| !node.physics_data.is_empty())
+        {
+            builder.begin_buffer();
+        }
+        value.non_render_nodes.extend(
+            model
+                .auxiliary_nodes
+                .iter()
+                .map(|node| CryNonRenderNode::from_auxiliary(node, &mut builder)),
+        );
         let mut emitted_resources = value
             .embedded_resources
             .iter()

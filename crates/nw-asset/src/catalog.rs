@@ -78,6 +78,28 @@ pub enum Error {
     LayoutOverflow,
 }
 
+/// A compatibility-catalog inconsistency encountered while following a legacy
+/// [`AssetId`] to the product identity used by the shipping catalog.
+///
+/// Missing identities are deliberately not errors: Lumberyard returns an empty
+/// `AssetInfo` for a catalog miss, and shipping content contains dangling
+/// references. Cycles and disagreement between RASC and RAOC are different:
+/// they make the identity ambiguous and must fail closed.
+#[derive(Debug, ThisError, Clone, PartialEq, Eq)]
+pub enum CompatibilityResolutionError {
+    #[error("compatibility catalog redirect cycle while resolving {asset_id}")]
+    RedirectCycle { asset_id: AssetId },
+
+    #[error(
+        "RASC/RAOC legacy redirects disagree for {asset_id}: {rasc_asset_id} vs {raoc_asset_id}"
+    )]
+    RedirectDisagreement {
+        asset_id: AssetId,
+        rasc_asset_id: AssetId,
+        raoc_asset_id: AssetId,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Rasc,
@@ -196,6 +218,69 @@ impl AssetCatalog {
     #[must_use]
     pub fn entry_by_id(&self, asset_id: AssetId) -> Option<&RascEntry> {
         self.rasc.entry(asset_id)
+    }
+
+    /// Follow the legacy-id redirect tables shared by RASC and RAOC.
+    ///
+    /// A catalog can contain a redirect chain, so resolution continues until
+    /// neither catalog supplies a replacement. If both catalogs contain a
+    /// redirect for the same identity, they must agree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatibilityResolutionError`] when the redirect graph cycles
+    /// or RASC and RAOC disagree about the next identity.
+    pub fn resolve_compatibility_id(
+        &self,
+        asset_id: AssetId,
+    ) -> Result<AssetId, CompatibilityResolutionError> {
+        let mut current = asset_id;
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(CompatibilityResolutionError::RedirectCycle { asset_id });
+            }
+
+            let rasc = self.rasc.resolve_legacy_id(current);
+            let raoc = self
+                .raoc
+                .as_ref()
+                .and_then(|raoc| raoc.resolve_legacy_id(current));
+            if let (Some(rasc_asset_id), Some(raoc_asset_id)) = (rasc, raoc)
+                && rasc_asset_id != raoc_asset_id
+            {
+                return Err(CompatibilityResolutionError::RedirectDisagreement {
+                    asset_id: current,
+                    rasc_asset_id,
+                    raoc_asset_id,
+                });
+            }
+
+            let Some(next) = rasc.or(raoc) else {
+                return Ok(current);
+            };
+            if next == current {
+                return Ok(current);
+            }
+            current = next;
+        }
+    }
+
+    /// Resolve a legacy identity and return its canonical RASC product entry.
+    ///
+    /// A missing product entry remains `Ok(None)` to match Lumberyard's
+    /// tolerated dangling-reference behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatibilityResolutionError`] under the same conditions as
+    /// [`Self::resolve_compatibility_id`].
+    pub fn entry_by_compatibility_id(
+        &self,
+        asset_id: AssetId,
+    ) -> Result<Option<&RascEntry>, CompatibilityResolutionError> {
+        let resolved = self.resolve_compatibility_id(asset_id)?;
+        Ok(self.rasc.entry(resolved))
     }
 
     #[must_use]
@@ -1548,6 +1633,110 @@ mod tests {
                 .entry_by_path("Localization\\EN-US\\Main.loc.xml")
                 .map(RascEntry::asset_type),
             Some(asset_type)
+        );
+    }
+
+    #[test]
+    fn asset_catalog_resolves_legacy_chains_to_canonical_entries() {
+        let legacy = AssetId::new(Uuid::from_u128(1), 1);
+        let intermediate = AssetId::new(Uuid::from_u128(2), 2);
+        let canonical = AssetId::new(Uuid::from_u128(3), 3);
+        let asset_type = AssetType::new(Uuid::from_u128(4));
+        let mut rasc = Rasc::new(
+            RASC_VERSION,
+            vec![RascEntry::new(
+                canonical,
+                asset_type,
+                "objects/canonical.cgf",
+                42,
+            )],
+        );
+        rasc.legacy_mappings = vec![
+            LegacyAssetIdMapping {
+                legacy,
+                real: intermediate,
+            },
+            LegacyAssetIdMapping {
+                legacy: intermediate,
+                real: canonical,
+            },
+        ];
+        rasc.by_legacy_id = rasc
+            .legacy_mappings
+            .iter()
+            .map(|mapping| (mapping.legacy(), mapping.real()))
+            .collect();
+        let catalog = AssetCatalog::new(rasc, None);
+
+        assert_eq!(catalog.resolve_compatibility_id(legacy), Ok(canonical));
+        assert_eq!(
+            catalog
+                .entry_by_compatibility_id(legacy)
+                .unwrap()
+                .map(RascEntry::path),
+            Some("objects/canonical.cgf")
+        );
+        assert_eq!(
+            catalog.entry_by_compatibility_id(AssetId::new(Uuid::from_u128(5), 5)),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn asset_catalog_rejects_redirect_cycles_and_catalog_disagreement() {
+        let first = AssetId::new(Uuid::from_u128(1), 1);
+        let second = AssetId::new(Uuid::from_u128(2), 2);
+        let third = AssetId::new(Uuid::from_u128(3), 3);
+        let mut rasc = Rasc::new(RASC_VERSION, Vec::new());
+        rasc.legacy_mappings = vec![
+            LegacyAssetIdMapping {
+                legacy: first,
+                real: second,
+            },
+            LegacyAssetIdMapping {
+                legacy: second,
+                real: first,
+            },
+        ];
+        rasc.by_legacy_id = rasc
+            .legacy_mappings
+            .iter()
+            .map(|mapping| (mapping.legacy(), mapping.real()))
+            .collect();
+        let catalog = AssetCatalog::new(rasc, None);
+        assert_eq!(
+            catalog.resolve_compatibility_id(first),
+            Err(CompatibilityResolutionError::RedirectCycle { asset_id: first })
+        );
+
+        let mut rasc = Rasc::new(RASC_VERSION, Vec::new());
+        rasc.by_legacy_id.insert(first, second);
+        let raoc = Raoc {
+            version: RAOC_VERSION,
+            file_size: 0,
+            entries: Vec::new(),
+            guid_asset_info: Vec::new(),
+            path_ids: Vec::new(),
+            legacy_mappings: vec![LegacyAssetIdMapping {
+                legacy: first,
+                real: third,
+            }],
+            types: Vec::new(),
+            dir_blob: Vec::new(),
+            file_blob: Vec::new(),
+            by_id: HashMap::new(),
+            by_guid: HashMap::new(),
+            by_path_hash: HashMap::new(),
+            by_legacy_id: [(first, third)].into_iter().collect(),
+        };
+        let catalog = AssetCatalog::new(rasc, Some(raoc));
+        assert_eq!(
+            catalog.resolve_compatibility_id(first),
+            Err(CompatibilityResolutionError::RedirectDisagreement {
+                asset_id: first,
+                rasc_asset_id: second,
+                raoc_asset_id: third,
+            })
         );
     }
 

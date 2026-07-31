@@ -6,7 +6,7 @@ use crate::CodegenContext;
 use crate::layout::LayoutIndex;
 use crate::model::{ReflectedClass, ReflectedEnum, ReflectedMember, SerializeContextModel};
 use crate::role::{ReflectedTypeRole, SerializeRoleClassifier};
-use crate::types::{ResolvedType, TypeResolver};
+use crate::types::{ResolvedType, ScalarType, TypeResolver};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SerializeCodegenUnit {
@@ -480,6 +480,10 @@ impl SerializeCodegenPlanner {
         model: &SerializeContextModel,
         resolver: &TypeResolver<'_>,
     ) -> SerializeCodegenItem {
+        let enum_underlying_type = model
+            .enum_underlying_types
+            .get(&enumeration.type_id)
+            .map(|type_id| resolver.resolve(*type_id));
         SerializeCodegenItem {
             source_type_id: enumeration.type_id,
             source_name: enumeration.name.clone(),
@@ -489,23 +493,61 @@ impl SerializeCodegenPlanner {
             factory: None,
             rtti_base_chain: Vec::new(),
             kind: SerializeCodegenItemKind::Enum,
-            enum_underlying_type: model
-                .enum_underlying_types
-                .get(&enumeration.type_id)
-                .map(|type_id| resolver.resolve(*type_id)),
+            enum_underlying_type: enum_underlying_type.clone(),
             fields: Vec::new(),
             variants: enumeration
                 .variants
                 .iter()
-                .map(|variant| SerializeCodegenVariant {
-                    source_name: variant.name.clone(),
-                    value_u64: variant.value_u64,
-                    value_u32: variant.value_u32,
-                    value_i32: variant.value_i32,
+                .map(|variant| {
+                    normalize_enum_variant(
+                        SerializeCodegenVariant {
+                            source_name: variant.name.clone(),
+                            value_u64: variant.value_u64,
+                            value_u32: variant.value_u32,
+                            value_i32: variant.value_i32,
+                        },
+                        enum_underlying_type.as_ref(),
+                    )
                 })
                 .collect(),
         }
     }
+}
+
+fn normalize_enum_variant(
+    mut variant: SerializeCodegenVariant,
+    underlying_type: Option<&ResolvedType>,
+) -> SerializeCodegenVariant {
+    let Some(raw_bits) = variant
+        .value_u64
+        .or_else(|| variant.value_u32.map(u64::from))
+        .or_else(|| variant.value_i32.map(|value| u64::from(value as u32)))
+    else {
+        return variant;
+    };
+
+    match underlying_type {
+        Some(ResolvedType::Scalar(ScalarType::U8)) => {
+            let value = raw_bits as u8;
+            variant.value_u64 = Some(u64::from(value));
+            variant.value_u32 = Some(u32::from(value));
+            variant.value_i32 = Some(i32::from(value));
+        }
+        Some(ResolvedType::Scalar(ScalarType::Char | ScalarType::SignedChar | ScalarType::I8)) => {
+            variant.value_i32 = Some(i32::from(raw_bits as u8 as i8));
+        }
+        Some(ResolvedType::Scalar(ScalarType::U16)) => {
+            let value = raw_bits as u16;
+            variant.value_u64 = Some(u64::from(value));
+            variant.value_u32 = Some(u32::from(value));
+            variant.value_i32 = Some(i32::from(value));
+        }
+        Some(ResolvedType::Scalar(ScalarType::I16)) => {
+            variant.value_i32 = Some(i32::from(raw_bits as u16 as i16));
+        }
+        _ => {}
+    }
+    variant
 }
 
 fn rtti_base_chain(
@@ -1558,6 +1600,176 @@ mod tests {
         assert_eq!(unit.items.len(), 1);
         assert_eq!(unit.items[0].kind, SerializeCodegenItemKind::Enum);
         assert_eq!(unit.items[0].source_name, "Mode");
+    }
+
+    #[test]
+    fn edit_context_descriptor_without_underlying_type_remains_a_class() {
+        let type_id = uuid!("33333333-3333-3333-3333-333333333333");
+        let model = SerializeContextModel::from_root(&json!({
+            "$id": 1,
+            "uuidMap": {
+                (type_id.hyphenated().to_string()): {
+                    "$id": 10,
+                    "name": "TriggerEntity",
+                    "typeId": type_id.hyphenated().to_string(),
+                    "elements": [{
+                        "$id": 11,
+                        "name": "ApplyToAllChildren",
+                        "typeId": type_ids::BOOL.hyphenated().to_string(),
+                        "is_base_class": false
+                    }],
+                    "attributes": []
+                }
+            },
+            "classNameToUuid": [],
+            "uuidGenericMap": [],
+            "uuidAnyCreationMap": {},
+            "editContext": {
+                "$id": 2,
+                "classData": [],
+                "enumData": [[
+                    type_id.hyphenated().to_string(),
+                    {
+                        "$id": 20,
+                        "name": "Trigger Entity",
+                        "attributes": []
+                    }
+                ]]
+            },
+            "enumTypeIdToUnderlyingTypeIdMap": {}
+        }));
+
+        let unit = SerializeCodegenPlanner::plan_model(&model);
+
+        assert_eq!(unit.items.len(), 1);
+        assert_eq!(unit.items[0].kind, SerializeCodegenItemKind::Struct);
+        assert_eq!(unit.items[0].source_name, "TriggerEntity");
+        assert_eq!(unit.items[0].fields.len(), 1);
+    }
+
+    #[test]
+    fn bodyless_edit_context_enum_remains_selectable_without_underlying_capture() {
+        let type_id = uuid!("33333333-3333-3333-3333-333333333333");
+        let model = SerializeContextModel::from_root(&json!({
+            "$id": 1,
+            "uuidMap": {},
+            "classNameToUuid": [],
+            "uuidGenericMap": [],
+            "uuidAnyCreationMap": {},
+            "editContext": {
+                "$id": 2,
+                "classData": [],
+                "enumData": [[
+                    type_id.hyphenated().to_string(),
+                    {
+                        "$id": 20,
+                        "name": "ConversationServices",
+                        "attributes": [[
+                            3841142509_u32,
+                            {
+                                "$id": 21,
+                                "attributeId": 3841142509_u32,
+                                "attributeName": "EnumValue",
+                                "value": {
+                                    "kind": "enumConstant",
+                                    "valueU64": "0x1",
+                                    "valueU32": 1,
+                                    "valueI32": 1,
+                                    "description": "Inn"
+                                }
+                            }
+                        ]]
+                    }
+                ]]
+            },
+            "enumTypeIdToUnderlyingTypeIdMap": {}
+        }));
+
+        let unit = SerializeCodegenPlanner::plan_model(&model);
+
+        assert_eq!(unit.items.len(), 1);
+        assert_eq!(unit.items[0].kind, SerializeCodegenItemKind::Enum);
+        assert_eq!(unit.items[0].source_name, "ConversationServices");
+        assert_eq!(unit.items[0].variants[0].source_name, "Inn");
+    }
+
+    #[test]
+    fn bodyless_enum_infers_physical_type_and_discards_captured_neighbor_bytes() {
+        let enum_type_id = uuid!("33333333-3333-3333-3333-333333333333");
+        let owner_type_id = uuid!("44444444-4444-4444-4444-444444444444");
+        let model = SerializeContextModel::from_root(&json!({
+            "$id": 1,
+            "uuidMap": {
+                (owner_type_id.hyphenated().to_string()): {
+                    "$id": 10,
+                    "name": "ConversationServicesData",
+                    "typeId": owner_type_id.hyphenated().to_string(),
+                    "elements": [{
+                        "$id": 11,
+                        "name": "element",
+                        "typeId": type_ids::U8.hyphenated().to_string(),
+                        "dataSize": "1",
+                        "is_base_class": false,
+                        "attributes": [[
+                            2_977_423_797_u32,
+                            {
+                                "$id": 12,
+                                "attributeId": 2_977_423_797_u32,
+                                "attributeName": "EnumType",
+                                "value": {
+                                    "kind": "Uuid",
+                                    "value": enum_type_id.hyphenated().to_string()
+                                }
+                            }
+                        ]]
+                    }],
+                    "attributes": []
+                }
+            },
+            "classNameToUuid": [],
+            "uuidGenericMap": [],
+            "uuidAnyCreationMap": {},
+            "editContext": {
+                "$id": 2,
+                "classData": [],
+                "enumData": [[
+                    enum_type_id.hyphenated().to_string(),
+                    {
+                        "$id": 20,
+                        "name": "ConversationServices",
+                        "attributes": [[
+                            3_841_142_509_u32,
+                            {
+                                "$id": 21,
+                                "attributeId": 3_841_142_509_u32,
+                                "attributeName": "EnumValue",
+                                "value": {
+                                    "kind": "enumConstant",
+                                    "valueU64": "0x6761726f74732011",
+                                    "valueU32": 1_953_700_369_u32,
+                                    "valueI32": 1_953_700_369_i32,
+                                    "description": "Open Mission Board"
+                                }
+                            }
+                        ]]
+                    }
+                ]]
+            },
+            "enumTypeIdToUnderlyingTypeIdMap": {}
+        }));
+
+        let unit = SerializeCodegenPlanner::plan_model(&model);
+        let enumeration = unit
+            .item_by_source_type_id(enum_type_id)
+            .expect("inferred enum should be planned");
+
+        assert_eq!(
+            enumeration.enum_underlying_type,
+            Some(ResolvedType::Scalar(ScalarType::U8))
+        );
+        assert_eq!(enumeration.variants[0].value_u64, Some(17));
+        assert_eq!(enumeration.variants[0].value_u32, Some(17));
+        assert_eq!(enumeration.variants[0].value_i32, Some(17));
     }
 
     fn named_field(name: &str, type_id: uuid::Uuid, source_name: &str) -> SerializeCodegenField {

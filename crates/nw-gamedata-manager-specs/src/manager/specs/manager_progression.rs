@@ -338,10 +338,16 @@ pub(super) fn player_tutorials_condition_data_manager_spec() -> NativeManagerSpe
                 NativeProjectionTransform::U32,
             ),
             projection_field(
-                "categorical_progression",
+                "categorical_progression_id",
                 "CategoricalProgression",
                 "categorical_progression",
-                NativeProjectionTransform::OptionalForeignKeyRow,
+                NativeProjectionTransform::OptionalQualifiedLowercaseCrcString,
+            ),
+            projection_field(
+                "categorical_progression_rank",
+                "CategoricalProgression",
+                "categorical_progression",
+                NativeProjectionTransform::OptionalQualifiedU16,
             ),
             projection_field(
                 "game_event",
@@ -532,7 +538,7 @@ pub(super) fn player_tutorials_data_manager_spec() -> NativeManagerSpec {
                 "condition_ids_and",
                 "ConditionIdsAND",
                 "condition_ids_and",
-                NativeProjectionTransform::OptionalForeignKeyRow,
+                NativeProjectionTransform::OptionalForeignKeyRowListDefaultEmpty,
             ),
             optional_u8_enum_default_projection_field(
                 "condition_ids_relation",
@@ -545,7 +551,7 @@ pub(super) fn player_tutorials_data_manager_spec() -> NativeManagerSpec {
                 "condition_ids_or",
                 "ConditionIdsOR",
                 "condition_ids_or",
-                NativeProjectionTransform::OptionalForeignKeyRow,
+                NativeProjectionTransform::OptionalForeignKeyRowListDefaultEmpty,
             ),
             typed_projection_field(
                 "classification",

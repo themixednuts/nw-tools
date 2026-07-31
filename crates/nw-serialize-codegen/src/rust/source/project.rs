@@ -453,6 +453,15 @@ fn emit_integrated_type_module<'a>(
 fn integrated_prefab_type_paths(
     layout: &crate::rust::layout::RustStandaloneTypeLayout<'_>,
 ) -> Vec<String> {
+    // The offline sparse prefab decoder reflects through every selected field,
+    // not only the top-level types that implement `Prefab`. Register the whole
+    // generated reflection closure so nested values such as
+    // `BTreeMap<Crc32, TimePoint>` are available to the bare cook registry.
+    //
+    // The runtime `App` path already reaches this same closure through the
+    // recursive per-module `register(app)` functions. Keeping the cook path
+    // equally complete prevents valid selected dependencies from surfacing one
+    // at a time as "no registration found" import failures.
     let module_items = layout
         .module_groups
         .iter()
@@ -469,7 +478,7 @@ fn integrated_prefab_type_paths(
         });
     let mut paths = module_items
         .chain(file_items)
-        .filter(|(_, item)| item.prefab.is_some())
+        .filter(|(_, item)| can_register_type(item))
         .map(|(module_path, item)| {
             let qualified = format!("self::{}::{}", module_path.join("::"), item.rust_name);
             (qualified, item)
@@ -1634,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn integrated_prefab_type_paths_are_sorted_and_plan_driven() {
+    fn integrated_prefab_type_paths_include_selected_reflection_closure() {
         use crate::rust::item_plan::{RustCodegenUnit, RustPrefabPlan};
 
         let mut zeta = rtti_leaf_with_base("ZetaComponent", "Component");
@@ -1643,14 +1652,17 @@ mod tests {
             tag: "Zeta".to_owned(),
             source_version: 1,
         });
+        zeta.derives = vec!["Reflect".to_owned()];
         let mut alpha = rtti_leaf_with_base("AlphaComponent", "Component");
         alpha.scope_path = vec!["alpha".to_owned()];
         alpha.prefab = Some(RustPrefabPlan {
             tag: "Alpha".to_owned(),
             source_version: 1,
         });
+        alpha.derives = vec!["Reflect".to_owned()];
         let mut runtime_only = rtti_leaf_with_base("RuntimeOnlyComponent", "Component");
         runtime_only.scope_path = vec!["runtime".to_owned()];
+        runtime_only.derives = vec!["Reflect".to_owned()];
         let unit = RustCodegenUnit {
             items: vec![zeta, runtime_only, alpha],
         };
@@ -1659,6 +1671,7 @@ mod tests {
             integrated_prefab_type_paths(&crate::rust::layout::standalone_type_layout(&unit)),
             vec![
                 "self::alpha::alpha_component::AlphaComponent".to_owned(),
+                "self::runtime::runtime_only_component::RuntimeOnlyComponent".to_owned(),
                 "self::zeta::zeta_component::ZetaComponent".to_owned(),
             ]
         );

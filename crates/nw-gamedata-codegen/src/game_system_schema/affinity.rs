@@ -72,6 +72,13 @@ pub(super) fn apply_type_affinity(
 ) -> Vec<GameSystemColumnTypeAffinity> {
     let mut states = collect_type_affinity_states(tables);
     for state in &mut states {
+        if state.effective_shape.is_expression_like() {
+            continue;
+        }
+        if state.effective_shape.is_qualified_reference_like() {
+            ColumnTypeAffinityPolicy::SemanticList.apply(data_tables, state);
+            continue;
+        }
         for policy in COLUMN_TYPE_AFFINITY_POLICIES {
             policy.apply(data_tables, state);
         }
@@ -591,6 +598,7 @@ pub(super) fn apply_semantic_list_affinity(
         localized_key_like,
         asset_path_like,
         expression_like,
+        qualified_reference_like,
         current_list,
         foreign_keys,
     ) = match &state.effective_shape {
@@ -599,6 +607,7 @@ pub(super) fn apply_semantic_list_affinity(
             localized_key_like,
             asset_path_like,
             expression_like,
+            qualified_reference_like,
             list,
             foreign_keys,
         } => (
@@ -606,10 +615,13 @@ pub(super) fn apply_semantic_list_affinity(
             *localized_key_like,
             *asset_path_like,
             *expression_like,
+            *qualified_reference_like,
             list.as_ref(),
             foreign_keys.clone(),
         ),
-        GameSystemColumnValueShape::Number { .. } => (false, false, false, false, None, Vec::new()),
+        GameSystemColumnValueShape::Number { .. } => {
+            (false, false, false, false, false, None, Vec::new())
+        }
         GameSystemColumnValueShape::Boolean
         | GameSystemColumnValueShape::Color { .. }
         | GameSystemColumnValueShape::Crc32
@@ -679,6 +691,7 @@ pub(super) fn apply_semantic_list_affinity(
         localized_key_like,
         asset_path_like,
         expression_like,
+        qualified_reference_like,
         list: Some(semantic_list),
         foreign_keys,
     };

@@ -18,6 +18,7 @@ pub(super) struct StringStats {
     pub(super) localized_key_like: bool,
     pub(super) asset_path_like: bool,
     pub(super) expression_like: bool,
+    pub(super) qualified_reference_like: bool,
     pub(super) rows_with_lists: usize,
     pub(super) total_entries: usize,
     pub(super) separators: HashSet<String>,
@@ -36,6 +37,7 @@ impl StringStats {
         self.localized_key_like |= is_localized_key_like(trimmed);
         self.asset_path_like |= is_asset_path_like(trimmed);
         self.expression_like |= is_expression_like(column_name, trimmed);
+        self.qualified_reference_like |= is_qualified_reference_like(trimmed);
         let list_entries = schema_list_entries(column_name, value, preserve_empty_entries);
         if list_entries.len() > 1 {
             self.rows_with_lists += 1;
@@ -66,6 +68,7 @@ impl StringStats {
         self.localized_key_like |= is_localized_key_like(trimmed);
         self.asset_path_like |= is_asset_path_like(trimmed);
         self.expression_like |= is_expression_like(column_name, trimmed);
+        self.qualified_reference_like |= is_qualified_reference_like(trimmed);
         let list_entries = match separators {
             SemanticListSeparators::Detected => {
                 schema_list_entries(column_name, value, preserve_empty_entries)
@@ -251,8 +254,8 @@ pub(super) fn schema_list_entries_with_separator<'a>(
 
 pub(super) fn schema_tokens(column_name: &str, value: &str) -> Vec<String> {
     let authored = trim_authored_schema_value(value);
-    if is_expression_like(column_name, authored) {
-        return reference_token_variants(authored);
+    if is_expression_like(column_name, authored) || is_qualified_reference_like(authored) {
+        return Vec::new();
     }
 
     let trimmed = normalize_reference_token(value);
@@ -525,15 +528,32 @@ pub(super) fn is_asset_path_like(value: &str) -> bool {
 
 pub(super) fn is_expression_like(column_name: &str, value: &str) -> bool {
     let lower = column_name.to_ascii_lowercase();
+    let trimmed = value.trim();
     lower.contains("formula")
         || lower.contains("expression")
-        || lower.contains("condition")
+        || lower.ends_with("condition")
+        || trimmed.contains("&&")
+        || trimmed.contains("||")
+        || trimmed.starts_with('!')
         || value.contains('{')
         || value.contains('}')
+        || value.contains('>')
+        || value.contains('<')
         || value.contains(">=")
         || value.contains("<=")
         || value.contains("==")
         || value.contains("!=")
+}
+
+pub(super) fn is_qualified_reference_like(value: &str) -> bool {
+    let value = trim_authored_schema_value(value);
+    let Some((identifier, qualifier)) = value.split_once(':') else {
+        return false;
+    };
+    !identifier.contains(':')
+        && is_probable_reference_token(identifier)
+        && !qualifier.trim().is_empty()
+        && qualifier.trim().parse::<u32>().is_ok()
 }
 
 pub(super) fn is_numeric_tail(value: &str) -> bool {
@@ -569,3 +589,53 @@ pub(super) fn row_label(table: &GameSystemTable, row_index: usize) -> String {
 
 #[allow(dead_code)]
 pub(super) fn _assert_error_send_sync(_: &GameSystemDataError) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boolean_achievement_syntax_is_one_authored_expression() {
+        for value in [
+            "debug_1 && !ss2_quest_01a_complete",
+            "ss2_quest_01_complete || ss2_quest_01a_complete",
+            "!(S_introtosettlement && S_firstquestcomplete)",
+        ] {
+            assert!(is_expression_like("RequiredAchievementId", value));
+            assert_eq!(
+                schema_list_entries("RequiredAchievementId", value, false),
+                vec![value]
+            );
+            assert!(schema_tokens("RequiredAchievementId", value).is_empty());
+        }
+    }
+
+    #[test]
+    fn simple_achievement_ids_remain_reference_candidates() {
+        let value = "achievement_intro_complete";
+        assert!(!is_expression_like("RequiredAchievementId", value));
+        assert!(!is_qualified_reference_like(value));
+        assert_eq!(
+            schema_tokens("RequiredAchievementId", value),
+            vec![value.to_owned()]
+        );
+    }
+
+    #[test]
+    fn condition_reference_columns_are_not_expression_columns_by_name() {
+        let value = "condition_a,condition_b";
+        assert!(!is_expression_like("ConditionIdsAND", value));
+        assert_eq!(
+            schema_tokens("ConditionIdsAND", value),
+            vec!["condition_a".to_owned(), "condition_b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn numeric_qualifier_is_not_erased_from_a_reference() {
+        let value = "PvP_XP:5";
+        assert!(!is_expression_like("CategoricalProgression", value));
+        assert!(is_qualified_reference_like(value));
+        assert!(schema_tokens("CategoricalProgression", value).is_empty());
+    }
+}

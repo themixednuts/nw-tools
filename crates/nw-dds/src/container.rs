@@ -1,8 +1,10 @@
+use std::borrow::Cow;
+
 use thiserror::Error as ThisError;
 
 use crate::{
-    DDPF_ALPHA, DDPF_ALPHA_PIXELS, DDPF_LUMINANCE, DDPF_RGB, DDS_FILE_HEADER_LEN, Dds, DdsError,
-    PixelFormat, SplitPart,
+    DDPF_ALPHA, DDPF_ALPHA_PIXELS, DDPF_BUMP_DUDV, DDPF_LUMINANCE, DDPF_RGB, DDS_FILE_HEADER_LEN,
+    Dds, DdsDimension, DdsError, DdsShape, PixelFormat, SplitPart,
 };
 
 const KTX2_ID: &[u8; 12] = b"\xABKTX 20\xBB\r\n\x1A\n";
@@ -10,13 +12,10 @@ const KTX2_HEADER_LEN: u64 = 80;
 const KTX2_LEVEL_INDEX_LEN: u64 = 24;
 const KTX2_SUPERCOMPRESSION_NONE: u32 = 0;
 
-const DDS_CAPS2_CUBEMAP: u32 = 0x0000_0200;
-const DX10_RESOURCE_DIMENSION_TEXTURE_1D: u32 = 2;
-const DX10_RESOURCE_DIMENSION_TEXTURE_3D: u32 = 4;
-const DX10_RESOURCE_MISC_TEXTURE_CUBE: u32 = 0x4;
-
 const VK_FORMAT_R8_UNORM: u32 = 9;
 const VK_FORMAT_R8G8_UNORM: u32 = 16;
+const VK_FORMAT_R8G8B8_UNORM: u32 = 23;
+const VK_FORMAT_B8G8R8_UNORM: u32 = 30;
 const VK_FORMAT_R8G8B8A8_UNORM: u32 = 37;
 const VK_FORMAT_R8G8B8A8_SRGB: u32 = 43;
 const VK_FORMAT_B8G8R8A8_UNORM: u32 = 44;
@@ -24,6 +23,7 @@ const VK_FORMAT_B8G8R8A8_SRGB: u32 = 50;
 const VK_FORMAT_R16_UNORM: u32 = 70;
 const VK_FORMAT_R16_SFLOAT: u32 = 76;
 const VK_FORMAT_R16G16_UNORM: u32 = 77;
+const VK_FORMAT_R16G16_SNORM: u32 = 78;
 const VK_FORMAT_R16G16_SFLOAT: u32 = 83;
 const VK_FORMAT_R16G16B16A16_UNORM: u32 = 91;
 const VK_FORMAT_R16G16B16A16_SFLOAT: u32 = 97;
@@ -45,6 +45,7 @@ const VK_FORMAT_BC6H_UFLOAT_BLOCK: u32 = 143;
 const VK_FORMAT_BC6H_SFLOAT_BLOCK: u32 = 144;
 const VK_FORMAT_BC7_UNORM_BLOCK: u32 = 145;
 const VK_FORMAT_BC7_SRGB_BLOCK: u32 = 146;
+const VK_FORMAT_A8_UNORM_KHR: u32 = 1_000_470_001;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ktx2 {
@@ -68,6 +69,9 @@ pub enum Error {
 
     #[error("unsupported DDS shape: {reason}")]
     UnsupportedShape { reason: &'static str },
+
+    #[error("DDS shape {shape:?} cannot be decoded as one 2D image")]
+    MultiImageShape { shape: DdsShape },
 
     #[error("unsupported Vulkan format {vk_format}")]
     UnsupportedVulkanFormat { vk_format: u32 },
@@ -181,7 +185,9 @@ impl Ktx2 {
             VK_FORMAT_R8G8B8A8_UNORM
         };
         let texture = single_mip_texture(Format::plain(vk, 4, 1), width, height)?;
-        let levels = Levels { bytes: vec![rgba] };
+        let levels = Levels {
+            bytes: vec![Cow::Borrowed(rgba)],
+        };
         let bytes = texture.write(&levels)?;
         Ok(Self { bytes })
     }
@@ -218,7 +224,7 @@ impl Ktx2 {
             height,
         )?;
         let levels = Levels {
-            bytes: vec![bytes.as_slice()],
+            bytes: vec![Cow::Borrowed(bytes.as_slice())],
         };
         let out = texture.write(&levels)?;
         Ok(Self { bytes: out })
@@ -256,7 +262,7 @@ impl Ktx2 {
             height,
         )?;
         let levels = Levels {
-            bytes: vec![bytes.as_slice()],
+            bytes: vec![Cow::Borrowed(bytes.as_slice())],
         };
         let out = texture.write(&levels)?;
         Ok(Self { bytes: out })
@@ -297,6 +303,16 @@ pub struct DecodedFloatImage {
     pub rgba: Vec<f32>,
 }
 
+/// Images decoded from the largest DDS mip in KTX2 image order.
+///
+/// The order is array layer, cubemap face, then volume depth slice. Plain 2D
+/// textures contain exactly one image.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedImageSet<T> {
+    pub shape: DdsShape,
+    pub images: Vec<T>,
+}
+
 /// Decode the largest mip of a DDS to RGBA8, assembling split sidecars first.
 ///
 /// Supports the block formats New World ships (BC1–BC7) and plain 32-bit
@@ -310,12 +326,37 @@ pub fn decode_top_mip<'a>(
     bytes: &'a [u8],
     sidecars: &[Sidecar<'a>],
 ) -> Result<DecodedImage, Error> {
-    let (texture, blocks, width, height) = top_mip_blocks(bytes, sidecars)?;
-    let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
-    Ok(DecodedImage {
-        width,
-        height,
-        rgba,
+    let set = decode_top_mip_images(bytes, sidecars)?;
+    into_plain_2d_image(set)
+}
+
+/// Decode every image in the largest DDS mip to RGBA8.
+///
+/// Array layers, cubemap faces, and volume depth slices are retained in
+/// [`DecodedImageSet::images`] in KTX2 image order.
+pub fn decode_top_mip_images<'a>(
+    bytes: &'a [u8],
+    sidecars: &[Sidecar<'a>],
+) -> Result<DecodedImageSet<DecodedImage>, Error> {
+    let top = top_mip_level(bytes, sidecars)?;
+    let images = top_mip_image_blocks(top.texture, top.shape, top.blocks.as_ref())?
+        .map(|blocks| {
+            let rgba = decode_texture_rgba(
+                top.texture.format,
+                blocks,
+                top.texture.width as usize,
+                top.texture.height as usize,
+            )?;
+            Ok(DecodedImage {
+                width: top.texture.width,
+                height: top.texture.height,
+                rgba,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(DecodedImageSet {
+        shape: top.shape,
+        images,
     })
 }
 
@@ -334,8 +375,13 @@ pub fn decode_top_mip_with_attached_alpha<'a>(
     let Some((alpha_bytes, alpha_sidecars)) = attached_alpha else {
         return Ok(color);
     };
-    let (alpha_texture, alpha_blocks, alpha_width, alpha_height) =
-        top_mip_blocks(alpha_bytes, alpha_sidecars)?;
+    let alpha_dds = Dds::parse(alpha_bytes)?;
+    let alpha_shape = alpha_dds.shape();
+    require_plain_2d_shape(alpha_shape)?;
+    let alpha_texture = Texture::from_dds(&alpha_dds)?;
+    let alpha_image = decode_top_mip(alpha_bytes, alpha_sidecars)?;
+    let alpha_width = alpha_image.width;
+    let alpha_height = alpha_image.height;
     if color.width != alpha_width || color.height != alpha_height {
         return Err(Error::AttachedAlphaDimensions {
             color_width: color.width,
@@ -344,12 +390,7 @@ pub fn decode_top_mip_with_attached_alpha<'a>(
             alpha_height,
         });
     }
-    let alpha = decode_rgba(
-        alpha_texture.format.vk,
-        alpha_blocks,
-        alpha_width as usize,
-        alpha_height as usize,
-    )?;
+    let alpha = alpha_image.rgba;
     let signal = if matches!(
         alpha_texture.format.vk,
         VK_FORMAT_R8_UNORM
@@ -389,21 +430,43 @@ pub fn decode_top_mip_rgba16<'a>(
     bytes: &'a [u8],
     sidecars: &[Sidecar<'a>],
 ) -> Result<DecodedImage16, Error> {
-    let (texture, blocks, width, height) = top_mip_blocks(bytes, sidecars)?;
-    let rgba = decode_rgba16(texture.format.vk, blocks, width as usize, height as usize)?;
-    Ok(DecodedImage16 {
-        width,
-        height,
-        rgba,
+    let set = decode_top_mip_rgba16_images(bytes, sidecars)?;
+    into_plain_2d_image(set)
+}
+
+/// Decode every image in the largest DDS mip to RGBA16 UNORM.
+pub fn decode_top_mip_rgba16_images<'a>(
+    bytes: &'a [u8],
+    sidecars: &[Sidecar<'a>],
+) -> Result<DecodedImageSet<DecodedImage16>, Error> {
+    let top = top_mip_level(bytes, sidecars)?;
+    let images = top_mip_image_blocks(top.texture, top.shape, top.blocks.as_ref())?
+        .map(|blocks| {
+            let rgba = decode_rgba16(
+                top.texture.format.vk,
+                blocks,
+                top.texture.width as usize,
+                top.texture.height as usize,
+            )?;
+            Ok(DecodedImage16 {
+                width: top.texture.width,
+                height: top.texture.height,
+                rgba,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(DecodedImageSet {
+        shape: top.shape,
+        images,
     })
 }
 
 /// Decode the largest mip of a float DDS to RGBA32F, assembling split sidecars
 /// first.
 ///
-/// Supports plain 16-bit and 32-bit float DDS formats. BC6H is classified as a
-/// float/HDR format by callers but is intentionally not decoded here because the
-/// available decoder path only exposes 8-bit preview pixels.
+/// Supports plain 16-bit and 32-bit float DDS formats plus signed and unsigned
+/// BC6H. BC6H is decoded directly to floating-point RGB so HDR values are not
+/// quantized through the RGBA8 preview path.
 ///
 /// # Errors
 ///
@@ -413,12 +476,34 @@ pub fn decode_top_mip_float<'a>(
     bytes: &'a [u8],
     sidecars: &[Sidecar<'a>],
 ) -> Result<DecodedFloatImage, Error> {
-    let (texture, blocks, width, height) = top_mip_blocks(bytes, sidecars)?;
-    let rgba = decode_float(texture.format.vk, blocks, width as usize, height as usize)?;
-    Ok(DecodedFloatImage {
-        width,
-        height,
-        rgba,
+    let set = decode_top_mip_float_images(bytes, sidecars)?;
+    into_plain_2d_image(set)
+}
+
+/// Decode every image in the largest DDS mip to RGBA32F.
+pub fn decode_top_mip_float_images<'a>(
+    bytes: &'a [u8],
+    sidecars: &[Sidecar<'a>],
+) -> Result<DecodedImageSet<DecodedFloatImage>, Error> {
+    let top = top_mip_level(bytes, sidecars)?;
+    let images = top_mip_image_blocks(top.texture, top.shape, top.blocks.as_ref())?
+        .map(|blocks| {
+            let rgba = decode_float(
+                top.texture.format.vk,
+                blocks,
+                top.texture.width as usize,
+                top.texture.height as usize,
+            )?;
+            Ok(DecodedFloatImage {
+                width: top.texture.width,
+                height: top.texture.height,
+                rgba,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(DecodedImageSet {
+        shape: top.shape,
+        images,
     })
 }
 
@@ -456,6 +541,7 @@ pub fn decode_all_mips_until<'a>(
     should_continue: &dyn Fn() -> bool,
 ) -> Result<Vec<DecodedImage>, Error> {
     let dds = Dds::parse(bytes)?;
+    require_plain_2d(&dds)?;
     let texture = Texture::from_dds(&dds)?;
     let payload = dds.payload(bytes).ok_or(Error::PayloadSize {
         expected: u64::try_from(dds.payload_bytes()).unwrap_or(u64::MAX),
@@ -470,7 +556,12 @@ pub fn decode_all_mips_until<'a>(
         let level = level as u32;
         let width = mip_extent(texture.width, level).max(1);
         let height = mip_extent(texture.height, level).max(1);
-        let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
+        let rgba = decode_texture_rgba(
+            texture.format,
+            blocks.as_ref(),
+            width as usize,
+            height as usize,
+        )?;
         images.push(DecodedImage {
             width,
             height,
@@ -492,6 +583,7 @@ pub fn decode_all_mips_until<'a>(
 /// Returns [`Error`] when the DDS is invalid or the header mip cannot be decoded.
 pub fn decode_header_mip(bytes: &[u8]) -> Result<DecodedImage, Error> {
     let dds = Dds::parse(bytes)?;
+    require_plain_2d(&dds)?;
     let texture = Texture::from_dds(&dds)?;
     let payload = dds.payload(bytes).ok_or(Error::PayloadSize {
         expected: u64::try_from(dds.payload_bytes()).unwrap_or(u64::MAX),
@@ -508,13 +600,16 @@ pub fn decode_header_mip(bytes: &[u8]) -> Result<DecodedImage, Error> {
         0
     };
     let chain = slice_chain(payload, &sizes[start_level..], start_level)?;
-    let blocks = chain.first().copied().ok_or(Error::UnsupportedShape {
-        reason: "header has no mip levels",
-    })?;
+    let blocks = chain
+        .first()
+        .map(Cow::as_ref)
+        .ok_or(Error::UnsupportedShape {
+            reason: "header has no mip levels",
+        })?;
     let level = u32::try_from(start_level).unwrap_or(0);
     let width = mip_extent(texture.width, level).max(1);
     let height = mip_extent(texture.height, level).max(1);
-    let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
+    let rgba = decode_texture_rgba(texture.format, blocks, width as usize, height as usize)?;
     Ok(DecodedImage {
         width,
         height,
@@ -540,6 +635,7 @@ pub fn decode_mip_max(
     fetch: impl FnOnce(SplitPart) -> Option<Vec<u8>>,
 ) -> Result<DecodedImage, Error> {
     let dds = Dds::parse(bytes)?;
+    require_plain_2d(&dds)?;
     let texture = Texture::from_dds(&dds)?;
     let sizes = texture.level_sizes()?;
     let mipmaps = sizes.len();
@@ -583,12 +679,13 @@ pub fn decode_mip_max(
             actual: bytes.len().saturating_sub(DDS_FILE_HEADER_LEN),
         })?;
         let chain = slice_chain(payload, &sizes[split_count..], split_count)?;
-        let blocks = *chain
+        let blocks = chain
             .get(target_usize - split_count)
+            .map(Cow::as_ref)
             .ok_or(Error::UnsupportedShape {
                 reason: "missing header mip",
             })?;
-        let rgba = decode_rgba(texture.format.vk, blocks, width as usize, height as usize)?;
+        let rgba = decode_texture_rgba(texture.format, blocks, width as usize, height as usize)?;
         Ok(DecodedImage {
             width,
             height,
@@ -603,7 +700,7 @@ pub fn decode_mip_max(
         })
         .ok_or(Error::MissingSidecar { index })?;
         check_mip_size(target, sizes[target_usize], sidecar.len())?;
-        let rgba = decode_rgba(texture.format.vk, &sidecar, width as usize, height as usize)?;
+        let rgba = decode_texture_rgba(texture.format, &sidecar, width as usize, height as usize)?;
         Ok(DecodedImage {
             width,
             height,
@@ -612,25 +709,109 @@ pub fn decode_mip_max(
     }
 }
 
-fn top_mip_blocks<'a>(
-    bytes: &'a [u8],
-    sidecars: &[Sidecar<'a>],
-) -> Result<(Texture, &'a [u8], u32, u32), Error> {
+struct TopMip<'a> {
+    texture: Texture,
+    shape: DdsShape,
+    blocks: Cow<'a, [u8]>,
+}
+
+fn top_mip_level<'a>(bytes: &'a [u8], sidecars: &[Sidecar<'a>]) -> Result<TopMip<'a>, Error> {
     let dds = Dds::parse(bytes)?;
+    let shape = dds.shape();
     let texture = Texture::from_dds(&dds)?;
     let payload = dds.payload(bytes).ok_or(Error::PayloadSize {
         expected: u64::try_from(dds.payload_bytes()).unwrap_or(u64::MAX),
         actual: bytes.len().saturating_sub(DDS_FILE_HEADER_LEN),
     })?;
-    let levels = Levels::from_dds(&dds, texture, payload, sidecars)?;
-    let blocks = levels
-        .bytes
-        .first()
-        .copied()
-        .ok_or(Error::UnsupportedShape {
-            reason: "texture has no mip levels",
+    let sizes = texture.level_sizes()?;
+    let blocks = if dds.is_split() {
+        let split =
+            collect_split_levels(&dds, sidecars, &sizes, SplitLevelRequirement::TopContiguous)?;
+        validate_payload_size(payload, &sizes[split.declared_count..])?;
+        if let Some(top) = split.levels.first() {
+            Cow::Borrowed(*top)
+        } else {
+            select_surface_major_level(payload, &sizes, 0, texture.surface_count())?
+        }
+    } else {
+        if let Some(sidecar) = sidecars.first() {
+            return Err(Error::UnexpectedSidecar {
+                part: sidecar.part(),
+            });
+        }
+        select_surface_major_level(payload, &sizes, 0, texture.surface_count())?
+    };
+    Ok(TopMip {
+        texture,
+        shape,
+        blocks,
+    })
+}
+
+fn top_mip_image_blocks<'a>(
+    texture: Texture,
+    shape: DdsShape,
+    blocks: &'a [u8],
+) -> Result<impl Iterator<Item = &'a [u8]>, Error> {
+    let image_count = usize::try_from(shape.image_count()).map_err(|_| Error::SizeOverflow {
+        what: "DDS image count",
+    })?;
+    let level_size = texture.level_size(0)?;
+    let image_size =
+        level_size
+            .checked_div(shape.image_count())
+            .ok_or(Error::UnsupportedShape {
+                reason: "texture has no images",
+            })?;
+    let image_size =
+        usize::try_from(image_size).map_err(|_| Error::SizeOverflow { what: "DDS image" })?;
+    let expected = image_size
+        .checked_mul(image_count)
+        .ok_or(Error::SizeOverflow {
+            what: "DDS mip level",
         })?;
-    Ok((texture, blocks, texture.width.max(1), texture.height.max(1)))
+    if blocks.len() != expected {
+        return Err(Error::MipSize {
+            level: 0,
+            expected: u64::try_from(expected).unwrap_or(u64::MAX),
+            actual: blocks.len(),
+        });
+    }
+    Ok(blocks.chunks_exact(image_size))
+}
+
+fn into_plain_2d_image<T>(mut set: DecodedImageSet<T>) -> Result<T, Error> {
+    require_plain_2d_shape(set.shape)?;
+    set.images.pop().ok_or(Error::UnsupportedShape {
+        reason: "texture has no images",
+    })
+}
+
+fn require_plain_2d(dds: &Dds) -> Result<(), Error> {
+    require_plain_2d_shape(dds.shape())
+}
+
+fn require_plain_2d_shape(shape: DdsShape) -> Result<(), Error> {
+    if shape.is_plain_2d() {
+        Ok(())
+    } else {
+        Err(Error::MultiImageShape { shape })
+    }
+}
+
+fn decode_texture_rgba(
+    format: Format,
+    data: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>, Error> {
+    let mut rgba = decode_rgba(format.vk, data, width, height)?;
+    if format.alpha_mode == AlphaMode::Opaque {
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel[3] = u8::MAX;
+        }
+    }
+    Ok(rgba)
 }
 
 fn decode_rgba(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Error> {
@@ -645,11 +826,20 @@ fn decode_rgba(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec<
         VK_FORMAT_R8G8_UNORM => {
             return plain_rg8(data, pixels);
         }
+        VK_FORMAT_R8G8B8_UNORM => {
+            return plain_rgb8(data, pixels, false);
+        }
+        VK_FORMAT_B8G8R8_UNORM => {
+            return plain_rgb8(data, pixels, true);
+        }
         VK_FORMAT_R8G8B8A8_UNORM | VK_FORMAT_R8G8B8A8_SRGB => {
             return plain_rgba(data, pixels, false);
         }
         VK_FORMAT_B8G8R8A8_UNORM | VK_FORMAT_B8G8R8A8_SRGB => {
             return plain_rgba(data, pixels, true);
+        }
+        VK_FORMAT_A8_UNORM_KHR => {
+            return plain_a8(data, pixels);
         }
         // BC7 decodes via bcdec_rs: it writes RGBA bytes straight into the
         // output (no 0xAARRGGBB repack pass) and benches faster than
@@ -719,14 +909,93 @@ fn decode_float(vk: u32, data: &[u8], width: usize, height: usize) -> Result<Vec
     })?;
     match vk {
         VK_FORMAT_R16_SFLOAT => plain_r16f(data, pixels),
+        VK_FORMAT_R16G16_SNORM => plain_rg16_snorm(data, pixels),
         VK_FORMAT_R16G16_SFLOAT => plain_rg16f(data, pixels),
         VK_FORMAT_R16G16B16A16_SFLOAT => plain_rgba16f(data, pixels),
         VK_FORMAT_R32_SFLOAT => plain_r32f(data, pixels),
         VK_FORMAT_R32G32_SFLOAT => plain_rg32f(data, pixels),
         VK_FORMAT_R32G32B32_SFLOAT => plain_rgb32f(data, pixels),
         VK_FORMAT_R32G32B32A32_SFLOAT => plain_rgba32f(data, pixels),
+        VK_FORMAT_BC6H_UFLOAT_BLOCK => decode_bc6h_blocks(data, width, height, false),
+        VK_FORMAT_BC6H_SFLOAT_BLOCK => decode_bc6h_blocks(data, width, height, true),
         _ => Err(Error::UnsupportedVulkanFormat { vk_format: vk }),
     }
+}
+
+fn plain_rg16_snorm(data: &[u8], pixels: usize) -> Result<Vec<f32>, Error> {
+    let needed = pixels.checked_mul(4).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![0.0f32; pixels * 4];
+    for (pixel, rg) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
+        pixel[0] = snorm16_to_f32(i16::from_le_bytes([rg[0], rg[1]]));
+        pixel[1] = snorm16_to_f32(i16::from_le_bytes([rg[2], rg[3]]));
+        pixel[3] = 1.0;
+    }
+    Ok(rgba)
+}
+
+fn snorm16_to_f32(value: i16) -> f32 {
+    (f32::from(value) / f32::from(i16::MAX)).max(-1.0)
+}
+
+fn decode_bc6h_blocks(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    is_signed: bool,
+) -> Result<Vec<f32>, Error> {
+    let row_pitch = width.checked_mul(4).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let total = row_pitch.checked_mul(height).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let blocks_x = width.div_ceil(4);
+    let blocks_y = height.div_ceil(4);
+    let expected = blocks_x
+        .checked_mul(blocks_y)
+        .and_then(|blocks| blocks.checked_mul(16))
+        .ok_or(Error::SizeOverflow {
+            what: "image dimensions",
+        })?;
+    if data.len() < expected {
+        return Err(Error::PayloadSize {
+            expected: expected as u64,
+            actual: data.len(),
+        });
+    }
+
+    let mut rgba = vec![0.0; total];
+    let mut rgb = [0.0; 4 * 4 * 3];
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let block_offset = (by * blocks_x + bx) * 16;
+            bcdec_rs::bc6h_float(
+                &data[block_offset..block_offset + 16],
+                &mut rgb,
+                4 * 3,
+                is_signed,
+            );
+            let px = bx * 4;
+            let py = by * 4;
+            let rows = (height - py).min(4);
+            let cols = (width - px).min(4);
+            for row in 0..rows {
+                for col in 0..cols {
+                    let source = (row * 4 + col) * 3;
+                    let target = (py + row) * row_pitch + (px + col) * 4;
+                    rgba[target..target + 3].copy_from_slice(&rgb[source..source + 3]);
+                    rgba[target + 3] = 1.0;
+                }
+            }
+        }
+    }
+    Ok(rgba)
 }
 
 /// Decode a BCn texture whose blocks expand to RGBA8 using a per-block `decode`
@@ -835,6 +1104,37 @@ fn plain_rg8(data: &[u8], pixels: usize) -> Result<Vec<u8>, Error> {
         pixel[0] = rg[0];
         pixel[1] = rg[1];
         pixel[3] = 255;
+    }
+    Ok(rgba)
+}
+
+fn plain_rgb8(data: &[u8], pixels: usize, swap_rb: bool) -> Result<Vec<u8>, Error> {
+    let needed = pixels.checked_mul(3).ok_or(Error::SizeOverflow {
+        what: "image dimensions",
+    })?;
+    let bytes = data.get(..needed).ok_or(Error::PayloadSize {
+        expected: needed as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![0u8; pixels * 4];
+    for (pixel, rgb) in rgba.chunks_exact_mut(4).zip(bytes.chunks_exact(3)) {
+        pixel[..3].copy_from_slice(rgb);
+        if swap_rb {
+            pixel.swap(0, 2);
+        }
+        pixel[3] = u8::MAX;
+    }
+    Ok(rgba)
+}
+
+fn plain_a8(data: &[u8], pixels: usize) -> Result<Vec<u8>, Error> {
+    let bytes = data.get(..pixels).ok_or(Error::PayloadSize {
+        expected: pixels as u64,
+        actual: data.len(),
+    })?;
+    let mut rgba = vec![u8::MAX; pixels * 4];
+    for (pixel, &alpha) in rgba.chunks_exact_mut(4).zip(bytes) {
+        pixel[3] = alpha;
     }
     Ok(rgba)
 }
@@ -1108,6 +1408,13 @@ struct Format {
     block_height: u32,
     block_depth: u32,
     block_bytes: u64,
+    alpha_mode: AlphaMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlphaMode {
+    Stored,
+    Opaque,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1119,7 +1426,7 @@ struct LevelIndex {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Levels<'a> {
-    bytes: Vec<&'a [u8]>,
+    bytes: Vec<Cow<'a, [u8]>>,
 }
 
 impl Texture {
@@ -1133,37 +1440,49 @@ impl Texture {
         }
 
         let format = Format::from_dds(dds)?;
-        let dx10 = dds.dx10();
-        let is_1d = dx10.is_some_and(|header| {
-            header.resource_dimension() == DX10_RESOURCE_DIMENSION_TEXTURE_1D
-        });
-        let is_3d = dds.depth() > 1
-            || dds
-                .header()
-                .cry_flags()
-                .contains(crate::CryFlags::VOLUME_TEXTURE)
-            || dx10.is_some_and(|header| {
-                header.resource_dimension() == DX10_RESOURCE_DIMENSION_TEXTURE_3D
+        let shape = dds.shape();
+        if dds.is_cry_extended()
+            && shape.faces == 6
+            && dds
+                .dx10()
+                .is_some_and(|header| header.array_size() == 0 || header.array_size() % 6 != 0)
+        {
+            return Err(Error::UnsupportedShape {
+                reason: "Lumberyard cubemap face count is not divisible by 6",
             });
-        let is_cube = dds.header().caps2() & DDS_CAPS2_CUBEMAP != 0
-            || dds.header().cry_flags().contains(crate::CryFlags::CUBEMAP)
-            || dx10.is_some_and(|header| header.misc_flag() & DX10_RESOURCE_MISC_TEXTURE_CUBE != 0);
-        if is_3d && is_cube {
+        }
+        if shape.dimension == DdsDimension::Three && shape.faces > 1 {
             return Err(Error::UnsupportedShape {
                 reason: "cubemap volume texture",
             });
         }
+        if shape.dimension == DdsDimension::Three && shape.array_layers > 1 {
+            return Err(Error::UnsupportedShape {
+                reason: "3D texture arrays are not valid DDS resources",
+            });
+        }
 
-        let array_size = dx10.map_or(1, |header| header.array_size().max(1));
         Ok(Self {
             format,
             width,
             height,
-            depth: dds.depth().max(1),
-            pixel_height: if is_1d { 0 } else { height },
-            pixel_depth: if is_3d { dds.depth().max(1) } else { 0 },
-            layer_count: if array_size > 1 { array_size } else { 0 },
-            face_count: if is_cube { 6 } else { 1 },
+            depth: shape.depth,
+            pixel_height: if shape.dimension == DdsDimension::One {
+                0
+            } else {
+                height
+            },
+            pixel_depth: if shape.dimension == DdsDimension::Three {
+                shape.depth
+            } else {
+                0
+            },
+            layer_count: if shape.array_layers > 1 {
+                shape.array_layers
+            } else {
+                0
+            },
+            face_count: shape.faces,
             level_count: dds.mipmaps().max(1),
         })
     }
@@ -1175,7 +1494,7 @@ impl Texture {
         let blocks_x = width.div_ceil(self.format.block_width);
         let blocks_y = height.div_ceil(self.format.block_height);
         let blocks_z = depth.div_ceil(self.format.block_depth);
-        let images = u64::from(self.face_count) * u64::from(self.layer_count.max(1));
+        let images = self.surface_count();
 
         u64::from(blocks_x)
             .checked_mul(u64::from(blocks_y))
@@ -1185,6 +1504,10 @@ impl Texture {
             .ok_or(Error::SizeOverflow {
                 what: "DDS mip level",
             })
+    }
+
+    fn surface_count(self) -> u64 {
+        u64::from(self.face_count) * u64::from(self.layer_count.max(1))
     }
 
     fn level_sizes(self) -> Result<Vec<u64>, Error> {
@@ -1222,7 +1545,7 @@ impl Texture {
         let mut index = vec![LevelIndex::default(); levels.bytes.len()];
         for logical_level in (0..levels.bytes.len()).rev() {
             offset = align_to(offset, self.alignment());
-            let bytes = levels.bytes[logical_level];
+            let bytes = levels.bytes[logical_level].as_ref();
             let byte_length = u64::try_from(bytes.len()).map_err(|_| Error::SizeOverflow {
                 what: "KTX2 level length",
             })?;
@@ -1250,7 +1573,15 @@ impl Texture {
 
         for logical_level in (0..levels.bytes.len()).rev() {
             pad_to(&mut out, index[logical_level].byte_offset)?;
-            out.extend_from_slice(levels.bytes[logical_level]);
+            let level = levels.bytes[logical_level].as_ref();
+            if self.format.alpha_mode == AlphaMode::Opaque {
+                for pixel in level.chunks_exact(4) {
+                    out.extend_from_slice(&pixel[..3]);
+                    out.push(u8::MAX);
+                }
+            } else {
+                out.extend_from_slice(level);
+            }
         }
         Ok(out)
     }
@@ -1319,6 +1650,7 @@ impl Format {
             54 => Ok(Self::plain(VK_FORMAT_R16_SFLOAT, 2, 2)),
             56 => Ok(Self::plain(VK_FORMAT_R16_UNORM, 2, 2)),
             61 => Ok(Self::plain(VK_FORMAT_R8_UNORM, 1, 1)),
+            65 => Ok(Self::plain(VK_FORMAT_A8_UNORM_KHR, 1, 1)),
             70 => Ok(Self::block(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8)),
             71 => Ok(Self::block(VK_FORMAT_BC1_RGBA_SRGB_BLOCK, 8)),
             72 => Ok(Self::block(VK_FORMAT_BC1_RGBA_SRGB_BLOCK, 8)),
@@ -1374,6 +1706,9 @@ impl Format {
             b"BC4S" => Ok(Self::block(VK_FORMAT_BC4_SNORM_BLOCK, 8)),
             b"ATI2" | b"BC5U" => Ok(Self::block(VK_FORMAT_BC5_UNORM_BLOCK, 16)),
             b"BC5S" => Ok(Self::block(VK_FORMAT_BC5_SNORM_BLOCK, 16)),
+            // D3D9 wrote numeric D3DFORMAT values into the FourCC field.
+            // 112 is D3DFMT_G16R16F, whose byte layout is R16G16 float.
+            [112, 0, 0, 0] => Ok(Self::plain(VK_FORMAT_R16G16_SFLOAT, 4, 2)),
             _ => Err(Error::UnsupportedFormat {
                 format: four_cc_name(four_cc),
             }),
@@ -1385,28 +1720,46 @@ impl Format {
         flags: crate::CryFlags,
         name: String,
     ) -> Result<Self, Error> {
+        if format.flags() & DDPF_BUMP_DUDV != 0
+            && format.rgb_bit_count() == 32
+            && format.red_mask() == 0x0000_ffff
+            && format.green_mask() == 0xffff_0000
+            && format.blue_mask() == 0
+            && format.alpha_mask() == 0
+        {
+            return Ok(Self::plain(VK_FORMAT_R16G16_SNORM, 4, 2));
+        }
         if (format.flags() & DDPF_LUMINANCE != 0 || format.flags() & DDPF_ALPHA != 0)
             && format.rgb_bit_count() == 8
         {
             return Ok(Self::plain(VK_FORMAT_R8_UNORM, 1, 1));
         }
-        if format.flags() & DDPF_RGB == 0 || format.rgb_bit_count() != 32 {
+        if format.flags() & DDPF_RGB == 0 {
             return Err(Error::UnsupportedFormat { format: name });
         }
 
         let has_alpha = format.flags() & DDPF_ALPHA_PIXELS != 0 || format.alpha_mask() != 0;
-        if !has_alpha {
-            return Err(Error::UnsupportedFormat { format: name });
-        }
-
         let srgb = flags.contains(crate::CryFlags::SRGB_READ);
         match (
+            format.rgb_bit_count(),
             format.red_mask(),
             format.green_mask(),
             format.blue_mask(),
             format.alpha_mask(),
         ) {
-            (0x0000_00ff, 0x0000_ff00, 0x00ff_0000, 0xff00_0000) => Ok(Self::plain(
+            (24, 0x0000_00ff, 0x0000_ff00, 0x00ff_0000, 0) => {
+                Ok(Self::plain(VK_FORMAT_R8G8B8_UNORM, 3, 1))
+            }
+            (24, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0) => {
+                Ok(Self::plain(VK_FORMAT_B8G8R8_UNORM, 3, 1))
+            }
+            (32, 0x0000_00ff, 0x0000_ff00, 0x00ff_0000, 0) if !has_alpha => {
+                Ok(Self::plain_opaque(VK_FORMAT_R8G8B8A8_UNORM, 4, 1))
+            }
+            (32, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0) if !has_alpha => {
+                Ok(Self::plain_opaque(VK_FORMAT_B8G8R8A8_UNORM, 4, 1))
+            }
+            (32, 0x0000_00ff, 0x0000_ff00, 0x00ff_0000, 0xff00_0000) => Ok(Self::plain(
                 if srgb {
                     VK_FORMAT_R8G8B8A8_SRGB
                 } else {
@@ -1415,7 +1768,7 @@ impl Format {
                 4,
                 1,
             )),
-            (0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0xff00_0000) => Ok(Self::plain(
+            (32, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0xff00_0000) => Ok(Self::plain(
                 if srgb {
                     VK_FORMAT_B8G8R8A8_SRGB
                 } else {
@@ -1436,6 +1789,7 @@ impl Format {
             block_height: 4,
             block_depth: 1,
             block_bytes,
+            alpha_mode: AlphaMode::Stored,
         }
     }
 
@@ -1447,6 +1801,14 @@ impl Format {
             block_height: 1,
             block_depth: 1,
             block_bytes,
+            alpha_mode: AlphaMode::Stored,
+        }
+    }
+
+    const fn plain_opaque(vk_format: u32, block_bytes: u64, type_size: u32) -> Self {
+        Self {
+            alpha_mode: AlphaMode::Opaque,
+            ..Self::plain(vk_format, block_bytes, type_size)
         }
     }
 }
@@ -1460,96 +1822,167 @@ impl<'a> Levels<'a> {
     ) -> Result<Self, Error> {
         let sizes = texture.level_sizes()?;
         let bytes = if dds.is_split() {
-            Self::split(dds, payload, sidecars, &sizes)?
+            Self::split(dds, texture, payload, sidecars, &sizes)?
         } else {
             if let Some(sidecar) = sidecars.first() {
                 return Err(Error::UnexpectedSidecar {
                     part: sidecar.part(),
                 });
             }
-            slice_chain(payload, &sizes, 0)?
+            slice_surface_major(payload, &sizes, 0, texture.surface_count())?
         };
         Ok(Self { bytes })
     }
 
     fn split(
         dds: &Dds,
+        texture: Texture,
         payload: &'a [u8],
         sidecars: &[Sidecar<'a>],
         sizes: &[u64],
-    ) -> Result<Vec<&'a [u8]>, Error> {
-        let persistent = usize::from(dds.header().persistent_mips());
-        let mipmaps = sizes.len();
-        if persistent > mipmaps {
-            return Err(Error::UnsupportedShape {
-                reason: "persistent mip count exceeds total mip count",
-            });
-        }
-
-        let split_count = mipmaps - persistent;
-        let mut split = vec![None; split_count];
-        let mut alpha_group = None;
-        for sidecar in sidecars {
-            let SplitPart::Mip { index, alpha } = sidecar.part() else {
-                return Err(Error::UnexpectedSidecar {
-                    part: sidecar.part(),
-                });
-            };
-            if alpha_group.is_some_and(|expected| expected != alpha) {
-                return Err(Error::UnexpectedSidecar {
-                    part: sidecar.part(),
-                });
-            }
-            alpha_group = Some(alpha);
-            let index_usize = usize::try_from(index).map_err(|_| Error::SizeOverflow {
-                what: "DDS split mip index",
-            })?;
-            // Split sidecars are numbered 1..=split_count, smallest mip to largest,
-            // so the highest index is the largest mip (level 0):
-            // level = split_count - index. (Cry/Lumberyard convention; the header
-            // file holds the persistent, smallest mips after the split chain.)
-            if index_usize == 0 || index_usize > split_count {
-                return Err(Error::UnexpectedSidecar {
-                    part: sidecar.part(),
-                });
-            }
-            let level = split_count - index_usize;
-            if split[level].is_some() {
-                return Err(Error::DuplicateSidecar { index });
-            }
-            let expected = sizes[level];
-            check_mip_size(
-                u32::try_from(level).unwrap_or(u32::MAX),
-                expected,
-                sidecar.bytes().len(),
-            )?;
-            let expected_len = usize::try_from(expected).map_err(|_| Error::SizeOverflow {
-                what: "DDS mip level",
-            })?;
-            split[level] = Some(sidecar.bytes().get(..expected_len).ok_or(Error::MipSize {
-                level: u32::try_from(level).unwrap_or(u32::MAX),
-                expected,
-                actual: sidecar.bytes().len(),
-            })?);
-        }
-
-        let mut levels = Vec::with_capacity(mipmaps);
-        for (level, bytes) in split.into_iter().enumerate() {
-            levels.push(bytes.ok_or_else(|| Error::MissingSidecar {
-                // Report the missing sidecar's 1-based index, not its mip level.
-                index: u32::try_from(split_count - level).unwrap_or(u32::MAX),
-            })?);
-        }
-        levels.extend(slice_chain(payload, &sizes[split_count..], split_count)?);
+    ) -> Result<Vec<Cow<'a, [u8]>>, Error> {
+        let split = collect_split_levels(dds, sidecars, sizes, SplitLevelRequirement::Complete)?;
+        let mut levels = Vec::with_capacity(sizes.len());
+        levels.extend(split.levels.into_iter().map(Cow::Borrowed));
+        levels.extend(slice_surface_major(
+            payload,
+            &sizes[split.declared_count..],
+            split.declared_count,
+            texture.surface_count(),
+        )?);
         Ok(levels)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitLevelRequirement {
+    /// A full mip-chain container needs every level declared outside the header.
+    Complete,
+    /// An authoring transform needs the contiguous high-resolution prefix.
+    ///
+    /// Some shipped attached-alpha chains omit intermediate levels between that
+    /// prefix and the persistent tail. Their largest image is still complete and
+    /// the authoring builder regenerates its mip chain from that image.
+    TopContiguous,
+}
+
+struct SplitLevels<'a> {
+    declared_count: usize,
+    levels: Vec<&'a [u8]>,
+}
+
+fn collect_split_levels<'a>(
+    dds: &Dds,
+    sidecars: &[Sidecar<'a>],
+    sizes: &[u64],
+    requirement: SplitLevelRequirement,
+) -> Result<SplitLevels<'a>, Error> {
+    let persistent = usize::from(dds.header().persistent_mips());
+    let mipmaps = sizes.len();
+    if persistent > mipmaps {
+        return Err(Error::UnsupportedShape {
+            reason: "persistent mip count exceeds total mip count",
+        });
+    }
+
+    let declared_count = mipmaps - persistent;
+    let available_count = match requirement {
+        SplitLevelRequirement::Complete => declared_count,
+        SplitLevelRequirement::TopContiguous => {
+            let mut highest = 0usize;
+            for sidecar in sidecars {
+                let SplitPart::Mip { index, .. } = sidecar.part() else {
+                    return Err(Error::UnexpectedSidecar {
+                        part: sidecar.part(),
+                    });
+                };
+                highest = highest.max(usize::try_from(index).map_err(|_| Error::SizeOverflow {
+                    what: "DDS split mip index",
+                })?);
+            }
+            if highest == 0 && declared_count != 0 {
+                return Err(Error::MissingSidecar {
+                    index: u32::try_from(declared_count).unwrap_or(u32::MAX),
+                });
+            }
+            highest
+        }
+    };
+    if available_count > declared_count {
+        let part = sidecars
+            .iter()
+            .max_by_key(|sidecar| match sidecar.part() {
+                SplitPart::Mip { index, .. } => index,
+                SplitPart::Header | SplitPart::AlphaHeader => 0,
+            })
+            .map_or(SplitPart::Header, |sidecar| sidecar.part());
+        return Err(Error::UnexpectedSidecar { part });
+    }
+
+    let mut split = vec![None; available_count];
+    let mut alpha_group = None;
+    for sidecar in sidecars {
+        let SplitPart::Mip { index, alpha } = sidecar.part() else {
+            return Err(Error::UnexpectedSidecar {
+                part: sidecar.part(),
+            });
+        };
+        if alpha_group.is_some_and(|expected| expected != alpha) {
+            return Err(Error::UnexpectedSidecar {
+                part: sidecar.part(),
+            });
+        }
+        alpha_group = Some(alpha);
+        let index_usize = usize::try_from(index).map_err(|_| Error::SizeOverflow {
+            what: "DDS split mip index",
+        })?;
+        // Split sidecars are numbered 1..=available_count, smallest available
+        // mip to largest, so the highest index is the largest mip (level 0).
+        if index_usize == 0 || index_usize > available_count {
+            return Err(Error::UnexpectedSidecar {
+                part: sidecar.part(),
+            });
+        }
+        let level = available_count - index_usize;
+        if split[level].is_some() {
+            return Err(Error::DuplicateSidecar { index });
+        }
+        let expected = sizes[level];
+        check_mip_size(
+            u32::try_from(level).unwrap_or(u32::MAX),
+            expected,
+            sidecar.bytes().len(),
+        )?;
+        let expected_len = usize::try_from(expected).map_err(|_| Error::SizeOverflow {
+            what: "DDS mip level",
+        })?;
+        split[level] = Some(sidecar.bytes().get(..expected_len).ok_or(Error::MipSize {
+            level: u32::try_from(level).unwrap_or(u32::MAX),
+            expected,
+            actual: sidecar.bytes().len(),
+        })?);
+    }
+
+    let levels = split
+        .into_iter()
+        .enumerate()
+        .map(|(level, bytes)| {
+            bytes.ok_or_else(|| Error::MissingSidecar {
+                index: u32::try_from(available_count - level).unwrap_or(u32::MAX),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SplitLevels {
+        declared_count,
+        levels,
+    })
 }
 
 fn slice_chain<'a>(
     payload: &'a [u8],
     sizes: &[u64],
     start_level: usize,
-) -> Result<Vec<&'a [u8]>, Error> {
+) -> Result<Vec<Cow<'a, [u8]>>, Error> {
     let expected = checked_sum(sizes)?;
     let actual_len = u64::try_from(payload.len()).map_err(|_| Error::SizeOverflow {
         what: "DDS payload length",
@@ -1579,10 +2012,170 @@ fn slice_chain<'a>(
             expected,
             actual: payload.len().saturating_sub(offset),
         })?;
-        levels.push(bytes);
+        levels.push(Cow::Borrowed(bytes));
         offset = end;
     }
     Ok(levels)
+}
+
+fn validate_payload_size(payload: &[u8], sizes: &[u64]) -> Result<(), Error> {
+    let expected = checked_sum(sizes)?;
+    let actual_len = u64::try_from(payload.len()).map_err(|_| Error::SizeOverflow {
+        what: "DDS payload length",
+    })?;
+    if actual_len < expected {
+        return Err(Error::PayloadSize {
+            expected,
+            actual: payload.len(),
+        });
+    }
+    Ok(())
+}
+
+fn select_surface_major_level<'a>(
+    payload: &'a [u8],
+    sizes: &[u64],
+    level: usize,
+    surface_count: u64,
+) -> Result<Cow<'a, [u8]>, Error> {
+    validate_payload_size(payload, sizes)?;
+    let level_size = *sizes.get(level).ok_or(Error::UnsupportedShape {
+        reason: "texture has no requested mip level",
+    })?;
+    if surface_count == 1 {
+        let offset =
+            usize::try_from(checked_sum(&sizes[..level])?).map_err(|_| Error::SizeOverflow {
+                what: "DDS mip offset",
+            })?;
+        let len = usize::try_from(level_size).map_err(|_| Error::SizeOverflow {
+            what: "DDS mip level",
+        })?;
+        let end = offset.checked_add(len).ok_or(Error::SizeOverflow {
+            what: "DDS mip offset",
+        })?;
+        return Ok(Cow::Borrowed(payload.get(offset..end).ok_or(
+            Error::MipSize {
+                level: u32::try_from(level).unwrap_or(u32::MAX),
+                expected: level_size,
+                actual: payload.len().saturating_sub(offset),
+            },
+        )?));
+    }
+
+    let surface_count_usize = usize::try_from(surface_count).map_err(|_| Error::SizeOverflow {
+        what: "DDS surface count",
+    })?;
+    let mut per_surface_sizes = Vec::with_capacity(sizes.len());
+    for size in sizes {
+        if size % surface_count != 0 {
+            return Err(Error::UnsupportedShape {
+                reason: "DDS mip size is not divisible by its surface count",
+            });
+        }
+        per_surface_sizes.push(usize::try_from(size / surface_count).map_err(|_| {
+            Error::SizeOverflow {
+                what: "DDS surface mip",
+            }
+        })?);
+    }
+    let surface_pitch = per_surface_sizes.iter().try_fold(0usize, |sum, size| {
+        sum.checked_add(*size).ok_or(Error::SizeOverflow {
+            what: "DDS surface chain",
+        })
+    })?;
+    let level_offset = per_surface_sizes[..level]
+        .iter()
+        .try_fold(0usize, |sum, size| {
+            sum.checked_add(*size).ok_or(Error::SizeOverflow {
+                what: "DDS surface mip offset",
+            })
+        })?;
+    let per_surface_level = per_surface_sizes[level];
+    let mut selected =
+        Vec::with_capacity(
+            usize::try_from(level_size).map_err(|_| Error::SizeOverflow {
+                what: "DDS mip level",
+            })?,
+        );
+    for surface in 0..surface_count_usize {
+        let start = surface
+            .checked_mul(surface_pitch)
+            .and_then(|offset| offset.checked_add(level_offset))
+            .ok_or(Error::SizeOverflow {
+                what: "DDS surface mip offset",
+            })?;
+        let end = start
+            .checked_add(per_surface_level)
+            .ok_or(Error::SizeOverflow {
+                what: "DDS surface mip offset",
+            })?;
+        selected.extend_from_slice(payload.get(start..end).ok_or(Error::MipSize {
+            level: u32::try_from(level).unwrap_or(u32::MAX),
+            expected: u64::try_from(per_surface_level).unwrap_or(u64::MAX),
+            actual: payload.len().saturating_sub(start),
+        })?);
+    }
+    Ok(Cow::Owned(selected))
+}
+
+/// Convert the DDS surface-major layout into level-major image data.
+///
+/// Standard DDS stores every mip for one array element or cubemap face before
+/// the next surface. KTX2 stores one whole mip level with all layers and faces
+/// together. Volume textures have one surface and keep their depth slices
+/// inside each mip, so they take the zero-copy path.
+fn slice_surface_major<'a>(
+    payload: &'a [u8],
+    sizes: &[u64],
+    start_level: usize,
+    surface_count: u64,
+) -> Result<Vec<Cow<'a, [u8]>>, Error> {
+    if surface_count == 1 {
+        return slice_chain(payload, sizes, start_level);
+    }
+    validate_payload_size(payload, sizes)?;
+    let surface_count_usize = usize::try_from(surface_count).map_err(|_| Error::SizeOverflow {
+        what: "DDS surface count",
+    })?;
+    let mut per_surface_sizes = Vec::with_capacity(sizes.len());
+    let mut levels = Vec::with_capacity(sizes.len());
+    for size in sizes {
+        if size % surface_count != 0 {
+            return Err(Error::UnsupportedShape {
+                reason: "DDS mip size is not divisible by its surface count",
+            });
+        }
+        let per_surface =
+            usize::try_from(size / surface_count).map_err(|_| Error::SizeOverflow {
+                what: "DDS surface mip",
+            })?;
+        per_surface_sizes.push(per_surface);
+        levels.push(Vec::with_capacity(usize::try_from(*size).map_err(
+            |_| Error::SizeOverflow {
+                what: "DDS mip level",
+            },
+        )?));
+    }
+
+    let mut offset = 0usize;
+    for _surface in 0..surface_count_usize {
+        for (index, per_surface) in per_surface_sizes.iter().copied().enumerate() {
+            let end = offset.checked_add(per_surface).ok_or(Error::SizeOverflow {
+                what: "DDS surface mip offset",
+            })?;
+            let level = u32::try_from(start_level + index).map_err(|_| Error::SizeOverflow {
+                what: "DDS mip index",
+            })?;
+            let bytes = payload.get(offset..end).ok_or(Error::MipSize {
+                level,
+                expected: u64::try_from(per_surface).unwrap_or(u64::MAX),
+                actual: payload.len().saturating_sub(offset),
+            })?;
+            levels[index].extend_from_slice(bytes);
+            offset = end;
+        }
+    }
+    Ok(levels.into_iter().map(Cow::Owned).collect())
 }
 
 fn check_mip_size(level: u32, expected: u64, actual: usize) -> Result<(), Error> {
@@ -1808,6 +2401,78 @@ mod tests {
     }
 
     #[test]
+    fn top_mip_decode_accepts_a_contiguous_prefix_before_a_persistent_gap() {
+        let mut header = dds_alpha8_header(16, 16);
+        put_u32(&mut header, 28, 5);
+        put_u32(&mut header, 36, crate::CryFlags::SPLIT.bits());
+        header[116] = 1;
+        header[124..128].copy_from_slice(&FOUR_CC_FYRC);
+        header.extend_from_slice(&[0x11]);
+
+        // The complete external chain would be `.dds.1a` through `.dds.4a`.
+        // This source retains the two largest images as a contiguous prefix and
+        // the 1x1 persistent tail; its 4x4 and 2x2 bridge levels are absent.
+        let mip0 = [0x77; 16 * 16];
+        let mip1 = [0x55; 8 * 8];
+        let sidecars = [
+            Sidecar::new(
+                SplitPart::Mip {
+                    index: 2,
+                    alpha: true,
+                },
+                &mip0,
+            ),
+            Sidecar::new(
+                SplitPart::Mip {
+                    index: 1,
+                    alpha: true,
+                },
+                &mip1,
+            ),
+        ];
+
+        let decoded = decode_top_mip_images(&header, &sidecars).unwrap();
+        assert_eq!((decoded.shape.width, decoded.shape.height), (16, 16));
+        assert_eq!(decoded.images.len(), 1);
+        assert!(
+            decoded.images[0]
+                .rgba
+                .chunks_exact(4)
+                .all(|pixel| pixel == [0x77, 0, 0, 0xff])
+        );
+
+        // Lossless full-chain conversion remains strict: it cannot invent the
+        // absent encoded mip levels.
+        assert_eq!(
+            Ktx2::from_dds(&header, &sidecars),
+            Err(Error::MissingSidecar { index: 4 })
+        );
+    }
+
+    #[test]
+    fn top_mip_decode_rejects_a_hole_inside_the_available_prefix() {
+        let mut header = dds_alpha8_header(16, 16);
+        put_u32(&mut header, 28, 5);
+        put_u32(&mut header, 36, crate::CryFlags::SPLIT.bits());
+        header[116] = 1;
+        header[124..128].copy_from_slice(&FOUR_CC_FYRC);
+        header.extend_from_slice(&[0x11]);
+        let mip0 = [0x77; 16 * 16];
+        let sidecars = [Sidecar::new(
+            SplitPart::Mip {
+                index: 2,
+                alpha: true,
+            },
+            &mip0,
+        )];
+
+        assert_eq!(
+            decode_top_mip_images(&header, &sidecars),
+            Err(Error::MissingSidecar { index: 1 })
+        );
+    }
+
+    #[test]
     fn decodes_alpha_only_pixel_mask_as_r8_plane() {
         let mut bytes = dds_alpha8_header(2, 2);
         bytes.extend_from_slice(&[0, 64, 128, 255]);
@@ -1841,6 +2506,243 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decodes_bc6h_directly_to_float_rgba() {
+        let mut bytes = dds_dx10_header(95, 4, 4);
+        bytes.extend_from_slice(&[0; 16]);
+
+        let decoded = decode_top_mip_float(&bytes, &[]).unwrap();
+
+        assert_eq!(decoded.width, 4);
+        assert_eq!(decoded.height, 4);
+        assert_eq!(decoded.rgba.len(), 4 * 4 * 4);
+        assert!(
+            decoded
+                .rgba
+                .chunks_exact(4)
+                .all(|pixel| pixel[0..3] == [0.0, 0.0, 0.0] && pixel[3] == 1.0)
+        );
+    }
+
+    #[test]
+    fn decodes_dxgi_a8_as_alpha_not_luminance() {
+        let mut bytes = dds_dx10_header(65, 2, 1);
+        bytes.extend_from_slice(&[0, 128]);
+
+        let decoded = decode_top_mip(&bytes, &[]).unwrap();
+
+        assert_eq!(decoded.rgba, vec![255, 255, 255, 0, 255, 255, 255, 128]);
+    }
+
+    #[test]
+    fn decodes_numeric_d3dfmt_g16r16f_to_float_rgba() {
+        let mut bytes = dds_header([112, 0, 0, 0], 1, 1, 1, 0);
+        bytes.extend_from_slice(&0x3c00u16.to_le_bytes());
+        bytes.extend_from_slice(&0xc000u16.to_le_bytes());
+
+        let decoded = decode_top_mip_float(&bytes, &[]).unwrap();
+
+        assert_eq!(decoded.rgba, vec![1.0, -2.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn decodes_standard_bump_dudv_as_signed_normalized_rg() {
+        let mut bytes =
+            dds_pixel_header(DDPF_BUMP_DUDV, 32, [0x0000_ffff, 0xffff_0000, 0, 0], 2, 1);
+        bytes.extend_from_slice(&i16::MIN.to_le_bytes());
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        bytes.extend_from_slice(&i16::MAX.to_le_bytes());
+        bytes.extend_from_slice(&i16::MIN.to_le_bytes());
+
+        let decoded = decode_top_mip_float(&bytes, &[]).unwrap();
+
+        assert_eq!(decoded.rgba, vec![-1.0, 0.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn decodes_standard_bgr24_and_bgrx32_layouts() {
+        let mut bgr24 = dds_pixel_header(
+            DDPF_RGB,
+            24,
+            [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0],
+            1,
+            1,
+        );
+        bgr24.extend_from_slice(&[3, 2, 1]);
+        assert_eq!(
+            decode_top_mip(&bgr24, &[]).unwrap().rgba,
+            vec![1, 2, 3, 255]
+        );
+
+        let mut bgrx32 = dds_pixel_header(
+            DDPF_RGB,
+            32,
+            [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0],
+            1,
+            1,
+        );
+        bgrx32.extend_from_slice(&[3, 2, 1, 0]);
+        assert_eq!(
+            decode_top_mip(&bgrx32, &[]).unwrap().rgba,
+            vec![1, 2, 3, 255]
+        );
+
+        let ktx = Ktx2::from_dds(&bgrx32, &[]).unwrap();
+        let reader = ktx2::Reader::new(ktx.bytes()).unwrap();
+        assert_eq!(reader.levels().next().unwrap().data, &[3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn preserves_cubemap_array_shape_in_ktx2_and_rejects_2d_decode() {
+        let mut bytes = dds_dx10_header(28, 4, 4);
+        put_u32(&mut bytes, DDS_FILE_HEADER_LEN + 8, 0x4);
+        put_u32(&mut bytes, DDS_FILE_HEADER_LEN + 12, 2);
+        bytes.extend_from_slice(&vec![0; 4 * 4 * 4 * 6 * 2]);
+
+        let dds = Dds::parse(&bytes).unwrap();
+        assert_eq!(
+            dds.shape(),
+            DdsShape {
+                dimension: DdsDimension::Two,
+                width: 4,
+                height: 4,
+                depth: 1,
+                array_layers: 2,
+                faces: 6,
+            }
+        );
+        assert!(matches!(
+            decode_top_mip(&bytes, &[]),
+            Err(Error::MultiImageShape { .. })
+        ));
+        let decoded = decode_top_mip_images(&bytes, &[]).unwrap();
+        assert_eq!(decoded.shape, dds.shape());
+        assert_eq!(decoded.images.len(), 12);
+        assert!(
+            decoded
+                .images
+                .iter()
+                .all(|image| (image.width, image.height, image.rgba.len()) == (4, 4, 64))
+        );
+
+        let ktx = Ktx2::from_dds(&bytes, &[]).unwrap();
+        let reader = ktx2::Reader::new(ktx.bytes()).unwrap();
+        assert_eq!(reader.header().layer_count, 2);
+        assert_eq!(reader.header().face_count, 6);
+    }
+
+    #[test]
+    fn interprets_lumberyard_cube_array_size_as_total_faces() {
+        let mut bytes = dds_dx10_header(95, 4, 4);
+        bytes[124..128].copy_from_slice(b"FYRC");
+        put_u32(&mut bytes, DDS_FILE_HEADER_LEN + 8, 0x4);
+        put_u32(&mut bytes, DDS_FILE_HEADER_LEN + 12, 6);
+        bytes.extend_from_slice(&vec![0; 16 * 6]);
+
+        let dds = Dds::parse(&bytes).unwrap();
+        assert_eq!(dds.shape().array_layers, 1);
+        assert_eq!(dds.shape().faces, 6);
+
+        let ktx = Ktx2::from_dds(&bytes, &[]).unwrap();
+        let reader = ktx2::Reader::new(ktx.bytes()).unwrap();
+        assert_eq!(reader.header().layer_count, 0);
+        assert_eq!(reader.header().face_count, 6);
+    }
+
+    #[test]
+    fn transposes_surface_major_dds_mips_into_level_major_images() {
+        let mut bytes = dds_dx10_header(28, 4, 4);
+        put_u32(&mut bytes, 28, 2);
+        put_u32(&mut bytes, DDS_FILE_HEADER_LEN + 8, 0x4);
+        for face in 0..6u8 {
+            bytes.extend_from_slice(&[face * 10, 0, 0, 255].repeat(4 * 4));
+            bytes.extend_from_slice(&[face * 10 + 1, 0, 0, 255].repeat(2 * 2));
+        }
+
+        let decoded = decode_top_mip_images(&bytes, &[]).unwrap();
+        assert_eq!(decoded.images.len(), 6);
+        for (face, image) in decoded.images.iter().enumerate() {
+            assert!(
+                image
+                    .rgba
+                    .chunks_exact(4)
+                    .all(|pixel| pixel[0] == face as u8 * 10)
+            );
+        }
+
+        let ktx = Ktx2::from_dds(&bytes, &[]).unwrap();
+        let reader = ktx2::Reader::new(ktx.bytes()).unwrap();
+        let levels = reader.levels().collect::<Vec<_>>();
+        assert_eq!(levels.len(), 2);
+        for (face, image) in levels[0].data.chunks_exact(4 * 4 * 4).enumerate() {
+            assert!(
+                image
+                    .chunks_exact(4)
+                    .all(|pixel| pixel[0] == face as u8 * 10)
+            );
+        }
+        for (face, image) in levels[1].data.chunks_exact(2 * 2 * 4).enumerate() {
+            assert!(
+                image
+                    .chunks_exact(4)
+                    .all(|pixel| pixel[0] == face as u8 * 10 + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn transposes_persistent_cubemap_mips_after_split_levels() {
+        let mut header = dds_dx10_header(28, 4, 4);
+        put_u32(&mut header, 28, 3);
+        put_u32(&mut header, 36, crate::CryFlags::SPLIT.bits());
+        header[116] = 2;
+        put_u32(&mut header, DDS_FILE_HEADER_LEN + 8, 0x4);
+        for face in 0..6u8 {
+            header.extend_from_slice(&[face * 10 + 1, 0, 0, 255].repeat(2 * 2));
+            header.extend_from_slice(&[face * 10 + 2, 0, 0, 255]);
+        }
+        let mut top = Vec::new();
+        for face in 0..6u8 {
+            top.extend_from_slice(&[face * 10, 0, 0, 255].repeat(4 * 4));
+        }
+        let sidecars = [Sidecar::new(
+            SplitPart::Mip {
+                index: 1,
+                alpha: false,
+            },
+            &top,
+        )];
+
+        let ktx = Ktx2::from_dds(&header, &sidecars).unwrap();
+        let reader = ktx2::Reader::new(ktx.bytes()).unwrap();
+        let levels = reader.levels().collect::<Vec<_>>();
+        assert_eq!(levels.len(), 3);
+        for (level, extent) in [(0usize, 4usize), (1, 2), (2, 1)] {
+            for (face, image) in levels[level]
+                .data
+                .chunks_exact(extent * extent * 4)
+                .enumerate()
+            {
+                assert!(
+                    image
+                        .chunks_exact(4)
+                        .all(|pixel| pixel[0] == face as u8 * 10 + level as u8)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bc6h_float_decode_crops_partial_edge_blocks() {
+        let rgba = decode_bc6h_blocks(&[0; 16], 3, 2, false).unwrap();
+
+        assert_eq!(rgba.len(), 3 * 2 * 4);
+        assert!(
+            rgba.chunks_exact(4)
+                .all(|pixel| pixel[0..3] == [0.0, 0.0, 0.0] && pixel[3] == 1.0)
+        );
+    }
+
     fn dds_header(
         four_cc: [u8; 4],
         width: u32,
@@ -1863,6 +2765,15 @@ mod tests {
         bytes
     }
 
+    fn dds_dx10_header(dxgi_format: u32, width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = dds_header(*b"DX10", width, height, 1, 0);
+        bytes.resize(DDS_FILE_HEADER_LEN + 20, 0);
+        put_u32(&mut bytes, DDS_FILE_HEADER_LEN, dxgi_format);
+        put_u32(&mut bytes, DDS_FILE_HEADER_LEN + 4, 3);
+        put_u32(&mut bytes, DDS_FILE_HEADER_LEN + 12, 1);
+        bytes
+    }
+
     fn dds_alpha8_header(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = vec![0; DDS_FILE_HEADER_LEN];
         bytes[0..4].copy_from_slice(DDS_MAGIC);
@@ -1874,6 +2785,30 @@ mod tests {
         put_u32(&mut bytes, 76, DDS_PIXEL_FORMAT_SIZE);
         put_u32(&mut bytes, 80, DDPF_ALPHA);
         put_u32(&mut bytes, 88, 8);
+        put_u32(&mut bytes, 108, 0x1000);
+        bytes
+    }
+
+    fn dds_pixel_header(
+        flags: u32,
+        rgb_bit_count: u32,
+        masks: [u32; 4],
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0; DDS_FILE_HEADER_LEN];
+        bytes[0..4].copy_from_slice(DDS_MAGIC);
+        put_u32(&mut bytes, 4, DDS_HEADER_SIZE);
+        put_u32(&mut bytes, 8, 0x1 | 0x2 | 0x4 | 0x1000);
+        put_u32(&mut bytes, 12, height);
+        put_u32(&mut bytes, 16, width);
+        put_u32(&mut bytes, 28, 1);
+        put_u32(&mut bytes, 76, DDS_PIXEL_FORMAT_SIZE);
+        put_u32(&mut bytes, 80, flags);
+        put_u32(&mut bytes, 88, rgb_bit_count);
+        for (index, mask) in masks.into_iter().enumerate() {
+            put_u32(&mut bytes, 92 + index * 4, mask);
+        }
         put_u32(&mut bytes, 108, 0x1000);
         bytes
     }

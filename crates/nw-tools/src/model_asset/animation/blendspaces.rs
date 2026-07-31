@@ -448,10 +448,12 @@ mod tests {
             nw_model::ModelAnimation {
                 skeleton: 0,
                 clip: clip("animations/shared/bound.caf", &[1]),
+                controller_binding: None,
             },
             nw_model::ModelAnimation {
                 skeleton: 1,
                 clip: clip("animations/shared/other.caf", &[2]),
+                controller_binding: None,
             },
         ]);
         let parameters = CharacterParameters::from_xml(str::from_utf8(parameters_xml).unwrap())

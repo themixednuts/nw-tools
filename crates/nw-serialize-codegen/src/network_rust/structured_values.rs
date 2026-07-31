@@ -93,6 +93,50 @@ fn anonymous_scalar_passthrough(
         .is_some_and(|identity| identity == scalar_rust_type(member_shape))
 }
 
+pub(super) fn exact_serialize_value_rust_type(
+    field: &NetworkField,
+    vtable: Option<&NetworkFieldHandlerVtable>,
+    wire_shape: Option<&SchemaWireShape>,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<String> {
+    let shape = field
+        .nested_type_shape
+        .as_ref()
+        .filter(|shape| shape.has_exact_identity())
+        .or_else(|| {
+            vtable
+                .and_then(|vtable| vtable.value_type_shape.as_ref())
+                .filter(|shape| shape.has_exact_identity())
+        })?;
+    let type_id = shape.type_id?;
+    let field_type_id = field
+        .serialize
+        .as_ref()
+        .map(|serialize| serialize.type_id)
+        .or_else(|| {
+            field
+                .source_type_identity_proven
+                .then_some(field.source_type_id)
+                .flatten()
+        })?;
+    if type_id != field_type_id {
+        return None;
+    }
+
+    let serialize = serialize_types.get(&type_id)?;
+    if !serialize.emits_source || serialize.wire_shapes.is_empty() {
+        return None;
+    }
+    let observed = wire_shape
+        .and_then(crate::network_schema::parse::wire_shape_scalar_product)
+        .or_else(|| crate::network_schema::parse::nested_type_shape_wire_shapes(shape, &[]))?;
+    if !wire_scalar_shapes_match(&observed, &serialize.wire_shapes) {
+        return None;
+    }
+
+    network_serialize_type_rust_type(serialize, serialize_types)
+}
+
 fn build_structured_value_field_plan(
     field: &NetworkField,
     shape: &crate::network_schema::NetworkNestedTypeShape,

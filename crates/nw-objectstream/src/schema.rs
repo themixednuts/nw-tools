@@ -349,7 +349,8 @@ impl<'a> SchemaValueCodec<'a> {
                 self.children_to_map(element.children())?,
             ));
         };
-        decode_asset(data)
+        crate::asset_reference::read_asset_value(element)
+            .map(schema_asset)
             .map(SchemaValue::Asset)
             .or_else(|_| Ok(SchemaValue::Bytes(data.to_vec())))
     }
@@ -857,33 +858,15 @@ fn decode_asset_id(data: &[u8]) -> Result<SchemaAssetId, SchemaValueCodecError> 
     })
 }
 
-fn decode_asset(data: &[u8]) -> Result<SchemaAsset, SchemaValueCodecError> {
-    if data.len() < 48 {
-        return Err(SchemaValueCodecError::InvalidLength {
-            field: "Asset",
-            expected: 48,
-            actual: data.len(),
-        });
+fn schema_asset(value: crate::asset_reference::AssetValue<'_>) -> SchemaAsset {
+    SchemaAsset {
+        id: SchemaAssetId {
+            guid: value.guid(),
+            sub_id: value.sub_id(),
+        },
+        asset_type: value.asset_type(),
+        hint: (!value.hint().trim().is_empty()).then(|| value.hint().to_owned()),
     }
-
-    let id = SchemaAssetId {
-        guid: Uuid::from_bytes(data[0..16].try_into().expect("slice length is checked")),
-        sub_id: u64::from_be_bytes(data[16..24].try_into().expect("slice length is checked"))
-            as u32,
-    };
-    let asset_type = Uuid::from_bytes(data[24..40].try_into().expect("slice length is checked"));
-    let hint_len =
-        u64::from_be_bytes(data[40..48].try_into().expect("slice length is checked")) as usize;
-    let hint = data
-        .get(48..48 + hint_len)
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .map(str::to_owned);
-
-    Ok(SchemaAsset {
-        id,
-        asset_type,
-        hint,
-    })
 }
 
 #[cfg(test)]
@@ -898,6 +881,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(value.value, SchemaValue::AssetId(SchemaAssetId::nil()));
+    }
+
+    #[test]
+    fn asset_value_uses_native_padded_layout() {
+        let guid = uuid::uuid!("24cfdb33-5178-5276-b6f9-b4631a32dcb6");
+        let asset_type = uuid::uuid!("fe12f366-67b2-4f3c-a0c3-7a83d06add40");
+        let hint = "actionlists/player.actionlist";
+        let mut data = Vec::new();
+        data.extend_from_slice(guid.as_bytes());
+        data.extend_from_slice(&7_u32.to_be_bytes());
+        data.extend_from_slice(&[0; 12]);
+        data.extend_from_slice(asset_type.as_bytes());
+        data.extend_from_slice(&(hint.len() as u64).to_be_bytes());
+        data.extend_from_slice(hint.as_bytes());
+
+        let codec = SchemaValueCodec::new(None);
+        let value = codec
+            .field_value(&Element::new(types::ASSET).with_data(data))
+            .unwrap();
+
+        assert_eq!(
+            value.value,
+            SchemaValue::Asset(SchemaAsset {
+                id: SchemaAssetId { guid, sub_id: 7 },
+                asset_type,
+                hint: Some(hint.to_owned()),
+            })
+        );
     }
 
     #[test]

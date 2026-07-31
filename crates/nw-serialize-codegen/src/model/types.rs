@@ -68,6 +68,8 @@ pub struct ReflectedGenericClass {
     pub map_key_type_id: Option<Uuid>,
     pub type_id: Option<Uuid>,
     pub registered_type_ids: Vec<Uuid>,
+    pub elements_apply_to_class_data: Option<bool>,
+    pub class_data_element_count: Option<u32>,
     pub templated_argument_count: Option<u32>,
     pub templated_type_ids: Vec<Uuid>,
     pub type_id_fold_type_ids: Vec<Uuid>,

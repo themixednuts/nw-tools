@@ -279,6 +279,8 @@ pub(crate) enum SemanticProjectionTransform {
     OptionalCrc32ZeroAsNone,
     Crc32List,
     OptionalLowercaseCrcString,
+    OptionalQualifiedLowercaseCrcString,
+    OptionalQualifiedU16,
     OptionalTrimmedLowercaseCrcString,
     TrimmedLowercaseCrcStringDefaultZero,
     LowercaseCrcStringList,
@@ -1973,6 +1975,12 @@ fn semantic_transform(field: &NativeProjectionField) -> Result<SemanticProjectio
         NativeProjectionTransform::OptionalLowercaseCrcString => {
             SemanticProjectionTransform::OptionalLowercaseCrcString
         }
+        NativeProjectionTransform::OptionalQualifiedLowercaseCrcString => {
+            SemanticProjectionTransform::OptionalQualifiedLowercaseCrcString
+        }
+        NativeProjectionTransform::OptionalQualifiedU16 => {
+            SemanticProjectionTransform::OptionalQualifiedU16
+        }
         NativeProjectionTransform::OptionalTrimmedLowercaseCrcString => {
             SemanticProjectionTransform::OptionalTrimmedLowercaseCrcString
         }
@@ -2293,6 +2301,7 @@ fn resolved_type_for_field(field: &SemanticRecordField) -> ResolvedType {
         | SemanticProjectionTransform::NonZeroU32 => ResolvedType::Scalar(ScalarType::U32),
         SemanticProjectionTransform::OptionalU32
         | SemanticProjectionTransform::OptionalNonZeroU32 => optional(ScalarType::U32),
+        SemanticProjectionTransform::OptionalQualifiedU16 => optional(ScalarType::U16),
         SemanticProjectionTransform::Crc32
         | SemanticProjectionTransform::LowercaseCrcString
         | SemanticProjectionTransform::LowercaseCrcStringDefaultZero
@@ -2303,6 +2312,7 @@ fn resolved_type_for_field(field: &SemanticRecordField) -> ResolvedType {
         SemanticProjectionTransform::OptionalCrc32
         | SemanticProjectionTransform::OptionalCrc32ZeroAsNone
         | SemanticProjectionTransform::OptionalLowercaseCrcString
+        | SemanticProjectionTransform::OptionalQualifiedLowercaseCrcString
         | SemanticProjectionTransform::OptionalTrimmedLowercaseCrcString => {
             optional(ScalarType::Crc32)
         }
@@ -2624,6 +2634,7 @@ mod tests {
                 localized_key_like: false,
                 asset_path_like: false,
                 expression_like: false,
+                qualified_reference_like: false,
                 list: None,
                 foreign_keys: Vec::new(),
             },

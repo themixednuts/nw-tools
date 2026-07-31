@@ -21,7 +21,8 @@ use thiserror::Error;
 
 use super::identity::IdentitySource;
 use super::inventory::MappedSource;
-use super::sidecar::{SIDECAR_SUFFIX, SourceAssetMeta, serialize_sidecar};
+pub use super::sidecar::sidecar_path;
+use super::sidecar::{SourceAssetMeta, serialize_sidecar};
 
 /// Native source subtree name at the output root.
 pub const ASSETS_DIR: &str = "assets";
@@ -125,7 +126,7 @@ pub fn write_native_sources(
         let meta = match source.identity_source {
             IdentitySource::Catalog => {
                 preserved_count += 1;
-                SourceAssetMeta::preserving(source.asset_id)
+                SourceAssetMeta::preserving(source.asset_id.into())
             }
             IdentitySource::Fallback => SourceAssetMeta::uncataloged(),
         };
@@ -141,12 +142,6 @@ pub fn write_native_sources(
 
 /// The sidecar path for a native source file (`<file>` + `.azmeta.json`).
 #[must_use]
-pub fn sidecar_path(source_file: &Path) -> PathBuf {
-    let mut sidecar = source_file.as_os_str().to_os_string();
-    sidecar.push(SIDECAR_SUFFIX);
-    PathBuf::from(sidecar)
-}
-
 fn create_dir_all(path: &Path) -> Result<(), WriteError> {
     std::fs::create_dir_all(path).map_err(|source| WriteError::Io {
         path: path.to_path_buf(),

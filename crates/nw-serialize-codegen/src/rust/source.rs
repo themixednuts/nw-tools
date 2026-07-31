@@ -417,6 +417,7 @@ fn render_item(
                 quote!({ #(#fields)* })
             };
             let range_impl = render_range_impl(item, &ident)?;
+            let native_component_impl = render_native_component_impl(item, &ident, options)?;
             Ok(quote! {
                 #[derive(#(#derives,)*)]
                 #identity_attr
@@ -426,6 +427,7 @@ fn render_item(
                 pub struct #ident #body
 
                 #range_impl
+                #native_component_impl
                 #standalone_identity
             })
         }
@@ -490,6 +492,45 @@ fn render_item(
             Ok(raw_enum)
         }
     }
+}
+
+fn render_native_component_impl(
+    item: &RustItemPlan,
+    ident: &Ident,
+    options: RustSourceOptions,
+) -> Result<TokenStream, RustSourceEmitError> {
+    if matches!(options.mode, RustSourceMode::Standalone) {
+        return Ok(TokenStream::new());
+    }
+    let Some(base_field) = item.identity.native_component_base_field.as_deref() else {
+        return Ok(TokenStream::new());
+    };
+    let field = item
+        .fields
+        .iter()
+        .find(|field| field.rust_name == base_field)
+        .expect("planned native component base field must remain in the emitted struct");
+    let base_ident =
+        syn::parse_str::<Ident>(base_field).map_err(|source| RustSourceEmitError::FieldIdent {
+            item_name: item.rust_name.clone(),
+            source_name: field.source_name.clone(),
+            identifier: base_field.to_owned(),
+            source,
+        })?;
+
+    Ok(quote! {
+        impl ::az_core::component::AzComponent for #ident {
+            fn component_id(&self) -> ::az_core::component::ComponentId {
+                ::az_core::component::AzComponent::component_id(&self.#base_ident)
+            }
+        }
+
+        const _: () = {
+            ::az_core::inventory::submit! {
+                ::az_core::component::ComponentLoweringRegistration::bevy_component::<#ident>()
+            }
+        };
+    })
 }
 
 fn render_serde_container_attr(item: &RustItemPlan) -> TokenStream {
@@ -745,7 +786,7 @@ fn render_sum_serialize_impl(
     options: RustSourceOptions,
 ) -> Result<TokenStream, RustSourceEmitError> {
     let type_info = az_type_info_trait_path(options);
-    let arms = item
+    let human_arms = item
         .variants
         .iter()
         .map(|variant| {
@@ -843,6 +884,40 @@ fn render_sum_serialize_impl(
             })
         })
         .collect::<Result<Vec<_>, RustSourceEmitError>>()?;
+    let binary_arms = item
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(variant_index, variant)| {
+            let variant_ident = parse_variant_ident(item, variant)?;
+            let variant_name = LitStr::new(&variant.rust_name, Span::call_site());
+            let variant_index = variant_index as u32;
+            if variant.payload_type.is_some() {
+                Ok(quote! {
+                    Self::#variant_ident(payload) => {
+                        ::serde::Serializer::serialize_newtype_variant(
+                            serializer,
+                            stringify!(#ident),
+                            #variant_index,
+                            #variant_name,
+                            payload,
+                        )
+                    }
+                })
+            } else {
+                Ok(quote! {
+                    Self::#variant_ident => {
+                        ::serde::Serializer::serialize_unit_variant(
+                            serializer,
+                            stringify!(#ident),
+                            #variant_index,
+                            #variant_name,
+                        )
+                    }
+                })
+            }
+        })
+        .collect::<Result<Vec<_>, RustSourceEmitError>>()?;
 
     Ok(quote! {
         impl ::serde::Serialize for #ident {
@@ -850,8 +925,14 @@ fn render_sum_serialize_impl(
             where
                 S: ::serde::Serializer,
             {
-                match self {
-                    #(#arms)*
+                if ::serde::Serializer::is_human_readable(&serializer) {
+                    match self {
+                        #(#human_arms)*
+                    }
+                } else {
+                    match self {
+                        #(#binary_arms)*
+                    }
                 }
             }
         }
@@ -916,15 +997,7 @@ fn render_sum_deserialize_impl(
                 if variant.payload_has_materialized_fields {
                     return Ok(quote! {
                         if type_id == <#payload_ty as #type_info>::TYPE_ID {
-                            let mut payload: ::core::option::Option<::serde_json::Value> = None;
-                            while let Some(key) = map.next_key::<String>()? {
-                                if key == #payload_key {
-                                    payload = Some(map.next_value::<::serde_json::Value>()?);
-                                } else {
-                                    let _ = map.next_value::<::serde::de::IgnoredAny>()?;
-                                }
-                            }
-                            let Some(source) = payload else {
+                            let Some(source) = source_fields.remove(#payload_key) else {
                                 return Err(::serde::de::Error::missing_field(#payload_key));
                             };
                             let mut value = ::serde_json::to_value(
@@ -940,28 +1013,17 @@ fn render_sum_deserialize_impl(
                 }
                 return Ok(quote! {
                     if type_id == <#payload_ty as #type_info>::TYPE_ID {
-                        let mut payload: ::core::option::Option<#payload_ty> = None;
-                        while let Some(key) = map.next_key::<String>()? {
-                            if key == #payload_key {
-                                payload = Some(map.next_value::<#payload_ty>()?);
-                            } else {
-                                let _ = map.next_value::<::serde::de::IgnoredAny>()?;
-                            }
-                        }
-                        match payload {
-                            Some(payload) => return Ok(#ident::#variant_ident(payload)),
-                            None => {
-                                return Err(::serde::de::Error::missing_field(#payload_key));
-                            }
-                        }
+                        let Some(source) = source_fields.remove(#payload_key) else {
+                            return Err(::serde::de::Error::missing_field(#payload_key));
+                        };
+                        let payload = ::serde_json::from_value::<#payload_ty>(source)
+                            .map_err(::serde::de::Error::custom)?;
+                        return Ok(#ident::#variant_ident(payload));
                     }
                 });
             }
             let decode = if variant.payload_has_materialized_fields {
                 quote! {
-                    let source_fields = <::serde_json::Map<String, ::serde_json::Value> as ::serde::Deserialize>::deserialize(
-                        ::serde::de::value::MapAccessDeserializer::new(map),
-                    )?;
                     let mut value = ::serde_json::to_value(
                         <#payload_ty as ::core::default::Default>::default(),
                     )
@@ -976,9 +1038,6 @@ fn render_sum_deserialize_impl(
                 }
             } else {
                 quote! {
-                    while let Some(_extra) = map.next_key::<String>()? {
-                        let _ = map.next_value::<::serde::de::IgnoredAny>()?;
-                    }
                     return Ok(#ident::#variant_ident(
                         <#payload_ty as ::core::default::Default>::default(),
                     ));
@@ -1026,6 +1085,36 @@ fn render_sum_deserialize_impl(
     } else {
         quote!(deserializer.deserialize_map(Visitor))
     };
+    let binary_variant_names = item
+        .variants
+        .iter()
+        .map(|variant| LitStr::new(&variant.rust_name, Span::call_site()))
+        .collect::<Vec<_>>();
+    let binary_variant_arms = item
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(variant_index, variant)| {
+            let variant_ident = parse_variant_ident(item, variant)?;
+            let variant_index = variant_index as u32;
+            if let Some(_) = variant.payload_type {
+                let payload_ty = parse_variant_payload_type(item, variant)?;
+                Ok(quote! {
+                    #variant_index => {
+                        ::serde::de::VariantAccess::newtype_variant::<#payload_ty>(variant)
+                            .map(#ident::#variant_ident)
+                    }
+                })
+            } else {
+                Ok(quote! {
+                    #variant_index => {
+                        ::serde::de::VariantAccess::unit_variant(variant)?;
+                        Ok(#ident::#variant_ident)
+                    }
+                })
+            }
+        })
+        .collect::<Result<Vec<_>, RustSourceEmitError>>()?;
 
     Ok(quote! {
         impl<'de> ::serde::Deserialize<'de> for #ident {
@@ -1033,6 +1122,52 @@ fn render_sum_deserialize_impl(
             where
                 D: ::serde::Deserializer<'de>,
             {
+                if !::serde::Deserializer::is_human_readable(&deserializer) {
+                    struct BinaryVisitor;
+
+                    impl<'de> ::serde::de::Visitor<'de> for BinaryVisitor {
+                        type Value = #ident;
+
+                        fn expecting(
+                            &self,
+                            formatter: &mut ::core::fmt::Formatter<'_>,
+                        ) -> ::core::fmt::Result {
+                            formatter.write_str(concat!(
+                                "binary ",
+                                stringify!(#ident),
+                                " variant",
+                            ))
+                        }
+
+                        fn visit_enum<A>(
+                            self,
+                            data: A,
+                        ) -> ::core::result::Result<Self::Value, A::Error>
+                        where
+                            A: ::serde::de::EnumAccess<'de>,
+                        {
+                            let (variant_index, variant) =
+                                ::serde::de::EnumAccess::variant::<u32>(data)?;
+                            match variant_index {
+                                #(#binary_variant_arms)*
+                                _ => Err(::serde::de::Error::invalid_value(
+                                    ::serde::de::Unexpected::Unsigned(
+                                        u64::from(variant_index),
+                                    ),
+                                    &self,
+                                )),
+                            }
+                        }
+                    }
+
+                    return ::serde::Deserializer::deserialize_enum(
+                        deserializer,
+                        stringify!(#ident),
+                        &[#(#binary_variant_names),*],
+                        BinaryVisitor,
+                    );
+                }
+
                 struct Visitor;
 
                 impl<'de> ::serde::de::Visitor<'de> for Visitor {
@@ -1047,24 +1182,22 @@ fn render_sum_deserialize_impl(
 
                     #visit_unit
 
-                    fn visit_map<A>(self, mut map: A) -> ::core::result::Result<Self::Value, A::Error>
+                    fn visit_map<A>(self, map: A) -> ::core::result::Result<Self::Value, A::Error>
                     where
                         A: ::serde::de::MapAccess<'de>,
                     {
                         #payload_merge_helper
-
-                        let Some(key) = map.next_key::<String>()? else {
-                            return Err(::serde::de::Error::missing_field("$type"));
-                        };
-                        if key != "$type" {
-                            return Err(::serde::de::Error::custom(format!(
-                                "expected `$type` as first field for {}, got `{}`",
-                                stringify!(#ident),
-                                key,
-                            )));
-                        }
-
-                        let type_id = map.next_value::<String>()?;
+                        let mut source_fields = <::serde_json::Map<
+                            String,
+                            ::serde_json::Value,
+                        > as ::serde::Deserialize>::deserialize(
+                            ::serde::de::value::MapAccessDeserializer::new(map),
+                        )?;
+                        let type_id = source_fields
+                            .remove("$type")
+                            .ok_or_else(|| ::serde::de::Error::missing_field("$type"))?;
+                        let type_id = ::serde_json::from_value::<String>(type_id)
+                            .map_err(::serde::de::Error::custom)?;
                         let type_id = #parse_type_id.map_err(::serde::de::Error::custom)?;
 
                         #(#variant_checks)*
@@ -1246,16 +1379,29 @@ pub(crate) fn speaks_legacy_serde_vocabulary(item: &RustItemPlan) -> bool {
         .any(|field| field.source_name != field.rust_name)
 }
 
+/// Whether canonical Prefab RON must use the reflected enum variant shape
+/// instead of this item's serde representation.
+///
+/// SerializeContext enums derive serde for their legacy integer ObjectStream
+/// representation, while sum enums implement the legacy `$type` JSON shape.
+/// Neither is the authoring representation: Prefab RON names the reflected
+/// variant and carries its reflected payload structurally.
+fn uses_structural_prefab_enum_wire(item: &RustItemPlan) -> bool {
+    matches!(item.kind, RustItemKind::Enum | RustItemKind::SumEnum) && !item.reflect_opaque_leaf
+}
+
 /// Whether this item's emitted `#[reflect(...)]` will actually register serde
 /// reflect type data.
 ///
-/// Mirrors the branch structure of [`reflect_attr_for_item`]: opaque hash leaves
-/// and Prefab components register unconditionally, everything else is gated on
-/// vocabulary ownership. These two must agree — when they drifted, 1,598
-/// generated files kept importing `ReflectSerialize`/`ReflectDeserialize` while
-/// no longer emitting the attribute that used them.
+/// Mirrors the branch structure of [`reflect_attr_for_item`]: opaque hash
+/// leaves register serde unconditionally, while every structurally reflected
+/// type — including Prefab components — is gated on vocabulary ownership.
+/// These two must agree — when they drifted, 1,598 generated files kept
+/// importing `ReflectSerialize`/`ReflectDeserialize` while no longer emitting
+/// the attribute that used them.
 pub(crate) fn emits_serde_reflect_data(item: &RustItemPlan) -> bool {
-    item.reflect_opaque_leaf || item.prefab.is_some() || !speaks_legacy_serde_vocabulary(item)
+    item.reflect_opaque_leaf
+        || (!uses_structural_prefab_enum_wire(item) && !speaks_legacy_serde_vocabulary(item))
 }
 
 fn reflect_attr_for_item(item: &RustItemPlan) -> TokenStream {
@@ -1312,7 +1458,11 @@ fn reflect_attr_for_item(item: &RustItemPlan) -> TokenStream {
             #[reflect(#component Hash, PartialEq #serialize #deserialize)]
         };
     }
+    let owns_legacy_wire =
+        uses_structural_prefab_enum_wire(item) || speaks_legacy_serde_vocabulary(item);
     if item.prefab.is_some() {
+        let has_serialize = has_serialize && !owns_legacy_wire;
+        let has_deserialize = has_deserialize && !owns_legacy_wire;
         return match (has_serialize, has_deserialize) {
             (true, true) => {
                 quote!(#[reflect(Component, Default, Prefab, Serialize, Deserialize)])
@@ -1324,13 +1474,15 @@ fn reflect_attr_for_item(item: &RustItemPlan) -> TokenStream {
     }
     // `Serialize`/`Deserialize` reflect registrations are reserved for types
     // whose serde impl IS the canonical Azoth wire (opaque leaves handled
-    // above). A non-prefab type whose serde impl speaks legacy ObjectStream
-    // vocabulary — any field emitted with `#[serde(rename = ...)]`, see
-    // `render_field_serde_attr` — must not register serde reflect type data:
-    // its canonical reflected encoding is structural (Rust field idents), and
-    // registering `ReflectSerialize` would route the az-prefab sparse codec
-    // through the legacy-named serde wire instead. The serde derive itself
-    // stays for the legacy ObjectStream import path.
+    // above). A reflected enum is structural in Prefab RON and AZSCENE even
+    // when its serde impl is the integer ObjectStream wire (or the `$type`
+    // sum-enum JSON wire). Likewise, a struct whose serde impl speaks legacy
+    // ObjectStream vocabulary — any field emitted with
+    // `#[serde(rename = ...)]`, see `render_field_serde_attr` — must not
+    // register serde reflect type data, whether or not it is itself a Prefab
+    // component. Registering either would route Azoth's structural codecs
+    // through the legacy wire instead. The serde impl itself stays for the
+    // ObjectStream import path.
     //
     // The rule is VOCABULARY OWNERSHIP, not identifier validity. It fires on
     // *any* rename, including legacy names like `m_scriptName` that would be
@@ -1345,9 +1497,8 @@ fn reflect_attr_for_item(item: &RustItemPlan) -> TokenStream {
     // earlier revision of this comment justified the rule on identifier validity
     // alone, which described roughly 7% of what the code does and read as an
     // invitation to narrow it.
-    let legacy_serde_vocabulary = speaks_legacy_serde_vocabulary(item);
-    let has_serialize = has_serialize && !legacy_serde_vocabulary;
-    let has_deserialize = has_deserialize && !legacy_serde_vocabulary;
+    let has_serialize = has_serialize && !owns_legacy_wire;
+    let has_deserialize = has_deserialize && !owns_legacy_wire;
     match (has_component, has_serialize, has_deserialize) {
         (true, true, true) => quote!(#[reflect(Component, Serialize, Deserialize)]),
         (true, true, false) => quote!(#[reflect(Component, Serialize)]),
@@ -2008,6 +2159,10 @@ mod tests {
         assert!(source.contains("impl ::core::fmt::Display for Mode"));
         assert!(source.contains("Marshaler"));
         assert!(!source.contains("impl ::gridmate::serialize::marshaler::Marshaler for Mode"));
+        assert!(
+            !source.contains("#[reflect(Serialize, Deserialize)]"),
+            "the integer ObjectStream enum wire must not own Prefab RON"
+        );
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
 
@@ -2891,10 +3046,16 @@ mod tests {
         assert!(source.contains("impl ::core::default::Default for InteractCondition"));
         assert!(source.contains("impl ::serde::Serialize for InteractCondition"));
         assert!(source.contains("impl<'de> ::serde::Deserialize<'de> for InteractCondition"));
+        assert!(source.contains("Serializer::is_human_readable"));
+        assert!(source.contains("serialize_newtype_variant"));
+        assert!(source.contains("Deserializer::is_human_readable"));
+        assert!(source.contains("deserialize_enum"));
         assert!(source.contains("\"$type\""));
         assert!(source.contains("MapAccessDeserializer::new(map)"));
         assert!(source.contains("merge_sum_payload_defaults"));
-        assert!(source.contains("while let Some(_extra)"));
+        assert!(!source.contains("while let Some(_extra)"));
+        assert!(source.contains(".remove(\"$type\")"));
+        assert!(!source.contains("expected `$type` as first field"));
         assert!(!source.contains("unknown_field(&extra"));
         assert!(!source.contains("#[default]"));
         syn::parse_file(&source).expect("source should be parseable Rust");
@@ -2960,6 +3121,8 @@ mod tests {
 
         assert!(source.contains("Empty,"));
         assert!(source.contains("Float(f32),"));
+        assert!(source.contains("serialize_unit_variant"));
+        assert!(source.contains("serialize_newtype_variant"));
         // `null` has to reach the empty variant, and the entry point has to ask
         // for a shape that permits it.
         assert!(source.contains("fn visit_unit"));
@@ -2967,12 +3130,13 @@ mod tests {
         assert!(!source.contains("deserializer.deserialize_map(Visitor)"));
         // The payload is read back by key, not from the leftover map entries.
         assert!(source.contains("\"m_data\""));
-        // The struct-payload arms must NOT be used for a scalar: both drop it.
-        assert!(!source.contains("MapAccessDeserializer::new(map)"));
+        // The whole object is buffered so the type tag may appear anywhere.
+        assert!(source.contains("MapAccessDeserializer::new(map)"));
         assert!(!source.contains("merge_sum_payload_defaults"));
         // Loud-on-unknown must survive -- an unrecognised payload type id is an
         // error, never a default.
         assert!(source.contains("unknown {} concrete type {}"));
+        assert!(!source.contains("expected `$type` as first field"));
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
 
@@ -3037,15 +3201,16 @@ mod tests {
 
         assert!(source.contains("EventData(EventData),"));
         assert!(source.contains("\"m_data\""));
-        assert!(source.contains("Option<::serde_json::Value>"));
+        assert!(source.contains(".remove(\"m_data\")"));
+        assert!(!source.contains("Option<::serde_json::Value>"));
         assert!(source.contains("merge_sum_payload_defaults(&mut value, source)"));
-        assert!(!source.contains("MapAccessDeserializer::new(map)"));
+        assert!(source.contains("MapAccessDeserializer::new(map)"));
         assert!(source.contains("unknown {} concrete type {}"));
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
 
     #[test]
-    fn widens_enum_repr_when_reflected_values_do_not_fit_underlying_type() {
+    fn normalizes_captured_enum_values_to_the_reflected_underlying_type() {
         let model = SerializeContextModel::from_root(&json!({
             "$id": 1,
             "uuidMap": {},
@@ -3094,9 +3259,10 @@ mod tests {
         let source = RustSourceEmitter::emit_unit(&unit, &crate::CodegenContext::inline())
             .expect("emitted Rust source");
 
-        assert!(source.contains("#[repr(u32)]"));
-        assert!(source.contains("impl From<ConversationType> for u32"));
-        assert!(source.contains("544_104_704 => Ok(Self::Conversation)"));
+        assert!(source.contains("#[repr(u8)]"));
+        assert!(source.contains("impl From<ConversationType> for u8"));
+        assert!(source.contains("0 => Ok(Self::Conversation)"));
+        assert!(!source.contains("544_104_704"));
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
 
@@ -3171,7 +3337,14 @@ mod tests {
                     "$id": 10,
                     "name": "AZ::Component",
                     "typeId": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
-                    "elements": [],
+                    "elements": [
+                        {
+                            "$id": 11,
+                            "name": "Id",
+                            "typeId": type_ids::U64.hyphenated().to_string(),
+                            "is_base_class": false
+                        }
+                    ],
                     "attributes": []
                 },
                 "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB": {
@@ -3215,7 +3388,11 @@ mod tests {
             .expect("emitted Rust source");
 
         assert!(source.contains("use az_derive::AzRtti;"));
-        assert!(!source.contains("AzComponent"));
+        assert!(source.contains("impl ::az_core::component::AzComponent for HealthComponent"));
+        assert!(
+            source.contains("::az_core::component::AzComponent::component_id(&self.az_component)")
+        );
+        assert!(source.contains("ComponentLoweringRegistration::bevy_component"));
         assert!(!source.contains("use bevy::prelude::{Component, Reflect};"));
         assert!(!source.contains("use bevy::prelude::Component;"));
         assert!(source.contains("use bevy::ecs::reflect::ReflectComponent;"));
@@ -3235,6 +3412,21 @@ mod tests {
         assert!(!component_reflect_attr.contains("Deserialize"));
         assert!(source.contains("pub struct HealthComponent"));
         assert!(source.contains("pub value: u32"));
+
+        let mut prefab_component = component.clone();
+        prefab_component.prefab = Some(RustPrefabPlan {
+            tag: prefab_component.source_name.clone(),
+            source_version: 1,
+        });
+        let prefab_reflect_attr = reflect_attr_for_item(&prefab_component).to_string();
+        assert!(prefab_reflect_attr.contains("Component"));
+        assert!(prefab_reflect_attr.contains("Default"));
+        assert!(prefab_reflect_attr.contains("Prefab"));
+        assert!(
+            !prefab_reflect_attr.contains("Serialize")
+                && !prefab_reflect_attr.contains("Deserialize"),
+            "a Prefab component's legacy ObjectStream serde wire must not own AZSCENE"
+        );
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
 
@@ -3313,7 +3505,12 @@ mod tests {
             root.contains(&format!("self::{component_module}::GameTransformComponent")),
             "unexpected root module:\n{root}"
         );
-        assert_eq!(root.matches(".register::<").count(), 1);
+        assert_eq!(
+            root.matches(".register::<").count(),
+            2,
+            "the cook registry must include the component and its selected reflected base"
+        );
+        assert!(root.contains("Component"));
         assert!(!root.contains("App"));
         syn::parse_file(source).expect("source should be parseable Rust");
         syn::parse_file(root).expect("root source should be parseable Rust");
@@ -3709,7 +3906,7 @@ mod tests {
     }
 
     #[test]
-    fn integrated_project_emits_only_local_registration_functions() {
+    fn integrated_project_keeps_app_registration_local_and_emits_cook_registry() {
         let unit = IrUnit {
             items: vec![fixture_item(
                 uuid!("11111111-1111-1111-1111-111111111111"),
@@ -3751,7 +3948,13 @@ mod tests {
             assert!(!file.source.contains("impl Plugin"), "{}", file.path);
             assert!(!file.source.contains("add_plugins"), "{}", file.path);
         }
-        assert!(!root.source.contains("pub fn register"));
+        assert!(root.source.contains(
+            "pub fn register_prefab_types(registry: &mut ::bevy::reflect::TypeRegistry)"
+        ));
+        assert!(root.source.contains(
+            "registry.register::<self::example::components::health_component::HealthComponent>();"
+        ));
+        assert_eq!(root.source.matches(".register::<").count(), 1);
         assert!(!parent.source.contains("pub fn register"));
         assert!(!parent.source.contains("health_component::register(app);"));
         assert!(!parent.source.contains("app.register_type::<"));

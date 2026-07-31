@@ -159,6 +159,7 @@ fn cloth_simulation_model(fabric: &nv_cloth_assets::ClothFabric) -> nw_model::Mo
     };
     let mesh = nw_model::Mesh {
         name: "cloth_simulation".to_owned(),
+        physics_data: Vec::new(),
         primitives: vec![primitive],
         role: nw_model::MeshRole::ClothSimulation,
         skin: Some(0),

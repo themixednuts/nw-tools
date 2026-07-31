@@ -12,6 +12,7 @@ description = "Assemble Cry chunk meshes into editable glTF source assets"
 workspace = true
 
 [dependencies]
+az-animation = { workspace = true }
 bevy_math = { workspace = true }
 cry-animation.workspace = true
 cry-chunk = { path = "../cry-chunk" }

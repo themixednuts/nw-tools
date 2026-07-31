@@ -89,6 +89,27 @@ Use these core concepts consistently:
 Wire evidence can reject a bad semantic guess, but it must not invent source
 semantics by itself.
 
+## Field Override Contract
+
+Field overrides are evidence inputs to normalization; never edit the normalized
+schema to patch a generated API. `typeIndex`/`typeId` select the type and
+`fieldIndex` selects the field by stable wire order. `field` is only an optional
+existing-name locator. Use the separate `name` property to assign a recovered
+semantic name, especially when Ghidra recovered an unnamed registered field:
+
+```json
+{
+  "typeIndex": 6951,
+  "fieldIndex": 0,
+  "name": "numPoints0",
+  "confidence": "high"
+}
+```
+
+Keeping selection and assignment separate lets an override name an anonymous
+field without pretending that the name was already present in the source
+report.
+
 ## Source-Style Replicated Containers
 
 Do not flatten generated replicated containers to aliases such as

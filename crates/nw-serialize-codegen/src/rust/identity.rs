@@ -5,6 +5,10 @@ pub struct RustTypeIdentityPlan {
     pub kind: RustTypeIdentityKind,
     pub type_id: Uuid,
     pub name: Option<String>,
+    /// Immediate serialized native-component base that owns the component id.
+    /// Integrated output delegates [`AzComponent::component_id`] through this
+    /// field and publishes the ordinary component-lowering registration.
+    pub native_component_base_field: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +24,7 @@ impl RustTypeIdentityPlan {
             kind: RustTypeIdentityKind::AzTypeInfo,
             type_id,
             name,
+            native_component_base_field: None,
         }
     }
 
@@ -29,7 +34,14 @@ impl RustTypeIdentityPlan {
             kind: RustTypeIdentityKind::AzRtti,
             type_id,
             name,
+            native_component_base_field: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_native_component_base_field(mut self, field: impl Into<String>) -> Self {
+        self.native_component_base_field = Some(field.into());
+        self
     }
 }
 

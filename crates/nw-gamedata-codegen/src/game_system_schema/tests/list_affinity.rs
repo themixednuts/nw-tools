@@ -264,6 +264,44 @@ fn seasons_rewards_stats_repairs_tracked_stat_surface_to_native_semantic_shapes(
 }
 
 #[test]
+fn seasons_reward_entitlements_keep_the_explicit_qualified_pair_list_contract() {
+    let data_tables = test_data_tables(
+        "SeasonsRewardData_Season10",
+        "SeasonsRewardData",
+        vec![
+            ("RewardID", ColumnType::String),
+            ("EntitlementIds", ColumnType::String),
+        ],
+        vec![
+            vec![
+                OwnedCellValue::String("Season10_Reward_1".to_owned()),
+                OwnedCellValue::String("Entitlement_A:2,Entitlement_B".to_owned()),
+            ],
+            vec![
+                OwnedCellValue::String("Season10_Reward_2".to_owned()),
+                OwnedCellValue::String("Entitlement_C:5".to_owned()),
+            ],
+        ],
+    );
+
+    let report = infer_data_tables_schema(&data_tables);
+    let entitlements = report_column(&report, "EntitlementIds");
+    let list = string_list(entitlements).expect("entitlement pair list shape");
+    assert_eq!(list.separators, vec![",".to_owned()]);
+    assert_eq!(
+        list.element_shape.as_ref(),
+        Some(&GameSystemListElementShape::Pair {
+            separator: ':',
+            first: GameSystemListAtomShape::Crc32,
+            second: GameSystemListAtomShape::Number {
+                number_shape: GameSystemNumberShape::PositiveInteger,
+            },
+            default_second_source_token: Some("1".to_owned()),
+        })
+    );
+}
+
+#[test]
 fn string_lists_record_element_shape() {
     let data_tables = test_data_tables(
         "ElementalMutation",

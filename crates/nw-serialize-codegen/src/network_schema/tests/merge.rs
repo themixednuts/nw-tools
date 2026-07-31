@@ -3,6 +3,57 @@ use super::*;
 use crate::ReflectedTypeCatalog;
 
 #[test]
+fn restricts_source_availability_to_the_emitted_codegen_unit() {
+    let first_type_id = uuid!("11111111-1111-1111-1111-111111111111");
+    let second_type_id = uuid!("22222222-2222-2222-2222-222222222222");
+    let item = |source_type_id, source_name: &str| SerializeCodegenItem {
+        source_type_id,
+        source_name: source_name.to_owned(),
+        role: ReflectedTypeRole::SupportType,
+        is_reflection_marker: false,
+        is_abstract: Some(false),
+        factory: None,
+        rtti_base_chain: Vec::new(),
+        kind: SerializeCodegenItemKind::Struct,
+        enum_underlying_type: None,
+        fields: Vec::new(),
+        variants: Vec::new(),
+    };
+    let catalog_unit = SerializeCodegenUnit {
+        items: vec![
+            item(first_type_id, "FirstType"),
+            item(second_type_id, "SecondType"),
+        ],
+    };
+    let emitted_unit = SerializeCodegenUnit {
+        items: vec![item(first_type_id, "FirstType")],
+    };
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+    schema.merge_serialize_codegen_unit(&catalog_unit, Some("serialize.json".to_owned()));
+
+    schema.restrict_serialize_source_availability(&emitted_unit);
+
+    assert!(
+        schema
+            .serialize_types
+            .iter()
+            .find(|serialize| serialize.type_id == first_type_id)
+            .is_some_and(|serialize| serialize.emits_source)
+    );
+    assert!(
+        schema
+            .serialize_types
+            .iter()
+            .find(|serialize| serialize.type_id == second_type_id)
+            .is_some_and(|serialize| !serialize.emits_source)
+    );
+}
+
+#[test]
 fn filters_implausible_message_unmarshal_storage_and_reindexes_remaining_fields() {
     let report = json!({
         "registryEntries": [{
@@ -1148,6 +1199,56 @@ fn renames_a_field_override_selected_by_index() {
     assert_eq!(merge.unmatched_field_count, 0);
     assert_eq!(merge.field_name_updated_count, 1);
     assert_eq!(schema.types[0].fields[0].name.as_deref(), Some("sections"));
+}
+
+#[test]
+fn field_override_can_name_an_unnamed_field_selected_by_index() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "63AD3B5A-3E2E-4923-ACCD-1DA221431EE0",
+            "typeIndex": 6951,
+            "typeName": "Javelin::PointsAccumulatorComponentReplicatedState",
+            "fields": [{
+                "index": 0,
+                "name": null,
+                "wireShape": "f32",
+                "confidence": "unknown"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&report).expect("schema");
+    let overrides = NetworkFieldOverrideFile {
+        fields: vec![NetworkFieldOverride {
+            type_id: None,
+            type_index: Some(6951),
+            type_name: None,
+            field_index: Some(0),
+            field: None,
+            name: Some("numPoints0".to_owned()),
+            native_type: None,
+            rust_type: None,
+            wire_shape: None,
+            wire_shape_source: None,
+            confidence: Some(NetworkConfidence::High),
+        }],
+    };
+
+    let merge =
+        schema.merge_field_overrides(&overrides, Some("network-field-overrides.json".to_owned()));
+
+    assert_eq!(merge.matched_field_count, 1);
+    assert_eq!(merge.unmatched_field_count, 0);
+    assert_eq!(merge.field_name_updated_count, 1);
+    assert_eq!(merge.confidence_updated_count, 1);
+    assert_eq!(
+        schema.types[0].fields[0].name.as_deref(),
+        Some("numPoints0")
+    );
+    assert_eq!(
+        schema.types[0].fields[0].confidence,
+        NetworkConfidence::High
+    );
 }
 
 #[test]

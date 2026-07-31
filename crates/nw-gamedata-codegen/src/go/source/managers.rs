@@ -2126,6 +2126,7 @@ func example() Example {
                 localized_key_like: false,
                 asset_path_like: false,
                 expression_like: false,
+                qualified_reference_like: false,
                 list: None,
                 foreign_keys: Vec::new(),
             },
@@ -5661,6 +5662,12 @@ fn go_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         SemanticProjectionTransform::OptionalLowercaseCrcString => {
             format!("optionalLowercaseCrcStringCell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::OptionalQualifiedLowercaseCrcString => {
+            format!("optionalQualifiedLowercaseCrcStringCell(table, sourceRow, {column})")
+        }
+        SemanticProjectionTransform::OptionalQualifiedU16 => {
+            format!("optionalQualifiedUint16Cell(table, sourceRow, {column})")
+        }
         SemanticProjectionTransform::OptionalTrimmedLowercaseCrcString => {
             format!("optionalTrimmedLowercaseCrcStringCell(table, sourceRow, {column})")
         }
@@ -6088,6 +6095,62 @@ func optionalLowercaseCrcStringCell(table *dynamicTable, row dynamicTableRow, co
 	}
 	crc := CRC32(crc32Lowercase(*text))
 	return &crc, nil
+}
+
+type qualifiedCRC32Uint16 struct {
+	ID CRC32
+	Rank uint16
+}
+
+func optionalQualifiedCRC32Uint16Cell(table *dynamicTable, row dynamicTableRow, columnName string) (*qualifiedCRC32Uint16, error) {
+	text, err := optionalStringCell(table, row, columnName)
+	if err != nil || text == nil {
+		return nil, err
+	}
+	identifier, rankText, found := strings.Cut(*text, ":")
+	identifier = strings.TrimSpace(identifier)
+	rankText = strings.TrimSpace(rankText)
+	if !found || identifier == "" || rankText == "" {
+		return nil, fmt.Errorf(
+			"row %s:%d column %q value %q must have non-empty identifier:rank syntax",
+			row.SourcePath,
+			row.RowIndex+1,
+			columnName,
+			*text,
+		)
+	}
+	rank, err := strconv.ParseUint(rankText, 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"row %s:%d column %q value %q has invalid uint16 rank %q: %w",
+			row.SourcePath,
+			row.RowIndex+1,
+			columnName,
+			*text,
+			rankText,
+			err,
+		)
+	}
+	return &qualifiedCRC32Uint16{
+		ID: CRC32(crc32Lowercase(identifier)),
+		Rank: uint16(rank),
+	}, nil
+}
+
+func optionalQualifiedLowercaseCrcStringCell(table *dynamicTable, row dynamicTableRow, columnName string) (*CRC32, error) {
+	value, err := optionalQualifiedCRC32Uint16Cell(table, row, columnName)
+	if err != nil || value == nil {
+		return nil, err
+	}
+	return &value.ID, nil
+}
+
+func optionalQualifiedUint16Cell(table *dynamicTable, row dynamicTableRow, columnName string) (*uint16, error) {
+	value, err := optionalQualifiedCRC32Uint16Cell(table, row, columnName)
+	if err != nil || value == nil {
+		return nil, err
+	}
+	return &value.Rank, nil
 }
 
 func optionalTrimmedLowercaseCrcStringCell(table *dynamicTable, row dynamicTableRow, columnName string) (*CRC32, error) {

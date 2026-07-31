@@ -93,17 +93,19 @@ impl<'a> ModelParser<'a> {
         self.parse_classes(root);
         self.parse_class_name_index(root);
         self.parse_generic_classes(root);
+        self.parse_enum_underlying_types(root);
+        self.infer_enum_underlying_types_from_members();
         self.parse_enums(root);
         self.parse_any_creators(root);
-        self.parse_enum_underlying_types(root);
     }
 
     fn parse_schema_document(&mut self, root: &'a Value, schema: &SerializeContext) {
         self.parse_schema_classes(root, schema);
         self.parse_schema_generic_classes(root, schema);
+        self.parse_enum_underlying_types(root);
+        self.infer_enum_underlying_types_from_members();
         self.parse_enums(root);
         self.parse_schema_indexes(schema);
-        self.parse_enum_underlying_types(root);
     }
 
     fn parse_schema_indexes(&mut self, schema: &SerializeContext) {
@@ -295,6 +297,16 @@ impl<'a> ModelParser<'a> {
             let Some(type_id) = parse_uuid(type_id) else {
                 continue;
             };
+            // The canonical underlying-type map is the strongest enum
+            // evidence. Some reflected native enums are absent from that map,
+            // but unlike ordinary edit-context class descriptors they have no
+            // serialized ClassData body. Keep those bodyless enum descriptors
+            // while refusing to reinterpret a real class as an enum.
+            if !self.model.enum_underlying_types.contains_key(&type_id)
+                && self.model.classes.contains_key(&type_id)
+            {
+                continue;
+            }
             if let Some(enumeration) = self.parse_enum(enum_data, type_id) {
                 self.model.enums.insert(type_id, enumeration);
             }
@@ -336,6 +348,29 @@ impl<'a> ModelParser<'a> {
                 ))
             })
             .collect();
+    }
+
+    fn infer_enum_underlying_types_from_members(&mut self) {
+        let mut candidates = BTreeMap::<Uuid, BTreeSet<Uuid>>::new();
+        for class in self.model.classes.values() {
+            collect_member_enum_underlying_types(&class.members, &mut candidates);
+        }
+        for generic in self.model.generic_classes.values() {
+            collect_member_enum_underlying_types(&generic.members, &mut candidates);
+        }
+
+        for (enum_type_id, underlying_type_ids) in candidates {
+            let mut underlying_type_ids = underlying_type_ids.into_iter();
+            let Some(underlying_type_id) = underlying_type_ids.next() else {
+                continue;
+            };
+            if underlying_type_ids.next().is_none() {
+                self.model
+                    .enum_underlying_types
+                    .entry(enum_type_id)
+                    .or_insert(underlying_type_id);
+            }
+        }
     }
 
     fn parse_class(
@@ -438,11 +473,21 @@ impl<'a> ModelParser<'a> {
         let class_data = generic_data
             .get("classData")
             .map(|value| self.refs.resolve(value));
+        let elements_apply_to_class_data = generic_data
+            .get("elementsApplyToClassData")
+            .map(|value| self.refs.resolve(value))
+            .and_then(Value::as_bool);
+        let class_data_element_count = generic_data
+            .get("classDataElementCount")
+            .map(|value| self.refs.resolve(value))
+            .and_then(value_u32);
         let generic = ReflectedGenericClass {
             reference_id: reference_id.clone(),
             map_key_type_id,
             type_id: self.field(generic_data, "typeId").and_then(value_uuid),
             registered_type_ids: self.uuid_array(generic_data.get("registeredTypeIds")),
+            elements_apply_to_class_data,
+            class_data_element_count,
             templated_argument_count: generic_data
                 .get("templatedArgumentCount")
                 .map(|value| self.refs.resolve(value))
@@ -485,7 +530,11 @@ impl<'a> ModelParser<'a> {
                 .map(|value| self.refs.resolve(value))
                 .and_then(non_empty_str)
                 .map(str::to_owned),
-            members: self.parse_members(generic_data),
+            members: self.parse_generic_members(
+                generic_data,
+                class_data,
+                elements_apply_to_class_data,
+            ),
         };
         self.exit_generic_parse(reference_id.as_ref());
         Some(generic)
@@ -519,6 +568,8 @@ impl<'a> ModelParser<'a> {
             map_key_type_id,
             type_id: generic_data.type_id().and_then(parse_uuid),
             registered_type_ids: parse_uuid_strings(generic_data.registered_type_ids()),
+            elements_apply_to_class_data: generic_data.elements_apply_to_class_data(),
+            class_data_element_count: generic_data.class_data_element_count(),
             templated_argument_count: generic_data.templated_argument_count(),
             templated_type_ids: parse_uuid_strings(generic_data.templated_type_ids()),
             type_id_fold_type_ids: parse_uuid_strings(generic_data.type_id_fold_type_ids()),
@@ -536,14 +587,76 @@ impl<'a> ModelParser<'a> {
             class_name: generic_data
                 .class_data()
                 .map(|class_data| class_data.name().to_owned()),
-            members: generic_data
-                .elements()
-                .into_iter()
-                .filter_map(|element| self.parse_schema_element(element, None))
-                .collect(),
+            members: self.parse_schema_generic_members(generic_data, raw_generic),
         };
         self.exit_generic_parse(reference_id.as_ref());
         Some(generic)
+    }
+
+    fn parse_generic_members(
+        &mut self,
+        generic_data: &'a Value,
+        class_data: Option<&'a Value>,
+        elements_apply_to_class_data: Option<bool>,
+    ) -> Vec<ReflectedMember> {
+        let generic_has_elements = generic_data
+            .get("elements")
+            .map(|value| self.refs.resolve(value))
+            .and_then(Value::as_array)
+            .is_some_and(|elements| !elements.is_empty());
+        if elements_apply_to_class_data != Some(false) && generic_has_elements {
+            self.parse_members(generic_data)
+        } else {
+            class_data
+                .map(|class_data| self.parse_members(class_data))
+                .unwrap_or_default()
+        }
+    }
+
+    fn parse_schema_generic_members(
+        &mut self,
+        generic_data: SchemaGenericClassInfo<'_>,
+        raw_generic: Option<&'a Value>,
+    ) -> Vec<ReflectedMember> {
+        let raw_generic = raw_generic.map(|generic| self.refs.resolve(generic));
+        let generic_elements = generic_data.elements();
+        if generic_data.elements_apply_to_class_data() != Some(false)
+            && !generic_elements.is_empty()
+        {
+            let raw_elements = raw_generic
+                .and_then(|generic| generic.get("elements"))
+                .map(|elements| self.refs.resolve(elements))
+                .and_then(Value::as_array);
+            return generic_elements
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, element)| {
+                    self.parse_schema_element(
+                        element,
+                        raw_schema_member(self.refs, raw_elements, index, element.id()),
+                    )
+                })
+                .collect();
+        }
+        let raw_class_data = raw_generic
+            .and_then(|generic| generic.get("classData"))
+            .map(|class_data| self.refs.resolve(class_data));
+        let raw_elements = raw_class_data
+            .and_then(|class_data| class_data.get("elements"))
+            .map(|elements| self.refs.resolve(elements))
+            .and_then(Value::as_array);
+        generic_data
+            .class_data()
+            .into_iter()
+            .flat_map(UuidMap::elements)
+            .enumerate()
+            .filter_map(|(index, element)| {
+                self.parse_schema_element(
+                    SchemaElementInfo::UuidMap(element),
+                    raw_schema_member(self.refs, raw_elements, index, element.id()),
+                )
+            })
+            .collect()
     }
 
     fn enter_generic_parse(&mut self, reference_id: Option<&ReferenceKey>) -> bool {
@@ -824,6 +937,25 @@ impl<'a> ModelParser<'a> {
             type_id: self.field(value, "typeId").and_then(value_uuid)?,
             type_name: self.optional_string(value, "typeName"),
         })
+    }
+}
+
+fn collect_member_enum_underlying_types(
+    members: &[ReflectedMember],
+    candidates: &mut BTreeMap<Uuid, BTreeSet<Uuid>>,
+) {
+    for member in members {
+        if let Some(enum_type_id) = member.enum_type_id()
+            && enum_type_id != member.type_id
+        {
+            candidates
+                .entry(enum_type_id)
+                .or_default()
+                .insert(member.type_id);
+        }
+        if let Some(generic) = member.generic_class.as_deref() {
+            collect_member_enum_underlying_types(&generic.members, candidates);
+        }
     }
 }
 

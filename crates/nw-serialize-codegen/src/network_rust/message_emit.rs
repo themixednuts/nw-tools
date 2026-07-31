@@ -473,9 +473,9 @@ pub(super) fn serialize_field_scalar_source_type(
         return None;
     }
     scalar_conversion_serialized_type(shape?)?;
-    let rust_type = format!("::nw_network::source::{}", rust_type_ident(&serialize.name));
-    syn::parse_str::<syn::Type>(&rust_type).ok()?;
-    Some(rust_type)
+    let source_type = serialize_types.get(&serialize.type_id)?;
+    network_serialize_type_rust_type(source_type, serialize_types)
+        .filter(|rust_type| is_generated_source_type(rust_type))
 }
 
 pub(super) fn conversion_marshal_type_string_for(

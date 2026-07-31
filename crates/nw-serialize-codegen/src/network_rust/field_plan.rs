@@ -46,17 +46,8 @@ pub(super) fn message_field_shape_report(
                 .and_then(exact_native_runtime_rust_type)
                 .map(normalize_generated_rust_type)
         })
-        .or_else(|| {
-            report.wire_shape.as_ref()?;
-            field
-                .native_type
-                .as_deref()
-                .and_then(|native_type| {
-                    network_native_type_rust_type(native_type, &BTreeMap::new())
-                })
-                .map(|rust_type| normalize_generated_rust_type(&rust_type))
-        })
-        .or_else(|| message_selected_serialize_rust_type(field, serialize_types))
+        .or_else(|| message_native_rust_type(field, report.wire_shape.as_ref()?, serialize_types))
+        .or_else(|| message_serialize_source_rust_type(field, serialize_types))
         .or(source_type)
         .or_else(|| {
             report
@@ -79,6 +70,24 @@ pub(super) fn message_field_shape_report(
         });
     report.supported = report.blocked_reason.is_none();
     report
+}
+
+fn message_native_rust_type(
+    field: &NetworkField,
+    shape: &SchemaWireShape,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<String> {
+    let native_type = field.native_type.as_deref()?;
+    let rust_type = network_native_type_rust_type(native_type, serialize_types)?;
+    if let Some(native_scalar) = network_native_scalar_type(native_type) {
+        let observed = expand_directional_wire_scalars(vec![native_scalar.wire_shape]);
+        let expected = crate::network_schema::parse::wire_shape_scalar_product(shape)
+            .map(expand_directional_wire_scalars)?;
+        if !wire_scalar_shapes_match(&observed, &expected) {
+            return None;
+        }
+    }
+    Some(normalize_generated_rust_type(&rust_type))
 }
 
 fn message_native_wire_shape(field: &NetworkField) -> Option<SchemaWireShape> {
@@ -247,10 +256,20 @@ pub(super) fn state_field_shape_report(
     let fixed_sequence = fixed_sequence_resolution
         .as_ref()
         .and_then(|resolution| resolution.as_ref().ok());
+    let exact_serialize_value_type = if explicit_field_type.is_none()
+        && !is_container_field
+        && !is_fixed_sequence_field
+        && !matches!(shape, Some(SchemaWireShape::RemoteServerGdeRef))
+    {
+        exact_serialize_value_rust_type(field, handler_vtable, shape, serialize_types)
+    } else {
+        None
+    };
     let structured_value_resolution = if explicit_field_type.is_none()
         && !is_container_field
         && !is_fixed_sequence_field
         && !matches!(shape, Some(SchemaWireShape::RemoteServerGdeRef))
+        && exact_serialize_value_type.is_none()
     {
         handler_vtable.and_then(|vtable| {
             structured_value_field_plan(field, Some(vtable), shape, serialize_types)
@@ -264,6 +283,12 @@ pub(super) fn state_field_shape_report(
     let generated_rust_field_type = explicit_field_type
         .map(ToOwned::to_owned)
         .or_else(|| fixed_sequence.map(NetworkFixedSequenceFieldReport::field_type))
+        .or_else(|| {
+            exact_serialize_value_type
+                .as_deref()
+                .zip(shape)
+                .map(|(rust_type, shape)| replicated_field_handler_type(shape, rust_type))
+        })
         .or_else(|| structured_value.map(|value| value.field_type.clone()))
         .or_else(|| {
             rust_type
@@ -398,6 +423,7 @@ pub(super) fn state_field_shape_report(
         } else {
             fixed_sequence
                 .map(NetworkFixedSequenceFieldReport::value_type)
+                .or_else(|| exact_serialize_value_type.clone())
                 .or_else(|| structured_value.map(|value| value.value_type.clone()))
                 .or_else(|| {
                     rust_type
@@ -454,14 +480,7 @@ pub(super) fn field_wire_shape_source(
     })
 }
 
-pub(super) fn message_serialize_source_rust_type(field: &NetworkField) -> Option<String> {
-    let serialize = field.serialize.as_ref()?;
-    exact_type_id_rust_type(serialize.type_id)
-        .map(ToOwned::to_owned)
-        .or_else(|| serialize_source_rust_type_name(&serialize.name))
-}
-
-pub(super) fn message_selected_serialize_rust_type(
+pub(super) fn message_serialize_source_rust_type(
     field: &NetworkField,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<String> {
@@ -500,17 +519,27 @@ pub(super) fn message_nested_shape_rust_type(
         }
         // Exact Ghidra identity without a SerializeContext match: still emit a
         // local support type from the proven nested wire layout.
-        if shape.has_proven_layout() {
+        if shape.has_proven_layout()
+            && !shape.members.is_empty()
+            && container_value_shape_members_are_emittable(shape, &[], serialize_types)
+        {
             return message_nested_shape_support_type_name(field, shape, message_type_name);
         }
+        return None;
     }
-    if shape.has_proven_symbolic_identity() {
+    if shape.has_proven_symbolic_identity()
+        && !shape.members.is_empty()
+        && container_value_shape_members_are_emittable(shape, &[], serialize_types)
+    {
         return message_nested_shape_support_type_name(field, shape, message_type_name);
     }
     if !shape.has_proven_anonymous_layout() {
         return None;
     }
-    message_nested_shape_support_type_name(field, shape, message_type_name)
+    (!shape.members.is_empty()
+        && container_value_shape_members_are_emittable(shape, &[], serialize_types))
+    .then(|| message_nested_shape_support_type_name(field, shape, message_type_name))
+    .flatten()
 }
 
 fn shared_network_nested_shape_rust_type(
@@ -641,7 +670,12 @@ pub(super) fn resolved_field_descriptor_rust_type(field: &NetworkField) -> Optio
         .rust_type
         .as_deref()
         .map(normalize_generated_rust_type)
-        .or_else(|| message_serialize_source_rust_type(field))
+        .or_else(|| {
+            let serialize = field.serialize.as_ref()?;
+            exact_type_id_rust_type(serialize.type_id)
+                .map(ToOwned::to_owned)
+                .or_else(|| serialize_source_rust_type_name(&serialize.name))
+        })
 }
 
 pub(super) fn normalize_generated_rust_type(rust_type: &str) -> String {
@@ -974,6 +1008,9 @@ pub(super) fn message_field_blocked_reason(
     if !field.confidence.is_high_or_exact() {
         return Some("low-confidence-field".to_owned());
     }
+    if shape.is_some_and(message_wire_shape_contains_class_value) {
+        return Some("unresolved-class-value".to_owned());
+    }
     if let Some(rust_type) = rust_type
         && syn::parse_str::<syn::Type>(rust_type).is_ok()
     {
@@ -1001,6 +1038,27 @@ pub(super) fn message_field_blocked_reason(
     // alone (see rust_field_shape). RegisterField-backed sequences still use
     // the handler-plan path in state_field_shape_report.
     None
+}
+
+fn message_wire_shape_contains_class_value(shape: &SchemaWireShape) -> bool {
+    match shape {
+        SchemaWireShape::ClassValue => true,
+        SchemaWireShape::Composite(members) | SchemaWireShape::DefaultOmitted(members) => {
+            members.iter().any(message_wire_shape_contains_class_value)
+        }
+        SchemaWireShape::BooleanChoice(choice) => {
+            message_wire_shape_contains_class_value(&choice.false_value)
+                || message_wire_shape_contains_class_value(&choice.true_value)
+        }
+        SchemaWireShape::Optional(inner)
+        | SchemaWireShape::Sequence(inner)
+        | SchemaWireShape::Set(inner) => message_wire_shape_contains_class_value(inner),
+        SchemaWireShape::Map { key, value } => {
+            message_wire_shape_contains_class_value(key)
+                || message_wire_shape_contains_class_value(value)
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn has_composite_support_type_evidence(field: &NetworkField) -> bool {

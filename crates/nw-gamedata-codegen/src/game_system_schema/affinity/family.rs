@@ -40,6 +40,9 @@ pub(super) fn apply_family_shape_affinity(
 ) {
     let mut shape_by_family: HashMap<(String, String), FamilyShapeAffinity> = HashMap::new();
     for state in states.iter() {
+        if state.effective_shape.requires_authored_string() {
+            continue;
+        }
         let family = (state.row_type_name.clone(), state.column_name.clone());
         let affinity = shape_by_family.entry(family).or_default();
         affinity.semantic_boolean |=
@@ -126,7 +129,7 @@ pub(super) fn apply_family_shape_affinity(
     }
 
     for state in states {
-        if state.effective_row_key {
+        if state.effective_row_key || state.effective_shape.requires_authored_string() {
             continue;
         };
         if matches!(
@@ -241,6 +244,7 @@ pub(super) fn apply_family_text_shape_repair(
         localized_key_like: false,
         asset_path_like: false,
         expression_like: false,
+        qualified_reference_like: false,
         list: None,
         foreign_keys: Vec::new(),
     };

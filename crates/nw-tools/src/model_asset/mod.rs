@@ -142,7 +142,11 @@ pub(crate) fn resolve(
             let mut animations = Vec::new();
             for clip in clips {
                 if clip_targets_skeleton(&clip, &skeleton) {
-                    animations.push(nw_model::ModelAnimation { skeleton: 0, clip });
+                    animations.push(nw_model::ModelAnimation {
+                        skeleton: 0,
+                        clip,
+                        controller_binding: None,
+                    });
                 } else {
                     record_unbound_animation(&mut extras, &clip.source_path, 0);
                 }

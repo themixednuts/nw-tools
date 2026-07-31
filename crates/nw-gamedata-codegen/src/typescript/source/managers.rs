@@ -1932,6 +1932,7 @@ mod tests {
                 localized_key_like: false,
                 asset_path_like: false,
                 expression_like: false,
+                qualified_reference_like: false,
                 list: None,
                 foreign_keys: Vec::new(),
             },
@@ -4716,6 +4717,12 @@ fn ts_projection_value(field: &crate::manager_records::SemanticRecordField) -> S
         SemanticProjectionTransform::OptionalLowercaseCrcString => {
             format!("optionalLowercaseCrcStringCell(table, sourceRow, {column})")
         }
+        SemanticProjectionTransform::OptionalQualifiedLowercaseCrcString => {
+            format!("optionalQualifiedCrcUint16Cell(table, sourceRow, {column})?.[0] ?? null")
+        }
+        SemanticProjectionTransform::OptionalQualifiedU16 => {
+            format!("optionalQualifiedCrcUint16Cell(table, sourceRow, {column})?.[1] ?? null")
+        }
         SemanticProjectionTransform::OptionalTrimmedLowercaseCrcString => {
             format!("optionalTrimmedLowercaseCrcStringCell(table, sourceRow, {column})")
         }
@@ -5026,6 +5033,32 @@ function optionalLowercaseCrcStringCell(
 ): Crc32 | null {
   const value = optionalStringCell(table, row, columnName);
   return value === null ? null : Crc32.fromStringLower(value);
+}
+
+function optionalQualifiedCrcUint16Cell(
+  table: DynamicTable,
+  row: DynamicTableRow,
+  columnName: string,
+): readonly [Crc32, number] | null {
+  const value = optionalStringCell(table, row, columnName);
+  if (value === null) {
+    return null;
+  }
+  const separator = value.indexOf(":");
+  const identifier = (separator < 0 ? "" : value.slice(0, separator)).trim();
+  const rankText = (separator < 0 ? "" : value.slice(separator + 1)).trim();
+  if (identifier.length === 0 || !/^[0-9]+$/.test(rankText)) {
+    throw new Error(
+      `row ${row.sourcePath}:${row.rowIndex + 1} column ${columnName} value ${JSON.stringify(value)} must have non-empty identifier:uint16-rank syntax`,
+    );
+  }
+  const rank = Number(rankText);
+  if (!Number.isSafeInteger(rank) || rank > 0xffff) {
+    throw new Error(
+      `row ${row.sourcePath}:${row.rowIndex + 1} column ${columnName} value ${JSON.stringify(value)} has rank outside uint16 range`,
+    );
+  }
+  return Object.freeze([Crc32.fromStringLower(identifier), rank] as const);
 }
 
 function optionalTrimmedLowercaseCrcStringCell(

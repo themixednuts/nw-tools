@@ -60,9 +60,52 @@ pub enum GameSystemColumnValueShape {
         localized_key_like: bool,
         asset_path_like: bool,
         expression_like: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        qualified_reference_like: bool,
         list: Option<GameSystemListShape>,
         foreign_keys: Vec<GameSystemForeignKeyCandidate>,
     },
+}
+
+impl GameSystemColumnValueShape {
+    /// Whether this string shape contains an authored boolean expression.
+    #[must_use]
+    pub fn is_expression_like(&self) -> bool {
+        matches!(
+            self,
+            Self::String {
+                expression_like: true,
+                ..
+            }
+        )
+    }
+
+    /// Whether this string shape contains an identifier with an authored
+    /// numeric qualifier, such as `PvP_XP:5`.
+    #[must_use]
+    pub fn is_qualified_reference_like(&self) -> bool {
+        matches!(
+            self,
+            Self::String {
+                qualified_reference_like: true,
+                ..
+            }
+        )
+    }
+
+    /// Whether this string shape carries authored syntax that cannot be
+    /// replaced by an inferred scalar type without losing information.
+    #[must_use]
+    pub fn requires_authored_string(&self) -> bool {
+        self.is_expression_like() || self.is_qualified_reference_like()
+    }
+
+    /// Whether every authored value can be represented losslessly as a plain
+    /// foreign-key key or list of keys.
+    #[must_use]
+    pub fn supports_lossless_foreign_key(&self) -> bool {
+        !self.requires_authored_string() && matches!(self, Self::String { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

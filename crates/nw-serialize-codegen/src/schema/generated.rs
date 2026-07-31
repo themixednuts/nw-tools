@@ -1,4 +1,3 @@
-
 // Example code that deserializes and serializes the model.
 // extern crate serde;
 // #[macro_use]
@@ -12,7 +11,7 @@
 //     let model: SerializeContext = serde_json::from_str(&json).unwrap();
 // }
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -147,6 +146,10 @@ pub struct StickyGenericClassInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     registered_type_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    elements_apply_to_class_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class_data_element_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     templated_argument_count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     templated_type_ids: Option<Vec<String>>,
@@ -239,6 +242,10 @@ pub struct TentacledGenericClassInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     registered_type_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    elements_apply_to_class_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class_data_element_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     templated_argument_count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     templated_type_ids: Option<Vec<String>>,
@@ -302,6 +309,10 @@ pub struct FluffyGenericClassInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     registered_type_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    elements_apply_to_class_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class_data_element_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     templated_argument_count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     templated_type_ids: Option<Vec<String>>,
@@ -360,6 +371,10 @@ pub struct PurpleGenericClassInfo {
     type_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     registered_type_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elements_apply_to_class_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class_data_element_count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     templated_argument_count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -455,6 +470,10 @@ pub struct UuidGenericMap {
     type_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     registered_type_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elements_apply_to_class_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class_data_element_count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     templated_argument_count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -682,4 +701,3 @@ pub struct UuidMapAzRtti {
     hierarchy: Option<Vec<Hierarchy>>,
     is_abstract: bool,
 }
-

@@ -659,6 +659,7 @@ mod tests {
                 kind: RustTypeIdentityKind::AzRtti,
                 type_id: source_type_id,
                 name: Some(source_name.to_owned()),
+                native_component_base_field: None,
             },
             repr: None,
             raw_conversion: None,

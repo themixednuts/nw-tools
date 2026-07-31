@@ -1214,7 +1214,7 @@ impl<'a> Resolver<'a> {
             dependencies.push(model_material_dependency(material_path, required));
         }
         let heap = format!("{path}heap");
-        if self.source.contains(&heap) {
+        if !file.data_refs().is_empty() {
             dependencies.push(AssetDependency::required_path("cry_model.heap", heap));
         }
         Ok(dependencies)
@@ -2376,6 +2376,36 @@ mod tests {
     }
 
     #[test]
+    fn packed_model_requires_its_mesh_heap_even_when_the_heap_is_missing() {
+        let source = MemorySource::default().with("objects/hero.cgf", cgf_with_data_ref());
+
+        let graph = inspect_direct(&source, "objects/hero.cgf").unwrap();
+
+        assert!(graph.unresolved().iter().any(|dependency| {
+            dependency.relation() == "cry_model.heap"
+                && dependency.target().to_string() == "objects/hero.cgfheap"
+                && dependency.is_required()
+                && dependency.reason() == UnresolvedReason::MissingAsset
+        }));
+    }
+
+    #[test]
+    fn unpacked_model_does_not_claim_an_unreferenced_heap() {
+        let source = MemorySource::default()
+            .with("objects/hero.cgf", minimal_cgf())
+            .with("objects/hero.cgfheap", b"stale heap".to_vec());
+
+        let graph = inspect_direct(&source, "objects/hero.cgf").unwrap();
+
+        assert!(
+            graph
+                .edges()
+                .iter()
+                .all(|edge| edge.relation() != "cry_model.heap")
+        );
+    }
+
+    #[test]
     fn resolves_and_validates_character_rnr_physics() {
         let source = MemorySource::default()
             .with(
@@ -2524,6 +2554,29 @@ mod tests {
         bytes.extend_from_slice(&0x746_u32.to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes
+    }
+
+    fn cgf_with_data_ref() -> Vec<u8> {
+        const FILE_HEADER_LEN: u32 = 16;
+        const CHUNK_HEADER_LEN: u32 = 16;
+        const DATA_REF_PAYLOAD_LEN: u32 = 32;
+
+        let mut bytes = b"CrCh".to_vec();
+        bytes.extend_from_slice(&0x746_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&FILE_HEADER_LEN.to_le_bytes());
+        bytes.extend_from_slice(&0x300b_u16.to_le_bytes());
+        bytes.extend_from_slice(&0x0800_u16.to_le_bytes());
+        bytes.extend_from_slice(&7_i32.to_le_bytes());
+        bytes.extend_from_slice(&DATA_REF_PAYLOAD_LEN.to_le_bytes());
+        bytes.extend_from_slice(&(FILE_HEADER_LEN + CHUNK_HEADER_LEN).to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&64_u32.to_le_bytes());
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 12]);
         bytes
     }
 

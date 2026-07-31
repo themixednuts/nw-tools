@@ -3,12 +3,12 @@
 //! The XML tree is retained losslessly while typed projections expose the
 //! model, attachment list, and reflected asset references used by exporters.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub mod reflected;
 
 pub use cry_xml::XmlElement;
-use nw_asset::{AssetDependencies, AssetDependency, AssetDependencyTarget};
+use nw_asset::{AssetDependencies, AssetDependency, AssetDependencyTarget, normalize_virtual_path};
 use nw_reflected_types::types::{
     SimpleAssetReferenceBase, SimpleAssetReferenceCharacterDefinitionAsset,
     SimpleAssetReferenceMeshAsset, SimpleAssetReferenceSkinAsset,
@@ -449,6 +449,229 @@ impl AssetDependencies for CharacterParameters {
     }
 }
 
+/// Exact CDF/CHRPARAMS ownership of CAF authoring sources.
+///
+/// This follows each character definition's parameter root, preserves the
+/// sequential `#Filepath` state through includes, expands wildcard entries
+/// through the caller's asset index, and records every owning skeleton. It does
+/// not infer ownership from controller overlap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CharacterAnimationOwnershipIndex {
+    skeletons_by_clip: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl CharacterAnimationOwnershipIndex {
+    /// Build exact clip ownership from parsed character definitions.
+    ///
+    /// `read_parameters` must return a parsed CHRPARAMS document for a virtual
+    /// path. `matching_paths` must expand Cry wildcards against the same asset
+    /// source used to read the definitions.
+    pub fn build<Definitions, ReadParameters, MatchingPaths>(
+        definitions: Definitions,
+        mut read_parameters: ReadParameters,
+        mut matching_paths: MatchingPaths,
+    ) -> Result<Self, CharacterAnimationOwnershipError>
+    where
+        Definitions: IntoIterator<Item = (String, CharacterDefinition)>,
+        ReadParameters: FnMut(&str) -> Result<Option<CharacterParameters>, String>,
+        MatchingPaths: FnMut(&str) -> Result<Vec<String>, String>,
+    {
+        let mut ownership = Self::default();
+        for (definition_path, definition) in definitions {
+            let skeleton = normalize_virtual_path(&definition.model.skeleton);
+            if skeleton.is_empty() {
+                return Err(CharacterAnimationOwnershipError::MissingSkeleton {
+                    definition: definition_path,
+                });
+            }
+            let (parameters_path, required) =
+                if let Some(path) = definition.model.params_override.as_deref() {
+                    (normalize_virtual_path(path), true)
+                } else {
+                    (replace_virtual_extension(&skeleton, "chrparams"), false)
+                };
+            let Some(parameters) = read_parameters(&parameters_path).map_err(|message| {
+                CharacterAnimationOwnershipError::ReadParameters {
+                    path: parameters_path.clone(),
+                    message,
+                }
+            })?
+            else {
+                if required {
+                    return Err(
+                        CharacterAnimationOwnershipError::MissingRequiredParameters {
+                            definition: definition_path,
+                            path: parameters_path,
+                        },
+                    );
+                }
+                continue;
+            };
+            let mut state = CharacterAnimationPathResolver::default();
+            let mut visited = HashSet::new();
+            ownership.visit_parameters(
+                &parameters_path,
+                &parameters,
+                &skeleton,
+                &mut state,
+                &mut visited,
+                &mut read_parameters,
+                &mut matching_paths,
+            )?;
+        }
+        Ok(ownership)
+    }
+
+    #[must_use]
+    pub fn skeletons_for_clip(&self, source_path: &str) -> Option<&BTreeSet<String>> {
+        self.skeletons_by_clip
+            .get(&canonical_animation_clip_path(source_path))
+    }
+
+    #[must_use]
+    pub fn clips(&self) -> impl Iterator<Item = (&str, &BTreeSet<String>)> {
+        self.skeletons_by_clip
+            .iter()
+            .map(|(clip, skeletons)| (clip.as_str(), skeletons))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit_parameters<ReadParameters, MatchingPaths>(
+        &mut self,
+        source_path: &str,
+        parameters: &CharacterParameters,
+        skeleton: &str,
+        state: &mut CharacterAnimationPathResolver,
+        visited: &mut HashSet<String>,
+        read_parameters: &mut ReadParameters,
+        matching_paths: &mut MatchingPaths,
+    ) -> Result<(), CharacterAnimationOwnershipError>
+    where
+        ReadParameters: FnMut(&str) -> Result<Option<CharacterParameters>, String>,
+        MatchingPaths: FnMut(&str) -> Result<Vec<String>, String>,
+    {
+        if !visited.insert(normalize_virtual_path(source_path).to_ascii_lowercase()) {
+            return Ok(());
+        }
+        for entry in &parameters.animations {
+            let path = state.resolve_entry(entry);
+            match entry.kind {
+                CharacterAnimationEntryKind::FilePath
+                | CharacterAnimationEntryKind::ParseSubfolders
+                | CharacterAnimationEntryKind::TracksDatabase
+                | CharacterAnimationEntryKind::AnimationEventDatabase
+                | CharacterAnimationEntryKind::FaceLibrary => {}
+                CharacterAnimationEntryKind::Include => {
+                    if path.trim().is_empty() {
+                        continue;
+                    }
+                    let included = read_parameters(&path).map_err(|message| {
+                        CharacterAnimationOwnershipError::ReadParameters {
+                            path: path.clone(),
+                            message,
+                        }
+                    })?;
+                    let Some(included) = included else {
+                        return Err(
+                            CharacterAnimationOwnershipError::MissingIncludedParameters {
+                                source_path: source_path.to_string(),
+                                path,
+                            },
+                        );
+                    };
+                    self.visit_parameters(
+                        &path,
+                        &included,
+                        skeleton,
+                        state,
+                        visited,
+                        read_parameters,
+                        matching_paths,
+                    )?;
+                }
+                CharacterAnimationEntryKind::WildcardAsset => {
+                    let matches = matching_paths(&path).map_err(|message| {
+                        CharacterAnimationOwnershipError::MatchPattern {
+                            source_path: source_path.to_string(),
+                            pattern: path.clone(),
+                            message,
+                        }
+                    })?;
+                    for matched in matches {
+                        self.add_clip_owner(&matched, skeleton);
+                    }
+                }
+                CharacterAnimationEntryKind::Asset => {
+                    self.add_clip_owner(&path, skeleton);
+                }
+                CharacterAnimationEntryKind::UnknownDirective => {
+                    return Err(CharacterAnimationOwnershipError::UnsupportedDirective {
+                        source_path: source_path.to_string(),
+                        name: entry.name.clone(),
+                        path: entry.path.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn add_clip_owner(&mut self, source_path: &str, skeleton: &str) {
+        if !is_animation_clip_path(source_path) {
+            return;
+        }
+        self.skeletons_by_clip
+            .entry(canonical_animation_clip_path(source_path))
+            .or_default()
+            .insert(normalize_virtual_path(skeleton));
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CharacterAnimationOwnershipError {
+    #[error("character definition {definition} has no skeleton")]
+    MissingSkeleton { definition: String },
+    #[error("character definition {definition} requires missing parameters {path}")]
+    MissingRequiredParameters { definition: String, path: String },
+    #[error("included character parameters {path} from {source_path} are missing")]
+    MissingIncludedParameters { source_path: String, path: String },
+    #[error("read character parameters {path}: {message}")]
+    ReadParameters { path: String, message: String },
+    #[error("expand animation pattern {pattern} from {source_path}: {message}")]
+    MatchPattern {
+        source_path: String,
+        pattern: String,
+        message: String,
+    },
+    #[error("unsupported CHRPARAMS directive `{name}` with path `{path}` in {source_path}")]
+    UnsupportedDirective {
+        source_path: String,
+        name: String,
+        path: String,
+    },
+}
+
+#[must_use]
+pub fn canonical_animation_clip_path(path: &str) -> String {
+    let normalized = normalize_virtual_path(path).to_ascii_lowercase();
+    normalized
+        .strip_suffix(".i_caf")
+        .map_or(normalized.clone(), |stem| format!("{stem}.caf"))
+}
+
+fn is_animation_clip_path(path: &str) -> bool {
+    let path = normalize_virtual_path(path).to_ascii_lowercase();
+    path.ends_with(".caf") || path.ends_with(".i_caf")
+}
+
+fn replace_virtual_extension(path: &str, extension: &str) -> String {
+    let path = normalize_virtual_path(path);
+    path.rsplit_once('.').map_or_else(
+        || format!("{path}.{extension}"),
+        |(stem, _)| format!("{stem}.{extension}"),
+    )
+}
+
 fn path_dependency(relation: &str, path: String, required: bool) -> AssetDependency {
     let target = if path.contains(['*', '?', '[']) {
         AssetDependencyTarget::pattern(path)
@@ -632,5 +855,51 @@ mod tests {
                     if reference.hint() == Some("animations/alligator.animevents")
             )
         }));
+    }
+
+    #[test]
+    fn animation_ownership_uses_cdf_parameters_and_shared_include_path_state() {
+        let definition = CharacterDefinition::from_xml(
+            r#"<CharacterDefinition><Model File="objects/hero.chr"/></CharacterDefinition>"#,
+        )
+        .unwrap();
+        let root = CharacterParameters::from_xml(
+            r##"<Params><AnimationList>
+                <Animation name="#filepath" path="animations/shared"/>
+                <Animation name="$Include" path="objects/shared.chrparams"/>
+                <Animation name="$Include" path=""/>
+            </AnimationList></Params>"##,
+        )
+        .unwrap();
+        let shared = CharacterParameters::from_xml(
+            r#"<Params><AnimationList>
+                <Animation name="idle" path="idle.caf"/>
+                <Animation name="moves" path="move_*.caf"/>
+            </AnimationList></Params>"#,
+        )
+        .unwrap();
+        let parameters = BTreeMap::from([
+            ("objects/hero.chrparams".to_string(), root),
+            ("objects/shared.chrparams".to_string(), shared),
+        ]);
+
+        let ownership = CharacterAnimationOwnershipIndex::build(
+            [("objects/hero.cdf".to_string(), definition)],
+            |path| Ok(parameters.get(path).cloned()),
+            |pattern| {
+                assert_eq!(pattern, "animations/shared/move_*.caf");
+                Ok(vec!["animations/shared/move_forward.i_caf".to_string()])
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            ownership.skeletons_for_clip("animations/shared/idle.i_caf"),
+            Some(&BTreeSet::from(["objects/hero.chr".to_string()]))
+        );
+        assert_eq!(
+            ownership.skeletons_for_clip("animations/shared/move_forward.caf"),
+            Some(&BTreeSet::from(["objects/hero.chr".to_string()]))
+        );
     }
 }

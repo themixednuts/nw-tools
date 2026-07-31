@@ -1890,6 +1890,7 @@ mod indexed_tests {
                 localized_key_like: false,
                 asset_path_like: false,
                 expression_like: false,
+                qualified_reference_like: false,
                 list: None,
                 foreign_keys: Vec::new(),
             },
