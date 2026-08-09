@@ -16,6 +16,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  AZ_RS_REV: f787c9eddc11a12458f50f1114d7c600e636a104
 
 jobs:
   fmt:
@@ -24,6 +25,13 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v7.0.0
+
+      - name: checkout az-rs
+        run: |
+          git init ..\az-rs
+          git -C ..\az-rs remote add origin https://github.com/TheMixys/az-rs.git
+          git -C ..\az-rs fetch --depth 1 origin $env:AZ_RS_REV
+          git -C ..\az-rs switch --detach FETCH_HEAD
 
       - name: rust
         run: rustup toolchain install stable --profile minimal --component rustfmt
@@ -38,6 +46,13 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v7.0.0
+
+      - name: checkout az-rs
+        run: |
+          git init ..\az-rs
+          git -C ..\az-rs remote add origin https://github.com/TheMixys/az-rs.git
+          git -C ..\az-rs fetch --depth 1 origin $env:AZ_RS_REV
+          git -C ..\az-rs switch --detach FETCH_HEAD
 
       - name: rust
         run: rustup toolchain install stable --profile minimal --component clippy
@@ -57,6 +72,13 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v7.0.0
+
+      - name: checkout az-rs
+        run: |
+          git init ..\az-rs
+          git -C ..\az-rs remote add origin https://github.com/TheMixys/az-rs.git
+          git -C ..\az-rs fetch --depth 1 origin $env:AZ_RS_REV
+          git -C ..\az-rs switch --detach FETCH_HEAD
 
       - name: rust
         run: rustup toolchain install stable --profile minimal
