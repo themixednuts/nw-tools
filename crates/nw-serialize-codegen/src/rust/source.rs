@@ -1097,7 +1097,7 @@ fn render_sum_deserialize_impl(
         .map(|(variant_index, variant)| {
             let variant_ident = parse_variant_ident(item, variant)?;
             let variant_index = variant_index as u32;
-            if let Some(_) = variant.payload_type {
+            if variant.payload_type.is_some() {
                 let payload_ty = parse_variant_payload_type(item, variant)?;
                 Ok(quote! {
                     #variant_index => {

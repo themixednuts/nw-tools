@@ -5,6 +5,8 @@
 //! pointing into the heap (New World's common interleaved layout). Both are
 //! resolved here, following nw-buddy's `convertPrimitive`.
 
+use std::collections::BTreeMap;
+
 use cry_chunk::{CgfFile, MeshChunk, MeshSubset, MeshSubsetBoneIds};
 use glam::{Mat3, Mat4, Quat, Vec2, Vec3};
 use serde::Serialize;
@@ -213,6 +215,14 @@ pub enum ModelBuildError {
     MissingSkinBone { bone: String, target: usize },
     #[error("material index {material_id} plus table offset {offset} exceeds Cry's i32 range")]
     MaterialIndexOverflow { material_id: i32, offset: usize },
+    #[error(
+        "mesh node `{mesh}` physicalization slot {slot} has malformed serialized geometry: {reason}"
+    )]
+    MalformedPhysicsGeometry {
+        mesh: String,
+        slot: usize,
+        reason: &'static str,
+    },
 }
 
 /// Build a model from a parsed chunk file and its heap (`&[]` if none).
@@ -266,6 +276,33 @@ impl Model {
                 .collect::<Result<Vec<_>, ModelBuildError>>()?;
             let has_drawable_subsets = cgf.mesh_subsets().contains_key(&mesh.subsets_chunk_id);
             if !has_drawable_subsets && !physics_data.is_empty() {
+                let world =
+                    node_world_matrix(cgf, node.parent_id, math::node_matrix(node.transform));
+                let mut primitives = Vec::new();
+                for payload in &physics_data {
+                    if let Some(mut decoded) =
+                        decode_serialized_physics_mesh(name, payload, &world)?
+                    {
+                        primitives.append(&mut decoded);
+                    }
+                }
+                if !primitives.is_empty() {
+                    meshes.push(Mesh {
+                        name: name.to_owned(),
+                        primitives,
+                        physics_data,
+                        role: if is_physics_proxy {
+                            MeshRole::PhysicsProxy
+                        } else {
+                            MeshRole::Render
+                        },
+                        skin: None,
+                        lod: node_lod(name),
+                        shadow_proxy: false,
+                        attachment: None,
+                    });
+                    continue;
+                }
                 auxiliary_nodes.push(AuxiliaryNode {
                     name: name.to_owned(),
                     role: if is_physics_proxy {
@@ -311,6 +348,180 @@ impl Model {
             skeletons,
             auxiliary_nodes,
         })
+    }
+}
+
+const PHYS_GEOM_VERSION: u32 = 1;
+const GEOM_TRIMESH: u32 = 1;
+const MESH_SHARED_VERTICES: u32 = 1;
+const MESH_FULL_SERIALIZATION: u32 = 0x40_0000;
+
+/// Decode the standalone triangle data written by CryPhysics
+/// `CGeomManager::SavePhysGeometry` / `CTriMesh::Save`. Physics-only CGFs have
+/// no `MeshSubsets` or render streams, so this serialized geometry is their
+/// sole editable triangle source.
+fn decode_serialized_physics_mesh(
+    mesh: &str,
+    payload: &MeshPhysicsData,
+    world: &Mat4,
+) -> Result<Option<Vec<Primitive>>, ModelBuildError> {
+    let mut reader = PhysicsGeometryReader::new(&payload.physical_data, mesh, payload.slot);
+    if reader.u32()? != PHYS_GEOM_VERSION {
+        return Ok(None);
+    }
+    reader.skip(64)?;
+    if reader.u32()? != GEOM_TRIMESH {
+        return Ok(None);
+    }
+
+    let vertex_count = reader.count("vertex count")?;
+    let triangle_count = reader.count("triangle count")?;
+    reader.skip(4)?;
+    let flags = reader.u32()?;
+    if flags & MESH_FULL_SERIALIZATION == 0 || flags & MESH_SHARED_VERTICES != 0 {
+        return Ok(None);
+    }
+
+    if reader.boolean()? {
+        reader.skip_count(vertex_count, 2, "vertex-map bytes")?;
+    }
+    if reader.boolean()? {
+        reader.skip_count(triangle_count, 2, "foreign-index bytes")?;
+    }
+
+    let mut positions = Vec::with_capacity(vertex_count);
+    for _ in 0..vertex_count {
+        let position = Vec3::new(reader.f32()?, reader.f32()?, reader.f32()?);
+        positions.push(math::cry_to_gltf(world.transform_point3(position)));
+    }
+    let index_count = triangle_count
+        .checked_mul(3)
+        .ok_or_else(|| reader.error("triangle index count overflows usize"))?;
+    let mut indices = Vec::with_capacity(index_count);
+    for _ in 0..index_count {
+        let index = u32::from(reader.u16()?);
+        if usize::try_from(index).map_or(true, |index| index >= vertex_count) {
+            return Err(reader.error("triangle index exceeds vertex count"));
+        }
+        indices.push(index);
+    }
+
+    let material_ids = if reader.boolean()? {
+        (0..triangle_count)
+            .map(|_| reader.u8().map(i32::from))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        vec![0; triangle_count]
+    };
+    let mut by_material = BTreeMap::<i32, Vec<u32>>::new();
+    for (triangle, material_id) in material_ids.into_iter().enumerate() {
+        let first = triangle * 3;
+        by_material
+            .entry(material_id)
+            .or_default()
+            .extend_from_slice(&indices[first..first + 3]);
+    }
+
+    Ok(Some(
+        by_material
+            .into_iter()
+            .map(|(material_id, indices)| Primitive {
+                positions: positions.clone(),
+                normals: None,
+                uvs: None,
+                indices,
+                joints: None,
+                weights: None,
+                joints2: None,
+                weights2: None,
+                material_id,
+            })
+            .collect(),
+    ))
+}
+
+struct PhysicsGeometryReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    mesh: &'a str,
+    slot: usize,
+}
+
+impl<'a> PhysicsGeometryReader<'a> {
+    const fn new(bytes: &'a [u8], mesh: &'a str, slot: usize) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            mesh,
+            slot,
+        }
+    }
+
+    fn error(&self, reason: &'static str) -> ModelBuildError {
+        ModelBuildError::MalformedPhysicsGeometry {
+            mesh: self.mesh.to_owned(),
+            slot: self.slot,
+            reason,
+        }
+    }
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8], ModelBuildError> {
+        let end = self
+            .offset
+            .checked_add(count)
+            .ok_or_else(|| self.error("stream offset overflows usize"))?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| self.error("stream ends before declared geometry data"))?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn skip(&mut self, count: usize) -> Result<(), ModelBuildError> {
+        self.take(count).map(|_| ())
+    }
+
+    fn skip_count(
+        &mut self,
+        count: usize,
+        element_size: usize,
+        reason: &'static str,
+    ) -> Result<(), ModelBuildError> {
+        let bytes = count
+            .checked_mul(element_size)
+            .ok_or_else(|| self.error(reason))?;
+        self.skip(bytes)
+    }
+
+    fn count(&mut self, reason: &'static str) -> Result<usize, ModelBuildError> {
+        usize::try_from(self.u32()?).map_err(|_| self.error(reason))
+    }
+
+    fn boolean(&mut self) -> Result<bool, ModelBuildError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(self.error("serialized bool is neither zero nor one")),
+        }
+    }
+
+    fn u8(&mut self) -> Result<u8, ModelBuildError> {
+        self.take(1).map(|bytes| bytes[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, ModelBuildError> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, ModelBuildError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn f32(&mut self) -> Result<f32, ModelBuildError> {
+        Ok(f32::from_bits(self.u32()?))
     }
 }
 
@@ -1334,6 +1545,68 @@ mod tests {
         assert_eq!(node_lod("body$lod2"), Some(2));
         assert_eq!(node_lod("body$LOD12_extra"), Some(12));
         assert_eq!(node_lod("body"), None);
+    }
+
+    #[test]
+    fn decodes_fully_serialized_cry_physics_triangle_mesh() {
+        let payload = MeshPhysicsData {
+            slot: 0,
+            chunk_id: 10,
+            flags: 0,
+            tetrahedra_chunk_id: 0,
+            physical_data: serialized_triangle([0, 1, 2]),
+            tetrahedra_data: Vec::new(),
+        };
+
+        let primitives =
+            decode_serialized_physics_mesh("$physics_proxy", &payload, &Mat4::IDENTITY)
+                .expect("decode physics geometry")
+                .expect("supported physics geometry");
+        assert_eq!(primitives.len(), 1);
+        assert_eq!(primitives[0].material_id, 7);
+        assert_eq!(primitives[0].indices, [0, 1, 2]);
+        assert_eq!(primitives[0].positions, [Vec3::ZERO, Vec3::NEG_X, Vec3::Z]);
+    }
+
+    #[test]
+    fn rejects_serialized_physics_triangle_with_out_of_range_index() {
+        let payload = MeshPhysicsData {
+            slot: 2,
+            chunk_id: 10,
+            flags: 0,
+            tetrahedra_chunk_id: 0,
+            physical_data: serialized_triangle([0, 1, 3]),
+            tetrahedra_data: Vec::new(),
+        };
+
+        assert!(matches!(
+            decode_serialized_physics_mesh("$physics_proxy", &payload, &Mat4::IDENTITY),
+            Err(ModelBuildError::MalformedPhysicsGeometry { slot: 2, .. })
+        ));
+    }
+
+    fn serialized_triangle(indices: [u16; 3]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&PHYS_GEOM_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&[0; 64]);
+        bytes.extend_from_slice(&GEOM_TRIMESH.to_le_bytes());
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&MESH_FULL_SERIALIZATION.to_le_bytes());
+        bytes.push(0);
+        bytes.push(0);
+        for position in [Vec3::ZERO, Vec3::X, Vec3::Y] {
+            for value in position.to_array() {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        for index in indices {
+            bytes.extend_from_slice(&index.to_le_bytes());
+        }
+        bytes.push(1);
+        bytes.push(7);
+        bytes
     }
 
     fn subset(first_vertex: usize, num_vertices: usize) -> MeshSubset {

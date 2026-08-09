@@ -53,9 +53,11 @@ fn emits_conversion_marshaler_for_explicit_message_scalar_types() {
     let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
     assert_eq!(output.report.generatable_message_count, 1);
-    assert!(output
-        .source
-        .contains("pub grid_side: ::nw_network::source::GridSides"));
+    assert!(
+        output
+            .source
+            .contains("pub grid_side: ::nw_network::source::GridSides")
+    );
     assert!(
         output.source.contains("codec =")
             && output.source.contains(
@@ -101,9 +103,11 @@ fn emits_selected_serialize_enum_message_field_from_source_type_id() {
         field.rust_value_type.as_deref(),
         Some("::nw_network::source::GridSides")
     );
-    assert!(output
-        .source
-        .contains("pub grid_side: ::nw_network::source::GridSides"));
+    assert!(
+        output
+            .source
+            .contains("pub grid_side: ::nw_network::source::GridSides")
+    );
     assert!(output.source.contains(
         "::nw_network::serialize::ConversionMarshaler<u8, ::nw_network::source::GridSides>"
     ));
@@ -132,9 +136,11 @@ fn leaves_explicit_self_marshaling_scalar_types_unwrapped() {
     let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
     assert_eq!(output.report.generatable_message_count, 1);
-    assert!(output
-        .source
-        .contains("pub type_index_crc: ::nw_network::TypeIndexCrc"));
+    assert!(
+        output
+            .source
+            .contains("pub type_index_crc: ::nw_network::TypeIndexCrc")
+    );
     assert!(!output.source.contains("ConversionMarshaler"));
     assert!(!output.source.contains("codec ="));
 }
@@ -164,13 +170,17 @@ fn emits_conversion_marshaler_for_explicit_replicated_state_scalar_types() {
     let output = NetworkRustEmitter::emit_replicated_states(&schema, [28]).expect("state source");
 
     assert_eq!(output.report.generatable_state_count, 1);
-    assert!(output
-        .source
-        .contains("pub grid_side: ::nw_network::serialize::ReplicatedFieldHandler<"));
+    assert!(
+        output
+            .source
+            .contains("pub grid_side: ::nw_network::serialize::ReplicatedFieldHandler<")
+    );
     assert!(output.source.contains("::nw_network::source::GridSides"));
-    assert!(output
-        .source
-        .contains("::nw_network::serialize::ConversionMarshaler<"));
+    assert!(
+        output
+            .source
+            .contains("::nw_network::serialize::ConversionMarshaler<")
+    );
     assert!(output.source.contains("u8,"));
 }
 
@@ -274,9 +284,11 @@ fn emits_selected_serialize_struct_message_field_from_source_type_id() {
         Some("::nw_network::source::PayloadData")
     );
     assert!(output.source.contains("pub struct PayloadMsg"));
-    assert!(output
-        .source
-        .contains("pub payload: ::nw_network::source::PayloadData"));
+    assert!(
+        output
+            .source
+            .contains("pub payload: ::nw_network::source::PayloadData")
+    );
 }
 
 #[test]
@@ -312,12 +324,16 @@ fn emits_marshaler_conversions_for_compact_generated_enums() {
         NetworkRustEmitter::emit_marshaler_conversions([&item]).expect("conversion source");
 
     assert_eq!(output.report.marshaler_conversion_count, 3);
-    assert!(output
-        .source
-        .contains("impl ::nw_network::serialize::MarshalerConversion<u8>"));
-    assert!(output
-        .source
-        .contains("for ::nw_network::source::GridSides"));
+    assert!(
+        output
+            .source
+            .contains("impl ::nw_network::serialize::MarshalerConversion<u8>")
+    );
+    assert!(
+        output
+            .source
+            .contains("for ::nw_network::source::GridSides")
+    );
     assert!(output.source.contains("let raw = i32::from(self);"));
     assert!(output.source.contains("min: 0u64"));
     assert!(output.source.contains("max: 4u64"));
@@ -401,9 +417,11 @@ fn emits_struct_marshaler_for_signed_enum_fields() {
     assert!(output.source.contains(
         "impl ::nw_network::serialize::Unmarshal for ::nw_network::source::TerritoryUpgradeData"
     ));
-    assert!(output
-        .source
-        .contains("let raw = i32::from(self.category);"));
+    assert!(
+        output
+            .source
+            .contains("let raw = i32::from(self.category);")
+    );
     assert!(output.source.contains("min: 0u64"));
     assert!(output.source.contains("max: 0u64"));
 }

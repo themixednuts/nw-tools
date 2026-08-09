@@ -898,7 +898,7 @@ fn render_integrated_register(
         .filter(|item| can_register_az_rtti(item))
         .map(|item| parse_register_item_ident(item))
         .collect::<Result<Vec<_>, _>>()?;
-    let arc_types = smart_pointer_types_needing_serde_reflect(&items)?;
+    let arc_types = smart_pointer_types_needing_serde_reflect(items)?;
     let file = syn::parse2::<syn::File>(quote! {
         pub fn register(app: &mut App) {
             #(#child_modules::register(app);)*

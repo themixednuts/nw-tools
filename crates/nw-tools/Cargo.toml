@@ -62,7 +62,7 @@ arboard = { version = "3.6.1", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["png", "qoi", "tiff", "exr", "gif"] }
 base64 = "0.22.1"
 uuid.workspace = true
-drizzle = { git = "https://github.com/themixednuts/drizzle-rs", rev = "78688095e29643709213dc3d23a95bcf374d22e2", features = [
+drizzle = { git = "https://github.com/themixednuts/drizzle-rs", rev = "a64799e7fe92361e24c7c79be1b944bf78fcb19a", features = [
   "turso",
 ] }
 futures-lite = "2"
@@ -71,10 +71,10 @@ toml = "0.9"
 walkdir = "2"
 
 [build-dependencies]
-drizzle-migrations = { git = "https://github.com/themixednuts/drizzle-rs", rev = "78688095e29643709213dc3d23a95bcf374d22e2" }
-drizzle-types = { git = "https://github.com/themixednuts/drizzle-rs", rev = "78688095e29643709213dc3d23a95bcf374d22e2" }
+drizzle-migrations = { git = "https://github.com/themixednuts/drizzle-rs", rev = "a64799e7fe92361e24c7c79be1b944bf78fcb19a" }
+drizzle-types = { git = "https://github.com/themixednuts/drizzle-rs", rev = "a64799e7fe92361e24c7c79be1b944bf78fcb19a" }
 
 [dev-dependencies]
-turso = { version = "=0.7.2", default-features = false, features = [
+turso = { version = "=0.8.0-pre.2", default-features = false, features = [
   "pure-rust-crypto",
 ] }

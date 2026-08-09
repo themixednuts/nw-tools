@@ -140,8 +140,7 @@ pub fn write_native_sources(
     })
 }
 
-/// The sidecar path for a native source file (`<file>` + `.azmeta.json`).
-#[must_use]
+/// Create an output directory while retaining its path in any I/O error.
 fn create_dir_all(path: &Path) -> Result<(), WriteError> {
     std::fs::create_dir_all(path).map_err(|source| WriteError::Io {
         path: path.to_path_buf(),

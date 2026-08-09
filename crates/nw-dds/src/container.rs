@@ -748,11 +748,11 @@ fn top_mip_level<'a>(bytes: &'a [u8], sidecars: &[Sidecar<'a>]) -> Result<TopMip
     })
 }
 
-fn top_mip_image_blocks<'a>(
+fn top_mip_image_blocks(
     texture: Texture,
     shape: DdsShape,
-    blocks: &'a [u8],
-) -> Result<impl Iterator<Item = &'a [u8]>, Error> {
+    blocks: &[u8],
+) -> Result<impl Iterator<Item = &[u8]>, Error> {
     let image_count = usize::try_from(shape.image_count()).map_err(|_| Error::SizeOverflow {
         what: "DDS image count",
     })?;
@@ -2637,7 +2637,7 @@ mod tests {
         bytes[124..128].copy_from_slice(b"FYRC");
         put_u32(&mut bytes, DDS_FILE_HEADER_LEN + 8, 0x4);
         put_u32(&mut bytes, DDS_FILE_HEADER_LEN + 12, 6);
-        bytes.extend_from_slice(&vec![0; 16 * 6]);
+        bytes.extend_from_slice(&[0; 16 * 6]);
 
         let dds = Dds::parse(&bytes).unwrap();
         assert_eq!(dds.shape().array_layers, 1);
