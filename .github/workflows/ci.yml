@@ -25,18 +25,23 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v7.0.0
+        with:
+          path: nw-tools
 
       - name: checkout az-rs
-        run: |
-          git init ..\az-rs
-          git -C ..\az-rs remote add origin https://github.com/TheMixys/az-rs.git
-          git -C ..\az-rs fetch --depth 1 origin $env:AZ_RS_REV
-          git -C ..\az-rs switch --detach FETCH_HEAD
+        uses: actions/checkout@v7.0.0
+        with:
+          repository: TheMixys/az-rs
+          ref: ${{ env.AZ_RS_REV }}
+          path: az-rs
+          ssh-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
+          persist-credentials: false
 
       - name: rust
         run: rustup toolchain install stable --profile minimal --component rustfmt
 
       - name: fmt
+        working-directory: nw-tools
         run: cargo fmt --all --check
 
   clippy:
@@ -46,13 +51,17 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v7.0.0
+        with:
+          path: nw-tools
 
       - name: checkout az-rs
-        run: |
-          git init ..\az-rs
-          git -C ..\az-rs remote add origin https://github.com/TheMixys/az-rs.git
-          git -C ..\az-rs fetch --depth 1 origin $env:AZ_RS_REV
-          git -C ..\az-rs switch --detach FETCH_HEAD
+        uses: actions/checkout@v7.0.0
+        with:
+          repository: TheMixys/az-rs
+          ref: ${{ env.AZ_RS_REV }}
+          path: az-rs
+          ssh-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
+          persist-credentials: false
 
       - name: rust
         run: rustup toolchain install stable --profile minimal --component clippy
@@ -61,8 +70,10 @@ jobs:
         uses: Swatinem/rust-cache@v2.9.1
         with:
           shared-key: clippy
+          workspaces: nw-tools -> target
 
       - name: clippy
+        working-directory: nw-tools
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
@@ -72,13 +83,17 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v7.0.0
+        with:
+          path: nw-tools
 
       - name: checkout az-rs
-        run: |
-          git init ..\az-rs
-          git -C ..\az-rs remote add origin https://github.com/TheMixys/az-rs.git
-          git -C ..\az-rs fetch --depth 1 origin $env:AZ_RS_REV
-          git -C ..\az-rs switch --detach FETCH_HEAD
+        uses: actions/checkout@v7.0.0
+        with:
+          repository: TheMixys/az-rs
+          ref: ${{ env.AZ_RS_REV }}
+          path: az-rs
+          ssh-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
+          persist-credentials: false
 
       - name: rust
         run: rustup toolchain install stable --profile minimal
@@ -87,6 +102,8 @@ jobs:
         uses: Swatinem/rust-cache@v2.9.1
         with:
           shared-key: test
+          workspaces: nw-tools -> target
 
       - name: test
+        working-directory: nw-tools
         run: cargo test --workspace --locked
