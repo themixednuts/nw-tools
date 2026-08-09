@@ -36,6 +36,16 @@ fn collapses_alternate_spelling_multi_helper_wire_products() {
         ),
         Some("fixed-vector<composite<fixed-bytes-4,string>,20>")
     );
+    // Equal-width scalar calls are successive payload members, not duplicate
+    // machine/semantic views of one member. ActorRequestId is two u64 limbs.
+    assert_eq!(
+        collapse_alternate_spelling_wire_product("composite<fixed-bytes-8,fixed-bytes-8>", None,),
+        None
+    );
+    assert_eq!(
+        collapse_alternate_spelling_wire_product("composite<fixed-bytes-8,u64>", None),
+        None
+    );
     // Distinct successive helpers must stay composed (FilterChat GameChatMessage).
     assert_eq!(
         collapse_alternate_spelling_wire_product(

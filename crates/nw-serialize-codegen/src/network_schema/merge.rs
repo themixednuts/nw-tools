@@ -712,7 +712,11 @@ fn group_source_fields(
 }
 
 pub(super) fn equivalent_native_type(left: &str, right: &str) -> bool {
-    canonical_native_type(left) == canonical_native_type(right)
+    let left = canonical_native_type(left);
+    let right = canonical_native_type(right);
+    left == right
+        || (type_leaf_name(left) == type_leaf_name(right)
+            && (!left.contains("::") || !right.contains("::")))
 }
 
 pub(super) fn field_has_proven_native_type_identity(field: &NetworkField, expected: &str) -> bool {

@@ -463,6 +463,69 @@ fn message_signatures_refine_wire_projections_into_semantic_native_types() {
 }
 
 #[test]
+fn message_signatures_accept_qualified_native_names_for_recovered_leaf_names() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "971DDBB2-67DB-4BEB-9632-85851D0EE00E",
+            "typeIndex": 5181,
+            "typeName": "Javelin::ClientMessages::PlayerComponentServerFacet_OnAckLevelInfoChanged",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "nativeType": "ActorRequestId",
+                "sourceTypeName": "ActorRequestId",
+                "wireShape": "composite<u64,u64>",
+                "wireLayout": "composite<fixed-bytes-8,fixed-bytes-8>",
+                "confidence": "message-unmarshal-partial-call-frame-prefix"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&report).expect("schema");
+
+    let merge = schema.merge_message_signatures(
+        &[NetworkMessageSignature {
+            type_id: Some(uuid!("971ddbb2-67db-4beb-9632-85851d0ee00e")),
+            type_index: Some(5181),
+            name: Some(
+                "Javelin::ClientMessages::PlayerComponentServerFacet_OnAckLevelInfoChanged"
+                    .to_owned(),
+            ),
+            rust_name: Some("PlayerComponentServerFacetOnAckLevelInfoChangedMsg".to_owned()),
+            source: Some("native-unmarshal-and-marshal-listing".to_owned()),
+            fields: vec![NetworkMessageFieldSignature {
+                index: Some(0),
+                name: "Header".to_owned(),
+                rust_type: Some("::nw_network::ActorRequestId".to_owned()),
+                native_type: Some("Javelin::ClientMessages::ActorRequestId".to_owned()),
+                wire_shape: Some(NetworkWireShape::Composite(vec![
+                    NetworkWireShape::U64,
+                    NetworkWireShape::U64,
+                ])),
+            }],
+        }],
+        Some("message-signatures.json".to_owned()),
+    );
+
+    assert_eq!(merge.native_type_conflict_count, 0);
+    assert_eq!(merge.wire_shape_conflict_count, 0);
+    let field = &schema.types[0].fields[0];
+    assert_eq!(
+        field.native_type.as_deref(),
+        Some("Javelin::ClientMessages::ActorRequestId")
+    );
+    assert_eq!(
+        field.wire_shape,
+        Some(NetworkWireShape::Composite(vec![
+            NetworkWireShape::U64,
+            NetworkWireShape::U64,
+        ]))
+    );
+    assert!(!field.signature_type_conflict);
+    assert!(!field.signature_wire_conflict);
+}
+
+#[test]
 fn message_signatures_do_not_replace_partial_ghidra_fields() {
     let report = json!({
         "registryEntries": [{

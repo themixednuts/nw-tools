@@ -456,8 +456,8 @@ pub(crate) fn top_level_composite_members(value: &str) -> Option<Vec<&str>> {
     generic_arguments(value, "composite")
 }
 
-/// Collapse `composite<A,B>` when A and B are width-compatible alternate spellings
-/// of the same payload (e.g. ActorRequestId limbs as fixed-bytes-8 vs u64).
+/// Collapse `composite<A,B>` when A and B are width-compatible structured
+/// spellings of the same payload.
 pub(crate) fn collapse_alternate_spelling_wire_product<'a>(
     wire: &'a str,
     nested: Option<&NetworkNestedTypeShape>,
@@ -467,7 +467,9 @@ pub(crate) fn collapse_alternate_spelling_wire_product<'a>(
         return None;
     }
     let (left, right) = (members[0], members[1]);
-    if compatible_alternate_wire_products(left, right) {
+    if compatible_alternate_wire_products(left, right)
+        && (has_explicit_wire_structure(left) || has_explicit_wire_structure(right))
+    {
         return Some(prefer_alternate_wire_product(left, right, nested));
     }
     // Successive helpers sometimes re-append a leading/trailing sub-product
@@ -475,6 +477,15 @@ pub(crate) fn collapse_alternate_spelling_wire_product<'a>(
     // Require nested-shape agreement so legitimate composite<field, same-type>
     // products are not collapsed.
     collapse_redundant_composite_boundary_limb(left, right, nested)
+}
+
+fn has_explicit_wire_structure(value: &str) -> bool {
+    top_level_composite_members(value).is_some()
+        || value.starts_with("vec<")
+        || value.starts_with("fixed-vector<")
+        || value.starts_with("counted-set<")
+        || value.starts_with("counted-map<")
+        || value.starts_with("bit-mask-composite<")
 }
 
 fn collapse_redundant_composite_boundary_limb<'a>(
