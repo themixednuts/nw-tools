@@ -29,13 +29,11 @@ jobs:
           path: nw-tools
 
       - name: checkout az-rs
-        uses: actions/checkout@v7.0.0
+        uses: ./nw-tools/.github/actions/checkout-az-rs
+        timeout-minutes: 5
         with:
-          repository: TheMixys/az-rs
-          ref: ${{ env.AZ_RS_REV }}
-          path: az-rs
-          ssh-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
-          persist-credentials: false
+          revision: ${{ env.AZ_RS_REV }}
+          ssh-private-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
 
       - name: rust
         run: rustup toolchain install stable --profile minimal --component rustfmt
@@ -55,13 +53,11 @@ jobs:
           path: nw-tools
 
       - name: checkout az-rs
-        uses: actions/checkout@v7.0.0
+        uses: ./nw-tools/.github/actions/checkout-az-rs
+        timeout-minutes: 5
         with:
-          repository: TheMixys/az-rs
-          ref: ${{ env.AZ_RS_REV }}
-          path: az-rs
-          ssh-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
-          persist-credentials: false
+          revision: ${{ env.AZ_RS_REV }}
+          ssh-private-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
 
       - name: rust
         run: rustup toolchain install stable --profile minimal --component clippy
@@ -87,13 +83,11 @@ jobs:
           path: nw-tools
 
       - name: checkout az-rs
-        uses: actions/checkout@v7.0.0
+        uses: ./nw-tools/.github/actions/checkout-az-rs
+        timeout-minutes: 5
         with:
-          repository: TheMixys/az-rs
-          ref: ${{ env.AZ_RS_REV }}
-          path: az-rs
-          ssh-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
-          persist-credentials: false
+          revision: ${{ env.AZ_RS_REV }}
+          ssh-private-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
 
       - name: rust
         run: rustup toolchain install stable --profile minimal

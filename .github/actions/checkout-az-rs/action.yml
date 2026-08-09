@@ -1,0 +1,40 @@
+name: Checkout pinned az-rs
+description: Fetch the private Azoth source dependency over GitHub SSH port 443.
+
+inputs:
+  revision:
+    description: Exact az-rs commit to fetch.
+    required: true
+  ssh-private-key:
+    description: Read-only az-rs deploy key.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        AZ_RS_DEPLOY_KEY: ${{ inputs.ssh-private-key }}
+        AZ_RS_REVISION: ${{ inputs.revision }}
+      run: |
+        set -euo pipefail
+
+        runner_temp="$(cygpath -u "$RUNNER_TEMP")"
+        workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
+        key_path="$runner_temp/az-rs-deploy-key"
+        known_hosts_path="$runner_temp/az-rs-known-hosts"
+
+        cleanup() {
+          rm -f "$key_path" "$known_hosts_path"
+        }
+        trap cleanup EXIT
+
+        umask 077
+        printf '%s\n' "$AZ_RS_DEPLOY_KEY" > "$key_path"
+        ssh-keyscan -p 443 ssh.github.com > "$known_hosts_path"
+
+        export GIT_SSH_COMMAND="ssh -i $key_path -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts_path -p 443"
+        git init "$workspace/az-rs"
+        git -C "$workspace/az-rs" remote add origin ssh://git@ssh.github.com:443/TheMixys/az-rs.git
+        git -C "$workspace/az-rs" fetch --no-tags --depth 1 origin "$AZ_RS_REVISION"
+        git -C "$workspace/az-rs" switch --detach FETCH_HEAD
