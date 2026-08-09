@@ -287,6 +287,8 @@
         highFunctionCache.clear();
         smallHighFunctionCache.clear();
         failedHighFunctions.clear();
+        highFunctionFailureSampleKeys.clear();
+        highFunctionFailureSamples = new JsonArray();
         highFunctionSeen.clear();
         highFunctionRecompileCounts.clear();
         registryAnalysisCosts.clear();

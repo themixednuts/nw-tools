@@ -38,10 +38,16 @@
                 Integer::sum);
         }
         try {
+            checkAnalysisCancelled();
             DecompileResults results = decompiler.decompileFunction(function, 30, monitor);
+            checkAnalysisCancelled();
             if (!results.decompileCompleted() || results.getHighFunction() == null) {
                 runMetrics.increment("highFunctionFailures");
                 failedHighFunctions.add(key);
+                recordHighFunctionFailure(
+                    function,
+                    "decompile-incomplete",
+                    results.getErrorMessage());
                 return null;
             }
             runMetrics.increment("highFunctionCompleted");
@@ -49,11 +55,46 @@
             cache.put(key, high);
             return high;
         }
-        catch (Exception ignored) {
+        catch (AnalysisCancelledException cancelled) {
+            throw cancelled;
+        }
+        catch (Exception error) {
+            checkAnalysisCancelled();
             runMetrics.increment("highFunctionFailures");
             failedHighFunctions.add(key);
+            recordHighFunctionFailure(
+                function,
+                error.getClass().getSimpleName(),
+                error.getMessage());
             return null;
         }
+    }
+
+    private void recordHighFunctionFailure(
+        Function function,
+        String reason,
+        String detail) {
+        String address = formatAddress(function.getEntryPoint());
+        String normalizedReason = reason == null || reason.isBlank()
+            ? "unknown"
+            : reason;
+        String normalizedDetail = detail == null ? "" : detail.strip();
+        if (normalizedDetail.length() > 512) {
+            normalizedDetail = normalizedDetail.substring(0, 512);
+        }
+        String key = address + "|" + normalizedReason + "|" + normalizedDetail;
+        if (!highFunctionFailureSampleKeys.add(key) || highFunctionFailureSamples.size() >= 32) {
+            return;
+        }
+        JsonObject sample = new JsonObject();
+        sample.addProperty("function", address);
+        sample.addProperty("functionName", function.getName());
+        sample.addProperty("reason", normalizedReason);
+        if (!normalizedDetail.isEmpty()) {
+            sample.addProperty("detail", normalizedDetail);
+        }
+        highFunctionFailureSamples.add(sample);
+        println("High-function decompile failure: " + sample);
     }
 
     private Map<String, HighFunction> highFunctionCacheFor(Function function) {

@@ -154,7 +154,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private static final String EXTRACTOR_VERSION =
-        "network-schema-extractor-20260809-physical-mask-branch-polarity-pass";
+        "network-schema-extractor-20260809-cancellable-high-function-diagnostics-pass";
 
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
@@ -330,6 +330,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final Map<String, HighFunction> smallHighFunctionCache =
         lruCache(SMALL_HIGH_FUNCTION_CACHE_LIMIT);
     private final Set<String> failedHighFunctions = new HashSet<>();
+    private final Set<String> highFunctionFailureSampleKeys = new LinkedHashSet<>();
+    private JsonArray highFunctionFailureSamples = new JsonArray();
     private final Set<String> highFunctionSeen = new HashSet<>();
     private final Map<String, Integer> highFunctionRecompileCounts = new HashMap<>();
     private final List<RegistryAnalysisCost> registryAnalysisCosts = new ArrayList<>();
@@ -873,6 +875,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         performance.add(
             "highFunctionRecompileHotspots",
             highFunctionRecompileHotspotsJson());
+        performance.add("highFunctionFailureSamples", highFunctionFailureSamples.deepCopy());
         performance.add("registryAnalysisHotspots", registryAnalysisHotspotsJson());
         report.add("performance", performance);
 
