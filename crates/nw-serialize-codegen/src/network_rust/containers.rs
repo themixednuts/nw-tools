@@ -679,6 +679,13 @@ fn member_wire_shape_is_emittable(
             member_wire_shape_is_emittable(false_value, embedded_shapes, serialize_types)
                 && member_wire_shape_is_emittable(true_value, embedded_shapes, serialize_types)
         }
+        NetworkMemberWireShape::BitMaskComposite { members, .. } => members.iter().all(|member| {
+            let value = match member {
+                NetworkMemberBitMaskWireShape::Required(value)
+                | NetworkMemberBitMaskWireShape::Masked { value, .. } => value,
+            };
+            member_wire_shape_is_emittable(value, embedded_shapes, serialize_types)
+        }),
         NetworkMemberWireShape::Vector(element)
         | NetworkMemberWireShape::Set(element)
         | NetworkMemberWireShape::FixedVector { element, .. }

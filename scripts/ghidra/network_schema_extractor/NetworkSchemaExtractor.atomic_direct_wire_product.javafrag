@@ -1,0 +1,64 @@
+    private boolean addAtomicDirectWireSequenceMemberCandidate(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        PcodeStorage storage,
+        NestedTypeShape shape,
+        PcodeOp op,
+        Function target,
+        String source) {
+
+        if (byBase == null || storage == null || shape == null ||
+            !"wire-sequence".equals(shape.memberBase) ||
+            !Boolean.TRUE.equals(shape.memberCoverageProven) ||
+            !Boolean.TRUE.equals(shape.wireOrderProven)) {
+            return false;
+        }
+        String nativeType = directUnmarshalValueTypeName(target);
+        String semantic = wireShapeFromNestedTypeShape(shape);
+        String layout = wireLayoutFromNestedTypeShape(shape);
+        if (nativeType == null || semantic == null || layout == null) {
+            return false;
+        }
+        String evidenceSource = firstNonEmpty(
+            source,
+            "pcode-nested-direct-type-call") +
+            "+atomic-direct-wire-product";
+        addNestedTypeMemberCandidate(
+            byBase,
+            storage,
+            nativeType,
+            WireShape.semantic(
+                semantic,
+                layout,
+                evidenceSource),
+            op,
+            target,
+            evidenceSource);
+        Map<Long, NestedTypeMember> members = byBase.get(storage.base);
+        NestedTypeMember member = members == null
+            ? null
+            : members.get(storage.offset);
+        return member != null && !Boolean.TRUE.equals(member.typeConflict);
+    }
+
+    private boolean appendAtomicMessageCallFrameWireProduct(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        PcodeStorage binding,
+        NestedTypeShape nested,
+        PcodeOp operation,
+        Function target) {
+
+        if (!addAtomicDirectWireSequenceMemberCandidate(
+                byBase,
+                binding,
+                nested,
+                operation,
+                target,
+                "message-call-frame-callee-output")) {
+            return false;
+        }
+        markNestedTypeMemberWireOrder(
+            byBase,
+            binding,
+            "cfg-call-order+atomic-callee-wire-product");
+        return true;
+    }

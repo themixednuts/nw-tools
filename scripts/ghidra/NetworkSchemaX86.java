@@ -27,6 +27,15 @@ final class NetworkSchemaX86 {
         return null;
     }
 
+    static Long signedImmediateValue(Instruction instruction, int operandIndex) {
+        for (Object object : operandObjects(instruction, operandIndex)) {
+            if (object instanceof Scalar scalar) {
+                return scalar.getSignedValue();
+            }
+        }
+        return null;
+    }
+
     static String operandText(Instruction instruction, int operandIndex) {
         try {
             return instruction.getDefaultOperandRepresentation(operandIndex);

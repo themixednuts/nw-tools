@@ -238,6 +238,10 @@
             new ArrayList<>(Collections.nCopies(storage.members.size(), null));
         ArrayList<PcodeOpAST> evidence =
             new ArrayList<>(Collections.nCopies(storage.members.size(), null));
+        HashMap<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock =
+            new HashMap<>();
+        HashMap<PcodeBlockBasic, PcodeOpAST> eventOriginsByBlock =
+            new HashMap<>();
         for (NestedTypeMember member : storage.members) {
             if (member == null || member.wireOrdinal == null ||
                 member.wireOrdinal < 0 || member.wireOrdinal >= ordered.size() ||
@@ -246,12 +250,62 @@
             }
             PcodeOpAST operation = nestedMemberEvidenceOperation(high, member);
             PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
-            if (operation == null || block == null ||
-                !terminalFlow.mandatoryBlocks().contains(block)) {
+            if (operation == null || block == null) {
                 return false;
             }
             ordered.set(member.wireOrdinal, member);
             evidence.set(member.wireOrdinal, operation);
+            String layout = firstNonEmpty(member.wireLayout, member.wireShape);
+            String source = firstNonEmpty(
+                member.wireShapeSource,
+                member.wireLayoutSource);
+            if (layout == null || source == null) {
+                return false;
+            }
+            WireShape memberEvidence = member.wireShape == null
+                ? WireShape.layout(layout, source)
+                : WireShape.semantic(
+                    member.wireShape,
+                    layout,
+                    source);
+            CodecWireEvent event = new CodecWireEvent(
+                member.nativeType,
+                memberEvidence,
+                member.callsite,
+                member.target,
+                member.targetName,
+                null,
+                null);
+            eventsByBlock.computeIfAbsent(
+                block,
+                ignored -> new ArrayList<>()).add(event);
+            eventOriginsByBlock.put(block, operation);
+        }
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> codecFailureEdges =
+            unsuccessfulCodecEventEdges(
+                high,
+                eventsByBlock,
+                eventOriginsByBlock,
+                terminalFlow.terminals());
+        if (!codecFailureEdges.isEmpty()) {
+            terminalFlow = unmarshalFlowWithExcludedEdges(
+                high,
+                terminalFlow,
+                mergeExcludedEdges(
+                    terminalFlow.excludedEdges(),
+                    codecFailureEdges),
+                terminalFlow.status() +
+                    "+nested-storage-codec-failure-edges");
+        }
+        if (!isCompleteUnmarshalTerminalFlow(terminalFlow)) {
+            return false;
+        }
+        for (PcodeOpAST operation : evidence) {
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+            if (block == null ||
+                !terminalFlow.mandatoryBlocks().contains(block)) {
+                return false;
+            }
         }
         for (int index = 0; index < evidence.size() - 1; index++) {
             if (evidence.get(index) != evidence.get(index + 1) &&

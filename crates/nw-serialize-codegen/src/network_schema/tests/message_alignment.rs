@@ -59,7 +59,7 @@ fn source_signatures_reorder_proven_helper_aggregates_without_using_storage_orde
                 "nativeType": "Amazon::Hub::ActorRef",
                 "storageExpression": "param_3 + 0x40",
                 "storageOffset": "0x40",
-                "wireShape": "actor-ref",
+                "wireShape": "composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>",
                 "confidence": "message-unmarshal-call-frame-output-member"
             }, {
                 "index": 4,
@@ -67,7 +67,7 @@ fn source_signatures_reorder_proven_helper_aggregates_without_using_storage_orde
                 "nativeType": "Amazon::Hub::ActorRef",
                 "storageExpression": "param_3 + 0x98",
                 "storageOffset": "0x98",
-                "wireShape": "actor-ref",
+                "wireShape": "composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>",
                 "confidence": "message-unmarshal-call-frame-output-member"
             }]
         }],
@@ -146,6 +146,14 @@ fn source_signatures_reorder_proven_helper_aggregates_without_using_storage_orde
             NetworkWireShape::U64,
             NetworkWireShape::U64,
         ]))
+    );
+    assert_eq!(
+        message.fields[2].wire_shape,
+        Some(NetworkWireShape::ActorRef)
+    );
+    assert_eq!(
+        message.fields[4].wire_shape,
+        Some(NetworkWireShape::ActorRef)
     );
 }
 

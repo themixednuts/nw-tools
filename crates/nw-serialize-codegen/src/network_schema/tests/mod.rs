@@ -29,6 +29,13 @@ fn collapses_alternate_spelling_multi_helper_wire_products() {
         ),
         Some("actor-ref")
     );
+    assert_eq!(
+        collapse_alternate_spelling_wire_product(
+            "composite<vec<composite<u32,string>>,fixed-vector<composite<fixed-bytes-4,string>,20>>",
+            None,
+        ),
+        Some("fixed-vector<composite<fixed-bytes-4,string>,20>")
+    );
     // Distinct successive helpers must stay composed (FilterChat GameChatMessage).
     assert_eq!(
         collapse_alternate_spelling_wire_product(
@@ -278,6 +285,17 @@ fn parses_counted_map_wire_shapes() {
             NetworkWireScalarShape::Bool,
         ])
     );
+}
+
+#[test]
+fn parses_actor_instantiation_parameters_wire_shape() {
+    use crate::network_schema::parse::parse_network_wire_shape;
+
+    let text = "actor-instantiation-parameters";
+    let shape = parse_network_wire_shape(text).expect("actor parameter wire shape");
+
+    assert_eq!(shape, NetworkWireShape::ActorInstantiationParameters);
+    assert_eq!(shape.wire_string(), text);
 }
 
 fn fragment_access_message_signatures() -> Vec<NetworkMessageSignature> {

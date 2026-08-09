@@ -311,6 +311,9 @@ pub(super) fn message_field_type_tokens(shape: &SchemaWireShape) -> proc_macro2:
         SchemaWireShape::Bytes => quote!(Vec<u8>),
         SchemaWireShape::String => quote!(String),
         SchemaWireShape::ClassValue => quote!(::nw_network::serialize::ClassValue),
+        SchemaWireShape::ActorInstantiationParameters => {
+            quote!(::nw_network::ActorInstantiationParameters)
+        }
         SchemaWireShape::Composite(members) => {
             let members = members.iter().map(message_field_type_tokens);
             quote!((#(#members,)*))
@@ -319,7 +322,9 @@ pub(super) fn message_field_type_tokens(shape: &SchemaWireShape) -> proc_macro2:
             let inner = message_field_type_tokens(inner);
             quote!(::core::option::Option<#inner>)
         }
-        SchemaWireShape::DefaultOmitted(_) | SchemaWireShape::BooleanChoice(_) => {
+        SchemaWireShape::DefaultOmitted(_)
+        | SchemaWireShape::BooleanChoice(_)
+        | SchemaWireShape::BitMaskComposite(_) => {
             let value_type = rust_field_shape(shape).value_type;
             syn::parse_str::<syn::Type>(&value_type)
                 .map(|value_type| quote!(#value_type))
@@ -342,9 +347,7 @@ pub(super) fn message_field_type_tokens(shape: &SchemaWireShape) -> proc_macro2:
             unreachable!("container message fields require an explicit semantic type")
         }
         SchemaWireShape::FixedSequence(sequence) => {
-            let element = scalar_rust_type(sequence.element);
-            let element = syn::parse_str::<syn::Type>(&element)
-                .expect("fixed-sequence element produces a valid Rust type");
+            let element = message_field_type_tokens(&sequence.element);
             let capacity = syn::LitInt::new(
                 &sequence.capacity.to_string(),
                 proc_macro2::Span::call_site(),
@@ -431,6 +434,7 @@ pub(super) fn message_wire_shape_marshal_attr_tokens(
         | SchemaWireShape::Optional(_)
         | SchemaWireShape::DefaultOmitted(_)
         | SchemaWireShape::BooleanChoice(_)
+        | SchemaWireShape::BitMaskComposite(_)
         | SchemaWireShape::Sequence(_)
         | SchemaWireShape::Map { .. }
         | SchemaWireShape::Set(_)

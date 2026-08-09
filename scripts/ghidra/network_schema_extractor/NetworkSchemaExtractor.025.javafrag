@@ -84,6 +84,41 @@
             : TrackedValue.baseOffset(trackedBaseKey, totalOffset);
     }
 
+    private TrackedValue trackedAddressDependenciesForMemoryOperand(
+        Instruction instruction,
+        int operandIndex,
+        Map<String, TrackedValue> registers) {
+
+        MemoryAddress memory = NetworkSchemaX86.memoryAddress(instruction, operandIndex);
+        if (memory == null) {
+            return null;
+        }
+        LinkedHashSet<PcodeStorage> dependencies = new LinkedHashSet<>();
+        boolean sawDependentBase = false;
+        for (MemoryTerm term : memory.terms) {
+            if ("RIP".equals(term.register) || "RSP".equals(term.register)) {
+                return null;
+            }
+            TrackedValue value = registers.get(term.register);
+            if (value == null) {
+                return null;
+            }
+            if (!value.storageDependencies.isEmpty()) {
+                if (sawDependentBase || term.scale != 1) {
+                    return null;
+                }
+                sawDependentBase = true;
+                dependencies.addAll(value.storageDependencies);
+            }
+            else if (value.immediate == null) {
+                return null;
+            }
+        }
+        return dependencies.isEmpty()
+            ? null
+            : TrackedValue.storageDependencies(dependencies);
+    }
+
     private Long trackedImmediateForMemoryOperand(
         Instruction instruction,
         int operandIndex,

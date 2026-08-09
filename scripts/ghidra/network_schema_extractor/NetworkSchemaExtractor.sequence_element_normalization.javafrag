@@ -1,0 +1,805 @@
+    private Integer readRawOrUnmarshalOutputSlot(Function target) {
+        if (target == null) {
+            return null;
+        }
+        return isReadRawFunction(target)
+            ? Integer.valueOf(2)
+            : unmarshalOutputParameterSlot(target);
+    }
+
+    private PcodeStorage sequenceElementRelativeOutputStorage(
+        List<PcodeOpAST> operations,
+        PcodeOpAST call,
+        CodecWireEvent event,
+        PcodeOpAST cursor,
+        SequenceExtent extent) {
+
+        Function target = pcodeCallTarget(call);
+        Integer outputSlot = readRawOrUnmarshalOutputSlot(target);
+        Function owner = call == null || call.getSeqnum() == null
+            ? null
+            : functionContaining(call.getSeqnum().getTarget());
+        Long provenRelative = provenSequenceElementArgumentOffset(
+            owner,
+            call,
+            target,
+            outputSlot,
+            cursor,
+            extent);
+        if (provenRelative != null) {
+            return new PcodeStorage("sequence-element", provenRelative);
+        }
+
+        PcodeStorage output = event.outputStorage();
+        if (output != null && Objects.equals(output.base, extent.data().base)) {
+            long relative = output.offset - extent.data().offset;
+            if (relative >= 0L && relative < extent.stride()) {
+                return new PcodeStorage("sequence-element", relative);
+            }
+        }
+        return stagedSequenceElementRelativeOutputStorage(
+            operations,
+            call,
+            event,
+            cursor,
+            extent);
+    }
+
+    private PcodeStorage stagedSequenceElementRelativeOutputStorage(
+        List<PcodeOpAST> operations,
+        PcodeOpAST call,
+        CodecWireEvent event,
+        PcodeOpAST cursor,
+        SequenceExtent extent) {
+
+        if (operations == null || call == null || event == null ||
+            event.outputStorage() == null || cursor == null || extent == null) {
+            return null;
+        }
+        Function owner = call.getSeqnum() == null
+            ? null
+            : functionContaining(call.getSeqnum().getTarget());
+        HighFunction high = highFunction(owner);
+        NetworkSchemaNaturalLoop loop = loopContaining(call);
+        if (high == null || loop == null) {
+            return null;
+        }
+
+        Long selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3 ||
+                !NetworkSchemaControlFlow.precedes(high, call, operation) ||
+                !referencesStorage(operation.getInput(2), event.outputStorage())) {
+                continue;
+            }
+            Long relative = pcodeConstantOffsetFromRoot(
+                operation.getInput(1),
+                cursor.getOutput(),
+                new LinkedHashSet<>(),
+                0);
+            if (relative == null || relative < 0L || relative >= extent.stride()) {
+                continue;
+            }
+            if (selected != null && !selected.equals(relative)) {
+                return null;
+            }
+            selected = relative;
+        }
+        if (selected != null) {
+            runMetrics.increment("sequenceElementStagedOutputProofs");
+        }
+        return selected == null
+            ? null
+            : new PcodeStorage("sequence-element", selected);
+    }
+
+    private PcodeStorage stagedSequenceElementCallOutputStorage(
+        Function helper,
+        PcodeOpAST call,
+        Function target,
+        PcodeStorage output,
+        PcodeOpAST cursor,
+        SequenceExtent extent) {
+
+        if (helper == null || call == null || target == null) {
+            return null;
+        }
+        PcodeStorage staged = output == null
+            ? provenUnmarshalOutputStorage(call)
+            : output;
+        HighFunction high = highFunction(helper);
+        if (high == null || staged == null) {
+            return null;
+        }
+        return stagedSequenceElementRelativeOutputStorage(
+            orderedPcodeOps(high),
+            call,
+            new CodecWireEvent(
+                null,
+                null,
+                call.getSeqnum().getTarget(),
+                target.getEntryPoint(),
+                fullFunctionName(target),
+                staged,
+                null),
+            cursor,
+            extent);
+    }
+
+    private Long provenSequenceElementArgumentOffset(
+        Function owner,
+        PcodeOpAST call,
+        Function target,
+        Integer outputSlot,
+        PcodeOpAST cursor,
+        SequenceExtent extent) {
+
+        if (owner == null || call == null || outputSlot == null ||
+            outputSlot <= 0 || cursor == null || extent == null) {
+            return null;
+        }
+        if (outputSlot < call.getNumInputs()) {
+            Long pcode = pcodeConstantOffsetFromRoot(
+                call.getInput(outputSlot),
+                cursor.getOutput(),
+                new LinkedHashSet<>(),
+                0);
+            if (pcode != null && pcode >= 0L && pcode < extent.stride()) {
+                return pcode;
+            }
+        }
+        return instructionSequenceElementArgumentOffset(
+            owner,
+            call,
+            target,
+            outputSlot,
+            extent);
+    }
+
+    private Long instructionSequenceElementArgumentOffset(
+        Function owner,
+        PcodeOpAST call,
+        Function target,
+        int outputSlot,
+        SequenceExtent extent) {
+
+        if (outputSlot > 4 || call.getSeqnum() == null) {
+            return null;
+        }
+        NetworkSchemaNaturalLoop loop = loopContaining(call);
+        if (uniqueAffineSequenceCursor(loop, extent) == null) {
+            return null;
+        }
+        PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(call);
+        ForwardArgState state = instructionStateBeforeCall(owner, call, target);
+        if (block == null || state == null) {
+            return null;
+        }
+        String argumentRegister = win64ArgumentRegister(outputSlot);
+        List<Instruction> instructions = functionInstructions(owner);
+        int callIndex = -1;
+        for (int index = 0; index < instructions.size(); index++) {
+            if (instructions.get(index).getMinAddress().equals(
+                    call.getSeqnum().getTarget())) {
+                callIndex = index;
+                break;
+            }
+        }
+        for (int index = callIndex - 1; index >= 0; index--) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            Instruction instruction = instructions.get(index);
+            Address address = instruction.getMinAddress();
+            if (address.compareTo(block.getStart()) < 0) {
+                break;
+            }
+            if (!argumentRegister.equals(
+                    NetworkSchemaX86.registerOperand(instruction, 0))) {
+                continue;
+            }
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            String sourceRegister;
+            long displacement;
+            if ("LEA".equals(mnemonic)) {
+                MemoryReference memory = NetworkSchemaX86.memoryReference(instruction, 1);
+                if (memory == null || memory.baseRegister == null) {
+                    return null;
+                }
+                sourceRegister = memory.baseRegister;
+                displacement = memory.displacement;
+            }
+            else if ("MOV".equals(mnemonic)) {
+                sourceRegister = NetworkSchemaX86.registerOperand(instruction, 1);
+                displacement = 0L;
+            }
+            else {
+                return null;
+            }
+            TrackedValue source = sourceRegister == null
+                ? null
+                : state.registers.get(sourceRegister);
+            boolean machineCursor = instructionRegisterIsSequenceCursor(
+                owner,
+                loop,
+                sourceRegister,
+                extent);
+            boolean trackedCursor = trackedValueReferencesStorage(
+                    source,
+                    extent.data()) &&
+                instructionRegisterAdvancesBySequenceStride(
+                    owner,
+                    loop,
+                    sourceRegister,
+                    extent.stride());
+            if (!machineCursor && !trackedCursor) {
+                return null;
+            }
+            return displacement >= 0L && displacement < extent.stride()
+                ? displacement
+                : null;
+        }
+        return null;
+    }
+
+    private boolean trackedValueReferencesStorage(
+        TrackedValue value,
+        PcodeStorage expected) {
+
+        if (value == null || expected == null) {
+            return false;
+        }
+        PcodeStorage direct = pcodeStorageFromTrackedValue(value);
+        return expected.sameLocation(direct) || value.storageDependencies.stream()
+            .anyMatch(expected::sameLocation);
+    }
+
+    private boolean instructionRegisterAdvancesBySequenceStride(
+        Function owner,
+        NetworkSchemaNaturalLoop loop,
+        String register,
+        long stride) {
+
+        if (owner == null || loop == null || register == null || stride <= 0L) {
+            return false;
+        }
+        boolean exactFunctionIncrement = false;
+        for (Instruction instruction : functionInstructions(owner)) {
+            if (monitor.isCancelled()) {
+                return false;
+            }
+            if (!register.equals(NetworkSchemaX86.registerOperand(instruction, 0))) {
+                continue;
+            }
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if (!"ADD".equals(mnemonic) && !"SUB".equals(mnemonic)) {
+                continue;
+            }
+            Long immediate = NetworkSchemaText.parseSignedIntegerLiteral(
+                NetworkSchemaX86.operandText(instruction, 1));
+            if (immediate == null) {
+                immediate = NetworkSchemaX86.signedImmediateValue(instruction, 1);
+            }
+            if (immediate == null) {
+                immediate = literalOperandValue(instruction, 1);
+            }
+            if (immediate == null) {
+                continue;
+            }
+            long delta;
+            try {
+                delta = "ADD".equals(mnemonic)
+                    ? immediate
+                    : Math.negateExact(immediate);
+            }
+            catch (ArithmeticException ignored) {
+                continue;
+            }
+            if (delta == stride) {
+                if (instructionAddressInLoop(instruction.getMinAddress(), loop)) {
+                    return true;
+                }
+                exactFunctionIncrement = true;
+            }
+        }
+        if (exactFunctionIncrement) {
+            // The decompiler may split the latch's machine instruction from the
+            // P-code block range. The caller already proved one affine P-code
+            // induction with this exact data root and stride, so the same-register
+            // machine increment is an exact representation fallback.
+            runMetrics.increment("instructionSequenceCursorFunctionStrideProofs");
+        }
+        return exactFunctionIncrement;
+    }
+
+    private boolean instructionRegisterIsSequenceCursor(
+        Function owner,
+        NetworkSchemaNaturalLoop loop,
+        String register,
+        SequenceExtent extent) {
+
+        if (owner == null || loop == null || loop.header() == null ||
+            loop.header().getStart() == null || register == null || extent == null) {
+            return false;
+        }
+        String key = functionCacheKey("instruction-sequence-cursor", owner) + ":" +
+            Long.toUnsignedString(loop.header().getStart().getOffset(), 16) + ":" +
+            register + ":" + storageKey(extent.data()) + ":" +
+            storageKey(extent.end()) + ":" + extent.stride();
+        Boolean cached = instructionSequenceCursorCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        boolean proven = proveInstructionRegisterIsSequenceCursor(
+            owner,
+            loop,
+            register,
+            extent);
+        if (!monitor.isCancelled()) {
+            instructionSequenceCursorCache.put(key, proven);
+        }
+        if (proven) {
+            runMetrics.increment("instructionSequenceCursorProofs");
+        }
+        return proven;
+    }
+
+    private boolean proveInstructionRegisterIsSequenceCursor(
+        Function owner,
+        NetworkSchemaNaturalLoop loop,
+        String register,
+        SequenceExtent extent) {
+
+        if (uniqueAffineSequenceCursor(loop, extent) == null) {
+            runMetrics.increment("instructionSequenceCursorAffineRejects");
+            return false;
+        }
+        if (!instructionRegisterAdvancesBySequenceStride(
+                owner,
+                loop,
+                register,
+                extent.stride())) {
+            runMetrics.increment("instructionSequenceCursorStrideRejects");
+            return false;
+        }
+        if (!instructionRegisterLoadedFromSequenceStorage(
+                owner,
+                loop,
+                register,
+                extent.data())) {
+            runMetrics.increment("instructionSequenceCursorDataOriginRejects");
+            return false;
+        }
+
+        String limit = null;
+        for (Instruction instruction : functionInstructions(owner)) {
+            if (monitor.isCancelled()) {
+                return false;
+            }
+            if (!instructionAddressInLoop(instruction.getMinAddress(), loop) ||
+                !"CMP".equals(NetworkSchemaX86.upperMnemonic(instruction))) {
+                continue;
+            }
+            String left = NetworkSchemaX86.registerOperand(instruction, 0);
+            String right = NetworkSchemaX86.registerOperand(instruction, 1);
+            String candidate = register.equals(left)
+                ? right
+                : register.equals(right) ? left : null;
+            if (candidate == null || candidate.equals(register) ||
+                !instructionRegisterLoadedFromSequenceStorage(
+                    owner,
+                    loop,
+                    candidate,
+                    extent.end())) {
+                continue;
+            }
+            if (limit != null && !limit.equals(candidate)) {
+                return false;
+            }
+            limit = candidate;
+        }
+        if (limit == null) {
+            runMetrics.increment("instructionSequenceCursorEndOriginRejects");
+        }
+        return limit != null;
+    }
+
+    private boolean instructionRegisterLoadedFromSequenceStorage(
+        Function owner,
+        NetworkSchemaNaturalLoop loop,
+        String register,
+        PcodeStorage storage) {
+
+        HighFunction high = highFunction(owner);
+        Instruction definition = nearestDominatingRegisterWrite(
+            owner,
+            high,
+            loop,
+            register);
+        if (definition == null ||
+            !"MOV".equals(NetworkSchemaX86.upperMnemonic(definition))) {
+            return false;
+        }
+        MemoryAddress memory = NetworkSchemaX86.memoryAddress(definition, 1);
+        if (memory == null || memory.terms.size() != 1 ||
+            memory.terms.get(0).scale != 1) {
+            return false;
+        }
+        PcodeStorage exact = instructionMemoryOperandStorage(
+            owner,
+            high,
+            definition,
+            1);
+        if (storage != null && storage.sameLocation(exact)) {
+            runMetrics.increment("instructionSequenceHeaderFormalOriginProofs");
+            return true;
+        }
+        ForwardArgState state = instructionStateBeforeAddress(
+            owner,
+            definition.getMinAddress());
+        TrackedValue location = state == null
+            ? null
+            : trackedBaseOffsetForMemoryOperand(definition, 1, state.registers);
+        PcodeStorage resolved = pcodeStorageFromTrackedValue(location);
+        return storage != null && storage.sameLocation(resolved);
+    }
+
+    private PcodeStorage instructionMemoryOperandStorage(
+        Function owner,
+        HighFunction high,
+        Instruction instruction,
+        int operandIndex) {
+
+        MemoryAddress memory = NetworkSchemaX86.memoryAddress(
+            instruction,
+            operandIndex);
+        if (owner == null || high == null || instruction == null ||
+            memory == null || memory.terms.size() != 1 ||
+            memory.terms.get(0).scale != 1) {
+            return null;
+        }
+        MemoryTerm term = memory.terms.get(0);
+        if ("RIP".equals(term.register) || "RSP".equals(term.register)) {
+            return null;
+        }
+        PcodeStorage base = instructionRegisterStorageBefore(
+            owner,
+            high,
+            instruction,
+            term.register,
+            new LinkedHashSet<>(),
+            0);
+        if (base == null) {
+            return null;
+        }
+        try {
+            return new PcodeStorage(
+                base.base,
+                Math.addExact(base.offset, (long) memory.displacement));
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private PcodeStorage instructionRegisterStorageBefore(
+        Function owner,
+        HighFunction high,
+        Instruction target,
+        String register,
+        Set<String> active,
+        int depth) {
+
+        if (owner == null || high == null || target == null || register == null ||
+            active == null || depth > 32 || monitor.isCancelled()) {
+            return null;
+        }
+        String key = register + "@" + target.getMinAddress();
+        if (!active.add(key)) {
+            return null;
+        }
+        try {
+            Instruction definition = nearestDominatingRegisterWriteBefore(
+                owner,
+                high,
+                target,
+                register);
+            if (definition == null) {
+                return win64FormalRegisterStorage(register);
+            }
+
+            String mnemonic = NetworkSchemaX86.upperMnemonic(definition);
+            if ("MOV".equals(mnemonic)) {
+                String source = NetworkSchemaX86.registerOperand(definition, 1);
+                return source == null
+                    ? null
+                    : instructionRegisterStorageBefore(
+                        owner,
+                        high,
+                        definition,
+                        source,
+                        active,
+                        depth + 1);
+            }
+            if ("LEA".equals(mnemonic)) {
+                MemoryAddress memory = NetworkSchemaX86.memoryAddress(definition, 1);
+                if (memory == null || memory.terms.size() != 1 ||
+                    memory.terms.get(0).scale != 1) {
+                    return null;
+                }
+                PcodeStorage base = instructionRegisterStorageBefore(
+                    owner,
+                    high,
+                    definition,
+                    memory.terms.get(0).register,
+                    active,
+                    depth + 1);
+                if (base == null) {
+                    return null;
+                }
+                try {
+                    return new PcodeStorage(
+                        base.base,
+                        Math.addExact(base.offset, (long) memory.displacement));
+                }
+                catch (ArithmeticException ignored) {
+                    return null;
+                }
+            }
+            if ("ADD".equals(mnemonic) || "SUB".equals(mnemonic)) {
+                Long immediate = NetworkSchemaText.parseSignedIntegerLiteral(
+                    NetworkSchemaX86.operandText(definition, 1));
+                if (immediate == null) {
+                    immediate = literalOperandValue(definition, 1);
+                }
+                PcodeStorage base = instructionRegisterStorageBefore(
+                    owner,
+                    high,
+                    definition,
+                    register,
+                    active,
+                    depth + 1);
+                if (base == null || immediate == null) {
+                    return null;
+                }
+                try {
+                    long delta = "ADD".equals(mnemonic)
+                        ? immediate
+                        : Math.negateExact(immediate);
+                    return new PcodeStorage(
+                        base.base,
+                        Math.addExact(base.offset, delta));
+                }
+                catch (ArithmeticException ignored) {
+                    return null;
+                }
+            }
+            return null;
+        }
+        finally {
+            active.remove(key);
+        }
+    }
+
+    private PcodeStorage win64FormalRegisterStorage(String register) {
+        return switch (register) {
+            case "RCX" -> new PcodeStorage("param_1", 0L);
+            case "RDX" -> new PcodeStorage("param_2", 0L);
+            case "R8" -> new PcodeStorage("param_3", 0L);
+            case "R9" -> new PcodeStorage("param_4", 0L);
+            default -> null;
+        };
+    }
+
+    private Instruction nearestDominatingRegisterWriteBefore(
+        Function owner,
+        HighFunction high,
+        Instruction target,
+        String register) {
+
+        if (owner == null || high == null || target == null || register == null) {
+            return null;
+        }
+        PcodeBlockBasic targetBlock = pcodeBlockContainingAddress(
+            high,
+            target.getMinAddress());
+        if (targetBlock == null) {
+            return null;
+        }
+        PcodeBlockBasic selectedBlock = null;
+        Instruction selected = null;
+        for (Instruction instruction : functionInstructions(owner)) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            PcodeBlockBasic block = pcodeBlockContainingAddress(
+                high,
+                instruction.getMinAddress());
+            boolean beforeInTargetBlock = block == targetBlock &&
+                instruction.getMinAddress().compareTo(target.getMinAddress()) < 0;
+            boolean dominatingBlock = block != null && block != targetBlock &&
+                NetworkSchemaControlFlow.dominates(high, block, targetBlock);
+            if ((!beforeInTargetBlock && !dominatingBlock) ||
+                !instructionWritesRegister(instruction, register)) {
+                continue;
+            }
+            boolean sameBlockAndLater = selectedBlock == block &&
+                instruction.getMinAddress().compareTo(selected.getMinAddress()) > 0;
+            boolean nearerBlock = selectedBlock != null && selectedBlock != block &&
+                NetworkSchemaControlFlow.dominates(high, selectedBlock, block);
+            if (selectedBlock == null || sameBlockAndLater || nearerBlock) {
+                selectedBlock = block;
+                selected = instruction;
+            }
+        }
+        return selected;
+    }
+
+    private Instruction nearestDominatingRegisterWrite(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        String register) {
+
+        if (owner == null || high == null || loop == null ||
+            loop.header() == null || register == null) {
+            return null;
+        }
+        PcodeBlockBasic selectedBlock = null;
+        Instruction selected = null;
+        for (Instruction instruction : functionInstructions(owner)) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            if (instructionAddressInLoop(instruction.getMinAddress(), loop) ||
+                !instructionWritesRegister(instruction, register)) {
+                continue;
+            }
+            PcodeBlockBasic block = pcodeBlockContainingAddress(
+                high,
+                instruction.getMinAddress());
+            if (block == null || !NetworkSchemaControlFlow.dominates(
+                    high,
+                    block,
+                    loop.header())) {
+                continue;
+            }
+            boolean sameBlockAndLater = selectedBlock == block &&
+                instruction.getMinAddress().compareTo(selected.getMinAddress()) > 0;
+            boolean nearerBlock = selectedBlock != null && selectedBlock != block &&
+                NetworkSchemaControlFlow.dominates(high, selectedBlock, block);
+            if (selectedBlock == null || sameBlockAndLater || nearerBlock) {
+                selectedBlock = block;
+                selected = instruction;
+            }
+        }
+        return selected;
+    }
+
+    private boolean instructionWritesRegister(
+        Instruction instruction,
+        String register) {
+
+        if (instruction == null || register == null ||
+            !register.equals(NetworkSchemaX86.registerOperand(instruction, 0))) {
+            return false;
+        }
+        String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+        return "MOV".equals(mnemonic) || "LEA".equals(mnemonic) ||
+            "XCHG".equals(mnemonic) || "POP".equals(mnemonic) ||
+            "ADD".equals(mnemonic) || "SUB".equals(mnemonic) ||
+            "BSWAP".equals(mnemonic) || writesRegister(mnemonic) ||
+            mnemonic != null && (mnemonic.startsWith("SET") ||
+                mnemonic.startsWith("CMOV"));
+    }
+
+    private boolean instructionAddressInLoop(
+        Address address,
+        NetworkSchemaNaturalLoop loop) {
+
+        return address != null && loop.body().stream().anyMatch(block ->
+            block.getStart() != null && block.getStop() != null &&
+                address.compareTo(block.getStart()) >= 0 &&
+                address.compareTo(block.getStop()) <= 0);
+    }
+
+    private void normalizeSequenceElementGuards(
+        List<PcodeOpAST> operations,
+        PcodeOpAST cursor,
+        SequenceExtent extent,
+        List<ContainerCodecCall> codecs) {
+
+        for (ContainerCodecCall codec : codecs) {
+            ArrayList<ContainerCodecGuard> normalized = new ArrayList<>();
+            for (ContainerCodecGuard guard : codec.guards) {
+                ContainerCodecGuard candidate = sequenceElementRelativeGuard(
+                    operations,
+                    cursor,
+                    extent,
+                    guard);
+                normalized.add(candidate == null ? guard : candidate);
+            }
+            codec.guards.clear();
+            codec.guards.addAll(normalized);
+        }
+    }
+
+    private ContainerCodecGuard sequenceElementRelativeGuard(
+        List<PcodeOpAST> operations,
+        PcodeOpAST cursor,
+        SequenceExtent extent,
+        ContainerCodecGuard guard) {
+
+        if (guard == null || !"storage-bit-mask".equals(guard.kind())) {
+            return null;
+        }
+        Long relative = null;
+        if (Objects.equals(guard.storageBase(), extent.data().base) &&
+            guard.storageOffset() != null) {
+            relative = guard.storageOffset() - extent.data().offset;
+        }
+        if ((relative == null || relative < 0L || relative >= extent.stride()) &&
+            guard.storageBase() != null &&
+            guard.storageBase().startsWith("instruction-register:") &&
+            guard.storageOffset() != null) {
+            String register = guard.storageBase().substring(
+                "instruction-register:".length());
+            PcodeOpAST branch = operations.stream()
+                .filter(operation -> operation.getOpcode() == PcodeOp.CBRANCH &&
+                    operation.getSeqnum() != null &&
+                    Objects.equals(operation.getSeqnum().getTarget(), guard.branch()))
+                .findFirst()
+                .orElse(null);
+            Function owner = functionContaining(guard.branch());
+            NetworkSchemaNaturalLoop loop = branch == null
+                ? null
+                : loopContaining(branch);
+            if (instructionRegisterIsSequenceCursor(
+                    owner,
+                    loop,
+                    register,
+                    extent)) {
+                relative = guard.storageOffset();
+                runMetrics.increment("instructionSequenceMaskGuardProofs");
+            }
+        }
+        if (relative == null || relative < 0L || relative >= extent.stride()) {
+            PcodeOpAST branch = operations.stream()
+                .filter(operation -> operation.getOpcode() == PcodeOp.CBRANCH &&
+                    operation.getSeqnum() != null &&
+                    Objects.equals(operation.getSeqnum().getTarget(), guard.branch()))
+                .findFirst()
+                .orElse(null);
+            GuardCondition condition = branch == null
+                ? null
+                : guardCondition(
+                    branch.getInput(branch.getNumInputs() - 1),
+                    false,
+                    new LinkedHashSet<>());
+            relative = condition == null
+                ? null
+                : pcodeConstantOffsetFromRoot(
+                    condition.storagePointer(),
+                    cursor.getOutput(),
+                    new LinkedHashSet<>(),
+                    0);
+        }
+        if (relative == null || relative < 0L || relative >= extent.stride()) {
+            return null;
+        }
+        return new ContainerCodecGuard(
+            guard.branch(),
+            guard.kind(),
+            guard.condition(),
+            guard.memberOnTrue(),
+            "sequence-element",
+            relative,
+            null,
+            guard.mask(),
+            guard.externalCondition(),
+            guard.externalConditionDiagnostic(),
+            firstNonEmpty(guard.evidenceSource(), "dominating-cbranch-pcode-storage") +
+                "+affine-sequence-element");
+    }

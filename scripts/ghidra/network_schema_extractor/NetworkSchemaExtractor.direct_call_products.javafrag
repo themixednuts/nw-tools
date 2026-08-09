@@ -76,6 +76,7 @@
                 observed.startsWith("optional<") ||
                 observed.startsWith("default-omitted<") ||
                 observed.startsWith("boolean-choice<") ||
+                observed.startsWith("bit-mask-composite<") ||
                 observed.startsWith("fixed-sequence<") ||
                 observed.startsWith("replicated-container<"));
     }

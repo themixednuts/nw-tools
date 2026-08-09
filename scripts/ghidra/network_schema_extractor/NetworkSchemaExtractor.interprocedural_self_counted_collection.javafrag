@@ -1,0 +1,44 @@
+    /**
+     * Maps a helper that owns its count read back onto the caller's output.
+     * The count-bounded loop is recovered inside the helper; the caller has no
+     * separate count storage to bind.
+     */
+    private InterproceduralCollectionCall selfCountedCollectionCall(
+        Function caller,
+        PcodeOpAST call,
+        Function helper,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        Map<String, CollectionOutputShape> shapes =
+            collectionOutputShapesByParameterFromPcode(helper);
+        if (shapes.size() != 1) {
+            recordNestedTypeShapeReject(shapes.isEmpty()
+                ? "self-counted-collection-output-unrecovered"
+                : "self-counted-collection-output-ambiguous");
+            return null;
+        }
+        CollectionOutputShape shape = shapes.values().iterator().next();
+        if (shape.wireEvidence == null || shape.storage == null ||
+            shape.storage.offset != 0L) {
+            return null;
+        }
+        Integer slot = formalParameterSlot(shape.storage);
+        if (slot == null) {
+            recordNestedTypeShapeReject(
+                "self-counted-collection-owner-parameter-unproven");
+            return null;
+        }
+        PcodeStorage owner = translatedAbsoluteHelperStorage(
+            provenCallArgumentStorage(caller, call, helper, slot),
+            callerParamStorage);
+        if (owner == null) {
+            recordNestedTypeShapeReject(
+                "self-counted-collection-owner-argument-unresolved");
+            return null;
+        }
+        return new InterproceduralCollectionCall(
+            owner,
+            null,
+            shape.storageKind,
+            shape.wireEvidence);
+    }

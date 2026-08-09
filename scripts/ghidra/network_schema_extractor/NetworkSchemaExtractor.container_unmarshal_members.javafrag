@@ -435,6 +435,14 @@
             falseSuccessor,
             membersByBlock,
             successfulTerminals);
+        if (structuralSuccessor == null &&
+            isStatusBearingUnmarshalCodec(codec)) {
+            structuralSuccessor = transitiveStructuralCodecSuccessor(
+                trueSuccessor,
+                falseSuccessor,
+                membersByBlock,
+                guard.block());
+        }
         // Prefer CFG asymmetry before status-byte provenance. Aggregate helpers
         // like ReceivePlayerPositionWithCameraClientMsg gate later ReadRaw calls
         // behind Marshaler<u32> success; the continuing codec block is enough.

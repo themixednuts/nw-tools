@@ -1,4 +1,202 @@
+    private record CallReadBufferBinding(
+        int argumentSlot,
+        String ownerParameter) {
+    }
+
+    private boolean wireShapeMatches(WireShape evidence, String expectedShape) {
+        return evidence != null && expectedShape != null &&
+            (Objects.equals(expectedShape, evidence.shape) ||
+                Objects.equals(expectedShape, evidence.layout));
+    }
+
+    /**
+     * Returns count-codec evidence without allowing generic codec composition
+     * to obscure a structurally proven VLQ decoder.
+     */
+    private WireShape countCodecWireEvidence(
+        Function owner,
+        PcodeOpAST operation,
+        String expectedShape) {
+
+        WireShape direct = directCallWireEvidence(owner, operation);
+        if (wireShapeMatches(direct, expectedShape)) {
+            return direct;
+        }
+        Function target = pcodeCallTarget(operation);
+        if (target == null) {
+            return null;
+        }
+        CallReadBufferBinding readBuffer = uniqueCallReadBufferBinding(
+            owner,
+            operation,
+            target);
+        HighFunction high = highFunction(target);
+        NetworkSchemaCodecClassifier.VariableIntegerCodec structural =
+            NetworkSchemaCodecClassifier.variableIntegerCodec(high);
+        if (readBuffer == null || structural == null ||
+            structural.direction() != NetworkSchemaCodecClassifier.CodecDirection.DECODE ||
+            !Objects.equals(expectedShape, structural.shape())) {
+            return null;
+        }
+        int nativeWidth = "vlq-u64".equals(structural.shape())
+            ? Long.BYTES
+            : Integer.BYTES;
+        String targetBuffer = "param_" + readBuffer.argumentSlot();
+        if (!hasReadBufferFlow(target, targetBuffer, new LinkedHashSet<>()) ||
+            scalarOutputParameterSlot(target, nativeWidth) == null) {
+            return null;
+        }
+        runMetrics.increment("directStructuralCountCodecProofs");
+        return WireShape.semantic(
+            structural.shape(),
+            "direct-count-codec-structure+call-buffer+scalar-output");
+    }
+
+    private boolean countProducerPrecedesConsumer(
+        HighFunction high,
+        PcodeOpAST producer,
+        PcodeOpAST consumer) {
+
+        if (NetworkSchemaControlFlow.precedes(high, producer, consumer)) {
+            return true;
+        }
+        if (high == null || producer == null || consumer == null ||
+            producer.getSeqnum() == null || consumer.getSeqnum() == null ||
+            producer.getSeqnum().getTarget().compareTo(
+                consumer.getSeqnum().getTarget()) >= 0) {
+            return false;
+        }
+        PcodeBlockBasic producerBlock = NetworkSchemaControlFlow.parentBlock(producer);
+        PcodeBlockBasic consumerBlock = NetworkSchemaControlFlow.parentBlock(consumer);
+        boolean reachable = producerBlock != null && consumerBlock != null &&
+            NetworkSchemaControlFlow.reaches(producerBlock, consumerBlock);
+        if (reachable) {
+            // The exact count-output storage match supplies the data-flow proof;
+            // reachability handles decompiler CFGs whose synthetic failure
+            // entries make the ordinary dominator relation too conservative.
+            runMetrics.increment("reachableCountProducerFallbacks");
+        }
+        return reachable;
+    }
+
     private WireShape directCallWireEvidence(
+        Function owner,
+        PcodeOpAST operation) {
+
+        WireShape evidence = directCallWireEvidence(operation);
+        if (evidence != null || owner == null || operation == null) {
+            return evidence;
+        }
+        Function target = pcodeCallTarget(operation);
+        if (target == null) {
+            return null;
+        }
+        CallReadBufferBinding readBuffer = uniqueCallReadBufferBinding(
+            owner,
+            operation,
+            target);
+        if (readBuffer == null) {
+            return null;
+        }
+        return wireShapeEvidenceFromUnmarshalTarget(
+            target,
+            unmarshalNativeTypeFromTarget(target),
+            "param_" + readBuffer.argumentSlot());
+    }
+
+    private Integer uniqueCallReadBufferArgumentSlot(
+        Function owner,
+        PcodeOpAST operation,
+        Function target) {
+
+        CallReadBufferBinding binding = uniqueCallReadBufferBinding(
+            owner,
+            operation,
+            target);
+        return binding == null ? null : binding.argumentSlot();
+    }
+
+    private String callReadBufferParameter(
+        Function owner,
+        PcodeOpAST operation) {
+
+        CallReadBufferBinding binding = uniqueCallReadBufferBinding(
+            owner,
+            operation,
+            pcodeCallTarget(operation));
+        return binding == null ? null : binding.ownerParameter();
+    }
+
+    private CallReadBufferBinding uniqueCallReadBufferBinding(
+        Function owner,
+        PcodeOpAST operation,
+        Function target) {
+
+        if (owner == null || operation == null || target == null) {
+            return null;
+        }
+        LinkedHashSet<String> ownerReadBuffers = new LinkedHashSet<>(
+            readBufferParameters(owner));
+        CallReadBufferBinding selected = null;
+        int argumentCount = provenCallArgumentCount(operation, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            LinkedHashSet<PcodeStorage> storages = new LinkedHashSet<>();
+            PcodeStorage proven = provenCallArgumentStorage(
+                owner,
+                operation,
+                target,
+                slot);
+            if (proven != null) {
+                storages.add(proven);
+            }
+            if (slot < operation.getNumInputs()) {
+                PcodeStorage direct = pcodeStorageExpression(operation.getInput(slot));
+                PcodeStorage loaded = pcodeLoadedStorageExpression(operation.getInput(slot));
+                if (direct != null) {
+                    storages.add(direct);
+                }
+                if (loaded != null) {
+                    storages.add(loaded);
+                }
+            }
+            LinkedHashSet<String> parameters = new LinkedHashSet<>();
+            for (PcodeStorage storage : storages) {
+                String parameter = formalParameterBaseFromStorage(owner, storage);
+                if (parameter == null) {
+                    continue;
+                }
+                if (ownerReadBuffers.contains(parameter) ||
+                    hasReadBufferFlow(owner, parameter, new LinkedHashSet<>())) {
+                    ownerReadBuffers.add(parameter);
+                    parameters.add(parameter);
+                }
+            }
+            if (parameters.isEmpty()) {
+                continue;
+            }
+            if (parameters.size() != 1) {
+                return null;
+            }
+            CallReadBufferBinding candidate = new CallReadBufferBinding(
+                slot,
+                parameters.iterator().next());
+            if (selected != null &&
+                (selected.argumentSlot() != candidate.argumentSlot() ||
+                    !selected.ownerParameter().equals(candidate.ownerParameter()))) {
+                return null;
+            }
+            selected = candidate;
+        }
+        if (selected != null && !Objects.equals(
+                uniqueReadBufferParameter(owner),
+                selected.ownerParameter())) {
+            runMetrics.increment("callsiteReadBufferSlotProofs");
+        }
+        return selected;
+    }
+
+    private WireShape directCallWireEvidence(
+        Function owner,
         HighFunction high,
         List<PcodeOpAST> operations,
         PcodeOpAST operation) {
@@ -13,5 +211,14 @@
                 rawRead);
             return normalized == null ? rawRead.wireEvidence : normalized;
         }
-        return directCallWireEvidence(operation);
+        return directCallWireEvidence(owner, operation);
+    }
+    private WireShape directCallWireEvidence(PcodeOpAST operation) {
+        Function target = pcodeCallTarget(operation);
+        WireShape rawEvidence = pcodeReadRawWireEvidence(operation, target);
+        if (rawEvidence != null) {
+            return rawEvidence;
+        }
+        String nativeType = unmarshalNativeTypeFromTarget(target);
+        return wireShapeEvidenceFromUnmarshalTarget(target, nativeType);
     }

@@ -378,6 +378,20 @@ final class NetworkSchemaFlowSequence {
             loop,
             entries,
             headerCarriesEvents);
+        Set<PcodeBlockBasic> successfulTerminals = reachable.stream()
+            .filter(block -> NetworkSchemaControlFlow.successors(block)
+                .contains(loop.header()))
+            .collect(java.util.stream.Collectors.toSet());
+        if (successfulTerminals.isEmpty()) {
+            return new Result<>(Status.NO_TERMINATING_PATH, List.of());
+        }
+        reachable = blocksReachingSuccessfulIteration(
+            reachable,
+            successfulTerminals);
+        entries = entries.stream().filter(reachable::contains).toList();
+        if (entries.isEmpty()) {
+            return new Result<>(Status.NO_TERMINATING_PATH, List.of());
+        }
         Map<PcodeBlockBasic, Set<PcodeBlockBasic>> edges = new HashMap<>();
         Set<PcodeBlockBasic> terminals = new HashSet<>();
         for (PcodeBlockBasic block : reachable) {
@@ -388,9 +402,6 @@ final class NetworkSchemaFlowSequence {
                 }
                 else if (reachable.contains(successor)) {
                     successors.add(successor);
-                }
-                else if (!loop.contains(successor)) {
-                    terminals.add(block);
                 }
             }
             edges.put(block, Set.copyOf(successors));
@@ -442,6 +453,35 @@ final class NetworkSchemaFlowSequence {
         return selected == null
             ? new Result<>(Status.NO_TERMINATING_PATH, List.of())
             : new Result<>(Status.COMPLETE, selected.events());
+    }
+
+    private static Set<PcodeBlockBasic> blocksReachingSuccessfulIteration(
+        Set<PcodeBlockBasic> reachable,
+        Set<PcodeBlockBasic> successfulTerminals) {
+
+        Map<PcodeBlockBasic, List<PcodeBlockBasic>> predecessors = new HashMap<>();
+        for (PcodeBlockBasic block : reachable) {
+            predecessors.put(block, new ArrayList<>());
+        }
+        for (PcodeBlockBasic block : reachable) {
+            for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(block)) {
+                if (reachable.contains(successor)) {
+                    predecessors.get(successor).add(block);
+                }
+            }
+        }
+        HashSet<PcodeBlockBasic> result = new HashSet<>(successfulTerminals);
+        ArrayDeque<PcodeBlockBasic> pending = new ArrayDeque<>(successfulTerminals);
+        while (!pending.isEmpty()) {
+            PcodeBlockBasic block = pending.removeLast();
+            for (PcodeBlockBasic predecessor :
+                    predecessors.getOrDefault(block, List.of())) {
+                if (result.add(predecessor)) {
+                    pending.addLast(predecessor);
+                }
+            }
+        }
+        return Set.copyOf(result);
     }
 
     private static <T> FlowGraph<T> flowGraph(

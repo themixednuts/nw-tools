@@ -101,6 +101,9 @@ pub(super) fn wire_shape_tokens(shape: &SchemaWireShape) -> proc_macro2::TokenSt
         SchemaWireShape::Bytes => quote!(NetworkWireShape::Bytes),
         SchemaWireShape::String => quote!(NetworkWireShape::String),
         SchemaWireShape::ClassValue => quote!(NetworkWireShape::ClassValue),
+        SchemaWireShape::ActorInstantiationParameters => {
+            quote!(NetworkWireShape::ActorInstantiationParameters)
+        }
         SchemaWireShape::Composite(members) => {
             let members = members.iter().map(wire_shape_tokens);
             quote!(NetworkWireShape::Composite(&[#(#members),*]))
@@ -120,6 +123,28 @@ pub(super) fn wire_shape_tokens(shape: &SchemaWireShape) -> proc_macro2::TokenSt
                 false_value: &#false_value,
                 true_value: &#true_value,
             })
+        }
+        SchemaWireShape::BitMaskComposite(shape) => {
+            let mask = wire_scalar_shape_tokens(shape.mask);
+            let members = shape.members.iter().map(|member| match member {
+                NetworkBitMaskMemberWireShape::Required(value) => {
+                    let value = wire_shape_tokens(value);
+                    quote!(NetworkBitMaskMemberWireShape::Required(&#value))
+                }
+                NetworkBitMaskMemberWireShape::Masked { mask, value } => {
+                    let value = wire_shape_tokens(value);
+                    quote!(NetworkBitMaskMemberWireShape::Masked {
+                        mask: #mask,
+                        value: &#value,
+                    })
+                }
+            });
+            quote!(
+                NetworkWireShape::BitMaskComposite(NetworkBitMaskCompositeWireShape {
+                    mask: #mask,
+                    members: &[#(#members),*],
+                })
+            )
         }
         SchemaWireShape::Sequence(value) => {
             let value = wire_shape_tokens(value);
@@ -142,11 +167,11 @@ pub(super) fn wire_shape_tokens(shape: &SchemaWireShape) -> proc_macro2::TokenSt
             quote!(NetworkWireShape::ReplicatedContainer(#container))
         }
         SchemaWireShape::FixedSequence(sequence) => {
-            let element = wire_scalar_shape_tokens(sequence.element);
+            let element = wire_shape_tokens(&sequence.element);
             let capacity = sequence.capacity;
             quote!(
                 NetworkWireShape::FixedSequence(NetworkFixedSequenceWireShape {
-                    element: #element,
+                    element: &#element,
                     capacity: #capacity,
                 })
             )

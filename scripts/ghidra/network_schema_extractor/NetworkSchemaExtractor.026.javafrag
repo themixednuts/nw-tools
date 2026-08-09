@@ -241,6 +241,8 @@
         JsonArray typeEvidence;
         NestedTypeShape nestedTypeShape;
         Boolean callFrameBoundaryProven;
+        String partialCallFrameNativeType;
+        Integer partialCallFramePrefixMemberCount;
         JsonArray mergedCallsites;
         Boolean multipleCallEvidence;
         Boolean typeConflict;
@@ -304,6 +306,14 @@
             if (callFrameBoundaryProven != null) {
                 object.addProperty("callFrameBoundaryProven", callFrameBoundaryProven);
             }
+            NetworkSchemaJson.add(
+                object,
+                "partialCallFrameNativeType",
+                partialCallFrameNativeType);
+            NetworkSchemaJson.add(
+                object,
+                "partialCallFramePrefixMemberCount",
+                partialCallFramePrefixMemberCount);
             JsonObject sourceTypeFoldEvidence =
                 foldEvidenceForCandidates(null, "computed", sourceTypeName, nativeType);
             if (sourceTypeFoldEvidence != null) {
@@ -532,10 +542,15 @@
         String terminalStatus;
         Boolean supportsUnmarshal;
         DelegatedCodecEvidence delegatedCodec;
+        Address concreteValueVtable;
+        String concreteValueVtableSource;
+        boolean concreteValueVtableConflict;
         final ArrayList<FieldCall> fields = new ArrayList<>();
         final JsonArray rejectedPcodeFields = new JsonArray();
         final HashMap<String, Integer> pcodeOrderByCallsite = new HashMap<>();
         int collapsedAggregateLeafCount;
+        int expandedPartialCallFrameCount;
+        int expandedPartialCallFrameMemberCount;
 
         JsonObject toJson() {
             JsonObject object = new JsonObject();
@@ -570,6 +585,17 @@
             if (delegatedCodec != null) {
                 object.add("delegatedCodec", delegatedCodec.toJson());
             }
+            NetworkSchemaJson.add(
+                object,
+                "concreteValueVtable",
+                formatAddress(concreteValueVtable));
+            NetworkSchemaJson.add(
+                object,
+                "concreteValueVtableSource",
+                concreteValueVtableSource);
+            if (concreteValueVtableConflict) {
+                object.addProperty("concreteValueVtableConflict", true);
+            }
 
             JsonArray fieldJson = new JsonArray();
             for (FieldCall field : fields) {
@@ -577,7 +603,8 @@
             }
             object.add("fields", fieldJson);
 
-            if (rejectedPcodeFields.size() != 0 || collapsedAggregateLeafCount != 0) {
+            if (rejectedPcodeFields.size() != 0 || collapsedAggregateLeafCount != 0 ||
+                expandedPartialCallFrameCount != 0) {
                 JsonObject diagnostics = new JsonObject();
                 if (rejectedPcodeFields.size() != 0) {
                     diagnostics.add("rejectedPcodeFields", rejectedPcodeFields);
@@ -586,6 +613,14 @@
                     diagnostics.addProperty(
                         "collapsedAggregateLeafCount",
                         collapsedAggregateLeafCount);
+                }
+                if (expandedPartialCallFrameCount != 0) {
+                    diagnostics.addProperty(
+                        "expandedPartialCallFrameCount",
+                        expandedPartialCallFrameCount);
+                    diagnostics.addProperty(
+                        "expandedPartialCallFrameMemberCount",
+                        expandedPartialCallFrameMemberCount);
                 }
                 object.add("recoveryDiagnostics", diagnostics);
             }

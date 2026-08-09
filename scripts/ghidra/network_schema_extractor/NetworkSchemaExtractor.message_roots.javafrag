@@ -88,6 +88,13 @@
                 return false;
             }
             List<PcodeOpAST> operations = orderedPcodeOps(high);
+            if (storage.offset == 0L && hasGuardedReadBufferCursorAdvance(
+                    high,
+                    operations,
+                    storage)) {
+                result = true;
+                return true;
+            }
             for (PcodeOpAST operation : operations) {
                 if (storage.offset == 0L && directCursorReadEvent(
                         high,
@@ -97,10 +104,15 @@
                     result = true;
                     return true;
                 }
-                if (operation.getOpcode() != PcodeOp.CALL) {
+                if (operation.getOpcode() != PcodeOp.CALL &&
+                    operation.getOpcode() != PcodeOp.CALLIND) {
                     continue;
                 }
-                Function target = pcodeCallTarget(operation);
+                Function target = operation.getOpcode() == PcodeOp.CALL
+                    ? pcodeCallTarget(operation)
+                    : concreteMessageVirtualCallTarget(
+                        function,
+                        operation);
                 Integer slot = provenCallArgumentSlot(
                     function,
                     operation,
@@ -132,6 +144,61 @@
         }
     }
 
+    private boolean hasGuardedReadBufferCursorAdvance(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeStorage buffer) {
+
+        if (high == null || operations == null || buffer == null) {
+            return false;
+        }
+        PcodeStorage cursor = buffer.plus(0x10L);
+        PcodeStorage limit = buffer.plus(0x8L);
+        for (PcodeOpAST store : operations) {
+            if (store.getOpcode() != PcodeOp.STORE || store.getNumInputs() < 3) {
+                continue;
+            }
+            PcodeStorage destination = pcodeStorageExpression(store.getInput(1));
+            if (!cursor.sameLocation(destination)) {
+                continue;
+            }
+            CursorAdvanceEvidence advance = cursorAdvance(
+                store.getInput(2),
+                cursor,
+                new LinkedHashSet<>());
+            if (advance == null || advance.byteCount() <= 0L ||
+                advance.byteCount() > 0x1000L ||
+                !hasGuardedCursorAdvance(high, operations, store, cursor)) {
+                continue;
+            }
+            PcodeMemoryPath advancedPath = pcodeMemoryPath(store.getInput(2), 1);
+            if (advancedPath == null) {
+                continue;
+            }
+            for (PcodeOpAST comparison : operations) {
+                if (!isOrderedPointerComparison(comparison) ||
+                    comparison.getNumInputs() != 2 ||
+                    !NetworkSchemaControlFlow.precedes(high, comparison, store)) {
+                    continue;
+                }
+                boolean firstIsAdvance = advancedPath.equals(
+                    pcodeMemoryPath(comparison.getInput(0), 1));
+                boolean secondIsAdvance = advancedPath.equals(
+                    pcodeMemoryPath(comparison.getInput(1), 1));
+                PcodeStorage comparedLimit = firstIsAdvance && !secondIsAdvance
+                    ? pcodeLoadedStorageExpression(comparison.getInput(1))
+                    : secondIsAdvance && !firstIsAdvance
+                        ? pcodeLoadedStorageExpression(comparison.getInput(0))
+                        : null;
+                if (limit.sameLocation(comparedLimit)) {
+                    runMetrics.increment("guardedReadBufferCursorAdvanceProofs");
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private String discoverMessageRootParameter(
         Function wrapper,
         String readBufferParameter) {
@@ -146,10 +213,15 @@
 
         for (int index = 0; index < operations.size(); index++) {
             PcodeOpAST operation = operations.get(index);
-            if (operation.getOpcode() != PcodeOp.CALL) {
+            if (operation.getOpcode() != PcodeOp.CALL &&
+                operation.getOpcode() != PcodeOp.CALLIND) {
                 continue;
             }
-            Function target = pcodeCallTarget(operation);
+            Function target = operation.getOpcode() == PcodeOp.CALL
+                ? pcodeCallTarget(operation)
+                : concreteMessageVirtualCallTarget(
+                    wrapper,
+                    operation);
             Integer readSlot = provenCallArgumentSlot(
                 wrapper,
                 operation,
@@ -184,7 +256,8 @@
 
         for (int index = 0; index < firstReadCall; index++) {
             PcodeOpAST operation = operations.get(index);
-            if (operation.getOpcode() != PcodeOp.CALL || operation.getOutput() == null) {
+            if (operation.getOpcode() != PcodeOp.CALL ||
+                operation.getOutput() == null) {
                 continue;
             }
             PcodeStorage returned = pcodeStorageExpression(operation.getOutput());

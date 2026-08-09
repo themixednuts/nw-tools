@@ -68,16 +68,37 @@
         WireShape knownEvidence) {
 
         Function target = pcodeCallTarget(call);
-        String nativeType = firstNonEmpty(
-            unmarshalNativeTypeFromTarget(target),
-            scalarOutputStoreNativeType(target));
-        Integer nativeWidth = nativeTypeByteWidth(nativeType);
+        WireShape evidence = knownEvidence == null
+            ? directCallWireEvidence((PcodeOpAST)call)
+            : knownEvidence;
+        Integer nativeWidth = scalarNativeOutputByteWidth(evidence);
         if (nativeWidth == null) {
-            WireShape evidence = knownEvidence == null
-                ? directCallWireEvidence((PcodeOpAST)call)
-                : knownEvidence;
-            nativeWidth = evidence == null ? null : wireShapeByteWidth(evidence.shape);
+            String nativeType = firstNonEmpty(
+                unmarshalNativeTypeFromTarget(target),
+                scalarOutputStoreNativeType(target));
+            nativeWidth = nativeTypeByteWidth(nativeType);
         }
         PcodeStorage storage = pcodeScalarUnmarshalOutputStorage(call, nativeWidth);
+        if (storage == null && nativeWidth != null) {
+            Integer slot = unmarshalOutputParameterSlot(target);
+            Function owner = call == null || call.getSeqnum() == null
+                ? null
+                : functionContaining(call.getSeqnum().getTarget());
+            storage = slot == null
+                ? null
+                : provenCallArgumentStorage(owner, call, target, slot);
+        }
         return storage == null ? Collections.emptySet() : Set.of(storage);
+    }
+
+    private Integer scalarNativeOutputByteWidth(WireShape evidence) {
+        String shape = evidence == null
+            ? null
+            : firstNonEmpty(evidence.shape, evidence.layout);
+        return switch (String.valueOf(shape)) {
+            // Variable-width wire integers still have fixed-width native outputs.
+            case "vlq-u32" -> Integer.BYTES;
+            case "vlq-u64" -> Long.BYTES;
+            default -> wireShapeByteWidth(shape);
+        };
     }

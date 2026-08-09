@@ -133,6 +133,51 @@
                 ",blocks=" + blocks);
     }
 
+    private boolean isAcyclicLinearCodecProduct(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        List<CodecWireEvent> events,
+        UnmarshalTerminalFlow terminalFlow) {
+
+        if (high == null || operations == null || events == null ||
+            events.size() < 2 || terminalFlow == null ||
+            terminalFlow.terminals().isEmpty()) {
+            return false;
+        }
+        List<NetworkSchemaNaturalLoop> loops =
+            NetworkSchemaControlFlow.naturalLoops(high);
+        PcodeOpAST previous = null;
+        for (CodecWireEvent event : events) {
+            checkAnalysisCancelled();
+            if (event == null || event.callsite() == null ||
+                event.wireEvidence() == null) {
+                return false;
+            }
+            PcodeOpAST operation = pcodeCallAt(high, event.callsite());
+            if (operation == null || loops.stream().anyMatch(loop -> loop.contains(operation)) ||
+                normalizedBooleanBranch(high, operations, event) != null) {
+                return false;
+            }
+            if (previous != null) {
+                PcodeBlockBasic previousBlock =
+                    NetworkSchemaControlFlow.parentBlock(previous);
+                PcodeBlockBasic currentBlock =
+                    NetworkSchemaControlFlow.parentBlock(operation);
+                boolean ordered = previousBlock == currentBlock
+                    ? previous.getSeqnum().compareTo(operation.getSeqnum()) < 0
+                    : NetworkSchemaControlFlow.reaches(previousBlock, currentBlock) &&
+                        !NetworkSchemaControlFlow.reaches(currentBlock, previousBlock);
+                if (!ordered) {
+                    return false;
+                }
+            }
+            previous = operation;
+        }
+        PcodeBlockBasic lastBlock = NetworkSchemaControlFlow.parentBlock(previous);
+        return lastBlock != null && terminalFlow.terminals().stream().anyMatch(terminal ->
+            terminal == lastBlock || NetworkSchemaControlFlow.reaches(lastBlock, terminal));
+    }
+
     private Map<PcodeBlockBasic, Set<PcodeBlockBasic>>
         unsuccessfulCodecEventEdges(
             HighFunction high,
@@ -200,6 +245,7 @@
 
     private void recordUnmarshalEventOrigin(
         Map<PcodeBlockBasic, PcodeOpAST> originsByBlock,
+        Map<CodecWireEvent, PcodeOpAST> originsByEvent,
         PcodeOpAST operation,
         List<CodecWireEvent> events) {
 
@@ -210,5 +256,12 @@
         PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
         if (block != null) {
             originsByBlock.put(block, operation);
+        }
+        if (originsByEvent != null) {
+            for (CodecWireEvent event : events) {
+                if (event != null) {
+                    originsByEvent.put(event, operation);
+                }
+            }
         }
     }

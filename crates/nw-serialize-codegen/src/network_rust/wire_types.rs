@@ -149,6 +149,10 @@ pub(super) fn rust_field_shape(shape: &SchemaWireShape) -> RustFieldShape {
             "::nw_network::serialize::ClassValue",
             "ReplicatedFieldHandler<::nw_network::serialize::ClassValue>",
         ),
+        SchemaWireShape::ActorInstantiationParameters => rust_field_shape_static(
+            "::nw_network::ActorInstantiationParameters",
+            "ReplicatedFieldHandler<::nw_network::ActorInstantiationParameters>",
+        ),
         SchemaWireShape::Composite(members) => {
             let (value_type, codec) = composite_projection(members);
             let field_type = replicated_field_type(&value_type, codec.as_deref());
@@ -202,6 +206,18 @@ pub(super) fn rust_field_shape(shape: &SchemaWireShape) -> RustFieldShape {
                 codec_type_or_default(&choice.false_value, &false_value.value_type),
                 codec_type_or_default(&choice.true_value, &true_value.value_type)
             );
+            let field_type = replicated_field_type(&value_type, Some(&codec));
+            RustFieldShape {
+                value_type,
+                field_type,
+                container_key_type_shape: None,
+                container_embedded_key_type_shapes: Vec::new(),
+                container_value_type_shape: None,
+                container_embedded_value_type_shapes: Vec::new(),
+            }
+        }
+        SchemaWireShape::BitMaskComposite(shape) => {
+            let (value_type, codec) = bit_mask_projection(shape);
             let field_type = replicated_field_type(&value_type, Some(&codec));
             RustFieldShape {
                 value_type,
@@ -272,12 +288,12 @@ pub(super) fn rust_field_shape(shape: &SchemaWireShape) -> RustFieldShape {
         }
         SchemaWireShape::FixedSequence(sequence) => {
             // Nested fixed-vector proofs (no handler vtable) emit ArrayVec from
-            // the scalar element + capacity. Top-level RegisterField fixed
+            // the recursive element + capacity. Top-level RegisterField fixed
             // sequences still prefer the handler-plan path in field_plan.
-            let element = scalar_rust_type(sequence.element);
+            let element_shape = rust_field_shape(&sequence.element);
+            let element = &element_shape.value_type;
             let value_type = format!("::arrayvec::ArrayVec<{element}, {}>", sequence.capacity);
-            let element_shape = SchemaWireShape::from(sequence.element);
-            let codec = wire_shape_codec_type(&element_shape)
+            let codec = wire_shape_codec_type(&sequence.element)
                 .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>"));
             let field_type = replicated_field_type(&value_type, codec.as_deref());
             RustFieldShape {
@@ -338,6 +354,7 @@ pub(super) fn wire_shape_codec_type(shape: &SchemaWireShape) -> Option<String> {
                 codec_type_or_default(&choice.true_value, &true_value)
             ))
         }
+        SchemaWireShape::BitMaskComposite(shape) => Some(bit_mask_projection(shape).1),
         SchemaWireShape::Sequence(inner) => wire_shape_codec_type(inner)
             .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>")),
         SchemaWireShape::Set(inner) => {
@@ -354,11 +371,8 @@ pub(super) fn wire_shape_codec_type(shape: &SchemaWireShape) -> Option<String> {
             let value_shape = rust_field_shape(value);
             map_sequence_codec_type(key, value, &key_shape, &value_shape)
         }
-        SchemaWireShape::FixedSequence(sequence) => {
-            let element_shape = SchemaWireShape::from(sequence.element);
-            wire_shape_codec_type(&element_shape)
-                .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>"))
-        }
+        SchemaWireShape::FixedSequence(sequence) => wire_shape_codec_type(&sequence.element)
+            .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>")),
         _ => None,
     }
 }
@@ -408,6 +422,45 @@ fn default_omitted_projection(members: &[SchemaWireShape]) -> (String, String) {
         tuple_rust_type(&codecs)
     );
     (value_type, codec)
+}
+
+fn bit_mask_projection(shape: &NetworkBitMaskCompositeWireShape) -> (String, String) {
+    assert!(
+        !shape.members.is_empty() && shape.members.len() <= 11,
+        "a shared byte mask contains between one and eleven payload members"
+    );
+    let mut value_types = Vec::with_capacity(shape.members.len() + 1);
+    value_types.push("u8".to_owned());
+    let mut policies = Vec::with_capacity(shape.members.len());
+    for member in &shape.members {
+        match member {
+            NetworkBitMaskMemberWireShape::Required(value) => {
+                let field = rust_field_shape(value);
+                let codec = codec_type_or_default(value, &field.value_type);
+                value_types.push(field.value_type);
+                policies.push(format!(
+                    "::nw_network::serialize::RequiredBitMaskCodec<{codec}>"
+                ));
+            }
+            NetworkBitMaskMemberWireShape::Masked { mask, value } => {
+                let field = rust_field_shape(value);
+                let codec = codec_type_or_default(value, &field.value_type);
+                value_types.push(format!("::core::option::Option<{}>", field.value_type));
+                policies.push(format!(
+                    "::nw_network::serialize::MaskedBitMaskCodec<{codec}, 0x{mask:02x}>"
+                ));
+            }
+        }
+    }
+    let value_type = tuple_rust_type(&value_types);
+    let policy_type = match policies.as_slice() {
+        [policy] => format!("({policy},)"),
+        policies => tuple_rust_type(policies),
+    };
+    (
+        value_type,
+        format!("::nw_network::serialize::BitMaskTupleCodec<{policy_type}>"),
+    )
 }
 
 fn codec_type_or_default(shape: &SchemaWireShape, value_type: &str) -> String {

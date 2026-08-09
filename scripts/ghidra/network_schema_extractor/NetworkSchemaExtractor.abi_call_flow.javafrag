@@ -200,7 +200,8 @@
         }
         int opcode = operation.getOpcode();
         return opcode == PcodeOp.CALL ||
-            opcode == PcodeOp.CALLIND;
+            opcode == PcodeOp.CALLIND ||
+            opcode == PcodeOp.BRANCHIND;
     }
 
     private ForwardArgState instructionStateBeforeCall(
@@ -223,12 +224,81 @@
         return state == null ? null : state.copy();
     }
 
+    private ForwardArgState instructionStateBeforeAddress(
+        Function owner,
+        Address target) {
+
+        if (owner == null || target == null) {
+            return null;
+        }
+        HighFunction high = highFunction(owner);
+        PcodeBlockBasic entryBlock = functionEntryBlock(high, owner);
+        PcodeBlockBasic targetBlock = pcodeBlockContainingAddress(high, target);
+        if (high == null || entryBlock == null || targetBlock == null) {
+            return null;
+        }
+        ForwardArgState input = abiBlockEntryStates(owner, high, entryBlock).get(
+            targetBlock.getIndex());
+        if (input == null) {
+            return null;
+        }
+        ForwardArgState state = input.copy();
+        for (Instruction instruction : blockInstructions(owner, targetBlock)) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            Address address = instruction.getMinAddress();
+            if (address.equals(target)) {
+                return state;
+            }
+            if (address.compareTo(target) > 0) {
+                return null;
+            }
+            observeForwardInstruction(instruction, state, false);
+        }
+        return null;
+    }
+
+    private PcodeBlockBasic pcodeBlockContainingAddress(
+        HighFunction high,
+        Address address) {
+
+        if (high == null || address == null) {
+            return null;
+        }
+        PcodeBlockBasic selected = null;
+        for (PcodeBlockBasic block : high.getBasicBlocks()) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            if (block.getStart() == null || block.getStop() == null ||
+                address.compareTo(block.getStart()) < 0 ||
+                address.compareTo(block.getStop()) > 0) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = block;
+        }
+        return selected;
+    }
+
     private boolean isExpectedCall(
         Instruction instruction,
         PcodeOp operation,
         Function expectedTarget) {
 
-        if (instruction == null || !instruction.getFlowType().isCall()) {
+        if (instruction == null) {
+            return false;
+        }
+        boolean call = instruction.getFlowType().isCall();
+        boolean indirectTailJump =
+            (operation.getOpcode() == PcodeOp.BRANCHIND ||
+             operation.getOpcode() == PcodeOp.CALLIND) &&
+            instruction.getFlowType().isJump() &&
+            instruction.getFlowType().isComputed();
+        if (!call && !indirectTailJump) {
             return false;
         }
         if (expectedTarget == null) {
@@ -272,7 +342,9 @@
             }
             ForwardArgState state = input.copy();
             for (Instruction instruction : blockInstructions(owner, block)) {
-                if (instruction.getFlowType().isCall()) {
+                if (instruction.getFlowType().isCall() ||
+                    (instruction.getFlowType().isJump() &&
+                     instruction.getFlowType().isComputed())) {
                     mergeCallsiteState(
                         callsites,
                         instruction.getMinAddress().getOffset(),
@@ -489,9 +561,12 @@
 
     private int provenCallArgumentCount(PcodeOp operation, Function target) {
         int encoded = encodedCallArgumentCount(operation);
-        if (operation != null && operation.getOpcode() == PcodeOp.CALLIND) {
-            // Indirect calls frequently omit register args from CALLIND p-code.
-            // Win64 frame tracking still recovers RCX/RDX/R8/R9 at the callsite.
+        if (operation != null &&
+            (operation.getOpcode() == PcodeOp.CALLIND ||
+             operation.getOpcode() == PcodeOp.BRANCHIND)) {
+            // Indirect calls and terminal virtual jumps frequently omit register
+            // args from p-code. Win64 frame tracking still recovers
+            // RCX/RDX/R8/R9 at the transfer site.
             return Math.max(encoded, 4);
         }
         if (operation == null || operation.getOpcode() != PcodeOp.CALL || target == null ||

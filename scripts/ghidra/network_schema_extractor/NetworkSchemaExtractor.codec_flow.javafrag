@@ -88,6 +88,7 @@
             CodecWireTrace body = new CodecWireTrace();
             Map<PcodeBlockBasic, List<CodecWireEvent>> eventsByBlock = new HashMap<>();
             Map<PcodeBlockBasic, PcodeOpAST> eventOriginsByBlock = new HashMap<>();
+            Map<CodecWireEvent, PcodeOpAST> eventOrigins = new IdentityHashMap<>();
             Set<PcodeBlockBasic> collapsedEventBlocks = new HashSet<>();
             List<PcodeOpAST> operations = orderedPcodeOps(high);
             Map<PcodeOpAST, UnmarshalSequenceAction> sequenceActions =
@@ -139,6 +140,7 @@
                         }
                         recordUnmarshalEventOrigin(
                             eventOriginsByBlock,
+                            eventOrigins,
                             op,
                             List.of(event));
                     }
@@ -158,6 +160,7 @@
                         }
                         recordUnmarshalEventOrigin(
                             eventOriginsByBlock,
+                            eventOrigins,
                             op,
                             sequence.events());
                     }
@@ -188,6 +191,7 @@
                     }
                     recordUnmarshalEventOrigin(
                         eventOriginsByBlock,
+                        eventOrigins,
                         op,
                         body.events.subList(eventStart, body.events.size()));
                     continue;
@@ -212,6 +216,7 @@
                     }
                     recordUnmarshalEventOrigin(
                         eventOriginsByBlock,
+                        eventOrigins,
                         op,
                         List.of(directRead));
                 }
@@ -285,7 +290,42 @@
                     NetworkSchemaFlowSequence.Status.COMPLETE,
                     List.copyOf(body.events));
             }
+            if (!sequence.complete() && isAcyclicLinearCodecProduct(
+                    high,
+                    operations,
+                    body.events,
+                    sequenceTerminalFlow)) {
+                sequence = new NetworkSchemaFlowSequence.Result<>(
+                    NetworkSchemaFlowSequence.Status.COMPLETE,
+                    List.copyOf(body.events));
+                runMetrics.increment("linearFailureGuardedCodecProducts");
+            }
             if (!sequence.complete()) {
+                SharedMaskCompositeAnalysis sharedMask =
+                    sharedMaskCompositeUnmarshalShape(
+                        high,
+                        operations,
+                        body.events,
+                        eventOrigins,
+                        sequenceTerminalFlow);
+                if (sharedMask.shape() != null) {
+                    CodecWireEvent first = body.events.get(0);
+                    CodecWireTrace result = new CodecWireTrace(List.of(
+                        new CodecWireEvent(
+                            unmarshalNativeTypeFromTarget(function),
+                            sharedMask.shape(),
+                            first.callsite(),
+                            function.getEntryPoint(),
+                            fullFunctionName(function),
+                            null,
+                            null)));
+                    completedContexts.put(context, new CodecWireTrace(result.events));
+                    codecWireTraceDiagnostics.put(
+                        context,
+                        "complete-shared-byte-mask:" + sharedMask.diagnostic());
+                    runMetrics.increment("sharedMaskCodecProducts");
+                    return result;
+                }
                 CodecWireTrace optional = optionalUnmarshalCodecTrace(
                     function,
                     high,
@@ -302,6 +342,7 @@
                             ":terminal=" + sequenceTerminalFlow.status() +
                             ":events=" + body.events.size() +
                             ":boolean-choice=" + booleanChoice.diagnostic() +
+                            ":shared-mask=" + sharedMask.diagnostic() +
                             ":success-coverage=" + successCoverage.diagnostic() +
                             ":status-flow=" +
                                 statusFlowGraphDebugByFunction.getOrDefault(
@@ -439,6 +480,26 @@
                 fullFunctionName(target),
                 rawRead == null ? null : rawRead.storage,
                 null));
+            return null;
+        }
+
+        String targetBufferParameter = formalParameterBaseFromStorage(
+            target,
+            targetReadBuffer);
+        WireShape atomicActorParameters = actorInstantiationParametersUnmarshalShape(
+            target,
+            unmarshalNativeTypeFromTarget(target),
+            targetBufferParameter);
+        if (atomicActorParameters != null) {
+            events.add(new CodecWireEvent(
+                unmarshalNativeTypeFromTarget(target),
+                atomicActorParameters,
+                op.getSeqnum().getTarget(),
+                target.getEntryPoint(),
+                fullFunctionName(target),
+                provenUnmarshalOutputStorage(op),
+                null));
+            runMetrics.increment("atomicActorInstantiationParameterCalls");
             return null;
         }
 
@@ -626,6 +687,12 @@
                 function,
                 readBufferParameter);
             return validated != null && candidate.shape.equals(validated.shape);
+        }
+        if ("actor-instantiation-parameters".equals(candidate.shape)) {
+            return actorInstantiationParametersUnmarshalShape(
+                function,
+                unmarshalNativeTypeFromTarget(function),
+                readBufferParameter) != null;
         }
         if ("optional<vlq-u64>".equals(candidate.layout)) {
             return events.size() == 2 &&

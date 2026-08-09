@@ -67,31 +67,43 @@
             // void Ghidra signature (e.g. NewWorld+0x15c29b0). Recover those from
             // the callsite rather than requiring ReadRaw body buffer flow.
             RawPcodeWrite rawWrite = pcodeReadRawWrite(operation, target);
-            WireShape rawEvidence = rawWrite == null
+            WireShape rawEvidence = pcodeReadRawWireEvidence(operation, target);
+            WireShape booleanEvidence = rawWrite == null
                 ? null
                 : boundedNormalizedBooleanReadEvidence(
                     high,
                     operations,
                     operation,
                     rawWrite);
-            if (rawEvidence == null && rawWrite != null) {
-                rawEvidence = rawWrite.wireEvidence;
+            if (booleanEvidence != null) {
+                rawEvidence = booleanEvidence;
             }
             List<CodecWireEvent> nestedEvents = null;
             boolean writesElement;
             if (rawEvidence != null) {
-                writesElement = false;
+                writesElement = unmarshalCodecWritesSequenceElement(
+                    function,
+                    high,
+                    loop,
+                    operations,
+                    operation,
+                    extent,
+                    readBuffer);
                 nestedEvents = List.of(new CodecWireEvent(
-                    rawWrite.nativeType,
+                    rawWrite == null ? null : rawWrite.nativeType,
                     rawEvidence,
                     operation.getSeqnum().getTarget(),
                     target.getEntryPoint(),
                     fullFunctionName(target),
-                    rawWrite.storage,
+                    rawWrite == null
+                        ? sequenceOwnerStorageForElementUnmarshal(
+                            operation,
+                            readBuffer)
+                        : rawWrite.storage,
                     null));
             }
             else {
-                WireShape directEvidence = directCallWireEvidence(operation);
+                WireShape directEvidence = directCallWireEvidence(function, operation);
                 if (directEvidence != null && directEvidence.hasProvenSemantics()) {
                     writesElement = unmarshalCodecWritesSequenceElement(
                         function,
@@ -234,18 +246,31 @@
             sequence.events().forEach(codec -> events.addAll(codec.events()));
         }
         else {
-            CodecWireEvent optional = optionalCollectionElementEvent(
+            CodecWireEvent masked = sharedMaskCollectionElementEvent(
                 function,
                 high,
                 loop,
                 operations,
+                extent,
                 codecsByBlock);
-            if (optional == null) {
-                recordNestedTypeShapeReject(
-                    "dynamic-collection-iteration-" + sequence.status());
-                return null;
+            if (masked != null) {
+                events.add(masked);
+                runMetrics.increment("sharedMaskCollectionElements");
             }
-            events.add(optional);
+            else {
+                CodecWireEvent optional = optionalCollectionElementEvent(
+                    function,
+                    high,
+                    loop,
+                    operations,
+                    codecsByBlock);
+                if (optional == null) {
+                    recordNestedTypeShapeReject(
+                        "dynamic-collection-iteration-" + sequence.status());
+                    return null;
+                }
+                events.add(optional);
+            }
         }
         WireShape evidence = dynamicSequenceWireEvidence(events);
         return evidence == null
@@ -254,6 +279,60 @@
                 dynamicSequenceNativeType(events),
                 evidence,
                 callsites);
+    }
+
+    private CodecWireEvent collectionElementProductEvent(
+        CollectionElementCodec element) {
+
+        if (element == null || element.operation() == null ||
+            element.events().isEmpty()) {
+            return null;
+        }
+        if (element.events().size() == 1) {
+            return element.events().get(0);
+        }
+        Function target = pcodeCallTarget(element.operation());
+        if (target == null) {
+            return null;
+        }
+        String nativeType = unmarshalNativeTypeFromTarget(target);
+        WireShape product = codecWireProduct(
+            nativeType,
+            element.events(),
+            "cfg-complete-collection-element-call-product");
+        if (product == null) {
+            return null;
+        }
+        runMetrics.increment("collectionElementCallProducts");
+        return new CodecWireEvent(
+            nativeType,
+            product,
+            element.operation().getSeqnum().getTarget(),
+            target.getEntryPoint(),
+            fullFunctionName(target),
+            provenUnmarshalOutputStorage(element.operation()),
+            null);
+    }
+
+    private Set<PcodeBlockBasic> mandatorySuccessfulLoopIterationBlocks(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop) {
+
+        if (high == null || loop == null || loop.header() == null) {
+            return Set.of();
+        }
+        List<PcodeBlockBasic> latches = loop.body().stream()
+            .filter(block -> NetworkSchemaControlFlow.successors(block)
+                .contains(loop.header()))
+            .toList();
+        if (latches.isEmpty()) {
+            return Set.of();
+        }
+        return loop.body().stream()
+            .filter(candidate -> latches.stream().allMatch(latch ->
+                candidate == latch ||
+                    NetworkSchemaControlFlow.dominates(high, candidate, latch)))
+            .collect(Collectors.toUnmodifiableSet());
     }
 
     private CodecWireEvent optionalCollectionElementEvent(
@@ -407,7 +486,11 @@
                 continue;
             }
             Function target = pcodeCallTarget(operation);
-            WireShape evidence = directCallWireEvidence(high, operations, operation);
+            WireShape evidence = directCallWireEvidence(
+                owner,
+                high,
+                operations,
+                operation);
             observePcodeTempUnmarshal(
                 tempNativeTypes,
                 tempWireShapes,
@@ -443,6 +526,7 @@
                 continue;
             }
             PcodeOpAST count = uniqueUnmarshalCountProducer(
+                owner,
                 high,
                 operations,
                 operation,
@@ -481,7 +565,11 @@
             if (nestedHelpers.contains(operation)) {
                 continue;
             }
-            WireShape evidence = directCallWireEvidence(high, operations, operation);
+            WireShape evidence = directCallWireEvidence(
+                owner,
+                high,
+                operations,
+                operation);
             if (evidence != null && evidence.layout != null) {
                 result.add(new PcodeCodecCall(operation, evidence));
                 consumedCallsites.add(operation.getSeqnum().getTarget());
@@ -547,7 +635,10 @@
         PcodeOpAST count) {
 
         DynamicSequenceExtent extent = dynamicSequenceExtent(loop, operations);
-        String readBufferParameter = uniqueReadBufferParameter(owner);
+        String readBufferParameter = callReadBufferParameter(owner, count);
+        if (readBufferParameter == null) {
+            readBufferParameter = uniqueReadBufferParameter(owner);
+        }
         CollectionIteration iteration =
             extent == null || readBufferParameter == null
                 ? null

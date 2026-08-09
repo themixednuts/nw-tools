@@ -1,0 +1,65 @@
+    private boolean isStatusBearingUnmarshalCodec(ContainerCodecCall codec) {
+        if (codec == null || codec.operation == null ||
+            codec.operation.getOpcode() != PcodeOp.CALL) {
+            return false;
+        }
+        Function target = pcodeCallTarget(codec.operation);
+        if (target == null ||
+            pcodeReadRawWireEvidence(codec.operation, target) != null) {
+            return false;
+        }
+        String nativeType = firstNonEmpty(
+            codec.nativeType,
+            unmarshalNativeTypeFromTarget(target));
+        String semantic = nativeType == null
+            ? null
+            : wireShapeFromNativeType(nativeType);
+        // A decoded boolean is commonly a presence/tag branch. Treating that
+        // branch as a codec-status edge would erase a real optional path.
+        return semantic == null || !"bool".equals(semantic);
+    }
+
+    private PcodeBlockBasic transitiveStructuralCodecSuccessor(
+        PcodeBlockBasic first,
+        PcodeBlockBasic second,
+        Map<PcodeBlockBasic, List<ContainerCodecCall>> membersByBlock,
+        PcodeBlockBasic source) {
+
+        boolean firstReachesCodec =
+            reachesLaterCodecBlock(first, membersByBlock, source);
+        boolean secondReachesCodec =
+            reachesLaterCodecBlock(second, membersByBlock, source);
+        return firstReachesCodec == secondReachesCodec
+            ? null
+            : firstReachesCodec ? first : second;
+    }
+
+    private boolean reachesLaterCodecBlock(
+        PcodeBlockBasic start,
+        Map<PcodeBlockBasic, List<ContainerCodecCall>> membersByBlock,
+        PcodeBlockBasic source) {
+
+        if (start == null || membersByBlock == null) {
+            return false;
+        }
+        Address sourceStart = source == null ? null : source.getStart();
+        for (Map.Entry<PcodeBlockBasic, List<ContainerCodecCall>> entry :
+                membersByBlock.entrySet()) {
+            PcodeBlockBasic codecBlock = entry.getKey();
+            if (codecBlock == null || entry.getValue() == null ||
+                entry.getValue().isEmpty()) {
+                continue;
+            }
+            Address codecStart = codecBlock.getStart();
+            if (codecBlock == source ||
+                sourceStart != null && codecStart != null &&
+                    codecStart.compareTo(sourceStart) <= 0) {
+                continue;
+            }
+            if (start == codecBlock ||
+                NetworkSchemaControlFlow.reaches(start, codecBlock)) {
+                return true;
+            }
+        }
+        return false;
+    }

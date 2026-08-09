@@ -277,6 +277,7 @@
         functionNameCache.clear();
         functionInstructionsCache.clear();
         abiCallsiteStateCache.clear();
+        instructionSequenceCursorCache.clear();
         machineRegisterArgumentCountCache.clear();
         allocatorReturnFunctionCache.clear();
         vectorConstructorIteratorCache.clear();

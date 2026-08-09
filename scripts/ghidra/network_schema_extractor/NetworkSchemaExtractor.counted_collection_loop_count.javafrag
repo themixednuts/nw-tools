@@ -1,0 +1,48 @@
+    private PcodeOpAST nearestCountCallForLoop(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations) {
+
+        return nearestCountCallForLoop(
+            owner,
+            high,
+            loop,
+            operations,
+            "vlq-u32");
+    }
+
+    private PcodeOpAST nearestCountCallForLoop(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        String expectedShape) {
+
+        PcodeOpAST selected = null;
+        for (PcodeOpAST operation : operations) {
+            checkAnalysisCancelled();
+            if (loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            WireShape evidence = countCodecWireEvidence(
+                owner,
+                operation,
+                expectedShape);
+            if (!wireShapeMatches(evidence, expectedShape) ||
+                !countCallControlsLoop(owner, high, operation, loop, operations)) {
+                continue;
+            }
+            if (selected == null || countProducerPrecedesConsumer(
+                    high,
+                    selected,
+                    operation)) {
+                selected = operation;
+                continue;
+            }
+            if (!countProducerPrecedesConsumer(high, operation, selected)) {
+                return null;
+            }
+        }
+        return selected;
+    }

@@ -586,6 +586,14 @@
             return baseOffset;
         }
 
+        TrackedValue dependencies = trackedAddressDependenciesForMemoryOperand(
+            instruction,
+            1,
+            state.registers);
+        if (dependencies != null) {
+            return dependencies;
+        }
+
         Long immediate = trackedImmediateForMemoryOperand(instruction, 1, state.registers);
         if (immediate != null) {
             return TrackedValue.immediate(immediate);

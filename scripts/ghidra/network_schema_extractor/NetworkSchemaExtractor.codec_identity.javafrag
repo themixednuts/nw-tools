@@ -186,21 +186,32 @@
         if (classValue != null) {
             return classValue;
         }
+        NetworkSchemaCodecClassifier.VariableIntegerCodec structural =
+            NetworkSchemaCodecClassifier.variableIntegerCodec(high);
+        Integer variableIntegerOutputWidth = structural == null
+            ? null
+            : "vlq-u64".equals(structural.shape()) ? Long.BYTES : Integer.BYTES;
+        if (structural != null &&
+            structural.direction() == NetworkSchemaCodecClassifier.CodecDirection.DECODE &&
+            hasReadBufferFlow(function, readBufferParameter, new LinkedHashSet<>()) &&
+            scalarOutputParameterSlot(function, variableIntegerOutputWidth) != null) {
+            runMetrics.increment("validatedVariableIntegerUnmarshalCodecs");
+            return WireShape.semantic(
+                structural.shape(),
+                "unmarshal-pcode-codec-structure+read-buffer+scalar-output");
+        }
+
+        // A VLQ decoder contains several bounded fixed-width read paths. It is
+        // therefore eligible for fixed-sequence recovery when the decompiler
+        // partitions those paths into a synthetic loop. Prefer the complete
+        // decision-chain proof above so a count decoder cannot collapse to one
+        // of its individual byte-read layouts.
         FixedSequenceShape fixedSequence = fixedSequenceShape(
             function,
             readBufferParameter,
             NetworkSchemaCodecClassifier.CodecDirection.DECODE);
         if (fixedSequence != null && fixedSequence.wireEvidence != null) {
             return fixedSequence.wireEvidence;
-        }
-        NetworkSchemaCodecClassifier.VariableIntegerCodec structural =
-            NetworkSchemaCodecClassifier.variableIntegerCodec(high);
-        if (structural != null &&
-            structural.direction() == NetworkSchemaCodecClassifier.CodecDirection.DECODE &&
-            hasReadBufferFlow(function, readBufferParameter, new LinkedHashSet<>())) {
-            return WireShape.semantic(
-                structural.shape(),
-                "unmarshal-pcode-codec-structure");
         }
 
         if (NetworkSchemaCodecClassifier.isBinary16Decode(high) &&

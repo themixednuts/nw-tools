@@ -672,6 +672,90 @@ fn imports_message_unmarshal_fields_without_registered_fields_capability() {
 }
 
 #[test]
+fn collapses_synthetic_nested_alternate_spelling_members() {
+    let machine = "composite<string,string,fixed-bytes-1,string,fixed-bytes-4,string,string,fixed-bytes-1,fixed-bytes-1,fixed-bytes-1,fixed-bytes-1,fixed-bytes-1,vec<composite<fixed-bytes-4,fixed-bytes-2,fixed-bytes-2,fixed-bytes-2,fixed-bytes-2,fixed-bytes-2,fixed-bytes-2,fixed-bytes-1>>,fixed-bytes-4,string,fixed-bytes-1,fixed-bytes-1,vec<composite<fixed-bytes-4,string>>>";
+    let semantic = "composite<string,string,u8,string,u32,string,string,bool,bool,bool,bool,bool,fixed-vector<composite<u32,u16,u16,u16,u16,u16,u16,u8>,20>,u32,string,bool,u8,vec<composite<u32,string>>>";
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000001886",
+            "typeIndex": 1886,
+            "typeName": "LocalizedSystemChatMessage",
+            "handler": {
+                "Marshal": "NewWorld+0x100",
+                "Unmarshal": "NewWorld+0x200"
+            },
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "storageExpression": "param_3 + 0x20",
+                "storageBase": "param_3",
+                "storageOffset": 32,
+                "wireShape": semantic,
+                "wireLayout": format!("composite<{machine},{semantic}>"),
+                "wireShapeSource": "cfg-multi-helper-alternate-spelling-collapse",
+                "wireLayoutSource": "cfg-ordered-multi-helper-wire-product",
+                "nestedTypeShape": {
+                    "identityProven": true,
+                    "typeName": "LocalizedSystemChatMessage",
+                    "typeNameFull": "LocalizedSystemChatMessage",
+                    "memberNameSource": "synthetic-offset",
+                    "memberNamesProven": false,
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "wireOrderSource": "cfg-ordered-multi-helper-wire-product",
+                    "validation": "message-unmarshal-constructor-vptr+az-rtti+typeregistry-type-name",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "name": "_0",
+                        "nameSource": "synthetic-offset",
+                        "nameProven": false,
+                        "wireShape": machine,
+                        "wireLayout": machine,
+                        "wireOrdinal": 0,
+                        "wireOrderSource": "cfg-ordered-multi-helper-wire-product",
+                        "callsite": "NewWorld+0x300"
+                    }, {
+                        "index": 1,
+                        "offset": "0x1",
+                        "name": "_1",
+                        "nameSource": "synthetic-offset",
+                        "nameProven": false,
+                        "wireShape": semantic,
+                        "wireLayout": semantic,
+                        "wireOrdinal": 1,
+                        "wireOrderSource": "cfg-ordered-multi-helper-wire-product",
+                        "callsite": "NewWorld+0x300"
+                    }]
+                },
+                "confidence": "high"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+
+    let schema =
+        NetworkSchema::from_ghidra_static_network_report(&report).expect("normalized schema");
+    let field = &schema.types[0].fields[0];
+    let nested = field.nested_type_shape.as_ref().expect("nested type shape");
+
+    assert_eq!(
+        field.wire_shape.as_ref().map(NetworkWireShape::wire_string),
+        Some(semantic.to_owned())
+    );
+    assert_eq!(nested.members.len(), 18);
+    assert_eq!(
+        nested.members[12].wire_shape.as_deref(),
+        Some("fixed-vector<composite<u32,u16,u16,u16,u16,u16,u16,u8>,20>")
+    );
+    assert_eq!(
+        nested.wire_order_source.as_deref(),
+        Some("cfg-multi-helper-alternate-spelling-collapse")
+    );
+}
+
+#[test]
 fn keeps_message_marshal_fields_separate_from_unmarshal_fields() {
     let report = json!({
         "registryEntries": [{

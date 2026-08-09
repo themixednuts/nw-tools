@@ -1,0 +1,301 @@
+    private void recoverConcreteDelegatedFragmentGraph(
+        MessageUnmarshalPlan plan,
+        Function wrapper,
+        DelegatedCodecEvidence evidence) {
+
+        if (plan == null || wrapper == null || evidence == null ||
+            evidence.valueStorage == null || evidence.readBufferStorage == null) {
+            return;
+        }
+        Address vtable = concreteDelegatedFragmentVtable(wrapper, evidence);
+        if (vtable == null) {
+            runMetrics.increment("delegatedFragmentConcreteVtableMissing");
+            return;
+        }
+
+        ArrayList<Address> marshalTargets = new ArrayList<>();
+        ArrayList<Address> unmarshalTargets = new ArrayList<>();
+        for (int index = 0; index < I_FRAGMENT_PHASE_NAMES.length; index++) {
+            checkAnalysisCancelled();
+            Address marshal = resolvedCodeTarget(readPointer(
+                vtable.add(I_FRAGMENT_MARSHAL_PHASE_SLOTS[index] * 8L)));
+            Address unmarshal = resolvedCodeTarget(readPointer(
+                vtable.add(I_FRAGMENT_UNMARSHAL_PHASE_SLOTS[index] * 8L)));
+            if (!isExecutableAddress(marshal) || !isExecutableAddress(unmarshal)) {
+                runMetrics.increment("delegatedFragmentConcretePhaseMissing");
+                return;
+            }
+            marshalTargets.add(marshal);
+            unmarshalTargets.add(unmarshal);
+        }
+
+        MessageUnmarshalPlan scratch = new MessageUnmarshalPlan();
+        scratch.wrapper = plan.wrapper;
+        scratch.wrapperName = plan.wrapperName;
+        scratch.instanceSize = plan.instanceSize;
+        scratch.rootStorageBase = evidence.valueStorage.base;
+        scratch.readBufferParameter = evidence.readBufferStorage.base;
+        scratch.rootEvidenceSource =
+            "direct-fragment-vptr+paired-virtual-unmarshal-phases";
+        int[] operationOrder = {0};
+        boolean sawReadPhase = false;
+
+        for (int index = 0; index < unmarshalTargets.size(); index++) {
+            checkAnalysisCancelled();
+            Function phase = functionAtOrContaining(unmarshalTargets.get(index));
+            String readBuffer = concreteFragmentReadBufferParameter(phase);
+            boolean reads = readBuffer != null;
+            evidence.concreteUnmarshalPhaseReads.add(reads);
+            if (!reads) {
+                continue;
+            }
+            sawReadPhase = true;
+            CodecWireTrace trace = traceUnmarshalCodec(
+                phase,
+                readBuffer,
+                codecWireTraceActiveContexts,
+                codecWireTraceCompletedContexts);
+            if (trace == null || trace.events.isEmpty()) {
+                runMetrics.increment("delegatedFragmentConcreteTraceMissing");
+                return;
+            }
+
+            int firstField = scratch.fields.size();
+            LinkedHashMap<String, PcodeStorage> frame = new LinkedHashMap<>();
+            frame.put("param_1", evidence.valueStorage);
+            frame.put(readBuffer, evidence.readBufferStorage);
+            recoverPcodeMessageGraph(
+                scratch,
+                phase,
+                readBuffer,
+                frame,
+                new LinkedHashSet<>(),
+                operationOrder);
+            if (!reconcileConcreteFragmentPhaseFields(
+                    scratch,
+                    firstField,
+                    trace,
+                    unmarshalTargets.get(index))) {
+                runMetrics.increment("delegatedFragmentConcreteFieldMismatch");
+                return;
+            }
+        }
+
+        evidence.concreteVtable = vtable;
+        evidence.concreteMarshalTargets.addAll(marshalTargets);
+        evidence.concreteUnmarshalTargets.addAll(unmarshalTargets);
+        evidence.concreteResolved = true;
+        evidence.concreteEvidenceSource =
+            "direct-fragment-vptr+paired-full-codec-phases";
+        plan.rootStorageBase = evidence.valueStorage.base;
+        plan.readBufferParameter = evidence.readBufferStorage.base;
+        plan.rootEvidenceSource = evidence.concreteEvidenceSource;
+        plan.fields.addAll(scratch.fields);
+        for (JsonElement rejected : scratch.rejectedPcodeFields) {
+            plan.rejectedPcodeFields.add(rejected);
+        }
+        if (!sawReadPhase && plan.fields.isEmpty()) {
+            plan.emptyWireProven = true;
+            plan.emptyWireEvidenceSource =
+                "concrete-fragment-vtable-all-unmarshal-phases-no-read";
+            plan.supportsUnmarshal = true;
+        }
+        runMetrics.increment("delegatedFragmentConcreteResolved");
+    }
+
+    private Address concreteDelegatedFragmentVtable(
+        Function wrapper,
+        DelegatedCodecEvidence evidence) {
+
+        HighFunction high = highFunction(wrapper);
+        PcodeOpAST delegatedCall = high == null
+            ? null
+            : pcodeCallAt(high, evidence.callsite);
+        if (high == null || delegatedCall == null) {
+            return null;
+        }
+
+        PcodeOpAST selectedStore = null;
+        Address selectedVtable = null;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            checkAnalysisCancelled();
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3 ||
+                !NetworkSchemaControlFlow.precedes(
+                    high,
+                    operation,
+                    delegatedCall)) {
+                continue;
+            }
+            PcodeStorage destination =
+                pcodeStorageExpression(operation.getInput(1));
+            Address vtable = uniquePcodeVtableAddress(operation.getInput(2));
+            if (!evidence.valueStorage.sameLocation(destination) ||
+                !isVtableLike(vtable)) {
+                continue;
+            }
+            if (selectedStore != null &&
+                !NetworkSchemaControlFlow.precedes(
+                    high,
+                    selectedStore,
+                    operation)) {
+                return null;
+            }
+            selectedStore = operation;
+            selectedVtable = vtable;
+        }
+        return selectedVtable;
+    }
+
+    private String concreteFragmentReadBufferParameter(Function phase) {
+        if (phase == null) {
+            return null;
+        }
+        ArrayList<String> candidates = new ArrayList<>();
+        for (int slot = 1; slot <= 4; slot++) {
+            String parameter = "param_" + slot;
+            if (hasReadBufferFlow(
+                    phase,
+                    parameter,
+                    new LinkedHashSet<>())) {
+                candidates.add(parameter);
+            }
+        }
+        return candidates.size() == 1 ? candidates.get(0) : null;
+    }
+
+    private boolean reconcileConcreteFragmentPhaseFields(
+        MessageUnmarshalPlan plan,
+        int firstField,
+        CodecWireTrace trace,
+        Address phaseTarget) {
+
+        if (plan == null || trace == null ||
+            firstField < 0 || firstField > plan.fields.size()) {
+            return false;
+        }
+        ArrayList<FieldCall> fields = new ArrayList<>(
+            plan.fields.subList(firstField, plan.fields.size()));
+        fields.sort(Comparator.comparingInt(field -> field.recoveryOrder));
+        if (fields.isEmpty()) {
+            return false;
+        }
+
+        if (trace.events.size() == fields.size()) {
+            for (int index = 0; index < fields.size(); index++) {
+                replaceConcreteFragmentFieldWireEvidence(
+                    fields.get(index),
+                    trace.events.get(index).wireEvidence(),
+                    phaseTarget);
+            }
+            return true;
+        }
+        if (trace.events.size() != 1 ||
+            !isAggregateWireEvidence(trace.events.get(0).wireEvidence())) {
+            return false;
+        }
+
+        FieldCall atomic = fields.get(0);
+        for (int index = plan.fields.size() - 1; index >= firstField; index--) {
+            plan.fields.remove(index);
+        }
+        plan.fields.add(atomic);
+        replaceConcreteFragmentFieldWireEvidence(
+            atomic,
+            trace.events.get(0).wireEvidence(),
+            phaseTarget);
+        return true;
+    }
+
+    private void replaceConcreteFragmentFieldWireEvidence(
+        FieldCall field,
+        WireShape evidence,
+        Address phaseTarget) {
+
+        if (field == null || evidence == null) {
+            return;
+        }
+        field.wireShape = firstNonEmpty(evidence.shape, evidence.layout);
+        field.wireShapeSource =
+            "concrete-fragment-vtable-phase+" + evidence.source;
+        field.wireLayout = firstNonEmpty(evidence.layout, evidence.shape);
+        field.wireLayoutSource =
+            "concrete-fragment-vtable-phase+" +
+                firstNonEmpty(evidence.layoutSource, evidence.source);
+        field.typeConflict = null;
+        if (field.callsite == null) {
+            field.callsite = phaseTarget;
+        }
+    }
+
+    private MessageMarshalPlan recoverConcreteDelegatedFragmentMarshalPlan(
+        RegistryEntry entry,
+        MessageMarshalPlan current,
+        MessageUnmarshalPlan unmarshal) {
+
+        DelegatedCodecEvidence evidence = unmarshal == null
+            ? null
+            : unmarshal.delegatedCodec;
+        if (evidence == null || !evidence.concreteResolved ||
+            evidence.concreteMarshalTargets.size() != I_FRAGMENT_PHASE_NAMES.length ||
+            evidence.concreteUnmarshalPhaseReads.size() !=
+                I_FRAGMENT_PHASE_NAMES.length) {
+            return current;
+        }
+        if (current != null && !current.fields.isEmpty()) {
+            return current;
+        }
+
+        ArrayList<MessageMarshalEvent> events = new ArrayList<>();
+        LinkedHashMap<String, PcodeStorage> phaseFrame = new LinkedHashMap<>();
+        phaseFrame.put("param_1", evidence.valueStorage);
+        for (int index = 0; index < evidence.concreteMarshalTargets.size(); index++) {
+            checkAnalysisCancelled();
+            Address targetAddress = evidence.concreteMarshalTargets.get(index);
+            Function target = functionAtOrContaining(targetAddress);
+            NetworkSchemaFlowSequence.Result<MessageMarshalEvent> sequence =
+                messageMarshalEventSequence(
+                    target,
+                    "param_3",
+                    phaseFrame,
+                    new LinkedHashSet<>());
+            if (target == null || !sequence.complete()) {
+                runMetrics.increment(
+                    "delegatedFragmentConcreteMarshalPhaseIncomplete");
+                return current;
+            }
+            boolean unmarshalReads =
+                evidence.concreteUnmarshalPhaseReads.get(index);
+            if (unmarshalReads == sequence.events().isEmpty()) {
+                runMetrics.increment(
+                    "delegatedFragmentConcreteDirectionalPhaseMismatch");
+                return current;
+            }
+            events.addAll(sequence.events());
+        }
+
+        Function wrapper = functionAtOrContaining(
+            parseCapturedAddress(entry.marshal));
+        if (wrapper == null) {
+            runMetrics.increment("delegatedFragmentConcreteMarshalWrapperMissing");
+            return current;
+        }
+
+        MessageMarshalPlan plan = new MessageMarshalPlan();
+        plan.wrapper = wrapper.getEntryPoint();
+        plan.wrapperName = fullFunctionName(wrapper);
+        plan.writeBufferParameter = "param_3";
+        plan.rootStorageBase = "param_1";
+        plan.analysisStatus = unmarshal.fields.isEmpty()
+            ? "complete-empty-concrete-fragment-vtable-flow"
+            : "complete-concrete-fragment-vtable-flow";
+        plan.events.addAll(events);
+        plan.rootStorageBase = uniqueMessageMarshalRoot(plan.events);
+        plan.fields.addAll(messageMarshalFields(plan.events));
+        if (!events.isEmpty() && plan.rootStorageBase == null) {
+            runMetrics.increment("delegatedFragmentConcreteMarshalRootMissing");
+            return current;
+        }
+        runMetrics.increment("delegatedFragmentConcreteMarshalResolved");
+        return plan;
+    }

@@ -144,7 +144,7 @@
                 if (operation.getOpcode() != PcodeOp.CALL) {
                     continue;
                 }
-                WireShape evidence = directCallWireEvidence(operation);
+                WireShape evidence = directCallWireEvidence(function, operation);
                 String parameter = uniqueLikelyOutputParameter(function, operation);
                 if (!loop.contains(operation) && evidence == null ||
                     loop.contains(operation) && evidence == null && parameter == null) {
@@ -171,8 +171,8 @@
                     "wireLayout",
                     evidence == null ? null : evidence.layout);
                 NetworkSchemaJson.add(call, "outputParameter", parameter);
-                if (!loop.contains(operation) && evidence != null &&
-                    "vlq-u32".equals(evidence.shape)) {
+                if (!loop.contains(operation) &&
+                    wireShapeMatches(evidence, "vlq-u32")) {
                     call.addProperty(
                         "controlsLoop",
                         countCallControlsLoop(function, high, operation, loop, operations));
@@ -440,7 +440,7 @@
 
         PcodeOpAST countCall = nearestCountCallForLoop(owner, high, loop, operations);
         if (countCall == null) {
-            if (hasDominatingVlqCountCandidate(high, loop, operations)) {
+            if (hasDominatingVlqCountCandidate(owner, high, loop, operations)) {
                 recordCountedCollectionReject(owner, loop, "count-not-linked-to-loop");
             }
             return null;
@@ -448,11 +448,15 @@
 
         DynamicSequenceExtent extent = dynamicSequenceExtent(loop, operations);
         PcodeStorage outputStorage;
+        ContainerStorageKind storageKind;
         String nativeType;
         WireShape sequence;
         Set<Address> codecCallsites;
         if (extent != null) {
-            String bufferParameter = uniqueReadBufferParameter(owner);
+            String bufferParameter = callReadBufferParameter(owner, countCall);
+            if (bufferParameter == null) {
+                bufferParameter = uniqueReadBufferParameter(owner);
+            }
             CollectionIteration iteration = bufferParameter == null
                 ? null
                 : collectionIteration(
@@ -467,6 +471,7 @@
                 return null;
             }
             outputStorage = directFormalParameterStorage(extent.data());
+            storageKind = ContainerStorageKind.VECTOR;
             nativeType = iteration.nativeType();
             sequence = iteration.wireEvidence();
             codecCallsites = iteration.codecCallsites();
@@ -492,6 +497,9 @@
                 loop,
                 operations,
                 elementCodecs);
+            storageKind = isProvenVectorHeaderStorage(operations, outputStorage)
+                ? ContainerStorageKind.VECTOR
+                : ContainerStorageKind.INDEX_MAP;
             nativeType = null;
             sequence = countedSequenceWireEvidence(elementCodecs);
             codecCallsites = elementSequence.consumedCallsites();
@@ -517,6 +525,7 @@
             sequence);
         return new CollectionOutputShape(
                 outputStorage,
+                storageKind,
                 nativeType,
                 sequence,
                 countCall.getSeqnum().getTarget(),
@@ -568,6 +577,7 @@
     }
 
     private boolean hasDominatingVlqCountCandidate(
+        Function owner,
         HighFunction high,
         NetworkSchemaNaturalLoop loop,
         List<PcodeOpAST> operations) {
@@ -580,9 +590,12 @@
             if (loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
                 continue;
             }
-            WireShape evidence = directCallWireEvidence(operation);
-            if (evidence != null && "vlq-u32".equals(evidence.shape) &&
-                NetworkSchemaControlFlow.precedes(high, operation, headerOperation)) {
+            WireShape evidence = countCodecWireEvidence(
+                owner,
+                operation,
+                "vlq-u32");
+            if (wireShapeMatches(evidence, "vlq-u32") &&
+                countProducerPrecedesConsumer(high, operation, headerOperation)) {
                 return true;
             }
         }
@@ -628,16 +641,6 @@
         countedCollectionRejectSamples.add(sample);
     }
 
-    private WireShape directCallWireEvidence(PcodeOpAST operation) {
-        Function target = pcodeCallTarget(operation);
-        WireShape rawEvidence = pcodeReadRawWireEvidence(operation, target);
-        if (rawEvidence != null) {
-            return rawEvidence;
-        }
-        String nativeType = unmarshalNativeTypeFromTarget(target);
-        return wireShapeEvidenceFromUnmarshalTarget(target, nativeType);
-    }
-
     private boolean strictlyOrderedCodecCalls(
         HighFunction high,
         List<PcodeCodecCall> codecs) {
@@ -664,7 +667,7 @@
         PcodeOpAST selected = null;
         for (PcodeOpAST operation : operations) {
             if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL ||
-                directCallWireEvidence(operation) != null ||
+                directCallWireEvidence(owner, operation) != null ||
                 codecs.stream().anyMatch(codec -> !NetworkSchemaControlFlow.precedes(
                     high,
                     codec.operation(),
@@ -720,36 +723,6 @@
         return parameters.size() == 1 ? parameters.iterator().next() : null;
     }
 
-    private PcodeOpAST nearestCountCallForLoop(
-        Function owner,
-        HighFunction high,
-        NetworkSchemaNaturalLoop loop,
-        List<PcodeOpAST> operations) {
-
-        PcodeOpAST selected = null;
-        for (PcodeOpAST operation : operations) {
-            if (loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
-                continue;
-            }
-            WireShape evidence = directCallWireEvidence(operation);
-            if (evidence == null || !"vlq-u32".equals(evidence.shape) ||
-                !countCallControlsLoop(owner, high, operation, loop, operations)) {
-                continue;
-            }
-            if (selected == null || NetworkSchemaControlFlow.precedes(
-                    high,
-                    selected,
-                    operation)) {
-                selected = operation;
-                continue;
-            }
-            if (!NetworkSchemaControlFlow.precedes(high, operation, selected)) {
-                return null;
-            }
-        }
-        return selected;
-    }
-
     private boolean countCallControlsLoop(
         Function owner,
         HighFunction high,
@@ -759,10 +732,16 @@
 
         PcodeOpAST headerOperation = firstLoopHeaderOperation(loop);
         if (headerOperation == null ||
-            !NetworkSchemaControlFlow.precedes(high, countCall, headerOperation)) {
+            !countProducerPrecedesConsumer(high, countCall, headerOperation)) {
             return false;
         }
-        Set<PcodeStorage> candidateStorages = scalarCallOutputStorages(countCall);
+        WireShape countEvidence = countCodecWireEvidence(
+            owner,
+            countCall,
+            "vlq-u32");
+        Set<PcodeStorage> candidateStorages = scalarCallOutputStorages(
+            countCall,
+            countEvidence);
         if (candidateStorages.isEmpty()) {
             return false;
         }
@@ -774,6 +753,9 @@
                 operations,
                 extent,
                 countCall)) {
+            return true;
+        }
+        if (countOutputControlsLoopExit(loop, operations, candidateStorages)) {
             return true;
         }
 
@@ -816,6 +798,43 @@
                     0))
                 .count();
             if (storageMatches == 1L) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean countOutputControlsLoopExit(
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        Set<PcodeStorage> countOutputs) {
+
+        if (loop == null || operations == null || countOutputs == null ||
+            countOutputs.isEmpty()) {
+            return false;
+        }
+        for (PcodeOpAST operation : operations) {
+            checkAnalysisCancelled();
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CBRANCH ||
+                operation.getNumInputs() < 2) {
+                continue;
+            }
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+            List<PcodeBlockBasic> successors = NetworkSchemaControlFlow.successors(block);
+            boolean continues = successors.stream().anyMatch(loop::contains);
+            boolean exits = successors.stream().anyMatch(successor -> !loop.contains(successor));
+            if (!continues || !exits) {
+                continue;
+            }
+            Varnode condition = operation.getInput(operation.getNumInputs() - 1);
+            long matches = countOutputs.stream()
+                .filter(storage -> pcodeNodeReferencesStorage(
+                    condition,
+                    storage,
+                    new LinkedHashSet<>(),
+                    0))
+                .count();
+            if (matches == 1L) {
                 return true;
             }
         }
@@ -868,6 +887,10 @@
         if (node == null || expected == null || depth > 48 ||
             !seen.add(pcodeNodeKey(node))) {
             return false;
+        }
+        PcodeStorage direct = pcodeStorageExpression(node);
+        if (expected.sameLocation(direct)) {
+            return true;
         }
         PcodeStorage storage = pcodeLoadedStorageExpression(node);
         if (expected.sameLocation(storage)) {

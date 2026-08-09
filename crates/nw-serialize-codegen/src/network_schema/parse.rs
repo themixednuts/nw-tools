@@ -111,6 +111,22 @@ pub(crate) fn parse_network_wire_shape(value: &str) -> Option<NetworkWireShape> 
             },
         ));
     }
+    if let Some(arguments) = generic_arguments(value, "bit-mask-composite") {
+        let [mask, members @ ..] = arguments.as_slice() else {
+            return None;
+        };
+        let mask = parse_byte_mask_scalar(mask)?;
+        let members = members
+            .iter()
+            .map(|member| parse_bit_mask_member_wire_shape(member))
+            .collect::<Option<Vec<_>>>()?;
+        if members.is_empty() || members.len() > 11 {
+            return None;
+        }
+        return Some(NetworkWireShape::BitMaskComposite(
+            NetworkBitMaskCompositeWireShape { mask, members },
+        ));
+    }
     if let Some(arguments) = generic_arguments(value, "set") {
         let [inner] = arguments.as_slice() else {
             return None;
@@ -145,7 +161,41 @@ pub(crate) fn parse_network_wire_shape(value: &str) -> Option<NetworkWireShape> 
     if value == "class-value" {
         return Some(NetworkWireShape::ClassValue);
     }
+    if value == "actor-instantiation-parameters" {
+        return Some(NetworkWireShape::ActorInstantiationParameters);
+    }
     parse_network_wire_scalar_shape(value).map(Into::into)
+}
+
+fn parse_byte_mask_scalar(value: &str) -> Option<NetworkWireScalarShape> {
+    match parse_network_wire_scalar_shape(value)? {
+        mask @ (NetworkWireScalarShape::U8 | NetworkWireScalarShape::FixedBytes(1)) => Some(mask),
+        _ => None,
+    }
+}
+
+fn parse_bit_mask_member_wire_shape(value: &str) -> Option<NetworkBitMaskMemberWireShape> {
+    if let Some(arguments) = generic_arguments(value, "required") {
+        let [value] = arguments.as_slice() else {
+            return None;
+        };
+        return Some(NetworkBitMaskMemberWireShape::Required(Box::new(
+            parse_network_wire_shape(value)?,
+        )));
+    }
+    let [mask, value] = generic_arguments(value, "masked")?
+        .as_slice()
+        .try_into()
+        .ok()?;
+    Some(NetworkBitMaskMemberWireShape::Masked {
+        mask: parse_single_byte_mask(mask)?,
+        value: Box::new(parse_network_wire_shape(value)?),
+    })
+}
+
+fn parse_single_byte_mask(value: &str) -> Option<u8> {
+    let mask = u8::from_str_radix(value.trim().strip_prefix("0x")?, 16).ok()?;
+    mask.is_power_of_two().then_some(mask)
 }
 
 pub(crate) fn parse_network_wire_scalar_shape(value: &str) -> Option<NetworkWireScalarShape> {
@@ -256,6 +306,10 @@ pub(crate) enum NetworkMemberWireShape<'a> {
         false_value: Box<Self>,
         true_value: Box<Self>,
     },
+    BitMaskComposite {
+        mask: NetworkWireScalarShape,
+        members: Vec<NetworkMemberBitMaskWireShape<'a>>,
+    },
     Vector(Box<Self>),
     Set(Box<Self>),
     Map {
@@ -271,6 +325,15 @@ pub(crate) enum NetworkMemberWireShape<'a> {
         capacity: u16,
     },
     Named(&'a str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NetworkMemberBitMaskWireShape<'a> {
+    Required(Box<NetworkMemberWireShape<'a>>),
+    Masked {
+        mask: u8,
+        value: Box<NetworkMemberWireShape<'a>>,
+    },
 }
 
 pub(crate) fn parse_network_member_wire_shape(value: &str) -> Option<NetworkMemberWireShape<'_>> {
@@ -311,6 +374,20 @@ pub(crate) fn parse_network_member_wire_shape(value: &str) -> Option<NetworkMemb
             true_value: Box::new(parse_network_member_wire_shape(true_value)?),
         });
     }
+    if let Some(arguments) = generic_arguments(value, "bit-mask-composite") {
+        let [mask, members @ ..] = arguments.as_slice() else {
+            return None;
+        };
+        let mask = parse_byte_mask_scalar(mask)?;
+        let members = members
+            .iter()
+            .map(|member| parse_network_member_bit_mask_shape(member))
+            .collect::<Option<Vec<_>>>()?;
+        if members.is_empty() || members.len() > 11 {
+            return None;
+        }
+        return Some(NetworkMemberWireShape::BitMaskComposite { mask, members });
+    }
     if let Some(arguments) = generic_arguments(value, "vec") {
         let [element] = arguments.as_slice().try_into().ok()?;
         return Some(NetworkMemberWireShape::Vector(Box::new(
@@ -346,6 +423,25 @@ pub(crate) fn parse_network_member_wire_shape(value: &str) -> Option<NetworkMemb
     }
     (!value.is_empty() && !value.contains(['<', '>', ',']))
         .then_some(NetworkMemberWireShape::Named(value))
+}
+
+fn parse_network_member_bit_mask_shape(value: &str) -> Option<NetworkMemberBitMaskWireShape<'_>> {
+    if let Some(arguments) = generic_arguments(value, "required") {
+        let [value] = arguments.as_slice() else {
+            return None;
+        };
+        return Some(NetworkMemberBitMaskWireShape::Required(Box::new(
+            parse_network_member_wire_shape(value)?,
+        )));
+    }
+    let [mask, value] = generic_arguments(value, "masked")?
+        .as_slice()
+        .try_into()
+        .ok()?;
+    Some(NetworkMemberBitMaskWireShape::Masked {
+        mask: parse_single_byte_mask(mask)?,
+        value: Box::new(parse_network_member_wire_shape(value)?),
+    })
 }
 
 fn generic_arguments<'a>(value: &'a str, name: &str) -> Option<Vec<&'a str>> {
@@ -437,6 +533,12 @@ fn prefer_alternate_wire_product<'a>(
     right: &'a str,
     nested: Option<&NetworkNestedTypeShape>,
 ) -> &'a str {
+    if left.starts_with("fixed-vector<") && right.starts_with("vec<") {
+        return left;
+    }
+    if right.starts_with("fixed-vector<") && left.starts_with("vec<") {
+        return right;
+    }
     if let Some(observed) = nested.and_then(|shape| nested_type_shape_wire_shapes(shape, &[])) {
         for candidate in [left, right] {
             if nested_member_wire_shapes(candidate, &[])
@@ -582,12 +684,99 @@ pub(crate) fn collapse_field_alternate_spelling_wire_products(field: &mut Networ
         return;
     };
     let preferred = preferred.to_owned();
+    collapse_synthetic_nested_alternate_spelling_product(
+        field.nested_type_shape.as_mut(),
+        &raw,
+        &preferred,
+    );
     let parsed = parse_network_wire_shape(&preferred);
     field.wire_layout = Some(preferred.clone());
     field.wire_layout_source = Some("cfg-multi-helper-alternate-spelling-collapse".to_owned());
     field.wire_shape_raw = Some(preferred);
     field.wire_shape = parsed;
     field.wire_shape_source = field.wire_layout_source.clone();
+}
+
+fn collapse_synthetic_nested_alternate_spelling_product(
+    shape: Option<&mut NetworkNestedTypeShape>,
+    raw: &str,
+    preferred: &str,
+) {
+    let Some(shape) = shape else {
+        return;
+    };
+    if shape.validation.as_deref()
+        != Some("message-unmarshal-constructor-vptr+az-rtti+typeregistry-type-name")
+        || shape.member_name_source.as_deref() != Some("synthetic-offset")
+        || shape.wire_order_source.as_deref() != Some("cfg-ordered-multi-helper-wire-product")
+        || shape.layout_proven != Some(true)
+        || shape.member_coverage_proven != Some(true)
+        || shape.wire_order_proven != Some(true)
+    {
+        return;
+    }
+
+    let Some(alternatives) = top_level_composite_members(raw) else {
+        return;
+    };
+    if alternatives.len() != 2 || shape.members.len() != alternatives.len() {
+        return;
+    }
+    let all_members_are_alternate_spellings =
+        shape
+            .members
+            .iter()
+            .zip(&alternatives)
+            .all(|(member, alternative)| {
+                let Some(member_product) = member
+                    .wire_shape
+                    .as_deref()
+                    .or(member.wire_layout.as_deref())
+                else {
+                    return false;
+                };
+                compatible_alternate_wire_products(member_product, alternative)
+                    && compatible_alternate_wire_products(member_product, preferred)
+            });
+    if !all_members_are_alternate_spellings {
+        return;
+    }
+
+    let member_products = top_level_composite_members(preferred).unwrap_or_else(|| vec![preferred]);
+    let callsite = shape
+        .members
+        .iter()
+        .find_map(|member| member.callsite.clone());
+    shape.members = member_products
+        .into_iter()
+        .enumerate()
+        .map(|(index, product)| NetworkNestedTypeMember {
+            index: u32::try_from(index).ok(),
+            offset: Some(format!("0x{index:x}")),
+            native_offset: None,
+            name: Some(format!("_{index}")),
+            name_source: Some("synthetic-offset".to_owned()),
+            name_proven: Some(false),
+            name_evidence: None,
+            native_type: None,
+            type_id: None,
+            type_id_source: None,
+            type_identity_proven: false,
+            type_identity_source: None,
+            wire_shape: Some(product.to_owned()),
+            wire_shape_source: Some("cfg-multi-helper-alternate-spelling-collapse".to_owned()),
+            wire_layout: Some(product.to_owned()),
+            wire_layout_source: Some("cfg-multi-helper-alternate-spelling-collapse".to_owned()),
+            byte_width: None,
+            wire_ordinal: u32::try_from(index).ok(),
+            wire_order_source: Some("cfg-multi-helper-alternate-spelling-collapse".to_owned()),
+            callsite: callsite.clone(),
+            target: None,
+            target_name: None,
+            type_conflict: false,
+        })
+        .collect();
+    shape.wire_order_source = Some("cfg-multi-helper-alternate-spelling-collapse".to_owned());
 }
 
 fn split_top_level_arguments(value: &str) -> Option<Vec<&str>> {
@@ -690,7 +879,8 @@ fn flatten_member_wire_shape(
         }
         NetworkMemberWireShape::Optional(_)
         | NetworkMemberWireShape::DefaultOmitted(_)
-        | NetworkMemberWireShape::BooleanChoice { .. } => None,
+        | NetworkMemberWireShape::BooleanChoice { .. }
+        | NetworkMemberWireShape::BitMaskComposite { .. } => None,
         NetworkMemberWireShape::Vector(element)
         | NetworkMemberWireShape::Set(element)
         | NetworkMemberWireShape::FixedVector { element, .. } => {

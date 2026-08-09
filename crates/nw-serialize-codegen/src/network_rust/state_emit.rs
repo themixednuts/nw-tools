@@ -701,6 +701,66 @@ fn member_wire_shape_projection(
                 )),
             })
         }
+        NetworkMemberWireShape::BitMaskComposite { members, .. } => {
+            let mut value_types = vec!["u8".to_owned()];
+            let mut policies = Vec::with_capacity(members.len());
+            for member in members {
+                match member {
+                    NetworkMemberBitMaskWireShape::Required(value) => {
+                        let value = member_wire_shape_projection(
+                            field,
+                            value,
+                            embedded_shapes,
+                            serialize_types,
+                        )?;
+                        let codec = member_projection_codec_type(&value);
+                        value_types.push(value.rust_type);
+                        policies.push(format!(
+                            "::nw_network::serialize::RequiredBitMaskCodec<{codec}>"
+                        ));
+                    }
+                    NetworkMemberBitMaskWireShape::Masked { mask, value } => {
+                        let value = member_wire_shape_projection(
+                            field,
+                            value,
+                            embedded_shapes,
+                            serialize_types,
+                        )?;
+                        let codec = member_projection_codec_type(&value);
+                        value_types.push(format!("::core::option::Option<{}>", value.rust_type));
+                        policies.push(format!(
+                            "::nw_network::serialize::MaskedBitMaskCodec<{codec}, 0x{mask:02x}>"
+                        ));
+                    }
+                }
+            }
+            let rust_type = tuple_projection(
+                &value_types
+                    .into_iter()
+                    .map(|value_type| (value_type, None))
+                    .collect::<Vec<_>>(),
+            )
+            .0;
+            let policies = match policies.as_slice() {
+                [policy] => format!("({policy},)"),
+                policies => {
+                    tuple_projection(
+                        &policies
+                            .iter()
+                            .cloned()
+                            .map(|policy| (policy, None))
+                            .collect::<Vec<_>>(),
+                    )
+                    .0
+                }
+            };
+            Some(MemberWireProjection {
+                rust_type,
+                codec_type: Some(format!(
+                    "::nw_network::serialize::BitMaskTupleCodec<{policies}>"
+                )),
+            })
+        }
         NetworkMemberWireShape::Vector(element) => {
             let element =
                 member_wire_shape_projection(field, element, embedded_shapes, serialize_types)?;
@@ -1172,10 +1232,18 @@ pub(super) fn replicated_state_field_type_tokens(
                 >
             )
         }
+        SchemaWireShape::ActorInstantiationParameters => {
+            quote!(
+                ::nw_network::serialize::ReplicatedFieldHandler<
+                    ::nw_network::ActorInstantiationParameters,
+                >
+            )
+        }
         SchemaWireShape::Composite(_)
         | SchemaWireShape::Optional(_)
         | SchemaWireShape::DefaultOmitted(_)
         | SchemaWireShape::BooleanChoice(_)
+        | SchemaWireShape::BitMaskComposite(_)
         | SchemaWireShape::Sequence(_)
         | SchemaWireShape::Map { .. }
         | SchemaWireShape::Set(_) => {

@@ -21,6 +21,13 @@ import java.util.Collection;
         String nativeType,
         String readBufferParameter) {
 
+        WireShape actorParameters = actorInstantiationParametersUnmarshalShape(
+            target,
+            nativeType,
+            readBufferParameter);
+        if (actorParameters != null) {
+            return actorParameters;
+        }
         WireShape direct = directWireShapeEvidenceFromUnmarshalTarget(
             target,
             nativeType,
@@ -38,14 +45,27 @@ import java.util.Collection;
         if (target == null || readBufferParameter == null) {
             return null;
         }
-        WireShape codecShape = validatedUnmarshalLeaf(target, readBufferParameter);
-        if (codecShape != null) {
-            return codecShape;
-        }
         String resolvedType = nativeType == null
             ? scalarOutputStoreNativeType(target)
             : nativeType;
         String nativeShape = wireShapeFromNativeType(resolvedType);
+        WireShape codecShape = validatedUnmarshalLeaf(target, readBufferParameter);
+        if (codecShape != null) {
+            String codecLayout = firstNonEmpty(codecShape.layout, codecShape.shape);
+            Integer nativeWidth = wireShapeByteWidth(nativeShape);
+            Integer codecWidth = wireShapeByteWidth(codecLayout);
+            boolean exactNativeProduct = nativeShape != null &&
+                (compatibleCodecProducts(nativeShape, codecShape.shape) ||
+                    compatibleCodecProducts(nativeShape, codecLayout) ||
+                    (nativeWidth != null && nativeWidth.equals(codecWidth)));
+            if (exactNativeProduct) {
+                return WireShape.semantic(
+                    nativeShape,
+                    codecLayout,
+                    "exact-native-type+validated-unmarshal-codec");
+            }
+            return codecShape;
+        }
         Integer width = wireShapeByteWidth(nativeShape);
         return width != null &&
             hasExactlyOneFixedRawRead(target, readBufferParameter, width)
@@ -903,13 +923,6 @@ import java.util.Collection;
             default -> String.valueOf(wireShape);
         };
     }
-
-    private void normalizeMessageFields(MessageUnmarshalPlan plan) {
-        applyRecoveredPcodeOrder(plan);
-        collapseExactAggregateLeaves(plan);
-        sortMessageFieldsByRecoveryOrder(plan);
-    }
-
     private void applyRecoveredPcodeOrder(MessageUnmarshalPlan plan) {
         for (FieldCall field : plan.fields) {
             if (field.callsite == null) {
@@ -959,7 +972,7 @@ import java.util.Collection;
         if (field == null) {
             return null;
         }
-        String evidence = field.wireLayout == null ? field.wireShape : field.wireLayout;
+        String evidence = field.wireShape == null ? field.wireLayout : field.wireShape;
         return evidence == null ? null : canonicalLayoutWireShape(evidence);
     }
 

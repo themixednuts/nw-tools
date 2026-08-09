@@ -10,17 +10,18 @@ use crate::CodegenContext;
 use crate::ir::{SerializeCodegenItem, SerializeCodegenItemKind, collect_resolved_named_type_ids};
 use crate::naming::{rust_field_ident, rust_module_ident, rust_type_ident};
 use crate::network_schema::parse::{
-    NetworkMemberWireShape, collection_element_wire_shape, nested_member_wire_shapes,
-    nested_shape_by_wire_name, nested_type_shape_members_in_wire_order,
+    NetworkMemberBitMaskWireShape, NetworkMemberWireShape, collection_element_wire_shape,
+    nested_member_wire_shapes, nested_shape_by_wire_name, nested_type_shape_members_in_wire_order,
     parse_network_member_wire_shape, parse_network_wire_shape, type_name_leaf,
 };
 use crate::network_schema::{
-    NetworkConfidence, NetworkContainerCodec, NetworkField, NetworkFieldHandlerVtable,
-    NetworkFragmentMetadata, NetworkNativeTypeInfoEvidence, NetworkPackedPositionWireShape,
-    NetworkReplicatedContainerPlan, NetworkReplicatedContainerStorageKind,
-    NetworkReplicatedContainerWireShape, NetworkSchema, NetworkSerializeKind, NetworkSerializeRole,
-    NetworkSerializeType, NetworkType, NetworkTypeCapability,
-    NetworkWireScalarShape as SchemaWireScalarShape, NetworkWireShape as SchemaWireShape,
+    NetworkBitMaskCompositeWireShape, NetworkBitMaskMemberWireShape, NetworkConfidence,
+    NetworkContainerCodec, NetworkField, NetworkFieldHandlerVtable, NetworkFragmentMetadata,
+    NetworkNativeTypeInfoEvidence, NetworkPackedPositionWireShape, NetworkReplicatedContainerPlan,
+    NetworkReplicatedContainerStorageKind, NetworkReplicatedContainerWireShape, NetworkSchema,
+    NetworkSerializeKind, NetworkSerializeRole, NetworkSerializeType, NetworkType,
+    NetworkTypeCapability, NetworkWireScalarShape as SchemaWireScalarShape,
+    NetworkWireShape as SchemaWireShape,
 };
 use crate::rust::types::{RustTypeOptions, RustTypeRenderer};
 use crate::types::{ResolvedType, ScalarType};

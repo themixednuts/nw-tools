@@ -1,0 +1,94 @@
+    private WireShape actorInstantiationParametersUnmarshalShape(
+        Function target,
+        String nativeType,
+        String readBufferParameter) {
+
+        String normalized = normalizeNativeType(nativeType);
+        if (target == null || readBufferParameter == null ||
+            !("ActorInstantiationParameters".equals(normalized) ||
+                "Amazon::Hub::ActorInstantiationParameters".equals(normalized))) {
+            return null;
+        }
+        HighFunction high = highFunction(target);
+        if (high == null) {
+            return null;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        NetworkSchemaNaturalLoop selectedLoop = null;
+        PcodeOpAST selectedCount = null;
+        CollectionElementSequence selectedElements = null;
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            checkAnalysisCancelled();
+            PcodeOpAST count = nearestCountCallForLoop(
+                target,
+                high,
+                loop,
+                operations,
+                "u16");
+            if (count == null || !actorParameterCountUsesReadBuffer(
+                    target,
+                    high,
+                    operations,
+                    count,
+                    readBufferParameter)) {
+                continue;
+            }
+            CollectionElementSequence elements = loopElementCodecs(
+                target,
+                high,
+                loop,
+                operations);
+            if (elements == null || elements.codecs().size() != 2 ||
+                !strictlyOrderedCodecCalls(high, elements.codecs())) {
+                continue;
+            }
+            WireShape first = elements.codecs().get(0).evidence();
+            WireShape second = elements.codecs().get(1).evidence();
+            boolean presence = first != null && (
+                "bool".equals(first.shape) ||
+                "fixed-bytes-1".equals(first.layout));
+            if (!presence || second == null ||
+                !"class-value".equals(second.shape)) {
+                continue;
+            }
+            if (selectedLoop != null) {
+                runMetrics.increment("actorInstantiationParametersAmbiguous");
+                return null;
+            }
+            selectedLoop = loop;
+            selectedCount = count;
+            selectedElements = elements;
+        }
+        if (selectedLoop == null || selectedCount == null || selectedElements == null) {
+            return null;
+        }
+        runMetrics.increment("actorInstantiationParametersCodecs");
+        return WireShape.semantic(
+            "actor-instantiation-parameters",
+            "unmarshal-native-type+u16-counted-bool-class-value-loop");
+    }
+
+    private boolean actorParameterCountUsesReadBuffer(
+        Function owner,
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        PcodeOpAST count,
+        String readBufferParameter) {
+
+        if (Objects.equals(
+                callReadBufferParameter(owner, count),
+                readBufferParameter)) {
+            return true;
+        }
+        Function target = pcodeCallTarget(count);
+        PcodeStorage binding = target == null
+            ? null
+            : callTargetReadBufferStorage(
+                high,
+                operations,
+                count,
+                target,
+                new PcodeStorage(readBufferParameter, 0L),
+                new LinkedHashSet<>());
+        return binding != null;
+    }

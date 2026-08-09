@@ -366,6 +366,9 @@
             nested.members.isEmpty()) {
             return;
         }
+        if (appendAtomicMessageCallFrameWireProduct(byBase, binding, nested, operation, target)) {
+            return;
+        }
         if (Boolean.TRUE.equals(nested.identityProven) && nested.typeId != null &&
             addProvenNestedTypeMemberCandidate(
                 byBase,

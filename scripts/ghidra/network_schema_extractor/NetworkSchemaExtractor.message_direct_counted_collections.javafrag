@@ -50,10 +50,7 @@
                 nativeType,
                 "message-unmarshal-pcode-direct-counted-collection",
                 operationOrder[0]++);
-            if (wireEvidence != null && wireEvidence.layout != null &&
-                wireEvidence.layout.startsWith("vec<")) {
-                field.collectionStorageKind = ContainerStorageKind.VECTOR;
-            }
+            field.collectionStorageKind = collection.storageKind;
             applyWireEvidence(field, wireEvidence);
         }
 

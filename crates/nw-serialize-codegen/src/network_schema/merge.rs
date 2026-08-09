@@ -480,7 +480,9 @@ fn canonical_wire_atoms(shape: &NetworkWireShape) -> Vec<NetworkWireShape> {
         NetworkWireShape::Composite(members) => {
             members.iter().flat_map(canonical_wire_atoms).collect()
         }
-        NetworkWireShape::DefaultOmitted(_) | NetworkWireShape::BooleanChoice(_) => {
+        NetworkWireShape::DefaultOmitted(_)
+        | NetworkWireShape::BooleanChoice(_)
+        | NetworkWireShape::BitMaskComposite(_) => {
             vec![shape.clone()]
         }
         NetworkWireShape::ActorRef => vec![
@@ -490,6 +492,33 @@ fn canonical_wire_atoms(shape: &NetworkWireShape) -> Vec<NetworkWireShape> {
         ],
         shape => vec![shape.clone()],
     }
+}
+
+pub(super) fn wire_shapes_machine_compatible(
+    left: &NetworkWireShape,
+    right: &NetworkWireShape,
+) -> bool {
+    if left == right {
+        return true;
+    }
+    let Some(left_product) = wire_shape_scalar_product(left) else {
+        return false;
+    };
+    let Some(right_product) = wire_shape_scalar_product(right) else {
+        return false;
+    };
+    wire_scalar_products_width_compatible(&left_product, &right_product)
+}
+
+pub(super) fn wire_shape_sequences_machine_compatible(
+    left: &[NetworkWireShape],
+    right: &[NetworkWireShape],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| wire_shapes_machine_compatible(left, right))
 }
 
 fn composite_wire_shape(shapes: &[NetworkWireShape]) -> NetworkWireShape {
@@ -511,10 +540,17 @@ fn match_message_field_sequence(
         if let Some(projection) = projection {
             let end = start.checked_add(projection.shapes.len())?;
             let tokens = machine_tokens.get(start..end)?;
-            let matches = tokens.iter().zip(&projection.shapes).all(|(token, expected)| {
-                matches!(token, MachineWireToken::Opaque { .. })
-                    || matches!(token, MachineWireToken::Shape { shape, .. } if shape == expected)
-            });
+            let matches = tokens
+                .iter()
+                .zip(&projection.shapes)
+                .all(|(token, expected)| {
+                    matches!(token, MachineWireToken::Opaque { .. })
+                        || matches!(
+                            token,
+                            MachineWireToken::Shape { shape, .. }
+                                if wire_shapes_machine_compatible(shape, expected)
+                        )
+                });
             if !matches {
                 return None;
             }

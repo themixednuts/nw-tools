@@ -125,6 +125,46 @@ pub struct NetworkBooleanChoiceWireShape {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkBitMaskMemberWireShape {
+    Required(Box<NetworkWireShape>),
+    Masked {
+        mask: u8,
+        value: Box<NetworkWireShape>,
+    },
+}
+
+impl NetworkBitMaskMemberWireShape {
+    pub(crate) fn wire_string(&self) -> String {
+        match self {
+            Self::Required(value) => format!("required<{}>", value.wire_string()),
+            Self::Masked { mask, value } => {
+                format!("masked<0x{mask:02x},{}>", value.wire_string())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkBitMaskCompositeWireShape {
+    pub mask: NetworkWireScalarShape,
+    pub members: Vec<NetworkBitMaskMemberWireShape>,
+}
+
+impl NetworkBitMaskCompositeWireShape {
+    pub(crate) fn wire_string(&self) -> String {
+        format!(
+            "bit-mask-composite<{},{}>",
+            self.mask.wire_string(),
+            self.members
+                .iter()
+                .map(NetworkBitMaskMemberWireShape::wire_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkWireShape {
     Bool,
     U8,
@@ -164,10 +204,12 @@ pub enum NetworkWireShape {
     Bytes,
     String,
     ClassValue,
+    ActorInstantiationParameters,
     Composite(Vec<Self>),
     Optional(Box<Self>),
     DefaultOmitted(Vec<Self>),
     BooleanChoice(NetworkBooleanChoiceWireShape),
+    BitMaskComposite(NetworkBitMaskCompositeWireShape),
     Sequence(Box<Self>),
     Set(Box<Self>),
     Map { key: Box<Self>, value: Box<Self> },
@@ -324,6 +366,7 @@ impl NetworkWireShape {
             Self::EntityRef => Some("entity-ref"),
             Self::Bytes => Some("length-prefixed-bytes"),
             Self::ClassValue => Some("class-value"),
+            Self::ActorInstantiationParameters => Some("actor-instantiation-parameters"),
             Self::FixedBytes(_)
             | Self::DeltaVec3(_)
             | Self::PackedPosition(_)
@@ -331,6 +374,7 @@ impl NetworkWireShape {
             | Self::Optional(_)
             | Self::DefaultOmitted(_)
             | Self::BooleanChoice(_)
+            | Self::BitMaskComposite(_)
             | Self::Sequence(_)
             | Self::Set(_)
             | Self::Map { .. }
@@ -368,6 +412,7 @@ impl NetworkWireShape {
                     choice.false_value.wire_string(),
                     choice.true_value.wire_string()
                 ),
+                Self::BitMaskComposite(shape) => shape.wire_string(),
                 Self::Sequence(value) => format!("vec<{}>", value.wire_string()),
                 Self::Set(value) => format!("set<{}>", value.wire_string()),
                 Self::Map { key, value } => {
@@ -426,6 +471,7 @@ impl Serialize for NetworkWireShape {
                 choice.false_value.wire_string(),
                 choice.true_value.wire_string()
             )),
+            Self::BitMaskComposite(shape) => serializer.serialize_str(&shape.wire_string()),
             Self::Sequence(value) => {
                 serializer.serialize_str(&format!("vec<{}>", value.wire_string()))
             }

@@ -602,8 +602,10 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
         PcodeOp operation,
         String writeBufferParameter) {
 
-        if (operation == null || operation.getOpcode() != PcodeOp.CALLIND ||
-            operation.getNumInputs() < 2 || writeBufferParameter == null) {
+        if (operation == null ||
+            (operation.getOpcode() != PcodeOp.CALLIND &&
+             operation.getOpcode() != PcodeOp.BRANCHIND) ||
+            operation.getNumInputs() < 1 || writeBufferParameter == null) {
             return null;
         }
         PcodeStorage expected = new PcodeStorage(writeBufferParameter, 0L);

@@ -133,6 +133,7 @@
             }
             CollectionOutputShape output = new CollectionOutputShape(
                 recovery.storage().data(),
+                ContainerStorageKind.VECTOR,
                 null,
                 recovery.shape().wireEvidence,
                 recovery.shape().countCallsite,

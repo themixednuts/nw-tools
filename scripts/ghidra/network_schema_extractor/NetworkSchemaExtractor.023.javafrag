@@ -302,12 +302,24 @@
                 op,
                 target,
                 slot);
+            storage = canonicalFormalParameterStorage(storage);
             storage = translatedAbsoluteHelperStorage(storage, callerParamStorage);
             if (storage != null) {
                 result.put(param, storage);
             }
         }
         return result;
+    }
+
+    private PcodeStorage canonicalFormalParameterStorage(PcodeStorage storage) {
+
+        if (storage == null || !"stack".equals(storage.base)) {
+            return storage;
+        }
+        Integer parameter = stackArgumentParameterIndex(storage.offset);
+        return parameter == null
+            ? storage
+            : new PcodeStorage("param_" + parameter, 0L);
     }
 
     private void addPcodeArgumentMapDiagnostic(

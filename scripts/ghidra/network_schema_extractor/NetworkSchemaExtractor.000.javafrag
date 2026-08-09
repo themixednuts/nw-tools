@@ -154,7 +154,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private static final String EXTRACTOR_VERSION =
-        "network-schema-extractor-20260730-semantic-container-reconciliation-pass";
+        "network-schema-extractor-20260809-physical-mask-branch-polarity-pass";
 
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
@@ -179,6 +179,13 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private static final int FIELD_HANDLER_UNMARSHAL_FULL_SLOT = 15;
     private static final int I_FRAGMENT_IS_METADATA_SLOT = 12;
     private static final int I_FRAGMENT_GET_CATEGORY_SLOT = 13;
+    private static final int[] I_FRAGMENT_MARSHAL_PHASE_SLOTS = {17, 19, 21};
+    private static final int[] I_FRAGMENT_UNMARSHAL_PHASE_SLOTS = {18, 20, 22};
+    private static final String[] I_FRAGMENT_PHASE_NAMES = {
+        "contents",
+        "attributes",
+        "field-metadata",
+    };
     private static final int I_FRAGMENT_VTABLE_SCAN_SLOTS = 24;
     private static final int REGISTRATION_FAILURE_SAMPLE_LIMIT = 256;
     private static final String[] REGISTRATION_HOOK_TEMPLATE_NAMES = {
@@ -308,6 +315,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final Map<String, List<Instruction>> functionInstructionsCache =
         lruCache(FUNCTION_INSTRUCTION_CACHE_LIMIT);
     private final Map<String, Map<Long, ForwardArgState>> abiCallsiteStateCache =
+        lruCache(FUNCTION_INSTRUCTION_CACHE_LIMIT);
+    private final Map<String, Boolean> instructionSequenceCursorCache =
         lruCache(FUNCTION_INSTRUCTION_CACHE_LIMIT);
     private final Map<String, Integer> machineRegisterArgumentCountCache =
         lruCache(FUNCTION_LOOKUP_CACHE_LIMIT);
@@ -654,6 +663,14 @@ public class NetworkSchemaExtractor extends GhidraScript {
             else {
                 MessageMarshalPlan marshalPlan = recoverMessageMarshalPlan(entry);
                 MessageUnmarshalPlan messagePlan = recoverMessageUnmarshalPlan(entry);
+                marshalPlan = recoverConcreteDelegatedFragmentMarshalPlan(
+                    entry,
+                    marshalPlan,
+                    messagePlan);
+                marshalPlan = recoverConcreteVirtualMessageMarshalPlan(
+                    entry,
+                    marshalPlan,
+                    messagePlan);
                 reconcileMessageCollectionShapes(entry, messagePlan);
                 alignMessageMarshalFieldsToUnmarshal(marshalPlan, messagePlan);
                 refineMessageUnmarshalCapability(messagePlan, marshalPlan);

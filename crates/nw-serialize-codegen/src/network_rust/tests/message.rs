@@ -779,6 +779,46 @@ fn accepts_wire_product_native_with_matching_layout() {
 }
 
 #[test]
+fn emits_recursive_bounded_sequence_types() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000006657",
+            "typeIndex": 6657,
+            "typeName": "Example::NestedBoundedSequenceMsg",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "name": "entries",
+                "storageExpression": "param_3 + 0x8",
+                "storageBase": "param_3",
+                "storageOffset": 8,
+                "wireShape": "fixed-vector<fixed-vector<composite<u32,string>,5>,20>",
+                "wireShapeSource": "cfg-counted-loop+bounded-storage-layout",
+                "confidence": "high"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::arrayvec::ArrayVec<::arrayvec::ArrayVec<(u32, String), 5>, 20>")
+    );
+    assert!(
+        output.source.contains(
+            "pub entries: ::arrayvec::ArrayVec<::arrayvec::ArrayVec<(u32, String), 5>, 20>"
+        ),
+        "{}",
+        output.source
+    );
+}
+
+#[test]
 fn accepts_boolean_choice_layout_without_native_type() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
@@ -1533,6 +1573,354 @@ fn emits_message_support_structs_from_proven_nested_shapes() {
 }
 
 #[test]
+fn emits_symbolic_actor_request_payload_from_complete_native_product() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "D6B79513-6682-491C-B243-3C675CE771B6",
+            "typeIndex": 3309,
+            "typeName": "Javelin::ClientMessages::GameModeParticipantComponentServerFacet_RequestLeaveGameMode",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "nativeType": "ActorRequestUuidU64U64Payload",
+                "sourceTypeName": "ActorRequestUuidU64U64Payload,Javelin::ClientMessages::ActorRequestUuidU64U64Payload",
+                "nestedTypeShape": {
+                    "typeName": "ActorRequestUuidU64U64Payload",
+                    "typeNameFull": "Javelin::ClientMessages::ActorRequestUuidU64U64Payload",
+                    "typeNameSource": "ghidra-symbol",
+                    "identityProven": true,
+                    "identitySource": "ghidra-direct-unmarshal-value-type+complete-output-storage+cfg-complete-wire-product",
+                    "function": "NewWorld+0x3273bb0",
+                    "functionName": "Javelin::ClientMessages::ActorRequestUuidU64U64Payload::Unmarshal",
+                    "memberBase": "param_1",
+                    "memberNameSource": "synthetic-offset",
+                    "memberNamesProven": false,
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "wireOrderSource": "cfg-dominating-output-storage-order+recursive-unmarshal-order",
+                    "nativeSize": 80,
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x8",
+                        "name": "_0",
+                        "nativeType": "u64",
+                        "wireShape": "u64",
+                        "wireLayout": "fixed-bytes-8",
+                        "wireOrdinal": 0,
+                        "byteWidth": 8
+                    }, {
+                        "index": 1,
+                        "offset": "0x10",
+                        "name": "_1",
+                        "nativeType": "u64",
+                        "wireShape": "u64",
+                        "wireLayout": "fixed-bytes-8",
+                        "wireOrdinal": 1,
+                        "byteWidth": 8
+                    }, {
+                        "index": 2,
+                        "offset": "0x30",
+                        "name": "_2",
+                        "wireShape": "fixed-bytes-16",
+                        "wireLayout": "fixed-bytes-16",
+                        "wireOrdinal": 2,
+                        "byteWidth": 16
+                    }, {
+                        "index": 3,
+                        "offset": "0x40",
+                        "name": "_3",
+                        "nativeType": "u64",
+                        "wireShape": "u64",
+                        "wireLayout": "fixed-bytes-8",
+                        "wireOrdinal": 3,
+                        "byteWidth": 8
+                    }, {
+                        "index": 4,
+                        "offset": "0x48",
+                        "name": "_4",
+                        "nativeType": "u64",
+                        "wireShape": "u64",
+                        "wireLayout": "fixed-bytes-8",
+                        "wireOrdinal": 4,
+                        "byteWidth": 8
+                    }]
+                },
+                "confidence": "message-unmarshal-pcode-call"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+    assert_eq!(output.report.generatable_message_count, 1);
+    assert_eq!(output.report.blocked_message_count, 0);
+    assert_eq!(output.report.support_type_count, 1);
+    let field = &output.report.message_generation_plans[0].fields[0];
+    assert_eq!(field.blocked_reason, None);
+    assert_eq!(
+        field.rust_value_type.as_deref(),
+        Some("ActorRequestUuidU64U64Payload")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub struct ActorRequestUuidU64U64Payload")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub field_0: ActorRequestUuidU64U64Payload")
+    );
+}
+
+#[test]
+fn source_signature_splits_actor_request_header_from_client_context_id() {
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "971DDBB2-67DB-4BEB-9632-85851D0EE00E",
+            "typeIndex": 5181,
+            "typeName": "Javelin::ClientMessages::PlayerComponentServerFacet_OnAckLevelInfoChanged",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "nativeType": "ActorRequestId",
+                "nestedTypeShape": {
+                    "typeNameSource": "ghidra-call-frame",
+                    "function": "NewWorld+0x65917b0",
+                    "memberBase": "param_1",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "wireOrderSource": "cfg-success-flow+complete-helper-wire-sequence",
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x8",
+                        "nativeType": "u64",
+                        "wireShape": "u64",
+                        "wireLayout": "fixed-bytes-8",
+                        "wireOrdinal": 0,
+                        "byteWidth": 8
+                    }, {
+                        "index": 1,
+                        "offset": "0x10",
+                        "nativeType": "u64",
+                        "wireShape": "u64",
+                        "wireLayout": "u64",
+                        "wireOrdinal": 1,
+                        "byteWidth": 8
+                    }, {
+                        "index": 2,
+                        "offset": "0x20",
+                        "nativeType": "u8",
+                        "wireShape": "u8",
+                        "wireLayout": "u8",
+                        "wireOrdinal": 2,
+                        "byteWidth": 1
+                    }]
+                },
+                "callFrameBoundaryProven": true,
+                "wireShape": "composite<fixed-bytes-8,u64,u8>",
+                "wireLayout": "composite<fixed-bytes-8,u64,u8>",
+                "confidence": "message-unmarshal-call-frame-boundary"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let merge = schema.merge_message_signatures(
+        &[NetworkMessageSignature {
+            type_id: Some(uuid!("971ddbb2-67db-4beb-9632-85851d0ee00e")),
+            type_index: Some(5181),
+            name: Some(
+                "Javelin::ClientMessages::PlayerComponentServerFacet_OnAckLevelInfoChanged"
+                    .to_owned(),
+            ),
+            rust_name: Some("PlayerComponentServerFacetOnAckLevelInfoChangedMsg".to_owned()),
+            source: Some("source-signature-notes".to_owned()),
+            fields: vec![
+                NetworkMessageFieldSignature {
+                    index: Some(0),
+                    name: "Header".to_owned(),
+                    rust_type: Some("::nw_network::ActorRequestId".to_owned()),
+                    native_type: Some("Javelin::ClientMessages::ActorRequestId".to_owned()),
+                    wire_shape: Some(crate::NetworkWireShape::Composite(vec![
+                        crate::NetworkWireShape::U64,
+                        crate::NetworkWireShape::U64,
+                    ])),
+                },
+                NetworkMessageFieldSignature {
+                    index: Some(1),
+                    name: "ClientContextInstanceId".to_owned(),
+                    rust_type: None,
+                    native_type: Some("ClientContextIDValue".to_owned()),
+                    wire_shape: Some(crate::NetworkWireShape::U8),
+                },
+            ],
+        }],
+        Some("message-signatures.json".to_owned()),
+    );
+
+    assert_eq!(merge.field_count_mismatch_count, 0);
+    assert_eq!(schema.types[0].fields.len(), 2);
+    assert_eq!(schema.types[0].fields[0].name.as_deref(), Some("Header"));
+    assert_eq!(
+        schema.types[0].fields[1].name.as_deref(),
+        Some("ClientContextInstanceId")
+    );
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+    assert_eq!(output.report.generatable_message_count, 1);
+    assert_eq!(output.report.blocked_message_count, 0);
+    assert!(
+        output
+            .source
+            .contains("pub struct PlayerComponentServerFacetOnAckLevelInfoChanged")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub header: ::nw_network::ActorRequestId")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub client_context_instance_id: ::nw_network::ClientContextId")
+    );
+    assert!(!output.source.contains("pub client_context_instance_id: u8"));
+}
+
+#[test]
+fn complete_native_listing_signatures_generate_masked_and_split_messages() {
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "3F5EB97D-B15D-4526-B160-2107215BF761",
+            "typeIndex": 6345,
+            "typeName": "Javelin::DebugConsoleClientMessages::OnUpdateDebugConsoleDMInfoMsg",
+            "capabilities": ["direct-message"],
+            "fields": []
+        }, {
+            "uuid": "AADFF090-E7A9-46F4-86EB-CBAC0884480E",
+            "typeIndex": 7010,
+            "typeName": "Javelin::ClientMessages::GraphBasedSpawnNodeComponentClientFacet_SyncDebugData",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "nativeType": "ActorRequestId",
+                "wireShape": "composite<u64,u64,vec<composite<fixed-bytes-16,u64>>,bool>"
+            }, {
+                "index": 1,
+                "wireShape": "vec<composite<fixed-bytes-16,u64,bool>>"
+            }, {
+                "index": 2,
+                "nativeType": "ActionListEntityRefVector"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let signatures: Vec<NetworkMessageSignature> = serde_json::from_value(json!([{
+        "typeId": "3F5EB97D-B15D-4526-B160-2107215BF761",
+        "typeIndex": 6345,
+        "name": "Javelin::DebugConsoleClientMessages::OnUpdateDebugConsoleDMInfoMsg",
+        "rustName": "OnUpdateDebugConsoleDMInfoMsg",
+        "source": "native-unmarshal-and-marshal-listing",
+        "fields": [{
+            "index": 0,
+            "name": "Entries",
+            "wireShape": "vec<bit-mask-composite<u8,required<fixed-bytes-16>,masked<0x01,u32>,masked<0x02,fixed-bytes-16>,masked<0x04,composite<entity-ref,u8>>>>"
+        }]
+    }, {
+        "typeId": "AADFF090-E7A9-46F4-86EB-CBAC0884480E",
+        "typeIndex": 7010,
+        "name": "Javelin::ClientMessages::GraphBasedSpawnNodeComponentClientFacet_SyncDebugData",
+        "rustName": "GraphBasedSpawnNodeComponentClientFacetSyncDebugDataMsg",
+        "source": "native-unmarshal-and-marshal-listing",
+        "fields": [{
+            "index": 0,
+            "name": "Header",
+            "nativeType": "Javelin::ClientMessages::ActorRequestId",
+            "rustType": "::nw_network::ActorRequestId",
+            "wireShape": "composite<u64,u64>"
+        }, {
+            "index": 1,
+            "name": "DebugEntries",
+            "wireShape": "vec<composite<fixed-bytes-16,u64,bool>>"
+        }, {
+            "index": 2,
+            "name": "ActionListEntityRefs",
+            "wireShape": "vec<composite<fixed-bytes-16,u64,u64>>"
+        }, {
+            "index": 3,
+            "name": "SpawnNodeEntityRefs",
+            "wireShape": "vec<composite<fixed-bytes-16,u64>>"
+        }, {
+            "index": 4,
+            "name": "DebugDataEnabled",
+            "nativeType": "bool",
+            "rustType": "bool",
+            "wireShape": "bool"
+        }]
+    }]))
+    .expect("signatures");
+    let merge =
+        schema.merge_message_signatures(&signatures, Some("message-signatures.json".to_owned()));
+
+    assert_eq!(merge.field_count_mismatch_count, 0);
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    assert_eq!(
+        output.report.generatable_message_count, 2,
+        "{:#?}",
+        output.report
+    );
+    assert_eq!(
+        output.report.blocked_message_count, 0,
+        "{:#?}",
+        output.report
+    );
+    assert!(
+        output
+            .source
+            .contains("pub struct OnUpdateDebugConsoleDMInfoMsg")
+    );
+    assert!(output.source.contains("pub entries: ::std::vec::Vec<"));
+    assert!(output.source.contains("BitMaskTupleCodec"));
+    assert!(
+        output
+            .source
+            .contains("pub struct GraphBasedSpawnNodeComponentClientFacetSyncDebugData")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub header: ::nw_network::ActorRequestId")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub debug_entries: ::std::vec::Vec<")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub action_list_entity_refs: ::std::vec::Vec<")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub spawn_node_entity_refs: ::std::vec::Vec<")
+    );
+    assert!(output.source.contains("pub debug_data_enabled: bool"));
+}
+
+#[test]
 fn exact_nested_client_ref_uses_the_runtime_wire_type() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
@@ -2159,7 +2547,7 @@ fn emits_source_backed_baselineable_fragments_without_wire_shapes() {
 }
 
 #[test]
-fn blocks_unimplemented_actor_instantiation_parameter_runtime_type() {
+fn emits_actor_instantiation_parameter_runtime_type() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
             "uuid": "F24987B3-0136-4BCF-9D27-08BDE18B0266",
@@ -2178,13 +2566,18 @@ fn blocks_unimplemented_actor_instantiation_parameter_runtime_type() {
 
     let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
-    assert_eq!(output.report.generatable_message_count, 0);
-    assert_eq!(output.report.blocked_message_count, 1);
+    assert_eq!(output.report.generatable_message_count, 1);
+    assert_eq!(output.report.blocked_message_count, 0);
     assert_eq!(
         output.report.message_generation_plans[0].fields[0]
-            .blocked_reason
+            .rust_value_type
             .as_deref(),
-        Some("missing-support-type")
+        Some("::nw_network::ActorInstantiationParameters")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub parameters: ::nw_network::ActorInstantiationParameters")
     );
 }
 
@@ -2225,7 +2618,7 @@ fn wire_product_wins_over_conflicting_native_scalar_type() {
 }
 
 #[test]
-fn recursively_blocks_unresolved_class_value_wire_products() {
+fn emits_recursive_class_value_wire_products() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
             "uuid": "A55A0001-0000-4000-8000-000000006167",
@@ -2245,15 +2638,54 @@ fn recursively_blocks_unresolved_class_value_wire_products() {
 
     let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
 
-    assert_eq!(output.report.generatable_message_count, 0);
-    assert_eq!(output.report.blocked_message_count, 1);
+    assert_eq!(output.report.generatable_message_count, 1);
+    assert_eq!(output.report.blocked_message_count, 0);
     assert_eq!(
         output.report.message_generation_plans[0].fields[0]
-            .blocked_reason
+            .rust_value_type
             .as_deref(),
-        Some("unresolved-class-value")
+        Some("::core::option::Option<::nw_network::serialize::ClassValue>")
     );
-    assert!(!output.source.contains("ClassValue"));
+    assert!(
+        output
+            .source
+            .contains("::nw_network::serialize::ClassValue")
+    );
+}
+
+#[test]
+fn emits_empty_marshal_only_messages() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "A55A0001-0000-4000-8000-000000000978",
+            "typeIndex": 978,
+            "typeName": "Amazon::Hub::RegistryMsg",
+            "messageUnmarshal": {
+                "analysisStatus": "marshal-only",
+                "supportsUnmarshal": false,
+                "terminalStatus": "no-success-terminal",
+                "fields": []
+            },
+            "messageMarshal": {
+                "analysisStatus": "complete-empty-cfg-stack-flow",
+                "fields": []
+            }
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+
+    assert_eq!(output.report.generatable_message_count, 1);
+    assert_eq!(output.report.blocked_message_count, 0);
+    assert!(output.source.contains("pub struct RegistryMsg"));
+    assert!(
+        output
+            .source
+            .contains("derive(Debug, Clone, PartialEq, Marshal)")
+    );
+    assert!(!output.source.contains("PartialEq, Marshaler"));
 }
 
 #[test]

@@ -726,8 +726,13 @@
         else {
             plan.readBufferParameter = plan.delegatedCodec.readBufferStorage.base;
             plan.rootEvidenceSource = plan.delegatedCodec.evidenceSource;
+            recoverConcreteDelegatedFragmentGraph(
+                plan,
+                wrapper,
+                plan.delegatedCodec);
         }
-        if (plan.delegatedCodec == null) {
+        if (plan.delegatedCodec == null ||
+            plan.delegatedCodec.concreteResolved) {
             reconcileComposableMessageFieldWireProducts(plan);
             applyMessageConstructorTypeBoundaries(plan, wrapper);
             applyMessageConstructorSpans(plan, wrapper);

@@ -1,0 +1,129 @@
+    private boolean boundaryLimbIsRedundant(String product, String limb) {
+        List<String> members = compositeWireShapeMembers(product);
+        if (members == null || members.isEmpty()) {
+            return false;
+        }
+        List<String> limbMembers = compositeWireShapeMembers(limb);
+        if (limbMembers == null) {
+            return compatibleCodecProducts(members.get(0), limb) ||
+                compatibleCodecProducts(members.get(members.size() - 1), limb);
+        }
+        if (limbMembers.isEmpty() || limbMembers.size() > members.size()) {
+            return false;
+        }
+        boolean prefix = true;
+        boolean suffix = true;
+        int suffixStart = members.size() - limbMembers.size();
+        for (int index = 0; index < limbMembers.size(); index++) {
+            prefix &= compatibleCodecProducts(members.get(index), limbMembers.get(index));
+            suffix &= compatibleCodecProducts(
+                members.get(suffixStart + index),
+                limbMembers.get(index));
+        }
+        return prefix || suffix;
+    }
+
+    private boolean compatibleCodecProducts(String left, String right) {
+        if (left == null || right == null) {
+            return false;
+        }
+        if (sameCodecProduct(left, right) || compatibleWireSemantics(left, right)) {
+            return true;
+        }
+        String leftContainer = wireCodecContainerName(left);
+        String rightContainer = wireCodecContainerName(right);
+        if (leftContainer != null && leftContainer.equals(rightContainer)) {
+            List<String> leftArgs = wireCodecContainerArguments(left);
+            List<String> rightArgs = wireCodecContainerArguments(right);
+            return leftArgs.size() == rightArgs.size() &&
+                compatibleCodecProductLists(leftArgs, rightArgs);
+        }
+        if (isDynamicAndFixedVectorPair(leftContainer, rightContainer)) {
+            List<String> leftArgs = wireCodecContainerArguments(left);
+            List<String> rightArgs = wireCodecContainerArguments(right);
+            List<String> dynamicArgs = "vec".equals(leftContainer)
+                ? leftArgs
+                : rightArgs;
+            List<String> fixedArgs = "fixed-vector".equals(leftContainer)
+                ? leftArgs
+                : rightArgs;
+            return dynamicArgs.size() == 1 &&
+                fixedArgs.size() == 2 &&
+                isPositiveVectorCapacity(fixedArgs.get(1)) &&
+                compatibleCodecProducts(dynamicArgs.get(0), fixedArgs.get(0));
+        }
+        List<String> leftMembers = compositeWireShapeMembers(left);
+        List<String> rightMembers = compositeWireShapeMembers(right);
+        if (leftMembers != null && rightMembers != null) {
+            if (leftMembers.size() != rightMembers.size()) {
+                return false;
+            }
+            for (int index = 0; index < leftMembers.size(); index++) {
+                if (!compatibleCodecProducts(
+                        leftMembers.get(index),
+                        rightMembers.get(index))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (leftMembers != null) {
+            List<String> expected = semanticMembers(right);
+            return expected != null &&
+                leftMembers.size() == expected.size() &&
+                compatibleCodecProductLists(leftMembers, expected);
+        }
+        if (rightMembers != null) {
+            List<String> expected = semanticMembers(left);
+            return expected != null &&
+                rightMembers.size() == expected.size() &&
+                compatibleCodecProductLists(expected, rightMembers);
+        }
+        return false;
+    }
+
+    private String wireCodecContainerName(String product) {
+        if (product == null || !product.endsWith(">")) {
+            return null;
+        }
+        int open = product.indexOf('<');
+        if (open <= 0) {
+            return null;
+        }
+        String name = product.substring(0, open);
+        return switch (name) {
+            case "vec", "set", "map", "optional", "fixed-vector", "array",
+                "fixed-array", "fixed-sequence", "replicated-container",
+                "bit-mask-composite", "required", "masked", "boolean-choice",
+                "default-omitted", "delta-vec3", "packed-position" -> name;
+            default -> null;
+        };
+    }
+
+    private List<String> wireCodecContainerArguments(String product) {
+        int open = product.indexOf('<');
+        return NetworkSchemaText.splitTopLevel(
+            product.substring(open + 1, product.length() - 1));
+    }
+
+    private boolean compatibleCodecProductLists(
+        List<String> left,
+        List<String> right) {
+
+        for (int index = 0; index < left.size(); index++) {
+            if (!compatibleCodecProducts(left.get(index), right.get(index))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isDynamicAndFixedVectorPair(String left, String right) {
+        return ("vec".equals(left) && "fixed-vector".equals(right)) ||
+            ("fixed-vector".equals(left) && "vec".equals(right));
+    }
+
+    private boolean isPositiveVectorCapacity(String value) {
+        Long capacity = NetworkSchemaText.parseIntegerLiteral(value);
+        return capacity != null && capacity > 0 && capacity <= Integer.MAX_VALUE;
+    }

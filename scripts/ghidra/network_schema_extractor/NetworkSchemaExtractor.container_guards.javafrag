@@ -37,6 +37,7 @@ import ghidra.program.model.pcode.PcodeBlock;
         if (!(member.getParent() instanceof PcodeBlockBasic memberBlock)) {
             return List.of();
         }
+        NetworkSchemaNaturalLoop memberLoop = loopContaining(member);
         ArrayList<ContainerCodecGuard> result = new ArrayList<>();
         for (PcodeOpAST operation : operations) {
             if (operation.getOpcode() != PcodeOp.CBRANCH ||
@@ -48,7 +49,8 @@ import ghidra.program.model.pcode.PcodeBlock;
             }
             PcodeBlock selectedSuccessor = uniqueGuardSuccessor(
                 guardBlock,
-                memberBlock);
+                memberBlock,
+                memberLoop);
             if (selectedSuccessor == null) {
                 continue;
             }
@@ -71,14 +73,25 @@ import ghidra.program.model.pcode.PcodeBlock;
 
     private PcodeBlock uniqueGuardSuccessor(
         PcodeBlockBasic guardBlock,
-        PcodeBlockBasic memberBlock) {
+        PcodeBlockBasic memberBlock,
+        NetworkSchemaNaturalLoop memberLoop) {
 
         PcodeBlock selected = null;
         for (int edge = 0; edge < guardBlock.getOutSize(); edge++) {
             PcodeBlock successor = guardBlock.getOut(edge);
             PcodeBlock leaf = successor == null ? null : successor.getFrontLeaf();
-            if (!(leaf instanceof PcodeBlockBasic basic) ||
-                basic != memberBlock && !NetworkSchemaControlFlow.reaches(basic, memberBlock)) {
+            if (!(leaf instanceof PcodeBlockBasic basic)) {
+                continue;
+            }
+            boolean sameIteration = memberLoop != null &&
+                memberLoop.contains(guardBlock) && memberLoop.contains(basic);
+            boolean reachesMember = basic == memberBlock || (sameIteration
+                ? NetworkSchemaControlFlow.reachesWithinIteration(
+                    basic,
+                    memberBlock,
+                    memberLoop)
+                : NetworkSchemaControlFlow.reaches(basic, memberBlock));
+            if (!reachesMember) {
                 continue;
             }
             if (selected != null) {
@@ -96,14 +109,26 @@ import ghidra.program.model.pcode.PcodeBlock;
         PcodeBlockBasic guardBlock,
         PcodeBlock selectedSuccessor) {
 
-        GuardCondition condition = guardCondition(
+        GuardCondition pcodeCondition = guardCondition(
             branch.getInput(branch.getNumInputs() - 1),
             false,
             new LinkedHashSet<>());
+        GuardCondition instructionCondition = instructionBitMaskGuardCondition(
+            high,
+            branch,
+            guardBlock);
+        GuardCondition condition = instructionCondition == null
+            ? pcodeCondition
+            : instructionCondition;
         if (condition == null) {
             return null;
         }
-        boolean memberOnTrue = guardBlock.getTrueOut() == selectedSuccessor;
+        Boolean instructionMemberOnTrue = instructionCondition == null
+            ? null
+            : instructionGuardMemberOnTrue(branch, selectedSuccessor);
+        boolean memberOnTrue = instructionMemberOnTrue == null
+            ? guardBlock.getTrueOut() == selectedSuccessor
+            : instructionMemberOnTrue;
         if (condition.negated()) {
             memberOnTrue = !memberOnTrue;
         }
@@ -124,6 +149,9 @@ import ghidra.program.model.pcode.PcodeBlock;
         ContainerExternalBooleanCondition externalCondition = externalRecovery == null
             ? null
             : externalRecovery.condition();
+        String evidenceSource = firstNonEmpty(
+            condition.evidenceSource(),
+            "dominating-cbranch-pcode-storage");
         return new ContainerCodecGuard(
             branch.getSeqnum().getTarget(),
             kind,
@@ -136,8 +164,8 @@ import ghidra.program.model.pcode.PcodeBlock;
             externalCondition,
             externalRecovery == null ? null : externalRecovery.diagnostic(),
             externalCondition == null
-                ? "dominating-cbranch-pcode-storage"
-                : "dominating-cbranch-pcode-storage+external-condition-proof");
+                ? evidenceSource
+                : evidenceSource + "+external-condition-proof");
     }
 
     private GuardCondition guardCondition(
@@ -172,20 +200,31 @@ import ghidra.program.model.pcode.PcodeBlock;
         String comparison = definition.getOpcode() == PcodeOp.INT_EQUAL
             ? "equal-zero"
             : "not-equal-zero";
-        PcodeOp valueDefinition = value.getDef();
-        Long mask = null;
-        if (valueDefinition != null &&
-            valueDefinition.getOpcode() == PcodeOp.INT_AND &&
-            valueDefinition.getNumInputs() == 2) {
-            int constantSlot = singleConstantSlot(valueDefinition);
-            if (constantSlot < 0) {
-                return null;
-            }
-            mask = NetworkSchemaIntegerEvaluator.evaluate(
-                valueDefinition.getInput(constantSlot));
-            value = valueDefinition.getInput(1 - constantSlot);
+        GuardMaskedValue masked = guardMaskedValue(
+            value,
+            new LinkedHashSet<>(),
+            0);
+        Long mask = masked == null ? null : masked.mask();
+        if (masked != null) {
+            value = masked.value();
         }
         PcodeStorage storage = pcodeLoadedStorageExpression(value);
+        Varnode storagePointer = loadedStoragePointer(
+            value,
+            new LinkedHashSet<>(),
+            0);
+        if (mask != null && (storage == null || storagePointer == null)) {
+            ShiftedMaskStorage shifted = shiftedMaskStorage(
+                value,
+                mask,
+                new LinkedHashSet<>(),
+                0);
+            if (shifted != null) {
+                storage = shifted.storage();
+                storagePointer = shifted.storagePointer();
+                mask = shifted.mask();
+            }
+        }
         Address storageAddress = storage == null
             ? absoluteLoadedStorageAddress(value)
             : null;
@@ -193,10 +232,335 @@ import ghidra.program.model.pcode.PcodeBlock;
             ? null
             : new GuardCondition(
                 storage,
+                storagePointer,
                 storageAddress,
                 mask,
                 comparison,
-                negated);
+                negated,
+                "dominating-cbranch-pcode-storage");
+    }
+
+    private record GuardMaskedValue(Varnode value, long mask) {
+    }
+
+    private GuardMaskedValue guardMaskedValue(
+        Varnode node,
+        Set<String> active,
+        int depth) {
+
+        if (node == null || depth > 16 || !active.add(pcodeSsaNodeKey(node))) {
+            return null;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null || definition.getNumInputs() == 0) {
+            return null;
+        }
+        if (definition.getOpcode() == PcodeOp.COPY ||
+            definition.getOpcode() == PcodeOp.CAST ||
+            definition.getOpcode() == PcodeOp.INT_ZEXT ||
+            definition.getOpcode() == PcodeOp.INT_SEXT ||
+            definition.getOpcode() == PcodeOp.SUBPIECE) {
+            return guardMaskedValue(
+                definition.getInput(0),
+                active,
+                depth + 1);
+        }
+        if (definition.getOpcode() != PcodeOp.INT_AND ||
+            definition.getNumInputs() != 2) {
+            return null;
+        }
+        int constantSlot = singleConstantSlot(definition);
+        Long mask = constantSlot < 0
+            ? null
+            : NetworkSchemaIntegerEvaluator.evaluate(
+                definition.getInput(constantSlot));
+        return mask == null || mask <= 0L
+            ? null
+            : new GuardMaskedValue(
+                definition.getInput(1 - constantSlot),
+                mask);
+    }
+
+    private GuardCondition instructionBitMaskGuardCondition(
+        HighFunction high,
+        PcodeOpAST branch,
+        PcodeBlockBasic guardBlock) {
+
+        Address branchAddress = branch == null || branch.getSeqnum() == null
+            ? null
+            : branch.getSeqnum().getTarget();
+        Function owner = branchAddress == null
+            ? null
+            : functionContaining(branchAddress);
+        Instruction jump = branchAddress == null
+            ? null
+            : currentProgram.getListing().getInstructionAt(branchAddress);
+        String jumpMnemonic = jump == null
+            ? null
+            : NetworkSchemaX86.upperMnemonic(jump);
+        String comparison = switch (Objects.toString(jumpMnemonic, "")) {
+            case "JE", "JZ" -> "equal-zero";
+            case "JNE", "JNZ" -> "not-equal-zero";
+            default -> null;
+        };
+        if (owner == null || high == null || guardBlock == null ||
+            jump == null || comparison == null) {
+            return null;
+        }
+
+        List<Instruction> block = blockInstructions(owner, guardBlock);
+        int jumpIndex = block.indexOf(jump);
+        Instruction test = null;
+        for (int index = jumpIndex - 1, inspected = 0;
+                index >= 0 && inspected < 4;
+                index--, inspected++) {
+            Instruction candidate = block.get(index);
+            String mnemonic = NetworkSchemaX86.upperMnemonic(candidate);
+            if ("TEST".equals(mnemonic)) {
+                test = candidate;
+                break;
+            }
+            if (candidate.getFlowType().isCall() ||
+                candidate.getFlowType().isJump()) {
+                break;
+            }
+        }
+        Long testMask = test == null
+            ? null
+            : NetworkSchemaX86.immediateValue(test, 1);
+        if (test == null || testMask == null || testMask <= 0L) {
+            return null;
+        }
+
+        PcodeStorage storage = instructionGuardMemoryStorage(
+            owner,
+            high,
+            test,
+            0);
+        long mask = testMask;
+        if (storage == null) {
+            String register = NetworkSchemaX86.registerOperand(test, 0);
+            if (register == null) {
+                return null;
+            }
+            for (int index = block.indexOf(test) - 1, inspected = 0;
+                    index >= 0 && inspected < 8;
+                    index--, inspected++) {
+                Instruction candidate = block.get(index);
+                String destination = NetworkSchemaX86.registerOperand(candidate, 0);
+                if (!register.equals(destination)) {
+                    continue;
+                }
+                String mnemonic = NetworkSchemaX86.upperMnemonic(candidate);
+                if ("SHR".equals(mnemonic) || "SAR".equals(mnemonic)) {
+                    Long shift = NetworkSchemaX86.immediateValue(candidate, 1);
+                    Long projected = shift == null
+                        ? null
+                        : leftShiftGuardMask(mask, shift);
+                    if (projected == null) {
+                        return null;
+                    }
+                    mask = projected;
+                    continue;
+                }
+                if ("MOV".equals(mnemonic) || "MOVZX".equals(mnemonic) ||
+                    "MOVSX".equals(mnemonic) || "MOVSXD".equals(mnemonic)) {
+                    storage = instructionGuardMemoryStorage(
+                        owner,
+                        high,
+                        candidate,
+                        1);
+                    if (storage != null) {
+                        break;
+                    }
+                    String source = NetworkSchemaX86.registerOperand(candidate, 1);
+                    if (source == null) {
+                        return null;
+                    }
+                    register = source;
+                    continue;
+                }
+                return null;
+            }
+        }
+        return storage == null || mask <= 0L
+            ? null
+            : new GuardCondition(
+                storage,
+                null,
+                null,
+                mask,
+                comparison,
+                false,
+                "dominating-cbranch-x86-test-mask");
+    }
+
+    private Boolean instructionGuardMemberOnTrue(
+        PcodeOpAST branch,
+        PcodeBlock selectedSuccessor) {
+
+        Address branchAddress = branch == null || branch.getSeqnum() == null
+            ? null
+            : branch.getSeqnum().getTarget();
+        Instruction jump = branchAddress == null
+            ? null
+            : currentProgram.getListing().getInstructionAt(branchAddress);
+        PcodeBlock leaf = selectedSuccessor == null
+            ? null
+            : selectedSuccessor.getFrontLeaf();
+        if (jump == null || !(leaf instanceof PcodeBlockBasic selected) ||
+            selected.getStart() == null || selected.getStop() == null) {
+            return null;
+        }
+        for (Address target : jump.getFlows()) {
+            if (target != null && target.compareTo(selected.getStart()) >= 0 &&
+                target.compareTo(selected.getStop()) <= 0) {
+                return true;
+            }
+        }
+        Address fallthrough = jump.getFallThrough();
+        return fallthrough != null &&
+            fallthrough.compareTo(selected.getStart()) >= 0 &&
+            fallthrough.compareTo(selected.getStop()) <= 0
+            ? false
+            : null;
+    }
+
+    private PcodeStorage instructionGuardMemoryStorage(
+        Function owner,
+        HighFunction high,
+        Instruction instruction,
+        int operandIndex) {
+
+        MemoryAddress memory = NetworkSchemaX86.memoryAddress(
+            instruction,
+            operandIndex);
+        if (memory == null || memory.terms.size() != 1 ||
+            memory.terms.get(0).scale != 1) {
+            return null;
+        }
+        PcodeStorage exact = instructionMemoryOperandStorage(
+            owner,
+            high,
+            instruction,
+            operandIndex);
+        if (exact != null) {
+            return exact;
+        }
+        MemoryTerm term = memory.terms.get(0);
+        return "RIP".equals(term.register) || "RSP".equals(term.register)
+            ? null
+            : new PcodeStorage(
+                "instruction-register:" + term.register,
+                memory.displacement);
+    }
+
+    private record ShiftedMaskStorage(
+        PcodeStorage storage,
+        Varnode storagePointer,
+        long mask) {
+    }
+
+    private ShiftedMaskStorage shiftedMaskStorage(
+        Varnode node,
+        long mask,
+        Set<String> active,
+        int depth) {
+
+        if (node == null || mask <= 0L || depth > 24 ||
+            !active.add(pcodeSsaNodeKey(node))) {
+            return null;
+        }
+        PcodeStorage direct = pcodeLoadedStorageExpression(node);
+        Varnode pointer = loadedStoragePointer(
+            node,
+            new LinkedHashSet<>(),
+            0);
+        if (direct != null && pointer != null) {
+            return new ShiftedMaskStorage(direct, pointer, mask);
+        }
+
+        PcodeOp definition = node.getDef();
+        if (definition == null || definition.getNumInputs() == 0) {
+            return null;
+        }
+        return switch (definition.getOpcode()) {
+            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT,
+                PcodeOp.INT_SEXT -> shiftedMaskStorage(
+                    definition.getInput(0),
+                    mask,
+                    active,
+                    depth + 1);
+            case PcodeOp.SUBPIECE -> {
+                Long byteOffset = definition.getNumInputs() < 2
+                    ? null
+                    : NetworkSchemaIntegerEvaluator.evaluate(
+                        definition.getInput(1));
+                Long projected = byteOffset == null ||
+                    byteOffset < 0L || byteOffset >= Long.BYTES
+                    ? null
+                    : leftShiftGuardMask(mask, byteOffset * 8L);
+                yield projected == null
+                    ? null
+                    : shiftedMaskStorage(
+                        definition.getInput(0),
+                        projected,
+                        active,
+                        depth + 1);
+            }
+            case PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT -> {
+                Long shift = definition.getNumInputs() < 2
+                    ? null
+                    : NetworkSchemaIntegerEvaluator.evaluate(
+                        definition.getInput(1));
+                Long projected = shift == null
+                    ? null
+                    : leftShiftGuardMask(mask, shift);
+                yield projected == null
+                    ? null
+                    : shiftedMaskStorage(
+                        definition.getInput(0),
+                        projected,
+                        active,
+                        depth + 1);
+            }
+            default -> null;
+        };
+    }
+
+    private Long leftShiftGuardMask(long mask, long shift) {
+        if (mask <= 0L || shift < 0L || shift >= Long.SIZE) {
+            return null;
+        }
+        long projected = mask << (int) shift;
+        return projected <= 0L || projected >>> (int) shift != mask
+            ? null
+            : projected;
+    }
+
+    private Varnode loadedStoragePointer(
+        Varnode node,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || depth > 32 || !seen.add(pcodeNodeKey(node))) {
+            return null;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return null;
+        }
+        if (definition.getOpcode() == PcodeOp.LOAD &&
+            definition.getNumInputs() >= 2) {
+            return definition.getInput(1);
+        }
+        if (transparentPcodeDefinition(definition)) {
+            return loadedStoragePointer(
+                definition.getInput(0),
+                seen,
+                depth + 1);
+        }
+        return null;
     }
 
     private Address absoluteLoadedStorageAddress(Varnode node) {
@@ -271,8 +635,10 @@ import ghidra.program.model.pcode.PcodeBlock;
 
     private record GuardCondition(
         PcodeStorage storage,
+        Varnode storagePointer,
         Address storageAddress,
         Long mask,
         String comparison,
-        boolean negated) {
+        boolean negated,
+        String evidenceSource) {
     }

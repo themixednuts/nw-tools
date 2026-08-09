@@ -1,0 +1,106 @@
+    private CodecWireEvent sharedMaskCollectionElementEvent(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        SequenceExtent extent,
+        Map<PcodeBlockBasic, List<CollectionElementCodec>> codecsByBlock) {
+
+        if (function == null || high == null || loop == null ||
+            operations == null || extent == null || codecsByBlock == null) {
+            recordNestedTypeShapeReject("shared-mask-collection-missing-input");
+            return null;
+        }
+        PcodeOpAST cursor = uniqueAffineSequenceCursor(loop, extent);
+        if (cursor == null) {
+            recordNestedTypeShapeReject("shared-mask-collection-cursor-unproven");
+            return null;
+        }
+        ArrayList<CollectionElementCodec> ordered = codecsByBlock.values().stream()
+            .flatMap(Collection::stream)
+            .sorted(Comparator.comparing(codec -> codec.operation().getSeqnum()))
+            .collect(Collectors.toCollection(ArrayList::new));
+        if (ordered.size() < 2) {
+            recordNestedTypeShapeReject("shared-mask-collection-too-few-members");
+            return null;
+        }
+        CollectionElementCodec unproven = ordered.stream()
+            .filter(codec -> !codec.writesElement() || codec.events().isEmpty())
+            .findFirst()
+            .orElse(null);
+        if (unproven != null) {
+            recordNestedTypeShapeReject(
+                "shared-mask-collection-member-output-unproven:" +
+                    formatAddress(unproven.operation().getSeqnum().getTarget()));
+            return null;
+        }
+
+        ArrayList<ContainerCodecCall> codecs = new ArrayList<>(ordered.size());
+        ArrayList<CodecWireEvent> events = new ArrayList<>(ordered.size());
+        for (CollectionElementCodec element : ordered) {
+            Address callsite = element.operation().getSeqnum().getTarget();
+            CodecWireEvent event = collectionElementProductEvent(element);
+            if (event == null) {
+                recordNestedTypeShapeReject(
+                    "shared-mask-collection-member-product-unresolved:" +
+                        formatAddress(callsite));
+                return null;
+            }
+            if (event.wireEvidence() == null || event.wireEvidence().layout == null) {
+                recordNestedTypeShapeReject(
+                    "shared-mask-collection-member-layout-unresolved:" +
+                        formatAddress(callsite));
+                return null;
+            }
+            PcodeStorage relativeOutput = sequenceElementRelativeOutputStorage(
+                operations,
+                element.operation(),
+                event,
+                cursor,
+                extent);
+            if (relativeOutput == null) {
+                recordNestedTypeShapeReject(
+                    "shared-mask-collection-relative-output-unproven:" +
+                        formatAddress(callsite));
+                return null;
+            }
+            event = new CodecWireEvent(
+                event.nativeType(),
+                event.wireEvidence(),
+                event.callsite(),
+                event.target(),
+                event.targetName(),
+                relativeOutput,
+                event.typeIdentitySource());
+            ContainerCodecCall codec = containerCodecFromWireEvent(
+                event,
+                "shared-mask-collection-element");
+            codec.operation = element.operation();
+            codecs.add(codec);
+            events.add(event);
+        }
+        applyContainerCodecGuards(high, codecs);
+        normalizeSequenceElementGuards(
+            operations,
+            cursor,
+            extent,
+            codecs);
+        SharedMaskCompositeAnalysis analysis = sharedMaskCompositeShape(
+            codecs,
+            events,
+            mandatorySuccessfulLoopIterationBlocks(high, loop));
+        if (analysis.shape() == null) {
+            recordNestedTypeShapeReject(
+                "shared-mask-collection-" + analysis.diagnostic());
+            return null;
+        }
+        CollectionElementCodec first = ordered.get(0);
+        return new CodecWireEvent(
+            null,
+            analysis.shape(),
+            first.operation().getSeqnum().getTarget(),
+            function.getEntryPoint(),
+            fullFunctionName(function),
+            null,
+            null);
+    }

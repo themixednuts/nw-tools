@@ -86,6 +86,9 @@ pub(super) fn exact_native_runtime_rust_type(native_type: &str) -> Option<&'stat
         "BaselineableFragment" | "Amazon::Hub::BaselineableFragment" => {
             Some("::nw_network::hub::BaselineableFragment")
         }
+        "ActorInstantiationParameters" | "Amazon::Hub::ActorInstantiationParameters" => {
+            Some("::nw_network::ActorInstantiationParameters")
+        }
         _ => None,
     }
 }
@@ -99,6 +102,11 @@ pub(super) fn network_native_scalar_type(native_type: &str) -> Option<NetworkNat
         "AZ::s32" | "int" | "int32_t" => ("i32", SchemaWireScalarShape::U32),
         "AZ::s64" | "long long" | "int64_t" => ("i64", SchemaWireScalarShape::U64),
         "AZ::u8" | "unsigned char" | "uint8_t" | "u8" => ("u8", SchemaWireScalarShape::U8),
+        "ClientContextIDValue"
+        | "PlayerComponent::ClientContextIDValue"
+        | "Javelin::PlayerComponent::ClientContextIDValue" => {
+            ("::nw_network::ClientContextId", SchemaWireScalarShape::U8)
+        }
         "AZ::u16" | "unsigned short" | "uint16_t" | "u16" => ("u16", SchemaWireScalarShape::U16),
         "AZ::u32" | "unsigned int" | "uint32_t" | "u32" => ("u32", SchemaWireScalarShape::U32),
         "AZ::u64" | "unsigned long long" | "uint64_t" | "u64" => {
@@ -215,6 +223,9 @@ pub(super) fn exact_member_rust_type(
                 });
         }
         let native_type = member.native_type.as_deref()?;
+        if let Some(runtime_type) = exact_native_runtime_rust_type(native_type) {
+            return Some(runtime_type.to_owned());
+        }
         let wire_shape = nested_member_wire_shape(member)?;
         let wire_product =
             crate::network_schema::parse::nested_member_wire_shapes(wire_shape, &[])?;

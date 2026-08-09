@@ -71,8 +71,27 @@
                 operation,
                 target,
                 Collections.emptyMap());
+            if (collection != null && collection.count() == null) {
+                ContainerCodecCall boundary = unmarshalCollectionBoundary(
+                    operation,
+                    target,
+                    collection.wireEvidence(),
+                    "container-helper-unmarshal-self-counted-collection");
+                applyUnmarshalContainerCodecOutputStorage(
+                    boundary,
+                    collection.owner());
+                if (!putUnmarshalCollectionAction(
+                        actions,
+                        operation,
+                        boundary,
+                        true)) {
+                    return null;
+                }
+                continue;
+            }
             if (collection != null && collection.count() != null) {
                 PcodeOpAST count = uniqueUnmarshalCountProducer(
+                    function,
                     high,
                     operations,
                     operation,
@@ -121,6 +140,7 @@
     }
 
     private PcodeOpAST uniqueUnmarshalCountProducer(
+        Function owner,
         HighFunction high,
         List<PcodeOpAST> operations,
         PcodeOpAST consumer,
@@ -130,14 +150,17 @@
         for (PcodeOpAST candidate : operations) {
             codecWireTraceCheckpoint();
             if (candidate.getOpcode() != PcodeOp.CALL ||
-                !NetworkSchemaControlFlow.precedes(high, candidate, consumer)) {
+                !countProducerPrecedesConsumer(high, candidate, consumer)) {
                 continue;
             }
-            WireShape evidence = directCallWireEvidence(candidate);
+            WireShape evidence = countCodecWireEvidence(
+                owner,
+                candidate,
+                "vlq-u32");
             Set<PcodeStorage> outputs = scalarCallOutputStorages(candidate, evidence);
             boolean matchingOutput = outputs.stream()
                 .anyMatch(countStorage::sameLocation);
-            if (evidence == null || !"vlq-u32".equals(evidence.shape) ||
+            if (!wireShapeMatches(evidence, "vlq-u32") ||
                 !matchingOutput) {
                 continue;
             }

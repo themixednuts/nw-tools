@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn emits_actor_instantiation_parameters_descriptor_shape() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "F24987B3-0136-4BCF-9D27-08BDE18B0266",
+            "typeIndex": 751,
+            "typeName": "Amazon::Hub::CreateActorMsg",
+            "fields": [{
+                "index": 0,
+                "name": "Parameters",
+                "nativeType": "Amazon::Hub::ActorInstantiationParameters",
+                "wireShape": "actor-instantiation-parameters",
+                "wireShapeSource": "unmarshal-native-type+u16-counted-bool-class-value-loop",
+                "wireLayout": "actor-instantiation-parameters",
+                "wireLayoutSource": "unmarshal-native-type+u16-counted-bool-class-value-loop",
+                "confidence": "message-unmarshal-pcode-direct-type-call"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_descriptors(&schema).expect("descriptor source");
+
+    assert_eq!(output.report.field_wire_shape_count, 1);
+    assert!(
+        output
+            .source
+            .contains("wire_shape: Some(NetworkWireShape::ActorInstantiationParameters)")
+    );
+}
+
+#[test]
 fn emits_compile_ready_descriptor_module() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{

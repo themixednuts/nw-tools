@@ -463,7 +463,8 @@
                 plan.pcodeOrderByCallsite.putIfAbsent(
                     op.getSeqnum().getTarget().toString(),
                     order);
-                if (op.getOpcode() == PcodeOp.CALL) {
+                if (op.getOpcode() == PcodeOp.CALL ||
+                    op.getOpcode() == PcodeOp.CALLIND) {
                     recoverPcodeMessageGraphCall(
                         plan,
                         function,
@@ -516,7 +517,15 @@
         Map<String, String> tempNativeTypes,
         Map<String, String> tempWireShapes) {
 
-        Function target = pcodeCallTarget(op);
+        ConcreteMessageVirtualDispatch concreteDispatch =
+            op.getOpcode() == PcodeOp.CALLIND
+                ? concreteMessageVirtualDispatch(owner, op)
+                : null;
+        Function target = op.getOpcode() == PcodeOp.CALL
+            ? pcodeCallTarget(op)
+            : concreteDispatch == null
+                ? null
+                : concreteDispatch.target();
         // Slot matching stays in the current owner's frame. Translate the
         // selected argument only when propagating storage into the caller.
         Integer readBufferSlot = provenCallArgumentSlot(
@@ -525,6 +534,9 @@
             target,
             new PcodeStorage(readBufferParameter, 0L));
         if (target == null) {
+            if (op.getOpcode() == PcodeOp.CALLIND) {
+                return;
+            }
             // Unresolved CALL targets include failure-path vtable cleanup
             // (e.g. NewWorld+0x7c2db3 CALL [RAX+0x38]). Those are not wire
             // codecs; only reject when the callsite still consumes the
@@ -544,6 +556,10 @@
         Map<String, PcodeStorage> arguments = callArgumentStorageMap(
             owner,
             op,
+            callerParamStorage);
+        recordConcreteMessageValueVtable(
+            plan,
+            concreteDispatch,
             callerParamStorage);
         RawPcodeWrite rawRead = pcodeReadRawWrite(op, target);
         if (rawRead != null) {
@@ -605,16 +621,26 @@
         String wireShape = wireEvidence == null ? null : wireEvidence.shape;
         NestedTypeShape nestedShape = null;
         NestedDirectTypeCallShape translatedShape = null;
-        if (wireShape == null && nativeType != null) {
-            translatedShape = recoverNestedDirectTypeCallShape(
-                owner,
-                op,
-                target,
-                nativeType,
-                callerParamStorage);
-            nestedShape = translatedShape == null
-                ? recoverNestedDirectTypeShape(target, nativeType)
-                : translatedShape.shape;
+        if (wireShape == null &&
+            (nativeType != null || concreteDispatch != null)) {
+            if (nativeType != null) {
+                translatedShape = recoverNestedDirectTypeCallShape(
+                    owner,
+                    op,
+                    target,
+                    nativeType,
+                    callerParamStorage);
+                nestedShape = translatedShape == null
+                    ? recoverNestedDirectTypeShape(target, nativeType)
+                    : translatedShape.shape;
+            }
+            else {
+                nestedShape = recoverNestedDirectTypeShape(target, null, true);
+                if (nestedShape != null) {
+                    runMetrics.increment(
+                        "concreteMessageVirtualAnonymousShapes");
+                }
+            }
             wireShape = wireShapeFromNestedTypeShape(nestedShape);
             if (wireShape != null) {
                 wireEvidence = WireShape.semantic(

@@ -1,0 +1,225 @@
+    private PcodeStorage packedScalarCollectionOwnerStorage(
+        Function owner,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        List<PcodeCodecCall> codecs,
+        PcodeStorage readBuffer,
+        boolean requireFormalOutput) {
+
+        if (owner == null || loop == null || operations == null ||
+            codecs == null || codecs.size() < 2) {
+            return null;
+        }
+        ArrayList<PcodeStorage> outputs = new ArrayList<>(codecs.size());
+        ArrayList<Address> callsites = new ArrayList<>(codecs.size());
+        ArrayList<ForwardArgState> callStates = new ArrayList<>(codecs.size());
+        for (PcodeCodecCall codec : codecs) {
+            if (codec == null || codec.operation() == null ||
+                codec.operation().getSeqnum() == null) {
+                return null;
+            }
+            Integer width = codec.evidence() == null
+                ? null
+                : wireShapeByteWidth(codec.evidence().shape);
+            Set<PcodeStorage> scalarOutputs = scalarCallOutputStorages(
+                codec.operation(),
+                codec.evidence());
+            if (width == null || width <= 0 || width > 8 ||
+                scalarOutputs.size() != 1) {
+                return null;
+            }
+            PcodeStorage output = scalarOutputs.iterator().next();
+            Function target = pcodeCallTarget(codec.operation());
+            ForwardArgState callState = instructionStateBeforeCall(
+                owner,
+                codec.operation(),
+                target);
+            if (!"stack".equals(output.base) || callState == null) {
+                return null;
+            }
+            outputs.add(output);
+            callsites.add(codec.operation().getSeqnum().getTarget());
+            callStates.add(callState);
+        }
+
+        HashMap<String, LinkedHashSet<Integer>> taintByVectorRegister =
+            new HashMap<>();
+        PcodeStorage selected = null;
+        for (Instruction instruction : functionInstructions(owner)) {
+            checkAnalysisCancelled();
+            Address address = instruction.getMinAddress();
+            if (!instructionAddressInLoop(address, loop)) {
+                continue;
+            }
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if ("CALL".equals(mnemonic)) {
+                taintByVectorRegister.clear();
+                continue;
+            }
+
+            MemoryReference destinationMemory =
+                NetworkSchemaX86.memoryReference(instruction, 0);
+            String sourceRegister = packedVectorRegisterKey(
+                NetworkSchemaX86.registerOperand(instruction, 1));
+            if (destinationMemory != null && sourceRegister != null) {
+                Set<Integer> stored = taintByVectorRegister.get(sourceRegister);
+                if (stored != null && stored.size() == codecs.size() &&
+                    callsites.stream().allMatch(callsite ->
+                        callsite.compareTo(address) < 0)) {
+                    PcodeStorage candidate = packedStoreCollectionOwnerStorage(
+                        operations,
+                        address);
+                    String parameter = formalParameterBaseFromStorage(owner, candidate);
+                    boolean accepted = requireFormalOutput
+                        ? isProvenOutputParameterBase(owner, parameter)
+                        : isStableCollectionStorage(candidate, readBuffer);
+                    if (accepted) {
+                        if (selected != null && !selected.sameLocation(candidate)) {
+                            return null;
+                        }
+                        selected = candidate;
+                    }
+                }
+            }
+
+            String destinationRegister = packedVectorRegisterKey(
+                NetworkSchemaX86.registerOperand(instruction, 0));
+            if (destinationRegister == null) {
+                continue;
+            }
+            Integer loadedOutput = packedScalarOutputRead(
+                instruction,
+                address,
+                outputs,
+                callsites,
+                callStates);
+            if (loadedOutput != null) {
+                taintByVectorRegister.put(
+                    destinationRegister,
+                    new LinkedHashSet<>(Set.of(loadedOutput)));
+                continue;
+            }
+            if (isPackedVectorCopyMnemonic(mnemonic) && sourceRegister != null) {
+                LinkedHashSet<Integer> copied = taintByVectorRegister.get(sourceRegister);
+                if (copied == null) {
+                    taintByVectorRegister.remove(destinationRegister);
+                }
+                else {
+                    taintByVectorRegister.put(
+                        destinationRegister,
+                        new LinkedHashSet<>(copied));
+                }
+                continue;
+            }
+            if (isPackedVectorCombineMnemonic(mnemonic)) {
+                LinkedHashSet<Integer> combined = new LinkedHashSet<>();
+                if (!mnemonic.startsWith("V")) {
+                    combined.addAll(taintByVectorRegister.getOrDefault(
+                        destinationRegister,
+                        new LinkedHashSet<>()));
+                }
+                for (int operand = 1; operand < instruction.getNumOperands(); operand++) {
+                    String source = packedVectorRegisterKey(
+                        NetworkSchemaX86.registerOperand(instruction, operand));
+                    if (source != null) {
+                        combined.addAll(taintByVectorRegister.getOrDefault(
+                            source,
+                            new LinkedHashSet<>()));
+                    }
+                }
+                if (combined.isEmpty()) {
+                    taintByVectorRegister.remove(destinationRegister);
+                }
+                else {
+                    taintByVectorRegister.put(destinationRegister, combined);
+                }
+                continue;
+            }
+            taintByVectorRegister.remove(destinationRegister);
+        }
+        if (selected != null) {
+            runMetrics.increment("packedScalarProductOwnerProofs");
+        }
+        return selected;
+    }
+
+    private Integer packedScalarOutputRead(
+        Instruction instruction,
+        Address address,
+        List<PcodeStorage> outputs,
+        List<Address> callsites,
+        List<ForwardArgState> callStates) {
+
+        if (NetworkSchemaX86.memoryReference(instruction, 1) == null) {
+            return null;
+        }
+        Integer selected = null;
+        for (int index = 0; index < outputs.size(); index++) {
+            if (callsites.get(index).compareTo(address) >= 0 ||
+                !instructionReferencesStackStorage(
+                    instruction,
+                    callStates.get(index),
+                    outputs.get(index))) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = index;
+        }
+        return selected;
+    }
+
+    private PcodeStorage packedStoreCollectionOwnerStorage(
+        List<PcodeOpAST> operations,
+        Address address) {
+
+        PcodeStorage selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3 || operation.getSeqnum() == null ||
+                !address.equals(operation.getSeqnum().getTarget())) {
+                continue;
+            }
+            PcodeStorage candidate = vectorHeaderOwnerStorageForElementPointer(
+                operations,
+                operation.getInput(1),
+                new LinkedHashSet<>(),
+                0);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.sameLocation(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private String packedVectorRegisterKey(String register) {
+        if (register == null ||
+            !register.matches("(?:XMM|YMM|ZMM)\\d+")) {
+            return null;
+        }
+        return "VEC" + register.replaceFirst("^[A-Z]+", "");
+    }
+
+    private boolean isPackedVectorCopyMnemonic(String mnemonic) {
+        return "MOVAPS".equals(mnemonic) || "MOVUPS".equals(mnemonic) ||
+            "MOVAPD".equals(mnemonic) || "MOVUPD".equals(mnemonic) ||
+            "MOVDQA".equals(mnemonic) || "MOVDQU".equals(mnemonic) ||
+            "VMOVAPS".equals(mnemonic) || "VMOVUPS".equals(mnemonic) ||
+            "VMOVAPD".equals(mnemonic) || "VMOVUPD".equals(mnemonic) ||
+            "VMOVDQA".equals(mnemonic) || "VMOVDQU".equals(mnemonic);
+    }
+
+    private boolean isPackedVectorCombineMnemonic(String mnemonic) {
+        return "SHUFPS".equals(mnemonic) || "SHUFPD".equals(mnemonic) ||
+            "UNPCKLPS".equals(mnemonic) || "UNPCKLPD".equals(mnemonic) ||
+            "PUNPCKLDQ".equals(mnemonic) || "PUNPCKLQDQ".equals(mnemonic) ||
+            "INSERTPS".equals(mnemonic) || "BLENDPS".equals(mnemonic) ||
+            "VSHUFPS".equals(mnemonic) || "VSHUFPD".equals(mnemonic) ||
+            "VUNPCKLPS".equals(mnemonic) || "VUNPCKLPD".equals(mnemonic) ||
+            "VINSERTPS".equals(mnemonic) || "VBLENDPS".equals(mnemonic);
+    }

@@ -1,5 +1,6 @@
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -7,6 +8,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.PcodeBlock;
@@ -94,6 +96,36 @@ final class NetworkSchemaCodecClassifier {
             if (matchesDecisionChain(comparisons, U32_DECODER_THRESHOLDS)) {
                 return new VariableIntegerCodec("vlq-u32", CodecDirection.DECODE);
             }
+        }
+
+        // Ghidra can preserve a machine register across the decoder decision
+        // chain while assigning different SSA lineage nodes to its uses. The
+        // physical byte register is still a valid identity here: all decoder
+        // thresholds must occur once and form one ordered CFG chain.
+        Map<String, List<BranchComparison>> byPhysicalStorage =
+            branchComparisonsByPhysicalStorage(high);
+        for (List<BranchComparison> comparisons : byPhysicalStorage.values()) {
+            if (matchesDecisionChain(comparisons, U64_DECODER_THRESHOLDS)) {
+                return new VariableIntegerCodec("vlq-u64", CodecDirection.DECODE);
+            }
+        }
+        for (List<BranchComparison> comparisons : byPhysicalStorage.values()) {
+            if (matchesDecisionChain(comparisons, U32_DECODER_THRESHOLDS)) {
+                return new VariableIntegerCodec("vlq-u32", CodecDirection.DECODE);
+            }
+        }
+
+        // A decoder may reload the discriminator byte between branches, so
+        // neither SSA lineage nor physical-register identity is guaranteed to
+        // survive the complete chain. The exact threshold sequence on one CFG
+        // path is sufficient structural proof and remains independent of names
+        // and addresses.
+        List<BranchComparison> comparisons = branchComparisonsOnAnyStorage(high);
+        if (matchesDecisionPath(comparisons, U64_DECODER_THRESHOLDS)) {
+            return new VariableIntegerCodec("vlq-u64", CodecDirection.DECODE);
+        }
+        if (matchesDecisionPath(comparisons, U32_DECODER_THRESHOLDS)) {
+            return new VariableIntegerCodec("vlq-u32", CodecDirection.DECODE);
         }
         return null;
     }
@@ -549,7 +581,7 @@ final class NetworkSchemaCodecClassifier {
         Iterator<PcodeOpAST> operations = high.getPcodeOps();
         while (operations.hasNext()) {
             PcodeOpAST operation = operations.next();
-            if (!isOrderedComparison(operation) || operation.getNumInputs() != 2 ||
+            if (!isThresholdComparison(operation) || operation.getNumInputs() != 2 ||
                 operation.getOutput() == null ||
                 !feedsConditionalBranch(operation.getOutput())) {
                 continue;
@@ -572,10 +604,124 @@ final class NetworkSchemaCodecClassifier {
         return result;
     }
 
+    private static Map<String, List<BranchComparison>> branchComparisonsByPhysicalStorage(
+        HighFunction high) {
+
+        LinkedHashMap<String, List<BranchComparison>> result = new LinkedHashMap<>();
+        Iterator<PcodeOpAST> operations = high.getPcodeOps();
+        while (operations.hasNext()) {
+            PcodeOpAST operation = operations.next();
+            if (!isThresholdComparison(operation) || operation.getNumInputs() != 2 ||
+                operation.getOutput() == null ||
+                !feedsConditionalBranch(operation.getOutput())) {
+                continue;
+            }
+            int constantIndex = operation.getInput(0).isConstant() ? 0 :
+                operation.getInput(1).isConstant() ? 1 : -1;
+            if (constantIndex < 0) {
+                continue;
+            }
+            Varnode value = operation.getInput(1 - constantIndex);
+            String storage = physicalStorageKey(
+                value,
+                new HashSet<>(),
+                0);
+            PcodeBlockBasic block = operation.getParent();
+            if (storage == null || block == null) {
+                continue;
+            }
+            long threshold = canonicalThreshold(operation, constantIndex, value.getSize());
+            result.computeIfAbsent(storage, ignored -> new ArrayList<>())
+                .add(new BranchComparison(threshold, block));
+        }
+        return result;
+    }
+
+    private static List<BranchComparison> branchComparisonsOnAnyStorage(
+        HighFunction high) {
+
+        ArrayList<BranchComparison> result = new ArrayList<>();
+        Iterator<PcodeOpAST> operations = high.getPcodeOps();
+        while (operations.hasNext()) {
+            PcodeOpAST operation = operations.next();
+            if (!isThresholdComparison(operation) || operation.getNumInputs() != 2 ||
+                operation.getOutput() == null ||
+                !feedsConditionalBranch(operation.getOutput())) {
+                continue;
+            }
+            int constantIndex = operation.getInput(0).isConstant() ? 0 :
+                operation.getInput(1).isConstant() ? 1 : -1;
+            PcodeBlockBasic block = operation.getParent();
+            if (constantIndex < 0 || block == null) {
+                continue;
+            }
+            Varnode value = operation.getInput(1 - constantIndex);
+            result.add(new BranchComparison(
+                canonicalThreshold(operation, constantIndex, value.getSize()),
+                block));
+        }
+        return List.copyOf(result);
+    }
+
+    private static String physicalStorageKey(
+        Varnode node,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || node.isConstant() || depth > 32 ||
+            !seen.add(varnodeKey(node))) {
+            return null;
+        }
+        if (node.isRegister()) {
+            // High p-code may attach different SSA definitions to repeated
+            // reads of the same physical byte register. The machine register
+            // remains the stable identity needed by the threshold chain.
+            return "register:" + node.getAddress();
+        }
+        PcodeOp definition = node.getDef();
+        if (definition != null && isValueForwarder(definition) &&
+            definition.getNumInputs() > 0) {
+            if (definition.getOpcode() == PcodeOp.SUBPIECE &&
+                (definition.getNumInputs() < 2 ||
+                    !definition.getInput(1).isConstant() ||
+                    definition.getInput(1).getOffset() != 0L)) {
+                return null;
+            }
+            String forwarded = physicalStorageKey(
+                definition.getInput(0),
+                seen,
+                depth + 1);
+            if (forwarded != null) {
+                return forwarded;
+            }
+        }
+        if (definition != null && definition.getOpcode() == PcodeOp.MULTIEQUAL) {
+            HashSet<String> inputs = new HashSet<>();
+            for (int index = 0; index < definition.getNumInputs(); index++) {
+                String input = physicalStorageKey(
+                    definition.getInput(index),
+                    new HashSet<>(seen),
+                    depth + 1);
+                if (input != null) {
+                    inputs.add(input);
+                }
+            }
+            return inputs.size() == 1 ? inputs.iterator().next() : null;
+        }
+        return null;
+    }
+
     private static boolean isOrderedComparison(PcodeOp operation) {
         return switch (operation.getOpcode()) {
             case PcodeOp.INT_LESS, PcodeOp.INT_LESSEQUAL,
                 PcodeOp.INT_SLESS, PcodeOp.INT_SLESSEQUAL -> true;
+            default -> false;
+        };
+    }
+
+    private static boolean isThresholdComparison(PcodeOp operation) {
+        return isOrderedComparison(operation) || switch (operation.getOpcode()) {
+            case PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL -> true;
             default -> false;
         };
     }
@@ -688,6 +834,62 @@ final class NetworkSchemaCodecClassifier {
         return true;
     }
 
+    private static boolean matchesDecisionPath(
+        List<BranchComparison> comparisons,
+        List<Long> thresholds) {
+
+        if (comparisons == null || thresholds == null || thresholds.isEmpty()) {
+            return false;
+        }
+        LinkedHashMap<Long, List<PcodeBlockBasic>> candidates = new LinkedHashMap<>();
+        for (Long threshold : thresholds) {
+            candidates.put(threshold, new ArrayList<>());
+        }
+        for (BranchComparison comparison : comparisons) {
+            List<PcodeBlockBasic> blocks = candidates.get(comparison.threshold());
+            if (blocks != null && !blocks.contains(comparison.block())) {
+                blocks.add(comparison.block());
+            }
+        }
+        if (candidates.values().stream().anyMatch(List::isEmpty)) {
+            return false;
+        }
+        Set<PcodeBlockBasic> decisionBlocks = candidates.values().stream()
+            .flatMap(Collection::stream)
+            .collect(Collectors.toUnmodifiableSet());
+        return candidates.get(thresholds.get(0)).stream().anyMatch(start ->
+            matchesDecisionPathFrom(
+                start,
+                1,
+                thresholds,
+                candidates,
+                decisionBlocks));
+    }
+
+    private static boolean matchesDecisionPathFrom(
+        PcodeBlockBasic current,
+        int thresholdIndex,
+        List<Long> thresholds,
+        Map<Long, List<PcodeBlockBasic>> candidates,
+        Set<PcodeBlockBasic> decisionBlocks) {
+
+        if (thresholdIndex >= thresholds.size()) {
+            return true;
+        }
+        for (PcodeBlockBasic next : candidates.get(thresholds.get(thresholdIndex))) {
+            if (reachesNextDecision(current, next, decisionBlocks) &&
+                matchesDecisionPathFrom(
+                    next,
+                    thresholdIndex + 1,
+                    thresholds,
+                    candidates,
+                    decisionBlocks)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static boolean reachesNextDecision(
         PcodeBlockBasic start,
         PcodeBlockBasic target,
@@ -732,6 +934,10 @@ final class NetworkSchemaCodecClassifier {
         long constant = normalizedConstant(
             comparison.getInput(constantIndex),
             valueSize);
+        if (comparison.getOpcode() == PcodeOp.INT_EQUAL ||
+            comparison.getOpcode() == PcodeOp.INT_NOTEQUAL) {
+            return constant;
+        }
         boolean inclusive = comparison.getOpcode() == PcodeOp.INT_LESSEQUAL ||
             comparison.getOpcode() == PcodeOp.INT_SLESSEQUAL;
         boolean constantFirst = constantIndex == 0;

@@ -1,0 +1,358 @@
+    private record SharedMaskCompositeAnalysis(
+        WireShape shape,
+        String diagnostic) {
+    }
+
+    private record SharedMaskWireGroup(
+        Long mask,
+        List<WireShape> members) {
+    }
+
+    private SharedMaskCompositeAnalysis sharedMaskCompositeUnmarshalShape(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        List<CodecWireEvent> events,
+        Map<CodecWireEvent, PcodeOpAST> eventOrigins,
+        UnmarshalTerminalFlow terminalFlow) {
+
+        if (high == null || operations == null || events == null ||
+            events.size() < 2 || terminalFlow == null ||
+            terminalFlow.terminals().isEmpty()) {
+            return new SharedMaskCompositeAnalysis(null, "missing-input");
+        }
+
+        ArrayList<ContainerCodecCall> codecs = new ArrayList<>(events.size());
+        for (CodecWireEvent event : events) {
+            PcodeOpAST operation = eventOrigins == null
+                ? null
+                : eventOrigins.get(event);
+            if (operation == null) {
+                operation = codecWireEventOperation(high, operations, event);
+            }
+            if (operation == null || event.wireEvidence() == null ||
+                event.wireEvidence().layout == null ||
+                !operations.contains(operation) ||
+                NetworkSchemaControlFlow.parentBlock(operation) == null) {
+                return new SharedMaskCompositeAnalysis(
+                    null,
+                    "event-origin-or-physical-path-unproven");
+            }
+            ContainerCodecCall codec = containerCodecFromWireEvent(
+                event,
+                "shared-mask-unmarshal-member");
+            codec.operation = operation;
+            codecs.add(codec);
+        }
+        applyContainerCodecGuards(high, codecs);
+
+        return sharedMaskCompositeShape(
+            codecs,
+            events,
+            sharedMaskMandatoryBlocks(
+                high,
+                codecs,
+                terminalFlow.mandatoryBlocks()));
+    }
+
+    private Set<PcodeBlockBasic> sharedMaskMandatoryBlocks(
+        HighFunction high,
+        List<ContainerCodecCall> codecs,
+        Set<PcodeBlockBasic> fallback) {
+
+        NetworkSchemaNaturalLoop commonLoop = null;
+        for (ContainerCodecCall codec : codecs) {
+            NetworkSchemaNaturalLoop loop = codec == null || codec.operation == null
+                ? null
+                : loopContaining(codec.operation);
+            if (loop == null) {
+                return fallback == null ? Set.of() : fallback;
+            }
+            if (commonLoop == null) {
+                commonLoop = loop;
+            }
+            else if (!Objects.equals(commonLoop.header(), loop.header())) {
+                return fallback == null ? Set.of() : fallback;
+            }
+        }
+        Set<PcodeBlockBasic> iteration = mandatorySuccessfulLoopIterationBlocks(
+            high,
+            commonLoop);
+        return iteration.isEmpty()
+            ? fallback == null ? Set.of() : fallback
+            : iteration;
+    }
+
+    private SharedMaskCompositeAnalysis sharedMaskCompositeShape(
+        List<ContainerCodecCall> codecs,
+        List<CodecWireEvent> events,
+        Set<PcodeBlockBasic> mandatoryBlocks) {
+
+        if (codecs == null || events == null || codecs.size() != events.size() ||
+            codecs.size() < 2) {
+            return new SharedMaskCompositeAnalysis(null, "missing-codec-product");
+        }
+        Set<PcodeBlockBasic> mandatory = mandatoryBlocks == null
+            ? Set.of()
+            : mandatoryBlocks;
+
+        int maskIndex = -1;
+        int candidateCount = 0;
+        for (int index = 0; index < codecs.size(); index++) {
+            ContainerCodecCall codec = codecs.get(index);
+            CodecWireEvent event = events.get(index);
+            Integer width = wireShapeByteWidth(codec.wireEvidence.layout);
+            if (event.outputStorage() == null || width == null || width != 1 ||
+                !mandatory.contains(
+                    NetworkSchemaControlFlow.parentBlock(codec.operation))) {
+                continue;
+            }
+            long guardedMembers = codecs.stream()
+                .filter(member -> member != codec)
+                .flatMap(member -> member.guards.stream())
+                .filter(guard -> sharedMaskGuardMatches(
+                    guard,
+                    event.outputStorage()))
+                .count();
+            if (guardedMembers == 0) {
+                continue;
+            }
+            maskIndex = index;
+            candidateCount++;
+        }
+        if (candidateCount != 1 || maskIndex != 0) {
+            return new SharedMaskCompositeAnalysis(
+                null,
+                "mask-producer-not-unique-or-first:candidates=" + candidateCount +
+                    ":index=" + maskIndex + ":product=" +
+                    sharedMaskProductDiagnostic(codecs, events, mandatory));
+        }
+
+        PcodeStorage maskStorage = events.get(maskIndex).outputStorage();
+        ArrayList<SharedMaskWireGroup> groups = new ArrayList<>();
+        Long currentMask = null;
+        ArrayList<WireShape> currentMembers = new ArrayList<>();
+        LinkedHashSet<Long> closedMasks = new LinkedHashSet<>();
+        boolean hasMaskedMember = false;
+        for (int index = 1; index < codecs.size(); index++) {
+            ContainerCodecCall codec = codecs.get(index);
+            ArrayList<ContainerCodecGuard> matching = codec.guards.stream()
+                .filter(guard -> sharedMaskGuardMatches(guard, maskStorage))
+                .collect(Collectors.toCollection(ArrayList::new));
+            if (matching.size() > 1) {
+                return new SharedMaskCompositeAnalysis(
+                    null,
+                    "member-has-multiple-mask-guards:" + formatAddress(codec.callsite));
+            }
+
+            Long memberMask = null;
+            if (!matching.isEmpty()) {
+                ContainerCodecGuard guard = matching.get(0);
+                if (!sharedMaskGuardSelectsSetBit(guard) ||
+                    guard.mask() == null ||
+                    guard.mask() <= 0L ||
+                    guard.mask() > 0xffL ||
+                    Long.bitCount(guard.mask()) != 1) {
+                    return new SharedMaskCompositeAnalysis(
+                        null,
+                        "unsupported-mask-polarity-or-width:" +
+                            formatAddress(guard.branch()));
+                }
+                memberMask = guard.mask();
+                hasMaskedMember = true;
+            }
+            else if (!mandatory.contains(
+                    NetworkSchemaControlFlow.parentBlock(codec.operation))) {
+                return new SharedMaskCompositeAnalysis(
+                    null,
+                    "unguarded-member-not-mandatory:" + formatAddress(codec.callsite));
+            }
+
+            if (!Objects.equals(currentMask, memberMask) && !currentMembers.isEmpty()) {
+                groups.add(new SharedMaskWireGroup(
+                    currentMask,
+                    List.copyOf(currentMembers)));
+                if (currentMask != null) {
+                    closedMasks.add(currentMask);
+                }
+                currentMembers.clear();
+            }
+            if (memberMask != null && closedMasks.contains(memberMask)) {
+                return new SharedMaskCompositeAnalysis(
+                    null,
+                    "non-contiguous-mask-group:0x" + Long.toHexString(memberMask));
+            }
+            currentMask = memberMask;
+            currentMembers.add(codec.wireEvidence);
+        }
+        if (!currentMembers.isEmpty()) {
+            groups.add(new SharedMaskWireGroup(
+                currentMask,
+                List.copyOf(currentMembers)));
+        }
+        if (!hasMaskedMember || groups.isEmpty() || groups.size() > 11) {
+            return new SharedMaskCompositeAnalysis(
+                null,
+                "missing-or-oversized-mask-product:groups=" + groups.size());
+        }
+
+        ArrayList<String> shapeMembers = new ArrayList<>(groups.size());
+        ArrayList<String> layoutMembers = new ArrayList<>(groups.size());
+        for (SharedMaskWireGroup group : groups) {
+            WireShape payload = orderedWireEvidence(
+                group.members(),
+                "shared-mask-member-product");
+            if (payload == null || payload.layout == null) {
+                return new SharedMaskCompositeAnalysis(
+                    null,
+                    "mask-payload-layout-unresolved");
+            }
+            String semantic = payload.shape == null ? payload.layout : payload.shape;
+            if (group.mask() == null) {
+                shapeMembers.add("required<" + semantic + ">");
+                layoutMembers.add("required<" + payload.layout + ">");
+            }
+            else {
+                String mask = String.format("0x%02x", group.mask());
+                shapeMembers.add("masked<" + mask + "," + semantic + ">");
+                layoutMembers.add("masked<" + mask + "," + payload.layout + ">");
+            }
+        }
+        String shape = "bit-mask-composite<u8," +
+            String.join(",", shapeMembers) + ">";
+        String maskLayout = events.get(maskIndex).wireEvidence().layout;
+        String layout = "bit-mask-composite<" + maskLayout + "," +
+            String.join(",", layoutMembers) + ">";
+        return new SharedMaskCompositeAnalysis(
+            WireShape.semantic(
+                shape,
+                layout,
+                "cfg-shared-byte-mask-codec-product"),
+            "complete:groups=" + groups.size());
+    }
+
+    private boolean blockLiesOnPhysicalFunctionPath(
+        HighFunction high,
+        PcodeBlockBasic block) {
+
+        if (high == null || block == null) {
+            return false;
+        }
+        List<PcodeBlockBasic> entries = high.getBasicBlocks().stream()
+            .filter(candidate -> NetworkSchemaControlFlow.predecessors(candidate).isEmpty())
+            .toList();
+        Set<PcodeBlockBasic> terminals = high.getBasicBlocks().stream()
+            .filter(this::isTerminatingPcodeBlock)
+            .collect(Collectors.toUnmodifiableSet());
+        return entries.stream().anyMatch(entry -> pcodeBlockReachesAny(
+                entry,
+                Set.of(block),
+                Map.of())) &&
+            pcodeBlockReachesAny(block, terminals, Map.of());
+    }
+
+    private boolean sharedMaskGuardMatches(
+        ContainerCodecGuard guard,
+        PcodeStorage storage) {
+
+        if (guard == null || storage == null ||
+            !"storage-bit-mask".equals(guard.kind()) ||
+            guard.storageBase() == null || guard.storageOffset() == null) {
+            return false;
+        }
+        return storage.sameLocation(new PcodeStorage(
+            guard.storageBase(),
+            guard.storageOffset()));
+    }
+
+    private String sharedMaskProductDiagnostic(
+        List<ContainerCodecCall> codecs,
+        List<CodecWireEvent> events,
+        Set<PcodeBlockBasic> mandatory) {
+
+        ArrayList<String> members = new ArrayList<>();
+        for (int index = 0; index < codecs.size(); index++) {
+            ContainerCodecCall codec = codecs.get(index);
+            CodecWireEvent event = events.get(index);
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(
+                codec.operation);
+            String output = event.outputStorage() == null
+                ? "none"
+                : event.outputStorage().expression();
+            String guards = codec.guards.stream()
+                .map(guard -> formatAddress(guard.branch()) + "/" + guard.kind() +
+                    "/" + Objects.toString(guard.storageBase(), "none") + "+" +
+                    Objects.toString(guard.storageOffset(), "none") + "/mask=" +
+                    Objects.toString(guard.mask(), "none") + "/" +
+                    guard.condition() + "/memberTrue=" + guard.memberOnTrue() +
+                    "/source=" + guard.evidenceSource())
+                .collect(Collectors.joining(","));
+            members.add(index + "{" + codec.wireEvidence.layout +
+                ";out=" + output +
+                ";mandatory=" + mandatory.contains(block) +
+                ";guards=[" + guards + "]}");
+        }
+        return String.join("|", members);
+    }
+
+    private boolean sharedMaskGuardSelectsSetBit(ContainerCodecGuard guard) {
+        boolean conditionTrueWhenSet = "not-equal-zero".equals(guard.condition());
+        return guard.memberOnTrue() == conditionTrueWhenSet;
+    }
+
+    private PcodeOpAST codecWireEventOperation(
+        HighFunction high,
+        List<PcodeOpAST> operations,
+        CodecWireEvent event) {
+
+        if (event == null || event.callsite() == null) {
+            return null;
+        }
+        PcodeOpAST fallback = null;
+        for (PcodeOpAST operation : operations) {
+            if (!event.callsite().equals(operation.getSeqnum().getTarget())) {
+                continue;
+            }
+            if (fallback == null) {
+                fallback = operation;
+            }
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (event.target() == null || target != null &&
+                event.target().equals(target.getEntryPoint())) {
+                return operation;
+            }
+        }
+        return fallback;
+    }
+
+    private boolean pcodeBlockReachesAny(
+        PcodeBlockBasic start,
+        Set<PcodeBlockBasic> targets,
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> excludedEdges) {
+
+        if (start == null || targets == null || targets.isEmpty()) {
+            return false;
+        }
+        ArrayDeque<PcodeBlockBasic> pending = new ArrayDeque<>();
+        LinkedHashSet<PcodeBlockBasic> visited = new LinkedHashSet<>();
+        pending.add(start);
+        visited.add(start);
+        while (!pending.isEmpty()) {
+            checkAnalysisCancelled();
+            PcodeBlockBasic current = pending.removeFirst();
+            if (targets.contains(current)) {
+                return true;
+            }
+            for (PcodeBlockBasic successor :
+                    NetworkSchemaControlFlow.successors(current)) {
+                if (excludedEdges.getOrDefault(current, Set.of()).contains(successor) ||
+                    !visited.add(successor)) {
+                    continue;
+                }
+                pending.addLast(successor);
+            }
+        }
+        return false;
+    }

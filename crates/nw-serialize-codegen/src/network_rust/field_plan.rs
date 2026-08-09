@@ -146,6 +146,7 @@ fn anonymous_message_wire_layout_shape(field: &NetworkField) -> Option<SchemaWir
             | SchemaWireShape::Optional(_)
             | SchemaWireShape::DefaultOmitted(_)
             | SchemaWireShape::BooleanChoice(_)
+            | SchemaWireShape::BitMaskComposite(_)
             | SchemaWireShape::FixedSequence(_)
             | SchemaWireShape::ClassValue
     ) {
@@ -789,20 +790,24 @@ pub(super) fn message_blocked_reasons(
     if network_type.name.is_none() {
         reasons.push("missing-type-name".to_owned());
     }
-    if network_type.fields.is_empty()
-        && network_type.marshal_fields.is_empty()
-        && !network_type.instance.as_ref().is_some_and(|instance| {
-            instance.empty_wire_proven
-                && instance.analysis_status
-                    == Some(crate::network_schema::NetworkMessageAnalysisStatus::ProvenEmpty)
-        })
-    {
-        reasons.push("message-layout-unresolved".to_owned());
-    }
     let supports_unmarshal = network_type
         .instance
         .as_ref()
         .and_then(|instance| instance.supports_unmarshal);
+    let has_known_empty_layout = network_type.instance.as_ref().is_some_and(|instance| {
+        instance.empty_wire_proven
+            && instance.analysis_status
+                == Some(crate::network_schema::NetworkMessageAnalysisStatus::ProvenEmpty)
+            || supports_unmarshal == Some(false)
+                && instance.analysis_status
+                    == Some(crate::network_schema::NetworkMessageAnalysisStatus::MarshalOnly)
+    });
+    if network_type.fields.is_empty()
+        && network_type.marshal_fields.is_empty()
+        && !has_known_empty_layout
+    {
+        reasons.push("message-layout-unresolved".to_owned());
+    }
     if supports_unmarshal != Some(false) && !message_directional_fields_agree(network_type) {
         reasons.push("marshal-unmarshal-field-mismatch".to_owned());
     }
@@ -817,10 +822,9 @@ fn message_directional_fields_agree(network_type: &NetworkType) -> bool {
     if let (Some(unmarshal), Some(marshal)) = (
         directional_fields_wire_product(&network_type.fields),
         directional_fields_wire_product(&network_type.marshal_fields),
-    ) {
-        if wire_scalar_products_directionally_agree(&unmarshal, &marshal) {
-            return true;
-        }
+    ) && wire_scalar_products_directionally_agree(&unmarshal, &marshal)
+    {
+        return true;
     }
     network_type.fields.len() == network_type.marshal_fields.len()
         && network_type
@@ -1008,11 +1012,6 @@ pub(super) fn message_field_blocked_reason(
     if !field.confidence.is_high_or_exact() {
         return Some("low-confidence-field".to_owned());
     }
-    if shape.is_some_and(message_wire_shape_contains_class_value)
-        && !message_field_has_proven_class_value_aggregate(field, rust_type)
-    {
-        return Some("unresolved-class-value".to_owned());
-    }
     if let Some(rust_type) = rust_type
         && syn::parse_str::<syn::Type>(rust_type).is_ok()
     {
@@ -1040,38 +1039,6 @@ pub(super) fn message_field_blocked_reason(
     // alone (see rust_field_shape). RegisterField-backed sequences still use
     // the handler-plan path in state_field_shape_report.
     None
-}
-
-fn message_field_has_proven_class_value_aggregate(
-    field: &NetworkField,
-    rust_type: Option<&str>,
-) -> bool {
-    rust_type.and_then(message_support_type_ident).is_some()
-        && field
-            .nested_type_shape
-            .as_ref()
-            .is_some_and(|shape| shape.has_proven_layout())
-}
-
-fn message_wire_shape_contains_class_value(shape: &SchemaWireShape) -> bool {
-    match shape {
-        SchemaWireShape::ClassValue => true,
-        SchemaWireShape::Composite(members) | SchemaWireShape::DefaultOmitted(members) => {
-            members.iter().any(message_wire_shape_contains_class_value)
-        }
-        SchemaWireShape::BooleanChoice(choice) => {
-            message_wire_shape_contains_class_value(&choice.false_value)
-                || message_wire_shape_contains_class_value(&choice.true_value)
-        }
-        SchemaWireShape::Optional(inner)
-        | SchemaWireShape::Sequence(inner)
-        | SchemaWireShape::Set(inner) => message_wire_shape_contains_class_value(inner),
-        SchemaWireShape::Map { key, value } => {
-            message_wire_shape_contains_class_value(key)
-                || message_wire_shape_contains_class_value(value)
-        }
-        _ => false,
-    }
 }
 
 pub(super) fn has_composite_support_type_evidence(field: &NetworkField) -> bool {

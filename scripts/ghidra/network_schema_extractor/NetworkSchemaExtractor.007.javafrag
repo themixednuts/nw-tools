@@ -26,6 +26,19 @@
             shape.members.isEmpty()) {
             return false;
         }
+        if (addAtomicDirectWireSequenceMemberCandidate(
+                byBase,
+                storage,
+                shape,
+                op,
+                target,
+                source)) {
+            markNestedTypeMemberWireOrder(
+                byBase,
+                storage,
+                "cfg-call-order+atomic-direct-wire-product");
+            return true;
+        }
         String typeIdentitySource = Boolean.TRUE.equals(shape.identityProven) &&
             shape.typeId != null
             ? shape.identitySource
@@ -181,6 +194,7 @@
         }
         return true;
     }
+
     private void proveDirectTypeIdentity(NestedTypeShape shape, Function target) {
         if (shape == null || target == null || shape.members.isEmpty()) {
             return;

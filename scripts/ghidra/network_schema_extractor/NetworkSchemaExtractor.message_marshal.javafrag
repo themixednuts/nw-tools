@@ -151,7 +151,10 @@
         MessageUnmarshalPlan unmarshal,
         MessageMarshalPlan marshal) {
 
-        if (!directionalMessagePlansDisagree(unmarshal, marshal)) {
+        boolean emptyDirectionalPlans = unmarshal != null && marshal != null &&
+            unmarshal.fields.isEmpty() && marshal.fields.isEmpty();
+        if (!emptyDirectionalPlans &&
+            !directionalMessagePlansDisagree(unmarshal, marshal)) {
             return;
         }
         Function wrapper = functionAtOrContaining(unmarshal.wrapper);

@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::{
-    NetworkNativeTypeInfoEvidence, NetworkWireScalarShape, hex_or_decimal_u64,
-    native_type_info_evidence, parse_network_wire_scalar_shape, string, string_ref,
+    NetworkNativeTypeInfoEvidence, NetworkWireScalarShape, NetworkWireShape, hex_or_decimal_u64,
+    native_type_info_evidence, parse_network_wire_scalar_shape, parse_network_wire_shape, string,
+    string_ref,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,9 +13,9 @@ pub enum NetworkFixedSequenceStorageKind {
     InlineFixed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkFixedSequenceWireShape {
-    pub element: NetworkWireScalarShape,
+    pub element: Box<NetworkWireShape>,
     pub capacity: u16,
 }
 
@@ -40,10 +41,9 @@ pub struct NetworkFixedSequenceShape {
 }
 
 impl NetworkFixedSequenceShape {
-    #[must_use]
-    pub const fn wire_shape(&self) -> NetworkFixedSequenceWireShape {
+    pub fn wire_shape(&self) -> NetworkFixedSequenceWireShape {
         NetworkFixedSequenceWireShape {
-            element: self.element_wire_shape,
+            element: Box::new(self.element_wire_shape.into()),
             capacity: self.capacity,
         }
     }
@@ -101,7 +101,7 @@ pub(super) fn parse_fixed_sequence_wire_shape(
     let (element, capacity) = inner.rsplit_once(',')?;
     let capacity = capacity.trim().parse::<u16>().ok()?;
     (capacity > 0).then_some(NetworkFixedSequenceWireShape {
-        element: parse_network_wire_scalar_shape(element.trim())?,
+        element: Box::new(parse_network_wire_shape(element.trim())?),
         capacity,
     })
 }
@@ -154,5 +154,25 @@ mod tests {
         });
 
         assert!(parse_fixed_sequence_shape(value.as_object().unwrap()).is_none());
+    }
+
+    #[test]
+    fn parses_nested_fixed_sequence_wire_shape() {
+        let shape = parse_fixed_sequence_wire_shape(
+            "fixed-vector<fixed-vector<composite<u32,string>,5>,20>",
+        )
+        .unwrap();
+
+        assert_eq!(shape.capacity, 20);
+        assert_eq!(
+            shape.element.as_ref(),
+            &NetworkWireShape::FixedSequence(NetworkFixedSequenceWireShape {
+                element: Box::new(NetworkWireShape::Composite(vec![
+                    NetworkWireShape::U32,
+                    NetworkWireShape::String,
+                ])),
+                capacity: 5,
+            })
+        );
     }
 }

@@ -648,7 +648,17 @@ fn merge_message_signature_direction(
         *fields = grouped;
         report.field_grouped_count += grouped_count;
     } else if fields.len() != signatures.len() {
-        return false;
+        if !is_complete_native_listing_signature(signatures, source) {
+            return false;
+        }
+        *fields = network_fields_from_message_signature(signatures, source.to_owned());
+        report.field_name_filled_count += signatures.len();
+        report.native_type_filled_count += signatures
+            .iter()
+            .filter(|field| field.native_type.is_some())
+            .count();
+        report.wire_shape_filled_count += signatures.len();
+        return true;
     }
 
     for (field, signature) in fields.iter_mut().zip(signatures) {
@@ -679,11 +689,22 @@ fn merge_message_signature_direction(
             field.wire_shape = Some(wire_shape.clone());
             field.wire_shape_source = Some(source.to_owned());
             report.wire_shape_filled_count += 1;
-        } else if let Some(expected) = signature.wire_shape.as_ref()
-            && field.wire_shape.as_ref() != Some(expected)
+        } else if let (Some(existing), Some(expected)) =
+            (field.wire_shape.as_ref(), signature.wire_shape.as_ref())
+            && existing != expected
         {
-            field.signature_wire_conflict = true;
-            report.wire_shape_conflict_count += 1;
+            if wire_shapes_machine_compatible(existing, expected) {
+                if field.wire_layout.is_none() {
+                    field.wire_layout = Some(existing.wire_string());
+                    field.wire_layout_source = field.wire_shape_source.clone();
+                }
+                field.wire_shape = Some(expected.clone());
+                field.wire_shape_source =
+                    Some("message-signature+machine-wire-equivalence".to_owned());
+            } else {
+                field.signature_wire_conflict = true;
+                report.wire_shape_conflict_count += 1;
+            }
         }
 
         if !field.signature_type_conflict
@@ -704,4 +725,18 @@ fn merge_message_signature_direction(
         );
     }
     true
+}
+
+fn is_complete_native_listing_signature(
+    fields: &[NetworkMessageFieldSignature],
+    source: &str,
+) -> bool {
+    source == "native-unmarshal-and-marshal-listing"
+        && !fields.is_empty()
+        && fields.iter().enumerate().all(|(index, field)| {
+            field.wire_shape.is_some()
+                && field
+                    .index
+                    .is_none_or(|field_index| u32::try_from(index).ok() == Some(field_index))
+        })
 }

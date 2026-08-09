@@ -6,6 +6,12 @@
         final PcodeStorage outcomeStorage;
         final PcodeStorage readBufferStorage;
         final String evidenceSource;
+        Address concreteVtable;
+        boolean concreteResolved;
+        String concreteEvidenceSource;
+        final ArrayList<Address> concreteMarshalTargets = new ArrayList<>();
+        final ArrayList<Address> concreteUnmarshalTargets = new ArrayList<>();
+        final ArrayList<Boolean> concreteUnmarshalPhaseReads = new ArrayList<>();
 
         DelegatedCodecEvidence(
             String kind,
@@ -40,6 +46,51 @@
                 outcomeStorage == null ? null : outcomeStorage.expression());
             object.addProperty("readBufferStorage", readBufferStorage.expression());
             object.addProperty("evidenceSource", evidenceSource);
+            NetworkSchemaJson.add(
+                object,
+                "concreteVtable",
+                formatAddress(concreteVtable));
+            if (concreteResolved) {
+                object.addProperty("concreteResolved", true);
+                NetworkSchemaJson.add(
+                    object,
+                    "concreteEvidenceSource",
+                    concreteEvidenceSource);
+            }
+            if (!concreteMarshalTargets.isEmpty() ||
+                !concreteUnmarshalTargets.isEmpty()) {
+                JsonArray phases = new JsonArray();
+                int phaseCount = Math.max(
+                    concreteMarshalTargets.size(),
+                    concreteUnmarshalTargets.size());
+                for (int index = 0; index < phaseCount; index++) {
+                    JsonObject phase = new JsonObject();
+                    if (index < I_FRAGMENT_PHASE_NAMES.length) {
+                        phase.addProperty(
+                            "phase",
+                            I_FRAGMENT_PHASE_NAMES[index]);
+                    }
+                    if (index < concreteMarshalTargets.size()) {
+                        NetworkSchemaJson.add(
+                            phase,
+                            "marshal",
+                            formatAddress(concreteMarshalTargets.get(index)));
+                    }
+                    if (index < concreteUnmarshalTargets.size()) {
+                        NetworkSchemaJson.add(
+                            phase,
+                            "unmarshal",
+                            formatAddress(concreteUnmarshalTargets.get(index)));
+                    }
+                    if (index < concreteUnmarshalPhaseReads.size()) {
+                        phase.addProperty(
+                            "unmarshalReadsWire",
+                            concreteUnmarshalPhaseReads.get(index));
+                    }
+                    phases.add(phase);
+                }
+                object.add("concretePhases", phases);
+            }
             return object;
         }
     }

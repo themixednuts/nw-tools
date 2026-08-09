@@ -1,3 +1,163 @@
+    private void normalizeMessageFields(MessageUnmarshalPlan plan) {
+        applyRecoveredPcodeOrder(plan);
+        clearPartialCallFrameNativeTypes(plan);
+        expandPartialCallFrameFields(plan);
+        applyRecoveredPcodeOrder(plan);
+        collapseExactAggregateLeaves(plan);
+        sortMessageFieldsByRecoveryOrder(plan);
+    }
+
+    private void clearPartialCallFrameNativeTypes(MessageUnmarshalPlan plan) {
+        for (FieldCall field : plan.fields) {
+            checkAnalysisCancelled();
+            if (!Boolean.TRUE.equals(field.callFrameBoundaryProven) ||
+                field.nativeType == null || field.nestedTypeShape == null ||
+                field.nestedTypeShape.members.size() < 2) {
+                continue;
+            }
+            List<NestedTypeMember> members =
+                provenWireOrderedMembers(field.nestedTypeShape.members);
+            if (members == null || members.size() < 2) {
+                continue;
+            }
+            int matchingPrefixMembers = 0;
+            for (NestedTypeMember member : members) {
+                Function target = functionAtOrContaining(member.target);
+                String targetType = directUnmarshalValueTypeName(target);
+                if (!typeNamesMatch(field.nativeType, targetType)) {
+                    break;
+                }
+                matchingPrefixMembers++;
+            }
+            if (matchingPrefixMembers == 0 ||
+                matchingPrefixMembers == members.size()) {
+                continue;
+            }
+            boolean laterMatch = false;
+            for (int index = matchingPrefixMembers; index < members.size(); index++) {
+                Function target = functionAtOrContaining(members.get(index).target);
+                if (typeNamesMatch(
+                        field.nativeType,
+                        directUnmarshalValueTypeName(target))) {
+                    laterMatch = true;
+                    break;
+                }
+            }
+            if (laterMatch) {
+                continue;
+            }
+            field.partialCallFrameNativeType = field.nativeType;
+            field.partialCallFramePrefixMemberCount = matchingPrefixMembers;
+            field.nativeType = null;
+            field.sourceTypeName = null;
+            field.sourceTypeId = null;
+            field.sourceTypeIdSource = null;
+            field.sourceTypeIdentityProven = null;
+            field.typeEvidence = null;
+            field.typeConflict = null;
+            runMetrics.increment("partialCallFrameNativeTypeClears");
+        }
+    }
+
+    private void expandPartialCallFrameFields(MessageUnmarshalPlan plan) {
+        ArrayList<FieldCall> partials = new ArrayList<>();
+        for (FieldCall field : plan.fields) {
+            if (field.partialCallFrameNativeType != null &&
+                field.partialCallFramePrefixMemberCount != null) {
+                partials.add(field);
+            }
+        }
+        for (FieldCall aggregate : partials) {
+            checkAnalysisCancelled();
+            List<NestedTypeMember> members =
+                provenWireOrderedMembers(aggregate.nestedTypeShape.members);
+            String base = messageFieldStorageBase(aggregate);
+            Long rootOffset = aggregate.storageBaseOffset == null
+                ? aggregate.storageOffset
+                : aggregate.storageBaseOffset;
+            int prefixCount = aggregate.partialCallFramePrefixMemberCount;
+            if (members == null || base == null || rootOffset == null ||
+                prefixCount <= 0 || prefixCount >= members.size()) {
+                continue;
+            }
+
+            ArrayList<String> prefixShapes = new ArrayList<>();
+            ArrayList<String> prefixLayouts = new ArrayList<>();
+            boolean prefixComplete = true;
+            for (int index = 0; index < prefixCount; index++) {
+                WireShape evidence = nestedMemberWireEvidence(members.get(index));
+                if (evidence == null || evidence.shape == null ||
+                    evidence.layout == null) {
+                    prefixComplete = false;
+                    break;
+                }
+                prefixShapes.add(evidence.shape);
+                prefixLayouts.add(evidence.layout);
+            }
+            if (!prefixComplete) {
+                continue;
+            }
+
+            String prefixShape = compositeWireShape(prefixShapes);
+            String prefixLayout = compositeWireShape(prefixLayouts);
+            String nativeShape = wireShapeFromNativeType(
+                aggregate.partialCallFrameNativeType);
+            if (nativeShape != null &&
+                compatibleCodecProducts(nativeShape, prefixShape)) {
+                prefixShape = nativeShape;
+            }
+
+            plan.fields.remove(aggregate);
+            PcodeStorage root = new PcodeStorage(base, rootOffset);
+            NestedTypeMember first = members.get(0);
+            FieldCall prefix = addPcodeMessageField(
+                plan,
+                first.callsite == null ? aggregate.callsite : first.callsite,
+                root,
+                aggregate.partialCallFrameNativeType,
+                "message-unmarshal-partial-call-frame-prefix",
+                aggregate.recoveryOrder);
+            prefix.sourceTypeName = aggregate.partialCallFrameNativeType;
+            prefix.wireShape = prefixShape;
+            prefix.wireShapeSource = "cfg-partial-call-frame-typed-prefix";
+            prefix.wireLayout = prefixLayout;
+            prefix.wireLayoutSource = "cfg-partial-call-frame-typed-prefix";
+
+            int projected = 1;
+            for (int index = prefixCount; index < members.size(); index++) {
+                NestedTypeMember member = members.get(index);
+                long relative = member.nativeOffset == null
+                    ? member.offset
+                    : member.nativeOffset;
+                int projectedOrder = aggregate.recoveryOrder == Integer.MAX_VALUE
+                    ? Integer.MAX_VALUE
+                    : (int) Math.min(
+                        Integer.MAX_VALUE,
+                        (long) aggregate.recoveryOrder + index);
+                FieldCall projectedField = addPcodeMessageField(
+                    plan,
+                    member.callsite == null ? aggregate.callsite : member.callsite,
+                    root.plus(relative),
+                    member.nativeType,
+                    "message-unmarshal-partial-call-frame-member",
+                    projectedOrder);
+                applyWireEvidence(projectedField, nestedMemberWireEvidence(member));
+                if (member.typeId != null &&
+                    Boolean.TRUE.equals(member.typeIdentityProven)) {
+                    projectedField.sourceTypeName = member.nativeType;
+                    projectedField.sourceTypeId = normalizeUuid(member.typeId);
+                    projectedField.sourceTypeIdSource = member.typeIdentitySource;
+                    projectedField.sourceTypeIdentityProven = true;
+                }
+                projected++;
+            }
+            plan.expandedPartialCallFrameCount++;
+            plan.expandedPartialCallFrameMemberCount += projected;
+            runMetrics.increment("partialCallFrameExpansions");
+            runMetrics.add("partialCallFrameProjectedFields", projected);
+        }
+    }
+
     private boolean isInteriorAggregateLeaf(FieldCall aggregate, FieldCall field) {
         if (field == null || field.storageOffset == null ||
             !Objects.equals(messageFieldStorageBase(aggregate), messageFieldStorageBase(field))) {
@@ -21,14 +181,16 @@
             return true;
         }
         for (NestedTypeMember member : aggregate.nestedTypeShape.members) {
+            checkAnalysisCancelled();
             WireShape memberEvidence = nestedMemberWireEvidence(member);
             if (memberEvidence == null || memberEvidence.layout == null) {
                 continue;
             }
             boolean offsetMatches = member.offset == relativeOffset ||
                 member.nativeOffset != null && member.nativeOffset == relativeOffset;
-            if (offsetMatches &&
-                canonicalLayoutWireShape(memberEvidence.layout).equals(fieldLayout)) {
+            String memberLayout = canonicalLayoutWireShape(memberEvidence.layout);
+            if (offsetMatches && memberLayout != null &&
+                compatibleCodecProducts(memberLayout, fieldLayout)) {
                 return true;
             }
         }
@@ -48,6 +210,7 @@
         }
         int parentIndex = 0;
         for (NestedTypeMember childMember : childMembers) {
+            checkAnalysisCancelled();
             WireShape childEvidence = nestedMemberWireEvidence(childMember);
             long nativeOffset = childMember.nativeOffset == null
                 ? childMember.offset
@@ -65,7 +228,7 @@
                     ? parentMember.offset
                     : parentMember.nativeOffset;
                 if (parentOffset == translatedOffset && parentEvidence != null &&
-                    parentEvidence.layout != null && sameCodecProduct(
+                    parentEvidence.layout != null && compatibleCodecProducts(
                         parentEvidence.layout,
                         childEvidence.layout)) {
                     matched = true;

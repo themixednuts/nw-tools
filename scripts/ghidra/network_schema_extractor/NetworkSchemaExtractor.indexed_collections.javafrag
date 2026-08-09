@@ -42,6 +42,16 @@
         PcodeStorage readBuffer = readBufferParameter == null
             ? null
             : new PcodeStorage(readBufferParameter, 0L);
+        PcodeStorage packedOwner = packedScalarCollectionOwnerStorage(
+            owner,
+            loop,
+            operations,
+            codecs,
+            readBuffer,
+            requireFormalOutput);
+        if (packedOwner != null) {
+            return packedOwner;
+        }
         PcodeStorage selected = null;
         PcodeCodecCall selectedCodec = null;
         for (PcodeCodecCall codec : codecs) {
@@ -185,6 +195,12 @@
         PcodeStorage direct = sequenceOwnerStorageForElementUnmarshal(
             call,
             readBuffer);
+        if (direct == null) {
+            direct = vectorHeaderOwnerStorageForElementUnmarshal(
+                operations,
+                call,
+                readBuffer);
+        }
         if (direct != null) {
             String parameter = formalParameterBaseFromStorage(owner, direct);
             return requireFormalOutput
@@ -208,14 +224,18 @@
                 operation.getNumInputs() < 3 ||
                 !NetworkSchemaControlFlow.precedes(high, call, operation) ||
                 (expectedWidth != null &&
-                    operation.getInput(2).getSize() != expectedWidth) ||
+                    operation.getInput(2).getSize() < expectedWidth) ||
                 !referencesAnyStorage(operation.getInput(2), outputs)) {
                 continue;
             }
-            PcodeStorage candidate = vectorOwnerStorageForElementPointer(
+            PcodeStorage candidate = vectorHeaderOwnerStorageForElementPointer(
+                operations,
                 operation.getInput(1),
                 new LinkedHashSet<>(),
                 0);
+            if (candidate == null) {
+                candidate = siblingStoreVectorOwnerStorage(operations, operation);
+            }
             String parameter = formalParameterBaseFromStorage(owner, candidate);
             if ((requireFormalOutput &&
                     !isProvenOutputParameterBase(owner, parameter)) ||
@@ -223,10 +243,45 @@
                     !isStableCollectionStorage(candidate, readBuffer))) {
                 continue;
             }
-            if (selected != null) {
+            if (selected != null && !selected.sameLocation(candidate)) {
                 return null;
             }
             selected = candidate;
+        }
+        return selected;
+    }
+
+    private PcodeStorage siblingStoreVectorOwnerStorage(
+        List<PcodeOpAST> operations,
+        PcodeOpAST selectedStore) {
+
+        if (operations == null || selectedStore == null ||
+            selectedStore.getSeqnum() == null) {
+            return null;
+        }
+        Address instruction = selectedStore.getSeqnum().getTarget();
+        PcodeStorage selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.STORE ||
+                operation.getNumInputs() < 3 || operation.getSeqnum() == null ||
+                !instruction.equals(operation.getSeqnum().getTarget())) {
+                continue;
+            }
+            PcodeStorage candidate = vectorHeaderOwnerStorageForElementPointer(
+                operations,
+                operation.getInput(1),
+                new LinkedHashSet<>(),
+                0);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.sameLocation(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        if (selected != null) {
+            runMetrics.increment("packedSiblingStoreOwnerProofs");
         }
         return selected;
     }
@@ -287,6 +342,106 @@
                 "local-owner-unproven");
         }
         return result;
+    }
+
+    private PcodeStorage vectorHeaderOwnerStorageForElementUnmarshal(
+        List<PcodeOpAST> operations,
+        PcodeOpAST call,
+        PcodeStorage readBuffer) {
+
+        if (call == null) {
+            return null;
+        }
+        Function target = pcodeCallTarget(call);
+        Integer outputSlot = readRawOrUnmarshalOutputSlot(target);
+        if (outputSlot == null || outputSlot <= 0 ||
+            outputSlot >= call.getNumInputs()) {
+            return null;
+        }
+        PcodeStorage owner = vectorHeaderOwnerStorageForElementPointer(
+            operations,
+            call.getInput(outputSlot),
+            new LinkedHashSet<>(),
+            0);
+        return owner != null && !owner.sameLocation(readBuffer) ? owner : null;
+    }
+
+    private PcodeStorage vectorHeaderOwnerStorageForElementPointer(
+        List<PcodeOpAST> operations,
+        Varnode node,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || depth > 48 ||
+            !seen.add("vector-header-owner:" + pcodeNodeKey(node))) {
+            return null;
+        }
+        PcodeStorage direct = pcodeStorageExpression(node);
+        if (isProvenVectorHeaderStorage(operations, direct)) {
+            return direct;
+        }
+        PcodeStorage loaded = pcodeLoadedStorageExpression(node);
+        if (isProvenVectorHeaderStorage(operations, loaded)) {
+            return loaded;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null) {
+            return null;
+        }
+        if (definition.getOpcode() == PcodeOp.LOAD &&
+            definition.getNumInputs() >= 2) {
+            PcodeStorage storage = pcodeStorageExpression(definition.getInput(1));
+            return isProvenVectorHeaderStorage(operations, storage)
+                ? storage
+                : null;
+        }
+        if (transparentPcodeDefinition(definition)) {
+            return vectorHeaderOwnerStorageForElementPointer(
+                operations,
+                definition.getInput(0),
+                seen,
+                depth + 1);
+        }
+        if (definition.getOpcode() != PcodeOp.PTRADD &&
+            definition.getOpcode() != PcodeOp.PTRSUB &&
+            definition.getOpcode() != PcodeOp.INT_ADD &&
+            definition.getOpcode() != PcodeOp.INT_SUB &&
+            definition.getOpcode() != PcodeOp.MULTIEQUAL) {
+            return null;
+        }
+        PcodeStorage selected = null;
+        for (int index = 0; index < definition.getNumInputs(); index++) {
+            Varnode input = definition.getInput(index);
+            if (input == null || input.isConstant()) {
+                continue;
+            }
+            PcodeStorage candidate = vectorHeaderOwnerStorageForElementPointer(
+                operations,
+                input,
+                new LinkedHashSet<>(seen),
+                depth + 1);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.sameLocation(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private boolean isProvenVectorHeaderStorage(
+        List<PcodeOpAST> operations,
+        PcodeStorage storage) {
+
+        if (storage == null) {
+            return false;
+        }
+        boolean local = "stack".equals(storage.base) && storage.offset < 0L;
+        boolean formal = storage.base != null &&
+            storage.base.matches("param_\\d+") && storage.offset >= 0L;
+        return (local || formal) && hasVectorHeader(operations, storage, local);
     }
 
     private void recordLocalVectorOwnerDiagnostic(
@@ -732,6 +887,14 @@
         List<PcodeOpAST> operations,
         PcodeStorage data) {
 
+        return hasVectorHeader(operations, data, true);
+    }
+
+    private boolean hasVectorHeader(
+        List<PcodeOpAST> operations,
+        PcodeStorage data,
+        boolean allowReverse) {
+
         int pointerSize = currentProgram.getDefaultPointerSize();
         PcodeStorage forwardEnd = data.plus(pointerSize);
         PcodeStorage forwardCapacity = data.plus(pointerSize * 2L);
@@ -747,7 +910,7 @@
                 operation,
                 forwardEnd,
                 pointerSize) ||
-                operationReferencesPointerStorage(
+                allowReverse && operationReferencesPointerStorage(
                     operation,
                     reverseEnd,
                     pointerSize);
@@ -755,24 +918,24 @@
                 operation,
                 forwardCapacity,
                 pointerSize) ||
-                operationReferencesPointerStorage(
+                allowReverse && operationReferencesPointerStorage(
                     operation,
                     reverseCapacity,
                     pointerSize);
             if (operation.getOpcode() == PcodeOp.LOAD && operation.getOutput() != null) {
                 PcodeStorage source = pcodeLoadedStorageExpression(operation.getOutput());
                 end |= forwardEnd.sameLocation(source) ||
-                    reverseEnd.sameLocation(source);
+                    allowReverse && reverseEnd.sameLocation(source);
                 capacity |= forwardCapacity.sameLocation(source) ||
-                    reverseCapacity.sameLocation(source);
+                    allowReverse && reverseCapacity.sameLocation(source);
             }
             else if (operation.getOpcode() == PcodeOp.STORE &&
                 operation.getNumInputs() >= 3) {
                 PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
                 end |= forwardEnd.sameLocation(destination) ||
-                    reverseEnd.sameLocation(destination);
+                    allowReverse && reverseEnd.sameLocation(destination);
                 capacity |= forwardCapacity.sameLocation(destination) ||
-                    reverseCapacity.sameLocation(destination);
+                    allowReverse && reverseCapacity.sameLocation(destination);
             }
             if (end && capacity) {
                 return true;

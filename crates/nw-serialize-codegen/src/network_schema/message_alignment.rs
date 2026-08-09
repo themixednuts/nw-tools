@@ -20,7 +20,11 @@ pub(super) fn reorder_message_fields_by_signature(
     let (Some(signature_shapes), Some(field_shapes)) = (signature_shapes, field_shapes) else {
         return 0;
     };
-    if field_shapes == signature_shapes {
+    if field_shapes
+        .iter()
+        .zip(&signature_shapes)
+        .all(|(field, signature)| wire_shape_sequences_machine_compatible(field, signature))
+    {
         return 0;
     }
 
@@ -30,7 +34,12 @@ pub(super) fn reorder_message_fields_by_signature(
         let exact = remaining
             .iter()
             .copied()
-            .filter(|field_index| field_shapes[*field_index] == signature_shapes[signature_index])
+            .filter(|field_index| {
+                wire_shape_sequences_machine_compatible(
+                    &field_shapes[*field_index],
+                    &signature_shapes[signature_index],
+                )
+            })
             .filter(|field_index| field_has_signature_native_type(&fields[*field_index], signature))
             .collect::<Vec<_>>();
         let [field_index] = exact.as_slice() else {
@@ -45,7 +54,10 @@ pub(super) fn reorder_message_fields_by_signature(
             continue;
         }
         let Some(position) = remaining.iter().position(|field_index| {
-            field_shapes[*field_index] == signature_shapes[signature_index]
+            wire_shape_sequences_machine_compatible(
+                &field_shapes[*field_index],
+                &signature_shapes[signature_index],
+            )
         }) else {
             return 0;
         };

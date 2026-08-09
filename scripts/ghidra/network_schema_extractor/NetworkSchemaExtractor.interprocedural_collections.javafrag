@@ -23,6 +23,11 @@
         if (helper == null || call == null) {
             return null;
         }
+        HighFunction helperHigh = highFunction(helper);
+        if (helperHigh == null ||
+            NetworkSchemaControlFlow.naturalLoops(helperHigh).isEmpty()) {
+            return null;
+        }
         Integer callerCountParameter = uniqueCallArgumentProducedByCodec(
             caller,
             call,
@@ -30,15 +35,16 @@
             "vlq-u32");
         if (callerCountParameter == null) {
             // The helper may count itself instead of being handed a count.
-            return selfCountedCollectionCall(call, helper, callerParamStorage);
+            return selfCountedCollectionCall(
+                caller,
+                call,
+                helper,
+                callerParamStorage);
         }
         InterproceduralCollectionHelper shape = interproceduralCollectionHelper(
             helper,
             callerCountParameter);
-        if (shape == null ||
-            call.getNumInputs() <= Math.max(
-                shape.ownerParameter(),
-                Math.max(shape.countParameter(), shape.readBufferParameter()))) {
+        if (shape == null) {
             return null;
         }
         if (shape.countParameter() != callerCountParameter) {
@@ -46,8 +52,11 @@
                 "interprocedural-collection-count-parameter-mismatch");
             return null;
         }
-        PcodeStorage buffer = pcodeStorageExpression(
-            call.getInput(shape.readBufferParameter()));
+        PcodeStorage buffer = provenCallArgumentStorage(
+            caller,
+            call,
+            helper,
+            shape.readBufferParameter());
         String bufferParameter = formalParameterBaseFromStorage(caller, buffer);
         if (bufferParameter == null ||
             !hasReadBufferFlow(caller, bufferParameter, new LinkedHashSet<>())) {
@@ -55,8 +64,16 @@
                 "interprocedural-collection-caller-buffer-unproven");
             return null;
         }
-        PcodeStorage owner = pcodeStorageExpression(call.getInput(shape.ownerParameter()));
-        PcodeStorage count = pcodeStorageExpression(call.getInput(shape.countParameter()));
+        PcodeStorage owner = provenCallArgumentStorage(
+            caller,
+            call,
+            helper,
+            shape.ownerParameter());
+        PcodeStorage count = provenCallArgumentStorage(
+            caller,
+            call,
+            helper,
+            shape.countParameter());
         owner = translatedAbsoluteHelperStorage(owner, callerParamStorage);
         count = translatedAbsoluteHelperStorage(count, callerParamStorage);
         return owner == null || count == null
@@ -66,62 +83,6 @@
                 count,
                 shape.storageKind(),
                 shape.wireEvidence());
-    }
-
-    /**
-     * A collection helper that unmarshals its own count.
-     *
-     * The interprocedural path above assumes the caller reads the count and
-     * passes it in, so it looks for a caller-side vlq-u32 producer bound to an
-     * argument. Many helpers instead read the count themselves and bound the
-     * element loop with it, leaving no caller-side producer to find. The
-     * count-bounded loop form those helpers use is already recovered
-     * intra-procedurally by collectionOutputShapesByParameterFromPcode, which
-     * yields the output parameter and the vec<> evidence; all that is missing is
-     * mapping that parameter back onto this call's argument.
-     *
-     * The returned call has no count storage: there is no caller-side count to
-     * point at. Callers that need one must treat null as "not a counted call
-     * they can reason about" rather than dereferencing it.
-     */
-    private InterproceduralCollectionCall selfCountedCollectionCall(
-        PcodeOpAST call,
-        Function helper,
-        Map<String, PcodeStorage> callerParamStorage) {
-
-        Map<String, CollectionOutputShape> shapes =
-            collectionOutputShapesByParameterFromPcode(helper);
-        if (shapes.size() != 1) {
-            if (shapes.size() > 1) {
-                recordNestedTypeShapeReject(
-                    "self-counted-collection-output-ambiguous");
-            }
-            return null;
-        }
-        CollectionOutputShape shape = shapes.values().iterator().next();
-        if (shape.wireEvidence == null || shape.storage == null ||
-            shape.storage.offset != 0L) {
-            return null;
-        }
-        Integer slot = formalParameterSlot(shape.storage);
-        if (slot == null || slot >= call.getNumInputs()) {
-            recordNestedTypeShapeReject(
-                "self-counted-collection-owner-parameter-unproven");
-            return null;
-        }
-        PcodeStorage owner = translatedAbsoluteHelperStorage(
-            pcodeStorageExpression(call.getInput(slot)),
-            callerParamStorage);
-        if (owner == null) {
-            recordNestedTypeShapeReject(
-                "self-counted-collection-owner-argument-unresolved");
-            return null;
-        }
-        return new InterproceduralCollectionCall(
-            owner,
-            null,
-            ContainerStorageKind.VECTOR,
-            shape.wireEvidence);
     }
 
     private Integer uniqueCallArgumentProducedByCodec(
@@ -169,14 +130,15 @@
             for (PcodeStorage candidate : candidates) {
                 codecWireTraceCheckpoint();
                 PcodeOpAST producer = uniqueUnmarshalCountProducer(
+                    caller,
                     high,
                     operations,
                     call,
                     candidate);
                 WireShape evidence = producer == null
                     ? null
-                    : directCallWireEvidence(producer);
-                if (evidence != null && Objects.equals(expectedShape, evidence.shape)) {
+                    : countCodecWireEvidence(caller, producer, expectedShape);
+                if (wireShapeMatches(evidence, expectedShape)) {
                     produced = true;
                     break;
                 }
@@ -279,12 +241,18 @@
 
         JsonArray producers = new JsonArray();
         for (PcodeOpAST candidate : operations) {
-            if (candidate.getOpcode() != PcodeOp.CALL ||
-                !NetworkSchemaControlFlow.precedes(high, candidate, call)) {
+            if (candidate.getOpcode() != PcodeOp.CALL) {
                 continue;
             }
-            WireShape evidence = directCallWireEvidence(candidate);
-            if (evidence == null || !Objects.equals(expectedShape, evidence.shape)) {
+            boolean precedesConsumer = countProducerPrecedesConsumer(
+                high,
+                candidate,
+                call);
+            WireShape evidence = countCodecWireEvidence(
+                caller,
+                candidate,
+                expectedShape);
+            if (!wireShapeMatches(evidence, expectedShape)) {
                 continue;
             }
             JsonObject producer = new JsonObject();
@@ -300,8 +268,10 @@
                 target == null ? null : target.getEntryPoint(),
                 addressFormatter);
             producer.addProperty("wireShape", evidence.shape);
+            NetworkSchemaJson.add(producer, "wireLayout", evidence.layout);
+            producer.addProperty("precedesConsumer", precedesConsumer);
             JsonArray outputs = new JsonArray();
-            for (PcodeStorage output : scalarCallOutputStorages(candidate)) {
+            for (PcodeStorage output : scalarCallOutputStorages(candidate, evidence)) {
                 addPcodeStorageDiagnostic(outputs, "scalar-output", output);
             }
             producer.add("outputs", outputs);
@@ -654,7 +624,7 @@
         if (outputs.size() != 1) {
             return false;
         }
-        PcodeOpAST selected = null;
+        boolean selected = false;
         for (PcodeOpAST operation : operations) {
             if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.STORE ||
                 operation.getNumInputs() < 3 ||
@@ -663,12 +633,13 @@
                 !storeTargetsSequenceElement(loop, operation, extent)) {
                 continue;
             }
-            if (selected != null) {
-                return false;
-            }
-            selected = operation;
+            // A decoded scalar may be projected into more than one native lane
+            // of the same aggregate element. Every matching destination is
+            // already proven affine to this sequence, so duplicate projections
+            // do not make the codec output ambiguous.
+            selected = true;
         }
-        return selected != null;
+        return selected;
     }
 
     private boolean abiCallWritesSequenceElement(
@@ -684,7 +655,20 @@
         if (target == null) {
             return false;
         }
-        Integer outputSlot = provenSequenceElementOutputSlot(target, extent);
+        Integer outputSlot;
+        boolean directOutputSlotOnly;
+        if (isReadRawFunction(target)) {
+            outputSlot = Integer.valueOf(2);
+            directOutputSlotOnly = true;
+        }
+        else {
+            outputSlot = provenSequenceElementOutputSlot(target, extent);
+            directOutputSlotOnly = false;
+            if (outputSlot == null) {
+                outputSlot = unmarshalOutputParameterSlot(target);
+                directOutputSlotOnly = outputSlot != null;
+            }
+        }
         if (outputSlot == null) {
             if (!messageCallFrameOutputs(target).isEmpty()) {
                 recordNestedTypeShapeReject(
@@ -718,12 +702,29 @@
             return false;
         }
 
-        if (outputSlot < call.getNumInputs() &&
-            pcodeNodeDependsOn(
-                call.getInput(outputSlot),
-                cursor.getOutput(),
-                new LinkedHashSet<>(),
-                0)) {
+        Long relativeOutput = provenSequenceElementArgumentOffset(
+            helper,
+            call,
+            target,
+            outputSlot,
+            cursor,
+            extent);
+        if (relativeOutput != null) {
+            if (directOutputSlotOnly) {
+                runMetrics.increment("sequenceElementDirectOutputSlotProofs");
+            }
+            return true;
+        }
+
+        PcodeStorage stagedRelative = stagedSequenceElementCallOutputStorage(
+            helper,
+            call,
+            target,
+            element,
+            cursor,
+            extent);
+        if (stagedRelative != null) {
+            runMetrics.increment("sequenceElementStagedCallOutputProofs");
             return true;
         }
 
@@ -735,11 +736,15 @@
                 outputSlot);
         boolean dataRooted = dependencies.stream()
             .anyMatch(extent.data()::sameLocation);
-        boolean endRooted = dependencies.stream()
-            .anyMatch(extent.end()::sameLocation);
         boolean bufferRooted = readBuffer != null && dependencies.stream()
             .anyMatch(readBuffer::sameLocation);
-        boolean proven = dataRooted && !endRooted && !bufferRooted;
+        // An affine cursor in an end-tested vector loop legitimately inherits
+        // both data and end SSA roots. The unique cursor and exact stride proofs
+        // above establish element identity; only ReadBuffer aliasing is unsafe.
+        boolean proven = dataRooted && !bufferRooted;
+        if (proven && directOutputSlotOnly) {
+            runMetrics.increment("sequenceElementDirectOutputSlotProofs");
+        }
         if (!proven) {
             recordNestedTypeShapeReject(
                 "sequence-element-abi-cursor-unproven");

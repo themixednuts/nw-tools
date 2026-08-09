@@ -188,6 +188,7 @@ final class PcodeStorage {
 
 final class CollectionOutputShape {
     final PcodeStorage storage;
+    final ContainerStorageKind storageKind;
     final String nativeType;
     final WireShape wireEvidence;
     final Address countCallsite;
@@ -197,6 +198,7 @@ final class CollectionOutputShape {
 
     CollectionOutputShape(
             PcodeStorage storage,
+            ContainerStorageKind storageKind,
             String nativeType,
             WireShape wireEvidence,
             Address countCallsite,
@@ -204,6 +206,7 @@ final class CollectionOutputShape {
             Set<Address> codecCallsites,
             Long interiorSpan) {
         this.storage = storage;
+        this.storageKind = storageKind;
         this.nativeType = nativeType;
         this.wireEvidence = wireEvidence;
         this.countCallsite = countCallsite;

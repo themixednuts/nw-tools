@@ -1089,6 +1089,108 @@ fn merges_message_signature_fields_when_static_report_has_none() {
 }
 
 #[test]
+fn complete_native_listing_signature_replaces_partial_overlapping_fields() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "AADFF090-E7A9-46F4-86EB-CBAC0884480E",
+            "typeIndex": 7010,
+            "typeName": "Javelin::ClientMessages::GraphBasedSpawnNodeComponentClientFacet_SyncDebugData",
+            "fields": [{
+                "index": 0,
+                "nativeType": "ActorRequestId",
+                "wireShape": "composite<u64,u64,vec<composite<fixed-bytes-16,u64>>,bool>"
+            }, {
+                "index": 1,
+                "wireShape": "vec<composite<fixed-bytes-16,u64,bool>>"
+            }, {
+                "index": 2,
+                "nativeType": "ActionListEntityRefVector"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&report).expect("schema");
+    let signatures = vec![
+        NetworkMessageFieldSignature {
+            index: Some(0),
+            name: "Header".to_owned(),
+            rust_type: Some("::nw_network::ActorRequestId".to_owned()),
+            native_type: Some("Javelin::ClientMessages::ActorRequestId".to_owned()),
+            wire_shape: Some(NetworkWireShape::Composite(vec![
+                NetworkWireShape::U64,
+                NetworkWireShape::U64,
+            ])),
+        },
+        NetworkMessageFieldSignature {
+            index: Some(1),
+            name: "DebugEntries".to_owned(),
+            rust_type: None,
+            native_type: None,
+            wire_shape: Some(NetworkWireShape::Sequence(Box::new(
+                NetworkWireShape::Composite(vec![
+                    NetworkWireShape::FixedBytes(16),
+                    NetworkWireShape::U64,
+                    NetworkWireShape::Bool,
+                ]),
+            ))),
+        },
+        NetworkMessageFieldSignature {
+            index: Some(2),
+            name: "ActionListEntityRefs".to_owned(),
+            rust_type: None,
+            native_type: None,
+            wire_shape: Some(NetworkWireShape::Sequence(Box::new(
+                NetworkWireShape::Composite(vec![
+                    NetworkWireShape::FixedBytes(16),
+                    NetworkWireShape::U64,
+                    NetworkWireShape::U64,
+                ]),
+            ))),
+        },
+        NetworkMessageFieldSignature {
+            index: Some(3),
+            name: "SpawnNodeEntityRefs".to_owned(),
+            rust_type: None,
+            native_type: None,
+            wire_shape: Some(NetworkWireShape::Sequence(Box::new(
+                NetworkWireShape::Composite(vec![
+                    NetworkWireShape::FixedBytes(16),
+                    NetworkWireShape::U64,
+                ]),
+            ))),
+        },
+        NetworkMessageFieldSignature {
+            index: Some(4),
+            name: "DebugDataEnabled".to_owned(),
+            rust_type: Some("bool".to_owned()),
+            native_type: Some("bool".to_owned()),
+            wire_shape: Some(NetworkWireShape::Bool),
+        },
+    ];
+
+    let merge = schema.merge_message_signatures(
+        &[NetworkMessageSignature {
+            type_id: Some(uuid!("aadff090-e7a9-46f4-86eb-cbac0884480e")),
+            type_index: Some(7010),
+            name: None,
+            rust_name: None,
+            source: Some("native-unmarshal-and-marshal-listing".to_owned()),
+            fields: signatures,
+        }],
+        Some("message-signatures.json".to_owned()),
+    );
+
+    assert_eq!(merge.field_count_mismatch_count, 0);
+    assert!(!schema.types[0].signature_field_count_conflict);
+    assert_eq!(schema.types[0].fields.len(), 5);
+    assert_eq!(schema.types[0].fields[0].name.as_deref(), Some("Header"));
+    assert_eq!(
+        schema.types[0].fields[4].name.as_deref(),
+        Some("DebugDataEnabled")
+    );
+}
+
+#[test]
 fn merges_field_overrides_with_source_style_container_types() {
     let report = json!({
         "registryEntries": [{

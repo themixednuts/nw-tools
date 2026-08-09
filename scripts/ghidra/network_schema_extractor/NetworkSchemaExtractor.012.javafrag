@@ -170,6 +170,23 @@
         if ("EntityRef".equals(normalized)) {
             return "entity-ref";
         }
+        if ("ActorInstantiationParameters".equals(normalized) ||
+            "Amazon::Hub::ActorInstantiationParameters".equals(normalized)) {
+            return "actor-instantiation-parameters";
+        }
+        if ("ActorRequestId".equals(normalized) ||
+            "Javelin::ClientMessages::ActorRequestId".equals(normalized)) {
+            return "composite<u64,u64>";
+        }
+        if ("ClientContextIDValue".equals(normalized) ||
+            "PlayerComponent::ClientContextIDValue".equals(normalized) ||
+            "Javelin::PlayerComponent::ClientContextIDValue".equals(normalized)) {
+            return "u8";
+        }
+        if ("ActionListEntityRefVector".equals(normalized) ||
+            "Javelin::ClientMessages::ActionListEntityRefVector".equals(normalized)) {
+            return "vec<composite<fixed-bytes-16,u64,u64>>";
+        }
         if ("u8".equals(normalized) ||
             "uint8_t".equals(normalized) ||
             "std::uint8_t".equals(normalized) ||
@@ -604,93 +621,6 @@
             return preferIncomingCodecProduct(left, right) ? right : left;
         }
         return null;
-    }
-
-    private boolean boundaryLimbIsRedundant(String product, String limb) {
-        List<String> members = compositeWireShapeMembers(product);
-        if (members == null || members.isEmpty()) {
-            return false;
-        }
-        return compatibleCodecProducts(members.get(0), limb) ||
-            compatibleCodecProducts(members.get(members.size() - 1), limb);
-    }
-
-    private boolean compatibleCodecProducts(String left, String right) {
-        if (left == null || right == null) {
-            return false;
-        }
-        if (sameCodecProduct(left, right) || compatibleWireSemantics(left, right)) {
-            return true;
-        }
-        String leftContainer = wireCodecContainerName(left);
-        String rightContainer = wireCodecContainerName(right);
-        if (leftContainer != null && leftContainer.equals(rightContainer)) {
-            List<String> leftArgs = wireCodecContainerArguments(left);
-            List<String> rightArgs = wireCodecContainerArguments(right);
-            return leftArgs.size() == rightArgs.size() &&
-                compatibleCodecProductLists(leftArgs, rightArgs);
-        }
-        List<String> leftMembers = compositeWireShapeMembers(left);
-        List<String> rightMembers = compositeWireShapeMembers(right);
-        if (leftMembers != null && rightMembers != null) {
-            if (leftMembers.size() != rightMembers.size()) {
-                return false;
-            }
-            for (int index = 0; index < leftMembers.size(); index++) {
-                if (!compatibleCodecProducts(
-                        leftMembers.get(index),
-                        rightMembers.get(index))) {
-                    return false;
-                }
-            }
-            return true;
-        }
-        if (leftMembers != null) {
-            List<String> expected = semanticMembers(right);
-            return expected != null &&
-                leftMembers.size() == expected.size() &&
-                compatibleCodecProductLists(leftMembers, expected);
-        }
-        if (rightMembers != null) {
-            List<String> expected = semanticMembers(left);
-            return expected != null &&
-                rightMembers.size() == expected.size() &&
-                compatibleCodecProductLists(expected, rightMembers);
-        }
-        return false;
-    }
-
-    private String wireCodecContainerName(String product) {
-        if (product == null || !product.endsWith(">")) {
-            return null;
-        }
-        int open = product.indexOf('<');
-        if (open <= 0) {
-            return null;
-        }
-        String name = product.substring(0, open);
-        return switch (name) {
-            case "vec", "set", "map", "optional", "fixed-vector", "array" -> name;
-            default -> null;
-        };
-    }
-
-    private List<String> wireCodecContainerArguments(String product) {
-        int open = product.indexOf('<');
-        return NetworkSchemaText.splitTopLevel(
-            product.substring(open + 1, product.length() - 1));
-    }
-
-    private boolean compatibleCodecProductLists(
-        List<String> left,
-        List<String> right) {
-
-        for (int index = 0; index < left.size(); index++) {
-            if (!compatibleCodecProducts(left.get(index), right.get(index))) {
-                return false;
-            }
-        }
-        return true;
     }
 
     private boolean preferIncomingCodecProduct(String existing, String incoming) {

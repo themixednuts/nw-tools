@@ -470,9 +470,40 @@
         List<NetworkSchemaBranchFlow.Path<CodecWireEvent>> paths) {
 
         String direct = uniqueBranchPayloadShape(paths);
-        return direct != null
-            ? direct
+        if (direct != null) {
+            return direct;
+        }
+        String product = uniqueBranchPayloadProduct(paths);
+        return product != null
+            ? product
             : defaultOmittedTupleShape(high, operations, paths);
+    }
+
+    private String uniqueBranchPayloadProduct(
+        List<NetworkSchemaBranchFlow.Path<CodecWireEvent>> paths) {
+
+        String selected = null;
+        for (NetworkSchemaBranchFlow.Path<CodecWireEvent> path : paths) {
+            if (path.events().size() < 2) {
+                return null;
+            }
+            ArrayList<String> members = new ArrayList<>();
+            for (CodecWireEvent event : path.events()) {
+                String shape = branchPayloadWireShape(event);
+                if (shape == null) {
+                    return null;
+                }
+                members.add(shape);
+            }
+            String product = compositeWireShape(members);
+            if (selected != null && !compatibleCodecProducts(selected, product)) {
+                return null;
+            }
+            if (selected == null) {
+                selected = product;
+            }
+        }
+        return selected;
     }
 
     private String branchPayloadWireShape(CodecWireEvent event) {

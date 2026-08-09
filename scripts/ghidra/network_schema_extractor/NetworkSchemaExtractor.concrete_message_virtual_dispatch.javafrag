@@ -1,0 +1,248 @@
+    private record ConcreteMessageVirtualDispatch(
+        PcodeVirtualDispatch dispatch,
+        Address vtable,
+        Function target,
+        String source) {}
+
+    private Function concreteMessageVirtualCallTarget(
+        Function owner,
+        PcodeOpAST operation) {
+
+        ConcreteMessageVirtualDispatch resolved =
+            concreteMessageVirtualDispatch(owner, operation);
+        return resolved == null ? null : resolved.target();
+    }
+
+    private ConcreteMessageVirtualDispatch concreteMessageVirtualDispatch(
+        Function owner,
+        PcodeOpAST operation) {
+
+        if (owner == null || operation == null ||
+            operation.getOpcode() != PcodeOp.CALLIND ||
+            operation.getNumInputs() < 2) {
+            return null;
+        }
+        PcodeVirtualDispatch dispatch =
+            pcodeVirtualDispatch(operation.getInput(0));
+        if (dispatch == null || dispatch.objectOffset() < 0L ||
+            dispatch.slotOffset() < 0L ||
+            (dispatch.slotOffset() % Long.BYTES) != 0L) {
+            return null;
+        }
+
+        Address vtable = null;
+        String source = null;
+        if (dispatch.root().staticAddress() != null) {
+            Address object = addProgramOffset(
+                dispatch.root().staticAddress(),
+                dispatch.objectOffset());
+            vtable = readPointer(object);
+            source = "static-object-virtual-dispatch";
+        }
+        else {
+            PcodeCallTargetInfo constructorInfo =
+                pcodeValueCallTargetInfo(operation.getInput(1));
+            Function constructor = constructorInfo == null
+                ? null
+                : constructorInfo.target;
+            vtable = finalConstructorReturnedVtable(
+                constructor,
+                dispatch.objectOffset());
+            source = "constructor-return-final-vptr-virtual-dispatch";
+        }
+        if (!isVtableLike(vtable)) {
+            return null;
+        }
+
+        Address targetAddress = resolvedCodeTarget(readPointer(
+            vtable.add(dispatch.slotOffset())));
+        Function target = functionAtOrContaining(targetAddress);
+        if (target == null || !target.getEntryPoint().equals(targetAddress)) {
+            return null;
+        }
+        runMetrics.increment("concreteMessageVirtualDispatches");
+        return new ConcreteMessageVirtualDispatch(
+            dispatch,
+            vtable,
+            target,
+            source);
+    }
+
+    private Address finalConstructorReturnedVtable(
+        Function constructor,
+        long objectOffset) {
+
+        if (constructor == null ||
+            objectOffset < Integer.MIN_VALUE ||
+            objectOffset > Integer.MAX_VALUE) {
+            return null;
+        }
+        Integer returnedSlot = returnedParameterSlot(constructor);
+        if (returnedSlot == null) {
+            return null;
+        }
+
+        VtableWrite selected = null;
+        for (VtableWrite write :
+                constructorVtableWrites(constructor.getEntryPoint())) {
+            checkAnalysisCancelled();
+            Long offset = constructorReturnedVtableOffset(
+                write,
+                returnedSlot);
+            if (offset == null || offset.longValue() != objectOffset ||
+                !isVtableLike(write.vtable)) {
+                continue;
+            }
+            if (selected == null || write.order > selected.order) {
+                selected = write;
+            }
+            else if (write.order == selected.order &&
+                !write.vtable.equals(selected.vtable)) {
+                return null;
+            }
+        }
+        return selected == null ? null : selected.vtable;
+    }
+
+    private Long constructorReturnedVtableOffset(
+        VtableWrite write,
+        int returnedSlot) {
+
+        if (write == null) {
+            return null;
+        }
+        if (write.thisOffset != null && returnedSlot == 1) {
+            return write.thisOffset.longValue();
+        }
+        if (write.baseKey != null &&
+            write.baseKey.equals("param_" + returnedSlot) &&
+            write.baseOffset != null) {
+            return write.baseOffset.longValue();
+        }
+        return null;
+    }
+
+    private void recordConcreteMessageValueVtable(
+        MessageUnmarshalPlan plan,
+        ConcreteMessageVirtualDispatch concrete,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        if (plan == null || concrete == null ||
+            concrete.dispatch().root().storageBase() == null) {
+            return;
+        }
+        PcodeStorage local = new PcodeStorage(
+            concrete.dispatch().root().storageBase(),
+            concrete.dispatch().objectOffset());
+        PcodeStorage absolute = translatedAbsoluteHelperStorage(
+            local,
+            callerParamStorage);
+        if (!isRootMessageStorage(plan, absolute)) {
+            return;
+        }
+        if (plan.concreteValueVtable == null) {
+            plan.concreteValueVtable = concrete.vtable();
+            plan.concreteValueVtableSource = concrete.source();
+            return;
+        }
+        if (!plan.concreteValueVtable.equals(concrete.vtable())) {
+            plan.concreteValueVtableConflict = true;
+            recordPcodeMessageGraphReject(
+                plan,
+                "concrete-message-vtable-conflict",
+                concrete.target());
+        }
+    }
+
+    private MessageMarshalPlan recoverConcreteVirtualMessageMarshalPlan(
+        RegistryEntry entry,
+        MessageMarshalPlan current,
+        MessageUnmarshalPlan unmarshal) {
+
+        if (entry == null || unmarshal == null ||
+            unmarshal.concreteValueVtable == null ||
+            unmarshal.concreteValueVtableConflict ||
+            current != null && !current.fields.isEmpty()) {
+            return current;
+        }
+        Function wrapper = functionAtOrContaining(
+            parseCapturedAddress(entry.marshal));
+        HighFunction high = highFunction(wrapper);
+        if (wrapper == null || high == null) {
+            return current;
+        }
+
+        NetworkSchemaFlowSequence.Result<MessageMarshalEvent> selected = null;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            checkAnalysisCancelled();
+            if (operation.getOpcode() != PcodeOp.CALLIND ||
+                operation.getNumInputs() < 2) {
+                continue;
+            }
+            PcodeVirtualDispatch dispatch =
+                pcodeVirtualDispatch(operation.getInput(0));
+            if (dispatch == null || dispatch.objectOffset() != 0L ||
+                dispatch.slotOffset() < 0L ||
+                (dispatch.slotOffset() % Long.BYTES) != 0L) {
+                continue;
+            }
+            Address targetAddress = resolvedCodeTarget(readPointer(
+                unmarshal.concreteValueVtable.add(
+                    dispatch.slotOffset())));
+            Function target = functionAtOrContaining(targetAddress);
+            if (target == null ||
+                !target.getEntryPoint().equals(targetAddress)) {
+                continue;
+            }
+            Integer bufferSlot = provenCallArgumentSlot(
+                wrapper,
+                operation,
+                target,
+                new PcodeStorage("param_3", 0L));
+            if (bufferSlot == null) {
+                continue;
+            }
+            Map<String, PcodeStorage> arguments =
+                callArgumentStorageMap(
+                    wrapper,
+                    operation,
+                    Collections.emptyMap());
+            NetworkSchemaFlowSequence.Result<MessageMarshalEvent> candidate =
+                messageMarshalEventSequence(
+                    target,
+                    "param_" + bufferSlot,
+                    arguments,
+                    new LinkedHashSet<>());
+            if (!candidate.complete()) {
+                runMetrics.increment(
+                    "concreteMessageVirtualMarshalIncomplete");
+                return current;
+            }
+            if (selected != null) {
+                runMetrics.increment(
+                    "concreteMessageVirtualMarshalAmbiguous");
+                return current;
+            }
+            selected = candidate;
+        }
+        if (selected == null) {
+            return current;
+        }
+
+        MessageMarshalPlan plan = new MessageMarshalPlan();
+        plan.wrapper = wrapper.getEntryPoint();
+        plan.wrapperName = fullFunctionName(wrapper);
+        plan.writeBufferParameter = "param_3";
+        plan.events.addAll(selected.events());
+        plan.rootStorageBase = uniqueMessageMarshalRoot(plan.events);
+        plan.fields.addAll(messageMarshalFields(plan.events));
+        plan.analysisStatus = plan.fields.isEmpty()
+            ? "complete-empty-concrete-vtable-flow"
+            : "complete-concrete-vtable-flow";
+        if (!plan.events.isEmpty() && plan.rootStorageBase == null) {
+            runMetrics.increment("concreteMessageVirtualMarshalRootMissing");
+            return current;
+        }
+        runMetrics.increment("concreteMessageVirtualMarshalResolved");
+        return plan;
+    }

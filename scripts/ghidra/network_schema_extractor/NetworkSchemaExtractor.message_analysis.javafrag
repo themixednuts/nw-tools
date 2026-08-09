@@ -5,12 +5,21 @@
         if (unmarshal == null) {
             return;
         }
-        if (unmarshal.delegatedCodec != null) {
+        if (unmarshal.delegatedCodec != null &&
+            !unmarshal.delegatedCodec.concreteResolved) {
             unmarshal.analysisStatus = "delegated-codec";
             return;
         }
+        if (unmarshal.delegatedCodec != null &&
+            unmarshal.delegatedCodec.concreteResolved &&
+            unmarshal.fields.isEmpty() &&
+            unmarshal.emptyWireProven) {
+            unmarshal.analysisStatus = "proven-empty";
+            return;
+        }
         if (Boolean.FALSE.equals(unmarshal.supportsUnmarshal) &&
-            marshal != null && !marshal.fields.isEmpty()) {
+            marshal != null && marshal.analysisStatus != null &&
+            marshal.analysisStatus.startsWith("complete")) {
             unmarshal.analysisStatus = "marshal-only";
             return;
         }
@@ -58,6 +67,9 @@
         UnmarshalTerminalFlow terminalFlow = successfulUnmarshalTerminalFlow(high);
         unmarshal.terminalStatus = terminalFlow.status();
         if (terminalFlow.terminals().isEmpty()) {
+            if ("no-success-terminal".equals(terminalFlow.status())) {
+                unmarshal.supportsUnmarshal = false;
+            }
             return false;
         }
         for (int slot = 1; slot <= 4; slot++) {

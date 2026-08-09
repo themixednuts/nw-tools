@@ -131,8 +131,23 @@ impl NetworkRustEmitter {
 
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
             pub struct NetworkFixedSequenceWireShape {
-                pub element: NetworkWireScalarShape,
+                pub element: &'static NetworkWireShape,
                 pub capacity: u16,
+            }
+
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            pub enum NetworkBitMaskMemberWireShape {
+                Required(&'static NetworkWireShape),
+                Masked {
+                    mask: u8,
+                    value: &'static NetworkWireShape,
+                },
+            }
+
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            pub struct NetworkBitMaskCompositeWireShape {
+                pub mask: NetworkWireScalarShape,
+                pub members: &'static [NetworkBitMaskMemberWireShape],
             }
 
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +190,7 @@ impl NetworkRustEmitter {
                 Bytes,
                 String,
                 ClassValue,
+                ActorInstantiationParameters,
                 Composite(&'static [NetworkWireShape]),
                 Optional(&'static NetworkWireShape),
                 DefaultOmitted(&'static [NetworkWireShape]),
@@ -182,6 +198,7 @@ impl NetworkRustEmitter {
                     false_value: &'static NetworkWireShape,
                     true_value: &'static NetworkWireShape,
                 },
+                BitMaskComposite(NetworkBitMaskCompositeWireShape),
                 Sequence(&'static NetworkWireShape),
                 Set(&'static NetworkWireShape),
                 Map {
@@ -567,6 +584,14 @@ impl NetworkRustEmitter {
             }
             report.message_generation_plans.push(plan.clone());
             if plan.can_generate {
+                let mut support_names = BTreeSet::new();
+                report.support_type_count += plan
+                    .fields
+                    .iter()
+                    .filter_map(|field| {
+                        message_field_support_tokens(field, &mut support_names, &serialize_types)
+                    })
+                    .count();
                 modules.push(message_module_tokens(
                     network_type,
                     &plan,
