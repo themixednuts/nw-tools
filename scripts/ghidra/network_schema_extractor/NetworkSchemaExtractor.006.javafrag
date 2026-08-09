@@ -806,6 +806,9 @@
                 storageShape,
                 wireSequenceShape,
                 high) ||
+            sameFlattenedNestedWireSequenceInProvenOrder(
+                storageShape,
+                wireSequenceShape) ||
             sameNestedWireSequence(storageShape, wireSequenceShape)) {
             proveDirectTypeIdentity(storageShape, target);
             return storageShape;
@@ -820,4 +823,3 @@
     private NestedTypeShape recoverNestedDirectMemberShape(
         Function current,
         Function callTarget) {
-

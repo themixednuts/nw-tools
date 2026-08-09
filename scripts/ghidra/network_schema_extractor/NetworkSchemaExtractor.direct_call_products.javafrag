@@ -114,6 +114,50 @@
         return true;
     }
 
+    private boolean sameFlattenedNestedWireSequenceInProvenOrder(
+        NestedTypeShape storage,
+        NestedTypeShape wire) {
+
+        if (storage == null || wire == null || storage.members.isEmpty() ||
+            wire.members.isEmpty()) {
+            return false;
+        }
+        ArrayList<NestedTypeMember> ordered =
+            new ArrayList<>(Collections.nCopies(storage.members.size(), null));
+        for (NestedTypeMember member : storage.members) {
+            if (member == null || member.wireOrdinal == null ||
+                member.wireOrderSource == null || member.wireOrdinal < 0 ||
+                member.wireOrdinal >= ordered.size() ||
+                ordered.get(member.wireOrdinal) != null ||
+                !(member.wireOrderSource.startsWith("cfg-") ||
+                    member.wireOrderSource.contains("+nested-wire-order"))) {
+                return false;
+            }
+            ordered.set(member.wireOrdinal, member);
+        }
+        if (!sameFlattenedCodecProducts(ordered, wire.members)) {
+            return false;
+        }
+        for (int index = 0; index < ordered.size(); index++) {
+            NestedTypeMember member = ordered.get(index);
+            member.nativeOffset = member.offset;
+            member.wireOrdinal = index;
+            member.wireOrderSource =
+                "proven-output-order+flattened-recursive-unmarshal-order";
+        }
+        storage.members.clear();
+        storage.members.addAll(ordered);
+        storage.layoutProven = true;
+        storage.memberCoverageProven = true;
+        storage.wireOrderProven = true;
+        storage.wireOrderSource =
+            "proven-output-order+flattened-recursive-unmarshal-order";
+        storage.validation = appendValidation(
+            storage.validation,
+            "flattened-recursive-wire-product");
+        return true;
+    }
+
     private CodecWireEvent directValueCallProductEvent(
         Function owner,
         PcodeOp operation,
