@@ -1,0 +1,26 @@
+    private Function directMessageMarshalTailTarget(
+        Function owner,
+        PcodeOpAST operation) {
+
+        if (owner == null || operation == null ||
+            operation.getOpcode() != PcodeOp.BRANCH ||
+            operation.getNumInputs() == 0) {
+            return null;
+        }
+        Address raw = pcodeAddress(operation.getInput(0));
+        Address resolved = resolvedCodeTarget(raw);
+        Function target = functionExactlyAt(raw);
+        if (target == null) {
+            target = functionExactlyAt(resolved);
+        }
+        if (target == null || target.equals(owner) ||
+            (owner.getBody() != null && owner.getBody().contains(target.getEntryPoint()))) {
+            return null;
+        }
+        Instruction instruction = currentProgram.getListing().getInstructionAt(
+            operation.getSeqnum().getTarget());
+        return instruction != null && instruction.getFlowType().isJump() &&
+            !instruction.getFlowType().isComputed()
+            ? target
+            : null;
+    }

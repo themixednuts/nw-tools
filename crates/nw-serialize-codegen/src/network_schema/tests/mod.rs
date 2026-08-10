@@ -224,6 +224,341 @@ fn nested_shape_from_layouts(layouts: &[&str]) -> crate::network_schema::Network
     }
 }
 
+fn proven_synthetic_nested_shape(
+    layouts: &[&str],
+) -> crate::network_schema::NetworkNestedTypeShape {
+    let mut shape = nested_shape_from_layouts(layouts);
+    shape.validation =
+        Some("message-unmarshal-constructor-vptr+az-rtti+typeregistry-type-name".to_owned());
+    shape.member_name_source = Some("synthetic-offset".to_owned());
+    shape.wire_order_source = Some("cfg-ordered-multi-helper-wire-product".to_owned());
+    shape.layout_proven = Some(true);
+    shape.member_coverage_proven = Some(true);
+    shape.wire_order_proven = Some(true);
+    for member in &mut shape.members {
+        member.callsite = Some("NewWorld+0x1234".to_owned());
+    }
+    shape
+}
+
+#[test]
+fn collapses_stale_duplicate_nested_wire_products() {
+    use crate::network_schema::parse::collapse_synthetic_nested_duplicate_wire_product;
+
+    let preferred = "composite<u64,u64,u32>";
+    let mut nested = proven_synthetic_nested_shape(&[
+        "composite<fixed-bytes-8,fixed-bytes-8,fixed-bytes-4>",
+        preferred,
+    ]);
+
+    assert!(collapse_synthetic_nested_duplicate_wire_product(
+        &mut nested,
+        preferred,
+    ));
+    assert_eq!(
+        nested
+            .members
+            .iter()
+            .filter_map(|member| member.wire_layout.as_deref())
+            .collect::<Vec<_>>(),
+        ["u64", "u64", "u32"]
+    );
+    assert!(
+        nested
+            .members
+            .iter()
+            .all(|member| member.callsite.as_deref() == Some("NewWorld+0x1234"))
+    );
+}
+
+#[test]
+fn preserves_genuine_nested_members_and_distinct_callsites() {
+    use crate::network_schema::parse::collapse_synthetic_nested_duplicate_wire_product;
+
+    let preferred = "composite<u64,u64>";
+    let mut genuine = proven_synthetic_nested_shape(&["u64", "u64"]);
+    assert!(!collapse_synthetic_nested_duplicate_wire_product(
+        &mut genuine,
+        preferred,
+    ));
+    assert_eq!(genuine.members.len(), 2);
+
+    let mut distinct_callsites =
+        proven_synthetic_nested_shape(&["composite<u64,u64>", "composite<u64,u64>"]);
+    distinct_callsites.members[1].callsite = Some("NewWorld+0x5678".to_owned());
+    assert!(!collapse_synthetic_nested_duplicate_wire_product(
+        &mut distinct_callsites,
+        preferred,
+    ));
+    assert_eq!(distinct_callsites.members.len(), 2);
+}
+
+#[test]
+fn collapses_redundant_call_frame_aggregate_fields() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "A8C4C56B-33F1-4A0A-A518-6D03A89EA3C4",
+            "typeIndex": 9001,
+            "typeName": "Test::AggregateMessage",
+            "fields": [{
+                "index": 0,
+                "name": "aggregate_0",
+                "storageBase": "param_3",
+                "storageOffset": 16,
+                "wireLayout": "composite<u32,bool>",
+                "nestedTypeShape": {
+                    "function": "NewWorld+0x1000",
+                    "memberBase": "param_3",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "validation": "call-frame-output-parameter",
+                    "members": [{
+                        "offset": "0x0",
+                        "wireLayout": "u32",
+                        "wireOrdinal": 0,
+                        "callsite": "NewWorld+0x1010"
+                    }, {
+                        "offset": "0x4",
+                        "wireLayout": "bool",
+                        "wireOrdinal": 1,
+                        "callsite": "NewWorld+0x1020"
+                    }]
+                },
+                "callsite": "NewWorld+0x1000",
+                "confidence": "message-unmarshal-call-frame-boundary"
+            }, {
+                "index": 1,
+                "name": "duplicate_bool",
+                "storageBase": "param_3",
+                "storageOffset": 20,
+                "wireLayout": "fixed-bytes-1",
+                "callsite": "NewWorld+0x1020",
+                "confidence": "message-unmarshal-call-frame-output-member"
+            }, {
+                "index": 2,
+                "name": "aggregate_1",
+                "storageBase": "param_3",
+                "storageOffset": 64,
+                "wireLayout": "composite<u32,string>",
+                "nestedTypeShape": {
+                    "function": "NewWorld+0x2000",
+                    "memberBase": "param_3",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "validation": "call-frame-output-parameter",
+                    "members": [{
+                        "offset": "0x0",
+                        "wireLayout": "u32",
+                        "wireOrdinal": 0,
+                        "callsite": "NewWorld+0x2010"
+                    }, {
+                        "offset": "0x8",
+                        "wireLayout": "string",
+                        "wireOrdinal": 1,
+                        "callsite": "NewWorld+0x2010"
+                    }]
+                },
+                "callsite": "NewWorld+0x2000",
+                "confidence": "message-unmarshal-call-frame-boundary"
+            }, {
+                "index": 3,
+                "name": "status_plus_duplicate_product",
+                "storageBase": "param_3",
+                "storageOffset": 64,
+                "wireLayout": "composite<fixed-bytes-4,fixed-bytes-4,string>",
+                "callsite": "NewWorld+0x2010",
+                "confidence": "message-unmarshal-pcode-stack"
+            }, {
+                "index": 4,
+                "name": "real_field",
+                "storageBase": "param_3",
+                "storageOffset": 128,
+                "wireLayout": "u64",
+                "callsite": "NewWorld+0x3000",
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+
+    let schema = NetworkSchema::from_ghidra_static_network_report(&report)
+        .expect("normalized network schema");
+    let fields = &schema.types[0].fields;
+    assert_eq!(
+        fields
+            .iter()
+            .filter_map(|field| field.name.as_deref())
+            .collect::<Vec<_>>(),
+        ["aggregate_0", "aggregate_1", "real_field"]
+    );
+    assert_eq!(
+        fields
+            .iter()
+            .filter_map(|field| field.index)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+}
+
+#[test]
+fn preserves_uncovered_call_frame_products() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "A1804D9A-F7F6-47ED-82B9-B37E3929B050",
+            "typeIndex": 9002,
+            "typeName": "Test::AggregateMessage",
+            "fields": [{
+                "index": 0,
+                "name": "aggregate",
+                "storageBase": "param_3",
+                "storageOffset": 16,
+                "wireLayout": "composite<u32,string>",
+                "nestedTypeShape": {
+                    "function": "NewWorld+0x4000",
+                    "memberBase": "param_3",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "validation": "call-frame-output-parameter",
+                    "members": [{
+                        "offset": "0x0",
+                        "wireLayout": "u32",
+                        "wireOrdinal": 0,
+                        "callsite": "NewWorld+0x4010"
+                    }, {
+                        "offset": "0x8",
+                        "wireLayout": "string",
+                        "wireOrdinal": 1,
+                        "callsite": "NewWorld+0x4010"
+                    }]
+                },
+                "callsite": "NewWorld+0x4000",
+                "confidence": "message-unmarshal-call-frame-boundary"
+            }, {
+                "index": 1,
+                "name": "not_just_status",
+                "storageBase": "param_3",
+                "storageOffset": 16,
+                "wireLayout": "composite<u64,u8,u32,string>",
+                "callsite": "NewWorld+0x4010",
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+
+    let schema = NetworkSchema::from_ghidra_static_network_report(&report)
+        .expect("normalized network schema");
+    assert_eq!(schema.types[0].fields.len(), 2);
+}
+
+#[test]
+fn normalizes_anonymous_call_frame_boundary_without_erasing_real_identity() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "790E00CC-474A-4128-90D9-321280ED762F",
+            "typeIndex": 9003,
+            "typeName": "Test::AggregateMessage",
+            "fields": [{
+                "index": 0,
+                "name": "anonymous_boundary",
+                "nativeType": "EntityRef",
+                "storageBase": "param_3",
+                "storageOffset": 16,
+                "wireShape": "entity-ref",
+                "nestedTypeShape": {
+                    "function": "NewWorld+0x5000",
+                    "memberBase": "param_3",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "validation": "call-frame-output-parameter",
+                    "members": [{
+                        "offset": "0x0",
+                        "nativeType": "EntityRef",
+                        "wireShape": "entity-ref",
+                        "wireOrdinal": 0,
+                        "callsite": "NewWorld+0x5010"
+                    }, {
+                        "offset": "0x40",
+                        "nativeType": "EntityRef",
+                        "wireShape": "entity-ref",
+                        "wireOrdinal": 1,
+                        "callsite": "NewWorld+0x5020"
+                    }]
+                },
+                "callsite": "NewWorld+0x5000",
+                "confidence": "message-unmarshal-call-frame-boundary"
+            }, {
+                "index": 1,
+                "name": "semantic_boundary",
+                "nativeType": "ActorRequestId",
+                "storageBase": "param_3",
+                "storageOffset": 160,
+                "wireShape": "actor-ref",
+                "nestedTypeShape": {
+                    "typeName": "ActorRequestId",
+                    "identityProven": true,
+                    "function": "NewWorld+0x5100",
+                    "memberBase": "param_3",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "validation": "call-frame-output-parameter",
+                    "members": [{
+                        "offset": "0x0",
+                        "nativeType": "u32",
+                        "wireShape": "u32",
+                        "wireOrdinal": 0,
+                        "callsite": "NewWorld+0x5110"
+                    }, {
+                        "offset": "0x4",
+                        "wireLayout": "fixed-bytes-16",
+                        "wireOrdinal": 1,
+                        "callsite": "NewWorld+0x5120"
+                    }, {
+                        "offset": "0x14",
+                        "wireLayout": "fixed-bytes-16",
+                        "wireOrdinal": 2,
+                        "callsite": "NewWorld+0x5130"
+                    }]
+                },
+                "callsite": "NewWorld+0x5100",
+                "confidence": "message-unmarshal-call-frame-boundary"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+
+    let schema = NetworkSchema::from_ghidra_static_network_report(&report)
+        .expect("normalized network schema");
+    let anonymous = &schema.types[0].fields[0];
+    assert_eq!(anonymous.native_type, None);
+    assert_eq!(
+        anonymous
+            .wire_shape
+            .as_ref()
+            .map(NetworkWireShape::wire_string),
+        Some("composite<entity-ref,entity-ref>".to_owned())
+    );
+    assert_eq!(
+        anonymous.wire_shape_source.as_deref(),
+        Some("normalized-proven-call-frame-output-product")
+    );
+
+    let semantic = &schema.types[0].fields[1];
+    assert_eq!(semantic.native_type.as_deref(), Some("ActorRequestId"));
+    assert_eq!(
+        semantic
+            .wire_shape
+            .as_ref()
+            .map(NetworkWireShape::wire_string),
+        Some("actor-ref".to_owned())
+    );
+}
+
 #[test]
 fn parses_nested_collection_member_wire_shapes() {
     use crate::network_schema::parse::nested_member_wire_shapes;

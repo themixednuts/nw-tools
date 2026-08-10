@@ -180,6 +180,13 @@
             containsOrderedAggregateProduct(aggregate, field, relativeOffset)) {
             return true;
         }
+        if (Boolean.TRUE.equals(aggregate.callFrameBoundaryProven) &&
+            containsStatusPrefixedCallsiteProduct(
+                aggregate,
+                field,
+                relativeOffset)) {
+            return true;
+        }
         for (NestedTypeMember member : aggregate.nestedTypeShape.members) {
             checkAnalysisCancelled();
             WireShape memberEvidence = nestedMemberWireEvidence(member);
@@ -195,6 +202,51 @@
             }
         }
         return false;
+    }
+
+    private boolean containsStatusPrefixedCallsiteProduct(
+        FieldCall aggregate,
+        FieldCall child,
+        long childOffset) {
+
+        if (aggregate == null || child == null || child.callsite == null ||
+            aggregate.nestedTypeShape == null) {
+            return false;
+        }
+        ArrayList<NestedTypeMember> covered = new ArrayList<>();
+        boolean started = false;
+        for (NestedTypeMember member : aggregate.nestedTypeShape.members) {
+            checkAnalysisCancelled();
+            long offset = member.nativeOffset == null
+                ? member.offset
+                : member.nativeOffset;
+            if (!started) {
+                if (offset != childOffset ||
+                    !Objects.equals(member.callsite, child.callsite)) {
+                    continue;
+                }
+                started = true;
+            }
+            if (!Objects.equals(member.callsite, child.callsite)) {
+                break;
+            }
+            covered.add(member);
+        }
+        List<String> coveredLayouts = flattenedWireLayouts(covered);
+        List<String> childLayouts = flattenedLayoutMembers(
+            firstNonEmpty(child.wireLayout, child.wireShape));
+        if (coveredLayouts == null || childLayouts == null ||
+            childLayouts.size() != coveredLayouts.size() + 1) {
+            return false;
+        }
+        for (int index = 0; index < coveredLayouts.size(); index++) {
+            if (!compatibleCodecProducts(
+                    childLayouts.get(index + 1),
+                    coveredLayouts.get(index))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private boolean containsOrderedAggregateProduct(

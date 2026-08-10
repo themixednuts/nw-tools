@@ -3,6 +3,14 @@ use super::*;
 use crate::ReflectedTypeCatalog;
 
 #[test]
+fn treats_azstd_and_std_strings_as_the_same_native_type() {
+    assert!(super::super::merge::equivalent_native_type(
+        "AZStd::string",
+        "std::string"
+    ));
+}
+
+#[test]
 fn restricts_source_availability_to_the_emitted_codegen_unit() {
     let first_type_id = uuid!("11111111-1111-1111-1111-111111111111");
     let second_type_id = uuid!("22222222-2222-2222-2222-222222222222");

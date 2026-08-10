@@ -84,7 +84,9 @@ impl NetworkSchema {
             enrich_fields_from_handler_projections(&mut network_type.fields, &projections);
             for field in &mut network_type.fields {
                 collapse_field_alternate_spelling_wire_products(field);
+                normalize_proven_message_aggregate_boundary(field);
             }
+            collapse_redundant_message_aggregate_fields(&mut network_type.fields);
             for field in &mut network_type.marshal_fields {
                 collapse_field_alternate_spelling_wire_products(field);
             }

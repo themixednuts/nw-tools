@@ -689,6 +689,9 @@ pub(crate) fn collapse_field_alternate_spelling_wire_products(field: &mut Networ
     let Some(raw) = raw else {
         return;
     };
+    if let Some(shape) = field.nested_type_shape.as_mut() {
+        collapse_synthetic_nested_duplicate_wire_product(shape, &raw);
+    }
     let Some(preferred) =
         collapse_alternate_spelling_wire_product(&raw, field.nested_type_shape.as_ref())
     else {
@@ -708,6 +711,215 @@ pub(crate) fn collapse_field_alternate_spelling_wire_products(field: &mut Networ
     field.wire_shape_source = field.wire_layout_source.clone();
 }
 
+pub(crate) fn collapse_redundant_message_aggregate_fields(fields: &mut Vec<NetworkField>) {
+    let redundant = (0..fields.len())
+        .filter(|&field_index| {
+            (0..fields.len()).any(|aggregate_index| {
+                aggregate_index != field_index
+                    && is_redundant_message_aggregate_field(
+                        &fields[aggregate_index],
+                        &fields[field_index],
+                    )
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    if redundant.is_empty() {
+        return;
+    }
+
+    let mut index = 0usize;
+    fields.retain(|_| {
+        let keep = !redundant.contains(&index);
+        index += 1;
+        keep
+    });
+    for (index, field) in fields.iter_mut().enumerate() {
+        field.index = u32::try_from(index).ok();
+    }
+}
+
+pub(crate) fn normalize_proven_message_aggregate_boundary(field: &mut NetworkField) {
+    let Some(shape) = field.nested_type_shape.as_ref().filter(|shape| {
+        shape.validation.as_deref() == Some("call-frame-output-parameter")
+            && shape.has_proven_anonymous_layout()
+            && shape.members.len() >= 2
+    }) else {
+        return;
+    };
+
+    let mut members = shape.members.iter().collect::<Vec<_>>();
+    members.sort_by_key(|member| member.wire_ordinal);
+    if members
+        .iter()
+        .enumerate()
+        .any(|(index, member)| member.wire_ordinal != u32::try_from(index).ok())
+    {
+        return;
+    }
+    let Some(child_type) = field.native_type.as_deref().filter(|native_type| {
+        members
+            .iter()
+            .any(|member| member.native_type.as_deref() == Some(*native_type))
+    }) else {
+        return;
+    };
+    let child_type = child_type.to_owned();
+
+    let Some(semantic_members) = members
+        .iter()
+        .map(|member| {
+            member
+                .wire_shape
+                .as_deref()
+                .or(member.wire_layout.as_deref())
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    let Some(layout_members) = members
+        .iter()
+        .map(|member| {
+            member
+                .wire_layout
+                .as_deref()
+                .or(member.wire_shape.as_deref())
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    let semantic = format!("composite<{}>", semantic_members.join(","));
+    let layout = format!("composite<{}>", layout_members.join(","));
+    let Some(nested_product) = nested_member_wire_shapes(&semantic, &[]) else {
+        return;
+    };
+    let parent_matches = network_field_wire_product(field).is_some_and(|parent_product| {
+        wire_products_machine_compatible(&parent_product, &nested_product)
+    });
+    if !parent_matches {
+        let source = "normalized-proven-call-frame-output-product".to_owned();
+        field.wire_shape = parse_network_wire_shape(&semantic);
+        field.wire_shape_raw = Some(semantic);
+        field.wire_shape_source = Some(source.clone());
+        field.wire_layout = Some(layout);
+        field.wire_layout_source = Some(source);
+    }
+
+    field.native_type = None;
+    if field.source_type_name.as_deref() == Some(child_type.as_str()) {
+        field.source_type_name = None;
+    }
+    if !field.source_type_identity_proven {
+        field.source_type_id = None;
+        field.source_type_id_source = None;
+    }
+    field.rust_type = None;
+    field.serialize = None;
+}
+
+fn is_redundant_message_aggregate_field(aggregate: &NetworkField, field: &NetworkField) -> bool {
+    let Some(shape) = aggregate.nested_type_shape.as_ref().filter(|shape| {
+        shape.validation.as_deref() == Some("call-frame-output-parameter")
+            && shape.has_proven_layout()
+    }) else {
+        return false;
+    };
+    let (Some(aggregate_base), Some(field_base)) = (
+        aggregate.storage_base.as_deref(),
+        field.storage_base.as_deref(),
+    ) else {
+        return false;
+    };
+    if aggregate_base != field_base {
+        return false;
+    }
+    let (Some(aggregate_offset), Some(field_offset)) =
+        (aggregate.storage_offset, field.storage_offset)
+    else {
+        return false;
+    };
+    let Some(relative_offset) = field_offset.checked_sub(aggregate_offset) else {
+        return false;
+    };
+    let Some(field_callsite) = field.callsite.as_deref() else {
+        return false;
+    };
+    let Some(field_product) = network_field_wire_product(field) else {
+        return false;
+    };
+
+    if shape.members.iter().any(|member| {
+        nested_member_offset(member) == Some(relative_offset)
+            && member.callsite.as_deref() == Some(field_callsite)
+            && nested_member_wire_product(member).is_some_and(|member_product| {
+                wire_products_machine_compatible(&field_product, &member_product)
+            })
+    }) {
+        return true;
+    }
+
+    let same_callsite_members = shape
+        .members
+        .iter()
+        .skip_while(|member| nested_member_offset(member) != Some(relative_offset))
+        .take_while(|member| member.callsite.as_deref() == Some(field_callsite))
+        .collect::<Vec<_>>();
+    if same_callsite_members.is_empty() {
+        return false;
+    }
+    let Some(member_products) = same_callsite_members
+        .into_iter()
+        .map(nested_member_wire_product)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let member_product = member_products.into_iter().flatten().collect::<Vec<_>>();
+    field_product.len() == member_product.len() + 1
+        && wire_scalar_products_width_compatible(&field_product[1..], &member_product)
+}
+
+fn network_field_wire_product(field: &NetworkField) -> Option<Vec<NetworkWireScalarShape>> {
+    let product = field
+        .wire_shape
+        .as_ref()
+        .map(NetworkWireShape::wire_string)
+        .or_else(|| field.wire_layout.clone())?;
+    nested_member_wire_shapes(&product, &[])
+}
+
+fn nested_member_wire_product(
+    member: &NetworkNestedTypeMember,
+) -> Option<Vec<NetworkWireScalarShape>> {
+    let product = member
+        .wire_shape
+        .as_deref()
+        .or(member.wire_layout.as_deref())?;
+    nested_member_wire_shapes(product, &[])
+}
+
+fn wire_products_machine_compatible(
+    left: &[NetworkWireScalarShape],
+    right: &[NetworkWireScalarShape],
+) -> bool {
+    wire_scalar_products_width_compatible(left, right)
+}
+
+fn nested_member_offset(member: &NetworkNestedTypeMember) -> Option<u32> {
+    let value = member
+        .native_offset
+        .as_deref()
+        .or(member.offset.as_deref())?;
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse().ok(),
+            |value| u32::from_str_radix(value, 16).ok(),
+        )
+}
+
 fn collapse_synthetic_nested_alternate_spelling_product(
     shape: Option<&mut NetworkNestedTypeShape>,
     raw: &str,
@@ -716,14 +928,7 @@ fn collapse_synthetic_nested_alternate_spelling_product(
     let Some(shape) = shape else {
         return;
     };
-    if shape.validation.as_deref()
-        != Some("message-unmarshal-constructor-vptr+az-rtti+typeregistry-type-name")
-        || shape.member_name_source.as_deref() != Some("synthetic-offset")
-        || shape.wire_order_source.as_deref() != Some("cfg-ordered-multi-helper-wire-product")
-        || shape.layout_proven != Some(true)
-        || shape.member_coverage_proven != Some(true)
-        || shape.wire_order_proven != Some(true)
-    {
+    if !is_proven_synthetic_nested_wire_product(shape) {
         return;
     }
 
@@ -753,6 +958,56 @@ fn collapse_synthetic_nested_alternate_spelling_product(
         return;
     }
 
+    replace_synthetic_nested_wire_product(shape, preferred);
+}
+
+pub(crate) fn collapse_synthetic_nested_duplicate_wire_product(
+    shape: &mut NetworkNestedTypeShape,
+    preferred: &str,
+) -> bool {
+    if !is_proven_synthetic_nested_wire_product(shape) || shape.members.len() != 2 {
+        return false;
+    }
+
+    let Some(callsite) = shape
+        .members
+        .first()
+        .and_then(|member| member.callsite.clone())
+    else {
+        return false;
+    };
+    if !shape
+        .members
+        .iter()
+        .all(|member| member.callsite.as_ref() == Some(&callsite))
+    {
+        return false;
+    }
+    if !shape.members.iter().all(|member| {
+        member
+            .wire_shape
+            .as_deref()
+            .or(member.wire_layout.as_deref())
+            .is_some_and(|product| compatible_alternate_wire_products(product, preferred))
+    }) {
+        return false;
+    }
+
+    replace_synthetic_nested_wire_product(shape, preferred);
+    true
+}
+
+fn is_proven_synthetic_nested_wire_product(shape: &NetworkNestedTypeShape) -> bool {
+    shape.validation.as_deref()
+        == Some("message-unmarshal-constructor-vptr+az-rtti+typeregistry-type-name")
+        && shape.member_name_source.as_deref() == Some("synthetic-offset")
+        && shape.wire_order_source.as_deref() == Some("cfg-ordered-multi-helper-wire-product")
+        && shape.layout_proven == Some(true)
+        && shape.member_coverage_proven == Some(true)
+        && shape.wire_order_proven == Some(true)
+}
+
+fn replace_synthetic_nested_wire_product(shape: &mut NetworkNestedTypeShape, preferred: &str) {
     let member_products = top_level_composite_members(preferred).unwrap_or_else(|| vec![preferred]);
     let callsite = shape
         .members

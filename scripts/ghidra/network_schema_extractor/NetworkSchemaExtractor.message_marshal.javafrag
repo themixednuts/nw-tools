@@ -317,6 +317,38 @@
                             NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
                     }
                 }
+                else if (operation.getOpcode() == PcodeOp.BRANCH) {
+                    Function target = directMessageMarshalTailTarget(function, operation);
+                    if (target == null) {
+                        continue;
+                    }
+                    Integer bufferSlot = provenCallArgumentSlot(
+                        function,
+                        operation,
+                        target,
+                        writeBuffer);
+                    if (bufferSlot == null) {
+                        recordNestedTypeShapeReject(
+                            "message-marshal-direct-tail-buffer-slot-unresolved:" +
+                                fullFunctionName(target));
+                        return messageMarshalFailure(
+                            NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                    }
+                    events = messageMarshalCallEvents(
+                        function,
+                        high,
+                        operation,
+                        target,
+                        bufferSlot,
+                        writeBufferParameter,
+                        callerParamStorage,
+                        indirectWrites,
+                        activeContexts);
+                    if (events.isEmpty()) {
+                        return messageMarshalFailure(
+                            NetworkSchemaFlowSequence.Status.NO_TERMINATING_PATH);
+                    }
+                }
                 else if (operation.getOpcode() == PcodeOp.CALLIND) {
                     Integer byteLength = provenVirtualRawWriteLength(
                         function,
@@ -439,10 +471,12 @@
         Map<String, PcodeStorage> localArguments = callArgumentStorageMap(
             owner,
             operation,
+            target,
             Collections.emptyMap());
         Map<String, PcodeStorage> arguments = callArgumentStorageMap(
             owner,
             operation,
+            target,
             callerParamStorage);
         NetworkSchemaFlowSequence.Result<MessageMarshalEvent> nested =
             messageMarshalEventSequence(

@@ -283,11 +283,21 @@
         PcodeOp op,
         Map<String, PcodeStorage> callerParamStorage) {
 
-        if (owner == null || op == null || op.getOpcode() != PcodeOp.CALL) {
-            return Collections.emptyMap();
-        }
-        Function target = pcodeCallTarget(op);
-        if (target == null) {
+        return callArgumentStorageMap(
+            owner,
+            op,
+            pcodeCallTarget(op),
+            callerParamStorage);
+    }
+
+    private Map<String, PcodeStorage> callArgumentStorageMap(
+        Function owner,
+        PcodeOp op,
+        Function target,
+        Map<String, PcodeStorage> callerParamStorage) {
+
+        if (owner == null || op == null || target == null ||
+            !isArgumentPassingOperation(op)) {
             return Collections.emptyMap();
         }
         LinkedHashMap<String, PcodeStorage> result = new LinkedHashMap<>();

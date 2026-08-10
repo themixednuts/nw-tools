@@ -201,6 +201,7 @@
         int opcode = operation.getOpcode();
         return opcode == PcodeOp.CALL ||
             opcode == PcodeOp.CALLIND ||
+            opcode == PcodeOp.BRANCH ||
             opcode == PcodeOp.BRANCHIND;
     }
 
@@ -298,13 +299,17 @@
              operation.getOpcode() == PcodeOp.CALLIND) &&
             instruction.getFlowType().isJump() &&
             instruction.getFlowType().isComputed();
-        if (!call && !indirectTailJump) {
+        boolean directTailJump = operation.getOpcode() == PcodeOp.BRANCH &&
+            instruction.getFlowType().isJump() &&
+            !instruction.getFlowType().isComputed();
+        if (!call && !indirectTailJump && !directTailJump) {
             return false;
         }
         if (expectedTarget == null) {
             return true;
         }
-        if (operation.getOpcode() != PcodeOp.CALL) {
+        if (operation.getOpcode() != PcodeOp.CALL &&
+            operation.getOpcode() != PcodeOp.BRANCH) {
             return false;
         }
         Address rawTarget = callTarget(instruction);

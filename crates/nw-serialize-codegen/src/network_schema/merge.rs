@@ -749,6 +749,7 @@ fn canonical_native_type(value: &str) -> &str {
         "AZ::s16" | "int16_t" | "short" => "i16",
         "AZ::s32" | "int32_t" | "int" => "i32",
         "AZ::s64" | "int64_t" | "long long" => "i64",
+        "AZStd::string" | "std::string" => "string",
         other => other,
     }
 }
