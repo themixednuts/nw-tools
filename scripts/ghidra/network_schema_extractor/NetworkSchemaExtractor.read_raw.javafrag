@@ -1,9 +1,16 @@
     private WireShape pcodeReadRawWireEvidence(PcodeOp operation, Function target) {
         Integer width = pcodeReadRawWidth(operation, target);
-        return width == null
-            ? null
+        if (width == null) {
+            return null;
+        }
+        String shape = fixedByteLayout(width);
+        return width > Byte.BYTES
+            ? WireShape.semantic(
+                shape,
+                shape,
+                "unmarshal-pcode-read-raw-fixed-payload")
             : WireShape.layout(
-                fixedByteLayout(width),
+                shape,
                 "unmarshal-pcode-read-raw-layout");
     }
 

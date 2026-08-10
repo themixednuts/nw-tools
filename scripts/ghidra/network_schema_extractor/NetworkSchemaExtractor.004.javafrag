@@ -947,11 +947,18 @@
         NetworkTemplateType handlerType = parseNetworkTemplateType(handlerTypeName);
 
         ContainerWireShape container = classifyReplicatedContainerWireShape(vtable);
+        boolean inlineContainer = false;
+        if (container == null) {
+            container = classifyInlineReplicatedContainerWireShape(vtable);
+            inlineContainer = container != null;
+        }
         if (container != null) {
             return new FieldHandlerShape(
                 "replicated-container",
-                "self-vtable-slot14-slot15-dispatch",
-                FIELD_HANDLER_CONTAINER_VTABLE_SLOTS,
+                inlineContainer ? "inline-counted-key-sequence-value-mask-protocol"
+                    : "self-vtable-slot14-slot15-dispatch",
+                inlineContainer ? FIELD_HANDLER_SCALAR_VTABLE_SLOTS
+                    : FIELD_HANDLER_CONTAINER_VTABLE_SLOTS,
                 container.primaryShape,
                 container,
                 null,

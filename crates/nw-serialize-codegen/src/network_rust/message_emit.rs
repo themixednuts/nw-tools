@@ -352,7 +352,11 @@ pub(super) fn message_field_type_tokens(shape: &SchemaWireShape) -> proc_macro2:
                 &sequence.capacity.to_string(),
                 proc_macro2::Span::call_site(),
             );
-            quote!(::arrayvec::ArrayVec<#element, #capacity>)
+            if sequence.length_prefixed {
+                quote!(::arrayvec::ArrayVec<#element, #capacity>)
+            } else {
+                quote!([#element; #capacity])
+            }
         }
     }
 }

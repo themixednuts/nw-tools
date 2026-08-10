@@ -10,6 +10,50 @@
             new LinkedHashSet<>());
     }
 
+    private WireShape fixedArrayLoopWireShape(
+        Function function,
+        String bufferParameter,
+        NetworkSchemaCodecClassifier.CodecDirection direction) {
+
+        HighFunction high = highFunction(function);
+        if (high == null || bufferParameter == null) {
+            return null;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        WireShape selected = null;
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            FixedSequenceStorage storage = fixedSequenceStorage(high, loop, operations);
+            if (storage == null || storage.capacity() <= 0 || storage.capacity() > 0xffff) {
+                continue;
+            }
+            WireShape element = fixedSequenceElementWireEvidence(
+                high,
+                loop,
+                operations,
+                storage,
+                bufferParameter,
+                direction);
+            if (element == null || element.layout == null ||
+                fixedSequenceCountCall(high, loop, operations, direction) != null) {
+                continue;
+            }
+            String logicalElement = element.shape == null ? element.layout : element.shape;
+            WireShape candidate = element.hasProvenSemantics()
+                ? WireShape.semantic(
+                    "fixed-array<" + logicalElement + "," + storage.capacity() + ">",
+                    "fixed-array<" + element.layout + "," + storage.capacity() + ">",
+                    "cfg-fixed-array-loop")
+                : WireShape.layout(
+                    "fixed-array<" + element.layout + "," + storage.capacity() + ">",
+                    "cfg-fixed-array-loop");
+            if (selected != null && !Objects.equals(selected.layout, candidate.layout)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
 
     private FixedSequenceResizeActions fixedSequenceResizeActions(
         Function owner,

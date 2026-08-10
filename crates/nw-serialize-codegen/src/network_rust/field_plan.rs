@@ -213,7 +213,7 @@ pub(super) fn state_field_shape_report(
     let source_type = serialize_field_scalar_source_type(field, shape, serialize_types);
     let rust_shape = shape
         .filter(|shape| {
-            !shape.is_replicated_container() && !matches!(shape, SchemaWireShape::FixedSequence(_))
+            !shape.is_replicated_container() && !fixed_sequence_requires_handler_plan(shape)
         })
         .map(rust_field_shape);
     let handler_vtable = field
@@ -244,7 +244,7 @@ pub(super) fn state_field_shape_report(
         .then(|| fixed_sequence_vtable_for_field(field, handler_vtables_by_address))
         .flatten();
     let is_fixed_sequence_field = explicit_field_type.is_none()
-        && (matches!(shape, Some(SchemaWireShape::FixedSequence(_)))
+        && (shape.is_some_and(fixed_sequence_requires_handler_plan)
             || fixed_sequence_vtable.is_some());
     let fixed_sequence_resolution = if is_fixed_sequence_field {
         Some(fixed_sequence_vtable.map_or(
@@ -296,7 +296,7 @@ pub(super) fn state_field_shape_report(
                 .filter(|_| {
                     shape.is_some_and(|shape| {
                         !shape.is_replicated_container()
-                            && !matches!(shape, SchemaWireShape::FixedSequence(_))
+                            && !fixed_sequence_requires_handler_plan(shape)
                     })
                 })
                 .map(|rust_type| {
@@ -311,7 +311,7 @@ pub(super) fn state_field_shape_report(
                 shape
                     .filter(|shape| {
                         !shape.is_replicated_container()
-                            && !matches!(shape, SchemaWireShape::FixedSequence(_))
+                            && !fixed_sequence_requires_handler_plan(shape)
                     })
                     .map(|shape| replicated_field_handler_type(shape, source_type))
             })
@@ -324,8 +324,7 @@ pub(super) fn state_field_shape_report(
         .or_else(|| {
             shape
                 .filter(|shape| {
-                    !shape.is_replicated_container()
-                        && !matches!(shape, SchemaWireShape::FixedSequence(_))
+                    !shape.is_replicated_container() && !fixed_sequence_requires_handler_plan(shape)
                 })
                 .and_then(|_| rust_shape.as_ref().map(|shape| shape.field_type.clone()))
         });
@@ -444,6 +443,13 @@ pub(super) fn state_field_shape_report(
         supported: blocked_reason.is_none(),
         blocked_reason,
     }
+}
+
+fn fixed_sequence_requires_handler_plan(shape: &SchemaWireShape) -> bool {
+    matches!(
+        shape,
+        SchemaWireShape::FixedSequence(sequence) if sequence.length_prefixed
+    )
 }
 
 pub(super) fn state_field_has_complete_shape(field: &NetworkStateFieldShapeReport) -> bool {

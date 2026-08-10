@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn emits_direct_fixed_array_state_field_without_a_sequence_plan() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "8CA7C6C0-2244-4E78-A55E-E7A8752A5984",
+            "typeIndex": 7002,
+            "typeName": "MB::FixedArrayReplicatedState",
+            "capabilities": ["replicated-state"],
+            "fields": [{
+                "index": 0,
+                "name": "values",
+                "group": 0,
+                "wireShape": "fixed-array<u8,4>",
+                "wireShapeSource": "cfg-fixed-array-loop",
+                "confidence": "register-field-call"
+            }]
+        }],
+        "fieldRegistrationFunctions": [],
+        "fieldHandlerVtables": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [7002])
+        .expect("replicated state source");
+    let plan = &output.report.state_generation_plans[0];
+    let field = &plan.fields[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(field.rust_value_type.as_deref(), Some("[u8; 4]"));
+    assert_eq!(
+        field.rust_field_type.as_deref(),
+        Some("::nw_network::serialize::ReplicatedFieldHandler<[u8; 4]>")
+    );
+    assert!(output.source.contains("pub values:"));
+    assert!(output.source.contains("ReplicatedFieldHandler<[u8; 4]"));
+}
+
+#[test]
 fn emits_presence_prefixed_composite_state_field() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
@@ -867,6 +904,20 @@ fn reports_selected_replicated_states_that_cannot_be_generated() {
     assert_eq!(output.report.state_generation_plan_count, 2);
     assert_eq!(output.report.generatable_state_count, 0);
     assert_eq!(output.report.blocked_state_count, 2);
+    assert_eq!(output.report.state_blocker_summary.total_plan_count, 2);
+    assert_eq!(output.report.state_blocker_summary.blocked_count, 2);
+    assert_eq!(
+        output.report.state_blocker_summary.reason_buckets[0].type_count,
+        1
+    );
+    assert!(
+        output
+            .report
+            .state_blocker_summary
+            .reason_buckets
+            .iter()
+            .any(|bucket| bucket.reason == "missing-network-type")
+    );
     assert_eq!(
         output.report.state_generation_plans[0].blocked_reasons,
         vec!["no-registered-fields"]

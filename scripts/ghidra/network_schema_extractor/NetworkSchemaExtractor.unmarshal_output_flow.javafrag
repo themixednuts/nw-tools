@@ -112,6 +112,16 @@
                 definition,
                 active,
                 depth + 1);
+            case PcodeOp.CALL -> {
+                Function target = pcodeCallTarget(definition);
+                Integer returnedSlot = returnedParameterSlot(target);
+                yield returnedSlot == null || returnedSlot >= definition.getNumInputs()
+                    ? null
+                    : transportedFormalParameterSlot(
+                        definition.getInput(returnedSlot),
+                        active,
+                        depth + 1);
+            }
             default -> null;
         };
     }

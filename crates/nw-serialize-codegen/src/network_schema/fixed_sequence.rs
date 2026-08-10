@@ -17,6 +17,7 @@ pub enum NetworkFixedSequenceStorageKind {
 pub struct NetworkFixedSequenceWireShape {
     pub element: Box<NetworkWireShape>,
     pub capacity: u16,
+    pub length_prefixed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +46,7 @@ impl NetworkFixedSequenceShape {
         NetworkFixedSequenceWireShape {
             element: Box::new(self.element_wire_shape.into()),
             capacity: self.capacity,
+            length_prefixed: true,
         }
     }
 }
@@ -97,12 +99,21 @@ pub(super) fn parse_fixed_sequence_shape(
 pub(super) fn parse_fixed_sequence_wire_shape(
     value: &str,
 ) -> Option<NetworkFixedSequenceWireShape> {
-    let inner = value.strip_prefix("fixed-vector<")?.strip_suffix('>')?;
+    let (inner, length_prefixed) = value
+        .strip_prefix("fixed-vector<")
+        .map(|inner| (inner, true))
+        .or_else(|| {
+            value
+                .strip_prefix("fixed-array<")
+                .map(|inner| (inner, false))
+        })?;
+    let inner = inner.strip_suffix('>')?;
     let (element, capacity) = inner.rsplit_once(',')?;
     let capacity = capacity.trim().parse::<u16>().ok()?;
     (capacity > 0).then_some(NetworkFixedSequenceWireShape {
         element: Box::new(parse_network_wire_shape(element.trim())?),
         capacity,
+        length_prefixed,
     })
 }
 
@@ -172,7 +183,17 @@ mod tests {
                     NetworkWireShape::String,
                 ])),
                 capacity: 5,
+                length_prefixed: true,
             })
         );
+    }
+
+    #[test]
+    fn parses_top_level_fixed_array_wire_shape() {
+        let shape = parse_fixed_sequence_wire_shape("fixed-array<u8,4>").unwrap();
+
+        assert_eq!(shape.capacity, 4);
+        assert_eq!(shape.element.as_ref(), &NetworkWireShape::U8);
+        assert!(!shape.length_prefixed);
     }
 }

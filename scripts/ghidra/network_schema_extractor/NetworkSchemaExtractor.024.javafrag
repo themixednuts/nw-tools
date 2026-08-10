@@ -43,22 +43,24 @@
         List<String> fullValueShapes =
             collapseWholeFloatVectorValue(stripTrailingContainerCount(
                 replicatedContainerFullValueShapes(fullShapes)));
-        if (fullValueShapes.size() != 1) {
-            if (fullValueShapes.size() >= 2 && keyShape.equals(fullValueShapes.get(0))) {
-                List<String> valuesWithoutKey = collapseWholeFloatVectorValue(
-                    stripTrailingContainerCount(
-                        fullValueShapes.subList(1, fullValueShapes.size())));
-                if (valuesWithoutKey.size() == 1) {
-                    return WireShape.semantic(
-                        containerShape(keyShape, valuesWithoutKey.get(0)),
-                        "replicated-container-delta-key-full-key-value");
-                }
-            }
+        boolean fullIncludesKey = fullValueShapes.size() >= 2 &&
+            keyShape.equals(fullValueShapes.get(0));
+        if (fullIncludesKey) {
+            fullValueShapes = collapseWholeFloatVectorValue(
+                stripTrailingContainerCount(
+                    fullValueShapes.subList(1, fullValueShapes.size())));
+        }
+        if (fullValueShapes.isEmpty()) {
             return null;
         }
+        String valueShape = fullValueShapes.size() == 1
+            ? fullValueShapes.get(0)
+            : "composite<" + String.join(",", fullValueShapes) + ">";
         return WireShape.semantic(
-            containerShape(keyShape, fullValueShapes.get(0)),
-            "replicated-container-delta-key-full-value");
+            containerShape(keyShape, valueShape),
+            fullIncludesKey
+                ? "replicated-container-delta-key-full-key-product"
+                : "replicated-container-delta-key-full-product");
     }
 
     private String containerShapeFromDeltaMarshalShapes(List<String> shapes) {
@@ -325,6 +327,13 @@
         Function function = isExecutableAddress(targetAddress)
             ? functionAtOrContaining(targetAddress)
             : null;
+        WireShape fixedArray = fixedArrayLoopWireShape(
+            function,
+            "param_2",
+            NetworkSchemaCodecClassifier.CodecDirection.ENCODE);
+        if (fixedArray != null) {
+            return fixedArray;
+        }
         FixedSequenceShape fixedSequence = fixedSequenceShape(
             function,
             "param_2",

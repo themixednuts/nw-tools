@@ -130,6 +130,14 @@
         }
         String readBufferParameter = readBufferParameters.get(0);
         evidence.unmarshalReadBufferParameter = readBufferParameter;
+        WireShape fixedArray = fixedArrayLoopWireShape(
+            function,
+            readBufferParameter,
+            NetworkSchemaCodecClassifier.CodecDirection.DECODE);
+        if (fixedArray != null) {
+            evidence.unmarshalDiagnostic = "proven-fixed-array";
+            return fixedArray;
+        }
         FixedSequenceShape fixedSequence = fixedSequenceShape(
             function,
             readBufferParameter,
@@ -323,6 +331,10 @@
     }
 
     private List<String> semanticMembers(String semantic) {
+        if (semantic != null && semantic.startsWith("delta-vec3<") &&
+            semantic.endsWith(">")) {
+            return List.of("u8", "u8", "u8");
+        }
         return switch (semantic) {
             case "vec2" -> List.of("f32", "f32");
             case "vec3" -> List.of("f32", "f32", "f32");
@@ -500,6 +512,117 @@
             Collections.emptyList(),
             fullContainerRecovery.plan,
             planDiagnostics);
+    }
+
+    private ContainerWireShape classifyInlineReplicatedContainerWireShape(Address vtable) {
+        if (!hasScalarFieldHandlerVtableAbi(vtable)) {
+            return null;
+        }
+        Address marshal = readPointer(vtable.add(FIELD_HANDLER_MARSHAL_SLOT * 8L));
+        Address unmarshal = readPointer(vtable.add(FIELD_HANDLER_UNMARSHAL_SLOT * 8L));
+        if (!hasInlineReplicatedContainerProtocol(marshal)) {
+            return null;
+        }
+        FullContainerPlanRecovery recovery = recoverFullContainerPlan(marshal);
+        FullContainerPlan plan = recovery.plan;
+        if (plan == null || plan.storageKind != ContainerStorageKind.INDEX_MAP ||
+            !plan.sequenceMarkerProven || plan.keyCodecs.isEmpty() ||
+            plan.valueCodecs.isEmpty()) {
+            return null;
+        }
+
+        reconcileFullContainerUnmarshalSemantics(plan, unmarshal);
+        if (plan.unmarshalReconciliation == null ||
+            !plan.unmarshalReconciliation.startsWith("complete-")) {
+            return null;
+        }
+
+        List<NativeTypeInfoEvidence> valueTypeInfoCandidates =
+            collectReplicatedContainerValueTypeInfoCandidates(
+                marshal,
+                marshal,
+                unmarshal,
+                unmarshal,
+                plan);
+        NestedTypeShape valueTypeShape = replicatedContainerExactValueTypeShapeFromPcode(
+            valueTypeInfoCandidates,
+            unmarshal,
+            vtable,
+            plan);
+        discardUnprovenContainerTypeId(valueTypeShape);
+        List<NativeTypeInfoEvidence> provenValueTypeInfoCandidates =
+            provenReplicatedContainerValueTypeInfoCandidates(
+                valueTypeInfoCandidates,
+                valueTypeShape);
+        NativeTypeInfoEvidence valueTypeInfo =
+            selectedReplicatedContainerValueTypeInfo(
+                provenValueTypeInfoCandidates,
+                valueTypeShape);
+
+        return new ContainerWireShape(
+            null,
+            null,
+            null,
+            null,
+            null,
+            Collections.emptyList(),
+            Collections.emptyList(),
+            valueTypeInfo,
+            valueTypeShape,
+            provenValueTypeInfoCandidates,
+            Collections.emptyList(),
+            plan,
+            Collections.emptyList());
+    }
+
+    private boolean hasInlineReplicatedContainerProtocol(Address marshal) {
+        Function function = functionAtOrContaining(resolvedCodeTarget(marshal));
+        if (function == null) {
+            return false;
+        }
+        HighFunction high = highFunction(function);
+        if (high == null || NetworkSchemaControlFlow.naturalLoops(high).isEmpty()) {
+            return false;
+        }
+        PcodeStorage writeBuffer = new PcodeStorage("param_2", 0L);
+        boolean count = false;
+        boolean key = false;
+        boolean sequence = false;
+        boolean mask = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (target == null || provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    writeBuffer) == null) {
+                continue;
+            }
+            WireShape evidence = directCallWireEvidence(operation);
+            String shape = evidence == null
+                ? null
+                : firstNonEmpty(evidence.shape, evidence.layout);
+            count |= "vlq-u32".equals(shape);
+            key |= "u64".equals(shape) || "fixed-bytes-8".equals(shape);
+            sequence |= isContainerSequenceMarker(shape);
+            mask |= "u8".equals(shape) || "fixed-bytes-1".equals(shape);
+        }
+        return count && key && sequence && mask;
+    }
+
+    private boolean hasScalarFieldHandlerVtableAbi(Address vtable) {
+        if (!isProgramAddress(vtable)) {
+            return false;
+        }
+        for (int slot = 0; slot < FIELD_HANDLER_SCALAR_VTABLE_SLOTS; slot++) {
+            if (!isExecutableAddress(readPointer(vtable.add(slot * 8L)))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private boolean hasReplicatedContainerVtableAbi(Address vtable) {

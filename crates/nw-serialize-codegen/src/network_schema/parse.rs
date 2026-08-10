@@ -483,6 +483,7 @@ fn has_explicit_wire_structure(value: &str) -> bool {
     top_level_composite_members(value).is_some()
         || value.starts_with("vec<")
         || value.starts_with("fixed-vector<")
+        || value.starts_with("fixed-array<")
         || value.starts_with("counted-set<")
         || value.starts_with("counted-map<")
         || value.starts_with("bit-mask-composite<")

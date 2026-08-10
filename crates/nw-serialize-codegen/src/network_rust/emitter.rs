@@ -39,6 +39,7 @@ impl NetworkRustEmitter {
             .count();
         report.blocked_state_count =
             report.state_generation_plan_count - report.generatable_state_count;
+        report.state_blocker_summary = state_blocker_summary(&report.state_generation_plans);
         report.message_generation_plans =
             message_generation_plans(schema, &wire_shapes, &value_type_candidates, context)?;
         report.message_generation_plan_count = report.message_generation_plans.len();
@@ -133,6 +134,7 @@ impl NetworkRustEmitter {
             pub struct NetworkFixedSequenceWireShape {
                 pub element: &'static NetworkWireShape,
                 pub capacity: u16,
+                pub length_prefixed: bool,
             }
 
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,6 +526,7 @@ impl NetworkRustEmitter {
         report.blocked_state_count =
             report.state_generation_plan_count - report.generatable_state_count;
         report.replicated_state_count = report.generatable_state_count;
+        report.state_blocker_summary = state_blocker_summary(&report.state_generation_plans);
 
         let tokens = quote! {
             #(#modules)*

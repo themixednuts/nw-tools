@@ -447,15 +447,36 @@
         if (keyOffset == null) {
             return null;
         }
+        ArrayList<ContainerCodecCall> valueCodecs = new ArrayList<>();
+        boolean sequenceMarkerProven = false;
         for (int index = 1; index < codecs.size(); index++) {
-            Long offset = codecs.get(index).elementOffset;
+            ContainerCodecCall codec = codecs.get(index);
+            Long offset = codec.elementOffset;
             if (offset == null || offset <= keyOffset) {
                 return null;
             }
+            if (isContainerSequenceCodec(codec)) {
+                sequenceMarkerProven = true;
+                continue;
+            }
+            valueCodecs.add(codec);
+        }
+        if (valueCodecs.isEmpty()) {
+            return null;
         }
         return new ContainerCodecPartition(
             List.of(codecs.get(0)),
-            List.copyOf(codecs.subList(1, codecs.size())));
+            valueCodecs,
+            sequenceMarkerProven);
+    }
+
+    private boolean isContainerSequenceCodec(ContainerCodecCall codec) {
+        if (codec == null || codec.wireEvidence == null) {
+            return false;
+        }
+        return isContainerSequenceMarker(firstNonEmpty(
+            codec.wireEvidence.shape,
+            codec.wireEvidence.layout));
     }
 
     private List<PcodeCodecCall> loopReadBufferCodecCalls(
@@ -489,7 +510,8 @@
 
     private record ContainerCodecPartition(
         List<ContainerCodecCall> keyCodecs,
-        List<ContainerCodecCall> valueCodecs) {
+        List<ContainerCodecCall> valueCodecs,
+        boolean sequenceMarkerProven) {
 
         ContainerCodecPartition {
             keyCodecs = List.copyOf(keyCodecs);

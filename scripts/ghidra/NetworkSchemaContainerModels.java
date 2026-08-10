@@ -224,6 +224,7 @@ final class FullContainerPlan {
     String unmarshalStorageProof;
     String unmarshalReconciliation;
     String unmarshalAnalysisStatus;
+    boolean sequenceMarkerProven;
     final ArrayList<String> unmarshalDiagnostics = new ArrayList<>();
     int helperDepth;
     final ArrayList<ContainerCodecCall> keyCodecs = new ArrayList<>();
@@ -249,6 +250,9 @@ final class FullContainerPlan {
         NetworkSchemaJson.add(object, "unmarshalStorageProof", unmarshalStorageProof);
         NetworkSchemaJson.add(object, "unmarshalReconciliation", unmarshalReconciliation);
         NetworkSchemaJson.add(object, "unmarshalAnalysisStatus", unmarshalAnalysisStatus);
+        if (sequenceMarkerProven) {
+            object.addProperty("sequenceMarkerProven", true);
+        }
         if (!unmarshalDiagnostics.isEmpty()) {
             JsonArray diagnostics = new JsonArray();
             unmarshalDiagnostics.forEach(diagnostics::add);

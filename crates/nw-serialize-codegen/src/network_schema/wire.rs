@@ -424,7 +424,12 @@ impl NetworkWireShape {
                     container.value.wire_string()
                 ),
                 Self::FixedSequence(sequence) => format!(
-                    "fixed-vector<{},{}>",
+                    "{}<{},{}>",
+                    if sequence.length_prefixed {
+                        "fixed-vector"
+                    } else {
+                        "fixed-array"
+                    },
                     sequence.element.wire_string(),
                     sequence.capacity
                 ),
@@ -487,7 +492,12 @@ impl Serialize for NetworkWireShape {
                 container.value.wire_string()
             )),
             Self::FixedSequence(sequence) => serializer.serialize_str(&format!(
-                "fixed-vector<{},{}>",
+                "{}<{},{}>",
+                if sequence.length_prefixed {
+                    "fixed-vector"
+                } else {
+                    "fixed-array"
+                },
                 sequence.element.wire_string(),
                 sequence.capacity
             )),

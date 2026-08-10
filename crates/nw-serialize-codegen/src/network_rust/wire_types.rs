@@ -287,14 +287,20 @@ pub(super) fn rust_field_shape(shape: &SchemaWireShape) -> RustFieldShape {
             replicated_container_field_shape(*container)
         }
         SchemaWireShape::FixedSequence(sequence) => {
-            // Nested fixed-vector proofs (no handler vtable) emit ArrayVec from
-            // the recursive element + capacity. Top-level RegisterField fixed
-            // sequences still prefer the handler-plan path in field_plan.
             let element_shape = rust_field_shape(&sequence.element);
             let element = &element_shape.value_type;
-            let value_type = format!("::arrayvec::ArrayVec<{element}, {}>", sequence.capacity);
-            let codec = wire_shape_codec_type(&sequence.element)
-                .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>"));
+            let value_type = if sequence.length_prefixed {
+                format!("::arrayvec::ArrayVec<{element}, {}>", sequence.capacity)
+            } else {
+                format!("[{element}; {}]", sequence.capacity)
+            };
+            let codec = wire_shape_codec_type(&sequence.element).map(|codec| {
+                if sequence.length_prefixed {
+                    format!("::nw_network::serialize::SequenceCodec<{codec}>")
+                } else {
+                    format!("::nw_network::serialize::ArrayCodec<{codec}>")
+                }
+            });
             let field_type = replicated_field_type(&value_type, codec.as_deref());
             RustFieldShape {
                 value_type,
@@ -371,8 +377,15 @@ pub(super) fn wire_shape_codec_type(shape: &SchemaWireShape) -> Option<String> {
             let value_shape = rust_field_shape(value);
             map_sequence_codec_type(key, value, &key_shape, &value_shape)
         }
-        SchemaWireShape::FixedSequence(sequence) => wire_shape_codec_type(&sequence.element)
-            .map(|codec| format!("::nw_network::serialize::SequenceCodec<{codec}>")),
+        SchemaWireShape::FixedSequence(sequence) => {
+            wire_shape_codec_type(&sequence.element).map(|codec| {
+                if sequence.length_prefixed {
+                    format!("::nw_network::serialize::SequenceCodec<{codec}>")
+                } else {
+                    format!("::nw_network::serialize::ArrayCodec<{codec}>")
+                }
+            })
+        }
         _ => None,
     }
 }

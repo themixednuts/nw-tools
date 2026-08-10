@@ -169,10 +169,12 @@ pub(super) fn wire_shape_tokens(shape: &SchemaWireShape) -> proc_macro2::TokenSt
         SchemaWireShape::FixedSequence(sequence) => {
             let element = wire_shape_tokens(&sequence.element);
             let capacity = sequence.capacity;
+            let length_prefixed = sequence.length_prefixed;
             quote!(
                 NetworkWireShape::FixedSequence(NetworkFixedSequenceWireShape {
                     element: &#element,
                     capacity: #capacity,
+                    length_prefixed: #length_prefixed,
                 })
             )
         }

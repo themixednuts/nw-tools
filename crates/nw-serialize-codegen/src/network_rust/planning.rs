@@ -121,8 +121,12 @@ pub(super) fn state_generation_plan(
         .count();
     let evidence_issues = state_evidence_issues(network_type);
     let mut blocked_reasons = state_blocked_reasons(network_type, &fields);
-    if !evidence_issues.is_empty() {
-        blocked_reasons.push(format!("invalid-evidence:{}", evidence_issues.len()));
+    let fatal_evidence_issue_count = evidence_issues
+        .iter()
+        .filter(|issue| state_evidence_issue_is_fatal(issue, &fields))
+        .count();
+    if fatal_evidence_issue_count != 0 {
+        blocked_reasons.push(format!("invalid-evidence:{fatal_evidence_issue_count}"));
     }
     NetworkStateGenerationPlanReport {
         type_index: network_type.type_index,
@@ -151,6 +155,21 @@ pub(super) fn state_generation_plan(
         blocked_reasons,
         fields,
     }
+}
+
+fn state_evidence_issue_is_fatal(
+    issue: &NetworkEvidenceIssue,
+    fields: &[NetworkStateFieldShapeReport],
+) -> bool {
+    if issue.kind != NetworkEvidenceIssueKind::NestedWireMismatch || issue.field_indices.is_empty()
+    {
+        return true;
+    }
+    issue.field_indices.iter().any(|field_index| {
+        !fields
+            .iter()
+            .any(|field| field.field_index == Some(*field_index) && field.supported)
+    })
 }
 
 pub(super) fn is_replicated_state_attribute_field(field: &NetworkField) -> bool {
@@ -296,6 +315,73 @@ pub(super) fn disambiguate_report_field_names(fields: &mut [NetworkStateFieldSha
 pub(super) const BLOCKER_EXAMPLE_LIMIT: usize = 8;
 pub(super) const BLOCKED_FIELD_EXAMPLE_LIMIT: usize = 8;
 
+pub(super) fn state_blocker_summary(
+    plans: &[NetworkStateGenerationPlanReport],
+) -> NetworkBlockerSummaryReport {
+    let mut reason_buckets = BTreeMap::<String, NetworkBlockerReasonBucketReport>::new();
+    let mut combination_buckets =
+        BTreeMap::<Vec<String>, NetworkBlockerCombinationBucketReport>::new();
+
+    for plan in plans.iter().filter(|plan| !plan.can_generate) {
+        let example = blocked_state_type_example(plan);
+        let reason_families = plan
+            .blocked_reasons
+            .iter()
+            .map(|reason| blocker_reason_family(reason).to_owned())
+            .collect::<BTreeSet<_>>();
+        for reason in reason_families {
+            let bucket = reason_buckets.entry(reason.clone()).or_insert_with(|| {
+                NetworkBlockerReasonBucketReport {
+                    reason,
+                    ..NetworkBlockerReasonBucketReport::default()
+                }
+            });
+            bucket.type_count += 1;
+            bucket.blocked_field_count +=
+                blocked_state_field_count_for_reason(plan, &bucket.reason);
+            if bucket.examples.len() < BLOCKER_EXAMPLE_LIMIT {
+                bucket.examples.push(example.clone());
+            }
+        }
+
+        let mut reasons = plan.blocked_reasons.clone();
+        reasons.sort();
+        let bucket = combination_buckets
+            .entry(reasons.clone())
+            .or_insert_with(|| NetworkBlockerCombinationBucketReport {
+                reasons,
+                ..NetworkBlockerCombinationBucketReport::default()
+            });
+        bucket.type_count += 1;
+        if bucket.examples.len() < BLOCKER_EXAMPLE_LIMIT {
+            bucket.examples.push(example);
+        }
+    }
+
+    let mut reason_buckets = reason_buckets.into_values().collect::<Vec<_>>();
+    reason_buckets.sort_by(|left, right| {
+        right
+            .type_count
+            .cmp(&left.type_count)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    let mut combination_buckets = combination_buckets.into_values().collect::<Vec<_>>();
+    combination_buckets.sort_by(|left, right| {
+        right
+            .type_count
+            .cmp(&left.type_count)
+            .then_with(|| left.reasons.cmp(&right.reasons))
+    });
+
+    NetworkBlockerSummaryReport {
+        total_plan_count: plans.len(),
+        generatable_count: plans.iter().filter(|plan| plan.can_generate).count(),
+        blocked_count: plans.iter().filter(|plan| !plan.can_generate).count(),
+        reason_buckets,
+        combination_buckets,
+    }
+}
+
 pub(super) fn message_blocker_summary(
     plans: &[NetworkMessageGenerationPlanReport],
 ) -> NetworkBlockerSummaryReport {
@@ -367,6 +453,39 @@ pub(super) fn blocker_reason_family(reason: &str) -> &str {
     reason.split_once(':').map_or(reason, |(family, _)| family)
 }
 
+fn blocked_state_field_count_for_reason(
+    plan: &NetworkStateGenerationPlanReport,
+    reason: &str,
+) -> usize {
+    plan.fields
+        .iter()
+        .filter(|field| {
+            field
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|field_reason| blocker_reason_family(field_reason) == reason)
+        })
+        .count()
+}
+
+fn blocked_state_type_example(
+    plan: &NetworkStateGenerationPlanReport,
+) -> NetworkBlockedTypeExampleReport {
+    NetworkBlockedTypeExampleReport {
+        type_index: plan.type_index,
+        type_name: plan.type_name.clone(),
+        field_count: plan.field_count,
+        blocked_reasons: plan.blocked_reasons.clone(),
+        blocked_fields: plan
+            .fields
+            .iter()
+            .filter(|field| field.blocked_reason.is_some())
+            .take(BLOCKED_FIELD_EXAMPLE_LIMIT)
+            .map(blocked_field_example)
+            .collect(),
+    }
+}
+
 pub(super) fn blocked_field_count_for_reason(
     plan: &NetworkMessageGenerationPlanReport,
     reason: &str,
@@ -415,5 +534,57 @@ pub(super) fn blocked_field_example(
         value_type_candidates: field.value_type_candidates.clone(),
         rust_value_type: field.rust_value_type.clone(),
         blocked_reason: field.blocked_reason.clone(),
+    }
+}
+
+#[cfg(test)]
+mod evidence_severity_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn field(field_index: u32, supported: bool) -> NetworkStateFieldShapeReport {
+        serde_json::from_value(json!({
+            "fieldIndex": field_index,
+            "fieldName": "value",
+            "group": 0,
+            "handlerVtable": null,
+            "wireShape": "u32",
+            "wireShapeSource": "test",
+            "valueTypeCandidates": [],
+            "rustValueType": "u32",
+            "rustFieldType": "ReplicatedFieldHandler<u32>",
+            "confidence": "high",
+            "supported": supported,
+            "blockedReason": if supported { None::<&str> } else { Some("missing-semantic-type") }
+        }))
+        .expect("state field report")
+    }
+
+    #[test]
+    fn nested_wire_mismatch_is_advisory_after_the_field_is_supported() {
+        let issue = NetworkEvidenceIssue {
+            kind: NetworkEvidenceIssueKind::NestedWireMismatch,
+            field_ordinals: vec![0],
+            field_indices: vec![7],
+            storage_offset: None,
+            evidence: Some("stale-directional-layout".to_owned()),
+        };
+
+        assert!(!state_evidence_issue_is_fatal(&issue, &[field(7, true)]));
+        assert!(state_evidence_issue_is_fatal(&issue, &[field(7, false)]));
+    }
+
+    #[test]
+    fn non_wire_mismatch_evidence_remains_fatal() {
+        let issue = NetworkEvidenceIssue {
+            kind: NetworkEvidenceIssueKind::FieldTypeConflict,
+            field_ordinals: vec![0],
+            field_indices: vec![7],
+            storage_offset: None,
+            evidence: None,
+        };
+
+        assert!(state_evidence_issue_is_fatal(&issue, &[field(7, true)]));
     }
 }

@@ -96,6 +96,7 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
                 }
                 plan.keyCodecs.addAll(partition.keyCodecs());
                 plan.valueCodecs.addAll(partition.valueCodecs());
+                plan.sequenceMarkerProven = partition.sequenceMarkerProven();
             }
             else {
                 plan.valueCodecs.addAll(codecs);
@@ -823,7 +824,6 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
             return null;
         }
         ContainerLoopInduction selected = null;
-        List<Long> selectedOffsets = null;
         for (PcodeOpAST phi : containerElementInductions(loop)) {
             ArrayList<Long> offsets = new ArrayList<>(codecs.size());
             for (ContainerCodecCall codec : codecs) {
@@ -834,21 +834,42 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
                 }
                 offsets.add(offset);
             }
-            if (offsets.size() != codecs.size()) {
+            boolean exactOffsets = offsets.size() == codecs.size();
+            if (!exactOffsets && !codecs.stream().allMatch(codec ->
+                    containerCodecDependsOnElementRoot(codec, phi.getOutput()))) {
                 continue;
             }
             ContainerLoopInduction candidate = inductionFromPhi(phi);
             if (candidate == null) {
                 continue;
             }
-            if (selected != null &&
-                (!selected.equals(candidate) || !selectedOffsets.equals(offsets))) {
+            if (selected != null && !selected.equals(candidate)) {
                 return null;
             }
             selected = candidate;
-            selectedOffsets = List.copyOf(offsets);
         }
         return selected;
+    }
+
+    private boolean containerCodecDependsOnElementRoot(
+        ContainerCodecCall codec,
+        Varnode elementRoot) {
+
+        PcodeOp operation = codec == null ? null : codec.operation;
+        if (operation == null || elementRoot == null) {
+            return false;
+        }
+        for (int slot = 1; slot < operation.getNumInputs(); slot++) {
+            Varnode input = operation.getInput(slot);
+            if (input != null && !input.isConstant() && pcodeNodeDependsOn(
+                    input,
+                    elementRoot,
+                    new LinkedHashSet<>(),
+                    0)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private ContainerLoopInduction inductionFromPhi(PcodeOpAST phi) {

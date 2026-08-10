@@ -257,6 +257,9 @@
                     loop,
                     readBufferParameter,
                     plan);
+                if (plan.sequenceMarkerProven) {
+                    candidate = withoutContainerSequenceCodecs(candidate);
+                }
                 if (candidate.isEmpty()) {
                     recordUnmarshalLoopCallDiagnostics(
                         function,
@@ -545,6 +548,17 @@
             }
         }
         return parameters.size() == 1 ? parameters.iterator().next() : null;
+    }
+
+    private List<ContainerCodecCall> withoutContainerSequenceCodecs(
+        List<ContainerCodecCall> codecs) {
+
+        if (codecs == null || codecs.isEmpty()) {
+            return codecs == null ? List.of() : codecs;
+        }
+        return codecs.stream()
+            .filter(codec -> !isContainerSequenceCodec(codec))
+            .toList();
     }
 
     private List<ContainerCodecCall> unmarshalContainerLoopCodecs(

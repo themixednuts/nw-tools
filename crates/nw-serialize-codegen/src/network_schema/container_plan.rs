@@ -3,7 +3,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use super::{
-    NetworkReplicatedContainerStorageKind, NetworkWireScalarShape, array_values,
+    NetworkReplicatedContainerStorageKind, NetworkWireScalarShape, array_values, bool_value,
     parse_network_wire_scalar_shape, string, string_ref, u32_value, uuid,
 };
 
@@ -313,6 +313,8 @@ pub struct NetworkReplicatedContainerPlan {
     pub unmarshal_storage_proof: Option<String>,
     pub unmarshal_reconciliation: Option<String>,
     pub unmarshal_analysis_status: Option<String>,
+    #[serde(default)]
+    pub sequence_marker_proven: bool,
     pub helper_depth: u32,
     pub key_codecs: Vec<NetworkContainerCodec>,
     pub value_codecs: Vec<NetworkContainerCodec>,
@@ -419,6 +421,7 @@ pub(super) fn parse_plan(object: &Map<String, Value>) -> Option<NetworkReplicate
         unmarshal_storage_proof: string(object, "unmarshalStorageProof"),
         unmarshal_reconciliation: string(object, "unmarshalReconciliation"),
         unmarshal_analysis_status: string(object, "unmarshalAnalysisStatus"),
+        sequence_marker_proven: bool_value(object, "sequenceMarkerProven").unwrap_or(false),
         helper_depth: u32_value(object, "helperDepth").unwrap_or_default(),
         key_codecs: parse_codecs(object, "keyCodecs"),
         value_codecs: parse_codecs(object, "valueCodecs"),
@@ -580,6 +583,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn preserves_proven_sequence_marker_evidence() {
+        let value = json!({
+            "storageKind": "index-map",
+            "sequenceMarkerProven": true,
+            "keyCodecs": [{ "wireShape": "u64" }],
+            "valueCodecs": [{ "wireShape": "u8" }]
+        });
+
+        let plan = parse_plan(value.as_object().expect("plan object")).expect("valid plan");
+
+        assert!(plan.sequence_marker_proven);
+    }
 
     #[test]
     fn linear_helper_members_are_an_exact_wire_sequence() {

@@ -1,6 +1,6 @@
 use super::*;
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v64";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v65";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
@@ -38,6 +38,8 @@ pub struct NetworkRustGenerationReport {
     pub generatable_state_count: usize,
     pub blocked_state_count: usize,
     pub state_generation_plans: Vec<NetworkStateGenerationPlanReport>,
+    #[serde(default)]
+    pub state_blocker_summary: NetworkBlockerSummaryReport,
     pub message_generation_plan_count: usize,
     pub generatable_message_count: usize,
     pub blocked_message_count: usize,
