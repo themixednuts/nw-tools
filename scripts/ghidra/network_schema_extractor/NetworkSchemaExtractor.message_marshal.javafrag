@@ -937,12 +937,11 @@
             result.events.addAll(field.events);
         }
         String source = "message-marshal-exact-unmarshal-constructor-boundary";
-        String layout = firstNonEmpty(
-            boundary.wireLayout,
-            wireLayoutFromNestedTypeShape(boundary.nestedTypeShape));
-        result.wireEvidence = boundary.wireShape == null
+        String semantic = wireShapeFromNestedTypeShape(boundary.nestedTypeShape);
+        String layout = wireLayoutFromNestedTypeShape(boundary.nestedTypeShape);
+        result.wireEvidence = semantic == null
             ? WireShape.layout(layout, source)
-            : WireShape.semantic(boundary.wireShape, layout, source);
+            : WireShape.semantic(semantic, layout, source);
         return result;
     }
 
