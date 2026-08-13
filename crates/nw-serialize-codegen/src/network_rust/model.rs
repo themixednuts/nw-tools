@@ -1,6 +1,6 @@
 use super::*;
 
-pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v65";
+pub const NETWORK_RUST_EMITTER_VERSION: &str = "network-rust-v66";
 
 #[derive(Debug, Error)]
 pub enum NetworkRustEmitError {
