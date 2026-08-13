@@ -26,9 +26,21 @@
     private boolean isProvenStringFormatter(Instruction instruction) {
         Address targetAddress = resolvedCodeTarget(callTarget(instruction));
         Function target = functionAtOrContaining(targetAddress);
-        return target != null &&
-            Integer.valueOf(1).equals(returnedParameterSlot(target)) &&
-            forwardsFormatParameterToSink(target, 2, 0, new LinkedHashSet<>());
+        if (target == null || !forwardsFormatParameterToSink(
+                target,
+                2,
+                0,
+                new LinkedHashSet<>())) {
+            return false;
+        }
+        if (!Integer.valueOf(1).equals(returnedParameterSlot(target))) {
+            // The native formatter's first argument is the destination
+            // AZStd::string and the caller consumes RAX as that same object.
+            // Ghidra can lose the pass-through return at the varargs wrapper,
+            // but the transitive format-sink proof remains exact.
+            runMetrics.increment("formattedFieldNameSinkOnlyProofs");
+        }
+        return true;
     }
 
     private boolean forwardsFormatParameterToSink(
@@ -50,15 +62,13 @@
                 return false;
             }
             for (PcodeOpAST operation : orderedPcodeOps(high)) {
-                if (operation.getOpcode() != PcodeOp.CALL) {
+                if (operation.getOpcode() != PcodeOp.CALL &&
+                    operation.getOpcode() != PcodeOp.CALLIND) {
                     continue;
                 }
                 Function target = pcodeCallTarget(operation);
-                if (target == null) {
-                    continue;
-                }
 
-                Integer sinkInput = formatSinkInput(target);
+                Integer sinkInput = formatSinkInput(operation, target);
                 if (sinkInput != null) {
                     if (sinkInput < operation.getNumInputs() &&
                         valueIsFormalParameter(
@@ -66,12 +76,29 @@
                             formatParameterSlot)) {
                         return true;
                     }
+                    if (callArgumentIsFormalParameter(
+                            function,
+                            operation,
+                            target,
+                            sinkInput,
+                            formatParameterSlot)) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (target == null) {
                     continue;
                 }
 
                 for (int input = 1; input < operation.getNumInputs(); input++) {
                     if (!valueIsFormalParameter(
                             operation.getInput(input),
+                            formatParameterSlot) &&
+                        !callArgumentIsFormalParameter(
+                            function,
+                            operation,
+                            target,
+                            input,
                             formatParameterSlot)) {
                         continue;
                     }
@@ -91,26 +118,98 @@
         }
     }
 
-    private boolean valueIsFormalParameter(Varnode value, int parameterSlot) {
-        PcodeStorage storage = pcodeStorageExpression(value);
-        return storage != null &&
-            storage.offset == 0L &&
-            Integer.valueOf(parameterSlot).equals(formalParameterSlot(storage));
+    private boolean callArgumentIsFormalParameter(
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        int argumentSlot,
+        int formalParameterSlot) {
+
+        PcodeStorage storage = provenCallArgumentStorage(
+            owner,
+            operation,
+            target,
+            argumentSlot);
+        if (("param_" + formalParameterSlot).equals(
+                formalParameterBaseFromStorage(owner, storage))) {
+            return true;
+        }
+        return Integer.valueOf(argumentSlot).equals(
+            uniqueReferencedCallArgumentSlot(
+                operation,
+                new PcodeStorage("param_" + formalParameterSlot, 0L)));
     }
 
-    private Integer formatSinkInput(Function function) {
-        String name = fullFunctionName(function);
+    private boolean valueIsFormalParameter(Varnode value, int parameterSlot) {
+        PcodeStorage storage = pcodeStorageExpression(value);
+        if (storage != null && storage.offset == 0L &&
+            Integer.valueOf(parameterSlot).equals(formalParameterSlot(storage))) {
+            return true;
+        }
+        return Integer.valueOf(parameterSlot).equals(
+            transportedFormalParameterSlot(value));
+    }
+
+    private Integer formatSinkInput(PcodeOp operation, Function function) {
+        String name = function == null ? null : fullFunctionName(function);
+        boolean importedSymbol = false;
+        if ((name == null || name.isBlank()) && operation != null &&
+            operation.getNumInputs() > 0) {
+            name = primarySymbolName(formatSinkTargetAddress(
+                operation.getInput(0),
+                new LinkedHashSet<>(),
+                0));
+            importedSymbol = name != null;
+        }
         if (name == null) {
             return null;
         }
         String normalized = name.toLowerCase(Locale.ROOT);
         if (normalized.contains("__stdio_common_vsnprintf_s")) {
+            if (importedSymbol) {
+                runMetrics.increment("importedFormatSinkProofs");
+            }
             return 5;
         }
         if (normalized.contains("__stdio_common_vsprintf")) {
+            if (importedSymbol) {
+                runMetrics.increment("importedFormatSinkProofs");
+            }
             return 4;
         }
         return null;
+    }
+
+    private Address formatSinkTargetAddress(
+        Varnode target,
+        Set<String> active,
+        int depth) {
+
+        if (target == null || depth > 8 ||
+            !active.add(pcodeNodeKey(target))) {
+            return null;
+        }
+        Address direct = pcodeAddress(target);
+        if (direct != null) {
+            return direct;
+        }
+        PcodeOp definition = target.getDef();
+        if (definition == null) {
+            return null;
+        }
+        return switch (definition.getOpcode()) {
+            case PcodeOp.LOAD -> definition.getNumInputs() > 1
+                ? pcodeAddress(definition.getInput(1))
+                : null;
+            case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INDIRECT ->
+                definition.getNumInputs() > 0
+                    ? formatSinkTargetAddress(
+                        definition.getInput(0),
+                        active,
+                        depth + 1)
+                    : null;
+            default -> null;
+        };
     }
 
     private StringDecode trackedFieldNameDecode(TrackedValue value) {

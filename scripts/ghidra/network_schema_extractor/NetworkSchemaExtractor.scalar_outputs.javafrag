@@ -5,6 +5,19 @@
         return pcodeScalarUnmarshalOutputStorage(call, nativeTypeByteWidth(nativeType));
     }
 
+    private PcodeStorage codecUnmarshalOutputStorage(
+        PcodeOp call,
+        String nativeType,
+        WireShape evidence) {
+
+        Integer nativeWidth = nativeTypeByteWidth(nativeType);
+        if (nativeWidth == null) {
+            nativeWidth = scalarNativeOutputByteWidth(evidence);
+        }
+        PcodeStorage storage = pcodeScalarUnmarshalOutputStorage(call, nativeWidth);
+        return storage == null ? provenUnmarshalOutputStorage(call) : storage;
+    }
+
     private PcodeStorage pcodeScalarUnmarshalOutputStorage(
         PcodeOp call,
         Integer nativeWidth) {
@@ -95,10 +108,16 @@
         String shape = evidence == null
             ? null
             : firstNonEmpty(evidence.shape, evidence.layout);
-        return switch (String.valueOf(shape)) {
-            // Variable-width wire integers still have fixed-width native outputs.
-            case "vlq-u32" -> Integer.BYTES;
-            case "vlq-u64" -> Long.BYTES;
-            default -> wireShapeByteWidth(shape);
-        };
+        String canonical = shape == null ? null : canonicalLayoutWireShape(shape);
+        Integer width = wireShapeByteWidth(canonical);
+        return width == null ? wireShapeByteWidth(shape) : width;
+    }
+
+    private Integer containerCodecNativeOutputByteWidth(ContainerCodecCall codec) {
+        Integer width = codec == null
+            ? null
+            : nativeTypeByteWidth(codec.nativeType);
+        return width != null || codec == null
+            ? width
+            : scalarNativeOutputByteWidth(codec.wireEvidence);
     }

@@ -1,0 +1,148 @@
+    private ContainerSequenceAnalysis branchCountedContainerSequence(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        String writeBufferParameter,
+        ContainerIteration iteration) {
+
+        SequenceCapacityGuard guard = sequenceCapacityGuard(
+            high,
+            loop,
+            operations,
+            null);
+        SequenceCountBranches branches = guard == null
+            ? null
+            : partitionedSequenceCountCalls(
+                function,
+                operations,
+                writeBufferParameter,
+                guard);
+        boolean affineLoop = affineSequenceInductions(loop).stream().anyMatch(induction -> {
+            Long stride = affinePointerInductionStride(induction, loop);
+            return stride != null && stride > 0L &&
+                loopConditionDependsOn(high, loop, induction.getOutput());
+        });
+        if (guard == null) {
+            runMetrics.increment("branchCountedSequenceGuardMisses");
+        }
+        if (branches == null) {
+            runMetrics.increment("branchCountedSequencePartitionMisses");
+        }
+        if (!affineLoop) {
+            runMetrics.increment("branchCountedSequenceAffineLoopMisses");
+        }
+        boolean callsOutsideLoop = branches != null &&
+            !loop.contains(branches.accepted()) && !loop.contains(branches.rejected());
+        boolean acceptedDominatesLoop = branches != null &&
+            NetworkSchemaControlFlow.dominates(
+                high,
+                NetworkSchemaControlFlow.parentBlock(branches.accepted()),
+                loop.header());
+        boolean acceptedCountLive = branches != null && guard != null &&
+            callReusesGuardedSequenceCount(
+                function,
+                high,
+                branches.accepted(),
+                writeBufferParameter,
+                guard);
+        boolean rejectedIsZero = branches != null &&
+            callHasExplicitZeroValue(branches.rejected());
+        if (!callsOutsideLoop) {
+            runMetrics.increment("branchCountedSequenceCallPlacementMisses");
+        }
+        if (!acceptedDominatesLoop) {
+            runMetrics.increment("branchCountedSequenceDominanceMisses");
+        }
+        if (!acceptedCountLive) {
+            runMetrics.increment("branchCountedSequenceCountLivenessMisses");
+        }
+        if (!rejectedIsZero) {
+            runMetrics.increment("branchCountedSequenceZeroFallbackMisses");
+        }
+        if (branches == null || !affineLoop || !callsOutsideLoop ||
+            !acceptedDominatesLoop || !acceptedCountLive || !rejectedIsZero) {
+            return ContainerSequenceAnalysis.rejected(
+                "missing-proven-branch-counted-sequence");
+        }
+
+        String elementShape = iteration.element().shape == null
+            ? iteration.element().layout
+            : iteration.element().shape;
+        if (elementShape == null || iteration.element().layout == null) {
+            return ContainerSequenceAnalysis.rejected("missing-logical-element-shape");
+        }
+        ContainerCodecCall codec = new ContainerCodecCall();
+        codec.operation = branches.accepted();
+        codec.callsite = branches.accepted().getSeqnum().getTarget();
+        codec.wireEvidence = WireShape.semantic(
+            "vec<" + elementShape + ">",
+            "vec<" + iteration.element().layout + ">",
+            "cfg-branch-counted-sequence");
+        codec.evidenceSource = "container-branch-counted-sequence";
+        codec.memberSemantics = "counted-sequence";
+        codec.analysisStatus = "complete";
+        codec.members.add(sequenceCountCodec(branches.accepted()));
+        codec.members.addAll(iteration.events());
+
+        LinkedHashSet<PcodeOpAST> elementOperations = new LinkedHashSet<>();
+        iteration.codecs().forEach(member -> elementOperations.add(member.operation));
+        runMetrics.increment("branchCountedContainerSequences");
+        return ContainerSequenceAnalysis.complete(new ContainerSequenceSummary(
+            codec,
+            List.of(branches.accepted(), branches.rejected()),
+            Set.copyOf(elementOperations)));
+    }
+
+    private ContainerSequenceAnalysis storedBranchCountedContainerSequence(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        String writeBufferParameter,
+        ContainerIteration iteration) {
+
+        ContainerSequenceAnalysis analysis = branchCountedContainerSequence(
+            function,
+            high,
+            loop,
+            operations,
+            writeBufferParameter,
+            iteration);
+        if (analysis.summary() != null) {
+            runMetrics.increment("storedBranchCountedContainerSequences");
+            return analysis;
+        }
+        return ContainerSequenceAnalysis.rejected("missing-partitioned-count-calls");
+    }
+    private PcodeOpAST branchUsingComparison(
+        PcodeBlockBasic block,
+        PcodeOpAST comparison) {
+
+        PcodeOpAST selected = null;
+        var iterator = block.getIterator();
+        while (iterator.hasNext()) {
+            PcodeOp operation = iterator.next();
+            if (!(operation instanceof PcodeOpAST branch) ||
+                branch.getOpcode() != PcodeOp.CBRANCH || branch.getNumInputs() < 2 ||
+                (!pcodeNodeDependsOn(
+                        branch.getInput(branch.getNumInputs() - 1),
+                        comparison.getOutput(),
+                        new LinkedHashSet<>(),
+                        0) &&
+                 !blockPhysicalValueDependsOn(
+                        block,
+                        branch,
+                        branch.getInput(branch.getNumInputs() - 1),
+                        comparison.getOutput(),
+                        new LinkedHashSet<>(),
+                        0))) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = branch;
+        }
+        return selected;
+    }

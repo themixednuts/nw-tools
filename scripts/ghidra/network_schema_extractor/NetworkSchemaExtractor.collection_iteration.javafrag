@@ -189,16 +189,34 @@
                                     provenUnmarshalOutputStorage(operation),
                                     null));
                             }
+                            else if (writesElement) {
+                                String nativeType = unmarshalNativeTypeFromTarget(target);
+                                WireShape semantic = semanticWireEvidenceForNativeType(
+                                    nativeType);
+                                if (semantic != null && semantic.hasProvenSemantics()) {
+                                    nestedEvents = List.of(new CodecWireEvent(
+                                        nativeType,
+                                        semantic,
+                                        operation.getSeqnum().getTarget(),
+                                        target.getEntryPoint(),
+                                        fullFunctionName(target),
+                                        provenUnmarshalOutputStorage(operation),
+                                        null));
+                                    runMetrics.increment(
+                                        "semanticCollectionElementFallbacks");
+                                }
+                            }
                             // Cursor/telemetry helpers often take the ReadBuffer (e.g.
                             // NewWorld+0x873230 size delta in 0x15c29b0) but are not
                             // element codecs. Only fail the iteration when the call
                             // actually stores into the sequence element.
-                            else if (writesElement) {
+                            if ((nestedEvents == null || nestedEvents.isEmpty()) &&
+                                writesElement) {
                                 recordNestedTypeShapeReject(
                                     "dynamic-collection-element-codec-unproven");
                                 return null;
                             }
-                            else {
+                            else if (nestedEvents == null || nestedEvents.isEmpty()) {
                                 continue;
                             }
                         }
@@ -230,10 +248,53 @@
             return null;
         }
 
+        Map<PcodeBlockBasic, List<ContainerCodecCall>> failureCodecsByBlock =
+            new HashMap<>();
+        codecsByBlock.forEach((block, codecs) -> {
+            ArrayList<ContainerCodecCall> failureCodecs = new ArrayList<>();
+            for (CollectionElementCodec element : codecs) {
+                ContainerCodecCall codec = new ContainerCodecCall();
+                codec.operation = element.operation();
+                codec.callsite = element.operation().getSeqnum().getTarget();
+                Function target = pcodeCallTarget(element.operation());
+                codec.target = target == null ? null : target.getEntryPoint();
+                codec.targetName = fullFunctionName(target);
+                codec.nativeType = unmarshalNativeTypeFromTarget(target);
+                failureCodecs.add(codec);
+            }
+            failureCodecsByBlock.put(block, List.copyOf(failureCodecs));
+        });
+        Set<PcodeBlockBasic> successfulTerminals = loop.body().stream()
+            .filter(block -> NetworkSchemaControlFlow.successors(block)
+                .contains(loop.header()))
+            .collect(Collectors.toUnmodifiableSet());
+        HashMap<PcodeBlockBasic, LinkedHashSet<PcodeBlockBasic>> mergedFailureEdges =
+            new HashMap<>();
+        unsuccessfulCodecEdges(failureCodecsByBlock, successfulTerminals)
+            .forEach((block, successors) -> mergedFailureEdges
+                .computeIfAbsent(block, ignored -> new LinkedHashSet<>())
+                .addAll(successors));
+        collectionLoopFailureEdges(
+                loop,
+                failureCodecsByBlock,
+                successfulTerminals)
+            .forEach((block, successors) -> mergedFailureEdges
+                .computeIfAbsent(block, ignored -> new LinkedHashSet<>())
+                .addAll(successors));
+        HashMap<PcodeBlockBasic, Set<PcodeBlockBasic>> immutableFailureEdges =
+            new HashMap<>();
+        mergedFailureEdges.forEach((block, successors) ->
+            immutableFailureEdges.put(block, Set.copyOf(successors)));
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> failureEdges =
+            Map.copyOf(immutableFailureEdges);
+        if (!failureEdges.isEmpty()) {
+            runMetrics.increment("collectionIterationFailureEdgesExcluded");
+        }
         NetworkSchemaFlowSequence.Result<CollectionElementCodec> sequence =
             NetworkSchemaFlowSequence.analyzeLoopIteration(
                 loop,
                 codecsByBlock,
+                failureEdges,
                 this::sameCollectionElementCodec);
         ArrayList<CodecWireEvent> events = new ArrayList<>();
         if (sequence.complete() && !sequence.events().isEmpty()) {

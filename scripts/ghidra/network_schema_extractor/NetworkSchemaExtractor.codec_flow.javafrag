@@ -510,7 +510,7 @@
             completedContexts);
         if (nested != null) {
             CodecWireEvent directProduct =
-                directValueCallProductEvent(owner, op, target, nested);
+                directCallProductEvent(owner, op, target, nested);
             if (directProduct == null) {
                 events.addAll(nested.events);
             }

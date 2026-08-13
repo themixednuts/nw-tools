@@ -453,6 +453,8 @@
         reconcileFullContainerUnmarshalSemantics(
             fullContainerRecovery.plan,
             unmarshalFull);
+        WireShape planShape = completeFullContainerIndexMapWireShape(
+            fullContainerRecovery.plan);
         List<NativeTypeInfoEvidence> valueTypeInfoCandidates =
             collectReplicatedContainerValueTypeInfoCandidates(
                 marshal,
@@ -485,6 +487,10 @@
             : semanticsProven
                 ? WireShape.semantic(primaryLayout, primarySource)
                 : WireShape.layout(primaryLayout, primarySource);
+        if (planShape != null &&
+            (primaryShape == null || !primaryShape.hasProvenSemantics())) {
+            primaryShape = planShape;
+        }
         WireShape deltaShape = deltaLayout == null
             ? null
             : semanticsProven
@@ -536,6 +542,10 @@
             !plan.unmarshalReconciliation.startsWith("complete-")) {
             return null;
         }
+        WireShape planShape = completeFullContainerIndexMapWireShape(plan);
+        if (planShape == null) {
+            return null;
+        }
 
         List<NativeTypeInfoEvidence> valueTypeInfoCandidates =
             collectReplicatedContainerValueTypeInfoCandidates(
@@ -560,7 +570,7 @@
                 valueTypeShape);
 
         return new ContainerWireShape(
-            null,
+            planShape,
             null,
             null,
             null,
@@ -594,23 +604,44 @@
                 continue;
             }
             Function target = pcodeCallTarget(operation);
-            if (target == null || provenCallArgumentSlot(
+            Integer writeBufferSlot = target == null
+                ? null
+                : provenCallArgumentSlot(
                     function,
                     operation,
                     target,
-                    writeBuffer) == null) {
+                    writeBuffer);
+            if (target == null || writeBufferSlot == null) {
                 continue;
             }
             WireShape evidence = directCallWireEvidence(operation);
+            if (evidence == null) {
+                evidence = validatedMarshalLeaf(
+                    target,
+                    "param_" + writeBufferSlot);
+            }
             String shape = evidence == null
                 ? null
                 : firstNonEmpty(evidence.shape, evidence.layout);
             count |= "vlq-u32".equals(shape);
-            key |= "u64".equals(shape) || "fixed-bytes-8".equals(shape);
+            key |= isInlineReplicatedContainerKeyShape(shape);
             sequence |= isContainerSequenceMarker(shape);
             mask |= "u8".equals(shape) || "fixed-bytes-1".equals(shape);
         }
         return count && key && sequence && mask;
+    }
+
+    private boolean isInlineReplicatedContainerKeyShape(String shape) {
+        return "u8".equals(shape) ||
+            "u16".equals(shape) ||
+            "u32".equals(shape) ||
+            "u64".equals(shape) ||
+            "vlq-u32".equals(shape) ||
+            "vlq-u64".equals(shape) ||
+            "fixed-bytes-8".equals(shape) ||
+            "fixed-bytes-16".equals(shape) ||
+            "actor-ref".equals(shape) ||
+            "entity-ref".equals(shape);
     }
 
     private boolean hasScalarFieldHandlerVtableAbi(Address vtable) {

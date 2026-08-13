@@ -1,0 +1,206 @@
+    private record PreconditionedUnmarshalGuard(
+        PcodeBlockBasic entry,
+        PcodeBlockBasic accepted,
+        PcodeBlockBasic rejected) {
+    }
+
+    private UnmarshalTerminalFlow preconditionedUnmarshalSuccessSubgraph(
+        HighFunction high,
+        String resultBase,
+        List<PcodeBlockBasic> entries,
+        boolean preconditionedSuccess) {
+
+        if (!preconditionedSuccess || high == null || resultBase == null ||
+            entries == null || entries.isEmpty()) {
+            return null;
+        }
+        PreconditionedUnmarshalGuard guard = null;
+        for (PcodeBlockBasic entry : entries) {
+            List<PcodeBlockBasic> successors = NetworkSchemaControlFlow.successors(entry);
+            if (successors.size() != 2) {
+                continue;
+            }
+            for (PcodeBlockBasic rejected : successors) {
+                if (!isOkByteZeroBranch(entry, rejected, resultBase)) {
+                    continue;
+                }
+                PcodeBlockBasic accepted = successors.get(0) == rejected
+                    ? successors.get(1)
+                    : successors.get(0);
+                if (!reachesUnmarshalBufferConsumer(high, accepted) ||
+                    reachesUnmarshalBufferConsumer(high, rejected)) {
+                    continue;
+                }
+                if (guard != null) {
+                    return null;
+                }
+                guard = new PreconditionedUnmarshalGuard(entry, accepted, rejected);
+            }
+        }
+        if (guard == null) {
+            return null;
+        }
+
+        LinkedHashSet<PcodeBlockBasic> safe = new LinkedHashSet<>();
+        ArrayDeque<PcodeBlockBasic> pending = new ArrayDeque<>();
+        safe.add(guard.entry());
+        if (!hasUnmarshalFailureOrUnknownWrite(guard.accepted(), resultBase)) {
+            safe.add(guard.accepted());
+            pending.addLast(guard.accepted());
+        }
+        while (!pending.isEmpty()) {
+            checkAnalysisCancelled();
+            PcodeBlockBasic block = pending.removeFirst();
+            for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(block)) {
+                if (successor == guard.rejected() ||
+                    hasUnmarshalFailureOrUnknownWrite(successor, resultBase)) {
+                    continue;
+                }
+                if (safe.add(successor)) {
+                    pending.addLast(successor);
+                }
+            }
+        }
+        PcodeBlockBasic accepted = guard.accepted();
+        Set<PcodeBlockBasic> terminals = safe.stream()
+            .filter(block -> isTerminatingPcodeBlock(block) ||
+                NetworkSchemaControlFlow.successors(block).stream()
+                    .noneMatch(safe::contains))
+            .filter(block -> safePathContainsUnmarshalBufferConsumer(
+                high,
+                accepted,
+                block,
+                safe))
+            .collect(Collectors.toUnmodifiableSet());
+        if (terminals.isEmpty()) {
+            return null;
+        }
+
+        HashMap<PcodeBlockBasic, Set<PcodeBlockBasic>> excluded = new HashMap<>();
+        for (PcodeBlockBasic block : high.getBasicBlocks()) {
+            checkAnalysisCancelled();
+            LinkedHashSet<PcodeBlockBasic> rejected = new LinkedHashSet<>();
+            for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(block)) {
+                boolean acceptedEdge = safe.contains(block) && safe.contains(successor) &&
+                    !(block == guard.entry() && successor == guard.rejected());
+                if (!acceptedEdge) {
+                    rejected.add(successor);
+                }
+            }
+            if (!rejected.isEmpty()) {
+                excluded.put(block, Set.copyOf(rejected));
+            }
+        }
+        Set<PcodeBlockBasic> mandatory = safe.stream()
+            .filter(block -> terminals.stream().allMatch(terminal ->
+                NetworkSchemaControlFlow.dominates(high, block, terminal)))
+            .collect(Collectors.toUnmodifiableSet());
+        runMetrics.increment("preconditionedUnmarshalSuccessSubgraphs");
+        return new UnmarshalTerminalFlow(
+            terminals,
+            Map.copyOf(excluded),
+            mandatory,
+            "complete-preconditioned-success-subgraph");
+    }
+
+    private boolean safePathContainsUnmarshalBufferConsumer(
+        HighFunction high,
+        PcodeBlockBasic accepted,
+        PcodeBlockBasic terminal,
+        Set<PcodeBlockBasic> safe) {
+
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+            if (block == null || !safe.contains(block) ||
+                block != accepted && !safeBlockReaches(accepted, block, safe) ||
+                block != terminal && !safeBlockReaches(block, terminal, safe)) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (target == null) {
+                continue;
+            }
+            if (pcodeReadRawWireEvidence(operation, target) != null ||
+                !readBufferParameters(target).isEmpty()) {
+                return true;
+            }
+            for (int slot = 1; slot <= 4; slot++) {
+                if (hasReadBufferFlow(
+                        target,
+                        "param_" + slot,
+                        new LinkedHashSet<>())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean safeBlockReaches(
+        PcodeBlockBasic start,
+        PcodeBlockBasic target,
+        Set<PcodeBlockBasic> safe) {
+
+        if (start == null || target == null || safe == null ||
+            !safe.contains(start) || !safe.contains(target)) {
+            return false;
+        }
+        if (start == target) {
+            return true;
+        }
+        ArrayDeque<PcodeBlockBasic> pending = new ArrayDeque<>();
+        LinkedHashSet<PcodeBlockBasic> visited = new LinkedHashSet<>();
+        pending.addLast(start);
+        visited.add(start);
+        while (!pending.isEmpty()) {
+            checkAnalysisCancelled();
+            PcodeBlockBasic block = pending.removeFirst();
+            for (PcodeBlockBasic successor :
+                    NetworkSchemaControlFlow.successors(block)) {
+                if (!safe.contains(successor) || !visited.add(successor)) {
+                    continue;
+                }
+                if (successor == target) {
+                    return true;
+                }
+                pending.addLast(successor);
+            }
+        }
+        return false;
+    }
+
+    private boolean hasExplicitUnmarshalFailureWrite(
+        HighFunction high,
+        String resultBase) {
+
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            StatusByteWrite write = unmarshalStatusByteWrite(operation);
+            if (write != null && resultBase.equals(write.base()) &&
+                write.value() == UnmarshalStatusByte.FAILURE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasUnmarshalFailureOrUnknownWrite(
+        PcodeBlockBasic block,
+        String resultBase) {
+
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (!(operation instanceof PcodeOpAST ast)) {
+                continue;
+            }
+            StatusByteWrite write = unmarshalStatusByteWrite(ast);
+            if (write != null && resultBase.equals(write.base()) &&
+                write.value() != UnmarshalStatusByte.SUCCESS) {
+                return true;
+            }
+        }
+        return false;
+    }

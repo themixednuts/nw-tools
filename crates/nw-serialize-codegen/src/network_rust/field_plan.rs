@@ -18,7 +18,7 @@ pub(super) fn message_field_shape_report(
         serialize_types,
     );
     if report.wire_shape.is_none()
-        && let Some(shape) = anonymous_message_wire_layout_shape(field)
+        && let Some(shape) = anonymous_wire_layout_shape(field)
     {
         report.wire_shape_source = field
             .wire_layout_source
@@ -104,7 +104,7 @@ fn message_native_wire_shape(field: &NetworkField) -> Option<SchemaWireShape> {
     .then_some(shape)
 }
 
-fn anonymous_message_wire_layout_shape(field: &NetworkField) -> Option<SchemaWireShape> {
+fn anonymous_wire_layout_shape(field: &NetworkField) -> Option<SchemaWireShape> {
     if field.rust_type.is_some()
         || field.source_type_id.is_some()
         || field.serialize.is_some()
@@ -205,16 +205,30 @@ pub(super) fn state_field_shape_report(
         .filter(|rust_type| syn::parse_str::<syn::Type>(rust_type).is_ok());
     let explicit_field_type =
         rust_type.filter(|rust_type| is_replicated_state_field_type(rust_type));
+    let inferred_serialize_shape =
+        if explicit_field_type.is_none() && field_wire_shape(field, wire_shapes).is_none() {
+            exact_serialize_source_wire_shape(field, serialize_types)
+        } else {
+            None
+        };
+    let anonymous_layout_shape = if explicit_field_type.is_none()
+        && field_wire_shape(field, wire_shapes).is_none()
+        && inferred_serialize_shape.is_none()
+    {
+        anonymous_wire_layout_shape(field)
+    } else {
+        None
+    };
     let shape = if explicit_field_type.is_some() {
         None
     } else {
         field_wire_shape(field, wire_shapes)
+            .or(inferred_serialize_shape.as_ref())
+            .or(anonymous_layout_shape.as_ref())
     };
     let source_type = serialize_field_scalar_source_type(field, shape, serialize_types);
     let rust_shape = shape
-        .filter(|shape| {
-            !shape.is_replicated_container() && !fixed_sequence_requires_handler_plan(shape)
-        })
+        .filter(|shape| !shape.is_replicated_container())
         .map(rust_field_shape);
     let handler_vtable = field
         .handler_vtable
@@ -230,7 +244,13 @@ pub(super) fn state_field_shape_report(
     let container_resolution = if is_container_field {
         Some(
             container_vtable.map_or(Err(ContainerPlanError::MissingPlan), |vtable| {
-                replicated_container_semantic_field_shape(field, vtable, shape, serialize_types)
+                replicated_container_semantic_field_shape(
+                    field,
+                    vtable,
+                    shape,
+                    &value_type_candidates,
+                    serialize_types,
+                )
             }),
         )
     } else {
@@ -243,9 +263,7 @@ pub(super) fn state_field_shape_report(
         .is_none()
         .then(|| fixed_sequence_vtable_for_field(field, handler_vtables_by_address))
         .flatten();
-    let is_fixed_sequence_field = explicit_field_type.is_none()
-        && (shape.is_some_and(fixed_sequence_requires_handler_plan)
-            || fixed_sequence_vtable.is_some());
+    let is_fixed_sequence_field = explicit_field_type.is_none() && fixed_sequence_vtable.is_some();
     let fixed_sequence_resolution = if is_fixed_sequence_field {
         Some(fixed_sequence_vtable.map_or(
             Err(fixed_sequence::FixedSequencePlanError::MissingPlan),
@@ -293,12 +311,7 @@ pub(super) fn state_field_shape_report(
         .or_else(|| structured_value.map(|value| value.field_type.clone()))
         .or_else(|| {
             rust_type
-                .filter(|_| {
-                    shape.is_some_and(|shape| {
-                        !shape.is_replicated_container()
-                            && !fixed_sequence_requires_handler_plan(shape)
-                    })
-                })
+                .filter(|_| shape.is_some_and(|shape| !shape.is_replicated_container()))
                 .map(|rust_type| {
                     replicated_field_handler_type(
                         shape.expect("state value override has a wire shape"),
@@ -309,10 +322,7 @@ pub(super) fn state_field_shape_report(
         .or_else(|| {
             source_type.as_deref().and_then(|source_type| {
                 shape
-                    .filter(|shape| {
-                        !shape.is_replicated_container()
-                            && !fixed_sequence_requires_handler_plan(shape)
-                    })
+                    .filter(|shape| !shape.is_replicated_container())
                     .map(|shape| replicated_field_handler_type(shape, source_type))
             })
         })
@@ -323,9 +333,7 @@ pub(super) fn state_field_shape_report(
         })
         .or_else(|| {
             shape
-                .filter(|shape| {
-                    !shape.is_replicated_container() && !fixed_sequence_requires_handler_plan(shape)
-                })
+                .filter(|shape| !shape.is_replicated_container())
                 .and_then(|_| rust_shape.as_ref().map(|shape| shape.field_type.clone()))
         });
     let blocked_reason = fixed_sequence_resolution
@@ -374,6 +382,13 @@ pub(super) fn state_field_shape_report(
         handler_vtable: field.handler_vtable.clone(),
         wire_shape_source: if explicit_field_type.is_some() && shape.is_none() {
             None
+        } else if inferred_serialize_shape.is_some() {
+            Some("serialize-source-type+wire-layout".to_owned())
+        } else if anonymous_layout_shape.is_some() {
+            field
+                .wire_layout_source
+                .clone()
+                .or_else(|| Some("state-wire-layout".to_owned()))
         } else {
             field_wire_shape_source(field, wire_shapes, wire_shape_sources)
         },
@@ -413,7 +428,11 @@ pub(super) fn state_field_shape_report(
         },
         nested_type_shape: structured_value
             .map(|value| value.shape.clone())
-            .or_else(|| field.nested_type_shape.clone()),
+            .or_else(|| {
+                (!is_container_field)
+                    .then(|| field.nested_type_shape.clone())
+                    .flatten()
+            }),
         nested_embedded_type_shapes: structured_value
             .map(|value| value.embedded_shapes.clone())
             .unwrap_or_default(),
@@ -445,11 +464,29 @@ pub(super) fn state_field_shape_report(
     }
 }
 
-fn fixed_sequence_requires_handler_plan(shape: &SchemaWireShape) -> bool {
-    matches!(
-        shape,
-        SchemaWireShape::FixedSequence(sequence) if sequence.length_prefixed
+fn exact_serialize_source_wire_shape(
+    field: &NetworkField,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<SchemaWireShape> {
+    let type_id = field
+        .source_type_identity_proven
+        .then_some(field.source_type_id)
+        .flatten()?;
+    let serialize = serialize_types.get(&type_id)?;
+    if !serialize.emits_source {
+        return None;
+    }
+    let source_shape = serialize_type_wire_shape(type_id, serialize_types)?;
+    let source_shape = parse_network_wire_shape(&source_shape)?;
+    let observed_shape = parse_network_wire_shape(field.wire_layout.as_deref()?)?;
+    let source_product = crate::network_schema::parse::wire_shape_scalar_product(&source_shape)?;
+    let observed_product =
+        crate::network_schema::parse::wire_shape_scalar_product(&observed_shape)?;
+    wire_scalar_shapes_match(
+        &expand_directional_wire_scalars(source_product),
+        &expand_directional_wire_scalars(observed_product),
     )
+    .then_some(source_shape)
 }
 
 pub(super) fn state_field_has_complete_shape(field: &NetworkStateFieldShapeReport) -> bool {

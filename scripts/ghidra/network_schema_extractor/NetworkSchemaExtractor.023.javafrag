@@ -587,10 +587,6 @@
         FullContainerPlan fullContainerPlan) {
 
         LinkedHashMap<String, NativeTypeInfoEvidence> candidates = new LinkedHashMap<>();
-        collectBufferFlowTypeInfo(marshal, "param_2", "delta", candidates);
-        collectBufferFlowTypeInfo(marshalFull, "param_2", "full", candidates);
-        collectBufferFlowTypeInfo(unmarshal, "param_2", "delta", candidates);
-        collectBufferFlowTypeInfo(unmarshalFull, "param_2", "full", candidates);
         collectContainerElementTypeInfo(
             unmarshalFull,
             "param_2",
@@ -600,11 +596,52 @@
             unmarshalFull,
             fullContainerPlan,
             candidates);
+        boolean hasExactStructuralEvidence = candidates.values().stream()
+            .anyMatch(this::isExactContainerValueTypeEvidence);
+        boolean hasCompletePlanSemantics = hasCompleteContainerPlanSemantics(
+            fullContainerPlan);
+        if (!hasExactStructuralEvidence && !hasCompletePlanSemantics) {
+            Address[] functions = { marshal, marshalFull, unmarshal, unmarshalFull };
+            String[] phases = { "delta", "full", "delta", "full" };
+            for (int index = 0; index < functions.length; index++) {
+                collectBufferFlowTypeInfo(
+                    functions[index],
+                    "param_2",
+                    phases[index],
+                    candidates);
+                if (candidates.values().stream()
+                        .anyMatch(this::isExactContainerValueTypeEvidence)) {
+                    runMetrics.increment("legacyContainerIdentityEarlyProofs");
+                    break;
+                }
+            }
+        }
+        else if (hasCompletePlanSemantics) {
+            runMetrics.increment("completeContainerPlansSkippedLegacyIdentityWalk");
+        }
         ArrayList<NativeTypeInfoEvidence> result = new ArrayList<>(candidates.size());
         for (NativeTypeInfoEvidence candidate : candidates.values()) {
             result.add(withDirectContainerElementSize(candidate, fullContainerPlan));
         }
         return result;
+    }
+
+    private boolean hasCompleteContainerPlanSemantics(FullContainerPlan plan) {
+        if (plan == null || plan.unmarshalReconciliation == null ||
+            !plan.unmarshalReconciliation.startsWith("complete-")) {
+            return false;
+        }
+        List<ContainerCodecCall> values = logicalContainerCodecLeaves(plan.valueCodecs);
+        WireShape value = sequenceElementWireEvidence(values);
+        if (value == null || !value.hasProvenSemantics()) {
+            return false;
+        }
+        if (plan.storageKind != ContainerStorageKind.INDEX_MAP) {
+            return true;
+        }
+        List<ContainerCodecCall> keys = logicalContainerCodecLeaves(plan.keyCodecs);
+        WireShape key = sequenceElementWireEvidence(keys);
+        return key != null && key.hasProvenSemantics();
     }
 
     private NativeTypeInfoEvidence selectedReplicatedContainerValueTypeInfo(
@@ -709,6 +746,7 @@
             phase,
             new ArrayDeque<>(),
             new LinkedHashSet<>(),
+            0,
             candidates);
     }
 
@@ -718,11 +756,21 @@
         String phase,
         Deque<Address> callStack,
         Set<String> completedContexts,
+        int depth,
         Map<String, NativeTypeInfoEvidence> candidates) {
 
         if (function == null || bufferParameter == null) {
             return;
         }
+        if (depth > 6) {
+            runMetrics.increment("legacyContainerIdentityDepthBudgetExhaustions");
+            return;
+        }
+        if (completedContexts.size() >= 64) {
+            runMetrics.increment("legacyContainerIdentityContextBudgetExhaustions");
+            return;
+        }
+        checkAnalysisCancelled();
         String context = function.getEntryPoint() + "|" + bufferParameter;
         if (callStack.contains(function.getEntryPoint()) || !completedContexts.add(context)) {
             return;
@@ -736,6 +784,7 @@
         try {
             PcodeStorage buffer = new PcodeStorage(bufferParameter, 0L);
             for (PcodeOpAST op : orderedPcodeOps(high)) {
+                checkAnalysisCancelled();
                 if (op.getOpcode() != PcodeOp.CALL) {
                     continue;
                 }
@@ -766,6 +815,7 @@
                     phase,
                     callStack,
                     completedContexts,
+                    depth + 1,
                     candidates);
             }
         }

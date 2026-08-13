@@ -1,0 +1,56 @@
+    private WireShape structuredSequenceElementWireEvidence(
+        List<ContainerCodecCall> codecs) {
+
+        if (codecs == null || codecs.size() != 1) {
+            return null;
+        }
+        ContainerCodecCall codec = codecs.get(0);
+        boolean optional = "optional-suffix".equals(codec.memberSemantics);
+        boolean structured = "structured-value".equals(codec.memberSemantics);
+        if ((!optional && !structured) || codec.members.isEmpty() ||
+            optional && (codec.optionalMembers.isEmpty() ||
+                codec.optionalMembers.stream().anyMatch(member -> member.guards.isEmpty()))) {
+            return null;
+        }
+        String nativeType = firstNonEmpty(
+            codec.nativeType,
+            marshalFunctionTemplateType(codec.targetName));
+        SerializeTypeInfo exact = exactSerializeTypeForTypeName(nativeType);
+        String exactTypeId = exact == null ? null : canonicalUuidFromString(exact.typeId);
+        String codecTypeId = canonicalUuidFromString(codec.typeId);
+        if (exact == null || exactTypeId == null ||
+            codecTypeId != null && !codecTypeId.equals(exactTypeId)) {
+            return null;
+        }
+
+        List<ContainerCodecCall> required = physicalContainerCodecLeaves(codec.members);
+        List<ContainerCodecCall> suffix = optional
+            ? physicalContainerCodecLeaves(codec.optionalMembers)
+            : List.of();
+        if (required == null || required.isEmpty() || suffix == null ||
+            optional && suffix.isEmpty()) {
+            return null;
+        }
+        String requiredLayout = physicalContainerCodecLayout(required);
+        String suffixLayout = optional
+            ? physicalContainerCodecLayout(suffix)
+            : null;
+        String layout = requiredLayout == null || optional && suffixLayout == null
+            ? null
+            : optional
+                ? compositeWireShape(List.of(requiredLayout, suffixLayout))
+                : requiredLayout;
+        if (layout == null) {
+            return null;
+        }
+
+        String source = "codec-template+complete-structured-element-boundary";
+        codec.nativeType = nativeType;
+        codec.typeId = exact.typeId;
+        codec.typeIdSource = "serialize-exact-name";
+        codec.typeIdentityProven = true;
+        codec.wireEvidence = WireShape.semantic(nativeType, layout, source);
+        codec.evidenceSource = source;
+        runMetrics.increment("structuredSequenceElementBoundaries");
+        return codec.wireEvidence;
+    }

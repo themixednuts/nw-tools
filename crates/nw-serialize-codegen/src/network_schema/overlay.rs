@@ -135,10 +135,11 @@ fn merge_registry_types(
         }
     }
 
-    for entry in source {
+    for mut entry in source {
         let type_id = entry.type_id.expect("overlay UUID was validated");
         if let Some(index) = destination_indices.get(&type_id).copied() {
             validate_registry_identity(&destination[index], &entry, type_id)?;
+            preserve_missing_registry_identity(&destination[index], &mut entry);
             destination[index] = entry;
             *replaced_count += 1;
         } else {
@@ -148,6 +149,20 @@ fn merge_registry_types(
         }
     }
     Ok(source_ids)
+}
+
+fn preserve_missing_registry_identity(base: &super::NetworkType, overlay: &mut super::NetworkType) {
+    overlay.type_index = overlay.type_index.or(base.type_index);
+    overlay.registry_index = overlay.registry_index.or(base.registry_index);
+    if overlay.name.is_none() {
+        overlay.name.clone_from(&base.name);
+        overlay.name_source.clone_from(&base.name_source);
+    }
+    if overlay.registration_type_name.is_none() {
+        overlay
+            .registration_type_name
+            .clone_from(&base.registration_type_name);
+    }
 }
 
 fn validate_registry_identity(
@@ -431,6 +446,48 @@ mod tests {
                 .types
                 .iter()
                 .any(|network_type| network_type.name.as_deref() == Some("UnrelatedMsg"))
+        );
+    }
+
+    #[test]
+    fn preserves_base_identity_missing_from_a_focused_overlay() {
+        let base_report = report_with_dependent_field(
+            "f32",
+            "marshal-call:marshal-function-name",
+            "fixed-bytes-4",
+        );
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&base_report).unwrap();
+        schema.types[0].name = Some("Javelin::GameModeParticipantReplicatedState".to_owned());
+        schema.types[0].name_source = Some("type-registry".to_owned());
+        schema.types[0].registration_type_name =
+            Some("Javelin::GameModeParticipantReplicatedState".to_owned());
+
+        let mut overlay = report_with_dependent_field(
+            "u32",
+            "marshal+unmarshal-pcode-agreement",
+            "fixed-bytes-4",
+        );
+        overlay["registryEntries"][0]["name"] = Value::Null;
+        overlay["registryEntries"][0]["nameSource"] = Value::Null;
+        overlay["registryEntries"][0]["registrationTypeName"] = Value::Null;
+
+        schema
+            .merge_ghidra_static_network_overlay(&overlay)
+            .unwrap();
+
+        let merged = &schema.types[0];
+        assert_eq!(
+            merged.name.as_deref(),
+            Some("Javelin::GameModeParticipantReplicatedState")
+        );
+        assert_eq!(merged.name_source.as_deref(), Some("type-registry"));
+        assert_eq!(
+            merged.registration_type_name.as_deref(),
+            Some("Javelin::GameModeParticipantReplicatedState")
+        );
+        assert_eq!(
+            merged.fields[0].wire_shape.as_ref().unwrap().wire_string(),
+            "u32"
         );
     }
 

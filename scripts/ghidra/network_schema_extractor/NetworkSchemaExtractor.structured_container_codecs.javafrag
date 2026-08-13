@@ -24,8 +24,17 @@
         NestedTypeShape directShape = nativeType == null
             ? uniqueSerializeContainerHelperShape(target, nested)
             : recoverNestedDirectTypeShape(target, nativeType);
-        if (directShape == null || !Boolean.TRUE.equals(directShape.identityProven) ||
-            directShape.typeId == null) {
+        String exactTemplateLayout = directShape == null && nativeType != null &&
+            nested.exact()
+                ? completeStructuredContainerWireLayout(nested)
+                : null;
+        SerializeTypeInfo exactTemplate = directShape == null && nativeType != null &&
+            exactTemplateLayout != null
+                ? exactSerializeTypeForTypeName(nativeType)
+                : null;
+        boolean recoveredShape = directShape != null &&
+            Boolean.TRUE.equals(directShape.identityProven) && directShape.typeId != null;
+        if (!recoveredShape && exactTemplate == null) {
             return null;
         }
 
@@ -46,16 +55,63 @@
         codec.analysisStatus = nested.analysisStatus();
         codec.members.addAll(nested.members());
         codec.optionalMembers.addAll(nested.optionalMembers());
-        codec.typeId = directShape.typeId;
-        codec.typeIdSource = directShape.typeIdSource;
+        codec.typeId = recoveredShape ? directShape.typeId : exactTemplate.typeId;
+        codec.typeIdSource = recoveredShape
+            ? directShape.typeIdSource
+            : "marshal-template+serialize-exact-name";
         codec.typeIdentityProven = true;
-        codec.sourceTypeLayoutComplete =
+        codec.sourceTypeLayoutComplete = exactTemplate != null ||
             Boolean.TRUE.equals(directShape.memberCoverageProven) &&
             Boolean.TRUE.equals(directShape.memberNamesProven) &&
             directShape.members.stream().allMatch(member ->
                 Boolean.TRUE.equals(member.nameProven) &&
                 Boolean.TRUE.equals(member.typeIdentityProven));
+        if (exactTemplate != null) {
+            codec.wireEvidence = WireShape.semantic(
+                nativeType,
+                exactTemplateLayout,
+                "marshal-template+serialize-exact-name+complete-structured-layout");
+            runMetrics.increment("exactMarshalTemplateStructuredBoundaries");
+        }
         return codec;
+    }
+
+    private String completeStructuredContainerWireLayout(ContainerCodecMembers nested) {
+        if (nested == null || !nested.exact() || nested.members().isEmpty()) {
+            return null;
+        }
+        List<ContainerCodecCall> required = physicalContainerCodecLeaves(nested.members());
+        String requiredLayout = physicalContainerCodecLayout(required);
+        if (requiredLayout == null) {
+            return null;
+        }
+        if (nested.optionalMembers().isEmpty()) {
+            return requiredLayout;
+        }
+        if (nested.optionalMembers().stream().anyMatch(member -> member.guards.isEmpty())) {
+            return null;
+        }
+        List<ContainerCodecCall> optional =
+            physicalContainerCodecLeaves(nested.optionalMembers());
+        String optionalLayout = physicalContainerCodecLayout(optional);
+        return optionalLayout == null
+            ? null
+            : compositeWireShape(List.of(requiredLayout, optionalLayout));
+    }
+
+    private String physicalContainerCodecLayout(List<ContainerCodecCall> codecs) {
+        if (codecs == null || codecs.isEmpty()) {
+            return null;
+        }
+        ArrayList<String> layouts = new ArrayList<>(codecs.size());
+        for (ContainerCodecCall codec : codecs) {
+            if (codec == null || codec.wireEvidence == null ||
+                codec.wireEvidence.layout == null) {
+                return null;
+            }
+            layouts.add(codec.wireEvidence.layout);
+        }
+        return compositeWireShape(layouts);
     }
 
     private boolean isStructuredContainerCodec(ContainerCodecCall codec) {
@@ -93,6 +149,61 @@
         boundary.callsite = operation.getSeqnum().getTarget();
         boundary.target = target.getEntryPoint();
         boundary.targetName = fullFunctionName(target);
+        if (promoteExactSingletonContainerHelperBoundary(boundary, helper, source)) {
+            return boundary;
+        }
+        populateContainerHelperBoundary(boundary, helper, source);
+        return boundary;
+    }
+
+    private boolean promoteExactSingletonContainerHelperBoundary(
+        ContainerCodecCall boundary,
+        ContainerCodecMembers helper,
+        String source) {
+
+        if (boundary == null || helper == null || !helper.exact() ||
+            !helper.optionalMembers().isEmpty() || helper.members().size() != 1) {
+            return false;
+        }
+        ContainerCodecCall child = helper.members().get(0);
+        if (child == null || child.wireEvidence == null ||
+            !child.wireEvidence.hasProvenSemantics() ||
+            !isSemanticContainerCodecBoundary(child)) {
+            return false;
+        }
+
+        boundary.nativeType = child.nativeType;
+        boundary.typeId = child.typeId;
+        boundary.typeIdSource = child.typeIdSource;
+        boundary.typeIdentityProven = child.typeIdentityProven;
+        boundary.sourceTypeLayoutComplete = child.sourceTypeLayoutComplete;
+        boundary.wireEvidence = child.wireEvidence;
+        boundary.evidenceSource = source + "+exact-singleton-semantic-child";
+        boundary.memberSemantics = child.memberSemantics;
+        boundary.analysisStatus = child.analysisStatus;
+        boundary.members.addAll(child.members);
+        boundary.optionalMembers.addAll(child.optionalMembers);
+        boundary.guards.addAll(child.guards);
+        runMetrics.increment("exactSingletonContainerHelperPromotions");
+        return true;
+    }
+
+    private boolean isSemanticContainerCodecBoundary(ContainerCodecCall codec) {
+        if (codec == null || codec.memberSemantics == null) {
+            return false;
+        }
+        return switch (codec.memberSemantics) {
+            case "counted-sequence", "fixed-sequence", "structured-value",
+                "optional-suffix" -> true;
+            default -> false;
+        };
+    }
+
+    private void populateContainerHelperBoundary(
+        ContainerCodecCall boundary,
+        ContainerCodecMembers helper,
+        String source) {
+
         boundary.evidenceSource = source;
         boundary.memberSemantics = !helper.optionalMembers().isEmpty()
             ? "optional-suffix"
@@ -102,5 +213,4 @@
         boundary.analysisStatus = helper.analysisStatus();
         boundary.members.addAll(helper.members());
         boundary.optionalMembers.addAll(helper.optionalMembers());
-        return boundary;
     }

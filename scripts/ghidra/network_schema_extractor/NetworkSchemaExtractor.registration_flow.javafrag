@@ -519,8 +519,12 @@
         }
 
         Long pcodeGroup = null;
+        Address pcodeGroupIdentity = null;
         if (call.getNumInputs() > 4) {
             pcodeGroup = NetworkSchemaIntegerEvaluator.evaluate(call.getInput(4));
+            if (pcodeGroup == null) {
+                pcodeGroupIdentity = uniquePcodeDataAddress(call.getInput(4));
+            }
         }
         TrackedValue abiGroupValue = abi == null ? null : abi.registers.get("R9");
         Long abiGroup = abiGroupValue == null ? null : abiGroupValue.immediate;
@@ -529,7 +533,23 @@
             result.groupKnown = true;
             result.group = group.intValue();
         }
+        else {
+            Address abiGroupIdentity = abiGroupValue == null ? null : abiGroupValue.address;
+            result.groupIdentityAddress = agreeingRegisterFieldAddress(
+                pcodeGroupIdentity,
+                abiGroupIdentity,
+                "group-identity");
+        }
         return result;
+    }
+
+    private Address uniquePcodeDataAddress(Varnode node) {
+        LinkedHashSet<Address> origins = new LinkedHashSet<>();
+        collectPcodeAddressOrigins(node, origins, new LinkedHashSet<>());
+        origins.removeIf(address ->
+            !isProgramAddress(address) ||
+                currentProgram.getFunctionManager().getFunctionContaining(address) != null);
+        return origins.size() == 1 ? origins.iterator().next() : null;
     }
 
     private PcodeStorage registerFieldRelativeHandler(
@@ -605,6 +625,23 @@
     }
 
     private Long agreeingRegisterFieldInteger(Long pcode, Long abi, String role) {
+        if (pcode == null) {
+            return abi;
+        }
+        if (abi == null) {
+            return pcode;
+        }
+        if (pcode.equals(abi)) {
+            return pcode;
+        }
+        registerFieldLoopRejectCounts.merge(
+            "register-field-" + role + "-source-conflict",
+            1,
+            Integer::sum);
+        return null;
+    }
+
+    private Address agreeingRegisterFieldAddress(Address pcode, Address abi, String role) {
         if (pcode == null) {
             return abi;
         }

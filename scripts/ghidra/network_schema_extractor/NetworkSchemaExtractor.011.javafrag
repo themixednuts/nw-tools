@@ -30,6 +30,18 @@
             return null;
         }
         runMetrics.increment("highFunctionMisses");
+        if (function.getEntryPoint().equals(
+                currentProgram.getImageBase().add(KNOWN_NON_SETTLING_DECOMPILE_RVA))) {
+            runMetrics.increment("highFunctionFailures");
+            runMetrics.increment("knownNonSettlingHighFunctionSkips");
+            failedHighFunctions.add(key);
+            recordHighFunctionFailure(
+                function,
+                "decompile-skipped-known-non-settling",
+                "Ghidra type propagation does not settle for this function; " +
+                    "previous timed decompiles produced no HighFunction");
+            return null;
+        }
         if (!highFunctionSeen.add(key)) {
             runMetrics.increment("highFunctionRecompilations");
             highFunctionRecompileCounts.merge(

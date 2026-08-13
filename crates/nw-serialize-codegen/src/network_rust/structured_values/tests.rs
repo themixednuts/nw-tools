@@ -139,3 +139,114 @@ fn exact_serialize_layout_recovers_member_name_from_unique_offset() {
         Some("exact-type-id+native-offset")
     );
 }
+
+#[test]
+fn exact_serialize_layout_names_only_the_wire_backed_field_subset() {
+    let payload_id = uuid!("d65749ab-07d4-4401-b2d4-d9282475ce59");
+    let quaternion_id = uuid!("73103120-3dd3-4873-bab3-9713fa2804fb");
+    let array_id = uuid!("a482c24c-5e32-513e-867e-4cafce782006");
+    let item_id = uuid!("9f4e062e-06a0-46d4-85df-e0da96467d3a");
+    let u32_id = uuid!("43da906b-7def-4ca8-9790-854106d3f983");
+    let u8_id = uuid!("72b9409a-7d1a-4831-9cfe-fcb3fadd3426");
+    let bool_id = uuid!("a0ca880c-afe4-43cb-926c-59ac48496112");
+    let shape = serde_json::from_value(json!({
+        "typeId": payload_id,
+        "identityProven": true,
+        "typeName": "HousingItemServerData",
+        "memberNamesProven": false,
+        "memberCoverageProven": true,
+        "wireOrderProven": true,
+        "members": [{
+            "nativeOffset": "0x20",
+            "name": "field_0",
+            "nameProven": false,
+            "wireShape": "fixed-array<u16,3>",
+            "wireOrdinal": 0
+        }, {
+            "nativeOffset": "0x10",
+            "name": "field_1",
+            "nameProven": false,
+            "wireShape": "quat-smallest-three",
+            "wireOrdinal": 1
+        }, {
+            "nativeOffset": "0x30",
+            "name": "field_2",
+            "nameProven": false,
+            "wireShape": "u32",
+            "wireOrdinal": 2
+        }, {
+            "nativeOffset": "0x2c",
+            "name": "field_3",
+            "nameProven": false,
+            "wireShape": "u8",
+            "wireOrdinal": 3
+        }]
+    }))
+    .expect("nested type shape");
+    let source = NetworkSerializeType {
+        type_id: payload_id,
+        kind: NetworkSerializeKind::Struct,
+        name: "HousingItemServerData".to_owned(),
+        role: NetworkSerializeRole::SupportType,
+        resolved_type: None,
+        emits_source: true,
+        factory: None,
+        field_count: 6,
+        fields: vec![
+            test_serialize_field("m_rotation", quaternion_id, 0x10),
+            test_serialize_field("m_positionOffset", array_id, 0x20),
+            test_serialize_field("m_itemId", item_id, 0x28),
+            test_serialize_field("m_state", u8_id, 0x2c),
+            test_serialize_field("m_isObstructed", bool_id, 0x2d),
+            test_serialize_field("m_itemIndex", u32_id, 0x30),
+        ],
+        variant_count: 0,
+        direct_dependency_type_ids: vec![quaternion_id, array_id, item_id, u8_id, bool_id, u32_id],
+        wire_shapes: Vec::new(),
+        is_abstract: Some(false),
+        is_reflection_marker: false,
+    };
+    let serialize_types = BTreeMap::from([(payload_id, &source)]);
+
+    let reconciled = try_reconcile_serialize_backed_member_names(shape, &serialize_types)
+        .expect("wire-backed source field subset reconciles by native offset");
+
+    assert_eq!(reconciled.member_names_proven, Some(true));
+    assert_eq!(
+        reconciled
+            .members
+            .iter()
+            .map(|member| member.name.as_deref().expect("member name"))
+            .collect::<Vec<_>>(),
+        vec!["m_positionOffset", "m_rotation", "m_itemIndex", "m_state"]
+    );
+    assert_eq!(
+        exact_member_rust_type(&reconciled, &reconciled.members[1], &serialize_types).as_deref(),
+        Some("::glam::Quat")
+    );
+    assert_eq!(
+        exact_member_rust_type(&reconciled, &reconciled.members[2], &serialize_types).as_deref(),
+        Some("u32")
+    );
+    assert_eq!(
+        exact_member_rust_type(&reconciled, &reconciled.members[3], &serialize_types).as_deref(),
+        Some("u8")
+    );
+}
+
+fn test_serialize_field(
+    name: &str,
+    type_id: Uuid,
+    offset: u32,
+) -> crate::network_schema::NetworkSerializeField {
+    crate::network_schema::NetworkSerializeField {
+        name: name.to_owned(),
+        type_id,
+        resolved_type: ResolvedType::Named {
+            type_id,
+            source_name: name.to_owned(),
+        },
+        offset: Some(offset),
+        is_base_class: false,
+    }
+}

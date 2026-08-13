@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+fn emits_anonymous_state_wire_layout_without_a_semantic_type() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "8CA7C6C0-2244-4E78-A55E-E7A8752A5984",
+            "typeIndex": 7003,
+            "typeName": "MB::AnonymousLayoutReplicatedState",
+            "capabilities": ["replicated-state"],
+            "fields": [{
+                "index": 0,
+                "name": "capturePointStatesColdData",
+                "group": 0,
+                "wireLayout": "vec<composite<fixed-bytes-1,fixed-bytes-8,optional<vlq-u64>,composite<fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-4,fixed-bytes-1,fixed-bytes-8,fixed-bytes-1>>>",
+                "wireLayoutSource": "cfg-counted-loop+ordered-element-codecs",
+                "confidence": "register-field-call"
+            }]
+        }],
+        "fieldRegistrationFunctions": [],
+        "fieldHandlerVtables": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [7003])
+        .expect("replicated state source");
+    let plan = &output.report.state_generation_plans[0];
+    let field = &plan.fields[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        field.rust_value_type.as_deref(),
+        Some(
+            "::std::vec::Vec<([u8; 1], [u8; 8], ::core::option::Option<u64>, ([u8; 4], [u8; 4], [u8; 4], [u8; 4], [u8; 1], [u8; 8], [u8; 1]))>"
+        )
+    );
+    assert_eq!(
+        field.wire_shape_source.as_deref(),
+        Some("cfg-counted-loop+ordered-element-codecs")
+    );
+    syn::parse_file(&output.source).expect("generated state source parses");
+}
+
+#[test]
 fn emits_direct_fixed_array_state_field_without_a_sequence_plan() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{

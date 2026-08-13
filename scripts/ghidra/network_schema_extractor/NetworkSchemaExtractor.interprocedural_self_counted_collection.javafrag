@@ -22,6 +22,11 @@
             shape.storage.offset != 0L) {
             return null;
         }
+        if (!selfCountedCollectionOwnsCompleteWireProduct(helper, shape)) {
+            recordNestedTypeShapeReject(
+                "self-counted-collection-is-nested-member");
+            return null;
+        }
         Integer slot = formalParameterSlot(shape.storage);
         if (slot == null) {
             recordNestedTypeShapeReject(
@@ -41,4 +46,52 @@
             null,
             shape.storageKind,
             shape.wireEvidence);
+    }
+
+    /**
+     * A self-counted helper can be promoted to the whole call only when its
+     * recovered count and element calls consume the complete wire product.
+     * Composite helpers often contain one nested vector alongside scalar or
+     * fixed-sequence members; promoting that descendant would discard those
+     * siblings from the caller's codec trace.
+     */
+    private boolean selfCountedCollectionOwnsCompleteWireProduct(
+        Function helper,
+        CollectionOutputShape shape) {
+
+        List<String> readBuffers = readBufferParameters(helper);
+        if (readBuffers.size() != 1) {
+            return false;
+        }
+        HighFunction high = highFunction(helper);
+        if (high == null) {
+            return false;
+        }
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        PcodeStorage readBuffer = new PcodeStorage(readBuffers.get(0), 0L);
+        LinkedHashSet<Address> ownedCallsites = new LinkedHashSet<>(
+            shape.codecCallsites);
+        ownedCallsites.add(shape.countCallsite);
+        for (PcodeOpAST operation : operations) {
+            codecWireTraceCheckpoint();
+            if (operation.getOpcode() != PcodeOp.CALL ||
+                ownedCallsites.contains(operation.getSeqnum().getTarget())) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (target == null) {
+                continue;
+            }
+            PcodeStorage targetReadBuffer = callTargetReadBufferStorage(
+                high,
+                operations,
+                operation,
+                target,
+                readBuffer,
+                new LinkedHashSet<>());
+            if (targetReadBuffer != null) {
+                return false;
+            }
+        }
+        return true;
     }

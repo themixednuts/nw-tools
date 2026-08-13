@@ -1,0 +1,41 @@
+    private Integer instructionAbiCallArgumentSlot(
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        PcodeStorage expected) {
+
+        if (expected == null) {
+            return null;
+        }
+        ForwardArgState state = instructionStateBeforeCall(owner, operation, target);
+        if (state == null) {
+            return null;
+        }
+        Integer selected = null;
+        int argumentCount = provenCallArgumentCandidateCount(owner, operation, target);
+        if (argumentCount < 4 && owner != null && target != null) {
+            HighFunction ownerHigh = highFunction(owner);
+            if (ownerHigh != null) {
+                for (PcodeOpAST candidate : orderedPcodeOps(ownerHigh)) {
+                    if (candidate.getOpcode() == PcodeOp.CALL &&
+                        target.equals(pcodeCallTarget(candidate))) {
+                        argumentCount = Math.max(
+                            argumentCount,
+                            encodedCallArgumentCount(candidate));
+                    }
+                }
+            }
+        }
+        for (int argumentSlot = 1; argumentSlot <= argumentCount; argumentSlot++) {
+            PcodeStorage actual = pcodeStorageFromTrackedValue(
+                win64CallArgumentValue(state, argumentSlot));
+            if (!expected.sameLocation(actual)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = argumentSlot;
+        }
+        return selected;
+    }

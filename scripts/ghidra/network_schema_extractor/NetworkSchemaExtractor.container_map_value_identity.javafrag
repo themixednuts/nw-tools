@@ -52,6 +52,18 @@
                 codecs,
                 "param_2");
             Function target = insertion == null ? null : pcodeCallTarget(insertion);
+            if (target == null) {
+                InstructionContainerInsertion instructionInsertion =
+                    uniqueInstructionContainerInsertion(
+                        function,
+                        high,
+                        loop,
+                        codecs,
+                        "param_2");
+                target = instructionInsertion == null
+                    ? null
+                    : instructionInsertion.target();
+            }
             NativeTypeInfoEvidence candidate = linkedNodeValueTypeInfo(
                 target,
                 valueOrigin,
@@ -187,10 +199,7 @@
                     operation))) {
                 continue;
             }
-            String insertionOwner = uniqueFormalParameterExcept(
-                owner,
-                operation,
-                readBufferParameter);
+            String insertionOwner = containerInsertionOutputParameter(owner, operation);
             if (insertionOwner == null || insertionOwner.equals(readBufferParameter)) {
                 continue;
             }

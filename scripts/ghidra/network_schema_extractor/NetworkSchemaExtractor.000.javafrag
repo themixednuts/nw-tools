@@ -154,7 +154,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private static final String EXTRACTOR_VERSION =
-        "network-schema-extractor-20260810-replicated-state-backlog-pass";
+        "network-schema-extractor-20260812-backedge-count-condition-v31-pass";
 
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
@@ -163,6 +163,13 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private static final long I_FRAGMENT_FULL_UNMARSHAL_RVA = 0x6160ae0L;
     private static final long TYPE_REGISTRY_REGISTER_TYPE_RVA = 0x61a9740L;
     private static final long QUEUE_REGISTRATION_HOOK_RVA = 0x61a95c0L;
+    private static final long MUSICAL_PERFORMANCE_STATE_CONSTRUCTOR_RVA = 0x3964df0L;
+    private static final long MUSICAL_PERFORMANCE_SEED_REGISTER_RVA = 0x3965761L;
+    private static final long MUSICAL_PERFORMANCE_COUNT_REGISTER_RVA = 0x3965785L;
+    private static final long MUSICAL_PERFORMANCE_SEED_HANDLER_VTABLE_RVA = 0x80ff398L;
+    private static final long KNOWN_NON_SETTLING_DECOMPILE_RVA = 0x31f5400L;
+    private static final int MUSICAL_PERFORMANCE_PROFILE_PERFORMER_COUNT = 4;
+    private static final int MUSICAL_PERFORMANCE_PROFILE_FIRST_GROUP = 4;
     private static final int FIXED_FIELD_TABLE_ENTRY_SIZE = 0x10;
     private static final int REPLICATED_STATE_ATTRIBUTE_VECTOR_OFFSET = 0x680;
     private static final int VECTOR_CURRENT_POINTER_OFFSET = 0x8;
@@ -342,6 +349,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private final Map<String, Optional<TypeIdDecode>> registrationThunkTypeIdCache =
         new HashMap<>();
     private final Map<String, Boolean> registrationHelperTableCache = new HashMap<>();
+    private final Map<String, List<Address>> registrationThunkHelperTableScanCache =
+        new HashMap<>();
     private final Map<String, Optional<String>> registrationHookSlotTypeNameCache =
         new HashMap<>();
     private final Map<String, Optional<MessageGraphRoots>> messageGraphRootsCache =

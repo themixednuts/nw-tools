@@ -19,13 +19,30 @@
                 diagnostics);
             ContainerSequenceSummary summary = analysis.summary();
             if (summary == null) {
+                diagnostics.add(containerPlanDiagnostic(
+                    function,
+                    loop.header().getStart(),
+                    null,
+                    null,
+                    "sequence",
+                    analysis.rejectReason(),
+                    writeBufferParameter,
+                    null,
+                    null,
+                    null,
+                    null));
                 continue;
             }
             boolean conflict = summary.elementOperations().stream().anyMatch(actions::containsKey) ||
                 summary.emissionOperations().stream().anyMatch(actions::containsKey);
             if (conflict) {
+                runMetrics.increment("containerSequenceSummaryConflicts");
                 continue;
             }
+            runMetrics.increment("containerSequenceSummaries");
+            runMetrics.add(
+                "containerSequenceSummaryActions",
+                summary.elementOperations().size() + summary.emissionOperations().size());
             for (PcodeOpAST operation : summary.elementOperations()) {
                 actions.put(operation, new ContainerSequenceAction(summary.codec(), false));
             }
@@ -47,7 +64,7 @@
 
         SequenceLoopStorage storage = sequenceLoopStorage(high, loop, operations);
         if (storage == null) {
-            return analyzeLinkedContainerSequence(
+            ContainerSequenceAnalysis linked = analyzeLinkedContainerSequence(
                 function,
                 high,
                 loop,
@@ -55,6 +72,26 @@
                 writeBufferParameter,
                 active,
                 diagnostics);
+            if (linked.summary() != null) {
+                return linked;
+            }
+            ContainerIterationAnalysis iterationAnalysis = analyzeContainerIteration(
+                function,
+                high,
+                loop,
+                operations,
+                writeBufferParameter,
+                active,
+                diagnostics);
+            return iterationAnalysis.iteration() == null
+                ? linked
+                : branchCountedContainerSequence(
+                    function,
+                    high,
+                    loop,
+                    operations,
+                    writeBufferParameter,
+                    iterationAnalysis.iteration());
         }
         ContainerIterationAnalysis iterationAnalysis = analyzeContainerIteration(
             function,
@@ -75,12 +112,28 @@
             operations,
             storage);
         if (guard == null) {
-            return staticSequenceAnalysis(
+            ContainerSequenceAnalysis fixed = staticSequenceAnalysis(
                 high,
                 loop,
                 operations,
                 storage,
                 iteration);
+            if (fixed.summary() != null) {
+                return fixed;
+            }
+            ContainerSequenceAnalysis counted = branchCountedContainerSequence(
+                function,
+                high,
+                loop,
+                operations,
+                writeBufferParameter,
+                iteration);
+            if (counted.summary() != null) {
+                runMetrics.increment("storageDetachedBranchCountedContainerSequences");
+                return counted;
+            }
+            return ContainerSequenceAnalysis.rejected(
+                "missing-capacity-guard-or-proven-branch-counted-sequence");
         }
         List<PcodeOpAST> countCalls = sequenceCountCalls(
             function,
@@ -91,7 +144,8 @@
             storage,
             guard);
         if (countCalls == null) {
-            return ContainerSequenceAnalysis.rejected("missing-partitioned-count-calls");
+            return storedBranchCountedContainerSequence(
+                function, high, loop, operations, writeBufferParameter, iteration);
         }
 
         String elementShape = iteration.element().shape == null
@@ -205,8 +259,11 @@
         if (!sequence.complete() || sequence.events().isEmpty()) {
             return ContainerIterationAnalysis.rejected("iteration-" + sequence.status());
         }
-        List<ContainerCodecCall> leaves = physicalContainerCodecLeaves(sequence.events());
-        WireShape element = sequenceElementWireEvidence(leaves);
+        WireShape element = structuredSequenceElementWireEvidence(sequence.events());
+        if (element == null) {
+            List<ContainerCodecCall> leaves = physicalContainerCodecLeaves(sequence.events());
+            element = sequenceElementWireEvidence(leaves);
+        }
         return element == null
             ? ContainerIterationAnalysis.rejected("missing-element-wire-evidence")
             : ContainerIterationAnalysis.complete(new ContainerIteration(
@@ -299,7 +356,7 @@
             if (!(operation instanceof PcodeOpAST phi) ||
                 phi.getOpcode() != PcodeOp.MULTIEQUAL || phi.getOutput() == null ||
                 phi.getOutput().getSize() != currentProgram.getDefaultPointerSize() ||
-                affinePointerInductionStride(phi) != null) {
+                affinePointerInductionStride(phi, loop) != null) {
                 continue;
             }
             PcodeStorage initial = null;
@@ -503,8 +560,8 @@
 
         SequenceLoopStorage selected = null;
         for (PcodeOpAST induction : affineSequenceInductions(loop)) {
-            Long stride = affinePointerInductionStride(induction);
-            PcodeStorage data = sequenceInitialStorage(induction);
+            Long stride = affinePointerInductionStride(induction, loop);
+            PcodeStorage data = sequenceInitialStorage(induction, loop);
             if (stride == null || stride <= 0L || data == null ||
                 !isSequenceStorageBase(data.base) ||
                 !loopConditionDependsOn(high, loop, induction.getOutput())) {
@@ -513,6 +570,11 @@
             PcodeStorage end = fixedSequenceEndStorage(loop, operations, induction, data);
             if (end == null || !end.base.equals(data.base) || end.offset <= data.offset) {
                 continue;
+            }
+            PcodeStorage boundedData = capacityBoundedInlineSequenceDataStorage(
+                high, loop, operations, data, end, stride);
+            if (boundedData != null) {
+                data = boundedData;
             }
             SequenceLoopStorage candidate = new SequenceLoopStorage(
                 induction,
@@ -531,15 +593,13 @@
         return base != null && (base.matches("param_\\d+") || "stack".equals(base));
     }
 
-    private PcodeStorage sequenceInitialStorage(PcodeOpAST induction) {
+    private PcodeStorage sequenceInitialStorage(
+        PcodeOpAST induction,
+        NetworkSchemaNaturalLoop loop) {
         PcodeStorage selected = null;
         for (int slot = 0; slot < induction.getNumInputs(); slot++) {
             Varnode input = induction.getInput(slot);
-            if (affineStepFromPhi(
-                    input,
-                    induction.getOutput(),
-                    new LinkedHashSet<>(),
-                    0) != null) {
+            if (isAffineBackedgeInput(induction, input, loop, slot)) {
                 continue;
             }
             PcodeStorage storage = pcodeStorageExpression(input);
@@ -578,8 +638,7 @@
             }
             PcodeOpAST branch = branchUsingComparison(block, comparison);
             SequenceBranchDirection direction = sequenceBranchDirection(branch, loop);
-            if (branch == null || direction == null ||
-                !comparisonReferencesSequenceStorage(comparison, storage)) {
+            if (branch == null || direction == null) {
                 continue;
             }
             Long capacity = boundedSequenceCapacity(comparison);
@@ -610,30 +669,9 @@
             }
             selected = candidate;
         }
-        return selected;
-    }
-
-    private PcodeOpAST branchUsingComparison(
-        PcodeBlockBasic block,
-        PcodeOpAST comparison) {
-
-        PcodeOpAST selected = null;
-        var iterator = block.getIterator();
-        while (iterator.hasNext()) {
-            PcodeOp operation = iterator.next();
-            if (!(operation instanceof PcodeOpAST branch) ||
-                branch.getOpcode() != PcodeOp.CBRANCH || branch.getNumInputs() < 2 ||
-                !pcodeNodeDependsOn(
-                    branch.getInput(branch.getNumInputs() - 1),
-                    comparison.getOutput(),
-                    new LinkedHashSet<>(),
-                    0)) {
-                continue;
-            }
-            if (selected != null) {
-                return null;
-            }
-            selected = branch;
+        if (selected != null && storage != null && !comparisonReferencesSequenceStorage(
+                selected.comparison(), storage)) {
+            runMetrics.increment("sequenceCapacityGuardRegisterCandidates");
         }
         return selected;
     }
@@ -652,11 +690,10 @@
         if (successors.size() != 2) {
             return null;
         }
-        Address destination = branch.getInput(0).getAddress();
-        PcodeBlockBasic trueSuccessor = successors.stream()
-            .filter(successor -> Objects.equals(successor.getStart(), destination))
-            .findFirst()
-            .orElse(null);
+        Address destination = pcodeAddress(branch.getInput(0));
+        PcodeBlockBasic trueSuccessor = branchTargetSuccessor(
+            successors,
+            destination);
         if (trueSuccessor == null) {
             return null;
         }
@@ -739,18 +776,38 @@
         }
         PcodeOpAST accepted = branches.accepted();
         PcodeOpAST rejected = branches.rejected();
+        boolean countReferencesStorage = callReferencesSequenceStorage(
+            function,
+            accepted,
+            writeBufferParameter,
+            storage);
+        boolean guardReferencesStorage = comparisonReferencesSequenceStorage(
+            guard.comparison(),
+            storage);
+        boolean guardedCountRegister = !guardReferencesStorage || !countReferencesStorage
+            ? callReusesGuardedSequenceCount(
+                function,
+                high,
+                accepted,
+                writeBufferParameter,
+                guard)
+            : false;
+        if (!countReferencesStorage && guardedCountRegister) {
+            countReferencesStorage = true;
+            runMetrics.increment("guardedSequenceCountRegisterProofs");
+        }
         if (loop.contains(accepted) || loop.contains(rejected) ||
             !NetworkSchemaControlFlow.dominates(
                 high,
                 NetworkSchemaControlFlow.parentBlock(accepted),
                 loop.header()) ||
-            !callReferencesSequenceStorage(
-                function,
-                accepted,
-                writeBufferParameter,
-                storage) ||
+            (!guardReferencesStorage && !guardedCountRegister) ||
+            !countReferencesStorage ||
             !callHasExplicitZeroValue(rejected)) {
             return null;
+        }
+        if (!guardReferencesStorage) {
+            runMetrics.increment("sequenceCapacityGuardRegisterProofs");
         }
         return List.of(accepted, rejected);
     }
@@ -878,62 +935,6 @@
         return false;
     }
 
-    private boolean callReferencesSequenceCount(
-        Function owner,
-        PcodeOpAST call,
-        String writeBufferParameter,
-        PcodeStorage count) {
-
-        LinkedHashMap<String, PcodeStorage> referenced = new LinkedHashMap<>();
-        for (int slot = 1; slot < call.getNumInputs(); slot++) {
-            collectPcodeStorages(
-                call.getInput(slot),
-                referenced,
-                new LinkedHashSet<>(),
-                0);
-        }
-        if (referenced.values().stream().anyMatch(count::sameLocation)) {
-            return true;
-        }
-
-        Function target = pcodeCallTarget(call);
-        Integer bufferSlot = provenCallArgumentSlot(
-            owner,
-            call,
-            target,
-            new PcodeStorage(writeBufferParameter, 0L));
-        if (bufferSlot == null) {
-            return false;
-        }
-        int argumentCount = provenCallArgumentCount(call, target);
-        for (int slot = 1; slot <= argumentCount; slot++) {
-            if (slot == bufferSlot) {
-                continue;
-            }
-            if (instructionCallArgumentStorageDependencies(owner, call, target, slot)
-                .stream()
-                .anyMatch(count::sameLocation)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean callHasExplicitZeroValue(PcodeOpAST call) {
-        Function owner = call == null || call.getSeqnum() == null
-            ? null
-            : functionContaining(call.getSeqnum().getTarget());
-        Function target = pcodeCallTarget(call);
-        int argumentCount = provenCallArgumentCount(call, target);
-        for (int slot = 1; slot <= argumentCount; slot++) {
-            Long value = provenCallArgumentImmediate(owner, call, target, slot);
-            if (value != null && value == 0L) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private WireShape sequenceElementWireEvidence(List<ContainerCodecCall> codecs) {
         if (codecs == null || codecs.isEmpty()) {
             return null;
@@ -941,13 +942,12 @@
         ArrayList<String> shapes = new ArrayList<>();
         ArrayList<String> layouts = new ArrayList<>();
         for (ContainerCodecCall codec : codecs) {
-            if (codec.wireEvidence == null || codec.wireEvidence.layout == null) {
+            if (codec.wireEvidence == null || codec.wireEvidence.layout == null ||
+                !codec.wireEvidence.hasProvenSemantics()) {
                 return null;
             }
             layouts.add(codec.wireEvidence.layout);
-            shapes.add(codec.wireEvidence.shape == null
-                ? codec.wireEvidence.layout
-                : codec.wireEvidence.shape);
+            shapes.add(codec.wireEvidence.shape);
         }
         String shape = compositeWireShape(shapes);
         String layout = compositeWireShape(layouts);

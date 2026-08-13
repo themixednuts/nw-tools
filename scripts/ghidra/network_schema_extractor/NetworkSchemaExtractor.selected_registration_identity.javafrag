@@ -119,10 +119,17 @@
     }
 
     private HookTypeEvidence registrationHookForThunk(Function registerThunk) {
+        if (registerThunk == null) {
+            return null;
+        }
+        LinkedHashSet<Address> helperTables = new LinkedHashSet<>();
         ReferenceIterator references = currentProgram.getReferenceManager()
             .getReferencesTo(registerThunk.getEntryPoint());
         while (references.hasNext()) {
-            Address helperTable = subtract(references.next().getFromAddress(), 0x10L);
+            helperTables.add(subtract(references.next().getFromAddress(), 0x10L));
+        }
+        helperTables.addAll(registrationHelperTablesContainingThunk(registerThunk));
+        for (Address helperTable : helperTables) {
             if (!isRegistrationHelperTable(helperTable)) {
                 continue;
             }
@@ -140,4 +147,62 @@
                 typeName);
         }
         return null;
+    }
+
+    private List<Address> registrationHelperTablesContainingThunk(
+        Function registerThunk) {
+
+        String cacheKey = addressCacheKey(
+            "registration-thunk-helper-table-scan",
+            registerThunk.getEntryPoint());
+        List<Address> cached = registrationThunkHelperTableScanCache.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+        runMetrics.increment("selectedRegistrationHelperPointerScans");
+        long pointer = registerThunk.getEntryPoint().getOffset();
+        byte[] bytes = new byte[currentProgram.getDefaultPointerSize()];
+        for (int index = 0; index < bytes.length; index++) {
+            bytes[index] = (byte)(pointer >>> (index * 8));
+        }
+        LinkedHashSet<Address> result = new LinkedHashSet<>();
+        for (MemoryBlock block : currentProgram.getMemory().getBlocks()) {
+            checkAnalysisCancelled();
+            if (!block.isRead() || block.isExecute()) {
+                continue;
+            }
+            Address cursor = block.getStart();
+            Address end = block.getEnd();
+            while (cursor != null && cursor.compareTo(end) <= 0 && result.size() < 32) {
+                Address found;
+                try {
+                    found = currentProgram.getMemory()
+                        .findBytes(cursor, bytes, null, true, monitor);
+                }
+                catch (Exception ignored) {
+                    break;
+                }
+                if (found == null || found.compareTo(end) > 0) {
+                    break;
+                }
+                Address helperTable = subtract(found, 0x10L);
+                if (isRegistrationHelperTable(helperTable)) {
+                    Address tableThunk = registrationCodePointer(
+                        helperTable.add(0x10L));
+                    if (registerThunk.getEntryPoint().equals(
+                            resolvedCodeTarget(tableThunk))) {
+                        result.add(helperTable);
+                        runMetrics.increment(
+                            "selectedRegistrationHelperPointerScanProofs");
+                    }
+                }
+                cursor = found.add(1L);
+            }
+            if (result.size() >= 32) {
+                break;
+            }
+        }
+        List<Address> frozen = List.copyOf(result);
+        registrationThunkHelperTableScanCache.put(cacheKey, frozen);
+        return frozen;
     }

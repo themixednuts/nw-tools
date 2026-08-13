@@ -158,6 +158,22 @@
         return true;
     }
 
+    private CodecWireEvent directCallProductEvent(
+        Function owner,
+        PcodeOp operation,
+        Function target,
+        CodecWireTrace nested) {
+
+        CodecWireEvent product = directValueCallProductEvent(
+            owner,
+            operation,
+            target,
+            nested);
+        return product == null
+            ? directNestedLeafCallEvent(operation, target, nested)
+            : product;
+    }
+
     private CodecWireEvent directValueCallProductEvent(
         Function owner,
         PcodeOp operation,
@@ -190,8 +206,41 @@
             operation.getSeqnum().getTarget(),
             target.getEntryPoint(),
             fullFunctionName(target),
-            provenUnmarshalOutputStorage(operation),
+            codecUnmarshalOutputStorage(operation, nativeType, product),
             null);
+    }
+
+    private CodecWireEvent directNestedLeafCallEvent(
+        PcodeOp operation,
+        Function target,
+        CodecWireTrace nested) {
+
+        if (operation == null || operation.getSeqnum() == null || target == null ||
+            target.getEntryPoint() == null || nested == null || nested.events.size() != 1) {
+            return null;
+        }
+        CodecWireEvent event = nested.events.get(0);
+        Address nestedCallsite = event == null ? null : event.callsite();
+        Address nestedTarget = event == null ? null : event.target();
+        Address targetEntry = resolvedCodeTarget(target.getEntryPoint());
+        if (event == null || event.wireEvidence() == null || nestedCallsite == null ||
+            nestedTarget == null ||
+            !Objects.equals(resolvedCodeTarget(nestedCallsite), targetEntry) ||
+            !Objects.equals(resolvedCodeTarget(nestedTarget), targetEntry)) {
+            return null;
+        }
+        runMetrics.increment("directNestedLeafCallEventsRebased");
+        return new CodecWireEvent(
+            event.nativeType(),
+            event.wireEvidence(),
+            operation.getSeqnum().getTarget(),
+            event.target(),
+            event.targetName(),
+            codecUnmarshalOutputStorage(
+                operation,
+                event.nativeType(),
+                event.wireEvidence()),
+            event.typeIdentitySource());
     }
 
     private WireShape codecWireProduct(

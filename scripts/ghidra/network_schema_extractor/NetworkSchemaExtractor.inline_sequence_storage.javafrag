@@ -1,0 +1,72 @@
+    private PcodeStorage capacityBoundedInlineSequenceDataStorage(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeStorage cursor,
+        PcodeStorage end,
+        long stride) {
+
+        if (high == null || loop == null || operations == null || cursor == null ||
+            end == null || stride <= 0L || !cursor.base.equals(end.base)) {
+            return null;
+        }
+        LinkedHashMap<String, PcodeStorage> candidates = new LinkedHashMap<>();
+        for (PcodeOpAST comparison : operations) {
+            if (loop.contains(comparison) || !isOrderedIntegerComparison(comparison) ||
+                comparison.getNumInputs() != 2 || comparison.getOutput() == null) {
+                continue;
+            }
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(comparison);
+            PcodeOpAST branch = block == null
+                ? null
+                : branchUsingComparison(block, comparison);
+            if (block == null || branch == null ||
+                !NetworkSchemaControlFlow.dominates(high, block, loop.header()) ||
+                sequenceBranchDirection(branch, loop) == null) {
+                continue;
+            }
+            Long capacity = boundedSequenceCapacity(comparison);
+            if (capacity == null || capacity <= 0L || capacity > 0xffffL) {
+                continue;
+            }
+            LinkedHashMap<String, PcodeStorage> referenced = new LinkedHashMap<>();
+            collectPcodeStorages(
+                comparison.getInput(0),
+                referenced,
+                new LinkedHashSet<>(),
+                0);
+            collectPcodeStorages(
+                comparison.getInput(1),
+                referenced,
+                new LinkedHashSet<>(),
+                0);
+            if (referenced.values().stream().noneMatch(end::sameLocation)) {
+                continue;
+            }
+            for (PcodeStorage candidate : referenced.values()) {
+                if (!candidate.base.equals(cursor.base) || candidate.offset > cursor.offset ||
+                    candidate.sameLocation(end)) {
+                    continue;
+                }
+                long interiorOffset;
+                long span;
+                long provenCapacity;
+                try {
+                    interiorOffset = Math.subtractExact(cursor.offset, candidate.offset);
+                    span = Math.subtractExact(end.offset, candidate.offset);
+                    provenCapacity = Math.floorDiv(span, stride);
+                }
+                catch (ArithmeticException ignored) {
+                    continue;
+                }
+                if (interiorOffset < 0L || interiorOffset >= stride || span <= 0L ||
+                    span % stride != 0L || provenCapacity != capacity) {
+                    continue;
+                }
+                candidates.putIfAbsent(storageKey(candidate), candidate);
+            }
+        }
+        return candidates.size() == 1
+            ? candidates.values().iterator().next()
+            : null;
+    }

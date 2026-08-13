@@ -1,0 +1,566 @@
+    private WireShape semanticWireEvidenceForNativeType(String nativeType) {
+        String wireShape = wireShapeFromNativeType(nativeType);
+        return wireShape == null
+            ? null
+            : WireShape.semantic(
+                wireShape,
+                "full-container-loop-marshal-template");
+    }
+
+    private void applyContainerCodecTypeIdentity(
+        ContainerCodecCall codec,
+        String nativeType) {
+
+        SerializeTypeInfo exact = exactSerializeTypeForTypeName(nativeType);
+        SerializeTypeInfo reflected = exact == null
+            ? serializeTypeForTypeName(nativeType)
+            : exact;
+        codec.typeId = reflected == null
+            ? typeIdForTypeName(nativeType)
+            : reflected.typeId;
+        codec.typeIdSource = reflected == null
+            ? "az-type-info-fold"
+            : exact == null
+                ? "serialize-unique-leaf-name"
+                : "serialize-exact-name";
+    }
+
+    private SerializeTypeInfo exactSerializeTypeForTypeName(String typeName) {
+        if (typeName == null || typeName.isBlank()) {
+            return null;
+        }
+        List<SerializeTypeInfo> candidates = serializeTypesByName.get(typeName.trim());
+        return candidates != null && candidates.size() == 1 ? candidates.get(0) : null;
+    }
+
+    private boolean hasContainingNaturalLoop(
+        NetworkSchemaNaturalLoop loop,
+        List<NetworkSchemaNaturalLoop> loops) {
+
+        if (loop == null || loops == null) {
+            return false;
+        }
+        for (NetworkSchemaNaturalLoop candidate : loops) {
+            if (isStrictNestedLoop(candidate, loop)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<NetworkSchemaNaturalLoop> directNestedNaturalLoops(
+        NetworkSchemaNaturalLoop parent,
+        List<NetworkSchemaNaturalLoop> loops) {
+
+        ArrayList<NetworkSchemaNaturalLoop> result = new ArrayList<>();
+        for (NetworkSchemaNaturalLoop child : loops) {
+            if (!isStrictNestedLoop(parent, child)) {
+                continue;
+            }
+            boolean intermediate = false;
+            for (NetworkSchemaNaturalLoop candidate : loops) {
+                if (candidate != parent && candidate != child &&
+                    isStrictNestedLoop(parent, candidate) &&
+                    isStrictNestedLoop(candidate, child)) {
+                    intermediate = true;
+                    break;
+                }
+            }
+            if (!intermediate) {
+                result.add(child);
+            }
+        }
+        result.sort(Comparator.comparing(loop -> loop.header().getStart()));
+        return List.copyOf(result);
+    }
+
+    private List<ContainerCodecCall> marshalNestedFixedSequenceCodecs(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop parent,
+        List<PcodeOpAST> operations,
+        PcodeStorage writeBuffer,
+        Set<String> active,
+        List<ContainerPlanDiagnostic> diagnostics) {
+
+        ArrayList<ContainerCodecCall> result = new ArrayList<>();
+        List<NetworkSchemaNaturalLoop> loops = NetworkSchemaControlFlow.naturalLoops(high);
+        for (NetworkSchemaNaturalLoop child : directNestedNaturalLoops(parent, loops)) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            ArrayList<ContainerCodecCall> iteration = new ArrayList<>();
+            boolean connected = false;
+            for (PcodeOpAST operation : operations) {
+                if (!child.contains(operation) ||
+                    !child.equals(NetworkSchemaControlFlow.innermostLoopContaining(
+                        high,
+                        operation))) {
+                    continue;
+                }
+                ContainerCodecCall codec = switch (operation.getOpcode()) {
+                    case PcodeOp.CALL -> {
+                        Function target = pcodeCallTarget(operation);
+                        connected |= target != null && provenCallArgumentSlot(
+                            function,
+                            operation,
+                            target,
+                            writeBuffer) != null;
+                        yield fullContainerDirectCodec(
+                            function,
+                            operation,
+                            writeBuffer,
+                            active,
+                            diagnostics);
+                    }
+                    case PcodeOp.CALLIND -> {
+                        connected |= provenVirtualRawWriteLength(
+                            function,
+                            operation,
+                            writeBuffer.base) != null;
+                        yield fullContainerRawCodec(
+                            function,
+                            operation,
+                            writeBuffer.base,
+                            diagnostics);
+                    }
+                    default -> null;
+                };
+                if (codec != null) {
+                    iteration.add(codec);
+                }
+            }
+            if (!connected) {
+                continue;
+            }
+            FixedSequenceStorage fixed = nestedElementFixedSequenceStorage(
+                high,
+                parent,
+                child,
+                operations);
+            ContainerCodecCall aggregate = fixed == null || iteration.isEmpty()
+                ? null
+                : nestedFixedSequenceCodec(high, child, iteration, fixed, "marshal");
+            if (aggregate == null) {
+                diagnostics.add(containerPlanDiagnostic(
+                    function,
+                    child.header().getStart(),
+                    null,
+                    null,
+                    "nested-loop",
+                    "buffer-connected-nested-fixed-sequence-unproven",
+                    writeBuffer.base,
+                    null,
+                    null,
+                    iteration.size(),
+                    null));
+                return null;
+            }
+            result.add(aggregate);
+        }
+        return List.copyOf(result);
+    }
+
+    private List<ContainerCodecCall> unmarshalNestedFixedSequenceCodecs(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop parent,
+        List<PcodeOpAST> operations,
+        PcodeStorage readBuffer,
+        FullContainerPlan plan) {
+
+        ArrayList<ContainerCodecCall> result = new ArrayList<>();
+        List<NetworkSchemaNaturalLoop> loops = NetworkSchemaControlFlow.naturalLoops(high);
+        for (NetworkSchemaNaturalLoop child : directNestedNaturalLoops(parent, loops)) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            ArrayList<ContainerCodecCall> iteration = new ArrayList<>();
+            boolean connected = false;
+            for (PcodeOpAST operation : operations) {
+                if (!child.contains(operation) || operation.getOpcode() != PcodeOp.CALL ||
+                    !child.equals(NetworkSchemaControlFlow.innermostLoopContaining(
+                        high,
+                        operation))) {
+                    continue;
+                }
+                Function target = pcodeCallTarget(operation);
+                connected |= target != null && provenCallArgumentSlot(
+                    function,
+                    operation,
+                    target,
+                    readBuffer) != null;
+                ContainerCodecCall codec = unmarshalContainerDirectCodec(
+                    function,
+                    high,
+                    child,
+                    operation,
+                    readBuffer,
+                    plan);
+                if (codec != null) {
+                    iteration.add(codec);
+                }
+            }
+            if (!connected) {
+                continue;
+            }
+            FixedSequenceStorage fixed = nestedElementFixedSequenceStorage(
+                high,
+                parent,
+                child,
+                operations);
+            ContainerCodecCall aggregate = fixed == null || iteration.isEmpty()
+                ? null
+                : nestedFixedSequenceCodec(high, child, iteration, fixed, "unmarshal");
+            if (aggregate == null) {
+                plan.unmarshalDiagnostics.add(
+                    formatAddress(child.header().getStart()) +
+                    ":buffer-connected-nested-fixed-sequence-unproven");
+                plan.unmarshalAnalysisStatus = mergeContainerCodecAnalysisStatus(
+                    plan.unmarshalAnalysisStatus,
+                    "nested-fixed-sequence-unproven");
+                return null;
+            }
+            result.add(aggregate);
+        }
+        return List.copyOf(result);
+    }
+
+    private ContainerCodecCall unmarshalContainerDirectCodec(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        PcodeOpAST operation,
+        PcodeStorage readBuffer,
+        FullContainerPlan plan) {
+
+        Function target = pcodeCallTarget(operation);
+        PcodeStorage targetReadBuffer = callTargetReadBufferStorage(
+            high,
+            orderedPcodeOps(high),
+            operation,
+            target,
+            readBuffer,
+            new LinkedHashSet<>());
+        if (target == null || targetReadBuffer == null) {
+            return null;
+        }
+        String targetDirectParameter = targetReadBuffer.offset == 0L
+            ? targetReadBuffer.base
+            : null;
+        WireShape rawEvidence = pcodeReadRawWireEvidence(operation, target);
+        if (rawEvidence != null) {
+            RawPcodeWrite raw = pcodeReadRawWrite(operation, target);
+            WireShape evidence = raw == null
+                ? rawEvidence
+                : unmarshalLoopRawWireEvidence(
+                    function,
+                    high,
+                    loop,
+                    operation,
+                    raw,
+                    plan);
+            ContainerCodecCall codec =
+                unmarshalContainerCodec(operation, target, null, evidence);
+            applyUnmarshalContainerCodecOutputStorage(
+                codec,
+                high,
+                operation,
+                raw == null ? null : raw.storage);
+            applyConstructorFieldTypeIdentity(
+                codec,
+                rawConstructorFieldIdentity(
+                    function,
+                    high,
+                    loop,
+                    operation,
+                    raw));
+            return codec;
+        }
+        WireShape leaf = targetDirectParameter == null
+            ? null
+            : validatedUnmarshalLeaf(target, targetDirectParameter);
+        if (leaf != null) {
+            ContainerCodecCall codec = unmarshalContainerCodec(
+                operation,
+                target,
+                unmarshalNativeTypeFromTarget(target),
+                leaf);
+            applyUnmarshalContainerCodecOutputStorage(
+                codec,
+                high,
+                operation,
+                provenUnmarshalOutputStorage(operation));
+            return codec;
+        }
+        ContainerCodecMembers nested = collectContainerUnmarshalCodecMembers(
+            target,
+            targetReadBuffer,
+            new LinkedHashSet<>(),
+            0);
+        if (!nested.exact() ||
+            nested.members().isEmpty() && nested.optionalMembers().isEmpty()) {
+            plan.unmarshalDiagnostics.add(
+                formatAddress(target.getEntryPoint()) + ":" + nested.analysisStatus());
+            plan.unmarshalAnalysisStatus = mergeContainerCodecAnalysisStatus(
+                plan.unmarshalAnalysisStatus,
+                "helper:" + nested.analysisStatus());
+            return null;
+        }
+        translateContainerHelperMemberStorage(
+            function,
+            operation,
+            target,
+            nested.members());
+        translateContainerHelperMemberStorage(
+            function,
+            operation,
+            target,
+            nested.optionalMembers());
+        ContainerCodecCall boundary = new ContainerCodecCall();
+        boundary.operation = operation;
+        boundary.callsite = operation.getSeqnum().getTarget();
+        boundary.target = target.getEntryPoint();
+        boundary.targetName = fullFunctionName(target);
+        boundary.evidenceSource = "full-container-unmarshal-loop-helper-boundary";
+        boundary.memberSemantics = !nested.optionalMembers().isEmpty()
+            ? "optional-suffix"
+            : "linear-sequence";
+        boundary.analysisStatus = nested.analysisStatus();
+        boundary.members.addAll(nested.members());
+        boundary.optionalMembers.addAll(nested.optionalMembers());
+        return boundary;
+    }
+
+    private FixedSequenceStorage nestedElementFixedSequenceStorage(
+        HighFunction high,
+        NetworkSchemaNaturalLoop parent,
+        NetworkSchemaNaturalLoop child,
+        List<PcodeOpAST> operations) {
+
+        LinkedHashMap<String, FixedSequenceStorage> candidates = new LinkedHashMap<>();
+        for (PcodeOpAST parentInduction : containerElementInductions(high, parent)) {
+            if (child.contains(parentInduction)) {
+                continue;
+            }
+            ContainerLoopInduction parentShape = inductionFromPhi(parentInduction, parent);
+            if (parentShape == null || parentShape.storageKind() != ContainerStorageKind.VECTOR ||
+                parentShape.stride() == null) {
+                continue;
+            }
+            for (PcodeOpAST childInduction : affineSequenceInductions(child)) {
+                Long stride = affinePointerInductionStride(childInduction, child);
+                Long start = nestedSequenceInitialOffset(
+                    childInduction,
+                    parentInduction.getOutput());
+                Long end = nestedSequenceEndOffset(
+                    child,
+                    operations,
+                    childInduction,
+                    parentInduction.getOutput());
+                if (stride == null || stride <= 0L || start == null) {
+                    continue;
+                }
+                if (end == null) {
+                    Integer tripCount = counterControlledLoopTripCount(high, child);
+                    Long span = tripCount == null
+                        ? null
+                        : multiplyExactOrNull(stride, tripCount.longValue());
+                    end = span == null ? null : addExactOrNull(start, span);
+                }
+                // The outer induction may be biased into the element. Preserve
+                // signed offsets here; the parent codec pass normalizes them.
+                long parentStride = parentShape.stride();
+                if (end == null || end <= start ||
+                    start <= -parentStride || end > parentStride ||
+                    end - start > parentStride) {
+                    continue;
+                }
+                long span = end - start;
+                if (span % stride != 0L) {
+                    continue;
+                }
+                long capacity = span / stride;
+                if (capacity <= 0L || capacity > 0x100L) {
+                    continue;
+                }
+                FixedSequenceStorage candidate = new FixedSequenceStorage(
+                    childInduction,
+                    new PcodeStorage("element", start),
+                    new PcodeStorage("element", end),
+                    stride,
+                    Math.toIntExact(capacity));
+                if (start < 0L) {
+                    runMetrics.increment("biasedNestedFixedSequenceOffsets");
+                }
+                String key = start + ":" + end + ":" + stride + ":" + capacity;
+                candidates.putIfAbsent(key, candidate);
+            }
+        }
+        return candidates.size() == 1
+            ? candidates.values().iterator().next()
+            : null;
+    }
+
+    private Long nestedSequenceInitialOffset(
+        PcodeOpAST induction,
+        Varnode parentElement) {
+
+        Long selected = null;
+        for (int slot = 0; slot < induction.getNumInputs(); slot++) {
+            Varnode input = induction.getInput(slot);
+            if (affineStepFromPhi(
+                    input,
+                    induction.getOutput(),
+                    new LinkedHashSet<>(),
+                    0) != null) {
+                continue;
+            }
+            Long offset = pcodeConstantOffsetFromRoot(
+                input,
+                parentElement,
+                new LinkedHashSet<>(),
+                0);
+            if (offset == null) {
+                continue;
+            }
+            if (selected != null && !selected.equals(offset)) {
+                return null;
+            }
+            selected = offset;
+        }
+        return selected;
+    }
+
+    private Long multiplyExactOrNull(long left, long right) {
+        try {
+            return Math.multiplyExact(left, right);
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private Long nestedSequenceEndOffset(
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        PcodeOpAST induction,
+        Varnode parentElement) {
+
+        Long selected = null;
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CBRANCH ||
+                operation.getNumInputs() < 2) {
+                continue;
+            }
+            Varnode condition = operation.getInput(operation.getNumInputs() - 1);
+            if (!pcodeNodeDependsOn(
+                    condition,
+                    induction.getOutput(),
+                    new LinkedHashSet<>(),
+                    0)) {
+                continue;
+            }
+            PcodeOp comparison = condition.getDef();
+            if (comparison == null || comparison.getNumInputs() != 2 ||
+                comparison.getOpcode() != PcodeOp.INT_EQUAL &&
+                comparison.getOpcode() != PcodeOp.INT_NOTEQUAL) {
+                continue;
+            }
+            for (int slot = 0; slot < comparison.getNumInputs(); slot++) {
+                Varnode input = comparison.getInput(slot);
+                if (pcodeNodeDependsOn(
+                        input,
+                        induction.getOutput(),
+                        new LinkedHashSet<>(),
+                        0)) {
+                    continue;
+                }
+                Long offset = pcodeConstantOffsetFromRoot(
+                    input,
+                    parentElement,
+                    new LinkedHashSet<>(),
+                    0);
+                if (offset == null) {
+                    continue;
+                }
+                if (selected != null && !selected.equals(offset)) {
+                    return null;
+                }
+                selected = offset;
+            }
+        }
+        return selected;
+    }
+
+    private ContainerCodecCall nestedFixedSequenceCodec(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<ContainerCodecCall> iteration,
+        FixedSequenceStorage fixed,
+        String direction) {
+
+        applyContainerCodecElementOffsets(high, loop, iteration);
+        if (iteration.stream().anyMatch(codec ->
+                !"element".equals(codec.elementBase) || codec.elementOffset == null)) {
+            return null;
+        }
+        List<ContainerCodecCall> logical = logicalContainerCodecLeaves(iteration);
+        WireShape element = logical == null
+            ? null
+            : sequenceElementWireEvidence(logical);
+        if (element == null || element.shape == null || element.layout == null) {
+            return null;
+        }
+        ContainerCodecCall aggregate = new ContainerCodecCall();
+        aggregate.operation = iteration.get(0).operation;
+        aggregate.callsite = iteration.get(0).callsite;
+        aggregate.wireEvidence = WireShape.semantic(
+            "fixed-array<" + element.shape + "," + fixed.capacity() + ">",
+            "fixed-array<" + element.layout + "," + fixed.capacity() + ">",
+            "cfg-element-relative-nested-fixed-sequence");
+        aggregate.evidenceSource = "full-container-" + direction +
+            "-nested-fixed-sequence";
+        aggregate.memberSemantics = "fixed-sequence";
+        aggregate.analysisStatus = "complete";
+        aggregate.elementBase = "element";
+        aggregate.elementOffset = fixed.data().offset;
+        for (int index = 0; index < fixed.capacity(); index++) {
+            long adjustment = fixed.data().offset + index * fixed.stride();
+            for (ContainerCodecCall member : iteration) {
+                aggregate.members.add(copyContainerCodecCall(member, adjustment));
+            }
+        }
+        return aggregate;
+    }
+
+    private ContainerCodecCall copyContainerCodecCall(
+        ContainerCodecCall source,
+        long elementAdjustment) {
+
+        ContainerCodecCall copy = new ContainerCodecCall();
+        copy.operation = source.operation;
+        copy.callsite = source.callsite;
+        copy.target = source.target;
+        copy.targetName = source.targetName;
+        copy.nativeType = source.nativeType;
+        copy.typeId = source.typeId;
+        copy.typeIdSource = source.typeIdSource;
+        copy.typeIdentityProven = source.typeIdentityProven;
+        copy.sourceTypeLayoutComplete = source.sourceTypeLayoutComplete;
+        copy.wireEvidence = source.wireEvidence;
+        copy.evidenceSource = source.evidenceSource;
+        copy.memberSemantics = source.memberSemantics;
+        copy.analysisStatus = source.analysisStatus;
+        copy.elementBase = "element";
+        copy.elementOffset = elementAdjustment +
+            (source.elementOffset == null ? 0L : source.elementOffset);
+        for (ContainerCodecCall member : source.members) {
+            copy.members.add(copyContainerCodecCall(member, elementAdjustment));
+        }
+        for (ContainerCodecCall member : source.optionalMembers) {
+            copy.optionalMembers.add(copyContainerCodecCall(member, elementAdjustment));
+        }
+        copy.guards.addAll(source.guards);
+        return copy;
+    }

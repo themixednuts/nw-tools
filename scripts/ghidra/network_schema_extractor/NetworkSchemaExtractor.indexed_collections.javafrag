@@ -11,7 +11,7 @@
             loop,
             operations,
             codecs);
-        PcodeStorage inserted = uniqueLikelyOutputStorage(owner, insertion);
+        PcodeStorage inserted = containerInsertionOutputStorage(owner, insertion);
         return inserted != null
             ? inserted
             : countedCollectionIndexedOutputStorage(
@@ -141,9 +141,13 @@
         if (operation == null) {
             return null;
         }
+        String outputParameter = uniqueLikelyOutputParameter(owner, operation);
+        if (outputParameter == null) {
+            return null;
+        }
         LinkedHashMap<String, PcodeStorage> storages = new LinkedHashMap<>();
         Function target = pcodeCallTarget(operation);
-        int argumentCount = provenCallArgumentCount(operation, target);
+        int argumentCount = provenCallArgumentCandidateCount(owner, operation, target);
         for (int slot = 1; slot <= argumentCount; slot++) {
             PcodeStorage storage = provenCallArgumentStorage(
                 owner,
@@ -151,13 +155,32 @@
                 target,
                 slot);
             String parameter = formalParameterBaseFromStorage(owner, storage);
-            if (isProvenOutputParameterBase(owner, parameter)) {
+            if (outputParameter.equals(parameter)) {
                 storages.putIfAbsent(storageKey(storage), storage);
             }
+            for (PcodeStorage dependency : instructionCallArgumentStorageDependencies(
+                    owner,
+                    operation,
+                    target,
+                    slot)) {
+                String dependentParameter = formalParameterBaseFromStorage(
+                    owner,
+                    dependency);
+                if (outputParameter.equals(dependentParameter)) {
+                    storages.putIfAbsent(storageKey(dependency), dependency);
+                }
+            }
         }
-        return storages.size() == 1
-            ? storages.values().iterator().next()
-            : null;
+        if (storages.isEmpty()) {
+            return null;
+        }
+        PcodeStorage selected = storages.values().iterator().next();
+        if (storages.values().stream().anyMatch(candidate ->
+                !selected.sameLocation(candidate))) {
+            return null;
+        }
+        runMetrics.increment("instructionDependencyOutputStorageProofs");
+        return selected;
     }
 
     private boolean isStableCollectionStorage(

@@ -23,20 +23,19 @@
             window.rootOffset(),
             window.nativeSize());
         Address ownerConstructor = handlerOwnerConstructor(field);
-        if (ownerConstructor == null) {
-            return null;
+        List<HandlerValueMemberProvider> providers = List.of();
+        if (ownerConstructor != null) {
+            List<VtableWrite> writes = constructorVtableWrites(ownerConstructor);
+            Long handlerBase = handlerBaseOffsetInConstructor(field, writes);
+            if (handlerBase != null) {
+                providers = handlerValueMemberProviders(
+                    ownerConstructor,
+                    handlerBase,
+                    window.rootOffset(),
+                    window.nativeSize(),
+                    payload);
+            }
         }
-        List<VtableWrite> writes = constructorVtableWrites(ownerConstructor);
-        Long handlerBase = handlerBaseOffsetInConstructor(field, writes);
-        if (handlerBase == null) {
-            return null;
-        }
-        List<HandlerValueMemberProvider> providers = handlerValueMemberProviders(
-            ownerConstructor,
-            handlerBase,
-            window.rootOffset(),
-            window.nativeSize(),
-            payload);
         List<HandlerValueLayoutMember> members = completeHandlerValueLayout(
             providers,
             payload,
@@ -59,8 +58,9 @@
         shape.layoutProven = true;
         shape.memberCoverageProven = true;
         shape.wireOrderProven = true;
-        shape.wireOrderSource =
-            "cfg-unmarshal-order+constructor-subobject-layout+scalar-storage";
+        shape.wireOrderSource = ownerConstructor == null
+            ? "cfg-unmarshal-order+scalar-storage"
+            : "cfg-unmarshal-order+constructor-subobject-layout+scalar-storage";
         shape.validation =
             "is-default-storage-pair+complete-nonoverlapping-layout+contiguous-wire-order";
         shape.nativeSize = window.nativeSize();

@@ -1,6 +1,8 @@
     private ContainerCodecMembers exactContainerUnmarshalSuccessTrace(
         Function function,
-        PcodeStorage readBuffer) {
+        PcodeStorage readBuffer,
+        HighFunction high,
+        List<ContainerCodecCall> discovered) {
 
         CodecWireTrace trace = traceUnmarshalCodec(
             function,
@@ -17,12 +19,73 @@
             }
             members.add(containerCodecFromWireEvent(
                 event,
-                "container-helper-unmarshal-success-trace"));
+                "container-helper-unmarshal-success-trace",
+                high));
         }
+        List<ContainerCodecCall> structured = successTraceStructuredMembers(
+            discovered,
+            members);
         return new ContainerCodecMembers(
-            members,
+            structured == null ? members : structured,
             List.of(),
             true,
             true,
-            "complete-success-trace");
+            structured == null
+                ? "complete-success-trace"
+                : "complete-success-trace+structured-discovery");
+    }
+
+    private ContainerCodecCall containerCodecFromWireEvent(
+        CodecWireEvent event,
+        String evidenceSource,
+        HighFunction high) {
+
+        ContainerCodecCall codec = containerCodecFromWireEvent(event, evidenceSource);
+        PcodeOpAST call = high == null || event == null || event.callsite() == null
+            ? null
+            : pcodeCallAt(high, event.callsite());
+        if (call == null) {
+            return codec;
+        }
+        codec.operation = call;
+        PcodeStorage output = event.outputStorage() == null
+            ? codecUnmarshalOutputStorage(
+                call,
+                event.nativeType(),
+                event.wireEvidence())
+            : event.outputStorage();
+        applyUnmarshalContainerCodecOutputStorage(codec, high, call, output);
+        return codec;
+    }
+
+    private List<ContainerCodecCall> successTraceStructuredMembers(
+        List<ContainerCodecCall> discovered,
+        List<ContainerCodecCall> traced) {
+
+        List<ContainerCodecCall> discoveredLeaves = discovered == null
+            ? null
+            : physicalContainerCodecLeaves(discovered);
+        List<ContainerCodecCall> tracedLeaves = traced == null
+            ? null
+            : physicalContainerCodecLeaves(traced);
+        if (discoveredLeaves == null || tracedLeaves == null ||
+            discoveredLeaves.isEmpty() ||
+            discoveredLeaves.size() != tracedLeaves.size()) {
+            return null;
+        }
+        for (int index = 0; index < discoveredLeaves.size(); index++) {
+            ContainerCodecCall candidate = discoveredLeaves.get(index);
+            ContainerCodecCall evidence = tracedLeaves.get(index);
+            if (!samePhysicalContainerCodec(candidate, evidence) ||
+                candidate.callsite == null || evidence.callsite == null ||
+                candidate.target == null || evidence.target == null ||
+                !Objects.equals(candidate.callsite, evidence.callsite) ||
+                !Objects.equals(
+                    resolvedCodeTarget(candidate.target),
+                    resolvedCodeTarget(evidence.target))) {
+                return null;
+            }
+        }
+        runMetrics.increment("successTraceStructuredDiscoveries");
+        return List.copyOf(discovered);
     }

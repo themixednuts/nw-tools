@@ -89,6 +89,9 @@ pub(super) fn exact_native_runtime_rust_type(native_type: &str) -> Option<&'stat
         "ActorInstantiationParameters" | "Amazon::Hub::ActorInstantiationParameters" => {
             Some("::nw_network::ActorInstantiationParameters")
         }
+        "GroupInviteData" | "Javelin::GroupInviteData" => {
+            Some("::nw_network::states::GroupInviteData")
+        }
         _ => None,
     }
 }
@@ -242,7 +245,12 @@ pub(super) fn exact_member_rust_type(
     let mut current_type_id = parent.type_id?;
     let member_path = member.name.as_deref()?;
     let member_type_id = member.type_id?;
-    let member_offset = parse_native_member_offset(member.offset.as_deref()?)?;
+    let member_offset = parse_native_member_offset(
+        member
+            .native_offset
+            .as_deref()
+            .or(member.offset.as_deref())?,
+    )?;
     let path = member_path
         .split('.')
         .map(str::trim)
@@ -333,15 +341,14 @@ fn network_resolved_type_rust_type_inner(
     let names = type_ids
         .into_iter()
         .map(|type_id| {
+            if let Some(rust_type) = exact_type_id_rust_type(type_id) {
+                return Some((type_id, rust_type.to_owned()));
+            }
             let serialize = serialize_types.get(&type_id)?;
-            let rust_type = exact_type_id_rust_type(type_id)
-                .map(ToOwned::to_owned)
-                .or_else(|| {
-                    serialize
-                        .emits_source
-                        .then(|| serialize_source_rust_type_name(&serialize.name))
-                        .flatten()
-                })
+            let rust_type = serialize
+                .emits_source
+                .then(|| serialize_source_rust_type_name(&serialize.name))
+                .flatten()
                 .or_else(|| {
                     resolving.insert(type_id).then_some(())?;
                     let rust_type = serialize.resolved_type.as_ref().and_then(|resolved| {

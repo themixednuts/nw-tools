@@ -65,7 +65,7 @@ pub(super) fn structured_value_field_plan(
     ))
 }
 
-fn reconcile_serialize_backed_member_names(
+pub(super) fn reconcile_serialize_backed_member_names(
     shape: crate::network_schema::NetworkNestedTypeShape,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> crate::network_schema::NetworkNestedTypeShape {
@@ -237,6 +237,44 @@ fn append_validation_marker(existing: Option<&str>, marker: &str) -> String {
     )
 }
 
+pub(super) fn serialize_type_wire_shape(
+    type_id: Uuid,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<String> {
+    serialize_type_wire_shape_with_active(type_id, serialize_types, &mut BTreeSet::new())
+}
+
+fn serialize_type_wire_shape_with_active(
+    type_id: Uuid,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+    active: &mut BTreeSet<Uuid>,
+) -> Option<String> {
+    let serialize = serialize_types.get(&type_id)?;
+    if !serialize.wire_shapes.is_empty() {
+        return Some(wire_product_shape(
+            serialize
+                .wire_shapes
+                .iter()
+                .map(|shape| shape.wire_string()),
+        ));
+    }
+    if !active.insert(type_id) {
+        return None;
+    }
+    let result = match serialize.resolved_type.as_ref() {
+        None => serialize
+            .fields
+            .iter()
+            .filter(|field| !field.is_base_class)
+            .map(|field| resolved_type_wire_shape(&field.resolved_type, serialize_types, active))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|members| (!members.is_empty()).then(|| wire_product_shape(members))),
+        Some(resolved) => resolved_type_wire_shape(resolved, serialize_types, active),
+    };
+    active.remove(&type_id);
+    result
+}
+
 fn resolved_type_wire_shape(
     resolved: &ResolvedType,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
@@ -245,34 +283,7 @@ fn resolved_type_wire_shape(
     match resolved {
         ResolvedType::Scalar(scalar) => scalar_resolved_wire_shape(*scalar).map(str::to_owned),
         ResolvedType::Named { type_id, .. } => {
-            let serialize = serialize_types.get(type_id)?;
-            if !serialize.wire_shapes.is_empty() {
-                return Some(wire_product_shape(
-                    serialize
-                        .wire_shapes
-                        .iter()
-                        .map(|shape| shape.wire_string()),
-                ));
-            }
-            if !active.insert(*type_id) {
-                return None;
-            }
-            let result = match serialize.resolved_type.as_ref() {
-                None => {
-                    let members = serialize
-                        .fields
-                        .iter()
-                        .filter(|field| !field.is_base_class)
-                        .map(|field| {
-                            resolved_type_wire_shape(&field.resolved_type, serialize_types, active)
-                        })
-                        .collect::<Option<Vec<_>>>()?;
-                    (!members.is_empty()).then(|| wire_product_shape(members))
-                }
-                Some(resolved) => resolved_type_wire_shape(resolved, serialize_types, active),
-            };
-            active.remove(type_id);
-            result
+            serialize_type_wire_shape_with_active(*type_id, serialize_types, active)
         }
         ResolvedType::Sequence {
             kind,
@@ -403,8 +414,7 @@ pub(super) fn exact_serialize_value_rust_type(
             vtable
                 .and_then(|vtable| vtable.value_type_shape.as_ref())
                 .filter(|shape| shape.has_exact_identity())
-        })?;
-    let type_id = shape.type_id?;
+        });
     let field_type_id = field
         .serialize
         .as_ref()
@@ -415,18 +425,33 @@ pub(super) fn exact_serialize_value_rust_type(
                 .then_some(field.source_type_id)
                 .flatten()
         })?;
-    if type_id != field_type_id {
+    if shape
+        .and_then(|shape| shape.type_id)
+        .is_some_and(|type_id| type_id != field_type_id)
+        || shape.is_none() && !field.source_type_identity_proven
+    {
         return None;
     }
 
-    let serialize = serialize_types.get(&type_id)?;
-    if !serialize.emits_source || serialize.wire_shapes.is_empty() {
+    let serialize = serialize_types.get(&field_type_id)?;
+    if !serialize.emits_source {
         return None;
     }
     let observed = wire_shape
         .and_then(crate::network_schema::parse::wire_shape_scalar_product)
-        .or_else(|| crate::network_schema::parse::nested_type_shape_wire_shapes(shape, &[]))?;
-    if !wire_scalar_shapes_match(&observed, &serialize.wire_shapes) {
+        .or_else(|| {
+            shape.and_then(|shape| {
+                crate::network_schema::parse::nested_type_shape_wire_shapes(shape, &[])
+            })
+        })?;
+    let expected = if serialize.wire_shapes.is_empty() {
+        let shape = serialize_type_wire_shape(field_type_id, serialize_types)?;
+        let shape = parse_network_wire_shape(&shape)?;
+        crate::network_schema::parse::wire_shape_scalar_product(&shape)?
+    } else {
+        serialize.wire_shapes.clone()
+    };
+    if !wire_scalar_shapes_match(&observed, &expected) {
         return None;
     }
 

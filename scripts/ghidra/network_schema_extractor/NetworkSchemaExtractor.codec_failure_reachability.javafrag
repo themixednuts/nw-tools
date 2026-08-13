@@ -19,6 +19,18 @@
         return semantic == null || !"bool".equals(semantic);
     }
 
+    private boolean reachesSuccessfulCodecTerminal(
+        PcodeBlockBasic start,
+        Set<PcodeBlockBasic> successfulTerminals) {
+
+        if (start == null || successfulTerminals == null ||
+            successfulTerminals.isEmpty()) {
+            return false;
+        }
+        return successfulTerminals.stream().anyMatch(terminal ->
+            start == terminal || NetworkSchemaControlFlow.reaches(start, terminal));
+    }
+
     private PcodeBlockBasic transitiveStructuralCodecSuccessor(
         PcodeBlockBasic first,
         PcodeBlockBasic second,

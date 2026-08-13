@@ -55,7 +55,11 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
         }
 
         FullContainerPlan selected = null;
-        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+        List<NetworkSchemaNaturalLoop> loops = NetworkSchemaControlFlow.naturalLoops(high);
+        for (NetworkSchemaNaturalLoop loop : loops) {
+            if (hasContainingNaturalLoop(loop, loops)) {
+                continue;
+            }
             List<ContainerCodecCall> codecs = fullContainerLoopCodecs(
                 function,
                 high,
@@ -70,7 +74,7 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
                     writeBufferParameter, null, null, 0, null));
                 continue;
             }
-            ContainerLoopInduction induction = containerLoopInduction(loop, codecs);
+            ContainerLoopInduction induction = containerLoopInduction(high, loop, codecs);
             if (induction == null) {
                 diagnostics.add(containerPlanDiagnostic(
                     function, loop.header().getStart(), null, null,
@@ -133,8 +137,14 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
 
         ArrayList<ContainerCodecCall> result = new ArrayList<>();
         PcodeStorage writeBuffer = new PcodeStorage(writeBufferParameter, 0L);
-        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        for (PcodeOpAST operation : operations) {
             if (!loop.contains(operation)) {
+                continue;
+            }
+            NetworkSchemaNaturalLoop ownerLoop =
+                NetworkSchemaControlFlow.innermostLoopContaining(high, operation);
+            if (ownerLoop != null && !ownerLoop.equals(loop)) {
                 continue;
             }
             ContainerCodecCall codec = switch (operation.getOpcode()) {
@@ -155,7 +165,20 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
                 result.add(codec);
             }
         }
-        applyContainerCodecElementOffsets(loop, result);
+        List<ContainerCodecCall> nested = marshalNestedFixedSequenceCodecs(
+            function,
+            high,
+            loop,
+            operations,
+            writeBuffer,
+            active,
+            diagnostics);
+        if (nested == null) {
+            return List.of();
+        }
+        result.addAll(nested);
+        result.sort(Comparator.comparing(codec -> codec.callsite));
+        applyContainerCodecElementOffsets(high, loop, result);
         return List.copyOf(result);
     }
 
@@ -183,11 +206,32 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
         }
         String targetName = fullFunctionName(target);
         String nativeType = marshalFunctionTemplateType(targetName);
-        WireShape wireEvidence = nativeType == null
+        WireShape nativeWireEvidence = nativeType == null
             ? null
             : semanticWireEvidenceForNativeType(nativeType);
-        if (nativeType == null) {
+        WireShape wireEvidence = nativeWireEvidence;
+        if (wireEvidence == null) {
+            // A named custom marshaler can expose a template-like native type
+            // without that type itself having a primitive wire mapping. Its
+            // validated codec body remains the authoritative wire evidence
+            // (for example QuatSmallestThreeQuantizedMarshaler).
             wireEvidence = validatedMarshalLeaf(target, "param_" + bufferSlot);
+        }
+        if (wireEvidence != null) {
+            ContainerCodecCall codec = new ContainerCodecCall();
+            codec.operation = operation;
+            codec.callsite = operation.getSeqnum().getTarget();
+            codec.target = target.getEntryPoint();
+            codec.targetName = targetName;
+            codec.nativeType = nativeType;
+            codec.wireEvidence = wireEvidence;
+            codec.evidenceSource = nativeWireEvidence == null
+                ? "full-container-loop-leaf-codec"
+                : "full-container-loop-marshal-template";
+            if (nativeType != null) {
+                applyContainerCodecTypeIdentity(codec, nativeType);
+            }
+            return codec;
         }
         ContainerCodecCall structured = structuredContainerCodec(
             operation,
@@ -201,41 +245,24 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
         if (structured != null) {
             return structured;
         }
-        if (wireEvidence == null) {
-            ContainerCodecCall boundary = containerHelperBoundary(
-                operation,
-                target,
-                "param_" + bufferSlot,
-                active,
-                0,
-                diagnostics,
-                "full-container-loop-helper-boundary");
-            if (boundary != null) {
-                return boundary;
-            }
-            diagnostics.add(callArgumentDiagnostic(
-                owner,
-                operation,
-                target,
-                writeBuffer,
-                "helper-codec-members-unresolved"));
-            return null;
+        ContainerCodecCall boundary = containerHelperBoundary(
+            operation,
+            target,
+            "param_" + bufferSlot,
+            active,
+            0,
+            diagnostics,
+            "full-container-loop-helper-boundary");
+        if (boundary != null) {
+            return boundary;
         }
-
-        ContainerCodecCall codec = new ContainerCodecCall();
-        codec.operation = operation;
-        codec.callsite = operation.getSeqnum().getTarget();
-        codec.target = target.getEntryPoint();
-        codec.targetName = targetName;
-        codec.nativeType = nativeType;
-        codec.wireEvidence = wireEvidence;
-        codec.evidenceSource = nativeType == null
-            ? "full-container-loop-leaf-codec"
-            : "full-container-loop-marshal-template";
-        if (nativeType != null) {
-            applyContainerCodecTypeIdentity(codec, nativeType);
-        }
-        return codec;
+        diagnostics.add(callArgumentDiagnostic(
+            owner,
+            operation,
+            target,
+            writeBuffer,
+            "helper-codec-members-unresolved"));
+        return null;
     }
 
     private ContainerCodecCall fullContainerRawCodec(
@@ -438,23 +465,6 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
             WireShape leaf = nativeType == null
                 ? validatedMarshalLeaf(target, "param_" + bufferSlot)
                 : null;
-            ContainerCodecCall structured = structuredContainerCodec(
-                operation,
-                target,
-                nativeType,
-                "param_" + bufferSlot,
-                active,
-                depth + 1,
-                diagnostics,
-                "container-helper-structured-value");
-            if (structured != null) {
-                result.add(structured);
-                allMembersMapped &= addContainerCodecMembersForOperation(
-                    membersByBlock,
-                    operation,
-                    List.of(structured));
-                continue;
-            }
             if (nativeWire != null || leaf != null) {
                 ContainerCodecCall member = new ContainerCodecCall();
                 member.operation = operation;
@@ -474,6 +484,23 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
                     membersByBlock,
                     operation,
                     List.of(member));
+                continue;
+            }
+            ContainerCodecCall structured = structuredContainerCodec(
+                operation,
+                target,
+                nativeType,
+                "param_" + bufferSlot,
+                active,
+                depth + 1,
+                diagnostics,
+                "container-helper-structured-value");
+            if (structured != null) {
+                result.add(structured);
+                allMembersMapped &= addContainerCodecMembersForOperation(
+                    membersByBlock,
+                    operation,
+                    List.of(structured));
                 continue;
             }
             ContainerCodecMembers nested = collectContainerCodecMembers(
@@ -499,15 +526,15 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
                 boundary.callsite = operation.getSeqnum().getTarget();
                 boundary.target = target.getEntryPoint();
                 boundary.targetName = targetName;
-                boundary.evidenceSource = "container-helper-boundary";
-                boundary.memberSemantics = !nested.optionalMembers().isEmpty()
-                    ? "optional-suffix"
-                    : nested.linear()
-                        ? "linear-sequence"
-                        : "cfg-reachable";
-                boundary.analysisStatus = nested.analysisStatus();
-                boundary.members.addAll(nested.members());
-                boundary.optionalMembers.addAll(nested.optionalMembers());
+                if (!promoteExactSingletonContainerHelperBoundary(
+                        boundary,
+                        nested,
+                        "container-helper-boundary")) {
+                    populateContainerHelperBoundary(
+                        boundary,
+                        nested,
+                        "container-helper-boundary");
+                }
                 result.add(boundary);
                 allMembersMapped &= addContainerCodecMembersForOperation(
                     membersByBlock,
@@ -516,6 +543,7 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
             }
         }
         active.remove(context);
+        applyContainerCodecGuards(high, result);
         NetworkSchemaFlowSequence.Result<ContainerCodecCall> flow =
             NetworkSchemaFlowSequence.analyze(
                 high,
@@ -533,11 +561,20 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
                 : null;
         boolean linear = nestedExact && allMembersMapped && flow.complete();
         boolean optionalExact = optional != null && optional.hasOptionalSuffix();
-        boolean exact = linear || optionalExact;
+        boolean guardedExact = !linear && !optionalExact &&
+            exactGuardedContainerMarshalProduct(
+                high,
+                flow,
+                result,
+                nestedExact,
+                allMembersMapped);
+        boolean exact = linear || optionalExact || guardedExact;
         String analysisStatus = linear
             ? "complete"
             : optionalExact
                 ? "optional-suffix"
+            : guardedExact
+                ? "complete-guarded-cfg"
             : nestedStatus != null
                 ? "nested:" + nestedStatus
                 : !allMembersMapped
@@ -552,6 +589,8 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
             ? flow.events()
             : optionalExact
                 ? optional.requiredEvents()
+                : guardedExact
+                    ? result
                 : result;
         List<ContainerCodecCall> optionalMembers = optionalExact
             ? optional.optionalEvents()
@@ -566,7 +605,6 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
                 writeBufferParameter,
                 optionalMembers);
         }
-        applyContainerCodecGuards(high, result);
         return new ContainerCodecMembers(
             requiredMembers,
             optionalMembers,
@@ -671,36 +709,10 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
         if (abiSlot != null) {
             return abiSlot;
         }
-        return pcodeSlot;
-    }
-
-    private Integer instructionAbiCallArgumentSlot(
-        Function owner,
-        PcodeOp operation,
-        Function target,
-        PcodeStorage expected) {
-
-        if (expected == null) {
-            return null;
+        if (pcodeSlot != null) {
+            return pcodeSlot;
         }
-        ForwardArgState state = instructionStateBeforeCall(owner, operation, target);
-        if (state == null) {
-            return null;
-        }
-        Integer selected = null;
-        int argumentCount = provenCallArgumentCount(operation, target);
-        for (int argumentSlot = 1; argumentSlot <= argumentCount; argumentSlot++) {
-            PcodeStorage actual = pcodeStorageFromTrackedValue(
-                win64CallArgumentValue(state, argumentSlot));
-            if (!expected.sameLocation(actual)) {
-                continue;
-            }
-            if (selected != null) {
-                return null;
-            }
-            selected = argumentSlot;
-        }
-        return selected;
+        return uniqueReferencedCallArgumentSlot(operation, expected);
     }
 
     private ContainerPlanDiagnostic callArgumentDiagnostic(
@@ -754,41 +766,6 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
             induction);
     }
 
-    private WireShape semanticWireEvidenceForNativeType(String nativeType) {
-        String wireShape = wireShapeFromNativeType(nativeType);
-        return wireShape == null
-            ? null
-            : WireShape.semantic(
-                wireShape,
-                "full-container-loop-marshal-template");
-    }
-
-    private void applyContainerCodecTypeIdentity(
-        ContainerCodecCall codec,
-        String nativeType) {
-
-        SerializeTypeInfo exact = exactSerializeTypeForTypeName(nativeType);
-        SerializeTypeInfo reflected = exact == null
-            ? serializeTypeForTypeName(nativeType)
-            : exact;
-        codec.typeId = reflected == null
-            ? typeIdForTypeName(nativeType)
-            : reflected.typeId;
-        codec.typeIdSource = reflected == null
-            ? "az-type-info-fold"
-            : exact == null
-                ? "serialize-unique-leaf-name"
-                : "serialize-exact-name";
-    }
-
-    private SerializeTypeInfo exactSerializeTypeForTypeName(String typeName) {
-        if (typeName == null || typeName.isBlank()) {
-            return null;
-        }
-        List<SerializeTypeInfo> candidates = serializeTypesByName.get(typeName.trim());
-        return candidates != null && candidates.size() == 1 ? candidates.get(0) : null;
-    }
-
     private ContainerLoopInduction containerLoopInduction(
         NetworkSchemaNaturalLoop loop) {
 
@@ -803,7 +780,7 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
                     phi.getOutput().getSize() != currentProgram.getDefaultPointerSize()) {
                     continue;
                 }
-                ContainerLoopInduction candidate = inductionFromPhi(phi);
+                ContainerLoopInduction candidate = inductionFromPhi(phi, loop);
                 if (candidate == null) {
                     continue;
                 }
@@ -817,6 +794,7 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
     }
 
     private ContainerLoopInduction containerLoopInduction(
+        HighFunction high,
         NetworkSchemaNaturalLoop loop,
         List<ContainerCodecCall> codecs) {
 
@@ -824,29 +802,51 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
             return null;
         }
         ContainerLoopInduction selected = null;
-        for (PcodeOpAST phi : containerElementInductions(loop)) {
-            ArrayList<Long> offsets = new ArrayList<>(codecs.size());
+        boolean ambiguousSingleInduction = false;
+        for (PcodeOpAST phi : containerElementInductions(high, loop)) {
+            boolean allCodecsConnected = true;
             for (ContainerCodecCall codec : codecs) {
                 Long offset = containerCodecElementOffset(loop, codec, phi.getOutput());
                 if (offset == null) {
-                    offsets.clear();
-                    break;
+                    if (!containerCodecDependsOnElementRoot(codec, phi.getOutput())) {
+                        allCodecsConnected = false;
+                        break;
+                    }
                 }
-                offsets.add(offset);
             }
-            boolean exactOffsets = offsets.size() == codecs.size();
-            if (!exactOffsets && !codecs.stream().allMatch(codec ->
-                    containerCodecDependsOnElementRoot(codec, phi.getOutput()))) {
+            if (!allCodecsConnected) {
                 continue;
             }
-            ContainerLoopInduction candidate = inductionFromPhi(phi);
+            ContainerLoopInduction candidate = loopExitInductionFromPhi(phi, loop);
             if (candidate == null) {
                 continue;
             }
             if (selected != null && !selected.equals(candidate)) {
-                return null;
+                ambiguousSingleInduction = true;
+                selected = null;
+                break;
             }
             selected = candidate;
+        }
+        if (selected == null || ambiguousSingleInduction) {
+            ContainerAffineProjection projection = uniqueContainerAffineProjection(
+                high,
+                loop,
+                codecs);
+            if (projection != null &&
+                projection.family().inductions().size() > 1) {
+                runMetrics.increment("affineContainerInductionFamilies");
+                return new ContainerLoopInduction(
+                    ContainerStorageKind.VECTOR,
+                    projection.family().stride(),
+                    "cfg-natural-loop-affine-induction-family");
+            }
+            ContainerLoopInduction exitInduction =
+                codecCompatibleAffineLoopExitInduction(high, loop, codecs);
+            if (exitInduction != null) {
+                runMetrics.increment("codecCompatibleAffineLoopExitInductionProofs");
+                return exitInduction;
+            }
         }
         return selected;
     }
@@ -861,11 +861,17 @@ import ghidra.program.model.pcode.PcodeBlockBasic;
         }
         for (int slot = 1; slot < operation.getNumInputs(); slot++) {
             Varnode input = operation.getInput(slot);
-            if (input != null && !input.isConstant() && pcodeNodeDependsOn(
-                    input,
-                    elementRoot,
-                    new LinkedHashSet<>(),
-                    0)) {
+            if (input != null && !input.isConstant() && (
+                    pcodeNodeDependsOn(
+                        input,
+                        elementRoot,
+                        new LinkedHashSet<>(),
+                        0) ||
+                    physicalRegisterNodeDependsOn(
+                        input,
+                        elementRoot,
+                        new LinkedHashSet<>(),
+                        0))) {
                 return true;
             }
         }

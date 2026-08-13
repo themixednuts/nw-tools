@@ -508,6 +508,18 @@
                 defaultWrite.operation(),
                 0);
         }
+        if (defaultByte == null && defaultWrite != null) {
+            defaultByte = instructionStoredByteConstant(
+                resolver.resolver(),
+                defaultWrite.operation().getSeqnum().getTarget());
+        }
+        if (defaultByte == null && defaultWrite != null) {
+            defaultByte = instructionCallOutputSeedByte(
+                resolver.resolver(),
+                call,
+                target,
+                resultStorage);
+        }
         if (defaultWrite == null) {
             return ExternalDefaultProbe.rejected("default-write-unproven");
         }
@@ -519,6 +531,228 @@
             call.getSeqnum().getTarget(),
             targetAddress,
             defaultByte == 1L));
+    }
+
+    private Long instructionCallOutputSeedByte(
+        Function owner,
+        PcodeOpAST call,
+        Function target,
+        PcodeStorage resultStorage) {
+
+        if (owner == null || call == null || resultStorage == null) {
+            return null;
+        }
+        ForwardArgState state = instructionStateBeforeCall(owner, call, target);
+        if (state == null) {
+            return null;
+        }
+        Integer referencedSlot = uniqueReferencedCallArgumentSlot(call, resultStorage);
+        for (int slot = 1; slot <= 4; slot++) {
+            TrackedValue argument = win64CallArgumentValue(state, slot);
+            if (argument == null) {
+                continue;
+            }
+            PcodeStorage actual = pcodeStorageFromTrackedValue(argument);
+            boolean carriesResult = resultStorage.sameLocation(actual) ||
+                argument.storageDependencies.stream().anyMatch(resultStorage::sameLocation) ||
+                Integer.valueOf(slot).equals(referencedSlot);
+            if (!carriesResult || argument.stackOffset == null) {
+                continue;
+            }
+            TrackedValue seed = state.valuesByStackSlot.get(argument.stackOffset);
+            if (seed != null && seed.immediate != null) {
+                runMetrics.increment("externalDefaultCallOutputSeedProofs");
+                return seed.immediate & 0xffL;
+            }
+        }
+        return null;
+    }
+
+    private Long instructionStoredByteConstant(
+        Function function,
+        Address writeAddress) {
+
+        if (function == null || writeAddress == null) {
+            return null;
+        }
+        ForwardArgState state = newForwardArgState();
+        for (Instruction instruction : functionInstructions(function)) {
+            if (instruction.getMinAddress().equals(writeAddress)) {
+                if (!"MOV".equals(instruction.getMnemonicString()) ||
+                    NetworkSchemaX86.registerOperand(instruction, 0) != null ||
+                    memoryWriteWidthBits(instruction) != Byte.SIZE) {
+                    return null;
+                }
+                TrackedValue source = trackedOperandValue(instruction, 1, state);
+                if (source != null && source.immediate != null) {
+                    return source.immediate & 0xffL;
+                }
+                Long immediate = literalOperandValue(instruction, 1);
+                if (immediate != null) {
+                    return immediate & 0xffL;
+                }
+                return instructionRegisterLowByteBefore(
+                    function,
+                    highFunction(function),
+                    instruction,
+                    NetworkSchemaX86.registerOperand(instruction, 1),
+                    new LinkedHashSet<>(),
+                    0);
+            }
+            observeForwardInstruction(instruction, state);
+        }
+        return null;
+    }
+
+    private Long instructionRegisterLowByteBefore(
+        Function owner,
+        HighFunction high,
+        Instruction before,
+        String register,
+        Set<String> active,
+        int depth) {
+
+        if (owner == null || high == null || before == null || register == null ||
+            active == null || depth > 32 || monitor.isCancelled()) {
+            return null;
+        }
+        String key = register + "@" + before.getMinAddress();
+        if (!active.add(key)) {
+            return null;
+        }
+        try {
+            Instruction definition = nearestDominatingRegisterWriteBefore(
+                owner,
+                high,
+                before,
+                register);
+            if (definition == null) {
+                return null;
+            }
+            String mnemonic = NetworkSchemaX86.upperMnemonic(definition);
+            String destination = NetworkSchemaX86.registerOperand(definition, 0);
+            String source = NetworkSchemaX86.registerOperand(definition, 1);
+            if (("XOR".equals(mnemonic) || "SUB".equals(mnemonic)) &&
+                register.equals(destination) && register.equals(source)) {
+                return 0L;
+            }
+            if ("MOV".equals(mnemonic) || "MOVZX".equals(mnemonic) ||
+                "MOVSX".equals(mnemonic) || "MOVSXD".equals(mnemonic)) {
+                Long immediate = literalOperandValue(definition, 1);
+                if (immediate != null) {
+                    return immediate & 0xffL;
+                }
+                if (source == null) {
+                    Long seeded = instructionSeededStackByteBeforeWriterCall(
+                        owner,
+                        high,
+                        definition);
+                    if (seeded != null) {
+                        return seeded;
+                    }
+                }
+                return source == null
+                    ? null
+                    : instructionRegisterLowByteBefore(
+                        owner,
+                        high,
+                        definition,
+                        source,
+                        active,
+                        depth + 1);
+            }
+            if ("AND".equals(mnemonic) && register.equals(destination)) {
+                Long mask = literalOperandValue(definition, 1);
+                if (mask != null && (mask & 0xffL) == 0L) {
+                    return 0L;
+                }
+            }
+            return null;
+        }
+        finally {
+            active.remove(key);
+        }
+    }
+
+    private Long instructionSeededStackByteBeforeWriterCall(
+        Function owner,
+        HighFunction high,
+        Instruction load) {
+
+        if (owner == null || high == null || load == null || monitor.isCancelled()) {
+            return null;
+        }
+        ForwardArgState loadState = instructionStateBeforeAddress(
+            owner,
+            load.getMinAddress());
+        MemoryReference source = NetworkSchemaX86.memoryReference(load, 1);
+        Integer outputSlot = loadState == null || source == null
+            ? null
+            : stackSlotOffset(source, loadState);
+        PcodeBlockBasic loadBlock = pcodeBlockContainingAddress(
+            high,
+            load.getMinAddress());
+        if (outputSlot == null || loadBlock == null) {
+            return null;
+        }
+
+        PcodeBlockBasic selectedBlock = null;
+        Instruction selectedCall = null;
+        Long selectedSeed = null;
+        for (Instruction instruction : functionInstructions(owner)) {
+            if (monitor.isCancelled()) {
+                return null;
+            }
+            if (!instruction.getFlowType().isCall()) {
+                continue;
+            }
+            PcodeBlockBasic block = pcodeBlockContainingAddress(
+                high,
+                instruction.getMinAddress());
+            boolean beforeInLoadBlock = block == loadBlock &&
+                instruction.getMinAddress().compareTo(load.getMinAddress()) < 0;
+            boolean dominatingBlock = block != null && block != loadBlock &&
+                NetworkSchemaControlFlow.dominates(high, block, loadBlock);
+            if (!beforeInLoadBlock && !dominatingBlock) {
+                continue;
+            }
+            ForwardArgState state = instructionStateBeforeAddress(
+                owner,
+                instruction.getMinAddress());
+            if (state == null) {
+                continue;
+            }
+            boolean receivesOutput = false;
+            for (int argumentSlot = 1; argumentSlot <= 4; argumentSlot++) {
+                TrackedValue argument = win64CallArgumentValue(state, argumentSlot);
+                if (argument != null && Objects.equals(
+                        argument.stackOffset,
+                        outputSlot)) {
+                    receivesOutput = true;
+                    break;
+                }
+            }
+            TrackedValue seed = receivesOutput
+                ? state.valuesByStackSlot.get(outputSlot)
+                : null;
+            if (seed == null || seed.immediate == null) {
+                continue;
+            }
+            boolean sameBlockAndLater = selectedBlock == block &&
+                instruction.getMinAddress().compareTo(
+                    selectedCall.getMinAddress()) > 0;
+            boolean nearerBlock = selectedBlock != null && selectedBlock != block &&
+                NetworkSchemaControlFlow.dominates(high, selectedBlock, block);
+            if (selectedBlock == null || sameBlockAndLater || nearerBlock) {
+                selectedBlock = block;
+                selectedCall = instruction;
+                selectedSeed = seed.immediate & 0xffL;
+            }
+        }
+        if (selectedSeed != null) {
+            runMetrics.increment("externalDefaultSeededOutputProofs");
+        }
+        return selectedSeed;
     }
 
     private boolean hasUniqueProvenCallStorageArgument(

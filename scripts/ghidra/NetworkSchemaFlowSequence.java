@@ -358,9 +358,20 @@ final class NetworkSchemaFlowSequence {
         Map<PcodeBlockBasic, List<T>> eventsByBlock,
         BiPredicate<T, T> equivalent) {
 
+        return analyzeLoopIteration(loop, eventsByBlock, Map.of(), equivalent);
+    }
+
+    static <T> Result<T> analyzeLoopIteration(
+        NetworkSchemaNaturalLoop loop,
+        Map<PcodeBlockBasic, List<T>> eventsByBlock,
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> excludedEdges,
+        BiPredicate<T, T> equivalent) {
+
         if (loop == null || loop.header() == null || equivalent == null) {
             return new Result<>(Status.CYCLIC_EVENTS, List.of());
         }
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> ignoredEdges =
+            excludedEdges == null ? Map.of() : excludedEdges;
         boolean headerCarriesEvents = !eventsByBlock
             .getOrDefault(loop.header(), List.of())
             .isEmpty();
@@ -368,6 +379,10 @@ final class NetworkSchemaFlowSequence {
             ? List.of(loop.header())
             : NetworkSchemaControlFlow.successors(loop.header())
                 .stream()
+                .filter(block -> !edgeExcluded(
+                    ignoredEdges,
+                    loop.header(),
+                    block))
                 .filter(block -> block != loop.header() && loop.contains(block))
                 .toList();
         if (entries.isEmpty()) {
@@ -377,17 +392,21 @@ final class NetworkSchemaFlowSequence {
         Set<PcodeBlockBasic> reachable = loopIterationReachable(
             loop,
             entries,
-            headerCarriesEvents);
+            headerCarriesEvents,
+            ignoredEdges);
         Set<PcodeBlockBasic> successfulTerminals = reachable.stream()
             .filter(block -> NetworkSchemaControlFlow.successors(block)
-                .contains(loop.header()))
+                .stream()
+                .anyMatch(successor -> successor == loop.header() &&
+                    !edgeExcluded(ignoredEdges, block, successor)))
             .collect(java.util.stream.Collectors.toSet());
         if (successfulTerminals.isEmpty()) {
             return new Result<>(Status.NO_TERMINATING_PATH, List.of());
         }
         reachable = blocksReachingSuccessfulIteration(
             reachable,
-            successfulTerminals);
+            successfulTerminals,
+            ignoredEdges);
         entries = entries.stream().filter(reachable::contains).toList();
         if (entries.isEmpty()) {
             return new Result<>(Status.NO_TERMINATING_PATH, List.of());
@@ -397,6 +416,9 @@ final class NetworkSchemaFlowSequence {
         for (PcodeBlockBasic block : reachable) {
             LinkedHashSet<PcodeBlockBasic> successors = new LinkedHashSet<>();
             for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(block)) {
+                if (edgeExcluded(ignoredEdges, block, successor)) {
+                    continue;
+                }
                 if (successor == loop.header()) {
                     terminals.add(block);
                 }
@@ -457,7 +479,8 @@ final class NetworkSchemaFlowSequence {
 
     private static Set<PcodeBlockBasic> blocksReachingSuccessfulIteration(
         Set<PcodeBlockBasic> reachable,
-        Set<PcodeBlockBasic> successfulTerminals) {
+        Set<PcodeBlockBasic> successfulTerminals,
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> excludedEdges) {
 
         Map<PcodeBlockBasic, List<PcodeBlockBasic>> predecessors = new HashMap<>();
         for (PcodeBlockBasic block : reachable) {
@@ -465,7 +488,8 @@ final class NetworkSchemaFlowSequence {
         }
         for (PcodeBlockBasic block : reachable) {
             for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(block)) {
-                if (reachable.contains(successor)) {
+                if (reachable.contains(successor) &&
+                    !edgeExcluded(excludedEdges, block, successor)) {
                     predecessors.get(successor).add(block);
                 }
             }
@@ -610,7 +634,8 @@ final class NetworkSchemaFlowSequence {
     private static Set<PcodeBlockBasic> loopIterationReachable(
         NetworkSchemaNaturalLoop loop,
         List<PcodeBlockBasic> entries,
-        boolean includeHeader) {
+        boolean includeHeader,
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> excludedEdges) {
 
         HashSet<PcodeBlockBasic> reachable = new HashSet<>();
         ArrayDeque<PcodeBlockBasic> pending = new ArrayDeque<>(entries);
@@ -621,12 +646,22 @@ final class NetworkSchemaFlowSequence {
                 continue;
             }
             for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(block)) {
-                if (successor != loop.header() && loop.contains(successor)) {
+                if (successor != loop.header() && loop.contains(successor) &&
+                    !edgeExcluded(excludedEdges, block, successor)) {
                     pending.addLast(successor);
                 }
             }
         }
         return Set.copyOf(reachable);
+    }
+
+    private static boolean edgeExcluded(
+        Map<PcodeBlockBasic, Set<PcodeBlockBasic>> excludedEdges,
+        PcodeBlockBasic source,
+        PcodeBlockBasic target) {
+
+        return excludedEdges != null &&
+            excludedEdges.getOrDefault(source, Set.of()).contains(target);
     }
 
     private static List<PcodeBlockBasic> topologicalBlockOrder(

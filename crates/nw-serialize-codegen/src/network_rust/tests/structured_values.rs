@@ -726,6 +726,72 @@ fn exact_serialize_value_uses_semantic_type_when_wire_products_match() {
 }
 
 #[test]
+fn exact_serialize_source_identity_supplies_missing_state_wire_shape() {
+    let guild_id = uuid!("0252597e-4d49-49d3-a0a3-4169106bbaba");
+    let uuid_id = uuid!("e152c105-a133-4d03-bbf8-3d4b2fba3e2a");
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "63AD3B5A-3E2E-4923-ACCD-1DA221431EE0",
+            "typeIndex": 3147,
+            "typeName": "MB::GuildsReplicatedState",
+            "capabilities": ["replicated-state"],
+            "fields": [{
+                "index": 0,
+                "name": "guildId",
+                "group": 0,
+                "sourceTypeId": guild_id.to_string(),
+                "sourceTypeIdSource": "handler-payload-flow+exact-serialize-layout",
+                "sourceTypeIdentityProven": true,
+                "wireLayout": "fixed-bytes-16",
+                "wireLayoutSource": "bidirectional-codec-product",
+                "confidence": "register-field-call"
+            }]
+        }],
+        "fieldRegistrationFunctions": [],
+        "fieldHandlerVtables": []
+    }))
+    .expect("schema");
+    schema.merge_serialize_codegen_unit(
+        &SerializeCodegenUnit {
+            items: vec![serialize_struct(
+                guild_id,
+                "GuildId",
+                vec![serialize_field(
+                    "m_id",
+                    uuid_id,
+                    ResolvedType::Scalar(ScalarType::Uuid),
+                    16,
+                )],
+            )],
+        },
+        Some("selection.json".to_owned()),
+    );
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [3147])
+        .expect("generated state source");
+    let plan = &output.report.state_generation_plans[0];
+    let field = &plan.fields[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        field.wire_shape_source.as_deref(),
+        Some("serialize-source-type+wire-layout")
+    );
+    assert_eq!(
+        field.rust_value_type.as_deref(),
+        Some("::nw_network::source::GuildId")
+    );
+    assert_eq!(
+        field.rust_field_type.as_deref(),
+        Some(
+            "::nw_network::serialize::ReplicatedFieldHandler<\
+             ::nw_network::source::GuildId>"
+        )
+    );
+    syn::parse_file(&output.source).expect("generated state source parses");
+}
+
+#[test]
 fn emits_nested_collection_products_from_proven_wire_shape() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{

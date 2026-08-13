@@ -190,7 +190,8 @@ pub(super) fn replicated_state_field_support_tokens(
         }
     }
     if let Some(shape) = field.container_value_type_shape.as_ref()
-        && field_references_shape_codec(field, shape)
+        && (field_references_shape_codec(field, shape)
+            || field_references_shape_value_type(field, shape, serialize_types))
         && let Some(tokens) = replicated_state_shape_support_tokens(
             field,
             shape,
@@ -203,6 +204,25 @@ pub(super) fn replicated_state_field_support_tokens(
         items.push(tokens);
     }
     items
+}
+
+fn field_references_shape_value_type(
+    field: &NetworkStateFieldShapeReport,
+    shape: &crate::network_schema::NetworkNestedTypeShape,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> bool {
+    let Some(value_type) = container_value_shape_report_rust_type(field, shape, serialize_types)
+    else {
+        return false;
+    };
+    field
+        .rust_value_type
+        .as_deref()
+        .is_some_and(|field_type| field_type.contains(&value_type))
+        || field
+            .rust_field_type
+            .as_deref()
+            .is_some_and(|field_type| field_type.contains(&value_type))
 }
 
 pub(super) fn container_embedded_shape_is_referenced(

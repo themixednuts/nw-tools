@@ -1,0 +1,649 @@
+    private Long affinePointerInductionStride(
+        PcodeOpAST phi,
+        NetworkSchemaNaturalLoop loop) {
+
+        Long semantic = affinePointerInductionStride(phi);
+        if (semantic != null) {
+            return semantic;
+        }
+        return physicalRegisterAffineStepInLoop(phi, loop);
+    }
+
+    private ContainerLoopInduction inductionFromPhi(
+        PcodeOpAST phi,
+        NetworkSchemaNaturalLoop loop) {
+
+        ContainerLoopInduction semantic = inductionFromPhi(phi);
+        if (semantic != null) {
+            return semantic;
+        }
+        Long stride = physicalRegisterAffineStepInLoop(phi, loop);
+        return stride == null
+            ? null
+            : new ContainerLoopInduction(
+                ContainerStorageKind.VECTOR,
+                stride,
+                "cfg-natural-loop-physical-register-induction");
+    }
+
+    private ContainerLoopInduction uniqueAffineLoopExitInduction(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop) {
+
+        PcodeOpAST selectedPhi = null;
+        ContainerLoopInduction selected = null;
+        var operations = loop.header().getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (!(operation instanceof PcodeOpAST phi) ||
+                phi.getOpcode() != PcodeOp.MULTIEQUAL || phi.getOutput() == null ||
+                phi.getOutput().getSize() != currentProgram.getDefaultPointerSize()) {
+                continue;
+            }
+            ContainerLoopInduction candidate = loopExitInductionFromPhi(phi, loop);
+            if (candidate == null ||
+                candidate.storageKind() != ContainerStorageKind.VECTOR ||
+                candidate.stride() == null || candidate.stride() <= 0L ||
+                !loopConditionDependsOn(high, loop, phi.getOutput())) {
+                continue;
+            }
+            if (selectedPhi != null && selectedPhi != phi) {
+                return null;
+            }
+            selectedPhi = phi;
+            selected = new ContainerLoopInduction(
+                ContainerStorageKind.VECTOR,
+                candidate.stride(),
+                "cfg-natural-loop-unique-exit-induction");
+        }
+        return selected;
+    }
+
+    private ContainerLoopInduction loopExitInductionFromPhi(
+        PcodeOpAST phi,
+        NetworkSchemaNaturalLoop loop) {
+
+        ContainerLoopInduction semantic = inductionFromPhi(phi);
+        if (semantic != null) {
+            return semantic;
+        }
+        Long stride = physicalRegisterAffineStepInLoop(phi, loop, false);
+        return stride == null
+            ? null
+            : new ContainerLoopInduction(
+                ContainerStorageKind.VECTOR,
+                stride,
+                "cfg-natural-loop-physical-register-exit-induction");
+    }
+
+    private ContainerLoopInduction codecCompatibleAffineLoopExitInduction(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<ContainerCodecCall> codecs) {
+
+        PcodeOpAST exitPhi = uniqueAffineLoopExitPhi(high, loop);
+        ContainerLoopInduction exit = exitPhi == null
+            ? null
+            : loopExitInductionFromPhi(exitPhi, loop);
+        if (exit == null || exit.stride() == null || codecs == null || codecs.isEmpty()) {
+            return null;
+        }
+
+        ContainerAffineInductionFamily family = affineInductionFamilyForExit(
+            loop,
+            exitPhi,
+            exit.stride());
+        ContainerAffineProjection projection = family == null
+            ? null
+            : containerAffineProjection(loop, codecs, family);
+        if (projection != null) {
+            for (int index = 0; index < codecs.size(); index++) {
+                ContainerCodecCall codec = codecs.get(index);
+                codec.elementBase = "element";
+                codec.elementOffset = projection.offsets().get(index);
+                projectContainerLoopCodecMemberOffsets(
+                    codec,
+                    projection.roots().get(index));
+            }
+            runMetrics.increment("exitAnchoredAffineInductionFamilyProofs");
+            return new ContainerLoopInduction(
+                ContainerStorageKind.VECTOR,
+                exit.stride(),
+                "cfg-natural-loop-exit-anchored-affine-family");
+        }
+
+        ArrayList<PcodeOpAST> codecInductions = new ArrayList<>();
+        for (PcodeOpAST induction : affineHeaderInductions(loop)) {
+            ContainerLoopInduction candidate = loopExitInductionFromPhi(induction, loop);
+            if (candidate != null && candidate.storageKind() == ContainerStorageKind.VECTOR &&
+                exit.stride().equals(candidate.stride())) {
+                codecInductions.add(induction);
+            }
+        }
+        if (codecInductions.isEmpty()) {
+            return null;
+        }
+        for (ContainerCodecCall codec : codecs) {
+            boolean connected = "element".equals(codec.elementBase) &&
+                codec.elementOffset != null && codec.elementOffset >= 0L &&
+                codec.elementOffset < exit.stride();
+            for (PcodeOpAST induction : codecInductions) {
+                if (connected) {
+                    break;
+                }
+                if (containerCodecElementOffset(loop, codec, induction.getOutput()) != null ||
+                    containerCodecDependsOnElementRoot(codec, induction.getOutput())) {
+                    connected = true;
+                    break;
+                }
+            }
+            if (!connected) {
+                return null;
+            }
+        }
+        return new ContainerLoopInduction(
+            ContainerStorageKind.VECTOR,
+            exit.stride(),
+            "cfg-natural-loop-codec-compatible-exit-induction");
+    }
+
+    private PcodeOpAST uniqueAffineLoopExitPhi(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop) {
+
+        PcodeOpAST selected = null;
+        for (PcodeOpAST phi : affineHeaderInductions(loop)) {
+            ContainerLoopInduction candidate = loopExitInductionFromPhi(phi, loop);
+            if (candidate == null || candidate.storageKind() != ContainerStorageKind.VECTOR ||
+                candidate.stride() == null || candidate.stride() <= 0L ||
+                !loopConditionDependsOn(high, loop, phi.getOutput())) {
+                continue;
+            }
+            if (selected != null && selected != phi) {
+                return null;
+            }
+            selected = phi;
+        }
+        return selected;
+    }
+
+    private List<PcodeOpAST> affineHeaderInductions(NetworkSchemaNaturalLoop loop) {
+        if (loop == null || loop.header() == null) {
+            return List.of();
+        }
+        ArrayList<PcodeOpAST> result = new ArrayList<>();
+        var operations = loop.header().getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (!(operation instanceof PcodeOpAST phi) ||
+                phi.getOpcode() != PcodeOp.MULTIEQUAL || phi.getOutput() == null ||
+                phi.getOutput().getSize() != currentProgram.getDefaultPointerSize() ||
+                loopExitInductionFromPhi(phi, loop) == null) {
+                continue;
+            }
+            result.add(phi);
+        }
+        return List.copyOf(result);
+    }
+
+    private ContainerAffineInductionFamily affineInductionFamilyForExit(
+        NetworkSchemaNaturalLoop loop,
+        PcodeOpAST exitPhi,
+        long stride) {
+
+        Varnode exitInitial = sequenceInitialValue(exitPhi, loop);
+        if (exitInitial == null || stride <= 0L) {
+            return null;
+        }
+        ArrayList<PcodeOpAST> members = new ArrayList<>();
+        IdentityHashMap<PcodeOpAST, Long> offsets = new IdentityHashMap<>();
+        for (PcodeOpAST phi : affineHeaderInductions(loop)) {
+            ContainerLoopInduction candidate = loopExitInductionFromPhi(phi, loop);
+            Varnode initial = sequenceInitialValue(phi, loop);
+            if (candidate == null || !Long.valueOf(stride).equals(candidate.stride()) ||
+                initial == null) {
+                continue;
+            }
+            Long offset = pcodeConstantOffsetFromRoot(
+                initial,
+                exitInitial,
+                new LinkedHashSet<>(),
+                0);
+            if (offset == null || offset < 0L || offset >= stride) {
+                continue;
+            }
+            members.add(phi);
+            offsets.put(phi, offset);
+        }
+        return members.contains(exitPhi) && members.size() >= 2
+            ? new ContainerAffineInductionFamily(members, offsets, stride)
+            : null;
+    }
+
+    private boolean isAffineBackedgeInput(
+        PcodeOpAST phi,
+        Varnode input,
+        NetworkSchemaNaturalLoop loop,
+        int inputSlot) {
+
+        if (phi == null || input == null || phi.getOutput() == null) {
+            return false;
+        }
+        PcodeBlockBasic predecessor = phiInputPredecessor(phi, loop, inputSlot);
+        boolean cfgBackedgeSlot = predecessor != null;
+        if (predecessor != null) {
+            if (!loop.contains(predecessor)) {
+                return false;
+            }
+        }
+        Long physicalStep = cfgBackedgeSlot
+            ? physicalRegisterAffineStepInBlock(predecessor, phi.getOutput())
+            : physicalRegisterAffineStepForInputInLoop(phi, input, loop);
+        boolean affine = affineStepFromPhi(
+                input,
+                phi.getOutput(),
+                new LinkedHashSet<>(),
+                0) != null ||
+            physicalStep != null;
+        if (affine && cfgBackedgeSlot) {
+            runMetrics.increment("cfgPhiBackedgeSlotProofs");
+            if (physicalStep != null) {
+                runMetrics.increment("cfgPhiBackedgeAffineStepProofs");
+            }
+        }
+        return affine;
+    }
+
+    private PcodeBlockBasic phiInputPredecessor(
+        PcodeOpAST phi,
+        NetworkSchemaNaturalLoop loop,
+        int inputSlot) {
+
+        PcodeBlockBasic header = loop == null ? null : loop.header();
+        if (phi == null || header == null || phi.getParent() != header ||
+            phi.getNumInputs() != header.getInSize() ||
+            inputSlot < 0 || inputSlot >= header.getInSize() ||
+            !(header.getIn(inputSlot) instanceof PcodeBlockBasic predecessor)) {
+            return null;
+        }
+        return predecessor;
+    }
+
+    private Long physicalRegisterAffineStepInLoop(
+        PcodeOpAST phi,
+        NetworkSchemaNaturalLoop loop) {
+
+        return physicalRegisterAffineStepInLoop(phi, loop, true);
+    }
+
+    private Long physicalRegisterAffineStepInLoop(
+        PcodeOpAST phi,
+        NetworkSchemaNaturalLoop loop,
+        boolean requirePointerUse) {
+
+        if (phi == null || loop == null || phi.getOutput() == null ||
+            phi.getOutput().getAddress() == null ||
+            !phi.getOutput().getAddress().getAddressSpace().isRegisterSpace() ||
+            phi.getOutput().getSize() != currentProgram.getDefaultPointerSize() ||
+            requirePointerUse && !physicalRegisterInductionUsedAsPointer(phi, loop)) {
+            return null;
+        }
+        Long backedgeStep = cfgPhiBackedgeAffineStep(phi, loop);
+        if (backedgeStep != null) {
+            runMetrics.increment("physicalRegisterAffineInductionProofs");
+            return backedgeStep;
+        }
+        Long selected = null;
+        for (PcodeBlockBasic block : loop.body()) {
+            if (block != loop.header() &&
+                !NetworkSchemaControlFlow.reaches(block, loop.header())) {
+                continue;
+            }
+            var operations = block.getIterator();
+            while (operations.hasNext()) {
+                PcodeOp operation = operations.next();
+                if (operation == phi || operation.getOutput() == null ||
+                    !physicalRegisterAffineOutputForPhi(operation, phi)) {
+                    continue;
+                }
+                Long candidate = physicalRegisterAffineStep(operation, phi.getOutput());
+                if (candidate == null || candidate <= 0L || candidate > 0x100000L) {
+                    continue;
+                }
+                if (selected != null && !selected.equals(candidate)) {
+                    return null;
+                }
+                selected = candidate;
+            }
+        }
+        if (selected != null) {
+            runMetrics.increment("physicalRegisterAffineInductionProofs");
+        }
+        return selected;
+    }
+
+    private Long cfgPhiBackedgeAffineStep(
+        PcodeOpAST phi,
+        NetworkSchemaNaturalLoop loop) {
+
+        if (phi == null || loop == null || phi.getOutput() == null) {
+            return null;
+        }
+        Long selected = null;
+        boolean mapped = false;
+        for (int slot = 0; slot < phi.getNumInputs(); slot++) {
+            PcodeBlockBasic predecessor = phiInputPredecessor(phi, loop, slot);
+            if (predecessor == null || !loop.contains(predecessor)) {
+                continue;
+            }
+            mapped = true;
+            Long candidate = physicalRegisterAffineStepInBlock(
+                predecessor,
+                phi.getOutput());
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        if (mapped && selected != null) {
+            runMetrics.increment("cfgPhiBackedgeAffineStepProofs");
+        }
+        return selected;
+    }
+
+    private Long physicalRegisterAffineStepInBlock(
+        PcodeBlockBasic block,
+        Varnode root) {
+
+        if (block == null || root == null) {
+            return null;
+        }
+        Long selected = null;
+        var operations = block.getIterator();
+        while (operations.hasNext()) {
+            PcodeOp operation = operations.next();
+            if (operation.getOutput() == null ||
+                !samePcodeStorageLocation(operation.getOutput(), root)) {
+                continue;
+            }
+            Long candidate = physicalRegisterAffineStep(operation, root);
+            if (candidate == null || candidate <= 0L || candidate > 0x100000L) {
+                continue;
+            }
+            if (selected != null && !selected.equals(candidate)) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private Long physicalRegisterAffineStepForInputInLoop(
+        PcodeOpAST phi,
+        Varnode input,
+        NetworkSchemaNaturalLoop loop) {
+
+        if (phi == null || input == null || loop == null || phi.getOutput() == null ||
+            input.getAddress() == null ||
+            !input.getAddress().getAddressSpace().isRegisterSpace() ||
+            phi.getOutput().getSize() != currentProgram.getDefaultPointerSize()) {
+            return null;
+        }
+        Long selected = null;
+        for (PcodeBlockBasic block : loop.body()) {
+            if (block != loop.header() &&
+                !NetworkSchemaControlFlow.reaches(block, loop.header())) {
+                continue;
+            }
+            var operations = block.getIterator();
+            while (operations.hasNext()) {
+                PcodeOp operation = operations.next();
+                if (operation == phi || operation.getOutput() == null ||
+                    !samePcodeStorageLocation(operation.getOutput(), input)) {
+                    continue;
+                }
+                Long candidate = physicalRegisterAffineStep(operation, phi.getOutput());
+                if (candidate == null || candidate <= 0L || candidate > 0x100000L) {
+                    continue;
+                }
+                if (selected != null && !selected.equals(candidate)) {
+                    return null;
+                }
+                selected = candidate;
+            }
+        }
+        if (selected != null && !physicalRegisterInductionUsedAsPointer(phi, loop)) {
+            runMetrics.increment("nonPointerPhysicalRegisterAffineBackedgeProofs");
+        }
+        return selected;
+    }
+
+    private boolean physicalRegisterAffineOutputForPhi(
+        PcodeOp operation,
+        PcodeOpAST phi) {
+
+        if (operation == null || operation.getOutput() == null || phi == null ||
+            phi.getOutput() == null) {
+            return false;
+        }
+        if (samePcodeStorageLocation(operation.getOutput(), phi.getOutput())) {
+            return true;
+        }
+        for (int slot = 0; slot < phi.getNumInputs(); slot++) {
+            Varnode input = phi.getInput(slot);
+            if (input != null && input.getAddress() != null &&
+                input.getAddress().getAddressSpace().isRegisterSpace() &&
+                samePcodeStorageLocation(operation.getOutput(), input)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean physicalRegisterInductionUsedAsPointer(
+        PcodeOpAST phi,
+        NetworkSchemaNaturalLoop loop) {
+
+        Varnode root = phi == null ? null : phi.getOutput();
+        if (root == null || loop == null) {
+            return false;
+        }
+        for (PcodeBlockBasic block : loop.body()) {
+            var operations = block.getIterator();
+            while (operations.hasNext()) {
+                PcodeOp operation = operations.next();
+                int firstOperand = operation.getOpcode() == PcodeOp.CALL ? 1 : 0;
+                boolean pointerOperation = operation.getOpcode() == PcodeOp.LOAD ||
+                    operation.getOpcode() == PcodeOp.STORE ||
+                    operation.getOpcode() == PcodeOp.PTRADD ||
+                    operation.getOpcode() == PcodeOp.PTRSUB ||
+                    operation.getOpcode() == PcodeOp.CALL;
+                if (!pointerOperation) {
+                    continue;
+                }
+                for (int slot = firstOperand; slot < operation.getNumInputs(); slot++) {
+                    Varnode input = operation.getInput(slot);
+                    if (input != null && physicalRegisterNodeDependsOn(
+                            input,
+                            root,
+                            new LinkedHashSet<>(),
+                            0)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private Long physicalRegisterAffineStep(PcodeOp operation, Varnode root) {
+        if (operation == null || root == null) {
+            return null;
+        }
+        if (operation.getOpcode() == PcodeOp.INT_ADD && operation.getNumInputs() == 2) {
+            for (int constantSlot = 0; constantSlot < 2; constantSlot++) {
+                Long constant = NetworkSchemaIntegerEvaluator.evaluate(
+                    operation.getInput(constantSlot));
+                Varnode base = operation.getInput(1 - constantSlot);
+                if (constant != null && physicalRegisterNodeDependsOn(
+                        base, root, new LinkedHashSet<>(), 0)) {
+                    return constant;
+                }
+            }
+            return null;
+        }
+        if (operation.getOpcode() != PcodeOp.PTRADD || operation.getNumInputs() != 3 ||
+            !physicalRegisterNodeDependsOn(
+                    operation.getInput(0),
+                    root,
+                    new LinkedHashSet<>(),
+                    0)) {
+            return null;
+        }
+        Long index = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(1));
+        Long scale = NetworkSchemaIntegerEvaluator.evaluate(operation.getInput(2));
+        if (index == null || scale == null) {
+            return null;
+        }
+        try {
+            return Math.multiplyExact(index, scale);
+        }
+        catch (ArithmeticException ignored) {
+            return null;
+        }
+    }
+
+    private boolean physicalRegisterNodeDependsOn(
+        Varnode node,
+        Varnode root,
+        Set<String> seen,
+        int depth) {
+
+        if (node == null || root == null || depth > 24) {
+            return false;
+        }
+        checkAnalysisCancelled();
+        if (samePcodeStorageLocation(node, root)) {
+            return true;
+        }
+        if (node.isConstant() || !seen.add(pcodeSsaNodeKey(node))) {
+            return false;
+        }
+        PcodeOp definition = node.getDef();
+        if (definition == null || definition.getOpcode() == PcodeOp.CALL ||
+            definition.getOpcode() == PcodeOp.CALLIND) {
+            return false;
+        }
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            if (physicalRegisterNodeDependsOn(
+                    definition.getInput(slot), root, seen, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    private boolean blockPhysicalValueDependsOn(
+        PcodeBlockBasic block,
+        PcodeOp boundary,
+        Varnode value,
+        Varnode root,
+        Set<String> seen,
+        int depth) {
+
+        if (block == null || boundary == null || value == null || root == null ||
+            depth > 16) {
+            return false;
+        }
+        if (pcodeNodeDependsOn(value, root, new LinkedHashSet<>(), 0) ||
+            physicalRegisterNodeDependsOn(value, root, new LinkedHashSet<>(), 0)) {
+            return true;
+        }
+        String key = pcodeSsaNodeKey(value) + "@" +
+            Objects.toString(boundary.getSeqnum(), "unknown");
+        if (!seen.add(key)) {
+            return false;
+        }
+        PcodeOp producer = lastPhysicalRegisterProducerBefore(block, boundary, value);
+        if (producer == null) {
+            return false;
+        }
+        for (int slot = 0; slot < producer.getNumInputs(); slot++) {
+            if (blockPhysicalValueDependsOn(
+                    block,
+                    producer,
+                    producer.getInput(slot),
+                    root,
+                    seen,
+                    depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private PcodeOp lastPhysicalRegisterProducerBefore(
+        PcodeBlockBasic block,
+        PcodeOp boundary,
+        Varnode value) {
+
+        if (block == null || boundary == null || value == null) {
+            return null;
+        }
+        PcodeOp selected = null;
+        var iterator = block.getIterator();
+        while (iterator.hasNext()) {
+            PcodeOp operation = iterator.next();
+            if (operation == boundary) {
+                break;
+            }
+            if (operation.getOutput() != null &&
+                samePcodeStorageLocation(operation.getOutput(), value)) {
+                selected = operation;
+            }
+        }
+        return selected;
+    }
+
+    private PcodeOp loopConditionComparison(
+        PcodeBlockBasic block,
+        PcodeOpAST branch,
+        Varnode condition,
+        Varnode induction) {
+
+        PcodeOp comparison = condition == null ? null : condition.getDef();
+        if (isLoopExitComparison(comparison) &&
+            pcodeOperationInputsDependOn(comparison, induction)) {
+            return comparison;
+        }
+        comparison = lastPhysicalRegisterProducerBefore(block, branch, condition);
+        return isLoopExitComparison(comparison) &&
+            pcodeOperationInputsDependOn(comparison, induction)
+                ? comparison
+                : null;
+    }
+
+    private boolean isLoopExitComparison(PcodeOp operation) {
+        return operation != null && switch (operation.getOpcode()) {
+            case PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL,
+                PcodeOp.INT_LESS, PcodeOp.INT_LESSEQUAL,
+                PcodeOp.INT_SLESS, PcodeOp.INT_SLESSEQUAL -> true;
+            default -> false;
+        };
+    }
+
+    private boolean pcodeOperationInputsDependOn(PcodeOp operation, Varnode root) {
+        if (operation == null || root == null) {
+            return false;
+        }
+        for (int slot = 0; slot < operation.getNumInputs(); slot++) {
+            Varnode input = operation.getInput(slot);
+            if (pcodeNodeDependsOn(input, root, new LinkedHashSet<>(), 0) ||
+                physicalRegisterNodeDependsOn(input, root, new LinkedHashSet<>(), 0)) {
+                return true;
+            }
+        }
+        return false;
+    }

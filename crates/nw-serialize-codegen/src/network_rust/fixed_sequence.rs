@@ -366,4 +366,43 @@ mod tests {
         assert!(output.source.contains("pub struct GroupId([u8; 16])"));
         assert!(output.source.contains("::arrayvec::ArrayVec<GroupId, 10>"));
     }
+
+    #[test]
+    fn emits_proven_structured_fixed_vector_without_scalar_storage_plan() {
+        let schema = NetworkSchema::from_ghidra_static_network_report(&serde_json::json!({
+            "registryEntries": [{
+                "uuid": "C5E8790C-7A92-4B68-A05A-AB0871AEFA68",
+                "typeIndex": 2133,
+                "typeName": "MB::EncounterComponentReplicatedState",
+                "fields": [{
+                    "index": 0,
+                    "group": 0,
+                    "name": "status",
+                    "handlerVtable": "NewWorld+0x80af538",
+                    "confidence": "register-field-call"
+                }]
+            }],
+            "fieldRegistrationFunctions": [],
+            "fieldHandlerVtables": [{
+                "address": "NewWorld+0x80af538",
+                "fieldCount": 1,
+                "wireShape": "fixed-vector<composite<u32,u32>,10>",
+                "wireShapeSource": "cfg-bounded-inline-sequence",
+                "wireLayout": "vec<composite<u32,u32>>",
+                "wireLayoutSource": "cfg-bounded-inline-sequence",
+                "slots": []
+            }]
+        }))
+        .expect("structured fixed-vector schema");
+
+        let output = NetworkRustEmitter::emit_replicated_states(&schema, [2133]).unwrap();
+        let plan = &output.report.state_generation_plans[0];
+
+        assert!(plan.can_generate, "{plan:#?}");
+        assert_eq!(
+            plan.fields[0].rust_value_type.as_deref(),
+            Some("::arrayvec::ArrayVec<(u32, u32), 10>")
+        );
+        assert_eq!(plan.fields[0].fixed_sequence, None);
+    }
 }

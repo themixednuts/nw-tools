@@ -297,6 +297,7 @@
         typeNameFlowCache.clear();
         registrationThunkTypeIdCache.clear();
         registrationHelperTableCache.clear();
+        registrationThunkHelperTableScanCache.clear();
         registrationHookSlotTypeNameCache.clear();
         messageGraphRootsCache.clear();
         messageCallFrameOutputCache.clear();

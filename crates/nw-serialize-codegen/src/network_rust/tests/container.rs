@@ -18,14 +18,10 @@ fn replicated_container_schema_with_named_shape(
 ) -> NetworkSchema {
     let mut plan = plan;
     let plan = plan.as_object_mut().expect("container plan object");
-    plan.insert(
-        "unmarshalReconciliation".to_owned(),
-        json!("complete-physical-sequence-agreement"),
-    );
-    plan.insert(
-        "unmarshalAnalysisStatus".to_owned(),
-        json!("exact-loop-codec-count"),
-    );
+    plan.entry("unmarshalReconciliation".to_owned())
+        .or_insert_with(|| json!("complete-physical-sequence-agreement"));
+    plan.entry("unmarshalAnalysisStatus".to_owned())
+        .or_insert_with(|| json!("exact-loop-codec-count"));
     let mut vtable = json!({
         "address": "NewWorld+0x8123456",
         "fieldCount": 1,
@@ -709,6 +705,412 @@ fn linear_container_plan_emits_ordered_support_struct() {
 }
 
 #[test]
+fn affine_vector_plan_preserves_nested_fixed_sequence_members() {
+    let schema = replicated_container_schema(json!({
+        "storageKind": "vector",
+        "elementStride": "0x40",
+        "valueCodecs": [
+            {
+                "wireShape": "fixed-array<u16,3>",
+                "wireLayout": "fixed-array<u16,3>",
+                "memberSemantics": "fixed-sequence",
+                "analysisStatus": "complete",
+                "elementOffset": "0x20",
+                "members": [
+                    { "wireShape": "u16" },
+                    { "wireShape": "u16" },
+                    { "wireShape": "u16" }
+                ]
+            },
+            {
+                "wireShape": "quat-smallest-three",
+                "wireLayout": "quat-smallest-three",
+                "elementOffset": "0x10"
+            },
+            {
+                "wireShape": "u32",
+                "wireLayout": "u32",
+                "elementOffset": "0x30"
+            },
+            {
+                "wireShape": "u8",
+                "wireLayout": "u8",
+                "elementOffset": "0x2c"
+            }
+        ]
+    }));
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::std::vec::Vec<ValuesValue>")
+    );
+    assert!(output.source.contains("pub field_0: [u16; 3]"));
+    assert!(output.source.contains("pub field_1: ::glam::Quat"));
+    assert!(
+        output
+            .source
+            .contains("::nw_network::serialize::QuatSmallestThreeQuantizedMarshaler")
+    );
+    assert!(output.source.contains("pub field_2: u32"));
+    assert!(output.source.contains("pub field_3: u8"));
+}
+
+#[test]
+fn exact_unmarshal_element_identity_bridges_an_incomplete_codec_reconciliation() {
+    let mut schema = replicated_container_schema(json!({
+        "storageKind": "vector",
+        "elementStride": 112,
+        "valueCodecs": [{
+            "memberSemantics": "linear-sequence",
+            "members": [
+                { "wireLayout": "fixed-bytes-16" },
+                { "wireShape": "u64" },
+                { "wireShape": "u32" }
+            ]
+        }]
+    }));
+    let vtable = &mut schema.field_handler_vtables[0];
+    vtable
+        .full_container_plan
+        .as_mut()
+        .expect("container plan")
+        .unmarshal_reconciliation = Some("marshal-unmarshal-codec-count-mismatch".to_owned());
+    vtable.value_type_info = Some(NetworkNativeTypeInfoEvidence {
+        address: Some("NewWorld+0x819d200".to_owned()),
+        name: Some("XpEvent".to_owned()),
+        type_id: Some(Uuid::parse_str("D10C59A8-C6E9-4B9C-923F-D48B5EB917B6").expect("type UUID")),
+        source: Some("unmarshal-full-element-vptr+affine-element-stride".to_owned()),
+        name_source: Some("az-rtti-vtable-provider".to_owned()),
+        native_size: Some(112),
+        native_size_source: Some("container-affine-element-stride".to_owned()),
+    });
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::std::vec::Vec<XpEvent>")
+    );
+    assert!(output.source.contains("pub struct XpEvent"));
+    assert!(output.source.contains("pub field_0: [u8; 16]"));
+    assert!(output.source.contains("pub field_2: u32"));
+}
+
+#[test]
+fn decoded_conditional_product_bridges_a_non_linear_marshal_helper() {
+    let mut schema = replicated_container_schema(json!({
+        "storageKind": "index-map",
+        "keyCodecs": [{ "wireShape": "u16" }],
+        "valueCodecs": [{
+            "memberSemantics": "cfg-reachable",
+            "members": [{ "wireLayout": "fixed-bytes-16" }]
+        }],
+        "unmarshalCodecs": [
+            { "wireShape": "u16" },
+            {
+                "memberSemantics": "linear-sequence",
+                "members": [
+                    {
+                        "wireLayout": "fixed-bytes-16",
+                        "guards": [{
+                            "branch": "NewWorld+0x1010",
+                            "kind": "boolean-storage",
+                            "condition": "not-equal-zero",
+                            "memberOnTrue": true,
+                            "storageBase": "stack",
+                            "storageOffset": "0xffffffffffffffb8",
+                            "evidenceSource": "dominating-cbranch-pcode-storage"
+                        }]
+                    },
+                    {
+                        "wireShape": "boolean-choice<u32,composite<u64,u32>>",
+                        "guards": [{
+                            "branch": "NewWorld+0x1020",
+                            "kind": "boolean-storage",
+                            "condition": "not-equal-zero",
+                            "memberOnTrue": true,
+                            "storageBase": "stack",
+                            "storageOffset": "0xffffffffffffffb9",
+                            "evidenceSource": "dominating-cbranch-pcode-storage"
+                        }]
+                    }
+                ]
+            }
+        ]
+    }));
+    let vtable = &mut schema.field_handler_vtables[0];
+    vtable.value_type_info = Some(NetworkNativeTypeInfoEvidence {
+        address: Some("NewWorld+0x819d200".to_owned()),
+        name: Some("ConditionalMapValue".to_owned()),
+        type_id: Some(Uuid::parse_str("D10C59A8-C6E9-4B9C-923F-D48B5EB917B6").expect("type UUID")),
+        source: Some("unmarshal-full-element-vptr+linked-node-allocation".to_owned()),
+        name_source: Some("az-rtti-vtable-provider".to_owned()),
+        native_size: Some(64),
+        native_size_source: Some("linked-node-allocation-size-minus-value-offset".to_owned()),
+    });
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::nw_network::serialize::IndexMap<u16, ConditionalMapValue>")
+    );
+    assert!(output.source.contains("pub struct ConditionalMapValue"));
+    assert!(output.source.contains("pub field_0: [u8; 16]"));
+}
+
+#[test]
+fn decoded_conditional_product_emits_anonymous_value_without_native_identity() {
+    let schema = replicated_container_schema(json!({
+        "storageKind": "index-map",
+        "keyCodecs": [{ "wireShape": "u16" }],
+        "valueCodecs": [{
+            "memberSemantics": "cfg-reachable",
+            "members": [{ "wireLayout": "fixed-bytes-16" }]
+        }],
+        "unmarshalCodecs": [
+            { "wireShape": "u16" },
+            {
+                "memberSemantics": "linear-sequence",
+                "members": [
+                    { "wireLayout": "fixed-bytes-16" },
+                    { "wireShape": "boolean-choice<u32,composite<u64,u32>>" }
+                ]
+            }
+        ]
+    }));
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::nw_network::serialize::IndexMap<u16, ValuesValue>")
+    );
+    assert!(output.source.contains("pub struct ValuesValue"));
+    assert!(output.source.contains("pub field_0: [u8; 16]"));
+    assert!(
+        output
+            .source
+            .contains("pub field_1: ::nw_network::serialize::BooleanChoice<u32, (u64, u32)>")
+    );
+}
+
+#[test]
+fn complete_unmarshal_product_bridges_a_cyclic_marshal_helper() {
+    let schema = replicated_container_schema(json!({
+        "storageKind": "vector",
+        "elementStride": 1072,
+        "unmarshalStorageProof": "cfg-natural-loop-affine-pointer-induction",
+        "unmarshalAnalysisStatus": "single-loop-codec-sequence",
+        "unmarshalReconciliation": "marshal-codec-sequence-not-linear",
+        "valueCodecs": [{
+            "memberSemantics": "cfg-reachable",
+            "analysisStatus": "nested:multiple-non-linear-helpers",
+            "members": [{
+                "memberSemantics": "cfg-reachable",
+                "analysisStatus": "nested:cyclic-events",
+                "members": [{ "wireShape": "u64" }]
+            }]
+        }],
+        "unmarshalCodecs": [{
+            "memberSemantics": "linear-sequence",
+            "analysisStatus": "complete",
+            "members": [
+                { "wireLayout": "fixed-bytes-16" },
+                { "wireShape": "fixed-vector<fixed-bytes-16,10>" },
+                { "wireShape": "u64" }
+            ]
+        }]
+    }));
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::std::vec::Vec<ValuesValue>")
+    );
+    assert!(output.source.contains("pub field_0: [u8; 16]"));
+    assert!(
+        output
+            .source
+            .contains("pub field_1: ::arrayvec::ArrayVec<[u8; 16], 10>")
+    );
+}
+
+#[test]
+fn complete_map_unmarshal_product_excludes_the_key_from_the_value() {
+    let schema = replicated_container_schema(json!({
+        "storageKind": "index-map",
+        "unmarshalStorageProof": "cfg-ordered-buffer-codecs+unique-owner-insertion",
+        "unmarshalAnalysisStatus": "single-loop-codec-sequence",
+        "unmarshalReconciliation": "marshal-codec-sequence-not-linear",
+        "keyCodecs": [{ "wireLayout": "fixed-bytes-16" }],
+        "valueCodecs": [{
+            "memberSemantics": "cfg-reachable",
+            "analysisStatus": "nested:multiple-non-linear-helpers",
+            "members": [{ "wireShape": "u64" }]
+        }],
+        "unmarshalCodecs": [
+            { "wireLayout": "fixed-bytes-16" },
+            {
+                "memberSemantics": "linear-sequence",
+                "analysisStatus": "complete",
+                "members": [
+                    { "wireShape": "u64" },
+                    { "wireShape": "fixed-vector<fixed-bytes-16,10>" }
+                ]
+            }
+        ]
+    }));
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::nw_network::serialize::IndexMap<[u8; 16], ValuesValue>")
+    );
+    assert!(output.source.contains("pub field_0: u64"));
+    assert!(
+        output
+            .source
+            .contains("pub field_1: ::arrayvec::ArrayVec<[u8; 16], 10>")
+    );
+}
+
+#[test]
+fn complete_guarded_marshal_product_preserves_mask_semantics() {
+    let schema = replicated_container_schema(json!({
+        "storageKind": "vector",
+        "elementStride": 56,
+        "unmarshalStorageProof": "cfg-natural-loop-affine-pointer-induction",
+        "unmarshalAnalysisStatus": "single-loop-codec-sequence",
+        "unmarshalReconciliation": "marshal-codec-sequence-not-linear",
+        "valueCodecs": [{
+            "memberSemantics": "cfg-reachable",
+            "analysisStatus": "complete-guarded-cfg",
+            "members": [
+                { "wireShape": "vlq-u32", "elementOffset": "0x0" },
+                { "wireLayout": "fixed-bytes-1", "elementOffset": "0x4" },
+                {
+                    "wireShape": "vlq-u32",
+                    "guards": [{
+                        "kind": "storage-bit-mask",
+                        "condition": "equal-zero",
+                        "memberOnTrue": false,
+                        "storageBase": "param_2",
+                        "storageOffset": "0x4",
+                        "mask": "0x1",
+                        "evidenceSource": "dominating-cbranch-x86-test-mask"
+                    }]
+                }
+            ]
+        }],
+        "unmarshalCodecs": [{
+            "memberSemantics": "linear-sequence",
+            "analysisStatus": "complete-success-trace+structured-discovery",
+            "members": [
+                { "wireShape": "vlq-u32" },
+                { "wireLayout": "fixed-bytes-1" },
+                { "wireShape": "vlq-u32" }
+            ]
+        }]
+    }));
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert!(output.source.contains("BitMaskTupleCodec"));
+}
+
+#[test]
+fn registered_profile_mask_product_emits_anonymous_value() {
+    let disabled_condition = json!({
+        "resolverObject": "NewWorld+0x1000",
+        "resolverVtable": "NewWorld+0x2000",
+        "resolverSlot": 1,
+        "resolver": "NewWorld+0x3000",
+        "conditionStorage": "NewWorld+0x100c",
+        "conditionOffset": "0xc",
+        "owner": "NewWorld+0xfb0",
+        "subobjectOffset": "0x50",
+        "destructorThunk": "NewWorld+0x4000",
+        "completeDestructor": "NewWorld+0x5000",
+        "initializer": "NewWorld+0x6000",
+        "nameField": "NewWorld+0x1010",
+        "nameOffset": "0x10",
+        "nameBegin": "NewWorld+0x7000",
+        "nameEnd": "NewWorld+0x7017",
+        "name": "feature.enabled",
+        "defaultValue": false,
+        "defaultWrite": "NewWorld+0x8000",
+        "defaultCallsite": "NewWorld+0x8010",
+        "defaultTarget": "NewWorld+0x9000",
+        "evidenceSource": "static-vtable-dispatch+adjustor-thunk+initializer-writes+resolver-default-flow"
+    });
+    let schema = replicated_container_schema(json!({
+        "storageKind": "vector",
+        "valueCodecs": [{
+            "memberSemantics": "cfg-reachable",
+            "members": [
+                { "wireShape": "vlq-u32", "elementOffset": "0x0" },
+                { "wireLayout": "fixed-bytes-1", "elementOffset": "0x4" },
+                {
+                    "wireShape": "vlq-u32",
+                    "guards": [{
+                        "branch": "NewWorld+0xa000",
+                        "kind": "storage-bit-mask",
+                        "condition": "equal-zero",
+                        "memberOnTrue": false,
+                        "storageBase": "param_2",
+                        "storageOffset": "0x4",
+                        "mask": "0x1",
+                        "evidenceSource": "dominating-cbranch-pcode-storage"
+                    }]
+                },
+                {
+                    "wireShape": "u32",
+                    "guards": [{
+                        "branch": "NewWorld+0xb000",
+                        "kind": "global-boolean",
+                        "condition": "not-equal-zero",
+                        "memberOnTrue": true,
+                        "storageAddress": "NewWorld+0x100c",
+                        "externalCondition": disabled_condition,
+                        "evidenceSource": "dominating-cbranch-pcode-storage+external-condition-proof"
+                    }]
+                }
+            ]
+        }]
+    }));
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::std::vec::Vec<ValuesValue>")
+    );
+    assert!(output.source.contains("pub struct ValuesValue"));
+    assert!(output.source.contains("BitMaskTupleCodec"));
+}
+
+#[test]
 fn vector_container_plan_preserves_value_marshaler() {
     let schema = replicated_container_schema(json!({
         "storageKind": "vector",
@@ -807,6 +1209,81 @@ fn non_linear_container_helper_is_an_explicit_blocker() {
 }
 
 #[test]
+fn matching_handler_and_bidirectional_codec_templates_authorize_runtime_value_type() {
+    let mut schema = replicated_container_schema(json!({
+        "storageKind": "index-map",
+        "unmarshalStorageProof": "cfg-ordered-buffer-codecs+unique-owner-insertion",
+        "unmarshalReconciliation": "marshal-codec-sequence-not-linear",
+        "keyCodecs": [{ "wireLayout": "fixed-bytes-16" }],
+        "valueCodecs": [{
+            "targetName": "GridMate::Marshaler::Marshal<GroupInviteData>",
+            "memberSemantics": "cfg-reachable",
+            "analysisStatus": "complete",
+            "members": [{ "wireShape": "u64" }]
+        }],
+        "unmarshalCodecs": [
+            { "wireLayout": "fixed-bytes-16" },
+            {
+                "targetName": "GridMate::Marshaler<GroupInviteData>::Unmarshal",
+                "memberSemantics": "cfg-reachable",
+                "analysisStatus": "complete",
+                "members": [{ "wireShape": "u64" }]
+            }
+        ]
+    }));
+    let vtable = &mut schema.field_handler_vtables[0];
+    vtable.handler_type_name =
+        Some("MB::ReplicatedContainer::ReplicatedContainer<GroupInviteData>".to_owned());
+    vtable.handler_type_source = Some("handler-constructor-template".to_owned());
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::nw_network::serialize::IndexMap<[u8; 16], ::nw_network::states::GroupInviteData>")
+    );
+    assert!(
+        plan.fields[0]
+            .rust_field_type
+            .as_deref()
+            .is_some_and(|field_type| field_type
+                .contains("DefaultMarshaler<::nw_network::states::GroupInviteData>"))
+    );
+}
+
+#[test]
+fn mismatched_bidirectional_codec_template_does_not_authorize_handler_type() {
+    let mut schema = replicated_container_schema(json!({
+        "storageKind": "index-map",
+        "keyCodecs": [{ "wireLayout": "fixed-bytes-16" }],
+        "valueCodecs": [{
+            "targetName": "GridMate::Marshaler::Marshal<GroupInviteData>",
+            "memberSemantics": "cfg-reachable",
+            "analysisStatus": "complete",
+            "members": [{ "wireShape": "u64" }]
+        }],
+        "unmarshalCodecs": [{
+            "targetName": "GridMate::Marshaler<OtherInviteData>::Unmarshal",
+            "memberSemantics": "cfg-reachable",
+            "analysisStatus": "complete",
+            "members": [{ "wireShape": "u64" }]
+        }]
+    }));
+    let vtable = &mut schema.field_handler_vtables[0];
+    vtable.handler_type_name =
+        Some("MB::ReplicatedContainer::ReplicatedContainer<GroupInviteData>".to_owned());
+    vtable.handler_type_source = Some("handler-constructor-template".to_owned());
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(!plan.can_generate);
+    assert_eq!(plan.blocked_reasons, ["non-linear-container-codec:1"]);
+}
+
+#[test]
 fn externally_gated_suffix_uses_the_registered_default_profile() {
     let condition = json!({
         "resolverObject": "NewWorld+0x1000",
@@ -864,6 +1341,173 @@ fn externally_gated_suffix_uses_the_registered_default_profile() {
 }
 
 #[test]
+fn typed_counted_sequence_emits_the_exact_unreflected_element_projection() {
+    let persistent_item_data_id = uuid!("1be36174-fd4f-4a1c-8e52-7c28d50eec5a");
+    let condition = json!({
+        "resolverObject": "NewWorld+0x1000",
+        "resolverVtable": "NewWorld+0x2000",
+        "resolverSlot": 1,
+        "resolver": "NewWorld+0x3000",
+        "conditionStorage": "NewWorld+0x100c",
+        "conditionOffset": "0xc",
+        "owner": "NewWorld+0xfb0",
+        "subobjectOffset": "0x50",
+        "destructorThunk": "NewWorld+0x4000",
+        "completeDestructor": "NewWorld+0x5000",
+        "initializer": "NewWorld+0x6000",
+        "nameField": "NewWorld+0x1010",
+        "nameOffset": "0x10",
+        "nameBegin": "NewWorld+0x7000",
+        "nameEnd": "NewWorld+0x7017",
+        "name": "javelin.enable-transmog",
+        "defaultValue": true,
+        "defaultWrite": "NewWorld+0x8000",
+        "defaultCallsite": "NewWorld+0x8010",
+        "defaultTarget": "NewWorld+0x9000",
+        "evidenceSource": "static-vtable-dispatch+adjustor-thunk+initializer-writes+resolver-default-flow"
+    });
+    let mut schema = replicated_container_schema(json!({
+        "storageKind": "index-map",
+        "keyCodecs": [{ "wireLayout": "fixed-bytes-16" }],
+        "valueCodecs": [{
+            "wireShape": "vec<PersistentItemData>",
+            "wireLayout": "vec<composite<u64,u8>>",
+            "memberSemantics": "counted-sequence",
+            "analysisStatus": "complete",
+            "members": [
+                { "wireShape": "vlq-u32" },
+                {
+                    "nativeType": "PersistentItemData",
+                    "typeId": persistent_item_data_id,
+                    "typeIdSource": "marshal-template+serialize-exact-name",
+                    "typeIdentityProven": true,
+                    "sourceTypeLayoutComplete": true,
+                    "memberSemantics": "optional-suffix",
+                    "analysisStatus": "optional-suffix",
+                    "members": [{ "wireShape": "u64" }],
+                    "optionalMembers": [{
+                        "wireShape": "u8",
+                        "guards": [{
+                            "branch": "NewWorld+0xa000",
+                            "kind": "global-boolean",
+                            "condition": "not-equal-zero",
+                            "memberOnTrue": true,
+                            "storageAddress": "NewWorld+0x100c",
+                            "externalCondition": condition,
+                            "evidenceSource": "dominating-cbranch+external-condition-proof"
+                        }]
+                    }]
+                }
+            ]
+        }]
+    }));
+    schema.merge_serialize_codegen_unit(
+        &SerializeCodegenUnit {
+            items: vec![named_value_item::<0>(
+                persistent_item_data_id,
+                "PersistentItemData",
+                [],
+            )],
+        },
+        Some("selection.json".to_owned()),
+    );
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::nw_network::serialize::IndexMap<[u8; 16], ::std::vec::Vec<PersistentItemData>>")
+    );
+    assert!(output.source.contains("pub struct PersistentItemData"));
+    assert!(output.source.contains("pub field_0: u64"));
+    assert!(output.source.contains("pub field_1: u8"));
+    assert!(
+        output
+            .source
+            .contains("impl ::nw_network::serialize::Marshal for PersistentItemData")
+    );
+}
+
+#[test]
+fn complete_typed_optional_codec_bypasses_the_non_linear_guard() {
+    let persistent_item_data_id = uuid!("1be36174-fd4f-4a1c-8e52-7c28d50eec5a");
+    let condition = json!({
+        "resolverObject": "NewWorld+0x1000",
+        "resolverVtable": "NewWorld+0x2000",
+        "resolverSlot": 1,
+        "resolver": "NewWorld+0x3000",
+        "conditionStorage": "NewWorld+0x100c",
+        "conditionOffset": "0xc",
+        "owner": "NewWorld+0xfb0",
+        "subobjectOffset": "0x50",
+        "destructorThunk": "NewWorld+0x4000",
+        "completeDestructor": "NewWorld+0x5000",
+        "initializer": "NewWorld+0x6000",
+        "nameField": "NewWorld+0x1010",
+        "nameOffset": "0x10",
+        "nameBegin": "NewWorld+0x7000",
+        "nameEnd": "NewWorld+0x7017",
+        "name": "javelin.enable-transmog",
+        "defaultValue": false,
+        "defaultWrite": "NewWorld+0x8000",
+        "defaultCallsite": "NewWorld+0x8010",
+        "defaultTarget": "NewWorld+0x9000",
+        "evidenceSource": "static-vtable-dispatch+adjustor-thunk+initializer-writes+resolver-default-flow"
+    });
+    let mut schema = replicated_container_schema(json!({
+        "storageKind": "vector",
+        "elementStride": 112,
+        "unmarshalReconciliation": "marshal-codec-sequence-not-linear",
+        "valueCodecs": [{
+            "nativeType": "PersistentItemData",
+            "typeId": persistent_item_data_id,
+            "typeIdSource": "full-direct-marshal-template",
+            "typeIdentityProven": true,
+            "sourceTypeLayoutComplete": true,
+            "wireShape": "PersistentItemData",
+            "memberSemantics": "optional-suffix",
+            "analysisStatus": "optional-suffix",
+            "members": [{ "wireShape": "u64" }],
+            "optionalMembers": [{
+                "wireShape": "u32",
+                "guards": [{
+                    "kind": "global-boolean",
+                    "condition": "not-equal-zero",
+                    "memberOnTrue": true,
+                    "storageAddress": "NewWorld+0x100c",
+                    "externalCondition": condition,
+                    "evidenceSource": "dominating-cbranch+external-condition-proof"
+                }]
+            }]
+        }]
+    }));
+    schema.merge_serialize_codegen_unit(
+        &SerializeCodegenUnit {
+            items: vec![named_value_item::<0>(
+                persistent_item_data_id,
+                "PersistentItemData",
+                [],
+            )],
+        },
+        Some("selection.json".to_owned()),
+    );
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::std::vec::Vec<PersistentItemData>")
+    );
+    assert!(output.source.contains("pub struct PersistentItemData"));
+    assert!(output.source.contains("pub field_0: u64"));
+    assert!(!output.source.contains("pub field_1: u32"));
+}
+
+#[test]
 fn raw_container_key_layout_emits_an_opaque_fixed_width_key() {
     let schema = replicated_container_schema(json!({
         "storageKind": "index-map",
@@ -913,7 +1557,6 @@ fn proven_uid_container_key_uses_the_resolved_generic_type() {
         is_abstract: Some(false),
         is_reflection_marker: false,
     });
-
     let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
     let plan = &output.report.state_generation_plans[0];
 
@@ -1019,4 +1662,220 @@ fn reflected_identity_without_struct_fields_uses_the_network_projection() {
         &shape,
         &source_types
     ));
+}
+
+#[test]
+fn reflected_sparse_container_value_uses_source_fields_by_native_offset() {
+    let payload_id = uuid!("d65749ab-07d4-4401-b2d4-d9282475ce59");
+    let quaternion_id = uuid!("73103120-3dd3-4873-bab3-9713fa2804fb");
+    let array_id = uuid!("a482c24c-5e32-513e-867e-4cafce782006");
+    let item_id = uuid!("9f4e062e-06a0-46d4-85df-e0da96467d3a");
+    let u32_id = uuid!("43da906b-7def-4ca8-9790-854106d3f983");
+    let u8_id = uuid!("72b9409a-7d1a-4831-9cfe-fcb3fadd3426");
+    let bool_id = uuid!("a0ca880c-afe4-43cb-926c-59ac48496112");
+    let mut schema = replicated_container_schema_with_shape(
+        json!({
+            "storageKind": "vector",
+            "elementStride": 64,
+            "valueCodecs": [
+                { "wireShape": "fixed-array<u16,3>" },
+                { "wireShape": "quat-smallest-three" },
+                { "wireShape": "u32" },
+                { "wireShape": "u8" }
+            ]
+        }),
+        Some(json!({
+            "typeId": payload_id,
+            "identityProven": true,
+            "typeName": "HousingItemServerData",
+            "typeNameFull": "HousingItemServerData",
+            "memberNamesProven": false,
+            "layoutProven": true,
+            "memberCoverageProven": true,
+            "wireOrderProven": true,
+            "members": [{
+                "nativeOffset": "0x20",
+                "offset": "0x0",
+                "name": "field_0",
+                "nameProven": false,
+                "wireShape": "fixed-array<u16,3>",
+                "wireOrdinal": 0
+            }, {
+                "nativeOffset": "0x10",
+                "offset": "0x1",
+                "name": "field_1",
+                "nameProven": false,
+                "wireShape": "quat-smallest-three",
+                "wireOrdinal": 1
+            }, {
+                "nativeOffset": "0x30",
+                "offset": "0x2",
+                "name": "field_2",
+                "nameProven": false,
+                "wireShape": "u32",
+                "wireOrdinal": 2
+            }, {
+                "nativeOffset": "0x2c",
+                "offset": "0x3",
+                "name": "field_3",
+                "nameProven": false,
+                "wireShape": "u8",
+                "wireOrdinal": 3
+            }]
+        })),
+    );
+    let source_field =
+        |name: &str, type_id, resolved_type, offset| crate::network_schema::NetworkSerializeField {
+            name: name.to_owned(),
+            type_id,
+            resolved_type,
+            offset: Some(offset),
+            is_base_class: false,
+        };
+    schema.serialize_types.push(NetworkSerializeType {
+        type_id: payload_id,
+        kind: NetworkSerializeKind::Struct,
+        name: "HousingItemServerData".to_owned(),
+        role: NetworkSerializeRole::SupportType,
+        resolved_type: None,
+        emits_source: true,
+        factory: None,
+        field_count: 6,
+        fields: vec![
+            source_field(
+                "m_rotation",
+                quaternion_id,
+                ResolvedType::Named {
+                    type_id: quaternion_id,
+                    source_name: "AZ::Quaternion".to_owned(),
+                },
+                0x10,
+            ),
+            source_field(
+                "m_positionOffset",
+                array_id,
+                ResolvedType::Sequence {
+                    kind: crate::types::SequenceKind::Array,
+                    element: Box::new(ResolvedType::Scalar(ScalarType::I16)),
+                    capacity: Some(3),
+                },
+                0x20,
+            ),
+            source_field(
+                "m_itemId",
+                item_id,
+                ResolvedType::Named {
+                    type_id: item_id,
+                    source_name: "AZ::Crc32".to_owned(),
+                },
+                0x28,
+            ),
+            source_field("m_state", u8_id, ResolvedType::Scalar(ScalarType::U8), 0x2c),
+            source_field(
+                "m_isObstructed",
+                bool_id,
+                ResolvedType::Scalar(ScalarType::Bool),
+                0x2d,
+            ),
+            source_field(
+                "m_itemIndex",
+                u32_id,
+                ResolvedType::Scalar(ScalarType::U32),
+                0x30,
+            ),
+        ],
+        variant_count: 0,
+        direct_dependency_type_ids: vec![quaternion_id, array_id, item_id, u8_id, bool_id, u32_id],
+        wire_shapes: Vec::new(),
+        is_abstract: Some(false),
+        is_reflection_marker: false,
+    });
+
+    let serialize_types = schema
+        .serialize_types
+        .iter()
+        .map(|serialize| (serialize.type_id, serialize))
+        .collect::<BTreeMap<_, _>>();
+    let field = &schema.types[0].fields[0];
+    let vtable = &schema.field_handler_vtables[0];
+    let container_plan = vtable.full_container_plan.as_ref().expect("container plan");
+    let reconciled = reconcile_serialize_backed_member_names(
+        vtable
+            .value_type_shape
+            .clone()
+            .expect("container value shape"),
+        &serialize_types,
+    );
+    assert_eq!(
+        reconciled
+            .members
+            .iter()
+            .map(|member| member.name.as_deref().expect("member name"))
+            .collect::<Vec<_>>(),
+        ["m_positionOffset", "m_rotation", "m_itemIndex", "m_state"]
+    );
+    for member in &reconciled.members {
+        assert!(
+            exact_member_rust_type(&reconciled, member, &serialize_types).is_some(),
+            "member has no exact Rust type: {member:#?}"
+        );
+        assert!(
+            container_value_member_wire_shape_is_emittable(
+                &reconciled,
+                member,
+                &[],
+                &serialize_types,
+            ),
+            "member wire shape is not emittable: {member:#?}"
+        );
+    }
+    assert!(
+        container_value_shape_members_are_emittable(&reconciled, &[], &serialize_types),
+        "{reconciled:#?}"
+    );
+    assert!(
+        container_value_type_from_proven_shape(field, vtable, container_plan, &serialize_types)
+            .is_some(),
+        "reconciled reflected shape was not selected"
+    );
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0]
+            .container_value_type_shape
+            .as_ref()
+            .expect("reported container value shape")
+            .members
+            .iter()
+            .map(|member| member.name.as_deref().expect("member name"))
+            .collect::<Vec<_>>(),
+        ["m_positionOffset", "m_rotation", "m_itemIndex", "m_state"]
+    );
+    assert!(
+        output
+            .source
+            .contains("::nw_network::source::HousingItemServerData"),
+        "{}",
+        output.source
+    );
+    assert!(
+        output.source.contains("value.position_offset"),
+        "{}",
+        output.source
+    );
+    assert!(
+        output.source.contains("value.rotation"),
+        "{}",
+        output.source
+    );
+    assert!(
+        output.source.contains("value.item_index"),
+        "{}",
+        output.source
+    );
+    assert!(output.source.contains("value.state"), "{}", output.source);
+    assert!(!output.source.contains("value.field_"));
 }

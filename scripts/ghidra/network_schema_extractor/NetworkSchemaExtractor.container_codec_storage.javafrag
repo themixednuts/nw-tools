@@ -1,13 +1,31 @@
     private void applyContainerCodecElementOffsets(
+        HighFunction high,
         NetworkSchemaNaturalLoop loop,
         List<ContainerCodecCall> codecs) {
 
         if (loop == null || codecs == null || codecs.isEmpty()) {
             return;
         }
+        ContainerAffineProjection projection = uniqueContainerAffineProjection(
+            high,
+            loop,
+            codecs);
+        if (projection != null) {
+            for (int index = 0; index < codecs.size(); index++) {
+                ContainerCodecCall codec = codecs.get(index);
+                codec.elementBase = "element";
+                codec.elementOffset = projection.offsets().get(index);
+                projectContainerLoopCodecMemberOffsets(
+                    codec,
+                    projection.roots().get(index));
+            }
+            runMetrics.increment("affineContainerInductionFamilyOffsets");
+            return;
+        }
         List<Long> selectedOffsets = null;
         Varnode selectedRoot = null;
-        for (PcodeOpAST induction : containerElementInductions(loop)) {
+        boolean ambiguousSingleInduction = false;
+        for (PcodeOpAST induction : containerElementInductions(high, loop)) {
             ArrayList<Long> offsets = new ArrayList<>(codecs.size());
             for (ContainerCodecCall codec : codecs) {
                 Long offset = containerCodecElementOffset(
@@ -23,13 +41,20 @@
             if (offsets.isEmpty()) {
                 continue;
             }
+            offsets = normalizedContainerElementOffsets(induction, loop, offsets);
+            if (offsets == null) {
+                continue;
+            }
             if (selectedOffsets != null) {
-                return;
+                ambiguousSingleInduction = true;
+                selectedOffsets = null;
+                selectedRoot = null;
+                break;
             }
             selectedOffsets = List.copyOf(offsets);
             selectedRoot = induction.getOutput();
         }
-        if (selectedOffsets == null) {
+        if (selectedOffsets == null || ambiguousSingleInduction) {
             return;
         }
         for (int index = 0; index < codecs.size(); index++) {
@@ -38,6 +63,199 @@
             codec.elementOffset = selectedOffsets.get(index);
             projectContainerLoopCodecMemberOffsets(codec, selectedRoot);
         }
+    }
+
+    private record ContainerAffineInductionFamily(
+        List<PcodeOpAST> inductions,
+        Map<PcodeOpAST, Long> initialOffsets,
+        long stride) {
+
+        ContainerAffineInductionFamily {
+            inductions = List.copyOf(inductions);
+            initialOffsets = Map.copyOf(initialOffsets);
+        }
+    }
+
+    private record ContainerAffineProjection(
+        List<Long> offsets,
+        List<Varnode> roots,
+        ContainerAffineInductionFamily family) {
+
+        ContainerAffineProjection {
+            offsets = List.copyOf(offsets);
+            roots = List.copyOf(roots);
+        }
+    }
+
+    private ContainerAffineProjection uniqueContainerAffineProjection(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<ContainerCodecCall> codecs) {
+
+        ContainerAffineProjection selected = null;
+        for (ContainerAffineInductionFamily family :
+                containerAffineInductionFamilies(high, loop)) {
+            ContainerAffineProjection candidate = containerAffineProjection(
+                loop,
+                codecs,
+                family);
+            if (candidate == null) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = candidate;
+        }
+        return selected;
+    }
+
+    private ContainerAffineProjection containerAffineProjection(
+        NetworkSchemaNaturalLoop loop,
+        List<ContainerCodecCall> codecs,
+        ContainerAffineInductionFamily family) {
+
+        if (loop == null || codecs == null || codecs.isEmpty() || family == null) {
+            return null;
+        }
+        ArrayList<Long> offsets = new ArrayList<>(codecs.size());
+        ArrayList<Varnode> roots = new ArrayList<>(codecs.size());
+        for (ContainerCodecCall codec : codecs) {
+            Long selectedOffset = null;
+            Varnode selectedRoot = null;
+            for (PcodeOpAST induction : family.inductions()) {
+                Long localOffset = containerCodecElementOffset(
+                    loop,
+                    codec,
+                    induction.getOutput());
+                Long initialOffset = family.initialOffsets().get(induction);
+                if (initialOffset == null || localOffset == null) {
+                    continue;
+                }
+                Long absoluteOffset = addExactOrNull(initialOffset, localOffset);
+                if (absoluteOffset == null || absoluteOffset < 0L ||
+                    absoluteOffset >= family.stride()) {
+                    continue;
+                }
+                if (selectedOffset != null &&
+                    !selectedOffset.equals(absoluteOffset)) {
+                    return null;
+                }
+                if (selectedOffset == null) {
+                    selectedOffset = absoluteOffset;
+                    selectedRoot = induction.getOutput();
+                }
+            }
+            if (selectedOffset == null || selectedRoot == null) {
+                return null;
+            }
+            offsets.add(selectedOffset);
+            roots.add(selectedRoot);
+        }
+        return new ContainerAffineProjection(offsets, roots, family);
+    }
+
+    private List<ContainerAffineInductionFamily> containerAffineInductionFamilies(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop) {
+
+        LinkedHashMap<Long, ArrayList<PcodeOpAST>> byStride = new LinkedHashMap<>();
+        IdentityHashMap<PcodeOpAST, Varnode> initialValues = new IdentityHashMap<>();
+        for (PcodeOpAST induction : containerElementInductions(high, loop)) {
+            ContainerLoopInduction shape = loopExitInductionFromPhi(induction, loop);
+            Varnode initial = sequenceInitialValue(induction, loop);
+            if (shape == null || shape.storageKind() != ContainerStorageKind.VECTOR ||
+                shape.stride() == null || initial == null) {
+                continue;
+            }
+            byStride.computeIfAbsent(shape.stride(), ignored -> new ArrayList<>())
+                .add(induction);
+            initialValues.put(induction, initial);
+        }
+
+        ArrayList<ContainerAffineInductionFamily> result = new ArrayList<>();
+        LinkedHashSet<String> emitted = new LinkedHashSet<>();
+        byStride.forEach((stride, inductions) -> {
+            for (PcodeOpAST anchor : inductions) {
+                Varnode anchorInitial = initialValues.get(anchor);
+                IdentityHashMap<PcodeOpAST, Long> offsets = new IdentityHashMap<>();
+                ArrayList<PcodeOpAST> members = new ArrayList<>();
+                for (PcodeOpAST induction : inductions) {
+                    Long offset = pcodeConstantOffsetFromRoot(
+                        initialValues.get(induction),
+                        anchorInitial,
+                        new LinkedHashSet<>(),
+                        0);
+                    if (offset == null || offset < 0L || offset >= stride) {
+                        continue;
+                    }
+                    members.add(induction);
+                    offsets.put(induction, offset);
+                }
+                if (members.size() < 2) {
+                    continue;
+                }
+                String key = members.stream()
+                    .map(member -> pcodeNodeKey(member.getOutput()) + "@" + offsets.get(member))
+                    .sorted()
+                    .collect(Collectors.joining("|")) + ":" + stride;
+                if (emitted.add(key)) {
+                    result.add(new ContainerAffineInductionFamily(
+                        members,
+                        offsets,
+                        stride));
+                }
+            }
+        });
+        return List.copyOf(result);
+    }
+
+    private Varnode sequenceInitialValue(
+        PcodeOpAST induction,
+        NetworkSchemaNaturalLoop loop) {
+        if (induction == null || induction.getOutput() == null) {
+            return null;
+        }
+        Varnode selected = null;
+        for (int slot = 0; slot < induction.getNumInputs(); slot++) {
+            Varnode input = induction.getInput(slot);
+            if (isAffineBackedgeInput(induction, input, loop, slot)) {
+                continue;
+            }
+            if (selected != null && !sameVarnodeIdentity(selected, input)) {
+                return null;
+            }
+            selected = input;
+        }
+        return selected;
+    }
+
+    private ArrayList<Long> normalizedContainerElementOffsets(
+        PcodeOpAST induction,
+        NetworkSchemaNaturalLoop loop,
+        List<Long> offsets) {
+
+        if (induction == null || offsets == null || offsets.isEmpty()) {
+            return null;
+        }
+        long minimum = offsets.stream().mapToLong(Long::longValue).min().orElse(0L);
+        if (minimum >= 0L) {
+            return new ArrayList<>(offsets);
+        }
+        ContainerLoopInduction shape = loopExitInductionFromPhi(induction, loop);
+        if (shape == null || shape.storageKind() != ContainerStorageKind.VECTOR ||
+            shape.stride() == null) {
+            return null;
+        }
+        ArrayList<Long> normalized = new ArrayList<>(offsets.size());
+        for (Long offset : offsets) {
+            Long adjusted = offset == null ? null : subtractExactOrNull(offset, minimum);
+            if (adjusted == null || adjusted < 0L || adjusted >= shape.stride()) {
+                return null;
+            }
+            normalized.add(adjusted);
+        }
+        return normalized;
     }
 
     private void projectContainerLoopCodecMemberOffsets(
@@ -85,6 +303,9 @@
         if (loop == null || operation == null || elementRoot == null) {
             return null;
         }
+        if ("element".equals(codec.elementBase) && codec.elementOffset != null) {
+            return codec.elementOffset;
+        }
         Integer valueWidth = codec.nativeType == null
             ? null
             : nativeTypeByteWidth(codec.nativeType);
@@ -96,6 +317,8 @@
             : functionContaining(operation.getSeqnum().getTarget());
         Function target = pcodeCallTarget(operation);
         Long selected = null;
+        Long minimumStructuredOffset = null;
+        boolean multipleStructuredOffsets = false;
         int argumentCount = provenCallArgumentCount(operation, target);
         for (int slot = 1; slot <= argumentCount; slot++) {
             Varnode input = slot < operation.getNumInputs()
@@ -120,16 +343,30 @@
                     argumentStorage,
                     elementRoot,
                     valueWidth);
+                if (offset == null) {
+                    offset = containerStagedArgumentSourceOffset(
+                        loop,
+                        operation,
+                        argumentStorage,
+                        elementRoot,
+                        valueWidth);
+                }
             }
-            if (offset == null || offset < 0L || offset > 0x100000L) {
+            if (offset == null || offset < -0x100000L || offset > 0x100000L) {
                 continue;
             }
             if (selected != null && !selected.equals(offset)) {
-                return null;
+                if (codec.members.isEmpty()) {
+                    return null;
+                }
+                multipleStructuredOffsets = true;
             }
             selected = offset;
+            minimumStructuredOffset = minimumStructuredOffset == null
+                ? offset
+                : Math.min(minimumStructuredOffset, offset);
         }
-        return selected;
+        return multipleStructuredOffsets ? minimumStructuredOffset : selected;
     }
 
     private Long containerIndirectArgumentSourceOffset(
@@ -172,6 +409,79 @@
                 }
                 selected = offset;
             }
+        }
+        return selected;
+    }
+
+    private Long containerStagedArgumentSourceOffset(
+        NetworkSchemaNaturalLoop loop,
+        PcodeOp call,
+        PcodeStorage argumentStorage,
+        Varnode elementRoot,
+        Integer valueWidth) {
+
+        // Aggregate codec inputs can be copied to a stack temporary in a
+        // dominating loop block before the wrapper receives their address.
+        if (loop == null || call == null || call.getSeqnum() == null ||
+            argumentStorage == null || !"stack".equals(argumentStorage.base) ||
+            elementRoot == null) {
+            return null;
+        }
+        PcodeBlockBasic callBlock = call instanceof PcodeOpAST ast
+            ? NetworkSchemaControlFlow.parentBlock(ast)
+            : null;
+        Function owner = functionContaining(call.getSeqnum().getTarget());
+        HighFunction high = highFunction(owner);
+        if (callBlock == null || high == null) {
+            return null;
+        }
+
+        Long selected = null;
+        for (PcodeBlockBasic block : loop.body()) {
+            if (!NetworkSchemaControlFlow.dominates(high, block, callBlock)) {
+                continue;
+            }
+            var iterator = block.getIterator();
+            while (iterator.hasNext()) {
+                PcodeOp operation = iterator.next();
+                if (operation.getSeqnum() == null) {
+                    continue;
+                }
+                if (block == callBlock &&
+                    operation.getSeqnum().getOrder() >= call.getSeqnum().getOrder()) {
+                    break;
+                }
+                if (operation.getOpcode() != PcodeOp.STORE ||
+                    operation.getNumInputs() < 3) {
+                    continue;
+                }
+                PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+                if (destination == null ||
+                    !argumentStorage.sameLocation(destination)) {
+                    continue;
+                }
+                Varnode stored = operation.getInput(2);
+                int byteLength = valueWidth == null
+                    ? stored.getSize()
+                    : Math.min(valueWidth, stored.getSize());
+                Long offset = loadedElementOffset(
+                    stored,
+                    elementRoot,
+                    0,
+                    byteLength,
+                    new LinkedHashSet<>(),
+                    0);
+                if (offset == null) {
+                    continue;
+                }
+                if (selected != null && !selected.equals(offset)) {
+                    return null;
+                }
+                selected = offset;
+            }
+        }
+        if (selected != null) {
+            runMetrics.increment("stagedContainerAggregateSourceOffsets");
         }
         return selected;
     }
@@ -403,36 +713,50 @@
         int depth) {
 
         Long selected = null;
+        boolean ignoredLoopCarriedStackInput = false;
         for (int slot = 0; slot < merge.getNumInputs(); slot++) {
+            Varnode input = merge.getInput(slot);
             Long offset = loadedElementOffset(
-                merge.getInput(slot),
+                input,
                 elementRoot,
                 byteOffset,
                 byteLength,
                 new LinkedHashSet<>(active),
                 depth);
-            if (offset == null || selected != null && !selected.equals(offset)) {
+            if (offset == null) {
+                if (input != null && input.getAddress() != null &&
+                    input.getAddress().getAddressSpace().isStackSpace()) {
+                    ignoredLoopCarriedStackInput = true;
+                    continue;
+                }
+                return null;
+            }
+            if (selected != null && !selected.equals(offset)) {
                 return null;
             }
             selected = offset;
         }
+        if (selected != null && ignoredLoopCarriedStackInput) {
+            runMetrics.increment("loopCarriedStackAggregateSourceProofs");
+        }
         return selected;
     }
 
-    private List<PcodeOpAST> containerElementInductions(NetworkSchemaNaturalLoop loop) {
+    private List<PcodeOpAST> containerElementInductions(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop) {
+
         ArrayList<PcodeOpAST> result = new ArrayList<>();
-        for (PcodeBlockBasic block : loop.body()) {
-            var iterator = block.getIterator();
-            while (iterator.hasNext()) {
-                PcodeOp operation = iterator.next();
-                if (!(operation instanceof PcodeOpAST phi) ||
-                    phi.getOpcode() != PcodeOp.MULTIEQUAL || phi.getOutput() == null ||
-                    phi.getOutput().getSize() != currentProgram.getDefaultPointerSize() ||
-                    inductionFromPhi(phi) == null) {
-                    continue;
-                }
-                result.add(phi);
+        var iterator = loop.header().getIterator();
+        while (iterator.hasNext()) {
+            PcodeOp operation = iterator.next();
+            if (!(operation instanceof PcodeOpAST phi) ||
+                phi.getOpcode() != PcodeOp.MULTIEQUAL || phi.getOutput() == null ||
+                phi.getOutput().getSize() != currentProgram.getDefaultPointerSize() ||
+                loopExitInductionFromPhi(phi, loop) == null) {
+                continue;
             }
+            result.add(phi);
         }
         return List.copyOf(result);
     }
@@ -442,6 +766,11 @@
 
         if (codecs == null || codecs.size() < 2) {
             return null;
+        }
+        ContainerCodecPartition structured = structuredIndexMapValuePartition(codecs);
+        if (structured != null) {
+            runMetrics.increment("structuredIndexMapValuePartitions");
+            return structured;
         }
         Long keyOffset = codecs.get(0).elementOffset;
         if (keyOffset == null) {
@@ -468,6 +797,58 @@
             List.of(codecs.get(0)),
             valueCodecs,
             sequenceMarkerProven);
+    }
+
+    private ContainerCodecPartition structuredIndexMapValuePartition(
+        List<ContainerCodecCall> codecs) {
+
+        int boundaryIndex = -1;
+        for (int index = 0; index < codecs.size(); index++) {
+            ContainerCodecCall codec = codecs.get(index);
+            if (codec == null || codec.members.isEmpty() ||
+                isContainerSequenceCodec(codec)) {
+                continue;
+            }
+            if (boundaryIndex >= 0) {
+                return null;
+            }
+            boundaryIndex = index;
+        }
+        if (boundaryIndex <= 0) {
+            return null;
+        }
+
+        Long boundaryOffset = codecs.get(boundaryIndex).elementOffset;
+        if (boundaryOffset == null) {
+            return null;
+        }
+        ArrayList<ContainerCodecCall> keyCodecs = new ArrayList<>();
+        ArrayList<ContainerCodecCall> valueCodecs = new ArrayList<>();
+        boolean sequenceMarkerProven = false;
+        for (int index = 0; index < codecs.size(); index++) {
+            ContainerCodecCall codec = codecs.get(index);
+            if (isContainerSequenceCodec(codec)) {
+                sequenceMarkerProven = true;
+                continue;
+            }
+            Long offset = codec.elementOffset;
+            if (offset == null || index < boundaryIndex && offset >= boundaryOffset ||
+                index >= boundaryIndex && offset < boundaryOffset) {
+                return null;
+            }
+            if (index < boundaryIndex) {
+                keyCodecs.add(codec);
+            }
+            else {
+                valueCodecs.add(codec);
+            }
+        }
+        return keyCodecs.isEmpty() || valueCodecs.isEmpty()
+            ? null
+            : new ContainerCodecPartition(
+                keyCodecs,
+                valueCodecs,
+                sequenceMarkerProven);
     }
 
     private boolean isContainerSequenceCodec(ContainerCodecCall codec) {

@@ -1,0 +1,27 @@
+    private boolean pcodeValueFeedsConditionalBranch(Varnode value) {
+        ArrayDeque<Varnode> pending = new ArrayDeque<>();
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        pending.add(value);
+        while (!pending.isEmpty() && seen.size() < PCODE_ALIAS_DESCENDANT_LIMIT) {
+            Varnode current = pending.removeFirst();
+            if (!seen.add(pcodeSsaNodeKey(current))) {
+                continue;
+            }
+            Iterator<PcodeOp> descendants = current.getDescendants();
+            while (descendants.hasNext()) {
+                PcodeOp descendant = descendants.next();
+                if (descendant.getOpcode() == PcodeOp.CBRANCH) {
+                    return true;
+                }
+                if (descendant.getOutput() != null &&
+                    switch (descendant.getOpcode()) {
+                        case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.BOOL_NEGATE,
+                            PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL -> true;
+                        default -> false;
+                    }) {
+                    pending.addLast(descendant.getOutput());
+                }
+            }
+        }
+        return false;
+    }

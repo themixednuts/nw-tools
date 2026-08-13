@@ -1,0 +1,225 @@
+    private String containerInsertionOutputParameter(
+        Function owner,
+        PcodeOp operation) {
+
+        String output = uniqueLikelyOutputParameter(owner, operation);
+        if (output != null) {
+            return output;
+        }
+        PcodeStorage receiver = uniqueContainerInsertionReceiverStorage(
+            owner,
+            operation);
+        return formalParameterBaseFromStorage(owner, receiver);
+    }
+
+    private PcodeStorage containerInsertionOutputStorage(
+        Function owner,
+        PcodeOp operation) {
+
+        PcodeStorage output = uniqueLikelyOutputStorage(owner, operation);
+        return output != null
+            ? output
+            : uniqueContainerInsertionReceiverStorage(owner, operation);
+    }
+
+    private PcodeStorage uniqueContainerInsertionReceiverStorage(
+        Function owner,
+        PcodeOp operation) {
+
+        if (owner == null || operation == null ||
+            !isArgumentPassingOperation(operation)) {
+            return null;
+        }
+        Function target = pcodeCallTarget(operation);
+        PcodeStorage instructionReceiver = instructionCallRegisterStorage(
+            owner,
+            operation,
+            target,
+            "RCX");
+        String instructionParameter = formalParameterBaseFromStorage(
+            owner,
+            instructionReceiver);
+        if (isProvenOutputParameterBase(owner, instructionParameter)) {
+            runMetrics.increment("instructionReceiverOutputParameterProofs");
+            return instructionReceiver;
+        }
+
+        LinkedHashMap<String, PcodeStorage> candidates = new LinkedHashMap<>();
+        if (operation.getNumInputs() > 1) {
+            addContainerInsertionReceiverCandidate(
+                owner,
+                candidates,
+                pcodeStorageExpression(operation.getInput(1)));
+        }
+        addContainerInsertionReceiverCandidate(
+            owner,
+            candidates,
+            provenCallArgumentStorage(owner, operation, target, 1));
+        for (PcodeStorage dependency : instructionCallArgumentStorageDependencies(
+                owner,
+                operation,
+                target,
+                1)) {
+            addContainerInsertionReceiverCandidate(owner, candidates, dependency);
+        }
+        if (candidates.isEmpty()) {
+            return null;
+        }
+        PcodeStorage selected = candidates.values().iterator().next();
+        if (candidates.values().stream().anyMatch(candidate ->
+                !selected.sameLocation(candidate))) {
+            return null;
+        }
+        runMetrics.increment("instructionReceiverOutputParameterProofs");
+        return selected;
+    }
+
+    private void addContainerInsertionReceiverCandidate(
+        Function owner,
+        Map<String, PcodeStorage> candidates,
+        PcodeStorage storage) {
+
+        String parameter = formalParameterBaseFromStorage(owner, storage);
+        if (isProvenOutputParameterBase(owner, parameter)) {
+            candidates.putIfAbsent(storageKey(storage), storage);
+        }
+    }
+
+    private InstructionContainerInsertion uniqueInstructionContainerInsertion(
+        Function owner,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeCodecCall> codecs,
+        String readBufferParameter) {
+
+        if (owner == null || high == null || loop == null || codecs == null ||
+            codecs.isEmpty()) {
+            return null;
+        }
+        UnmarshalTerminalFlow terminalFlow = successfulUnmarshalTerminalFlow(high);
+        if (terminalFlow.terminals().isEmpty()) {
+            runMetrics.increment("instructionContainerInsertionSuccessFlowMisses");
+            return null;
+        }
+        InstructionContainerInsertion selected = null;
+        for (PcodeBlockBasic block : loop.body()) {
+            for (Instruction instruction : blockInstructions(owner, block)) {
+                checkAnalysisCancelled();
+                if (!instruction.getFlowType().isCall() ||
+                    codecs.stream().anyMatch(codec -> Objects.equals(
+                        codec.operation().getSeqnum().getTarget(),
+                        instruction.getMinAddress())) ||
+                    !instructionFollowsAllContainerCodecs(
+                        high,
+                        block,
+                        instruction.getMinAddress(),
+                        codecs,
+                        terminalFlow)) {
+                    continue;
+                }
+                ForwardArgState state = instructionStateBeforeAddress(
+                    owner,
+                    instruction.getMinAddress());
+                PcodeStorage receiver = state == null
+                    ? null
+                    : pcodeStorageFromTrackedValue(state.registers.get("RCX"));
+                String outputParameter = formalParameterBaseFromStorage(owner, receiver);
+                if (!isProvenOutputParameterBase(owner, outputParameter) ||
+                    outputParameter.equals(readBufferParameter)) {
+                    continue;
+                }
+                Function target = functionAtOrContaining(
+                    resolvedCodeTarget(callTarget(instruction)));
+                if (target == null) {
+                    continue;
+                }
+                InstructionContainerInsertion candidate =
+                    new InstructionContainerInsertion(
+                        instruction.getMinAddress(),
+                        target,
+                        outputParameter);
+                if (selected != null && !selected.callsite().equals(candidate.callsite())) {
+                    runMetrics.increment("instructionContainerInsertionConflicts");
+                    return null;
+                }
+                selected = candidate;
+            }
+        }
+        if (selected != null) {
+            runMetrics.increment("instructionContainerInsertionProofs");
+        }
+        return selected;
+    }
+
+    private boolean instructionFollowsAllContainerCodecs(
+        HighFunction high,
+        PcodeBlockBasic instructionBlock,
+        Address instructionAddress,
+        List<PcodeCodecCall> codecs,
+        UnmarshalTerminalFlow terminalFlow) {
+
+        if (high == null || instructionBlock == null || instructionAddress == null ||
+            terminalFlow == null || terminalFlow.terminals().isEmpty()) {
+            return false;
+        }
+        for (PcodeCodecCall codec : codecs) {
+            PcodeOpAST operation = codec.operation();
+            PcodeBlockBasic codecBlock = NetworkSchemaControlFlow.parentBlock(operation);
+            Address codecAddress = operation == null || operation.getSeqnum() == null
+                ? null
+                : operation.getSeqnum().getTarget();
+            if (codecBlock == null || codecAddress == null) {
+                return false;
+            }
+            if (codecBlock == instructionBlock) {
+                if (codecAddress.compareTo(instructionAddress) >= 0) {
+                    return false;
+                }
+            }
+            else if (!unmarshalSuccessFlowReaches(
+                    codecBlock,
+                    instructionBlock,
+                    terminalFlow)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean unmarshalSuccessFlowReaches(
+        PcodeBlockBasic source,
+        PcodeBlockBasic target,
+        UnmarshalTerminalFlow terminalFlow) {
+
+        if (source == null || target == null || terminalFlow == null) {
+            return false;
+        }
+        if (source == target) {
+            return true;
+        }
+        ArrayDeque<PcodeBlockBasic> pending = new ArrayDeque<>();
+        LinkedHashSet<PcodeBlockBasic> visited = new LinkedHashSet<>();
+        pending.addLast(source);
+        visited.add(source);
+        while (!pending.isEmpty()) {
+            checkAnalysisCancelled();
+            PcodeBlockBasic block = pending.removeFirst();
+            Set<PcodeBlockBasic> excluded = terminalFlow.excludedEdges()
+                .getOrDefault(block, Set.of());
+            for (PcodeBlockBasic successor : NetworkSchemaControlFlow.successors(block)) {
+                if (excluded.contains(successor) || !visited.add(successor)) {
+                    continue;
+                }
+                if (successor == target) {
+                    return true;
+                }
+                pending.addLast(successor);
+            }
+        }
+        return false;
+    }
+    private record InstructionContainerInsertion(
+        Address callsite,
+        Function target,
+        String outputParameter) {
+    }

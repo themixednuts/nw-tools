@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use super::{
     NetworkReplicatedContainerStorageKind, NetworkWireScalarShape, array_values, bool_value,
-    parse_network_wire_scalar_shape, string, string_ref, u32_value, uuid,
+    parse_network_wire_scalar_shape, parse_network_wire_shape, string, string_ref, u32_value, uuid,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,7 +127,7 @@ impl NetworkContainerCodec {
         (!shapes.is_empty()).then_some(shapes)
     }
 
-    fn default_profile_wire_shapes(&self) -> Option<Vec<NetworkWireScalarShape>> {
+    pub(crate) fn default_profile_wire_shapes(&self) -> Option<Vec<NetworkWireScalarShape>> {
         if self.member_semantics != Some(NetworkContainerMemberSemantics::OptionalSuffix) {
             return self.exact_wire_shapes();
         }
@@ -229,6 +229,108 @@ impl NetworkContainerCodec {
         (!shapes.is_empty()).then_some(shapes)
     }
 
+    fn decoded_logical_wire_shapes(&self) -> Option<Vec<String>> {
+        self.guards
+            .iter()
+            .all(decode_guard_is_transient)
+            .then_some(())?;
+        if self.member_semantics == Some(NetworkContainerMemberSemantics::OptionalSuffix) {
+            return self.default_profile_wire_shapes().map(|shapes| {
+                shapes
+                    .into_iter()
+                    .map(NetworkWireScalarShape::wire_string)
+                    .collect()
+            });
+        }
+        if matches!(
+            self.member_semantics,
+            Some(
+                NetworkContainerMemberSemantics::CountedSequence
+                    | NetworkContainerMemberSemantics::FixedSequence
+            )
+        ) {
+            return self.wire_shape.clone().map(|shape| vec![shape]);
+        }
+        if self.members.is_empty() {
+            return self
+                .wire_shape
+                .clone()
+                .or_else(|| self.wire_layout.clone())
+                .map(|shape| vec![shape]);
+        }
+        if !self.optional_members.is_empty()
+            || !matches!(
+                self.member_semantics,
+                Some(
+                    NetworkContainerMemberSemantics::LinearSequence
+                        | NetworkContainerMemberSemantics::CfgReachable
+                        | NetworkContainerMemberSemantics::StructuredValue
+                )
+            )
+        {
+            return None;
+        }
+
+        let mut shapes = Vec::new();
+        for member in &self.members {
+            shapes.extend(member.decoded_logical_wire_shapes()?);
+        }
+        (!shapes.is_empty()).then_some(shapes)
+    }
+
+    fn registered_profile_logical_wire_shapes_unguarded(&self) -> Option<Vec<String>> {
+        if matches!(
+            self.member_semantics,
+            Some(
+                NetworkContainerMemberSemantics::CountedSequence
+                    | NetworkContainerMemberSemantics::FixedSequence
+            )
+        ) {
+            return self.wire_shape.clone().map(|shape| vec![shape]);
+        }
+        if self.members.is_empty() {
+            return self
+                .wire_shape
+                .clone()
+                .or_else(|| self.wire_layout.clone())
+                .map(|shape| vec![shape]);
+        }
+        if !matches!(
+            self.member_semantics,
+            Some(
+                NetworkContainerMemberSemantics::LinearSequence
+                    | NetworkContainerMemberSemantics::CfgReachable
+                    | NetworkContainerMemberSemantics::StructuredValue
+                    | NetworkContainerMemberSemantics::OptionalSuffix
+            )
+        ) || (!self.optional_members.is_empty()
+            && self.member_semantics != Some(NetworkContainerMemberSemantics::OptionalSuffix))
+            || (self.member_semantics == Some(NetworkContainerMemberSemantics::CfgReachable)
+                && !self.contains_profiled_mask_guard())
+        {
+            return None;
+        }
+
+        let mut shapes = registered_profile_logical_codec_sequence(&self.members)?;
+        if !self.optional_members.is_empty() {
+            shapes.extend(registered_profile_logical_codec_sequence(
+                &self.optional_members,
+            )?);
+        }
+        (!shapes.is_empty()).then_some(shapes)
+    }
+
+    fn contains_profiled_mask_guard(&self) -> bool {
+        self.guards
+            .iter()
+            .any(|guard| guard.kind == "storage-bit-mask")
+            || self.members.iter().any(Self::contains_profiled_mask_guard)
+            || self
+                .optional_members
+                .iter()
+                .any(Self::contains_profiled_mask_guard)
+    }
+
     pub fn direct_type_name(&self) -> Option<&str> {
         (self.guards.is_empty() && self.optional_members.is_empty()).then_some(())?;
         (self.members.is_empty()
@@ -318,13 +420,43 @@ pub struct NetworkReplicatedContainerPlan {
     pub helper_depth: u32,
     pub key_codecs: Vec<NetworkContainerCodec>,
     pub value_codecs: Vec<NetworkContainerCodec>,
+    #[serde(default)]
+    pub unmarshal_codecs: Vec<NetworkContainerCodec>,
 }
 
 impl NetworkReplicatedContainerPlan {
+    /// Returns the exact physical value sequence observed in MarshalFull.
+    ///
+    /// This intentionally does not claim cross-direction agreement. Callers
+    /// must supply an independent unmarshal-side identity or layout proof.
+    pub fn exact_marshal_value_wire_shapes(&self) -> Option<Vec<NetworkWireScalarShape>> {
+        exact_codec_sequence(&self.value_codecs)
+    }
+
     pub fn exact_key_wire_shapes(&self) -> Option<Vec<NetworkWireScalarShape>> {
         self.has_complete_cross_direction_agreement()
             .then_some(())?;
         exact_codec_sequence(&self.key_codecs)
+    }
+
+    /// Returns an exact map-key sequence when the value codec is too complex
+    /// for whole-container reconciliation but unmarshal still consumes the
+    /// independently observed key first.
+    pub fn independently_matching_key_wire_shapes(&self) -> Option<Vec<NetworkWireScalarShape>> {
+        (self.storage == NetworkReplicatedContainerStorageKind::Map).then_some(())?;
+        (self.unmarshal_storage_proof.as_deref()
+            == Some("cfg-ordered-buffer-codecs+unique-owner-insertion"))
+        .then_some(())?;
+
+        let encoded = exact_codec_sequence(&self.key_codecs)?;
+        let mut decoded = Vec::new();
+        for codec in &self.unmarshal_codecs {
+            decoded.extend(codec.exact_wire_shapes()?);
+            if decoded.len() >= encoded.len() {
+                return (decoded == encoded).then_some(encoded);
+            }
+        }
+        None
     }
 
     pub fn exact_value_wire_shapes(&self) -> Option<Vec<NetworkWireScalarShape>> {
@@ -357,11 +489,100 @@ impl NetworkReplicatedContainerPlan {
         exact_logical_codec_sequence(&self.value_codecs)
     }
 
+    pub fn decoded_logical_value_wire_shapes(&self) -> Option<Vec<String>> {
+        self.has_complete_cross_direction_agreement()
+            .then_some(())?;
+        self.decoded_logical_value_wire_shapes_unguarded()
+    }
+
+    /// Returns the complete unmarshal-side value product when the extractor
+    /// proved one owned container loop even though marshal helper recursion
+    /// prevented cross-direction reconciliation.
+    pub fn complete_unmarshal_logical_value_wire_shapes(&self) -> Option<Vec<String>> {
+        (self.unmarshal_analysis_status.as_deref() == Some("single-loop-codec-sequence"))
+            .then_some(())?;
+        match self.storage {
+            NetworkReplicatedContainerStorageKind::Map => (self.unmarshal_storage_proof.as_deref()
+                == Some("cfg-ordered-buffer-codecs+unique-owner-insertion"))
+            .then_some(())?,
+            NetworkReplicatedContainerStorageKind::Vec => (self.unmarshal_storage_proof.as_deref()
+                == Some("cfg-natural-loop-affine-pointer-induction"))
+            .then_some(())?,
+        };
+        self.unmarshal_codecs
+            .iter()
+            .all(|codec| {
+                codec.members.is_empty()
+                    || codec
+                        .analysis_status
+                        .as_deref()
+                        .is_some_and(|status| status.starts_with("complete"))
+            })
+            .then_some(())?;
+        self.decoded_logical_value_wire_shapes_unguarded()
+    }
+
+    fn decoded_logical_value_wire_shapes_unguarded(&self) -> Option<Vec<String>> {
+        let mut decoded = decoded_logical_codec_sequence(&self.unmarshal_codecs)?;
+        if self.storage == NetworkReplicatedContainerStorageKind::Map {
+            let key = exact_logical_codec_sequence(&self.key_codecs)
+                .or_else(|| decoded_logical_codec_sequence(&self.key_codecs))?;
+            decoded.starts_with(&key).then_some(())?;
+            decoded.drain(..key.len());
+        }
+        (!decoded.is_empty()).then_some(decoded)
+    }
+
+    /// Returns a profile-resolved marshal product when guarded CFG recovery is
+    /// complete and the unmarshal side independently proves the same element
+    /// boundary. The marshal product is retained because it carries mask and
+    /// registered-feature semantics that a flat decode trace cannot express.
+    pub fn complete_marshal_logical_value_wire_shapes(&self) -> Option<Vec<String>> {
+        self.complete_unmarshal_logical_value_wire_shapes()?;
+        self.value_codecs
+            .iter()
+            .all(|codec| {
+                codec
+                    .analysis_status
+                    .as_deref()
+                    .is_some_and(|status| status.starts_with("complete"))
+            })
+            .then_some(())?;
+        registered_profile_logical_codec_sequence(&self.value_codecs)
+    }
+
+    /// Resolves semantic codec guards against the binary's registered default
+    /// profile while retaining mask-driven wire products as one logical shape.
+    pub fn registered_profile_logical_value_wire_shapes(&self) -> Option<Vec<String>> {
+        self.has_complete_cross_direction_agreement()
+            .then_some(())?;
+        registered_profile_logical_codec_sequence(&self.value_codecs)
+    }
+
     #[must_use]
     pub fn has_complete_cross_direction_agreement(&self) -> bool {
         self.unmarshal_reconciliation
             .as_deref()
             .is_some_and(|status| status.starts_with("complete-"))
+            || self.has_independently_matching_logical_products()
+    }
+
+    fn has_independently_matching_logical_products(&self) -> bool {
+        if self.unmarshal_codecs.is_empty() {
+            return false;
+        }
+
+        let Some(mut encoded) = registered_profile_logical_codec_sequence(&self.key_codecs) else {
+            return false;
+        };
+        let Some(values) = registered_profile_logical_codec_sequence(&self.value_codecs) else {
+            return false;
+        };
+        encoded.extend(values);
+
+        decoded_logical_codec_sequence(&self.unmarshal_codecs).is_some_and(|decoded| {
+            !encoded.is_empty() && logical_products_machine_compatible(&encoded, &decoded)
+        })
     }
 
     pub fn direct_value_type(&self) -> Option<(&str, Option<Uuid>)> {
@@ -425,6 +646,7 @@ pub(super) fn parse_plan(object: &Map<String, Value>) -> Option<NetworkReplicate
         helper_depth: u32_value(object, "helperDepth").unwrap_or_default(),
         key_codecs: parse_codecs(object, "keyCodecs"),
         value_codecs: parse_codecs(object, "valueCodecs"),
+        unmarshal_codecs: parse_codecs(object, "unmarshalCodecs"),
     })
 }
 
@@ -559,6 +781,212 @@ fn exact_logical_codec_sequence(codecs: &[NetworkContainerCodec]) -> Option<Vec<
         shapes.extend(codec.exact_logical_wire_shapes()?);
     }
     (!shapes.is_empty()).then_some(shapes)
+}
+
+fn decoded_logical_codec_sequence(codecs: &[NetworkContainerCodec]) -> Option<Vec<String>> {
+    let mut shapes = Vec::new();
+    for codec in codecs {
+        shapes.extend(codec.decoded_logical_wire_shapes()?);
+    }
+    (!shapes.is_empty()).then_some(shapes)
+}
+
+fn registered_profile_logical_codec_sequence(
+    codecs: &[NetworkContainerCodec],
+) -> Option<Vec<String>> {
+    let active = codecs
+        .iter()
+        .map(|codec| {
+            registered_profile_codec_guards(codec)
+                .map(|(included, guards)| included.then_some((codec, guards)))
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let semantic_guards = active
+        .iter()
+        .flat_map(|(_, guards)| guards.iter().copied())
+        .collect::<Vec<_>>();
+    if semantic_guards.is_empty() {
+        let mut shapes = Vec::new();
+        for (codec, _) in active {
+            shapes.extend(codec.registered_profile_logical_wire_shapes_unguarded()?);
+        }
+        return (!shapes.is_empty()).then_some(shapes);
+    }
+    semantic_guards
+        .iter()
+        .all(|guard| guard.kind == "storage-bit-mask")
+        .then_some(())?;
+
+    let storage_base = semantic_guards.first()?.storage_base.as_deref()?;
+    let storage_offset = parse_u64_string(semantic_guards.first()?.storage_offset.as_deref()?)?;
+    semantic_guards
+        .iter()
+        .all(|guard| {
+            guard.storage_base.as_deref() == Some(storage_base)
+                && guard.storage_offset.as_deref().and_then(parse_u64_string)
+                    == Some(storage_offset)
+        })
+        .then_some(())?;
+
+    let producers = active
+        .iter()
+        .enumerate()
+        .filter(|(_, (codec, guards))| {
+            guards.is_empty()
+                && codec.element_offset == Some(storage_offset)
+                && codec
+                    .wire_shape
+                    .as_deref()
+                    .or(codec.wire_layout.as_deref())
+                    .is_some_and(is_byte_mask_shape)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let [producer_index] = producers.as_slice() else {
+        return None;
+    };
+    active[..*producer_index]
+        .iter()
+        .all(|(_, guards)| guards.is_empty())
+        .then_some(())?;
+
+    let mut result = Vec::new();
+    for (codec, _) in &active[..*producer_index] {
+        result.extend(codec.registered_profile_logical_wire_shapes_unguarded()?);
+    }
+    let mask_shape = active[*producer_index]
+        .0
+        .wire_shape
+        .as_deref()
+        .or(active[*producer_index].0.wire_layout.as_deref())?;
+
+    let mut groups: Vec<(Option<u8>, Vec<String>)> = Vec::new();
+    for (codec, guards) in &active[*producer_index + 1..] {
+        let mask = match guards.as_slice() {
+            [] => None,
+            [guard] => {
+                let mask = parse_u64_string(guard.mask.as_deref()?)?;
+                (mask <= u8::MAX.into() && mask.is_power_of_two()).then_some(())?;
+                let condition_true_when_set = match guard.condition.as_str() {
+                    "not-equal-zero" => true,
+                    "equal-zero" => false,
+                    _ => return None,
+                };
+                (guard.member_on_true == condition_true_when_set).then_some(())?;
+                Some(u8::try_from(mask).ok()?)
+            }
+            _ => return None,
+        };
+        let member_shapes = codec.registered_profile_logical_wire_shapes_unguarded()?;
+        if groups
+            .last()
+            .is_some_and(|(group_mask, _)| *group_mask == mask)
+        {
+            groups.last_mut()?.1.extend(member_shapes);
+        } else {
+            groups.push((mask, member_shapes));
+        }
+    }
+    (!groups.is_empty() && groups.len() <= 11).then_some(())?;
+
+    let members = groups
+        .into_iter()
+        .map(|(mask, shapes)| {
+            let payload = logical_shape_product(&shapes)?;
+            Some(match mask {
+                Some(mask) => format!("masked<0x{mask:02x},{payload}>"),
+                None => format!("required<{payload}>"),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    result.push(format!(
+        "bit-mask-composite<{mask_shape},{}>",
+        members.join(",")
+    ));
+    Some(result)
+}
+
+fn registered_profile_codec_guards(
+    codec: &NetworkContainerCodec,
+) -> Option<(bool, Vec<&NetworkContainerCodecGuard>)> {
+    let mut semantic = Vec::new();
+    for guard in &codec.guards {
+        if decode_guard_is_transient(guard) {
+            continue;
+        }
+        if guard.kind == "global-boolean" && guard.mask.is_none() {
+            if !guard.includes_member_for_registered_default()? {
+                return Some((false, Vec::new()));
+            }
+            continue;
+        }
+        if guard.kind != "storage-bit-mask" {
+            return None;
+        }
+        semantic.push(guard);
+    }
+    Some((true, semantic))
+}
+
+fn logical_shape_product(shapes: &[String]) -> Option<String> {
+    match shapes {
+        [] => None,
+        [shape] => Some(shape.clone()),
+        shapes => Some(format!("composite<{}>", shapes.join(","))),
+    }
+}
+
+fn logical_products_machine_compatible(left: &[String], right: &[String]) -> bool {
+    if left == right {
+        return true;
+    }
+    let Some(left) = logical_shape_product(left).and_then(|shape| parse_network_wire_shape(&shape))
+    else {
+        return false;
+    };
+    let Some(right) =
+        logical_shape_product(right).and_then(|shape| parse_network_wire_shape(&shape))
+    else {
+        return false;
+    };
+    super::merge::wire_shapes_machine_compatible(&left, &right)
+}
+
+fn is_byte_mask_shape(value: &str) -> bool {
+    matches!(
+        parse_network_wire_scalar_shape(value),
+        Some(
+            NetworkWireScalarShape::Bool
+                | NetworkWireScalarShape::U8
+                | NetworkWireScalarShape::FixedBytes(1)
+        )
+    )
+}
+
+fn parse_u64_string(value: &str) -> Option<u64> {
+    let value = value.trim();
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse().ok(),
+            |hex| u64::from_str_radix(hex, 16).ok(),
+        )
+}
+
+fn decode_guard_is_transient(guard: &NetworkContainerCodecGuard) -> bool {
+    guard.kind == "boolean-storage"
+        && guard.storage_base.as_deref() == Some("stack")
+        && guard.storage_address.is_none()
+        && guard.mask.is_none()
+        && guard.external_condition.is_none()
 }
 
 fn hex_or_decimal_u64(value: Option<&Value>) -> Option<u64> {
@@ -854,5 +1282,231 @@ mod tests {
         );
         assert_eq!(plan.exact_key_wire_shapes(), None);
         assert_eq!(plan.exact_value_wire_shapes(), None);
+    }
+
+    #[test]
+    fn independently_matches_map_key_before_non_linear_value_codec() {
+        let value = json!({
+            "storageKind": "index-map",
+            "unmarshalStorageProof": "cfg-ordered-buffer-codecs+unique-owner-insertion",
+            "unmarshalReconciliation": "marshal-codec-sequence-not-linear",
+            "keyCodecs": [{ "wireLayout": "fixed-bytes-16" }],
+            "valueCodecs": [{
+                "memberSemantics": "cfg-reachable",
+                "members": [{ "wireShape": "u64" }]
+            }],
+            "unmarshalCodecs": [
+                { "wireLayout": "fixed-bytes-16" },
+                {
+                    "memberSemantics": "cfg-reachable",
+                    "members": [{ "wireShape": "u64" }]
+                }
+            ]
+        });
+
+        let plan = parse_plan(value.as_object().expect("plan object")).expect("valid plan");
+
+        assert_eq!(plan.exact_key_wire_shapes(), None);
+        assert_eq!(
+            plan.independently_matching_key_wire_shapes(),
+            Some(vec![NetworkWireScalarShape::FixedBytes(16)])
+        );
+    }
+
+    #[test]
+    fn independent_map_key_requires_storage_and_exact_codec_boundary_proofs() {
+        let plan_without_storage_proof = json!({
+            "storageKind": "index-map",
+            "keyCodecs": [{ "wireLayout": "fixed-bytes-16" }],
+            "valueCodecs": [{ "wireShape": "u8" }],
+            "unmarshalCodecs": [{ "wireLayout": "fixed-bytes-16" }]
+        });
+        let plan_without_storage_proof =
+            parse_plan(plan_without_storage_proof.as_object().expect("plan object"))
+                .expect("valid plan");
+        assert_eq!(
+            plan_without_storage_proof.independently_matching_key_wire_shapes(),
+            None
+        );
+
+        let plan_without_codec_boundary = json!({
+            "storageKind": "index-map",
+            "unmarshalStorageProof": "cfg-ordered-buffer-codecs+unique-owner-insertion",
+            "keyCodecs": [{ "wireLayout": "fixed-bytes-16" }],
+            "valueCodecs": [{ "wireShape": "u8" }],
+            "unmarshalCodecs": [{
+                "memberSemantics": "linear-sequence",
+                "members": [
+                    { "wireLayout": "fixed-bytes-16" },
+                    { "wireShape": "u8" }
+                ]
+            }]
+        });
+        let plan_without_codec_boundary = parse_plan(
+            plan_without_codec_boundary
+                .as_object()
+                .expect("plan object"),
+        )
+        .expect("valid plan");
+        assert_eq!(
+            plan_without_codec_boundary.independently_matching_key_wire_shapes(),
+            None
+        );
+    }
+
+    #[test]
+    fn registered_profile_folds_mask_members_and_omits_disabled_global_suffix() {
+        let disabled_condition = json!({
+            "resolverObject": "NewWorld+0x1000",
+            "resolverVtable": "NewWorld+0x2000",
+            "resolverSlot": 1,
+            "resolver": "NewWorld+0x3000",
+            "conditionStorage": "NewWorld+0x100c",
+            "conditionOffset": "0xc",
+            "owner": "NewWorld+0xfb0",
+            "subobjectOffset": "0x50",
+            "destructorThunk": "NewWorld+0x4000",
+            "completeDestructor": "NewWorld+0x5000",
+            "initializer": "NewWorld+0x6000",
+            "nameField": "NewWorld+0x1010",
+            "nameOffset": "0x10",
+            "nameBegin": "NewWorld+0x7000",
+            "nameEnd": "NewWorld+0x7017",
+            "name": "feature.enabled",
+            "defaultValue": false,
+            "defaultWrite": "NewWorld+0x8000",
+            "defaultCallsite": "NewWorld+0x8010",
+            "defaultTarget": "NewWorld+0x9000",
+            "evidenceSource": "static-vtable-dispatch+adjustor-thunk+initializer-writes+resolver-default-flow"
+        });
+        let value = json!({
+            "storageKind": "vector",
+            "unmarshalReconciliation": "complete-conditional-path-agreement",
+            "valueCodecs": [{
+                "memberSemantics": "cfg-reachable",
+                "members": [
+                    { "wireShape": "vlq-u32", "elementOffset": "0x0" },
+                    { "wireLayout": "fixed-bytes-1", "elementOffset": "0x4" },
+                    {
+                        "wireShape": "vlq-u32",
+                        "guards": [{
+                            "branch": "NewWorld+0xa000",
+                            "kind": "storage-bit-mask",
+                            "condition": "equal-zero",
+                            "memberOnTrue": false,
+                            "storageBase": "param_2",
+                            "storageOffset": "0x4",
+                            "mask": "0x1",
+                            "evidenceSource": "dominating-cbranch-pcode-storage"
+                        }]
+                    },
+                    {
+                        "wireShape": "u32",
+                        "guards": [{
+                            "branch": "NewWorld+0xb000",
+                            "kind": "global-boolean",
+                            "condition": "not-equal-zero",
+                            "memberOnTrue": true,
+                            "storageAddress": "NewWorld+0x100c",
+                            "externalCondition": disabled_condition,
+                            "evidenceSource": "dominating-cbranch-pcode-storage+external-condition-proof"
+                        }]
+                    }
+                ]
+            }]
+        });
+
+        let plan = parse_plan(value.as_object().expect("plan object")).expect("valid plan");
+
+        assert_eq!(
+            plan.registered_profile_logical_value_wire_shapes(),
+            Some(vec![
+                "vlq-u32".to_owned(),
+                "bit-mask-composite<fixed-bytes-1,masked<0x01,vlq-u32>>".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn independently_matching_logical_products_override_a_conservative_status() {
+        let value = json!({
+            "storageKind": "index-map",
+            "unmarshalReconciliation": "marshal-unmarshal-codec-count-mismatch",
+            "keyCodecs": [{ "wireLayout": "fixed-bytes-16" }],
+            "valueCodecs": [{
+                "memberSemantics": "linear-sequence",
+                "members": [
+                    { "wireShape": "u64" },
+                    { "wireShape": "vec<composite<u32,u8>>", "memberSemantics": "counted-sequence" }
+                ]
+            }],
+            "unmarshalCodecs": [
+                { "wireLayout": "fixed-bytes-16" },
+                {
+                    "memberSemantics": "linear-sequence",
+                    "members": [
+                        {
+                            "wireShape": "u64",
+                            "guards": [{
+                                "kind": "boolean-storage",
+                                "condition": "not-equal-zero",
+                                "memberOnTrue": true,
+                                "storageBase": "stack",
+                                "storageOffset": "0xffffffffffffffb8",
+                                "evidenceSource": "dominating-cbranch-pcode-storage"
+                            }]
+                        },
+                        { "wireShape": "vec<composite<u32,u8>>", "memberSemantics": "counted-sequence" }
+                    ]
+                }
+            ]
+        });
+
+        let plan = parse_plan(value.as_object().expect("plan object")).expect("valid plan");
+
+        assert!(plan.has_complete_cross_direction_agreement());
+        assert_eq!(
+            plan.registered_profile_logical_value_wire_shapes(),
+            Some(vec!["u64".to_owned(), "vec<composite<u32,u8>>".to_owned()])
+        );
+    }
+
+    #[test]
+    fn independent_reconciliation_rejects_empty_or_different_decode_products() {
+        let mut value = json!({
+            "storageKind": "vector",
+            "unmarshalReconciliation": "unmarshal-loop-unresolved",
+            "valueCodecs": [{ "wireShape": "u32" }],
+            "unmarshalCodecs": []
+        });
+        let unresolved =
+            parse_plan(value.as_object().expect("plan object")).expect("valid unresolved plan");
+        assert!(!unresolved.has_complete_cross_direction_agreement());
+
+        value["unmarshalCodecs"] = json!([{ "wireShape": "u64" }]);
+        let mismatched =
+            parse_plan(value.as_object().expect("plan object")).expect("valid mismatched plan");
+        assert!(!mismatched.has_complete_cross_direction_agreement());
+    }
+
+    #[test]
+    fn independent_reconciliation_accepts_equivalent_nested_and_flat_products() {
+        let value = json!({
+            "storageKind": "vector",
+            "unmarshalReconciliation": "marshal-unmarshal-codec-count-mismatch",
+            "valueCodecs": [{
+                "wireShape": "vec<composite<u32,u8>>",
+                "memberSemantics": "counted-sequence"
+            }],
+            "unmarshalCodecs": [
+                { "wireShape": "vlq-u32" },
+                { "wireShape": "u32" },
+                { "wireLayout": "fixed-bytes-1" }
+            ]
+        });
+
+        let plan = parse_plan(value.as_object().expect("plan object")).expect("valid plan");
+
+        assert!(plan.has_complete_cross_direction_agreement());
     }
 }

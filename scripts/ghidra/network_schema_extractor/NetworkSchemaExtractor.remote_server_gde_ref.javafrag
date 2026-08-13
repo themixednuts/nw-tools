@@ -6,16 +6,14 @@
         Address marshalAddress,
         Address unmarshalAddress) {
 
-        if (handlerVtable == null || physicalShape == null ||
-            wireEvidence == null || valueType == null ||
-            valueType.typeShape() == null ||
-            !Boolean.TRUE.equals(valueType.typeShape().identityProven) ||
-            valueType.typeShape().typeId == null) {
+        if (handlerVtable == null || physicalShape == null || wireEvidence == null) {
             return null;
         }
 
-        NestedTypeShape valueShape = valueType.typeShape();
-        if (uuidEquals(valueShape.typeId, REMOTE_SERVER_GDE_REF_TYPE_ID) &&
+        NestedTypeShape valueShape = valueType == null ? null : valueType.typeShape();
+        if (valueShape != null &&
+            Boolean.TRUE.equals(valueShape.identityProven) &&
+            uuidEquals(valueShape.typeId, REMOTE_SERVER_GDE_REF_TYPE_ID) &&
             valueShape.nativeSize != null && valueShape.nativeSize == 24L &&
             Boolean.TRUE.equals(valueShape.layoutProven) &&
             Boolean.TRUE.equals(valueShape.memberCoverageProven) &&
@@ -39,33 +37,17 @@
             return null;
         }
 
-        SerializeTypeInfo reflected = serializeTypesById.get(
-            normalizeUuid(valueShape.typeId));
+        SerializeTypeInfo reflected = valueShape == null || valueShape.typeId == null
+            ? null
+            : serializeTypesById.get(normalizeUuid(valueShape.typeId));
         Long nativeSize = reflected == null ? null : serializeTypeByteWidth(reflected);
-        if (reflected == null || nativeSize == null || nativeSize != 40L ||
-            !uuidEquals(reflected.typeId, REMOTE_SERVER_GDE_REF_TYPE_ID)) {
-            return null;
-        }
-
-        List<SerializeWireSlot> slots = serializeTypeNativeWireLayout(reflected.typeId);
-        if (slots.size() != 2) {
-            return null;
-        }
-        SerializeWireSlot actorId = slots.get(0);
-        SerializeWireSlot targetId = slots.get(1);
-        if (actorId.offset != 16L ||
-            !"fixed-bytes-16".equals(actorId.wireShape) ||
-            targetId.offset != 32L || !"u64".equals(targetId.wireShape)) {
-            return null;
-        }
-
         List<HandlerValueWindow> windows = handlerValueStorageWindows(handlerVtable);
-        if (windows.size() != 1 || windows.get(0).nativeSize() != nativeSize) {
+        if (windows.size() != 1 || windows.get(0).nativeSize() != 40L) {
             return null;
         }
         long valueRoot = windows.get(0).rootOffset();
-        Long actorStorageOffset = addExactOrNull(valueRoot, actorId.offset);
-        Long targetStorageOffset = addExactOrNull(valueRoot, targetId.offset);
+        Long actorStorageOffset = addExactOrNull(valueRoot, 16L);
+        Long targetStorageOffset = addExactOrNull(valueRoot, 32L);
         if (actorStorageOffset == null || targetStorageOffset == null) {
             return null;
         }
@@ -81,10 +63,23 @@
             return null;
         }
 
+        String source = "handler-storage-window+marshal-pcode+" +
+            "unmarshal-pcode-low-u64-projection";
+        if (reflected != null && nativeSize != null && nativeSize == 40L &&
+            uuidEquals(reflected.typeId, REMOTE_SERVER_GDE_REF_TYPE_ID)) {
+            List<SerializeWireSlot> slots = serializeTypeNativeWireLayout(reflected.typeId);
+            if (slots.size() != 2 || slots.get(0).offset != 16L ||
+                !"fixed-bytes-16".equals(slots.get(0).wireShape) ||
+                slots.get(1).offset != 32L || !"u64".equals(slots.get(1).wireShape)) {
+                return null;
+            }
+            source = "reflected-value-layout+marshal-pcode+" +
+                "unmarshal-pcode-low-u64-projection";
+        }
         return WireShape.semantic(
             "remote-server-gde-ref",
             "fixed-bytes-16",
-            "reflected-value-layout+marshal-pcode+unmarshal-pcode-low-u64-projection");
+            source);
     }
 
     private boolean marshalWritesRemoteServerGdeActorId(

@@ -41,10 +41,19 @@
                 : returnedUnmarshalResultBase(high, candidateBases);
         }
         if (resultBase == null) {
-            return candidateBases.isEmpty()
-                ? scalarReturnUnmarshalTerminalFlow(high)
-                : UnmarshalTerminalFlow.unresolved(
-                    "result-base-count:" + candidateBases.size());
+            if (candidateBases.isEmpty()) {
+                UnmarshalTerminalFlow transparent =
+                    transparentReturnedResultUnmarshalTerminalFlow(
+                        high,
+                        expectedResultBase,
+                        active,
+                        depth);
+                return transparent != null
+                    ? transparent
+                    : scalarReturnUnmarshalTerminalFlow(high);
+            }
+            return UnmarshalTerminalFlow.unresolved(
+                "result-base-count:" + candidateBases.size());
         }
 
         Set<PcodeOpAST> delegatedSuccess = delegatedUnmarshalSuccessCalls(
@@ -61,6 +70,12 @@
         if (entries.isEmpty()) {
             return UnmarshalTerminalFlow.unresolved("missing-entry-block");
         }
+        boolean preconditionedSuccess = hasPreconditionedUnmarshalSuccess(
+                high,
+                resultBase);
+        UnmarshalStatusByte initialStatus = preconditionedSuccess
+            ? UnmarshalStatusByte.SUCCESS
+            : UnmarshalStatusByte.UNSET;
 
         Map<PcodeBlockBasic, Map<PcodeBlockBasic, UnmarshalStatusByte>>
             terminalIncoming = new HashMap<>();
@@ -74,12 +89,13 @@
                 transferUnmarshalStatus(
                     high,
                     entry,
-                    UnmarshalStatusByte.UNSET,
+                    initialStatus,
                     null,
                     resultBase,
                     delegatedSuccess,
                     active,
-                    depth));
+                    depth,
+                    preconditionedSuccess));
             entryNodes.add(node);
             if (nodes.add(node)) {
                 pending.addLast(node);
@@ -117,7 +133,8 @@
                         resultBase,
                         delegatedSuccess,
                         active,
-                        depth));
+                        depth,
+                        preconditionedSuccess));
                 edges.add(new UnmarshalFlowEdge(source, target));
                 if (nodes.add(target)) {
                     pending.addLast(target);
@@ -130,6 +147,14 @@
             .filter(node -> node.status() == UnmarshalStatusByte.SUCCESS)
             .collect(Collectors.toCollection(LinkedHashSet::new));
         if (successfulTerminals.isEmpty()) {
+            UnmarshalTerminalFlow preconditioned = preconditionedUnmarshalSuccessSubgraph(
+                high,
+                resultBase,
+                entries,
+                preconditionedSuccess);
+            if (preconditioned != null) {
+                return preconditioned;
+            }
             return UnmarshalTerminalFlow.unresolved("no-success-terminal");
         }
 
@@ -178,6 +203,194 @@
             Map.copyOf(immutableExcluded),
             mandatoryBlocks,
             "complete-status-product-graph");
+    }
+
+    private boolean hasPreconditionedUnmarshalSuccess(
+        HighFunction high,
+        String resultBase) {
+
+        if (high == null || resultBase == null) {
+            return false;
+        }
+        boolean sawFailure = false;
+        boolean sawSuccess = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            StatusByteWrite write = unmarshalStatusByteWrite(operation);
+            if (write == null || !resultBase.equals(write.base())) {
+                continue;
+            }
+            sawFailure |= write.value() == UnmarshalStatusByte.FAILURE;
+            sawSuccess |= write.value() == UnmarshalStatusByte.SUCCESS;
+        }
+        if (sawSuccess) {
+            return false;
+        }
+
+        for (PcodeBlockBasic source : high.getBasicBlocks()) {
+            if (!NetworkSchemaControlFlow.predecessors(source).isEmpty()) {
+                continue;
+            }
+            List<PcodeBlockBasic> successors = NetworkSchemaControlFlow.successors(source);
+            if (successors.size() != 2) {
+                continue;
+            }
+            for (PcodeBlockBasic zeroSuccessor : successors) {
+                if (!isOkByteZeroBranch(source, zeroSuccessor, resultBase)) {
+                    continue;
+                }
+                PcodeBlockBasic nonzeroSuccessor = successors.get(0) == zeroSuccessor
+                    ? successors.get(1)
+                    : successors.get(0);
+                if (!reachesUnmarshalBufferConsumer(high, nonzeroSuccessor) ||
+                    reachesUnmarshalBufferConsumer(high, zeroSuccessor)) {
+                    continue;
+                }
+                runMetrics.increment("preconditionedUnmarshalSuccessSeeds");
+                runMetrics.increment(sawFailure
+                    ? "preconditionedUnmarshalFailureWriteSeeds"
+                    : "preconditionedUnmarshalEntryGuardSeeds");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean reachesUnmarshalBufferConsumer(
+        HighFunction high,
+        PcodeBlockBasic start) {
+
+        if (high == null || start == null) {
+            return false;
+        }
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(operation);
+            if (block == null || block != start &&
+                !NetworkSchemaControlFlow.reaches(start, block)) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            if (target == null) {
+                continue;
+            }
+            if (pcodeReadRawWireEvidence(operation, target) != null ||
+                !readBufferParameters(target).isEmpty()) {
+                return true;
+            }
+            // Ghidra can omit trailing register arguments from a call op even
+            // though the callee still consumes the corresponding Win64 formal.
+            // Probe all register formals directly so a preconditioned result
+            // wrapper is not mistaken for an always-failing helper.
+            for (int slot = 1; slot <= 4; slot++) {
+                if (hasReadBufferFlow(
+                        target,
+                        "param_" + slot,
+                        new LinkedHashSet<>())) {
+                    runMetrics.increment(
+                        "preconditionedUnmarshalRegisterBufferConsumers");
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private UnmarshalTerminalFlow transparentReturnedResultUnmarshalTerminalFlow(
+        HighFunction high,
+        String expectedResultBase,
+        Set<String> active,
+        int depth) {
+
+        Function owner = high.getFunction();
+        Integer returnedSlot = returnedParameterSlot(owner);
+        String resultBase = returnedSlot == null ? null : "param_" + returnedSlot;
+        if (resultBase == null || expectedResultBase != null &&
+            !expectedResultBase.equals(resultBase) ||
+            !allReturnsTransportFormalParameter(high, returnedSlot)) {
+            return null;
+        }
+
+        PcodeOpAST delegatedCall = null;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Integer resultSlot = provenCallArgumentSlot(
+                owner,
+                operation,
+                target,
+                new PcodeStorage(resultBase, 0L));
+            if (target == null || resultSlot == null ||
+                !isTailResultDelegation(operation, resultBase)) {
+                continue;
+            }
+            UnmarshalTerminalFlow nested = successfulUnmarshalTerminalFlow(
+                highFunction(target),
+                "param_" + resultSlot,
+                active,
+                depth + 1);
+            if (!isCompleteUnmarshalTerminalFlow(nested)) {
+                continue;
+            }
+            if (delegatedCall != null) {
+                return null;
+            }
+            delegatedCall = operation;
+        }
+        if (delegatedCall == null) {
+            return null;
+        }
+
+        PcodeBlockBasic delegatedBlock =
+            NetworkSchemaControlFlow.parentBlock(delegatedCall);
+        Set<PcodeBlockBasic> terminals = high.getBasicBlocks().stream()
+            .filter(this::isTerminatingPcodeBlock)
+            .collect(Collectors.toUnmodifiableSet());
+        if (delegatedBlock == null || terminals.isEmpty() ||
+            terminals.stream().anyMatch(terminal ->
+                !NetworkSchemaControlFlow.dominates(high, delegatedBlock, terminal))) {
+            return null;
+        }
+        Set<PcodeBlockBasic> mandatory = high.getBasicBlocks().stream()
+            .filter(block -> terminals.stream().allMatch(terminal ->
+                NetworkSchemaControlFlow.dominates(high, block, terminal)))
+            .collect(Collectors.toUnmodifiableSet());
+        runMetrics.increment("transparentUnmarshalResultWrappers");
+        return new UnmarshalTerminalFlow(
+            terminals,
+            Map.of(),
+            mandatory,
+            "complete-transparent-returned-result-delegate");
+    }
+
+    private boolean allReturnsTransportFormalParameter(
+        HighFunction high,
+        int parameterSlot) {
+
+        boolean sawReturn = false;
+        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            if (operation.getOpcode() != PcodeOp.RETURN) {
+                continue;
+            }
+            if (operation.getNumInputs() < 2) {
+                return false;
+            }
+            sawReturn = true;
+            Varnode value = operation.getInput(operation.getNumInputs() - 1);
+            PcodeStorage storage = pcodeStorageExpression(value);
+            Integer slot = formalParameterSlot(storage);
+            if (slot == null) {
+                slot = transportedFormalParameterSlot(value);
+            }
+            if (!Integer.valueOf(parameterSlot).equals(slot) ||
+                formalParameterSlot(storage) != null && storage.offset != 0L) {
+                return false;
+            }
+        }
+        return sawReturn;
     }
 
     private Set<PcodeBlockBasic> mandatorySuccessfulPhysicalBlocks(
@@ -256,7 +469,8 @@
         String resultBase,
         Set<PcodeOpAST> delegatedSuccess,
         Set<String> active,
-        int depth) {
+        int depth,
+        boolean preconditionedSuccess) {
 
         UnmarshalStatusByte status = input;
         var operations = block.getIterator();
@@ -273,10 +487,19 @@
                     write,
                     active,
                     depth);
-                status = written == UnmarshalStatusByte.UNKNOWN &&
-                    terminalEdgeStatus != null
-                    ? terminalEdgeStatus
-                    : written;
+                if (written == UnmarshalStatusByte.UNKNOWN &&
+                    terminalEdgeStatus != null) {
+                    status = terminalEdgeStatus;
+                }
+                else if (written == UnmarshalStatusByte.UNKNOWN &&
+                    preconditionedSuccess) {
+                    status = UnmarshalStatusByte.FAILURE;
+                    runMetrics.increment(
+                        "preconditionedUnmarshalUnknownWritesAsFailure");
+                }
+                else {
+                    status = written;
+                }
             }
             else if (delegatedSuccess.contains(ast)) {
                 status = UnmarshalStatusByte.SUCCESS;
@@ -341,12 +564,14 @@
             return false;
         }
         Address destination = pcodeAddress(branch.getInput(0));
-        if (!blockContainsAddress(successor, destination)) {
+        boolean takenEdge = blockContainsAddress(successor, destination);
+        if (!takenEdge && source.getOutSize() != 2) {
             return false;
         }
         PcodeOp condition = branch.getInput(1).getDef();
         if (condition == null ||
-            condition.getOpcode() != PcodeOp.INT_EQUAL ||
+            (condition.getOpcode() != PcodeOp.INT_EQUAL &&
+                condition.getOpcode() != PcodeOp.INT_NOTEQUAL) ||
             condition.getNumInputs() != 2) {
             return false;
         }
@@ -356,6 +581,12 @@
                 ? 1
                 : -1;
         if (zeroSlot < 0) {
+            return false;
+        }
+        boolean zeroOutcome = condition.getOpcode() == PcodeOp.INT_EQUAL
+            ? takenEdge
+            : !takenEdge;
+        if (!zeroOutcome) {
             return false;
         }
         PcodeStorage ok = okByteStorage(condition.getInput(1 - zeroSlot));
@@ -498,17 +729,57 @@
             return false;
         }
         ForwardArgState state = input.copy();
+        LinkedHashSet<String> dereferencedResultPointers = new LinkedHashSet<>();
         for (Instruction instruction : blockInstructions(owner, source)) {
             if (instruction.getMinAddress().equals(compare.getMinAddress())) {
                 TrackedValue value = state.registers.get(okRegister);
-                return value != null &&
-                    resultBase.equals(value.baseKey) &&
-                    value.baseOffset != null &&
-                    value.baseOffset.intValue() == 0;
+                if (trackedValueIsBasePointer(value, resultBase)) {
+                    return true;
+                }
+                if (dereferencedResultPointers.contains(okRegister)) {
+                    runMetrics.increment("dereferencedUnmarshalResultWrapperProofs");
+                    return true;
+                }
+                return false;
+            }
+
+            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+            boolean resultDereference = false;
+            if (destination != null &&
+                "MOV".equals(NetworkSchemaX86.upperMnemonic(instruction))) {
+                String sourceRegister = NetworkSchemaX86.registerOperand(instruction, 1);
+                if (sourceRegister != null &&
+                    dereferencedResultPointers.contains(sourceRegister)) {
+                    resultDereference = true;
+                }
+                MemoryReference sourceMemory =
+                    NetworkSchemaX86.memoryReference(instruction, 1);
+                TrackedValue sourceBase = sourceMemory == null
+                    ? null
+                    : state.registers.get(sourceMemory.baseRegister);
+                if (sourceMemory != null && sourceMemory.displacement == 0 &&
+                    trackedValueIsBasePointer(sourceBase, resultBase)) {
+                    resultDereference = true;
+                }
+            }
+            if (destination != null) {
+                dereferencedResultPointers.remove(destination);
+                if (resultDereference) {
+                    dereferencedResultPointers.add(destination);
+                }
             }
             observeForwardInstruction(instruction, state, false);
         }
         return false;
+    }
+
+    private boolean trackedValueIsBasePointer(
+        TrackedValue value,
+        String expectedBase) {
+
+        return value != null && expectedBase != null &&
+            expectedBase.equals(value.baseKey) &&
+            value.baseOffset != null && value.baseOffset.intValue() == 0;
     }
 
     private boolean blockContainsAddress(PcodeBlockBasic block, Address address) {
@@ -584,7 +855,7 @@
             case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT ->
                 okByteStorage(definition.getInput(0));
             case PcodeOp.LOAD -> definition.getNumInputs() >= 2
-                ? pcodeStorageExpression(definition.getInput(1))
+                ? unmarshalResultStorageExpression(definition.getInput(1))
                 : null;
             case PcodeOp.SUBPIECE -> definition.getNumInputs() >= 2 &&
                 NetworkSchemaIntegerEvaluator.equals(definition.getInput(1), 0L)

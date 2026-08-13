@@ -93,6 +93,18 @@
 
             if ("MOV".equals(mnemonic)) {
                 TrackedValue value = trackedOperandValue(instruction, 1, state);
+                MemoryReference sourceMemory =
+                    NetworkSchemaX86.memoryReference(instruction, 1);
+                TrackedValue current = state.registers.get(destination);
+                if (sourceMemory != null &&
+                    sourceMemory.displacement == 0 &&
+                    destination.equals(sourceMemory.baseRegister) &&
+                    current != null && current.fieldName != null) {
+                    // AZStd::string's SSO branch leaves the inline buffer in the
+                    // register and the heap branch replaces it with *register.
+                    // Both addresses carry the same already-proven formatted name.
+                    value = current.copy();
+                }
                 putOrRemove(state.registers, destination, value);
                 if (isAllocatorVtableSlotLoad(instruction)) {
                     state.allocatorDispatchRegisters.add(destination);
@@ -639,7 +651,8 @@
 
     private boolean hasProvableOrigin(TrackedValue value) {
         return value != null &&
-            (value.baseKey != null || !value.storageDependencies.isEmpty());
+            (value.immediate != null || value.baseKey != null ||
+                !value.storageDependencies.isEmpty());
     }
 
     private int byteWidth(Integer widthBits) {

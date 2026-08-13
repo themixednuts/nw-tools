@@ -628,7 +628,10 @@ pub(super) fn network_field_handler_vtable(
             .get("valueTypeInfo")
             .and_then(Value::as_object)
             .map(native_type_info_evidence),
-        value_type_candidates: native_type_info_candidates(vtable, "valueTypeInfoCandidates"),
+        value_type_candidates: ["valueTypeInfoCandidates", "valueTypeCandidates"]
+            .into_iter()
+            .flat_map(|key| native_type_info_candidates(vtable, key))
+            .collect(),
         value_type_shape: vtable
             .get("valueTypeShape")
             .and_then(Value::as_object)

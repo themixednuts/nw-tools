@@ -41,7 +41,8 @@
             operation.getNumInputs() < 3) {
             return null;
         }
-        PcodeStorage destination = pcodeStorageExpression(operation.getInput(1));
+        PcodeStorage destination = unmarshalResultStorageExpression(
+            operation.getInput(1));
         if (destination == null || destination.base == null ||
             !destination.base.matches("param_[0-9]+")) {
             return null;
@@ -65,6 +66,26 @@
                     : UnmarshalStatusByte.UNKNOWN;
         }
         return new StatusByteWrite(destination.base, status);
+    }
+
+    /**
+     * Resolves both a direct result object and the void-helper convention where
+     * param_N points at a result-object pointer. Only a zero-offset first
+     * dereference is collapsed, so unrelated pointer members cannot be
+     * mistaken for the result status bytes.
+     */
+    private PcodeStorage unmarshalResultStorageExpression(Varnode node) {
+        PcodeStorage direct = pcodeStorageExpression(node);
+        if (direct != null) {
+            return direct;
+        }
+        PcodeMemoryPath path = pcodeMemoryPath(node, 1);
+        if (path == null || path.root().storageBase() == null ||
+            path.dereferenceOffsets().size() != 1 ||
+            path.dereferenceOffsets().get(0) != 0L) {
+            return null;
+        }
+        return new PcodeStorage(path.root().storageBase(), path.offset());
     }
 
     private boolean isTerminatingPcodeBlock(PcodeBlockBasic block) {

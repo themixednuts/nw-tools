@@ -32,10 +32,13 @@ impl PreservedAssetId {
 
 /// A native source-metadata sidecar (`azoth.source-meta/v1`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceAssetMeta {
     pub spec: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preserved_asset_id: Option<PreservedAssetId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_source_guid: Option<Uuid>,
 }
 
 impl SourceAssetMeta {
@@ -44,6 +47,17 @@ impl SourceAssetMeta {
         Self {
             spec: SOURCE_META_SPEC.to_owned(),
             preserved_asset_id: Some(preserved_asset_id),
+            preserved_source_guid: None,
+        }
+    }
+
+    /// Preserve one source GUID whose builder emits several products.
+    #[must_use]
+    pub fn preserving_source_guid(preserved_source_guid: Uuid) -> Self {
+        Self {
+            spec: SOURCE_META_SPEC.to_owned(),
+            preserved_asset_id: None,
+            preserved_source_guid: Some(preserved_source_guid),
         }
     }
 
@@ -52,6 +66,7 @@ impl SourceAssetMeta {
         Self {
             spec: SOURCE_META_SPEC.to_owned(),
             preserved_asset_id: None,
+            preserved_source_guid: None,
         }
     }
 }
@@ -97,6 +112,16 @@ mod tests {
         assert_eq!(
             String::from_utf8(serialize_sidecar(&SourceAssetMeta::uncataloged()).unwrap()).unwrap(),
             "{\"spec\":\"azoth.source-meta/v1\"}\n"
+        );
+    }
+
+    #[test]
+    fn multi_product_sidecar_preserves_only_the_source_guid() {
+        let meta =
+            SourceAssetMeta::preserving_source_guid(uuid!("11835fa2-8e74-5b52-9de9-b7a993c96746"));
+        assert_eq!(
+            String::from_utf8(serialize_sidecar(&meta).unwrap()).unwrap(),
+            "{\"spec\":\"azoth.source-meta/v1\",\"preserved_source_guid\":\"11835fa2-8e74-5b52-9de9-b7a993c96746\"}\n"
         );
     }
 

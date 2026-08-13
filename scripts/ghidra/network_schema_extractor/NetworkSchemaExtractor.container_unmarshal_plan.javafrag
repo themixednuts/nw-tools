@@ -32,6 +32,11 @@
                         : "complete-conditional-physical-agreement";
                     return;
                 }
+                if (sameConditionalContainerPhysicalPaths(encoded, decoded)) {
+                    plan.unmarshalReconciliation =
+                        "complete-conditional-path-agreement";
+                    return;
+                }
             }
             plan.unmarshalReconciliation = "marshal-codec-sequence-not-linear";
             return;
@@ -64,7 +69,16 @@
                 : "complete-physical-sequence-agreement";
             return;
         }
-        if (decoded.size() != expectedCount) {
+        ArrayList<ContainerCodecCall> encodedPlan = new ArrayList<>(
+            plan.keyCodecs.size() + plan.valueCodecs.size());
+        encodedPlan.addAll(plan.keyCodecs);
+        encodedPlan.addAll(plan.valueCodecs);
+        if (sameConditionalContainerPhysicalPaths(encodedPlan, decoded)) {
+            plan.unmarshalReconciliation = "complete-conditional-path-agreement";
+            return;
+        }
+        List<ContainerCodecCall> decodedLeaves = physicalContainerCodecLeaves(decoded);
+        if (decodedLeaves == null || decodedLeaves.size() != expectedCount) {
             plan.unmarshalReconciliation = "marshal-unmarshal-codec-count-mismatch";
             return;
         }
@@ -75,7 +89,7 @@
         ArrayList<WireShape> reconciled = new ArrayList<>(expectedCount);
         for (int index = 0; index < expectedCount; index++) {
             WireShape marshal = encoded.get(index).wireEvidence;
-            WireShape unmarshal = decoded.get(index).wireEvidence;
+            WireShape unmarshal = decodedLeaves.get(index).wireEvidence;
             if (marshal == null || marshal.layout == null ||
                 unmarshal == null || !unmarshal.hasProvenSemantics()) {
                 plan.unmarshalReconciliation = "unmarshal-codec-semantic-unproven";
@@ -104,7 +118,7 @@
 
         for (int index = 0; index < expectedCount; index++) {
             ContainerCodecCall target = encoded.get(index);
-            ContainerCodecCall source = decoded.get(index);
+            ContainerCodecCall source = decodedLeaves.get(index);
             target.wireEvidence = reconciled.get(index);
             target.evidenceSource = "marshal-full+unmarshal-loop-ordinal-agreement";
             if (target.nativeType == null) {
@@ -251,6 +265,9 @@
                     formatAddress(function.getEntryPoint()) + ":no-natural-loop");
             }
             for (NetworkSchemaNaturalLoop loop : loops) {
+                if (hasContainingNaturalLoop(loop, loops)) {
+                    continue;
+                }
                 List<ContainerCodecCall> candidate = unmarshalContainerLoopCodecs(
                     function,
                     high,
@@ -269,6 +286,11 @@
                         plan);
                     continue;
                 }
+                List<ContainerCodecCall> physicalCandidate =
+                    physicalContainerCodecLeaves(candidate);
+                int physicalCount = physicalCandidate == null
+                    ? -1
+                    : physicalCandidate.size();
                 boolean rootMarshalAgreement = depth == 0 &&
                     fullContainerLoopMatchesMarshalPlan(plan, candidate, expectedCount);
                 String storageProof = unmarshalContainerStorageProof(
@@ -283,11 +305,12 @@
                     plan.unmarshalDiagnostics.add(
                         unmarshalLoopDiagnosticPrefix(function, loop) +
                         ":codec-count=" + candidate.size() +
+                        ":physical-codec-count=" + physicalCount +
                         ":expected-count=" + expectedCount +
                         ":storage-proof-unresolved");
                     continue;
                 }
-                if (candidate.size() == expectedCount) {
+                if (physicalCount == expectedCount) {
                     if (selectedExact != null) {
                         recordNestedTypeShapeReject("ambiguous-full-container-unmarshal-loop");
                         return null;
@@ -435,6 +458,9 @@
         FullContainerPlan plan,
         boolean rootMarshalAgreement) {
 
+        if (rootMarshalAgreement) {
+            return "vtable-unmarshal-full+marshal-loop-physical-agreement";
+        }
         ContainerLoopInduction induction = containerLoopInduction(loop);
         if (plan.storageKind == ContainerStorageKind.VECTOR) {
             return induction != null &&
@@ -445,9 +471,6 @@
         }
         if (induction != null && induction.storageKind() != ContainerStorageKind.INDEX_MAP) {
             return null;
-        }
-        if (rootMarshalAgreement) {
-            return "vtable-unmarshal-full+marshal-loop-physical-agreement";
         }
         List<PcodeCodecCall> codecs = loopReadBufferCodecCalls(
             function,
@@ -477,18 +500,24 @@
         if (plan == null || decoded == null || expectedCount <= 0) {
             return false;
         }
-        List<ContainerCodecCall> keyLeaves = physicalContainerCodecLeaves(plan.keyCodecs);
-        List<ContainerCodecCall> valueLeaves = physicalContainerCodecLeaves(plan.valueCodecs);
-        List<ContainerCodecCall> decodedLeaves = physicalContainerCodecLeaves(decoded);
-        if (keyLeaves == null || valueLeaves == null || decodedLeaves == null ||
-            keyLeaves.size() + valueLeaves.size() != expectedCount ||
-            decodedLeaves.size() != expectedCount) {
+        ArrayList<ContainerCodecCall> encoded = new ArrayList<>(
+            plan.keyCodecs.size() + plan.valueCodecs.size());
+        encoded.addAll(plan.keyCodecs);
+        encoded.addAll(plan.valueCodecs);
+        if (encoded.isEmpty()) {
             return false;
         }
-        ArrayList<ContainerCodecCall> encoded = new ArrayList<>(expectedCount);
-        encoded.addAll(keyLeaves);
-        encoded.addAll(valueLeaves);
-        return samePhysicalContainerCodecSequence(encoded, decodedLeaves);
+        if (samePhysicalContainerCodecSequence(encoded, decoded)) {
+            return true;
+        }
+        boolean ordinalAgreement = sameProvenOrdinalContainerCodecSequence(
+            encoded,
+            decoded,
+            expectedCount);
+        if (ordinalAgreement) {
+            runMetrics.increment("rootContainerOrdinalPhysicalProofs");
+        }
+        return ordinalAgreement;
     }
 
     private String fullContainerInsertionOutput(
@@ -509,45 +538,35 @@
                     operation))) {
                 continue;
             }
-            String candidate = uniqueFormalParameterExcept(
-                owner,
-                operation,
-                readBufferParameter);
+            String candidate = containerInsertionOutputParameter(owner, operation);
             if (candidate == null) {
                 continue;
             }
+            if (candidate.equals(readBufferParameter)) {
+                continue;
+            }
             if (selectedOwner != null && !selectedOwner.equals(candidate)) {
+                runMetrics.increment("fullContainerInsertionOwnerConflicts");
                 return null;
             }
             selectedOwner = candidate;
         }
-        return selectedOwner;
-    }
-
-    private String uniqueFormalParameterExcept(
-        Function owner,
-        PcodeOp operation,
-        String excludedParameter) {
-
-        LinkedHashSet<String> parameters = new LinkedHashSet<>();
-        Function target = pcodeCallTarget(operation);
-        int argumentCount = provenCallArgumentCount(operation, target);
-        for (int slot = 1; slot <= argumentCount; slot++) {
-            PcodeStorage storage = provenCallArgumentStorage(
-                owner,
-                operation,
-                target,
-                slot);
-            String parameter = storage != null && storage.base != null &&
-                    storage.base.matches("param_\\d+")
-                ? storage.base
-                : formalParameterBaseFromStorage(owner, storage);
-            if (parameter != null && parameter.matches("param_\\d+") &&
-                !parameter.equals(excludedParameter)) {
-                parameters.add(parameter);
-            }
+        if (selectedOwner == null) {
+            InstructionContainerInsertion instructionInsertion =
+                uniqueInstructionContainerInsertion(
+                    owner,
+                    high,
+                    loop,
+                    codecs,
+                    readBufferParameter);
+            selectedOwner = instructionInsertion == null
+                ? null
+                : instructionInsertion.outputParameter();
         }
-        return parameters.size() == 1 ? parameters.iterator().next() : null;
+        runMetrics.increment(selectedOwner == null
+            ? "fullContainerInsertionOwnerMisses"
+            : "fullContainerInsertionOwnerProofs");
+        return selectedOwner;
     }
 
     private List<ContainerCodecCall> withoutContainerSequenceCodecs(
@@ -570,103 +589,40 @@
 
         ArrayList<ContainerCodecCall> result = new ArrayList<>();
         PcodeStorage readBuffer = new PcodeStorage(readBufferParameter, 0L);
-        for (PcodeOpAST operation : orderedPcodeOps(high)) {
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        for (PcodeOpAST operation : operations) {
             if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
                 continue;
             }
-            Function target = pcodeCallTarget(operation);
-            Integer bufferSlot = provenCallArgumentSlot(
-                function,
-                operation,
-                target,
-                readBuffer);
-            if (target == null || bufferSlot == null) {
+            NetworkSchemaNaturalLoop ownerLoop =
+                NetworkSchemaControlFlow.innermostLoopContaining(high, operation);
+            if (ownerLoop != null && !ownerLoop.equals(loop)) {
                 continue;
             }
-            WireShape rawEvidence = pcodeReadRawWireEvidence(operation, target);
-            if (rawEvidence != null) {
-                RawPcodeWrite raw = pcodeReadRawWrite(operation, target);
-                WireShape evidence = raw == null
-                    ? rawEvidence
-                    : unmarshalLoopRawWireEvidence(
-                        function,
-                        high,
-                        loop,
-                        operation,
-                        raw,
-                        plan);
-                ContainerCodecCall codec =
-                    unmarshalContainerCodec(operation, target, null, evidence);
-                applyUnmarshalContainerCodecOutputStorage(
-                    codec,
-                    high,
-                    operation,
-                    raw == null ? null : raw.storage);
-                applyConstructorFieldTypeIdentity(
-                    codec,
-                    rawConstructorFieldIdentity(
-                        function,
-                        high,
-                        loop,
-                        operation,
-                        raw));
+            ContainerCodecCall codec = unmarshalContainerDirectCodec(
+                function,
+                high,
+                loop,
+                operation,
+                readBuffer,
+                plan);
+            if (codec != null) {
                 result.add(codec);
-                continue;
             }
-            WireShape leaf = validatedUnmarshalLeaf(target, "param_" + bufferSlot);
-            if (leaf != null) {
-                ContainerCodecCall codec = unmarshalContainerCodec(
-                    operation,
-                    target,
-                    unmarshalNativeTypeFromTarget(target),
-                    leaf);
-                applyUnmarshalContainerCodecOutputStorage(
-                    codec,
-                    high,
-                    operation,
-                    provenUnmarshalOutputStorage(operation));
-                result.add(codec);
-                continue;
-            }
-            ContainerCodecMembers nested = collectContainerUnmarshalCodecMembers(
-                target,
-                "param_" + bufferSlot,
-                new LinkedHashSet<>(),
-                0);
-            if (!nested.exact() ||
-                nested.members().isEmpty() && nested.optionalMembers().isEmpty()) {
-                plan.unmarshalDiagnostics.add(
-                    formatAddress(target.getEntryPoint()) + ":" + nested.analysisStatus());
-                plan.unmarshalAnalysisStatus = mergeContainerCodecAnalysisStatus(
-                    plan.unmarshalAnalysisStatus,
-                    "helper:" + nested.analysisStatus());
-                continue;
-            }
-            translateContainerHelperMemberStorage(
-                function,
-                operation,
-                target,
-                nested.members());
-            translateContainerHelperMemberStorage(
-                function,
-                operation,
-                target,
-                nested.optionalMembers());
-            ContainerCodecCall boundary = new ContainerCodecCall();
-            boundary.operation = operation;
-            boundary.callsite = operation.getSeqnum().getTarget();
-            boundary.target = target.getEntryPoint();
-            boundary.targetName = fullFunctionName(target);
-            boundary.evidenceSource = "full-container-unmarshal-loop-helper-boundary";
-            boundary.memberSemantics = !nested.optionalMembers().isEmpty()
-                ? "optional-suffix"
-                : "linear-sequence";
-            boundary.analysisStatus = nested.analysisStatus();
-            boundary.members.addAll(nested.members());
-            boundary.optionalMembers.addAll(nested.optionalMembers());
-            result.add(boundary);
         }
-        applyContainerCodecElementOffsets(loop, result);
+        List<ContainerCodecCall> nested = unmarshalNestedFixedSequenceCodecs(
+            function,
+            high,
+            loop,
+            operations,
+            readBuffer,
+            plan);
+        if (nested == null) {
+            return List.of();
+        }
+        result.addAll(nested);
+        result.sort(Comparator.comparing(codec -> codec.callsite));
+        applyContainerCodecElementOffsets(high, loop, result);
         return List.copyOf(result);
     }
 
@@ -758,12 +714,22 @@
         PcodeOpAST call,
         PcodeStorage output) {
 
-        PcodeStorage resolved = typedAggregateUnmarshalOutputStorage(codec, call);
+        PcodeStorage aggregateOutput = typedAggregateUnmarshalOutputStorage(codec, call);
+        PcodeStorage resolved = isParameterStorage(aggregateOutput)
+            ? aggregateOutput
+            : null;
         if (resolved == null && isParameterStorage(output)) {
             resolved = output;
         }
         if (resolved == null) {
-            resolved = postCallUnmarshalOutputStorage(codec, high, call, output);
+            PcodeStorage localOutput = aggregateOutput == null
+                ? output
+                : aggregateOutput;
+            resolved = postCallUnmarshalOutputStorage(
+                codec,
+                high,
+                call,
+                localOutput);
         }
         if (resolved == null) {
             resolved = normalizedBooleanUnmarshalOutputStorage(
@@ -781,12 +747,7 @@
         PcodeOpAST call,
         PcodeStorage output) {
 
-        Integer width = codec == null || codec.nativeType == null
-            ? null
-            : nativeTypeByteWidth(codec.nativeType);
-        if (width == null && codec != null && codec.wireEvidence != null) {
-            width = wireShapeByteWidth(codec.wireEvidence.layout);
-        }
+        Integer width = containerCodecNativeOutputByteWidth(codec);
         Long outputEnd = output == null || width == null || width <= 0
             ? null
             : addExactOrNull(output.offset, width.longValue());

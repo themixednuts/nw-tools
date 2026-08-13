@@ -109,6 +109,12 @@
             if (argument != null) {
                 candidates.add(argument);
             }
+            // Recover stack provenance when a scalar count is reloaded into R8D/R9D.
+            candidates.addAll(instructionCallArgumentStorageDependencies(
+                caller,
+                call,
+                helper,
+                slot));
             if (slot < call.getNumInputs()) {
                 PcodeStorage direct = pcodeStorageExpression(call.getInput(slot));
                 PcodeStorage loaded = pcodeLoadedStorageExpression(call.getInput(slot));
@@ -546,8 +552,8 @@
             if (!(operation instanceof PcodeOpAST induction) ||
                 induction.getOpcode() != PcodeOp.MULTIEQUAL ||
                 induction.getOutput() == null ||
-                !Objects.equals(inductionInitialConstant(induction), 0L) ||
-                !Objects.equals(affinePointerInductionStride(induction), 1L)) {
+                !Objects.equals(inductionInitialConstant(high, induction, loop), 0L) ||
+                !Objects.equals(affineLoopInductionStep(induction, loop), 1L)) {
                 continue;
             }
             for (PcodeOpAST comparison : orderedPcodeOps(high)) {
@@ -555,16 +561,18 @@
                     comparison.getNumInputs() != 2) {
                     continue;
                 }
-                int counterSlot = affineOffsetFromPhi(
+                PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(comparison);
+                Long leftOffset = affineLoopInductionOffsetAt(
+                    block,
+                    comparison,
                     comparison.getInput(0),
-                    induction.getOutput(),
-                    new LinkedHashSet<>(),
-                    0) != null ? 0 :
-                    affineOffsetFromPhi(
-                        comparison.getInput(1),
-                        induction.getOutput(),
-                        new LinkedHashSet<>(),
-                        0) != null ? 1 : -1;
+                    induction.getOutput());
+                Long rightOffset = affineLoopInductionOffsetAt(
+                    block,
+                    comparison,
+                    comparison.getInput(1),
+                    induction.getOutput());
+                int counterSlot = leftOffset != null ? 0 : rightOffset != null ? 1 : -1;
                 if (counterSlot < 0 || !pcodeNodeReferencesStorage(
                         comparison.getInput(1 - counterSlot),
                         count,
@@ -572,12 +580,7 @@
                         0)) {
                     continue;
                 }
-                Long counterOffset = affineOffsetFromPhi(
-                    comparison.getInput(counterSlot),
-                    induction.getOutput(),
-                    new LinkedHashSet<>(),
-                    0);
-                PcodeBlockBasic block = NetworkSchemaControlFlow.parentBlock(comparison);
+                Long counterOffset = counterSlot == 0 ? leftOffset : rightOffset;
                 PcodeOpAST branch = branchUsingComparison(block, comparison);
                 Boolean trueContinues = branchTrueContinuesLoop(branch, loop);
                 long expectedOffset = block == loop.header() ? 0L : 1L;
@@ -811,8 +814,8 @@
         }
         PcodeOpAST selected = null;
         for (PcodeOpAST induction : affineSequenceInductions(loop)) {
-            Long stride = affinePointerInductionStride(induction);
-            PcodeStorage initial = fixedSequenceInitialStorage(induction);
+            Long stride = affinePointerInductionStride(induction, loop);
+            PcodeStorage initial = fixedSequenceInitialStorage(induction, loop);
             if (stride == null || stride != extent.stride() || initial == null ||
                 !initial.sameLocation(extent.data())) {
                 continue;
@@ -871,8 +874,8 @@
         SequenceExtent extent) {
 
         for (PcodeOpAST induction : affineSequenceInductions(loop)) {
-            Long stride = affinePointerInductionStride(induction);
-            PcodeStorage initial = fixedSequenceInitialStorage(induction);
+            Long stride = affinePointerInductionStride(induction, loop);
+            PcodeStorage initial = fixedSequenceInitialStorage(induction, loop);
             if (stride == null || stride != extent.stride() || initial == null ||
                 !initial.sameLocation(extent.data())) {
                 continue;

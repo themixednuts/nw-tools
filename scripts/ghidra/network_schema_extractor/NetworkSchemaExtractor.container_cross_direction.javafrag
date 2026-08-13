@@ -15,6 +15,32 @@
             physicalContainerCodecLeaves(encodedValueCodecs);
         List<ContainerCodecCall> decodedLeaves =
             physicalContainerCodecLeaves(decoded);
+        List<ContainerCodecCall> encodedKeyLogical =
+            logicalContainerCodecLeaves(encodedKeyCodecs);
+        List<ContainerCodecCall> encodedValueLogical =
+            logicalContainerCodecLeaves(encodedValueCodecs);
+        List<ContainerCodecCall> decodedLogical =
+            logicalContainerCodecLeaves(decoded);
+        ArrayList<ContainerCodecCall> encodedLogical = new ArrayList<>();
+        if (encodedKeyLogical != null && encodedValueLogical != null) {
+            encodedLogical.addAll(encodedKeyLogical);
+            encodedLogical.addAll(encodedValueLogical);
+        }
+        if (!encodedLogical.isEmpty() && decodedLogical != null &&
+            trustedInterproceduralSemanticContainerSequence(decodedLogical) &&
+            sameLogicalContainerCodecSequence(encodedLogical, decodedLogical)) {
+            boolean completeSemantics = true;
+            for (int index = 0; index < encodedLogical.size(); index++) {
+                completeSemantics &= applyUnmarshalCodecSemantics(
+                    encodedLogical.get(index),
+                    decodedLogical.get(index));
+            }
+            if (completeSemantics) {
+                runMetrics.increment(
+                    "trustedInterproceduralContainerSemanticAgreements");
+                return ContainerCodecAgreement.SEMANTIC;
+            }
+        }
         if (encodedKeyLeaves == null || encodedValueLeaves == null ||
             decodedLeaves == null) {
             return ContainerCodecAgreement.NONE;
@@ -28,17 +54,11 @@
             return ContainerCodecAgreement.NONE;
         }
 
-        List<ContainerCodecCall> encodedKeyLogical =
-            logicalContainerCodecLeaves(encodedKeyCodecs);
-        List<ContainerCodecCall> encodedValueLogical =
-            logicalContainerCodecLeaves(encodedValueCodecs);
-        List<ContainerCodecCall> decodedLogical =
-            logicalContainerCodecLeaves(decoded);
         if (encodedKeyLogical == null || encodedValueLogical == null ||
             decodedLogical == null) {
             return ContainerCodecAgreement.PHYSICAL;
         }
-        ArrayList<ContainerCodecCall> encodedLogical = new ArrayList<>(
+        encodedLogical = new ArrayList<>(
             encodedKeyLogical.size() + encodedValueLogical.size());
         encodedLogical.addAll(encodedKeyLogical);
         encodedLogical.addAll(encodedValueLogical);
@@ -55,6 +75,25 @@
         return completeSemantics
             ? ContainerCodecAgreement.SEMANTIC
             : ContainerCodecAgreement.PHYSICAL;
+    }
+
+    private boolean trustedInterproceduralSemanticContainerSequence(
+        List<ContainerCodecCall> codecs) {
+
+        if (codecs == null || codecs.isEmpty()) {
+            return false;
+        }
+        boolean interprocedural = false;
+        for (ContainerCodecCall codec : codecs) {
+            if (codec == null || codec.wireEvidence == null ||
+                !codec.wireEvidence.hasProvenSemantics()) {
+                return false;
+            }
+            String source = codec.wireEvidence.source;
+            interprocedural |= source != null &&
+                source.startsWith("cfg-interprocedural-counted-sequence");
+        }
+        return interprocedural;
     }
 
     private boolean samePhysicalContainerCodecSequence(
@@ -78,10 +117,78 @@
         return true;
     }
 
+    private boolean sameProvenOrdinalContainerCodecSequence(
+        List<ContainerCodecCall> encoded,
+        List<ContainerCodecCall> decoded,
+        int expectedCount) {
+
+        List<ContainerCodecCall> encodedLeaves = physicalContainerCodecLeaves(encoded);
+        List<ContainerCodecCall> decodedLeaves = physicalContainerCodecLeaves(decoded);
+        if (encodedLeaves == null || decodedLeaves == null || expectedCount <= 0 ||
+            encodedLeaves.size() != expectedCount || decodedLeaves.size() != expectedCount) {
+            return false;
+        }
+        for (int index = 0; index < expectedCount; index++) {
+            Set<String> encodedLayouts = provenOrdinalContainerPhysicalLayouts(
+                encodedLeaves.get(index));
+            Set<String> decodedLayouts = provenOrdinalContainerPhysicalLayouts(
+                decodedLeaves.get(index));
+            boolean matched = encodedLayouts.stream().anyMatch(encodedLayout ->
+                decodedLayouts.stream().anyMatch(decodedLayout ->
+                    containerPhysicalLayoutsMatch(encodedLayout, decodedLayout)));
+            if (!matched) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Set<String> provenOrdinalContainerPhysicalLayouts(ContainerCodecCall codec) {
+        if (codec == null) {
+            return Set.of();
+        }
+        LinkedHashSet<String> layouts = new LinkedHashSet<>();
+        List<String> observed = containerPhysicalLayouts(codec);
+        if (observed != null && observed.size() == 1) {
+            layouts.add(observed.get(0));
+        }
+
+        LinkedHashSet<String> nativeTypes = new LinkedHashSet<>();
+        String targetType = marshalFunctionTemplateType(codec.targetName);
+        if (targetType != null) {
+            nativeTypes.add(targetType);
+        }
+        if (codec.nativeType != null) {
+            nativeTypes.add(codec.nativeType);
+        }
+        for (String nativeType : nativeTypes) {
+            WireShape semantic = semanticWireEvidenceForNativeType(nativeType);
+            List<String> semanticLayouts = semantic == null
+                ? null
+                : containerAggregatePhysicalLayouts(semantic.layout);
+            if (semanticLayouts != null && semanticLayouts.size() == 1) {
+                layouts.add(semanticLayouts.get(0));
+            }
+        }
+        List<String> proven = List.copyOf(layouts);
+        for (int left = 0; left < proven.size(); left++) {
+            for (int right = left + 1; right < proven.size(); right++) {
+                if (!containerPhysicalLayoutsMatch(
+                        proven.get(left),
+                        proven.get(right))) {
+                    return Set.of();
+                }
+            }
+        }
+        return Set.copyOf(layouts);
+    }
+
     private ContainerCodecAgreement reconcileConditionalContainerCodecSequence(
         List<ContainerCodecCall> encoded,
         List<ContainerCodecCall> decoded) {
 
+        encoded = transparentConditionalContainerCodecSequence(encoded);
+        decoded = transparentConditionalContainerCodecSequence(decoded);
         if (encoded == null || decoded == null || encoded.isEmpty() ||
             encoded.size() != decoded.size()) {
             return ContainerCodecAgreement.NONE;
@@ -100,6 +207,375 @@
             }
         }
         return agreement;
+    }
+
+    private List<ContainerCodecCall> transparentConditionalContainerCodecSequence(
+        List<ContainerCodecCall> codecs) {
+
+        if (codecs == null) {
+            return null;
+        }
+        ArrayList<ContainerCodecCall> flattened = new ArrayList<>();
+        for (ContainerCodecCall codec : codecs) {
+            if (codec != null && codec.guards.isEmpty() &&
+                codec.optionalMembers.isEmpty() &&
+                "linear-sequence".equals(codec.memberSemantics)) {
+                List<ContainerCodecCall> members =
+                    transparentConditionalContainerCodecSequence(codec.members);
+                if (members == null || members.isEmpty()) {
+                    return null;
+                }
+                flattened.addAll(members);
+                continue;
+            }
+            flattened.add(codec);
+        }
+        return List.copyOf(flattened);
+    }
+
+    private boolean sameConditionalContainerPhysicalPaths(
+        List<ContainerCodecCall> encoded,
+        List<ContainerCodecCall> decoded) {
+
+        Set<String> encodedPaths = conditionalContainerPhysicalPathSet(encoded);
+        Set<String> decodedPaths = conditionalContainerPhysicalPathSet(decoded);
+        return encodedPaths != null && !encodedPaths.isEmpty() &&
+            encodedPaths.equals(decodedPaths);
+    }
+
+    private Set<String> conditionalContainerPhysicalPathSet(
+        List<ContainerCodecCall> codecs) {
+
+        if (codecs == null || codecs.isEmpty()) {
+            return null;
+        }
+        LinkedHashMap<String, ContainerCodecGuard> guards = new LinkedHashMap<>();
+        collectConditionalContainerGuards(codecs, guards);
+        if (guards.size() > 12) {
+            return null;
+        }
+        List<String> guardKeys = List.copyOf(guards.keySet());
+        int assignmentCount = 1 << guardKeys.size();
+        LinkedHashSet<String> paths = new LinkedHashSet<>();
+        for (int assignment = 0; assignment < assignmentCount; assignment++) {
+            checkAnalysisCancelled();
+            List<List<String>> alternatives = conditionalContainerPhysicalPaths(
+                codecs,
+                guardKeys,
+                assignment);
+            if (alternatives == null) {
+                return null;
+            }
+            for (List<String> path : alternatives) {
+                if (!path.isEmpty()) {
+                    paths.add(containerPhysicalPathKey(path));
+                }
+                if (paths.size() > 512) {
+                    return null;
+                }
+            }
+        }
+        return Set.copyOf(paths);
+    }
+
+    private void collectConditionalContainerGuards(
+        List<ContainerCodecCall> codecs,
+        Map<String, ContainerCodecGuard> guards) {
+
+        for (ContainerCodecCall codec : codecs) {
+            if (codec == null) {
+                continue;
+            }
+            for (ContainerCodecGuard guard : codec.guards) {
+                String key = conditionalContainerGuardKey(guard);
+                if (key != null) {
+                    guards.putIfAbsent(key, guard);
+                }
+            }
+            collectConditionalContainerGuards(codec.members, guards);
+            collectConditionalContainerGuards(codec.optionalMembers, guards);
+        }
+    }
+
+    private String conditionalContainerGuardKey(ContainerCodecGuard guard) {
+        if (guard == null || guard.kind() == null) {
+            return null;
+        }
+        if (guard.storageAddress() != null) {
+            return "address:" + guard.storageAddress();
+        }
+        if ("stack".equals(guard.storageBase()) || guard.storageBase() == null) {
+            return null;
+        }
+        return "storage:" + guard.storageBase() + ":" + guard.storageOffset() +
+            ":" + guard.mask();
+    }
+
+    private List<List<String>> conditionalContainerPhysicalPaths(
+        List<ContainerCodecCall> codecs,
+        List<String> guardKeys,
+        int assignment) {
+
+        ArrayList<List<String>> paths = new ArrayList<>();
+        paths.add(List.of());
+        for (ContainerCodecCall codec : codecs) {
+            List<List<String>> memberPaths = conditionalContainerPhysicalPaths(
+                codec,
+                guardKeys,
+                assignment);
+            if (memberPaths == null) {
+                return null;
+            }
+            paths = concatenateContainerPhysicalPaths(paths, memberPaths);
+            if (paths == null) {
+                return null;
+            }
+        }
+        return List.copyOf(paths);
+    }
+
+    private List<List<String>> conditionalContainerPhysicalPaths(
+        ContainerCodecCall codec,
+        List<String> guardKeys,
+        int assignment) {
+
+        if (codec == null) {
+            return null;
+        }
+        for (ContainerCodecGuard guard : codec.guards) {
+            String key = conditionalContainerGuardKey(guard);
+            if (key == null) {
+                continue;
+            }
+            int index = guardKeys.indexOf(key);
+            if (index < 0) {
+                return null;
+            }
+            boolean storageNonzero = (assignment & (1 << index)) != 0;
+            boolean branchTrue = "equal-zero".equals(guard.condition())
+                ? !storageNonzero
+                : storageNonzero;
+            if (branchTrue != guard.memberOnTrue()) {
+                return List.of(List.of());
+            }
+        }
+        if (!codec.members.isEmpty()) {
+            List<List<String>> required = conditionalContainerPhysicalPaths(
+                codec.members,
+                guardKeys,
+                assignment);
+            if (required == null) {
+                return null;
+            }
+            if (!"optional-suffix".equals(codec.memberSemantics)) {
+                return codec.optionalMembers.isEmpty()
+                    ? required
+                    : null;
+            }
+            List<List<String>> optional = conditionalContainerPhysicalPaths(
+                codec.optionalMembers,
+                guardKeys,
+                assignment);
+            return optional == null
+                ? null
+                : concatenateContainerPhysicalPaths(required, optional);
+        }
+        if (!codec.optionalMembers.isEmpty()) {
+            return null;
+        }
+        String product = codec.wireEvidence == null
+            ? null
+            : firstNonEmpty(codec.wireEvidence.layout, codec.wireEvidence.shape);
+        return containerWirePhysicalAlternatives(product);
+    }
+
+    private ArrayList<List<String>> concatenateContainerPhysicalPaths(
+        List<List<String>> prefixes,
+        List<List<String>> suffixes) {
+
+        if (prefixes == null || suffixes == null ||
+            (long) prefixes.size() * suffixes.size() > 512L) {
+            return null;
+        }
+        ArrayList<List<String>> combined = new ArrayList<>(
+            prefixes.size() * suffixes.size());
+        for (List<String> prefix : prefixes) {
+            for (List<String> suffix : suffixes) {
+                ArrayList<String> path = new ArrayList<>(prefix.size() + suffix.size());
+                path.addAll(prefix);
+                path.addAll(suffix);
+                combined.add(List.copyOf(path));
+            }
+        }
+        return combined;
+    }
+
+    private List<List<String>> containerWirePhysicalAlternatives(String product) {
+        if (product == null) {
+            return null;
+        }
+        List<String> composite = compositeMemberWireShapes(product);
+        if (composite != null) {
+            ArrayList<List<String>> result = new ArrayList<>();
+            result.add(List.of());
+            for (String member : composite) {
+                List<List<String>> alternatives = containerWirePhysicalAlternatives(member);
+                if (alternatives == null) {
+                    return null;
+                }
+                result = concatenateContainerPhysicalPaths(result, alternatives);
+                if (result == null) {
+                    return null;
+                }
+            }
+            return List.copyOf(result);
+        }
+        String container = wireCodecContainerName(product);
+        List<String> arguments = container == null
+            ? List.of()
+            : wireCodecContainerArguments(product);
+        if ("boolean-choice".equals(container) && arguments.size() == 2) {
+            ArrayList<List<String>> result = new ArrayList<>();
+            for (String branch : arguments) {
+                List<List<String>> alternatives = containerWirePhysicalAlternatives(branch);
+                if (alternatives == null) {
+                    return null;
+                }
+                for (List<String> alternative : alternatives) {
+                    ArrayList<String> path = new ArrayList<>(alternative.size() + 1);
+                    path.add("bool");
+                    path.addAll(alternative);
+                    result.add(List.copyOf(path));
+                }
+            }
+            return List.copyOf(result);
+        }
+        if ("bit-mask-composite".equals(container) && arguments.size() >= 2) {
+            List<List<String>> paths = containerWirePhysicalAlternatives(arguments.get(0));
+            if (paths == null) {
+                return null;
+            }
+            for (int index = 1; index < arguments.size(); index++) {
+                String member = arguments.get(index);
+                String memberContainer = wireCodecContainerName(member);
+                List<String> memberArguments = memberContainer == null
+                    ? List.of()
+                    : wireCodecContainerArguments(member);
+                if ("required".equals(memberContainer) && memberArguments.size() == 1) {
+                    paths = concatenateContainerPhysicalPaths(
+                        paths,
+                        containerWirePhysicalAlternatives(memberArguments.get(0)));
+                }
+                else if ("masked".equals(memberContainer) && memberArguments.size() == 2) {
+                    List<List<String>> present =
+                        containerWirePhysicalAlternatives(memberArguments.get(1));
+                    if (present == null) {
+                        return null;
+                    }
+                    ArrayList<List<String>> optional = new ArrayList<>(present.size() + 1);
+                    optional.add(List.of());
+                    optional.addAll(present);
+                    paths = concatenateContainerPhysicalPaths(paths, optional);
+                }
+                else {
+                    return null;
+                }
+                if (paths == null) {
+                    return null;
+                }
+            }
+            return paths;
+        }
+        if ("required".equals(container) && arguments.size() == 1) {
+            return containerWirePhysicalAlternatives(arguments.get(0));
+        }
+        if ("optional".equals(container) && arguments.size() == 1) {
+            List<List<String>> present =
+                containerWirePhysicalAlternatives(arguments.get(0));
+            if (present == null) {
+                return null;
+            }
+            ArrayList<List<String>> result = new ArrayList<>(present.size() + 1);
+            result.add(List.of("u8"));
+            for (List<String> member : present) {
+                ArrayList<String> path = new ArrayList<>(member.size() + 1);
+                path.add("u8");
+                path.addAll(member);
+                result.add(List.copyOf(path));
+            }
+            return List.copyOf(result);
+        }
+        if ("default-omitted".equals(container) &&
+            arguments.size() >= 2 && arguments.size() <= 12) {
+            ArrayList<List<List<String>>> members = new ArrayList<>();
+            for (String argument : arguments) {
+                List<List<String>> alternatives =
+                    containerWirePhysicalAlternatives(argument);
+                if (alternatives == null) {
+                    return null;
+                }
+                members.add(alternatives);
+            }
+            ArrayList<List<String>> result = new ArrayList<>();
+            int assignmentCount = 1 << arguments.size();
+            for (int assignment = 0; assignment < assignmentCount; assignment++) {
+                ArrayList<List<String>> paths = new ArrayList<>();
+                paths.add(new ArrayList<>(Collections.nCopies(arguments.size(), "bool")));
+                for (int index = 0; index < members.size(); index++) {
+                    if ((assignment & (1 << index)) == 0) {
+                        continue;
+                    }
+                    paths = concatenateContainerPhysicalPaths(paths, members.get(index));
+                    if (paths == null) {
+                        return null;
+                    }
+                }
+                result.addAll(paths);
+                if (result.size() > 512) {
+                    return null;
+                }
+            }
+            return List.copyOf(result);
+        }
+        if (("vec".equals(container) || "set".equals(container)) &&
+            arguments.size() == 1) {
+            List<List<String>> elements =
+                containerWirePhysicalAlternatives(arguments.get(0));
+            String elementKey = containerPhysicalAlternativesKey(elements);
+            return elementKey == null
+                ? null
+                : List.of(List.of(container + "<" + elementKey + ">"));
+        }
+        if ("map".equals(container) && arguments.size() == 2) {
+            String key = containerPhysicalAlternativesKey(
+                containerWirePhysicalAlternatives(arguments.get(0)));
+            String value = containerPhysicalAlternativesKey(
+                containerWirePhysicalAlternatives(arguments.get(1)));
+            return key == null || value == null
+                ? null
+                : List.of(List.of("map<" + key + "," + value + ">"));
+        }
+        List<String> aggregate = containerAggregatePhysicalLayouts(product);
+        return aggregate == null ? null : List.of(aggregate);
+    }
+
+    private String containerPhysicalAlternativesKey(List<List<String>> alternatives) {
+        if (alternatives == null || alternatives.isEmpty()) {
+            return null;
+        }
+        return alternatives.stream()
+            .map(this::containerPhysicalPathKey)
+            .sorted()
+            .collect(Collectors.joining("/"));
+    }
+
+    private String containerPhysicalPathKey(List<String> path) {
+        return path.stream()
+            .map(layout -> {
+                Integer width = wireShapeByteWidth(layout);
+                return width == null ? layout : "fixed-bytes-" + width;
+            })
+            .collect(Collectors.joining("|"));
     }
 
     private ContainerCodecAgreement reconcileConditionalContainerCodec(

@@ -97,6 +97,15 @@
         if (declared == null) {
             return null;
         }
+        if ("quat-smallest-three".equals(declared.shape()) &&
+            hasSmallestThreeCoreCall(
+                function,
+                NetworkSchemaCodecClassifier.CodecDirection.ENCODE) &&
+            hasVirtualBufferCall(function, writeBufferParameter, 0x40L)) {
+            return WireShape.semantic(
+                "quat-smallest-three",
+                "marshal-codec-specialization+smallest-three-core+write-flow");
+        }
         if ("string".equals(declared.shape()) &&
             hasStructuralCodecCall(
                 function,
@@ -125,6 +134,12 @@
             return WireShape.semantic(
                 "entity-ref",
                 "marshal-pcode-conditional-entity-reference");
+        }
+        if ("quat-comp-norm".equals(declared.shape()) &&
+            hasVirtualBufferCall(function, writeBufferParameter, 0x40L)) {
+            return WireShape.semantic(
+                "quat-comp-norm",
+                "marshal-codec-specialization+variable-width-write-flow");
         }
 
         Integer expectedWidth = wireShapeByteWidth(declared.shape());
@@ -210,7 +225,11 @@
             function,
             readBufferParameter,
             NetworkSchemaCodecClassifier.CodecDirection.DECODE);
-        if (fixedSequence != null && fixedSequence.wireEvidence != null) {
+        if (fixedSequence != null && fixedSequence.wireEvidence != null &&
+            fixedSequenceCoversAllReadBufferConsumption(
+                function,
+                readBufferParameter,
+                fixedSequence)) {
             return fixedSequence.wireEvidence;
         }
 
@@ -261,6 +280,16 @@
         if (declared == null) {
             return null;
         }
+        if ("quat-smallest-three".equals(declared.shape()) &&
+            (isDirectSmallestThreeUnmarshalCore(function, readBufferParameter) ||
+             hasExclusiveSmallestThreeReadBufferCall(
+                 function,
+                 readBufferParameter)) &&
+            hasReadBufferFlow(function, readBufferParameter, new LinkedHashSet<>())) {
+            return WireShape.semantic(
+                "quat-smallest-three",
+                "unmarshal-codec-specialization+exclusive-smallest-three-read-flow");
+        }
         if ("sequence-number".equals(declared.shape()) &&
             hasStructuralCodecCall(
                 function,
@@ -279,6 +308,12 @@
             return WireShape.semantic(
                 "entity-ref",
                 "unmarshal-pcode-conditional-entity-reference");
+        }
+        if ("quat-comp-norm".equals(declared.shape()) &&
+            hasReadBufferFlow(function, readBufferParameter, new LinkedHashSet<>())) {
+            return WireShape.semantic(
+                "quat-comp-norm",
+                "unmarshal-codec-specialization+variable-width-read-flow");
         }
         Integer expectedWidth = wireShapeByteWidth(declared.shape());
         return expectedWidth != null &&
@@ -312,53 +347,15 @@
                 "quat-smallest-three",
                 "marshal-pcode-quaternion-smallest-three");
         }
-        return null;
-    }
-
-    private WireShape structuralSmallestThreeUnmarshalLeaf(
-        Function function,
-        String readBufferParameter) {
-
-        HighFunction high = highFunction(function);
-        if (high == null ||
-            !hasSmallestThreeCoreCall(
-                function,
-                NetworkSchemaCodecClassifier.CodecDirection.DECODE) ||
-            !hasReadBufferFlow(function, readBufferParameter, new LinkedHashSet<>())) {
-            return null;
-        }
-        if (NetworkSchemaCodecClassifier.isProjectedVec3SmallestThreeDecodeWrapper(high)) {
-            return WireShape.semantic(
-                "vec3-smallest-three",
-                "unmarshal-pcode-projected-smallest-three");
-        }
-        if (NetworkSchemaCodecClassifier.isQuaternionSmallestThreeDecodeWrapper(high)) {
-            return WireShape.semantic(
-                "quat-smallest-three",
-                "unmarshal-pcode-quaternion-smallest-three");
-        }
-        return null;
-    }
-
-    private boolean hasSmallestThreeCoreCall(
-        Function function,
-        NetworkSchemaCodecClassifier.CodecDirection direction) {
-
-        HighFunction high = highFunction(function);
-        if (high == null) {
-            return false;
-        }
-        for (PcodeOpAST operation : orderedPcodeOps(high)) {
-            if (operation.getOpcode() != PcodeOp.CALL) {
-                continue;
-            }
-            Function target = pcodeCallTarget(operation);
-            if (NetworkSchemaCodecClassifier.smallestThreeCoreDirection(highFunction(target)) ==
-                direction) {
-                return true;
-            }
-        }
-        return false;
+        // The native quaternion wrapper can pass the source pointer directly
+        // to the already-proven smallest-three core, leaving no component
+        // LOADs in the wrapper SSA. Once the core and raw-write receiver are
+        // proven, exclusion of the vec3 projection is sufficient to identify
+        // the quaternion form.
+        runMetrics.increment("directQuaternionSmallestThreeWrappers");
+        return WireShape.semantic(
+            "quat-smallest-three",
+            "marshal-pcode-direct-quaternion-smallest-three-core");
     }
 
     private boolean isEntityRefCodec(
@@ -652,20 +649,31 @@
             if (operation.getOpcode() != PcodeOp.CALLIND || operation.getNumInputs() == 0) {
                 continue;
             }
+            PcodeStorage expected = new PcodeStorage(bufferParameter, 0L);
+            if (instructionVirtualDispatchOnReceiver(
+                    function,
+                    operation,
+                    expected,
+                    (int)slotOffset)) {
+                runMetrics.increment("instructionVirtualBufferDispatchProofs");
+                return true;
+            }
             PcodeVirtualDispatch target = pcodeVirtualDispatch(operation.getInput(0));
             if (target == null || target.objectOffset() != 0L ||
                 target.slotOffset() != slotOffset) {
                 continue;
             }
             boolean pcodeReceiver = target.root().isStorage(bufferParameter);
-            Integer abiSlot = instructionAbiCallArgumentSlot(
+            ForwardArgState state = instructionStateBeforeCall(
                 function,
                 operation,
-                null,
-                new PcodeStorage(bufferParameter, 0L));
-            boolean abiReceiver = Integer.valueOf(1).equals(abiSlot);
+                null);
+            PcodeStorage abiStorage = state == null
+                ? null
+                : pcodeStorageFromTrackedValue(win64CallArgumentValue(state, 1));
+            boolean abiReceiver = expected.sameLocation(abiStorage);
             if ((pcodeReceiver || abiReceiver) &&
-                (!pcodeReceiver || abiSlot == null || abiReceiver)) {
+                (!pcodeReceiver || abiStorage == null || abiReceiver)) {
                 return true;
             }
         }
@@ -937,61 +945,4 @@
         }
         PcodeStorage loaded = pcodeLoadedStorageExpression(value);
         return expected.sameLocation(loaded);
-    }
-
-    private boolean pcodeValueFeedsConditionalBranch(Varnode value) {
-        ArrayDeque<Varnode> pending = new ArrayDeque<>();
-        LinkedHashSet<String> seen = new LinkedHashSet<>();
-        pending.add(value);
-        while (!pending.isEmpty() && seen.size() < PCODE_ALIAS_DESCENDANT_LIMIT) {
-            Varnode current = pending.removeFirst();
-            if (!seen.add(pcodeSsaNodeKey(current))) {
-                continue;
-            }
-            Iterator<PcodeOp> descendants = current.getDescendants();
-            while (descendants.hasNext()) {
-                PcodeOp descendant = descendants.next();
-                if (descendant.getOpcode() == PcodeOp.CBRANCH) {
-                    return true;
-                }
-                if (descendant.getOutput() != null &&
-                    switch (descendant.getOpcode()) {
-                        case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.BOOL_NEGATE,
-                            PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL -> true;
-                        default -> false;
-                    }) {
-                    pending.addLast(descendant.getOutput());
-                }
-            }
-        }
-        return false;
-    }
-
-    private Map<String, Set<Integer>> directCursorReadWidths(
-        HighFunction high,
-        List<PcodeOpAST> operations) {
-
-        LinkedHashMap<String, Set<Integer>> result = new LinkedHashMap<>();
-        int parameterCount = win64RegisterParameterCandidateCount(high);
-        for (int slot = 1; slot <= parameterCount; slot++) {
-            String parameter = "param_" + slot;
-            LinkedHashSet<Integer> widths = new LinkedHashSet<>();
-            for (PcodeOpAST operation : operations) {
-                CodecWireEvent event = directCursorReadEvent(
-                    high,
-                    operation,
-                    operations,
-                    parameter);
-                Integer width = event == null
-                    ? null
-                    : wireShapeByteWidth(event.wireEvidence().layout);
-                if (width != null) {
-                    widths.add(width);
-                }
-            }
-            if (!widths.isEmpty()) {
-                result.put(parameter, Set.copyOf(widths));
-            }
-        }
-        return Map.copyOf(result);
     }

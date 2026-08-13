@@ -1,0 +1,57 @@
+    private boolean fixedSequenceCoversAllReadBufferConsumption(
+        Function function,
+        String readBufferParameter,
+        FixedSequenceShape shape) {
+
+        HighFunction high = highFunction(function);
+        if (high == null || readBufferParameter == null || shape == null ||
+            shape.loopHeader == null) {
+            return false;
+        }
+        NetworkSchemaNaturalLoop sequenceLoop = null;
+        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+            if (!shape.loopHeader.equals(loop.header().getStart())) {
+                continue;
+            }
+            if (sequenceLoop != null) {
+                return false;
+            }
+            sequenceLoop = loop;
+        }
+        if (sequenceLoop == null) {
+            return false;
+        }
+
+        List<PcodeOpAST> operations = orderedPcodeOps(high);
+        PcodeStorage readBuffer = new PcodeStorage(readBufferParameter, 0L);
+        for (PcodeOpAST operation : operations) {
+            CodecWireEvent direct = directCursorReadEvent(
+                high,
+                operation,
+                operations,
+                readBufferParameter);
+            if (direct != null && !sequenceLoop.contains(operation)) {
+                runMetrics.increment("fixedSequenceLeafCoverageRejects");
+                return false;
+            }
+            if (operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Integer bufferSlot = provenCallArgumentSlot(
+                function,
+                operation,
+                target,
+                readBuffer);
+            if (bufferSlot == null || shape.countCallsite != null &&
+                shape.countCallsite.equals(operation.getSeqnum().getTarget())) {
+                continue;
+            }
+            if (!sequenceLoop.contains(operation)) {
+                runMetrics.increment("fixedSequenceLeafCoverageRejects");
+                return false;
+            }
+        }
+        runMetrics.increment("fixedSequenceLeafCoverageProofs");
+        return true;
+    }

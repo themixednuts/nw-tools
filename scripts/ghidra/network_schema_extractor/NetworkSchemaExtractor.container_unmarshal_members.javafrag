@@ -89,8 +89,9 @@
                 if (sequence != null) {
                     if (sequence.emit()) {
                         ContainerCodecCall boundary = unmarshalSequenceBoundary(
+                            high,
                             operation,
-                            sequence.events());
+                            sequence);
                         discovered.add(boundary);
                         allMembersMapped &= addContainerCodecMembersForOperation(
                             membersByBlock,
@@ -213,7 +214,9 @@
                     boundary.evidenceSource = "container-helper-unmarshal-boundary";
                     boundary.memberSemantics = !nested.optionalMembers().isEmpty()
                         ? "optional-suffix"
-                        : "linear-sequence";
+                        : nested.linear()
+                            ? "linear-sequence"
+                            : "cfg-reachable";
                     boundary.analysisStatus = nested.analysisStatus();
                     boundary.members.addAll(nested.members());
                     boundary.optionalMembers.addAll(nested.optionalMembers());
@@ -276,15 +279,27 @@
             if (!exact) {
                 ContainerCodecMembers traced = exactContainerUnmarshalSuccessTrace(
                     function,
-                    readBuffer);
+                    readBuffer,
+                    high,
+                    discovered);
                 if (traced != null) {
                     return traced;
                 }
             }
+            applyContainerCodecGuards(high, discovered);
+            boolean guardedExact = !exact && exactGuardedContainerUnmarshalProduct(
+                flow,
+                terminalFlow,
+                discovered,
+                nestedExact,
+                allMembersMapped);
+            exact |= guardedExact;
             String analysisStatus = linear
                 ? "complete"
                 : optionalExact
                     ? "optional-suffix"
+                    : guardedExact
+                        ? "complete-guarded-cfg"
                     : optional != null
                         ? "optional-analysis:" + flowSequenceStatus(optional.status()) +
                             ":paths=" + optional.distinctSequenceCount() +
@@ -302,7 +317,6 @@
                 analysisStatus += ":failure-edges=" +
                     pcodeEdgeOffsets(unsuccessfulCodecEdges);
             }
-            applyContainerCodecGuards(high, discovered);
             return new ContainerCodecMembers(
                 linear
                     ? flow.events()
@@ -317,24 +331,6 @@
         finally {
             active.remove(context);
         }
-    }
-
-    private ContainerCodecCall unmarshalSequenceBoundary(
-        PcodeOpAST operation,
-        List<CodecWireEvent> events) {
-
-        ContainerCodecCall boundary = new ContainerCodecCall();
-        boundary.operation = operation;
-        boundary.callsite = operation.getSeqnum().getTarget();
-        boundary.evidenceSource = "container-helper-unmarshal-sequence";
-        boundary.memberSemantics = "linear-sequence";
-        boundary.analysisStatus = "complete";
-        for (CodecWireEvent event : events) {
-            boundary.members.add(containerCodecFromWireEvent(
-                event,
-                "container-helper-unmarshal-sequence-member"));
-        }
-        return boundary;
     }
 
     private ContainerCodecCall containerCodecFromWireEvent(
@@ -578,8 +574,12 @@
         if (firstClearsOk != secondClearsOk) {
             return firstClearsOk ? second : first;
         }
-        boolean firstSuccess = successfulTerminals.contains(first) && !firstClearsOk;
-        boolean secondSuccess = successfulTerminals.contains(second) && !secondClearsOk;
+        boolean firstSuccess = reachesSuccessfulCodecTerminal(
+            first,
+            successfulTerminals) && !firstClearsOk;
+        boolean secondSuccess = reachesSuccessfulCodecTerminal(
+            second,
+            successfulTerminals) && !secondClearsOk;
         if (firstSuccess != secondSuccess) {
             return firstSuccess ? first : second;
         }

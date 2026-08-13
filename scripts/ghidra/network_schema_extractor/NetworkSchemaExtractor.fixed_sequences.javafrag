@@ -110,8 +110,8 @@
 
         ArrayList<FixedSequenceStorage> candidates = new ArrayList<>();
         for (PcodeOpAST phi : affineSequenceInductions(loop)) {
-            Long stride = affinePointerInductionStride(phi);
-            PcodeStorage anchor = fixedSequenceInitialStorage(phi);
+            Long stride = affinePointerInductionStride(phi, loop);
+            PcodeStorage anchor = fixedSequenceInitialStorage(phi, loop);
             Long baseAdjustment = stride == null
                 ? null
                 : fixedSequenceElementBaseAdjustment(
@@ -129,6 +129,16 @@
             PcodeStorage end = fixedSequenceEndStorage(loop, operations, phi, data);
             if (end == null) {
                 continue;
+            }
+            PcodeStorage boundedData = capacityBoundedInlineSequenceDataStorage(
+                high,
+                loop,
+                operations,
+                data,
+                end,
+                stride);
+            if (boundedData != null) {
+                data = boundedData;
             }
             long span;
             try {
@@ -202,22 +212,20 @@
                 phi.getOpcode() == PcodeOp.MULTIEQUAL &&
                 phi.getOutput() != null &&
                 phi.getOutput().getSize() == currentProgram.getDefaultPointerSize() &&
-                affinePointerInductionStride(phi) != null) {
+                affinePointerInductionStride(phi, loop) != null) {
                 result.add(phi);
             }
         }
         return result;
     }
 
-    private PcodeStorage fixedSequenceInitialStorage(PcodeOpAST phi) {
+    private PcodeStorage fixedSequenceInitialStorage(
+        PcodeOpAST phi,
+        NetworkSchemaNaturalLoop loop) {
         PcodeStorage selected = null;
         for (int slot = 0; slot < phi.getNumInputs(); slot++) {
             Varnode input = phi.getInput(slot);
-            if (affineStepFromPhi(
-                    input,
-                    phi.getOutput(),
-                    new LinkedHashSet<>(),
-                    0) != null) {
+            if (isAffineBackedgeInput(phi, input, loop, slot)) {
                 continue;
             }
             PcodeStorage storage = pcodeStorageExpression(input);
@@ -241,12 +249,24 @@
         Varnode induction) {
 
         for (PcodeOpAST operation : orderedPcodeOps(high)) {
-            if (loop.contains(operation) && operation.getOpcode() == PcodeOp.CBRANCH &&
-                operation.getNumInputs() >= 2 && pcodeNodeDependsOn(
-                    operation.getInput(operation.getNumInputs() - 1),
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CBRANCH ||
+                operation.getNumInputs() < 2) {
+                continue;
+            }
+            Varnode condition = operation.getInput(operation.getNumInputs() - 1);
+            if (pcodeNodeDependsOn(
+                    condition,
+                    induction,
+                    new LinkedHashSet<>(),
+                    0) ||
+                blockPhysicalValueDependsOn(
+                    NetworkSchemaControlFlow.parentBlock(operation),
+                    operation,
+                    condition,
                     induction,
                     new LinkedHashSet<>(),
                     0)) {
+                runMetrics.increment("physicalOrSsaLoopConditionProofs");
                 return true;
             }
         }
@@ -270,10 +290,21 @@
                     condition,
                     induction.getOutput(),
                     new LinkedHashSet<>(),
+                    0) &&
+                !blockPhysicalValueDependsOn(
+                    NetworkSchemaControlFlow.parentBlock(operation),
+                    operation,
+                    condition,
+                    induction.getOutput(),
+                    new LinkedHashSet<>(),
                     0)) {
                 continue;
             }
-            PcodeOp comparison = condition.getDef();
+            PcodeOp comparison = loopConditionComparison(
+                NetworkSchemaControlFlow.parentBlock(operation),
+                operation,
+                condition,
+                induction.getOutput());
             if (comparison == null || comparison.getNumInputs() != 2) {
                 continue;
             }
@@ -281,6 +312,11 @@
             for (int slot = 0; slot < comparison.getNumInputs(); slot++) {
                 Varnode input = comparison.getInput(slot);
                 if (!pcodeNodeDependsOn(
+                        input,
+                        induction.getOutput(),
+                        new LinkedHashSet<>(),
+                        0) &&
+                    !physicalRegisterNodeDependsOn(
                         input,
                         induction.getOutput(),
                         new LinkedHashSet<>(),
@@ -350,7 +386,7 @@
 
         LinkedHashMap<String, WireShape> candidates = new LinkedHashMap<>();
         List<PcodeOpAST> inductions = affineSequenceInductions(loop).stream()
-            .filter(phi -> sequenceElementInduction(phi, storage))
+            .filter(phi -> sequenceElementInduction(phi, loop, storage))
             .toList();
         HashMap<String, String> tempNativeTypes = new HashMap<>();
         HashMap<String, String> tempWireShapes = new HashMap<>();
@@ -458,10 +494,11 @@
 
     private boolean sequenceElementInduction(
         PcodeOpAST phi,
+        NetworkSchemaNaturalLoop loop,
         FixedSequenceStorage storage) {
 
-        Long stride = affinePointerInductionStride(phi);
-        PcodeStorage initial = fixedSequenceInitialStorage(phi);
+        Long stride = affinePointerInductionStride(phi, loop);
+        PcodeStorage initial = fixedSequenceInitialStorage(phi, loop);
         return stride != null && stride == storage.stride() && initial != null &&
             initial.base.equals(storage.data().base) &&
             initial.offset >= storage.data().offset &&
@@ -494,6 +531,10 @@
         for (int slot = 1; slot < operation.getNumInputs(); slot++) {
             Varnode input = operation.getInput(slot);
             for (PcodeOpAST induction : inductions) {
+                if (samePcodeStorageLocation(input, induction.getOutput())) {
+                    runMetrics.increment("physicalRegisterSequenceElementUses");
+                    return true;
+                }
                 Long offset = pcodeConstantOffsetFromRoot(
                     input,
                     induction.getOutput(),

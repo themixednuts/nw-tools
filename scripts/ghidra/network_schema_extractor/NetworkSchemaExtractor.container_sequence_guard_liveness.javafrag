@@ -1,0 +1,165 @@
+    private boolean callReusesGuardedSequenceCount(
+        Function function,
+        HighFunction high,
+        PcodeOpAST accepted,
+        String writeBufferParameter,
+        SequenceCapacityGuard guard) {
+
+        if (function == null || high == null || accepted == null ||
+            accepted.getSeqnum() == null || writeBufferParameter == null ||
+            guard == null || guard.branch() == null ||
+            guard.branch().getSeqnum() == null) {
+            return false;
+        }
+        PcodeBlockBasic guardBlock = NetworkSchemaControlFlow.parentBlock(
+            guard.branch());
+        PcodeBlockBasic acceptedBlock = guard.accepted();
+        PcodeBlockBasic callBlock = NetworkSchemaControlFlow.parentBlock(accepted);
+        if (guardBlock == null || acceptedBlock == null || callBlock == null ||
+            !NetworkSchemaControlFlow.dominates(high, acceptedBlock, callBlock)) {
+            return false;
+        }
+
+        Instruction jump = currentProgram.getListing().getInstructionAt(
+            guard.branch().getSeqnum().getTarget());
+        String countRegister = guardedSequenceCountRegister(
+            function,
+            guardBlock,
+            jump);
+        Integer countSlot = win64RegisterArgumentSlot(countRegister);
+        Function target = pcodeCallTarget(accepted);
+        Integer bufferSlot = provenCallArgumentSlot(
+            function,
+            accepted,
+            target,
+            new PcodeStorage(writeBufferParameter, 0L));
+        if (countSlot == null || bufferSlot == null ||
+            countSlot.equals(bufferSlot)) {
+            return false;
+        }
+
+        Address callsite = accepted.getSeqnum().getTarget();
+        for (PcodeBlockBasic block : high.getBasicBlocks()) {
+            boolean afterAccepted = block == acceptedBlock ||
+                NetworkSchemaControlFlow.reaches(acceptedBlock, block);
+            boolean reachesCall = block == callBlock ||
+                NetworkSchemaControlFlow.reaches(block, callBlock);
+            if (!afterAccepted || !reachesCall) {
+                continue;
+            }
+            for (Instruction instruction : blockInstructions(function, block)) {
+                Address address = instruction.getMinAddress();
+                if (block == callBlock && address.compareTo(callsite) >= 0) {
+                    break;
+                }
+                if (instruction.getFlowType().isCall() ||
+                    countRegister.equals(
+                        NetworkSchemaX86.registerOperand(instruction, 0))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private String guardedSequenceCountRegister(
+        Function function,
+        PcodeBlockBasic guardBlock,
+        Instruction jump) {
+
+        if (function == null || guardBlock == null || jump == null) {
+            return null;
+        }
+        List<Instruction> instructions = blockInstructions(function, guardBlock);
+        int jumpIndex = instructions.indexOf(jump);
+        for (int index = jumpIndex - 1, inspected = 0;
+                index >= 0 && inspected < 8;
+                index--, inspected++) {
+            Instruction instruction = instructions.get(index);
+            if (instruction.getFlowType().isCall() ||
+                instruction.getFlowType().isJump()) {
+                return null;
+            }
+            if (!"CMP".equals(NetworkSchemaX86.upperMnemonic(instruction))) {
+                continue;
+            }
+            String first = NetworkSchemaX86.registerOperand(instruction, 0);
+            String second = NetworkSchemaX86.registerOperand(instruction, 1);
+            Long firstImmediate = NetworkSchemaX86.immediateValue(instruction, 0);
+            Long secondImmediate = NetworkSchemaX86.immediateValue(instruction, 1);
+            if (first != null && secondImmediate != null && second == null) {
+                return first;
+            }
+            if (second != null && firstImmediate != null && first == null) {
+                return second;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    private Integer win64RegisterArgumentSlot(String register) {
+        return switch (Objects.toString(register, "")) {
+            case "RCX" -> 1;
+            case "RDX" -> 2;
+            case "R8" -> 3;
+            case "R9" -> 4;
+            default -> null;
+        };
+    }
+
+    private boolean callHasExplicitZeroValue(PcodeOpAST call) {
+        Function owner = call == null || call.getSeqnum() == null
+            ? null
+            : functionContaining(call.getSeqnum().getTarget());
+        Function target = pcodeCallTarget(call);
+        int argumentCount = provenCallArgumentCount(call, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            Long value = provenCallArgumentImmediate(owner, call, target, slot);
+            if (value != null && value == 0L) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean callReferencesSequenceCount(
+        Function owner,
+        PcodeOpAST call,
+        String writeBufferParameter,
+        PcodeStorage count) {
+
+        LinkedHashMap<String, PcodeStorage> referenced = new LinkedHashMap<>();
+        for (int slot = 1; slot < call.getNumInputs(); slot++) {
+            collectPcodeStorages(
+                call.getInput(slot),
+                referenced,
+                new LinkedHashSet<>(),
+                0);
+        }
+        if (referenced.values().stream().anyMatch(count::sameLocation)) {
+            return true;
+        }
+
+        Function target = pcodeCallTarget(call);
+        Integer bufferSlot = provenCallArgumentSlot(
+            owner,
+            call,
+            target,
+            new PcodeStorage(writeBufferParameter, 0L));
+        if (bufferSlot == null) {
+            return false;
+        }
+        int argumentCount = provenCallArgumentCount(call, target);
+        for (int slot = 1; slot <= argumentCount; slot++) {
+            if (slot == bufferSlot) {
+                continue;
+            }
+            if (instructionCallArgumentStorageDependencies(owner, call, target, slot)
+                .stream()
+                .anyMatch(count::sameLocation)) {
+                return true;
+            }
+        }
+        return false;
+    }

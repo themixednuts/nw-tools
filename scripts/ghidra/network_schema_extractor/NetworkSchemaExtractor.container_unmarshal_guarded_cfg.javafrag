@@ -1,0 +1,247 @@
+    private ContainerCodecCall unmarshalSequenceBoundary(
+        HighFunction high,
+        PcodeOpAST operation,
+        UnmarshalSequenceAction sequence) {
+
+        ContainerCodecCall boundary = new ContainerCodecCall();
+        boundary.operation = operation;
+        boundary.callsite = operation.getSeqnum().getTarget();
+        boundary.evidenceSource = "container-helper-unmarshal-sequence";
+        boundary.analysisStatus = "complete";
+        UnmarshalStaticSequenceStorage storage = sequence.storage();
+        int elementEventCount = sequence.elementEventCount();
+        int iterations = storage == null ? 1 : storage.iterations();
+        if (iterations > 1 && elementEventCount > 0 &&
+            sequence.events().size() == elementEventCount * iterations) {
+            ArrayList<ContainerCodecCall> element = new ArrayList<>(elementEventCount);
+            for (int index = 0; index < elementEventCount; index++) {
+                element.add(containerCodecFromWireEvent(
+                    sequence.events().get(index),
+                    "container-helper-unmarshal-sequence-member",
+                    high));
+            }
+            WireShape elementEvidence = sequenceElementWireEvidence(element);
+            if (elementEvidence != null && elementEvidence.layout != null &&
+                storage.data() != null) {
+                boundary.wireEvidence = fixedArrayWireShape(
+                    elementEvidence,
+                    iterations,
+                    "cfg-counter-controlled-unmarshal-fixed-sequence");
+                boundary.memberSemantics = "fixed-sequence";
+                boundary.elementBase = storage.data().base;
+                boundary.elementOffset = storage.data().offset;
+                for (int iteration = 0; iteration < iterations; iteration++) {
+                    for (int memberIndex = 0;
+                            memberIndex < elementEventCount;
+                            memberIndex++) {
+                        ContainerCodecCall copy = containerCodecFromWireEvent(
+                            sequence.events().get(memberIndex),
+                            "container-helper-unmarshal-sequence-member",
+                            high);
+                        applyStaticSequenceMemberStorage(
+                            copy,
+                            storage,
+                            iteration,
+                            elementEventCount);
+                        boundary.members.add(copy);
+                    }
+                }
+                runMetrics.increment("counterControlledUnmarshalFixedSequences");
+                return boundary;
+            }
+        }
+
+        boundary.memberSemantics = "linear-sequence";
+        for (CodecWireEvent event : sequence.events()) {
+            boundary.members.add(containerCodecFromWireEvent(
+                event,
+                "container-helper-unmarshal-sequence-member",
+                high));
+        }
+        return boundary;
+    }
+
+    private void applyStaticSequenceMemberStorage(
+        ContainerCodecCall member,
+        UnmarshalStaticSequenceStorage storage,
+        int iteration,
+        int elementEventCount) {
+
+        if (member == null || storage == null || storage.data() == null) {
+            return;
+        }
+        long adjustment;
+        try {
+            adjustment = Math.multiplyExact((long)iteration, storage.stride());
+        }
+        catch (ArithmeticException ignored) {
+            return;
+        }
+        Long elementEnd = addExactOrNull(storage.data().offset, storage.stride());
+        if (storage.data().base.equals(member.elementBase) &&
+            elementEnd != null &&
+            member.elementOffset != null &&
+            member.elementOffset >= storage.data().offset &&
+            member.elementOffset < elementEnd) {
+            member.elementOffset = addExactOrNull(member.elementOffset, adjustment);
+            return;
+        }
+        if (elementEventCount == 1) {
+            member.elementBase = storage.data().base;
+            member.elementOffset = addExactOrNull(storage.data().offset, adjustment);
+        }
+    }
+
+    private boolean exactGuardedContainerUnmarshalProduct(
+        NetworkSchemaFlowSequence.Result<ContainerCodecCall> flow,
+        UnmarshalTerminalFlow terminalFlow,
+        List<ContainerCodecCall> codecs,
+        boolean nestedExact,
+        boolean allMembersMapped) {
+
+        if (flow == null || terminalFlow == null || codecs == null || codecs.isEmpty() ||
+            !nestedExact || !allMembersMapped ||
+            flow.status() != NetworkSchemaFlowSequence.Status.DIVERGENT_PATHS ||
+            terminalFlow.mandatoryBlocks().isEmpty()) {
+            return false;
+        }
+
+        boolean foundSemanticGuard = false;
+        for (ContainerCodecCall codec : codecs) {
+            PcodeBlockBasic block = codec == null || codec.operation == null
+                ? null
+                : NetworkSchemaControlFlow.parentBlock(codec.operation);
+            if (block == null) {
+                return false;
+            }
+            if (terminalFlow.mandatoryBlocks().contains(block)) {
+                continue;
+            }
+            if (!hasSemanticContainerCodecGuard(codec, codecs)) {
+                return false;
+            }
+            foundSemanticGuard = true;
+        }
+        if (foundSemanticGuard) {
+            runMetrics.increment("guardedUnmarshalCodecProducts");
+        }
+        return foundSemanticGuard;
+    }
+
+    private boolean exactGuardedContainerMarshalProduct(
+        HighFunction high,
+        NetworkSchemaFlowSequence.Result<ContainerCodecCall> flow,
+        List<ContainerCodecCall> codecs,
+        boolean nestedExact,
+        boolean allMembersMapped) {
+
+        if (high == null || flow == null || codecs == null || codecs.isEmpty() ||
+            !nestedExact || !allMembersMapped ||
+            flow.status() != NetworkSchemaFlowSequence.Status.DIVERGENT_PATHS) {
+            return false;
+        }
+        Set<PcodeBlockBasic> terminals = high.getBasicBlocks().stream()
+            .filter(this::isTerminatingPcodeBlock)
+            .collect(Collectors.toUnmodifiableSet());
+        Set<PcodeBlockBasic> mandatory = mandatoryPhysicalBlocks(
+            high,
+            terminals,
+            Map.of());
+        if (mandatory.isEmpty()) {
+            return false;
+        }
+
+        boolean foundSemanticGuard = false;
+        for (ContainerCodecCall codec : codecs) {
+            PcodeBlockBasic block = codec == null || codec.operation == null
+                ? null
+                : NetworkSchemaControlFlow.parentBlock(codec.operation);
+            if (block == null) {
+                return false;
+            }
+            if (mandatory.contains(block)) {
+                continue;
+            }
+            if (!hasSemanticContainerCodecGuard(codec, codecs)) {
+                return false;
+            }
+            foundSemanticGuard = true;
+        }
+        if (foundSemanticGuard) {
+            runMetrics.increment("guardedMarshalCodecProducts");
+        }
+        return foundSemanticGuard;
+    }
+
+    private boolean hasSemanticContainerCodecGuard(
+        ContainerCodecCall codec,
+        List<ContainerCodecCall> orderedCodecs) {
+
+        if (codec == null) {
+            return false;
+        }
+        for (ContainerCodecGuard guard : codec.guards) {
+            if (guard == null || guard.kind() == null) {
+                continue;
+            }
+            if ("storage-bit-mask".equals(guard.kind()) &&
+                guard.mask() != null && guard.storageBase() != null &&
+                !"stack".equals(guard.storageBase()) &&
+                guard.storageOffset() != null) {
+                return true;
+            }
+            if ("global-boolean".equals(guard.kind()) &&
+                guard.storageAddress() != null &&
+                completeExternalBooleanCondition(guard.externalCondition())) {
+                return true;
+            }
+            if ("boolean-storage".equals(guard.kind()) &&
+                semanticBooleanGuardStorage(codec, guard, orderedCodecs)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean completeExternalBooleanCondition(
+        ContainerExternalBooleanCondition condition) {
+
+        return condition != null && condition.resolverObject() != null &&
+            condition.resolverVtable() != null && condition.resolverSlot() != null &&
+            condition.resolver() != null && condition.conditionStorage() != null &&
+            condition.conditionOffset() != null && condition.owner() != null &&
+            condition.subobjectOffset() != null && condition.destructorThunk() != null &&
+            condition.completeDestructor() != null && condition.initializer() != null &&
+            condition.nameField() != null && condition.nameOffset() != null &&
+            condition.nameBegin() != null && condition.nameEnd() != null &&
+            condition.name() != null && !condition.name().isBlank() &&
+            condition.defaultValue() != null && condition.defaultWrite() != null &&
+            condition.defaultCallsite() != null && condition.defaultTarget() != null &&
+            "static-vtable-dispatch+adjustor-thunk+initializer-writes+resolver-default-flow"
+                .equals(condition.evidenceSource());
+    }
+
+    private boolean semanticBooleanGuardStorage(
+        ContainerCodecCall codec,
+        ContainerCodecGuard guard,
+        List<ContainerCodecCall> orderedCodecs) {
+
+        String base = guard.storageBase();
+        Long offset = guard.storageOffset();
+        if (base == null || "stack".equals(base) || offset == null) {
+            return false;
+        }
+        if (pcodeParameterIndex(base) != null) {
+            return true;
+        }
+        for (ContainerCodecCall candidate : orderedCodecs) {
+            if (candidate == codec) {
+                break;
+            }
+            if (candidate != null && base.equals(candidate.elementBase) &&
+                offset.equals(candidate.elementOffset)) {
+                return true;
+            }
+        }
+        return false;
+    }

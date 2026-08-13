@@ -117,7 +117,7 @@
                 phi.getOutput().getSize() != currentProgram.getDefaultPointerSize()) {
                 continue;
             }
-            Long stride = affinePointerInductionStride(phi);
+            Long stride = affinePointerInductionStride(phi, loop);
             if (stride != null && stride == expectedElementStride) {
                 result.add(phi);
             }
@@ -434,6 +434,11 @@
         if (sameVarnodeIdentity(node, root)) {
             return 0L;
         }
+        if (samePcodeStorageLocation(node, root) &&
+            selfReferentialPhysicalRegisterPhi(root)) {
+            runMetrics.increment("physicalRegisterAffineRootAliases");
+            return 0L;
+        }
         if (!seen.add(pcodeNodeKey(node))) {
             return null;
         }
@@ -459,6 +464,23 @@
                 definition, root, seen, depth + 1);
             default -> null;
         };
+    }
+
+    private boolean selfReferentialPhysicalRegisterPhi(Varnode root) {
+        if (root == null || root.getAddress() == null ||
+            !root.getAddress().getAddressSpace().isRegisterSpace()) {
+            return false;
+        }
+        PcodeOp definition = root.getDef();
+        if (definition == null || definition.getOpcode() != PcodeOp.MULTIEQUAL) {
+            return false;
+        }
+        for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+            if (samePcodeStorageLocation(definition.getInput(slot), root)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private Long pcodeAddOffsetFromRoot(

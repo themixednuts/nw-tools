@@ -23,35 +23,177 @@
         WireShape selected = null;
         for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
             FixedSequenceStorage storage = fixedSequenceStorage(high, loop, operations);
-            if (storage == null || storage.capacity() <= 0 || storage.capacity() > 0xffff) {
+            WireShape candidate = null;
+            if (storage != null && storage.capacity() > 0 && storage.capacity() <= 0xffff) {
+                WireShape element = fixedSequenceElementWireEvidence(
+                    high,
+                    loop,
+                    operations,
+                    storage,
+                    bufferParameter,
+                    direction);
+                if (element != null && element.layout != null &&
+                    fixedSequenceCountCall(high, loop, operations, direction) == null) {
+                    candidate = fixedArrayWireShape(
+                        element,
+                        storage.capacity(),
+                        "cfg-fixed-array-loop");
+                }
+            }
+            if (candidate == null) {
+                candidate = counterIndexedFixedArrayLoopWireShape(
+                    function,
+                    high,
+                    loop,
+                    operations,
+                    bufferParameter,
+                    direction);
+            }
+            if (candidate == null) {
                 continue;
             }
-            WireShape element = fixedSequenceElementWireEvidence(
-                high,
-                loop,
-                operations,
-                storage,
-                bufferParameter,
-                direction);
-            if (element == null || element.layout == null ||
-                fixedSequenceCountCall(high, loop, operations, direction) != null) {
-                continue;
-            }
-            String logicalElement = element.shape == null ? element.layout : element.shape;
-            WireShape candidate = element.hasProvenSemantics()
-                ? WireShape.semantic(
-                    "fixed-array<" + logicalElement + "," + storage.capacity() + ">",
-                    "fixed-array<" + element.layout + "," + storage.capacity() + ">",
-                    "cfg-fixed-array-loop")
-                : WireShape.layout(
-                    "fixed-array<" + element.layout + "," + storage.capacity() + ">",
-                    "cfg-fixed-array-loop");
             if (selected != null && !Objects.equals(selected.layout, candidate.layout)) {
                 return null;
             }
             selected = candidate;
         }
         return selected;
+    }
+
+    private WireShape counterIndexedFixedArrayLoopWireShape(
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        List<PcodeOpAST> operations,
+        String bufferParameter,
+        NetworkSchemaCodecClassifier.CodecDirection direction) {
+
+        Integer capacity = counterControlledLoopTripCount(high, loop);
+        PcodeOpAST induction = capacity == null
+            ? null
+            : counterControlledLoopInduction(high, loop, capacity);
+        if (capacity == null || capacity <= 0 || capacity > 0xffff ||
+            induction == null ||
+            fixedSequenceCountCall(high, loop, operations, direction) != null) {
+            return null;
+        }
+
+        PcodeStorage buffer = new PcodeStorage(bufferParameter, 0L);
+        LinkedHashMap<String, WireShape> evidenceByLayout = new LinkedHashMap<>();
+        for (PcodeOpAST operation : operations) {
+            if (!loop.contains(operation) || operation.getOpcode() != PcodeOp.CALL) {
+                continue;
+            }
+            Function target = pcodeCallTarget(operation);
+            Integer bufferSlot = provenCallArgumentSlot(
+                function,
+                operation,
+                target,
+                buffer);
+            if (target == null || bufferSlot == null ||
+                !hasCounterIndexedFormalArgument(
+                    operation,
+                    target,
+                    bufferSlot,
+                    bufferParameter,
+                    induction.getOutput())) {
+                continue;
+            }
+            WireShape evidence = directCallWireEvidence(operation);
+            if (evidence != null && evidence.layout != null) {
+                evidenceByLayout.putIfAbsent(evidence.layout, evidence);
+            }
+        }
+        if (evidenceByLayout.size() != 1) {
+            return null;
+        }
+        return fixedArrayWireShape(
+            evidenceByLayout.values().iterator().next(),
+            capacity,
+            "cfg-counter-indexed-fixed-array-loop");
+    }
+
+    private PcodeOpAST counterControlledLoopInduction(
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        int expectedCapacity) {
+
+        PcodeOpAST selected = null;
+        var iterator = loop.header().getIterator();
+        while (iterator.hasNext()) {
+            PcodeOp operation = iterator.next();
+            if (!(operation instanceof PcodeOpAST induction) ||
+                induction.getOpcode() != PcodeOp.MULTIEQUAL ||
+                induction.getOutput() == null) {
+                continue;
+            }
+            Long step = affineLoopInductionStep(induction, loop);
+            Long initial = inductionInitialConstant(high, induction, loop);
+            Integer capacity = step == null || step <= 0L || initial == null
+                ? null
+                : loopTripCountForInduction(
+                    high,
+                    loop,
+                    induction,
+                    initial,
+                    step);
+            if (!Integer.valueOf(expectedCapacity).equals(capacity)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = induction;
+        }
+        return selected;
+    }
+
+    private boolean hasCounterIndexedFormalArgument(
+        PcodeOp operation,
+        Function target,
+        int bufferSlot,
+        String bufferParameter,
+        Varnode induction) {
+
+        int argumentCount = provenCallArgumentCount(operation, target);
+        for (int slot = 1; slot <= argumentCount && slot < operation.getNumInputs(); slot++) {
+            if (slot == bufferSlot) {
+                continue;
+            }
+            Varnode argument = operation.getInput(slot);
+            if (argument == null || argument.isConstant() || !pcodeNodeDependsOn(
+                    argument,
+                    induction,
+                    new LinkedHashSet<>(),
+                    0)) {
+                continue;
+            }
+            LinkedHashMap<String, PcodeStorage> storages = new LinkedHashMap<>();
+            collectPcodeStorages(argument, storages, new LinkedHashSet<>(), 0);
+            boolean rootedInValueParameter = storages.values().stream().anyMatch(storage ->
+                storage.base.matches("param_\\d+") &&
+                    !storage.base.equals(bufferParameter));
+            if (rootedInValueParameter) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private WireShape fixedArrayWireShape(
+        WireShape element,
+        int capacity,
+        String source) {
+
+        String logicalElement = element.shape == null ? element.layout : element.shape;
+        return element.hasProvenSemantics()
+            ? WireShape.semantic(
+                "fixed-array<" + logicalElement + "," + capacity + ">",
+                "fixed-array<" + element.layout + "," + capacity + ">",
+                source)
+            : WireShape.layout(
+                "fixed-array<" + element.layout + "," + capacity + ">",
+                source);
     }
 
 
@@ -226,8 +368,8 @@
                 "phi",
                 phi.getSeqnum().getTarget(),
                 addressFormatter);
-            Long stride = affinePointerInductionStride(phi);
-            PcodeStorage initial = fixedSequenceInitialStorage(phi);
+            Long stride = affinePointerInductionStride(phi, loop);
+            PcodeStorage initial = fixedSequenceInitialStorage(phi, loop);
             PcodeStorage end = initial == null
                 ? null
                 : fixedSequenceEndStorage(loop, operations, phi, initial);

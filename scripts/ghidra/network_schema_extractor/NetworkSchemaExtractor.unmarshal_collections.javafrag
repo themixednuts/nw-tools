@@ -8,7 +8,15 @@
             new IdentityHashMap<>();
         Map<Address, CollectionOutputShape> localCollections =
             containerCollectionOutputs(function);
-        for (NetworkSchemaNaturalLoop loop : NetworkSchemaControlFlow.naturalLoops(high)) {
+        ArrayList<NetworkSchemaNaturalLoop> loops = new ArrayList<>(
+            NetworkSchemaControlFlow.naturalLoops(high));
+        loops.sort((left, right) -> {
+            int bySize = Integer.compare(right.blockCount(), left.blockCount());
+            return bySize != 0
+                ? bySize
+                : left.header().getStart().compareTo(right.header().getStart());
+        });
+        for (NetworkSchemaNaturalLoop loop : loops) {
             codecWireTraceCheckpoint();
             PcodeOpAST count = nearestCountCallForLoop(function, high, loop, operations);
             CollectionOutputShape shape = count == null
@@ -36,6 +44,29 @@
             if (shape == null || count == null || !Objects.equals(
                     shape.loopHeader,
                     loop.header().getStart())) {
+                if (!addSemanticUnmarshalCollectionActions(
+                        actions,
+                        function,
+                        high,
+                        loop,
+                        readBufferParameter,
+                        operations)) {
+                    return null;
+                }
+                continue;
+            }
+            UnmarshalCollectionAction enclosing = actions.get(count);
+            if (enclosing != null && (!enclosing.emit() ||
+                collectionActionOwnsCallsites(
+                    actions,
+                    enclosing,
+                    operations,
+                    shape.codecCallsites))) {
+                // Outer-first loop processing has already emitted this count
+                // and claimed every codec call in the nested loop. The child
+                // is a structural subset of that grouped element, not a second
+                // collection boundary.
+                runMetrics.increment("nestedUnmarshalCollectionActionsFolded");
                 continue;
             }
             ContainerCodecCall boundary = unmarshalCollectionBoundary(
@@ -65,7 +96,49 @@
             if (operation.getOpcode() != PcodeOp.CALL) {
                 continue;
             }
+            if (actions.containsKey(operation)) {
+                // Natural-loop recovery owns all calls it consumed. The
+                // standalone helper scan below is a fallback for unclaimed
+                // calls, not a competing interpretation of the same callsite.
+                runMetrics.increment("claimedUnmarshalCollectionCallsSkipped");
+                continue;
+            }
             Function target = pcodeCallTarget(operation);
+            Integer bufferSlot = provenCallArgumentSlot(
+                function,
+                operation,
+                target,
+                new PcodeStorage(readBufferParameter, 0L));
+            FixedSequenceShape fixedSequence = target == null || bufferSlot == null
+                ? null
+                : fixedSequenceShape(
+                    target,
+                    "param_" + bufferSlot,
+                    NetworkSchemaCodecClassifier.CodecDirection.DECODE);
+            if (fixedSequence != null && fixedSequence.wireEvidence != null &&
+                fixedSequenceCoversAllReadBufferConsumption(
+                    target,
+                    "param_" + bufferSlot,
+                    fixedSequence)) {
+                ContainerCodecCall boundary = unmarshalCollectionBoundary(
+                    operation,
+                    target,
+                    fixedSequence.wireEvidence,
+                    "container-helper-unmarshal-fixed-sequence");
+                applyUnmarshalContainerCodecOutputStorage(
+                    boundary,
+                    high,
+                    operation,
+                    provenUnmarshalOutputStorage(operation));
+                if (!putUnmarshalCollectionAction(
+                        actions,
+                        operation,
+                        boundary,
+                        true)) {
+                    return null;
+                }
+                continue;
+            }
             InterproceduralCollectionCall collection = interproceduralCollectionCall(
                 function,
                 operation,
@@ -99,6 +172,10 @@
                 if (count == null) {
                     return null;
                 }
+                if (actions.containsKey(count)) {
+                    runMetrics.increment("claimedUnmarshalCollectionCountsSkipped");
+                    continue;
+                }
                 ContainerCodecCall boundary = unmarshalCollectionBoundary(
                     count,
                     target,
@@ -114,11 +191,6 @@
                 continue;
             }
 
-            Integer bufferSlot = provenCallArgumentSlot(
-                function,
-                operation,
-                target,
-                new PcodeStorage(readBufferParameter, 0L));
             if (target == null || bufferSlot == null) {
                 continue;
             }
@@ -137,6 +209,77 @@
                     : firstNonEmpty(evidence.shape, evidence.layout));
         }
         return actions;
+    }
+
+    private boolean addSemanticUnmarshalCollectionActions(
+        Map<PcodeOpAST, UnmarshalCollectionAction> actions,
+        Function function,
+        HighFunction high,
+        NetworkSchemaNaturalLoop loop,
+        String readBufferParameter,
+        List<PcodeOpAST> operations) {
+
+        PcodeOpAST count = nearestCountCallForLoop(function, high, loop, operations);
+        if (count == null || !Objects.equals(
+                callReadBufferParameter(function, count),
+                readBufferParameter)) {
+            return true;
+        }
+        CollectionElementSequence elements = loopElementCodecs(
+            function,
+            high,
+            loop,
+            operations);
+        if (elements == null || elements.codecs().isEmpty() ||
+            !strictlyOrderedCodecCalls(high, elements.codecs())) {
+            return true;
+        }
+        WireShape evidence = countedSequenceWireEvidence(elements.codecs());
+        if (evidence == null || elements.consumedCallsites().isEmpty()) {
+            return true;
+        }
+        UnmarshalCollectionAction enclosing = actions.get(count);
+        if (enclosing != null && (!enclosing.emit() ||
+            collectionActionOwnsCallsites(
+                actions,
+                enclosing,
+                operations,
+                elements.consumedCallsites()))) {
+            runMetrics.increment("nestedUnmarshalCollectionActionsFolded");
+            return true;
+        }
+
+        LinkedHashMap<Address, PcodeOpAST> consumed = new LinkedHashMap<>();
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL ||
+                !elements.consumedCallsites().contains(
+                    operation.getSeqnum().getTarget())) {
+                continue;
+            }
+            if (!loop.contains(operation)) {
+                return true;
+            }
+            consumed.put(operation.getSeqnum().getTarget(), operation);
+        }
+        if (!consumed.keySet().containsAll(elements.consumedCallsites())) {
+            return true;
+        }
+
+        ContainerCodecCall boundary = unmarshalCollectionBoundary(
+            count,
+            pcodeCallTarget(count),
+            evidence,
+            "container-helper-unmarshal-semantic-counted-loop");
+        if (!putUnmarshalCollectionAction(actions, count, boundary, true)) {
+            return false;
+        }
+        for (PcodeOpAST operation : consumed.values()) {
+            if (!putUnmarshalCollectionAction(actions, operation, boundary, false)) {
+                return false;
+            }
+        }
+        runMetrics.increment("semanticUnmarshalCollectionBoundaries");
+        return true;
     }
 
     private PcodeOpAST uniqueUnmarshalCountProducer(
@@ -164,10 +307,19 @@
                 !matchingOutput) {
                 continue;
             }
-            if (selected != null) {
+            if (selected == null || countProducerPrecedesConsumer(
+                    high,
+                    selected,
+                    candidate)) {
+                selected = candidate;
+                continue;
+            }
+            if (!countProducerPrecedesConsumer(high, candidate, selected)) {
                 return null;
             }
-            selected = candidate;
+        }
+        if (selected != null) {
+            runMetrics.increment("latestUnmarshalCountProducerProofs");
         }
         return selected;
     }
@@ -186,6 +338,30 @@
             }
         }
         return null;
+    }
+
+    private boolean collectionActionOwnsCallsites(
+        Map<PcodeOpAST, UnmarshalCollectionAction> actions,
+        UnmarshalCollectionAction owner,
+        List<PcodeOpAST> operations,
+        Set<Address> callsites) {
+
+        if (owner == null || callsites == null || callsites.isEmpty()) {
+            return false;
+        }
+        int matched = 0;
+        for (PcodeOpAST operation : operations) {
+            if (operation.getOpcode() != PcodeOp.CALL ||
+                !callsites.contains(operation.getSeqnum().getTarget())) {
+                continue;
+            }
+            matched++;
+            UnmarshalCollectionAction action = actions.get(operation);
+            if (action == null || action.emit() || action.codec() != owner.codec()) {
+                return false;
+            }
+        }
+        return matched == callsites.size();
     }
 
     private ContainerCodecCall unmarshalCollectionBoundary(
@@ -217,7 +393,86 @@
 
         UnmarshalCollectionAction candidate = new UnmarshalCollectionAction(codec, emit);
         UnmarshalCollectionAction previous = actions.putIfAbsent(operation, candidate);
-        return previous == null || previous.codec() == codec && previous.emit() == emit;
+        if (previous == null || previous.codec() == codec && previous.emit() == emit) {
+            return true;
+        }
+        if (previous.emit() != emit || !compatibleUnmarshalCollectionBoundary(
+                previous.codec(),
+                codec)) {
+            runMetrics.increment("conflictingUnmarshalCollectionActions");
+            return false;
+        }
+        if (unmarshalCollectionBoundaryEvidenceScore(codec) >
+            unmarshalCollectionBoundaryEvidenceScore(previous.codec())) {
+            actions.put(operation, candidate);
+        }
+        runMetrics.increment("equivalentUnmarshalCollectionActionMerges");
+        return true;
+    }
+
+    private boolean compatibleUnmarshalCollectionBoundary(
+        ContainerCodecCall left,
+        ContainerCodecCall right) {
+
+        codecWireTraceCheckpoint();
+        if (left == right) {
+            return true;
+        }
+        if (left == null || right == null ||
+            !compatibleCollectionIdentity(left.nativeType, right.nativeType) ||
+            !compatibleCollectionIdentity(left.typeId, right.typeId) ||
+            !sameWireEvidence(left.wireEvidence, right.wireEvidence) ||
+            !Objects.equals(left.memberSemantics, right.memberSemantics) ||
+            !Objects.equals(left.analysisStatus, right.analysisStatus) ||
+            !compatibleCollectionIdentity(left.elementBase, right.elementBase) ||
+            !compatibleCollectionIdentity(left.elementOffset, right.elementOffset) ||
+            left.members.size() != right.members.size() ||
+            left.optionalMembers.size() != right.optionalMembers.size() ||
+            left.guards.size() != right.guards.size()) {
+            return false;
+        }
+        for (int index = 0; index < left.members.size(); index++) {
+            if (!compatibleUnmarshalCollectionBoundary(
+                    left.members.get(index),
+                    right.members.get(index))) {
+                return false;
+            }
+        }
+        for (int index = 0; index < left.optionalMembers.size(); index++) {
+            if (!compatibleUnmarshalCollectionBoundary(
+                    left.optionalMembers.get(index),
+                    right.optionalMembers.get(index))) {
+                return false;
+            }
+        }
+        for (int index = 0; index < left.guards.size(); index++) {
+            if (!sameContainerCodecGuard(
+                    left.guards.get(index),
+                    right.guards.get(index))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean compatibleCollectionIdentity(Object left, Object right) {
+        return left == null || right == null || Objects.equals(left, right);
+    }
+
+    private int unmarshalCollectionBoundaryEvidenceScore(ContainerCodecCall codec) {
+        if (codec == null) {
+            return 0;
+        }
+        int score = 0;
+        score += codec.target == null ? 0 : 1;
+        score += codec.nativeType == null ? 0 : 2;
+        score += codec.typeId == null ? 0 : 2;
+        score += codec.typeIdentityProven ? 1 : 0;
+        score += codec.sourceTypeLayoutComplete ? 1 : 0;
+        score += codec.elementBase == null ? 0 : 4;
+        score += codec.elementOffset == null ? 0 : 1;
+        score += codec.members.size() + codec.optionalMembers.size() + codec.guards.size();
+        return score;
     }
 
     private record UnmarshalCollectionAction(

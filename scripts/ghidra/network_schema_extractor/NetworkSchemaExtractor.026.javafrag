@@ -194,6 +194,8 @@
         String nameSource;
         Address nameSourceAddress;
         Integer group;
+        Address groupIdentityAddress;
+        String groupSource;
         Integer handlerOffset;
         String handlerExpression;
         Address handlerVtable;
@@ -258,6 +260,11 @@
             NetworkSchemaJson.add(object, "nameSourceAddress", formatAddress(nameSourceAddress));
             NetworkSchemaJson.add(object, "nameAddress", formatAddress(nameAddress));
             NetworkSchemaJson.add(object, "group", group);
+            NetworkSchemaJson.add(object, "groupSource", groupSource);
+            NetworkSchemaJson.add(
+                object,
+                "groupIdentityAddress",
+                formatAddress(groupIdentityAddress));
             if (handlerOffset != null) {
                 object.addProperty("handlerOffset", "0x" + Integer.toHexString(handlerOffset));
             }

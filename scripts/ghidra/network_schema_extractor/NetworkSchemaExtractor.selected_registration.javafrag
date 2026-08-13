@@ -72,5 +72,143 @@
             function.fields.clear();
             function.fields.addAll(executedFields);
         }
+        assignStaticFieldGroupOrdinals(function.fields);
+        expandRuntimeProfileFieldRegistrations(function);
         return function;
+    }
+
+    private void assignStaticFieldGroupOrdinals(List<FieldCall> fields) {
+        if (fields == null || fields.isEmpty()) {
+            return;
+        }
+        int nextGroup = fields.stream()
+            .map(field -> field.group)
+            .filter(Objects::nonNull)
+            .max(Integer::compareTo)
+            .orElse(0) + 1;
+        LinkedHashMap<Address, Integer> groupsByIdentity = new LinkedHashMap<>();
+        for (FieldCall field : fields) {
+            if (field.group != null || field.groupIdentityAddress == null) {
+                continue;
+            }
+            Integer group = groupsByIdentity.get(field.groupIdentityAddress);
+            if (group == null) {
+                group = nextGroup++;
+                groupsByIdentity.put(field.groupIdentityAddress, group);
+            }
+            field.group = group;
+            field.groupSource = "static-filter-group-handle-ordinal";
+        }
+    }
+
+    private void expandRuntimeProfileFieldRegistrations(RegistrationFunction function) {
+        if (function == null || function.function == null ||
+            !function.function.getEntryPoint().equals(currentProgram.getImageBase().add(
+                MUSICAL_PERFORMANCE_STATE_CONSTRUCTOR_RVA))) {
+            return;
+        }
+
+        Address seedCallsite = currentProgram.getImageBase().add(
+            MUSICAL_PERFORMANCE_SEED_REGISTER_RVA);
+        Address countCallsite = currentProgram.getImageBase().add(
+            MUSICAL_PERFORMANCE_COUNT_REGISTER_RVA);
+        Address seedHandlerVtable = currentProgram.getImageBase().add(
+            MUSICAL_PERFORMANCE_SEED_HANDLER_VTABLE_RVA);
+        FieldCall seed = uniqueRuntimeProfileField(
+            function.fields,
+            "performerSeed",
+            seedCallsite);
+        FieldCall count = uniqueRuntimeProfileField(
+            function.fields,
+            "performanceZonePlayerCount",
+            countCallsite);
+        if (seed == null || count == null || seed.handlerVtable != null ||
+            count.handlerVtable == null ||
+            !functionReferencesAddress(function.function, seedHandlerVtable) ||
+            function.fields.stream().anyMatch(field -> field.group != null && field.group >=
+                MUSICAL_PERFORMANCE_PROFILE_FIRST_GROUP)) {
+            return;
+        }
+
+        // New World 3-26 obtains this cardinality through ConfigProviderEventBus::GetInt,
+        // so it is absent from the static image. The protocol profile fixes it at four.
+        // Keep the projection fail-closed on the exact constructor, callsites, names,
+        // dynamic-handler vtable, and pre-profile group range checked above.
+        function.fields.remove(seed);
+        function.fields.remove(count);
+        for (int ordinal = 0;
+             ordinal < MUSICAL_PERFORMANCE_PROFILE_PERFORMER_COUNT;
+             ordinal++) {
+            function.fields.add(runtimeProfilePerformerSeed(
+                seed,
+                seedHandlerVtable,
+                ordinal));
+            if (ordinal == 0) {
+                count.group = MUSICAL_PERFORMANCE_PROFILE_FIRST_GROUP;
+                count.groupSource = "nw-3-26-runtime-profile-cardinality";
+                count.evidenceSource = "runtime-profile-first-dynamic-filter-group";
+                function.fields.add(count);
+            }
+        }
+        for (int index = 0; index < function.fields.size(); index++) {
+            function.fields.get(index).index = index;
+        }
+    }
+
+    private FieldCall uniqueRuntimeProfileField(
+        List<FieldCall> fields,
+        String name,
+        Address callsite) {
+
+        FieldCall match = null;
+        for (FieldCall field : fields) {
+            if (!name.equals(field.name) || field.callsite == null ||
+                !field.callsite.equals(callsite)) {
+                continue;
+            }
+            if (match != null) {
+                return null;
+            }
+            match = field;
+        }
+        return match;
+    }
+
+    private boolean functionReferencesAddress(Function function, Address target) {
+        if (function == null || target == null) {
+            return false;
+        }
+        for (Instruction instruction : functionInstructions(function)) {
+            for (Reference reference : instruction.getReferencesFrom()) {
+                if (target.equals(reference.getToAddress())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private FieldCall runtimeProfilePerformerSeed(
+        FieldCall template,
+        Address handlerVtable,
+        int ordinal) {
+
+        FieldCall field = new FieldCall();
+        field.callsite = template.callsite;
+        field.recoveryOrder = template.recoveryOrder;
+        field.nameAddress = template.nameAddress;
+        field.name = "performerSeed_" + ordinal;
+        field.nameSource = "nw-3-26-runtime-profile-repeated-register-field";
+        field.nameSourceAddress = template.callsite;
+        field.group = MUSICAL_PERFORMANCE_PROFILE_FIRST_GROUP + ordinal;
+        field.groupSource = "nw-3-26-runtime-profile-cardinality";
+        field.handlerExpression = "*(this + 0x15c8) + " +
+            "0x" + Long.toHexString((long)ordinal * 0x38L);
+        field.handlerVtable = handlerVtable;
+        field.registrationKind = "field";
+        field.storageExpression = field.handlerExpression;
+        field.storageIdentity = "runtime-profile-performer-handler[" + ordinal + "]";
+        field.confidence = "register-field-call";
+        field.evidenceSource = "runtime-profile-dynamic-register-field";
+        return field;
     }

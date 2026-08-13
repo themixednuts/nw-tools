@@ -21,7 +21,8 @@
         int argumentSlot) {
 
         if (argumentSlot < 1 ||
-            argumentSlot > provenCallArgumentCount(operation, callTarget)) {
+            argumentSlot > provenCallArgumentCandidateCount(
+                owner, operation, callTarget)) {
             return null;
         }
         ForwardArgState state = instructionStateBeforeCall(owner, operation, callTarget);
@@ -35,7 +36,8 @@
         int argumentSlot) {
 
         if (argumentSlot < 1 ||
-            argumentSlot > provenCallArgumentCount(operation, callTarget)) {
+            argumentSlot > provenCallArgumentCandidateCount(
+                owner, operation, callTarget)) {
             return Set.of();
         }
         ForwardArgState state = instructionStateBeforeCall(owner, operation, callTarget);
@@ -500,7 +502,8 @@
         if (owner == null || operation == null ||
             !isArgumentPassingOperation(operation) ||
             argumentSlot < 1 ||
-            argumentSlot > provenCallArgumentCount(operation, target)) {
+            argumentSlot > provenCallArgumentCandidateCount(
+                owner, operation, target)) {
             return null;
         }
 
@@ -531,7 +534,8 @@
         if (owner == null || operation == null ||
             !isArgumentPassingOperation(operation) ||
             argumentSlot < 1 ||
-            argumentSlot > provenCallArgumentCount(operation, target)) {
+            argumentSlot > provenCallArgumentCandidateCount(
+                owner, operation, target)) {
             return null;
         }
 
@@ -594,6 +598,53 @@
             return 4;
         }
         return count;
+    }
+
+    private int provenCallArgumentCandidateCount(
+        Function owner,
+        PcodeOp operation,
+        Function target) {
+
+        int count = provenCallArgumentCount(operation, target);
+        if (count >= 4 || owner == null || operation == null ||
+            operation.getSeqnum() == null) {
+            return count;
+        }
+        PcodeBlockBasic block = operation instanceof PcodeOpAST ast
+            ? NetworkSchemaControlFlow.parentBlock(ast)
+            : null;
+        Address callsite = operation.getSeqnum().getTarget();
+        if (block == null || callsite == null) {
+            return count;
+        }
+
+        boolean[] prepared = new boolean[5];
+        Instruction instruction = currentProgram.getListing().getInstructionBefore(callsite);
+        while (instruction != null &&
+            instruction.getAddress().compareTo(block.getStart()) >= 0) {
+            checkAnalysisCancelled();
+            String mnemonic = NetworkSchemaX86.upperMnemonic(instruction);
+            if (mnemonic != null && mnemonic.startsWith("CALL")) {
+                break;
+            }
+            String destination = NetworkSchemaX86.registerOperand(instruction, 0);
+            for (int slot = 1; slot <= 4; slot++) {
+                if (win64ArgumentRegister(slot).equals(destination)) {
+                    prepared[slot] = true;
+                }
+            }
+            instruction = currentProgram.getListing().getInstructionBefore(
+                instruction.getAddress());
+        }
+
+        int candidate = count;
+        while (candidate < 4 && prepared[candidate + 1]) {
+            candidate++;
+        }
+        if (candidate > count) {
+            runMetrics.increment("explicitWin64CallArgumentProofs");
+        }
+        return candidate;
     }
 
     private int machineRegisterArgumentCount(Function function) {
@@ -664,7 +715,9 @@
         }
 
         String[] registers = { "RCX", "RDX", "R8", "R9" };
-        int registerArgumentCount = Math.min(4, provenCallArgumentCount(operation, target));
+        int registerArgumentCount = Math.min(
+            4,
+            provenCallArgumentCandidateCount(owner, operation, target));
         Integer selected = null;
         for (int index = 0; index < registerArgumentCount; index++) {
             PcodeStorage storage = pcodeStorageFromTrackedValue(

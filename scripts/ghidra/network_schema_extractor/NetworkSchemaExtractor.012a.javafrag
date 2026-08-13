@@ -39,6 +39,7 @@
                 state.registers.remove("R11");
                 return;
             }
+            TrackedValue formattedFieldName = formattedFieldNameCallValue(instruction, state);
             invalidateStackArgumentsPassedByAddress(state);
 
             if (!observeConstructors) {
@@ -52,6 +53,9 @@
                         "RAX",
                         TrackedValue.immediate(state.nextFilterGroupIndex++));
                 }
+                else if (formattedFieldName != null) {
+                    state.registers.put("RAX", formattedFieldName);
+                }
                 else if (passthrough != null) {
                     state.registers.put("RAX", passthrough);
                 }
@@ -64,8 +68,6 @@
                 }
                 return;
             }
-
-            TrackedValue formattedFieldName = formattedFieldNameCallValue(instruction, state);
 
             if (isAllocatorCall(instruction, state)) {
                 clearVolatileRegisters(state.registers);

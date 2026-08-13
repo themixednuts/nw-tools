@@ -1,0 +1,93 @@
+    private Map<PcodeBlockBasic, Set<PcodeBlockBasic>> collectionLoopFailureEdges(
+        NetworkSchemaNaturalLoop loop,
+        Map<PcodeBlockBasic, List<ContainerCodecCall>> codecsByBlock,
+        Set<PcodeBlockBasic> successfulTerminals) {
+
+        if (loop == null || codecsByBlock == null || codecsByBlock.isEmpty()) {
+            return Map.of();
+        }
+        HashMap<PcodeBlockBasic, Set<PcodeBlockBasic>> result = new HashMap<>();
+        for (Map.Entry<PcodeBlockBasic, List<ContainerCodecCall>> entry :
+                codecsByBlock.entrySet()) {
+            List<ContainerCodecCall> codecs = entry.getValue();
+            ContainerCodecCall lastCodec = codecs == null || codecs.isEmpty()
+                ? null
+                : codecs.get(codecs.size() - 1);
+            PcodeOpAST call = lastCodec == null ? null : lastCodec.operation;
+            CodecGuardBranch guard = call == null
+                ? null
+                : codecGuardBranch(entry.getKey(), call, codecsByBlock);
+            if (guard == null || !loop.contains(guard.block())) {
+                continue;
+            }
+            List<PcodeBlockBasic> successors =
+                NetworkSchemaControlFlow.successors(guard.block());
+            if (successors.size() != 2) {
+                continue;
+            }
+            PcodeBlockBasic first = successors.get(0);
+            PcodeBlockBasic second = successors.get(1);
+            boolean firstContinues = collectionLoopSuccessContinuation(
+                loop,
+                first,
+                successfulTerminals);
+            boolean secondContinues = collectionLoopSuccessContinuation(
+                loop,
+                second,
+                successfulTerminals);
+            if (firstContinues == secondContinues) {
+                continue;
+            }
+            PcodeBlockBasic failure = firstContinues ? second : first;
+            if (loop.contains(failure) ||
+                NetworkSchemaControlFlow.reaches(failure, loop.header()) ||
+                !collectionLoopFailureTerminal(failure, loop)) {
+                continue;
+            }
+            result.put(guard.block(), Set.of(failure));
+            runMetrics.increment("collectionIterationLoopFailureEdgesExcluded");
+        }
+        return Map.copyOf(result);
+    }
+
+    private boolean collectionLoopSuccessContinuation(
+        NetworkSchemaNaturalLoop loop,
+        PcodeBlockBasic start,
+        Set<PcodeBlockBasic> successfulTerminals) {
+
+        return start != null && loop.contains(start) &&
+            (successfulTerminals.contains(start) ||
+                reachesSuccessfulCodecTerminal(start, successfulTerminals)) &&
+            !failJoinClearsUnmarshalOk(start, 2);
+    }
+
+    private boolean collectionLoopFailureTerminal(
+        PcodeBlockBasic start,
+        NetworkSchemaNaturalLoop loop) {
+
+        if (start == null || loop == null) {
+            return false;
+        }
+        ArrayDeque<PcodeBlockBasic> pending = new ArrayDeque<>();
+        LinkedHashSet<PcodeBlockBasic> visited = new LinkedHashSet<>();
+        pending.addLast(start);
+        visited.add(start);
+        while (!pending.isEmpty() && visited.size() <= 32) {
+            checkAnalysisCancelled();
+            PcodeBlockBasic block = pending.removeFirst();
+            if (loop.contains(block)) {
+                return false;
+            }
+            if (blockClearsUnmarshalOkByte(block) ||
+                isTerminatingPcodeBlock(block)) {
+                return true;
+            }
+            for (PcodeBlockBasic successor :
+                    NetworkSchemaControlFlow.successors(block)) {
+                if (visited.add(successor)) {
+                    pending.addLast(successor);
+                }
+            }
+        }
+        return false;
+    }

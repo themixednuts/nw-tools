@@ -90,6 +90,50 @@
         return "replicated-container<" + keyShape + "," + valueShape + ">";
     }
 
+    private WireShape completeFullContainerIndexMapWireShape(FullContainerPlan plan) {
+        if (plan == null || plan.storageKind != ContainerStorageKind.INDEX_MAP ||
+            plan.unmarshalReconciliation == null ||
+            !plan.unmarshalReconciliation.startsWith("complete-") ||
+            plan.keyCodecs.isEmpty() || plan.valueCodecs.isEmpty()) {
+            return null;
+        }
+        List<ContainerCodecCall> keys = logicalContainerCodecLeaves(plan.keyCodecs);
+        List<ContainerCodecCall> values = logicalContainerCodecLeaves(plan.valueCodecs);
+        WireShape key = sequenceElementWireEvidence(keys);
+        WireShape value = sequenceElementWireEvidence(values);
+        if (key == null || value == null || !key.hasProvenSemantics() ||
+            !value.hasProvenSemantics() ||
+            !isScalarContainerPlanWireEvidence(key) ||
+            !isScalarContainerPlanWireEvidence(value)) {
+            return null;
+        }
+        String shape = containerShape(key.shape, value.shape);
+        String layout = containerShape(key.layout, value.layout);
+        if (shape == null || layout == null) {
+            return null;
+        }
+        runMetrics.increment("completeContainerPlansPromotedToWireShapes");
+        return WireShape.semantic(
+            shape,
+            layout,
+            "full-container-plan+unmarshal-agreement");
+    }
+
+    private boolean isScalarContainerPlanWireEvidence(WireShape evidence) {
+        if (evidence == null || !evidence.hasProvenSemantics() ||
+            isAggregateWireEvidence(evidence)) {
+            return false;
+        }
+        for (String candidate : new String[] {evidence.shape, evidence.layout}) {
+            if (candidate == null || candidate.isBlank() ||
+                "class-value".equals(candidate) ||
+                "actor-instantiation-parameters".equals(candidate)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private void collectOrderedMarshalShapes(
         Address address,
         String writeBufferParameter,

@@ -891,7 +891,7 @@
             case "u16", "half-f32" -> 2;
             case "u32", "f32", "vec2-comp" -> 4;
             case "vec3-comp", "vec3-comp-norm" -> 6;
-            case "u64", "f64", "vec2", "quat-comp", "quat-comp-norm" -> 8;
+            case "u64", "f64", "vec2", "quat-comp" -> 8;
             case "uuid", "vec4", "quat", "aabb2d" -> 16;
             case "vec3" -> 12;
             case "aabb3d" -> 24;

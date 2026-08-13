@@ -17,10 +17,17 @@ pub(super) fn replicated_container_semantic_field_shape(
     field: &NetworkField,
     vtable: &NetworkFieldHandlerVtable,
     wire_shape: Option<&SchemaWireShape>,
+    value_type_candidates: &[NetworkNativeTypeInfoEvidence],
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Result<RustFieldShape, ContainerPlanError> {
     let plan_error = if let Some(plan) = vtable.full_container_plan.as_ref() {
-        match replicated_container_plan_field_shape(field, vtable, plan, serialize_types) {
+        match replicated_container_plan_field_shape(
+            field,
+            vtable,
+            plan,
+            value_type_candidates,
+            serialize_types,
+        ) {
             Ok(shape) => return Ok(shape),
             Err(ContainerPlanError::NonLinearCodec) => {
                 return Err(ContainerPlanError::NonLinearCodec);
@@ -41,16 +48,36 @@ fn replicated_container_plan_field_shape(
     field: &NetworkField,
     vtable: &NetworkFieldHandlerVtable,
     plan: &NetworkReplicatedContainerPlan,
+    value_type_candidates: &[NetworkNativeTypeInfoEvidence],
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Result<RustFieldShape, ContainerPlanError> {
     if plan.has_non_linear_key_codec() {
         return Err(ContainerPlanError::NonLinearCodec);
     }
 
-    let proven_value = container_value_type_from_proven_shape(field, vtable, plan, serialize_types);
+    let proven_value = container_value_type_from_proven_shape(field, vtable, plan, serialize_types)
+        .or_else(|| container_value_type_from_typed_counted_sequence(field, plan, serialize_types))
+        .or_else(|| container_value_type_from_complete_typed_codec(field, plan, serialize_types))
+        .or_else(|| {
+            container_value_type_from_native_candidate(
+                field,
+                plan,
+                value_type_candidates,
+                serialize_types,
+            )
+        })
+        .or_else(|| container_value_type_from_handler_template(vtable, plan, serialize_types));
     if plan.has_non_linear_value_codec()
         && proven_value.is_none()
         && plan.default_profile_value_wire_shapes().is_none()
+        && plan
+            .registered_profile_logical_value_wire_shapes()
+            .is_none()
+        && plan.decoded_logical_value_wire_shapes().is_none()
+        && plan.complete_marshal_logical_value_wire_shapes().is_none()
+        && plan
+            .complete_unmarshal_logical_value_wire_shapes()
+            .is_none()
     {
         return Err(ContainerPlanError::NonLinearCodec);
     }
@@ -91,6 +118,243 @@ fn replicated_container_plan_field_shape(
             .unwrap_or_default(),
         container_value_type_shape: value.value_type_shape,
         container_embedded_value_type_shapes: value.embedded_value_type_shapes,
+    })
+}
+
+fn container_value_type_from_complete_typed_codec(
+    field: &NetworkField,
+    plan: &NetworkReplicatedContainerPlan,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<ContainerValueType> {
+    let [codec] = plan.value_codecs.as_slice() else {
+        return None;
+    };
+    codec.type_identity_proven.then_some(())?;
+    codec.source_type_layout_complete.then_some(())?;
+    matches!(
+        codec.member_semantics,
+        Some(
+            crate::network_schema::NetworkContainerMemberSemantics::OptionalSuffix
+                | crate::network_schema::NetworkContainerMemberSemantics::StructuredValue
+        )
+    )
+    .then_some(())?;
+
+    let type_id = codec.type_id?;
+    let native_type = normalized_cpp_value_type(codec.native_type.as_deref()?)?;
+    let serialize = serialize_types.get(&type_id)?;
+    (normalized_cpp_value_type(&serialize.name)? == native_type).then_some(())?;
+
+    let mut shape = synthetic_container_value_shape("Value", &codec.default_profile_wire_shapes()?);
+    shape.type_id = Some(type_id);
+    shape.type_id_source = codec.type_id_source.clone();
+    shape.identity_proven = Some(true);
+    shape.identity_source =
+        Some("marshal-template+serialize-exact-name+complete-source-layout".to_owned());
+    shape.type_name = Some(native_type.clone());
+    shape.type_name_full = Some(native_type);
+    shape.type_name_source = Some("complete-direct-marshal-template".to_owned());
+    shape.validation = Some("complete-typed-codec+registered-profile-wire-product".to_owned());
+
+    Some(ContainerValueType {
+        rust_type: container_value_shape_rust_type(field, &shape, serialize_types)?,
+        marshaler_type: container_value_shape_codec_name(field, &shape)?,
+        value_type_shape: Some(shape),
+        embedded_value_type_shapes: Vec::new(),
+    })
+}
+
+fn container_value_type_from_typed_counted_sequence(
+    field: &NetworkField,
+    plan: &NetworkReplicatedContainerPlan,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<ContainerValueType> {
+    let [sequence] = plan.value_codecs.as_slice() else {
+        return None;
+    };
+    if sequence.member_semantics
+        != Some(crate::network_schema::NetworkContainerMemberSemantics::CountedSequence)
+        || sequence.analysis_status.as_deref() != Some("complete")
+        || !sequence.guards.is_empty()
+        || !sequence.optional_members.is_empty()
+    {
+        return None;
+    }
+    let [count, element] = sequence.members.as_slice() else {
+        return None;
+    };
+    if !matches!(
+        count.exact_wire_shapes()?.as_slice(),
+        [SchemaWireScalarShape::VlqU32 | SchemaWireScalarShape::VlqU64]
+    ) || !element.type_identity_proven
+        || !element.source_type_layout_complete
+        || !matches!(
+            element.member_semantics,
+            Some(
+                crate::network_schema::NetworkContainerMemberSemantics::StructuredValue
+                    | crate::network_schema::NetworkContainerMemberSemantics::OptionalSuffix
+            )
+        )
+    {
+        return None;
+    }
+
+    let element_type_id = element.type_id?;
+    let native_type = normalized_cpp_value_type(element.native_type.as_deref()?)?;
+    let sequence_element = sequence
+        .wire_shape
+        .as_deref()?
+        .strip_prefix("vec<")?
+        .strip_suffix('>')
+        .and_then(normalized_cpp_value_type)?;
+    (sequence_element == native_type).then_some(())?;
+    let serialize = serialize_types.get(&element_type_id)?;
+    (normalized_cpp_value_type(&serialize.name)? == native_type).then_some(())?;
+
+    let mut shape =
+        synthetic_container_value_shape("Value", &element.default_profile_wire_shapes()?);
+    shape.type_id = Some(element_type_id);
+    shape.type_id_source = element.type_id_source.clone();
+    shape.identity_proven = Some(true);
+    shape.identity_source =
+        Some("marshal-template+serialize-exact-name+complete-counted-element-product".to_owned());
+    shape.type_name = Some(native_type.clone());
+    shape.type_name_full = Some(native_type);
+    shape.type_name_source = Some("counted-sequence-element-template".to_owned());
+    shape.validation =
+        Some("complete-counted-sequence+typed-element+registered-profile-wire-product".to_owned());
+
+    let element_rust_type = container_value_shape_rust_type(field, &shape, serialize_types)?;
+    let rust_type = format!("::std::vec::Vec<{element_rust_type}>");
+    Some(ContainerValueType {
+        marshaler_type: format!("::nw_network::serialize::DefaultMarshaler<{rust_type}>"),
+        rust_type,
+        value_type_shape: Some(shape),
+        embedded_value_type_shapes: Vec::new(),
+    })
+}
+
+fn container_value_type_from_handler_template(
+    vtable: &NetworkFieldHandlerVtable,
+    plan: &NetworkReplicatedContainerPlan,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<ContainerValueType> {
+    (vtable.handler_type_source.as_deref() == Some("handler-constructor-template")).then_some(())?;
+    let handler_type = vtable.handler_type_name.as_deref()?;
+    let (handler_template, handler_arguments) = cpp_template(handler_type)?;
+    (type_name_leaf(handler_template) == "ReplicatedContainer").then_some(())?;
+    let [handler_value_type] = handler_arguments.as_slice() else {
+        return None;
+    };
+
+    let [marshal_codec] = plan.value_codecs.as_slice() else {
+        return None;
+    };
+    (marshal_codec.analysis_status.as_deref() == Some("complete")).then_some(())?;
+    let marshal_value_type = codec_target_value_type(marshal_codec, "Marshal")?;
+
+    let mut unmarshal_value_types = plan
+        .unmarshal_codecs
+        .iter()
+        .filter(|codec| codec.analysis_status.as_deref() == Some("complete"))
+        .filter_map(|codec| codec_target_value_type(codec, "Unmarshal"));
+    let unmarshal_value_type = unmarshal_value_types.next()?;
+    unmarshal_value_types.next().is_none().then_some(())?;
+
+    let handler_value_type = normalized_cpp_value_type(handler_value_type)?;
+    (handler_value_type == marshal_value_type && handler_value_type == unmarshal_value_type)
+        .then_some(())?;
+    let rust_type = network_native_type_rust_type(&handler_value_type, serialize_types)?;
+    Some(ContainerValueType {
+        marshaler_type: format!("::nw_network::serialize::DefaultMarshaler<{rust_type}>"),
+        rust_type,
+        value_type_shape: None,
+        embedded_value_type_shapes: Vec::new(),
+    })
+}
+
+fn codec_target_value_type(codec: &NetworkContainerCodec, method: &str) -> Option<String> {
+    let target_name = codec.target_name.as_deref()?;
+    let class_suffix = format!("::{method}");
+    if let Some(class_name) = target_name.strip_suffix(&class_suffix)
+        && let Some((template, arguments)) = cpp_template(class_name)
+        && type_name_leaf(template) == "Marshaler"
+    {
+        let [value_type] = arguments.as_slice() else {
+            return None;
+        };
+        return normalized_cpp_value_type(value_type);
+    }
+
+    let method_marker = format!("::{method}<");
+    let method_start = target_name.rfind(&method_marker)? + 2;
+    let (template, arguments) = cpp_template(&target_name[method_start..])?;
+    (template == method).then_some(())?;
+    let [value_type] = arguments.as_slice() else {
+        return None;
+    };
+    normalized_cpp_value_type(value_type)
+}
+
+fn container_value_type_from_native_candidate(
+    field: &NetworkField,
+    plan: &NetworkReplicatedContainerPlan,
+    candidates: &[NetworkNativeTypeInfoEvidence],
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<ContainerValueType> {
+    let mut exact = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.type_id.is_some()
+                && candidate
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| !name.is_empty())
+                && candidate.native_size.is_some()
+                && candidate
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("unmarshal-full-element-vptr+"))
+                && (plan.storage != NetworkReplicatedContainerStorageKind::Vec
+                    || plan.element_stride == candidate.native_size)
+        })
+        .collect::<Vec<_>>();
+    exact.sort_by_key(|candidate| candidate.type_id);
+    exact.dedup_by_key(|candidate| candidate.type_id);
+    let [candidate] = exact.as_slice() else {
+        return None;
+    };
+
+    let mut shape = if let Some(wire_shapes) = plan.exact_marshal_value_wire_shapes() {
+        synthetic_container_value_shape("Value", &wire_shapes)
+    } else {
+        synthetic_container_value_shape_from_products(
+            "Value",
+            &plan
+                .registered_profile_logical_value_wire_shapes()
+                .or_else(|| plan.decoded_logical_value_wire_shapes())?,
+        )
+    };
+    shape.type_id = candidate.type_id;
+    shape.type_id_source = candidate.source.clone();
+    shape.identity_proven = Some(true);
+    shape.identity_source = candidate.source.clone();
+    shape.type_name = candidate.name.clone();
+    shape.type_name_source = candidate.name_source.clone();
+    shape.az_rtti_address = candidate.address.clone();
+    shape.native_size = candidate.native_size;
+    shape.native_size_source = candidate.native_size_source.clone();
+    shape.validation = Some(
+        "unmarshal-element-vptr+native-stride+complete-cross-direction-wire-product".to_owned(),
+    );
+    let shape = reconcile_serialize_backed_member_names(shape, serialize_types);
+    container_value_shape_members_are_emittable(&shape, &[], serialize_types).then_some(())?;
+
+    Some(ContainerValueType {
+        rust_type: container_value_shape_rust_type(field, &shape, serialize_types)?,
+        marshaler_type: container_value_shape_codec_name(field, &shape)?,
+        value_type_shape: Some(shape),
+        embedded_value_type_shapes: Vec::new(),
     })
 }
 
@@ -170,12 +434,10 @@ pub(super) fn container_key_type(
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<ContainerValueType> {
     container_codec_value_type(&plan.key_codecs, serialize_types).or_else(|| {
-        wire_sequence_container_value_type(
-            field,
-            "Key",
-            &plan.exact_key_wire_shapes()?,
-            serialize_types,
-        )
+        let wire_shapes = plan
+            .exact_key_wire_shapes()
+            .or_else(|| plan.independently_matching_key_wire_shapes())?;
+        wire_sequence_container_value_type(field, "Key", &wire_shapes, serialize_types)
     })
 }
 
@@ -187,10 +449,30 @@ pub(super) fn container_value_type(
     if let Some(value) = container_codec_value_type(&plan.value_codecs, serialize_types) {
         return Some(value);
     }
+    if let Some(value) = container_value_type_from_semantic_sequences(field, plan, serialize_types)
+    {
+        return Some(value);
+    }
 
     let wire_shapes = plan
         .exact_value_wire_shapes()
-        .or_else(|| plan.default_profile_value_wire_shapes())?;
+        .or_else(|| plan.default_profile_value_wire_shapes());
+    if wire_shapes.is_none()
+        && let Some(products) = plan
+            .registered_profile_logical_value_wire_shapes()
+            .or_else(|| plan.complete_marshal_logical_value_wire_shapes())
+            .or_else(|| plan.decoded_logical_value_wire_shapes())
+            .or_else(|| plan.complete_unmarshal_logical_value_wire_shapes())
+    {
+        let shape = synthetic_container_value_shape_from_products("Value", &products);
+        return Some(ContainerValueType {
+            rust_type: container_value_shape_rust_type(field, &shape, serialize_types)?,
+            marshaler_type: container_value_shape_codec_name(field, &shape)?,
+            value_type_shape: Some(shape),
+            embedded_value_type_shapes: Vec::new(),
+        });
+    }
+    let wire_shapes = wire_shapes?;
     if let Some(serialize) = field.serialize.as_ref()
         && serialize.role == NetworkSerializeRole::SupportType
         && wire_scalar_shapes_match(&wire_shapes, &serialize.wire_shapes)
@@ -207,18 +489,58 @@ pub(super) fn container_value_type(
     wire_sequence_container_value_type(field, "Value", &wire_shapes, serialize_types)
 }
 
+fn container_value_type_from_semantic_sequences(
+    field: &NetworkField,
+    plan: &NetworkReplicatedContainerPlan,
+    serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
+) -> Option<ContainerValueType> {
+    plan.value_codecs
+        .iter()
+        .any(container_codec_has_semantic_sequence)
+        .then_some(())?;
+    let products = plan.exact_logical_value_wire_shapes()?;
+    let shape = synthetic_container_value_shape_from_products("Value", &products);
+    Some(ContainerValueType {
+        rust_type: container_value_shape_rust_type(field, &shape, serialize_types)?,
+        marshaler_type: container_value_shape_codec_name(field, &shape)?,
+        value_type_shape: Some(shape),
+        embedded_value_type_shapes: Vec::new(),
+    })
+}
+
+fn container_codec_has_semantic_sequence(codec: &NetworkContainerCodec) -> bool {
+    matches!(
+        codec.member_semantics,
+        Some(
+            crate::network_schema::NetworkContainerMemberSemantics::CountedSequence
+                | crate::network_schema::NetworkContainerMemberSemantics::FixedSequence
+        )
+    ) || codec
+        .members
+        .iter()
+        .any(container_codec_has_semantic_sequence)
+}
+
 pub(super) fn container_value_type_from_proven_shape(
     field: &NetworkField,
     vtable: &NetworkFieldHandlerVtable,
     plan: &NetworkReplicatedContainerPlan,
     serialize_types: &BTreeMap<Uuid, &NetworkSerializeType>,
 ) -> Option<ContainerValueType> {
-    let shape = vtable
-        .value_type_shape
+    let shape = field
+        .nested_type_shape
         .as_ref()
-        .filter(|shape| shape.has_exact_identity() || shape.has_proven_anonymous_layout())?;
+        .filter(|shape| shape.has_exact_identity() || shape.has_proven_anonymous_layout())
+        .or_else(|| {
+            vtable
+                .value_type_shape
+                .as_ref()
+                .filter(|shape| shape.has_exact_identity() || shape.has_proven_anonymous_layout())
+        })?
+        .clone();
+    let shape = reconcile_serialize_backed_member_names(shape, serialize_types);
     container_value_shape_members_are_emittable(
-        shape,
+        &shape,
         &vtable.embedded_value_type_shapes,
         serialize_types,
     )
@@ -227,7 +549,7 @@ pub(super) fn container_value_type_from_proven_shape(
         .exact_value_wire_shapes()
         .or_else(|| plan.default_profile_value_wire_shapes())
         && !container_value_shape_matches_with_embedded(
-            shape,
+            &shape,
             &wire_shapes,
             &vtable.embedded_value_type_shapes,
         )
@@ -235,9 +557,9 @@ pub(super) fn container_value_type_from_proven_shape(
         return None;
     }
     Some(ContainerValueType {
-        rust_type: container_value_shape_rust_type(field, shape, serialize_types)?,
-        marshaler_type: container_value_shape_codec_name(field, shape)?,
-        value_type_shape: Some(shape.clone()),
+        rust_type: container_value_shape_rust_type(field, &shape, serialize_types)?,
+        marshaler_type: container_value_shape_codec_name(field, &shape)?,
+        value_type_shape: Some(shape),
         embedded_value_type_shapes: vtable.embedded_value_type_shapes.clone(),
     })
 }
@@ -377,6 +699,70 @@ fn synthetic_container_value_shape(
         wire_order_source: Some("exact-container-codec-sequence".to_owned()),
         datatype_path: None,
         validation: Some("complete-wire-layout".to_owned()),
+        native_size: None,
+        native_size_source: None,
+        members,
+    }
+}
+
+fn synthetic_container_value_shape_from_products(
+    role: &str,
+    wire_shapes: &[String],
+) -> crate::network_schema::NetworkNestedTypeShape {
+    let members = wire_shapes
+        .iter()
+        .enumerate()
+        .map(
+            |(index, wire_shape)| crate::network_schema::NetworkNestedTypeMember {
+                index: u32::try_from(index).ok(),
+                offset: None,
+                native_offset: None,
+                name: Some(format!("field_{index}")),
+                name_source: Some("synthetic-wire-ordinal".to_owned()),
+                name_proven: Some(false),
+                name_evidence: None,
+                native_type: None,
+                type_id: None,
+                type_id_source: None,
+                type_identity_proven: false,
+                type_identity_source: None,
+                wire_shape: Some(wire_shape.clone()),
+                wire_shape_source: Some("decoded-cross-direction-wire-product".to_owned()),
+                wire_layout: None,
+                wire_layout_source: None,
+                byte_width: None,
+                wire_ordinal: u32::try_from(index).ok(),
+                wire_order_source: Some("decoded-cross-direction-wire-product".to_owned()),
+                callsite: None,
+                target: None,
+                target_name: None,
+                type_conflict: false,
+            },
+        )
+        .collect();
+    crate::network_schema::NetworkNestedTypeShape {
+        type_id: None,
+        type_id_source: None,
+        identity_proven: Some(false),
+        identity_source: None,
+        type_name: Some(role.to_owned()),
+        type_name_full: None,
+        type_name_source: Some("generated-network-support-type".to_owned()),
+        function: None,
+        function_name: None,
+        factory: None,
+        az_rtti_address: None,
+        constructor: None,
+        vtable: None,
+        member_base: Some("element".to_owned()),
+        member_name_source: Some("synthetic-wire-ordinal".to_owned()),
+        member_names_proven: Some(false),
+        layout_proven: Some(true),
+        member_coverage_proven: Some(true),
+        wire_order_proven: Some(true),
+        wire_order_source: Some("decoded-cross-direction-wire-product".to_owned()),
+        datatype_path: None,
+        validation: Some("complete-cross-direction-wire-product".to_owned()),
         native_size: None,
         native_size_source: None,
         members,

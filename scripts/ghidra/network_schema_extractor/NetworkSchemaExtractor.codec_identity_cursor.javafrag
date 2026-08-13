@@ -1,0 +1,28 @@
+    private Map<String, Set<Integer>> directCursorReadWidths(
+        HighFunction high,
+        List<PcodeOpAST> operations) {
+
+        LinkedHashMap<String, Set<Integer>> result = new LinkedHashMap<>();
+        int parameterCount = win64RegisterParameterCandidateCount(high);
+        for (int slot = 1; slot <= parameterCount; slot++) {
+            String parameter = "param_" + slot;
+            LinkedHashSet<Integer> widths = new LinkedHashSet<>();
+            for (PcodeOpAST operation : operations) {
+                CodecWireEvent event = directCursorReadEvent(
+                    high,
+                    operation,
+                    operations,
+                    parameter);
+                Integer width = event == null
+                    ? null
+                    : wireShapeByteWidth(event.wireEvidence().layout);
+                if (width != null) {
+                    widths.add(width);
+                }
+            }
+            if (!widths.isEmpty()) {
+                result.put(parameter, Set.copyOf(widths));
+            }
+        }
+        return Map.copyOf(result);
+    }

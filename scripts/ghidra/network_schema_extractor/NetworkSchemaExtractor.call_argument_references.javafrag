@@ -1,0 +1,30 @@
+    /**
+     * Finds an exact formal argument dependency through SSA copies and pointer
+     * arithmetic. Direct storage and Win64 ABI matches are handled first by
+     * provenCallArgumentSlot; this is the conservative fallback for stack-backed
+     * continuation frames.
+     */
+    private Integer uniqueReferencedCallArgumentSlot(
+        PcodeOp operation,
+        PcodeStorage expected) {
+
+        if (operation == null || expected == null) {
+            return null;
+        }
+        Integer selected = null;
+        for (int slot = 1; slot < operation.getNumInputs(); slot++) {
+            Varnode input = operation.getInput(slot);
+            if (!pcodeNodeReferencesStorage(
+                    input,
+                    expected,
+                    new LinkedHashSet<>(),
+                    0)) {
+                continue;
+            }
+            if (selected != null) {
+                return null;
+            }
+            selected = slot;
+        }
+        return selected;
+    }

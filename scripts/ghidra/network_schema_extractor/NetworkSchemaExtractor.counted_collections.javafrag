@@ -674,7 +674,7 @@
                     operation))) {
                 continue;
             }
-            String parameter = uniqueLikelyOutputParameter(owner, operation);
+            String parameter = containerInsertionOutputParameter(owner, operation);
             if (parameter == null) {
                 continue;
             }
@@ -702,13 +702,15 @@
             loop,
             operations,
             codecs);
-        return insertion == null ? null : uniqueLikelyOutputParameter(owner, insertion);
+        return insertion == null
+            ? null
+            : containerInsertionOutputParameter(owner, insertion);
     }
 
     private String uniqueLikelyOutputParameter(Function owner, PcodeOp operation) {
         LinkedHashSet<String> parameters = new LinkedHashSet<>();
         Function target = pcodeCallTarget(operation);
-        int argumentCount = provenCallArgumentCount(operation, target);
+        int argumentCount = provenCallArgumentCandidateCount(owner, operation, target);
         for (int slot = 1; slot <= argumentCount; slot++) {
             PcodeStorage storage = provenCallArgumentStorage(
                 owner,
@@ -718,6 +720,20 @@
             String parameter = formalParameterBaseFromStorage(owner, storage);
             if (isProvenOutputParameterBase(owner, parameter)) {
                 parameters.add(parameter);
+            }
+            for (PcodeStorage dependency : instructionCallArgumentStorageDependencies(
+                    owner,
+                    operation,
+                    target,
+                    slot)) {
+                String dependentParameter = formalParameterBaseFromStorage(
+                    owner,
+                    dependency);
+                if (isProvenOutputParameterBase(owner, dependentParameter)) {
+                    parameters.add(dependentParameter);
+                    runMetrics.increment(
+                        "instructionDependencyOutputParameterProofs");
+                }
             }
         }
         return parameters.size() == 1 ? parameters.iterator().next() : null;
@@ -767,7 +783,7 @@
                 phi.getOpcode() != PcodeOp.MULTIEQUAL || phi.getOutput() == null) {
                 continue;
             }
-            Long step = affinePointerInductionStride(phi);
+            Long step = affinePointerInductionStride(phi, loop);
             if (step != null && step > 0L) {
                 inductions.add(phi);
             }
@@ -848,8 +864,8 @@
         DynamicSequenceExtent selected = null;
         int pointerSize = currentProgram.getDefaultPointerSize();
         for (PcodeOpAST induction : affineSequenceInductions(loop)) {
-            Long stride = affinePointerInductionStride(induction);
-            PcodeStorage data = fixedSequenceInitialStorage(induction);
+            Long stride = affinePointerInductionStride(induction, loop);
+            PcodeStorage data = fixedSequenceInitialStorage(induction, loop);
             if (stride == null || stride <= 0L || data == null ||
                 !loopConditionReferencesStorage(loop, operations, data.plus(pointerSize))) {
                 continue;

@@ -344,6 +344,12 @@
         field.nameAddress = state.nameAddress;
         field.name = state.name;
         field.group = state.groupKnown ? state.group : null;
+        field.groupIdentityAddress = state.groupIdentityAddress;
+        field.groupSource = state.groupKnown
+            ? "register-field-immediate"
+            : state.groupIdentityAddress == null
+                ? null
+                : "register-field-static-handle";
         field.handlerOffset = state.handlerOffset;
         field.handlerExpression = state.handlerExpression;
         field.handlerVtable = state.handlerVtable;
@@ -792,6 +798,9 @@
         if (group != null && group.immediate != null) {
             result.groupKnown = true;
             result.group = group.immediate.intValue();
+        }
+        else if (group != null && group.address != null) {
+            result.groupIdentityAddress = group.address;
         }
         return result;
     }
