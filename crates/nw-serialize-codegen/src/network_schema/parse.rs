@@ -899,7 +899,7 @@ pub(crate) fn reconcile_proven_nested_wire_order(field: &mut NetworkField) {
 
 pub(crate) fn normalize_proven_message_aggregate_boundary(field: &mut NetworkField) {
     let Some(shape) = field.nested_type_shape.as_ref().filter(|shape| {
-        shape.validation.as_deref() == Some("call-frame-output-parameter")
+        nested_validation_has_proof(shape, "call-frame-output-parameter")
             && shape.has_proven_anonymous_layout()
             && shape.members.len() >= 2
     }) else {
@@ -979,7 +979,7 @@ pub(crate) fn normalize_proven_message_aggregate_boundary(field: &mut NetworkFie
 
 fn is_redundant_message_aggregate_field(aggregate: &NetworkField, field: &NetworkField) -> bool {
     let Some(shape) = aggregate.nested_type_shape.as_ref().filter(|shape| {
-        shape.validation.as_deref() == Some("call-frame-output-parameter")
+        nested_validation_has_proof(shape, "call-frame-output-parameter")
             && shape.has_proven_layout()
     }) else {
         return false;
@@ -1001,6 +1001,9 @@ fn is_redundant_message_aggregate_field(aggregate: &NetworkField, field: &Networ
     let Some(relative_offset) = field_offset.checked_sub(aggregate_offset) else {
         return false;
     };
+    if nested_helper_shape_is_contained(shape, field, relative_offset) {
+        return true;
+    }
     let Some(field_callsite) = field.callsite.as_deref() else {
         return false;
     };
@@ -1037,6 +1040,59 @@ fn is_redundant_message_aggregate_field(aggregate: &NetworkField, field: &Networ
     let member_product = member_products.into_iter().flatten().collect::<Vec<_>>();
     field_product.len() == member_product.len() + 1
         && wire_scalar_products_width_compatible(&field_product[1..], &member_product)
+}
+
+fn nested_validation_has_proof(shape: &NetworkNestedTypeShape, proof: &str) -> bool {
+    shape
+        .validation
+        .as_deref()
+        .is_some_and(|validation| validation.split('+').any(|item| item == proof))
+}
+
+fn nested_helper_shape_is_contained(
+    parent: &NetworkNestedTypeShape,
+    field: &NetworkField,
+    child_offset: u32,
+) -> bool {
+    let Some(child) = field.nested_type_shape.as_ref().filter(|shape| {
+        shape.layout_proven == Some(true)
+            && shape.members.len() >= 2
+            && shape.members.iter().all(|member| !member.type_conflict)
+    }) else {
+        return false;
+    };
+    let (Some(parent_size), Some(child_size)) = (parent.native_size, child.native_size) else {
+        return false;
+    };
+    let child_offset = u64::from(child_offset);
+    if child_size == 0
+        || child_offset
+            .checked_add(child_size)
+            .is_none_or(|child_end| child_end > parent_size)
+    {
+        return false;
+    }
+
+    child.members.iter().all(|child_member| {
+        let Some(child_member_offset) = nested_member_offset(child_member) else {
+            return false;
+        };
+        let Some(translated_offset) = u32::try_from(child_offset)
+            .ok()
+            .and_then(|offset| offset.checked_add(child_member_offset))
+        else {
+            return false;
+        };
+        let Some(child_product) = nested_member_wire_product(child_member) else {
+            return false;
+        };
+        parent.members.iter().any(|parent_member| {
+            nested_member_offset(parent_member) == Some(translated_offset)
+                && nested_member_wire_product(parent_member).is_some_and(|parent_product| {
+                    wire_products_machine_compatible(&parent_product, &child_product)
+                })
+        })
+    })
 }
 
 fn network_field_wire_product(field: &NetworkField) -> Option<Vec<NetworkWireScalarShape>> {

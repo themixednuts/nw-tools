@@ -247,15 +247,11 @@ pub(super) fn merge_message_field_native_type(
     }
 
     if signature.wire_shape.as_ref().is_some_and(|expected_shape| {
-        field
-            .wire_shape
-            .as_ref()
-            .is_some_and(|existing_shape| {
-                existing_shape == expected_shape
-                    || wire_shapes_machine_compatible(existing_shape, expected_shape)
-            })
-    })
-        && (is_wire_projection_native_type(field) || !field_has_proven_native_type(field))
+        field.wire_shape.as_ref().is_some_and(|existing_shape| {
+            existing_shape == expected_shape
+                || wire_shapes_machine_compatible(existing_shape, expected_shape)
+        })
+    }) && (is_wire_projection_native_type(field) || !field_has_proven_native_type(field))
     {
         field.native_type = Some(expected.to_owned());
         report.native_type_filled_count += 1;

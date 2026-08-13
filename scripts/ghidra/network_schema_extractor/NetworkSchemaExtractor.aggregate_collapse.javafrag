@@ -176,6 +176,12 @@
             return false;
         }
         long relativeOffset = offset - start;
+        if (containsNestedAggregateMemberSet(
+                aggregate,
+                field,
+                relativeOffset)) {
+            return true;
+        }
         if (isProvenAggregateField(field) &&
             containsOrderedAggregateProduct(aggregate, field, relativeOffset)) {
             return true;
@@ -202,6 +208,62 @@
             }
         }
         return false;
+    }
+
+    private boolean containsNestedAggregateMemberSet(
+        FieldCall parent,
+        FieldCall child,
+        long childOffset) {
+
+        if (parent == null || child == null || childOffset < 0 ||
+            parent.nestedTypeShape == null || child.nestedTypeShape == null ||
+            !Boolean.TRUE.equals(child.nestedTypeShape.layoutProven) ||
+            child.nestedTypeShape.members.size() < 2) {
+            return false;
+        }
+        Long parentSize = parent.nestedTypeShape.nativeSize;
+        Long childSize = child.nestedTypeShape.nativeSize;
+        Long childEnd = childSize == null
+            ? null
+            : addExactOrNull(childOffset, childSize);
+        if (parentSize == null || parentSize <= 0 || childSize == null ||
+            childSize <= 0 || childEnd == null || childEnd > parentSize) {
+            return false;
+        }
+
+        int matched = 0;
+        for (NestedTypeMember childMember : child.nestedTypeShape.members) {
+            checkAnalysisCancelled();
+            WireShape childEvidence = nestedMemberWireEvidence(childMember);
+            long memberOffset = childMember.nativeOffset == null
+                ? childMember.offset
+                : childMember.nativeOffset;
+            Long translatedOffset = addExactOrNull(childOffset, memberOffset);
+            if (childEvidence == null || childEvidence.layout == null ||
+                Boolean.TRUE.equals(childMember.typeConflict) ||
+                translatedOffset == null) {
+                return false;
+            }
+            boolean memberMatched = false;
+            for (NestedTypeMember parentMember : parent.nestedTypeShape.members) {
+                WireShape parentEvidence = nestedMemberWireEvidence(parentMember);
+                long parentOffset = parentMember.nativeOffset == null
+                    ? parentMember.offset
+                    : parentMember.nativeOffset;
+                if (parentOffset == translatedOffset && parentEvidence != null &&
+                    parentEvidence.layout != null && compatibleCodecProducts(
+                        parentEvidence.layout,
+                        childEvidence.layout)) {
+                    memberMatched = true;
+                    break;
+                }
+            }
+            if (!memberMatched) {
+                return false;
+            }
+            matched++;
+        }
+        return matched >= 2;
     }
 
     private boolean containsStatusPrefixedCallsiteProduct(

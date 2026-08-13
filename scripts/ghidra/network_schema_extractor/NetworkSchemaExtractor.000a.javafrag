@@ -452,7 +452,15 @@
 
         Path temp = Files.createTempFile(parent, output.getName() + ".", ".tmp");
         try {
-            try (Writer writer = Files.newBufferedWriter(temp, StandardCharsets.UTF_8)) {
+            try (
+                OutputStream fileOutput = Files.newOutputStream(temp);
+                OutputStream boundedOutput = new BoundedReportOutputStream(
+                    fileOutput,
+                    MAX_REPORT_BYTES,
+                    absoluteOutput);
+                Writer writer = new java.io.BufferedWriter(
+                    new OutputStreamWriter(boundedOutput, StandardCharsets.UTF_8))
+            ) {
                 gson.toJson(report, writer);
             }
             long expectedSize = Files.size(temp);
@@ -485,6 +493,45 @@
         }
         finally {
             Files.deleteIfExists(temp);
+        }
+    }
+
+    private static final class BoundedReportOutputStream extends FilterOutputStream {
+        private final long maxBytes;
+        private final Path reportPath;
+        private long writtenBytes;
+
+        private BoundedReportOutputStream(
+            OutputStream output,
+            long maxBytes,
+            Path reportPath) {
+
+            super(output);
+            this.maxBytes = maxBytes;
+            this.reportPath = reportPath;
+        }
+
+        @Override
+        public void write(int value) throws IOException {
+            reserve(1);
+            out.write(value);
+        }
+
+        @Override
+        public void write(byte[] buffer, int offset, int length) throws IOException {
+            reserve(length);
+            out.write(buffer, offset, length);
+        }
+
+        private void reserve(int length) throws IOException {
+            if (length < 0 || writtenBytes > maxBytes - length) {
+                throw new IOException(
+                    "Network schema report exceeded the " +
+                    (maxBytes / (1024L * 1024L)) +
+                    " MiB safety limit while writing " + reportPath +
+                    "; probable diagnostic amplification");
+            }
+            writtenBytes += length;
         }
     }
 
@@ -707,3 +754,6 @@
         if (ref == null) {
             return object;
         }
+import java.io.FilterOutputStream;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;

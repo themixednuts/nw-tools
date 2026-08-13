@@ -658,7 +658,9 @@
                 nestedShape,
                 callerParamStorage)
             : translatedShape.storage;
-        if (wireEvidence == null && isRootMessageStorage(plan, output)) {
+        boolean hasRootArgument = hasRootMessageArgument(plan, arguments);
+        if (wireEvidence == null && isRootMessageStorage(plan, output) &&
+            !hasRootArgument) {
             String targetReadBuffer = uniqueReadBufferParameter(target);
             String diagnostic = targetReadBuffer == null
                 ? "read-buffer-parameter-unresolved"
@@ -672,8 +674,11 @@
                 "semantic-codec-unresolved:" + diagnostic,
                 target);
         }
-        if ((nativeType != null || wireEvidence != null && wireEvidence.hasProvenSemantics()) &&
-            isRootMessageStorage(plan, output)) {
+        boolean directFieldHasWireEvidence =
+            wireEvidence != null && wireEvidence.hasProvenSemantics();
+        if ((nativeType != null || directFieldHasWireEvidence) &&
+            isRootMessageStorage(plan, output) &&
+            (directFieldHasWireEvidence || !hasRootArgument)) {
             FieldCall field = addPcodeMessageField(
                 plan,
                 op.getSeqnum().getTarget(),
@@ -693,13 +698,17 @@
             return;
         }
 
+        if (nativeType != null && !directFieldHasWireEvidence &&
+            isRootMessageStorage(plan, output) && hasRootArgument) {
+            runMetrics.increment("unshapedDirectDelegateDescents");
+        }
         observePcodeTempUnmarshal(
             tempNativeTypes,
             tempWireShapes,
             op,
             nativeType,
             wireShape);
-        if (!hasRootMessageArgument(plan, arguments)) {
+        if (!hasRootArgument) {
             return;
         }
         applyMessageCallFrameOutputs(

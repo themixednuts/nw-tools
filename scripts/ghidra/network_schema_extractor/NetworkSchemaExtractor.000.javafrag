@@ -154,9 +154,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private static final String EXTRACTOR_VERSION =
-        "network-schema-extractor-20260813-proven-nested-wire-order-pass";
+        "network-schema-extractor-20260813-bounded-contained-helper-aggregate-pass";
 
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
+    private static final long MAX_REPORT_BYTES = 512L * 1024L * 1024L;
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
     private static final long ADD_FILTER_GROUP_RVA = 0x1677dd0L;
     private static final long REPLICATED_STATE_CONSTRUCTOR_RVA = 0x162f3e0L;

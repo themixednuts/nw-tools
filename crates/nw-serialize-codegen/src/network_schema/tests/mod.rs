@@ -403,6 +403,85 @@ fn collapses_redundant_call_frame_aggregate_fields() {
 }
 
 #[test]
+fn collapses_contained_nested_helper_aggregate_with_distinct_callsite() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "8A03CB14-81B4-45F9-9BE8-6240E52C4B91",
+            "typeIndex": 9006,
+            "typeName": "Test::ContainedHelperMessage",
+            "fields": [{
+                "index": 0,
+                "name": "header",
+                "storageBase": "param_3",
+                "storageOffset": 0,
+                "wireLayout": "composite<u64,u64>"
+            }, {
+                "index": 1,
+                "name": "nested_tail_helper",
+                "storageBase": "param_3",
+                "storageOffset": 80,
+                "wireLayout": "composite<vec3,u32>",
+                "nestedTypeShape": {
+                    "function": "NewWorld+0x2000",
+                    "memberBase": "param_3",
+                    "layoutProven": true,
+                    "nativeSize": 92,
+                    "members": [{
+                        "offset": "0x0",
+                        "wireLayout": "fixed-bytes-12",
+                        "callsite": "NewWorld+0x2010"
+                    }, {
+                        "offset": "0x10",
+                        "wireLayout": "u32",
+                        "callsite": "NewWorld+0x2020"
+                    }]
+                },
+                "callsite": "NewWorld+0x1100"
+            }, {
+                "index": 2,
+                "name": "enclosing_payload",
+                "storageBase": "param_3",
+                "storageOffset": 48,
+                "wireLayout": "composite<vec3,u32>",
+                "nestedTypeShape": {
+                    "function": "NewWorld+0x3000",
+                    "memberBase": "param_3",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "validation": "call-frame-output-parameter+symbolic-direct-type-identity",
+                    "nativeSize": 124,
+                    "members": [{
+                        "offset": "0x20",
+                        "wireLayout": "fixed-bytes-12",
+                        "wireOrdinal": 0,
+                        "callsite": "NewWorld+0x3010"
+                    }, {
+                        "offset": "0x30",
+                        "wireLayout": "u32",
+                        "wireOrdinal": 1,
+                        "callsite": "NewWorld+0x3020"
+                    }]
+                },
+                "callsite": "NewWorld+0x1200"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+
+    let schema = NetworkSchema::from_ghidra_static_network_report(&report)
+        .expect("normalized network schema");
+    assert_eq!(
+        schema.types[0]
+            .fields
+            .iter()
+            .filter_map(|field| field.name.as_deref())
+            .collect::<Vec<_>>(),
+        ["header", "enclosing_payload"]
+    );
+}
+
+#[test]
 fn collapses_repeated_helper_fields_already_covered_by_a_leading_product() {
     let report = json!({
         "registryEntries": [{
