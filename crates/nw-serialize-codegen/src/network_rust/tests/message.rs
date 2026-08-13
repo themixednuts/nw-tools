@@ -1981,7 +1981,7 @@ fn exact_nested_client_ref_uses_the_runtime_wire_type() {
 }
 
 #[test]
-fn exact_nested_runtime_type_uses_its_nominal_marshaler() {
+fn exact_runtime_type_uses_its_nominal_marshaler_without_nested_evidence() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{
             "uuid": "49334933-4933-4933-8933-493349334938",
@@ -1994,29 +1994,6 @@ fn exact_nested_runtime_type_uses_its_nominal_marshaler() {
                 "nativeType": "Amazon::REP::LoginToken",
                 "rustType": "::nw_network::LoginToken",
                 "wireShape": "composite<string,half-f32>",
-                "nestedTypeShape": {
-                    "memberNamesProven": true,
-                    "layoutProven": true,
-                    "memberCoverageProven": true,
-                    "wireOrderProven": true,
-                    "members": [{
-                        "index": 0,
-                        "offset": "0x0",
-                        "name": "signature",
-                        "nameProven": true,
-                        "nativeType": "AZStd::string",
-                        "wireShape": "string",
-                        "wireOrdinal": 0
-                    }, {
-                        "index": 1,
-                        "offset": "0x20",
-                        "name": "value",
-                        "nameProven": true,
-                        "nativeType": "float",
-                        "wireShape": "half-f32",
-                        "wireOrdinal": 1
-                    }]
-                },
                 "confidence": "message-unmarshal-constructor-typed-boundary"
             }]
         }],
