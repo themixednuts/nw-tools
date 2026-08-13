@@ -1981,6 +1981,66 @@ fn exact_nested_client_ref_uses_the_runtime_wire_type() {
 }
 
 #[test]
+fn exact_nested_runtime_type_uses_its_nominal_marshaler() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "49334933-4933-4933-8933-493349334938",
+            "typeIndex": 6182,
+            "typeName": "Amazon::REP::LoginTokenMsg",
+            "capabilities": ["direct-message"],
+            "fields": [{
+                "index": 0,
+                "name": "loginToken",
+                "nativeType": "Amazon::REP::LoginToken",
+                "rustType": "::nw_network::LoginToken",
+                "wireShape": "composite<string,half-f32>",
+                "nestedTypeShape": {
+                    "memberNamesProven": true,
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "name": "signature",
+                        "nameProven": true,
+                        "nativeType": "AZStd::string",
+                        "wireShape": "string",
+                        "wireOrdinal": 0
+                    }, {
+                        "index": 1,
+                        "offset": "0x20",
+                        "name": "value",
+                        "nameProven": true,
+                        "nativeType": "float",
+                        "wireShape": "half-f32",
+                        "wireOrdinal": 1
+                    }]
+                },
+                "confidence": "message-unmarshal-constructor-typed-boundary"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    }))
+    .expect("schema");
+
+    let output = NetworkRustEmitter::emit_messages(&schema).expect("message source");
+    let plan = &output.report.message_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        plan.fields[0].rust_value_type.as_deref(),
+        Some("::nw_network::LoginToken")
+    );
+    assert!(
+        output
+            .source
+            .contains("pub login_token: ::nw_network::LoginToken")
+    );
+    assert!(!output.source.contains("TupleCodec"));
+}
+
+#[test]
 fn exact_unreflected_nested_identity_emits_local_support_type() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{

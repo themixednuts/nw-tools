@@ -370,7 +370,13 @@ pub(super) fn message_field_marshal_attr_tokens(
     }
     if field.nested_type_shape.is_some()
         && field.rust_value_type.as_deref().is_some_and(|rust_type| {
-            is_generated_source_type(rust_type) || message_support_type_ident(rust_type).is_some()
+            is_generated_source_type(rust_type)
+                || message_support_type_ident(rust_type).is_some()
+                || field
+                    .native_type
+                    .as_deref()
+                    .and_then(exact_native_runtime_rust_type)
+                    .is_some_and(|runtime_type| runtime_type == rust_type.trim())
         })
     {
         return quote! {};
