@@ -713,7 +713,7 @@ pub(crate) fn collapse_field_alternate_spelling_wire_products(field: &mut Networ
 }
 
 pub(crate) fn collapse_redundant_message_aggregate_fields(fields: &mut Vec<NetworkField>) {
-    let redundant = (0..fields.len())
+    let mut redundant = (0..fields.len())
         .filter(|&field_index| {
             (0..fields.len()).any(|aggregate_index| {
                 aggregate_index != field_index
@@ -724,6 +724,7 @@ pub(crate) fn collapse_redundant_message_aggregate_fields(fields: &mut Vec<Netwo
             })
         })
         .collect::<BTreeSet<_>>();
+    redundant.extend(repeated_helper_fields_covered_by_leading_product(fields));
     if redundant.is_empty() {
         return;
     }
@@ -739,6 +740,63 @@ pub(crate) fn collapse_redundant_message_aggregate_fields(fields: &mut Vec<Netwo
     }
 }
 
+fn repeated_helper_fields_covered_by_leading_product(fields: &[NetworkField]) -> BTreeSet<usize> {
+    let mut redundant = BTreeSet::new();
+    for (aggregate_index, aggregate) in fields.iter().enumerate() {
+        if aggregate.wire_shape_source.as_deref() != Some("cfg-partial-call-frame-typed-prefix")
+            || aggregate.nested_type_shape.is_some()
+        {
+            continue;
+        }
+        let Some(NetworkWireShape::Composite(members)) = aggregate.wire_shape.as_ref() else {
+            continue;
+        };
+        let Some(first_member) = members.first() else {
+            continue;
+        };
+        if members.len() < 2 || members.iter().any(|member| member != first_member) {
+            continue;
+        }
+        let Some(native_type) = aggregate.native_type.as_deref() else {
+            continue;
+        };
+        let Some(storage_base) = aggregate.storage_base.as_deref() else {
+            continue;
+        };
+        let Some(mut previous_offset) = aggregate.storage_offset else {
+            continue;
+        };
+
+        let mut covered = Vec::new();
+        for (relative_index, member) in members.iter().enumerate().skip(1) {
+            let Some(candidate_index) = aggregate_index.checked_add(relative_index) else {
+                covered.clear();
+                break;
+            };
+            let Some(candidate) = fields.get(candidate_index) else {
+                covered.clear();
+                break;
+            };
+            let candidate_matches = candidate.storage_base.as_deref() == Some(storage_base)
+                && candidate
+                    .storage_offset
+                    .is_some_and(|offset| offset > previous_offset)
+                && candidate.native_type.as_deref() == Some(native_type)
+                && candidate.wire_shape.as_ref() == Some(member);
+            if !candidate_matches {
+                covered.clear();
+                break;
+            }
+            previous_offset = candidate
+                .storage_offset
+                .expect("covered helper field has a storage offset");
+            covered.push(candidate_index);
+        }
+        redundant.extend(covered);
+    }
+    redundant
+}
+
 pub(crate) fn reconcile_proven_nested_wire_order(field: &mut NetworkField) {
     if !matches!(
         field.wire_shape.as_ref(),
@@ -746,12 +804,11 @@ pub(crate) fn reconcile_proven_nested_wire_order(field: &mut NetworkField) {
     ) {
         return;
     }
-    let Some(shape) = field.nested_type_shape.as_ref().filter(|shape| {
-        shape.has_proven_layout()
-            && !shape.has_exact_identity()
-            && !shape.has_proven_symbolic_identity()
-            && shape.members.len() >= 2
-    }) else {
+    let Some(shape) = field
+        .nested_type_shape
+        .as_ref()
+        .filter(|shape| shape.has_proven_layout() && shape.members.len() >= 2)
+    else {
         return;
     };
     let Some(members) = nested_type_shape_members_in_wire_order(shape) else {
@@ -793,6 +850,34 @@ pub(crate) fn reconcile_proven_nested_wire_order(field: &mut NetworkField) {
     ) else {
         return;
     };
+
+    if shape.has_exact_identity() || shape.has_proven_symbolic_identity() {
+        let Some(parent_semantic) = field
+            .wire_shape
+            .as_ref()
+            .and_then(wire_shape_scalar_product)
+        else {
+            return;
+        };
+        let Some(parent_layout) = field
+            .wire_layout
+            .as_deref()
+            .and_then(|product| nested_member_wire_shapes(product, &[]))
+        else {
+            return;
+        };
+        let Some(nested_semantic) = nested_member_wire_shapes(&semantic, &[]) else {
+            return;
+        };
+        let Some(nested_layout) = nested_member_wire_shapes(&layout, &[]) else {
+            return;
+        };
+        if wire_products_machine_compatible(&parent_semantic, &nested_semantic)
+            || !wire_products_machine_compatible(&parent_layout, &nested_layout)
+        {
+            return;
+        }
+    }
 
     let source = if shape.validation.as_deref() == Some("call-frame-output-parameter") {
         "normalized-proven-call-frame-output-product"

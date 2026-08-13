@@ -298,6 +298,98 @@ fn message_signatures_report_native_type_conflicts_without_overwriting_evidence(
 }
 
 #[test]
+fn message_signatures_resolve_unproven_native_type_candidates() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "0B826B33-89F5-49E0-B8CB-FE4433427778",
+            "typeIndex": 19,
+            "typeName": "REPClient::RegistrationRequestV3Msg",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "nativeType": "composite",
+                "sourceTypeName": "Amazon::REP::LoginToken,LoginToken",
+                "wireShape": "composite<string,string>",
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&report).expect("schema");
+
+    let merge = schema.merge_message_signatures(
+        &[NetworkMessageSignature {
+            type_id: Some(uuid!("0b826b33-89f5-49e0-b8cb-fe4433427778")),
+            type_index: Some(19),
+            name: Some("RegistrationRequestV3Msg".to_owned()),
+            rust_name: Some("RegistrationRequestV3Msg".to_owned()),
+            source: None,
+            fields: vec![NetworkMessageFieldSignature {
+                index: Some(0),
+                name: "LoginToken".to_owned(),
+                rust_type: Some("::nw_network::LoginToken".to_owned()),
+                native_type: Some("LoginToken".to_owned()),
+                wire_shape: None,
+            }],
+        }],
+        Some("message-signatures.json".to_owned()),
+    );
+
+    assert_eq!(merge.native_type_conflict_count, 0);
+    assert_eq!(
+        schema.types[0].fields[0].native_type.as_deref(),
+        Some("LoginToken")
+    );
+    assert!(!schema.types[0].fields[0].signature_type_conflict);
+}
+
+#[test]
+fn message_signatures_refine_unproven_aliases_when_wire_shapes_agree() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "951EF3ED-C9A0-4E3D-A6FD-7FE0673D28D2",
+            "typeIndex": 422,
+            "typeName": "ReplicateClient::FragmentUpdateMsg",
+            "fields": [{
+                "index": 0,
+                "name": "field_0",
+                "nativeType": "ProxyAddress",
+                "wireShape": "composite<u32,fixed-bytes-16,fixed-bytes-16>",
+                "wireLayout": "composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>",
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+    let mut schema = NetworkSchema::from_ghidra_static_network_report(&report).expect("schema");
+
+    let merge = schema.merge_message_signatures(
+        &[NetworkMessageSignature {
+            type_id: Some(uuid!("951ef3ed-c9a0-4e3d-a6fd-7fe0673d28d2")),
+            type_index: Some(422),
+            name: Some("ReplicateClient::FragmentUpdateMsg".to_owned()),
+            rust_name: Some("ReplicateClientFragmentUpdateMsg".to_owned()),
+            source: None,
+            fields: vec![NetworkMessageFieldSignature {
+                index: Some(0),
+                name: "TargetRef".to_owned(),
+                rust_type: Some("::nw_network::ActorRef".to_owned()),
+                native_type: Some("ActorRef".to_owned()),
+                wire_shape: Some(NetworkWireShape::ActorRef),
+            }],
+        }],
+        Some("message-signatures.json".to_owned()),
+    );
+
+    assert_eq!(merge.native_type_conflict_count, 0);
+    assert_eq!(
+        schema.types[0].fields[0].native_type.as_deref(),
+        Some("ActorRef")
+    );
+    assert!(!schema.types[0].fields[0].signature_type_conflict);
+}
+
+#[test]
 fn message_signature_conflicts_are_recomputed_after_schema_round_trip() {
     let report = json!({
         "registryEntries": [{

@@ -240,13 +240,22 @@ pub(super) fn merge_message_field_native_type(
 
     if equivalent_native_type(existing, expected)
         || field_has_proven_native_type_identity(field, expected)
+        || field_has_native_type_candidate(field, expected)
     {
         field.native_type = Some(expected.to_owned());
         return;
     }
 
-    if is_wire_projection_native_type(field)
-        && signature.wire_shape.as_ref() == field.wire_shape.as_ref()
+    if signature.wire_shape.as_ref().is_some_and(|expected_shape| {
+        field
+            .wire_shape
+            .as_ref()
+            .is_some_and(|existing_shape| {
+                existing_shape == expected_shape
+                    || wire_shapes_machine_compatible(existing_shape, expected_shape)
+            })
+    })
+        && (is_wire_projection_native_type(field) || !field_has_proven_native_type(field))
     {
         field.native_type = Some(expected.to_owned());
         report.native_type_filled_count += 1;
@@ -737,6 +746,23 @@ pub(super) fn field_has_proven_native_type_identity(field: &NetworkField, expect
     direct
         .or(nested)
         .is_some_and(|existing| type_leaf_name(existing) == type_leaf_name(expected))
+}
+
+fn field_has_native_type_candidate(field: &NetworkField, expected: &str) -> bool {
+    field.source_type_name.as_deref().is_some_and(|candidates| {
+        candidates
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| equivalent_native_type(candidate, expected))
+    })
+}
+
+fn field_has_proven_native_type(field: &NetworkField) -> bool {
+    field.source_type_identity_proven
+        || field
+            .nested_type_shape
+            .as_ref()
+            .is_some_and(NetworkNestedTypeShape::has_exact_identity)
 }
 
 fn canonical_native_type(value: &str) -> &str {

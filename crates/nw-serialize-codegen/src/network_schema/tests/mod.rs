@@ -403,6 +403,79 @@ fn collapses_redundant_call_frame_aggregate_fields() {
 }
 
 #[test]
+fn collapses_repeated_helper_fields_already_covered_by_a_leading_product() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "34F86809-B6D0-46F5-821C-F3E14C15E995",
+            "typeIndex": 9004,
+            "typeName": "Test::RepeatedHelperMessage",
+            "fields": [{
+                "index": 0,
+                "name": "entity_refs",
+                "nativeType": "EntityRef",
+                "sourceTypeName": "EntityRef",
+                "storageBase": "param_3",
+                "storageOffset": 16,
+                "wireShape": "composite<entity-ref,entity-ref,entity-ref>",
+                "wireShapeSource": "cfg-partial-call-frame-typed-prefix",
+                "wireLayout": "composite<entity-ref,entity-ref,entity-ref>",
+                "callsite": "NewWorld+0x1000",
+                "confidence": "message-unmarshal-partial-call-frame-prefix"
+            }, {
+                "index": 1,
+                "name": "duplicate_entity_ref_1",
+                "nativeType": "EntityRef",
+                "storageBase": "param_3",
+                "storageOffset": 80,
+                "wireShape": "entity-ref",
+                "wireLayout": "entity-ref",
+                "callsite": "NewWorld+0x1010",
+                "confidence": "message-unmarshal-pcode-stack"
+            }, {
+                "index": 2,
+                "name": "duplicate_entity_ref_2",
+                "nativeType": "EntityRef",
+                "storageBase": "param_3",
+                "storageOffset": 144,
+                "wireShape": "entity-ref",
+                "wireLayout": "entity-ref",
+                "callsite": "NewWorld+0x1020",
+                "confidence": "message-unmarshal-pcode-stack"
+            }, {
+                "index": 3,
+                "name": "real_field",
+                "nativeType": "AZStd::string",
+                "storageBase": "param_3",
+                "storageOffset": 208,
+                "wireShape": "string",
+                "wireLayout": "string",
+                "callsite": "NewWorld+0x1030",
+                "confidence": "message-unmarshal-pcode-stack"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+
+    let schema = NetworkSchema::from_ghidra_static_network_report(&report)
+        .expect("normalized network schema");
+    let fields = &schema.types[0].fields;
+    assert_eq!(
+        fields
+            .iter()
+            .filter_map(|field| field.name.as_deref())
+            .collect::<Vec<_>>(),
+        ["entity_refs", "real_field"]
+    );
+    assert_eq!(
+        fields
+            .iter()
+            .filter_map(|field| field.index)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+}
+
+#[test]
 fn preserves_uncovered_call_frame_products() {
     let report = json!({
         "registryEntries": [{
@@ -552,6 +625,124 @@ fn normalizes_anonymous_call_frame_boundary_without_erasing_real_identity() {
     assert_eq!(semantic.native_type.as_deref(), Some("ActorRequestId"));
     assert_eq!(
         semantic
+            .wire_shape
+            .as_ref()
+            .map(NetworkWireShape::wire_string),
+        Some("actor-ref".to_owned())
+    );
+}
+
+#[test]
+fn reconciles_stale_semantic_products_from_complete_exact_nested_layouts() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "FC70C4CE-F60C-43A1-8D44-F3257B7DE18A",
+            "typeIndex": 9005,
+            "typeName": "Test::ExactNestedMessage",
+            "fields": [{
+                "index": 0,
+                "name": "ability_limit",
+                "nativeType": "composite",
+                "sourceTypeName": "AbilityInstanceLimit",
+                "wireShape": "composite<composite<u32,bool>,bool>",
+                "wireShapeSource": "cfg-ordered-multi-helper-wire-product",
+                "wireLayout": "composite<u32,bool>",
+                "wireLayoutSource": "message-unmarshal-final-nested-shape",
+                "nestedTypeShape": {
+                    "typeId": "16B90EF8-DC71-4B3D-B113-E1B2E231A535",
+                    "identityProven": true,
+                    "typeName": "AbilityInstanceLimit",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "validation": "call-frame-output-parameter+known-serialize-identity-layout",
+                    "members": [{
+                        "index": 0,
+                        "wireShape": "u32",
+                        "wireLayout": "u32",
+                        "wireOrdinal": 0
+                    }, {
+                        "index": 1,
+                        "wireShape": "bool",
+                        "wireLayout": "bool",
+                        "wireOrdinal": 1
+                    }]
+                },
+                "confidence": "high"
+            }, {
+                "index": 1,
+                "name": "symbolic_value",
+                "nativeType": "composite",
+                "wireShape": "composite<string,composite<string,fixed-bytes-2>>",
+                "wireShapeSource": "cfg-ordered-multi-helper-wire-product",
+                "wireLayout": "composite<string,fixed-bytes-2>",
+                "wireLayoutSource": "message-unmarshal-final-nested-shape",
+                "nestedTypeShape": {
+                    "identityProven": true,
+                    "typeName": "SymbolicValue",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "validation": "pcode-read-buffer-call-stack-wire-sequence+symbolic-direct-type-identity",
+                    "members": [{
+                        "index": 0,
+                        "wireShape": "string",
+                        "wireLayout": "string",
+                        "wireOrdinal": 0
+                    }, {
+                        "index": 1,
+                        "wireLayout": "fixed-bytes-2",
+                        "wireOrdinal": 1
+                    }]
+                },
+                "confidence": "high"
+            }, {
+                "index": 2,
+                "name": "actor_ref",
+                "nativeType": "ActorRef",
+                "wireShape": "actor-ref",
+                "wireLayout": "composite<fixed-bytes-4,fixed-bytes-16,fixed-bytes-16>",
+                "nestedTypeShape": {
+                    "identityProven": true,
+                    "typeName": "ActorRef",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "validation": "call-frame-output-parameter+known-serialize-identity-layout",
+                    "members": [{
+                        "index": 0,
+                        "wireShape": "u32",
+                        "wireLayout": "fixed-bytes-4",
+                        "wireOrdinal": 0
+                    }, {
+                        "index": 1,
+                        "wireLayout": "fixed-bytes-16",
+                        "wireOrdinal": 1
+                    }, {
+                        "index": 2,
+                        "wireLayout": "fixed-bytes-16",
+                        "wireOrdinal": 2
+                    }]
+                },
+                "confidence": "high"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+
+    let schema = NetworkSchema::from_ghidra_static_network_report(&report)
+        .expect("normalized network schema");
+    let fields = &schema.types[0].fields;
+    assert_eq!(
+        fields[0].wire_shape_raw.as_deref(),
+        Some("composite<u32,bool>")
+    );
+    assert_eq!(
+        fields[1].wire_shape_raw.as_deref(),
+        Some("composite<string,fixed-bytes-2>")
+    );
+    assert_eq!(
+        fields[2]
             .wire_shape
             .as_ref()
             .map(NetworkWireShape::wire_string),

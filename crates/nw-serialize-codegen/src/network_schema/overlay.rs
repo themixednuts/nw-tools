@@ -140,6 +140,7 @@ fn merge_registry_types(
         if let Some(index) = destination_indices.get(&type_id).copied() {
             validate_registry_identity(&destination[index], &entry, type_id)?;
             preserve_missing_registry_identity(&destination[index], &mut entry);
+            preserve_stronger_registry_analysis(&destination[index], &mut entry);
             destination[index] = entry;
             *replaced_count += 1;
         } else {
@@ -149,6 +150,30 @@ fn merge_registry_types(
         }
     }
     Ok(source_ids)
+}
+
+fn preserve_stronger_registry_analysis(
+    base: &super::NetworkType,
+    overlay: &mut super::NetworkType,
+) {
+    let overlay_is_unresolved = overlay.fields.is_empty()
+        && overlay.marshal_fields.is_empty()
+        && overlay.instance.as_ref().is_some_and(|instance| {
+            instance.analysis_status == Some(super::NetworkMessageAnalysisStatus::Unresolved)
+        });
+    let base_has_recovered_analysis = (!base.fields.is_empty() || !base.marshal_fields.is_empty())
+        && base.instance.as_ref().is_some_and(|instance| {
+            instance.analysis_status.is_some()
+                && instance.analysis_status != Some(super::NetworkMessageAnalysisStatus::Unresolved)
+        });
+    if !overlay_is_unresolved || !base_has_recovered_analysis {
+        return;
+    }
+
+    overlay.instance.clone_from(&base.instance);
+    overlay.fields.clone_from(&base.fields);
+    overlay.marshal_fields.clone_from(&base.marshal_fields);
+    overlay.signature_field_count_conflict = base.signature_field_count_conflict;
 }
 
 fn preserve_missing_registry_identity(base: &super::NetworkType, overlay: &mut super::NetworkType) {
@@ -488,6 +513,44 @@ mod tests {
         assert_eq!(
             merged.fields[0].wire_shape.as_ref().unwrap().wire_string(),
             "u32"
+        );
+    }
+
+    #[test]
+    fn preserves_recovered_message_fields_when_an_overlay_regresses_to_unresolved() {
+        let mut base = report_with_dependent_field(
+            "vec<composite<fixed-bytes-16,fixed-bytes-8,fixed-bytes-8>>",
+            "cfg-counted-loop+ordered-element-codecs",
+            "vec<composite<fixed-bytes-16,fixed-bytes-8,fixed-bytes-8>>",
+        );
+        base["registryEntries"][0]["messageUnmarshal"] = json!({
+            "createInstance": "NewWorld+0x7c1400",
+            "analysisStatus": "recovered-fields",
+            "instanceSize": 32,
+            "instanceSizeSource": "create-instance-operator-new"
+        });
+        let mut schema = NetworkSchema::from_ghidra_static_network_report(&base).unwrap();
+
+        let mut overlay = base.clone();
+        overlay["registryEntries"][0]["fields"] = json!([]);
+        overlay["registryEntries"][0]["messageUnmarshal"] = json!({
+            "createInstance": "NewWorld+0x7c1400",
+            "analysisStatus": "unresolved",
+            "instanceSize": 32,
+            "instanceSizeSource": "create-instance-operator-new"
+        });
+
+        schema
+            .merge_ghidra_static_network_overlay(&overlay)
+            .unwrap();
+
+        assert_eq!(schema.types[0].fields.len(), 1);
+        assert_eq!(
+            schema.types[0]
+                .instance
+                .as_ref()
+                .and_then(|instance| instance.analysis_status),
+            Some(crate::network_schema::NetworkMessageAnalysisStatus::RecoveredFields)
         );
     }
 
