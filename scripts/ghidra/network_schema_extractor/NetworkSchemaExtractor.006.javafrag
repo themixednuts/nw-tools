@@ -252,6 +252,14 @@
                             formatAddress(op.getSeqnum().getTarget()));
                 }
 
+                if (appendNestedDirectMessageCallFrameCandidates(
+                        byBase,
+                        target,
+                        op,
+                        callTarget)) {
+                    continue;
+                }
+
 
                 NestedTypeShape nestedMemberShape =
                     recoverNestedDirectMemberShape(target, callTarget);
@@ -319,6 +327,41 @@
             markNestedTypeMemberWireOrder(byBase, storage, "cfg-store-order");
         }
         return byBase;
+    }
+
+    private boolean appendNestedDirectMessageCallFrameCandidates(
+        Map<String, LinkedHashMap<Long, NestedTypeMember>> byBase,
+        Function owner,
+        PcodeOpAST operation,
+        Function target) {
+
+        if (byBase == null || owner == null || operation == null || target == null ||
+            collectionOutputShapesByParameterFromPcode(target).isEmpty()) {
+            return false;
+        }
+        Map<String, PcodeStorage> arguments = callArgumentStorageMap(
+            owner,
+            operation,
+            Collections.emptyMap());
+        boolean translated = false;
+        for (MessageCallFrameOutput output : messageCallFrameOutputs(target)) {
+            PcodeStorage binding = arguments.get(output.parameterBase());
+            if (binding == null || output.shape() == null ||
+                output.shape().members.isEmpty()) {
+                continue;
+            }
+            appendTranslatedMessageCallFrameMembers(
+                byBase,
+                binding,
+                output.shape(),
+                operation,
+                target);
+            translated = true;
+        }
+        if (translated) {
+            runMetrics.increment("nestedDirectCallFrameCollectionOutputs");
+        }
+        return translated;
     }
 
     private NestedDirectTypeCallShape translatedNestedDirectTypeCallShape(
@@ -495,6 +538,7 @@
         if (field == null || shape == null) {
             return;
         }
+        promoteNestedTypeWireOrderProof(shape);
         enrichKnownSerializeIdentity(shape);
         if (field.nestedTypeShape == null) {
             field.nestedTypeShape = shape;
@@ -510,15 +554,43 @@
             shapeWire = wireShapeFromNestedTypeShape(shape);
         }
         String shapeLayout = wireLayoutFromNestedTypeShape(shape);
+        boolean placeholderLayout = field.wireLayout != null &&
+            Objects.equals(field.wireLayout, field.wireShape);
         if (shapeLayout != null &&
-            (field.wireLayout == null || field.wireLayout.equals(shapeLayout))) {
+            (field.wireLayout == null || field.wireLayout.equals(shapeLayout) ||
+                placeholderLayout)) {
             field.wireLayout = shapeLayout;
             field.wireLayoutSource = wireShapeSource;
+            if (placeholderLayout && !Objects.equals(shapeLayout, shapeWire)) {
+                runMetrics.increment("nestedPhysicalLayoutUpgrades");
+            }
         }
         if (shapeWire != null &&
             (field.wireShape == null || field.wireShape.equals(shapeWire))) {
             field.wireShape = shapeWire;
             field.wireShapeSource = wireShapeSource;
+        }
+    }
+
+    private void promoteNestedTypeWireOrderProof(NestedTypeShape shape) {
+        if (shape == null || shape.members.isEmpty()) {
+            return;
+        }
+        List<NestedTypeMember> ordered = provenWireOrderedMembers(shape.members);
+        if (ordered == null || ordered.size() != shape.members.size()) {
+            return;
+        }
+        for (NestedTypeMember member : ordered) {
+            if (member == null || Boolean.TRUE.equals(member.typeConflict) ||
+                firstNonEmpty(member.wireLayout, member.wireShape) == null) {
+                return;
+            }
+        }
+        shape.layoutProven = true;
+        shape.memberCoverageProven = true;
+        shape.wireOrderProven = true;
+        if (shape.wireOrderSource == null) {
+            shape.wireOrderSource = "contiguous-member-wire-ordinals";
         }
     }
 
@@ -551,8 +623,12 @@
         if (shape == null || shape.members.isEmpty()) {
             return null;
         }
+        List<NestedTypeMember> ordered = provenWireOrderedMembers(shape.members);
+        Collection<NestedTypeMember> members = ordered == null
+            ? shape.members
+            : ordered;
         ArrayList<String> memberShapes = new ArrayList<>();
-        for (NestedTypeMember member : shape.members) {
+        for (NestedTypeMember member : members) {
             if (member == null ||
                 Boolean.TRUE.equals(member.typeConflict) ||
                 member.wireShape == null ||
@@ -565,10 +641,12 @@
     }
 
     private String wireLayoutFromNestedTypeShape(NestedTypeShape shape) {
-        if (shape == null || !Boolean.TRUE.equals(shape.memberCoverageProven) ||
-            !Boolean.TRUE.equals(shape.wireOrderProven)) {
+        if (shape == null) {
             return null;
         }
+        // A contiguous, unique wire ordinal on every member proves both order
+        // and coverage even when an interprocedural call-frame shape did not
+        // copy the aggregate-level proof flags.
         List<NestedTypeMember> members = provenWireOrderedMembers(shape.members);
         if (members == null || members.isEmpty()) {
             return null;
@@ -716,6 +794,13 @@
                         byBase,
                         rawWrite.storage,
                         "cfg-call-order");
+                    continue;
+                }
+                if (appendNestedDirectMessageCallFrameCandidates(
+                        byBase,
+                        target,
+                        op,
+                        callTarget)) {
                     continue;
                 }
                 NestedTypeShape nestedMemberShape = recoverNestedDirectMemberShape(

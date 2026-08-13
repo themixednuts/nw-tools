@@ -154,7 +154,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     }
 
     private static final String EXTRACTOR_VERSION =
-        "network-schema-extractor-20260812-backedge-count-condition-v31-pass";
+        "network-schema-extractor-20260813-proven-nested-wire-order-pass";
 
     private static final String CACHE_SCHEMA_VERSION = EXTRACTOR_VERSION + "/analysis-cache-v1";
     private static final long REGISTER_FIELD_RVA = 0x1775c60L;
@@ -180,6 +180,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private static final int FIELD_HANDLER_CONTAINER_VTABLE_SLOTS = 20;
     private static final int FIELD_HANDLER_CONSTRUCTOR_WRITE_SPAN = 0x200;
     private static final int FIELD_HANDLER_IS_DEFAULT_VALUE_SLOT = 1;
+    private static final int FIELD_HANDLER_SET_CURRENT_VALUE_AS_DEFAULT_SLOT = 2;
     private static final int FIELD_HANDLER_MARSHAL_SLOT = 5;
     private static final int FIELD_HANDLER_UNMARSHAL_SLOT = 6;
     private static final int FIELD_HANDLER_MARSHAL_FULL_SLOT = 14;

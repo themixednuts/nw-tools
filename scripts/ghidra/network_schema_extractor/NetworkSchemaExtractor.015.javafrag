@@ -649,6 +649,9 @@
             return false;
         }
         for (int slot = 0; slot < FIELD_HANDLER_SCALAR_VTABLE_SLOTS; slot++) {
+            if (slot == FIELD_HANDLER_SET_CURRENT_VALUE_AS_DEFAULT_SLOT) {
+                continue;
+            }
             if (!isExecutableAddress(readPointer(vtable.add(slot * 8L)))) {
                 return false;
             }
@@ -661,6 +664,9 @@
             return false;
         }
         for (int slot = 0; slot < FIELD_HANDLER_CONTAINER_VTABLE_SLOTS; slot++) {
+            if (slot == FIELD_HANDLER_SET_CURRENT_VALUE_AS_DEFAULT_SLOT) {
+                continue;
+            }
             if (!isExecutableAddress(readPointer(vtable.add(slot * 8L)))) {
                 return false;
             }

@@ -1,0 +1,171 @@
+    /**
+     * A byte range copied from the decoded scalar into a larger p-code value.
+     * PIECE stores are common for narrow fields decoded into stack aggregates:
+     * the scalar occupies one lane while the remaining lanes retain their old
+     * value. Whole-value provenance rejects that valid partial store, so this
+     * tracks the exact source and destination byte offsets instead.
+     */
+    private record PcodeValueStorageLane(
+        long sourceOffset,
+        int valueOffset,
+        int byteLength) {
+    }
+
+    private boolean isDirectPcodeStorageAssignment(PcodeOp operation) {
+        if (operation == null || operation.getOutput() == null) {
+            return false;
+        }
+        int opcode = operation.getOpcode();
+        if (opcode != PcodeOp.COPY && opcode != PcodeOp.CAST &&
+            opcode != PcodeOp.INT_ZEXT && opcode != PcodeOp.INT_SEXT &&
+            opcode != PcodeOp.SUBPIECE && opcode != PcodeOp.PIECE) {
+            return false;
+        }
+        PcodeStorage output = pcodeStorageExpression(operation.getOutput());
+        return output != null &&
+            (isParameterStorage(output) || "stack".equals(output.base));
+    }
+
+    private PcodeValueStorageLane pcodeValueStorageLaneInRange(
+        Varnode value,
+        PcodeStorage expected,
+        long expectedEnd,
+        Set<String> active,
+        int depth) {
+
+        if (value == null || expected == null || depth > 48 ||
+            !active.add(pcodeNodeKey(value))) {
+            return null;
+        }
+        PcodeStorage loaded = pcodeLoadedStorageExpression(value);
+        Long loadedEnd = loaded == null
+            ? null
+            : addExactOrNull(loaded.offset, (long)value.getSize());
+        if (loaded != null && loadedEnd != null &&
+            Objects.equals(loaded.base, expected.base) &&
+            loaded.offset >= expected.offset && loadedEnd <= expectedEnd) {
+            return new PcodeValueStorageLane(
+                loaded.offset,
+                0,
+                value.getSize());
+        }
+
+        PcodeOp definition = value.getDef();
+        if (definition == null ||
+            definition.getOpcode() == PcodeOp.CALL ||
+            definition.getOpcode() == PcodeOp.CALLIND) {
+            return null;
+        }
+        int opcode = definition.getOpcode();
+        if (opcode == PcodeOp.COPY || opcode == PcodeOp.CAST ||
+            opcode == PcodeOp.INT_ZEXT || opcode == PcodeOp.INT_SEXT ||
+            opcode == PcodeOp.INDIRECT) {
+            return definition.getNumInputs() == 0
+                ? null
+                : pcodeValueStorageLaneInRange(
+                    definition.getInput(0),
+                    expected,
+                    expectedEnd,
+                    new LinkedHashSet<>(active),
+                    depth + 1);
+        }
+        if (opcode == PcodeOp.SUBPIECE &&
+            definition.getNumInputs() == 2 &&
+            definition.getInput(1).isConstant()) {
+            PcodeValueStorageLane source = pcodeValueStorageLaneInRange(
+                definition.getInput(0),
+                expected,
+                expectedEnd,
+                new LinkedHashSet<>(active),
+                depth + 1);
+            if (source == null) {
+                return null;
+            }
+            long windowStart = definition.getInput(1).getOffset();
+            Long windowEnd = addExactOrNull(windowStart, (long)value.getSize());
+            if (windowEnd == null || windowStart < 0L ||
+                windowStart > Integer.MAX_VALUE ||
+                windowEnd > Integer.MAX_VALUE) {
+                return null;
+            }
+            long sourceStart = source.valueOffset();
+            long sourceEnd = sourceStart + source.byteLength();
+            long overlapStart = Math.max(sourceStart, windowStart);
+            long overlapEnd = Math.min(sourceEnd, windowEnd);
+            if (overlapEnd <= overlapStart) {
+                return null;
+            }
+            return new PcodeValueStorageLane(
+                source.sourceOffset() + overlapStart - sourceStart,
+                (int)(overlapStart - windowStart),
+                (int)(overlapEnd - overlapStart));
+        }
+        if (opcode == PcodeOp.PIECE) {
+            ArrayList<PcodeValueStorageLane> lanes = new ArrayList<>();
+            int valueOffset = 0;
+            for (int slot = definition.getNumInputs() - 1; slot >= 0; slot--) {
+                Varnode input = definition.getInput(slot);
+                PcodeValueStorageLane lane = pcodeValueStorageLaneInRange(
+                    input,
+                    expected,
+                    expectedEnd,
+                    new LinkedHashSet<>(active),
+                    depth + 1);
+                if (lane != null) {
+                    lanes.add(new PcodeValueStorageLane(
+                        lane.sourceOffset(),
+                        valueOffset + lane.valueOffset(),
+                        lane.byteLength()));
+                }
+                valueOffset += input.getSize();
+            }
+            return mergeContiguousPcodeValueStorageLanes(lanes);
+        }
+        if (opcode == PcodeOp.MULTIEQUAL) {
+            PcodeValueStorageLane selected = null;
+            for (int slot = 0; slot < definition.getNumInputs(); slot++) {
+                PcodeValueStorageLane candidate = pcodeValueStorageLaneInRange(
+                    definition.getInput(slot),
+                    expected,
+                    expectedEnd,
+                    new LinkedHashSet<>(active),
+                    depth + 1);
+                if (candidate == null ||
+                    selected != null && !selected.equals(candidate)) {
+                    return null;
+                }
+                selected = candidate;
+            }
+            return selected;
+        }
+        return null;
+    }
+
+    private PcodeValueStorageLane mergeContiguousPcodeValueStorageLanes(
+        List<PcodeValueStorageLane> lanes) {
+
+        if (lanes == null || lanes.isEmpty()) {
+            return null;
+        }
+        ArrayList<PcodeValueStorageLane> ordered = new ArrayList<>(lanes);
+        ordered.sort(Comparator.comparingInt(PcodeValueStorageLane::valueOffset));
+        PcodeValueStorageLane first = ordered.get(0);
+        long sourceEnd = first.sourceOffset() + first.byteLength();
+        long valueEnd = (long)first.valueOffset() + first.byteLength();
+        for (int index = 1; index < ordered.size(); index++) {
+            PcodeValueStorageLane lane = ordered.get(index);
+            if (lane.sourceOffset() != sourceEnd ||
+                lane.valueOffset() != valueEnd) {
+                return null;
+            }
+            sourceEnd += lane.byteLength();
+            valueEnd += lane.byteLength();
+        }
+        long byteLength = sourceEnd - first.sourceOffset();
+        return byteLength <= 0L || byteLength > Integer.MAX_VALUE
+            ? null
+            : new PcodeValueStorageLane(
+                first.sourceOffset(),
+                first.valueOffset(),
+                (int)byteLength);
+    }

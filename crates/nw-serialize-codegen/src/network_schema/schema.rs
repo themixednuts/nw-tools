@@ -1,6 +1,16 @@
 use super::*;
 
 impl NetworkSchema {
+    /// Applies a runtime configuration value to every matching conditional
+    /// container codec while preserving the native default in the schema.
+    pub fn apply_external_boolean_profile(&mut self, name: &str, value: bool) -> usize {
+        self.field_handler_vtables
+            .iter_mut()
+            .filter_map(|vtable| vtable.full_container_plan.as_mut())
+            .map(|plan| plan.apply_external_boolean_profile(name, value))
+            .sum()
+    }
+
     pub fn from_ghidra_static_network_report(
         report: &Value,
     ) -> Result<Self, NetworkSchemaImportError> {
@@ -83,7 +93,9 @@ impl NetworkSchema {
         for network_type in &mut self.types {
             enrich_fields_from_handler_projections(&mut network_type.fields, &projections);
             for field in &mut network_type.fields {
+                promote_named_codec_wire_shape(field);
                 collapse_field_alternate_spelling_wire_products(field);
+                reconcile_proven_nested_wire_order(field);
                 normalize_proven_message_aggregate_boundary(field);
             }
             collapse_redundant_message_aggregate_fields(&mut network_type.fields);
@@ -614,6 +626,21 @@ impl NetworkSchema {
                 })
                 .count(),
         }
+    }
+}
+
+fn promote_named_codec_wire_shape(field: &mut NetworkField) {
+    if field.wire_shape.is_some() {
+        return;
+    }
+    let function_name = field
+        .nested_type_shape
+        .as_ref()
+        .and_then(|shape| shape.function_name.as_deref());
+    if function_name.is_some_and(|name| name.contains("::NonUniformScaleCompMarshaler>::Unmarshal"))
+    {
+        field.wire_shape = Some(NetworkWireShape::NonUniformScaleComp);
+        field.wire_shape_source = Some("named-unmarshal-codec-specialization".to_owned());
     }
 }
 

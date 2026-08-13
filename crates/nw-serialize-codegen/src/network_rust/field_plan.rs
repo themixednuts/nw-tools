@@ -288,6 +288,8 @@ pub(super) fn state_field_shape_report(
         && !is_container_field
         && !is_fixed_sequence_field
         && !matches!(shape, Some(SchemaWireShape::RemoteServerGdeRef))
+        && !matches!(shape, Some(SchemaWireShape::PackedPosition(_)))
+        && !matches!(shape, Some(SchemaWireShape::NonUniformScaleComp))
         && exact_serialize_value_type.is_none()
     {
         handler_vtable.and_then(|vtable| {

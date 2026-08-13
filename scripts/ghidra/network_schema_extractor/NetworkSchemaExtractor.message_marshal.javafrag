@@ -575,50 +575,6 @@
         return messageMarshalSource(selected, callerParamStorage);
     }
 
-    /**
-     * Storage a scalar was loaded from before being staged into a stack
-     * temporary.
-     *
-     * `Marshaler<T>::Marshal(status, &temp, buffer)` takes its value by pointer,
-     * so the argument names a stack slot rather than message storage. The
-     * tracked store into that slot still carries the origin, which is what ties
-     * the field back to the message.
-     */
-    private PcodeStorage stagedStackSourceStorage(
-        Function owner,
-        PcodeOp operation,
-        Function target,
-        PcodeStorage candidate) {
-
-        if (candidate == null || !"stack".equals(candidate.base) ||
-            candidate.offset < Integer.MIN_VALUE ||
-            candidate.offset > Integer.MAX_VALUE) {
-            return null;
-        }
-        ForwardArgState state = instructionStateBeforeCall(owner, operation, target);
-        TrackedValue staged = state == null
-            ? null
-            : state.valuesByStackSlot.get((int)candidate.offset);
-        if (staged == null) {
-            return null;
-        }
-        PcodeStorage direct = pcodeStorageFromTrackedValue(staged);
-        if (isParameterStorage(direct)) {
-            return direct;
-        }
-        PcodeStorage resolved = null;
-        for (PcodeStorage dependency : staged.storageDependencies) {
-            if (!isParameterStorage(dependency)) {
-                continue;
-            }
-            if (resolved != null && !resolved.sameLocation(dependency)) {
-                return null;
-            }
-            resolved = dependency;
-        }
-        return resolved;
-    }
-
     private List<MessageMarshalEvent> messageMarshalRawEvent(
         Function owner,
         PcodeOpAST operation,

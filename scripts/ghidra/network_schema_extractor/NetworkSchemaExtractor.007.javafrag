@@ -503,15 +503,20 @@
         long end = 0;
         for (int i = 0; i < members.size(); i++) {
             NestedTypeMember member = members.get(i);
+            Integer byteWidth = member == null ? null : member.byteWidth;
+            if (byteWidth == null && member != null && i + 1 == members.size() &&
+                isAggregateWireEvidence(nestedMemberWireEvidence(member))) {
+                byteWidth = 1;
+            }
             if (member == null ||
                 Boolean.TRUE.equals(member.typeConflict) ||
-                member.byteWidth == null ||
-                member.byteWidth <= 0 ||
+                byteWidth == null ||
+                byteWidth <= 0 ||
                 member.offset < 0 ||
                 member.offset < end) {
                 return false;
             }
-            end = member.offset + member.byteWidth;
+            end = member.offset + byteWidth;
             if (end > 0x400) {
                 return false;
             }

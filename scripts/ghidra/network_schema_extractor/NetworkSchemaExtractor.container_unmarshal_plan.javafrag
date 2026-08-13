@@ -748,6 +748,21 @@
         PcodeStorage output) {
 
         Integer width = containerCodecNativeOutputByteWidth(codec);
+        return postCallUnmarshalOutputStorage(
+            high,
+            call,
+            output,
+            width,
+            false);
+    }
+
+    private PcodeStorage postCallUnmarshalOutputStorage(
+        HighFunction high,
+        PcodeOpAST call,
+        PcodeStorage output,
+        Integer width,
+        boolean allowLocalStackDestination) {
+
         Long outputEnd = output == null || width == null || width <= 0
             ? null
             : addExactOrNull(output.offset, width.longValue());
@@ -774,34 +789,64 @@
                 }
                 continue;
             }
-            if (operation.getOpcode() != PcodeOp.STORE ||
-                operation.getNumInputs() < 3) {
+            boolean memoryStore = operation.getOpcode() == PcodeOp.STORE &&
+                operation.getNumInputs() >= 3;
+            boolean directStorageAssignment =
+                isDirectPcodeStorageAssignment(operation);
+            if (!memoryStore && !directStorageAssignment) {
                 continue;
             }
-            PcodeStorage destination =
-                pcodeStorageExpression(operation.getInput(1));
+            PcodeStorage destination = memoryStore
+                ? pcodeStorageExpression(operation.getInput(1))
+                : pcodeStorageExpression(operation.getOutput());
+            Varnode storedValue = memoryStore
+                ? operation.getInput(2)
+                : operation.getOutput();
             Long sourceOffset = pcodeValueStorageOffsetInRange(
-                operation.getInput(2),
+                storedValue,
                 output,
                 outputEnd,
                 new LinkedHashSet<>(),
                 0);
-            if (!isParameterStorage(destination) || sourceOffset == null) {
+            int destinationByteOffset = 0;
+            if (sourceOffset == null) {
+                PcodeValueStorageLane lane = pcodeValueStorageLaneInRange(
+                    storedValue,
+                    output,
+                    outputEnd,
+                    new LinkedHashSet<>(),
+                    0);
+                if (lane != null) {
+                    sourceOffset = lane.sourceOffset();
+                    destinationByteOffset = lane.valueOffset();
+                    runMetrics.increment("packedPostCallOutputByteLaneProofs");
+                }
+            }
+            boolean allowedDestination = isParameterStorage(destination) ||
+                allowLocalStackDestination && destination != null &&
+                    "stack".equals(destination.base);
+            if (!allowedDestination || sourceOffset == null) {
                 continue;
             }
             long relative = sourceOffset - output.offset;
             PcodeStorage root;
             try {
-                root = destination.plus(-relative);
+                root = destination.plus(Math.subtractExact(
+                    (long)destinationByteOffset,
+                    relative));
             }
             catch (ArithmeticException ignored) {
                 return null;
             }
-            if (root.offset < 0L || root.offset > 0x100000L ||
+            if (isParameterStorage(root) &&
+                    (root.offset < 0L || root.offset > 0x100000L) ||
                 selected != null && !selected.sameLocation(root)) {
                 return null;
             }
             selected = root;
+            if (directStorageAssignment) {
+                runMetrics.increment("postCallDirectStorageAssignmentProofs");
+            }
         }
         return selected;
     }

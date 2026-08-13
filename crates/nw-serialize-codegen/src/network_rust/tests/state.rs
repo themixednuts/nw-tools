@@ -1,6 +1,128 @@
 use super::*;
 
 #[test]
+fn packed_position_shape_wins_over_native_storage_projection() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "79C28008-4FC5-4EFB-88A1-538F4FB7DDE1",
+            "typeIndex": 13,
+            "typeName": "MB::PositionInTheWorldReplicatedState",
+            "capabilities": ["replicated-state"],
+            "fields": [{
+                "index": 0,
+                "name": "position",
+                "group": 0,
+                "wireShape": "packed-position<0xc2c80000,0x44fa0000>",
+                "wireShapeSource": "marshal+unmarshal-pcode-agreement",
+                "wireLayout": "fixed-bytes-10",
+                "wireLayoutSource": "marshal+unmarshal-pcode-agreement",
+                "nestedTypeShape": {
+                    "identityProven": false,
+                    "typeName": "Value",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "nativeSize": 16,
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "name": "field_0",
+                        "nativeType": "u64",
+                        "wireLayout": "f32",
+                        "byteWidth": 8,
+                        "wireOrdinal": 0
+                    }, {
+                        "index": 1,
+                        "offset": "0x8",
+                        "name": "field_1",
+                        "nativeType": "u64",
+                        "wireLayout": "u64",
+                        "byteWidth": 8,
+                        "wireOrdinal": 1
+                    }]
+                },
+                "confidence": "high"
+            }]
+        }],
+        "fieldRegistrationFunctions": [],
+        "fieldHandlerVtables": []
+    }))
+    .expect("schema");
+
+    let output =
+        NetworkRustEmitter::emit_replicated_states(&schema, [13]).expect("replicated state source");
+    let field = &output.report.state_generation_plans[0].fields[0];
+
+    assert!(output.report.state_generation_plans[0].can_generate);
+    assert_eq!(field.rust_value_type.as_deref(), Some("::glam::Vec3"));
+    assert_eq!(
+        field.rust_field_type.as_deref(),
+        Some(
+            "ReplicatedFieldHandler<::glam::Vec3, PackedPositionMarshaller<0xc2c80000, 0x44fa0000>>"
+        )
+    );
+    assert!(!output.source.contains("pub struct PositionValue"));
+}
+
+#[test]
+fn named_non_uniform_scale_codec_wins_over_default_branch_layout() {
+    let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "79C28008-4FC5-4EFB-88A1-538F4FB7DDE1",
+            "typeIndex": 13,
+            "typeName": "MB::PositionInTheWorldReplicatedState",
+            "capabilities": ["replicated-state"],
+            "fields": [{
+                "index": 0,
+                "name": "scale",
+                "group": 0,
+                "handlerVtable": "NewWorld+0x8465bc0",
+                "wireLayout": "fixed-bytes-1",
+                "wireLayoutSource": "unmarshal-pcode-call-stack",
+                "nestedTypeShape": {
+                    "identityProven": false,
+                    "typeName": "Value",
+                    "functionName": "MB::ReplicatedFieldHandler<AZ::Vector3,MB::PositionInTheWorldReplicatedState::NonUniformScaleCompMarshaler>::Unmarshal",
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "nativeSize": 16,
+                    "members": [{
+                        "index": 0,
+                        "offset": "0x0",
+                        "name": "field_0",
+                        "nativeType": "u32",
+                        "wireLayout": "half-f32",
+                        "byteWidth": 4,
+                        "wireOrdinal": 0
+                    }]
+                },
+                "confidence": "high"
+            }]
+        }],
+        "fieldRegistrationFunctions": [],
+        "fieldHandlerVtables": [{
+            "address": "NewWorld+0x8465bc0",
+            "fieldCount": 1,
+            "slots": []
+        }]
+    }))
+    .expect("schema");
+
+    let output =
+        NetworkRustEmitter::emit_replicated_states(&schema, [13]).expect("replicated state source");
+    let field = &output.report.state_generation_plans[0].fields[0];
+
+    assert!(output.report.state_generation_plans[0].can_generate);
+    assert_eq!(field.wire_shape, Some(SchemaWireShape::NonUniformScaleComp));
+    assert_eq!(field.rust_value_type.as_deref(), Some("::glam::Vec3"));
+    assert_eq!(
+        field.rust_field_type.as_deref(),
+        Some("ReplicatedFieldHandler<::glam::Vec3, NonUniformScaleCompMarshaler>")
+    );
+}
+
+#[test]
 fn emits_anonymous_state_wire_layout_without_a_semantic_type() {
     let schema = NetworkSchema::from_ghidra_static_network_report(&json!({
         "registryEntries": [{

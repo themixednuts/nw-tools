@@ -72,6 +72,7 @@
         return vectorElementWireShape(observed) != null ||
             observed != null && (
                 observed.startsWith("set<") ||
+                observed.startsWith("map<") ||
                 observed.startsWith("composite<") ||
                 observed.startsWith("optional<") ||
                 observed.startsWith("default-omitted<") ||

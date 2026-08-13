@@ -474,12 +474,12 @@
         if (field == null || evidence == null) {
             return;
         }
-        String incoming = firstNonEmpty(evidence.layout, evidence.shape);
-        if (incoming == null) {
+        String incomingLayout = firstNonEmpty(evidence.layout, evidence.shape);
+        if (incomingLayout == null) {
             return;
         }
-        String existing = firstNonEmpty(field.wireLayout, field.wireShape);
-        if (existing == null) {
+        String existingLayout = firstNonEmpty(field.wireLayout, field.wireShape);
+        if (existingLayout == null) {
             if (evidence.shape != null) {
                 field.wireShape = evidence.shape;
                 field.wireShapeSource = evidence.source;
@@ -494,38 +494,52 @@
             }
             return;
         }
-        if (compatibleCodecProducts(existing, incoming) &&
-            (evidence.shape == null ||
-                compatibleCodecProducts(existing, evidence.shape)) &&
-            (evidence.layout == null ||
-                compatibleCodecProducts(existing, evidence.layout))) {
-            // Alternate spellings of the same payload (ActorRequestId as
-            // fixed-bytes-8/u64 limbs vs typed u64s, ActorRef limbs vs actor-ref).
-            // Prefer the richer product; do not concatenate into a false product.
-            String incomingShape = firstNonEmpty(evidence.shape, evidence.layout);
+        boolean layoutAgreement = compatibleCodecProducts(
+            existingLayout,
+            incomingLayout);
+        boolean semanticAgreement = field.wireShape != null &&
+            evidence.shape != null &&
+            compatibleCodecProducts(field.wireShape, evidence.shape);
+        if (layoutAgreement || semanticAgreement) {
+            // Shape and layout are separate evidence channels. Equal physical
+            // products may carry different semantic spellings, such as an
+            // index-map represented on the wire by a vector of key/value limbs.
+            String incomingShape = evidence.shape;
             if (field.wireShape == null ||
-                preferIncomingCodecProduct(field.wireShape, incomingShape)) {
+                incomingShape != null &&
+                    preferIncomingCodecProduct(field.wireShape, incomingShape)) {
                 field.wireShape = incomingShape;
-                field.wireShapeSource = evidence.shape != null
-                    ? evidence.source
-                    : evidence.layoutSource;
+                field.wireShapeSource = evidence.source;
             }
             boolean explicitLayout = evidence.layout != null &&
                 !Objects.equals(evidence.layout, evidence.shape);
-            if (field.wireLayout == null || explicitLayout) {
-                field.wireLayout = firstNonEmpty(evidence.layout, evidence.shape);
+            boolean existingPlaceholderLayout = field.wireLayout != null &&
+                Objects.equals(field.wireLayout, field.wireShape);
+            if (field.wireLayout == null ||
+                explicitLayout && existingPlaceholderLayout) {
+                field.wireLayout = incomingLayout;
                 field.wireLayoutSource = evidence.layout != null
                     ? evidence.layoutSource
                     : evidence.source;
+            }
+            if (layoutAgreement && evidence.shape != null &&
+                evidence.layout != null &&
+                !Objects.equals(evidence.shape, evidence.layout)) {
+                runMetrics.increment("semanticPhysicalLayoutMerges");
             }
             return;
         }
         // Same storage, successive helpers: compose an ordered product instead of
         // first-winning a partial helper body (FilterChat GameChatMessage pattern).
-        String composed = compositeWireShape(List.of(existing, incoming));
-        field.wireLayout = composed;
+        String composedLayout = compositeWireShape(
+            List.of(existingLayout, incomingLayout));
+        String existingShape = firstNonEmpty(field.wireShape, existingLayout);
+        String incomingShape = firstNonEmpty(evidence.shape, incomingLayout);
+        String composedShape = compositeWireShape(
+            List.of(existingShape, incomingShape));
+        field.wireLayout = composedLayout;
         field.wireLayoutSource = "cfg-ordered-multi-helper-wire-product";
-        field.wireShape = composed;
+        field.wireShape = composedShape;
         field.wireShapeSource = field.wireLayoutSource;
         field.typeConflict = null;
         collapseAlternateSpellingWireProduct(field);
@@ -546,25 +560,15 @@
         if (field == null) {
             return;
         }
-        collapseAlternateSpellingWireProduct(field);
-        String layout = field.wireLayout;
-        String shape = field.wireShape;
-        if (layout == null || shape == null ||
-            sameCodecProduct(layout, shape) ||
-            compatibleCodecProducts(layout, shape) ||
-            compatibleWireSemantics(layout, shape)) {
-            return;
+        if (field.nestedTypeShape != null) {
+            applyNestedTypeShapeToField(
+                field,
+                field.nestedTypeShape,
+                "message-unmarshal-final-nested-shape");
         }
-        if (canonicalLayoutWireShape(layout) == null ||
-            canonicalLayoutWireShape(shape) == null) {
-            return;
-        }
-        String composed = compositeWireShape(List.of(layout, shape));
-        field.wireLayout = composed;
-        field.wireLayoutSource = "cfg-ordered-multi-helper-wire-product";
-        field.wireShape = composed;
-        field.wireShapeSource = field.wireLayoutSource;
-        field.typeConflict = null;
+        // Successive helper products are composed when their evidence is merged.
+        // The two fields here are semantic and physical views of one product;
+        // composing them creates a duplicate payload and erases typed containers.
         collapseAlternateSpellingWireProduct(field);
     }
 
@@ -581,12 +585,20 @@
         String right = members.get(1);
         if (compatibleCodecProducts(left, right)) {
             boolean preferRight = preferIncomingCodecProduct(left, right);
-            field.wireShape = preferRight ? right : left;
-            field.wireLayout = sameCodecProduct(left, right)
-                ? field.wireShape
+            String semantic = preferRight ? right : left;
+            String layout = sameCodecProduct(left, right)
+                ? semantic
                 : preferRight ? left : right;
+            boolean replaceShape = field.wireShape == null ||
+                Objects.equals(field.wireShape, product) ||
+                preferIncomingCodecProduct(field.wireShape, semantic);
+            if (replaceShape) {
+                field.wireShape = semantic;
+                field.wireShapeSource =
+                    "cfg-multi-helper-alternate-spelling-collapse";
+            }
+            field.wireLayout = layout;
             field.wireLayoutSource = "cfg-multi-helper-alternate-spelling-collapse";
-            field.wireShapeSource = field.wireLayoutSource;
             field.typeConflict = null;
             return;
         }
@@ -598,9 +610,12 @@
             return;
         }
         field.wireLayout = preferred;
-        field.wireShape = preferred;
         field.wireLayoutSource = "cfg-multi-helper-alternate-spelling-collapse";
-        field.wireShapeSource = field.wireLayoutSource;
+        if (field.wireShape == null || Objects.equals(field.wireShape, product) ||
+            preferIncomingCodecProduct(field.wireShape, preferred)) {
+            field.wireShape = preferred;
+            field.wireShapeSource = field.wireLayoutSource;
+        }
         field.typeConflict = null;
     }
 

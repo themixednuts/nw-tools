@@ -502,6 +502,22 @@
                 : ContainerStorageKind.INDEX_MAP;
             nativeType = null;
             sequence = countedSequenceWireEvidence(elementCodecs);
+            if (storageKind == ContainerStorageKind.INDEX_MAP) {
+                WireShape indexMap = countedIndexMapWireEvidence(
+                    owner,
+                    high,
+                    countedCollectionInsertionCall(
+                        owner,
+                        high,
+                        loop,
+                        operations,
+                        elementCodecs),
+                    elementCodecs,
+                    sequence);
+                if (indexMap != null) {
+                    sequence = indexMap;
+                }
+            }
             codecCallsites = elementSequence.consumedCallsites();
         }
         if (outputStorage == null) {
@@ -934,30 +950,17 @@
     }
 
     private WireShape countedSequenceWireEvidence(List<PcodeCodecCall> codecs) {
-        ArrayList<String> shapes = new ArrayList<>(codecs.size());
-        ArrayList<String> layouts = new ArrayList<>(codecs.size());
-        boolean semantic = true;
-        for (PcodeCodecCall codec : codecs) {
-            WireShape evidence = codec.evidence();
-            layouts.add(evidence.layout);
-            if (evidence.hasProvenSemantics()) {
-                shapes.add(evidence.shape);
-            }
-            else {
-                semantic = false;
-            }
-        }
-        String elementLayout = compositeWireShape(layouts);
-        if (elementLayout == null) {
+        WireShape element = orderedCodecProductWireEvidence(
+            codecs,
+            "cfg-counted-loop+ordered-element-codecs");
+        if (element == null) {
             return null;
         }
-        String layout = "vec<" + elementLayout + ">";
+        String layout = "vec<" + element.layout + ">";
         String source = "cfg-counted-loop+ordered-element-codecs";
-        if (!semantic) {
-            return WireShape.layout(layout, source);
-        }
-        String elementShape = compositeWireShape(shapes);
-        return WireShape.semantic("vec<" + elementShape + ">", layout, source);
+        return element.hasProvenSemantics()
+            ? WireShape.semantic("vec<" + element.shape + ">", layout, source)
+            : WireShape.layout(layout, source);
     }
 
     private boolean sameWireEvidence(WireShape left, WireShape right) {

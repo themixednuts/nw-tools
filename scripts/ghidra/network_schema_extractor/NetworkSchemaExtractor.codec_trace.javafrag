@@ -643,9 +643,11 @@
             }
             wireShape = wireShapeFromNestedTypeShape(nestedShape);
             if (wireShape != null) {
-                wireEvidence = WireShape.semantic(
-                    wireShape,
-                    "message-unmarshal-pcode-stack-nested-shape");
+                String wireLayout = wireLayoutFromNestedTypeShape(nestedShape);
+                String source = "message-unmarshal-pcode-stack-nested-shape";
+                wireEvidence = wireLayout == null
+                    ? WireShape.semantic(wireShape, source)
+                    : WireShape.semantic(wireShape, wireLayout, source);
             }
         }
 

@@ -633,6 +633,158 @@ fn parses_counted_map_wire_shapes() {
 }
 
 #[test]
+fn nested_type_wire_product_respects_proven_wire_ordinals() {
+    use crate::network_schema::parse::nested_type_shape_wire_shapes;
+
+    let mut nested = nested_shape_from_layouts(&[
+        "fixed-bytes-8",
+        "u64",
+        "fixed-bytes-1",
+        "fixed-bytes-1",
+        "vec<composite<fixed-bytes-1,fixed-bytes-4,fixed-bytes-8,fixed-bytes-4>>",
+    ]);
+    nested.wire_order_proven = Some(true);
+    for (member, ordinal) in nested.members.iter_mut().zip([0, 1, 4, 3, 2]) {
+        member.wire_ordinal = Some(ordinal);
+    }
+
+    assert_eq!(
+        nested_type_shape_wire_shapes(&nested, &[]),
+        Some(vec![
+            NetworkWireScalarShape::FixedBytes(8),
+            NetworkWireScalarShape::U64,
+            NetworkWireScalarShape::VlqU32,
+            NetworkWireScalarShape::FixedBytes(1),
+            NetworkWireScalarShape::FixedBytes(4),
+            NetworkWireScalarShape::FixedBytes(8),
+            NetworkWireScalarShape::FixedBytes(4),
+            NetworkWireScalarShape::FixedBytes(1),
+            NetworkWireScalarShape::FixedBytes(1),
+        ])
+    );
+}
+
+#[test]
+fn normalizes_call_frame_aggregate_from_proven_wire_ordinals() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "A9A48C2D-4A51-4E31-B1E8-2E85F58451D5",
+            "typeIndex": 9003,
+            "typeName": "Test::ReadyOwnerData",
+            "fields": [{
+                "index": 0,
+                "wireShape": "composite<vec<string>,fixed-bytes-8,fixed-bytes-16>",
+                "wireLayout": "composite<vec<string>,fixed-bytes-8,fixed-bytes-16>",
+                "nestedTypeShape": {
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "validation": "call-frame-output-parameter",
+                    "members": [{
+                        "index": 0,
+                        "wireShape": "vec<string>",
+                        "wireLayout": "vec<string>",
+                        "wireOrdinal": 2
+                    }, {
+                        "index": 1,
+                        "wireShape": "u64",
+                        "wireLayout": "fixed-bytes-8",
+                        "wireOrdinal": 0
+                    }, {
+                        "index": 2,
+                        "wireShape": "fixed-bytes-16",
+                        "wireLayout": "fixed-bytes-16",
+                        "wireOrdinal": 1
+                    }]
+                },
+                "confidence": "message-unmarshal-call-frame-boundary"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+
+    let schema = NetworkSchema::from_ghidra_static_network_report(&report)
+        .expect("normalized network schema");
+    let field = &schema.types[0].fields[0];
+    assert_eq!(
+        field.wire_shape_raw.as_deref(),
+        Some("composite<u64,fixed-bytes-16,vec<string>>")
+    );
+    assert_eq!(
+        field.wire_layout.as_deref(),
+        Some("composite<fixed-bytes-8,fixed-bytes-16,vec<string>>")
+    );
+    assert_eq!(
+        field.wire_shape_source.as_deref(),
+        Some("normalized-proven-call-frame-output-product")
+    );
+}
+
+#[test]
+fn normalizes_structured_members_without_flattening_semantics() {
+    let report = json!({
+        "registryEntries": [{
+            "uuid": "40DE90B4-7932-44E6-92E2-7415EB03234A",
+            "typeIndex": 9004,
+            "typeName": "Test::UpdatePhasing",
+            "fields": [{
+                "index": 0,
+                "wireShape": "composite<u64,u64,u8,u8,map<composite<u8,u32>,composite<u64,u32>>>",
+                "wireLayout": "composite<fixed-bytes-8,u64,fixed-bytes-1,fixed-bytes-1,vec<composite<fixed-bytes-1,fixed-bytes-4,fixed-bytes-8,fixed-bytes-4>>>",
+                "nestedTypeShape": {
+                    "layoutProven": true,
+                    "memberCoverageProven": true,
+                    "wireOrderProven": true,
+                    "validation": "layout-consistent-direct-type",
+                    "members": [{
+                        "index": 0,
+                        "wireShape": "u64",
+                        "wireLayout": "fixed-bytes-8",
+                        "wireOrdinal": 0
+                    }, {
+                        "index": 1,
+                        "wireShape": "u64",
+                        "wireLayout": "u64",
+                        "wireOrdinal": 1
+                    }, {
+                        "index": 2,
+                        "wireShape": "u8",
+                        "wireLayout": "fixed-bytes-1",
+                        "wireOrdinal": 4
+                    }, {
+                        "index": 3,
+                        "wireShape": "u8",
+                        "wireLayout": "fixed-bytes-1",
+                        "wireOrdinal": 3
+                    }, {
+                        "index": 4,
+                        "wireShape": "map<composite<u8,u32>,composite<u64,u32>>",
+                        "wireLayout": "vec<composite<fixed-bytes-1,fixed-bytes-4,fixed-bytes-8,fixed-bytes-4>>",
+                        "wireOrdinal": 2
+                    }]
+                },
+                "confidence": "message-unmarshal-call-frame-boundary"
+            }]
+        }],
+        "fieldRegistrationFunctions": []
+    });
+
+    let schema = NetworkSchema::from_ghidra_static_network_report(&report)
+        .expect("normalized network schema");
+    let field = &schema.types[0].fields[0];
+    assert_eq!(
+        field.wire_shape_raw.as_deref(),
+        Some("composite<u64,u64,map<composite<u8,u32>,composite<u64,u32>>,u8,u8>")
+    );
+    assert_eq!(
+        field.wire_layout.as_deref(),
+        Some(
+            "composite<fixed-bytes-8,u64,vec<composite<fixed-bytes-1,fixed-bytes-4,fixed-bytes-8,fixed-bytes-4>>,fixed-bytes-1,fixed-bytes-1>"
+        )
+    );
+}
+
+#[test]
 fn parses_actor_instantiation_parameters_wire_shape() {
     use crate::network_schema::parse::parse_network_wire_shape;
 

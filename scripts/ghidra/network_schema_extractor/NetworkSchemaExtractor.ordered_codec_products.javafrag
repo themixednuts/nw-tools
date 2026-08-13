@@ -1,0 +1,32 @@
+    private WireShape orderedCodecProductWireEvidence(
+        List<PcodeCodecCall> codecs,
+        String source) {
+
+        if (codecs == null || codecs.isEmpty()) {
+            return null;
+        }
+        ArrayList<String> shapes = new ArrayList<>(codecs.size());
+        ArrayList<String> layouts = new ArrayList<>(codecs.size());
+        boolean semantic = true;
+        for (PcodeCodecCall codec : codecs) {
+            WireShape evidence = codec.evidence();
+            layouts.add(evidence.layout);
+            if (evidence.hasProvenSemantics()) {
+                shapes.add(evidence.shape);
+            }
+            else {
+                semantic = false;
+            }
+        }
+        String productLayout = compositeWireShape(layouts);
+        if (productLayout == null) {
+            return null;
+        }
+        if (!semantic) {
+            return WireShape.layout(productLayout, source);
+        }
+        String productShape = compositeWireShape(shapes);
+        return productShape == null
+            ? null
+            : WireShape.semantic(productShape, productLayout, source);
+    }

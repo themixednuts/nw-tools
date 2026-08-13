@@ -1505,6 +1505,17 @@ fn complete_typed_optional_codec_bypasses_the_non_linear_guard() {
     assert!(output.source.contains("pub struct PersistentItemData"));
     assert!(output.source.contains("pub field_0: u64"));
     assert!(!output.source.contains("pub field_1: u32"));
+
+    assert_eq!(
+        schema.apply_external_boolean_profile("javelin.enable-transmog", true),
+        1
+    );
+    let live_output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let live_plan = &live_output.report.state_generation_plans[0];
+
+    assert!(live_plan.can_generate, "{live_plan:#?}");
+    assert!(live_output.source.contains("pub field_0: u64"));
+    assert!(live_output.source.contains("pub field_1: u32"));
 }
 
 #[test]

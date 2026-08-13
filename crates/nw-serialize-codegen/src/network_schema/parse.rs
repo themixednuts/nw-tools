@@ -739,6 +739,79 @@ pub(crate) fn collapse_redundant_message_aggregate_fields(fields: &mut Vec<Netwo
     }
 }
 
+pub(crate) fn reconcile_proven_nested_wire_order(field: &mut NetworkField) {
+    if !matches!(
+        field.wire_shape.as_ref(),
+        Some(NetworkWireShape::Composite(_))
+    ) {
+        return;
+    }
+    let Some(shape) = field.nested_type_shape.as_ref().filter(|shape| {
+        shape.has_proven_layout()
+            && !shape.has_exact_identity()
+            && !shape.has_proven_symbolic_identity()
+            && shape.members.len() >= 2
+    }) else {
+        return;
+    };
+    let Some(members) = nested_type_shape_members_in_wire_order(shape) else {
+        return;
+    };
+    if members.iter().any(|member| member.type_conflict) {
+        return;
+    }
+
+    let Some(semantic_members) = members
+        .iter()
+        .map(|member| {
+            member
+                .wire_shape
+                .as_deref()
+                .or(member.wire_layout.as_deref())
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    let Some(layout_members) = members
+        .iter()
+        .map(|member| {
+            member
+                .wire_layout
+                .as_deref()
+                .or(member.wire_shape.as_deref())
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    let semantic = format!("composite<{}>", semantic_members.join(","));
+    let layout = format!("composite<{}>", layout_members.join(","));
+    let (Some(parsed_semantic), Some(_)) = (
+        parse_network_wire_shape(&semantic),
+        parse_network_wire_shape(&layout),
+    ) else {
+        return;
+    };
+
+    let source = if shape.validation.as_deref() == Some("call-frame-output-parameter") {
+        "normalized-proven-call-frame-output-product"
+    } else {
+        "normalized-proven-nested-wire-order-product"
+    };
+    if field.wire_shape_raw.as_deref() != Some(semantic.as_str())
+        || field.wire_shape.as_ref() != Some(&parsed_semantic)
+    {
+        field.wire_shape = Some(parsed_semantic);
+        field.wire_shape_raw = Some(semantic);
+        field.wire_shape_source = Some(source.to_owned());
+    }
+    if field.wire_layout.as_deref() != Some(layout.as_str()) {
+        field.wire_layout = Some(layout);
+        field.wire_layout_source = Some(source.to_owned());
+    }
+}
+
 pub(crate) fn normalize_proven_message_aggregate_boundary(field: &mut NetworkField) {
     let Some(shape) = field.nested_type_shape.as_ref().filter(|shape| {
         shape.validation.as_deref() == Some("call-frame-output-parameter")
@@ -1088,8 +1161,10 @@ pub(crate) fn nested_type_shape_wire_shapes(
         return None;
     }
 
+    let members = nested_type_shape_members_in_wire_order(shape)
+        .unwrap_or_else(|| shape.members.iter().collect());
     let mut shapes = Vec::new();
-    for member in &shape.members {
+    for member in members {
         let wire_shape = member
             .wire_shape
             .as_deref()

@@ -390,34 +390,98 @@
         return false;
     }
     private List<FieldCall> recoverRegisterFieldCallsFromPcode(Function owner) {
-        HighFunction high = highFunction(owner);
+        return recoverRegisterFieldCallsFromPcode(
+            owner,
+            owner,
+            constructorFieldState(owner),
+            new LinkedHashSet<>(),
+            0);
+    }
+
+    private List<FieldCall> recoverRegisterFieldCallsFromPcode(
+        Function rootOwner,
+        Function current,
+        ForwardArgState constructionState,
+        Set<Address> activeHelpers,
+        int depth) {
+
+        if (rootOwner == null || current == null || depth > 8 ||
+            !activeHelpers.add(current.getEntryPoint())) {
+            return Collections.emptyList();
+        }
+        try {
+            return recoverRegisterFieldCallsFromPcodeBody(
+                rootOwner,
+                current,
+                constructionState,
+                activeHelpers,
+                depth);
+        }
+        finally {
+            activeHelpers.remove(current.getEntryPoint());
+        }
+    }
+
+    private List<FieldCall> recoverRegisterFieldCallsFromPcodeBody(
+        Function rootOwner,
+        Function current,
+        ForwardArgState constructionState,
+        Set<Address> activeHelpers,
+        int depth) {
+
+        HighFunction high = highFunction(current);
         if (high == null) {
             registerFieldLoopRejectCounts.merge("pcode-owner-decompile-failed", 1, Integer::sum);
             return Collections.emptyList();
         }
 
         Address registerField = currentProgram.getImageBase().add(REGISTER_FIELD_RVA);
-        ForwardArgState constructionState = constructorFieldState(owner);
         ArrayList<FieldCall> fields = new ArrayList<>();
         for (PcodeOpAST operation : orderedPcodeOps(high)) {
+            checkAnalysisCancelled();
             if (operation.getOpcode() != PcodeOp.CALL) {
                 continue;
             }
             PcodeCallTargetInfo target = pcodeCallTargetInfo(operation);
-            if (target == null || !registerField.equals(target.resolvedTarget)) {
+            if (target == null) {
                 continue;
             }
-            ArgState arguments = registerFieldArgumentsFromPcode(
-                owner,
-                operation,
-                constructionState);
-            FieldCall field = fieldCallFromArgState(
-                owner,
-                operation.getSeqnum().getTarget(),
-                fields.size(),
-                arguments);
-            field.evidenceSource = "register-field-pcode-call-arguments";
-            fields.add(field);
+            if (registerField.equals(target.resolvedTarget)) {
+                ArgState arguments = registerFieldArgumentsFromPcode(
+                    current,
+                    operation,
+                    constructionState);
+                FieldCall field = fieldCallFromArgState(
+                    rootOwner,
+                    operation.getSeqnum().getTarget(),
+                    fields.size(),
+                    arguments);
+                field.evidenceSource = depth == 0
+                    ? "register-field-pcode-call-arguments"
+                    : "register-field-transitive-helper";
+                fields.add(field);
+                continue;
+            }
+
+            Function helper = target.target;
+            PcodeStorage receiver = operation.getNumInputs() > 1
+                ? pcodeStorageExpression(operation.getInput(1))
+                : null;
+            if (helper == null || receiver == null || receiver.offset != 0L ||
+                !"param_1".equals(receiver.base) ||
+                !functionReferencesAddress(helper, registerField)) {
+                continue;
+            }
+            List<FieldCall> helperFields = recoverRegisterFieldCallsFromPcode(
+                rootOwner,
+                helper,
+                constructionState,
+                activeHelpers,
+                depth + 1);
+            for (FieldCall field : helperFields) {
+                field.index = fields.size();
+                fields.add(field);
+            }
         }
         return fields;
     }

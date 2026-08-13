@@ -53,6 +53,8 @@ pub struct NetworkContainerExternalBooleanCondition {
     pub name_end: Option<String>,
     pub name: Option<String>,
     pub default_value: Option<bool>,
+    #[serde(skip)]
+    pub profile_value: Option<bool>,
     pub default_write: Option<String>,
     pub default_callsite: Option<String>,
     pub default_target: Option<String>,
@@ -89,6 +91,26 @@ pub struct NetworkContainerCodec {
 }
 
 impl NetworkContainerCodec {
+    fn apply_external_boolean_profile(&mut self, name: &str, value: bool) -> usize {
+        let mut matched = 0;
+        for guard in &mut self.guards {
+            let Some(condition) = guard.external_condition.as_mut() else {
+                continue;
+            };
+            if condition.name.as_deref() == Some(name) {
+                condition.profile_value = Some(value);
+                matched += 1;
+            }
+        }
+        matched
+            + self
+                .members
+                .iter_mut()
+                .chain(&mut self.optional_members)
+                .map(|member| member.apply_external_boolean_profile(name, value))
+                .sum::<usize>()
+    }
+
     /// Returns the physical scalar operations performed by this codec.
     ///
     /// Counted sequences retain their logical collection shape on the parent
@@ -146,7 +168,7 @@ impl NetworkContainerCodec {
             } else {
                 condition = Some(external);
             }
-            let include = guard.includes_member_for_registered_default()?;
+            let include = guard.includes_member_for_effective_profile()?;
             if let Some(expected) = include_suffix {
                 (expected == include).then_some(())?;
             } else {
@@ -358,11 +380,11 @@ impl NetworkContainerCodec {
 }
 
 impl NetworkContainerCodecGuard {
-    fn includes_member_for_registered_default(&self) -> Option<bool> {
+    fn includes_member_for_effective_profile(&self) -> Option<bool> {
         (self.kind == "global-boolean" && self.mask.is_none()).then_some(())?;
         let condition = self.external_condition.as_ref()?;
         condition.has_complete_proof().then_some(())?;
-        let value = condition.default_value?;
+        let value = condition.profile_value.or(condition.default_value)?;
         let branch_on_true = match self.condition.as_str() {
             "equal-zero" => !value,
             "not-equal-zero" => value,
@@ -465,8 +487,8 @@ impl NetworkReplicatedContainerPlan {
         exact_codec_sequence(&self.value_codecs)
     }
 
-    /// Resolves externally gated wire members using the configuration default
-    /// registered by the analyzed binary.
+    /// Resolves externally gated wire members using the selected runtime
+    /// profile, falling back to the default registered by the analyzed binary.
     pub fn default_profile_value_wire_shapes(&self) -> Option<Vec<NetworkWireScalarShape>> {
         self.has_complete_cross_direction_agreement()
             .then_some(())?;
@@ -475,6 +497,17 @@ impl NetworkReplicatedContainerPlan {
             shapes.extend(codec.default_profile_wire_shapes()?);
         }
         (!shapes.is_empty()).then_some(shapes)
+    }
+
+    /// Selects one runtime value for every matching external boolean condition
+    /// in this plan. The extracted native default remains unchanged.
+    pub fn apply_external_boolean_profile(&mut self, name: &str, value: bool) -> usize {
+        self.key_codecs
+            .iter_mut()
+            .chain(&mut self.value_codecs)
+            .chain(&mut self.unmarshal_codecs)
+            .map(|codec| codec.apply_external_boolean_profile(name, value))
+            .sum()
     }
 
     pub fn exact_logical_key_wire_shapes(&self) -> Option<Vec<String>> {
@@ -760,6 +793,7 @@ fn parse_external_boolean_condition(
         name_end: string(object, "nameEnd"),
         name: string(object, "name"),
         default_value: object.get("defaultValue").and_then(Value::as_bool),
+        profile_value: None,
         default_write: string(object, "defaultWrite"),
         default_callsite: string(object, "defaultCallsite"),
         default_target: string(object, "defaultTarget"),
@@ -922,7 +956,7 @@ fn registered_profile_codec_guards(
             continue;
         }
         if guard.kind == "global-boolean" && guard.mask.is_none() {
-            if !guard.includes_member_for_registered_default()? {
+            if !guard.includes_member_for_effective_profile()? {
                 return Some((false, Vec::new()));
             }
             continue;
