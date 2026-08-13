@@ -226,11 +226,11 @@
         }
         if (direct != null) {
             String parameter = formalParameterBaseFromStorage(owner, direct);
-            return requireFormalOutput
-                ? isProvenOutputParameterBase(owner, parameter) ? direct : null
-                : isStableCollectionStorage(direct, readBuffer) ? direct : null;
+            boolean accepted = requireFormalOutput ? isProvenOutputParameterBase(owner, parameter) : isStableCollectionStorage(direct, readBuffer);
+            if (accepted) return direct;
+            // Follow staged scalar outputs into their post-success element STORE.
+            runMetrics.increment("stagedCollectionElementOwnerFallbacks");
         }
-
         Set<PcodeStorage> outputs = scalarCallOutputStorages(
             call,
             codec.evidence());

@@ -13,16 +13,16 @@ use nw_serialize_codegen::{
     CompileUnit, CompletedCodegenUnits, GoSourceEmitter, GoStandaloneProjectFile,
     NETWORK_SCHEMA_VERSION, NetworkFieldOverrideFile, NetworkMessageFieldSignature,
     NetworkMessageSignature, NetworkReplicatedStateEmitOptions, NetworkRustEmitter, NetworkSchema,
-    NetworkType, NetworkTypeCapability, NetworkWireShape, ReflectedTypeCatalogSummary,
-    RustCodegenPlanner, RustSourceEmitter, RustSourceField, RustSourceInventory,
-    RustSourceInventoryItem, RustStandaloneProjectFile, SerializeCodegenRootMode,
-    SerializeCodegenRootSelection, SerializeCodegenSelectionManifest, SerializeCodegenUnit,
-    SerializeContextCompileInputs, SerializeContextCompiler, SerializeContextDocument, Severity,
-    TypeScriptSourceEmitter, TypeScriptStandaloneProjectFile, TypeScriptStandaloneProjectOptions,
-    class_registration_trace_root_from_jsonl_str, complete_known_missing_reflected_bodies,
-    is_module_descriptor_json_name, module_descriptor_capture, module_descriptors_root,
-    module_descriptors_root_from_capture, module_name_from_path, module_name_from_resource_name,
-    resolve_codegen_root_type_ids,
+    NetworkSchemaSourceKind, NetworkType, NetworkTypeCapability, NetworkWireShape,
+    ReflectedTypeCatalogSummary, RustCodegenPlanner, RustSourceEmitter, RustSourceField,
+    RustSourceInventory, RustSourceInventoryItem, RustStandaloneProjectFile,
+    SerializeCodegenRootMode, SerializeCodegenRootSelection, SerializeCodegenSelectionManifest,
+    SerializeCodegenUnit, SerializeContextCompileInputs, SerializeContextCompiler,
+    SerializeContextDocument, Severity, TypeScriptSourceEmitter, TypeScriptStandaloneProjectFile,
+    TypeScriptStandaloneProjectOptions, class_registration_trace_root_from_jsonl_str,
+    complete_known_missing_reflected_bodies, is_module_descriptor_json_name,
+    module_descriptor_capture, module_descriptors_root, module_descriptors_root_from_capture,
+    module_name_from_path, module_name_from_resource_name, resolve_codegen_root_type_ids,
 };
 use rust_embed::RustEmbed;
 use serde::Serialize;
@@ -494,6 +494,24 @@ fn network_schema(args: &NetworkSchemaArgs, status: CodegenStatus) -> Result<()>
         NetworkSchema::from_ghidra_static_network_report_with_context(&primary_input, &context)
             .context("normalize Ghidra static report into network schema")?
     };
+    if args.base_schema.is_some() {
+        // The inputs merged below replace the matching provenance from the base.
+        // This keeps incremental normalization idempotent when an explicit source
+        // label differs from the path recorded by the previous pass.
+        schema
+            .sources
+            .retain(|source| source.kind != NetworkSchemaSourceKind::SerializeContext);
+        if args.typeindex.is_some() {
+            schema
+                .sources
+                .retain(|source| source.kind != NetworkSchemaSourceKind::TypeIndex);
+        }
+        if !args.message_signatures.is_empty() {
+            schema
+                .sources
+                .retain(|source| source.kind != NetworkSchemaSourceKind::MessageSignatures);
+        }
+    }
     progress.advance_with_message(
         1,
         Some(if args.base_schema.is_some() {
