@@ -53,6 +53,213 @@ fn replicated_container_schema_with_named_shape(
     .expect("plan-backed schema")
 }
 
+fn replicated_container_schema_with_shared_shape(
+    field_names: &[&str],
+    plan: serde_json::Value,
+    value_type_shape: serde_json::Value,
+) -> NetworkSchema {
+    let mut plan = plan;
+    let plan = plan.as_object_mut().expect("container plan object");
+    plan.entry("unmarshalReconciliation".to_owned())
+        .or_insert_with(|| json!("complete-physical-sequence-agreement"));
+    plan.entry("unmarshalAnalysisStatus".to_owned())
+        .or_insert_with(|| json!("exact-loop-codec-count"));
+    let fields = field_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            json!({
+                "index": index,
+                "group": 0,
+                "name": name,
+                "handlerVtable": "NewWorld+0x8123456",
+                "confidence": "register-field-call"
+            })
+        })
+        .collect::<Vec<_>>();
+    NetworkSchema::from_ghidra_static_network_report(&json!({
+        "registryEntries": [{
+            "uuid": "EA233975-66A9-4A2A-A493-2B6A43674868",
+            "typeIndex": 4242,
+            "typeName": "MB::PlanBackedReplicatedState",
+            "fields": fields
+        }],
+        "fieldRegistrationFunctions": [],
+        "fieldHandlerVtables": [{
+            "address": "NewWorld+0x8123456",
+            "fieldCount": field_names.len(),
+            "fullContainerPlan": plan,
+            "valueTypeShape": value_type_shape,
+            "slots": []
+        }]
+    }))
+    .expect("shared plan-backed schema")
+}
+
+#[test]
+fn shared_anonymous_container_layout_emits_one_support_type() {
+    let schema = replicated_container_schema_with_shared_shape(
+        &["cdmap1", "cdmap2", "cdmap3"],
+        json!({
+            "storageKind": "index-map",
+            "keyCodecs": [{ "wireShape": "u32" }],
+            "valueCodecs": [
+                { "wireShape": "u64" },
+                { "wireShape": "u64" }
+            ]
+        }),
+        json!({
+            "identityProven": false,
+            "layoutProven": true,
+            "typeName": "Value",
+            "typeNameSource": "synthetic-anonymous-composite",
+            "memberNameSource": "synthetic-wire-ordinal",
+            "memberNamesProven": false,
+            "memberCoverageProven": true,
+            "wireOrderProven": true,
+            "nativeSize": 16,
+            "members": [
+                {
+                    "index": 0,
+                    "offset": "0x0",
+                    "name": "field_0",
+                    "wireShape": "u64",
+                    "wireOrdinal": 0,
+                    "callsite": "NewWorld+0x666c32f"
+                },
+                {
+                    "index": 1,
+                    "offset": "0x8",
+                    "name": "field_1",
+                    "wireShape": "u64",
+                    "wireOrdinal": 1,
+                    "callsite": "NewWorld+0x666c345"
+                }
+            ]
+        }),
+    );
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert!(plan.can_generate, "{plan:#?}");
+    assert_eq!(
+        output.source.matches("pub struct CdmapValue {").count(),
+        1,
+        "{}",
+        output.source
+    );
+    assert_eq!(
+        output
+            .source
+            .matches("pub struct CdmapValueMarshaler;")
+            .count(),
+        1
+    );
+    assert!(!output.source.contains("Cdmap1Value"), "{}", output.source);
+    assert!(!output.source.contains("Cdmap2Value"), "{}", output.source);
+    assert!(!output.source.contains("Cdmap3Value"), "{}", output.source);
+    assert_eq!(
+        plan.fields
+            .iter()
+            .map(|field| field.rust_value_type.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            Some("::nw_network::serialize::IndexMap<u32, CdmapValue>"),
+            Some("::nw_network::serialize::IndexMap<u32, CdmapValue>"),
+            Some("::nw_network::serialize::IndexMap<u32, CdmapValue>")
+        ]
+    );
+}
+
+#[test]
+fn equal_anonymous_container_layouts_with_different_handlers_remain_distinct() {
+    let mut schema = replicated_container_schema_with_shared_shape(
+        &["cdmap1", "cdmap2"],
+        json!({
+            "storageKind": "index-map",
+            "keyCodecs": [{ "wireShape": "u32" }],
+            "valueCodecs": [
+                { "wireShape": "u64" },
+                { "wireShape": "u64" }
+            ]
+        }),
+        json!({
+            "identityProven": false,
+            "layoutProven": true,
+            "typeName": "Value",
+            "memberNamesProven": false,
+            "memberCoverageProven": true,
+            "wireOrderProven": true,
+            "nativeSize": 16,
+            "members": [
+                { "index": 0, "offset": "0x0", "name": "field_0", "wireShape": "u64", "wireOrdinal": 0 },
+                { "index": 1, "offset": "0x8", "name": "field_1", "wireShape": "u64", "wireOrdinal": 1 }
+            ]
+        }),
+    );
+    let mut second_vtable = schema.field_handler_vtables[0].clone();
+    second_vtable.address = Some("NewWorld+0x8123457".to_owned());
+    schema.field_handler_vtables.push(second_vtable);
+    schema.types[0].fields[1].handler_vtable = Some("NewWorld+0x8123457".to_owned());
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+
+    assert!(output.source.contains("pub struct Cdmap1Value {"));
+    assert!(output.source.contains("pub struct Cdmap2Value {"));
+    assert!(!output.source.contains("pub struct CdmapValue {"));
+}
+
+#[test]
+fn shared_container_name_rewrite_does_not_rewrite_the_canonical_codec_twice() {
+    let schema = replicated_container_schema_with_shared_shape(
+        &["m_localEffectsMap", "m_effectsMap"],
+        json!({
+            "storageKind": "index-map",
+            "keyCodecs": [{ "wireShape": "u32" }],
+            "valueCodecs": [
+                { "wireShape": "u64" },
+                { "wireShape": "u32" }
+            ]
+        }),
+        json!({
+            "identityProven": false,
+            "layoutProven": true,
+            "typeName": "Value",
+            "memberNamesProven": false,
+            "memberCoverageProven": true,
+            "wireOrderProven": true,
+            "nativeSize": 16,
+            "members": [
+                { "index": 0, "offset": "0x0", "name": "field_0", "wireShape": "u64", "wireOrdinal": 0 },
+                { "index": 1, "offset": "0x8", "name": "field_1", "wireShape": "u32", "wireOrdinal": 1 }
+            ]
+        }),
+    );
+
+    let output = NetworkRustEmitter::emit_replicated_states(&schema, [4242]).unwrap();
+    let plan = &output.report.state_generation_plans[0];
+
+    assert_eq!(
+        output
+            .source
+            .matches("pub struct LocalEffectsMapValueMarshaler;")
+            .count(),
+        1
+    );
+    assert!(plan.fields.iter().all(|field| {
+        field
+            .rust_field_type
+            .as_deref()
+            .is_some_and(|rust_type| rust_type.contains("LocalEffectsMapValueMarshaler"))
+    }));
+    assert!(
+        !output.source.contains("LocalLocalEffectsMapValueMarshaler"),
+        "{}",
+        output.source
+    );
+}
+
 #[test]
 fn anonymous_container_value_layout_emits_support_struct() {
     let schema = replicated_container_schema_with_shape(

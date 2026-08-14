@@ -101,6 +101,7 @@ pub(super) fn state_generation_plan(
         })
         .collect::<Vec<_>>();
     disambiguate_report_field_names(&mut fields);
+    canonicalize_shared_anonymous_container_support_types(&mut fields);
     let field_count = fields.len();
     let shaped_field_count = fields
         .iter()
@@ -310,6 +311,248 @@ pub(super) fn disambiguate_report_field_names(fields: &mut [NetworkStateFieldSha
         }
         field.field_name = Some(candidate);
     }
+}
+
+fn canonicalize_shared_anonymous_container_support_types(
+    fields: &mut [NetworkStateFieldShapeReport],
+) {
+    let mut groups = Vec::<Vec<usize>>::new();
+    for field_index in 0..fields.len() {
+        let Some(shape) = fields[field_index].container_value_type_shape.as_ref() else {
+            continue;
+        };
+        if !shape.has_proven_anonymous_layout() {
+            continue;
+        }
+        if let Some(group) = groups.iter_mut().find(|group| {
+            shared_anonymous_container_projection(&fields[group[0]], &fields[field_index])
+        }) {
+            group.push(field_index);
+        } else {
+            groups.push(vec![field_index]);
+        }
+    }
+
+    for group in groups.into_iter().filter(|group| group.len() > 1) {
+        let representative = group[0];
+        let Some(default_field_name) = fields[representative].field_name.clone() else {
+            continue;
+        };
+        let shared_field_name = common_numbered_field_name(fields, &group)
+            .filter(|candidate| {
+                shared_support_name_is_available(fields, &group, representative, candidate)
+            })
+            .unwrap_or(default_field_name);
+
+        for field_index in group {
+            canonicalize_container_support_names(&mut fields[field_index], &shared_field_name);
+        }
+    }
+}
+
+fn shared_anonymous_container_projection(
+    left: &NetworkStateFieldShapeReport,
+    right: &NetworkStateFieldShapeReport,
+) -> bool {
+    left.handler_vtable.is_some()
+        && left.handler_vtable == right.handler_vtable
+        && support_shape_options_match(
+            left.container_key_type_shape.as_ref(),
+            right.container_key_type_shape.as_ref(),
+        )
+        && support_shape_slices_match(
+            &left.container_embedded_key_type_shapes,
+            &right.container_embedded_key_type_shapes,
+        )
+        && support_shape_options_match(
+            left.container_value_type_shape.as_ref(),
+            right.container_value_type_shape.as_ref(),
+        )
+        && support_shape_slices_match(
+            &left.container_embedded_value_type_shapes,
+            &right.container_embedded_value_type_shapes,
+        )
+        && normalized_container_types_match(
+            left,
+            left.rust_value_type.as_deref(),
+            right,
+            right.rust_value_type.as_deref(),
+        )
+        && normalized_container_types_match(
+            left,
+            left.rust_field_type.as_deref(),
+            right,
+            right.rust_field_type.as_deref(),
+        )
+}
+
+fn normalized_container_types_match(
+    left: &NetworkStateFieldShapeReport,
+    left_type: Option<&str>,
+    right: &NetworkStateFieldShapeReport,
+    right_type: Option<&str>,
+) -> bool {
+    normalized_container_type(left, left_type)
+        .zip(normalized_container_type(right, right_type))
+        .is_some_and(|(left, right)| left == right)
+}
+
+fn normalized_container_type(
+    field: &NetworkStateFieldShapeReport,
+    rust_type: Option<&str>,
+) -> Option<String> {
+    let shape = field.container_value_type_shape.as_ref()?;
+    let field_name = field.field_name.as_deref()?;
+    let value_type = container_value_shape_support_type_name(field_name, shape)?;
+    let codec_type = structured_value_codec_name(field_name, shape)?;
+    Some(
+        rust_type?
+            .replace(&codec_type, "{ANONYMOUS_CODEC}")
+            .replace(&value_type, "{ANONYMOUS_VALUE}"),
+    )
+}
+
+fn support_shape_options_match(
+    left: Option<&crate::network_schema::NetworkNestedTypeShape>,
+    right: Option<&crate::network_schema::NetworkNestedTypeShape>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => support_shapes_match(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn support_shape_slices_match(
+    left: &[crate::network_schema::NetworkNestedTypeShape],
+    right: &[crate::network_schema::NetworkNestedTypeShape],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| support_shapes_match(left, right))
+}
+
+fn support_shapes_match(
+    left: &crate::network_schema::NetworkNestedTypeShape,
+    right: &crate::network_schema::NetworkNestedTypeShape,
+) -> bool {
+    if left.has_exact_identity() || right.has_exact_identity() {
+        return left.has_exact_identity()
+            && right.has_exact_identity()
+            && left.type_id == right.type_id;
+    }
+    let Some(left_members) = nested_type_shape_members_in_wire_order(left) else {
+        return false;
+    };
+    let Some(right_members) = nested_type_shape_members_in_wire_order(right) else {
+        return false;
+    };
+    left.native_size == right.native_size
+        && left_members.len() == right_members.len()
+        && left_members
+            .into_iter()
+            .zip(right_members)
+            .all(|(left, right)| {
+                left.offset == right.offset
+                    && left.native_offset == right.native_offset
+                    && left.name == right.name
+                    && left.native_type == right.native_type
+                    && left.type_id == right.type_id
+                    && left.type_identity_proven == right.type_identity_proven
+                    && left.wire_shape == right.wire_shape
+                    && left.wire_layout == right.wire_layout
+                    && left.byte_width == right.byte_width
+                    && left.wire_ordinal == right.wire_ordinal
+                    && left.type_conflict == right.type_conflict
+            })
+}
+
+fn common_numbered_field_name(
+    fields: &[NetworkStateFieldShapeReport],
+    group: &[usize],
+) -> Option<String> {
+    let mut names = group
+        .iter()
+        .map(|index| fields[*index].field_name.as_deref())
+        .collect::<Option<Vec<_>>>()?
+        .into_iter();
+    let first = strip_numeric_field_suffix(names.next()?);
+    (!first.is_empty() && names.all(|name| strip_numeric_field_suffix(name) == first))
+        .then(|| first.to_owned())
+}
+
+fn strip_numeric_field_suffix(name: &str) -> &str {
+    name.trim_end_matches(|character: char| character.is_ascii_digit())
+        .trim_end_matches('_')
+}
+
+fn shared_support_name_is_available(
+    fields: &[NetworkStateFieldShapeReport],
+    group: &[usize],
+    representative: usize,
+    candidate: &str,
+) -> bool {
+    let Some(shape) = fields[representative].container_value_type_shape.as_ref() else {
+        return false;
+    };
+    let Some(candidate_value) = container_value_shape_support_type_name(candidate, shape) else {
+        return false;
+    };
+    let Some(candidate_codec) = structured_value_codec_name(candidate, shape) else {
+        return false;
+    };
+    fields.iter().enumerate().all(|(index, field)| {
+        if group.contains(&index) {
+            return true;
+        }
+        let Some(shape) = field.container_value_type_shape.as_ref() else {
+            return true;
+        };
+        let Some(field_name) = field.field_name.as_deref() else {
+            return true;
+        };
+        container_value_shape_support_type_name(field_name, shape)
+            .is_none_or(|name| name != candidate_value)
+            && structured_value_codec_name(field_name, shape)
+                .is_none_or(|name| name != candidate_codec)
+    })
+}
+
+fn canonicalize_container_support_names(
+    field: &mut NetworkStateFieldShapeReport,
+    shared_field_name: &str,
+) {
+    let Some(shape) = field.container_value_type_shape.as_ref() else {
+        return;
+    };
+    let Some(field_name) = field.field_name.as_deref() else {
+        return;
+    };
+    let Some(old_value) = container_value_shape_support_type_name(field_name, shape) else {
+        return;
+    };
+    let Some(old_codec) = structured_value_codec_name(field_name, shape) else {
+        return;
+    };
+    let Some(new_value) = container_value_shape_support_type_name(shared_field_name, shape) else {
+        return;
+    };
+    let Some(new_codec) = structured_value_codec_name(shared_field_name, shape) else {
+        return;
+    };
+    for rust_type in [&mut field.rust_value_type, &mut field.rust_field_type]
+        .into_iter()
+        .flatten()
+    {
+        *rust_type = rust_type
+            .replace(&old_codec, "{SHARED_CONTAINER_CODEC}")
+            .replace(&old_value, "{SHARED_CONTAINER_VALUE}")
+            .replace("{SHARED_CONTAINER_CODEC}", &new_codec)
+            .replace("{SHARED_CONTAINER_VALUE}", &new_value);
+    }
+    field.support_type_field_name = Some(shared_field_name.to_owned());
 }
 
 pub(super) const BLOCKER_EXAMPLE_LIMIT: usize = 8;

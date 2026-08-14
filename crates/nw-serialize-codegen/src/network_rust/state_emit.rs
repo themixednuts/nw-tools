@@ -271,9 +271,7 @@ pub(super) fn replicated_state_shape_support_tokens(
     }
 
     let codec_ident = format_ident!("{codec_name}");
-    let local_value_type_name = field
-        .field_name
-        .as_deref()
+    let local_value_type_name = report_support_field_name(field)
         .and_then(|field_name| container_value_shape_support_type_name(field_name, shape));
     let uses_source_type = container_value_shape_report_uses_source_type(shape, serialize_types);
     let value_type_string = if uses_source_type {
@@ -581,9 +579,7 @@ pub(super) fn container_value_shape_report_rust_type(
             .or(shape.type_name.as_deref())
             .and_then(serialize_source_rust_type_name)
     } else {
-        field
-            .field_name
-            .as_deref()
+        report_support_field_name(field)
             .and_then(|field_name| container_value_shape_support_type_name(field_name, shape))
     }
 }
@@ -852,7 +848,7 @@ fn member_wire_shape_projection(
             Some(MemberWireProjection {
                 rust_type: container_value_shape_report_rust_type(field, shape, serialize_types)?,
                 codec_type: Some(structured_value_codec_name(
-                    field.field_name.as_deref()?,
+                    report_support_field_name(field)?,
                     shape,
                 )?),
             })
@@ -905,7 +901,7 @@ pub(super) fn container_value_member_codec_type(
 ) -> Option<String> {
     let wire_shape = nested_member_wire_shape(member)?;
     if let Some(shape) = nested_shape_by_wire_name(wire_shape, embedded_shapes) {
-        return structured_value_codec_name(field.field_name.as_deref()?, shape);
+        return structured_value_codec_name(report_support_field_name(field)?, shape);
     }
     let parsed = parse_network_member_wire_shape(wire_shape);
     if let Some(shape) = parsed
@@ -962,7 +958,14 @@ pub(super) fn container_value_shape_report_codec_name(
     field: &NetworkStateFieldShapeReport,
     shape: &crate::network_schema::NetworkNestedTypeShape,
 ) -> Option<String> {
-    structured_value_codec_name(field.field_name.as_deref()?, shape)
+    structured_value_codec_name(report_support_field_name(field)?, shape)
+}
+
+fn report_support_field_name(field: &NetworkStateFieldShapeReport) -> Option<&str> {
+    field
+        .support_type_field_name
+        .as_deref()
+        .or(field.field_name.as_deref())
 }
 
 pub(super) fn replicated_state_attr_tokens(

@@ -369,6 +369,7 @@ pub(super) fn state_field_shape_report(
     NetworkStateFieldShapeReport {
         field_index: field.index,
         field_name: field.name.clone(),
+        support_type_field_name: None,
         group: field.group,
         registration_kind: field.registration_kind.clone(),
         filter_group_attribute: field.filter_group_attribute,
