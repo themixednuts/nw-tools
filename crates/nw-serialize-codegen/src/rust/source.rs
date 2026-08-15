@@ -786,6 +786,33 @@ fn render_sum_serialize_impl(
     options: RustSourceOptions,
 ) -> Result<TokenStream, RustSourceEmitError> {
     let type_info = az_type_info_trait_path(options);
+    // A concrete payload spreads its own fields across the tagged object, so
+    // the discriminator has to be written into the same map the payload writes
+    // into. `#[serde(flatten)]` is serde's own adapter for that: it forwards
+    // the payload's entries straight to the outer map, in the payload's own
+    // encoding. Buffering the payload through `serde_json::Value` cannot do
+    // that job faithfully -- `serde_json` has no representation for a
+    // non-finite float, so a reflected `NaN` member silently becomes `null`.
+    let tagged_payload_helper = if item
+        .variants
+        .iter()
+        .any(|variant| variant.payload_has_materialized_fields && variant.payload_key.is_none())
+    {
+        quote! {
+            #[derive(::serde::Serialize)]
+            struct TypeTaggedPayload<'a, T>
+            where
+                T: ::serde::Serialize,
+            {
+                #[serde(rename = "$type")]
+                type_id: ::std::string::String,
+                #[serde(flatten)]
+                payload: &'a T,
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
     let human_arms = item
         .variants
         .iter()
@@ -809,77 +836,49 @@ fn render_sum_serialize_impl(
                 let payload_key = LitStr::new(payload_key, Span::call_site());
                 return Ok(quote! {
                     Self::#variant_ident(payload) => {
-                        let mut fields = ::serde_json::Map::new();
-                        fields.insert(
-                            "$type".to_owned(),
-                            ::serde_json::Value::String(
-                                <#payload_ty as #type_info>::TYPE_ID.to_string(),
-                            ),
-                        );
-                        fields.insert(
-                            #payload_key.to_owned(),
-                            ::serde_json::to_value(payload)
-                                .map_err(::serde::ser::Error::custom)?,
-                        );
+                        let mut map = ::serde::Serializer::serialize_map(
+                            serializer,
+                            ::core::option::Option::Some(2usize),
+                        )?;
+                        ::serde::ser::SerializeMap::serialize_entry(
+                            &mut map,
+                            "$type",
+                            &<#payload_ty as #type_info>::TYPE_ID.to_string(),
+                        )?;
+                        ::serde::ser::SerializeMap::serialize_entry(
+                            &mut map,
+                            #payload_key,
+                            payload,
+                        )?;
+                        ::serde::ser::SerializeMap::end(map)
+                    }
+                });
+            }
+            if variant.payload_has_materialized_fields {
+                return Ok(quote! {
+                    Self::#variant_ident(payload) => {
                         ::serde::Serialize::serialize(
-                            &::serde_json::Value::Object(fields),
+                            &TypeTaggedPayload {
+                                type_id: <#payload_ty as #type_info>::TYPE_ID.to_string(),
+                                payload,
+                            },
                             serializer,
                         )
                     }
                 });
             }
-            let (pattern, body) = if variant.payload_has_materialized_fields {
-                (
-                    quote! {
-                        Self::#variant_ident(payload)
-                    },
-                    quote! {
-                        let mut fields = match ::serde_json::to_value(payload)
-                            .map_err(::serde::ser::Error::custom)?
-                        {
-                            ::serde_json::Value::Object(fields) => fields,
-                            ::serde_json::Value::Null => ::serde_json::Map::new(),
-                            value => {
-                                let mut fields = ::serde_json::Map::new();
-                                fields.insert("value".to_owned(), value);
-                                fields
-                            }
-                        };
-                        fields.insert(
-                            "$type".to_owned(),
-                            ::serde_json::Value::String(
-                                <#payload_ty as #type_info>::TYPE_ID.to_string(),
-                            ),
-                        );
-                        ::serde::Serialize::serialize(
-                            &::serde_json::Value::Object(fields),
-                            serializer,
-                        )
-                    },
-                )
-            } else {
-                (
-                    quote! {
-                        Self::#variant_ident(_)
-                    },
-                    quote! {
-                        let mut fields = ::serde_json::Map::new();
-                        fields.insert(
-                            "$type".to_owned(),
-                            ::serde_json::Value::String(
-                                <#payload_ty as #type_info>::TYPE_ID.to_string(),
-                            ),
-                        );
-                        ::serde::Serialize::serialize(
-                            &::serde_json::Value::Object(fields),
-                            serializer,
-                        )
-                    },
-                )
-            };
             Ok(quote! {
-                #pattern => {
-                    #body
+                Self::#variant_ident(_) => {
+                    let mut map = ::serde::Serializer::serialize_map(
+                        serializer,
+                        ::core::option::Option::Some(1usize),
+                    )?;
+                    ::serde::ser::SerializeMap::serialize_entry(
+                        &mut map,
+                        "$type",
+                        &<#payload_ty as #type_info>::TYPE_ID.to_string(),
+                    )?;
+                    ::serde::ser::SerializeMap::end(map)
                 }
             })
         })
@@ -925,6 +924,8 @@ fn render_sum_serialize_impl(
             where
                 S: ::serde::Serializer,
             {
+                #tagged_payload_helper
+
                 if ::serde::Serializer::is_human_readable(&serializer) {
                     match self {
                         #(#human_arms)*
@@ -949,37 +950,6 @@ fn render_sum_deserialize_impl(
         RustSourceMode::Integrated => quote!(::uuid::Uuid::parse_str(&type_id)),
         RustSourceMode::Standalone => quote!(AzUuid::parse_str(&type_id)),
     };
-    let payload_merge_helper = if item
-        .variants
-        .iter()
-        .any(|variant| variant.payload_has_materialized_fields)
-    {
-        quote! {
-            fn merge_sum_payload_defaults(
-                value: &mut ::serde_json::Value,
-                source: ::serde_json::Value,
-            ) {
-                match (value, source) {
-                    (
-                        ::serde_json::Value::Object(value),
-                        ::serde_json::Value::Object(source),
-                    ) => {
-                        for (key, source_value) in source {
-                            match value.get_mut(&key) {
-                                Some(value) => merge_sum_payload_defaults(value, source_value),
-                                None => {
-                                    value.insert(key, source_value);
-                                }
-                            }
-                        }
-                    }
-                    (value, source) => *value = source,
-                }
-            }
-        }
-    } else {
-        TokenStream::new()
-    };
     let variant_checks = item
         .variants
         .iter()
@@ -994,62 +964,128 @@ fn render_sum_deserialize_impl(
             // whether the concrete Rust payload is scalar or structured.
             if let Some(payload_key) = &variant.payload_key {
                 let payload_key = LitStr::new(payload_key, Span::call_site());
-                if variant.payload_has_materialized_fields {
-                    return Ok(quote! {
-                        if type_id == <#payload_ty as #type_info>::TYPE_ID {
-                            let Some(source) = source_fields.remove(#payload_key) else {
-                                return Err(::serde::de::Error::missing_field(#payload_key));
-                            };
-                            let mut value = ::serde_json::to_value(
-                                <#payload_ty as ::core::default::Default>::default(),
-                            )
-                            .map_err(::serde::de::Error::custom)?;
-                            merge_sum_payload_defaults(&mut value, source);
-                            return ::serde_json::from_value::<#payload_ty>(value)
-                                .map(#ident::#variant_ident)
-                                .map_err(::serde::de::Error::custom);
-                        }
-                    });
-                }
                 return Ok(quote! {
                     if type_id == <#payload_ty as #type_info>::TYPE_ID {
-                        let Some(source) = source_fields.remove(#payload_key) else {
-                            return Err(::serde::de::Error::missing_field(#payload_key));
-                        };
-                        let payload = ::serde_json::from_value::<#payload_ty>(source)
-                            .map_err(::serde::de::Error::custom)?;
-                        return Ok(#ident::#variant_ident(payload));
+                        while let ::core::option::Option::Some(key) =
+                            ::serde::de::MapAccess::next_key::<::std::string::String>(&mut map)?
+                        {
+                            if key == #payload_key {
+                                let payload = ::serde::de::MapAccess::next_value::<#payload_ty>(
+                                    &mut map,
+                                )?;
+                                while ::serde::de::MapAccess::next_entry::<
+                                    ::serde::de::IgnoredAny,
+                                    ::serde::de::IgnoredAny,
+                                >(&mut map)?
+                                    .is_some()
+                                {}
+                                return ::core::result::Result::Ok(
+                                    #ident::#variant_ident(payload),
+                                );
+                            }
+                            ::serde::de::MapAccess::next_value::<::serde::de::IgnoredAny>(
+                                &mut map,
+                            )?;
+                        }
+                        return ::core::result::Result::Err(
+                            ::serde::de::Error::missing_field(#payload_key),
+                        );
                     }
                 });
             }
-            let decode = if variant.payload_has_materialized_fields {
-                quote! {
-                    let mut value = ::serde_json::to_value(
-                        <#payload_ty as ::core::default::Default>::default(),
-                    )
-                    .map_err(::serde::de::Error::custom)?;
-                    merge_sum_payload_defaults(
-                        &mut value,
-                        ::serde_json::Value::Object(source_fields),
-                    );
-                    return ::serde_json::from_value::<#payload_ty>(value)
-                        .map(#ident::#variant_ident)
-                        .map_err(::serde::de::Error::custom);
-                }
-            } else {
-                quote! {
-                    return Ok(#ident::#variant_ident(
-                        <#payload_ty as ::core::default::Default>::default(),
-                    ));
-                }
-            };
+            // The concrete payload's own fields are what is left of the map, so
+            // it deserializes straight from the remaining entries. Native keeps
+            // a member absent from the stream at its factory-constructed value,
+            // which is the payload type's own `serde` default -- not something
+            // this dispatch reconstructs by round-tripping a default instance
+            // through an owned buffer.
+            if variant.payload_has_materialized_fields {
+                return Ok(quote! {
+                    if type_id == <#payload_ty as #type_info>::TYPE_ID {
+                        return <#payload_ty as ::serde::Deserialize>::deserialize(
+                            ::serde::de::value::MapAccessDeserializer::new(
+                                StringKeyMapAccess(map),
+                            ),
+                        )
+                        .map(#ident::#variant_ident);
+                    }
+                });
+            }
             Ok(quote! {
                 if type_id == <#payload_ty as #type_info>::TYPE_ID {
-                    #decode
+                    while ::serde::de::MapAccess::next_entry::<
+                        ::serde::de::IgnoredAny,
+                        ::serde::de::IgnoredAny,
+                    >(&mut map)?
+                        .is_some()
+                    {}
+                    return ::core::result::Result::Ok(#ident::#variant_ident(
+                        <#payload_ty as ::core::default::Default>::default(),
+                    ));
                 }
             })
         })
         .collect::<Result<Vec<_>, RustSourceEmitError>>()?;
+
+    // A concrete payload's fields are the entries left in the tagged object, so
+    // it deserializes through the caller's own `MapAccess`. That access hands
+    // keys back in the encoding's own key form -- RON writes an object key as a
+    // string, while a derived struct asks for an identifier -- so the keys are
+    // normalized to strings on the way through. Nothing else is touched: values
+    // stay on the wire, which is what keeps a reflected `NaN` intact.
+    let string_key_map_access = if item
+        .variants
+        .iter()
+        .any(|variant| variant.payload_has_materialized_fields && variant.payload_key.is_none())
+    {
+        quote! {
+            struct StringKeyMapAccess<A>(A);
+
+            impl<'de, A> ::serde::de::MapAccess<'de> for StringKeyMapAccess<A>
+            where
+                A: ::serde::de::MapAccess<'de>,
+            {
+                type Error = A::Error;
+
+                fn next_key_seed<K>(
+                    &mut self,
+                    seed: K,
+                ) -> ::core::result::Result<::core::option::Option<K::Value>, Self::Error>
+                where
+                    K: ::serde::de::DeserializeSeed<'de>,
+                {
+                    match ::serde::de::MapAccess::next_key::<::std::string::String>(&mut self.0)? {
+                        ::core::option::Option::Some(key) => {
+                            ::serde::de::DeserializeSeed::deserialize(
+                                seed,
+                                ::serde::de::IntoDeserializer::into_deserializer(key),
+                            )
+                            .map(::core::option::Option::Some)
+                        }
+                        ::core::option::Option::None => {
+                            ::core::result::Result::Ok(::core::option::Option::None)
+                        }
+                    }
+                }
+
+                fn next_value_seed<V>(
+                    &mut self,
+                    seed: V,
+                ) -> ::core::result::Result<V::Value, Self::Error>
+                where
+                    V: ::serde::de::DeserializeSeed<'de>,
+                {
+                    ::serde::de::MapAccess::next_value_seed(&mut self.0, seed)
+                }
+
+                fn size_hint(&self) -> ::core::option::Option<usize> {
+                    ::serde::de::MapAccess::size_hint(&self.0)
+                }
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
 
     // An AZ dynamic value holding nothing serializes as `null`, so a sum with a
     // payload-less variant has to accept a unit as well as a map. `serde_json`
@@ -1075,9 +1111,9 @@ fn render_sum_deserialize_impl(
         })
         .transpose()?;
     let expecting = if empty_variant.is_some() {
-        "null, or an AZ polymorphic object with a `$type` field"
+        "null, or an AZ polymorphic object whose first field is `$type`"
     } else {
-        "AZ polymorphic object with a `$type` field"
+        "an AZ polymorphic object whose first field is `$type`"
     };
     let expecting = LitStr::new(expecting, Span::call_site());
     let entry_point = if empty_variant.is_some() {
@@ -1097,7 +1133,7 @@ fn render_sum_deserialize_impl(
         .map(|(variant_index, variant)| {
             let variant_ident = parse_variant_ident(item, variant)?;
             let variant_index = variant_index as u32;
-            if let Some(_) = variant.payload_type {
+            if variant.payload_type.is_some() {
                 let payload_ty = parse_variant_payload_type(item, variant)?;
                 Ok(quote! {
                     #variant_index => {
@@ -1168,6 +1204,8 @@ fn render_sum_deserialize_impl(
                     );
                 }
 
+                #string_key_map_access
+
                 struct Visitor;
 
                 impl<'de> ::serde::de::Visitor<'de> for Visitor {
@@ -1182,22 +1220,40 @@ fn render_sum_deserialize_impl(
 
                     #visit_unit
 
-                    fn visit_map<A>(self, map: A) -> ::core::result::Result<Self::Value, A::Error>
+                    fn visit_map<A>(
+                        self,
+                        mut map: A,
+                    ) -> ::core::result::Result<Self::Value, A::Error>
                     where
                         A: ::serde::de::MapAccess<'de>,
                     {
-                        #payload_merge_helper
-                        let mut source_fields = <::serde_json::Map<
-                            String,
-                            ::serde_json::Value,
-                        > as ::serde::Deserialize>::deserialize(
-                            ::serde::de::value::MapAccessDeserializer::new(map),
-                        )?;
-                        let type_id = source_fields
-                            .remove("$type")
-                            .ok_or_else(|| ::serde::de::Error::missing_field("$type"))?;
-                        let type_id = ::serde_json::from_value::<String>(type_id)
-                            .map_err(::serde::de::Error::custom)?;
+                        // The discriminator is the first entry, not a field
+                        // that may appear anywhere. ObjectStream projects the
+                        // element header's type id ahead of every child, and
+                        // the matching `Serialize` impl writes `$type` first.
+                        // Reading it from the stream is what lets the concrete
+                        // payload deserialize directly from the entries that
+                        // follow, with no intermediate owned buffer -- and it
+                        // is an owned `serde_json::Value` buffer that silently
+                        // rewrites a reflected non-finite float to `null`.
+                        let ::core::option::Option::Some(key) =
+                            ::serde::de::MapAccess::next_key::<::std::string::String>(&mut map)?
+                        else {
+                            return ::core::result::Result::Err(
+                                ::serde::de::Error::missing_field("$type"),
+                            );
+                        };
+                        if key != "$type" {
+                            return ::core::result::Result::Err(
+                                ::serde::de::Error::custom(format!(
+                                    "expected `$type` as first field for {}, got `{}`",
+                                    stringify!(#ident),
+                                    key,
+                                )),
+                            );
+                        }
+                        let type_id =
+                            ::serde::de::MapAccess::next_value::<::std::string::String>(&mut map)?;
                         let type_id = #parse_type_id.map_err(::serde::de::Error::custom)?;
 
                         #(#variant_checks)*
@@ -3051,11 +3107,16 @@ mod tests {
         assert!(source.contains("Deserializer::is_human_readable"));
         assert!(source.contains("deserialize_enum"));
         assert!(source.contains("\"$type\""));
-        assert!(source.contains("MapAccessDeserializer::new(map)"));
-        assert!(source.contains("merge_sum_payload_defaults"));
-        assert!(!source.contains("while let Some(_extra)"));
-        assert!(source.contains(".remove(\"$type\")"));
-        assert!(!source.contains("expected `$type` as first field"));
+        // The tag is read off the stream, then the concrete payload
+        // deserializes straight from the entries that follow it. Nothing is
+        // buffered in an owned value on the way -- `serde_json` cannot hold a
+        // non-finite float, so buffering would rewrite `NaN` to `null`.
+        assert!(source.contains("expected `$type` as first field"));
+        assert!(source.contains("MapAccessDeserializer::new("));
+        assert!(source.contains("StringKeyMapAccess(map)"));
+        assert!(!source.contains("merge_sum_payload_defaults"));
+        assert!(!source.contains("serde_json"));
+        assert!(!source.contains(".remove(\"$type\")"));
         assert!(!source.contains("unknown_field(&extra"));
         assert!(!source.contains("#[default]"));
         syn::parse_file(&source).expect("source should be parseable Rust");
@@ -3130,18 +3191,20 @@ mod tests {
         assert!(!source.contains("deserializer.deserialize_map(Visitor)"));
         // The payload is read back by key, not from the leftover map entries.
         assert!(source.contains("\"m_data\""));
-        // The whole object is buffered so the type tag may appear anywhere.
-        assert!(source.contains("MapAccessDeserializer::new(map)"));
+        // A scalar payload streams out of the keyed entry; there is no owned
+        // buffer to lose a `NaN` float in.
+        assert!(source.contains("expected `$type` as first field"));
+        assert!(!source.contains("MapAccessDeserializer"));
         assert!(!source.contains("merge_sum_payload_defaults"));
+        assert!(!source.contains("serde_json"));
         // Loud-on-unknown must survive -- an unrecognised payload type id is an
         // error, never a default.
         assert!(source.contains("unknown {} concrete type {}"));
-        assert!(!source.contains("expected `$type` as first field"));
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
 
     #[test]
-    fn emits_keyed_struct_payload_with_native_default_merge() {
+    fn emits_keyed_struct_payload_read_straight_from_its_entry() {
         let dynamic_id = uuid!("D761E0C2-A098-497C-B8EB-EA62F5ED896B");
         let unit = RustCodegenUnit {
             items: vec![RustItemPlan {
@@ -3201,10 +3264,13 @@ mod tests {
 
         assert!(source.contains("EventData(EventData),"));
         assert!(source.contains("\"m_data\""));
-        assert!(source.contains(".remove(\"m_data\")"));
-        assert!(!source.contains("Option<::serde_json::Value>"));
-        assert!(source.contains("merge_sum_payload_defaults(&mut value, source)"));
-        assert!(source.contains("MapAccessDeserializer::new(map)"));
+        // A structured keyed payload reads out of its own entry with its own
+        // `Deserialize`, so its `serde` defaults -- not a re-serialized default
+        // instance -- supply members the stream omits.
+        assert!(source.contains("next_value::<"));
+        assert!(!source.contains(".remove(\"m_data\")"));
+        assert!(!source.contains("merge_sum_payload_defaults"));
+        assert!(!source.contains("serde_json"));
         assert!(source.contains("unknown {} concrete type {}"));
         syn::parse_file(&source).expect("source should be parseable Rust");
     }
