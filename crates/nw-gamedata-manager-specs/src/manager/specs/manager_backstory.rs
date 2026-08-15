@@ -57,6 +57,30 @@ pub(super) fn static_backstory_data_manager_spec() -> NativeManagerSpec {
                 "intelligence",
                 NativeProjectionTransform::U32,
             ),
+            projection_field(
+                "add_to_loadouts",
+                "AddToLoadouts",
+                "add_to_loadouts",
+                NativeProjectionTransform::Bool,
+            ),
+            projection_field(
+                "objective_unlock_override",
+                "ObjectiveUnlockOverride",
+                "objective_unlock_override",
+                NativeProjectionTransform::StringList,
+            ),
+            projection_field(
+                "achievement_unlock_override",
+                "AchievementUnlockOverride",
+                "achievement_unlock_override",
+                NativeProjectionTransform::StringList,
+            ),
+            projection_field(
+                "force_ftue",
+                "ForceFTUE",
+                "force_ftue",
+                NativeProjectionTransform::Bool,
+            ),
         ],
         secondary_indexes: Vec::new(),
         lookup_methods: vec![
