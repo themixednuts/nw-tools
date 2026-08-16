@@ -1212,6 +1212,12 @@ fn semantic_manager_record(
         NativeManagerShape::OneTableCrcKeyProjection(shape) => {
             Some(one_table_crc_record(manager_name, shape))
         }
+        // The bespoke backstory columns are the Rust runtime emitter's; every
+        // other language lowers this manager through its carried projection,
+        // exactly as it did before the shape existed.
+        NativeManagerShape::StaticBackstoryData(shape) => {
+            Some(one_table_crc_record(manager_name, shape.projection()))
+        }
         NativeManagerShape::TableFamilyCrcKeyProjection(shape) => {
             Some(table_family_crc_record(manager_name, shape))
         }

@@ -117,6 +117,7 @@ pub(super) fn augmentation(
         | NativeManagerShape::OneTableOwnedStringCrcIndex(_)
         | NativeManagerShape::TableFamilyOwnedStringCrcIndex(_)
         | NativeManagerShape::OneTableCrcKeyProjection(_)
+        | NativeManagerShape::StaticBackstoryData(_)
         | NativeManagerShape::TableFamilyCrcKeyProjection(_)
         | NativeManagerShape::TableFamilyFallbackCrcKeyProjection(_)
         | NativeManagerShape::TableFamilyPartitionedCrcKeyProjection(_)

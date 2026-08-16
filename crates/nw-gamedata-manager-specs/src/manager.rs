@@ -203,6 +203,7 @@ pub enum NativeManagerShape {
     CurrencyExchangeMapping(NativeCurrencyExchangeMappingManager),
     GovernanceData(NativeGovernanceDataManager),
     LootBucketData(NativeLootBucketDataManager),
+    StaticBackstoryData(NativeStaticBackstoryDataManager),
     EntitlementData(NativeEntitlementDataManager),
     EquipmentSetData(NativeEquipmentSetDataManager),
     TerritoryDefinitionsData(NativeTerritoryDefinitionsDataManager),
@@ -1374,6 +1375,23 @@ pub struct NativeLootBucketDataManager {
     module: RustIdentifier,
 }
 
+/// A CRC-key projection plus three columns no [`NativeProjectionTransform`]
+/// can express: `InventoryItem` (item descriptors with gear score, perks and
+/// bracket tags), `WeaponMasteries` and `CategoricalProgression` (`Name:Amount`
+/// pairs, the latter folded together with eighteen per-skill columns).
+///
+/// The bespoke columns are the emitter's, as in [`NativeLootBucketDataManager`]:
+/// the emitter authors its own parse helpers into the emitted module. Every
+/// column the transform vocabulary *can* express stays in the carried
+/// [`NativeOneTableCrcKeyProjectionManager`], which is also what the standalone
+/// language products lower this manager through -- they project the expressible
+/// columns and have never carried the bespoke three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeStaticBackstoryDataManager {
+    module: RustIdentifier,
+    projection: NativeOneTableCrcKeyProjectionManager,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeEntitlementDataManager {
     module: RustIdentifier,
@@ -2363,6 +2381,11 @@ impl NativeManagerShape {
     #[must_use]
     pub const fn loot_bucket_data(manager: NativeLootBucketDataManager) -> Self {
         Self::LootBucketData(manager)
+    }
+
+    #[must_use]
+    pub const fn static_backstory_data(manager: NativeStaticBackstoryDataManager) -> Self {
+        Self::StaticBackstoryData(manager)
     }
 
     #[must_use]
@@ -6053,6 +6076,21 @@ impl NativeLootBucketDataManager {
 
     simple_accessors! {
         module: RustIdentifier
+    }
+}
+
+impl NativeStaticBackstoryDataManager {
+    #[must_use]
+    pub const fn new(
+        module: RustIdentifier,
+        projection: NativeOneTableCrcKeyProjectionManager,
+    ) -> Self {
+        Self { module, projection }
+    }
+
+    simple_accessors! {
+        module: RustIdentifier,
+        projection: NativeOneTableCrcKeyProjectionManager,
     }
 }
 

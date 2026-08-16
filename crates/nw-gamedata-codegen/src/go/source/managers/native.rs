@@ -124,6 +124,7 @@ pub(super) fn residual_native_manager_augmentation(
         | NativeManagerShape::OneTableOwnedStringCrcIndex(_)
         | NativeManagerShape::TableFamilyOwnedStringCrcIndex(_)
         | NativeManagerShape::OneTableCrcKeyProjection(_)
+        | NativeManagerShape::StaticBackstoryData(_)
         | NativeManagerShape::MultiTableCrcKeyProjection(_)
         | NativeManagerShape::TableFamilyCrcKeyProjection(_)
         | NativeManagerShape::TableFamilyFallbackCrcKeyProjection(_)
