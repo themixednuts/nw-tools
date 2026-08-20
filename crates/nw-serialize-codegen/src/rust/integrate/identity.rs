@@ -277,6 +277,14 @@ pub struct ScannedComponent {
     pub has_manual_default_impl: bool,
     pub has_facet_derive: bool,
     pub has_class_desc_derive: bool,
+    /// `#[derive(Message)]` — the type is a top-level wire message, so its
+    /// class entry is `of_message` and it also owes a debug introspector.
+    pub has_message_derive: bool,
+    /// `#[derive(ReplicatedState)]` — the type is a replication fragment.
+    pub has_replicated_state_derive: bool,
+    /// The declaration carries generic parameters, so no registration site can
+    /// name it without choosing arguments the scanner does not have.
+    pub is_generic: bool,
     pub has_duplicate_derive_tokens: bool,
     pub has_class_desc_attr: bool,
     pub class_desc_needs_normalization: bool,
@@ -345,6 +353,9 @@ pub fn scan_component_structs(text: &str, file_path: &Path) -> Vec<ScannedCompon
         let has_az_type_info_derive =
             has_derive_token(attr_block, "AzTypeInfo") || has_derive_token(attr_block, "AzRtti");
         let has_class_desc_derive = has_derive_token(attr_block, "ClassDesc");
+        let has_message_derive = has_derive_token(attr_block, "Message");
+        let has_replicated_state_derive = has_derive_token(attr_block, "ReplicatedState");
+        let is_generic = text[name_end..].starts_with('<');
         let has_duplicate_derive_tokens = derive_block_has_duplicate_tokens(attr_block);
         let (field_names, field_names_in_order, insert_offset, unit_struct_semicolon) =
             parse_struct_body(text, name_end);
@@ -398,6 +409,9 @@ pub fn scan_component_structs(text: &str, file_path: &Path) -> Vec<ScannedCompon
             has_manual_default_impl,
             has_facet_derive,
             has_class_desc_derive,
+            has_message_derive,
+            has_replicated_state_derive,
+            is_generic,
             has_duplicate_derive_tokens,
             has_class_desc_attr,
             class_desc_needs_normalization,

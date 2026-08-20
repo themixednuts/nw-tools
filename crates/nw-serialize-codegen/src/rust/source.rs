@@ -518,18 +518,17 @@ fn render_native_component_impl(
             source,
         })?;
 
+    // The lowering itself is not emitted here. A registration beside the type
+    // says only what the type is; it cannot say which host wants it, and the
+    // linker answered that by accident. The crate root enumerates every
+    // lowering in `lowerings()` instead — see
+    // [`render_integrated_lowering_registry`](project::render_integrated_lowering_registry).
     Ok(quote! {
         impl ::az_core::component::AzComponent for #ident {
             fn component_id(&self) -> ::az_core::component::ComponentId {
                 ::az_core::component::AzComponent::component_id(&self.#base_ident)
             }
         }
-
-        const _: () = {
-            ::az_core::inventory::submit! {
-                ::az_core::component::ComponentLoweringRegistration::bevy_component::<#ident>()
-            }
-        };
     })
 }
 
@@ -3392,7 +3391,33 @@ mod tests {
         assert!(
             source.contains("::az_core::component::AzComponent::component_id(&self.az_component)")
         );
-        assert!(source.contains("ComponentLoweringRegistration::bevy_component"));
+        // The lowering is enumerated at the crate root, not submitted beside
+        // the type. A registration next to the type says what the type is; only
+        // the crate can say which of its types a host takes on.
+        assert!(!source.contains("inventory::submit"));
+        assert!(!source.contains("ComponentLoweringRegistration"));
+        let project =
+            RustSourceEmitter::emit_integrated_project(&unit, &crate::CodegenContext::inline())
+                .expect("integrated project");
+        let root = &project
+            .files
+            .iter()
+            .find(|file| file.path == "mod.rs")
+            .expect("generated root module")
+            .source;
+        assert!(root.contains(
+            "pub fn lowerings() -> [::az_core::component::ComponentLoweringRegistration; 1usize]"
+        ));
+        assert!(
+            root.contains("ComponentLoweringRegistration::bevy_component::<"),
+            "unexpected root module:\n{root}"
+        );
+        assert_eq!(
+            root.matches("self::example::components::health_component::HealthComponent")
+                .count(),
+            2,
+            "the component is named once by the cook registry and once by the lowering list:\n{root}"
+        );
         assert!(!source.contains("use bevy::prelude::{Component, Reflect};"));
         assert!(!source.contains("use bevy::prelude::Component;"));
         assert!(source.contains("use bevy::ecs::reflect::ReflectComponent;"));

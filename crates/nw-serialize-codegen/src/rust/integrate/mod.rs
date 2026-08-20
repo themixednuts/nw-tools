@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 pub mod identity;
 pub mod source_index;
+pub mod wire;
 
 use crate::CodegenContext;
 use crate::naming::rust_field_ident;
@@ -355,6 +356,12 @@ pub enum RustIntegrationError {
     },
     #[error("failed to read Rust source at {path}")]
     Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to write Rust source at {path}")]
+    Write {
         path: PathBuf,
         #[source]
         source: io::Error,

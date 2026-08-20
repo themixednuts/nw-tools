@@ -184,6 +184,7 @@ fn emit_integrated_type_files(
     // at emit time inside `render_integrated_prefab_type_registry`. Turning
     // either back into `Vec<syn::Type>` here does not compile.
     let prefab_arc_types = integrated_prefab_arc_types(&layout)?;
+    let lowering_type_paths = integrated_lowering_type_paths(&layout);
     let tasks = integrated_type_tasks(&layout, &module_tree, &register_children_by_module);
 
     let emitted = context
@@ -208,6 +209,11 @@ fn emit_integrated_type_files(
                 },
                 if task.module_path.is_empty() {
                     &prefab_arc_types
+                } else {
+                    &[]
+                },
+                if task.module_path.is_empty() {
+                    &lowering_type_paths
                 } else {
                     &[]
                 },
@@ -377,6 +383,7 @@ fn emit_integrated_type_module<'a>(
     items: &[&RustItemPlan],
     prefab_type_paths: &[String],
     prefab_arc_types: &[String],
+    lowering_type_paths: &[String],
 ) -> Result<String, RustSourceEmitError> {
     let child_modules = child_dirs
         .map(parse_module_ident)
@@ -446,6 +453,9 @@ fn emit_integrated_type_module<'a>(
             prefab_arc_types,
         )?);
     }
+    if !lowering_type_paths.is_empty() {
+        source.push_str(&render_integrated_lowering_registry(lowering_type_paths)?);
+    }
 
     rustfmt_source(&source)
 }
@@ -462,6 +472,35 @@ fn integrated_prefab_type_paths(
     // recursive per-module `register(app)` functions. Keeping the cook path
     // equally complete prevents valid selected dependencies from surfacing one
     // at a time as "no registration found" import failures.
+    integrated_type_paths(layout, can_register_type)
+}
+
+/// The component lowerings this unit owns, as crate-root-qualified paths.
+///
+/// Deliberately flat and whole-unit, for the same reason
+/// [`integrated_prefab_arc_types`] is: the enumeration is emitted once, at the
+/// crate root, beside `register_prefab_types`. The root module owns no items of
+/// its own, so a per-module list there would enumerate nothing.
+///
+/// The predicate is exactly the one
+/// [`render_native_component_impl`](super::render_native_component_impl) uses to
+/// decide whether a type gets an `AzComponent` impl at all. That is the point:
+/// a type with the impl and without the entry is a component this host lowers
+/// nowhere, and a type with the entry and without the impl does not compile.
+fn integrated_lowering_type_paths(
+    layout: &crate::rust::layout::RustStandaloneTypeLayout<'_>,
+) -> Vec<String> {
+    integrated_type_paths(layout, |item| {
+        item.identity.native_component_base_field.is_some()
+    })
+}
+
+/// Crate-root-qualified paths for every item in the unit matching `select`,
+/// ordered by path then source type id so emission is stable across runs.
+fn integrated_type_paths(
+    layout: &crate::rust::layout::RustStandaloneTypeLayout<'_>,
+    select: impl Fn(&RustItemPlan) -> bool,
+) -> Vec<String> {
     let module_items = layout
         .module_groups
         .iter()
@@ -478,7 +517,7 @@ fn integrated_prefab_type_paths(
         });
     let mut paths = module_items
         .chain(file_items)
-        .filter(|(_, item)| can_register_type(item))
+        .filter(|(_, item)| select(item))
         .map(|(module_path, item)| {
             let qualified = format!("self::{}::{}", module_path.join("::"), item.rust_name);
             (qualified, item)
@@ -1057,6 +1096,46 @@ fn render_integrated_prefab_type_registry(
             #(registry.register::<#prefab_arc_types>();)*
             #(registry.register_type_data::<#prefab_arc_types, ::bevy::reflect::ReflectSerialize>();)*
             #(registry.register_type_data::<#prefab_arc_types, ::bevy::reflect::ReflectDeserialize>();)*
+        }
+    })
+    .map_err(RustSourceEmitError::File)?;
+    Ok(prettyplease::unparse(&file))
+}
+
+/// Emit the crate-root component-lowering enumeration.
+///
+/// One line per type carrying a native component base field — the same set that
+/// got an `AzComponent` impl. `bevy_component::<T>()` is a `const fn`, so the
+/// array is a compile-time value and the only cost of a 650-entry list is the
+/// static it lives in.
+///
+/// The array is length-typed rather than a `Vec` so the count is part of the
+/// signature: a host reading `lowerings()` sees how many adapters it is taking
+/// on, and a regeneration that silently drops one changes the type.
+fn render_integrated_lowering_registry(
+    lowering_type_paths: &[String],
+) -> Result<String, RustSourceEmitError> {
+    let count = lowering_type_paths.len();
+    let lowering_type_paths = lowering_type_paths
+        .iter()
+        .map(|path| {
+            syn::parse_str::<syn::Path>(path).map_err(|source| RustSourceEmitError::ItemIdent {
+                source_name: format!("lowering:{path}"),
+                identifier: path.clone(),
+                source,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let file = syn::parse2::<syn::File>(quote! {
+        /// Every component lowering this generated tree owns.
+        ///
+        /// Handed to a composing host by the crate's contribution; nothing
+        /// registers itself.
+        #[must_use]
+        pub fn lowerings() -> [::az_core::component::ComponentLoweringRegistration; #count] {
+            [
+                #(::az_core::component::ComponentLoweringRegistration::bevy_component::<#lowering_type_paths>(),)*
+            ]
         }
     })
     .map_err(RustSourceEmitError::File)?;
