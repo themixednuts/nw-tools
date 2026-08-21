@@ -3406,7 +3406,7 @@ mod tests {
             .expect("generated root module")
             .source;
         assert!(root.contains(
-            "pub fn lowerings() -> [::az_core::component::ComponentLoweringRegistration; 1usize]"
+            "pub fn lowerings() -> [::az_core::component::ComponentLoweringRegistration; 1]"
         ));
         assert!(
             root.contains("ComponentLoweringRegistration::bevy_component::<"),
@@ -3518,9 +3518,7 @@ mod tests {
         assert!(source.contains("Prefab,"));
         assert!(source.contains("#[reflect(Component, Default, Prefab, Serialize, Deserialize)]"));
         assert!(source.contains("#[prefab(tag = \"GameTransformComponent\", version = 0u32)]"));
-        assert!(root.contains(
-            "pub fn register_prefab_types(registry: &mut ::bevy::reflect::TypeRegistry)"
-        ));
+        assert!(root.contains("pub fn prefab_types() -> [::az_prefab::PrefabType; 2]"));
         let component_module = component_file
             .path
             .strip_suffix(".rs")
@@ -3531,7 +3529,7 @@ mod tests {
             "unexpected root module:\n{root}"
         );
         assert_eq!(
-            root.matches(".register::<").count(),
+            root.matches("::az_prefab::PrefabType::of::<").count(),
             2,
             "the cook registry must include the component and its selected reflected base"
         );
@@ -3973,13 +3971,27 @@ mod tests {
             assert!(!file.source.contains("impl Plugin"), "{}", file.path);
             assert!(!file.source.contains("add_plugins"), "{}", file.path);
         }
-        assert!(root.source.contains(
-            "pub fn register_prefab_types(registry: &mut ::bevy::reflect::TypeRegistry)"
+        assert!(
+            root.source
+                .contains("pub fn prefab_types() -> [::az_prefab::PrefabType; 1]")
+        );
+        // prettyplease wraps long turbofish arguments across lines and adds a
+        // trailing comma when it does; neither is part of the entry, so fold
+        // both out rather than pinning to its current line-breaking.
+        let root_compact = root
+            .source
+            .split_whitespace()
+            .collect::<String>()
+            .replace(",>", ">");
+        assert!(root_compact.contains(
+            "::az_prefab::PrefabType::of::<self::example::components::health_component::HealthComponent>()"
         ));
-        assert!(root.source.contains(
-            "registry.register::<self::example::components::health_component::HealthComponent>();"
-        ));
-        assert_eq!(root.source.matches(".register::<").count(), 1);
+        assert_eq!(
+            root_compact
+                .matches("::az_prefab::PrefabType::of::<")
+                .count(),
+            1
+        );
         assert!(!parent.source.contains("pub fn register"));
         assert!(!parent.source.contains("health_component::register(app);"));
         assert!(!parent.source.contains("app.register_type::<"));

@@ -479,7 +479,7 @@ fn integrated_prefab_type_paths(
 ///
 /// Deliberately flat and whole-unit, for the same reason
 /// [`integrated_prefab_arc_types`] is: the enumeration is emitted once, at the
-/// crate root, beside `register_prefab_types`. The root module owns no items of
+/// crate root, beside `prefab_types`. The root module owns no items of
 /// its own, so a per-module list there would enumerate nothing.
 ///
 /// The predicate is exactly the one
@@ -531,15 +531,15 @@ fn integrated_type_paths(
     paths.into_iter().map(|(path, _)| path).collect()
 }
 
-/// The `Arc<T>` registrations `register_prefab_types` owes the offline cook
-/// registry, collected across the whole unit.
+/// The `Arc<T>` entries `prefab_types` owes the offline cook registry,
+/// collected across the whole unit.
 ///
-/// Deliberately whole-unit, not per-module, because the two registration
-/// functions have different shapes. `register(app)` is recursive — each module
-/// registers its own items and calls its children — so the per-module Arc list
-/// in [`render_integrated_register`] reaches everything. `register_prefab_types`
-/// is emitted once, at the crate root, and is flat. The root module owns no
-/// items of its own, so a per-module list there would register nothing at all.
+/// Deliberately whole-unit, not per-module, because the two surfaces have
+/// different shapes. `register(app)` is recursive — each module registers its
+/// own items and calls its children — so the per-module Arc list in
+/// [`render_integrated_register`] reaches everything. `prefab_types` is emitted
+/// once, at the crate root, and is flat. The root module owns no items of its
+/// own, so a per-module list there would enumerate nothing at all.
 ///
 /// Runs the same [`smart_pointer_types_needing_serde_reflect`] predicate the App
 /// path uses rather than reimplementing the collection, so the cook registry and
@@ -1054,15 +1054,28 @@ fn collect_arc_types(ty: &Type, out: &mut BTreeMap<String, Type>) {
     }
 }
 
-/// Emit the cook-path registry initializer.
+/// Emit the crate-root Bevy-native Prefab type enumeration.
 ///
-/// The `Arc<T>` block mirrors the tail of [`render_integrated_register`] on
-/// purpose. Both registries need it and neither can be derived from the other:
+/// One composed `PrefabType` entry per reflected type, handed to a composing
+/// host rather than applied to a `TypeRegistry` the generated crate reached into
+/// itself: a hidden `fn(&mut TypeRegistry)` only survives when the linker keeps
+/// the contributing crate, and two claims on one type path have to fail
+/// composition naming both instead of racing for last-writer-wins.
+///
+/// The `Arc<T>` entries mirror the tail of [`render_integrated_register`] on
+/// purpose. Both registries need them and neither can be derived from the other:
 /// the runtime reaches these types through an `App`, the importer through a bare
-/// `TypeRegistry`, and registering on only one side is what let 1,066 files fail
-/// at import with the generated code looking correct. `register::<T>()` must
-/// precede the `register_type_data` calls — `TypeRegistry` panics on type data
-/// for an unregistered type.
+/// `TypeRegistry`, and covering only one side is what let 1,066 files fail at
+/// import with the generated code looking correct. They are `hook` entries
+/// rather than `of` entries because `TypeRegistry::register` alone does not
+/// carry `ReflectSerialize`/`ReflectDeserialize`, and `register_type_data`
+/// panics on an unregistered type — so the register and its data must travel as
+/// one entry, in that order, keyed on the one type path.
+///
+/// The array is length-typed rather than a `Vec` so the count is part of the
+/// signature, matching [`render_integrated_lowering_registry`]: a host reading
+/// `prefab_types()` sees how many types it is taking on, and a regeneration that
+/// silently drops one changes the type.
 fn render_integrated_prefab_type_registry(
     prefab_type_paths: &[String],
     prefab_arc_types: &[String],
@@ -1090,16 +1103,45 @@ fn render_integrated_prefab_type_registry(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let count = unsuffixed_count(prefab_type_paths.len() + prefab_arc_types.len());
     let file = syn::parse2::<syn::File>(quote! {
-        pub fn register_prefab_types(registry: &mut ::bevy::reflect::TypeRegistry) {
-            #(registry.register::<#prefab_type_paths>();)*
-            #(registry.register::<#prefab_arc_types>();)*
-            #(registry.register_type_data::<#prefab_arc_types, ::bevy::reflect::ReflectSerialize>();)*
-            #(registry.register_type_data::<#prefab_arc_types, ::bevy::reflect::ReflectDeserialize>();)*
+        /// Every Bevy-native Prefab type this generated tree owns.
+        ///
+        /// The array is the enumeration: a type left out of it reaches no host,
+        /// and no link order can put it back. Handed to a composing host by the
+        /// crate's contribution; nothing registers itself.
+        ///
+        /// The `Arc<T>` entries are hooks because `TypeRegistry::register`
+        /// alone does not carry their `ReflectSerialize`/`ReflectDeserialize`
+        /// data, and `register_type_data` panics on an unregistered type — so
+        /// the register and its data travel as one composed entry keyed on the
+        /// type path.
+        #[must_use]
+        pub fn prefab_types() -> [::az_prefab::PrefabType; #count] {
+            [
+                #(::az_prefab::PrefabType::of::<#prefab_type_paths>(),)*
+                #(::az_prefab::PrefabType::hook(
+                    <#prefab_arc_types as ::bevy::reflect::TypePath>::type_path(),
+                    |registry| {
+                        registry.register::<#prefab_arc_types>();
+                        registry.register_type_data::<#prefab_arc_types, ::bevy::reflect::ReflectSerialize>();
+                        registry.register_type_data::<#prefab_arc_types, ::bevy::reflect::ReflectDeserialize>();
+                    },
+                ),)*
+            ]
         }
     })
     .map_err(RustSourceEmitError::File)?;
     Ok(prettyplease::unparse(&file))
+}
+
+/// An array length that renders as `648`, not `648usize`.
+///
+/// `usize`'s `ToTokens` writes the suffix, which would put a literal in the
+/// emitted signature that no one would write by hand and that a reader diffing
+/// generated against committed source has to look past.
+fn unsuffixed_count(count: usize) -> proc_macro2::Literal {
+    proc_macro2::Literal::usize_unsuffixed(count)
 }
 
 /// Emit the crate-root component-lowering enumeration.
@@ -1115,7 +1157,7 @@ fn render_integrated_prefab_type_registry(
 fn render_integrated_lowering_registry(
     lowering_type_paths: &[String],
 ) -> Result<String, RustSourceEmitError> {
-    let count = lowering_type_paths.len();
+    let count = unsuffixed_count(lowering_type_paths.len());
     let lowering_type_paths = lowering_type_paths
         .iter()
         .map(|path| {
@@ -1835,6 +1877,11 @@ mod tests {
             "::bevy::platform::sync::Arc<TutorialStep>",
         ] {
             for expected in [
+                // One composed entry per Arc type, keyed on its type path, with
+                // the register and both type-data calls inside it.
+                format!(
+                    "::az_prefab::PrefabType::hook(<{rendered}as::bevy::reflect::TypePath>::type_path()"
+                ),
                 format!("registry.register::<{rendered}>()"),
                 format!(
                     "registry.register_type_data::<{rendered},::bevy::reflect::ReflectSerialize>()"
