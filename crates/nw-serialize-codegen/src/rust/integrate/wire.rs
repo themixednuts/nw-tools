@@ -23,6 +23,7 @@
 //! exists to catch.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -130,6 +131,39 @@ pub struct WirePlan {
     /// no host.
     pub enumerated: BTreeSet<String>,
     pub skipped: Vec<WireSkip>,
+    /// Enumerated types that claim a wire identity another one already claims.
+    pub clashes: Vec<WireClash>,
+}
+
+/// Two or more enumerated types claiming one wire identity.
+///
+/// A composing host catches this at `finalize`, but only the first pair it
+/// reaches: fail-fast means a tree with five collisions costs five
+/// compile-and-test cycles to uncover, one at a time. The pass sees every
+/// declaration at once, so it names all of them before a line is emitted.
+///
+/// Under the retired `inventory` registration nothing caught it at all — the
+/// collision resolved by link order, silently, and whichever type lost simply
+/// never decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireClash {
+    /// The registry key it collides on: `az-uuid` or `type-index`.
+    pub axis: &'static str,
+    pub key: String,
+    /// The claiming types, in scan order.
+    pub types: Vec<String>,
+}
+
+impl fmt::Display for WireClash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} {} claimed by {}",
+            self.axis,
+            self.key,
+            self.types.join(", ")
+        )
+    }
 }
 
 impl WirePlan {
@@ -173,16 +207,36 @@ pub fn plan(root: &Path, context: &CodegenContext) -> Result<WirePlan, RustInteg
 
     let mut nodes = BTreeMap::<Vec<String>, Node>::new();
     let mut plan = WirePlan::default();
+    let mut uuids = BTreeMap::<String, Vec<String>>::new();
+    let mut indices = BTreeMap::<String, Vec<String>>::new();
     for scan in &scans {
         let Some(module_path) = module_path(root, &scan.path) else {
             continue;
         };
         let mut types = Vec::new();
         let handwritten = hand_fragments(&scan.text);
+        let claimed = identities(&scan.text)
+            .into_iter()
+            .map(|(name, uuid, index)| (name, (uuid, index)))
+            .collect::<BTreeMap<_, _>>();
         for component in &scan.scanned {
             match classify(component) {
                 Classified::Wire(mut wire) => {
                     wire.fragment |= handwritten.contains(&wire.name);
+                    if let Some((uuid, index)) = claimed.get(&wire.name) {
+                        if let Some(uuid) = uuid {
+                            uuids
+                                .entry(uuid.to_ascii_uppercase())
+                                .or_insert_with(Vec::new)
+                                .push(wire.name.clone());
+                        }
+                        if let Some(index) = index {
+                            indices
+                                .entry(index.clone())
+                                .or_insert_with(Vec::new)
+                                .push(wire.name.clone());
+                        }
+                    }
                     plan.declared.insert(wire.name.clone(), scan.path.clone());
                     types.push(wire);
                 }
@@ -246,6 +300,29 @@ pub fn plan(root: &Path, context: &CodegenContext) -> Result<WirePlan, RustInteg
                 .count(),
         });
     }
+
+    // Reported for every enumerated type, not only the ones a composition
+    // happens to reach first. Two types on one identity is a defect in the
+    // declarations, so it is named here rather than left to fail-fast.
+    plan.clashes = uuids
+        .into_iter()
+        .filter(|(_, types)| types.len() > 1)
+        .map(|(key, types)| WireClash {
+            axis: "az-uuid",
+            key,
+            types,
+        })
+        .chain(
+            indices
+                .into_iter()
+                .filter(|(_, types)| types.len() > 1)
+                .map(|(key, types)| WireClash {
+                    axis: "type-index",
+                    key,
+                    types,
+                }),
+        )
+        .collect();
 
     Ok(plan)
 }
@@ -366,6 +443,56 @@ fn hand_fragments(text: &str) -> BTreeSet<String> {
 /// They are `None` rather than a reported skip because they are not an
 /// incomplete wire declaration, they are a different mechanism, and 115
 /// permanent lines in the skip report would bury the two shapes that ARE gaps.
+/// The wire identity each `pub struct` in one file claims.
+///
+/// Read from the source rather than from `ScannedComponent`, which carries the
+/// derives but not `class_desc(type_index = …)`. Both halves are needed: the
+/// class registry keys on the AZ uuid and wire dispatch keys on the envelope
+/// index, so two types can collide on either axis independently.
+fn identities(text: &str) -> Vec<(String, Option<String>, Option<String>)> {
+    let mut found = Vec::new();
+    let mut attrs = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#[") {
+            attrs.push_str(trimmed);
+            attrs.push('\n');
+            continue;
+        }
+        if let Some(name) = declared_struct(trimmed) {
+            let uuid = between(&attrs, "az_type_info(\"", "\"")
+                .or_else(|| between(&attrs, "az_rtti(", ")").and_then(|inner| {
+                    between(&inner, "\"", "\"").filter(|value| value.len() == 36)
+                }));
+            let index = between(&attrs, "type_index = ", ")")
+                .map(|value| value.trim().to_owned());
+            if uuid.is_some() || index.is_some() {
+                found.push((name, uuid, index));
+            }
+        }
+        if !trimmed.is_empty() && !trimmed.starts_with("//") {
+            attrs.clear();
+        }
+    }
+    found
+}
+
+/// The struct a line declares, when it declares one.
+fn declared_struct(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("pub struct ")?;
+    let name = rest
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .next()?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// The text between two markers, when both are present.
+fn between(haystack: &str, open: &str, close: &str) -> Option<String> {
+    let start = haystack.find(open)? + open.len();
+    let end = haystack[start..].find(close)? + start;
+    Some(haystack[start..end].to_owned())
+}
+
 fn classify(component: &ScannedComponent) -> Classified {
     if !component.has_class_desc_derive {
         return if component.has_replicated_state_derive {
@@ -800,6 +927,7 @@ mod tests {
             src.join("lib.rs"),
             concat!(
                 "pub mod bundle;\n",
+                "pub mod echo;\n",
                 "#[cfg(feature = \"combat\")]\n",
                 "pub mod combat;\n",
                 "pub mod solo;\n",
@@ -818,6 +946,7 @@ mod tests {
             concat!(
                 "#[derive(ClassDesc, Message, Marshaler)]\n",
                 "#[class_desc(type_index = 2)]\n",
+                "#[az_type_info(\"1D9E5A21-0000-4000-8000-000000000001\")]\n",
                 "pub struct Ping;\n",
                 "\n",
                 "// Bevy's ECS message derive, which shares the name.\n",
@@ -843,6 +972,18 @@ mod tests {
         .expect("write bundle");
         fs::write(src.join("combat").join("mod.rs"), "pub mod damage;\n")
             .expect("write combat mod");
+        // Claims `Ping`'s envelope index and its AZ uuid. Under `inventory`
+        // this resolved by link order; a composing host fails on it.
+        fs::write(
+            src.join("echo.rs"),
+            concat!(
+                "#[derive(ClassDesc, Message, Marshaler)]\n",
+                "#[class_desc(type_index = 2)]\n",
+                "#[az_type_info(\"1D9E5A21-0000-4000-8000-000000000001\")]\n",
+                "pub struct Echo;\n",
+            ),
+        )
+        .expect("write echo");
         fs::write(
             src.join("combat").join("damage.rs"),
             concat!(
@@ -999,6 +1140,34 @@ mod tests {
             !root.contains("out.extend(self::damage::classes());"),
             "the root declares no `damage`; only `combat` and `aliased` reach it"
         );
+    }
+
+    /// Two types on one wire identity is a defect in the declarations, and the
+    /// pass names every one of them rather than leaving it to a composing
+    /// host's fail-fast `finalize` to surface them one cycle at a time.
+    #[test]
+    fn types_sharing_a_wire_identity_are_all_reported() {
+        let temp = crate_root();
+        let plan = planned(&temp);
+
+        let axes = plan
+            .clashes
+            .iter()
+            .map(|clash| clash.axis)
+            .collect::<BTreeSet<_>>();
+        assert!(axes.contains("az-uuid"), "{:?}", plan.clashes);
+        assert!(axes.contains("type-index"), "{:?}", plan.clashes);
+
+        for clash in &plan.clashes {
+            let mut types = clash.types.clone();
+            types.sort();
+            assert_eq!(types, vec!["Echo".to_owned(), "Ping".to_owned()]);
+        }
+
+        // Reporting a clash is not a reason to stop emitting: the enumeration
+        // is still what the crate declares, and the fix belongs in the
+        // declarations rather than in the generated block.
+        assert!(rendered(&plan, "echo.rs").contains("of_message::<Echo>()"));
     }
 
     /// Bevy's ECS `Message` derive shares a name with gridmate's wire-message

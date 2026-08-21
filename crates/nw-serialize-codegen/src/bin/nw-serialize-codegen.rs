@@ -312,6 +312,13 @@ fn write_wire_registration(args: &WireArgs, status: CodegenStatus) -> Result<()>
             skip.path.display()
         );
     }
+    // Named before the counts, because a clash means two types are fighting
+    // over one identity and the counts below are describing a tree that cannot
+    // compose. Every one is listed: a host's `finalize` fails on the first it
+    // reaches, so discovering them one at a time costs a cycle each.
+    for clash in &plan.clashes {
+        eprintln!("clash {clash}");
+    }
     let classes = plan.files.iter().map(|file| file.classes).sum::<usize>();
     let fragments = plan.files.iter().map(|file| file.fragments).sum::<usize>();
     let introspects = plan
@@ -320,12 +327,13 @@ fn write_wire_registration(args: &WireArgs, status: CodegenStatus) -> Result<()>
         .map(|file| file.introspects)
         .sum::<usize>();
     println!(
-        "wire registration: {} module(s), {} class(es), {} fragment(s), {} introspect(s), {} declared-but-unlisted",
+        "wire registration: {} module(s), {} class(es), {} fragment(s), {} introspect(s), {} declared-but-unlisted, {} identity clash(es)",
         plan.files.len(),
         classes,
         fragments,
         introspects,
-        plan.unenumerated().len()
+        plan.unenumerated().len(),
+        plan.clashes.len()
     );
 
     if args.apply {
