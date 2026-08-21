@@ -90,6 +90,26 @@ impl std::fmt::Display for WireSkipReason {
     }
 }
 
+/// One `mod` declaration in a module's own source, resolved to the node it
+/// names.
+///
+/// Declared rather than read off the directory tree, because the two disagree
+/// exactly where it matters. `#[path]` moves a file into a module the layout
+/// does not imply, and `#[cfg]` decides whether the module exists in *this*
+/// compile at all — so a chain built from the file tree calls modules a feature
+/// set removed, and a crate that gates its modules on capabilities stops
+/// compiling the moment the enumeration lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Child {
+    /// The name the parent calls it by; `#[path]` decouples this from the file.
+    name: String,
+    /// Module path of the node this declaration resolves to.
+    target: Vec<String>,
+    /// The declaration's own `#[cfg(...)]` attributes, verbatim. The chained
+    /// call carries them, so the call exists exactly when the module does.
+    cfgs: Vec<String>,
+}
+
 /// The rewritten source for one module, ready to write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireFile {
@@ -158,9 +178,11 @@ pub fn plan(root: &Path, context: &CodegenContext) -> Result<WirePlan, RustInteg
             continue;
         };
         let mut types = Vec::new();
+        let handwritten = hand_fragments(&scan.text);
         for component in &scan.scanned {
             match classify(component) {
-                Classified::Wire(wire) => {
+                Classified::Wire(mut wire) => {
+                    wire.fragment |= handwritten.contains(&wire.name);
                     plan.declared.insert(wire.name.clone(), scan.path.clone());
                     types.push(wire);
                 }
@@ -176,29 +198,39 @@ pub fn plan(root: &Path, context: &CodegenContext) -> Result<WirePlan, RustInteg
                 Classified::None => {}
             }
         }
+        let children = declarations(&scan.text, &scan.path, root);
         nodes.insert(
-            module_path.clone(),
+            module_path,
             Node {
                 path: scan.path.clone(),
-                module_path,
                 text: scan.text.clone(),
                 types,
-                children: Vec::new(),
+                children,
             },
         );
     }
 
-    link_children(&mut nodes);
     let carries = carried_registries(&nodes);
 
     for (module_path, node) in &nodes {
-        let Some(carried) = carries.get(module_path) else {
-            continue;
-        };
+        let carried = carries.get(module_path).copied().unwrap_or_default();
         if !carried.any() {
+            // A module that no longer carries wire types must not keep the
+            // block it carried last run. This pass owns that region, and a
+            // stale enumeration left behind is the exact drift it exists to
+            // prevent — it would name types the crate no longer publishes.
+            if node.text.contains(BEGIN) {
+                plan.files.push(WireFile {
+                    path: node.path.clone(),
+                    source: strip(&node.text),
+                    classes: 0,
+                    fragments: 0,
+                    introspects: 0,
+                });
+            }
             continue;
         }
-        let block = render(node, module_path.is_empty(), carried, &carries);
+        let block = render(node, module_path.is_empty(), &carried, &carries);
         for wire in &node.types {
             plan.enumerated.insert(wire.name.clone());
         }
@@ -218,8 +250,44 @@ pub fn plan(root: &Path, context: &CodegenContext) -> Result<WirePlan, RustInteg
     Ok(plan)
 }
 
-/// Write every rendered module back over its source file.
+/// Write every rendered module back over its source file, then format them.
+///
+/// The rendered block is not what rustfmt would have written — a long turbofish
+/// wraps, a one-element array folds, a chained registrar call breaks — so
+/// without this step the pass and `cargo fmt --check` disagree about every file
+/// the pass owns, and neither is wrong. Formatting here is also what makes the
+/// pass idempotent: rustfmt is idempotent, so a second run over an unchanged
+/// crate produces no diff instead of oscillating between two spellings.
 pub fn apply(plan: &WirePlan) -> Result<(), RustIntegrationError> {
+    write(plan)?;
+    format(plan.files.iter().map(|file| file.path.as_path()))
+}
+
+/// Run rustfmt over the rewritten files.
+///
+/// Batched, because a process per file over ~200 modules is most of the pass's
+/// wall time. The edition is passed explicitly: rustfmt defaults to 2015 and
+/// would fail to parse edition-2024 source it is handed directly rather than
+/// through Cargo.
+fn format<'a>(paths: impl Iterator<Item = &'a Path>) -> Result<(), RustIntegrationError> {
+    let paths = paths.collect::<Vec<_>>();
+    for batch in paths.chunks(64) {
+        let output = std::process::Command::new("rustfmt")
+            .arg("--edition")
+            .arg("2024")
+            .args(batch)
+            .output()
+            .map_err(RustIntegrationError::Format)?;
+        if !output.status.success() {
+            return Err(RustIntegrationError::Rustfmt(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write(plan: &WirePlan) -> Result<(), RustIntegrationError> {
     for file in &plan.files {
         fs::write(&file.path, &file.source).map_err(|source| RustIntegrationError::Write {
             path: file.path.clone(),
@@ -237,10 +305,9 @@ struct FileScan {
 
 struct Node {
     path: PathBuf,
-    module_path: Vec<String>,
     text: String,
     types: Vec<WireType>,
-    children: Vec<String>,
+    children: Vec<Child>,
 }
 
 enum Classified {
@@ -249,29 +316,74 @@ enum Classified {
     None,
 }
 
+/// Types this file implements `gridmate::hub::Fragment` for by hand.
+///
+/// `#[derive(ReplicatedState)]` is the usual way a type says it is a concrete
+/// replication fragment; it is not the only one. A type whose replication
+/// layout the derive cannot express writes the impl itself, and it is exactly
+/// as much a fragment for having done so — the hand-written
+/// `FragmentRegistration` submit that used to sit beside such an impl is what
+/// this pass replaces, so reading only the derive would drop live wire state.
+fn hand_fragments(text: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in text.lines() {
+        // A generic impl heads `impl<`, so it never reaches the split, and a
+        // generic type has no monomorphic registration site anyway.
+        let Some((implemented, target)) = line
+            .trim_end()
+            .strip_prefix("impl ")
+            .and_then(|rest| rest.split_once(" for "))
+        else {
+            continue;
+        };
+        let trait_name = implemented.split('<').next().unwrap_or(implemented).trim();
+        if trait_name.rsplit("::").next() != Some("Fragment") {
+            continue;
+        }
+        let target = target.trim().trim_end_matches('{').trim();
+        if !target.is_empty()
+            && target
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '_')
+        {
+            names.insert(target.to_owned());
+        }
+    }
+    names
+}
+
+/// What a declared type owes the wire registries, if anything.
+///
+/// `ClassDesc` is what makes a type a wire type: it carries the native type
+/// index every entry is keyed on, and both `ClassRegistration` constructors are
+/// bounded on `Class`. Everything else follows from that.
+///
+/// A bare `#[derive(Message)]` is therefore *not* a declaration here. Bevy's
+/// ECS message derive shares the name with gridmate's wire-message derive —
+/// there are 115 of them in the New World runtime alone — and only the wire one
+/// is written beside a `ClassDesc`. Reading the name alone put ECS events on
+/// the protocol, which does not even compile: `of_message` requires `Class`.
+/// They are `None` rather than a reported skip because they are not an
+/// incomplete wire declaration, they are a different mechanism, and 115
+/// permanent lines in the skip report would bury the two shapes that ARE gaps.
 fn classify(component: &ScannedComponent) -> Classified {
-    let declares = component.has_class_desc_derive
-        || component.has_message_derive
-        || component.has_replicated_state_derive;
-    if !declares {
-        return Classified::None;
+    if !component.has_class_desc_derive {
+        return if component.has_replicated_state_derive {
+            Classified::Skip(WireSkipReason::FragmentWithoutClass)
+        } else {
+            Classified::None
+        };
     }
     if component.is_generic {
         return Classified::Skip(WireSkipReason::Generic);
     }
-    let kind = if component.has_message_derive {
-        WireKind::Message
-    } else if component.has_class_desc_derive {
-        WireKind::Class
-    } else {
-        return Classified::Skip(WireSkipReason::FragmentWithoutClass);
-    };
-    if component.has_replicated_state_derive && !component.has_class_desc_derive {
-        return Classified::Skip(WireSkipReason::FragmentWithoutClass);
-    }
     Classified::Wire(WireType {
         name: component.component_name.clone(),
-        kind,
+        kind: if component.has_message_derive {
+            WireKind::Message
+        } else {
+            WireKind::Class
+        },
         fragment: component.has_replicated_state_derive,
     })
 }
@@ -297,26 +409,107 @@ fn module_path(root: &Path, path: &Path) -> Option<Vec<String>> {
     }
 }
 
-fn link_children(nodes: &mut BTreeMap<Vec<String>, Node>) {
-    let children = nodes
-        .keys()
-        .filter(|path| !path.is_empty())
-        .filter_map(|path| {
-            let (name, parent) = path.split_last()?;
-            Some((parent.to_vec(), name.clone()))
-        })
-        .fold(
-            BTreeMap::<Vec<String>, Vec<String>>::new(),
-            |mut acc, (parent, name)| {
-                acc.entry(parent).or_default().push(name);
-                acc
-            },
-        );
-    for (parent, names) in children {
-        if let Some(node) = nodes.get_mut(&parent) {
-            node.children = names;
+/// The file modules one source declares, in declaration order.
+///
+/// A line scanner rather than a parse: the three facts it needs — the name, the
+/// `#[cfg]`s, the `#[path]` — are all written on the declaration's own lines,
+/// and the attribute run above a `mod` item is the only place they can be.
+/// Inline `mod name { … }` is deliberately not a declaration here: its types
+/// live in this file and are already in this module's own block.
+fn declarations(text: &str, file: &Path, root: &Path) -> Vec<Child> {
+    let mut children = Vec::new();
+    let mut cfgs: Vec<String> = Vec::new();
+    let mut declared: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if let Some(attribute) = line.strip_prefix("#[").and_then(|rest| rest.strip_suffix(']')) {
+            if attribute.starts_with("cfg(") {
+                cfgs.push(line.to_owned());
+            } else if let Some(value) = attribute
+                .strip_prefix("path")
+                .map(str::trim_start)
+                .and_then(|value| value.strip_prefix('='))
+            {
+                declared = Some(value.trim().trim_matches('"').to_owned());
+            }
+            continue;
+        }
+        if let Some(name) = module(line)
+            && let Some(target) = resolve(&name, declared.as_deref(), file, root)
+        {
+            children.push(Child {
+                name,
+                target,
+                cfgs: cfgs.clone(),
+            });
+        }
+        cfgs.clear();
+        declared = None;
+    }
+    children
+}
+
+/// The module a line declares, when it is a file-module declaration.
+fn module(line: &str) -> Option<String> {
+    let mut rest = line;
+    if let Some(after) = rest.strip_prefix("pub")
+        && after.starts_with([' ', '('])
+    {
+        rest = after.trim_start();
+        if rest.starts_with('(') {
+            rest = rest.split_once(')')?.1.trim_start();
         }
     }
+    let name = rest.strip_prefix("mod ")?.trim().strip_suffix(';')?.trim();
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_'))
+    .then(|| name.to_owned())
+}
+
+/// The node a declaration names.
+///
+/// `#[path]` is relative to the directory of the declaring file, which is the
+/// language's own rule for a module declared at a file's top level. Without it,
+/// a module is `<dir>/<name>.rs` or `<dir>/<name>/mod.rs`, where `<dir>` is the
+/// declaring file's own directory for a root or `mod.rs`, and the file's stem
+/// beside it otherwise.
+fn resolve(name: &str, declared: Option<&str>, file: &Path, root: &Path) -> Option<Vec<String>> {
+    let beside = file.parent()?;
+    if let Some(declared) = declared {
+        return module_path(root, &normalize(&beside.join(declared)));
+    }
+    let directory = match file.file_stem().and_then(|stem| stem.to_str())? {
+        "lib" | "main" | "mod" => beside.to_path_buf(),
+        stem => beside.join(stem),
+    };
+    [
+        directory.join(format!("{name}.rs")),
+        directory.join(name).join("mod.rs"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+    .and_then(|candidate| module_path(root, &candidate))
+}
+
+/// Resolve `.` and `..` lexically, so a `#[path]` that steps out of its own
+/// directory still lands on the node the scan collected.
+fn normalize(path: &Path) -> PathBuf {
+    let mut parts = Vec::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.iter().collect()
 }
 
 /// Which registries each module's subtree contributes to.
@@ -347,27 +540,43 @@ impl Carried {
 
 fn carried_registries(nodes: &BTreeMap<Vec<String>, Node>) -> BTreeMap<Vec<String>, Carried> {
     let mut carries = BTreeMap::<Vec<String>, Carried>::new();
-    // Deepest first: a parent's answer is its own types plus its children's,
-    // and every child is longer than its parent.
-    let mut paths = nodes.keys().cloned().collect::<Vec<_>>();
-    paths.sort_by_key(|path| std::cmp::Reverse(path.len()));
-    for path in paths {
-        let node = &nodes[&path];
-        let mut carried = Carried {
-            classes: !node.types.is_empty(),
-            fragments: node.types.iter().any(|wire| wire.fragment),
-            introspects: node.types.iter().any(|wire| wire.kind == WireKind::Message),
-        };
-        for child in &node.children {
-            let mut child_path = path.clone();
-            child_path.push(child.clone());
-            if let Some(child_carried) = carries.get(&child_path) {
-                carried = carried.merge(*child_carried);
-            }
-        }
-        carries.insert(path, carried);
+    for path in nodes.keys() {
+        carry(nodes, path, &mut carries, &mut BTreeSet::new());
     }
     carries
+}
+
+/// One module's answer: its own types plus every module it declares.
+///
+/// A declaration graph, not the directory tree — `#[path]` lets a module name a
+/// file that is not below it — so the walk memoizes and refuses to re-enter a
+/// node it is already inside, rather than assuming depth orders the work.
+fn carry(
+    nodes: &BTreeMap<Vec<String>, Node>,
+    path: &[String],
+    carries: &mut BTreeMap<Vec<String>, Carried>,
+    visiting: &mut BTreeSet<Vec<String>>,
+) -> Carried {
+    if let Some(carried) = carries.get(path) {
+        return *carried;
+    }
+    let Some(node) = nodes.get(path) else {
+        return Carried::default();
+    };
+    if !visiting.insert(path.to_vec()) {
+        return Carried::default();
+    }
+    let mut carried = Carried {
+        classes: !node.types.is_empty(),
+        fragments: node.types.iter().any(|wire| wire.fragment),
+        introspects: node.types.iter().any(|wire| wire.kind == WireKind::Message),
+    };
+    for child in &node.children {
+        carried = carried.merge(carry(nodes, &child.target, carries, visiting));
+    }
+    visiting.remove(path);
+    carries.insert(path.to_vec(), carried);
+    carried
 }
 
 fn render(
@@ -380,15 +589,10 @@ fn render(
     block.push_str(BEGIN);
     block.push('\n');
 
-    let contributors = |select: fn(&Carried) -> bool| -> Vec<String> {
+    let contributors = |select: fn(&Carried) -> bool| -> Vec<&Child> {
         node.children
             .iter()
-            .filter(|child| {
-                let mut child_path = node.module_path.clone();
-                child_path.push((*child).clone());
-                carries.get(&child_path).is_some_and(select)
-            })
-            .cloned()
+            .filter(|child| carries.get(&child.target).is_some_and(select))
             .collect()
     };
 
@@ -445,7 +649,7 @@ fn function(
     name: &str,
     entry: &str,
     entries: &[String],
-    children: &[String],
+    children: &[&Child],
     cfg: Option<&str>,
 ) -> String {
     let mut source = String::new();
@@ -468,6 +672,12 @@ fn function(
     }
 
     let _ = writeln!(source, "pub(crate) fn {name}() -> Vec<{entry}> {{");
+    // Every chained call can be conditional, and then no feature set mutates
+    // the list. The allow says so at the one line that would otherwise warn,
+    // rather than at the module.
+    if children.iter().all(|child| !child.cfgs.is_empty()) {
+        let _ = writeln!(source, "    #[allow(unused_mut)]");
+    }
     if entries.is_empty() {
         let _ = writeln!(source, "    let mut out = Vec::new();");
     } else {
@@ -478,7 +688,14 @@ fn function(
         let _ = writeln!(source, "    ];");
     }
     for child in children {
-        let _ = writeln!(source, "    out.extend(self::{child}::{name}());");
+        for cfg in &child.cfgs {
+            let _ = writeln!(source, "    {cfg}");
+        }
+        let _ = writeln!(
+            source,
+            "    out.extend(self::{}::{name}());",
+            child.name.as_str()
+        );
     }
     let _ = writeln!(source, "    out");
     let _ = writeln!(source, "}}");
@@ -524,7 +741,7 @@ fn root_register(carried: &Carried) -> String {
 /// added, and a second block would be a second answer to which types this
 /// module owns.
 fn splice(text: &str, block: &str) -> String {
-    let Some(begin) = text.find(BEGIN) else {
+    let Some((begin, end)) = bounds(text) else {
         let mut source = text.to_owned();
         if !source.ends_with('\n') {
             source.push('\n');
@@ -533,16 +750,37 @@ fn splice(text: &str, block: &str) -> String {
         source.push_str(block);
         return source;
     };
+    let mut source = text[..begin].to_owned();
+    source.push_str(block);
+    source.push_str(&text[end..]);
+    source
+}
+
+/// Remove the marked block and the blank line that introduced it.
+fn strip(text: &str) -> String {
+    let Some((begin, end)) = bounds(text) else {
+        return text.to_owned();
+    };
+    let mut source = text[..begin].trim_end().to_owned();
+    source.push('\n');
+    let rest = text[end..].trim_start_matches('\n');
+    if !rest.is_empty() {
+        source.push('\n');
+        source.push_str(rest);
+    }
+    source
+}
+
+/// Byte range of this pass's block, when the source carries one.
+fn bounds(text: &str) -> Option<(usize, usize)> {
+    let begin = text.find(BEGIN)?;
     let end = text[begin..]
         .find(END)
         .map(|offset| begin + offset + END.len())
         .map_or(text.len(), |end| {
             end + usize::from(text[end..].starts_with('\n'))
         });
-    let mut source = text[..begin].to_owned();
-    source.push_str(block);
-    source.push_str(&text[end..]);
-    source
+    Some((begin, end))
 }
 
 #[cfg(test)]
@@ -555,16 +793,54 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let src = temp.path();
         fs::create_dir_all(src.join("combat")).expect("create combat module");
+        // Shaped like a capability-gated crate: one module a feature admits,
+        // one it removes, and a `#[path]` alias that names a file the layout
+        // puts somewhere else entirely.
         fs::write(
             src.join("lib.rs"),
-            "pub mod combat;\npub mod solo;\n\n#[derive(ClassDesc, Marshaler)]\n#[class_desc(type_index = 1)]\npub struct RootOnly;\n",
+            concat!(
+                "pub mod bundle;\n",
+                "#[cfg(feature = \"combat\")]\n",
+                "pub mod combat;\n",
+                "pub mod solo;\n",
+                "#[cfg(not(feature = \"combat\"))]\n",
+                "#[path = \"combat/damage.rs\"]\n",
+                "pub mod aliased;\n",
+                "\n",
+                "#[derive(ClassDesc, Marshaler)]\n",
+                "#[class_desc(type_index = 1)]\n",
+                "pub struct RootOnly;\n",
+            ),
         )
         .expect("write lib");
         fs::write(
             src.join("solo.rs"),
-            "#[derive(ClassDesc, Message, Marshaler)]\n#[class_desc(type_index = 2)]\npub struct Ping;\n",
+            concat!(
+                "#[derive(ClassDesc, Message, Marshaler)]\n",
+                "#[class_desc(type_index = 2)]\n",
+                "pub struct Ping;\n",
+                "\n",
+                "// Bevy's ECS message derive, which shares the name.\n",
+                "#[derive(Debug, Clone, Message)]\n",
+                "pub struct Fired;\n",
+            ),
         )
         .expect("write solo");
+        // A fragment whose replication layout the derive cannot express, so the
+        // impl is written by hand.
+        fs::write(
+            src.join("bundle.rs"),
+            concat!(
+                "#[derive(ClassDesc, Marshaler)]\n",
+                "#[class_desc(type_index = 4)]\n",
+                "pub struct Bundle;\n",
+                "\n",
+                "impl gridmate::hub::Fragment for Bundle {\n",
+                "    fn base(&self) -> &gridmate::hub::FragmentBase { &self.base }\n",
+                "}\n",
+            ),
+        )
+        .expect("write bundle");
         fs::write(src.join("combat").join("mod.rs"), "pub mod damage;\n")
             .expect("write combat mod");
         fs::write(
@@ -682,6 +958,93 @@ mod tests {
         assert!(
             !root.contains("out.extend(self::solo::fragments());"),
             "solo contributes no fragment, so the root must not call for one"
+        );
+    }
+
+    /// A derive is not the only way a type says it is a fragment.
+    #[test]
+    fn a_hand_written_fragment_impl_enumerates_the_type() {
+        let temp = crate_root();
+        let plan = planned(&temp);
+        let bundle = rendered(&plan, "bundle.rs");
+
+        assert!(bundle.contains("FragmentRegistration::of::<Bundle>()"));
+        assert!(bundle.contains("ClassRegistration::of::<Bundle>()"));
+        assert!(
+            rendered(&plan, "lib.rs").contains("out.extend(self::bundle::fragments());"),
+            "the crate root reaches it like any other fragment"
+        );
+    }
+
+    /// The chain is built from what each module *declares*, not from the file
+    /// tree: a feature that removes a module must remove the call to it, and a
+    /// `#[path]` module answers to the name its parent gave it.
+    #[test]
+    fn a_chained_call_carries_the_declaration_that_named_it() {
+        let temp = crate_root();
+        let plan = planned(&temp);
+        let root = rendered(&plan, "lib.rs");
+
+        assert!(
+            root.contains("#[cfg(feature = \"combat\")]\n    out.extend(self::combat::classes());"),
+            "a gated module is called under its own gate"
+        );
+        assert!(
+            root.contains(
+                "#[cfg(not(feature = \"combat\"))]\n    out.extend(self::aliased::classes());"
+            ),
+            "a `#[path]` module is chained by the name its parent declares"
+        );
+        assert!(
+            !root.contains("out.extend(self::damage::classes());"),
+            "the root declares no `damage`; only `combat` and `aliased` reach it"
+        );
+    }
+
+    /// Bevy's ECS `Message` derive shares a name with gridmate's wire-message
+    /// derive, and only the wire one is written beside a `ClassDesc`.
+    #[test]
+    fn an_ecs_message_is_not_a_wire_declaration() {
+        let temp = crate_root();
+        let plan = planned(&temp);
+
+        let solo = rendered(&plan, "solo.rs");
+        assert!(solo.contains("pub struct Fired;"), "authored source survives");
+        assert!(!solo.contains("::<Fired>()"), "no entry constructor names it");
+        assert!(
+            solo.contains("[::gridmate::az::ClassRegistration; 1]"),
+            "the module's one wire type is still enumerated"
+        );
+        assert!(
+            !plan.declared.contains_key("Fired"),
+            "not an incomplete wire declaration but a different mechanism, so \
+             it is not reported as a gap either"
+        );
+        assert!(plan.skipped.iter().all(|skip| skip.name != "Fired"));
+    }
+
+    /// The pass owns its block in both directions: a module that stops
+    /// carrying wire types loses it, rather than keeping a list of types the
+    /// crate no longer publishes.
+    #[test]
+    fn a_module_that_stops_carrying_types_loses_its_block() {
+        let temp = crate_root();
+        apply(&planned(&temp)).expect("apply");
+        let solo = temp.path().join("solo.rs");
+        assert!(fs::read_to_string(&solo).expect("read solo").contains(BEGIN));
+
+        // The wire type goes; the ECS message beside it stays.
+        fs::write(&solo, "#[derive(Debug, Clone, Message)]\npub struct Fired;\n")
+            .expect("rewrite solo");
+        apply(&planned(&temp)).expect("reapply");
+
+        let stripped = fs::read_to_string(&solo).expect("reread solo");
+        assert!(!stripped.contains(BEGIN));
+        assert!(!stripped.contains(END));
+        assert!(stripped.contains("pub struct Fired;"));
+        assert!(
+            !rendered(&planned(&temp), "lib.rs").contains("self::solo::classes()"),
+            "and the root stops calling it"
         );
     }
 

@@ -380,6 +380,10 @@ pub enum RustIntegrationError {
     },
     #[error("failed to emit Rust source")]
     Emit(#[source] Box<RustSourceEmitError>),
+    #[error("failed to run rustfmt over the rewritten Rust source")]
+    Format(#[source] io::Error),
+    #[error("rustfmt rejected the rewritten Rust source: {0}")]
+    Rustfmt(String),
 }
 
 fn parse_inventory_file(
