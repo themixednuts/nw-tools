@@ -39,7 +39,7 @@ oxc_codegen = { workspace = true, optional = true }
 oxc_parser = { workspace = true, optional = true }
 oxc_span = { workspace = true, optional = true }
 prettyplease = { workspace = true }
-proc-macro2 = { workspace = true }
+proc-macro2 = { workspace = true, features = ["span-locations"] }
 quote = { workspace = true }
 rust-embed = { workspace = true, optional = true }
 serde = { workspace = true }

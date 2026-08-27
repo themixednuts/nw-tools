@@ -28,6 +28,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use syn::spanned::Spanned as _;
+
 use crate::CodegenContext;
 use crate::rust::integrate::identity::{ScannedComponent, scan_component_structs};
 
@@ -290,7 +292,7 @@ pub fn plan(root: &Path, context: &CodegenContext) -> Result<WirePlan, RustInteg
         }
         plan.files.push(WireFile {
             path: node.path.clone(),
-            source: splice(&node.text, &block),
+            source: splice(&node.text, &block, &node.path)?,
             classes: node.types.len(),
             fragments: node.types.iter().filter(|wire| wire.fragment).count(),
             introspects: node
@@ -460,12 +462,11 @@ fn identities(text: &str) -> Vec<(String, Option<String>, Option<String>)> {
             continue;
         }
         if let Some(name) = declared_struct(trimmed) {
-            let uuid = between(&attrs, "az_type_info(\"", "\"")
-                .or_else(|| between(&attrs, "az_rtti(", ")").and_then(|inner| {
-                    between(&inner, "\"", "\"").filter(|value| value.len() == 36)
-                }));
-            let index = between(&attrs, "type_index = ", ")")
-                .map(|value| value.trim().to_owned());
+            let uuid = between(&attrs, "az_type_info(\"", "\"").or_else(|| {
+                between(&attrs, "az_rtti(", ")")
+                    .and_then(|inner| between(&inner, "\"", "\"").filter(|value| value.len() == 36))
+            });
+            let index = between(&attrs, "type_index = ", ")").map(|value| value.trim().to_owned());
             if uuid.is_some() || index.is_some() {
                 found.push((name, uuid, index));
             }
@@ -552,7 +553,10 @@ fn declarations(text: &str, file: &Path, root: &Path) -> Vec<Child> {
         if line.is_empty() || line.starts_with("//") {
             continue;
         }
-        if let Some(attribute) = line.strip_prefix("#[").and_then(|rest| rest.strip_suffix(']')) {
+        if let Some(attribute) = line
+            .strip_prefix("#[")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
             if attribute.starts_with("cfg(") {
                 cfgs.push(line.to_owned());
             } else if let Some(value) = attribute
@@ -862,25 +866,58 @@ fn root_register(carried: &Carried) -> String {
     source
 }
 
-/// Replace the marked block, or append it.
+/// Place the one marked block before the first top-level test module.
 ///
-/// Replacement rather than append-only: the pass runs again whenever a type is
-/// added, and a second block would be a second answer to which types this
-/// module owns.
-fn splice(text: &str, block: &str) -> String {
-    let Some((begin, end)) = bounds(text) else {
-        let mut source = text.to_owned();
+/// Every run removes the previous owned block before finding its canonical
+/// position. That relocates legacy trailing blocks and keeps repeat runs
+/// idempotent while leaving authored items in their original order.
+fn splice(text: &str, block: &str, path: &Path) -> Result<String, RustIntegrationError> {
+    let authored = strip(text);
+    let Some(insertion) = first_top_level_test_module(&authored, path)? else {
+        let mut source = authored;
         if !source.ends_with('\n') {
             source.push('\n');
         }
         source.push('\n');
         source.push_str(block);
-        return source;
+        return Ok(source);
     };
-    let mut source = text[..begin].to_owned();
+    let mut source = authored[..insertion].trim_end().to_owned();
+    source.push_str("\n\n");
     source.push_str(block);
-    source.push_str(&text[end..]);
-    source
+    source.push('\n');
+    source.push_str(&authored[insertion..]);
+    Ok(source)
+}
+
+fn first_top_level_test_module(
+    text: &str,
+    path: &Path,
+) -> Result<Option<usize>, RustIntegrationError> {
+    let file = syn::parse_file(text).map_err(|source| RustIntegrationError::Parse {
+        path: path.to_path_buf(),
+        source: Box::new(crate::rust::analyze::RustSourceAnalyzeError::Parse(source)),
+    })?;
+    Ok(file.items.iter().find_map(|item| {
+        let syn::Item::Mod(module) = item else {
+            return None;
+        };
+        let is_test_module = module.ident == "tests"
+            && module.attrs.iter().any(|attribute| {
+                attribute.path().is_ident("cfg")
+                    && attribute.parse_args::<syn::Meta>().is_ok_and(
+                        |meta| matches!(meta, syn::Meta::Path(path) if path.is_ident("test")),
+                    )
+            });
+        is_test_module.then(|| {
+            module
+                .attrs
+                .first()
+                .map_or_else(|| module.span(), syn::Attribute::span)
+                .byte_range()
+                .start
+        })
+    }))
 }
 
 /// Remove the marked block and the blank line that introduced it.
@@ -1178,8 +1215,14 @@ mod tests {
         let plan = planned(&temp);
 
         let solo = rendered(&plan, "solo.rs");
-        assert!(solo.contains("pub struct Fired;"), "authored source survives");
-        assert!(!solo.contains("::<Fired>()"), "no entry constructor names it");
+        assert!(
+            solo.contains("pub struct Fired;"),
+            "authored source survives"
+        );
+        assert!(
+            !solo.contains("::<Fired>()"),
+            "no entry constructor names it"
+        );
         assert!(
             solo.contains("[::gridmate::az::ClassRegistration; 1]"),
             "the module's one wire type is still enumerated"
@@ -1192,6 +1235,47 @@ mod tests {
         assert!(plan.skipped.iter().all(|skip| skip.name != "Fired"));
     }
 
+    #[test]
+    fn first_insertion_precedes_the_first_top_level_test_module() {
+        let temp = crate_root();
+        let solo = temp.path().join("solo.rs");
+        let mut source = fs::read_to_string(&solo).expect("read solo");
+        source.push_str("\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn authored() {}\n}\n");
+        fs::write(&solo, source).expect("write test module");
+
+        let plan = planned(&temp);
+        let rewritten = rendered(&plan, "solo.rs");
+
+        assert!(
+            rewritten.find(BEGIN).expect("generated block")
+                < rewritten.find("#[cfg(test)]").expect("test module"),
+            "wire registration belongs before the first top-level test module"
+        );
+    }
+
+    #[test]
+    fn existing_generated_block_after_tests_is_relocated_before_them() {
+        let temp = crate_root();
+        let solo = temp.path().join("solo.rs");
+        let mut source = fs::read_to_string(&solo).expect("read solo");
+        source.push_str("\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn authored() {}\n}\n\n");
+        source.push_str(BEGIN);
+        source.push_str("\nfn stale_registration() {}\n");
+        source.push_str(END);
+        source.push('\n');
+        fs::write(&solo, source).expect("write trailing generated block");
+
+        let plan = planned(&temp);
+        let rewritten = rendered(&plan, "solo.rs");
+
+        assert!(
+            rewritten.find(BEGIN).expect("generated block")
+                < rewritten.find("#[cfg(test)]").expect("test module"),
+            "an existing owned block must be relocated to its canonical position"
+        );
+        assert!(!rewritten.contains("stale_registration"));
+    }
+
     /// The pass owns its block in both directions: a module that stops
     /// carrying wire types loses it, rather than keeping a list of types the
     /// crate no longer publishes.
@@ -1200,11 +1284,18 @@ mod tests {
         let temp = crate_root();
         apply(&planned(&temp)).expect("apply");
         let solo = temp.path().join("solo.rs");
-        assert!(fs::read_to_string(&solo).expect("read solo").contains(BEGIN));
+        assert!(
+            fs::read_to_string(&solo)
+                .expect("read solo")
+                .contains(BEGIN)
+        );
 
         // The wire type goes; the ECS message beside it stays.
-        fs::write(&solo, "#[derive(Debug, Clone, Message)]\npub struct Fired;\n")
-            .expect("rewrite solo");
+        fs::write(
+            &solo,
+            "#[derive(Debug, Clone, Message)]\npub struct Fired;\n",
+        )
+        .expect("rewrite solo");
         apply(&planned(&temp)).expect("reapply");
 
         let stripped = fs::read_to_string(&solo).expect("reread solo");
@@ -1231,6 +1322,27 @@ mod tests {
         assert!(
             twice.contains("pub struct Ping;"),
             "authored source survives"
+        );
+    }
+
+    #[test]
+    fn canonical_placement_is_idempotent_across_repeat_runs() {
+        let temp = crate_root();
+        let solo = temp.path().join("solo.rs");
+        let mut source = fs::read_to_string(&solo).expect("read solo");
+        source.push_str("\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn authored() {}\n}\n");
+        fs::write(&solo, source).expect("write test module");
+
+        apply(&planned(&temp)).expect("first apply");
+        let once = fs::read_to_string(&solo).expect("read first output");
+        apply(&planned(&temp)).expect("second apply");
+        let twice = fs::read_to_string(&solo).expect("read second output");
+
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches(BEGIN).count(), 1);
+        assert!(
+            twice.find(BEGIN).expect("generated block")
+                < twice.find("#[cfg(test)]").expect("test module")
         );
     }
 }
