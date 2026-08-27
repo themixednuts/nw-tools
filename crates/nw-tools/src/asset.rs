@@ -16,7 +16,7 @@ use crate::progress::Job;
 use crate::source;
 use crate::support::{
     AssetRootArg, GlobSet, MatchMode, PakSet, PathSelector, ScanIssues,
-    contains_ascii_case_insensitive, load_lookup,
+    contains_ascii_case_insensitive, guard_existing, load_lookup,
 };
 use crate::ui::{Cell, Report, Table, theme};
 
@@ -53,19 +53,24 @@ pub struct Summary {
     #[command(flatten)]
     root: AssetRootArg,
 
+    /// Pak archive name or glob; repeat to select multiple archives.
     #[arg(long = "pak")]
     paks: Vec<String>,
 
+    /// Column used to order the summary.
     #[arg(long, value_enum, default_value_t = SummarySort::Count)]
     sort: SummarySort,
 
+    /// Group entries by observed extension or decoded asset kind.
     #[arg(long, value_enum, default_value_t = SummaryGroup::Ext)]
     group: SummaryGroup,
 
+    /// Largest archive entry to inspect, in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_ENTRY_SIZE)]
     max_entry_size: u64,
 
-    #[arg(long, default_value_t = 40)]
+    /// Maximum summary rows to print; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 40)]
     show: usize,
 
     #[command(flatten)]
@@ -88,22 +93,26 @@ pub enum SearchCmd {
 
 #[derive(Debug, Args)]
 pub struct SearchPath {
+    /// Path text or glob pattern to search for.
     query: String,
 
     #[command(flatten)]
     root: AssetRootArg,
 
+    /// Pak archive name or glob; repeat to select multiple archives.
     #[arg(long = "pak")]
     paks: Vec<String>,
 
-    #[arg(long)]
+    /// Interpret the query as a glob pattern.
+    #[arg(long, conflicts_with_all = ["case_sensitive", "exact"])]
     glob: bool,
 
-    #[arg(long)]
+    /// Match path text with case-sensitive substring search.
+    #[arg(long, conflicts_with_all = ["glob", "exact"])]
     case_sensitive: bool,
 
     /// Exact substring match instead of the default fuzzy ranking.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["glob", "case_sensitive"])]
     exact: bool,
 
     /// Resolve each hit's catalog AssetId (adds a GUID column) and let the query
@@ -111,7 +120,8 @@ pub struct SearchPath {
     #[arg(long)]
     catalog: bool,
 
-    #[arg(long, default_value_t = 100)]
+    /// Maximum matching entries to print; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 100)]
     show: usize,
 
     #[command(flatten)]
@@ -120,11 +130,13 @@ pub struct SearchPath {
 
 #[derive(Debug, Args)]
 pub struct SearchObjectStream {
+    /// Text to search for in decoded ObjectStream values.
     query: String,
 
     #[command(flatten)]
     root: AssetRootArg,
 
+    /// Pak archive name or glob; repeat to select multiple archives.
     #[arg(long = "pak")]
     paks: Vec<String>,
 
@@ -140,12 +152,15 @@ pub struct SearchObjectStream {
     #[arg(long)]
     exact: bool,
 
-    #[arg(long, default_value_t = 100)]
+    /// Maximum matching values to print; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 100)]
     show: usize,
 
+    /// Largest archive entry to decode, in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_ENTRY_SIZE)]
     max_entry_size: u64,
 
+    /// Skip embedded SerializeContext UUID-to-name lookup.
     #[arg(long)]
     no_names: bool,
 
@@ -171,17 +186,23 @@ pub struct Dependencies {
     asset: String,
 
     /// Extract the root and all resolved dependencies under this directory.
-    #[arg(long)]
+    #[arg(long = "out-dir", alias = "out", value_name = "DIR")]
     out: Option<PathBuf>,
 
     /// Only include immediate dependencies instead of the transitive closure.
     #[arg(long)]
     direct: bool,
 
-    #[arg(long)]
+    /// Replace existing extracted files; requires --out.
+    #[arg(long = "force", requires = "out")]
     overwrite: bool,
 
-    #[arg(long, default_value_t = 100)]
+    /// Print the extraction plan without writing files; requires --out.
+    #[arg(long, requires = "out")]
+    dry_run: bool,
+
+    /// Maximum dependency rows to print; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 100)]
     show: usize,
 
     #[command(flatten)]
@@ -199,11 +220,25 @@ pub enum UpdateCmd {
 
 #[derive(Debug, Args)]
 pub struct UpdateObjectStream {
+    /// Existing pak archive to read.
     input_pak: PathBuf,
+    /// Pak archive to write.
+    #[arg(long = "out", value_name = "FILE")]
     output_pak: PathBuf,
+    /// Archive path of the ObjectStream entry to replace.
     entry: String,
+    /// Replacement ObjectStream file.
     input: PathBuf,
 
+    /// Replace an existing output pak.
+    #[arg(long)]
+    force: bool,
+
+    /// Validate inputs and print the update plan without writing the output pak.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Skip embedded SerializeContext UUID-to-name lookup.
     #[arg(long)]
     no_names: bool,
 
@@ -221,12 +256,16 @@ pub enum ExtractCmd {
 
 #[derive(Debug, Args)]
 pub struct ExtractExt {
+    /// Observed extension key to extract.
     extension: String,
+    /// Output directory for extracted entries.
+    #[arg(long = "out-dir", value_name = "DIR")]
     out: PathBuf,
 
     #[command(flatten)]
     root: AssetRootArg,
 
+    /// Pak archive name or glob; repeat to select multiple archives.
     #[arg(long = "pak")]
     paks: Vec<String>,
 
@@ -238,10 +277,16 @@ pub struct ExtractExt {
     #[arg(long)]
     glob: Vec<String>,
 
-    #[arg(long)]
+    /// Replace existing extracted files.
+    #[arg(long = "force")]
     overwrite: bool,
 
-    #[arg(long, default_value_t = 25)]
+    /// Print the extraction plan without writing files.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Maximum extracted paths to include in the summary; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 25)]
     show: usize,
 
     #[command(flatten)]
@@ -250,11 +295,14 @@ pub struct ExtractExt {
 
 #[derive(Debug, Args)]
 pub struct ExtractObjectStream {
+    /// Output directory for decoded ObjectStream files.
+    #[arg(long = "out-dir", value_name = "DIR")]
     out: PathBuf,
 
     #[command(flatten)]
     root: AssetRootArg,
 
+    /// Pak archive name or glob; repeat to select multiple archives.
     #[arg(long = "pak")]
     paks: Vec<String>,
 
@@ -266,19 +314,28 @@ pub struct ExtractObjectStream {
     #[arg(long)]
     glob: Vec<String>,
 
+    /// Encoding used for extracted ObjectStream files.
     #[arg(long, value_enum, default_value_t = EncodingArg::Json)]
     encoding: EncodingArg,
 
+    /// Largest archive entry to decode, in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_ENTRY_SIZE)]
     max_entry_size: u64,
 
+    /// Skip embedded SerializeContext UUID-to-name lookup.
     #[arg(long)]
     no_names: bool,
 
-    #[arg(long)]
+    /// Replace existing extracted files.
+    #[arg(long = "force")]
     overwrite: bool,
 
-    #[arg(long, default_value_t = 25)]
+    /// Print the extraction plan without writing files.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Maximum extracted paths to include in the summary; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 25)]
     show: usize,
 
     #[command(flatten)]
@@ -287,22 +344,31 @@ pub struct ExtractObjectStream {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SummarySort {
+    /// Sort by entry count.
     Count,
+    /// Sort by unpacked byte size.
     Size,
+    /// Sort by packed byte size.
     Packed,
+    /// Sort by group key.
     Key,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SummaryGroup {
+    /// Group by observed extension key.
     Ext,
+    /// Group by decoded asset kind.
     Kind,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum EncodingArg {
+    /// ObjectStream binary encoding.
     Binary,
+    /// ObjectStream XML encoding.
     Xml,
+    /// ObjectStream JSON encoding.
     Json,
 }
 
@@ -564,7 +630,7 @@ impl SearchPath {
             rows.sort();
         }
         let matched = rows.len();
-        rows.truncate(self.show);
+        rows.truncate(crate::support::limit_count(rows.len(), self.show));
 
         let stats = vec![
             ("archives".to_string(), paks.paths().len().to_string()),
@@ -754,7 +820,8 @@ impl Dependencies {
             .collect::<Vec<_>>();
         mappings.sort_unstable();
         let mut table = Table::new(["Required", "Relation", "Source", "Target", "Status"]);
-        for (source, relation, required, target, status) in mappings.iter().take(self.show) {
+        let shown = crate::support::limit_count(mappings.len(), self.show);
+        for (source, relation, required, target, status) in mappings.iter().take(shown) {
             table.push([
                 Cell::text(if *required { "yes" } else { "no" }),
                 Cell::text(relation),
@@ -765,6 +832,18 @@ impl Dependencies {
         }
 
         if let Some(out) = self.out {
+            if self.dry_run {
+                report = report
+                    .stat("dry-run", "yes")
+                    .stat("would-write", paths.len())
+                    .stat("output", out.display());
+                report.table_or(table, "no authored dependency mappings");
+                if mappings.len() > shown {
+                    report.more(mappings.len() - shown, "mapping(s)");
+                }
+                report.print();
+                return Ok(());
+            }
             let claims = PathClaims::default();
             let mut extracted = ExtractReport {
                 matched: paths.len() as u64,
@@ -791,8 +870,8 @@ impl Dependencies {
                 .stat("output", out.display());
         }
         report.table_or(table, "no authored dependency mappings");
-        if mappings.len() > self.show {
-            report.more(mappings.len() - self.show, "mapping(s)");
+        if mappings.len() > shown {
+            report.more(mappings.len() - shown, "mapping(s)");
         }
         report.print();
         Ok(())
@@ -920,7 +999,7 @@ impl SearchObjectStream {
                 .then(left.value.cmp(&right.value))
         });
         let matched = rows.len();
-        rows.truncate(self.show);
+        rows.truncate(crate::support::limit_count(rows.len(), self.show));
 
         let stats = vec![
             ("archives".to_string(), paks.paths().len().to_string()),
@@ -1056,6 +1135,7 @@ impl Update {
 impl UpdateObjectStream {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
+        guard_existing(&self.output_pak, self.force.into())?;
         let lookup = load_lookup(self.no_names)?;
         let pak = PakMmapReader::open(&self.input_pak)?;
         let entry = pak
@@ -1071,6 +1151,17 @@ impl UpdateObjectStream {
         let bytes = replacement
             .into_encoding(original.encoding, lookup.as_ref())
             .with_context(|| format!("encode replacement as {}", original.encoding))?;
+
+        if self.dry_run {
+            Report::new("asset update objectstream")
+                .stat("dry-run", "yes")
+                .stat("input", self.input_pak.display())
+                .stat("output", self.output_pak.display())
+                .stat("entry", entry_name)
+                .stat("replacement-bytes", bytes.len())
+                .print();
+            return Ok(());
+        }
 
         drop(pak);
         let progress = ctx.progress.stage("objectstream update");
@@ -1093,6 +1184,15 @@ impl ExtractExt {
         let ctx = self.jobs.ctx()?;
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
+        if self.dry_run {
+            Report::new("asset extension extract")
+                .stat("dry-run", "yes")
+                .stat("archives", paks.paths().len())
+                .stat("extension", &self.extension)
+                .stat("output", self.out.display())
+                .print();
+            return Ok(());
+        }
         let extension = Extension::new(&self.extension);
         let selector = PathSelector::new(self.filter, self.glob);
         let claims = PathClaims::default();
@@ -1175,6 +1275,15 @@ impl ExtractObjectStream {
         let ctx = self.jobs.ctx()?;
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
+        if self.dry_run {
+            Report::new("asset ObjectStream extract")
+                .stat("dry-run", "yes")
+                .stat("archives", paks.paths().len())
+                .stat("encoding", format!("{:?}", self.encoding))
+                .stat("output", self.out.display())
+                .print();
+            return Ok(());
+        }
         let lookup = load_lookup(self.no_names)?;
         let encoding = ObjectStreamEncoding::from(self.encoding);
         let selector = PathSelector::new(self.filter, self.glob);
@@ -1360,10 +1469,11 @@ impl SummaryReport {
         }
 
         let mut report = Report::with_stats("asset summary", stats);
-        let shown = &rows[..rows.len().min(limit)];
+        let shown_count = crate::support::limit_count(rows.len(), limit);
+        let shown = &rows[..shown_count];
         report.table_or(summary_table(shown), "no entries");
-        if self.stats.len() > limit {
-            report.more(self.stats.len() - limit, "group(s)");
+        if self.stats.len() > shown_count {
+            report.more(self.stats.len() - shown_count, "group(s)");
         }
         report.print();
     }
@@ -1625,6 +1735,11 @@ impl ExtractReport {
         self.skipped_existing += other.skipped_existing;
         self.skipped_duplicate += other.skipped_duplicate;
         self.bytes_written += other.bytes_written;
+        let row_limit = if row_limit == 0 {
+            usize::MAX
+        } else {
+            row_limit
+        };
         let remaining = row_limit.saturating_sub(self.rows.len());
         let take = remaining.min(other.rows.len());
         self.rows.extend(other.rows.drain(..take));
@@ -1648,7 +1763,12 @@ impl ExtractReport {
         if !table.is_empty() {
             report.table(table);
         }
-        let remaining = self.written.saturating_sub(limit as u64);
+        let shown = if limit == 0 {
+            self.written
+        } else {
+            limit as u64
+        };
+        let remaining = self.written.saturating_sub(shown);
         if remaining > 0 {
             report.more(remaining, "file(s)");
         }

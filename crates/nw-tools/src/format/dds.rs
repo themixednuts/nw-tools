@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 use humansize::{DECIMAL, format_size};
 use nw_pak::PakMmapReader;
 
@@ -14,28 +14,38 @@ use crate::ui::{Cell, Report, Table};
 use super::common::{finish_scan, path_label, strip_suffix_ignore_ascii_case};
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("output").args(["out", "out_dir"]).multiple(false)))]
 pub struct Dds {
-    /// DDS file or directory. Omit to browse textures under the current directory.
+    /// DDS file or directory. Omit to browse textures in the installed game's paks.
     path: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 40)]
+    /// Maximum texture summaries to print; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 40)]
     show: usize,
 
-    /// Convert the texture(s) to this format, written under --out.
-    #[arg(long, value_enum, requires = "out")]
+    /// Convert the texture(s) to this format.
+    #[arg(long, value_enum, requires = "output")]
     to: Option<DdsFormat>,
 
-    /// Output path/dir for --to.
-    #[arg(long, value_name = "PATH", requires = "to")]
+    /// Output file for a conversion that produces exactly one file.
+    #[arg(long, value_name = "FILE", requires = "to")]
     out: Option<PathBuf>,
+
+    /// Output directory for a KTX2 conversion that can produce multiple files.
+    #[arg(long = "out-dir", value_name = "DIR", requires = "to")]
+    out_dir: Option<PathBuf>,
 
     /// Decode the texture and show it inline (kitty graphics protocol).
     #[arg(long)]
     view: bool,
 
     /// Replace existing outputs.
-    #[arg(long)]
+    #[arg(long = "force")]
     overwrite: bool,
+
+    /// Validate arguments and print the conversion plan without writing outputs.
+    #[arg(long, requires = "to")]
+    dry_run: bool,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -73,19 +83,29 @@ struct DdsSequence {
     out: PathBuf,
 
     /// Replace an existing output.
-    #[arg(long)]
+    #[arg(long = "force")]
     overwrite: bool,
+
+    /// Validate arguments and print the sequence-export plan without writing the output.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// Output format for `dds --to`.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DdsFormat {
+    /// Khronos KTX 2 texture container.
     Ktx2,
+    /// Portable Network Graphics image.
     Png,
+    /// Tagged Image File Format image.
     #[value(alias = "tif")]
     Tiff,
+    /// OpenEXR high-dynamic-range image.
     Exr,
+    /// Graphics Interchange Format image or animation.
     Gif,
+    /// Quite OK Image format.
     Qoi,
 }
 
@@ -127,9 +147,31 @@ struct DdsConvert {
     bytes: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DdsConversionOutput<'a> {
+    File(&'a Path),
+    Dir(&'a Path),
+}
+
+impl<'a> DdsConversionOutput<'a> {
+    const fn path(&self) -> &'a Path {
+        match *self {
+            Self::File(path) | Self::Dir(path) => path,
+        }
+    }
+}
+
 impl Dds {
     pub(super) fn run(self) -> Result<()> {
         if let Some(DdsCommand::Sequence(sequence)) = &self.command {
+            if sequence.dry_run {
+                Report::new("dds sequence")
+                    .stat("dry-run", "yes")
+                    .stat("inputs", sequence.inputs.len())
+                    .stat("output", sequence.out.display())
+                    .print();
+                return Ok(());
+            }
             return export_dds_sequence(sequence);
         }
         let ctx = self.jobs.ctx()?;
@@ -138,10 +180,56 @@ impl Dds {
                 .path
                 .as_deref()
                 .context("--to needs a DDS file or directory path")?;
-            let out = self.out.as_deref().expect("--out is required with --to");
-            return match format.image() {
-                None => convert_dds_to_ktx2(&ctx, path, out, self.overwrite),
-                Some(format) => write_dds_image(path, out, format, self.overwrite),
+            let image_format = format.image();
+            let output = if image_format.is_some() {
+                if path.is_dir() {
+                    bail!("image export expects one DDS file; use KTX2 for directory conversion");
+                }
+                if self.out_dir.is_some() {
+                    bail!("use --out <FILE> for single-image DDS conversion");
+                }
+                DdsConversionOutput::File(
+                    self.out
+                        .as_deref()
+                        .context("--out <FILE> is required for single-image DDS conversion")?,
+                )
+            } else if path.is_dir() {
+                if self.out.is_some() {
+                    bail!("use --out-dir <DIR> for directory KTX2 conversion");
+                }
+                DdsConversionOutput::Dir(
+                    self.out_dir
+                        .as_deref()
+                        .context("--out-dir <DIR> is required for directory KTX2 conversion")?,
+                )
+            } else if let Some(out) = self.out.as_deref() {
+                let groups = collect_dds_groups(path)?;
+                if groups.len() != 1 {
+                    bail!(
+                        "DDS input expands to {} KTX2 files; use --out-dir <DIR>",
+                        groups.len()
+                    );
+                }
+                DdsConversionOutput::File(out)
+            } else {
+                DdsConversionOutput::Dir(
+                    self.out_dir
+                        .as_deref()
+                        .context("KTX2 conversion requires --out <FILE> or --out-dir <DIR>")?,
+                )
+            };
+            if self.dry_run {
+                Report::new("dds conversion")
+                    .stat("dry-run", "yes")
+                    .stat("input", path.display())
+                    .stat("output", output.path().display())
+                    .stat("format", format!("{format:?}"))
+                    .print();
+                return Ok(());
+            }
+            return match image_format {
+                None => convert_dds_to_ktx2(&ctx, path, output, self.overwrite),
+                Some(format) => write_dds_image(path, output.path(), format, self.overwrite),
             };
         }
         if self.view {
@@ -200,9 +288,10 @@ impl Dds {
         }
         scans.sort_by(|left, right| left.source.cmp(&right.source));
 
+        let shown = crate::support::limit_count(scans.len(), self.show);
         let mut report = Report::new("dds")
             .stat("files", scans.len())
-            .stat("shown", scans.len().min(self.show));
+            .stat("shown", shown);
         let mut table = Table::new([
             "Source",
             "Kind",
@@ -214,7 +303,7 @@ impl Dds {
             "Bytes",
         ])
         .right([7]);
-        for scan in scans.iter().take(self.show) {
+        for scan in scans.iter().take(shown) {
             table.push([
                 Cell::path(scan.source.clone()),
                 Cell::text(scan.kind.clone()),
@@ -227,8 +316,8 @@ impl Dds {
             ]);
         }
         report.table_or(table, "no DDS files to show");
-        if scans.len() > self.show {
-            report.more(scans.len() - self.show, "file(s)");
+        if scans.len() > shown {
+            report.more(scans.len() - shown, "file(s)");
         }
         report.print();
 
@@ -273,12 +362,13 @@ impl Dds {
                 .print();
             return Ok(());
         }
+        let shown = crate::support::limit_count(items.len(), self.show);
         let mut report = Report::new("dds")
             .stat("install", &source)
             .stat("textures", items.len())
-            .stat("shown", items.len().min(self.show));
+            .stat("shown", shown);
         let mut table = Table::new(["Texture", "Frames", "Mips"]).right([1, 2]);
-        for item in items.iter().take(self.show) {
+        for item in items.iter().take(shown) {
             table.push([
                 Cell::path(item.label.clone()),
                 Cell::text(item.frames.len().to_string()),
@@ -286,8 +376,8 @@ impl Dds {
             ]);
         }
         report.table_or(table, "no DDS textures to show");
-        if items.len() > self.show {
-            report.more(items.len() - self.show, "texture(s)");
+        if items.len() > shown {
+            report.more(items.len() - shown, "texture(s)");
         }
         report.print();
         Ok(())
@@ -424,13 +514,24 @@ fn fit_image(image: &image::RgbaImage, max: u32) -> image::RgbaImage {
     )
 }
 
-fn convert_dds_to_ktx2(ctx: &RunCtx, path: &Path, out: &Path, overwrite: bool) -> Result<()> {
+fn convert_dds_to_ktx2(
+    ctx: &RunCtx,
+    path: &Path,
+    output: DdsConversionOutput<'_>,
+    overwrite: bool,
+) -> Result<()> {
     let groups = collect_dds_groups(path)?;
+    if matches!(output, DdsConversionOutput::File(_)) && groups.len() != 1 {
+        bail!(
+            "DDS input expands to {} KTX2 files; use --out-dir <DIR>",
+            groups.len()
+        );
+    }
     let batch = ctx.map_results_compact(
         "dds conversion",
         &groups,
         |group| path_label(&group.header),
-        |group, progress| progress.step(|| convert_dds_group(group, path, out, overwrite)),
+        |group, progress| progress.step(|| convert_dds_group(group, path, output, overwrite)),
     );
     let skipped = batch.skipped();
     let cancelled = batch.was_cancelled();
@@ -854,7 +955,7 @@ fn collect_dds_inputs(path: &Path) -> Result<Vec<PathBuf>> {
 fn convert_dds_group(
     group: &DdsGroup,
     input: &Path,
-    out: &Path,
+    output: DdsConversionOutput<'_>,
     overwrite: bool,
 ) -> Result<DdsConvert> {
     let header_bytes =
@@ -875,12 +976,12 @@ fn convert_dds_group(
         .collect::<Vec<_>>();
     let ktx = nw_dds::Ktx2::from_dds(&header_bytes, &sidecars)
         .with_context(|| format!("convert {}", group.header.display()))?;
-    let output = dds_ktx2_output_path(input, &group.header, out)?;
-    write_guarded(&output, ktx.bytes(), overwrite.into())?;
+    let output_path = dds_ktx2_output_path(input, &group.header, output)?;
+    write_guarded(&output_path, ktx.bytes(), overwrite.into())?;
 
     Ok(DdsConvert {
         source: group.header.display().to_string(),
-        output: output.display().to_string(),
+        output: output_path.display().to_string(),
         bytes: format_size(ktx.bytes().len(), DECIMAL),
     })
 }
@@ -915,15 +1016,14 @@ fn dds_header_path(path: &Path, part: nw_dds::SplitPart) -> Result<PathBuf> {
     }
 }
 
-fn dds_ktx2_output_path(input: &Path, header: &Path, out: &Path) -> Result<PathBuf> {
-    let exact_file = input.is_file()
-        && out
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("ktx2"));
-    if exact_file {
-        return Ok(out.to_path_buf());
-    }
+fn dds_ktx2_output_path(
+    input: &Path,
+    header: &Path,
+    output: DdsConversionOutput<'_>,
+) -> Result<PathBuf> {
+    let DdsConversionOutput::Dir(out) = output else {
+        return Ok(output.path().to_path_buf());
+    };
 
     let relative = if input.is_dir() {
         header.strip_prefix(input).unwrap_or(header).to_path_buf()

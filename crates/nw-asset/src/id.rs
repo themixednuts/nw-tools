@@ -107,6 +107,68 @@ impl From<ParseIntError> for AssetIdParseError {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SourceAssetId(Uuid);
+
+impl SourceAssetId {
+    #[must_use]
+    pub const fn guid(self) -> Uuid {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn asset_id(self) -> AssetId {
+        AssetId::new(self.0, 0)
+    }
+}
+
+impl TryFrom<AssetId> for SourceAssetId {
+    type Error = SourceAssetIdError;
+
+    fn try_from(asset_id: AssetId) -> Result<Self, Self::Error> {
+        if asset_id.guid.is_nil() {
+            return Err(SourceAssetIdError::Nil);
+        }
+        if asset_id.sub_id != 0 {
+            return Err(SourceAssetIdError::Product { asset_id });
+        }
+        Ok(Self(asset_id.guid))
+    }
+}
+
+impl fmt::Debug for SourceAssetId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SourceAssetId")
+            .field(&self.asset_id())
+            .finish()
+    }
+}
+
+impl fmt::Display for SourceAssetId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.asset_id().fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceAssetIdError {
+    Nil,
+    Product { asset_id: AssetId },
+}
+
+impl fmt::Display for SourceAssetIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Nil => f.write_str("nil asset id is not a source identity"),
+            Self::Product { asset_id } => {
+                write!(f, "asset id {asset_id} is a product identity")
+            }
+        }
+    }
+}
+
+impl Error for SourceAssetIdError {}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AssetType(Uuid);
 

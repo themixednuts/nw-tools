@@ -32,6 +32,8 @@ def schedule(manifest):
         [
             str(executable),
             "--plain",
+            "--format",
+            "json",
             "--color",
             "never",
             "azoth",
@@ -68,6 +70,8 @@ def describe(manifest):
         [
             str(executable),
             "--plain",
+            "--format",
+            "json",
             "--color",
             "never",
             "azoth",
@@ -99,6 +103,8 @@ def export_command(asset_filter):
     return [
         str(executable),
         "--plain",
+        "--format",
+        "json",
         "--color",
         "never",
         "format",
@@ -109,7 +115,7 @@ def export_command(asset_filter):
         "gltf",
         "--filter",
         asset_filter,
-        "--overwrite",
+        "--force",
         "--no-blend",
         "--no-progress",
     ]

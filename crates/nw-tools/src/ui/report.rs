@@ -183,16 +183,16 @@ impl Table {
         self.rows.is_empty()
     }
 
-    pub(crate) fn headers(&self) -> &[String] {
+    pub fn headers(&self) -> &[String] {
         &self.headers
     }
 
-    pub(crate) fn rows(&self) -> &[Vec<Cell>] {
+    pub fn rows(&self) -> &[Vec<Cell>] {
         &self.rows
     }
 
     /// Column widths fitted to `limit`, accounting for the gutter and gaps.
-    pub(crate) fn column_widths(&self, limit: usize) -> Vec<usize> {
+    pub fn column_widths(&self, limit: usize) -> Vec<usize> {
         let columns = self
             .headers
             .len()
@@ -224,7 +224,7 @@ impl Table {
         lines
     }
 
-    pub(crate) fn header_line(&self, widths: &[usize], caps: Caps) -> Line<'static> {
+    pub fn header_line(&self, widths: &[usize], caps: Caps) -> Line<'static> {
         let mut spans = vec![gutter()];
         for (index, width) in widths.iter().enumerate() {
             if index > 0 {
@@ -243,7 +243,7 @@ impl Table {
         Line::from(spans)
     }
 
-    pub(crate) fn rule_line(&self, widths: &[usize], caps: Caps) -> Line<'static> {
+    pub fn rule_line(&self, widths: &[usize], caps: Caps) -> Line<'static> {
         let glyphs = theme::glyphs(caps);
         let mut spans = vec![gutter()];
         for (index, width) in widths.iter().enumerate() {
@@ -260,7 +260,7 @@ impl Table {
         Line::from(spans)
     }
 
-    pub(crate) fn data_line(&self, row: &[Cell], widths: &[usize], caps: Caps) -> Line<'static> {
+    pub fn data_line(&self, row: &[Cell], widths: &[usize], caps: Caps) -> Line<'static> {
         let mut spans = vec![gutter()];
         for (index, width) in widths.iter().enumerate() {
             if index > 0 {

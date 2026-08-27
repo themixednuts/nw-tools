@@ -6,7 +6,7 @@ use clap::{Args, Subcommand};
 use humansize::{DECIMAL, format_size};
 
 use crate::jobs::JobArgs;
-use crate::support::{MatchMode, collect_matching, ensure_parent};
+use crate::support::{MatchMode, collect_matching, write_guarded};
 use crate::ui::{Cell, Report, Table};
 
 use super::common::{csv_cell, finish_scan, lowered, path_label, text_matches};
@@ -35,7 +35,8 @@ pub struct CatalogSummary {
     #[arg(long)]
     path: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 25)]
+    /// Maximum catalog summaries to print; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 25)]
     show: usize,
 
     #[command(flatten)]
@@ -44,6 +45,8 @@ pub struct CatalogSummary {
 
 #[derive(Debug, Args)]
 pub struct CatalogFind {
+    /// Path text to search for; multiple values are matched together.
+    #[arg(required = true, num_args = 1.., value_name = "PATTERN")]
     query: Vec<String>,
 
     /// Catalog file or directory. Omit to read from the located install's Engine.pak.
@@ -54,7 +57,8 @@ pub struct CatalogFind {
     #[arg(long)]
     exact: bool,
 
-    #[arg(long, default_value_t = 25)]
+    /// Maximum matching entries to print; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 25)]
     show: usize,
 
     #[command(flatten)]
@@ -63,6 +67,8 @@ pub struct CatalogFind {
 
 #[derive(Debug, Args)]
 pub struct CatalogGet {
+    /// Exact catalog path or asset identifier; repeat to show several entries.
+    #[arg(required = true, num_args = 1.., value_name = "ASSET")]
     query: Vec<String>,
 
     /// Catalog file or directory. Omit to read from the located install's Engine.pak.
@@ -75,11 +81,21 @@ pub struct CatalogGet {
 
 #[derive(Debug, Args)]
 pub struct CatalogExport {
+    /// CSV file to write.
+    #[arg(long = "out", value_name = "FILE")]
     out: PathBuf,
 
     /// Catalog file or directory. Omit to read from the located install's Engine.pak.
     #[arg(long)]
     path: Option<PathBuf>,
+
+    /// Replace an existing CSV file.
+    #[arg(long)]
+    force: bool,
+
+    /// Read and validate catalogs without writing the CSV file.
+    #[arg(long)]
+    dry_run: bool,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -243,7 +259,17 @@ impl CatalogExport {
                 .then(left.asset_id.cmp(&right.asset_id))
         });
 
-        write_catalog_csv(&self.out, &rows)
+        if self.dry_run {
+            Report::new("catalog export")
+                .stat("dry-run", "yes")
+                .stat("catalogs", inputs.len())
+                .stat("would-export", rows.len())
+                .stat("path", self.out.display())
+                .print();
+            return finish_scan(cancelled, skipped, &errors, "catalog export");
+        }
+
+        write_catalog_csv(&self.out, &rows, self.force)
             .with_context(|| format!("write {}", self.out.display()))?;
         Report::new("catalog export")
             .stat("catalogs", inputs.len())
@@ -410,7 +436,7 @@ fn scan_catalog(
                     }
                 };
                 matched += 1;
-                if rows.len() < limit {
+                if limit == 0 || rows.len() < limit {
                     rows.push(CatalogRow {
                         source: source.clone(),
                         kind: "RASC".to_string(),
@@ -454,7 +480,7 @@ fn scan_catalog(
                     }
                 };
                 matched += 1;
-                if rows.len() < limit {
+                if limit == 0 || rows.len() < limit {
                     rows.push(CatalogRow {
                         source: source.clone(),
                         kind: "RAOC".to_string(),
@@ -582,8 +608,7 @@ fn export_catalog(source: &str, bytes: &[u8]) -> Result<Vec<CatalogExportRow>> {
     })
 }
 
-fn write_catalog_csv(path: &Path, rows: &[CatalogExportRow]) -> Result<()> {
-    ensure_parent(path)?;
+fn write_catalog_csv(path: &Path, rows: &[CatalogExportRow], force: bool) -> Result<()> {
     let mut csv = String::from("catalog,kind,asset_id,asset_type,size_bytes,flags,path\n");
     for row in rows {
         csv.push_str(&csv_cell(&row.source));
@@ -601,8 +626,7 @@ fn write_catalog_csv(path: &Path, rows: &[CatalogExportRow]) -> Result<()> {
         csv.push_str(&csv_cell(&row.path));
         csv.push('\n');
     }
-    std::fs::write(path, csv)?;
-    Ok(())
+    write_guarded(path, csv.as_bytes(), force.into())
 }
 
 fn raoc_text_matches(entry: &nw_asset::RaocEntry, needles: &[String]) -> bool {

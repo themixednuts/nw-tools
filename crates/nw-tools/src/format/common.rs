@@ -6,8 +6,11 @@ use std::path::Path;
 /// and the conversion path).
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub(super) enum EncodingArg {
+    /// ObjectStream binary encoding.
     Binary,
+    /// ObjectStream XML encoding.
     Xml,
+    /// ObjectStream JSON encoding.
     Json,
 }
 

@@ -22,27 +22,42 @@ pub struct ObjectStream {
     /// ObjectStream file or directory. Omit to browse files under the current directory.
     path: Option<PathBuf>,
 
+    /// Print the decoded ObjectStream element tree.
     #[arg(long, conflicts_with = "to")]
     dom: bool,
 
+    /// Search decoded element names and values for this text.
     #[arg(long, conflicts_with = "to")]
     query: Option<String>,
 
     /// Exact substring match instead of the default fuzzy ranking (with --query).
-    #[arg(long)]
+    #[arg(long, requires = "query")]
     exact: bool,
 
     /// Convert ObjectStream files to this encoding.
     #[arg(long, value_enum)]
     to: Option<EncodingArg>,
 
-    /// Conversion output file or directory. Defaults beside each input.
-    #[arg(long, value_name = "PATH", requires = "to")]
+    /// Conversion output file for a single ObjectStream input.
+    #[arg(long, value_name = "FILE", requires = "to", conflicts_with = "out_dir")]
     out: Option<PathBuf>,
 
+    /// Conversion output directory for a directory of ObjectStream inputs.
+    #[arg(
+        long = "out-dir",
+        value_name = "DIR",
+        requires = "to",
+        conflicts_with = "out"
+    )]
+    out_dir: Option<PathBuf>,
+
     /// Replace existing conversion outputs.
-    #[arg(long, requires = "to")]
+    #[arg(long = "force", requires = "to")]
     overwrite: bool,
+
+    /// Print the conversion plan without writing output files.
+    #[arg(long, requires = "to")]
+    dry_run: bool,
 
     /// Case-insensitive path substring prefilter.
     #[arg(long)]
@@ -52,12 +67,15 @@ pub struct ObjectStream {
     #[arg(long)]
     glob: Vec<String>,
 
-    #[arg(long, default_value_t = 40)]
+    /// Maximum elements or matches to print per file; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 40)]
     show: usize,
 
-    #[arg(long, default_value_t = 20)]
+    /// Maximum input files to include in the report; `0` means unlimited.
+    #[arg(long = "limit-files", default_value_t = 20)]
     files: usize,
 
+    /// Skip embedded SerializeContext UUID-to-name lookup.
     #[arg(long)]
     no_names: bool,
 
@@ -134,11 +152,37 @@ impl ObjectStream {
         let root = self.path.clone().unwrap_or_else(|| PathBuf::from("."));
         let paths = objectstream_paths(&root, &self.extensions, &selector)?;
         if let Some(encoding) = self.to {
+            let out = if root.is_file() {
+                if self.out_dir.is_some() {
+                    bail!("use --out <FILE> when converting one ObjectStream file");
+                }
+                self.out.as_deref()
+            } else {
+                if self.out.is_some() {
+                    bail!("use --out-dir <DIR> when converting an ObjectStream directory");
+                }
+                self.out_dir.as_deref()
+            };
+            if self.dry_run {
+                Report::new("objectstream conversion")
+                    .stat("dry-run", "yes")
+                    .stat("files", paths.len())
+                    .stat("encoding", format!("{encoding:?}"))
+                    .stat(
+                        "output",
+                        out.map_or_else(
+                            || "<beside input>".to_owned(),
+                            |path| path.display().to_string(),
+                        ),
+                    )
+                    .print();
+                return Ok(());
+            }
             return convert_objectstreams(
                 &ctx,
                 &root,
                 &paths,
-                self.out.as_deref(),
+                out,
                 encoding.into(),
                 self.overwrite,
                 lookup.as_ref(),
@@ -187,12 +231,12 @@ impl ObjectStream {
         }
         scans.sort_by(|left, right| object_source(left).cmp(object_source(right)));
 
-        let shown = scans.len().min(self.files);
+        let shown = crate::support::limit_count(scans.len(), self.files);
         let mut report = Report::new("objectstream")
             .stat("files", scans.len())
             .stat("shown", shown)
             .stat("names", if lookup.is_some() { "loaded" } else { "off" });
-        for scan in scans.into_iter().take(self.files) {
+        for scan in scans.into_iter().take(shown) {
             match scan {
                 ObjectScan::Stats(scan) => push_object_stats(&mut report, &scan),
                 ObjectScan::Dom(scan) => push_object_dom(&mut report, &scan),
@@ -293,6 +337,7 @@ fn scan_objectstream(
     limit: usize,
     lookup: Option<&NameLookup>,
 ) -> Result<Option<ObjectScan>> {
+    let limit = crate::support::limit_count(usize::MAX, limit);
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let Some(bytes) = objectstream_payload(&bytes)
         .with_context(|| format!("decode wrapper for {}", path.display()))?

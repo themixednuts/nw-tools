@@ -7,16 +7,38 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Set;
 
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.Structure;
 
 public class NetworkSchemaDataTypeProbe extends GhidraScript {
+    private static final String SCRIPT_VERSION = "1.0.0";
+
     @Override
     protected void run() throws Exception {
-        String rawNames = requiredEnvironment("NW_NETWORK_PROBE_TYPE_NAMES");
-        Path output = Path.of(requiredEnvironment("NW_NETWORK_PROBE_OUT"));
+        GhidraCli cli = GhidraCli.parse(
+            getScriptArgs(),
+            Set.of("type-names", "out"),
+            Set.of("force", "dry-run"),
+            0);
+        if (cli.helpRequested()) {
+            printHelp();
+            return;
+        }
+        if (cli.versionRequested()) {
+            println("NetworkSchemaDataTypeProbe " + SCRIPT_VERSION);
+            return;
+        }
+        String rawNames = cli.required("type-names", "NW_NETWORK_PROBE_TYPE_NAMES");
+        Path output = Path.of(cli.required("out", "NW_NETWORK_PROBE_OUT"));
+        boolean force = cli.flag("force", null, false);
+        boolean dryRun = cli.flag("dry-run", null, false);
+        if (Files.exists(output) && !force && !dryRun) {
+            throw new IllegalArgumentException(
+                "output already exists: " + output + "; pass --force to replace it");
+        }
         List<String> requested = List.of(rawNames.split(";"));
         ArrayList<String> lines = new ArrayList<>();
 
@@ -35,16 +57,27 @@ public class NetworkSchemaDataTypeProbe extends GhidraScript {
             }
         }
 
-        Files.createDirectories(output.toAbsolutePath().getParent());
-        Files.write(output, lines, StandardCharsets.UTF_8);
-        println("Wrote data-type probe: " + output.toAbsolutePath());
+        if (dryRun) {
+            println("Dry run: would write " + lines.size() + " data-type row(s) to " +
+                output.toAbsolutePath());
+        }
+        else {
+            Files.createDirectories(output.toAbsolutePath().getParent());
+            Files.write(output, lines, StandardCharsets.UTF_8);
+            println("Wrote data-type probe: " + output.toAbsolutePath());
+        }
     }
 
-    private String requiredEnvironment(String name) {
-        String value = System.getenv(name);
-        if (value == null || value.isBlank()) {
-            throw new IllegalArgumentException(name + " is required");
-        }
-        return value;
+    private void printHelp() {
+        println("NetworkSchemaDataTypeProbe " + SCRIPT_VERSION);
+        println("Inspect named network-schema datatypes in the current Ghidra program.");
+        println("");
+        println("Options:");
+        println("  --type-names <LIST>  Semicolon-separated type names [env: NW_NETWORK_PROBE_TYPE_NAMES]");
+        println("  --out <FILE>         Output report [env: NW_NETWORK_PROBE_OUT]");
+        println("  --force              Replace an existing output");
+        println("  --dry-run            Analyze without filesystem writes");
+        println("  -h, --help           Print help");
+        println("  -V, --version        Print version");
     }
 }

@@ -17,7 +17,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 base64 = "0.22.1"
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 flate2.workspace = true
 heck.workspace = true
 nw-asset = { workspace = true, features = ["oodle"] }
@@ -40,6 +40,7 @@ serde_json.workspace = true
 sha2.workspace = true
 syn.workspace = true
 thiserror.workspace = true
+tracing-subscriber.workspace = true
 treesitter-types-go.workspace = true
 uuid.workspace = true
 

@@ -4,6 +4,7 @@
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
@@ -83,6 +84,19 @@ public class RmiDispatchMapper extends GhidraScript {
 
     @Override
     protected void run() throws Exception {
+        GhidraCli cli = GhidraCli.parse(
+            getScriptArgs(),
+            Set.of(),
+            Set.of("apply", "dry-run"),
+            0);
+        if (cli.helpRequested()) {
+            printHelp();
+            return;
+        }
+        if (cli.versionRequested()) {
+            println("RmiDispatchMapper " + VERSION);
+            return;
+        }
         if (currentProgram == null) {
             popup("No current program is open.");
             return;
@@ -92,10 +106,21 @@ public class RmiDispatchMapper extends GhidraScript {
         symbols = currentProgram.getSymbolTable();
         dataTypes = currentProgram.getDataTypeManager();
         hubCategory = new CategoryPath(new CategoryPath(CategoryPath.ROOT, "Amazon"), "Hub");
-        apply = askYesNo(
-            "Apply RMIDispatch mapping?",
-            "Apply validated RMIDispatch datatypes, function names, and signatures?\n\n" +
-                "No runs a dry-run report only.");
+        if (cli.flag("dry-run", null, false)) {
+            apply = false;
+        }
+        else if (cli.value("apply", null) != null) {
+            apply = cli.flag("apply", null, false);
+        }
+        else if (isRunningHeadless()) {
+            apply = false;
+        }
+        else {
+            apply = askYesNo(
+                "Apply RMIDispatch mapping?",
+                "Apply validated RMIDispatch datatypes, function names, and signatures?\n\n" +
+                    "No runs a dry-run report only.");
+        }
 
         Structure slot = ensureActorDispatcherSlot();
         Structure lookupResult = ensureActorDispatcherLookupResult();
@@ -119,6 +144,17 @@ public class RmiDispatchMapper extends GhidraScript {
 
         println("RMIDispatch mapping " + (apply ? "applied" : "dry-run") +
             ": applied=" + applied + " skipped=" + skipped);
+    }
+
+    private void printHelp() {
+        println("RmiDispatchMapper " + VERSION);
+        println("Apply validated RMIDispatch datatypes, names, and signatures.");
+        println("");
+        println("Options:");
+        println("  --apply[=<BOOL>]  Apply program mutations; headless default is false");
+        println("  --dry-run         Inspect without mutating the current program");
+        println("  -h, --help        Print help");
+        println("  -V, --version     Print version");
     }
 
     private Structure ensureActorDispatcherSlot() throws Exception {

@@ -1,9 +1,11 @@
 # GameData SDK Codegen
 
-`nw-gamedata-codegen` emits self-contained Rust, TypeScript, and Go packages
-that read New World shipping assets directly. Generated packages do not depend
-on a game project, Bevy, a cooked asset cache, RON sources, or generated
-physical-table modules.
+The `nw-gamedata-codegen` crate is the reusable compiler and emitter for
+self-contained Rust, TypeScript, and Go packages that read New World shipping
+assets directly. It intentionally ships no binary from `nw-tools`; the
+user-facing CLI is the `nw-gamedata-codegen standalone` mode in the
+`new-world` workspace. This removes the former same-named, overlapping
+executables from `PATH` while keeping one compiler implementation.
 
 ## Architecture
 
@@ -109,9 +111,9 @@ asset loader.
 ## Generation
 
 ```powershell
-cargo run -p nw-gamedata-codegen --bin nw-gamedata-codegen -- `
+cargo run -p newworld-gamedata-codegen --bin nw-gamedata-codegen -- standalone `
   --assets "E:\Games\steamapps\common\New World\assets" `
-  --output C:\Temp\new-world-gamedata
+  C:\Temp\new-world-gamedata
 ```
 
 Omit the language option to emit all three packages in one catalog/schema pass,

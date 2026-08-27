@@ -513,7 +513,6 @@ dependencies = [
  "bevy_math",
  "bevy_reflect",
  "glam",
- "inventory",
  "serde",
  "thiserror 2.0.18",
  "uuid",
@@ -564,8 +563,8 @@ name = "az-jobs"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "ctrlc",
  "rayon",
- "signal-hook 0.4.4",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -586,8 +585,17 @@ name = "az-turso"
 version = "0.1.0"
 dependencies = [
  "async-lock",
+ "fs2",
  "thiserror 2.0.18",
- "turso",
+ "turso 0.8.0-pre.2",
+ "turso_core 0.8.0-pre.2",
+ "turso_ext 0.8.0-pre.2",
+ "turso_macros 0.8.0-pre.2",
+ "turso_parser 0.8.0-pre.2",
+ "turso_sdk_kit 0.8.0-pre.2",
+ "turso_sdk_kit_macros 0.8.0-pre.2",
+ "turso_sync_engine 0.8.0-pre.2",
+ "turso_sync_sdk_kit 0.8.0-pre.2",
 ]
 
 [[package]]
@@ -596,7 +604,6 @@ version = "0.1.0"
 dependencies = [
  "az-jobs",
  "futures",
- "signal-hook 0.4.4",
  "tokio-util",
  "tracing",
 ]
@@ -2011,7 +2018,7 @@ dependencies = [
  "futures-util",
  "paste",
  "smallvec",
- "turso",
+ "turso 0.7.2",
 ]
 
 [[package]]
@@ -2026,7 +2033,7 @@ dependencies = [
  "percent-encoding",
  "smallvec",
  "thiserror 2.0.18",
- "turso",
+ "turso 0.7.2",
 ]
 
 [[package]]
@@ -2049,7 +2056,7 @@ dependencies = [
  "serde_json",
  "syn 2.0.118",
  "toml 0.9.12+spec-1.1.0",
- "turso",
+ "turso 0.7.2",
 ]
 
 [[package]]
@@ -2092,7 +2099,7 @@ dependencies = [
  "drizzle-types",
  "paste",
  "thiserror 2.0.18",
- "turso",
+ "turso 0.7.2",
 ]
 
 [[package]]
@@ -3791,6 +3798,7 @@ dependencies = [
  "syn 2.0.118",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing-subscriber",
  "treesitter-types-go",
  "uuid",
 ]
@@ -3844,9 +3852,11 @@ dependencies = [
  "heck 0.5.0",
  "nw-jobs",
  "petgraph",
+ "serde_json",
  "stylua",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4059,7 +4069,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
- "turso",
+ "turso 0.7.2",
  "uuid",
  "walkdir",
 ]
@@ -6423,9 +6433,23 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
- "turso_core",
- "turso_sdk_kit",
- "turso_sync_sdk_kit",
+ "turso_core 0.7.2",
+ "turso_sdk_kit 0.7.2",
+ "turso_sync_sdk_kit 0.7.2",
+]
+
+[[package]]
+name = "turso"
+version = "0.8.0-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8e4c60e5377490f890ad63889719e4b15a4b2734c22c2be0750a930ad155171"
+dependencies = [
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "turso_core 0.8.0-pre.2",
+ "turso_sdk_kit 0.8.0-pre.2",
+ "turso_sync_sdk_kit 0.8.0-pre.2",
 ]
 
 [[package]]
@@ -6489,9 +6513,79 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
- "turso_ext",
- "turso_macros",
- "turso_parser",
+ "turso_ext 0.7.2",
+ "turso_macros 0.7.2",
+ "turso_parser 0.7.2",
+ "twox-hash",
+ "uncased",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "turso_core"
+version = "0.8.0-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "126a369027e3f8d5736f871267e9a79fe18e081cf4023b520d3a45097bc9e841"
+dependencies = [
+ "aegis",
+ "aes",
+ "aes-gcm",
+ "allocator-api2 0.4.0",
+ "antithesis_sdk",
+ "arc-swap",
+ "aristo",
+ "bigdecimal",
+ "bitflags 2.13.0",
+ "branches",
+ "bumpalo",
+ "bytemuck",
+ "cfg_aliases",
+ "cfg_block",
+ "chrono",
+ "crc32c",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "either",
+ "fallible-iterator",
+ "fastbloom",
+ "hex",
+ "icu_collator",
+ "icu_locale",
+ "intrusive-collections",
+ "io-uring",
+ "libc",
+ "libloading",
+ "libm",
+ "loom",
+ "miette",
+ "num-bigint",
+ "num-traits",
+ "pack1",
+ "parking_lot",
+ "pastey",
+ "polling",
+ "rand 0.9.4",
+ "rapidhash",
+ "regex",
+ "regex-syntax",
+ "roaring",
+ "rustc-hash 2.1.2",
+ "rustix 1.1.4",
+ "ryu",
+ "serde_json",
+ "shuttle",
+ "simsimd",
+ "smallvec",
+ "strum 0.26.3",
+ "strum_macros 0.26.4",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "turso_ext 0.8.0-pre.2",
+ "turso_macros 0.8.0-pre.2",
+ "turso_parser 0.8.0-pre.2",
  "twox-hash",
  "uncased",
  "uuid",
@@ -6506,7 +6600,29 @@ checksum = "2cca983d5255440f8074a017c1bebe4bb387f079a43fedc179f3de1e6f3e3def"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
- "turso_macros",
+ "turso_macros 0.7.2",
+]
+
+[[package]]
+name = "turso_ext"
+version = "0.8.0-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cca983d5255440f8074a017c1bebe4bb387f079a43fedc179f3de1e6f3e3def"
+dependencies = [
+ "chrono",
+ "getrandom 0.4.3",
+ "turso_macros 0.8.0-pre.2",
+]
+
+[[package]]
+name = "turso_macros"
+version = "0.8.0-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cd0d06b919b0c6a517451c05a855368fecf101eeb87b4eaf299a3daa97ad2e2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -6532,7 +6648,22 @@ dependencies = [
  "strum 0.26.3",
  "strum_macros 0.26.4",
  "thiserror 2.0.18",
- "turso_macros",
+ "turso_macros 0.7.2",
+]
+
+[[package]]
+name = "turso_parser"
+version = "0.8.0-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6c143277cc1387ba02aed82856a20c43108f8aaa4caf55201f73b229db08fcf"
+dependencies = [
+ "bitflags 2.13.0",
+ "memchr",
+ "miette",
+ "strum 0.26.3",
+ "strum_macros 0.26.4",
+ "thiserror 2.0.18",
+ "turso_macros 0.8.0-pre.2",
 ]
 
 [[package]]
@@ -6547,9 +6678,37 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "turso_core",
- "turso_ext",
- "turso_sdk_kit_macros",
+ "turso_core 0.7.2",
+ "turso_ext 0.7.2",
+ "turso_sdk_kit_macros 0.7.2",
+]
+
+[[package]]
+name = "turso_sdk_kit"
+version = "0.8.0-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18a3a833a9757e14890e7be3f91b9bededc068a4038aabf065db283205977507"
+dependencies = [
+ "bindgen",
+ "env_logger 0.11.11",
+ "parking_lot",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "turso_core 0.8.0-pre.2",
+ "turso_ext 0.8.0-pre.2",
+ "turso_sdk_kit_macros 0.8.0-pre.2",
+]
+
+[[package]]
+name = "turso_sdk_kit_macros"
+version = "0.8.0-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f7bd6f95e5701fc19f354c2c008a6bbd91a45261973b1bb53c84846869a0a0f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -6581,8 +6740,31 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
- "turso_core",
- "turso_parser",
+ "turso_core 0.7.2",
+ "turso_parser 0.7.2",
+ "uuid",
+]
+
+[[package]]
+name = "turso_sync_engine"
+version = "0.8.0-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da743ad475ed263a3ce566099c2445e98eb7b8f90e95a363db4b2559e72cd62c"
+dependencies = [
+ "base64",
+ "bytes",
+ "crc32c",
+ "genawaiter",
+ "http",
+ "libc",
+ "prost",
+ "roaring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "turso_core 0.8.0-pre.2",
+ "turso_parser 0.8.0-pre.2",
  "uuid",
 ]
 
@@ -6599,10 +6781,29 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "turso_core",
- "turso_sdk_kit",
- "turso_sdk_kit_macros",
- "turso_sync_engine",
+ "turso_core 0.7.2",
+ "turso_sdk_kit 0.7.2",
+ "turso_sdk_kit_macros 0.7.2",
+ "turso_sync_engine 0.7.2",
+]
+
+[[package]]
+name = "turso_sync_sdk_kit"
+version = "0.8.0-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c2c9adc424f837e5fb8c316a0df7bb53b8ceaef89d64b29342afdc8372e77c2"
+dependencies = [
+ "bindgen",
+ "env_logger 0.11.11",
+ "genawaiter",
+ "parking_lot",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "turso_core 0.8.0-pre.2",
+ "turso_sdk_kit 0.8.0-pre.2",
+ "turso_sdk_kit_macros 0.8.0-pre.2",
+ "turso_sync_engine 0.8.0-pre.2",
 ]
 
 [[package]]

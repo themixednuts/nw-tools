@@ -27,7 +27,7 @@ metadata.
 
 ```powershell
 # Resolve one shipped CDF and every referenced asset from the located install.
-nw-tools --plain format model --filter objects/characters/example.cdf --out models
+nw-tools --plain format model --filter objects/characters/example.cdf --out-dir models
 
 # Add explicit animation, Mannequin, and audio control sources.
 nw-tools format model character.cdf --animation locomotion.caf `
@@ -62,7 +62,7 @@ validated before it is written.
 
 ```powershell
 nw-tools format audio sounds/example.bnk --out example.json `
-  --extract-embedded embedded-wem
+  --out-dir embedded-wem
 ```
 
 ## SerializeContext type generation
@@ -72,7 +72,7 @@ by runtime crates instead of maintaining hand-written mirrors:
 
 ```powershell
 nw-serialize-codegen generate --language rust --rust-layout vendored `
-  --selection explicit --selection-file selection.json --out crates/generated-types
+  --selection explicit --selection-file selection.json --out-dir crates/generated-types
 ```
 
 ## GameData SDK generation

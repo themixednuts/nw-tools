@@ -38,7 +38,7 @@ Chunk { header, root: Proto (tree of nested Protos) }
 disasm::disassemble  ──►  textual disassembly (--dis)                [LuaDis.pas]
   │  ir::lift + ir::ssa      CFG → dominators → φ → rename           [LuaSSA.pas / LuaSSAPasses.pas]
   ▼
-SsaFunction { blocks, nodes, φ }  ──►  ssa dump (--ssa-dump)
+SsaFunction { blocks, nodes, φ }  ──►  ssa dump (--mode ssa)
   │  analyses + structuring  SSA → ControlComponent set + RegionTree + ReconstructionPlan
   ▼
 ControlComponent set + RegionTree + ReconstructionPlan { values, bindings, node schedule }
@@ -47,7 +47,7 @@ ControlComponent set + RegionTree + ReconstructionPlan { values, bindings, node 
 ast::Block  (structured Stmt/Expr tree)
   │  codegen                 AST → Lua source (pretty-printer)       [replaces EmitNode string concat]
   ▼
-String  (--dec)
+String  (--mode dec)
 ```
 
 **Core rules**
@@ -132,7 +132,7 @@ crates/nw-lua/
       table.rs               typed NEWTABLE floating-byte allocation/source-count hints
       passes.rs              typed pass pipeline, schedules, reports, analysis cache
       passes/simplify.rs     conservative SSA cleanup transforms [LuaSSAPasses.pas]
-      dump.rs                DumpSSA equivalent (--ssa-dump)
+      dump.rs                DumpSSA equivalent (--mode ssa)
     decompile/               [LuaDecomp*.inc] — SSA → decompiler IR (never strings)
       mod.rs                 Decompiler driver, DecompOptions, per-proto
       ast/                   compact decompiler IR (the working tree passes build + rewrite).
@@ -163,7 +163,7 @@ crates/nw-lua/
       lower.rs               decompile::ast → full_moon::ast::Block (precedence/parens),
                              then stylua_lib::format_code + full_moon reparse gate
     bin/
-      nw-lua.rs              CLI: --dis --dec --ssa-dump --annotate --lua-version --opcode-table
+      nw-lua.rs              CLI: --mode dis|dec|ssa --annotate --lua-version --opcode-table
   tests/                     integration tests + fixtures
 ```
 
@@ -301,7 +301,7 @@ Vertical, tracer-bullet slices. Each phase must `cargo build -p nw-lua`,
 - **P1 — Opcodes + instruction decode + disassembler (5.1).** `SemanticOp`, 5.1
   `OpcodeTable`, `Instruction` decode, `--dis`. Validate against reference `--dis`.
 - **P2 — SSA (5.1).** CFG, dominators (petgraph), dominance frontiers, φ placement,
-  rename, semantic-op lifting, `--ssa-dump`.
+  rename, semantic-op lifting, `--mode ssa`.
 - **P3 — `emit` adapter (full_moon + stylua).** Region/SSA → `full_moon::ast::Block` builder
   adapter (owns trivia/spacing + precedence parens) → `to_string()` → `stylua_lib::format_code`
   → `full_moon` reparse gate. Round-trip test on hand-built blocks. See `docs/AST_DECISION.md`.

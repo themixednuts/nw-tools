@@ -2,15 +2,54 @@
 //! enabled, plain text otherwise.
 
 use std::io::{self, Write};
+use std::sync::OnceLock;
 
+use clap::ValueEnum;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use serde_json::json;
 
 use super::report::{Block, Report};
 use super::theme::{self, Caps};
 
+/// Encoding for command reports written to stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum OutputFormat {
+    /// Human-readable terminal output.
+    #[default]
+    Text,
+    /// Stable `nw-tools.report.v1` JSON.
+    Json,
+}
+
+static OUTPUT_FORMAT: OnceLock<OutputFormat> = OnceLock::new();
+
+/// Select the process-wide report encoding before running a command.
+pub fn init(format: OutputFormat) {
+    let _ = OUTPUT_FORMAT.set(format);
+}
+
+/// The selected process-wide report encoding.
+pub fn output_format() -> OutputFormat {
+    OUTPUT_FORMAT.get().copied().unwrap_or_default()
+}
+
+/// Write a command-specific JSON document followed by a newline.
+pub fn print_json(value: &impl serde::Serialize) {
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    if serde_json::to_writer_pretty(&mut lock, value).is_ok() {
+        let _ = writeln!(lock);
+    }
+}
+
 /// Render `report` to stdout using the resolved process capabilities.
 pub fn print_report(report: &Report) {
+    if OUTPUT_FORMAT.get() == Some(&OutputFormat::Json) {
+        print_json_report(report);
+        return;
+    }
+
     let caps = theme::caps();
     let width = theme::report_width(caps);
     let mut out = String::new();
@@ -39,6 +78,48 @@ pub fn print_report(report: &Report) {
     let stdout = io::stdout();
     let mut lock = stdout.lock();
     let _ = lock.write_all(out.as_bytes());
+}
+
+fn print_json_report(report: &Report) {
+    let stats = report
+        .stats()
+        .iter()
+        .map(|(name, value)| json!({ "name": name, "value": value }))
+        .collect::<Vec<_>>();
+    let blocks = report
+        .blocks()
+        .iter()
+        .map(|block| match block {
+            Block::Table(table) => json!({
+                "type": "table",
+                "columns": table.headers(),
+                "rows": table
+                    .rows()
+                    .iter()
+                    .map(|row| row.iter().map(|cell| cell.raw()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+            }),
+            Block::Line(line) => json!({
+                "type": "text",
+                "text": line
+                    .spans
+                    .iter()
+                    .fold(String::new(), |mut text, span| {
+                        text.push_str(&span.content);
+                        text
+                    }),
+            }),
+            Block::Blank => json!({ "type": "blank" }),
+        })
+        .collect::<Vec<_>>();
+    let document = json!({
+        "schema": "nw-tools.report.v1",
+        "title": report.title(),
+        "stats": stats,
+        "blocks": blocks,
+    });
+
+    print_json(&document);
 }
 
 /// The header band: bold accent title followed by a dim stat strip.

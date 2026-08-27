@@ -124,7 +124,11 @@ impl Summary {
             let Some(examples) = self.examples.get(&category) else {
                 continue;
             };
-            for example in examples.iter().take(examples_per_category) {
+            for example in examples.iter().take(if examples_per_category == 0 {
+                usize::MAX
+            } else {
+                examples_per_category
+            }) {
                 println!(
                     "{}\t{}\t{}\t{}",
                     category.label(),

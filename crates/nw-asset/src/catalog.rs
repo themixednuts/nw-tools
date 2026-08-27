@@ -7,7 +7,7 @@ use thiserror::Error as ThisError;
 use uuid::Uuid;
 
 use crate::uuid::AzUuidExt;
-use crate::{AssetId, AssetType};
+use crate::{AssetId, AssetType, SourceAssetId};
 
 pub const ASSET_CATALOG_PATH: &str = "assetcatalog.catalog";
 pub const ASSET_CATALOG_OPTIMIZED_PATH: &str = "assetcatalog_optimized.catalog";
@@ -98,6 +98,46 @@ pub enum CompatibilityResolutionError {
         rasc_asset_id: AssetId,
         raoc_asset_id: AssetId,
     },
+}
+
+#[derive(Debug, ThisError, Clone, PartialEq, Eq)]
+pub enum TypedAssetResolutionError {
+    #[error(transparent)]
+    Compatibility(#[from] CompatibilityResolutionError),
+
+    #[error("asset {asset_id} has type {actual}, expected {expected}")]
+    TypeMismatch {
+        asset_id: AssetId,
+        expected: AssetType,
+        actual: AssetType,
+    },
+
+    #[error("source asset {source_id} has multiple products of type {asset_type}: {products:?}")]
+    AmbiguousSourceProducts {
+        source_id: SourceAssetId,
+        asset_type: AssetType,
+        products: Vec<AssetId>,
+    },
+}
+
+#[derive(Debug, ThisError, Clone, PartialEq, Eq)]
+pub enum SerializedAssetReferenceResolutionError {
+    #[error(transparent)]
+    Compatibility(#[from] CompatibilityResolutionError),
+
+    #[error("source asset {source_id} has multiple products of type {asset_type}: {products:?}")]
+    AmbiguousSourceProducts {
+        source_id: SourceAssetId,
+        asset_type: AssetType,
+        products: Vec<AssetId>,
+    },
+}
+
+#[derive(Debug)]
+struct SourceProductAmbiguity {
+    source_id: SourceAssetId,
+    asset_type: AssetType,
+    products: Vec<AssetId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -283,6 +323,108 @@ impl AssetCatalog {
         Ok(self.rasc.entry(resolved))
     }
 
+    /// Resolve a real, legacy, or source asset identity to one typed product.
+    ///
+    /// Source identities carry sub-ID zero. When no exact product exists, the
+    /// catalog's same-source entries are filtered by the reflected `Asset<T>`
+    /// type and must yield at most one product.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TypedAssetResolutionError`] when legacy catalogs disagree or
+    /// cycle, an exact product has the wrong type, or a source emits multiple
+    /// products of the requested type.
+    pub fn entry_by_typed_asset_id(
+        &self,
+        asset_id: AssetId,
+        expected_type: AssetType,
+    ) -> Result<Option<&RascEntry>, TypedAssetResolutionError> {
+        let resolved = self.resolve_compatibility_id(asset_id)?;
+        if let Some(entry) = self.rasc.entry(resolved) {
+            if entry.asset_type() == expected_type {
+                return Ok(Some(entry));
+            }
+            return Err(TypedAssetResolutionError::TypeMismatch {
+                asset_id: resolved,
+                expected: expected_type,
+                actual: entry.asset_type(),
+            });
+        }
+        let Ok(source_id) = SourceAssetId::try_from(resolved) else {
+            return Ok(None);
+        };
+        self.entry_by_unique_source_product(source_id, expected_type)
+            .map_err(
+                |ambiguity| TypedAssetResolutionError::AmbiguousSourceProducts {
+                    source_id: ambiguity.source_id,
+                    asset_type: ambiguity.asset_type,
+                    products: ambiguity.products,
+                },
+            )
+    }
+
+    fn entry_by_unique_source_product(
+        &self,
+        source_id: SourceAssetId,
+        asset_type: AssetType,
+    ) -> Result<Option<&RascEntry>, SourceProductAmbiguity> {
+        let mut matching = self
+            .rasc
+            .entries_by_source(source_id)
+            .filter(|entry| entry.asset_type() == asset_type);
+        let Some(first) = matching.next() else {
+            return Ok(None);
+        };
+        let Some(second) = matching.next() else {
+            return Ok(Some(first));
+        };
+        let products = std::iter::once(first)
+            .chain(std::iter::once(second))
+            .chain(matching)
+            .map(RascEntry::asset_id)
+            .collect();
+        Err(SourceProductAmbiguity {
+            source_id,
+            asset_type,
+            products,
+        })
+    }
+
+    /// Resolve a serialized Lumberyard Asset<T> reference to its exact
+    /// compatibility-catalog product or one same-source product.
+    ///
+    /// Compatibility remapping changes only identity and hint. The serialized
+    /// reflected type remains T, so an exact redirected product is returned
+    /// even when its catalog product type differs. When the resolved identity
+    /// names a source instead of an exact product, the source must have exactly
+    /// one product matching the serialized reflected type.
+    ///
+    /// # Errors
+    ///
+    /// Returns SerializedAssetReferenceResolutionError when redirects cannot
+    /// be resolved consistently or a source has multiple matching products.
+    pub fn entry_for_serialized_asset_reference(
+        &self,
+        asset_id: AssetId,
+        serialized_type: AssetType,
+    ) -> Result<Option<&RascEntry>, SerializedAssetReferenceResolutionError> {
+        let resolved = self.resolve_compatibility_id(asset_id)?;
+        if let Some(entry) = self.rasc.entry(resolved) {
+            return Ok(Some(entry));
+        }
+        let Ok(source_id) = SourceAssetId::try_from(resolved) else {
+            return Ok(None);
+        };
+        self.entry_by_unique_source_product(source_id, serialized_type)
+            .map_err(
+                |ambiguity| SerializedAssetReferenceResolutionError::AmbiguousSourceProducts {
+                    source_id: ambiguity.source_id,
+                    asset_type: ambiguity.asset_type,
+                    products: ambiguity.products,
+                },
+            )
+    }
+
     #[must_use]
     pub fn id_by_path(&self, path: &str) -> Option<AssetId> {
         if let Some(asset_id) = self.raoc.as_ref().and_then(|raoc| raoc.id_by_path(path)) {
@@ -448,6 +590,22 @@ impl Rasc {
         Self::new_with_runner(version, entries, &nw_jobs::JobRunner::inline())
     }
 
+    /// Build a catalog from product entries and legacy identity redirects.
+    #[must_use]
+    pub fn new_with_legacy_mappings(
+        version: u32,
+        entries: Vec<RascEntry>,
+        legacy_mappings: Vec<LegacyAssetIdMapping>,
+    ) -> Self {
+        let mut catalog = Self::new(version, entries);
+        catalog.by_legacy_id = legacy_mappings
+            .iter()
+            .map(|mapping| (mapping.legacy(), mapping.real()))
+            .collect();
+        catalog.legacy_mappings = legacy_mappings;
+        catalog
+    }
+
     /// Build lookup indexes using the caller's worker policy.
     #[must_use]
     pub fn new_with_runner(
@@ -588,10 +746,10 @@ impl Rasc {
     /// Product entries emitted from the same source GUID as `asset_id`.
     pub fn entries_by_source(
         &self,
-        asset_id: AssetId,
+        source_id: SourceAssetId,
     ) -> impl ExactSizeIterator<Item = &RascEntry> {
         self.by_source
-            .get(&asset_id.guid)
+            .get(&source_id.guid())
             .map(Vec::as_slice)
             .unwrap_or_default()
             .iter()
@@ -1679,6 +1837,266 @@ mod tests {
         assert_eq!(
             catalog.entry_by_compatibility_id(AssetId::new(Uuid::from_u128(5), 5)),
             Ok(None)
+        );
+    }
+
+    #[test]
+    fn asset_catalog_resolves_source_identity_to_unique_product_type() {
+        let guid = Uuid::from_u128(1);
+        let source_id = AssetId::new(guid, 0);
+        let slice_id = AssetId::new(guid, 2);
+        let metadata_id = AssetId::new(guid, 6);
+        let slice_type = AssetType::new(Uuid::from_u128(2));
+        let catalog = AssetCatalog::new(
+            Rasc::new(
+                RASC_VERSION,
+                vec![
+                    RascEntry::new(slice_id, slice_type, "slices/test/target.dynamicslice", 42),
+                    RascEntry::new(
+                        metadata_id,
+                        AssetType::nil(),
+                        "slices/test/target.slice.meta",
+                        7,
+                    ),
+                ],
+            ),
+            None,
+        );
+
+        assert_eq!(
+            catalog
+                .entry_by_typed_asset_id(source_id, slice_type)
+                .unwrap()
+                .map(RascEntry::asset_id),
+            Some(slice_id)
+        );
+    }
+
+    #[test]
+    fn typed_asset_lookup_does_not_treat_missing_product_as_source_identity() {
+        let guid = Uuid::from_u128(1);
+        let missing_product = AssetId::new(guid, 7);
+        let available_product = AssetId::new(guid, 2);
+        let asset_type = AssetType::new(Uuid::from_u128(2));
+        let catalog = AssetCatalog::new(
+            Rasc::new(
+                RASC_VERSION,
+                vec![RascEntry::new(
+                    available_product,
+                    asset_type,
+                    "slices/test/target.dynamicslice",
+                    42,
+                )],
+            ),
+            None,
+        );
+
+        assert_eq!(
+            catalog.entry_by_typed_asset_id(missing_product, asset_type),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn typed_asset_lookup_rejects_exact_product_with_wrong_type() {
+        let product = AssetId::new(Uuid::from_u128(1), 2);
+        let actual_type = AssetType::new(Uuid::from_u128(2));
+        let expected_type = AssetType::new(Uuid::from_u128(3));
+        let catalog = AssetCatalog::new(
+            Rasc::new(
+                RASC_VERSION,
+                vec![RascEntry::new(
+                    product,
+                    actual_type,
+                    "slices/test/target.dynamicslice",
+                    42,
+                )],
+            ),
+            None,
+        );
+
+        assert_eq!(
+            catalog.entry_by_typed_asset_id(product, expected_type),
+            Err(TypedAssetResolutionError::TypeMismatch {
+                asset_id: product,
+                expected: expected_type,
+                actual: actual_type,
+            })
+        );
+    }
+
+    #[test]
+    fn serialized_asset_reference_resolves_redirected_exact_product_without_retyping() {
+        let legacy_id = AssetId::new(Uuid::from_u128(1), 7);
+        let lod_product_id = AssetId::new(Uuid::from_u128(2), 4);
+        let serialized_mesh_type =
+            AssetType::new(uuid::uuid!("C2869E3B-DDA0-4E01-8FE3-6770D788866B"));
+        let lod_product_type = AssetType::new(uuid::uuid!("9AAE4926-CB6A-4C60-9948-A1A22F51DB23"));
+        let rasc = Rasc::new_with_legacy_mappings(
+            RASC_VERSION,
+            vec![RascEntry::new(
+                lod_product_id,
+                lod_product_type,
+                "objects/test/mesh_lod1.azmesh",
+                42,
+            )],
+            vec![LegacyAssetIdMapping::new(legacy_id, lod_product_id)],
+        );
+        let catalog = AssetCatalog::new(rasc, None);
+
+        assert_eq!(
+            catalog
+                .entry_for_serialized_asset_reference(legacy_id, serialized_mesh_type)
+                .unwrap()
+                .map(RascEntry::asset_id),
+            Some(lod_product_id)
+        );
+        assert_eq!(
+            catalog.entry_by_typed_asset_id(legacy_id, serialized_mesh_type),
+            Err(TypedAssetResolutionError::TypeMismatch {
+                asset_id: lod_product_id,
+                expected: serialized_mesh_type,
+                actual: lod_product_type,
+            })
+        );
+    }
+
+    #[test]
+    fn serialized_asset_reference_resolves_unique_source_product_and_rejects_ambiguity() {
+        let guid = Uuid::from_u128(1);
+        let source_id = AssetId::new(guid, 0);
+        let first_product = AssetId::new(guid, 2);
+        let second_product = AssetId::new(guid, 3);
+        let serialized_type = AssetType::new(Uuid::from_u128(2));
+        let other_type = AssetType::new(Uuid::from_u128(3));
+        let unique_catalog = AssetCatalog::new(
+            Rasc::new(
+                RASC_VERSION,
+                vec![
+                    RascEntry::new(
+                        first_product,
+                        serialized_type,
+                        "slices/test/target.dynamicslice",
+                        42,
+                    ),
+                    RascEntry::new(
+                        second_product,
+                        other_type,
+                        "slices/test/target.slice.meta",
+                        7,
+                    ),
+                ],
+            ),
+            None,
+        );
+
+        assert_eq!(
+            unique_catalog
+                .entry_for_serialized_asset_reference(source_id, serialized_type)
+                .unwrap()
+                .map(RascEntry::asset_id),
+            Some(first_product)
+        );
+
+        let ambiguous_catalog = AssetCatalog::new(
+            Rasc::new(
+                RASC_VERSION,
+                vec![
+                    RascEntry::new(
+                        first_product,
+                        serialized_type,
+                        "slices/test/first.dynamicslice",
+                        42,
+                    ),
+                    RascEntry::new(
+                        second_product,
+                        serialized_type,
+                        "slices/test/second.dynamicslice",
+                        42,
+                    ),
+                ],
+            ),
+            None,
+        );
+        assert_eq!(
+            ambiguous_catalog.entry_for_serialized_asset_reference(source_id, serialized_type),
+            Err(
+                SerializedAssetReferenceResolutionError::AmbiguousSourceProducts {
+                    source_id: SourceAssetId::try_from(source_id).unwrap(),
+                    asset_type: serialized_type,
+                    products: vec![first_product, second_product],
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn typed_asset_lookup_rejects_ambiguous_source_products() {
+        let guid = Uuid::from_u128(1);
+        let source_id = AssetId::new(guid, 0);
+        let first_product = AssetId::new(guid, 2);
+        let second_product = AssetId::new(guid, 3);
+        let asset_type = AssetType::new(Uuid::from_u128(2));
+        let catalog = AssetCatalog::new(
+            Rasc::new(
+                RASC_VERSION,
+                vec![
+                    RascEntry::new(
+                        first_product,
+                        asset_type,
+                        "slices/test/first.dynamicslice",
+                        42,
+                    ),
+                    RascEntry::new(
+                        second_product,
+                        asset_type,
+                        "slices/test/second.dynamicslice",
+                        42,
+                    ),
+                ],
+            ),
+            None,
+        );
+
+        assert_eq!(
+            catalog.entry_by_typed_asset_id(source_id, asset_type),
+            Err(TypedAssetResolutionError::AmbiguousSourceProducts {
+                source_id: SourceAssetId::try_from(source_id).unwrap(),
+                asset_type,
+                products: vec![first_product, second_product],
+            })
+        );
+    }
+
+    #[test]
+    fn typed_asset_lookup_resolves_legacy_redirect_to_source_identity() {
+        let guid = Uuid::from_u128(1);
+        let legacy_id = AssetId::new(Uuid::from_u128(2), 9);
+        let source_id = AssetId::new(guid, 0);
+        let product = AssetId::new(guid, 2);
+        let asset_type = AssetType::new(Uuid::from_u128(3));
+        let mut rasc = Rasc::new(
+            RASC_VERSION,
+            vec![RascEntry::new(
+                product,
+                asset_type,
+                "slices/test/target.dynamicslice",
+                42,
+            )],
+        );
+        rasc.legacy_mappings = vec![LegacyAssetIdMapping {
+            legacy: legacy_id,
+            real: source_id,
+        }];
+        rasc.by_legacy_id.insert(legacy_id, source_id);
+        let catalog = AssetCatalog::new(rasc, None);
+
+        assert_eq!(
+            catalog
+                .entry_by_typed_asset_id(legacy_id, asset_type)
+                .unwrap()
+                .map(RascEntry::asset_id),
+            Some(product)
         );
     }
 

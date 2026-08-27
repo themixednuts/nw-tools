@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, ValueEnum};
+use clap::{ArgGroup, Args, ValueEnum};
 use nw_localization::{
     LanguageCode, LocalizationCatalog, LocalizationKey, LocalizationLoader, LocalizationTag,
     localization_keys,
@@ -18,26 +18,33 @@ use super::common::{csv_cell, finish_scan, lowered, path_label, text_matches, tr
 use super::datasheet_browser::browse_datasheets;
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("output").args(["out", "out_dir"]).multiple(false)))]
 pub struct Datasheet {
-    /// Datasheet file or directory. Omit to browse datasheets under the current directory.
+    /// Datasheet file or directory. Omit to browse the installed game's paks
+    /// interactively, or the current directory with plain output.
     path: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 25)]
+    /// Maximum datasheet summaries to print; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 25)]
     show: usize,
 
+    /// Include column definitions in the report.
     #[arg(long)]
     columns: bool,
 
+    /// Maximum rows to print from each datasheet; `0` means unlimited.
     #[arg(long)]
     rows: Option<usize>,
 
+    /// Cell text to search for; repeat to match several terms.
     #[arg(long)]
     find: Vec<String>,
 
     /// Exact substring match for --find instead of the default fuzzy ranking.
-    #[arg(long)]
+    #[arg(long, requires = "find")]
     exact: bool,
 
+    /// Include empty cells in row output and CSV exports.
     #[arg(long)]
     show_empty: bool,
 
@@ -57,13 +64,21 @@ pub struct Datasheet {
     #[arg(long, value_enum, default_value_t = LocalizeArg::Text)]
     localize: LocalizeArg,
 
-    /// Export rows to CSV under this file or directory.
-    #[arg(long, value_name = "PATH")]
-    csv: Option<PathBuf>,
+    /// Export one datasheet to this CSV file.
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
+
+    /// Export a directory of datasheets as CSV files under this directory.
+    #[arg(long = "out-dir", value_name = "DIR")]
+    out_dir: Option<PathBuf>,
 
     /// Replace existing CSV outputs.
-    #[arg(long, requires = "csv")]
+    #[arg(long = "force", requires = "output")]
     overwrite: bool,
+
+    /// Read and validate datasheets without writing CSV output files.
+    #[arg(long, requires = "output")]
+    dry_run: bool,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -71,8 +86,11 @@ pub struct Datasheet {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(super) enum LocalizeArg {
+    /// Render localization keys without resolving text.
     Key,
+    /// Render resolved localized text.
     Text,
+    /// Render both localization keys and resolved text.
     Both,
 }
 
@@ -182,7 +200,8 @@ impl Datasheet {
         // inside the TUI — so it short-circuits before any filesystem scan or
         // eager catalog load.
         let will_grid = crate::tui::interactive()
-            && self.csv.is_none()
+            && self.out.is_none()
+            && self.out_dir.is_none()
             && !self.columns
             && self.rows.is_none()
             && self.find.is_empty();
@@ -204,15 +223,26 @@ impl Datasheet {
 
         let ctx = self.jobs.ctx()?;
         let root = self.path.clone().unwrap_or_else(|| PathBuf::from("."));
+        let out = if root.is_file() {
+            if self.out_dir.is_some() {
+                bail!("use --out <FILE> when exporting one datasheet");
+            }
+            self.out.as_ref()
+        } else {
+            if self.out.is_some() {
+                bail!("use --out-dir <DIR> when exporting a datasheet directory");
+            }
+            self.out_dir.as_ref()
+        };
         let paths = collect_matching(&root, nw_datasheet::is_datasheet_path)?;
         let find = lowered(self.find);
         let needs_localization = self.locale.is_some()
             && self.localize != LocalizeArg::Key
-            && (self.csv.is_some() || self.rows.is_some() || !find.is_empty());
+            && (out.is_some() || self.rows.is_some() || !find.is_empty());
         let needed_keys = if needs_localization {
             collect_datasheet_localization_keys(
                 &paths,
-                (self.csv.is_none() && find.is_empty())
+                (out.is_none() && find.is_empty())
                     .then_some(self.rows)
                     .flatten(),
             )?
@@ -259,7 +289,15 @@ impl Datasheet {
             localization: localization.as_deref(),
             localize: self.localize,
         };
-        if let Some(out) = self.csv.as_ref() {
+        if let Some(out) = out {
+            if self.dry_run {
+                Report::new("datasheet export")
+                    .stat("dry-run", "yes")
+                    .stat("files", paths.len())
+                    .stat("output", out.display())
+                    .print();
+                return Ok(());
+            }
             return export_datasheets(&ctx, &root, &paths, out, &options, self.overwrite);
         }
         let batch = ctx.map_results_compact(
@@ -441,18 +479,11 @@ fn write_datasheet_csv(
 }
 
 fn datasheet_csv_output_path(root: &Path, source: &Path, out: &Path) -> PathBuf {
-    if root.is_file() && out.extension().is_some() {
+    if root.is_file() {
         return out.to_path_buf();
     }
 
-    let relative = if root.is_file() {
-        source
-            .file_name()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| source.to_path_buf())
-    } else {
-        source.strip_prefix(root).unwrap_or(source).to_path_buf()
-    };
+    let relative = source.strip_prefix(root).unwrap_or(source).to_path_buf();
     let mut output = out.join(relative);
     output.set_extension("csv");
     output
@@ -509,7 +540,7 @@ fn scan_sheet(path: &Path, options: &SheetOptions) -> Result<SheetScan> {
             sheet
                 .rows()
                 .enumerate()
-                .take(limit)
+                .take(if limit == 0 { usize::MAX } else { limit })
                 .map(|(index, row)| RowSample {
                     source: source.clone(),
                     row: index.to_string(),
@@ -549,7 +580,8 @@ fn sheet_summary_report(scans: &[SheetScan], limit: usize) -> Report {
         "Type",
     ])
     .right([2, 3, 4, 5, 6, 7]);
-    for scan in scans.iter().take(limit) {
+    let shown = crate::support::limit_count(scans.len(), limit);
+    for scan in scans.iter().take(shown) {
         let summary = &scan.summary;
         table.push([
             Cell::path(scan.source.clone()),
@@ -567,8 +599,8 @@ fn sheet_summary_report(scans: &[SheetScan], limit: usize) -> Report {
     if !table.is_empty() {
         report.table(table);
     }
-    if scans.len() > limit {
-        report.more(scans.len() - limit, "files");
+    if scans.len() > shown {
+        report.more(scans.len() - shown, "files");
     }
     report
 }

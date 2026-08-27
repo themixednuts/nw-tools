@@ -26,7 +26,9 @@ pub fn run(config: &Config) -> Result<Summary, String> {
     let mut files = collect_lua_files(&config.roots)?;
     files.sort();
     let total_files_seen = files.len();
-    files.truncate(config.limit);
+    if config.limit != 0 {
+        files.truncate(config.limit);
+    }
 
     let mut summary = Summary {
         roots: config.roots.clone(),
@@ -110,7 +112,7 @@ fn collect_lua_files(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
 
 fn collect_lua_files_inner(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     if !path.exists() {
-        return Ok(());
+        return Err(format!("corpus root does not exist: {}", path.display()));
     }
     if path.is_file() {
         if path.extension().is_some_and(|ext| ext == "lua") {

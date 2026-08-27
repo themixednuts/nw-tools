@@ -2,12 +2,12 @@ use std::{
     collections::BTreeSet,
     ffi::OsStr,
     fmt, fs,
-    io::{self, Read as _, Write as _},
+    io::{self, IsTerminal as _, Read as _, Write as _},
     path::{Path, PathBuf},
-    process,
+    process::{self, Command as ProcessCommand},
 };
 
-use clap::{ArgAction, ArgGroup, Parser};
+use clap::{ArgAction, ArgGroup, Parser, ValueEnum};
 use nw_jobs::JobRunner;
 use nw_lua::{
     LuaError,
@@ -15,27 +15,35 @@ use nw_lua::{
     version::{LuaTarget, LuaVersion},
 };
 
-const MAX_AUTOMATIC_JOBS: usize = 8;
-
 #[derive(Debug, Parser)]
 #[command(
     name = "nw-lua",
     version,
     about = "Disassemble or decompile Lua binary chunks",
     override_usage = "nw-lua [options] <file.luac>...",
-    group(ArgGroup::new("mode").args(["dis", "dec", "ssa_dump"]).multiple(false))
+    group(ArgGroup::new("output").args(["out", "out_dir"]).multiple(false)),
+    after_help = "Environment:\n  RUST_LOG  Layer tracing directives over -v/--verbose or -q/--quiet.\n  NO_COLOR  Disable automatic color output."
 )]
 struct Cli {
-    #[arg(long, action = ArgAction::SetTrue, help = "disassemble bytecode")]
-    dis: bool,
-    #[arg(
-        long,
-        action = ArgAction::SetTrue,
-        help = "decompile to Lua source (DEFAULT when no mode given)"
-    )]
-    dec: bool,
-    #[arg(long, action = ArgAction::SetTrue, help = "dump SSA IR for all protos")]
-    ssa_dump: bool,
+    /// Output encoding. JSON uses the stable `nw-lua.output.v1` envelope.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+
+    /// Increase default log verbosity (`-v` info, `-vv` debug, `-vvv` trace).
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
+
+    /// Restrict default diagnostics to errors. RUST_LOG can add directives.
+    #[arg(short, long, conflicts_with = "verbose")]
+    quiet: bool,
+
+    /// When to colorize diagnostic output.
+    #[arg(long, value_enum, default_value_t = ColorArg::Auto)]
+    color: ColorArg,
+
+    /// Lua rendering operation.
+    #[arg(long, value_enum, default_value_t = Mode::Decompile)]
+    mode: Mode,
     #[arg(
         long,
         action = ArgAction::SetTrue,
@@ -50,15 +58,15 @@ struct Cli {
     no_idiomatic: bool,
     #[arg(
         long,
-        value_name = "VER",
-        value_parser = parse_lua_version,
-        help = "override the detected complete compiler target (currently 51)"
+        value_name = "VERSION",
+        value_enum,
+        help = "override the detected Lua bytecode version"
     )]
-    lua_version: Option<LuaTarget>,
+    lua_version: Option<LuaVersionArg>,
     #[arg(
         long,
-        value_name = "F",
-        help = "load a custom opcode-table mapping from file F"
+        value_name = "FILE",
+        help = "load a custom opcode-table mapping from FILE"
     )]
     opcode_table: Option<PathBuf>,
     #[arg(long, action = ArgAction::SetTrue, help = "emit debug trace to stderr")]
@@ -67,26 +75,97 @@ struct Cli {
         short = 'j',
         long,
         value_name = "N",
-        default_value_t = default_jobs(),
-        value_parser = parse_jobs,
-        help = "maximum parallel workers for multiple input files"
+        help = "worker count; omit for automatic selection, or use 0 for the caller thread"
     )]
-    jobs: usize,
+    jobs: Option<usize>,
     #[arg(
         short,
-        long,
-        value_name = "F",
-        help = "write one result to file F, or multiple results under directory F"
+        long = "out",
+        alias = "output",
+        value_name = "FILE",
+        help = "write one input's rendered result to FILE"
     )]
-    output: Option<PathBuf>,
-    #[arg(value_name = "file.luac", allow_hyphen_values = true, num_args = 1..)]
+    out: Option<PathBuf>,
+    #[arg(
+        long = "out-dir",
+        value_name = "DIR",
+        help = "write multiple inputs' rendered results beneath DIR"
+    )]
+    out_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        requires = "output",
+        help = "replace existing output files"
+    )]
+    force: bool,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        requires = "output",
+        help = "read and render inputs without writing output files"
+    )]
+    dry_run: bool,
+    #[arg(value_name = "FILE", allow_hyphen_values = true, num_args = 1..)]
     inputs: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+enum OutputFormat {
+    /// Human-readable command output.
+    #[default]
+    Text,
+    /// Machine-readable output with rendered lines represented as strings.
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+enum ColorArg {
+    /// Colorize diagnostics only on a terminal when NO_COLOR is unset.
+    #[default]
+    Auto,
+    /// Always colorize diagnostic output.
+    Always,
+    /// Never colorize diagnostic output.
+    Never,
+}
+
+impl ColorArg {
+    fn stderr_ansi(self) -> bool {
+        match self {
+            Self::Auto => std::env::var_os("NO_COLOR").is_none() && io::stderr().is_terminal(),
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LuaVersionArg {
+    /// Lua 5.1 bytecode.
+    #[value(name = "51")]
+    Lua51,
+}
+
+impl LuaVersionArg {
+    fn target(self) -> LuaTarget {
+        match self {
+            Self::Lua51 => LuaTarget::for_version(LuaVersion::V51)
+                .expect("the built-in Lua 5.1 opcode table is available"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
+    /// Disassemble bytecode.
+    #[value(name = "dis")]
     Disassemble,
+    /// Decompile to Lua source.
+    #[value(name = "dec")]
     Decompile,
+    /// Dump SSA intermediate representation for every prototype.
+    #[value(name = "ssa")]
     SsaDump,
 }
 
@@ -106,7 +185,11 @@ fn main() {
 
 fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
-    let mode = cli.mode();
+    init_logging(cli.verbose, cli.quiet, cli.color);
+    if cli.format == OutputFormat::Json && std::env::var_os("NW_LUA_JSON_CHILD").is_none() {
+        return run_json_child();
+    }
+    let mode = cli.mode;
 
     validate_cli(&cli, mode)?;
     let table = load_opcode_table(&cli)?;
@@ -115,6 +198,26 @@ fn run() -> Result<(), CliError> {
     } else {
         run_batch(&cli, mode, table.as_ref())
     }
+}
+
+fn init_logging(verbosity: u8, quiet: bool, color: ColorArg) {
+    let level = match (quiet, verbosity) {
+        (true, _) => tracing_subscriber::filter::LevelFilter::ERROR,
+        (false, 0) => tracing_subscriber::filter::LevelFilter::WARN,
+        (false, 1) => tracing_subscriber::filter::LevelFilter::INFO,
+        (false, 2) => tracing_subscriber::filter::LevelFilter::DEBUG,
+        (false, _) => tracing_subscriber::filter::LevelFilter::TRACE,
+    };
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env_lossy();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .with_target(false)
+        .with_ansi(color.stderr_ansi())
+        .compact()
+        .try_init();
 }
 
 fn validate_cli(cli: &Cli, mode: Mode) -> Result<(), CliError> {
@@ -134,11 +237,58 @@ fn validate_cli(cli: &Cli, mode: Mode) -> Result<(), CliError> {
                 "stdin cannot be combined with multiple input files".to_string(),
             ));
         }
-        if cli.output.as_deref().is_none_or(is_dash) {
+        if cli.out.is_some() {
             return Err(CliError::Message(
-                "multiple input files require an output directory with --output".to_string(),
+                "multiple input files require --out-dir <DIR>, not --out".to_string(),
             ));
         }
+        if cli.out_dir.as_deref().is_none_or(is_dash) {
+            return Err(CliError::Message(
+                "multiple input files require --out-dir <DIR>".to_string(),
+            ));
+        }
+    } else if cli.out_dir.is_some() {
+        return Err(CliError::Message(
+            "one input file uses --out <FILE>, not --out-dir".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn run_json_child() -> Result<(), CliError> {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let Some(executable) = args.first() else {
+        return Ok(());
+    };
+    let output = ProcessCommand::new(executable)
+        .args(&args[1..])
+        .env("NW_LUA_JSON_CHILD", "1")
+        .output()
+        .map_err(|source| CliError::Io {
+            context: "run nw-lua JSON child".to_string(),
+            source,
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+    let document = serde_json::json!({
+        "schema": "nw-lua.output.v1",
+        "command": args[1..]
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        "success": output.status.success(),
+        "exit_code": output.status.code(),
+        "lines": stdout.lines().collect::<Vec<_>>(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&document).expect("serialize nw-lua output envelope")
+    );
+    if !output.status.success() {
+        process::exit(output.status.code().unwrap_or(1));
     }
     Ok(())
 }
@@ -169,7 +319,17 @@ fn run_single(cli: &Cli, mode: Mode, table: Option<&OpcodeTable>) -> Result<(), 
         table,
         module_stem.as_deref(),
     )?;
-    write_output(cli.output.as_deref(), &output)?;
+    write_output(cli.out.as_deref(), &output, cli.force, cli.dry_run)?;
+    if cli.dry_run {
+        eprintln!(
+            "dry-run: rendered {} -> {}",
+            input.display(),
+            cli.out
+                .as_deref()
+                .expect("--dry-run requires output")
+                .display()
+        );
+    }
     Ok(())
 }
 
@@ -182,15 +342,17 @@ struct BatchOutcome {
 }
 
 fn run_batch(cli: &Cli, mode: Mode, table: Option<&OpcodeTable>) -> Result<(), CliError> {
-    let output_dir = cli.output.as_deref().expect("validated output directory");
-    fs::create_dir_all(output_dir).map_err(|source| CliError::Io {
-        context: format!("create output directory {}", output_dir.display()),
-        source,
-    })?;
+    let output_dir = cli.out_dir.as_deref().expect("validated output directory");
     let outputs = batch_output_paths(&cli.inputs, output_dir, mode)?;
-    let jobs = cli.jobs.min(cli.inputs.len());
-    let runner = JobRunner::with_workers(jobs)
-        .map_err(|error| CliError::Message(format!("create {jobs}-worker pool: {error}")))?;
+    guard_outputs(&outputs, cli.force)?;
+    if !cli.dry_run {
+        fs::create_dir_all(output_dir).map_err(|source| CliError::Io {
+            context: format!("create output directory {}", output_dir.display()),
+            source,
+        })?;
+    }
+    let runner = JobRunner::from_jobs(cli.jobs)
+        .map_err(|error| CliError::Message(format!("create worker pool: {error}")))?;
 
     let outcomes = runner.map_indexed(cli.inputs.len(), |index| {
         let input = &cli.inputs[index];
@@ -210,6 +372,13 @@ fn run_batch(cli: &Cli, mode: Mode, table: Option<&OpcodeTable>) -> Result<(), C
                 outcome.output_bytes,
             );
         }
+    }
+    if cli.dry_run {
+        eprintln!(
+            "dry-run: rendered {} inputs beneath {}",
+            cli.inputs.len(),
+            output_dir.display()
+        );
     }
     Ok(())
 }
@@ -231,7 +400,7 @@ fn render_file(
         table,
         module_stem.as_deref(),
     )?;
-    write_output(Some(output), &rendered)?;
+    write_output(Some(output), &rendered, cli.force, cli.dry_run)?;
     Ok(BatchOutcome {
         input: input.to_path_buf(),
         output: output.to_path_buf(),
@@ -272,18 +441,6 @@ fn output_key(path: &Path) -> String {
         key.to_lowercase()
     } else {
         key.into_owned()
-    }
-}
-
-impl Cli {
-    fn mode(&self) -> Mode {
-        if self.dis {
-            Mode::Disassemble
-        } else if self.ssa_dump {
-            Mode::SsaDump
-        } else {
-            Mode::Decompile
-        }
     }
 }
 
@@ -362,7 +519,10 @@ fn annotate_source(disassembly: &str, source: &str) -> String {
 
 fn load_opcode_table(cli: &Cli) -> Result<Option<OpcodeTable>, CliError> {
     let Some(path) = &cli.opcode_table else {
-        return Ok(cli.lua_version.map(OpcodeTable::builtin));
+        return Ok(cli
+            .lua_version
+            .map(LuaVersionArg::target)
+            .map(OpcodeTable::builtin));
     };
 
     let text = fs::read_to_string(path).map_err(|source| CliError::Io {
@@ -371,7 +531,7 @@ fn load_opcode_table(cli: &Cli) -> Result<Option<OpcodeTable>, CliError> {
     })?;
     let table = OpcodeTable::from_custom_text(&text)?;
 
-    if let Some(version) = cli.lua_version
+    if let Some(version) = cli.lua_version.map(LuaVersionArg::target)
         && version != table.version
     {
         return Err(CliError::Message(format!(
@@ -401,12 +561,41 @@ fn read_input(path: &Path) -> Result<Vec<u8>, CliError> {
     }
 }
 
-fn write_output(path: Option<&Path>, output: &str) -> Result<(), CliError> {
+fn guard_outputs(paths: &[PathBuf], force: bool) -> Result<(), CliError> {
+    for path in paths {
+        guard_output(path, force)?;
+    }
+    Ok(())
+}
+
+fn guard_output(path: &Path, force: bool) -> Result<(), CliError> {
+    if !force && path.exists() {
+        return Err(CliError::Message(format!(
+            "output already exists: {} (use --force to replace it)",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn write_output(
+    path: Option<&Path>,
+    output: &str,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), CliError> {
     match path {
-        Some(path) if !is_dash(path) => fs::write(path, output).map_err(|source| CliError::Io {
-            context: format!("write {}", path.display()),
-            source,
-        }),
+        Some(path) if !is_dash(path) => {
+            guard_output(path, force)?;
+            if dry_run {
+                return Ok(());
+            }
+            fs::write(path, output).map_err(|source| CliError::Io {
+                context: format!("write {}", path.display()),
+                source,
+            })
+        }
+        _ if dry_run => Ok(()),
         _ => io::stdout()
             .lock()
             .write_all(output.as_bytes())
@@ -414,33 +603,6 @@ fn write_output(path: Option<&Path>, output: &str) -> Result<(), CliError> {
                 context: "write stdout".to_string(),
                 source,
             }),
-    }
-}
-
-fn parse_lua_version(value: &str) -> Result<LuaTarget, String> {
-    let version = match value {
-        "51" => LuaVersion::V51,
-        "52" => LuaVersion::V52,
-        "53" => LuaVersion::V53,
-        "54" => LuaVersion::V54,
-        "55" => LuaVersion::V55,
-        _ => return Err("expected one of 51, 52, 53, 54, 55".to_string()),
-    };
-    LuaTarget::for_version(version)
-        .map_err(|_| format!("unsupported Lua version {version}; only Lua 5.1 is supported"))
-}
-
-fn default_jobs() -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(MAX_AUTOMATIC_JOBS)
-}
-
-fn parse_jobs(value: &str) -> Result<usize, String> {
-    match value.parse() {
-        Ok(jobs) if jobs > 0 => Ok(jobs),
-        Ok(_) => Err("worker count must be greater than zero".to_string()),
-        Err(error) => Err(format!("invalid worker count: {error}")),
     }
 }
 

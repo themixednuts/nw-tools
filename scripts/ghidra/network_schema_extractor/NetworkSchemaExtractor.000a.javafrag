@@ -41,8 +41,8 @@
     }
 
     private AnalysisRequest analysisRequest() throws Exception {
-        if (isRunningHeadless()) {
-            return headlessAnalysisRequest(getScriptArgs());
+        if (isRunningHeadless() || !cli.positionals().isEmpty()) {
+            return headlessAnalysisRequest(cli.positionals().toArray(String[]::new));
         }
 
         List<AnalysisMode> modes = List.of(AnalysisMode.values());
@@ -164,38 +164,10 @@
     }
 
     private static Gson createGson() {
-        GsonBuilder builder = new GsonBuilder()
-            .disableHtmlEscaping();
-        if (envFlag("NW_NETWORK_SCHEMA_PRETTY")) {
-            builder.setPrettyPrinting();
-        }
-        return builder.create();
-    }
-
-    private static boolean envFlag(String name) {
-        String value = System.getenv(name);
-        if (value == null) {
-            return false;
-        }
-        value = value.trim();
-        return !value.isEmpty() &&
-            !"0".equals(value) &&
-            !"false".equalsIgnoreCase(value) &&
-            !"no".equalsIgnoreCase(value);
-    }
-
-    private static int envInt(String name, int defaultValue) {
-        String value = System.getenv(name);
-        if (value == null || value.isBlank()) {
-            return defaultValue;
-        }
-        try {
-            int parsed = Integer.parseInt(value.trim());
-            return parsed < 0 ? defaultValue : parsed;
-        }
-        catch (NumberFormatException ignored) {
-            return defaultValue;
-        }
+        return new GsonBuilder()
+            .disableHtmlEscaping()
+            .setPrettyPrinting()
+            .create();
     }
 
     private static <K, V> Map<K, V> lruCache(int maxEntries) {
@@ -413,7 +385,7 @@
     }
 
     private File inputFile() throws Exception {
-        String explicit = envValue("NW_NETWORK_SCHEMA_TYPEREGISTRY_JSON");
+        String explicit = cli.value("typeregistry", "NW_NETWORK_SCHEMA_TYPEREGISTRY_JSON");
         if (explicit != null) {
             return new File(explicit);
         }
@@ -421,6 +393,10 @@
     }
 
     private File outputFile(File input, AnalysisRequest analysis) {
+        String explicit = cli.value("out", "NW_NETWORK_SCHEMA_OUT");
+        if (explicit != null) {
+            return new File(explicit);
+        }
         File parent = input.getParentFile();
         if (parent == null) {
             parent = new File(".");
@@ -443,6 +419,9 @@
     }
 
     private File writeReportFile(File output, JsonObject report, Gson gson) throws IOException {
+        if (dryRun) {
+            return output.getAbsoluteFile();
+        }
         Path outputPath = output.toPath();
         Path absoluteOutput = outputPath.toAbsolutePath();
         Path parent = absoluteOutput.getParent();
@@ -573,12 +552,23 @@
         return parent == null ? new File(fallbackName).toPath() : parent.resolve(fallbackName);
     }
 
-    private String envValue(String name) {
-        String value = System.getenv(name);
-        if (value == null || value.trim().isEmpty()) {
-            return null;
-        }
-        return value.trim();
+    private void printCliHelp() {
+        println("NetworkSchemaExtractor " + EXTRACTOR_VERSION);
+        println("Extract New World network type and field registration evidence.");
+        println("");
+        println("Usage:");
+        println("  NetworkSchemaExtractor [full] [OPTIONS]");
+        println("  NetworkSchemaExtractor types <INDICES> [OPTIONS]");
+        println("  NetworkSchemaExtractor handlers <VTABLES> [OPTIONS]");
+        println("  NetworkSchemaExtractor trace <ADDRESS> [OPTIONS]");
+        println("");
+        println("Options:");
+        println("  --typeregistry <FILE>  TypeRegistry JSON [env: NW_NETWORK_SCHEMA_TYPEREGISTRY_JSON]");
+        println("  --out <FILE>           Output report [env: NW_NETWORK_SCHEMA_OUT]");
+        println("  --force                Replace an existing report");
+        println("  --dry-run              Analyze without filesystem writes");
+        println("  -h, --help             Print help");
+        println("  -V, --version          Print version");
     }
 
     private void loadSerializeTypeIndex(File typeregistryInput) {

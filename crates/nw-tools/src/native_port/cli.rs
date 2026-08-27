@@ -21,6 +21,8 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use walkdir::WalkDir;
 
+use crate::ui::{Cell, Report, Table};
+
 use super::{
     AssetId, DecodedClass, Inventory, MappedSource, Mapper, SourceInput, normalize_legacy_path,
     writer::write_native_sources,
@@ -43,10 +45,14 @@ pub enum Cmd {
         /// Extracted/legacy content root to walk.
         root: PathBuf,
         /// Output directory for the native `assets/` tree (must not exist).
+        #[arg(long = "out-dir", value_name = "DIR")]
         out: PathBuf,
         /// Optional RASC `assetcatalog.catalog` for identity preservation.
         #[arg(long)]
         catalog: Option<PathBuf>,
+        /// Print and validate the publication plan without writing native sources.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -60,7 +66,12 @@ impl Cmd {
     pub fn run(self) -> Result<()> {
         match self {
             Self::Inventory { root, catalog } => run_inventory(&root, catalog.as_deref()),
-            Self::Publish { root, out, catalog } => run_publish(&root, &out, catalog.as_deref()),
+            Self::Publish {
+                root,
+                out,
+                catalog,
+                dry_run,
+            } => run_publish(&root, &out, catalog.as_deref(), dry_run),
         }
     }
 }
@@ -90,7 +101,7 @@ fn run_inventory(root: &Path, catalog: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn run_publish(root: &Path, out: &Path, catalog: Option<&Path>) -> Result<()> {
+fn run_publish(root: &Path, out: &Path, catalog: Option<&Path>, dry_run: bool) -> Result<()> {
     let catalog = catalog.map(load_catalog).transpose()?;
     let walked = walk_root(root, catalog.as_ref())?;
 
@@ -104,6 +115,15 @@ fn run_publish(root: &Path, out: &Path, catalog: Option<&Path>) -> Result<()> {
     print_report(root, &inventory);
     if inventory.has_blocking_errors() {
         anyhow::bail!("texture slice has blocking errors; refusing to write");
+    }
+
+    if dry_run {
+        Report::new("port publish")
+            .stat("dry-run", "yes")
+            .stat("sources", inventory.sources.len())
+            .stat("output", out.display())
+            .print();
+        return Ok(());
     }
 
     // Map normalized legacy path -> disk path for the payload reader.
@@ -122,12 +142,11 @@ fn run_publish(root: &Path, out: &Path, catalog: Option<&Path>) -> Result<()> {
     };
 
     let summary = write_native_sources(&inventory.sources, &reader, out)?;
-    println!(
-        "wrote {} native texture sources ({} catalog-preserved) into {}",
-        summary.source_count,
-        summary.preserved_count,
-        summary.output.display()
-    );
+    Report::new("port publish")
+        .stat("sources", summary.source_count)
+        .stat("catalog-preserved", summary.preserved_count)
+        .stat("output", summary.output.display())
+        .print();
     Ok(())
 }
 
@@ -276,48 +295,64 @@ fn classify(path: &str) -> Option<DecodedClass> {
 }
 
 fn print_report(root: &Path, inventory: &Inventory) {
-    println!("pass-1 inventory for {}", root.display());
-    println!("  mapped sources:        {}", inventory.sources.len());
-    println!(
-        "  uncataloged fallbacks: {}",
-        inventory.uncataloged_fallbacks
-    );
-    println!(
-        "  exceptions hit:        {}",
-        inventory.exceptions_hit.len()
-    );
-    println!("  counts per legacy tree:");
+    let mut report = Report::new("port inventory")
+        .stat("root", root.display())
+        .stat("mapped", inventory.sources.len())
+        .stat("uncataloged", inventory.uncataloged_fallbacks)
+        .stat("exceptions", inventory.exceptions_hit.len());
+
+    let mut tree_rows = Table::new(["Legacy tree", "Sources"]).right([1]);
     for (tree, count) in &inventory.tree_counts {
-        println!("    {tree:<14} {count}");
+        tree_rows.push([Cell::path(tree), Cell::text(count.to_string())]);
     }
+    report.table_or(tree_rows, "no mapped legacy trees");
+
     if !inventory.blocked.is_empty() {
-        println!("  BLOCKED (publication hard-fail):");
+        report.section("Blocked");
+        let mut rows = Table::new(["Source", "Destination", "Reason"]);
         for blocked in &inventory.blocked {
-            println!(
-                "    {} -> {} ({})",
-                blocked.normalized_legacy_path, blocked.canonical_path, blocked.reason
-            );
+            rows.push([
+                Cell::path(&blocked.normalized_legacy_path),
+                Cell::path(&blocked.canonical_path),
+                Cell::text(&blocked.reason),
+            ]);
         }
+        report.table(rows);
     }
     if !inventory.collisions.is_empty() {
-        println!("  COLLISIONS:");
+        report.section("Collisions");
+        let mut rows = Table::new(["Kind", "Key", "First input", "Second input"]);
         for collision in &inventory.collisions {
-            println!(
-                "    {:?} on `{}`: `{}` vs `{}`",
-                collision.kind, collision.key, collision.first_input, collision.second_input
-            );
+            rows.push([
+                Cell::text(format!("{:?}", collision.kind)),
+                Cell::text(&collision.key),
+                Cell::path(&collision.first_input),
+                Cell::path(&collision.second_input),
+            ]);
         }
+        report.table(rows);
     }
     if !inventory.route_errors.is_empty() {
-        println!("  UNMAPPED:");
+        report.section("Unmapped");
+        let mut rows = Table::new(["Source", "Reason"]);
         for failure in &inventory.route_errors {
-            println!("    {}: {}", failure.original_spelling, failure.detail);
+            rows.push([
+                Cell::path(&failure.original_spelling),
+                Cell::text(&failure.detail),
+            ]);
         }
+        report.table(rows);
     }
     if !inventory.normalize_errors.is_empty() {
-        println!("  NORMALIZE ERRORS:");
+        report.section("Normalization errors");
+        let mut rows = Table::new(["Source", "Reason"]);
         for failure in &inventory.normalize_errors {
-            println!("    {}: {}", failure.original_spelling, failure.detail);
+            rows.push([
+                Cell::path(&failure.original_spelling),
+                Cell::text(&failure.detail),
+            ]);
         }
+        report.table(rows);
     }
+    report.print();
 }

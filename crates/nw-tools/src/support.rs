@@ -108,6 +108,7 @@ pub struct PakSet {
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct AssetRootArg {
+    /// New World asset directory; defaults to the detected game installation.
     #[arg(long, value_name = "ROOT")]
     root: Option<PathBuf>,
 }
@@ -282,7 +283,7 @@ pub enum Overwrite {
 }
 
 impl From<bool> for Overwrite {
-    /// Maps a `--overwrite` flag: `true` ⇒ [`Overwrite::Replace`].
+    /// Maps a `--force` flag: `true` ⇒ [`Overwrite::Replace`].
     fn from(replace: bool) -> Self {
         if replace { Self::Replace } else { Self::Keep }
     }
@@ -295,7 +296,7 @@ impl From<bool> for Overwrite {
 /// Returns an error if the file exists and `overwrite` is [`Overwrite::Keep`].
 pub fn guard_existing(path: &Path, overwrite: Overwrite) -> Result<()> {
     if overwrite == Overwrite::Keep && path.exists() {
-        bail!("{} exists (pass --overwrite to replace it)", path.display());
+        bail!("{} exists (pass --force to replace it)", path.display());
     }
     Ok(())
 }
@@ -326,6 +327,16 @@ pub fn write_guarded(path: &Path, bytes: &[u8], overwrite: Overwrite) -> Result<
     ensure_parent(path)?;
     std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+/// Number of rows to take under the CLI limit contract (`0` means unlimited).
+#[must_use]
+pub const fn limit_count(total: usize, limit: usize) -> usize {
+    if limit == 0 || total < limit {
+        total
+    } else {
+        limit
+    }
 }
 
 fn collect_matching_inner(
@@ -397,6 +408,13 @@ fn wildcard_matches_bytes(pattern: &[u8], value: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_limit_takes_every_row() {
+        assert_eq!(limit_count(17, 0), 17);
+        assert_eq!(limit_count(17, 3), 3);
+        assert_eq!(limit_count(2, 3), 2);
+    }
 
     #[test]
     fn pak_mount_root_omits_root_level_pak_name() {

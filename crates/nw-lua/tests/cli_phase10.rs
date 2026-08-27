@@ -19,12 +19,12 @@ fn command() -> Command {
 #[test]
 fn cli_disassembles_shopcommon() {
     let output = command()
-        .arg("--dis")
+        .args(["--mode", "dis"])
         .arg(fixture("shopcommon.luac"))
         .output()
-        .expect("run nw-lua --dis");
+        .expect("run nw-lua --mode dis");
 
-    let stdout = assert_success(output, "--dis");
+    let stdout = assert_success(output, "--mode dis");
     assert!(!stdout.trim().is_empty());
     assert!(stdout.contains("GETGLOBAL"), "{stdout}");
     assert!(stdout.contains("RETURN"), "{stdout}");
@@ -57,18 +57,18 @@ fn cli_decompiles_shopcommon_by_default_and_reparses() {
 #[test]
 fn cli_ssa_dump_is_non_empty_and_deterministic() {
     let first = command()
-        .arg("--ssa-dump")
+        .args(["--mode", "ssa"])
         .arg(fixture("shopcommon.luac"))
         .output()
-        .expect("run first nw-lua --ssa-dump");
+        .expect("run first nw-lua --mode ssa");
     let second = command()
-        .arg("--ssa-dump")
+        .args(["--mode", "ssa"])
         .arg(fixture("shopcommon.luac"))
         .output()
-        .expect("run second nw-lua --ssa-dump");
+        .expect("run second nw-lua --mode ssa");
 
-    let first = assert_success(first, "first --ssa-dump");
-    let second = assert_success(second, "second --ssa-dump");
+    let first = assert_success(first, "first --mode ssa");
+    let second = assert_success(second, "second --mode ssa");
     assert!(!first.trim().is_empty());
     assert_eq!(first, second);
 }
@@ -83,14 +83,15 @@ fn cli_rejects_future_lua_version_override_cleanly() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unsupported Lua version 5.4"), "{stderr}");
+    assert!(stderr.contains("invalid value '54'"), "{stderr}");
+    assert!(stderr.contains("possible values: 51"), "{stderr}");
     assert!(!stderr.to_ascii_lowercase().contains("panic"), "{stderr}");
 }
 
 #[test]
 fn cli_accepts_custom_opcode_table() {
     let output = command()
-        .arg("--dis")
+        .args(["--mode", "dis"])
         .arg("--opcode-table")
         .arg(fixture("idle_heroes.txt"))
         .arg(fixture("shopcommon.luac"))
@@ -106,7 +107,7 @@ fn cli_accepts_custom_opcode_table() {
 fn cli_reads_luac_from_stdin() {
     let bytes = fs::read(fixture("shopcommon.luac")).expect("read shopcommon fixture");
     let mut child = command()
-        .arg("--dis")
+        .args(["--mode", "dis"])
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -130,7 +131,7 @@ fn cli_reads_luac_from_stdin() {
 fn cli_parallel_batch_decompiles_to_deterministic_output_names() {
     let output_dir = tempfile::tempdir().expect("create batch output directory");
     let output = command()
-        .args(["--jobs", "2", "--output"])
+        .args(["--jobs", "2", "--out-dir"])
         .arg(output_dir.path())
         .arg(fixture("shopcommon.luac"))
         .arg(fixture("linear/local_add.luac"))
@@ -157,7 +158,7 @@ fn cli_batch_requires_an_output_directory() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("require an output directory"), "{stderr}");
+    assert!(stderr.contains("require --out-dir <DIR>"), "{stderr}");
 }
 
 fn assert_success(output: Output, context: &str) -> String {
