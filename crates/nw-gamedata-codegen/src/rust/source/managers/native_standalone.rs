@@ -183,6 +183,9 @@ fn build_manager_augmentation(
         NativeManagerShape::OneTableCrcKeyProjection(shape) => {
             context.crc_projection(shape, "one_table_crc_projection")
         }
+        NativeManagerShape::StaticBackstoryData(shape) => {
+            context.crc_projection(shape.projection(), "one_table_crc_projection")
+        }
         NativeManagerShape::MultiTableCrcKeyProjection(shape) => {
             let values = shape
                 .projections()

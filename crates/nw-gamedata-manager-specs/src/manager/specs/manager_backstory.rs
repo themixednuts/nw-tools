@@ -1,7 +1,23 @@
 use super::*;
 
+/// `StaticBackstoryDataManager` is a CRC-key projection wrapped in a bespoke
+/// shape, because three of its columns cannot be expressed as a
+/// [`NativeProjectionTransform`]:
+///
+///   * `InventoryItem` - `ItemDescriptor` values with bracket tags, a native
+///     `strtol` gear score, and five fixed perk slots
+///   * `WeaponMasteries` - `Name:Amount` pairs, also carried as parallel cells
+///   * `CategoricalProgression` - the same pair splitting, folded together with
+///     eighteen per-skill columns
+///
+/// Those three belong to the emitter, which authors its own parse helpers into
+/// the emitted module the way `loot_bucket_data` does. Everything the transform
+/// vocabulary *can* express stays in the projection below, so the standalone
+/// language products keep lowering this manager exactly as they did when it was
+/// a plain [`NativeManagerShape::OneTableCrcKeyProjection`] - they project these
+/// columns and have never carried the bespoke three.
 pub(super) fn static_backstory_data_manager_spec() -> NativeManagerSpec {
-    crc_projection(CrcProjectionSpec {
+    let projected = crc_projection(CrcProjectionSpec {
         module: "static_backstory_data",
         table_name: "Backstory",
         row_type_name: "BackstoryDefinition",
@@ -57,6 +73,30 @@ pub(super) fn static_backstory_data_manager_spec() -> NativeManagerSpec {
                 "intelligence",
                 NativeProjectionTransform::U32,
             ),
+            projection_field(
+                "add_to_loadouts",
+                "AddToLoadouts",
+                "add_to_loadouts",
+                NativeProjectionTransform::Bool,
+            ),
+            projection_field(
+                "objective_unlock_override",
+                "ObjectiveUnlockOverride",
+                "objective_unlock_override",
+                NativeProjectionTransform::StringList,
+            ),
+            projection_field(
+                "achievement_unlock_override",
+                "AchievementUnlockOverride",
+                "achievement_unlock_override",
+                NativeProjectionTransform::StringList,
+            ),
+            projection_field(
+                "force_ftue",
+                "ForceFTUE",
+                "force_ftue",
+                NativeProjectionTransform::Bool,
+            ),
         ],
         secondary_indexes: Vec::new(),
         lookup_methods: vec![
@@ -81,5 +121,14 @@ pub(super) fn static_backstory_data_manager_spec() -> NativeManagerSpec {
             "Javelin::StaticBackstoryDataManager::StaticBackstoryDataManager",
             "Javelin::StaticBackstoryDataManager::CacheAllDataTables",
         ],
-    })
+    });
+
+    let Some(NativeManagerShape::OneTableCrcKeyProjection(projection)) = projected.shape().cloned()
+    else {
+        unreachable!("crc_projection builds a one-table CRC-key projection shape");
+    };
+
+    projected.with_shape(NativeManagerShape::static_backstory_data(
+        NativeStaticBackstoryDataManager::new(ident("static_backstory_data"), projection),
+    ))
 }

@@ -19,10 +19,10 @@ use nw_serialize_codegen::{
     SerializeCodegenRootMode, SerializeCodegenRootSelection, SerializeCodegenSelectionManifest,
     SerializeCodegenUnit, SerializeContextCompileInputs, SerializeContextCompiler,
     SerializeContextDocument, Severity, TypeScriptSourceEmitter, TypeScriptStandaloneProjectFile,
-    TypeScriptStandaloneProjectOptions, class_registration_trace_root_from_jsonl_str,
+    TypeScriptStandaloneProjectOptions, WirePlan, class_registration_trace_root_from_jsonl_str,
     complete_known_missing_reflected_bodies, is_module_descriptor_json_name,
     module_descriptor_capture, module_descriptors_root, module_descriptors_root_from_capture,
-    module_name_from_path, module_name_from_resource_name, resolve_codegen_root_type_ids,
+    module_name_from_path, module_name_from_resource_name, resolve_codegen_root_type_ids, wire,
 };
 use rust_embed::RustEmbed;
 use serde::Serialize;
@@ -55,6 +55,21 @@ enum Command {
     NetworkSchema(NetworkSchemaArgs),
     /// Generate Rust descriptor source from a normalized network schema JSON.
     NetworkRust(NetworkRustArgs),
+    /// Write each module's gridmate wire enumeration into a crate's own source.
+    Wire(WireArgs),
+}
+
+#[derive(Debug, Args)]
+struct WireArgs {
+    /// Crate `src` directory to scan and rewrite.
+    #[arg(long)]
+    root: PathBuf,
+    /// Write the rendered blocks. Without it the run only reports what it found.
+    #[arg(long)]
+    apply: bool,
+    /// Worker count. Omit for Rayon default; use 0 to run on the caller thread.
+    #[arg(long)]
+    jobs: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -277,7 +292,57 @@ fn main() -> Result<()> {
         Command::Generate(args) => generate(&args, status),
         Command::NetworkSchema(args) => network_schema(&args, status),
         Command::NetworkRust(args) => network_rust(&args, status),
+        Command::Wire(args) => write_wire_registration(&args, status),
     }
+}
+
+fn write_wire_registration(args: &WireArgs, status: CodegenStatus) -> Result<()> {
+    let context = codegen_context(args.jobs, status)?;
+    let plan = wire::plan(&args.root, &context)
+        .with_context(|| format!("plan wire registration for {}", args.root.display()))?;
+
+    // Reported before any write, and reported even on a dry run: a type the
+    // scan cannot name is one no host will decode, and that is the answer a
+    // caller needs whether or not the blocks land.
+    for skip in &plan.skipped {
+        eprintln!(
+            "skipped {} ({}): {}",
+            skip.name,
+            skip.reason,
+            skip.path.display()
+        );
+    }
+    // Named before the counts, because a clash means two types are fighting
+    // over one identity and the counts below are describing a tree that cannot
+    // compose. Every one is listed: a host's `finalize` fails on the first it
+    // reaches, so discovering them one at a time costs a cycle each.
+    for clash in &plan.clashes {
+        eprintln!("clash {clash}");
+    }
+    let classes = plan.files.iter().map(|file| file.classes).sum::<usize>();
+    let fragments = plan.files.iter().map(|file| file.fragments).sum::<usize>();
+    let introspects = plan
+        .files
+        .iter()
+        .map(|file| file.introspects)
+        .sum::<usize>();
+    println!(
+        "wire registration: {} module(s), {} class(es), {} fragment(s), {} introspect(s), {} declared-but-unlisted, {} identity clash(es)",
+        plan.files.len(),
+        classes,
+        fragments,
+        introspects,
+        plan.unenumerated().len(),
+        plan.clashes.len()
+    );
+
+    if args.apply {
+        wire::apply(&plan).context("write wire registration blocks")?;
+        println!("wrote {} module(s)", plan.files.len());
+    } else {
+        println!("dry run; pass --apply to write");
+    }
+    Ok(())
 }
 
 fn init_status(mode: StatusMode) -> Result<CodegenStatus> {
@@ -704,7 +769,9 @@ fn network_rust(args: &NetworkRustArgs, status: CodegenStatus) -> Result<()> {
         Some(root) => {
             let inventory = RustSourceInventory::from_root(root, &context)
                 .with_context(|| format!("scan Rust source root {}", root.display()))?;
-            let audit = audit_network_rust_source(&schema, &inventory);
+            let wire = wire::plan(root, &context)
+                .with_context(|| format!("plan wire registration for {}", root.display()))?;
+            let audit = audit_network_rust_source(&schema, &inventory, Some(&wire));
             progress.advance_with_message(1, Some("audited Rust source".to_owned()));
             Some(audit)
         }
@@ -760,13 +827,15 @@ fn network_rust(args: &NetworkRustArgs, status: CodegenStatus) -> Result<()> {
             write_path_if_changed(report_path, &report)?;
         }
         println!(
-            "source audit: {} checked, {} current, {} missing, {} ambiguous, {} field mismatch, {} derive mismatch",
+            "source audit: {} checked, {} current, {} missing, {} ambiguous, {} field mismatch, {} derive mismatch, {} not enumerated ({} declared-but-unlisted overall)",
             audit.checked_type_count,
             audit.current_type_count,
             audit.missing_type_count,
             audit.ambiguous_type_count,
             audit.field_count_mismatch_count,
-            audit.derive_mismatch_count
+            audit.derive_mismatch_count,
+            audit.not_enumerated_count,
+            audit.unenumerated_types.len()
         );
     }
     println!(
@@ -929,7 +998,15 @@ struct NetworkRustSourceAudit {
     ambiguous_type_count: usize,
     field_count_mismatch_count: usize,
     derive_mismatch_count: usize,
+    not_enumerated_count: usize,
     items: Vec<NetworkRustSourceAuditItem>,
+    /// Types the source declares with a wire derive that no module's
+    /// enumeration names, whether or not the network schema knows them.
+    ///
+    /// The per-item status only reaches types the schema carries; this is the
+    /// whole-crate answer, and it is the one that matters, because an omitted
+    /// type is absent from every host that composes this crate.
+    unenumerated_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -955,11 +1032,20 @@ enum NetworkRustSourceAuditStatus {
     Ambiguous,
     FieldCountMismatch,
     DeriveMismatch,
+    /// The type is declared with its wire derives and no module's `classes()`
+    /// names it, so no composed host can decode it.
+    ///
+    /// This is the omission the derives used to make impossible by submitting
+    /// themselves. Nothing scans for derives at compose time any more — the
+    /// enumeration is the answer — so a type left out is silently absent, and
+    /// this status is where that shows up.
+    NotEnumerated,
 }
 
 fn audit_network_rust_source(
     schema: &NetworkSchema,
     inventory: &RustSourceInventory,
+    wire: Option<&WirePlan>,
 ) -> NetworkRustSourceAudit {
     let mut items = Vec::new();
     for network_type in schema
@@ -972,12 +1058,20 @@ fn audit_network_rust_source(
         };
         let rust_name = rust_source_candidate_name(schema_name);
         let candidates = rust_source_candidates(inventory, network_type, schema_name, &rust_name);
-        items.push(audit_network_rust_source_item(
-            network_type,
-            schema_name,
-            &rust_name,
-            candidates,
-        ));
+        let mut item =
+            audit_network_rust_source_item(network_type, schema_name, &rust_name, candidates);
+        // Enumeration is checked only for a type the source actually declares:
+        // a `Missing` or `Ambiguous` type has no single declaration to enumerate,
+        // and reporting it twice would hide the first, more actionable answer.
+        if matches!(item.status, NetworkRustSourceAuditStatus::Current)
+            && wire.is_some_and(|wire| {
+                wire.declared.contains_key(&item.rust_name)
+                    && !wire.enumerated.contains(&item.rust_name)
+            })
+        {
+            item.status = NetworkRustSourceAuditStatus::NotEnumerated;
+        }
+        items.push(item);
     }
 
     let mut counts = BTreeMap::<NetworkRustSourceAuditStatus, usize>::new();
@@ -1002,7 +1096,18 @@ fn audit_network_rust_source(
         derive_mismatch_count: *counts
             .get(&NetworkRustSourceAuditStatus::DeriveMismatch)
             .unwrap_or(&0),
+        not_enumerated_count: *counts
+            .get(&NetworkRustSourceAuditStatus::NotEnumerated)
+            .unwrap_or(&0),
         items,
+        unenumerated_types: wire
+            .map(|wire| {
+                wire.unenumerated()
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

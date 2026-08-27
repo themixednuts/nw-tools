@@ -201,6 +201,8 @@ pub use rust::identity::{RustTypeIdentityKind, RustTypeIdentityPlan};
 pub use rust::integrate::source_index::{
     RustDeriveCapabilities, RustSourceTypeIndex, RustSourceTypeLocation,
 };
+pub use rust::integrate::wire;
+pub use rust::integrate::wire::{WireFile, WireKind, WirePlan, WireSkip, WireSkipReason, WireType};
 pub use rust::integrate::{
     FlatRustItemPathResolver, RustIntegrationAction, RustIntegrationError, RustIntegrationItemPlan,
     RustIntegrationPlan, RustIntegrationPlanner, RustItemPathResolver, RustSourceInventory,
