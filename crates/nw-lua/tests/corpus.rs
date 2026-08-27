@@ -527,6 +527,11 @@ fn run_nw_corpus_structural_sample(limit: usize, label: &str) {
         eprintln!("skipping NW corpus test; corpus roots are missing");
         return;
     }
+    let Some(worker) = option_env!("CARGO_BIN_EXE_nw-lua-corpus-child") else {
+        eprintln!("skipping NW corpus test; enable the corpus-tests feature");
+        return;
+    };
+    let worker = Path::new(worker);
 
     let files = corpus_files(limit);
     assert!(!files.is_empty(), "NW corpus roots contained no Lua files");
@@ -544,7 +549,6 @@ fn run_nw_corpus_structural_sample(limit: usize, label: &str) {
     let mut structural_matched_ops = 0usize;
     let mut structural_total_ops = 0usize;
     let mut buckets = BTreeMap::<String, FailureBucket>::new();
-    let worker = Path::new(env!("CARGO_BIN_EXE_nw-lua-corpus-child"));
 
     for source in &files {
         let paths = TempPaths::new("phase9c_corpus");
@@ -659,12 +663,8 @@ fn run_child_structural(worker: &Path, bytecode: &Path) -> Result<ChildReport, F
         .output()
         .map_err(|err| FileResult::Crash(err.to_string()))?;
 
-    if !output.status.success() {
-        return Err(FileResult::Crash(output_summary(&output)));
-    }
-
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.lines().any(|line| line.trim() == CHILD_OK) {
+    if output.status.success() && stdout.lines().any(|line| line.trim() == CHILD_OK) {
         return Ok(parse_child_report(&stdout));
     }
     if let Some(message) = stdout
@@ -674,6 +674,10 @@ fn run_child_structural(worker: &Path, bytecode: &Path) -> Result<ChildReport, F
         return Err(FileResult::Err(
             message.trim_start_matches('\t').trim().to_string(),
         ));
+    }
+
+    if !output.status.success() {
+        return Err(FileResult::Crash(output_summary(&output)));
     }
 
     Err(FileResult::Crash(format!(

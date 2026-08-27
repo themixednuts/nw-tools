@@ -20,6 +20,25 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn main() {
     let args = env::args_os().collect::<Vec<_>>();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--help" || arg == "-h")
+    {
+        println!(
+            "Internal New World Lua corpus worker\n\n\
+             Usage:\n  nw-lua-corpus-child <chunk.luac>\n  \
+             nw-lua-corpus-child --idempotent <luac.exe> <chunk.luac>\n  \
+             nw-lua-corpus-child --structural <luac.exe> <chunk.luac>"
+        );
+        return;
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("nw-lua-corpus-child {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let result = if args.get(1).is_some_and(|arg| arg == "--idempotent") {
         let Some(luac) = args.get(2) else {
             eprintln!("usage: nw-lua-corpus-child --idempotent <luac.exe> <chunk.luac>");
@@ -55,7 +74,7 @@ fn main() {
         }
         Err(error) => {
             println!("{CHILD_ERR}\t{}", one_line(&error));
-            process::exit(0);
+            process::exit(1);
         }
     }
 }

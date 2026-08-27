@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+autobins = false
+
+[features]
+corpus-tests = []
 
 [lints]
 workspace = true
@@ -18,8 +22,10 @@ full_moon.workspace = true
 heck.workspace = true
 nw-jobs.workspace = true
 petgraph.workspace = true
+serde_json.workspace = true
 stylua.workspace = true
 thiserror.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -31,6 +37,11 @@ path = "src/bin/nw-lua.rs"
 [[bin]]
 name = "nw-lua-fidelity"
 path = "src/bin/nw-lua-fidelity.rs"
+
+[[bin]]
+name = "nw-lua-corpus-child"
+path = "src/bin/nw-lua-corpus-child.rs"
+required-features = ["corpus-tests"]
 
 [[bench]]
 name = "decompile_hot_path"

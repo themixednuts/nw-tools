@@ -16,16 +16,17 @@ Usage:
 
 ```text
 nw-lua [options] <file.luac>...
-  --dis                 disassemble bytecode
-  --dec                 decompile to Lua source (default)
-  --ssa-dump            dump SSA IR for all protos
+  --mode <dis|dec|ssa>  rendering operation (default: dec)
   --annotate            prepend disassembly as Lua comments during decompilation
   --no-idiomatic        skip idiomatic AST cleanup during decompilation
   --lua-version <VER>   override the detected complete compiler target (currently 51)
   --opcode-table <F>    load a custom opcode-table mapping from file F
   --debug               emit debug trace to stderr
   -j, --jobs <N>        maximum parallel workers for multiple input files
-  -o, --output <F>      write one result to F, or multiple results under directory F
+  -o, --out <FILE>      write one input's rendered result to FILE
+      --out-dir <DIR>   write multiple inputs' rendered results beneath DIR
+      --force           replace existing output files
+      --dry-run         read and render inputs without writing output files
   -h, --help            print help
   -V, --version         print version
 ```
@@ -33,10 +34,10 @@ nw-lua [options] <file.luac>...
 Examples:
 
 ```powershell
-cargo run -p nw-lua --bin nw-lua -- --dec crates/nw-lua/tests/fixtures/shopcommon.luac
-cargo run -p nw-lua --bin nw-lua -- --dis --opcode-table crates/nw-lua/tests/fixtures/idle_heroes.txt crates/nw-lua/tests/fixtures/shopcommon.luac
-cargo run -p nw-lua --bin nw-lua -- --ssa-dump crates/nw-lua/tests/fixtures/shopcommon.luac -o shopcommon.ssa.txt
-cargo run -p nw-lua --bin nw-lua -- --jobs 8 --output decompiled one.luac two.luac three.luac
+cargo run -p nw-lua --bin nw-lua -- --mode dec crates/nw-lua/tests/fixtures/shopcommon.luac
+cargo run -p nw-lua --bin nw-lua -- --mode dis --opcode-table crates/nw-lua/tests/fixtures/idle_heroes.txt crates/nw-lua/tests/fixtures/shopcommon.luac
+cargo run -p nw-lua --bin nw-lua -- --mode ssa crates/nw-lua/tests/fixtures/shopcommon.luac -o shopcommon.ssa.txt
+cargo run -p nw-lua --bin nw-lua -- --jobs 8 --out-dir decompiled one.luac two.luac three.luac
 ```
 
 Multiple inputs are processed in parallel with deterministic names under the
