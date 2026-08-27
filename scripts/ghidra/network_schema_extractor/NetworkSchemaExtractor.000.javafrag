@@ -190,20 +190,13 @@ public class NetworkSchemaExtractor extends GhidraScript {
     private static final int CONTAINER_VALUE_SHAPE_REJECT_SAMPLE_LIMIT = 96;
     private static final int FIELD_WIRE_SHAPE_SAMPLE_LIMIT = 96;
     private static final int PCODE_MESSAGE_REJECT_SAMPLE_LIMIT = 64;
-    private static final int HIGH_FUNCTION_CACHE_LIMIT =
-        envInt("NW_NETWORK_SCHEMA_HIGH_FUNCTION_CACHE_LIMIT", 512);
-    private static final int SMALL_HIGH_FUNCTION_CACHE_LIMIT =
-        envInt("NW_NETWORK_SCHEMA_SMALL_HIGH_FUNCTION_CACHE_LIMIT", 4096);
-    private static final int SMALL_HIGH_FUNCTION_BYTE_LIMIT =
-        envInt("NW_NETWORK_SCHEMA_SMALL_HIGH_FUNCTION_BYTE_LIMIT", 256);
-    private static final int FUNCTION_INSTRUCTION_CACHE_LIMIT =
-        envInt("NW_NETWORK_SCHEMA_INSTRUCTION_CACHE_LIMIT", 8192);
-    private static final int FUNCTION_LOOKUP_CACHE_LIMIT =
-        envInt("NW_NETWORK_SCHEMA_FUNCTION_CACHE_LIMIT", 32768);
-    private static final int PCODE_MEMORY_PATH_CACHE_LIMIT =
-        envInt("NW_NETWORK_SCHEMA_MEMORY_PATH_CACHE_LIMIT", 65536);
-    private static final int CODEC_CLASSIFICATION_CACHE_LIMIT =
-        envInt("NW_NETWORK_SCHEMA_CODEC_CACHE_LIMIT", 16384);
+    private static final int HIGH_FUNCTION_CACHE_LIMIT = 512;
+    private static final int SMALL_HIGH_FUNCTION_CACHE_LIMIT = 4096;
+    private static final int SMALL_HIGH_FUNCTION_BYTE_LIMIT = 256;
+    private static final int FUNCTION_INSTRUCTION_CACHE_LIMIT = 8192;
+    private static final int FUNCTION_LOOKUP_CACHE_LIMIT = 32768;
+    private static final int PCODE_MEMORY_PATH_CACHE_LIMIT = 65536;
+    private static final int CODEC_CLASSIFICATION_CACHE_LIMIT = 16384;
     private static final String[] FIELD_HANDLER_SLOT_NAMES = {
         "Destructor",
         "IsDefaultValue",
@@ -297,6 +290,9 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
     private final Gson gson = createGson();
     private final NetworkSchemaRunMetrics runMetrics = new NetworkSchemaRunMetrics();
+    private GhidraCli cli;
+    private boolean forceOutput;
+    private boolean dryRun;
 
     private final Map<String, Address> pointerReadCache = new HashMap<>();
     private final Map<String, List<Address>> asciiStringSearchCache = new HashMap<>();
@@ -440,6 +436,21 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
     @Override
     protected void run() throws Exception {
+        cli = GhidraCli.parse(
+            getScriptArgs(),
+            Set.of("typeregistry", "out"),
+            Set.of("force", "dry-run"),
+            2);
+        if (cli.helpRequested()) {
+            printCliHelp();
+            return;
+        }
+        if (cli.versionRequested()) {
+            println("NetworkSchemaExtractor " + EXTRACTOR_VERSION);
+            return;
+        }
+        forceOutput = cli.flag("force", null, false);
+        dryRun = cli.flag("dry-run", null, false);
         resetAnalysisCachesForRun();
         NetworkSchemaControlFlow.setCancellationCheckpoint(this::checkAnalysisCancelled);
         try {
@@ -465,6 +476,10 @@ public class NetworkSchemaExtractor extends GhidraScript {
         boolean analyzeMessages = !analyzeHandlersOnly;
         File input = inputFile();
         File output = outputFile(input, analysis);
+        if (output.exists() && !forceOutput && !dryRun) {
+            throw new IllegalArgumentException(
+                "output already exists: " + output + "; pass --force to replace it");
+        }
         Address registerField = currentProgram.getImageBase().add(REGISTER_FIELD_RVA);
 
         long phaseStarted = runMetrics.startPhase();
@@ -480,7 +495,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
             initializeDecompiler();
             JsonObject trace = countedCollectionFunctionTraces(analysis.functionAddress());
             File actualOutput = writeReportFile(output, trace, createGson());
-            println("Wrote counted-collection trace: " + actualOutput.getAbsolutePath());
+            println((dryRun ? "Dry run: would write counted-collection trace: " :
+                "Wrote counted-collection trace: ") + actualOutput.getAbsolutePath());
             return;
         }
 
@@ -494,7 +510,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
         if (analysis.mode() == AnalysisMode.HANDLER_VTABLES) {
             JsonObject selectedHandlers = selectedHandlerVtableReport(analysis.handlerVtables());
             File actualOutput = writeReportFile(output, selectedHandlers, createGson());
-            println("Wrote selected handler report: " + actualOutput.getAbsolutePath());
+            println((dryRun ? "Dry run: would write selected handler report: " :
+                "Wrote selected handler report: ") + actualOutput.getAbsolutePath());
             return;
         }
 
@@ -712,6 +729,7 @@ public class NetworkSchemaExtractor extends GhidraScript {
         JsonObject report = new JsonObject();
         report.addProperty("schema", "newworld.network_schema.static.v1");
         report.addProperty("extractorVersion", EXTRACTOR_VERSION);
+        report.addProperty("dryRun", dryRun);
         report.addProperty("cacheSchemaVersion", CACHE_SCHEMA_VERSION);
         report.addProperty("analysisMode", analysis.mode().jsonName);
         if (!selectedTypeIndices.isEmpty()) {
@@ -861,7 +879,8 @@ public class NetworkSchemaExtractor extends GhidraScript {
 
         File actualOutput = writeReportFile(output, report, gson);
 
-        println("Wrote network schema static report: " + actualOutput.getAbsolutePath());
+        println((dryRun ? "Dry run: would write network schema static report: " :
+            "Wrote network schema static report: ") + actualOutput.getAbsolutePath());
         println("RegisterField functions: " + registrationFunctions.size() +
             ", calls: " + dynamicFieldCount +
             ", mapped registry entries: " + mappedRegistryEntries);

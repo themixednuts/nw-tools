@@ -7,6 +7,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
@@ -18,10 +19,31 @@ import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 
 public class NetworkSchemaReferenceProbe extends GhidraScript {
+    private static final String SCRIPT_VERSION = "1.0.0";
+
     @Override
     protected void run() throws Exception {
-        String rawOffsets = requiredEnvironment("NW_NETWORK_PROBE_OFFSETS");
-        Path output = Path.of(requiredEnvironment("NW_NETWORK_PROBE_OUT"));
+        GhidraCli cli = GhidraCli.parse(
+            getScriptArgs(),
+            Set.of("offsets", "out"),
+            Set.of("force", "dry-run"),
+            0);
+        if (cli.helpRequested()) {
+            printHelp();
+            return;
+        }
+        if (cli.versionRequested()) {
+            println("NetworkSchemaReferenceProbe " + SCRIPT_VERSION);
+            return;
+        }
+        String rawOffsets = cli.required("offsets", "NW_NETWORK_PROBE_OFFSETS");
+        Path output = Path.of(cli.required("out", "NW_NETWORK_PROBE_OUT"));
+        boolean force = cli.flag("force", null, false);
+        boolean dryRun = cli.flag("dry-run", null, false);
+        if (Files.exists(output) && !force && !dryRun) {
+            throw new IllegalArgumentException(
+                "output already exists: " + output + "; pass --force to replace it");
+        }
         ArrayList<String> lines = new ArrayList<>();
 
         for (String rawOffset : rawOffsets.split(",")) {
@@ -46,9 +68,15 @@ public class NetworkSchemaReferenceProbe extends GhidraScript {
             }
         }
 
-        Files.createDirectories(output.toAbsolutePath().getParent());
-        Files.write(output, lines, StandardCharsets.UTF_8);
-        println("Wrote reference probe: " + output.toAbsolutePath());
+        if (dryRun) {
+            println("Dry run: would write " + lines.size() + " reference row(s) to " +
+                output.toAbsolutePath());
+        }
+        else {
+            Files.createDirectories(output.toAbsolutePath().getParent());
+            Files.write(output, lines, StandardCharsets.UTF_8);
+            println("Wrote reference probe: " + output.toAbsolutePath());
+        }
     }
 
     private void appendPointerChain(List<String> lines, Address source, int maxDepth) {
@@ -96,14 +124,6 @@ public class NetworkSchemaReferenceProbe extends GhidraScript {
         return result.toString();
     }
 
-    private String requiredEnvironment(String name) {
-        String value = System.getenv(name);
-        if (value == null || value.isBlank()) {
-            throw new IllegalArgumentException(name + " is required");
-        }
-        return value;
-    }
-
     private Address moduleAddress(String value) {
         int plus = value.indexOf('+');
         String offset = (plus < 0 ? value : value.substring(plus + 1)).strip();
@@ -116,5 +136,18 @@ public class NetworkSchemaReferenceProbe extends GhidraScript {
     private String formatOffset(Address address) {
         return "NewWorld+0x" + Long.toUnsignedString(
             address.subtract(currentProgram.getImageBase()), 16);
+    }
+
+    private void printHelp() {
+        println("NetworkSchemaReferenceProbe " + SCRIPT_VERSION);
+        println("List code and data references to module-relative addresses.");
+        println("");
+        println("Options:");
+        println("  --offsets <LIST>  Comma-separated module offsets [env: NW_NETWORK_PROBE_OFFSETS]");
+        println("  --out <FILE>      Output report [env: NW_NETWORK_PROBE_OUT]");
+        println("  --force           Replace an existing output");
+        println("  --dry-run         Analyze without filesystem writes");
+        println("  -h, --help        Print help");
+        println("  -V, --version     Print version");
     }
 }

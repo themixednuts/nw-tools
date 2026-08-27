@@ -26,7 +26,17 @@ By default the script runs in dry-run mode and writes:
 resources/serialize.renames.json
 ```
 
-Set `AZ_SERIALIZE_RENAME_APPLY=true` before launching Ghidra to apply renames.
+For headless or repeatable runs, pass script arguments after the script name:
+
+```text
+--serialize-json resources/serialize.json --out resources/serialize.renames.json --apply-renames --force
+```
+
+Run `AzReflectionRenamer.java --help` for the complete flag list. Every input
+also has a canonical `AZOTH_` environment binding shown in that help; flags take
+precedence. `--dry-run` performs analysis without mutating the program or writing
+the report. Boolean values use `1|true|yes|on` and `0|false|no|off`,
+case-insensitively.
 
 ## Network Schema Extractor
 
@@ -62,6 +72,10 @@ Compile the bundled script without running binary analysis:
 scripts/ghidra/Test-NetworkSchemaExtractor.ps1 -GhidraHome D:\.ghidra
 ```
 
+`-GhidraHome` defaults from `NW_GHIDRA_HOME`. Both PowerShell entrypoints use
+advanced-function help (`Get-Help ... -Full`), support `-Version`, and the sync
+entrypoint provides `-Force` and `-DryRun` for its generated output.
+
 - `NetworkSchemaAddressFormatter.java` — address formatter callback shared by models.
 - `NetworkSchemaModels.java` — leaf model/data holders.
 - `NetworkSchemaPcode.java` — p-code evidence model holders.
@@ -77,6 +91,20 @@ Interactive runs present an analysis-mode dialog. `Full schema` remains the defa
 Focused type, handler-vtable, and function-trace runs ask for their addresses or type
 indices directly and write distinct report files, so they cannot replace the complete
 schema report.
+
+Headless runs use the same modes plus explicit, discoverable options:
+
+```text
+NetworkSchemaExtractor full --typeregistry resources/typeregistry.json \
+  --out resources/network-schema.static.json --force
+NetworkSchemaExtractor types 0x12,0x34 \
+  --typeregistry resources/typeregistry.json --dry-run
+```
+
+Run `NetworkSchemaExtractor --help` for its complete surface. The standalone
+datatype, function, codec, and reference probes also implement `--help`,
+`--version`, `--out`, `--force`, and `--dry-run`; their `NW_NETWORK_*`
+environment bindings are documented alongside the corresponding flags.
 
 The script emits every `typeregistry.json` row, recovers
 `MB::ReplicatedState::RegisterField` callers from Ghidra where available, and

@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -21,24 +22,40 @@ import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.PcodeOpAST;
 
 public class NetworkSchemaFunctionProbe extends GhidraScript {
+    private static final String SCRIPT_VERSION = "1.0.0";
     private static final Pattern INTEGER_OR_RANGE = Pattern.compile(
         "\\s*([+-]?(?:0[xX][0-9a-fA-F]+|[0-9]+))" +
         "(?:\\s*-\\s*([+-]?(?:0[xX][0-9a-fA-F]+|[0-9]+)))?\\s*");
 
     @Override
     protected void run() throws Exception {
-        String rawOffsets = requiredEnvironment("NW_NETWORK_PROBE_OFFSETS");
-        Path output = Path.of(requiredEnvironment("NW_NETWORK_PROBE_OUT"));
-        boolean includePcode = Boolean.parseBoolean(
-            System.getenv().getOrDefault("NW_NETWORK_PROBE_PCODE", "false"));
-        boolean includeCfg = Boolean.parseBoolean(
-            System.getenv().getOrDefault("NW_NETWORK_PROBE_CFG", "false"));
-        List<Integer> vtableSlots = optionalIntegerListEnvironment(
-            "NW_NETWORK_PROBE_VTABLE_SLOTS");
-        if (vtableSlots.isEmpty()) {
-            Integer slot = optionalIntegerEnvironment("NW_NETWORK_PROBE_VTABLE_SLOT");
-            vtableSlots = slot == null ? List.of(-1) : List.of(slot);
+        GhidraCli cli = GhidraCli.parse(
+            getScriptArgs(),
+            Set.of("offsets", "out", "vtable-slots"),
+            Set.of("pcode", "cfg", "force", "dry-run"),
+            0);
+        if (cli.helpRequested()) {
+            printHelp();
+            return;
         }
+        if (cli.versionRequested()) {
+            println("NetworkSchemaFunctionProbe " + SCRIPT_VERSION);
+            return;
+        }
+        String rawOffsets = cli.required("offsets", "NW_NETWORK_PROBE_OFFSETS");
+        Path output = Path.of(cli.required("out", "NW_NETWORK_PROBE_OUT"));
+        boolean includePcode = cli.flag("pcode", "NW_NETWORK_PROBE_PCODE", false);
+        boolean includeCfg = cli.flag("cfg", "NW_NETWORK_PROBE_CFG", false);
+        boolean force = cli.flag("force", null, false);
+        boolean dryRun = cli.flag("dry-run", null, false);
+        if (Files.exists(output) && !force && !dryRun) {
+            throw new IllegalArgumentException(
+                "output already exists: " + output + "; pass --force to replace it");
+        }
+        List<Integer> vtableSlots = optionalIntegerList(
+            cli.value("vtable-slots", "NW_NETWORK_PROBE_VTABLE_SLOTS"),
+            "--vtable-slots");
+        vtableSlots = vtableSlots.isEmpty() ? List.of(-1) : vtableSlots;
         List<String> sections = new ArrayList<>();
 
         DecompInterface decompiler = new DecompInterface();
@@ -77,18 +94,18 @@ public class NetworkSchemaFunctionProbe extends GhidraScript {
             decompiler.dispose();
         }
 
-        Files.createDirectories(output.toAbsolutePath().getParent());
-        Files.writeString(output, String.join("\n", sections), StandardCharsets.UTF_8);
-        println("Wrote function probe: " + output.toAbsolutePath());
+        if (dryRun) {
+            println("Dry run: would write " + sections.size() + " function section(s) to " +
+                output.toAbsolutePath());
+        }
+        else {
+            Files.createDirectories(output.toAbsolutePath().getParent());
+            Files.writeString(output, String.join("\n", sections), StandardCharsets.UTF_8);
+            println("Wrote function probe: " + output.toAbsolutePath());
+        }
     }
 
-    private Integer optionalIntegerEnvironment(String name) {
-        String value = System.getenv(name);
-        return value == null || value.isBlank() ? null : Integer.decode(value.strip());
-    }
-
-    private List<Integer> optionalIntegerListEnvironment(String name) {
-        String value = System.getenv(name);
+    private List<Integer> optionalIntegerList(String value, String source) {
         if (value == null || value.isBlank()) {
             return List.of();
         }
@@ -97,7 +114,7 @@ public class NetworkSchemaFunctionProbe extends GhidraScript {
             Matcher matcher = INTEGER_OR_RANGE.matcher(part);
             if (!matcher.matches()) {
                 throw new IllegalArgumentException(
-                    name + " contains an invalid slot or range: " + part.strip());
+                    source + " contains an invalid slot or range: " + part.strip());
             }
             int first = Integer.decode(matcher.group(1));
             int last = matcher.group(2) == null ? first : Integer.decode(matcher.group(2));
@@ -170,14 +187,6 @@ public class NetworkSchemaFunctionProbe extends GhidraScript {
         return List.copyOf(result);
     }
 
-    private String requiredEnvironment(String name) {
-        String value = System.getenv(name);
-        if (value == null || value.isBlank()) {
-            throw new IllegalArgumentException(name + " is required");
-        }
-        return value;
-    }
-
     private Address moduleAddress(String value) {
         String normalized = value;
         int plus = normalized.indexOf('+');
@@ -195,5 +204,21 @@ public class NetworkSchemaFunctionProbe extends GhidraScript {
     private String formatOffset(Address address) {
         long offset = address.subtract(currentProgram.getImageBase());
         return "NewWorld+0x" + Long.toUnsignedString(offset, 16);
+    }
+
+    private void printHelp() {
+        println("NetworkSchemaFunctionProbe " + SCRIPT_VERSION);
+        println("Decompile explicit module-relative functions for network-schema research.");
+        println("");
+        println("Options:");
+        println("  --offsets <LIST>       Comma-separated module offsets [env: NW_NETWORK_PROBE_OFFSETS]");
+        println("  --out <FILE>           Output report [env: NW_NETWORK_PROBE_OUT]");
+        println("  --pcode[=<BOOL>]       Include SSA p-code [env: NW_NETWORK_PROBE_PCODE]");
+        println("  --cfg[=<BOOL>]         Include control-flow graph [env: NW_NETWORK_PROBE_CFG]");
+        println("  --vtable-slots <LIST>  Slots or inclusive ranges [env: NW_NETWORK_PROBE_VTABLE_SLOTS]");
+        println("  --force                Replace an existing output");
+        println("  --dry-run              Analyze without filesystem writes");
+        println("  -h, --help             Print help");
+        println("  -V, --version          Print version");
     }
 }

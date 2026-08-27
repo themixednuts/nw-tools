@@ -92,6 +92,7 @@ import ghidra.program.model.symbol.SymbolType;
 import ghidra.util.exception.CancelledException;
 
 public class AzReflectionRenamer extends GhidraScript {
+    private static final String SCRIPT_VERSION = "1.0.0";
     private static final Pattern MODULE_ADDR_RE =
         Pattern.compile("^(?<module>[^+]+)\\+0x(?<offset>[0-9a-fA-F]+)$");
     private static final Pattern HEX_ADDR_RE =
@@ -199,10 +200,34 @@ public class AzReflectionRenamer extends GhidraScript {
     private String currentModuleSource;
     private String currentModuleName;
     private Set<String> ambiguousModuleComponentNames;
+    private GhidraCli cli;
+    private boolean forceOutput;
+    private boolean dryRun;
     private static final Map<String, String> MODULE_NAMES_BY_VTABLE = moduleNamesByVtable();
 
     @Override
     protected void run() throws Exception {
+        cli = GhidraCli.parse(
+            getScriptArgs(),
+            Set.of(
+                "serialize-json",
+                "out",
+                "module-evidence",
+                "class-registration",
+                "field-registration",
+                "behavior-context"),
+            Set.of("apply-renames", "full-actions", "force", "dry-run"),
+            0);
+        if (cli.helpRequested()) {
+            printHelp();
+            return;
+        }
+        if (cli.versionRequested()) {
+            println("AzReflectionRenamer " + SCRIPT_VERSION);
+            return;
+        }
+        forceOutput = cli.flag("force", null, false);
+        dryRun = cli.flag("dry-run", null, false);
         if (currentProgram == null) {
             popup("No current program is open.");
             return;
@@ -228,6 +253,10 @@ public class AzReflectionRenamer extends GhidraScript {
         fieldRegistrationEvidence = loadFieldRegistrationEvidence(inputFile);
         applyRenames = chooseApplyRenames();
         outputFile = chooseOutputFile(inputFile);
+        if (outputFile.exists() && !forceOutput && !dryRun) {
+            throw new IllegalArgumentException(
+                "output already exists: " + outputFile + "; pass --force to replace it");
+        }
         behaviorContextEvidence = loadBehaviorContextEvidence(inputFile);
 
         JsonElement root;
@@ -299,6 +328,7 @@ public class AzReflectionRenamer extends GhidraScript {
         report.addProperty("mode", "ghidra-java");
         report.addProperty("requestedRenames", applyRenames);
         report.addProperty("applyRenames", applyRenames);
+        report.addProperty("dryRun", dryRun);
         report.addProperty("rttiTypeCount", scan.rttiTypes.size());
         report.addProperty("classDataCount", scan.classData.size());
         report.addProperty("elementCallbackCount", elementCallbackCount(scan.classData));
@@ -342,8 +372,13 @@ public class AzReflectionRenamer extends GhidraScript {
             report.add("actions", actions.fullActions());
         }
 
-        try (FileWriter writer = new FileWriter(outputFile)) {
-            gson.toJson(report, writer);
+        if (dryRun) {
+            println("Dry run: would write rename report to " + outputFile.getAbsolutePath());
+        }
+        else {
+            try (FileWriter writer = new FileWriter(outputFile)) {
+                gson.toJson(report, writer);
+            }
         }
 
         String summary = buildSummary(scan, actions, stats);
@@ -351,7 +386,7 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private File chooseInputFile() throws Exception {
-        String explicit = envValue("AZ_SERIALIZE_JSON");
+        String explicit = optionValue("serialize-json", "AZOTH_SERIALIZE_JSON");
         if (explicit != null) {
             return new File(explicit);
         }
@@ -359,8 +394,10 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private boolean includeFullActionReport() {
-        String explicit = envValue("AZ_SERIALIZE_RENAME_FULL_ACTIONS");
-        return explicit != null && envBool(explicit);
+        return optionBool(
+            "full-actions",
+            "AZOTH_SERIALIZE_RENAME_FULL_ACTIONS",
+            false);
     }
 
     private File chooseInputFileViaPicker() throws Exception {
@@ -451,9 +488,12 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private boolean chooseApplyRenames() throws Exception {
-        String explicit = envValue("AZ_SERIALIZE_RENAME");
+        if (dryRun) {
+            return false;
+        }
+        String explicit = optionValue("apply-renames", "AZOTH_SERIALIZE_RENAME");
         if (explicit != null) {
-            return envBool(explicit);
+            return optionBool("apply-renames", "AZOTH_SERIALIZE_RENAME", false);
         }
         return askYesNo(
             "AZ SerializeContext Renamer",
@@ -463,7 +503,7 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private File chooseOutputFile(File input) throws Exception {
-        String explicit = envValue("AZ_SERIALIZE_RENAME_OUT");
+        String explicit = optionValue("out", "AZOTH_SERIALIZE_RENAME_OUT");
         if (explicit != null) {
             return new File(explicit);
         }
@@ -541,16 +581,7 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private File moduleEvidenceInput(File serializeInput) {
-        String explicit = envValue("AZ_SERIALIZE_MODULE_PATH");
-        if (explicit == null) {
-            explicit = envValue("AZ_SERIALIZE_MODULE_DIR");
-        }
-        if (explicit == null) {
-            explicit = envValue("AZ_MODULE_PATH");
-        }
-        if (explicit == null) {
-            explicit = envValue("AZ_MODULE_DIR");
-        }
+        String explicit = optionValue("module-evidence", "AZOTH_SERIALIZE_MODULE_EVIDENCE");
         if (explicit != null) {
             return new File(explicit);
         }
@@ -794,10 +825,9 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private File classRegistrationEvidenceInput(File serializeInput) {
-        String explicit = envValue("AZ_SERIALIZE_CLASS_REGISTRATION_PATH");
-        if (explicit == null) {
-            explicit = envValue("AZ_CLASS_REGISTRATION_TRACE");
-        }
+        String explicit = optionValue(
+            "class-registration",
+            "AZOTH_SERIALIZE_CLASS_REGISTRATION");
         if (explicit != null) {
             return new File(explicit);
         }
@@ -1272,10 +1302,9 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private File fieldRegistrationEvidenceInput(File serializeInput) {
-        String explicit = envValue("AZ_SERIALIZE_FIELD_REGISTRATION_PATH");
-        if (explicit == null) {
-            explicit = envValue("AZ_FIELD_REGISTRATION_TRACE");
-        }
+        String explicit = optionValue(
+            "field-registration",
+            "AZOTH_SERIALIZE_FIELD_REGISTRATION");
         if (explicit != null) {
             return new File(explicit);
         }
@@ -1468,7 +1497,7 @@ public class AzReflectionRenamer extends GhidraScript {
     }
 
     private BehaviorContextInput findBehaviorContextInput(File serializeInput) {
-        String explicit = envValue("AZ_BEHAVIOR_CONTEXT_JSON");
+        String explicit = optionValue("behavior-context", "AZOTH_BEHAVIOR_CONTEXT_JSON");
         if (explicit != null) {
             File file = new File(explicit);
             return behaviorContextFileInput(file);
@@ -3484,18 +3513,31 @@ public class AzReflectionRenamer extends GhidraScript {
         return result;
     }
 
-    private String envValue(String name) {
-        String value = System.getenv(name);
-        if (value == null || value.trim().isEmpty()) {
-            return null;
-        }
-        return value;
+    private String optionValue(String option, String environment) {
+        return cli.value(option, environment);
     }
 
-    private boolean envBool(String value) {
-        String v = value.toLowerCase();
-        return v.equals("1") || v.equals("true") || v.equals("yes") ||
-            v.equals("y") || v.equals("on");
+    private boolean optionBool(String option, String environment, boolean defaultValue) {
+        return cli.flag(option, environment, defaultValue);
+    }
+
+    private void printHelp() {
+        println("AzReflectionRenamer " + SCRIPT_VERSION);
+        println("Inspect captured reflection evidence and optionally apply names and datatypes.");
+        println("");
+        println("Options:");
+        println("  --serialize-json <FILE>       SerializeContext capture [env: AZOTH_SERIALIZE_JSON]");
+        println("  --module-evidence <PATH>      Module evidence file or directory [env: AZOTH_SERIALIZE_MODULE_EVIDENCE]");
+        println("  --class-registration <FILE>   Class-registration trace [env: AZOTH_SERIALIZE_CLASS_REGISTRATION]");
+        println("  --field-registration <FILE>   Field-registration trace [env: AZOTH_SERIALIZE_FIELD_REGISTRATION]");
+        println("  --behavior-context <FILE>     BehaviorContext JSON or archive [env: AZOTH_BEHAVIOR_CONTEXT_JSON]");
+        println("  --out <FILE>                  Rename report [env: AZOTH_SERIALIZE_RENAME_OUT]");
+        println("  --apply-renames[=<BOOL>]      Apply program mutations [env: AZOTH_SERIALIZE_RENAME]");
+        println("  --full-actions[=<BOOL>]       Include every action [env: AZOTH_SERIALIZE_RENAME_FULL_ACTIONS]");
+        println("  --force                       Replace an existing report");
+        println("  --dry-run                     Analyze without mutations or filesystem writes");
+        println("  -h, --help                    Print help");
+        println("  -V, --version                 Print version");
     }
 
     private ScanResult scanSerializeContext(JsonElement root) {

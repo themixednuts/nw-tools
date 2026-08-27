@@ -1,11 +1,33 @@
+<#
+.SYNOPSIS
+Builds the generated NetworkSchemaExtractor Ghidra script.
+.PARAMETER SourceDir
+Directory containing the checked-in helper sources and fragments.
+.PARAMETER OutDir
+Directory where NetworkSchemaExtractor.java is written.
+.PARAMETER Force
+Replaces an existing generated script.
+.PARAMETER DryRun
+Validates inputs and prints the output plan without changing files.
+#>
+[CmdletBinding()]
 param(
     [string] $SourceDir = $PSScriptRoot,
-    [string] $OutDir = "$HOME/ghidra_scripts"
+    [string] $OutDir = "$HOME/ghidra_scripts",
+    [switch] $Force,
+    [switch] $DryRun,
+    [switch] $Version
 )
 
 $ErrorActionPreference = 'Stop'
 
+if ($Version) {
+    Write-Output 'Sync-NetworkSchemaExtractor 1.0.0'
+    return
+}
+
 $sourceNames = @(
+    'GhidraCli.java',
     'NetworkSchemaAddressFormatter.java',
     'NetworkSchemaX86.java',
     'NetworkSchemaText.java',
@@ -28,10 +50,6 @@ $sourceNames = @(
     'NetworkSchemaRunMetrics.java'
 )
 
-if (!(Test-Path -LiteralPath $OutDir)) {
-    New-Item -ItemType Directory -Path $OutDir | Out-Null
-}
-
 $extractorDir = Join-Path $SourceDir 'network_schema_extractor'
 $extractorFragments = Get-ChildItem -LiteralPath $extractorDir -Filter 'NetworkSchemaExtractor.*.javafrag' |
     Sort-Object @{ Expression = { $_.Name -eq 'NetworkSchemaExtractor.codec_trace.javafrag' } }, Name
@@ -49,6 +67,18 @@ foreach ($path in $checkedSources) {
     if ($lineCount -gt $maxSourceLines) {
         throw "Source file exceeds $maxSourceLines lines: $path ($lineCount lines)"
     }
+}
+
+$bundlePath = Join-Path $OutDir 'NetworkSchemaExtractor.java'
+if ((Test-Path -LiteralPath $bundlePath) -and !$Force -and !$DryRun) {
+    throw "Output already exists: $bundlePath. Pass -Force to replace it."
+}
+if ($DryRun) {
+    Write-Output "Dry run: would bundle $($checkedSources.Count) source file(s) into $bundlePath"
+    return
+}
+if (!(Test-Path -LiteralPath $OutDir)) {
+    New-Item -ItemType Directory -Path $OutDir | Out-Null
 }
 
 $imports = [ordered] @{}
@@ -107,7 +137,6 @@ foreach ($line in $body) {
     $output.Add($line)
 }
 
-$bundlePath = Join-Path $OutDir 'NetworkSchemaExtractor.java'
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllLines($bundlePath, [string[]] $output, $utf8NoBom)
 
