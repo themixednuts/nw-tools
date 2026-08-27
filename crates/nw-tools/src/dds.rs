@@ -58,11 +58,16 @@ impl DdsItem {
 /// Image formats supported by DDS image and sequence exports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ImageFormat {
+    /// Portable Network Graphics image.
     Png,
+    /// Tagged Image File Format image.
     #[value(alias = "tif")]
     Tiff,
+    /// OpenEXR high-dynamic-range image.
     Exr,
+    /// Graphics Interchange Format image or animation.
     Gif,
+    /// Quite OK Image format.
     Qoi,
 }
 

@@ -5,3 +5,4 @@
 //! (namely [`native_port`]) without going through the CLI process.
 
 pub mod native_port;
+pub mod ui;

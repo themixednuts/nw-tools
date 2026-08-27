@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
+use crate::ui::{OutputFormat, Report, print};
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum Cmd {
     #[command(
@@ -44,8 +46,7 @@ impl Describe {
     fn run(self) -> Result<()> {
         let document = read_document(&self.manifest)?;
         let description = describe_document(&document, &self.manifest, &self.package_root);
-        serde_json::to_writer(std::io::stdout().lock(), &description)?;
-        println!();
+        print_document("azoth describe", &description)?;
         Ok(())
     }
 }
@@ -64,16 +65,29 @@ impl Schedule {
     fn run(self) -> Result<()> {
         let document = read_document(&self.manifest)?;
         let schedule = crate::audio_export::blend_schedule_document(&document, &self.package_root)?;
-        serde_json::to_writer(
-            std::io::stdout().lock(),
+        print_document(
+            "azoth schedule",
             &serde_json::json!({
                 "schemaVersion": 1,
                 "schedule": schedule,
             }),
         )?;
-        println!();
         Ok(())
     }
+}
+
+fn print_document(title: &str, document: &serde_json::Value) -> Result<()> {
+    if print::output_format() == OutputFormat::Json {
+        print::print_json(document);
+        return Ok(());
+    }
+
+    let mut report = Report::new(title);
+    for line in serde_json::to_string_pretty(document)?.lines() {
+        report.note(line);
+    }
+    report.print();
+    Ok(())
 }
 
 fn read_document(path: &Path) -> Result<serde_json::Value> {

@@ -49,7 +49,9 @@ const MODEL_CONSUMER_EXTENSIONS: &[&str] = &[
 /// Output container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Container {
+    /// Self-contained binary glTF file.
     Glb,
+    /// JSON glTF manifest with external resources.
     Gltf,
 }
 
@@ -68,10 +70,14 @@ pub struct Model {
     /// from the located install's paks (narrow with `--filter`).
     path: Option<PathBuf>,
 
-    /// Output file (single) or directory (batch). Defaults beside the input, or
-    /// `./models` for install mode.
-    #[arg(long)]
+    /// Output file for a single input. Defaults beside the input.
+    #[arg(long, value_name = "FILE", conflicts_with = "out_dir")]
     out: Option<PathBuf>,
+
+    /// Output directory for directory or installed-asset conversion.
+    /// Defaults to the input directory, or `./models` for install mode.
+    #[arg(long = "out-dir", value_name = "DIR", conflicts_with = "out")]
+    out_dir: Option<PathBuf>,
 
     /// Output container.
     #[arg(long, value_enum, default_value_t = Container::Glb)]
@@ -121,7 +127,7 @@ pub struct Model {
     /// to select several characters in one run (union match, one dependency-index
     /// build). Characters export one at a time; `--jobs` parallelizes work inside
     /// each character. Omit to convert the whole install.
-    #[arg(long = "filter")]
+    #[arg(long = "filter", conflicts_with = "path")]
     filters: Vec<String>,
 
     /// Geometry only — skip materials and textures.
@@ -129,8 +135,12 @@ pub struct Model {
     geometry_only: bool,
 
     /// Replace existing output files.
-    #[arg(long)]
+    #[arg(long = "force")]
     overwrite: bool,
+
+    /// Validate arguments and print the conversion plan without writing outputs.
+    #[arg(long)]
+    dry_run: bool,
 
     #[command(flatten)]
     jobs: JobArgs,
@@ -189,6 +199,31 @@ impl Model {
 
     pub fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
+        let single_file = self.path.as_ref().is_some_and(|path| !path.is_dir());
+        if single_file && self.out_dir.is_some() {
+            bail!("use --out <FILE> when converting one model file");
+        }
+        if !single_file && self.out.is_some() {
+            bail!("use --out-dir <DIR> for directory or installed-asset conversion");
+        }
+        if self.dry_run {
+            let input = self.path.as_ref().map_or_else(
+                || "<installed assets>".to_owned(),
+                |path| path.display().to_string(),
+            );
+            let output = self
+                .out
+                .as_ref()
+                .or(self.out_dir.as_ref())
+                .map_or_else(|| "<default>".to_owned(), |path| path.display().to_string());
+            Report::new("model")
+                .stat("dry-run", "yes")
+                .stat("input", input)
+                .stat("output", output)
+                .stat("container", self.container.extension())
+                .print();
+            return Ok(());
+        }
         match self.path.clone() {
             None => self.export_install(&ctx),
             Some(path) if path.is_dir() => self.export_tree(&ctx, &path),
@@ -268,7 +303,7 @@ impl Model {
     /// decoded audio, glTF buffers) is never multiplied by host parallelism.
     /// `--jobs` still parallelizes work *inside* each conversion.
     fn export_tree(&self, ctx: &RunCtx, dir: &Path) -> Result<()> {
-        let out_dir = self.out.clone().unwrap_or_else(|| dir.to_path_buf());
+        let out_dir = self.out_dir.clone().unwrap_or_else(|| dir.to_path_buf());
         let package = if self.container == Container::Gltf {
             Some(PackageWriter::new(&out_dir)?)
         } else {
@@ -333,7 +368,10 @@ impl Model {
         if meshes.is_empty() {
             bail!("no matching meshes found in the install paks");
         }
-        let out_dir = self.out.clone().unwrap_or_else(|| PathBuf::from("models"));
+        let out_dir = self
+            .out_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("models"));
         let package = if self.container == Container::Gltf {
             Some(PackageWriter::new(&out_dir)?)
         } else {

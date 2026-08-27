@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgGroup, Args};
+use clap::{ArgGroup, Args, ValueEnum};
 use humansize::{DECIMAL, format_size};
 use nw_lua::{
     bytecode::OpcodeTable,
@@ -17,35 +17,35 @@ use crate::ui::{Cell, Report, Table};
 use super::common::{finish_scan, path_label, strip_suffix_ignore_ascii_case};
 
 #[derive(Debug, Args)]
-#[command(group(ArgGroup::new("mode").args(["dis", "dec", "ssa_dump"]).multiple(false)))]
+#[command(group(ArgGroup::new("output").args(["out", "out_dir"]).multiple(false)))]
 pub struct Lua {
     /// Lua bytecode file or directory.
     #[arg(value_name = "PATH")]
-    path: Option<PathBuf>,
+    path: PathBuf,
 
-    /// Disassemble bytecode.
-    #[arg(long)]
-    dis: bool,
+    /// Lua rendering operation.
+    #[arg(long, value_enum, default_value_t = LuaMode::Decompile)]
+    mode: LuaMode,
 
-    /// Decompile to Lua source (default).
-    #[arg(long)]
-    dec: bool,
-
-    /// Dump SSA IR for all prototypes.
-    #[arg(long)]
-    ssa_dump: bool,
-
-    /// Output file for a single input, or output directory for a batch.
-    #[arg(long, value_name = "PATH")]
+    /// Output file when PATH names one Lua bytecode file.
+    #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
 
+    /// Output directory when PATH names a directory of Lua bytecode files.
+    #[arg(long = "out-dir", value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+
     /// Replace existing outputs.
-    #[arg(long)]
+    #[arg(long = "force")]
     overwrite: bool,
 
-    /// Override detected version: 51|52|53|54|55 (only 51 supported now).
-    #[arg(long, value_name = "VER", value_parser = parse_lua_version)]
-    lua_version: Option<LuaTarget>,
+    /// Validate inputs and print the rendering plan without writing output files.
+    #[arg(long, requires = "output")]
+    dry_run: bool,
+
+    /// Override the detected Lua bytecode version.
+    #[arg(long, value_enum, value_name = "VERSION")]
+    lua_version: Option<LuaVersionArg>,
 
     /// Load a custom opcode-table mapping from file F.
     #[arg(long, value_name = "F")]
@@ -59,11 +59,33 @@ pub struct Lua {
     jobs: JobArgs,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum LuaMode {
+    /// Disassemble bytecode.
+    #[value(name = "dis")]
     Disassemble,
+    /// Decompile to Lua source.
+    #[value(name = "dec")]
     Decompile,
+    /// Dump SSA intermediate representation for every prototype.
+    #[value(name = "ssa")]
     SsaDump,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LuaVersionArg {
+    /// Lua 5.1 bytecode.
+    #[value(name = "51")]
+    Lua51,
+}
+
+impl LuaVersionArg {
+    fn target(self) -> Result<LuaTarget> {
+        match self {
+            Self::Lua51 => LuaTarget::for_version(LuaVersion::V51)
+                .context("Lua 5.1 opcode table is unavailable"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,12 +105,13 @@ struct LuaOutput {
 impl Lua {
     pub(super) fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
-        let root = self
-            .path
-            .as_deref()
-            .context("format lua needs a .luac file or directory path")?;
-        let mode = self.mode()?;
-        let table = load_opcode_table(self.lua_version, self.opcode_table.as_deref())?;
+        let root = self.path.as_path();
+        let mode = self.mode;
+        if self.no_idiomatic && mode != LuaMode::Decompile {
+            bail!("--no-idiomatic can only be used with --mode dec");
+        }
+        let lua_version = self.lua_version.map(LuaVersionArg::target).transpose()?;
+        let table = load_opcode_table(lua_version, self.opcode_table.as_deref())?;
         let render = LuaRender {
             mode,
             no_idiomatic: self.no_idiomatic,
@@ -106,8 +129,20 @@ impl Lua {
             return Ok(());
         }
 
-        if self.out.is_none() {
-            if root.is_file() && paths.len() == 1 {
+        let single_file = root.is_file() && paths.len() == 1;
+        let out = if single_file {
+            if self.out_dir.is_some() {
+                bail!("use --out <FILE> when processing one Lua bytecode file");
+            }
+            self.out.as_deref()
+        } else {
+            if self.out.is_some() {
+                bail!("use --out-dir <DIR> when processing multiple Lua bytecode files");
+            }
+            self.out_dir.as_deref()
+        };
+        let Some(out) = out else {
+            if single_file {
                 let output = render_file(&paths[0], render)?;
                 std::io::stdout()
                     .lock()
@@ -115,32 +150,20 @@ impl Lua {
                     .context("write stdout")?;
                 return Ok(());
             }
-            bail!("--out is required when processing multiple Lua bytecode files");
-        }
-
-        write_batch(
-            &ctx,
-            root,
-            &paths,
-            self.out.as_deref().expect("--out checked above"),
-            self.overwrite,
-            render,
-        )
-    }
-
-    fn mode(&self) -> Result<LuaMode> {
-        let mode = if self.dis {
-            LuaMode::Disassemble
-        } else if self.ssa_dump {
-            LuaMode::SsaDump
-        } else {
-            let _ = self.dec;
-            LuaMode::Decompile
+            bail!("--out-dir is required when processing multiple Lua bytecode files");
         };
-        if self.no_idiomatic && mode != LuaMode::Decompile {
-            bail!("--no-idiomatic can only be used with decompilation");
+
+        if self.dry_run {
+            Report::new("lua")
+                .stat("dry-run", "yes")
+                .stat("files", paths.len())
+                .stat("mode", mode.done_label())
+                .stat("output", out.display())
+                .print();
+            return Ok(());
         }
-        Ok(mode)
+
+        write_batch(&ctx, root, &paths, out, self.overwrite, render)
     }
 }
 
@@ -319,19 +342,6 @@ fn module_stem(path: &Path) -> Option<String> {
         .and_then(OsStr::to_str)
         .filter(|stem| !stem.is_empty())
         .map(str::to_string)
-}
-
-fn parse_lua_version(value: &str) -> Result<LuaTarget, String> {
-    let version = match value {
-        "51" => LuaVersion::V51,
-        "52" => LuaVersion::V52,
-        "53" => LuaVersion::V53,
-        "54" => LuaVersion::V54,
-        "55" => LuaVersion::V55,
-        _ => return Err("expected one of 51, 52, 53, 54, 55".to_string()),
-    };
-    LuaTarget::for_version(version)
-        .map_err(|_| format!("unsupported Lua version {version}; only Lua 5.1 is supported"))
 }
 
 #[cfg(test)]

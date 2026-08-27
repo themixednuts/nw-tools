@@ -21,7 +21,7 @@ pub struct Install {
 }
 
 impl Install {
-    /// Resolve the install from `NEW_WORLD_DIR`, then Steam library metadata.
+    /// Resolve the install from `NW_INSTALL_DIR`, then Steam library metadata.
     ///
     /// # Errors
     ///
@@ -54,7 +54,7 @@ impl Install {
     }
 
     pub fn from_env() -> Result<Option<Self>, Error> {
-        let Some(root) = env_path("NEW_WORLD_DIR").map(normalize_root) else {
+        let Some(root) = env_path("NW_INSTALL_DIR").map(normalize_root) else {
             return Ok(None);
         };
         if !Self::is_root(&root) {
@@ -125,7 +125,7 @@ impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Explicit => f.write_str("explicit path"),
-            Self::Env => f.write_str("NEW_WORLD_DIR"),
+            Self::Env => f.write_str("NW_INSTALL_DIR"),
             Self::Steam => f.write_str("Steam library metadata"),
         }
     }
@@ -162,7 +162,7 @@ pub struct AppManifest {
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("could not find New World; set NEW_WORLD_DIR or install Steam app {APP_ID_STR}")]
+    #[error("could not find New World; set NW_INSTALL_DIR or install Steam app {APP_ID_STR}")]
     NotFound,
     #[error("{path} does not look like a New World install")]
     InvalidRoot { path: PathBuf },

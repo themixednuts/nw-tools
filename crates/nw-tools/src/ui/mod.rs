@@ -8,6 +8,7 @@ pub mod print;
 pub mod report;
 pub mod theme;
 
+pub use print::OutputFormat;
 pub use report::{Cell, Report, Table};
 
 #[cfg(test)]

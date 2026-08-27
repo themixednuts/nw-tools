@@ -15,23 +15,40 @@ mod rnr_asset;
 mod source;
 mod support;
 mod tui;
-mod ui;
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use nw_tools::native_port;
+use nw_tools::ui;
 
-use ui::{Report, theme};
+use ui::{OutputFormat, Report, print, theme};
 
 #[derive(Debug, Parser)]
-#[command(name = "nw-tools", version, about = "New World asset inspection tools")]
+#[command(
+    name = "nw-tools",
+    version,
+    about = "New World asset inspection tools",
+    after_help = "Environment:\n  RUST_LOG       Layer tracing directives over -v/--verbose or -q/--quiet.\n  NO_COLOR       Disable automatic color output.\n  NW_INSTALL_DIR Preferred New World install root."
+)]
 struct Cli {
     /// When to colorize output.
     #[arg(long, value_enum, default_value_t = ColorArg::Auto, global = true)]
     color: ColorArg,
 
+    /// Output encoding for read and query commands.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text, global = true)]
+    format: OutputFormat,
+
     /// Plain, non-interactive output: no color, no full-screen browsers.
     #[arg(long, global = true)]
     plain: bool,
+
+    /// Increase default log verbosity (`-v` info, `-vv` debug, `-vvv` trace).
+    #[arg(short, long, action = ArgAction::Count, global = true)]
+    verbose: u8,
+
+    /// Restrict default diagnostics to errors. RUST_LOG can add directives.
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -39,8 +56,11 @@ struct Cli {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ColorArg {
+    /// Colorize only when the output stream supports it.
     Auto,
+    /// Always emit ANSI color codes.
     Always,
+    /// Never emit ANSI color codes.
     Never,
 }
 
@@ -64,7 +84,10 @@ enum Command {
     #[command(about = "Print the detected New World install paths")]
     Locate,
     #[command(about = "Normalize an archive path")]
-    Paths { path: String },
+    Paths {
+        /// Archive path to normalize.
+        path: String,
+    },
     #[command(about = "Cross-pak asset summary, search, and extraction")]
     Asset {
         #[command(subcommand)]
@@ -80,7 +103,7 @@ enum Command {
         #[command(subcommand)]
         command: format::Cmd,
     },
-    #[command(about = "Extract-time legacy asset port (ADR 0027 + ADR 0028)")]
+    #[command(about = "Convert extracted legacy assets into native source assets")]
     Port {
         #[command(subcommand)]
         command: native_port::Cmd,
@@ -89,9 +112,23 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    theme::init(cli.color.into(), cli.plain);
+    print::init(cli.format);
+    theme::init(
+        cli.color.into(),
+        cli.plain || cli.format == OutputFormat::Json,
+    );
+    let level = match (cli.quiet, cli.verbose) {
+        (true, _) => tracing_subscriber::filter::LevelFilter::ERROR,
+        (false, 0) => tracing_subscriber::filter::LevelFilter::WARN,
+        (false, 1) => tracing_subscriber::filter::LevelFilter::INFO,
+        (false, 2) => tracing_subscriber::filter::LevelFilter::DEBUG,
+        (false, _) => tracing_subscriber::filter::LevelFilter::TRACE,
+    };
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env_lossy();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .with_target(false)
         .init();
 
@@ -107,7 +144,9 @@ fn main() -> anyhow::Result<()> {
             report.print();
         }
         Some(Command::Paths { path }) => {
-            println!("{}", nw_filesystem::normalize_archive_path(&path));
+            let mut report = Report::new("path");
+            report.kv("normalized", nw_filesystem::normalize_archive_path(&path));
+            report.print();
         }
         Some(Command::Asset { command }) => command.run()?,
         Some(Command::Pak { command }) => command.run()?,

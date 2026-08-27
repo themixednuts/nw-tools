@@ -11,7 +11,7 @@ use nw_pak::{Compression, PakMmapReader, azcs, crypak, oodle, shape};
 use crate::extract::{MountedPath, PathClaims};
 use crate::jobs::JobArgs;
 use crate::progress::Job;
-use crate::support::{AssetRootArg, GlobSet, PakSet, PathSelector, ScanIssues};
+use crate::support::{AssetRootArg, GlobSet, PakSet, PathSelector, ScanIssues, guard_existing};
 use crate::ui::{Cell, Report, Table, theme};
 
 #[derive(Debug, Subcommand)]
@@ -45,19 +45,24 @@ pub struct List {
     #[command(flatten)]
     root: AssetRootArg,
 
+    /// Keep only entries using this compression method.
     #[arg(long, value_enum)]
     method: Option<MethodArg>,
 
+    /// Keep only entries classified in this asset family.
     #[arg(long, value_enum)]
     family: Option<FamilyArg>,
 
+    /// Archive-path glob; repeat to include multiple patterns.
     #[arg(long)]
     name: Vec<String>,
 
+    /// Keep only entries wrapped in an AZ Core Stream header.
     #[arg(long)]
     azcs: bool,
 
-    #[arg(long)]
+    /// Maximum rows to print; `0` means unlimited.
+    #[arg(long = "limit")]
     show: Option<usize>,
 
     #[command(flatten)]
@@ -69,9 +74,11 @@ pub struct Shape {
     #[command(flatten)]
     root: AssetRootArg,
 
+    /// Maximum sample entries to print for each observed archive shape.
     #[arg(long, default_value_t = 20)]
     samples: usize,
 
+    /// Inspect AZ Core Stream wrappers inside entries.
     #[arg(long)]
     azcs: bool,
 
@@ -81,11 +88,14 @@ pub struct Shape {
 
 #[derive(Debug, Args)]
 pub struct Extract {
+    /// Output directory for extracted entries.
+    #[arg(long = "out-dir", value_name = "DIR")]
     out: PathBuf,
 
     #[command(flatten)]
     root: AssetRootArg,
 
+    /// Pak archive name or glob; repeat to select multiple archives.
     #[arg(long = "pak")]
     paks: Vec<String>,
 
@@ -97,10 +107,16 @@ pub struct Extract {
     #[arg(long)]
     glob: Vec<String>,
 
-    #[arg(long)]
+    /// Replace existing extracted files.
+    #[arg(long = "force")]
     overwrite: bool,
 
-    #[arg(long, default_value_t = 25)]
+    /// Print the extraction plan without writing files.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Maximum extracted paths to include in the summary; `0` means unlimited.
+    #[arg(long = "limit", default_value_t = 25)]
     show: usize,
 
     #[command(flatten)]
@@ -109,24 +125,41 @@ pub struct Extract {
 
 #[derive(Debug, Args)]
 pub struct Repack {
+    /// Directory whose files become pak entries.
     input_dir: PathBuf,
+    /// CryPak-compatible archive to create.
+    #[arg(long = "out", value_name = "FILE")]
     output_pak: PathBuf,
 
+    /// Replace an existing output pak.
+    #[arg(long)]
+    force: bool,
+
+    /// Validate paths and print the repack plan without writing the output pak.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Compression method for newly written entries.
     #[arg(long, value_enum, default_value_t = MethodArg::Deflate)]
     method: MethodArg,
 
+    /// CryPak ZIP extra-field marker policy.
     #[arg(long, value_enum, default_value_t = ExtraArg::Auto)]
     extra: ExtraArg,
 
+    /// Compression effort for Deflate or Oodle entries.
     #[arg(long, value_enum, default_value_t = LevelArg::Default)]
     level: LevelArg,
 
+    /// Archive-path glob written with Oodle; repeat for multiple patterns.
     #[arg(long = "oodle-pattern")]
     oodle_patterns: Vec<String>,
 
+    /// Oodle compressor used for matching entries.
     #[arg(long, value_enum, default_value_t = OodleCompressorArg::Kraken)]
     oodle_compressor: OodleCompressorArg,
 
+    /// Oodle compression effort used for matching entries.
     #[arg(long, value_enum, default_value_t = OodleLevelArg::Normal)]
     oodle_level: OodleLevelArg,
 
@@ -136,30 +169,49 @@ pub struct Repack {
 
 #[derive(Debug, Args)]
 pub struct Update {
+    /// Existing pak archive to read.
     input_pak: PathBuf,
+    /// Pak archive to write.
+    #[arg(long = "out", value_name = "FILE")]
     output_pak: PathBuf,
 
+    /// Replace an existing output pak.
+    #[arg(long)]
+    force: bool,
+
+    /// Validate inputs and print the update plan without writing the output pak.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Replacement mapping `ENTRY=PATH`; repeat for multiple entries.
     #[arg(long = "replace", value_name = "ENTRY=PATH", required = true)]
     replacements: Vec<ReplaceArg>,
 
+    /// Compression method for replacement entries; defaults to Deflate.
     #[arg(long, value_enum)]
     method: Option<MethodArg>,
 
+    /// CryPak ZIP extra-field marker policy; defaults to automatic detection.
     #[arg(long, value_enum)]
     extra: Option<ExtraArg>,
 
+    /// AZ Core Stream wrapper policy for replacement payloads.
     #[arg(long, value_enum, default_value_t = AzcsArg::Preserve)]
     azcs: AzcsArg,
 
+    /// Compression effort for replacement entries.
     #[arg(long, value_enum, default_value_t = LevelArg::Default)]
     level: LevelArg,
 
+    /// Archive-path glob written with Oodle; repeat for multiple patterns.
     #[arg(long = "oodle-pattern")]
     oodle_patterns: Vec<String>,
 
+    /// Oodle compressor used for matching replacement entries.
     #[arg(long, value_enum, default_value_t = OodleCompressorArg::Kraken)]
     oodle_compressor: OodleCompressorArg,
 
+    /// Oodle compression effort used for matching replacement entries.
     #[arg(long, value_enum, default_value_t = OodleLevelArg::Normal)]
     oodle_level: OodleLevelArg,
 
@@ -169,66 +221,103 @@ pub struct Update {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum MethodArg {
+    /// Store bytes without compression.
     Store,
+    /// Compress with standard Deflate.
     Deflate,
+    /// Compress with RAD Game Tools Oodle.
     Oodle,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ExtraArg {
+    /// Preserve or infer the CryPak marker from the input shape.
     Auto,
+    /// Write no CryPak marker.
     None,
+    /// Write the 0x10 marker form.
     Marker10,
+    /// Write the 0x15 marker form.
     Marker15,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum FamilyArg {
+    /// Audio control, bank, and media entries.
     Audio,
+    /// Structured game-data entries.
     Data,
+    /// Mesh, skeleton, and animation entries.
     Model,
+    /// Entries outside the known families.
     Other,
+    /// Root-level archive metadata.
     Root,
+    /// Lua and script entries.
     Script,
+    /// Shader entries.
     Shader,
+    /// Terrain entries.
     Terrain,
+    /// Texture entries.
     Texture,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LevelArg {
+    /// Minimum compression effort.
     Fastest,
+    /// Low compression effort.
     Faster,
+    /// Default balanced compression effort.
     Default,
+    /// Normal compression effort.
     Normal,
+    /// Higher compression effort.
     Better,
+    /// Maximum compression effort.
     Best,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OodleCompressorArg {
+    /// General-purpose high-ratio Oodle compressor.
     Kraken,
+    /// Fast Oodle compressor for mixed data.
     Mermaid,
+    /// Very fast Oodle compressor for low-latency data.
     Selkie,
+    /// Oodle meta-compressor that selects a suitable codec.
     Hydra,
+    /// Maximum-ratio Oodle compressor.
     Leviathan,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OodleLevelArg {
+    /// Lowest-latency Oodle mode.
     Superfast,
+    /// Fast Oodle mode.
     Fast,
+    /// Balanced Oodle mode.
     Normal,
+    /// First optimal-search level.
     Optimal1,
+    /// Second optimal-search level.
     Optimal2,
+    /// Highest exposed optimal-search level.
     Optimal5,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum AzcsArg {
+    /// Preserve the source entry's AZ Core Stream wrapper shape.
     Preserve,
+    /// Write the payload without an AZ Core Stream wrapper.
     Raw,
+    /// Write an uncompressed AZ Core Stream wrapper.
     Plain,
+    /// Write a zlib-compressed AZ Core Stream wrapper.
     Zlib,
 }
 
@@ -336,7 +425,7 @@ impl List {
         }
         rows.sort();
         let total_rows = rows.len();
-        if let Some(show) = self.show {
+        if let Some(show) = self.show.filter(|show| *show != 0) {
             rows.truncate(show);
         }
 
@@ -494,6 +583,14 @@ impl Extract {
         let ctx = self.jobs.ctx()?;
         let root = self.root.resolve()?;
         let paks = PakSet::collect(root, self.paks)?;
+        if self.dry_run {
+            Report::new("pak extract")
+                .stat("dry-run", "yes")
+                .stat("archives", paks.paths().len())
+                .stat("output", self.out.display())
+                .print();
+            return Ok(());
+        }
         let filter = PathSelector::new(self.filter, self.glob);
         let claims = PathClaims::default();
         let cancel = ctx.cancel.clone();
@@ -530,6 +627,20 @@ impl Extract {
 impl Repack {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
+        guard_existing(&self.output_pak, self.force.into())?;
+        anyhow::ensure!(
+            self.input_dir.is_dir(),
+            "input directory does not exist: {}",
+            self.input_dir.display()
+        );
+        if self.dry_run {
+            Report::new("pak repack")
+                .stat("dry-run", "yes")
+                .stat("input", self.input_dir.display())
+                .stat("output", self.output_pak.display())
+                .print();
+            return Ok(());
+        }
         let oodle_options =
             oodle::Options::new(self.oodle_compressor.into(), self.oodle_level.into());
         let mut options = crypak::Options::new()
@@ -558,6 +669,7 @@ impl Repack {
 impl Update {
     fn run(self) -> Result<()> {
         let ctx = self.jobs.ctx()?;
+        guard_existing(&self.output_pak, self.force.into())?;
         let oodle_options =
             oodle::Options::new(self.oodle_compressor.into(), self.oodle_level.into());
         let mut options = crypak::Options::new()
@@ -585,6 +697,16 @@ impl Update {
                 patch = patch.extra(extra.into());
             }
             patches.push(patch);
+        }
+
+        if self.dry_run {
+            Report::new("pak update")
+                .stat("dry-run", "yes")
+                .stat("input", self.input_pak.display())
+                .stat("output", self.output_pak.display())
+                .stat("replacements", patches.len())
+                .print();
+            return Ok(());
         }
 
         let progress = ctx.progress.stage("pak update");
@@ -753,6 +875,11 @@ impl PakExtractReport {
         self.skipped_existing += other.skipped_existing;
         self.skipped_duplicate += other.skipped_duplicate;
         self.bytes_written += other.bytes_written;
+        let row_limit = if row_limit == 0 {
+            usize::MAX
+        } else {
+            row_limit
+        };
         let remaining = row_limit.saturating_sub(self.rows.len());
         let take = remaining.min(other.rows.len());
         self.rows.extend(other.rows.drain(..take));
@@ -776,7 +903,12 @@ impl PakExtractReport {
         if !table.is_empty() {
             report.table(table);
         }
-        let remaining = self.written.saturating_sub(limit as u64);
+        let shown = if limit == 0 {
+            self.written
+        } else {
+            limit as u64
+        };
+        let remaining = self.written.saturating_sub(shown);
         if remaining > 0 {
             report.more(remaining, "file(s)");
         }

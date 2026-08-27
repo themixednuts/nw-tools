@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 
 use crate::support::{ensure_parent, guard_existing};
-use crate::ui::Report;
+use crate::ui::{Cell, OutputFormat, Report, Table, print};
 
 #[derive(Debug, Args)]
 pub struct Audio {
@@ -15,16 +15,20 @@ pub struct Audio {
     path: PathBuf,
 
     /// Write pretty JSON metadata to this path instead of stdout.
-    #[arg(long)]
+    #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
 
     /// For BNK input, extract and validate every DIDX/DATA embedded WEM here.
-    #[arg(long)]
+    #[arg(long = "out-dir", alias = "extract-embedded", value_name = "DIR")]
     extract_embedded: Option<PathBuf>,
 
     /// Replace existing JSON or extracted WEM files.
-    #[arg(long)]
+    #[arg(long = "force")]
     overwrite: bool,
+
+    /// Inspect the input and print the write plan without creating output files.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 impl Audio {
@@ -32,6 +36,20 @@ impl Audio {
         let bytes = std::fs::read(&self.path)
             .with_context(|| format!("read audio asset {}", self.path.display()))?;
         let inspected = inspect(&self.path, &bytes)?;
+
+        if self.dry_run {
+            let mut report = Report::new("audio")
+                .stat("dry-run", "yes")
+                .stat("source", self.path.display());
+            if let Some(out) = &self.out {
+                report = report.stat("json-output", out.display());
+            }
+            if let Some(directory) = &self.extract_embedded {
+                report = report.stat("embedded-output", directory.display());
+            }
+            report.print();
+            return Ok(());
+        }
 
         if let Some(directory) = &self.extract_embedded {
             extract_embedded(&self.path, &bytes, directory, self.overwrite)?;
@@ -47,10 +65,38 @@ impl Audio {
                 .stat("output", out.display())
                 .print();
         } else {
-            println!("{json}");
+            print_inspection(&self.path, &inspected);
         }
         Ok(())
     }
+}
+
+fn print_inspection(path: &Path, inspected: &serde_json::Value) {
+    if print::output_format() == OutputFormat::Json {
+        print::print_json(inspected);
+        return;
+    }
+
+    let kind = inspected
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let mut report = Report::new("audio")
+        .stat("source", path.display())
+        .stat("kind", kind);
+    let mut table = Table::new(["Field", "Value"]);
+    if let Some(fields) = inspected.as_object() {
+        for (name, value) in fields {
+            if name != "kind" {
+                table.push([
+                    Cell::text(name),
+                    Cell::text(serde_json::to_string(value).unwrap_or_default()),
+                ]);
+            }
+        }
+    }
+    report.table_or(table, "no metadata fields");
+    report.print();
 }
 
 fn inspect(path: &Path, bytes: &[u8]) -> Result<serde_json::Value> {
