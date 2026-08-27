@@ -460,6 +460,128 @@ pub struct CharacterAnimationOwnershipIndex {
     skeletons_by_clip: BTreeMap<String, BTreeSet<String>>,
 }
 
+/// Exact animation-set aliases recovered from CDF/CHRPARAMS roots.
+///
+/// Cry resolves Mannequin and blend-space animation names through the owning
+/// character's `AnimationList`. This index preserves that authored lookup,
+/// including shared includes, sequential `#filepath` state, and wildcard alias
+/// expansion. Aliases that resolve to different assets across characters are
+/// intentionally omitted from [`Self::path_for_alias`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CharacterAnimationAliasIndex {
+    paths_by_alias: BTreeMap<String, CharacterAnimationAliasPath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CharacterAnimationAliasPath {
+    Unique(String),
+    Ambiguous,
+}
+
+impl CharacterAnimationAliasIndex {
+    /// Build exact alias bindings from character definitions and their
+    /// parameter graphs.
+    pub fn build<Definitions, ReadParameters, MatchingPaths>(
+        definitions: Definitions,
+        mut read_parameters: ReadParameters,
+        mut matching_paths: MatchingPaths,
+    ) -> Result<Self, CharacterAnimationAliasError>
+    where
+        Definitions: IntoIterator<Item = (String, CharacterDefinition)>,
+        ReadParameters: FnMut(&str) -> Result<Option<CharacterParameters>, String>,
+        MatchingPaths: FnMut(&str) -> Result<Vec<String>, String>,
+    {
+        let mut aliases = Self::default();
+        for (definition_path, definition) in definitions {
+            let skeleton = normalize_virtual_path(&definition.model.skeleton);
+            if skeleton.is_empty() {
+                return Err(CharacterAnimationOwnershipError::MissingSkeleton {
+                    definition: definition_path,
+                });
+            }
+            let (parameters_path, required) =
+                if let Some(path) = definition.model.params_override.as_deref() {
+                    (normalize_virtual_path(path), true)
+                } else {
+                    (replace_virtual_extension(&skeleton, "chrparams"), false)
+                };
+            let Some(parameters) = read_parameters(&parameters_path).map_err(|message| {
+                CharacterAnimationOwnershipError::ReadParameters {
+                    path: parameters_path.clone(),
+                    message,
+                }
+            })?
+            else {
+                if required {
+                    return Err(
+                        CharacterAnimationOwnershipError::MissingRequiredParameters {
+                            definition: definition_path,
+                            path: parameters_path,
+                        },
+                    );
+                }
+                continue;
+            };
+            let mut state = CharacterAnimationPathResolver::default();
+            let mut visited = HashSet::new();
+            visit_character_animation_parameters(
+                &parameters_path,
+                &parameters,
+                &mut state,
+                &mut visited,
+                &mut read_parameters,
+                &mut matching_paths,
+                &mut |alias, source_path| aliases.add_alias(alias, source_path),
+            )?;
+        }
+        Ok(aliases)
+    }
+
+    /// Return a path only when every character that defines the alias agrees
+    /// on the same animation asset.
+    #[must_use]
+    pub fn path_for_alias(&self, alias: &str) -> Option<&str> {
+        match self.paths_by_alias.get(&normalize_animation_alias(alias)) {
+            Some(CharacterAnimationAliasPath::Unique(path)) => Some(path),
+            Some(CharacterAnimationAliasPath::Ambiguous) | None => None,
+        }
+    }
+
+    #[must_use]
+    pub fn aliases(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.paths_by_alias
+            .iter()
+            .filter_map(|(alias, path)| match path {
+                CharacterAnimationAliasPath::Unique(path) => Some((alias.as_str(), path.as_str())),
+                CharacterAnimationAliasPath::Ambiguous => None,
+            })
+    }
+
+    fn add_alias(&mut self, alias: &str, source_path: &str) {
+        if !is_character_animation_asset_path(source_path) {
+            return;
+        }
+        let alias = normalize_animation_alias(alias);
+        if alias.is_empty() {
+            return;
+        }
+        let source_path = normalize_virtual_path(source_path).to_ascii_lowercase();
+        self.paths_by_alias
+            .entry(alias)
+            .and_modify(|entry| {
+                if !matches!(entry, CharacterAnimationAliasPath::Unique(existing) if existing == &source_path)
+                {
+                    *entry = CharacterAnimationAliasPath::Ambiguous;
+                }
+            })
+            .or_insert(CharacterAnimationAliasPath::Unique(source_path));
+    }
+}
+
+/// Alias-index traversal has the same source-graph failure surface as ownership
+/// traversal; keep one durable public error vocabulary for both indices.
+pub type CharacterAnimationAliasError = CharacterAnimationOwnershipError;
+
 impl CharacterAnimationOwnershipIndex {
     /// Build exact clip ownership from parsed character definitions.
     ///
@@ -509,14 +631,14 @@ impl CharacterAnimationOwnershipIndex {
             };
             let mut state = CharacterAnimationPathResolver::default();
             let mut visited = HashSet::new();
-            ownership.visit_parameters(
+            visit_character_animation_parameters(
                 &parameters_path,
                 &parameters,
-                &skeleton,
                 &mut state,
                 &mut visited,
                 &mut read_parameters,
                 &mut matching_paths,
+                &mut |_, source_path| ownership.add_clip_owner(source_path, &skeleton),
             )?;
         }
         Ok(ownership)
@@ -535,87 +657,6 @@ impl CharacterAnimationOwnershipIndex {
             .map(|(clip, skeletons)| (clip.as_str(), skeletons))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn visit_parameters<ReadParameters, MatchingPaths>(
-        &mut self,
-        source_path: &str,
-        parameters: &CharacterParameters,
-        skeleton: &str,
-        state: &mut CharacterAnimationPathResolver,
-        visited: &mut HashSet<String>,
-        read_parameters: &mut ReadParameters,
-        matching_paths: &mut MatchingPaths,
-    ) -> Result<(), CharacterAnimationOwnershipError>
-    where
-        ReadParameters: FnMut(&str) -> Result<Option<CharacterParameters>, String>,
-        MatchingPaths: FnMut(&str) -> Result<Vec<String>, String>,
-    {
-        if !visited.insert(normalize_virtual_path(source_path).to_ascii_lowercase()) {
-            return Ok(());
-        }
-        for entry in &parameters.animations {
-            let path = state.resolve_entry(entry);
-            match entry.kind {
-                CharacterAnimationEntryKind::FilePath
-                | CharacterAnimationEntryKind::ParseSubfolders
-                | CharacterAnimationEntryKind::TracksDatabase
-                | CharacterAnimationEntryKind::AnimationEventDatabase
-                | CharacterAnimationEntryKind::FaceLibrary => {}
-                CharacterAnimationEntryKind::Include => {
-                    if path.trim().is_empty() {
-                        continue;
-                    }
-                    let included = read_parameters(&path).map_err(|message| {
-                        CharacterAnimationOwnershipError::ReadParameters {
-                            path: path.clone(),
-                            message,
-                        }
-                    })?;
-                    let Some(included) = included else {
-                        return Err(
-                            CharacterAnimationOwnershipError::MissingIncludedParameters {
-                                source_path: source_path.to_string(),
-                                path,
-                            },
-                        );
-                    };
-                    self.visit_parameters(
-                        &path,
-                        &included,
-                        skeleton,
-                        state,
-                        visited,
-                        read_parameters,
-                        matching_paths,
-                    )?;
-                }
-                CharacterAnimationEntryKind::WildcardAsset => {
-                    let matches = matching_paths(&path).map_err(|message| {
-                        CharacterAnimationOwnershipError::MatchPattern {
-                            source_path: source_path.to_string(),
-                            pattern: path.clone(),
-                            message,
-                        }
-                    })?;
-                    for matched in matches {
-                        self.add_clip_owner(&matched, skeleton);
-                    }
-                }
-                CharacterAnimationEntryKind::Asset => {
-                    self.add_clip_owner(&path, skeleton);
-                }
-                CharacterAnimationEntryKind::UnknownDirective => {
-                    return Err(CharacterAnimationOwnershipError::UnsupportedDirective {
-                        source_path: source_path.to_string(),
-                        name: entry.name.clone(),
-                        path: entry.path.clone(),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn add_clip_owner(&mut self, source_path: &str, skeleton: &str) {
         if !is_animation_clip_path(source_path) {
             return;
@@ -625,6 +666,87 @@ impl CharacterAnimationOwnershipIndex {
             .or_default()
             .insert(normalize_virtual_path(skeleton));
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_character_animation_parameters<ReadParameters, MatchingPaths, VisitAsset>(
+    source_path: &str,
+    parameters: &CharacterParameters,
+    state: &mut CharacterAnimationPathResolver,
+    visited: &mut HashSet<String>,
+    read_parameters: &mut ReadParameters,
+    matching_paths: &mut MatchingPaths,
+    visit_asset: &mut VisitAsset,
+) -> Result<(), CharacterAnimationOwnershipError>
+where
+    ReadParameters: FnMut(&str) -> Result<Option<CharacterParameters>, String>,
+    MatchingPaths: FnMut(&str) -> Result<Vec<String>, String>,
+    VisitAsset: FnMut(&str, &str),
+{
+    if !visited.insert(normalize_virtual_path(source_path).to_ascii_lowercase()) {
+        return Ok(());
+    }
+    for entry in &parameters.animations {
+        let path = state.resolve_entry(entry);
+        match entry.kind {
+            CharacterAnimationEntryKind::FilePath
+            | CharacterAnimationEntryKind::ParseSubfolders
+            | CharacterAnimationEntryKind::TracksDatabase
+            | CharacterAnimationEntryKind::AnimationEventDatabase
+            | CharacterAnimationEntryKind::FaceLibrary => {}
+            CharacterAnimationEntryKind::Include => {
+                if path.trim().is_empty() {
+                    continue;
+                }
+                let included = read_parameters(&path).map_err(|message| {
+                    CharacterAnimationOwnershipError::ReadParameters {
+                        path: path.clone(),
+                        message,
+                    }
+                })?;
+                let Some(included) = included else {
+                    return Err(
+                        CharacterAnimationOwnershipError::MissingIncludedParameters {
+                            source_path: source_path.to_string(),
+                            path,
+                        },
+                    );
+                };
+                visit_character_animation_parameters(
+                    &path,
+                    &included,
+                    state,
+                    visited,
+                    read_parameters,
+                    matching_paths,
+                    visit_asset,
+                )?;
+            }
+            CharacterAnimationEntryKind::WildcardAsset => {
+                let matches = matching_paths(&path).map_err(|message| {
+                    CharacterAnimationOwnershipError::MatchPattern {
+                        source_path: source_path.to_string(),
+                        pattern: path.clone(),
+                        message,
+                    }
+                })?;
+                for matched in matches {
+                    if let Some(alias) = expanded_animation_alias(&entry.name, &matched) {
+                        visit_asset(&alias, &matched);
+                    }
+                }
+            }
+            CharacterAnimationEntryKind::Asset => visit_asset(&entry.name, &path),
+            CharacterAnimationEntryKind::UnknownDirective => {
+                return Err(CharacterAnimationOwnershipError::UnsupportedDirective {
+                    source_path: source_path.to_string(),
+                    name: entry.name.clone(),
+                    path: entry.path.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -662,6 +784,30 @@ pub fn canonical_animation_clip_path(path: &str) -> String {
 fn is_animation_clip_path(path: &str) -> bool {
     let path = normalize_virtual_path(path).to_ascii_lowercase();
     path.ends_with(".caf") || path.ends_with(".i_caf")
+}
+
+fn is_character_animation_asset_path(path: &str) -> bool {
+    let path = normalize_virtual_path(path).to_ascii_lowercase();
+    [".caf", ".i_caf", ".bspace", ".comb"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+}
+
+fn normalize_animation_alias(alias: &str) -> String {
+    alias.trim().to_ascii_lowercase()
+}
+
+fn expanded_animation_alias(pattern: &str, source_path: &str) -> Option<String> {
+    let path = normalize_virtual_path(source_path);
+    if !is_character_animation_asset_path(&path) {
+        return None;
+    }
+    let file = path.rsplit('/').next()?;
+    let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+    Some(pattern.split_once('*').map_or_else(
+        || pattern.to_owned(),
+        |(prefix, suffix)| format!("{prefix}{stem}{suffix}"),
+    ))
 }
 
 fn replace_virtual_extension(path: &str, extension: &str) -> String {
@@ -901,5 +1047,87 @@ mod tests {
             ownership.skeletons_for_clip("animations/shared/move_forward.caf"),
             Some(&BTreeSet::from(["objects/hero.chr".to_string()]))
         );
+    }
+
+    #[test]
+    fn animation_aliases_follow_includes_filepath_and_native_wildcard_names() {
+        let definition = CharacterDefinition::from_xml(
+            r#"<CharacterDefinition><Model File="objects/hero.chr"/></CharacterDefinition>"#,
+        )
+        .unwrap();
+        let root = CharacterParameters::from_xml(
+            r##"<Params><AnimationList>
+                <Animation name="#filepath" path="animations/shared"/>
+                <Animation name="$Include" path="objects/shared.chrparams"/>
+            </AnimationList></Params>"##,
+        )
+        .unwrap();
+        let shared = CharacterParameters::from_xml(
+            r#"<Params><AnimationList>
+                <Animation name="idle" path="idle.caf"/>
+                <Animation name="move_*_loop" path="move_*.caf"/>
+            </AnimationList></Params>"#,
+        )
+        .unwrap();
+        let parameters = BTreeMap::from([
+            ("objects/hero.chrparams".to_string(), root),
+            ("objects/shared.chrparams".to_string(), shared),
+        ]);
+
+        let aliases = CharacterAnimationAliasIndex::build(
+            [("objects/hero.cdf".to_string(), definition)],
+            |path| Ok(parameters.get(path).cloned()),
+            |pattern| {
+                assert_eq!(pattern, "animations/shared/move_*.caf");
+                Ok(vec!["animations/shared/move_forward.i_caf".to_string()])
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            aliases.path_for_alias("IDLE"),
+            Some("animations/shared/idle.caf")
+        );
+        assert_eq!(
+            aliases.path_for_alias("move_move_forward_loop"),
+            Some("animations/shared/move_forward.i_caf")
+        );
+    }
+
+    #[test]
+    fn animation_aliases_omit_cross_character_disagreements() {
+        let first = CharacterDefinition::from_xml(
+            r#"<CharacterDefinition><Model File="objects/first.chr"/></CharacterDefinition>"#,
+        )
+        .unwrap();
+        let second = CharacterDefinition::from_xml(
+            r#"<CharacterDefinition><Model File="objects/second.chr"/></CharacterDefinition>"#,
+        )
+        .unwrap();
+        let first_parameters = CharacterParameters::from_xml(
+            r#"<Params><AnimationList><Animation name="idle" path="animations/first_idle.caf"/></AnimationList></Params>"#,
+        )
+        .unwrap();
+        let second_parameters = CharacterParameters::from_xml(
+            r#"<Params><AnimationList><Animation name="idle" path="animations/second_idle.caf"/></AnimationList></Params>"#,
+        )
+        .unwrap();
+        let parameters = BTreeMap::from([
+            ("objects/first.chrparams".to_string(), first_parameters),
+            ("objects/second.chrparams".to_string(), second_parameters),
+        ]);
+
+        let aliases = CharacterAnimationAliasIndex::build(
+            [
+                ("objects/first.cdf".to_string(), first),
+                ("objects/second.cdf".to_string(), second),
+            ],
+            |path| Ok(parameters.get(path).cloned()),
+            |_| Ok(Vec::new()),
+        )
+        .unwrap();
+
+        assert_eq!(aliases.path_for_alias("idle"), None);
+        assert_eq!(aliases.aliases().count(), 0);
     }
 }
