@@ -3,11 +3,12 @@ use std::{
     fs,
     io::{self, IsTerminal, Read, Write},
     path::{Component, Path, PathBuf},
+    process::Command as ProcessCommand,
     sync::Mutex,
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use nw_serialize_codegen::{
     CodegenContext, CodegenStatus, CodegenStatusEvent, CodegenStatusKind, CodegenStatusSink,
     CompileUnit, CompletedCodegenUnits, GoSourceEmitter, GoStandaloneProjectFile,
@@ -36,13 +37,65 @@ const EMBEDDED_SERIALIZE_CONTEXT: &[u8] = include_bytes!("../../../../resources/
 struct EmbeddedModuleDescriptors;
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(
+    name = "nw-serialize-codegen",
+    version,
+    about,
+    after_help = "ENVIRONMENT:\n  RUST_LOG  Layer tracing directives over -v/--verbose or -q/--quiet.\n  NO_COLOR  Disable automatic color output."
+)]
 struct Cli {
+    /// Output encoding. JSON uses the stable `nw-serialize-codegen.output.v1` envelope.
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+
     /// Status rendering. `auto` uses terminal progress on TTY stderr and trace events otherwise.
     #[arg(long, global = true, value_enum, default_value_t = StatusMode::Auto)]
     status: StatusMode,
+
+    /// Increase default log verbosity (`-v` info, `-vv` debug, `-vvv` trace).
+    #[arg(short, long, global = true, action = ArgAction::Count)]
+    verbose: u8,
+
+    /// Restrict default diagnostics to errors. RUST_LOG can add directives.
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    quiet: bool,
+
+    /// When to colorize diagnostic output.
+    #[arg(long, global = true, value_enum, default_value_t = ColorArg::Auto)]
+    color: ColorArg,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+enum OutputFormat {
+    /// Human-readable command output.
+    #[default]
+    Text,
+    /// Machine-readable output with rendered lines represented as strings.
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+enum ColorArg {
+    /// Colorize diagnostics only on a terminal when NO_COLOR is unset.
+    #[default]
+    Auto,
+    /// Always colorize diagnostic output.
+    Always,
+    /// Never colorize diagnostic output.
+    Never,
+}
+
+impl ColorArg {
+    fn stderr_ansi(self) -> bool {
+        match self {
+            Self::Auto => std::env::var_os("NO_COLOR").is_none() && io::stderr().is_terminal(),
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -78,7 +131,7 @@ struct GenerateArgs {
     #[command(flatten)]
     catalog: CatalogArgs,
     /// Output directory. With `--language all`, language subdirectories are created inside it.
-    #[arg(long)]
+    #[arg(long = "out-dir", alias = "out", value_name = "DIR")]
     out: PathBuf,
     /// Language to generate.
     #[arg(long, value_enum, default_value_t = Language::All)]
@@ -110,6 +163,8 @@ struct GenerateArgs {
     /// TypeScript VitePlus pack entry. Repeat to add entries.
     #[arg(long = "typescript-pack-entry")]
     typescript_pack_entries: Vec<String>,
+    #[command(flatten)]
+    write: WriteOptions,
 }
 
 #[derive(Debug, Args)]
@@ -153,8 +208,10 @@ struct NetworkSchemaArgs {
     #[arg(long = "field-overrides-source")]
     field_overrides_source: Option<String>,
     /// Output path for the derived network schema JSON. This does not rewrite typeregistry.json.
-    #[arg(long)]
+    #[arg(long, value_name = "FILE")]
     out: PathBuf,
+    #[command(flatten)]
+    write: WriteOptions,
 }
 
 #[derive(Debug, Args)]
@@ -163,7 +220,7 @@ struct NetworkRustArgs {
     #[arg(long)]
     schema: PathBuf,
     /// Output Rust module path.
-    #[arg(long)]
+    #[arg(long, value_name = "FILE")]
     out: PathBuf,
     /// Rust artifact to emit.
     #[arg(long, value_enum, default_value_t = NetworkRustKind::Descriptors)]
@@ -172,7 +229,7 @@ struct NetworkRustArgs {
     #[arg(long = "type-index", value_name = "INDEX")]
     type_indices: Vec<u32>,
     /// Optional generation report JSON path.
-    #[arg(long)]
+    #[arg(long, value_name = "FILE")]
     report: Option<PathBuf>,
     /// Optional Rust source root to audit generated network descriptors against.
     #[arg(long = "rust-source-root")]
@@ -183,6 +240,19 @@ struct NetworkRustArgs {
     /// Worker count. Omit for Rayon default; use 0 to run on the caller thread.
     #[arg(long)]
     jobs: Option<usize>,
+    #[command(flatten)]
+    write: WriteOptions,
+}
+
+#[derive(Debug, Args, Clone, Copy)]
+struct WriteOptions {
+    /// Replace existing generated files whose contents differ.
+    #[arg(long)]
+    force: bool,
+
+    /// Compile and validate every output without creating or replacing files.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -194,7 +264,7 @@ enum Language {
     TypeScript,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StatusMode {
     Auto,
     Quiet,
@@ -271,7 +341,12 @@ struct WriteSummary {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let status = init_status(cli.status)?;
+    if cli.format == OutputFormat::Json
+        && std::env::var_os("NW_SERIALIZE_CODEGEN_JSON_CHILD").is_none()
+    {
+        return run_json_child();
+    }
+    let status = init_status(cli.status, cli.verbose, cli.quiet, cli.color)?;
     match cli.command {
         Command::Summary(args) => summary(&args, status),
         Command::Generate(args) => generate(&args, status),
@@ -280,16 +355,50 @@ fn main() -> Result<()> {
     }
 }
 
-fn init_status(mode: StatusMode) -> Result<CodegenStatus> {
+fn run_json_child() -> Result<()> {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let Some(executable) = args.first() else {
+        return Ok(());
+    };
+    let output = ProcessCommand::new(executable)
+        .args(&args[1..])
+        .env("NW_SERIALIZE_CODEGEN_JSON_CHILD", "1")
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+    let document = serde_json::json!({
+        "schema": "nw-serialize-codegen.output.v1",
+        "command": args[1..]
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        "success": output.status.success(),
+        "exit_code": output.status.code(),
+        "lines": stdout.lines().collect::<Vec<_>>(),
+    });
+    println!("{}", serde_json::to_string_pretty(&document)?);
+    if !output.status.success() {
+        std::process::exit(output.status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+fn init_status(
+    mode: StatusMode,
+    verbosity: u8,
+    quiet: bool,
+    color: ColorArg,
+) -> Result<CodegenStatus> {
     let mode = effective_status_mode(mode);
+    init_tracing(verbosity, quiet, color, mode == StatusMode::Trace);
     match mode {
         StatusMode::Auto => unreachable!("auto is resolved before status initialization"),
         StatusMode::Quiet => Ok(CodegenStatus::default()),
         StatusMode::Progress => Ok(CodegenStatus::new(ProgressStatusSink::default())),
-        StatusMode::Trace => {
-            init_tracing();
-            Ok(CodegenStatus::default())
-        }
+        StatusMode::Trace => Ok(CodegenStatus::default()),
         StatusMode::Json => Ok(CodegenStatus::new(JsonStatusSink::default())),
     }
 }
@@ -302,14 +411,29 @@ fn effective_status_mode(mode: StatusMode) -> StatusMode {
     }
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("nw_serialize_codegen::status=info,nw_jobs=warn"));
+fn init_tracing(verbosity: u8, quiet: bool, color: ColorArg, trace_status: bool) {
+    let level = match (quiet, verbosity) {
+        (true, _) => tracing_subscriber::filter::LevelFilter::ERROR,
+        (false, 0) => tracing_subscriber::filter::LevelFilter::WARN,
+        (false, 1) => tracing_subscriber::filter::LevelFilter::INFO,
+        (false, 2) => tracing_subscriber::filter::LevelFilter::DEBUG,
+        (false, _) => tracing_subscriber::filter::LevelFilter::TRACE,
+    };
+    let mut filter = EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env_lossy();
+    if trace_status && std::env::var_os("RUST_LOG").is_none() {
+        filter = filter.add_directive(
+            "nw_serialize_codegen::status=info"
+                .parse()
+                .expect("valid status tracing directive"),
+        );
+    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(io::stderr)
         .with_target(false)
-        .with_ansi(io::stderr().is_terminal())
+        .with_ansi(color.stderr_ansi())
         .compact()
         .try_init();
 }
@@ -646,22 +770,16 @@ fn network_schema(args: &NetworkSchemaArgs, status: CodegenStatus) -> Result<()>
     }
     let mut source = serde_json::to_vec_pretty(&schema).context("serialize network schema JSON")?;
     source.push(b'\n');
-    if let Some(parent) = args
-        .out
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create output directory {}", parent.display()))?;
-    }
-    let changed = write_file_if_changed(&args.out, &source)?;
+    let changed = write_path_if_changed(&args.out, &source, args.write)?;
     println!(
         "network schema: {} type(s), {} register-field function(s), {} register-field call(s)",
         schema.summary.type_count,
         schema.summary.register_field_function_count,
         schema.summary.register_field_count
     );
-    if changed {
+    if args.write.dry_run && changed {
+        println!("would write {}", args.out.display());
+    } else if changed {
         println!("wrote {}", args.out.display());
     } else {
         println!("unchanged {}", args.out.display());
@@ -726,20 +844,27 @@ fn network_rust(args: &NetworkRustArgs, status: CodegenStatus) -> Result<()> {
         }
     };
     progress.advance_with_message(1, Some(format!("emitted {:?}", args.kind)));
-    write_path_if_changed(&args.out, output.source.as_bytes())?;
-    progress.advance_with_message(1, Some("wrote source".to_owned()));
+    write_path_if_changed(&args.out, output.source.as_bytes(), args.write)?;
+    progress.advance_with_message(
+        1,
+        Some(if args.write.dry_run {
+            "validated source output".to_owned()
+        } else {
+            "wrote source".to_owned()
+        }),
+    );
     if let Some(report_path) = &args.report {
         let mut report =
             serde_json::to_vec_pretty(&output.report).context("serialize network Rust report")?;
         report.push(b'\n');
-        write_path_if_changed(report_path, &report)?;
+        write_path_if_changed(report_path, &report, args.write)?;
     }
     if let Some(audit) = &source_audit {
         if let Some(report_path) = &args.rust_source_audit {
             let mut report =
                 serde_json::to_vec_pretty(audit).context("serialize network Rust source audit")?;
             report.push(b'\n');
-            write_path_if_changed(report_path, &report)?;
+            write_path_if_changed(report_path, &report, args.write)?;
         }
         println!(
             "source audit: {} checked, {} current, {} missing, {} ambiguous, {} field mismatch, {} derive mismatch",
@@ -1141,10 +1266,15 @@ fn generate_language(
             context,
         )?,
     };
-    let summary = write_output_files(out, &files, context)
+    let summary = write_output_files(out, &files, context, args.write)
         .with_context(|| format!("write {language} output to {}", out.display()))?;
     println!(
-        "{language}: wrote {} files to {} ({} changed, {} unchanged)",
+        "{language}: {} {} files to {} ({} changed, {} unchanged)",
+        if args.write.dry_run {
+            "would write"
+        } else {
+            "wrote"
+        },
         files.len(),
         out.display(),
         summary.changed,
@@ -1569,11 +1699,9 @@ fn write_output_files(
     root: &Path,
     files: &[OutputFile],
     context: &CodegenContext,
+    write: WriteOptions,
 ) -> Result<WriteSummary> {
     assert_unique_paths(files)?;
-    fs::create_dir_all(root)
-        .with_context(|| format!("create output directory {}", root.display()))?;
-
     let tasks = files
         .iter()
         .map(|file| {
@@ -1583,6 +1711,18 @@ fn write_output_files(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let changes = context.runner().try_map(&tasks, |task| {
+        output_change_needed(&task.path, task.source.as_bytes(), write)
+    })?;
+    if write.dry_run {
+        return Ok(WriteSummary {
+            changed: changes.iter().filter(|changed| **changed).count(),
+            unchanged: changes.iter().filter(|changed| !**changed).count(),
+        });
+    }
+
+    fs::create_dir_all(root)
+        .with_context(|| format!("create output directory {}", root.display()))?;
     let parent_dirs = tasks
         .iter()
         .filter_map(|task| task.path.parent())
@@ -1608,7 +1748,7 @@ fn write_output_files(
     let writes = context
         .runner()
         .try_map_until_cancelled(&tasks, context.cancel(), |task| {
-            let changed = write_file_if_changed(&task.path, task.source.as_bytes())?;
+            let changed = write_file_if_changed(&task.path, task.source.as_bytes(), write)?;
             write_progress.advance(1);
             Ok::<bool, anyhow::Error>(changed)
         })?;
@@ -1658,16 +1798,38 @@ fn output_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(root.join(relative_path))
 }
 
-fn write_file_if_changed(path: &Path, source: &[u8]) -> Result<bool> {
-    let source_hash = blake3::hash(source);
-    if existing_file_matches_hash(path, source.len() as u64, source_hash)? {
+fn write_file_if_changed(path: &Path, source: &[u8], write: WriteOptions) -> Result<bool> {
+    if !output_change_needed(path, source, write)? {
         return Ok(false);
+    }
+    if write.dry_run {
+        return Ok(true);
     }
     fs::write(path, source).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
 }
 
-fn write_path_if_changed(path: &Path, source: &[u8]) -> Result<bool> {
+fn output_change_needed(path: &Path, source: &[u8], write: WriteOptions) -> Result<bool> {
+    let source_hash = blake3::hash(source);
+    if existing_file_matches_hash(path, source.len() as u64, source_hash)? {
+        return Ok(false);
+    }
+    if path.exists() && !write.force {
+        bail!(
+            "output already exists and differs: {} (use --force to replace it)",
+            path.display()
+        );
+    }
+    Ok(true)
+}
+
+fn write_path_if_changed(path: &Path, source: &[u8], write: WriteOptions) -> Result<bool> {
+    if !output_change_needed(path, source, write)? {
+        return Ok(false);
+    }
+    if write.dry_run {
+        return Ok(true);
+    }
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1675,7 +1837,8 @@ fn write_path_if_changed(path: &Path, source: &[u8]) -> Result<bool> {
         fs::create_dir_all(parent)
             .with_context(|| format!("create output directory {}", parent.display()))?;
     }
-    write_file_if_changed(path, source)
+    fs::write(path, source).with_context(|| format!("write {}", path.display()))?;
+    Ok(true)
 }
 
 fn existing_file_matches_hash(
@@ -1703,6 +1866,70 @@ fn existing_file_matches_hash(
         hasher.update(&buffer[..bytes_read]);
     }
     Ok(hasher.finalize() == expected_hash)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn generate_uses_typed_output_directory_flag() {
+        let parsed = Cli::try_parse_from([
+            "nw-serialize-codegen",
+            "generate",
+            "--out-dir",
+            "generated",
+            "--dry-run",
+        ])
+        .expect("parse generate command");
+
+        let Command::Generate(args) = parsed.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(args.out, Path::new("generated"));
+        assert!(args.write.dry_run);
+    }
+
+    #[test]
+    fn dry_run_reports_change_without_creating_output() {
+        let root = tempfile::tempdir().expect("create temp directory");
+        let output = root.path().join("nested/generated.rs");
+        let changed = write_path_if_changed(
+            &output,
+            b"generated\n",
+            WriteOptions {
+                force: false,
+                dry_run: true,
+            },
+        )
+        .expect("dry-run output preflight");
+
+        assert!(changed);
+        assert!(!output.exists());
+        assert!(!output.parent().expect("output parent").exists());
+    }
+
+    #[test]
+    fn differing_existing_output_requires_force() {
+        let root = tempfile::tempdir().expect("create temp directory");
+        let output = root.path().join("generated.rs");
+        fs::write(&output, "old\n").expect("write old output");
+
+        let error = write_path_if_changed(
+            &output,
+            b"new\n",
+            WriteOptions {
+                force: false,
+                dry_run: false,
+            },
+        )
+        .expect_err("changed output must require force");
+        assert!(error.to_string().contains("use --force"));
+        assert_eq!(
+            fs::read_to_string(&output).expect("read old output"),
+            "old\n"
+        );
+    }
 }
 
 fn reject_compile_errors(compile_unit: &CompileUnit) -> Result<()> {

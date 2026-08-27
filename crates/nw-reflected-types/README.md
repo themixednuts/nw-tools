@@ -17,7 +17,7 @@ cargo run -p nw-serialize-codegen -- generate `
   --language rust `
   --rust-layout vendored `
   --rust-package nw-reflected-types `
-  --out crates/nw-reflected-types
+  --out-dir crates/nw-reflected-types
 cargo fmt -p nw-reflected-types
 ```
 
