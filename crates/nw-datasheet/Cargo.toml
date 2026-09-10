@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 crc32fast.workspace = true
-nw-asset.workspace = true
+nw-asset = { workspace = true, features = ["assets"] }
 nw-localization.workspace = true
 serde.workspace = true
 thiserror.workspace = true

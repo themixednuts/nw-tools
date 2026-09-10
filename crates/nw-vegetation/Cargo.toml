@@ -10,7 +10,7 @@ description = "Legacy New World vegetation and distribution format parsers"
 
 [dependencies]
 glam.workspace = true
-nw-asset.workspace = true
+nw-asset = { workspace = true, features = ["assets"] }
 nw-objectstream.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

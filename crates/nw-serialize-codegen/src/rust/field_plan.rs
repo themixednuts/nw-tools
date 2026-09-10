@@ -870,7 +870,10 @@ fn rust_storage_override_for_field(
     {
         return Some(match mode {
             RustCodegenMode::Integrated => "Option<::bevy::math::Vec3>",
-            RustCodegenMode::Standalone => "Option<glam::Vec3>",
+            // `bevy_math` re-exports the `glam` vector types and is already a
+            // dependency of the emitted standalone crate; naming `glam`
+            // directly would require a dependency the manifest does not carry.
+            RustCodegenMode::Standalone => "Option<bevy_math::Vec3>",
         });
     }
 
@@ -971,7 +974,7 @@ mod tests {
         );
         assert_eq!(
             rust_storage_override_for_field(RustCodegenMode::Standalone, &item, &field),
-            Some("Option<glam::Vec3>")
+            Some("Option<bevy_math::Vec3>")
         );
     }
 

@@ -46,11 +46,11 @@ pub mod model;
 pub mod module_descriptors;
 pub mod naming;
 pub mod native;
-#[cfg(feature = "full")]
+#[cfg(feature = "network")]
 pub mod network_rust;
-#[cfg(feature = "full")]
+#[cfg(feature = "network")]
 pub mod network_schema;
-#[cfg(feature = "full")]
+#[cfg(feature = "network")]
 pub mod network_selection;
 pub mod reference;
 pub mod role;
@@ -161,14 +161,14 @@ pub use naming::{
     rust_type_name, rust_type_names_by_id,
 };
 pub use native::{NativeSymbol, NativeSymbolIndex, NativeSymbolUse, NativeSymbolUseKind};
-#[cfg(feature = "full")]
+#[cfg(feature = "network")]
 pub use network_rust::{
     NETWORK_RUST_EMITTER_VERSION, NetworkEvidenceIssue, NetworkEvidenceIssueKind,
     NetworkFixedSequenceFieldReport, NetworkReplicatedStateEmitOptions, NetworkRustEmitError,
     NetworkRustEmitter, NetworkRustGenerationReport, NetworkRustOutput,
     NetworkStateFieldShapeReport, NetworkStateGenerationPlanReport,
 };
-#[cfg(feature = "full")]
+#[cfg(feature = "network")]
 pub use network_schema::{
     NETWORK_SCHEMA_VERSION, NetworkAzRtti, NetworkAzRttiProvider, NetworkBooleanChoiceWireShape,
     NetworkConfidence, NetworkContainerCodec, NetworkContainerMemberSemantics,
@@ -185,7 +185,7 @@ pub use network_schema::{
     NetworkSerializeType, NetworkType, NetworkTypeCapability, NetworkTypeIndexMergeReport,
     NetworkVirtualFunction, NetworkWireScalarShape, NetworkWireShape,
 };
-#[cfg(feature = "full")]
+#[cfg(feature = "network")]
 pub use network_selection::{NetworkSerializeRootPlan, NetworkSerializeRootPlanner};
 pub use reference::{
     ReferenceExpansionContext, ReferenceIndex, ReferenceKey, ReferencePathSegment, ReferenceReport,

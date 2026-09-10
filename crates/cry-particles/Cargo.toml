@@ -13,5 +13,5 @@ workspace = true
 
 [dependencies]
 cry-xml.workspace = true
-nw-asset.workspace = true
+nw-asset = { workspace = true, features = ["assets"] }
 thiserror.workspace = true

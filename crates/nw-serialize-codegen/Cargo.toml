@@ -15,8 +15,13 @@ required-features = ["full"]
 [features]
 default = ["full"]
 rust-serialize-context = []
+# Network schema normalization and schema-to-Rust emission. Pulls no optional
+# dependencies, so build scripts that only need network codegen can opt out of
+# the Go/TypeScript emitters and the CLI.
+network = []
 full = [
     "rust-serialize-context",
+    "network",
     "dep:clap",
     "dep:oxc_allocator",
     "dep:oxc_codegen",

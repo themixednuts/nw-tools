@@ -1,4 +1,4 @@
-//! On-disk cache (Turso MVCC via `drizzle`) for the resolved asset catalog.
+//! On-disk cache (local Turso via `drizzle`) for the resolved asset catalog.
 //!
 //! Parsing New World's 365 MB asset catalog out of `Engine.pak` costs ~12 s per
 //! run. The catalog only changes when the game updates, so we parse RASC and
@@ -64,7 +64,7 @@ impl<F> CacheFutureExt for F where F: Future + Sized {}
 /// of tiny insert statements for the shipped catalog.
 const CATALOG_CHUNK: usize = 4_000;
 
-/// The parsed catalog cache, backed by a migrated Turso MVCC database.
+/// The parsed catalog cache, backed by a migrated local Turso database.
 pub struct Cache {
     local_database: az_turso::LocalDatabase,
     db: Drizzle<Schema>,
@@ -100,7 +100,7 @@ impl Cache {
 
     fn migrated(path: &str) -> anyhow::Result<Self> {
         async {
-            let local_database = az_turso::open_local_mvcc(path, BUSY_TIMEOUT).await?;
+            let local_database = az_turso::open_local(path, BUSY_TIMEOUT).await?;
             let conn = local_database.connection().clone();
 
             let (mut db, _) = Drizzle::new(conn, Schema::new());
@@ -218,7 +218,7 @@ impl Cache {
 
 async fn configure_cache_connection(db: &Drizzle<Schema>) -> anyhow::Result<()> {
     // This is a disposable cache, so retain the existing NORMAL synchronous
-    // policy while using MVCC for concurrent in-process IO.
+    // policy; `az-turso` owns the WAL journaling policy for local databases.
     db.execute(Pragma::Synchronous(Synchronous::Normal)).await?;
     db.execute(Pragma::TempStore(TempStore::Memory)).await?;
     db.execute(Pragma::MmapSize(268_435_456)).await?;
@@ -393,7 +393,7 @@ mod tests {
         let mut cache = Cache::open_in_memory().unwrap();
         assert_eq!(
             cache.local_database.journal_mode().wait().unwrap(),
-            az_turso::MVCC_JOURNAL_MODE
+            az_turso::WAL_JOURNAL_MODE
         );
         assert!(cache.fingerprint().is_none());
         let material_id = nw_asset::AssetId::new(uuid::Uuid::from_u128(1), 0);
@@ -472,10 +472,10 @@ mod tests {
         }
         .wait();
 
-        let cache = Cache::open(&path).expect("migrate cache to MVCC");
+        let cache = Cache::open(&path).expect("migrate cache to local Turso");
         assert_eq!(
             cache.local_database.journal_mode().wait().unwrap(),
-            az_turso::MVCC_JOURNAL_MODE
+            az_turso::WAL_JOURNAL_MODE
         );
         let mut rows = cache
             .db
