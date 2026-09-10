@@ -1377,9 +1377,37 @@ fn render_standalone_identity_impls(
     if !matches!(options.mode, RustSourceMode::Standalone) {
         return TokenStream::new();
     }
-    if item.source_type_id.is_nil() && !has_az_identity_derive(item) {
+    // A `SumEnum` is a synthetic polymorphic wrapper with no engine identity of
+    // its own, so it never carries an `AzRtti` impl.
+    if matches!(item.kind, RustItemKind::SumEnum) {
         return TokenStream::new();
     }
+    // A reflected type whose registered type ID is nil is a defect in the
+    // captured reflection data, not a type we can legitimately skip: it can
+    // still be named as a polymorphic payload, and the tagged
+    // serialize/deserialize impls reference `<Payload as AzRtti>::TYPE_ID`
+    // unconditionally. Emit the impl so the output compiles, but say so in the
+    // log and in the emitted source, because a nil type ID cannot discriminate
+    // anything on the wire.
+    let nil_identity = item.identity.type_id.is_nil();
+    if nil_identity && !has_az_identity_derive(item) {
+        tracing::warn!(
+            source_name = %item.source_name,
+            rust_name = %item.rust_name,
+            "reflected type has a nil registered type ID; emitting `AzRtti` with the nil ID so tagged payload impls resolve, but it cannot discriminate a polymorphic payload on the wire -- correct the reflection capture for this type upstream"
+        );
+    }
+    // `quote!` cannot emit line comments, so the marker rides along as a doc
+    // attribute; it survives pretty-printing and is visible to anyone reading
+    // or porting the generated source.
+    let nil_identity_note = nil_identity.then(|| {
+        quote! {
+            #[doc = " FIXME(reflection-data): this type's registered type ID is nil in the"]
+            #[doc = " reflection capture, so `TYPE_ID` below is nil too and cannot identify"]
+            #[doc = " this type as a polymorphic payload on the wire. Correct the capture"]
+            #[doc = " upstream rather than relying on this identity."]
+        }
+    });
 
     let type_id = az_uuid_expr(item.identity.type_id);
     let name = item
@@ -1399,6 +1427,7 @@ fn render_standalone_identity_impls(
         }
     });
     quote! {
+        #nil_identity_note
         impl AzRtti for #ident {
             const NAME: &'static str = #name;
             const TYPE_ID: AzUuid = #type_id;
