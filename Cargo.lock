@@ -461,11 +461,13 @@ dependencies = [
 name = "az-asset"
 version = "0.1.0"
 dependencies = [
+ "az-bytes",
  "az-core",
  "az-filesystem",
  "bevy_app",
  "bevy_reflect",
  "blake3",
+ "byteorder",
  "crc32fast",
  "rayon",
  "rustc-hash 2.1.2",
@@ -501,6 +503,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "az-bytes"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -604,6 +614,7 @@ version = "0.1.0"
 dependencies = [
  "az-jobs",
  "futures",
+ "thiserror 2.0.18",
  "tokio-util",
  "tracing",
 ]
