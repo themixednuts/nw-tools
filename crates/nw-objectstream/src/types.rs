@@ -8,6 +8,7 @@ use std::array::TryFromSliceError;
 use serde_json::{Number, Value, json};
 use uuid::{Uuid, uuid};
 
+use crate::asset_reference;
 use crate::type_uuid::{self, type_ids};
 
 pub use crate::type_uuid::type_ids::{
@@ -51,8 +52,7 @@ pub const BYTE_STREAM: Uuid = type_ids::BYTE_STREAM;
 ///
 /// # Panics
 ///
-/// Panics if an asset payload declares a hint length that does not match the
-/// remaining bytes, or if a vector-like payload is not four-byte aligned.
+/// Panics if a vector-like payload is not four-byte aligned.
 pub fn uuid_data_to_serialize(
     id: &Uuid,
     data: &[u8],
@@ -80,42 +80,8 @@ pub fn uuid_data_to_serialize(
                 .encode_upper(&mut Uuid::encode_buffer())
         ),
 
-        ASSET => {
-            let mut buf = Uuid::encode_buffer();
-            let guid = Uuid::from_bytes(data[0..16].try_into()?)
-                .braced()
-                .encode_upper(&mut buf);
-            let sub_id = u64::from_be_bytes(data[16..32].try_into()?);
-            let mut buf = Uuid::encode_buffer();
-            let asset_type = Uuid::from_bytes(data[32..48].try_into()?)
-                .braced()
-                .encode_upper(&mut buf);
-            let size = u64::from_be_bytes(data[48..56].try_into()?);
-            let hint = String::from_utf8_lossy(&data[56..]);
-            assert_eq!(
-                hint.len(),
-                usize::try_from(size).expect("asset hint length fits usize")
-            );
-            if is_json {
-                json!({"assetId": json!({ "guid": guid, "subId": sub_id}), "type": asset_type, "hint": hint})
-            } else {
-                json!(format!(
-                    "id={guid}:{sub_id},type={asset_type},hint={{{hint}}}"
-                ))
-            }
-        }
-        ASSET_ID => {
-            let mut buf = Uuid::encode_buffer();
-            let guid = Uuid::from_bytes(data[0..16].try_into()?)
-                .braced()
-                .encode_upper(&mut buf);
-            let sub_id = u32::from_be_bytes(data[16..20].try_into()?);
-            if is_json {
-                json!({ "guid": guid, "subId": sub_id })
-            } else {
-                json!(format!("{guid}:{sub_id}"))
-            }
-        }
+        ASSET => asset_value(data, is_json).unwrap_or_else(|| utf8_or_empty(data)),
+        ASSET_ID => asset_id_value(data, is_json).unwrap_or_else(|| utf8_or_empty(data)),
 
         VECTOR_FLOAT | VECTOR2 | VECTOR3 | VECTOR4 | TRANSFORM | QUATERNION | COLOR | MATRIX3X3
         | MATRIX4X4 => {
@@ -141,12 +107,67 @@ pub fn uuid_data_to_serialize(
         }
         BYTE_STREAM => json!(hex::encode_upper(data)),
 
-        _ => match String::from_utf8(data.into()) {
-            Ok(string) => json!(string),
-            _ => json!(""),
-        },
+        _ => utf8_or_empty(data),
     };
     Ok(res)
+}
+
+/// Spell an `AZ::Data::Asset` payload: the asset id, the asset type, and
+/// the hint. JSON takes the object [`crate::serialize_value_to_uuid_data`]
+/// reads back; XML keeps the `id=...,type=...,hint={...}` text the engine
+/// writes.
+///
+/// `None` for a payload in no layout [`asset_reference::read_asset_value_bytes`]
+/// knows, which is a payload this module cannot spell without losing bytes.
+fn asset_value(data: &[u8], is_json: bool) -> Option<Value> {
+    let asset = asset_reference::read_asset_value_bytes(data).ok()?;
+    let mut guid_buf = Uuid::encode_buffer();
+    let guid = asset.guid().braced().encode_upper(&mut guid_buf);
+    let mut type_buf = Uuid::encode_buffer();
+    let asset_type = asset.asset_type().braced().encode_upper(&mut type_buf);
+    let sub_id = asset.sub_id();
+    let hint = asset.hint();
+
+    Some(if is_json {
+        json!({
+            "assetId": json!({ "guid": guid, "subId": sub_id }),
+            "type": asset_type,
+            "hint": hint,
+        })
+    } else {
+        json!(format!(
+            "id={guid}:{sub_id},type={asset_type},hint={{{hint}}}"
+        ))
+    })
+}
+
+/// Spell an `AZ::Data::AssetId` payload: sixteen guid bytes and a
+/// big-endian `u32` sub-id.
+///
+/// `None` for a payload of any other width. A wider one holds something
+/// this module does not know about, and spelling only its first twenty
+/// bytes would drop the rest on the way back.
+fn asset_id_value(data: &[u8], is_json: bool) -> Option<Value> {
+    let guid: [u8; 16] = data.get(..16)?.try_into().ok()?;
+    let sub_id: [u8; 4] = data.get(16..)?.try_into().ok()?;
+    let sub_id = u32::from_be_bytes(sub_id);
+    let mut buf = Uuid::encode_buffer();
+    let guid = Uuid::from_bytes(guid).braced().encode_upper(&mut buf);
+
+    Some(if is_json {
+        json!({ "guid": guid, "subId": sub_id })
+    } else {
+        json!(format!("{guid}:{sub_id}"))
+    })
+}
+
+/// The spelling a payload with no typed parse keeps: its UTF-8 text, or
+/// an empty string when the bytes are not text.
+fn utf8_or_empty(data: &[u8]) -> Value {
+    match std::str::from_utf8(data) {
+        Ok(text) => json!(text),
+        Err(_) => json!(""),
+    }
 }
 
 /// Render an `Element`'s raw `data` as the JSON `value` member a JSON
@@ -154,10 +175,10 @@ pub fn uuid_data_to_serialize(
 ///
 /// [`uuid_data_to_serialize`] spells the typed shape; a shape the JSON
 /// reader has no parse for keeps its textual form here. Float sequences
-/// stay a JSON array, because that is the form the reader takes back:
-/// folding one into a string produced a bracketed, quoted, comma-joined
-/// literal that no reverse conversion accepted, and the element came back
-/// with no payload at all.
+/// stay a JSON array, and asset values stay a JSON object, because those
+/// are the forms the reader takes back: folding either into a string
+/// produced a literal that no reverse conversion accepted, and the
+/// element came back with no payload at all.
 ///
 /// # Errors
 ///
@@ -166,7 +187,7 @@ pub fn uuid_data_to_serialize(
 pub fn uuid_data_to_json(id: &Uuid, data: &[u8]) -> Result<Value, TryFromSliceError> {
     let value = uuid_data_to_serialize(id, data, true)?;
     Ok(match value {
-        Value::String(_) | Value::Array(_) => value,
+        Value::String(_) | Value::Array(_) | Value::Object(_) => value,
         other => Value::String(other.to_string()),
     })
 }

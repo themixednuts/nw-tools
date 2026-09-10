@@ -82,6 +82,19 @@ impl<'a> AssetValue<'a> {
             hint,
         )
     }
+
+    /// Pack this value in the layout the reader takes back, the one the
+    /// game writes: the guid, a big-endian `u32` sub-id, the reserved
+    /// `AssetId` bytes, the asset type, then the hint behind its
+    /// big-endian `u64` length.
+    ///
+    /// The reserved bytes are written as zeros. They are `AssetId` ABI
+    /// padding the reader already ignores, so a value that carried
+    /// something else in them reads back the same.
+    #[must_use]
+    pub fn to_bytes(self) -> Vec<u8> {
+        AssetValueLayout::ASSET_ID_32.write(self)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -270,6 +283,14 @@ where
         });
     }
     let data = element.data().ok_or(AssetValueError::MissingData)?;
+    AssetValueLayout::read(data)
+}
+
+/// Read an `AZ::Data::Asset` value straight from its payload bytes.
+///
+/// [`read_asset_value`] reaches the same layouts through an element; the
+/// serializers hold the bytes alone.
+pub fn read_asset_value_bytes(data: &[u8]) -> Result<AssetValue<'_>, AssetValueError> {
     AssetValueLayout::read(data)
 }
 
@@ -627,6 +648,20 @@ impl AssetValueLayout {
         }
 
         Err(AssetValueError::UnsupportedLayout(data.len()))
+    }
+
+    /// Pack `value` in this layout, the inverse of [`Self::try_read`].
+    fn write(&self, value: AssetValue<'_>) -> Vec<u8> {
+        let hint = value.hint().as_bytes();
+        let mut bytes = vec![0u8; self.hint_offset];
+        bytes[0..16].copy_from_slice(value.guid().as_bytes());
+        bytes[16..20].copy_from_slice(&value.sub_id().to_be_bytes());
+        bytes[self.asset_type_offset..self.asset_type_offset + 16]
+            .copy_from_slice(value.asset_type().as_bytes());
+        bytes[self.hint_len_offset..self.hint_len_offset + 8]
+            .copy_from_slice(&(hint.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(hint);
+        bytes
     }
 
     fn try_read<'a>(&self, data: &'a [u8]) -> Result<Option<AssetValue<'a>>, AssetValueError> {

@@ -871,7 +871,7 @@ mod tests {
     use std::collections::HashMap;
 
     use arcstr::ArcStr;
-    use uuid::Uuid;
+    use uuid::{Uuid, uuid};
 
     use super::*;
     use crate::value::az_field_name_crc;
@@ -1339,6 +1339,268 @@ mod tests {
                     None,
                 )?,
                 "{value} and the array spelling describe one tree"
+            );
+        }
+        Ok(())
+    }
+
+    /// A `Material` reference: the guid, sub id, and type of an
+    /// `AZ::Data::Asset`, with the hint the game keeps beside them.
+    const ASSET_GUID: Uuid = uuid!("1E9A1948-F2A6-5500-B918-964558497331");
+    const ASSET_TYPE: Uuid = uuid!("F46985B5-F7FF-4FCB-8E8C-DC240D701841");
+    const ASSET_SUB_ID: u32 = 7;
+    const ASSET_HINT: &str = "materials/terrain/foo.mtl";
+
+    /// The object spelling of `Material` in a JSON `value` member.
+    const ASSET_OBJECT: &str = r#"{"assetId":{"guid":"{1E9A1948-F2A6-5500-B918-964558497331}","subId":7},"type":"{F46985B5-F7FF-4FCB-8E8C-DC240D701841}","hint":"materials/terrain/foo.mtl"}"#;
+
+    /// The text the XML writer emits for `Material`.
+    const ASSET_TEXT: &str = "id={1E9A1948-F2A6-5500-B918-964558497331}:7,type={F46985B5-F7FF-4FCB-8E8C-DC240D701841},hint={materials/terrain/foo.mtl}";
+
+    /// The object spelling of the same id as a bare `AZ::Data::AssetId`.
+    const ASSET_ID_OBJECT: &str = r#"{"guid":"{1E9A1948-F2A6-5500-B918-964558497331}","subId":7}"#;
+
+    /// The text the XML writer emits for a bare `AZ::Data::AssetId`.
+    const ASSET_ID_TEXT: &str = "{1E9A1948-F2A6-5500-B918-964558497331}:7";
+
+    /// The layout the game writes for an `AZ::Data::Asset`: a 32-byte
+    /// `AssetId` -- the guid, a big-endian `u32` sub id, twelve reserved
+    /// bytes -- then the asset type, the big-endian `u64` hint length,
+    /// and the hint.
+    fn asset_payload() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(56 + ASSET_HINT.len());
+        bytes.extend_from_slice(ASSET_GUID.as_bytes());
+        bytes.extend_from_slice(&ASSET_SUB_ID.to_be_bytes());
+        bytes.extend_from_slice(&[0; 12]);
+        bytes.extend_from_slice(ASSET_TYPE.as_bytes());
+        bytes.extend_from_slice(&(ASSET_HINT.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(ASSET_HINT.as_bytes());
+        bytes
+    }
+
+    /// An `AZ::Data::AssetId` on its own: the guid and a big-endian `u32`
+    /// sub id.
+    fn asset_id_payload() -> Vec<u8> {
+        let mut bytes = ASSET_GUID.as_bytes().to_vec();
+        bytes.extend_from_slice(&ASSET_SUB_ID.to_be_bytes());
+        bytes
+    }
+
+    /// A member whose JSON `value` is an object: the payload the element
+    /// API carries, the object the JSON writer must emit for it, and the
+    /// text the XML writer emits.
+    struct ObjectMember {
+        field: &'static str,
+        id: Uuid,
+        name: &'static str,
+        payload: fn() -> Vec<u8>,
+        object: &'static str,
+        text: &'static str,
+    }
+
+    const OBJECT_MEMBERS: [ObjectMember; 2] = [
+        ObjectMember {
+            field: "Material",
+            id: types::ASSET,
+            name: "Asset",
+            payload: asset_payload,
+            object: ASSET_OBJECT,
+            text: ASSET_TEXT,
+        },
+        ObjectMember {
+            field: "AssetId",
+            id: types::ASSET_ID,
+            name: "AssetId",
+            payload: asset_id_payload,
+            object: ASSET_ID_OBJECT,
+            text: ASSET_ID_TEXT,
+        },
+    ];
+
+    /// An `AZ::Entity` carrying one versioned member, with `<field>`,
+    /// `<typeId>`, `<typeName>`, and `<value>` standing in for the member.
+    const MEMBER_JSON: &str = r#"{
+  "name": "ObjectStream",
+  "version": 3,
+  "Objects": [
+    {
+      "typeId": "{75651658-8663-478D-9090-2432DFCAFA44}",
+      "typeName": "AZ::Entity",
+      "Objects": [
+        {
+          "field": "<field>",
+          "typeId": "<typeId>",
+          "typeName": "<typeName>",
+          "version": 1,
+          "value": <value>
+        }
+      ]
+    }
+  ]
+}"#;
+
+    impl ObjectMember {
+        /// The tree [`MEMBER_JSON`] spells, built through the element API.
+        fn stream(&self) -> ObjectStream {
+            let member = Element {
+                name: ArcStr::from(self.name),
+                field: Some(ArcStr::from(self.field)),
+                name_crc: Some(az_field_name_crc(self.field)),
+                version: Some(1),
+                data: Some((self.payload)()),
+                ..Element::new(self.id)
+            };
+            let entity = Element {
+                name: ArcStr::from("AZ::Entity"),
+                elements: vec![member],
+                ..Element::new(types::AZ_ENTITY)
+            };
+            ObjectStream {
+                tag: StreamTag::BINARY,
+                version: 3,
+                elements: vec![entity],
+            }
+        }
+
+        /// [`MEMBER_JSON`] with `value` spelled as `value`.
+        fn json(&self, value: &str) -> String {
+            MEMBER_JSON
+                .replace("<field>", self.field)
+                .replace("<typeId>", &uuid_xml_attr(&self.id))
+                .replace("<typeName>", self.name)
+                .replace("<value>", value)
+        }
+
+        /// The spellings extracted files already carry besides the
+        /// object: the object folded into a string, as `uuid_data_to_json`
+        /// spelled any object before it passed objects through, and the
+        /// text the XML writer emits.
+        fn older_spellings(&self) -> serde_json::Result<[String; 2]> {
+            Ok([
+                serde_json::to_string(self.object)?,
+                serde_json::to_string(self.text)?,
+            ])
+        }
+
+        fn lookup(&self) -> NameLookup {
+            let uuids: HashMap<Uuid, ArcStr> = [
+                (types::AZ_ENTITY, ArcStr::from("AZ::Entity")),
+                (self.id, ArcStr::from(self.name)),
+            ]
+            .into_iter()
+            .collect();
+            let crcs: HashMap<u32, ArcStr> =
+                [(az_field_name_crc(self.field), ArcStr::from(self.field))]
+                    .into_iter()
+                    .collect();
+            NameLookup::new().with_uuids(uuids).with_crcs(crcs)
+        }
+
+        fn only_member<'a>(&self, stream: &'a ObjectStream) -> &'a Element {
+            let member = &stream.elements()[0].children()[0];
+            assert_eq!(member.id(), &self.id, "{}", self.field);
+            member
+        }
+    }
+
+    #[test]
+    fn an_asset_writes_a_json_object_the_reader_reads_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for member in &OBJECT_MEMBERS {
+            let json = to_encoding_bytes(&member.stream(), ObjectStreamEncoding::Json)?;
+            let json = String::from_utf8(json)?;
+
+            // A real JSON object, not an object folded into a string. The
+            // reader parsed only the XML text, so a folded object packed
+            // nothing and the member reached binary with no payload.
+            assert!(
+                json.contains(&format!("\"value\": {}", member.object)),
+                "{}: {json}",
+                member.field
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&json)?,
+                serde_json::from_str::<Value>(&member.json(member.object))?,
+                "{}",
+                member.field
+            );
+
+            let binary = transcode_bytes(json.as_bytes(), ObjectStreamEncoding::Binary, None)?;
+            let payload = (member.payload)();
+            assert!(
+                binary
+                    .windows(payload.len())
+                    .any(|window| window == payload),
+                "{}: the binary carries the layout the game writes",
+                member.field
+            );
+
+            let hashes = member.lookup();
+            let parsed = ObjectStream::from_bytes(&binary, Some(&hashes))?;
+            let element = member.only_member(&parsed);
+            assert_eq!(element.data(), Some(payload.as_slice()), "{}", member.field);
+            assert_eq!(element.field().map(ArcStr::as_str), Some(member.field));
+            assert_eq!(element.version(), Some(1), "{}", member.field);
+
+            let round_tripped =
+                transcode_bytes(&binary, ObjectStreamEncoding::Json, Some(&hashes))?;
+            assert_eq!(
+                serde_json::from_slice::<Value>(&round_tripped)?,
+                serde_json::from_str::<Value>(&json)?,
+                "{}",
+                member.field
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_asset_reads_back_from_its_older_spellings() -> Result<(), Box<dyn std::error::Error>> {
+        for member in &OBJECT_MEMBERS {
+            let payload = (member.payload)();
+            let from_object = transcode_bytes(
+                member.json(member.object).as_bytes(),
+                ObjectStreamEncoding::Binary,
+                None,
+            )?;
+            for value in member.older_spellings()? {
+                let json = member.json(&value);
+                let binary = transcode_bytes(json.as_bytes(), ObjectStreamEncoding::Binary, None)?;
+                let parsed = ObjectStream::from_bytes(&binary, None)?;
+                assert_eq!(
+                    member.only_member(&parsed).data(),
+                    Some(payload.as_slice()),
+                    "{value} did not pack the {} payload",
+                    member.field
+                );
+                assert_eq!(
+                    binary, from_object,
+                    "{value} and the object spelling describe one tree"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_asset_keeps_its_xml_text_the_reader_reads_back() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for member in &OBJECT_MEMBERS {
+            let xml = to_encoding_bytes(&member.stream(), ObjectStreamEncoding::Xml)?;
+            let xml = String::from_utf8(xml)?;
+            assert!(
+                xml.contains(&format!("value=\"{}\"", member.text)),
+                "{}: {xml}",
+                member.field
+            );
+
+            let binary = transcode_bytes(xml.as_bytes(), ObjectStreamEncoding::Binary, None)?;
+            let parsed = ObjectStream::from_bytes(&binary, None)?;
+            assert_eq!(
+                member.only_member(&parsed).data(),
+                Some((member.payload)().as_slice()),
+                "{}",
+                member.field
             );
         }
         Ok(())

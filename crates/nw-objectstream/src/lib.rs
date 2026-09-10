@@ -48,10 +48,11 @@ use std::str;
 
 use arcstr::ArcStr;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::asset_reference::AssetValue;
 use crate::lookup::NameLookup;
 use crate::types::{uuid_data_to_json, uuid_data_to_serialize};
 
@@ -895,6 +896,13 @@ fn serialize_value_to_uuid_data(id: &Uuid, value: &Value) -> Option<Vec<u8>> {
     if is_float_sequence(id) {
         return serialize_float_sequence(value);
     }
+    // An asset value has an object spelling as well as a text one, so it
+    // is packed from the JSON value rather than from the value's text.
+    match *id {
+        types::ASSET => return serialize_asset_value(value),
+        types::ASSET_ID => return serialize_asset_id_value(value),
+        _ => {}
+    }
     let text = value_text(value)?;
     match *id {
         types::CHAR | types::AZ_S8 | types::SIGNED_CHAR => {
@@ -913,7 +921,6 @@ fn serialize_value_to_uuid_data(id: &Uuid, value: &Value) -> Option<Vec<u8>> {
         types::DOUBLE => Some((text.parse::<f64>().ok()?).to_be_bytes().to_vec()),
         types::BOOL => Some([u8::from(parse_bool_text(&text)?)].to_vec()),
         types::AZ_UUID => Some(parse_uuid_text(&text)?.into_bytes().to_vec()),
-        types::ASSET => serialize_asset_value(&text),
         types::AZSTD_STRING | types::AZSTD_BASIC_STRING | types::AZSTD_STRING_XML_ALIAS => {
             Some(text.as_bytes().to_vec())
         }
@@ -1002,23 +1009,80 @@ fn parse_uuid_text(value: &str) -> Option<Uuid> {
     Uuid::parse_str(value.trim().trim_start_matches('{').trim_end_matches('}')).ok()
 }
 
-fn serialize_asset_value(value: &str) -> Option<Vec<u8>> {
-    let (asset_id, rest) = value.trim().strip_prefix("id=")?.split_once(",type=")?;
-    let (guid, sub_id) = asset_id.rsplit_once(':')?;
+/// Pack an `AZ::Data::Asset` value.
+///
+/// Two spellings reach this: the object the JSON writer emits, with the
+/// asset id, the asset type, and the hint under their own members, and
+/// the `id=...,type=...,hint={...}` text the XML writer emits. Both go
+/// out through [`AssetValue::to_bytes`], so both produce the layout the
+/// reader takes back.
+fn serialize_asset_value(value: &Value) -> Option<Vec<u8>> {
+    if let Some(object) = json_object(value) {
+        let (guid, sub_id) = asset_id_members(object.get("assetId")?)?;
+        let asset_type = parse_uuid_text(object.get("type")?.as_str()?)?;
+        let hint = match object.get("hint") {
+            Some(hint) => hint.as_str()?,
+            None => "",
+        };
+        return Some(AssetValue::new(guid, sub_id, asset_type, hint).to_bytes());
+    }
+
+    let text = value_text(value)?;
+    let (asset_id, rest) = text.trim().strip_prefix("id=")?.split_once(",type=")?;
+    let (guid, sub_id) = parse_asset_id_text(asset_id)?;
     let (type_id, hint) = rest.split_once(",hint={")?;
     let hint = hint.split_once('}').map_or(hint, |(hint, _)| hint);
-    let guid = parse_uuid_text(guid)?;
-    let sub_id = sub_id.parse::<u64>().ok()?;
     let type_id = parse_uuid_text(type_id)?;
-    let hint = hint.as_bytes();
+    Some(AssetValue::new(guid, sub_id, type_id, hint).to_bytes())
+}
 
-    let mut bytes = Vec::with_capacity(48 + hint.len());
+/// Pack an `AZ::Data::AssetId` value: the sixteen guid bytes and a
+/// big-endian `u32` sub-id, the layout `types::uuid_data_to_serialize`
+/// reads. The object spelling and the `{guid}:{subId}` text both read.
+fn serialize_asset_id_value(value: &Value) -> Option<Vec<u8>> {
+    let (guid, sub_id) = match json_object(value) {
+        Some(object) => asset_id_members_of(&object)?,
+        None => parse_asset_id_text(&value_text(value)?)?,
+    };
+
+    let mut bytes = Vec::with_capacity(20);
     bytes.extend_from_slice(guid.as_bytes());
     bytes.extend_from_slice(&sub_id.to_be_bytes());
-    bytes.extend_from_slice(type_id.as_bytes());
-    bytes.extend_from_slice(&(hint.len() as u64).to_be_bytes());
-    bytes.extend_from_slice(hint);
     Some(bytes)
+}
+
+/// The object spelling of a value: the object itself, or one folded into
+/// a string the way a writer that kept only text spelled it.
+fn json_object(value: &Value) -> Option<Cow<'_, Map<String, Value>>> {
+    match value {
+        Value::Object(object) => Some(Cow::Borrowed(object)),
+        Value::String(text) => match serde_json::from_str::<Value>(text.trim()).ok()? {
+            Value::Object(object) => Some(Cow::Owned(object)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The `guid` and `subId` members of an asset id object.
+fn asset_id_members(value: &Value) -> Option<(Uuid, u32)> {
+    asset_id_members_of(json_object(value)?.as_ref())
+}
+
+fn asset_id_members_of(object: &Map<String, Value>) -> Option<(Uuid, u32)> {
+    let guid = parse_uuid_text(object.get("guid")?.as_str()?)?;
+    let sub_id = match object.get("subId")? {
+        Value::Number(number) => u32::try_from(number.as_u64()?).ok()?,
+        Value::String(text) => text.trim().parse::<u32>().ok()?,
+        _ => return None,
+    };
+    Some((guid, sub_id))
+}
+
+/// Read the `{guid}:{subId}` text an asset id takes in XML.
+fn parse_asset_id_text(text: &str) -> Option<(Uuid, u32)> {
+    let (guid, sub_id) = text.trim().rsplit_once(':')?;
+    Some((parse_uuid_text(guid)?, sub_id.trim().parse::<u32>().ok()?))
 }
 
 /// The stream keys a member by the CRC-32 of its *field* name — the
@@ -1370,17 +1434,26 @@ mod tests {
             &data[..16],
             Uuid::parse_str("1E9A1948-F2A6-5500-B918-964558497331")?.as_bytes()
         );
-        assert_eq!(u64::from_be_bytes(data[16..24].try_into()?), 7);
+        assert_eq!(u32::from_be_bytes(data[16..20].try_into()?), 7);
+        assert_eq!(&data[20..32], [0; 12], "the reserved AssetId bytes");
         assert_eq!(
-            &data[24..40],
+            &data[32..48],
             Uuid::parse_str("F46985B5-F7FF-4FCB-8E8C-DC240D701841")?.as_bytes()
         );
-        let hint_len = usize::try_from(u64::from_be_bytes(data[40..48].try_into()?))?;
+        let hint_len = usize::try_from(u64::from_be_bytes(data[48..56].try_into()?))?;
         assert_eq!(hint_len, "materials/terrain/foo.mtl".len());
         assert_eq!(
-            std::str::from_utf8(&data[48..])?,
+            std::str::from_utf8(&data[56..])?,
             "materials/terrain/foo.mtl"
         );
+
+        // The sub-id survives only in this layout. Packed as a big-endian
+        // `u64` where the guid ends, its four significant bytes land in
+        // the reserved span the reader skips, and the four zero bytes it
+        // leaves behind read back as a sub-id of zero.
+        let asset = asset_reference::read_asset_value(&stream.elements()[0])?;
+        assert_eq!(asset.sub_id(), 7);
+        assert_eq!(asset.hint(), "materials/terrain/foo.mtl");
         Ok(())
     }
 
