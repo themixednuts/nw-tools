@@ -5,7 +5,7 @@
 
 use std::array::TryFromSliceError;
 
-use serde_json::{Value, json};
+use serde_json::{Number, Value, json};
 use uuid::{Uuid, uuid};
 
 use crate::type_uuid::{self, type_ids};
@@ -120,16 +120,19 @@ pub fn uuid_data_to_serialize(
         VECTOR_FLOAT | VECTOR2 | VECTOR3 | VECTOR4 | TRANSFORM | QUATERNION | COLOR | MATRIX3X3
         | MATRIX4X4 => {
             assert!(data.len().is_multiple_of(4));
-            let data = data.chunks_exact(4);
-            let data = data.map(|b| {
-                let num = f32::from_be_bytes(b.try_into().unwrap());
-                format!("{num:.7}")
-            });
+            let floats = data
+                .chunks_exact(4)
+                .map(|b| f32::from_be_bytes(b.try_into().unwrap()));
 
             if is_json {
-                Value::Array(data.map(|v| json!(v)).collect())
+                Value::Array(floats.map(float_json_number).collect())
             } else {
-                json!(data.collect::<Vec<_>>().join(" "))
+                json!(
+                    floats
+                        .map(|num| format!("{num:.7}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
             }
         }
 
@@ -144,4 +147,39 @@ pub fn uuid_data_to_serialize(
         },
     };
     Ok(res)
+}
+
+/// Render an `Element`'s raw `data` as the JSON `value` member a JSON
+/// writer emits.
+///
+/// [`uuid_data_to_serialize`] spells the typed shape; a shape the JSON
+/// reader has no parse for keeps its textual form here. Float sequences
+/// stay a JSON array, because that is the form the reader takes back:
+/// folding one into a string produced a bracketed, quoted, comma-joined
+/// literal that no reverse conversion accepted, and the element came back
+/// with no payload at all.
+///
+/// # Errors
+///
+/// Returns the [`TryFromSliceError`] from [`uuid_data_to_serialize`] when
+/// `data` is not the width the type expects.
+pub fn uuid_data_to_json(id: &Uuid, data: &[u8]) -> Result<Value, TryFromSliceError> {
+    let value = uuid_data_to_serialize(id, data, true)?;
+    Ok(match value {
+        Value::String(_) | Value::Array(_) => value,
+        other => Value::String(other.to_string()),
+    })
+}
+
+/// Spell one float the way this module spells scalars — seven decimals —
+/// but as a JSON number rather than a quoted string.
+///
+/// A value JSON cannot write as a number, such as a NaN or an infinity,
+/// keeps the textual form so the element still carries its payload.
+fn float_json_number(value: f32) -> Value {
+    let text = format!("{value:.7}");
+    text.parse::<f64>()
+        .ok()
+        .and_then(Number::from_f64)
+        .map_or(Value::String(text), Value::Number)
 }

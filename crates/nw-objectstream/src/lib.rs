@@ -53,7 +53,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::lookup::NameLookup;
-use crate::types::uuid_data_to_serialize;
+use crate::types::{uuid_data_to_json, uuid_data_to_serialize};
 
 // === binary flag bits ===
 
@@ -892,6 +892,9 @@ const fn size_field_capacity(width: u8) -> Option<usize> {
 }
 
 fn serialize_value_to_uuid_data(id: &Uuid, value: &Value) -> Option<Vec<u8>> {
+    if is_float_sequence(id) {
+        return serialize_float_sequence(value);
+    }
     let text = value_text(value)?;
     match *id {
         types::CHAR | types::AZ_S8 | types::SIGNED_CHAR => {
@@ -911,26 +914,70 @@ fn serialize_value_to_uuid_data(id: &Uuid, value: &Value) -> Option<Vec<u8>> {
         types::BOOL => Some([u8::from(parse_bool_text(&text)?)].to_vec()),
         types::AZ_UUID => Some(parse_uuid_text(&text)?.into_bytes().to_vec()),
         types::ASSET => serialize_asset_value(&text),
-        types::VECTOR_FLOAT
-        | types::VECTOR2
-        | types::VECTOR3
-        | types::VECTOR4
-        | types::TRANSFORM
-        | types::QUATERNION
-        | types::COLOR
-        | types::MATRIX3X3
-        | types::MATRIX4X4 => {
-            let mut bytes = Vec::new();
-            for value in text.split_whitespace() {
-                bytes.extend_from_slice(&value.parse::<f32>().ok()?.to_be_bytes());
-            }
-            Some(bytes)
-        }
         types::AZSTD_STRING | types::AZSTD_BASIC_STRING | types::AZSTD_STRING_XML_ALIAS => {
             Some(text.as_bytes().to_vec())
         }
         types::BYTE_STREAM => hex::decode(text.trim().as_bytes()).ok(),
         _ => Some(text.as_bytes().to_vec()),
+    }
+}
+
+/// Types whose payload is a sequence of big-endian `f32`s: one for a
+/// `VectorFloat`, two through four for the vectors, four for a
+/// `Quaternion` or `Color`, nine and sixteen for the matrices, and twelve
+/// for a `Transform`, which stores a 3x4 matrix.
+const fn is_float_sequence(id: &Uuid) -> bool {
+    matches!(
+        *id,
+        types::VECTOR_FLOAT
+            | types::VECTOR2
+            | types::VECTOR3
+            | types::VECTOR4
+            | types::TRANSFORM
+            | types::QUATERNION
+            | types::COLOR
+            | types::MATRIX3X3
+            | types::MATRIX4X4
+    )
+}
+
+/// Pack a float sequence into its big-endian `f32` payload.
+///
+/// Three spellings reach this: the JSON array the JSON writer emits, the
+/// whitespace-separated text the XML writer emits, and the bracketed,
+/// quoted, comma-joined array folded into a string that older JSON
+/// extracts carry. All three spell the same numbers, so all three read.
+fn serialize_float_sequence(value: &Value) -> Option<Vec<u8>> {
+    let Value::Array(values) = value else {
+        let text = value_text(value)?;
+        let text = text.trim();
+        if text.starts_with('[') {
+            let array = serde_json::from_str::<Value>(text).ok()?;
+            return match array {
+                Value::Array(_) => serialize_float_sequence(&array),
+                _ => None,
+            };
+        }
+        let mut bytes = Vec::new();
+        for field in text.split_whitespace() {
+            bytes.extend_from_slice(&field.parse::<f32>().ok()?.to_be_bytes());
+        }
+        return Some(bytes);
+    };
+
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&float_from_value(value)?.to_be_bytes());
+    }
+    Some(bytes)
+}
+
+/// One element of a float sequence, as a number or as its text.
+fn float_from_value(value: &Value) -> Option<f32> {
+    match value {
+        Value::Number(number) => Some(number.as_f64()? as f32),
+        Value::String(text) => text.trim().parse::<f32>().ok(),
+        _ => None,
     }
 }
 
@@ -1113,15 +1160,7 @@ impl From<Element> for JSONElement {
             name: value.name.to_string(),
             specialization: value.specialization,
             value: match &value.data {
-                Some(data) if !data.is_empty() => {
-                    uuid_data_to_serialize(&value.id, data, true).ok().map(|v| {
-                        if v.is_string() {
-                            v
-                        } else {
-                            Value::String(v.to_string())
-                        }
-                    })
-                }
+                Some(data) if !data.is_empty() => uuid_data_to_json(&value.id, data).ok(),
                 Some(data) if data.is_empty() && value.elements.is_empty() => Some("".into()),
                 _ => None,
             },
@@ -1147,15 +1186,7 @@ impl From<&Element> for JSONElement {
             name: value.name.to_string(),
             specialization: value.specialization,
             value: match &value.data {
-                Some(data) if !data.is_empty() => {
-                    uuid_data_to_serialize(&value.id, data, true).ok().map(|v| {
-                        if v.is_string() {
-                            v
-                        } else {
-                            Value::String(v.to_string())
-                        }
-                    })
-                }
+                Some(data) if !data.is_empty() => uuid_data_to_json(&value.id, data).ok(),
                 Some(data) if data.is_empty() && value.elements.is_empty() => Some("".into()),
                 _ => None,
             },

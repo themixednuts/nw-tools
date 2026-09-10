@@ -14,7 +14,7 @@ use crate::binary::{
 };
 use crate::deserialize;
 use crate::lookup::NameLookup;
-use crate::types::uuid_data_to_serialize;
+use crate::types::{uuid_data_to_json, uuid_data_to_serialize};
 use crate::{
     Element, ObjectStream, ObjectStreamEncoding, ObjectStreamError, ST_BINARY_VALUE_SIZE_MASK,
     ST_BINARYFLAG_EXTRA_SIZE_FIELD, ST_BINARYFLAG_HAS_VALUE, StreamTag,
@@ -478,14 +478,7 @@ fn json_value_attrs(id: &uuid::Uuid, data: Option<&[u8]>) -> (Option<Value>, Opt
     if data.is_empty() {
         return (None, Some(Value::String(String::new())));
     }
-    let value = uuid_data_to_serialize(id, data, true).ok().map(|value| {
-        if value.is_string() {
-            value
-        } else {
-            Value::String(value.to_string())
-        }
-    });
-    (value, None)
+    (uuid_data_to_json(id, data).ok(), None)
 }
 
 #[derive(Debug)]
@@ -1193,6 +1186,161 @@ mod tests {
         assert_eq!(name.data(), Some(&b"player_character"[..]));
         assert!(name.has_value() && name.has_extra_size_field());
         assert_eq!(name.data_size, Some(16));
+        Ok(())
+    }
+
+    /// `GameTransformComponent::m_worldTM`: an `AZ::Transform` is twelve
+    /// big-endian floats, a three-column rotation basis and a translation.
+    const WORLD_TM: [f32; 12] = [
+        1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 12.5, -3.25, 0.125,
+    ];
+
+    /// The array spelling [`WORLD_TM`] takes in a JSON `value` member.
+    const WORLD_TM_ARRAY: &str = "[1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0,12.5,-3.25,0.125]";
+
+    /// The spelling JSON extracts written before the writer emitted a real
+    /// array carry: the array folded into a string, seven decimals, quoted
+    /// and comma-joined.
+    const WORLD_TM_BRACKETED_STRING: &str = r#""[\"1.0000000\",\"0.0000000\",\"0.0000000\",\"0.0000000\",\"1.0000000\",\"0.0000000\",\"0.0000000\",\"0.0000000\",\"1.0000000\",\"12.5000000\",\"-3.2500000\",\"0.1250000\"]""#;
+
+    /// The spelling the XML writer emits, whitespace-separated.
+    const WORLD_TM_SPACED_STRING: &str = r#""1.0000000 0.0000000 0.0000000 0.0000000 1.0000000 0.0000000 0.0000000 0.0000000 1.0000000 12.5000000 -3.2500000 0.1250000""#;
+
+    /// An `AZ::Entity` carrying one `m_worldTM`, with `<value>` standing in
+    /// for the spelling of the `value` member.
+    const TRANSFORM_JSON: &str = r#"{
+  "name": "ObjectStream",
+  "version": 3,
+  "Objects": [
+    {
+      "typeId": "{75651658-8663-478D-9090-2432DFCAFA44}",
+      "typeName": "AZ::Entity",
+      "Objects": [
+        {
+          "field": "m_worldTM",
+          "typeId": "{5D9958E9-9F1E-4985-B532-FFFDE75FEDFD}",
+          "typeName": "AZ::Transform",
+          "value": <value>
+        }
+      ]
+    }
+  ]
+}"#;
+
+    fn transform_json(value: &str) -> String {
+        TRANSFORM_JSON.replace("<value>", value)
+    }
+
+    fn world_tm_bytes() -> Vec<u8> {
+        WORLD_TM.iter().flat_map(|f| f.to_be_bytes()).collect()
+    }
+
+    /// The tree [`TRANSFORM_JSON`] spells, built through the element API.
+    fn transform_stream() -> ObjectStream {
+        let transform = Element {
+            name: ArcStr::from("AZ::Transform"),
+            field: Some(ArcStr::from("m_worldTM")),
+            name_crc: Some(az_field_name_crc("m_worldTM")),
+            data: Some(world_tm_bytes()),
+            ..Element::new(types::TRANSFORM)
+        };
+        let entity = Element {
+            name: ArcStr::from("AZ::Entity"),
+            elements: vec![transform],
+            ..Element::new(types::AZ_ENTITY)
+        };
+        ObjectStream {
+            tag: StreamTag::BINARY,
+            version: 3,
+            elements: vec![entity],
+        }
+    }
+
+    fn transform_lookup() -> NameLookup {
+        let uuids: HashMap<Uuid, ArcStr> = [
+            (types::AZ_ENTITY, ArcStr::from("AZ::Entity")),
+            (types::TRANSFORM, ArcStr::from("AZ::Transform")),
+        ]
+        .into_iter()
+        .collect();
+        let crcs: HashMap<u32, ArcStr> =
+            [(az_field_name_crc("m_worldTM"), ArcStr::from("m_worldTM"))]
+                .into_iter()
+                .collect();
+        NameLookup::new().with_uuids(uuids).with_crcs(crcs)
+    }
+
+    fn only_transform(stream: &ObjectStream) -> &Element {
+        let transform = &stream.elements()[0].children()[0];
+        assert_eq!(transform.id(), &types::TRANSFORM);
+        transform
+    }
+
+    #[test]
+    fn a_float_sequence_writes_a_json_array_the_reader_reads_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let json = to_encoding_bytes(&transform_stream(), ObjectStreamEncoding::Json)?;
+        let json = String::from_utf8(json)?;
+
+        // A real JSON array, not an array folded into a string. The string
+        // form parsed as no floats at all, so the member reached binary
+        // with an empty payload and the reader failed on it.
+        assert!(
+            json.contains(&format!("\"value\": {WORLD_TM_ARRAY}")),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&json)?,
+            serde_json::from_str::<Value>(&transform_json(WORLD_TM_ARRAY))?
+        );
+
+        let binary = transcode_bytes(json.as_bytes(), ObjectStreamEncoding::Binary, None)?;
+        let payload = world_tm_bytes();
+        assert_eq!(payload.len(), 48);
+        assert!(
+            binary
+                .windows(payload.len())
+                .any(|window| window == payload),
+            "the binary carries the twelve big-endian floats"
+        );
+
+        let hashes = transform_lookup();
+        let parsed = ObjectStream::from_bytes(&binary, Some(&hashes))?;
+        let transform = only_transform(&parsed);
+        assert_eq!(transform.data(), Some(payload.as_slice()));
+        assert_eq!(transform.field().map(ArcStr::as_str), Some("m_worldTM"));
+
+        let round_tripped = transcode_bytes(&binary, ObjectStreamEncoding::Json, Some(&hashes))?;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&round_tripped)?,
+            serde_json::from_str::<Value>(&json)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_float_sequence_reads_back_from_its_older_spellings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = world_tm_bytes();
+        for value in [WORLD_TM_BRACKETED_STRING, WORLD_TM_SPACED_STRING] {
+            let json = transform_json(value);
+            let binary = transcode_bytes(json.as_bytes(), ObjectStreamEncoding::Binary, None)?;
+            let parsed = ObjectStream::from_bytes(&binary, None)?;
+            assert_eq!(
+                only_transform(&parsed).data(),
+                Some(payload.as_slice()),
+                "{value} did not pack the twelve big-endian floats"
+            );
+            assert_eq!(
+                binary,
+                transcode_bytes(
+                    transform_json(WORLD_TM_ARRAY).as_bytes(),
+                    ObjectStreamEncoding::Binary,
+                    None,
+                )?,
+                "{value} and the array spelling describe one tree"
+            );
+        }
         Ok(())
     }
 
