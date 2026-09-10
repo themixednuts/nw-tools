@@ -11,6 +11,22 @@
 //! `Uuid::create_name(...)` directly; the fold helpers below call the
 //! `const fn` primitives in [`nw_asset::uuid::const_impl`] because trait
 //! methods cannot be evaluated in `const fn` context.
+//!
+//! # Which identity an argument contributes
+//!
+//! `AZ_TYPE_INFO_INTERNAL_SPECIALIZED_TEMPLATE_POSTFIX_UUID` folds
+//! `AzTypeInfo<Arg>::Uuid()` per argument, left to right, then the template
+//! base. For a fundamental or reflected class that is its id. For an enum
+//! with `AZ_TYPE_INFO_SPECIALIZE` it is the enum's own id, not the underlying
+//! integer the serializer stores; for an enum without one it is the null id,
+//! whose 16 zero bytes still hash. For a nested template it is that
+//! template's own folded id. A SerializeContext capture's `templatedTypeIds`
+//! record the underlying integer and the nested template's base instead, so
+//! a specialization folded from them misses those cases; the
+//! `nw-serialize-codegen` crate's `specialized_type_id` module reads the
+//! identities the fold takes from the `EnumType` attribute, from
+//! `typeIdFoldTypeIds` and from the nested generic info, and feeds them to
+//! the helpers here.
 
 use uuid::Uuid;
 
@@ -783,6 +799,153 @@ mod tests {
         assert_eq!(
             amazon_pervasives_uid(128),
             uuid!("3485f20a-98c0-5315-876b-21bcd23a7bc0")
+        );
+    }
+
+    /// An enum argument folds under the enum's own `AzTypeInfo` identity.
+    ///
+    /// `AttributeComponent::m_preReloadAttributes` is
+    /// `unordered_map<CharacterAttributeType, int>`: its getter
+    /// `NewWorld+0x27a0800` folds the key getter `NewWorld+0x27a0cb0`, a
+    /// static initialised from `CreateString("{F4197081-…}")`, then `s32`,
+    /// `hash<K>`, `equal_to<K>`, the allocator and the `unordered_map` base.
+    /// `SBItemClass::m_ItemClasses` (`unordered_set<ItemClasses>`,
+    /// `NewWorld+0x5cf2900` with key getter `NewWorld+0x2e8a550`) and
+    /// `PaperdollComponent::m_paperdollVisualSlotMapping`
+    /// (`map<PaperdollSlotTypes, AZStd::string>`, `NewWorld+0x6965870` with
+    /// key getter `NewWorld+0x4620da0`) fold the same way. The capture
+    /// records each of these ids for the member while its `templatedTypeIds`
+    /// name the underlying integer; the pair's `typeIdFoldTypeIds` name the
+    /// enum. `ContributionType`, `SettlementProgressionCategory` and
+    /// `PaperdollSlotTypes` reach three more recorded maps the same way.
+    #[test]
+    fn folds_enum_arguments_under_their_own_identity() {
+        let character_attribute_type = uuid!("F4197081-D1D9-4A95-8FA0-81534BE2C33B");
+        let item_classes = uuid!("A3755086-8B0A-4D14-B073-FC3E1433C3F6");
+        let paperdoll_slot_types = uuid!("5D42C439-A859-4133-9032-88DE31048F2C");
+        let contribution_type = uuid!("EA27A445-C5F3-42AB-8BA0-8F617A19DC38");
+        let settlement_progression_category = uuid!("99FFBB9B-34A3-44A1-A576-1D13D732B0AA");
+
+        assert_eq!(
+            azstd_unordered_map(character_attribute_type, type_ids::INT),
+            uuid!("F87FA543-7DF5-5FC8-8767-9F1AFCBD1D0D")
+        );
+        assert_ne!(
+            azstd_unordered_map(type_ids::INT, type_ids::INT),
+            uuid!("F87FA543-7DF5-5FC8-8767-9F1AFCBD1D0D")
+        );
+        assert_eq!(
+            azstd_unordered_set(item_classes),
+            uuid!("104B16EC-793B-5BB1-B613-1F4343F3C94F")
+        );
+        assert_eq!(
+            azstd_map(paperdoll_slot_types, type_ids::AZSTD_STRING),
+            uuid!("5D30068C-1D6A-51F6-94A1-FA512EF61ED6")
+        );
+        assert_eq!(
+            azstd_unordered_map(contribution_type, type_ids::FLOAT),
+            uuid!("74CCF29C-5848-5404-80AD-EC6284EA6E12")
+        );
+        assert_eq!(
+            azstd_unordered_map(type_ids::ENTITY_ID, settlement_progression_category),
+            uuid!("07EDC5F7-55F7-5CB3-BFB6-5C783891CDE4")
+        );
+        assert_eq!(
+            azstd_unordered_map(
+                paperdoll_slot_types,
+                uuid!("1BE36174-FD4F-4A1C-8E52-7C28D50EEC5A")
+            ),
+            uuid!("A1A7BDBF-18A6-579D-9261-37DC8F309DBA")
+        );
+    }
+
+    /// An enum without `AZ_TYPE_INFO_SPECIALIZE` folds as the null id:
+    /// `AzTypeInfo<T, true>::Uuid()` returns `CreateNull()`, and `CreateData`
+    /// hashes its 16 zero bytes like any other argument. `NewWorld+0x6966860`
+    /// folds `unordered_map<enum, VitalsStatData>` with `AZ::Uuid::GetNull()`
+    /// as the key and inside `hash<K>` and `equal_to<K>`; the capture records
+    /// it as `585E4F2A-…` with `templatedTypeIds` `[u8, VitalsStatData]` and
+    /// the pair's `typeIdFoldTypeIds` `[null, VitalsStatData]`.
+    #[test]
+    fn folds_an_unspecialized_enum_argument_as_the_null_identity() {
+        let vitals_stat_data = uuid!("050982C9-1218-4C39-9B5A-E4192297825D");
+
+        assert_eq!(
+            azstd_unordered_map(Uuid::nil(), vitals_stat_data),
+            uuid!("585E4F2A-A289-53DE-ACF6-766B76FB7147")
+        );
+        assert_ne!(
+            azstd_unordered_map(type_ids::U8, vitals_stat_data),
+            uuid!("585E4F2A-A289-53DE-ACF6-766B76FB7147")
+        );
+    }
+
+    /// A vector declared with an explicit `AZ::AZStdAlloc<Allocator>` folds
+    /// that allocator where `AZStd::allocator` would otherwise stand.
+    ///
+    /// The capture records only the element (`templatedArgumentCount` 1), so
+    /// the allocator is not recoverable from the resource.
+    /// `ComponentApplication::Descriptor::modules` is
+    /// `DynamicModuleDescriptorList`, a vector over `OSStdAllocator`;
+    /// `Composite::Children` (`vector<intrusive_ptr<Node>>`) and
+    /// `ConditionGroup::Conditions` (`vector<Condition>`) allocate through
+    /// `AZStdAlloc<SystemAllocator>`.
+    #[test]
+    fn folds_vectors_with_explicit_allocators() {
+        let os_allocator = azstd_alloc(type_ids::AZ_OS_ALLOCATOR);
+        let system_allocator = azstd_alloc(type_ids::AZ_SYSTEM_ALLOCATOR);
+        let dynamic_module_descriptor = uuid!("D2932FA3-9942-4FD2-A703-2E750F57C003");
+        let node = uuid!("C5DD7EA9-9644-4965-8E1B-95170FE334F0");
+        let condition = uuid!("09240109-42B0-4BFD-BA59-9FEDA69055D4");
+
+        assert_eq!(
+            azstd_vector_with_allocator(dynamic_module_descriptor, os_allocator),
+            uuid!("8E779F80-AEAA-565B-ABB1-DE10B18CF995")
+        );
+        assert_ne!(
+            azstd_vector(dynamic_module_descriptor),
+            uuid!("8E779F80-AEAA-565B-ABB1-DE10B18CF995")
+        );
+        assert_eq!(
+            azstd_intrusive_ptr(node),
+            uuid!("EA418FC5-62CE-52A8-ABB4-299F072B6629")
+        );
+        assert_eq!(
+            azstd_vector_with_allocator(azstd_intrusive_ptr(node), system_allocator),
+            uuid!("15B4F50E-8C6E-5262-8555-E181A9B6FFAC")
+        );
+        assert_eq!(
+            azstd_vector_with_allocator(condition, system_allocator),
+            uuid!("A3BE97B0-BE01-51C4-9717-7CDD03C6C10E")
+        );
+        // `DynamicModuleDescriptor::dynamicLibraryPath` is `AZ::OSString`, a
+        // `basic_string<char, char_traits<char>, OSStdAllocator>`.
+        assert_eq!(
+            azstd_basic_string(
+                type_ids::CHAR,
+                azstd_char_traits(type_ids::CHAR),
+                os_allocator
+            ),
+            uuid!("189CC2ED-FDDE-5680-91D4-9F630A79187F")
+        );
+    }
+
+    /// A nested template folds under its own specialization, which the
+    /// capture records as the template base: `FB2ABB26-…` is
+    /// `unordered_map<AZ::Uuid, shared_ptr<D34A1B4F>>`, whose
+    /// `templatedTypeIds` name the `shared_ptr` base while the value member's
+    /// generic info names the pointee.
+    #[test]
+    fn folds_a_nested_specialization_argument() {
+        let pointee = uuid!("D34A1B4F-C0F3-4E73-A88A-FBC48FF7800E");
+
+        assert_eq!(
+            azstd_unordered_map(type_ids::AZ_UUID, azstd_shared_ptr(pointee)),
+            uuid!("FB2ABB26-BEA1-5A5E-885F-5A0038082549")
+        );
+        assert_ne!(
+            azstd_unordered_map(type_ids::AZ_UUID, type_ids::AZSTD_SHARED_PTR),
+            uuid!("FB2ABB26-BEA1-5A5E-885F-5A0038082549")
         );
     }
 }

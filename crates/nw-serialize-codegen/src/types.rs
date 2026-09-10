@@ -227,15 +227,26 @@ impl<'a> TypeResolver<'a> {
                 source_name: base_name.to_owned(),
             };
         }
-        if let Some(enum_type_id) = member.enum_type_id()
-            && let Some(name) = self.model.type_name(enum_type_id)
-        {
-            return ResolvedType::Named {
-                type_id: enum_type_id,
-                source_name: name.to_owned(),
-            };
+        if let Some(resolved) = self.enum_member_type(member) {
+            return resolved;
         }
         self.resolve_member(member, 0, &mut BTreeSet::new())
+    }
+
+    /// The enum a member's `EnumType` attribute names.
+    ///
+    /// The serializer stores an enum as its underlying integer, so the
+    /// member's `typeId` is the integer's; the attribute carries the enum's
+    /// own identity, which is what a container specialization folds and what
+    /// the generated member is keyed by. A container's `value1` / `element`
+    /// member carries the attribute just as a class member does.
+    fn enum_member_type(&self, member: &ReflectedMember) -> Option<ResolvedType> {
+        let enum_type_id = member.enum_type_id()?;
+        let name = self.model.type_name(enum_type_id)?;
+        Some(ResolvedType::Named {
+            type_id: enum_type_id,
+            source_name: name.to_owned(),
+        })
     }
 
     fn resolve_with_state(
@@ -580,6 +591,9 @@ impl<'a> TypeResolver<'a> {
         depth: usize,
         visiting: &mut BTreeSet<Uuid>,
     ) -> ResolvedType {
+        if let Some(resolved) = self.enum_member_type(member) {
+            return resolved;
+        }
         if let Some(generic) = member.generic_class.as_deref() {
             return self.resolve_generic(generic, depth + 1, visiting);
         }

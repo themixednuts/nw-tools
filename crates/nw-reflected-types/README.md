@@ -23,3 +23,14 @@ cargo fmt -p nw-reflected-types
 
 Generated types are schema evidence, not behavior. Binary/XML parsing semantics
 remain grounded in New World Ghidra evidence and the matching Lumberyard source.
+
+## Enum-keyed containers
+
+A container member whose `value1` or `element` field carries the `EnumType`
+attribute is keyed by that enum in the generated Rust
+(`BTreeMap<PaperdollSlotTypes, String>`, not `BTreeMap<i32, String>`). The
+serializer stores the enum as its underlying integer and records the integer
+as the argument's type, but the identity the binary folds into the container's
+specialization is the enum's own `TYPE_ID`. The `specialized_type_id` module
+of `nw-serialize-codegen` states the rule and reproduces the recorded
+identities.

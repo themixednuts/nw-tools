@@ -59,6 +59,7 @@ pub mod schema;
 pub mod selection;
 #[cfg(feature = "full")]
 pub mod selection_manifest;
+pub mod specialized_type_id;
 pub mod status;
 #[cfg(feature = "full")]
 pub mod support_usage;
@@ -143,7 +144,10 @@ pub use layout::{
     layout_path_starts_with, reflected_base_type_ids, sanitize_path_segment,
     source_namespace_segments,
 };
-pub use lint::{Diagnostic, DiagnosticCode, Severity, lint_codegen_unit, lint_document};
+pub use lint::{
+    Diagnostic, DiagnosticCode, Severity, lint_codegen_unit, lint_document,
+    lint_specialized_type_ids,
+};
 pub use model::{
     ClassNameIndexEntry, ReflectedAttribute, ReflectedAttributeValue, ReflectedAzRtti,
     ReflectedAzRttiHierarchyEntry, ReflectedClass, ReflectedEnum, ReflectedEnumVariant,
@@ -231,6 +235,10 @@ pub use selection::{
 pub use selection_manifest::{
     SelectionManifestError, SerializeCodegenEngineOwnedTypeEntry, SerializeCodegenRootEntry,
     SerializeCodegenSelectionManifest,
+};
+pub use specialized_type_id::{
+    FOLDED_TEMPLATE_NAMES, SpecializedTypeIdFoldEntry, SpecializedTypeIdFolder,
+    SpecializedTypeIdSweep, SpecializedTypeIdSweepCount, recorded_type_id,
 };
 pub use status::{
     CodegenStatus, CodegenStatusEvent, CodegenStatusKind, CodegenStatusPhase, CodegenStatusSink,

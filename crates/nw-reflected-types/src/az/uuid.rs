@@ -169,3 +169,35 @@ pub mod type_ids {
     pub const CRC32: Uuid = Uuid::from_u128(0x9F4E062E_06A0_46D4_85DF_E0DA96467D3A);
     pub const ASSET_ID: Uuid = Uuid::from_u128(0x652ED536_3402_439B_AEBE_4A5DBC554085);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Uuid;
+    use crate::az::rtti::AzRtti;
+    use crate::types::PaperdollSlotTypes;
+
+    const AZSTD_ALLOCATOR: Uuid = Uuid::from_u128(0xE9F5A3BE_2B3D_4C62_9E6B_4E00A13AB452);
+    const AZSTD_LESS: Uuid = Uuid::from_u128(0x41B40AFC_68FD_4ED9_9EC7_BA9992802E1B);
+    const AZSTD_MAP: Uuid = Uuid::from_u128(0xF8ECF58D_D33E_49DC_BF34_8FA499AC3AE1);
+    const AZSTD_STRING: Uuid = Uuid::from_u128(0x03AAAB3F_5C47_5A66_9EBC_D5FA4DB353C9);
+
+    /// `PaperdollComponent::m_paperdollVisualSlotMapping` is
+    /// `map<PaperdollSlotTypes, AZStd::string>`; its getter
+    /// `NewWorld+0x6965870` folds the key getter `NewWorld+0x4620da0`, which
+    /// returns the enum's own identity, then the string, `less<K>`, the
+    /// allocator and the `map` base. The serializer stores the key as `int`,
+    /// so a fold from `int` never reaches the identity the capture records
+    /// for the member; the generated enum's `TYPE_ID` does.
+    #[test]
+    fn generated_enum_identity_folds_the_recorded_map_specialization() {
+        let key = PaperdollSlotTypes::TYPE_ID;
+        let less = Uuid::specialized_template_postfix(AZSTD_LESS, &[key]).expect("less<K>");
+        let map = Uuid::specialized_template_postfix(
+            AZSTD_MAP,
+            &[key, AZSTD_STRING, less, AZSTD_ALLOCATOR],
+        )
+        .expect("map<K, V>");
+
+        assert_eq!(map, Uuid::from_u128(0x5D30068C_1D6A_51F6_94A1_FA512EF61ED6));
+    }
+}

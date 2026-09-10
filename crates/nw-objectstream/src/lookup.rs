@@ -96,6 +96,12 @@ pub struct NameLookup {
     /// Field-name CRC-32 to field-name string.
     pub crcs: HashMap<u32, ArcStr>,
     /// Reflected enum UUID to its SerializeContext wire-storage UUID.
+    ///
+    /// Filled from `enumTypeIdToUnderlyingTypeIdMap`, and for an enum absent
+    /// from that map from the `EnumType` attribute on the members that store
+    /// it, when every such member stores the same integer. The serializer
+    /// writes an enum as that integer and records the integer as the
+    /// member's type; the attribute carries the enum's own identity.
     #[serde(default)]
     pub enum_underlying_types: HashMap<Uuid, Uuid>,
 }
@@ -154,12 +160,27 @@ impl NameLookup {
         lookup.extend_types(OBJECT_STREAM_TYPES);
 
         let refs = JsonRefs::new(root);
-        let mut walker = SerializeWalker {
-            lookup: &mut lookup,
-            refs: &refs,
-            seen_refs: HashSet::new(),
+        let enum_type_candidates = {
+            let mut walker = SerializeWalker {
+                lookup: &mut lookup,
+                refs: &refs,
+                seen_refs: HashSet::new(),
+                enum_type_candidates: HashMap::new(),
+            };
+            walker.visit(root, 0);
+            walker.enum_type_candidates
         };
-        walker.visit(root, 0);
+        for (enum_type_id, underlying_type_ids) in enum_type_candidates {
+            let mut underlying_type_ids = underlying_type_ids.into_iter();
+            if let (Some(underlying_type_id), None) =
+                (underlying_type_ids.next(), underlying_type_ids.next())
+            {
+                lookup
+                    .enum_underlying_types
+                    .entry(enum_type_id)
+                    .or_insert(underlying_type_id);
+            }
+        }
         if let Some(enums) = root
             .get("enumTypeIdToUnderlyingTypeIdMap")
             .and_then(Value::as_object)
@@ -289,9 +310,42 @@ struct SerializeWalker<'a, 'lookup> {
     lookup: &'lookup mut NameLookup,
     refs: &'a JsonRefs<'a>,
     seen_refs: HashSet<u64>,
+    /// Enum UUID to the member type UUIDs its `EnumType` attributes sit on.
+    enum_type_candidates: HashMap<Uuid, HashSet<Uuid>>,
 }
 
 impl SerializeWalker<'_, '_> {
+    fn resolve<'v>(&'v self, value: &'v Value) -> &'v Value {
+        value
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|reference| self.refs.get(reference))
+            .unwrap_or(value)
+    }
+
+    /// The enum named by an element's `EnumType` attribute
+    /// (`AZ_CRC("EnumType", 0xb177e1b5)`), which `ClassBuilder::Field` adds
+    /// to a field whose enum has its own identity.
+    fn enum_type_attribute(&self, object: &serde_json::Map<String, Value>) -> Option<Uuid> {
+        object
+            .get("attributes")
+            .map(|attributes| self.resolve(attributes))?
+            .as_array()?
+            .iter()
+            .find_map(|entry| {
+                let [_, attribute] = self.resolve(entry).as_array()?.as_slice() else {
+                    return None;
+                };
+                let attribute = self.resolve(attribute);
+                if attribute.get("attributeName").and_then(Value::as_str) != Some("EnumType") {
+                    return None;
+                }
+                self.resolve(attribute.get("value")?)
+                    .get("value")
+                    .and_then(value_uuid)
+            })
+    }
+
     fn visit(&mut self, value: &Value, depth: usize) {
         const MAX_DEPTH: usize = 128;
         if depth > MAX_DEPTH {
@@ -339,6 +393,17 @@ impl SerializeWalker<'_, '_> {
                         .crcs
                         .entry(name_crc)
                         .or_insert_with(|| ArcStr::from(name));
+                }
+
+                if let (Some(type_id), Some(enum_type_id)) = (
+                    object.get("typeId").and_then(value_uuid),
+                    self.enum_type_attribute(object),
+                ) && enum_type_id != type_id
+                {
+                    self.enum_type_candidates
+                        .entry(enum_type_id)
+                        .or_default()
+                        .insert(type_id);
                 }
 
                 for value in object.values() {
@@ -462,6 +527,116 @@ mod tests {
                 &Uuid::parse_str("CCCCCCCC-CCCC-4CCC-CCCC-CCCCCCCCCCCC").unwrap()
             ),
             Some(type_ids::U8)
+        );
+    }
+
+    /// `CharacterAttributeType` (`F4197081-…`) is absent from
+    /// `enumTypeIdToUnderlyingTypeIdMap`; the `EnumType` attribute on the
+    /// `value1` element of `unordered_map<CharacterAttributeType, int>` is
+    /// what records that the serializer stores it as `int`.
+    #[test]
+    fn enum_type_attributes_recover_underlying_types_absent_from_the_map() {
+        let root = serde_json::json!({
+            "$id": 1,
+            "uuidMap": {
+                "AAAAAAAA-AAAA-4AAA-AAAA-AAAAAAAAAAAA": {
+                    "$id": 2,
+                    "name": "Example",
+                    "typeId": "AAAAAAAA-AAAA-4AAA-AAAA-AAAAAAAAAAAA",
+                    "elements": [
+                        {
+                            "$id": 3,
+                            "name": "value1",
+                            "nameCrc": 1,
+                            "typeId": "72039442-EB38-4D42-A1AD-CB68F7E0EEF6",
+                            "attributes": [[
+                                2977423797_u32,
+                                {
+                                    "$id": 4,
+                                    "attributeId": 2977423797_u32,
+                                    "attributeName": "EnumType",
+                                    "value": {
+                                        "kind": "Uuid",
+                                        "value": "F4197081-D1D9-4A95-8FA0-81534BE2C33B"
+                                    }
+                                }
+                            ]]
+                        },
+                        {
+                            "$id": 5,
+                            "name": "m_mapped",
+                            "nameCrc": 2,
+                            "typeId": "72B9409A-7D1A-4831-9CFE-FCB3FADD3426",
+                            "attributes": [[2977423797_u32, { "$ref": "#6" }]]
+                        },
+                        {
+                            "$id": 7,
+                            "name": "m_disagreeing",
+                            "nameCrc": 3,
+                            "typeId": "72039442-EB38-4D42-A1AD-CB68F7E0EEF6",
+                            "attributes": [[
+                                2977423797_u32,
+                                {
+                                    "$id": 8,
+                                    "attributeId": 2977423797_u32,
+                                    "attributeName": "EnumType",
+                                    "value": {
+                                        "kind": "Uuid",
+                                        "value": "DDDDDDDD-DDDD-4DDD-DDDD-DDDDDDDDDDDD"
+                                    }
+                                }
+                            ]]
+                        },
+                        {
+                            "$id": 9,
+                            "name": "m_disagreeing_too",
+                            "nameCrc": 4,
+                            "typeId": "72B9409A-7D1A-4831-9CFE-FCB3FADD3426",
+                            "attributes": [[2977423797_u32, { "$ref": "#8" }]]
+                        }
+                    ]
+                }
+            },
+            "editContext": {
+                "$id": 10,
+                "attribute": {
+                    "$id": 6,
+                    "attributeId": 2977423797_u32,
+                    "attributeName": "EnumType",
+                    "value": {
+                        "kind": "Uuid",
+                        "value": "CCCCCCCC-CCCC-4CCC-CCCC-CCCCCCCCCCCC"
+                    }
+                }
+            },
+            "enumTypeIdToUnderlyingTypeIdMap": {
+                "CCCCCCCC-CCCC-4CCC-CCCC-CCCCCCCCCCCC":
+                    "ECA0B403-C4F8-4B86-95FC-81688D046E40"
+            }
+        });
+
+        let hashes = NameLookup::from_serialize_value(&root);
+
+        assert_eq!(
+            hashes.enum_underlying_type(
+                &Uuid::parse_str("F4197081-D1D9-4A95-8FA0-81534BE2C33B").unwrap()
+            ),
+            Some(type_ids::INT),
+            "an enum absent from the map takes the integer its EnumType member stores"
+        );
+        assert_eq!(
+            hashes.enum_underlying_type(
+                &Uuid::parse_str("CCCCCCCC-CCCC-4CCC-CCCC-CCCCCCCCCCCC").unwrap()
+            ),
+            Some(type_ids::U16),
+            "the map outranks the member evidence"
+        );
+        assert_eq!(
+            hashes.enum_underlying_type(
+                &Uuid::parse_str("DDDDDDDD-DDDD-4DDD-DDDD-DDDDDDDDDDDD").unwrap()
+            ),
+            None,
+            "members that disagree on the integer record nothing"
         );
     }
 }

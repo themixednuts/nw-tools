@@ -4,8 +4,10 @@ use crate::document::SerializeContextDocument;
 use crate::field_projection::projected_missing_reflected_types;
 use crate::ir::SerializeCodegenUnit;
 use crate::layout::{LayoutAnalysisReport, LayoutRootAudit, LayoutRootFindingKind};
+use crate::model::SerializeContextModel;
 use crate::reference::{ReferenceKey, ReferenceReport};
 use crate::schema::{SchemaAzRttiInfo, SchemaGenericClassInfo, SerializeContext};
+use crate::specialized_type_id::{FOLDED_TEMPLATE_NAMES, SpecializedTypeIdFolder};
 use crate::types::scalar_type;
 
 const MAX_SCHEMA_GENERIC_LINT_DEPTH: usize = 64;
@@ -31,6 +33,7 @@ pub enum DiagnosticCode {
     AmbiguousWrapperTarget,
     AmbiguousSharedSupportRoot,
     UniqueOwnedSupportRoot,
+    SpecializedTypeIdFoldMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +64,32 @@ pub fn lint_codegen_unit(codegen_unit: &SerializeCodegenUnit) -> Vec<Diagnostic>
     let root_audit = LayoutAnalysisReport::from_codegen_unit(codegen_unit).root_audit();
     diagnostics.extend(layout_root_diagnostics(&root_audit));
     diagnostics
+}
+
+/// Warns for every registered specialization of a folded template whose
+/// recorded identity does not reproduce from the identities its arguments
+/// contribute (see [`crate::specialized_type_id`]). A template the fold does
+/// not cover produces nothing.
+#[must_use]
+pub fn lint_specialized_type_ids(model: &SerializeContextModel) -> Vec<Diagnostic> {
+    SpecializedTypeIdFolder::new(model)
+        .sweep(FOLDED_TEMPLATE_NAMES)
+        .misses()
+        .filter_map(|entry| {
+            let folded = entry.folded_type_id?;
+            Some(Diagnostic {
+                severity: Severity::Warning,
+                code: DiagnosticCode::SpecializedTypeIdFoldMismatch,
+                message: format!(
+                    "{} specialization `{}` folds to `{folded}` from its argument identities {:?}; templatedTypeIds {:?}",
+                    entry.class_name,
+                    entry.recorded_type_id,
+                    entry.argument_identities,
+                    entry.templated_type_ids
+                ),
+            })
+        })
+        .collect()
 }
 
 fn missing_type_diagnostics(codegen_unit: &SerializeCodegenUnit) -> Vec<Diagnostic> {
@@ -880,6 +909,60 @@ mod tests {
                 .message
                 .contains("DoorComponentServerFacet.m_target")
         );
+    }
+
+    /// Over every folded template the lint names exactly the specializations
+    /// whose arguments the capture does not record (see
+    /// [`crate::specialized_type_id`]): the vectors and the `OSString`
+    /// declared over an explicit `AZ::AZStdAlloc<Allocator>`, which record
+    /// only their element.
+    #[test]
+    fn lints_project_specialized_type_ids_down_to_the_unrecorded_arguments() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("resources")
+            .join("serialize.json");
+        let document = SerializeContextDocument::from_path(path)
+            .expect("project serialize.json should match generated schema");
+        let model = SerializeContextModel::from_document(&document);
+
+        let diagnostics = lint_specialized_type_ids(&model);
+        let misses = SpecializedTypeIdFolder::new(&model)
+            .sweep(FOLDED_TEMPLATE_NAMES)
+            .misses()
+            .map(|entry| entry.recorded_type_id)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            misses,
+            std::collections::BTreeSet::from([
+                // DynamicModuleDescriptor::dynamicLibraryPath, AZ::OSString.
+                uuid!("189CC2ED-FDDE-5680-91D4-9F630A79187F"),
+                // ComponentApplication::Descriptor::modules, AZStdAlloc<OSAllocator>.
+                uuid!("8E779F80-AEAA-565B-ABB1-DE10B18CF995"),
+                // Composite::Children, AZStdAlloc<SystemAllocator>.
+                uuid!("15B4F50E-8C6E-5262-8555-E181A9B6FFAC"),
+                // ConditionGroup::Conditions, AZStdAlloc<SystemAllocator>.
+                uuid!("A3BE97B0-BE01-51C4-9717-7CDD03C6C10E"),
+            ]),
+            "{diagnostics:#?}"
+        );
+        assert_eq!(diagnostics.len(), misses.len(), "{diagnostics:#?}");
+        for diagnostic in &diagnostics {
+            assert_eq!(diagnostic.severity, Severity::Warning);
+            assert_eq!(
+                diagnostic.code,
+                DiagnosticCode::SpecializedTypeIdFoldMismatch
+            );
+            assert!(
+                misses
+                    .iter()
+                    .any(|recorded| diagnostic.message.contains(&recorded.to_string())),
+                "{}",
+                diagnostic.message
+            );
+        }
     }
 
     #[test]

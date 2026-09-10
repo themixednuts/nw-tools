@@ -1701,6 +1701,112 @@ mod tests {
         assert_eq!(mode.variants[0].discriminant, Some(7));
     }
 
+    /// A container member whose `value1` / `element` carries the `EnumType`
+    /// attribute is keyed by that enum in the generated Rust, and the enum is
+    /// emitted with its own identity, reflected name, underlying integer and
+    /// `EnumValue` members, so the member's specialization folds to the
+    /// identity the capture records (see [`crate::specialized_type_id`]).
+    ///
+    /// `AttributeComponent::m_preReloadAttributes` is
+    /// `unordered_map<CharacterAttributeType, int>`, `SBItemClass::m_ItemClasses`
+    /// is `unordered_set<ItemClasses>` and
+    /// `PaperdollComponent::m_paperdollVisualSlotMapping` is
+    /// `map<PaperdollSlotTypes, AZStd::string>`. `CharacterAttributeType` is
+    /// absent from `enumTypeIdToUnderlyingTypeIdMap`; its `int` comes from the
+    /// members that store it.
+    #[test]
+    fn plans_enum_keyed_containers_from_the_shipped_serialize_context() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("resources")
+            .join("serialize.json");
+        let document = SerializeContextDocument::from_path(path)
+            .expect("project serialize.json should match generated schema");
+        let model = SerializeContextModel::from_document(&document);
+        let unit = SerializeCodegenPlanner::plan_model(&model);
+
+        let attribute_component = uuid!("CD88BC6F-2EDE-4916-A4B0-2144EBE39EAC");
+        let sb_item_class = uuid!("0AF5339B-3F79-7FED-FBFD-29542BADB3E0");
+        let paperdoll_component = uuid!("BA93B9FF-7A7E-4028-889E-12D418A11C71");
+        let character_attribute_type = uuid!("F4197081-D1D9-4A95-8FA0-81534BE2C33B");
+        let item_classes = uuid!("A3755086-8B0A-4D14-B073-FC3E1433C3F6");
+        let paperdoll_slot_types = uuid!("5D42C439-A859-4133-9032-88DE31048F2C");
+
+        let index = unit.index();
+        let mut selected = BTreeSet::new();
+        for root in [attribute_component, sb_item_class, paperdoll_component] {
+            let item = index
+                .item_by_type_id(root)
+                .unwrap_or_else(|| panic!("serialize.json should reflect {root}"));
+            index.extend_transitive_dependency_type_ids(item, &mut selected);
+        }
+        let emitted = unit.select_exact_type_ids(&selected);
+        let rust = RustCodegenPlanner::standalone()
+            .plan_serialize_codegen_unit(&emitted, &crate::CodegenContext::inline());
+        let item = |type_id: Uuid| {
+            rust.items
+                .iter()
+                .find(|item| item.source_type_id == type_id)
+                .unwrap_or_else(|| panic!("{type_id} should be planned"))
+        };
+        let field = |type_id: Uuid, name: &str| {
+            item(type_id)
+                .fields
+                .iter()
+                .find(|field| field.source_name == name)
+                .unwrap_or_else(|| panic!("{type_id} should plan {name}"))
+                .rust_type
+                .clone()
+        };
+
+        assert_eq!(
+            field(attribute_component, "m_preReloadAttributes"),
+            "std::collections::HashMap<CharacterAttributeType, i32>"
+        );
+        assert_eq!(
+            field(sb_item_class, "m_ItemClasses"),
+            "std::collections::HashSet<ItemClasses>"
+        );
+        assert_eq!(
+            field(paperdoll_component, "m_paperdollVisualSlotMapping"),
+            "std::collections::BTreeMap<PaperdollSlotTypes, String>"
+        );
+
+        for (type_id, name, underlying) in [
+            (character_attribute_type, "CharacterAttributeType", "i32"),
+            (item_classes, "ItemClasses", "u64"),
+            (paperdoll_slot_types, "PaperdollSlotTypes", "i32"),
+        ] {
+            let enumeration = item(type_id);
+            assert!(
+                matches!(enumeration.kind, RustItemKind::Enum | RustItemKind::RawEnum),
+                "{name} should be an enum item, got {:?}",
+                enumeration.kind
+            );
+            assert_eq!(enumeration.rust_name, name);
+            assert_eq!(enumeration.identity.type_id, type_id, "{name} identity");
+            assert_eq!(enumeration.identity.name.as_deref(), Some(name));
+            assert_eq!(enumeration.repr.as_deref(), Some(underlying), "{name} repr");
+            assert_eq!(
+                enumeration
+                    .raw_conversion
+                    .as_ref()
+                    .map(|conversion| conversion.raw_type.as_str()),
+                Some(underlying),
+                "{name} raw conversion"
+            );
+            assert!(
+                !enumeration.variants.is_empty()
+                    && enumeration
+                        .variants
+                        .iter()
+                        .all(|variant| variant.discriminant.is_some()),
+                "{name} should carry its EnumValue members"
+            );
+        }
+    }
+
     #[test]
     fn integrated_planner_derives_marshaler_for_color_scalars() {
         fn color_field(name: &str, scalar: ScalarType) -> SerializeCodegenField {

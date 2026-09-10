@@ -62,6 +62,11 @@ impl ReflectedMember {
     }
 }
 
+/// A `GenericClassInfo` capture: one template specialization.
+///
+/// The identity the specialization folds to is recorded in
+/// `specialized_type_id` (see [`crate::specialized_type_id`] for the fold and
+/// for which identity each argument contributes to it).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReflectedGenericClass {
     pub reference_id: Option<ReferenceKey>,
@@ -71,10 +76,21 @@ pub struct ReflectedGenericClass {
     pub elements_apply_to_class_data: Option<bool>,
     pub class_data_element_count: Option<u32>,
     pub templated_argument_count: Option<u32>,
+    /// `GenericClassInfo::GetTemplatedTypeId` per explicit template argument:
+    /// `SerializeGenericTypeInfo<Arg>::GetClassTypeId()`, which is the
+    /// underlying integer's id for an enum (specialized or not) and the
+    /// template base for a nested template. These are not always the
+    /// identities the specialization folds from.
     pub templated_type_ids: Vec<Uuid>,
+    /// The identities the fold takes, recorded on pairs and wrappers: the
+    /// enum's own id where `templated_type_ids` record its underlying
+    /// integer, and the null id for an enum without a specialization. Empty
+    /// on the containers themselves.
     pub type_id_fold_type_ids: Vec<Uuid>,
     pub specialized_type_id: Option<Uuid>,
     pub generic_type_id: Option<Uuid>,
+    /// Uninitialised pointer bytes in the capture (`3DD05677-F77F-0000-…`,
+    /// `00EBD56F-F77F-0000-…`), not an identity.
     pub legacy_specialized_type_id: Option<Uuid>,
     pub non_type_template_arguments: BTreeMap<String, ReflectedNonTypeTemplateArgument>,
     pub class_type_id: Option<Uuid>,
