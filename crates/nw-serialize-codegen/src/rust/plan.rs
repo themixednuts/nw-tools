@@ -12,7 +12,9 @@ use crate::layout::{LayoutIndex, dependency_ordered_codegen_items, reflected_bas
 use crate::model::SerializeContextModel;
 use crate::naming::{rust_type_ident, rust_variant_ident};
 use crate::role::ReflectedTypeRole;
-use crate::rust::derive_plan::{RustDeriveCaches, RustDerivePlanner, field_supports_reflect};
+use crate::rust::derive_plan::{
+    RustDeriveCaches, RustDerivePlanner, field_supports_reflect, rust_type_supports_native_hash_key,
+};
 use crate::rust::enum_plan::{RustEnumPlanner, RustVariantPlan, enum_has_duplicate_discriminants};
 use crate::rust::field_plan::{RustFieldPlanner, integrated_custom_field_type};
 use crate::rust::identity::RustTypeIdentityPlan;
@@ -1414,10 +1416,10 @@ fn collect_reflect_opaque_hash_leaf_type_ids(
             ) {
                 continue;
             }
-            collect_hash_leaf_positions(&field.resolved_type, &mut out);
+            collect_hash_leaf_positions(&field.resolved_type, items_by_type_id, &mut out);
         }
         if let Some(resolved) = &item.enum_underlying_type {
-            collect_hash_leaf_positions(resolved, &mut out);
+            collect_hash_leaf_positions(resolved, items_by_type_id, &mut out);
         }
     }
     out
@@ -1429,40 +1431,53 @@ fn collect_reflect_opaque_hash_leaf_type_ids(
 /// immediately-nested `Named` `type_id`. Only an immediate `Named` element/key
 /// is a leaf — a nested container at that position reflects as its own dynamic
 /// collection and is surveyed on its own recursion.
-fn collect_hash_leaf_positions(resolved: &ResolvedType, out: &mut BTreeSet<Uuid>) {
+fn collect_hash_leaf_positions(
+    resolved: &ResolvedType,
+    items_by_type_id: &BTreeMap<Uuid, &SerializeCodegenItem>,
+    out: &mut BTreeSet<Uuid>,
+) {
     match resolved {
         ResolvedType::Sequence { kind, element, .. } => {
+            // Only a position that actually renders as a hashing collection is
+            // in the panic class. `RustTypeRenderer` degrades an
+            // `UnorderedSet` whose element is not a native hash key to a plain
+            // `Vec`, which reflects as a dynamic *list* and never hashes its
+            // elements -- so such an element must not be forced opaque.
             if matches!(kind, SequenceKind::UnorderedSet)
+                && rust_type_supports_native_hash_key(element, items_by_type_id)
                 && let ResolvedType::Named { type_id, .. } = element.as_ref()
             {
                 out.insert(*type_id);
             }
-            collect_hash_leaf_positions(element, out);
+            collect_hash_leaf_positions(element, items_by_type_id, out);
         }
         ResolvedType::Map { kind, key, value } => {
+            // Same degradation applies to an unordered map with a key that is
+            // not a native hash key: it renders as `Vec<(K, V)>`.
             if matches!(kind, MapKind::UnorderedMap | MapKind::UnorderedFlatMap)
+                && rust_type_supports_native_hash_key(key, items_by_type_id)
                 && let ResolvedType::Named { type_id, .. } = key.as_ref()
             {
                 out.insert(*type_id);
             }
-            collect_hash_leaf_positions(key, out);
-            collect_hash_leaf_positions(value, out);
+            collect_hash_leaf_positions(key, items_by_type_id, out);
+            collect_hash_leaf_positions(value, items_by_type_id, out);
         }
         ResolvedType::Pair { first, second } => {
-            collect_hash_leaf_positions(first, out);
-            collect_hash_leaf_positions(second, out);
+            collect_hash_leaf_positions(first, items_by_type_id, out);
+            collect_hash_leaf_positions(second, items_by_type_id, out);
         }
         ResolvedType::RangedInteger { value, .. }
         | ResolvedType::Optional { value }
         | ResolvedType::ReplicatedField { value } => {
-            collect_hash_leaf_positions(value, out);
+            collect_hash_leaf_positions(value, items_by_type_id, out);
         }
         ResolvedType::Pointer { target, .. } => {
-            collect_hash_leaf_positions(target, out);
+            collect_hash_leaf_positions(target, items_by_type_id, out);
         }
         ResolvedType::Tuple { elements } => {
             for element in elements {
-                collect_hash_leaf_positions(element, out);
+                collect_hash_leaf_positions(element, items_by_type_id, out);
             }
         }
         ResolvedType::Named { .. }
