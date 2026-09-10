@@ -11,12 +11,16 @@ publish.workspace = true
 workspace = true
 
 [features]
-default = ["oodle"]
-oodle = ["nw-pak/oodle"]
+default = ["assets", "oodle"]
+# Asset catalogs, dependency references, and pak-backed content access.
+# Disable to keep only the dependency-free asset identity types and the
+# `AZ::Uuid` primitives, which need nothing beyond `uuid`.
+assets = ["dep:nw-filesystem", "dep:nw-jobs", "dep:nw-pak"]
+oodle = ["assets", "nw-pak/oodle"]
 
 [dependencies]
-nw-filesystem.workspace = true
-nw-jobs.workspace = true
-nw-pak.workspace = true
+nw-filesystem = { workspace = true, optional = true }
+nw-jobs = { workspace = true, optional = true }
+nw-pak = { workspace = true, optional = true }
 thiserror.workspace = true
 uuid.workspace = true

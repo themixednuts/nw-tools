@@ -20,7 +20,7 @@ cry-character.workspace = true
 cry-chunk.workspace = true
 cry-mannequin.workspace = true
 cry-particles.workspace = true
-nw-asset.workspace = true
+nw-asset = { workspace = true, features = ["assets"] }
 nw-jobs.workspace = true
 nw-model.workspace = true
 nw-objectstream.workspace = true
