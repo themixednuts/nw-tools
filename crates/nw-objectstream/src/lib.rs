@@ -47,7 +47,6 @@ use std::io::{self, Cursor, Read, Write};
 use std::str;
 
 use arcstr::ArcStr;
-use crc32fast::hash;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -743,6 +742,90 @@ impl Element {
         self.flags & ST_BINARY_VALUE_SIZE_MASK
     }
 
+    /// Binary element-header flags byte, plus the value's byte length.
+    ///
+    /// The header is derived from what the element actually carries —
+    /// `name_crc`, `version`, and `data` — instead of being trusted from
+    /// [`Element::flags`]. Only elements parsed from a binary payload ever
+    /// had a header to preserve; ones built from XML, from JSON, or through
+    /// the builder methods leave `flags` at its `Default` of
+    /// [`ST_BINARYFLAG_ELEMENT_END`], which the reader treats as an
+    /// element-list terminator rather than a header. Deriving here makes
+    /// every source produce the same bytes for the same contents, so the
+    /// writer has one rule instead of one rule per producer.
+    ///
+    /// A stored header is reused verbatim when it already agrees with the
+    /// contents, so a binary payload that spent a wider size field than the
+    /// length needs still survives a parse-and-write cycle byte for byte.
+    ///
+    /// The returned length is the value's size in bytes; the writer emits it
+    /// as a separate field only when [`ST_BINARYFLAG_EXTRA_SIZE_FIELD`] is
+    /// set, because otherwise the bottom three flag bits already hold it.
+    #[must_use]
+    pub fn binary_header(&self) -> (u8, Option<usize>) {
+        if self.binary_header_matches_contents() {
+            return (self.flags, self.data_size);
+        }
+
+        let mut flags = ST_BINARYFLAG_ELEMENT_HEADER;
+        if self.name_crc.is_some() {
+            flags |= ST_BINARYFLAG_HAS_NAME;
+        }
+        if self.version.is_some() {
+            flags |= ST_BINARYFLAG_HAS_VERSION;
+        }
+
+        let Some(data) = self.data.as_deref() else {
+            return (flags, None);
+        };
+
+        flags |= ST_BINARYFLAG_HAS_VALUE;
+        let len = data.len();
+        if let Ok(inline) = u8::try_from(len)
+            && inline <= ST_BINARY_VALUE_SIZE_MASK
+        {
+            flags |= inline;
+        } else {
+            flags |= ST_BINARYFLAG_EXTRA_SIZE_FIELD | size_field_width(len);
+        }
+        (flags, Some(len))
+    }
+
+    /// `true` iff `flags` and `data_size` already describe this element's
+    /// `name_crc`, `version`, and `data`.
+    fn binary_header_matches_contents(&self) -> bool {
+        if self.flags & ST_BINARYFLAG_ELEMENT_HEADER == 0
+            || self.has_name() != self.name_crc.is_some()
+            || self.has_version() != self.version.is_some()
+        {
+            return false;
+        }
+
+        let Some(data) = self.data.as_deref() else {
+            return !self.has_value() && !self.has_extra_size_field() && self.value_width() == 0;
+        };
+        if !self.has_value() || self.data_size != Some(data.len()) {
+            return false;
+        }
+
+        if self.has_extra_size_field() {
+            size_field_capacity(self.value_width()).is_some_and(|max| data.len() <= max)
+        } else {
+            usize::from(self.value_width()) == data.len()
+        }
+    }
+
+    /// Store the header [`Element::binary_header`] derives, so an element
+    /// built from XML or JSON reports the same `flags`, `data_size`, and
+    /// [`Element::has_value`]-style predicates as one parsed from binary.
+    #[must_use]
+    fn with_derived_binary_header(mut self) -> Self {
+        let (flags, data_size) = self.binary_header();
+        self.flags = flags;
+        self.data_size = data_size;
+        self
+    }
+
     /// Iterate all elements in this subtree (depth-first pre-order,
     /// includes `self`).
     #[inline]
@@ -783,6 +866,28 @@ impl<'a> IntoIterator for &'a Element {
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.elements.iter()
+    }
+}
+
+/// Width in bytes of the narrowest explicit size field that holds `len`.
+const fn size_field_width(len: usize) -> u8 {
+    if len <= u8::MAX as usize {
+        1
+    } else if len <= u16::MAX as usize {
+        2
+    } else {
+        4
+    }
+}
+
+/// Largest value length an explicit size field of `width` bytes encodes.
+/// `None` for a width the binary reader does not accept.
+const fn size_field_capacity(width: u8) -> Option<usize> {
+    match width {
+        1 => Some(u8::MAX as usize),
+        2 => Some(u16::MAX as usize),
+        4 => Some(u32::MAX as usize),
+        _ => None,
     }
 }
 
@@ -869,13 +974,16 @@ fn serialize_asset_value(value: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// The stream keys a member by the CRC-32 of its *field* name — the
+/// member name inside the owning class, such as `ID` — so `name_crc`
+/// comes from `field` and not from the type name in `name`. A root
+/// element is not a member of anything, has no field, and so carries no
+/// name CRC. [`value::az_field_name_crc`] owns the hash the binary reader
+/// resolves against, including its case folding.
 impl From<XMLElement> for Element {
     fn from(value: XMLElement) -> Self {
-        let name_crc = if value.name.is_empty() {
-            None
-        } else {
-            Some(hash(value.name.as_bytes()))
-        };
+        let field = value.field.map(ArcStr::from);
+        let name_crc = field.as_deref().map(value::az_field_name_crc);
         let data = value
             .value
             .as_ref()
@@ -884,22 +992,22 @@ impl From<XMLElement> for Element {
             id: value.id,
             name: ArcStr::from(value.name),
             name_crc,
-            field: value.field.map(ArcStr::from),
+            field,
             version: value.version,
             elements: value.elements.into_iter().map(Element::from).collect(),
             data,
             ..Default::default()
         }
+        .with_derived_binary_header()
     }
 }
 
+/// See the [`XMLElement`] conversion above for why `name_crc` is hashed
+/// from `field` rather than from the type name.
 impl From<JSONElement> for Element {
     fn from(value: JSONElement) -> Self {
-        let name_crc = if value.name.is_empty() {
-            None
-        } else {
-            Some(hash(value.name.as_bytes()))
-        };
+        let field = value.field.map(ArcStr::from);
+        let name_crc = field.as_deref().map(value::az_field_name_crc);
         let data = value
             .value
             .as_ref()
@@ -908,7 +1016,7 @@ impl From<JSONElement> for Element {
             id: value.id,
             name: ArcStr::from(value.name),
             name_crc,
-            field: value.field.map(ArcStr::from),
+            field,
             version: value.version,
             specialization: value.specialization,
             data,
@@ -918,6 +1026,7 @@ impl From<JSONElement> for Element {
                 .unwrap_or_default(),
             ..Default::default()
         }
+        .with_derived_binary_header()
     }
 }
 

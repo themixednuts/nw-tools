@@ -15,7 +15,10 @@ use crate::binary::{
 use crate::deserialize;
 use crate::lookup::NameLookup;
 use crate::types::uuid_data_to_serialize;
-use crate::{Element, ObjectStream, ObjectStreamEncoding, ObjectStreamError, StreamTag};
+use crate::{
+    Element, ObjectStream, ObjectStreamEncoding, ObjectStreamError, ST_BINARY_VALUE_SIZE_MASK,
+    ST_BINARYFLAG_EXTRA_SIZE_FIELD, ST_BINARYFLAG_HAS_VALUE, StreamTag,
+};
 
 const XML_OBJECT_STREAM: &str = "ObjectStream";
 const XML_CLASS: &str = "Class";
@@ -137,8 +140,14 @@ enum BinaryWriteFrame<'a> {
     EndOfList,
 }
 
+/// Write one element header and its value.
+///
+/// The flags byte comes from [`Element::binary_header`] rather than from
+/// `element.flags`, so an element that reached this writer from XML, JSON,
+/// or the builder methods emits the same header as one read from binary.
 fn write_element_header_and_data<W: Write>(element: &Element, writer: &mut W) -> io::Result<()> {
-    writer.write_all(&[element.flags])?;
+    let (flags, data_size) = element.binary_header();
+    writer.write_all(&[flags])?;
     if let Some(crc) = element.name_crc {
         writer.write_all(&crc.to_be_bytes())?;
     }
@@ -150,11 +159,11 @@ fn write_element_header_and_data<W: Write>(element: &Element, writer: &mut W) ->
     if let Some(specialized) = element.specialization {
         writer.write_all(&specialized.as_u128().to_be_bytes())?;
     }
-    if element.has_value()
-        && element.has_extra_size_field()
-        && let Some(size) = element.data_size
+    if flags & ST_BINARYFLAG_HAS_VALUE != 0
+        && flags & ST_BINARYFLAG_EXTRA_SIZE_FIELD != 0
+        && let Some(size) = data_size
     {
-        match element.value_width() {
+        match flags & ST_BINARY_VALUE_SIZE_MASK {
             1 => writer.write_all(
                 &u8::try_from(size)
                     .map_err(|_| invalid_size_width(size, 1))?
@@ -866,10 +875,16 @@ fn write_indent<W: Write>(writer: &mut W, indent: usize) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use arcstr::ArcStr;
     use uuid::Uuid;
 
     use super::*;
-    use crate::ST_BINARYFLAG_ELEMENT_HEADER;
+    use crate::value::az_field_name_crc;
+    use crate::{
+        ST_BINARYFLAG_ELEMENT_HEADER, ST_BINARYFLAG_HAS_NAME, ST_BINARYFLAG_HAS_VERSION, types,
+    };
 
     #[test]
     fn binary_to_xml_handles_deep_objectstream_without_recursion() -> Result<(), ObjectStreamError>
@@ -918,5 +933,353 @@ mod tests {
         }
         bytes.extend(std::iter::repeat_n(0, depth + 1));
         bytes
+    }
+
+    /// A small `AZ::Entity` in the JSON shape this crate writes: a root
+    /// class with a version and no field, four valued members covering the
+    /// inline and one-byte size encodings, and a nested container.
+    const PLAYER_JSON: &str = r#"{
+  "name": "ObjectStream",
+  "version": 3,
+  "Objects": [
+    {
+      "typeId": "{75651658-8663-478D-9090-2432DFCAFA44}",
+      "typeName": "AZ::Entity",
+      "version": 2,
+      "Objects": [
+        {
+          "field": "ID",
+          "typeId": "{D6597933-47CD-4FC8-B911-63F3E2B0993A}",
+          "typeName": "AZ::u64",
+          "value": 12345678901234567890
+        },
+        {
+          "field": "Name",
+          "typeId": "{03AAAB3F-5C47-5A66-9EBC-D5FA4DB353C9}",
+          "typeName": "AZStd::string",
+          "value": "player_character"
+        },
+        {
+          "field": "m_replicationIndex",
+          "typeId": "{43DA906B-7DEF-4CA8-9790-854106D3F983}",
+          "typeName": "AZ::u32",
+          "value": 7
+        },
+        {
+          "field": "IsRuntimeActive",
+          "typeId": "{A0CA880C-AFE4-43CB-926C-59AC48496112}",
+          "typeName": "bool",
+          "value": true
+        },
+        {
+          "field": "Components",
+          "typeId": "{A60E3E61-1FF6-4982-B6B8-9E4350C4C679}",
+          "typeName": "AZStd::vector",
+          "Objects": [
+            {
+              "field": "element",
+              "typeId": "{43DA906B-7DEF-4CA8-9790-854106D3F983}",
+              "typeName": "AZ::u32",
+              "value": 3
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}"#;
+
+    const PLAYER_FIELDS: [&str; 6] = [
+        "ID",
+        "Name",
+        "m_replicationIndex",
+        "IsRuntimeActive",
+        "Components",
+        "element",
+    ];
+
+    /// Type and field tables that spell the same names [`PLAYER_JSON`]
+    /// does, so a binary parse of that tree resolves back to it.
+    fn player_lookup() -> NameLookup {
+        let uuids: HashMap<Uuid, ArcStr> = [
+            (types::AZ_ENTITY, ArcStr::from("AZ::Entity")),
+            (types::AZ_U64, ArcStr::from("AZ::u64")),
+            (types::AZSTD_STRING, ArcStr::from("AZStd::string")),
+            (types::UNSIGNED_INT, ArcStr::from("AZ::u32")),
+            (types::BOOL, ArcStr::from("bool")),
+            (types::AZSTD_VECTOR, ArcStr::from("AZStd::vector")),
+        ]
+        .into_iter()
+        .collect();
+        let crcs: HashMap<u32, ArcStr> = PLAYER_FIELDS
+            .into_iter()
+            .map(|field| (az_field_name_crc(field), ArcStr::from(field)))
+            .collect();
+        NameLookup::new().with_uuids(uuids).with_crcs(crcs)
+    }
+
+    /// Hand-assembled binary payload. Every flags byte and size field is
+    /// spelled out at the call site, so a round trip is checked against
+    /// the layout `binary::read_element_header` reads rather than against
+    /// the writer's own idea of it.
+    struct BinaryFixture(Vec<u8>);
+
+    impl BinaryFixture {
+        fn new(stream_version: u32) -> Self {
+            let mut bytes = vec![StreamTag::BINARY.0];
+            bytes.extend_from_slice(&stream_version.to_be_bytes());
+            Self(bytes)
+        }
+
+        fn open(
+            &mut self,
+            flags: u8,
+            field: Option<&str>,
+            version: Option<u8>,
+            id: Uuid,
+            size_field: &[u8],
+            data: &[u8],
+        ) -> &mut Self {
+            self.0.push(flags);
+            if let Some(field) = field {
+                self.0
+                    .extend_from_slice(&az_field_name_crc(field).to_be_bytes());
+            }
+            if let Some(version) = version {
+                self.0.push(version);
+            }
+            self.0.extend_from_slice(id.as_bytes());
+            self.0.extend_from_slice(size_field);
+            self.0.extend_from_slice(data);
+            self
+        }
+
+        fn close(&mut self) -> &mut Self {
+            self.0.push(0);
+            self
+        }
+
+        /// Terminate the root element list and take the bytes.
+        fn finish(mut self) -> Vec<u8> {
+            self.0.push(0);
+            self.0
+        }
+    }
+
+    fn player_binary() -> Vec<u8> {
+        let has_value = ST_BINARYFLAG_ELEMENT_HEADER | ST_BINARYFLAG_HAS_NAME | 0x10;
+        let extra = has_value | ST_BINARYFLAG_EXTRA_SIZE_FIELD;
+
+        let mut fixture = BinaryFixture::new(3);
+        fixture.open(
+            ST_BINARYFLAG_ELEMENT_HEADER | ST_BINARYFLAG_HAS_VERSION,
+            None,
+            Some(2),
+            types::AZ_ENTITY,
+            &[],
+            &[],
+        );
+        fixture
+            .open(
+                extra | 1,
+                Some("ID"),
+                None,
+                types::AZ_U64,
+                &[8],
+                &12_345_678_901_234_567_890_u64.to_be_bytes(),
+            )
+            .close();
+        fixture
+            .open(
+                extra | 1,
+                Some("Name"),
+                None,
+                types::AZSTD_STRING,
+                &[16],
+                b"player_character",
+            )
+            .close();
+        fixture
+            .open(
+                has_value | 4,
+                Some("m_replicationIndex"),
+                None,
+                types::UNSIGNED_INT,
+                &[],
+                &7_u32.to_be_bytes(),
+            )
+            .close();
+        fixture
+            .open(
+                has_value | 1,
+                Some("IsRuntimeActive"),
+                None,
+                types::BOOL,
+                &[],
+                &[1],
+            )
+            .close();
+        fixture.open(
+            ST_BINARYFLAG_ELEMENT_HEADER | ST_BINARYFLAG_HAS_NAME,
+            Some("Components"),
+            None,
+            types::AZSTD_VECTOR,
+            &[],
+            &[],
+        );
+        fixture
+            .open(
+                has_value | 4,
+                Some("element"),
+                None,
+                types::UNSIGNED_INT,
+                &[],
+                &3_u32.to_be_bytes(),
+            )
+            .close();
+        fixture.close().close();
+        fixture.finish()
+    }
+
+    #[test]
+    fn json_transcodes_to_binary_the_reader_reads_back() -> Result<(), Box<dyn std::error::Error>> {
+        let binary = transcode_bytes(PLAYER_JSON.as_bytes(), ObjectStreamEncoding::Binary, None)?;
+
+        // The root header must open an element, not terminate the list:
+        // a `Default` flags byte of 0 is ST_BINARYFLAG_ELEMENT_END, which
+        // ended the stream at its first byte and left everything after it
+        // as trailing data.
+        let mut prefix = vec![StreamTag::BINARY.0];
+        prefix.extend_from_slice(&3_u32.to_be_bytes());
+        prefix.push(ST_BINARYFLAG_ELEMENT_HEADER | ST_BINARYFLAG_HAS_VERSION);
+        prefix.push(2);
+        prefix.extend_from_slice(types::AZ_ENTITY.as_bytes());
+        assert_eq!(&binary[..prefix.len()], prefix.as_slice());
+
+        // Reparsing runs ensure_reader_exhausted, so a successful parse is
+        // also the assertion that nothing trails the root terminator.
+        let hashes = player_lookup();
+        let parsed = ObjectStream::from_bytes(&binary, Some(&hashes))?;
+        let expected = ObjectStream::from_bytes(PLAYER_JSON.as_bytes(), None)?;
+        assert_eq!(parsed.elements(), expected.elements());
+        assert_eq!(
+            transcode_bytes(&binary, ObjectStreamEncoding::Binary, None)?,
+            binary
+        );
+
+        let root = &parsed.elements()[0];
+        assert_eq!(root.name().as_str(), "AZ::Entity");
+        assert_eq!(root.version(), Some(2));
+        assert_eq!(root.field(), None);
+        assert_eq!(root.name_crc(), None, "a root element is nobody's member");
+
+        let members: Vec<&str> = root
+            .children()
+            .iter()
+            .map(|child| child.field().map_or("", ArcStr::as_str))
+            .collect();
+        assert_eq!(members, PLAYER_FIELDS[..5]);
+        for child in root.children() {
+            let field = child.field().expect("member resolves through the lookup");
+            assert_eq!(child.name_crc(), Some(az_field_name_crc(field)));
+            assert_ne!(
+                child.name_crc(),
+                Some(crc32fast::hash(child.name().as_bytes())),
+                "the CRC keys the member name, not the type name"
+            );
+        }
+
+        let name = &root.children()[1];
+        assert_eq!(name.data(), Some(&b"player_character"[..]));
+        assert!(name.has_value() && name.has_extra_size_field());
+        assert_eq!(name.data_size, Some(16));
+        Ok(())
+    }
+
+    #[test]
+    fn binary_json_binary_round_trips_byte_for_byte() -> Result<(), Box<dyn std::error::Error>> {
+        let binary = player_binary();
+        let hashes = player_lookup();
+
+        let json = transcode_bytes(&binary, ObjectStreamEncoding::Json, Some(&hashes))?;
+        let round_tripped = transcode_bytes(&json, ObjectStreamEncoding::Binary, None)?;
+
+        assert_eq!(round_tripped, binary);
+        assert_eq!(
+            transcode_bytes(PLAYER_JSON.as_bytes(), ObjectStreamEncoding::Binary, None)?,
+            binary,
+            "the JSON literal and the hand-written fixture describe one tree"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn derived_headers_encode_every_value_size_width() -> Result<(), Box<dyn std::error::Error>> {
+        let header = ST_BINARYFLAG_ELEMENT_HEADER | ST_BINARYFLAG_HAS_VALUE;
+        let extra = header | ST_BINARYFLAG_EXTRA_SIZE_FIELD;
+        let elements = vec![
+            Element::new(types::BYTE_STREAM).with_data(Vec::new()),
+            Element::new(types::UNSIGNED_INT).with_data(7_u32.to_be_bytes()),
+            Element::new(types::BYTE_STREAM).with_data(vec![1; 200]),
+            Element::new(types::BYTE_STREAM).with_data(vec![2; 1_000]),
+            Element::new(types::BYTE_STREAM).with_data(vec![3; 70_000]),
+            Element::new(types::AZ_ENTITY)
+                .with_field("Components")
+                .with_children(vec![Element::new(types::UNSIGNED_INT)]),
+        ];
+        let derived: Vec<(u8, Option<usize>)> = elements
+            .iter()
+            .map(Element::binary_header)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            derived,
+            vec![
+                (header, Some(0)),
+                (header | 4, Some(4)),
+                (extra | 1, Some(200)),
+                (extra | 2, Some(1_000)),
+                (extra | 4, Some(70_000)),
+                (ST_BINARYFLAG_ELEMENT_HEADER, None),
+            ]
+        );
+
+        let stream = ObjectStream {
+            tag: StreamTag::BINARY,
+            version: 3,
+            elements,
+        };
+        let parsed = ObjectStream::from_bytes(&stream.to_bytes(), None)?;
+        let round_tripped: Vec<Option<&[u8]>> =
+            parsed.elements().iter().map(Element::data).collect();
+        let original: Vec<Option<&[u8]>> = stream.elements().iter().map(Element::data).collect();
+        assert_eq!(round_tripped, original);
+        Ok(())
+    }
+
+    #[test]
+    fn a_binary_sourced_header_keeps_its_own_size_field() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // A four-byte value carried in an explicit one-byte size field is
+        // valid but not minimal. Deriving a header must not silently
+        // re-encode a payload that already had one.
+        let mut fixture = BinaryFixture::new(3);
+        fixture
+            .open(
+                ST_BINARYFLAG_ELEMENT_HEADER
+                    | ST_BINARYFLAG_HAS_VALUE
+                    | ST_BINARYFLAG_EXTRA_SIZE_FIELD
+                    | 1,
+                None,
+                None,
+                types::UNSIGNED_INT,
+                &[4],
+                &7_u32.to_be_bytes(),
+            )
+            .close();
+        let bytes = fixture.finish();
+
+        let parsed = ObjectStream::from_bytes(&bytes, None)?;
+        assert_eq!(parsed.to_bytes(), bytes);
+        Ok(())
     }
 }
