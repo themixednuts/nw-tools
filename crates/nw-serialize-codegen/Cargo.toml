@@ -19,9 +19,15 @@ rust-serialize-context = []
 # dependencies, so build scripts that only need network codegen can opt out of
 # the Go/TypeScript emitters and the CLI.
 network = []
+# Tree-sitter parse of a `GetTypeName<T>` C++ declaration. The fallback
+# scan agrees with it on every declaration in the shipped reflection data,
+# so this only buys robustness on inputs that data does not contain -- and
+# it costs ~18 crates plus a C toolchain.
+cpp-parse = ["dep:treesitter-types-cpp"]
 full = [
     "rust-serialize-context",
     "network",
+    "cpp-parse",
     "dep:clap",
     "dep:oxc_allocator",
     "dep:oxc_codegen",
@@ -54,7 +60,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
 treesitter-types-go = { workspace = true, optional = true }
-treesitter-types-cpp = { workspace = true }
+treesitter-types-cpp = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

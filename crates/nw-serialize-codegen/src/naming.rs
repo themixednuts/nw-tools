@@ -354,6 +354,15 @@ struct CppDeclarationSyntax {
     calling_convention: Option<CppCallingConvention>,
 }
 
+/// Without `cpp-parse` the caller falls back to the hand-rolled template
+/// argument scan, which agrees with the parsed result on every declaration in
+/// the shipped reflection data.
+#[cfg(not(feature = "cpp-parse"))]
+fn parse_cpp_declaration(_declaration: &str) -> Option<CppDeclarationSyntax> {
+    None
+}
+
+#[cfg(feature = "cpp-parse")]
 fn parse_cpp_declaration(declaration: &str) -> Option<CppDeclarationSyntax> {
     let calling_convention = declaration
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
@@ -400,11 +409,13 @@ fn parse_cpp_declaration(declaration: &str) -> Option<CppDeclarationSyntax> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "cpp-parse")]
 struct CppSyntaxNode {
     kind: String,
     text: String,
 }
 
+#[cfg(feature = "cpp-parse")]
 fn collect_cpp_nodes(
     node: treesitter_types_cpp::tree_sitter::Node<'_>,
     source: &[u8],
