@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/themixednuts/nw-tools"
 publish = false
@@ -44,8 +44,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 arcstr = { version = "1.2.0", features = ["serde"] }
 arrayvec = "0.7"
-az-animation = { version = "0.1.0", path = "../az-rs/crates/az/animation" }
-az-turso = { version = "0.1.0", path = "../az-rs/crates/az/turso" }
+az-animation = { version = "0.1.0", git = "https://github.com/themixednuts/az-rs.git", rev = "d12892d19ff012e46561f431a5c367ad3ee5f11a" }
+az-turso = { version = "0.1.0", git = "https://github.com/themixednuts/az-rs.git", rev = "d12892d19ff012e46561f431a5c367ad3ee5f11a" }
 az-physics-assets = { version = "0.1.0", path = "crates/az-physics-assets" }
 glam = { version = "0.32", features = ["serde"] }
 bevy_math = { version = "0.19", default-features = false, features = ["std"] }

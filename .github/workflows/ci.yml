@@ -16,7 +16,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  AZ_RS_REV: f787c9eddc11a12458f50f1114d7c600e636a104
 
 jobs:
   fmt:
@@ -25,21 +24,11 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v7.0.0
-        with:
-          path: nw-tools
-
-      - name: checkout az-rs
-        uses: ./nw-tools/.github/actions/checkout-az-rs
-        timeout-minutes: 5
-        with:
-          revision: ${{ env.AZ_RS_REV }}
-          ssh-private-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
 
       - name: rust
         run: rustup toolchain install stable --profile minimal --component rustfmt
 
       - name: fmt
-        working-directory: nw-tools
         run: cargo fmt --all --check
 
   clippy:
@@ -49,15 +38,6 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v7.0.0
-        with:
-          path: nw-tools
-
-      - name: checkout az-rs
-        uses: ./nw-tools/.github/actions/checkout-az-rs
-        timeout-minutes: 5
-        with:
-          revision: ${{ env.AZ_RS_REV }}
-          ssh-private-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
 
       - name: rust
         run: rustup toolchain install stable --profile minimal --component clippy
@@ -66,10 +46,8 @@ jobs:
         uses: Swatinem/rust-cache@v2.9.1
         with:
           shared-key: clippy
-          workspaces: nw-tools -> target
 
       - name: clippy
-        working-directory: nw-tools
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
@@ -79,15 +57,6 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v7.0.0
-        with:
-          path: nw-tools
-
-      - name: checkout az-rs
-        uses: ./nw-tools/.github/actions/checkout-az-rs
-        timeout-minutes: 5
-        with:
-          revision: ${{ env.AZ_RS_REV }}
-          ssh-private-key: ${{ secrets.AZ_RS_DEPLOY_KEY }}
 
       - name: rust
         run: rustup toolchain install stable --profile minimal
@@ -96,8 +65,6 @@ jobs:
         uses: Swatinem/rust-cache@v2.9.1
         with:
           shared-key: test
-          workspaces: nw-tools -> target
 
       - name: test
-        working-directory: nw-tools
         run: cargo test --workspace --locked

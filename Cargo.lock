@@ -435,6 +435,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "az-animation"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
  "arrayvec",
  "az-asset",
@@ -460,14 +461,13 @@ dependencies = [
 [[package]]
 name = "az-asset"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
- "az-bytes",
  "az-core",
  "az-filesystem",
  "bevy_app",
  "bevy_reflect",
  "blake3",
- "byteorder",
  "crc32fast",
  "rayon",
  "rustc-hash 2.1.2",
@@ -480,6 +480,7 @@ dependencies = [
 [[package]]
 name = "az-asset-builder"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
  "az-asset",
  "az-asset-builder-derive",
@@ -499,6 +500,7 @@ dependencies = [
 [[package]]
 name = "az-asset-builder-derive"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -506,16 +508,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "az-bytes"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "az-core"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
  "az-derive",
  "az-gem-contract",
@@ -531,6 +526,7 @@ dependencies = [
 [[package]]
 name = "az-derive"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -540,6 +536,7 @@ dependencies = [
 [[package]]
 name = "az-filesystem"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
  "directories",
  "dunce",
@@ -551,6 +548,7 @@ dependencies = [
 [[package]]
 name = "az-gem-contract"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
  "az-gem-contract-derive",
  "serde",
@@ -561,6 +559,7 @@ dependencies = [
 [[package]]
 name = "az-gem-contract-derive"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -571,6 +570,7 @@ dependencies = [
 [[package]]
 name = "az-jobs"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
  "crossbeam-channel",
  "ctrlc",
@@ -593,6 +593,7 @@ dependencies = [
 [[package]]
 name = "az-turso"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
  "async-lock",
  "fs2",
@@ -611,10 +612,10 @@ dependencies = [
 [[package]]
 name = "az-work"
 version = "0.1.0"
+source = "git+https://github.com/themixednuts/az-rs.git?rev=d12892d19ff012e46561f431a5c367ad3ee5f11a#d12892d19ff012e46561f431a5c367ad3ee5f11a"
 dependencies = [
  "az-jobs",
  "futures",
- "thiserror 2.0.18",
  "tokio-util",
  "tracing",
 ]
